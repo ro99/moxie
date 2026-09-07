@@ -1,9 +1,11 @@
 # Rust build output
 /target/
 
-# Normative implementation pack — kept local, not pushed to a remote.
-# See README.md "Repository layout" for the consequences of this choice.
-/docs/spec/
+# Reference documents (documents 01-09, the architectural diagnosis) are kept
+# local and are not pushed to a remote. Living records are tracked instead --
+# see docs/README.md for the placement contract.
+/docs/spec/*
+!/docs/spec/templates/
 
 # Local scratch, probe output, benchmark results and converted artifacts.
 /scratch/

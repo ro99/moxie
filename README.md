@@ -17,14 +17,16 @@ implementation and makes no claim of achieved performance.
 |---|---|---|
 | `AGENTS.md` | Single shared policy entry point for implementation agents | yes |
 | `CLAUDE.md` | Pointer to `AGENTS.md`; no divergent second policy | yes |
-| `docs/spec/` | Normative implementation pack: documents 01–09, the architectural diagnosis, and task templates | **no — gitignored** |
+| `docs/README.md` | Placement contract: what is tracked, what is not, and which template each record uses | yes |
+| `docs/spec/01-09`, `docs/spec/strata-arch-diagnosis.md` | Reference documents: the normative specification | **no — kept local** |
+| `docs/spec/templates/` | Forms used to author living records | yes |
+| `docs/decisions/`, `docs/tasks/`, `docs/handovers/`, `docs/models/`, `docs/evidence/` | Living records: owner-gate register, ADRs, task contracts, handovers, bring-up contracts, support matrix, benchmark manifests, experiment conclusions | yes |
 
-`docs/spec/` is deliberately excluded from version control at the owner's direction, so it does not
-reach a remote. Consequence to be aware of: the tracked entry points link into an untracked
-directory, and a fresh clone gets pointers with no targets. Documents 07 and 09 require operative
-contracts, ADRs, decision registers and handovers to be version-controlled; satisfying that will
-need either a private remote for `docs/spec/` or a separate tracked location for the decision
-register and ADRs. Raise it before M0's decision register is created.
+The reference documents are kept local at the owner's direction and do not reach the remote. Everything
+implementation actually decides, assigns, measures and hands over **is** tracked, which is what
+documents 07 and 09 require and what R25 identifies as a cause of legacy drift. See
+[docs/README.md](docs/README.md) for the full contract. A fresh clone therefore has the living records
+but not the specification; the pack has to be copied in separately.
 
 ## Start here
 
@@ -57,11 +59,31 @@ relative to the legacy root, resolved against commit `2dc566eb8e440fff4837ac75ca
 - Legacy checkout: `/home/rodrigo/Developer/strata` (verified at that commit, 2026-09-06).
 - Do not modify, reset or clean the legacy tree, and do not depend on its dirty worktree or deleted handover.
 
-Toolchain and hardware are pinned and inventoried by M0. A preliminary check on this machine found
-rustc/cargo 1.97.1, CUDA 13.0 (nvcc V13.0.88), and three GPUs — RTX 5060 Ti 16 GB as device 0, two
-RTX 3090 24 GB as devices 1 and 2. This is a sanity check, not the M0 inventory; M0 must capture
-UUIDs, SM capabilities, peer access, PCIe topology under load, NUMA, host/pinned limits and measured
-sustained bandwidth.
+### GPU device ordering
+
+**`CUDA_DEVICE_ORDER=PCI_BUS_ID` is required.** CUDA's default is `FASTEST_FIRST`, which reorders
+devices by an opaque heuristic that can change with the driver; under `PCI_BUS_ID` a CUDA ordinal
+matches its `nvidia-smi` index and means the same physical card every time. It is set in
+[`.cargo/config.toml`](.cargo/config.toml) for everything cargo launches; a binary started outside
+cargo needs it in its own environment. Ordinals are for humans and diagnostics — anything recorded as
+evidence identifies a GPU by UUID, per document 07.
+
+### Preliminary hardware check
+
+Not the M0 inventory. M0 must still capture SM capabilities, peer access, PCIe topology under load,
+NUMA, host/pinned-memory limits and measured sustained bandwidth. rustc/cargo 1.97.1, CUDA 13.0
+(nvcc V13.0.88).
+
+| Ordinal | Device | VRAM | PCI bus | NUMA |
+|---|---|---|---|---|
+| 0 | RTX 5060 Ti | 16311 MiB | `0000:03:00.0` | 0 |
+| 1 | RTX 3090 | 24576 MiB | `0000:82:00.0` | 1 |
+| 2 | RTX 3090 | 24576 MiB | `0000:83:00.0` | 1 |
+
+The 3090 pair are `PHB` peers on NUMA node 1; the 5060 Ti is on NUMA node 0 and reachable only as
+`SYS`, across the socket interconnect. Relevant to M5: the TP2 candidate on the 3090 pair and any
+heterogeneous stage involving the 5060 Ti are not comparable placements, and document 03 requires the
+link widths and simultaneous-transfer behavior to be measured rather than assumed (R12).
 
 ## First assignment to an implementation agent
 
