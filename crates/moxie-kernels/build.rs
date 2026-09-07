@@ -1,9 +1,9 @@
-//! Compile the M0 smoke kernels to fatbins, one per target set.
+//! Compile the smoke kernels to fatbins, one per target set.
 //!
 //! Two images are produced deliberately:
 //!
-//! * `m0_smoke.fatbin`      -- every architecture the product targets.
-//! * `m0_smoke_sm86.fatbin` -- SM86 only.
+//! * `smoke.fatbin`      -- every architecture the product targets.
+//! * `smoke_sm86.fatbin` -- SM86 only.
 //!
 //! The second is not redundant. Document 03 warns that "SM100/Hopper recipes are
 //! not automatically compatible" with SM120 and that the 5060 Ti must be
@@ -22,7 +22,7 @@ use std::process::Command;
 const ARCHS: &[&str] = &["86", "120"];
 
 fn main() {
-    println!("cargo:rerun-if-changed=cuda/m0_smoke.cu");
+    println!("cargo:rerun-if-changed=cuda/smoke.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=NVCC");
@@ -43,16 +43,16 @@ fn main() {
         );
     }
 
-    build_fatbin(&nvcc, &out, "m0_smoke.fatbin", ARCHS);
-    build_fatbin(&nvcc, &out, "m0_smoke_sm86.fatbin", &["86"]);
+    build_fatbin(&nvcc, &out, "smoke.fatbin", ARCHS);
+    build_fatbin(&nvcc, &out, "smoke_sm86.fatbin", &["86"]);
 
     println!(
-        "cargo:rustc-env=MOXIE_M0_FATBIN={}",
-        out.join("m0_smoke.fatbin").display()
+        "cargo:rustc-env=MOXIE_SMOKE_FATBIN={}",
+        out.join("smoke.fatbin").display()
     );
     println!(
-        "cargo:rustc-env=MOXIE_M0_FATBIN_SM86={}",
-        out.join("m0_smoke_sm86.fatbin").display()
+        "cargo:rustc-env=MOXIE_SMOKE_FATBIN_SM86={}",
+        out.join("smoke_sm86.fatbin").display()
     );
     println!("cargo:rustc-env=MOXIE_KERNEL_ARCHS={}", ARCHS.join(","));
 }
@@ -68,7 +68,7 @@ fn build_fatbin(nvcc: &str, out: &Path, name: &str, archs: &[&str]) {
         cmd.arg("-gencode")
             .arg(format!("arch=compute_{a},code=sm_{a}"));
     }
-    cmd.arg("cuda/m0_smoke.cu").arg("-o").arg(&dst);
+    cmd.arg("cuda/smoke.cu").arg("-o").arg(&dst);
 
     let status = cmd
         .status()

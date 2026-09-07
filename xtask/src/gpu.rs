@@ -35,7 +35,7 @@ pub struct CaseResult {
     pub outcome: Outcome,
 }
 
-/// Run every M0 GPU case on every visible device.
+/// Run every GPU case on every visible device.
 pub fn run() -> i32 {
     let count = match moxie_cuda::device_count() {
         Ok(n) => n,
@@ -156,7 +156,7 @@ fn case(cap: &DeviceCapability, name: &'static str, r: Result<Outcome, Error>) -
 fn axpy(cap: &DeviceCapability) -> Result<Outcome, Error> {
     const N: usize = 4096;
     let ctx = DeviceContext::new(cap.ordinal)?;
-    let module = Module::load(&ctx, moxie_kernels::M0_SMOKE_FATBIN)?;
+    let module = Module::load(&ctx, moxie_kernels::SMOKE_FATBIN)?;
     let func = module.function(moxie_kernels::AXPY_F32)?;
 
     let x: Vec<f32> = (0..N).map(|i| (i as f32) * 0.5).collect();
@@ -165,8 +165,8 @@ fn axpy(cap: &DeviceCapability) -> Result<Outcome, Error> {
 
     let mut dx = DeviceBuffer::alloc(&ctx, N * 4)?;
     let mut dy = DeviceBuffer::alloc(&ctx, N * 4)?;
-    dx.copy_from_host(&ctx, bytemuck_f32(&x))?;
-    dy.copy_from_host(&ctx, bytemuck_f32(&y_in))?;
+    dx.copy_from_host(bytemuck_f32(&x))?;
+    dy.copy_from_host(bytemuck_f32(&y_in))?;
 
     let mut px = dx.device_ptr();
     let mut py = dy.device_ptr();
@@ -178,21 +178,15 @@ fn axpy(cap: &DeviceCapability) -> Result<Outcome, Error> {
         (&raw mut pa).cast(),
         (&raw mut pn).cast(),
     ];
-    // SAFETY: the parameter list matches `moxie_m0_axpy_f32(const float*,
+    // SAFETY: the parameter list matches `moxie_smoke_axpy_f32(const float*,
     // float*, float, unsigned)` in count, order and type. Both device pointers
     // address N*4 bytes, which is exactly what the kernel indexes for i < N.
     unsafe {
-        func.launch_blocking(
-            &ctx,
-            (N.div_ceil(256) as u32, 1, 1),
-            (256, 1, 1),
-            0,
-            &mut params,
-        )?;
+        func.launch_blocking((N.div_ceil(256) as u32, 1, 1), (256, 1, 1), 0, &mut params)?;
     }
 
     let mut out = vec![0f32; N];
-    dy.copy_to_host(&ctx, bytemuck_f32_mut(&mut out))?;
+    dy.copy_to_host(bytemuck_f32_mut(&mut out))?;
 
     for i in 0..N {
         let want = a * x[i] + y_in[i];
@@ -227,12 +221,12 @@ fn bf16(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let n = inputs.len();
 
     let ctx = DeviceContext::new(cap.ordinal)?;
-    let module = Module::load(&ctx, moxie_kernels::M0_SMOKE_FATBIN)?;
+    let module = Module::load(&ctx, moxie_kernels::SMOKE_FATBIN)?;
     let func = module.function(moxie_kernels::F32_TO_BF16_BITS)?;
 
     let mut dsrc = DeviceBuffer::alloc(&ctx, n * 4)?;
     let ddst = DeviceBuffer::alloc(&ctx, n * 2)?;
-    dsrc.copy_from_host(&ctx, bytemuck_f32(&inputs))?;
+    dsrc.copy_from_host(bytemuck_f32(&inputs))?;
 
     let mut ps = dsrc.device_ptr();
     let mut pd = ddst.device_ptr();
@@ -242,15 +236,15 @@ fn bf16(cap: &DeviceCapability) -> Result<Outcome, Error> {
         (&raw mut pd).cast(),
         (&raw mut pn).cast(),
     ];
-    // SAFETY: matches `moxie_m0_f32_to_bf16_bits(const float*, unsigned short*,
+    // SAFETY: matches `moxie_smoke_f32_to_bf16_bits(const float*, unsigned short*,
     // unsigned)`. Source holds n*4 bytes, destination n*2, and the kernel writes
     // one u16 per i < n.
     unsafe {
-        func.launch_blocking(&ctx, (1, 1, 1), (n as u32, 1, 1), 0, &mut params)?;
+        func.launch_blocking((1, 1, 1), (n as u32, 1, 1), 0, &mut params)?;
     }
 
     let mut got = vec![0u16; n];
-    ddst.copy_to_host(&ctx, bytemuck_u16_mut(&mut got))?;
+    ddst.copy_to_host(bytemuck_u16_mut(&mut got))?;
 
     for (i, v) in inputs.iter().enumerate() {
         let want = host_f32_to_bf16_bits(*v);
@@ -283,7 +277,7 @@ fn host_f32_to_bf16_bits(v: f32) -> u16 {
 /// Loading an image with no binary for this device must be a typed error.
 fn arch_mismatch(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let ctx = DeviceContext::new(cap.ordinal)?;
-    let r = Module::load(&ctx, moxie_kernels::M0_SMOKE_FATBIN_SM86_ONLY);
+    let r = Module::load(&ctx, moxie_kernels::SMOKE_FATBIN_SM86_ONLY);
     let is_sm86 = cap.sm() == "sm_86";
     match (is_sm86, r) {
         (true, Ok(_)) => Ok(Outcome::Passed),
@@ -311,7 +305,7 @@ fn arch_mismatch(cap: &DeviceCapability) -> Result<Outcome, Error> {
 }
 
 // Small local reinterpretation helpers. Deliberately not a dependency: these are
-// the only three shapes M0 needs.
+// the only three shapes this lane needs.
 fn bytemuck_f32(v: &[f32]) -> &[u8] {
     // SAFETY: f32 has no padding and no invalid bit patterns; the resulting
     // slice covers exactly the same allocation, with alignment 1.

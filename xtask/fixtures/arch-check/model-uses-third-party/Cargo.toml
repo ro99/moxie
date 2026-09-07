@@ -1,0 +1,12 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# No forbidden `moxie-*` edge at all. The device access and the task runtime come
+# from crates.io instead -- exactly what document 02 denies a model adapter, and
+# exactly what a workspace-only dependency filter cannot see. Must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+cudarc = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread"] }

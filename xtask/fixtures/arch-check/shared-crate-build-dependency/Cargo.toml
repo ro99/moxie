@@ -1,0 +1,13 @@
+[package]
+name = "moxie-state"
+version = "0.0.0"
+edition = "2024"
+
+# Production dependencies are clean; the kernel toolchain arrives through a build
+# dependency. Document 02 requires build dependencies to be enforced, because
+# that is how generated code and kernel compilation get in. Must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+
+[build-dependencies]
+cc = "1"

@@ -3,9 +3,14 @@
 # PCI_BUS_ID makes CUDA ordinals match `nvidia-smi` indices, so a device ordinal
 # in a plan, manifest or bug report means the same card every time.
 #
-# This applies only to processes cargo launches (build scripts, `cargo run`,
-# `cargo test`, `cargo xtask`). A binary started outside cargo needs the variable
-# set in its own environment. Ordinals are for humans and diagnostics; anything
-# recorded as evidence identifies a GPU by UUID, per document 07.
+# `force = true` is load-bearing. Without it, cargo's `[env]` only supplies a
+# value when the variable is *unset*, so an inherited FASTEST_FIRST from the
+# shell would win silently and every ordinal in this repo would mean a different
+# card. That has happened on this machine before.
+#
+# This covers processes cargo launches (build scripts, `cargo run`, `cargo test`,
+# `cargo xtask`). A binary started outside cargo needs the variable set in its
+# own environment. Ordinals are for humans and diagnostics; anything recorded as
+# evidence identifies a GPU by UUID, per document 07.
 [env]
-CUDA_DEVICE_ORDER = "PCI_BUS_ID"
+CUDA_DEVICE_ORDER = { value = "PCI_BUS_ID", force = true }

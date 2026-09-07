@@ -5,28 +5,34 @@
 //! discovery. It exposes *images and descriptors*; loading and launching belong
 //! to `moxie-cuda` and, later, to the executor.
 //!
-//! M0 scope: the smoke kernels only. Real operation kernels arrive with the
+//! Scope: the smoke kernels only. Real operation kernels arrive with the
 //! operations that define them.
+//!
+//! Naming: identifiers here describe what the code *is*, never which milestone
+//! produced it. `smoke` says "toolchain and launch probe, not a product kernel"
+//! and stays true forever; a milestone tag stops meaning anything the moment the
+//! milestone closes, and `moxie_smoke_axpy_f32` is a CUDA symbol baked into the
+//! fatbin ABI, so renaming it later breaks every lookup by name.
 
 #![forbid(unsafe_code)]
 
 use moxie_types::KernelCapability;
 
 /// Fatbin containing every architecture this build targets.
-pub const M0_SMOKE_FATBIN: &[u8] = include_bytes!(env!("MOXIE_M0_FATBIN"));
+pub const SMOKE_FATBIN: &[u8] = include_bytes!(env!("MOXIE_SMOKE_FATBIN"));
 
 /// Fatbin containing SM86 only.
 ///
 /// Used to prove that loading an image with no binary for the current device
 /// fails with a typed `UnsupportedKernel`. Do not "fix" a failure to load this
 /// on an SM120 device -- that failure is the assertion.
-pub const M0_SMOKE_FATBIN_SM86_ONLY: &[u8] = include_bytes!(env!("MOXIE_M0_FATBIN_SM86"));
+pub const SMOKE_FATBIN_SM86_ONLY: &[u8] = include_bytes!(env!("MOXIE_SMOKE_FATBIN_SM86"));
 
-/// Compute capabilities compiled into `M0_SMOKE_FATBIN`, as `["86", "120"]`.
+/// Compute capabilities compiled into `SMOKE_FATBIN`, as `["86", "120"]`.
 pub const KERNEL_ARCHS: &str = env!("MOXIE_KERNEL_ARCHS");
 
-pub const AXPY_F32: &str = "moxie_m0_axpy_f32";
-pub const F32_TO_BF16_BITS: &str = "moxie_m0_f32_to_bf16_bits";
+pub const AXPY_F32: &str = "moxie_smoke_axpy_f32";
+pub const F32_TO_BF16_BITS: &str = "moxie_smoke_f32_to_bf16_bits";
 
 /// The architectures this build qualified, as `sm_NN` capability strings.
 pub fn qualified_sm() -> Vec<String> {
@@ -54,16 +60,16 @@ mod tests {
     #[test]
     fn fatbins_are_present_and_non_trivial() {
         // A zero-length image would load as a silent no-op on some drivers.
-        assert!(M0_SMOKE_FATBIN.len() > 1024, "fatbin looks empty");
-        assert!(M0_SMOKE_FATBIN_SM86_ONLY.len() > 512);
+        assert!(SMOKE_FATBIN.len() > 1024, "fatbin looks empty");
+        assert!(SMOKE_FATBIN_SM86_ONLY.len() > 512);
         // The multi-arch image must be the larger of the two: it carries strictly
         // more code. If this ever inverts, the build lost an architecture.
         assert!(
-            M0_SMOKE_FATBIN.len() > M0_SMOKE_FATBIN_SM86_ONLY.len(),
+            SMOKE_FATBIN.len() > SMOKE_FATBIN_SM86_ONLY.len(),
             "multi-arch fatbin ({}) is not larger than the sm86-only one ({}); \
              an architecture was probably dropped from the build",
-            M0_SMOKE_FATBIN.len(),
-            M0_SMOKE_FATBIN_SM86_ONLY.len()
+            SMOKE_FATBIN.len(),
+            SMOKE_FATBIN_SM86_ONLY.len()
         );
     }
 

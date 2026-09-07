@@ -11,7 +11,7 @@ const USAGE: &str = "\
 cargo xtask <command>
 
   arch-check              Dependency direction, model ownership, negative fixtures
-  test-gpu                Real CUDA launches on every visible device (M0 exit gate)
+  test-gpu                Real CUDA launches on every visible device
   probe [--out <path>]    Hardware/topology inventory; writes markdown when --out given
   index                   List command contracts and their required lane
 

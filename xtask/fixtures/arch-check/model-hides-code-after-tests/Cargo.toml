@@ -1,0 +1,10 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# The dependency list is clean and the first item is innocent. The violations sit
+# *below* a test module, where a checker that stops at the first `#[cfg(test)]`
+# never looks. Must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }

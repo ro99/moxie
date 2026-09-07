@@ -4,7 +4,7 @@
 //! conversion from FP32."
 //!
 //! Truncation is the common shortcut and it is wrong: it biases every weight
-//! toward zero. The M0 GPU lane compares this host implementation against the
+//! toward zero. The GPU lane compares this host implementation against the
 //! device's `__float2bfloat16` bit for bit.
 
 /// Round-to-nearest-even f32 -> bf16, returning the raw 16-bit pattern.

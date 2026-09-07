@@ -123,12 +123,12 @@ fn measure_h2d(ordinal: u32) -> Result<(f64, f64, f64), moxie_types::Error> {
 
     // One warm-up: the first copy pays context and mapping costs that are not
     // part of the steady-state rate.
-    dev.copy_from_host(&ctx, &host)?;
+    dev.copy_from_host(&host)?;
 
     let mut rates = Vec::with_capacity(XFER_REPS);
     for _ in 0..XFER_REPS {
         let t = std::time::Instant::now();
-        dev.copy_from_host(&ctx, &host)?;
+        dev.copy_from_host(&host)?;
         let secs = t.elapsed().as_secs_f64();
         rates.push((XFER_BYTES as f64) / secs / 1e9);
     }

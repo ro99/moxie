@@ -107,7 +107,7 @@ impl Op {
 /// semantically required, state effects, partition legality, workspace upper
 /// bound, host oracle, and capability tests."
 ///
-/// M0 carries the machine-checkable subset. `has_host_oracle` is the field that
+/// This draft carries the machine-checkable subset. `has_host_oracle` is the field that
 /// makes the rule bite: without one there is nothing to validate a kernel
 /// against, so lowering is refused.
 #[derive(Debug, Clone)]

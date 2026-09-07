@@ -11,34 +11,91 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Allowed *production* workspace dependencies, per crate. Absent from this map
-/// means "not a known crate", which is itself a failure: a new crate must
-/// declare where it sits in the ownership graph before it can build.
+/// Everything a crate may depend on in production, workspace and third-party
+/// alike. Absent from this map means "not a known crate", which is itself a
+/// failure: a new crate must declare where it sits in the ownership graph
+/// before it can build.
 ///
-/// Dev-dependencies are checked separately and more loosely: document 02 permits
-/// a test harness, and says that "is not permission for production dependencies".
-fn allowlist() -> BTreeMap<&'static str, &'static [&'static str]> {
+/// Third-party crates are listed for the same reason workspace crates are.
+/// Document 02 denies a model adapter "CUDA, storage, engine, sampling,
+/// allocator, thread/task runtimes" -- and almost every one of those is
+/// reachable from crates.io, so an allowlist that only inspects `moxie-*`
+/// dependencies enforces nothing. An empty `third_party` is the default and
+/// widening one is an ADR.
+struct Allowed {
+    workspace: &'static [&'static str],
+    third_party: &'static [&'static str],
+}
+
+fn allowlist() -> BTreeMap<&'static str, Allowed> {
+    const NONE: &[&str] = &[];
     BTreeMap::from([
-        ("moxie-types", &[] as &[&str]),
-        ("moxie-graph", &["moxie-types"][..]),
-        ("moxie-model-api", &["moxie-types", "moxie-graph"][..]),
-        ("moxie-format", &["moxie-types"][..]),
-        ("moxie-state", &["moxie-types"][..]),
-        ("moxie-cuda", &["moxie-types"][..]),
-        ("moxie-kernels", &["moxie-types"][..]),
+        (
+            "moxie-types",
+            Allowed {
+                workspace: NONE,
+                third_party: NONE,
+            },
+        ),
+        (
+            "moxie-graph",
+            Allowed {
+                workspace: &["moxie-types"],
+                third_party: NONE,
+            },
+        ),
+        (
+            "moxie-model-api",
+            Allowed {
+                workspace: &["moxie-types", "moxie-graph"],
+                third_party: NONE,
+            },
+        ),
+        (
+            "moxie-format",
+            Allowed {
+                workspace: &["moxie-types"],
+                third_party: NONE,
+            },
+        ),
+        (
+            "moxie-state",
+            Allowed {
+                workspace: &["moxie-types"],
+                third_party: NONE,
+            },
+        ),
+        (
+            "moxie-cuda",
+            Allowed {
+                workspace: &["moxie-types"],
+                third_party: NONE,
+            },
+        ),
+        (
+            "moxie-kernels",
+            Allowed {
+                workspace: &["moxie-types"],
+                third_party: NONE,
+            },
+        ),
         // The composition root / tooling. Document 02: "Only the composition
         // root/registry and integration tests may" import concrete models.
         (
             "xtask",
-            &[
-                "moxie-types",
-                "moxie-graph",
-                "moxie-model-api",
-                "moxie-format",
-                "moxie-state",
-                "moxie-cuda",
-                "moxie-kernels",
-            ][..],
+            Allowed {
+                workspace: &[
+                    "moxie-types",
+                    "moxie-graph",
+                    "moxie-model-api",
+                    "moxie-format",
+                    "moxie-state",
+                    "moxie-cuda",
+                    "moxie-kernels",
+                ],
+                // Manifest parsing for this checker. Nothing else.
+                third_party: &["toml"],
+            },
         ),
     ])
 }
@@ -47,6 +104,14 @@ fn allowlist() -> BTreeMap<&'static str, &'static [&'static str]> {
 /// Document 02: "A model crate's allowed production dependencies are
 /// graph/model-api/types and narrowly approved pure metadata parsing."
 const MODEL_ALLOWED: &[&str] = &["moxie-types", "moxie-graph", "moxie-model-api"];
+
+/// Third-party crates a model adapter may depend on in production.
+///
+/// Document 02 allows "narrowly approved pure metadata parsing" and nothing
+/// else. Nothing is approved yet: approving one is an ADR naming the crate and
+/// why the parsing it does is pure. Empty is the correct default, not an
+/// oversight.
+const MODEL_ALLOWED_THIRD_PARTY: &[&str] = &[];
 
 /// Crate-name prefixes that identify a concrete model adapter.
 const MODEL_PREFIX: &str = "moxie-models-";
@@ -165,15 +230,23 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
             .ok_or_else(|| format!("{}: package has no name", manifest.display()))?
             .to_string();
 
-        let deps = workspace_deps(&doc, "dependencies");
+        // Both production sections. Document 02 requires enforcement of "actual
+        // module imports, model build scripts/FFI, dynamic registration edges,
+        // and generated code" -- a build dependency is how generated code and
+        // kernel compilation get in, so it is production, not tooling.
+        let mut deps = all_deps(&doc, "dependencies");
+        deps.extend(all_deps(&doc, "build-dependencies"));
+        // `dev-dependencies` are deliberately not checked: document 02 permits a
+        // test harness there, and integration tests are one of the two places
+        // allowed to import a concrete model.
         let is_model = name.starts_with(MODEL_PREFIX);
 
         // Rule 1: dependency direction, from the ownership table.
-        let permitted: Vec<&str> = if is_model {
-            MODEL_ALLOWED.to_vec()
+        let (allow_ws, allow_tp): (Vec<&str>, Vec<&str>) = if is_model {
+            (MODEL_ALLOWED.to_vec(), MODEL_ALLOWED_THIRD_PARTY.to_vec())
         } else {
             match allow.get(name.as_str()) {
-                Some(v) => v.to_vec(),
+                Some(a) => (a.workspace.to_vec(), a.third_party.to_vec()),
                 None => {
                     out.push(Violation {
                         crate_name: name.clone(),
@@ -181,12 +254,17 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
                         detail: "not in the arch-check allowlist; declare its ownership first"
                             .into(),
                     });
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 }
             }
         };
         for d in &deps {
-            if !permitted.contains(&d.as_str()) {
+            let permitted = if d.starts_with("moxie-") {
+                allow_ws.contains(&d.as_str())
+            } else {
+                allow_tp.contains(&d.as_str())
+            };
+            if !permitted {
                 out.push(Violation {
                     crate_name: name.clone(),
                     rule: "forbidden dependency",
@@ -226,7 +304,7 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
             for file in rust_sources(&src) {
                 let body = std::fs::read_to_string(&file).unwrap_or_default();
                 // Strip test modules: dev-time harness use is permitted.
-                let body = body.split("#[cfg(test)]").next().unwrap_or("");
+                let body = strip_cfg_test(&body);
                 let lower = body.to_lowercase();
                 for (needle, why) in MODEL_FORBIDDEN_SOURCE {
                     if lower.contains(needle) {
@@ -243,16 +321,18 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
     Ok(out)
 }
 
-/// Workspace dependency names from one manifest section, covering both
-/// `foo.workspace = true` and `foo = { path = ... }` spellings.
-fn workspace_deps(doc: &toml::Value, section: &str) -> Vec<String> {
+/// Every dependency name in one manifest section, workspace and third-party
+/// alike, covering the `foo.workspace = true`, `foo = "1.0"` and
+/// `foo = { path = ... }` spellings.
+///
+/// Deliberately unfiltered. An earlier version kept only `moxie-*` names, which
+/// meant a model crate could depend on a CUDA wrapper or an async runtime from
+/// crates.io and pass -- the exact dependencies document 02 denies it.
+fn all_deps(doc: &toml::Value, section: &str) -> Vec<String> {
     let Some(tbl) = doc.get(section).and_then(|v| v.as_table()) else {
         return Vec::new();
     };
-    tbl.keys()
-        .filter(|k| k.starts_with("moxie-"))
-        .cloned()
-        .collect()
+    tbl.keys().cloned().collect()
 }
 
 fn find_manifests(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -281,6 +361,119 @@ fn find_manifests(root: &Path) -> Result<Vec<PathBuf>, String> {
     }
     out.sort();
     Ok(out)
+}
+
+/// Remove `#[cfg(test)]` items, keeping everything else.
+///
+/// An earlier version used `split("#[cfg(test)]").next()`, which kept only the
+/// text *before the first* test module and silently discarded every line after
+/// it. A model crate could put FFI declarations, file I/O and a cache below a
+/// test module and pass the check. This brace-matches instead, so only the
+/// attributed item is removed.
+///
+/// The matcher skips line comments, block comments and string/char literals so
+/// that a brace inside one does not throw off the count. A raw string with an
+/// unbalanced brace and a `#` delimiter could still fool it; this scan is a
+/// secondary net behind the dependency rules, not the only barrier.
+fn strip_cfg_test(src: &str) -> String {
+    const ATTR: &str = "#[cfg(test)]";
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        if src[i..].starts_with(ATTR) {
+            // Find the item's opening brace, then its match.
+            match find_item_end(bytes, i + ATTR.len()) {
+                Some(end) => {
+                    i = end;
+                    continue;
+                }
+                // No brace found (e.g. `#[cfg(test)] use ...;`): drop just the
+                // attribute and carry on.
+                None => {
+                    i += ATTR.len();
+                    continue;
+                }
+            }
+        }
+        let ch = src[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// From `start`, find the first `{` and return the index just past its match.
+fn find_item_end(b: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    // Locate the opening brace, bailing out if a `;` ends the item first.
+    while i < b.len() && b[i] != b'{' {
+        if b[i] == b';' {
+            return None;
+        }
+        i += 1;
+    }
+    if i >= b.len() {
+        return None;
+    }
+    let mut depth = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'\'' => {
+                // A char literal, or a lifetime like `'a`. Only skip when it
+                // closes within a few bytes, which a lifetime never does.
+                let mut j = i + 1;
+                let mut closed = false;
+                while j < b.len() && j <= i + 4 {
+                    if b[j] == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if b[j] == b'\'' {
+                        closed = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                i = if closed { j + 1 } else { i + 1 };
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 fn rust_sources(dir: &Path) -> Vec<PathBuf> {

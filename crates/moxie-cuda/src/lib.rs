@@ -261,6 +261,13 @@ impl DeviceContext {
         self.ordinal
     }
 
+    /// The raw context handle, for sibling types in this crate that must make
+    /// it current before touching a resource it owns. Deliberately not public:
+    /// nothing outside `moxie-cuda` may hold a bare context.
+    pub(crate) fn raw(&self) -> ffi::CUcontext {
+        self.ctx
+    }
+
     /// Make this context current on the calling thread.
     pub fn make_current(&self) -> Result<()> {
         check(
@@ -310,21 +317,43 @@ impl Drop for DeviceContext {
 ///
 /// R07 and document 02: "A kernel launch leases its inputs/outputs/workspace
 /// until completion. Retirement is event-driven; Rust `Drop` alone must not free
-/// in-flight CUDA memory." This M0 type discharges that obligation the blunt way
+/// in-flight CUDA memory." This type discharges that obligation the blunt way
 /// -- it synchronises the context before freeing. The real engine replaces this
 /// with an event-retained lease; the invariant is the same, and this type must
 /// not be "optimised" by simply deleting the synchronise.
+/// A buffer cannot outlive the context that owns it. The compiler enforces it:
+///
+/// ```compile_fail
+/// use moxie_cuda::{DeviceBuffer, DeviceContext};
+/// let escaped = {
+///     let ctx = DeviceContext::new(0).unwrap();
+///     DeviceBuffer::alloc(&ctx, 16).unwrap()
+/// }; // `ctx` dropped here, releasing the primary context
+/// drop(escaped); // would free into a released context
+/// ```
 #[derive(Debug)]
-pub struct DeviceBuffer {
+pub struct DeviceBuffer<'ctx> {
     ptr: ffi::CUdeviceptr,
     len: usize,
+    /// The context that owns this allocation.
+    ///
+    /// Borrowed, not copied, so the compiler refuses a buffer that outlives its
+    /// context. Without this the allocation could be freed after
+    /// `cuDevicePrimaryCtxRelease`, and `Drop` would synchronise whatever
+    /// context happened to be current on the dropping thread -- protecting the
+    /// wrong stream while freeing into the wrong context.
+    ctx: &'ctx DeviceContext,
 }
 
-impl DeviceBuffer {
-    pub fn alloc(ctx: &DeviceContext, len: usize) -> Result<Self> {
+impl<'ctx> DeviceBuffer<'ctx> {
+    pub fn alloc(ctx: &'ctx DeviceContext, len: usize) -> Result<Self> {
         ctx.make_current()?;
         if len == 0 {
-            return Ok(Self { ptr: 0, len: 0 });
+            return Ok(Self {
+                ptr: 0,
+                len: 0,
+                ctx,
+            });
         }
         let mut ptr: ffi::CUdeviceptr = 0;
         let r = check(
@@ -344,7 +373,7 @@ impl DeviceBuffer {
                 other => other,
             });
         }
-        Ok(Self { ptr, len })
+        Ok(Self { ptr, len, ctx })
     }
 
     pub fn len(&self) -> usize {
@@ -359,7 +388,7 @@ impl DeviceBuffer {
         self.ptr
     }
 
-    pub fn copy_from_host(&mut self, ctx: &DeviceContext, src: &[u8]) -> Result<()> {
+    pub fn copy_from_host(&mut self, src: &[u8]) -> Result<()> {
         if src.len() > self.len {
             return Err(Error::InvalidRequest {
                 field: "src",
@@ -369,7 +398,7 @@ impl DeviceBuffer {
         if src.is_empty() {
             return Ok(());
         }
-        ctx.make_current()?;
+        self.ctx.make_current()?;
         check(
             // SAFETY: `src` is a valid readable slice of `src.len()` bytes and the
             // destination holds at least that many, checked above. The synchronous
@@ -380,7 +409,7 @@ impl DeviceBuffer {
         )
     }
 
-    pub fn copy_to_host(&self, ctx: &DeviceContext, dst: &mut [u8]) -> Result<()> {
+    pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<()> {
         if dst.len() > self.len {
             return Err(Error::InvalidRequest {
                 field: "dst",
@@ -390,7 +419,7 @@ impl DeviceBuffer {
         if dst.is_empty() {
             return Ok(());
         }
-        ctx.make_current()?;
+        self.ctx.make_current()?;
         check(
             // SAFETY: `dst` is a valid writable slice of `dst.len()` bytes and the
             // source holds at least that many, checked above.
@@ -400,15 +429,19 @@ impl DeviceBuffer {
     }
 }
 
-impl Drop for DeviceBuffer {
+impl Drop for DeviceBuffer<'_> {
     fn drop(&mut self) {
         if self.ptr == 0 {
             return;
         }
-        // SAFETY: synchronising before the free is what makes this sound. An
-        // asynchronous copy or kernel may still be reading this allocation, and
-        // the driver would happily hand the pages to the next allocation. R07.
+        // SAFETY: the owning context is made current first -- synchronising or
+        // freeing under a foreign context would protect the wrong stream and
+        // free into the wrong context. Synchronising before the free is then
+        // what makes this sound: an asynchronous copy or kernel may still be
+        // reading this allocation, and the driver would happily hand the pages
+        // to the next allocation. R07. Teardown errors are not actionable.
         unsafe {
+            let _ = ffi::cuCtxSetCurrent(self.ctx.raw());
             let _ = ffi::cuCtxSynchronize();
             let _ = ffi::cuMemFree_v2(self.ptr);
         }
@@ -417,17 +450,20 @@ impl Drop for DeviceBuffer {
 
 /// A loaded device image (fatbin, cubin or PTX).
 #[derive(Debug)]
-pub struct Module {
+pub struct Module<'ctx> {
     module: ffi::CUmodule,
+    /// The context that owns this module, for the same reason as
+    /// `DeviceBuffer::ctx`.
+    ctx: &'ctx DeviceContext,
 }
 
-impl Module {
+impl<'ctx> Module<'ctx> {
     /// Load a device image.
     ///
     /// A fatbin with no binary for the current device fails here with
     /// `UnsupportedKernel`, which is the behaviour M0 asserts: an architecture
     /// we did not compile for must be an error, never a silent no-op.
-    pub fn load(ctx: &DeviceContext, image: &[u8]) -> Result<Self> {
+    pub fn load(ctx: &'ctx DeviceContext, image: &[u8]) -> Result<Self> {
         ctx.make_current()?;
         let mut module: ffi::CUmodule = core::ptr::null_mut();
         check(
@@ -435,10 +471,12 @@ impl Module {
             unsafe { ffi::cuModuleLoadData(&mut module, image.as_ptr() as *const c_void) },
             "cuModuleLoadData",
         )?;
-        Ok(Self { module })
+        Ok(Self { module, ctx })
     }
 
-    pub fn function(&self, name: &str) -> Result<Function> {
+    /// Look up a kernel. The returned `Function` borrows this module, so it
+    /// cannot outlive the image it was resolved from.
+    pub fn function(&self, name: &str) -> Result<Function<'_>> {
         let cname = CString::new(name).map_err(|_| Error::InvalidRequest {
             field: "kernel_name",
             detail: "interior NUL".into(),
@@ -449,25 +487,33 @@ impl Module {
             unsafe { ffi::cuModuleGetFunction(&mut f, self.module, cname.as_ptr()) },
             "cuModuleGetFunction",
         )?;
-        Ok(Function { func: f })
+        Ok(Function {
+            func: f,
+            ctx: self.ctx,
+        })
     }
 }
 
-impl Drop for Module {
+impl Drop for Module<'_> {
     fn drop(&mut self) {
-        // SAFETY: unloading a module we loaded; errors are not actionable here.
+        // SAFETY: the owning context is made current before unloading, for the
+        // same reason as `DeviceBuffer`. Teardown errors are not actionable.
         unsafe {
+            let _ = ffi::cuCtxSetCurrent(self.ctx.raw());
             let _ = ffi::cuModuleUnload(self.module);
         }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct Function {
+pub struct Function<'m> {
     func: ffi::CUfunction,
+    /// Borrowed from the owning `Module`, which borrows it from the context.
+    /// A `Function` therefore cannot outlive either.
+    ctx: &'m DeviceContext,
 }
 
-impl Function {
+impl Function<'_> {
     /// Launch on the default stream and synchronise.
     ///
     /// # Safety
@@ -477,13 +523,12 @@ impl Function {
     /// this, which is why this wrapper is narrow and its callers are few.
     pub unsafe fn launch_blocking(
         &self,
-        ctx: &DeviceContext,
         grid: (u32, u32, u32),
         block: (u32, u32, u32),
         shared_bytes: u32,
         params: &mut [*mut c_void],
     ) -> Result<()> {
-        ctx.make_current()?;
+        self.ctx.make_current()?;
         check(
             // SAFETY: delegated to this function's own safety contract, which the
             // caller accepted. Handles and geometry are validated by the driver,
@@ -508,7 +553,7 @@ impl Function {
         // A launch is asynchronous, so a fault surfaces at the next
         // synchronisation. Attributing it here keeps the error at its launch
         // site rather than blaming whatever ran next (document 02).
-        ctx.synchronize()
+        self.ctx.synchronize()
     }
 }
 
