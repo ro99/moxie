@@ -1,1 +1,12 @@
-tmp/
+# Rust build output
+/target/
+
+# Normative implementation pack — kept local, not pushed to a remote.
+# See README.md "Repository layout" for the consequences of this choice.
+/docs/spec/
+
+# Local scratch, probe output, benchmark results and converted artifacts.
+/scratch/
+/results/
+/artifacts/
+*.safetensors
