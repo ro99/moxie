@@ -81,7 +81,9 @@ NUMA, host/pinned-memory limits and measured sustained bandwidth. rustc/cargo 1.
 | 2 | RTX 3090 | 24576 MiB | `0000:83:00.0` | 1 |
 
 The 3090 pair are `PHB` peers on NUMA node 1; the 5060 Ti is on NUMA node 0 and reachable only as
-`SYS`, across the socket interconnect. Relevant to M5: the TP2 candidate on the 3090 pair and any
+`SYS`, across the socket interconnect. PCIe P2P reports `OK` for every pair, but only because a
+patched open kernel module is installed, and enabling it is not a speedup on its own — read
+[docs/evidence/topology-p2p.md](docs/evidence/topology-p2p.md) before costing any multi-GPU plan. Relevant to M5: the TP2 candidate on the 3090 pair and any
 heterogeneous stage involving the 5060 Ti are not comparable placements, and document 03 requires the
 link widths and simultaneous-transfer behavior to be measured rather than assumed (R12).
 

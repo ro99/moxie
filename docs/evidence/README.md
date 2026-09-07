@@ -1,5 +1,8 @@
 # Evidence
 
+- `topology-p2p.md` — PCIe P2P is enabled on all pairs via a **patched open kernel module**, not the
+  stock driver. Read it before assuming anything about multi-GPU transport: P2P cuts peer latency ~11x
+  but makes NCCL bulk collectives 2.6–4x *slower* above roughly 512 KB.
 - `support-matrix.md` — capability claims, each linked to a passing gate ID. Use
   [SUPPORT-MATRIX.md](../spec/templates/SUPPORT-MATRIX.md). Initial status of every row is
   NOT IMPLEMENTED, never supported.
