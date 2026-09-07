@@ -1,0 +1,10 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# The dependency list is clean; the violation is in the source. Document 02: a
+# text grep is not architectural enforcement on its own, but a private FFI
+# declaration inside an adapter is a hard boundary breach. Must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }

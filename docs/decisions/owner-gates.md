@@ -7,6 +7,9 @@ Work on shared infrastructure and small fixtures proceeds while a gate is open. 
 blocked claim, present evidence and a recommendation, and **ask related questions in a batch** before
 any conclusion or irreversible work that depends on them.
 
+M0 attached measured evidence to O1, O2 and O5; see
+[task 0001](../tasks/0001-m0-freeze-evidence.md) for the batched questions.
+
 Record an answer by changing `Status` to `RESOLVED <date>`, writing the ruling verbatim under the
 gate, and linking the ADR that implements it. Do not paraphrase the owner's words into a stronger
 claim than they made.
@@ -16,6 +19,11 @@ claim than they made.
 ## O1 — Initial release catalog
 
 **Status:** OPEN
+
+**M0 evidence (2026-09-07).** Five of the seven roadmap families have no
+checkpoint on this machine: Gemma, Laguna, Inkling, GLM-5.2, DeepSeek. Present:
+Kimi K3, GLM-5.3-NVFP4, GLM-5.3-Flash-NVFP4. This blocks the *bring-up order*,
+not only the final catalog. See [checkpoint-inventory](../evidence/checkpoint-inventory.md).
 
 Which exact checkpoint revisions are the initial release catalog, and in what order? Include
 image-capable and native speculative-head variants.
@@ -27,6 +35,12 @@ catalog.
 ## O2 — Acceptable NVFP4 quality loss
 
 **Status:** OPEN
+
+**M0 evidence.** GLM-5.3-NVFP4 is **W4A4**: it ships `input_scale` activation
+scales. Document 03's initial canonical profile is weight-only with BF16
+activations, so importing it weight-only discards a part of what its publisher
+validated. Separately, converting Kimi K3's MXFP4 experts to NVFP4 would be
+double quantisation. Both need paired evidence under this gate.
 
 What numerical/task-quality loss is acceptable for NVFP4 versus the released checkpoint? Requires
 paired logits, perplexity, task results, and representative conversation failures.
@@ -59,6 +73,11 @@ taking a silent exception.
 ## O5 — Storage and conversion authorization
 
 **Status:** OPEN
+
+**M0 evidence.** Free space: `/` 551 G, `/fast` 1.4 T, `/data` 286 G,
+`/archive` 1.3 T (spinning). Converting GLM-5.3-NVFP4 (433 G) fits on `/fast`;
+converting Kimi K3 (1.5 T) does not fit anywhere as a second copy. No
+higher-precision original of Kimi K3 is known to be available.
 
 Which storage paths, disk-space budget, source checkpoints, and conversion time may be used? Is a
 higher-precision original available?

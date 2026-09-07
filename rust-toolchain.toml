@@ -1,0 +1,5 @@
+# Pinned by M0. Changing this is an ADR, not an edit: document 07 requires a
+# reproducible build and a recorded executable identity for every benchmark.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

@@ -1,6 +1,6 @@
 # PCIe peer-to-peer: enabled, and not a speedup by itself
 
-Status: **verified enabled on this machine, 2026-09-07.** Performance figures below are **inherited,
+Status: **enabled between the two 3090s only, verified 2026-09-07.** Performance figures below are **inherited,
 not re-measured in this repository** — see Provenance. Nothing here is a benchmark result for Moxie.
 
 ## Verified here
@@ -15,8 +15,24 @@ GPU1  OK     X    OK
 GPU2  OK    OK     X
 ```
 
-Including GPU0 (5060 Ti, NUMA 0) to the 3090 pair (NUMA 1) — that path is `SYS`, crossing the socket
-interconnect, and it still reports P2P-capable.
+**That matrix is misleading, and an earlier revision of this file repeated it as fact.** The CUDA
+driver disagrees. `cuDeviceCanAccessPeer`, queried by `cargo xtask probe`, grants peer access only
+within the 3090 pair:
+
+| from \ to | 0 (5060 Ti) | 1 (3090) | 2 (3090) |
+|---|---|---|---|
+| **0** | — | no | no |
+| **1** | no | — | **yes** |
+| **2** | no | **yes** | — |
+
+The CUDA API is the authority: it decides whether the engine can issue a peer transfer at all.
+`nvidia-smi topo -p2p` describes what the topology can express, not what CUDA will grant. The
+5060 Ti sits on NUMA node 0 and reaches the 3090s only as `SYS`, across the socket interconnect, and
+cross-socket peer access is not available here.
+
+**Consequence:** peer transport exists between devices 1 and 2 only. Any plan involving the 5060 Ti
+must stage through the host. A capability probe must call `cuDeviceCanAccessPeer` per ordered pair
+and must never derive peer availability from `nvidia-smi`.
 
 ## Why this is not the stock configuration
 
@@ -38,17 +54,18 @@ direction.
 
 Two consequences for the engine, not just for the build:
 
-1. The capability probe in document 03 must read P2P availability **at runtime per pair**, and the
-   planner must treat it as a discovered capability, never a constant. A plan cached from a run with
-   P2P is invalid on a boot without it — plan cache keys include capabilities (document 02).
+1. The capability probe in document 03 must read P2P availability **at runtime per pair**, via
+   `cuDeviceCanAccessPeer`, and the planner must treat it as a discovered capability, never a
+   constant. A plan cached from a run with P2P is invalid on a boot without it — plan cache keys
+   include capabilities (document 02).
 2. `nvidia-fs/2.26.6` currently reports `broken`, so GPUDirect Storage is unavailable. Relevant to the
    terabyte/disk-spilling path in document 03; not required by any current milestone.
 
 ## Inherited measurements — do not treat as current
 
 Measured during the legacy Strata project on `0000:82:00.0` <-> `0000:83:00.0` (the 3090 pair, `PHB`,
-cross-root-complex; bus 82 is Gen3 **x8**, bus 83 is x16 — the R12 correction). Re-measure before any
-planner cost model depends on these numbers.
+cross-root-complex; bus 82 is Gen3 **x8**, bus 83 is x16 — the R12 correction, independently
+reconfirmed by M0's probe). Re-measure before any planner cost model depends on these numbers.
 
 | Metric | Host-staged | Direct P2P |
 |---|---|---|
@@ -80,8 +97,9 @@ separately.
 
 ## Provenance
 
-- Verified in this repository 2026-09-07: the `topo -p2p` matrix, driver version, open-module identity,
-  build timestamps, `srcversion` equality across both installed kernels, `nvidia-fs` state.
+- Verified in this repository 2026-09-07: the `topo -p2p` matrix, the `cuDeviceCanAccessPeer` matrix
+  (which contradicts it), driver version, open-module identity, build timestamps, `srcversion`
+  equality across both installed kernels, `nvidia-fs` state.
 - Inherited from legacy Strata project notes and **not** re-run here: every figure in the measurements
   table, the NCCL crossover, and the patch commit identity. Their original context limitations apply;
   document 08's rule holds — historical measurements are not predictions.

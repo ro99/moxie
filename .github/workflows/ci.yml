@@ -1,0 +1,47 @@
+# Host CI lane.
+#
+# Document 07: "Host CI can run without a checkpoint or GPU. It cannot approve a
+# CUDA optimization alone." This lane therefore runs everything that is pure, and
+# is explicit that the GPU, topology, quality and benchmark lanes are NOT run
+# here. A green tick from this workflow is not evidence about the device.
+name: host
+
+on:
+  push:
+  pull_request:
+
+env:
+  # Never rely on the default FASTEST_FIRST ordering. See AGENTS.md.
+  CUDA_DEVICE_ORDER: PCI_BUS_ID
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        # rust-toolchain.toml pins the version; this only makes the components
+        # available.
+        run: rustup component add rustfmt clippy
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Architecture ownership
+        # Includes the negative fixtures: a checker that has never rejected
+        # anything is not evidence (document 02).
+        run: cargo run -p xtask -- arch-check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Host tests
+        run: cargo test --workspace
+
+      # Not run here, and not claimed by this workflow:
+      #   cargo xtask test-gpu        real devices, sm_86 and sm_120
+      #   cargo xtask test-topology   M5, needs both 3090s
+      #   cargo xtask quality         M3, needs pinned artifacts
+      #   cargo xtask bench           M6, needs the isolated benchmark box
+      # Document 07: a skipped lane is unmeasured, never passing.

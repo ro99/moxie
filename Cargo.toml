@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/moxie-types",
+    "crates/moxie-graph",
+    "crates/moxie-model-api",
+    "crates/moxie-format",
+    "crates/moxie-state",
+    "crates/moxie-cuda",
+    "crates/moxie-kernels",
+    "xtask",
+]
+exclude = ["xtask/fixtures"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+moxie-types = { path = "crates/moxie-types" }
+moxie-graph = { path = "crates/moxie-graph" }
+moxie-model-api = { path = "crates/moxie-model-api" }
+moxie-format = { path = "crates/moxie-format" }
+moxie-state = { path = "crates/moxie-state" }
+moxie-cuda = { path = "crates/moxie-cuda" }
+moxie-kernels = { path = "crates/moxie-kernels" }
+
+[profile.release]
+debug = 1
+
+# Applied to every crate via `[lints] workspace = true`. Document 02 requires the
+# FFI boundary to be audited, not merely compiled: unsafe code must be justified
+# in writing at each site.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -1,0 +1,9 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# R09: CUDA compiled under a model directory is exactly what the legacy layer
+# checker could not see. This fixture must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }

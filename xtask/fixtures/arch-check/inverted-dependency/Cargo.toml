@@ -1,0 +1,9 @@
+[package]
+name = "moxie-types"
+version = "0.0.0"
+edition = "2024"
+
+# moxie-types is the bottom of the graph (document 02). Depending upward inverts
+# the ownership direction. This fixture must be rejected.
+[dependencies]
+moxie-graph = { path = "../../../../crates/moxie-graph" }

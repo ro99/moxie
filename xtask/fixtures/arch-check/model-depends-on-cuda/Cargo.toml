@@ -1,0 +1,10 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# Document 09 B: a model definition may not contain "CUDA allocation/launch/copy,
+# device streams/events". This fixture must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-cuda = { path = "../../../../crates/moxie-cuda" }

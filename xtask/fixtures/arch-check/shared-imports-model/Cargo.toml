@@ -1,0 +1,10 @@
+[package]
+name = "moxie-state"
+version = "0.0.0"
+edition = "2024"
+
+# Document 02: "Shared production crates cannot import concrete models." Only the
+# composition root and integration tests may. This fixture must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-models-fake = { path = "../model-depends-on-cuda" }
