@@ -75,6 +75,7 @@ dependencies = [
 name = "moxie-oracles"
 version = "0.0.0"
 dependencies = [
+ "moxie-format",
  "moxie-graph",
  "moxie-types",
 ]

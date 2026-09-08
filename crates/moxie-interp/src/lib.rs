@@ -135,6 +135,10 @@ impl Interpreter {
         cancel: &Cancel,
     ) -> Result<StepOutput> {
         let before = state.frontiers(branch)?;
+        // The cache must be this branch's, at this prefix, holding this version
+        // of it. Without that check the provenance rules guard a counter while
+        // the bytes come from anywhere.
+        kv.check_owner(state, branch)?;
         let mut values: Vec<Option<Value>> = vec![None; graph.value_count()];
 
         // Bind inputs and weights.
@@ -184,16 +188,48 @@ impl Interpreter {
             let spec = graph.spec(*v).expect("bound value has a spec");
             let want = spec.extent(&symbols)?;
             let bound = values[v.0 as usize].as_ref().expect("bound above");
+            let name = graph.name(*v).unwrap_or("?");
             let got: Vec<u64> = match bound {
                 Value::Float(t) => t.shape().iter().map(|d| *d as u64).collect(),
                 Value::Index(i) => vec![i.len() as u64],
             };
             if got != want {
                 return Err(Error::InvalidArtifact {
-                    detail: format!(
-                        "{} has shape {got:?} but the graph declares {want:?}",
-                        graph.name(*v).unwrap_or("?")
-                    ),
+                    detail: format!("{name} has shape {got:?} but the graph declares {want:?}"),
+                });
+            }
+            // Shape agreement is not dtype agreement. The fourth review bound an
+            // FP32 tensor holding a value BF16 cannot represent to a BF16-declared
+            // input and execution accepted it, so every error bound downstream
+            // was resting on an invariant nothing checked. A checked constructor
+            // does not help when the caller can pick a different one.
+            match (bound, spec.role.precision()) {
+                (Value::Float(t), Some(p)) if t.precision() != p => {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!("{name} is {} but the graph declares {p}", t.precision()),
+                    });
+                }
+                (Value::Float(_), None) => {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!("{name} is declared an index but a tensor was bound"),
+                    });
+                }
+                (Value::Index(_), Some(p)) => {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!("{name} is declared {p} but an index was bound"),
+                    });
+                }
+                _ => {}
+            }
+            // A non-finite weight produces non-finite everything, and document
+            // 05's rule that "NaN logits ... produce typed errors" is worth
+            // nothing if the NaN is admitted at the boundary and only noticed
+            // after the state has advanced.
+            if let Value::Float(t) = bound
+                && let Some(i) = t.data().iter().position(|x| !x.is_finite())
+            {
+                return Err(Error::InvalidArtifact {
+                    detail: format!("{name} element {i} is {}", t.data()[i]),
                 });
             }
         }
@@ -204,6 +240,20 @@ impl Interpreter {
         for node in graph.nodes() {
             cancel.check(node.params.op().name())?;
             let out = self.eval(node, &values, kv, &mut staged, &positions)?;
+            // Checked per node, not only at the output: attributing a NaN to the
+            // operation that produced it is the difference between a defect
+            // report and a puzzle.
+            if let Value::Float(t) = &out
+                && let Some(i) = t.data().iter().position(|x| !x.is_finite())
+            {
+                return Err(Error::Numerical {
+                    detail: format!(
+                        "{} produced {} at element {i}",
+                        node.params.op().name(),
+                        t.data()[i]
+                    ),
+                });
+            }
             values[node.output.0 as usize] = Some(out);
         }
 
@@ -226,6 +276,8 @@ impl Interpreter {
         }
         state.execute(branch, rows as u64)?;
         let prefix = state.frontiers(branch)?.executed;
+        // The cache now describes a longer prefix, so its identity moves with it.
+        kv.resync(state, branch)?;
         let retained = state.record_logits(branch, prefix)?;
 
         Ok(StepOutput {

@@ -1,6 +1,6 @@
 # Task 0003 — M1, part 1: the BF16 host reference interpreter
 
-Status: **implemented 2026-09-08**, owner review pending. Proposed 2026-09-07 after the [M0 correction
+Status: **implemented 2026-09-08**, corrected after review the same day; owner review pending. Proposed 2026-09-07 after the [M0 correction
 task](0002-m0-review-and-integer-transition.md) closed F1–F6 and four review passes; started the
 same day with those gates green (`arch-check` 19 rejected + 1 accepted fixtures, `spec-check` 10
 documents, 222 host unit tests + 1 doctest, `test-gpu` 15 cases with both architectures qualified).
@@ -131,15 +131,32 @@ global reduction; declaring `Replicated` says the shared form is what M5 must ex
 sharding is impossible.*
 *State effect: `None`.*
 
-**`SwiGlu`** — `y[r, i] = silu(gate[r, i]) · up[r, i]`, `silu(v) = v / (1 + e^{−v})`.
+**`SwiGlu`** — `y[r, i] = silu(gate[r, i]) · up[r, i]`, `silu(v) = v · σ(v)`.
+
+σ is evaluated in the **overflow-free** form, choosing by sign so the exponent is
+never positive:
+
+```text
+σ(v) = 1 / (1 + e^{−v})        for v >= 0
+σ(v) = e^{v} / (1 + e^{v})     for v <  0
+```
+
+The naive single expression overflows: `e^{88}` already exceeds `f32::MAX`, so
+for `v` around −88 the denominator becomes `+inf` and `silu` collapses to exactly
+zero. This is the form the pinned legacy source uses
+(`src/platform/numerics.cpp:44`), and document 08 says to read those references
+before inventing a replacement.
 `gate` and `up` are **separate inputs**. Document 02: "A gate/up tensor's logical order is not its
 physical interleaved disk layout" — the graph takes two edges and any interleaving is an importer's
 problem, not this operation's.
 Distinct from `GeGlu` and from Kimi's bounded `SituGlu` (R06). Neither is implemented; requesting
 one is `UnsupportedKernel`, not a silent substitution.
-*Error: `|ŷ − y_f64| ≤ γ(4) · |y_f64|` — four rounding steps: `e^{−v}`, `1 +`, the divide, the
-product. `e^{−v}` is bounded at 1 ulp by the platform's `expf`; the other three at 0.5 ulp each, so
-4 full ulps bounds the composition.*
+*Error: `|ŷ − y_f64| ≤ γ(4) · |y_f64|` — four rounding steps: the exponential, the add, the divide,
+the product. The exponential is bounded at 1 ulp by the platform's `expf`; the other three at 0.5 ulp
+each, so 4 full ulps bounds the composition. **The relative bound holds while the result is a normal
+FP32 number.** For strongly negative gates `σ(v)` enters the subnormal range, where gradual underflow
+costs mantissa bits and no relative bound survives; there the contract is an absolute floor of
+`f32::MIN_POSITIVE`. Stated because it is a real limit of FP32, not because a test needed room.*
 *Partition: `ColumnShardable` — elementwise on the feed-forward axis.*
 *State effect: `None`.*
 
@@ -172,9 +189,17 @@ Visibility is `moxie_oracles::mask::Visibility::Causal` over **absolute** positi
 key is **removed from the sum**, not given a large negative bias — the existing fixture asserts a
 masked position contributes exactly zero, and a `-inf` bias only approximates that. A query with no
 visible key is `Numerical`, never a uniform draw.
-*Error: `|ô − o_f64| ≤ γ(2K + Hd + 3) · Σ_k |p[q,k]·V[k,i]|`, where `K` is the number of visible
-keys: `Hd` steps for each dot product, `K` exponentials, `K` accumulation steps for the denominator,
-the max subtraction, the divide, and the weighted sum.*
+*Error — **revised 2026-09-08; the first version was disproven**. See "The attention bound was
+wrong" below. The sound statement is two terms, and it is data-dependent:*
+
+```text
+Δs   = γ(Hd) · max_k ( Σ_i |Q[q,i]·K[k,i]| ) / sqrt(Hd)      // score error
+|ô − o_f64| ≤ (e^{2·Δs} − 1) · max_k |V[k,i]|                // through the softmax
+            + γ(K + 2) · Σ_k |p[q,k]·V[k,i]|                 // the weighted sum
+```
+
+*Implemented as `moxie_oracles::attention::attention_error_bound`, so the contract and the tests use
+one expression rather than two that can drift apart.*
 *Partition: `NotDetermined`. Head ownership, KV replication for GQA and the output reduction are
 document 04's M5 work; declaring it undetermined makes TP lowering fail closed rather than silently
 produce a rank-local answer.*
@@ -191,6 +216,49 @@ produce a rank-local answer.*
 "sharded vocabulary normalization/sampling" to have correct global semantics — sharding the
 projection does not by itself make the softmax correct, and M5 owns that.*
 *State effect: `None`.*
+
+### The attention bound was wrong, and why the corrected one has a different shape
+
+The first version of this contract said `γ(2K + Hd + 3) · Σ|p·V|`, derived by counting rounding
+steps as everywhere else. **It is invalid, and the fourth review disproved it with a counterexample
+built from BF16-representable inputs.** The counterexample is preserved as
+`a_cancelling_score_widens_the_bound_because_the_error_is_real`:
+
+```text
+K[0] = [2^24, 1, -2^24, 0]     Q = [1, 1, 1, 1]     V[0] = [1, 0, 0, 0]
+K[1] = [2^24, 0, -2^24, 0]                          V[1] = [0, 1, 0, 0]
+
+exact scores (FP64): [0.5, 0.0]      ->  softmax [0.6225, 0.3775]
+computed  (FP32):    [0.0, 0.0]      ->  softmax [0.5,    0.5   ]
+
+normalized error 0.32, against a declared bound of 6.6e-7
+```
+
+FP32 cannot represent `2^24 + 1`, so the first key's dot product cancels to exactly zero and the two
+scores become equal. The softmax then returns a uniform distribution where the true one is not.
+
+Counting operations cannot bound this, because the score error does not *add* to the result — it
+passes through an **exponential**. Multiplying a step count by `Σ|p·V|` is the right shape for the
+weighted sum and the wrong shape for the softmax, and no constant makes it right.
+
+The corrected bound says what actually holds. If every score carries absolute error at most `Δs`,
+then every ratio `p̂_j/p_j` lies in `[e^{−2Δs}, e^{2Δs}]`, so `‖p̂ − p‖₁ ≤ e^{2Δs} − 1`; multiply by
+the largest value component and add the ordinary sequential-sum bound for the weighted sum itself.
+`Δs` comes from the dot product's own conditioning, which is where the cancellation shows up.
+
+Two consequences, both stated rather than discovered later:
+
+- **Attention's FP32 accuracy is not a constant.** It depends on how well conditioned `Q·K` is. A
+  CUDA kernel qualified against this contract must be qualified on data whose conditioning is
+  stated, and document 07's requirement to "stress cancellation and near-zero outputs" is precisely
+  the regime where the first term dominates.
+- **The bound is honest about being weak there.** On the counterexample it exceeds 0.1, and a test
+  asserts that; on well-conditioned data a second test asserts it stays below 1e-5. A bound that was
+  merely enlarged until the counterexample fit would fail the second test.
+
+The other operations' bounds are unchanged. `Linear`'s `γ(K+1)·Σ|x·w|` is the standard Higham result
+and survives cancellation because it is normalized by term magnitude rather than by `|y|`; the norm's
+sum of squares cannot cancel; RoPE's is stated absolutely for the same reason.
 
 ### State, transactions and cancellation
 
@@ -213,6 +281,30 @@ projection does not by itself make the softmax correct, and M5 owns that.*
 - `KvPages` is `RestoreCapability::Truncate`, so a rollback drops the tail. No `Explicit` component
   is in this slice's schema, and no restore evidence is therefore required — stated so that a later
   reader does not think the evidence machinery was skipped.
+- **The physical cache carries the same identity as the state.** `KvCache` is bound to a
+  `(sequence, branch, prefix lineage)` and the interpreter checks it before reading a byte. Without
+  that, `moxie-state`'s provenance rules guard a counter while the bytes come from anywhere: the
+  fourth review substituted one sequence's cache into another's execution, and the step succeeded,
+  returned the wrong history's answer, and reported valid logits. The identity reuses
+  `PrefixLineage` rather than inventing a second scheme, so "another sequence", "another branch" and
+  "the prefix that used to be here" are one comparison.
+
+### Operand validation at execution
+
+Declared shapes, roles and precisions are checked against the values actually supplied, not only
+between operations at build time:
+
+- **Precision.** A tensor whose precision differs from its declared role is refused. The fourth
+  review bound an FP32 tensor holding a BF16-unrepresentable value to a BF16-declared input and
+  execution accepted it — a checked constructor guarantees nothing when the caller can pick a
+  different one.
+- **Finiteness.** A non-finite bound value is `InvalidArtifact` before anything runs, and a
+  non-finite node output is `Numerical` naming the operation that produced it. Document 05's rule
+  that "NaN logits ... produce typed errors" is worth nothing if the NaN is admitted at the boundary
+  and only noticed after the state has advanced.
+- **Positions.** Every position-consuming operation must read the **same** binding, enforced when
+  the graph is built. Validating one operand and trusting the rest let a graph whose RoPE read
+  position 0 and whose attention read 999 execute at prefix 1.
 
 ### The oracle relationship, stated plainly
 
@@ -365,7 +457,11 @@ it is:
 - **One head group, full causal, one layer per KV store.** GQA/MQA head mapping, sliding windows in
   a graph, sinks and biases, MLA, and model-defined sparse selection are document 04's later work
   and are absent rather than approximated.
-- **No paging, no memory authority, no service.** M2 and M4 own those.
+- **No paging, no memory authority, no service.** Their *initial* implementations are M1.3 and
+  M1.4, not M2/M4 — document 06 M1.3 asks for "rank-owned CUDA context, event-backed leases,
+  resource ledger, basic allocator" and M1.4 for "appendable paged state plus transaction API ...
+  a generation service and minimal diagnostic CLI". M2 and M4 deepen them. An earlier draft of this
+  record deferred them a milestone too far; the next-task list below is the correct reading.
 
 ### Next
 
@@ -385,3 +481,109 @@ one:
 
 Recommended order is 1, 3, 2, 4: the manifest and the state API are what the CUDA path needs to be
 compared *at*, and doing the kernel before the paged state would mean writing it twice.
+
+
+---
+
+## Review corrections, 2026-09-08
+
+A review of `0f803e1` found seven issues that the passing tests did not catch, two of them
+mathematical. All seven are reproduced and closed. **The two numerical findings were disproven
+contracts, not tolerances that needed room**, and both are corrected by revising the analysis with
+the counterexample preserved as a test.
+
+| Command | Before | After |
+|---|---|---|
+| `cargo test --workspace --locked --offline` | 290 + 1 doctest | **303 + 1 doctest** |
+| device lane | 298 + 2 doctests | **311 + 2 doctests** |
+| `cargo fmt`, `clippy -D warnings`, `arch-check`, `spec-check` | PASS | **PASS** |
+| `cargo xtask-cuda test-gpu` | PASS | **PASS**, unchanged |
+
+### R1 — the attention error bound was invalid · closed
+
+Reproduced with BF16-representable inputs: normalized error **0.32** against a declared bound of
+**6.6e-7**. Counting rounding steps cannot bound an error that passes through a softmax, because it
+passes through an exponential rather than being added to the result. The corrected bound has a
+different *shape*, not a bigger constant — see
+"[The attention bound was wrong](#the-attention-bound-was-wrong-and-why-the-corrected-one-has-a-different-shape)"
+above for the counterexample and the derivation.
+
+It is implemented once, as `moxie_oracles::attention::attention_error_bound`, so the contract and the
+tests cannot drift apart. Three tests: the counterexample (asserting the old bound was wrong by
+orders of magnitude, and that the new one exceeds 0.1 there), a well-conditioned case asserting the
+bound stays below 1e-5, and the general comparison. A bound merely enlarged to fit the counterexample
+would fail the second.
+
+The review also noted the old test normalized by `Σ|V|` where the contract said `Σ|p·V|` — a weaker
+metric than the one declared. The shared function removes that gap by construction.
+
+### R2 — SwiGLU collapsed to zero for representable inputs · closed
+
+Reproduced: gate `−90` with a BF16-rounded `up` near `1e30` returned exactly `0`; the reference is
+`−7.3765e−8`. `1/(1 + e^{−v})` overflows for `v` around −88, so the denominator became `+inf`.
+
+Fixed with the sign-dependent sigmoid, which is **the form the pinned legacy source already uses**
+(`src/platform/numerics.cpp:44`). Document 08 says to read those references before inventing a
+replacement, and this is a case where not doing so cost a correct answer. The contract now also
+states the subnormal limit explicitly: the relative bound holds while the result is normal, and below
+that an absolute floor of `f32::MIN_POSITIVE` applies.
+
+### R3 — a cache from another sequence was accepted · closed
+
+Reproduced: substituting a cache holding a different token prefix succeeded, returned the other
+history's answer, and `next_logits_valid` was true. `KvCache` had no identity, so every provenance
+rule in `moxie-state` was guarding a counter while the bytes came from anywhere.
+
+`KvCache` is now bound to a `(sequence, branch, prefix lineage)` and `check_owner` runs before the
+interpreter reads a byte. The identity reuses `PrefixLineage` rather than inventing a second scheme,
+so one comparison distinguishes another sequence, another branch, a cache that lags or leads the
+frontier, and a cache holding a prefix that has since been replaced. Four tests, one per case.
+
+Full paging remains a later task, as the review allowed.
+
+### R4 — bindings bypassed the declared precision · closed
+
+Reproduced: an FP32 tensor holding a BF16-unrepresentable value satisfied a BF16-declared input.
+Binding validation compared shapes and never dtypes, so every error bound downstream rested on an
+invariant nothing checked — a checked constructor guarantees nothing when the caller can choose a
+different one. Role and precision are now compared at binding, in both directions (a tensor where an
+index is declared, and the reverse).
+
+### R5 — only the first position operand was validated · closed
+
+Reproduced: a graph whose RoPE read position `0` and whose attention read `999` executed at prefix 1.
+
+Fixed structurally rather than by validating each operand: `GraphBuilder` requires every
+position-consuming node to read the **same** binding, so there is one vector and the frontier check
+covers all of it. A graph built the other way is refused at construction.
+
+### R6 — non-finite results were committed · closed
+
+Reproduced: a BF16-tagged vocabulary weight containing NaN produced a successful step with NaN
+logits, advanced the counters, and made `next_logits_valid` true. NaN is BF16-representable, so the
+storage invariant does not catch it.
+
+Non-finite bound values are now `InvalidArtifact` before anything runs, and a non-finite node output
+is `Numerical` naming the operation that produced it — attributing it to the operation rather than
+leaving a mysterious logit.
+
+### R7 — malformed KV geometry panicked · closed
+
+Reproduced: a one-element key attended with head dimension two ran the slice off the end.
+`KvHistory::append` checks key and value widths against each other, which is not the same as checking
+them against the geometry they are later read under. `head_slice` now validates and returns
+`InvalidArtifact`; document 02 requires typed errors at this boundary, and a panic is not one.
+
+### Record correction
+
+The earlier "no paging, no memory authority, no service — M2 and M4 own those" was wrong about the
+milestone. Document 06 puts their *initial* implementations in **M1.3 and M1.4**; M2 and M4 deepen
+them. Corrected above, and the next-task list was already the right reading.
+
+### What this changes about using these bounds to qualify CUDA work
+
+The attention contract is now data-dependent and says so. A kernel qualified against it must be
+qualified on data whose conditioning is stated, and the cancellation regime document 07 asks to
+stress is exactly where the bound is weak — correctly, because FP32 attention genuinely is. That is
+a more useful acceptance contract than the constant it replaces, but it is a different one, and any
+future kernel gate has to be written against this version.

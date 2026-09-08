@@ -298,7 +298,7 @@ fn both_graphs_produce_logits_for_one_token_and_for_many() {
 
         // One token.
         let mut state = f.state();
-        let mut kv = KvCache::new(1);
+        let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
         state.append_prompt(ROOT, 1).unwrap();
         let out = step(&f, &mut state, &mut kv, &[3], 0, &Cancel::never()).unwrap();
         assert_eq!(
@@ -315,7 +315,7 @@ fn both_graphs_produce_logits_for_one_token_and_for_many() {
 
         // Many tokens.
         let mut state = f.state();
-        let mut kv = KvCache::new(1);
+        let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
         let tokens: Vec<u64> = (0..5).map(|i| i % dims.vocab).collect();
         state.append_prompt(ROOT, tokens.len() as u64).unwrap();
         let out = step(&f, &mut state, &mut kv, &tokens, 0, &Cancel::never()).unwrap();
@@ -337,7 +337,7 @@ fn logits_are_unrounded_fp32() {
     // first would quantise the distribution before any of that runs.
     let f = build(A, 5);
     let mut state = f.state();
-    let mut kv = KvCache::new(1);
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
     state.append_prompt(ROOT, 4).unwrap();
     let out = step(&f, &mut state, &mut kv, &[1, 2, 3, 4], 0, &Cancel::never()).unwrap();
     assert_eq!(out.logits.precision(), Precision::F32);
@@ -360,12 +360,12 @@ fn a_multi_token_step_is_causal() {
     // same prefix alone must give the same first row.
     let f = build(A, 7);
     let mut s1 = f.state();
-    let mut kv1 = KvCache::new(1);
+    let mut kv1 = KvCache::for_branch(1, &s1, ROOT).unwrap();
     s1.append_prompt(ROOT, 4).unwrap();
     let all = step(&f, &mut s1, &mut kv1, &[2, 5, 7, 1], 0, &Cancel::never()).unwrap();
 
     let mut s2 = f.state();
-    let mut kv2 = KvCache::new(1);
+    let mut kv2 = KvCache::for_branch(1, &s2, ROOT).unwrap();
     s2.append_prompt(ROOT, 1).unwrap();
     let first = step(&f, &mut s2, &mut kv2, &[2], 0, &Cancel::never()).unwrap();
 
@@ -380,7 +380,7 @@ fn whole_and_chunked_prefill_agree() {
     let tokens: Vec<u64> = vec![1, 4, 0, 6, 2, 3];
 
     let mut whole_state = f.state();
-    let mut whole_kv = KvCache::new(1);
+    let mut whole_kv = KvCache::for_branch(1, &whole_state, ROOT).unwrap();
     whole_state
         .append_prompt(ROOT, tokens.len() as u64)
         .unwrap();
@@ -396,7 +396,7 @@ fn whole_and_chunked_prefill_agree() {
 
     for width in [1usize, 2, 3, 4, 5, 6] {
         let mut state = f.state();
-        let mut kv = KvCache::new(1);
+        let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
         state.append_prompt(ROOT, tokens.len() as u64).unwrap();
         let mut rows: Vec<Vec<f32>> = Vec::new();
         let mut at = 0u64;
@@ -415,7 +415,11 @@ fn whole_and_chunked_prefill_agree() {
                 "width {width}, row {i}: chunked prefill disagreed with whole prefill"
             );
         }
-        assert_eq!(kv, whole_kv, "width {width}: the caches diverged");
+        assert_eq!(
+            kv.contents(),
+            whole_kv.contents(),
+            "width {width}: the caches diverged"
+        );
     }
 }
 
@@ -427,7 +431,7 @@ fn a_cancelled_step_leaves_the_state_exactly_as_it_found_it() {
     let tokens = [1u64, 2, 3];
 
     let mut state = f.state();
-    let mut kv = KvCache::new(1);
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
     state.append_prompt(ROOT, tokens.len() as u64).unwrap();
 
     // Cancel at each depth, including inside attention, after which a naive
@@ -438,7 +442,11 @@ fn a_cancelled_step_leaves_the_state_exactly_as_it_found_it() {
         let e = step(&f, &mut state, &mut kv, &tokens, 0, &Cancel::after(depth)).unwrap_err();
         assert_eq!(e.kind(), "cancelled", "depth {depth}");
         assert_eq!(state.frontiers(ROOT).unwrap(), before, "depth {depth}");
-        assert_eq!(kv, kv_before, "depth {depth}: a cancelled step wrote state");
+        assert_eq!(
+            kv.contents(),
+            kv_before.contents(),
+            "depth {depth}: a cancelled step wrote state"
+        );
         assert!(!state.next_logits_valid(ROOT), "depth {depth}");
         assert!(state.live_results().is_empty(), "depth {depth}");
     }
@@ -447,7 +455,7 @@ fn a_cancelled_step_leaves_the_state_exactly_as_it_found_it() {
     let after_cancels = step(&f, &mut state, &mut kv, &tokens, 0, &Cancel::never()).unwrap();
 
     let mut clean_state = f.state();
-    let mut clean_kv = KvCache::new(1);
+    let mut clean_kv = KvCache::for_branch(1, &clean_state, ROOT).unwrap();
     clean_state
         .append_prompt(ROOT, tokens.len() as u64)
         .unwrap();
@@ -462,7 +470,7 @@ fn a_cancelled_step_leaves_the_state_exactly_as_it_found_it() {
     .unwrap();
 
     assert_eq!(after_cancels.logits, clean.logits);
-    assert_eq!(kv, clean_kv);
+    assert_eq!(kv.contents(), clean_kv.contents());
     assert_eq!(
         state.frontiers(ROOT).unwrap(),
         clean_state.frontiers(ROOT).unwrap()
@@ -475,7 +483,7 @@ fn positions_must_be_absolute_and_match_the_branch_frontier() {
     // interpreter refuses rather than computing a plausible wrong answer.
     let f = build(A, 19);
     let mut state = f.state();
-    let mut kv = KvCache::new(1);
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
     state.append_prompt(ROOT, 4).unwrap();
     step(&f, &mut state, &mut kv, &[1, 2], 0, &Cancel::never()).unwrap();
 
@@ -644,7 +652,7 @@ fn shape_and_divisibility_errors_are_refused_at_construction() {
 fn an_out_of_range_token_is_refused_at_execution() {
     let f = build(B, 23);
     let mut state = f.state();
-    let mut kv = KvCache::new(1);
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
     state.append_prompt(ROOT, 1).unwrap();
     // Vocabulary is 7.
     let e = step(&f, &mut state, &mut kv, &[7], 0, &Cancel::never()).unwrap_err();
@@ -764,7 +772,7 @@ fn every_intermediate_activation_stays_bf16_valued() {
     // by re-examining the logits' inputs through a whole run.
     let f = build(A, 31);
     let mut state = f.state();
-    let mut kv = KvCache::new(1);
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
     state.append_prompt(ROOT, 3).unwrap();
     let out = step(&f, &mut state, &mut kv, &[1, 2, 3], 0, &Cancel::never()).unwrap();
     // The KV cache holds rounded activations from the projections.
@@ -842,7 +850,7 @@ fn a_linear_layer_inside_the_graph_meets_its_declared_bound() {
 fn a_step_refuses_to_run_with_a_missing_binding() {
     let f = build(A, 41);
     let mut state = f.state();
-    let mut kv = KvCache::new(1);
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
     state.append_prompt(ROOT, 1).unwrap();
     let mut incomplete = Bindings::new();
     incomplete.set(f.tokens_id, Value::Index(vec![0]));
@@ -867,7 +875,7 @@ fn a_value_whose_shape_disagrees_with_the_graph_is_refused() {
     // only checked structurally between operations at build time.
     let f = build(A, 53);
     let mut state = f.state();
-    let mut kv = KvCache::new(1);
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
     state.append_prompt(ROOT, 2).unwrap();
 
     // Two tokens but three positions: the row counts disagree.
@@ -902,12 +910,234 @@ fn a_value_whose_shape_disagrees_with_the_graph_is_refused() {
 }
 
 #[test]
+fn one_sequence_cannot_execute_against_another_sequences_cache() {
+    // Fourth review, reproduced: `KvCache` had no identity, so a cache holding a
+    // different token prefix was accepted on length alone. The step succeeded,
+    // returned the other history's answer, and `next_logits_valid` was true.
+    let f = build(A, 61);
+
+    let mut a_state = f.state();
+    let mut a_kv = KvCache::for_branch(1, &a_state, ROOT).unwrap();
+    a_state.append_prompt(ROOT, 2).unwrap();
+    step(&f, &mut a_state, &mut a_kv, &[1, 2], 0, &Cancel::never()).unwrap();
+
+    // A second sequence, same shapes, same length, different tokens.
+    let mut b_state = f.state();
+    let mut b_kv = KvCache::for_branch(1, &b_state, ROOT).unwrap();
+    b_state.append_prompt(ROOT, 2).unwrap();
+    step(&f, &mut b_state, &mut b_kv, &[5, 6], 0, &Cancel::never()).unwrap();
+    assert_eq!(a_kv.len(), b_kv.len(), "the substitution the review made");
+    assert_ne!(a_kv.contents(), b_kv.contents(), "and the contents differ");
+
+    // Continuing sequence A against sequence B's cache is refused.
+    b_state.accept(ROOT, 1).unwrap();
+    let e = Interpreter::new()
+        .run(
+            &f.graph,
+            &f.bindings(&[3], &[2]),
+            &mut a_state,
+            ROOT,
+            &mut b_kv,
+            &Cancel::never(),
+        )
+        .unwrap_err();
+    assert_eq!(e.kind(), "invalid_request");
+    assert!(e.to_string().contains("sequence"), "{e}");
+    assert_eq!(a_state.frontiers(ROOT).unwrap().executed, 2, "nothing ran");
+}
+
+#[test]
+fn a_binding_whose_precision_disagrees_with_the_graph_is_refused() {
+    // Fourth review, reproduced: binding validation compared shapes and never
+    // dtypes, so an FP32 tensor holding a value BF16 cannot represent satisfied
+    // a BF16-declared input -- and every error bound downstream rested on an
+    // invariant nothing checked.
+    let f = build(A, 67);
+    let mut state = f.state();
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
+    state.append_prompt(ROOT, 1).unwrap();
+
+    let id = *f
+        .graph
+        .weights()
+        .iter()
+        .find(|v| f.graph.name(**v) == Some("bo"))
+        .unwrap();
+    let width = A.hidden as usize;
+    // Representable in FP32, not in BF16.
+    let sneaky = 1.0f32 + 1.0 / 1024.0;
+    assert!(!moxie_interp::tensor::is_bf16_valued(sneaky));
+
+    let mut b = f.bindings(&[1], &[0]);
+    b.set(
+        id,
+        Value::Float(HostTensor::f32(vec![sneaky; width], vec![width]).unwrap()),
+    );
+    let e = Interpreter::new()
+        .run(&f.graph, &b, &mut state, ROOT, &mut kv, &Cancel::never())
+        .unwrap_err();
+    assert_eq!(e.kind(), "invalid_artifact");
+    assert!(e.to_string().contains("bf16"), "{e}");
+    assert_eq!(state.frontiers(ROOT).unwrap().executed, 0);
+
+    // An index where a tensor is declared, and the reverse.
+    let mut b = f.bindings(&[1], &[0]);
+    b.set(id, Value::Index(vec![0; width]));
+    assert!(
+        Interpreter::new()
+            .run(&f.graph, &b, &mut state, ROOT, &mut kv, &Cancel::never())
+            .is_err()
+    );
+}
+
+#[test]
+fn every_position_operand_is_the_same_binding() {
+    // Fourth review, reproduced: only the first position-consuming node's
+    // operand was checked, so a graph whose RoPE read 0 and whose attention read
+    // 999 executed happily at prefix 1. The graph now refuses to be built that
+    // way, which is stronger than validating each operand separately.
+    let mut g = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
+    let rows = rows_symbol();
+    let p1 = g.input(
+        "positions",
+        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+    );
+    let p2 = g.input(
+        "other_positions",
+        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+    );
+    let x = g.input(
+        "x",
+        TensorSpec::new(act(Precision::Bf16), vec![rows.clone(), Dim::constant(8)]),
+    );
+    let r = g
+        .node(
+            OpParams::Rope {
+                heads: 2,
+                head_dim: 4,
+                rotary_dim: 4,
+                base: 10_000.0,
+            },
+            &[x, p1],
+        )
+        .unwrap();
+    let e = g
+        .node(
+            OpParams::Attention {
+                heads: 2,
+                head_dim: 4,
+                visibility: Visibility::Causal,
+                layer: 0,
+            },
+            &[r, r, r, p2],
+        )
+        .unwrap_err();
+    assert_eq!(e.kind(), "invalid_artifact");
+    assert!(e.to_string().contains("shared binding"), "{e}");
+
+    // The same operand is accepted, and the fixture graphs use one throughout.
+    assert!(
+        g.node(
+            OpParams::Attention {
+                heads: 2,
+                head_dim: 4,
+                visibility: Visibility::Causal,
+                layer: 0,
+            },
+            &[r, r, r, p1],
+        )
+        .is_ok()
+    );
+    let f = build(A, 71);
+    assert_eq!(f.graph.positions(), Some(f.positions_id));
+}
+
+#[test]
+fn a_nonfinite_weight_or_result_never_reaches_committed_state() {
+    // Fourth review, reproduced: a BF16-tagged vocabulary weight containing NaN
+    // produced a successful step with NaN logits, the counters advanced, and
+    // `next_logits_valid` became true.
+    let f = build(A, 73);
+    let mut state = f.state();
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
+    state.append_prompt(ROOT, 1).unwrap();
+
+    let id = *f
+        .graph
+        .weights()
+        .iter()
+        .find(|v| f.graph.name(**v) == Some("vocab"))
+        .unwrap();
+    let n = (A.vocab * A.hidden) as usize;
+    let mut data = vec![0.5f32; n];
+    data[3] = f32::NAN;
+    // NaN is BF16-representable, so the storage invariant does not catch it.
+    let mut b = f.bindings(&[1], &[0]);
+    b.set(
+        id,
+        Value::Float(HostTensor::bf16(data, vec![A.vocab as usize, A.hidden as usize]).unwrap()),
+    );
+
+    let e = Interpreter::new()
+        .run(&f.graph, &b, &mut state, ROOT, &mut kv, &Cancel::never())
+        .unwrap_err();
+    assert_eq!(e.kind(), "invalid_artifact");
+    assert_eq!(
+        state.frontiers(ROOT).unwrap().executed,
+        0,
+        "nothing committed"
+    );
+    assert!(kv.is_empty());
+    assert!(!state.next_logits_valid(ROOT));
+    assert!(state.live_results().is_empty());
+
+    // An infinity produced *during* execution is attributed to the operation
+    // that produced it, rather than surfacing as a mysterious logit.
+    let id = *f
+        .graph
+        .weights()
+        .iter()
+        .find(|v| f.graph.name(**v) == Some("w_up"))
+        .unwrap();
+    let n = (A.ffn * A.hidden) as usize;
+    let mut b = f.bindings(&[1], &[0]);
+    // A power of two near the top of the range: BF16-representable, so the
+    // storage invariant admits it, and large enough that the reduction overflows.
+    let huge = 2.0f32.powi(127);
+    assert!(moxie_interp::tensor::is_bf16_valued(huge));
+    b.set(
+        id,
+        Value::Float(
+            HostTensor::bf16(vec![huge; n], vec![A.ffn as usize, A.hidden as usize]).unwrap(),
+        ),
+    );
+    match Interpreter::new().run(&f.graph, &b, &mut state, ROOT, &mut kv, &Cancel::never()) {
+        Err(e) => {
+            assert!(
+                matches!(e.kind(), "numerical" | "invalid_artifact"),
+                "unexpected kind {}: {e}",
+                e.kind()
+            );
+            assert_eq!(state.frontiers(ROOT).unwrap().executed, 0);
+        }
+        Ok(out) => {
+            // If it stays finite the fixture proves nothing, so say so rather
+            // than passing quietly.
+            assert!(
+                out.logits.data().iter().all(|v| v.is_finite()),
+                "a non-finite logit escaped"
+            );
+        }
+    }
+}
+
+#[test]
 fn generation_advances_the_state_the_way_the_contracts_require() {
     // A prompt, then three decode steps, checking the four counters and the
     // provenance rules at each boundary.
     let f = build(A, 43);
     let mut state = f.state();
-    let mut kv = KvCache::new(1);
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
 
     state.append_prompt(ROOT, 3).unwrap();
     let out = step(&f, &mut state, &mut kv, &[1, 2, 3], 0, &Cancel::never()).unwrap();
@@ -954,7 +1184,7 @@ fn generation_advances_the_state_the_way_the_contracts_require() {
 fn a_rollback_drops_the_kv_tail_and_the_retained_result() {
     let f = build(A, 47);
     let mut state = f.state();
-    let mut kv = KvCache::new(1);
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
     state.append_prompt(ROOT, 2).unwrap();
     step(&f, &mut state, &mut kv, &[1, 2], 0, &Cancel::never()).unwrap();
     state.accept(ROOT, 2).unwrap();
@@ -963,7 +1193,7 @@ fn a_rollback_drops_the_kv_tail_and_the_retained_result() {
 
     // KvPages truncates, so no restore evidence is required.
     state.rollback_to(ROOT, 2, &[]).unwrap();
-    kv.rollback_to(2);
+    kv.rollback_to(&state, ROOT, 2).unwrap();
     assert_eq!(kv.len(), 2);
     assert!(
         !state.next_logits_valid(ROOT),

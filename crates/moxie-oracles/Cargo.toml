@@ -10,5 +10,8 @@ publish = false
 moxie-types.workspace = true
 moxie-graph.workspace = true
 
+[dev-dependencies]
+moxie-format.workspace = true
+
 [lints]
 workspace = true

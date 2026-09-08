@@ -293,6 +293,15 @@ impl OpParams {
     }
 }
 
+/// Which input, if any, an operation reads positions from.
+fn position_operand(params: &OpParams) -> Option<usize> {
+    match params {
+        OpParams::Rope { .. } => Some(1),
+        OpParams::Attention { .. } => Some(3),
+        _ => None,
+    }
+}
+
 /// One node: an operation, its parameters, its inputs and its output.
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -317,9 +326,20 @@ pub struct Graph {
     weights: Vec<ValueId>,
     output: ValueId,
     rows: SymbolId,
+    positions: Option<ValueId>,
 }
 
 impl Graph {
+    /// The single value every position-consuming node reads.
+    ///
+    /// One binding, enforced when the graph is built. Two nodes reading
+    /// different position vectors is not a graph an executor can validate
+    /// cheaply -- and the fourth review showed that validating only the first
+    /// one lets the rest say anything they like.
+    pub fn positions(&self) -> Option<ValueId> {
+        self.positions
+    }
+
     /// The symbol standing for this step's row count.
     ///
     /// Declared rather than inferred, so an executor can bind it and check the
@@ -375,6 +395,7 @@ pub struct GraphBuilder {
     weights: Vec<ValueId>,
     oracle: OracleId,
     rows: SymbolId,
+    positions: Option<ValueId>,
 }
 
 impl GraphBuilder {
@@ -390,6 +411,7 @@ impl GraphBuilder {
             weights: Vec::new(),
             oracle,
             rows,
+            positions: None,
         }
     }
 
@@ -462,6 +484,29 @@ impl GraphBuilder {
                     clash.id.0
                 ),
             });
+        }
+        // Every operation that consumes positions must consume the *same* ones.
+        // An executor validates that vector against the branch's frontier once;
+        // if two nodes could read different vectors, only one of them would be
+        // checked.
+        if let Some(i) = position_operand(&params) {
+            let v = inputs[i];
+            match self.positions {
+                Some(existing) if existing != v => {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!(
+                            "{} reads positions from value {} but this graph already uses \
+                             value {}; every position-consuming operation must read one \
+                             shared binding",
+                            params.op().name(),
+                            v.0,
+                            existing.0
+                        ),
+                    });
+                }
+                Some(_) => {}
+                None => self.positions = Some(v),
+            }
         }
         let out_shape = self.check_shapes(&params, inputs)?;
         let out_spec = TensorSpec::new(ValueRole::Activation(params.output_precision()), out_shape);
@@ -668,6 +713,7 @@ impl GraphBuilder {
             weights: self.weights,
             output,
             rows: self.rows,
+            positions: self.positions,
         })
     }
 }

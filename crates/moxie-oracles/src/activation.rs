@@ -13,12 +13,37 @@
 
 use moxie_types::{Error, Result};
 
-/// `silu(v) = v / (1 + e^{−v})`, FP32.
+/// The logistic sigmoid, in the overflow-free form.
+///
+/// `1/(1 + e^{−v})` overflows for `v` around −88 in FP32: `e^{88}` is already
+/// past `f32::MAX`, so the denominator becomes `+inf` and the whole expression
+/// collapses to zero. The algebraically identical `e^v / (1 + e^v)` has the same
+/// problem mirrored, for large positive `v`.
+///
+/// Choosing by sign keeps the exponent negative in both branches, so the
+/// argument to `exp` is never larger than zero and the result is never `inf`.
+/// This is the form the pinned legacy source already uses
+/// (`src/platform/numerics.cpp:44`), and document 08 says to read those
+/// references before inventing a replacement. The first version of this file did
+/// not, and the fourth review found the overflow.
+pub fn sigmoid(v: f32) -> f32 {
+    if v >= 0.0 {
+        1.0 / (1.0 + (-v).exp())
+    } else {
+        let e = v.exp();
+        e / (1.0 + e)
+    }
+}
+
+/// `silu(v) = v · sigmoid(v)`, FP32.
 ///
 /// Four rounding steps -- the exponential, the add, the divide, the multiply --
-/// which is where task 0003's `γ(4)` bound comes from.
+/// which is where task 0003's `γ(4)` bound comes from. The bound is relative and
+/// holds while the result is a normal FP32 number; in the subnormal range,
+/// gradual underflow costs mantissa bits and the contract falls back to an
+/// absolute floor of `f32::MIN_POSITIVE`. See task 0003.
 pub fn silu(v: f32) -> f32 {
-    v / (1.0 + (-v).exp())
+    v * sigmoid(v)
 }
 
 /// `y[i] = silu(gate[i]) · up[i]`, FP32, unrounded.
@@ -43,6 +68,11 @@ mod tests {
     use crate::metric::{ErrorSummary, gamma};
 
     /// The equation, transcribed separately in FP64.
+    ///
+    /// FP64 has enough exponent range that the naive form does not overflow for
+    /// any FP32 input, so this stays the textbook expression -- it is the
+    /// specification, and writing the implementation's own trick here would make
+    /// the comparison circular.
     fn swiglu_row_f64(gate: &[f32], up: &[f32]) -> Vec<f64> {
         gate.iter()
             .zip(up)
@@ -68,6 +98,72 @@ mod tests {
         let bound = gamma(4);
         assert_eq!(s.count, n);
         assert!(s.within(bound), "{s} exceeded gamma(4) = {bound:.3e}");
+    }
+
+    #[test]
+    fn silu_does_not_collapse_to_zero_at_a_large_negative_gate() {
+        // Fourth review, reproduced: `1/(1 + e^{-v})` overflows for v around -88,
+        // and the naive form returned exactly 0 where the true value is a small
+        // negative number. With a large `up` the product is comfortably
+        // representable, so the error was 100% of a value that mattered.
+        let up = 1e30f32;
+        let got = swiglu_row(&[-90.0], &[up]).unwrap()[0];
+        let want = swiglu_row_f64(&[-90.0], &[up])[0];
+        assert!(want < 0.0 && want.is_finite(), "the reference is {want:e}");
+        assert_ne!(got, 0.0, "silu(-90) collapsed to zero");
+        assert!(got < 0.0, "and it kept its sign: {got:e}");
+        let rel = ((got as f64 - want) / want).abs();
+        assert!(
+            rel < 1e-6,
+            "relative error {rel:e}, got {got:e} want {want:e}"
+        );
+    }
+
+    #[test]
+    fn the_sigmoid_is_finite_across_the_whole_fp32_range() {
+        // Both directions: the naive positive-branch form overflows for large
+        // negative v, and its mirror for large positive v. Neither branch here
+        // ever evaluates `exp` at a positive argument.
+        for v in [
+            -f32::MAX,
+            -1e30,
+            -200.0,
+            -90.0,
+            -88.0,
+            -1.0,
+            0.0,
+            1.0,
+            88.0,
+            90.0,
+            200.0,
+            1e30,
+            f32::MAX,
+        ] {
+            let s = sigmoid(v);
+            assert!(s.is_finite(), "sigmoid({v:e}) = {s}");
+            assert!((0.0..=1.0).contains(&s), "sigmoid({v:e}) = {s} left [0,1]");
+            assert!(silu(v).is_finite(), "silu({v:e})");
+        }
+        assert_eq!(sigmoid(0.0), 0.5);
+        // Monotonic across the branch boundary at zero.
+        assert!(sigmoid(-1e-6) < sigmoid(0.0));
+        assert!(sigmoid(0.0) < sigmoid(1e-6));
+    }
+
+    #[test]
+    fn silu_matches_the_reference_into_the_subnormal_range() {
+        // Where the relative bound stops holding, and what replaces it: gradual
+        // underflow costs mantissa bits, so the contract falls back to an
+        // absolute floor rather than pretending to relative accuracy.
+        for v in [-100.0f32, -103.0, -110.0, -120.0] {
+            let got = silu(v) as f64;
+            let want = (v as f64) / (1.0 + (-(v as f64)).exp());
+            let abs = (got - want).abs();
+            assert!(
+                abs <= f32::MIN_POSITIVE as f64,
+                "silu({v}) = {got:e}, want {want:e}, absolute error {abs:e}"
+            );
+        }
     }
 
     #[test]
