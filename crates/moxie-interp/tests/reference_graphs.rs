@@ -1342,6 +1342,96 @@ fn a_graph_whose_attention_layers_are_not_dense_is_refused_at_construction() {
     assert!(g.finish(a1, &oracles()).is_ok());
 }
 
+/// A valid graph that touches no sequence state: RoPE consumes positions, so the
+/// step has a place in the sequence, but nothing writes KV.
+fn stateless_graph() -> (Graph, ValueId, ValueId, ValueId) {
+    let mut g = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
+    let rows = rows_symbol();
+    let pos = g.input(
+        "positions",
+        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+    );
+    let x = g.input(
+        "x",
+        TensorSpec::new(act(Precision::Bf16), vec![rows.clone(), Dim::constant(8)]),
+    );
+    let w = g
+        .weight(
+            "w",
+            TensorSpec::new(weight(), vec![Dim::constant(4), Dim::constant(8)]),
+        )
+        .unwrap();
+    let r = g
+        .node(
+            OpParams::Rope {
+                heads: 2,
+                head_dim: 4,
+                rotary_dim: 4,
+                base: 10_000.0,
+            },
+            &[x, pos],
+        )
+        .unwrap();
+    let out = g
+        .node(
+            OpParams::VocabProjection {
+                vocab: 4,
+                hidden: 8,
+            },
+            &[r, w],
+        )
+        .unwrap();
+    (g.finish(out, &oracles()).unwrap(), pos, x, w)
+}
+
+#[test]
+fn a_graph_that_touches_no_state_is_refused_before_anything_is_written() {
+    // Sixth review, second pass: the layer-coverage check compared counts, and
+    // zero equals zero, so a `RoPE -> VocabProjection` graph with a zero-layer
+    // cache passed it and then advanced `executed` past a cache that could never
+    // hold anything. The counter stayed at 1 with no way to retry.
+    let (graph, pos, x, w) = stateless_graph();
+    assert!(graph.attention_layers().is_empty());
+
+    let mut state = SequenceState::new([StateKind::KvPages, StateKind::PositionCounter]);
+    let mut kv = KvCache::for_branch(0, &state, ROOT).unwrap();
+    state.append_prompt(ROOT, 1).unwrap();
+    let before = state.frontiers(ROOT).unwrap();
+
+    let mut b = Bindings::new();
+    b.set(pos, Value::Index(vec![0]));
+    b.set(
+        x,
+        Value::Float(HostTensor::bf16(vec![0.5; 8], vec![1, 8]).unwrap()),
+    );
+    b.set(
+        w,
+        Value::Float(HostTensor::bf16(vec![0.25; 32], vec![4, 8]).unwrap()),
+    );
+
+    let e = Interpreter::new()
+        .run(&graph, &b, &mut state, ROOT, &mut kv, &Cancel::never())
+        .unwrap_err();
+    assert_eq!(e.kind(), "invalid_artifact");
+    assert!(e.to_string().contains("no attention"), "{e}");
+
+    // Nothing moved.
+    assert_eq!(state.frontiers(ROOT).unwrap(), before);
+    assert!(!state.next_logits_valid(ROOT));
+    assert!(state.live_results().is_empty());
+    assert!(
+        kv.check_owner(&state, ROOT).is_ok(),
+        "the cache is still usable"
+    );
+
+    // The same sequence still runs a real graph cleanly afterwards.
+    let f = build(A, 89);
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
+    let out = step(&f, &mut state, &mut kv, &[1], 0, &Cancel::never()).unwrap();
+    assert_eq!(out.prefix, 1);
+    assert!(state.next_logits_valid(ROOT));
+}
+
 #[test]
 fn generation_advances_the_state_the_way_the_contracts_require() {
     // A prompt, then three decode steps, checking the four counters and the

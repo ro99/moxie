@@ -147,6 +147,25 @@ impl Interpreter {
         // it is a property of the graph and the cache, so it is checked here,
         // before anything is written.
         let graph_layers = graph.attention_layers().len();
+        // A step publishes sequence state, and a graph that touches no state has
+        // none to publish. The sixth review's second pass reached the same
+        // atomicity defect through a `RoPE -> VocabProjection` graph with a
+        // zero-layer cache: the counts matched at zero, so the coverage check
+        // below passed, and then `executed` advanced past a cache that could
+        // never hold anything.
+        //
+        // Attention-free execution is a coherent thing to want -- it just does
+        // not advance `executed`, so it is a different operation with different
+        // publication rules. Refused here rather than half-supported; document
+        // 06 M1.4's transaction API is where it would belong.
+        if graph_layers == 0 {
+            return Err(Error::InvalidArtifact {
+                detail: "this graph has no attention, so it touches no sequence state and \
+                         cannot be executed as a step; a stateless graph would not advance \
+                         the executed frontier and needs its own publication rules"
+                    .into(),
+            });
+        }
         if kv.layers() != graph_layers {
             return Err(Error::InvalidArtifact {
                 detail: format!(
@@ -289,22 +308,24 @@ impl Interpreter {
 
         // Publication.
         //
-        // Everything above either succeeded or returned without writing. What
-        // follows must not be able to half-succeed, so the order is: the one
-        // undoable mutation first, then the irreversible one, then only
-        // operations whose preconditions are already established.
+        // `state.execute` is the one mutation that cannot be taken back: there
+        // is no `unexecute`, and the restore path below puts back the *cache*
+        // and nothing else. So the rule is not "undo on failure" -- it is that
+        // **nothing after `execute` may be able to fail**, and every condition
+        // that could make one of those calls fail is checked before it.
         //
-        // The last precondition to check is the counter, because `execute` is
-        // the step that cannot be taken back.
-        before
-            .executed
-            .checked_add(rows as u64)
-            .ok_or(Error::InvalidRequest {
-                field: "executed",
-                detail: "token counter overflow".into(),
-            })?;
+        // An earlier version argued that from the shape of the code, and two
+        // review passes found holes in the argument. It is now checked instead.
+        let expected_prefix =
+            before
+                .executed
+                .checked_add(rows as u64)
+                .ok_or(Error::InvalidRequest {
+                    field: "executed",
+                    detail: "token counter overflow".into(),
+                })?;
 
-        // Undoable: remember what to truncate back to.
+        // The KV appends are the undoable half, so they go first.
         let lengths: Vec<usize> = kv.contents().iter().map(|l| l.len()).collect();
         for a in staged.drain(..) {
             if let Err(e) = kv.append(a.layer, a.position, a.key, a.value) {
@@ -313,24 +334,35 @@ impl Interpreter {
             }
         }
 
-        // Irreversible, and cannot fail: the branch resolved above and the
-        // counter was just checked. The two calls after it cannot fail either --
-        // `commit` because every layer received exactly `rows` appends, so the
-        // cache length now equals `executed`, and `record_logits` because its
-        // prefix *is* `executed`. Each is still propagated rather than
-        // unwrapped: if one of those arguments is ever wrong, a failed step is a
-        // better outcome than a panic, and the cache is put back either way.
-        if let Err(e) = state.execute(branch, rows as u64) {
+        // The last thing that could make `commit` fail, checked while the state
+        // is still untouched: every layer must now hold exactly the prefix the
+        // counter is about to reach. Arguing this from "each attention node
+        // appended `rows` rows" is what let a zero-layer cache through, because
+        // the argument is vacuously true when there are no layers.
+        if kv.len() as u64 != expected_prefix || !kv.is_coherent() {
+            let lens: Vec<usize> = kv.contents().iter().map(|l| l.len()).collect();
             kv.truncate_layers(&lengths);
-            return Err(e);
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "after {rows} row(s) the cache layers hold {lens:?}, not \
+                     {expected_prefix} each; nothing was committed"
+                ),
+            });
         }
+
+        // From here nothing can fail. `execute` has a resolved branch and a
+        // checked counter; `commit` has a cache whose length was just verified
+        // against the prefix it will see, on a sequence and branch checked at
+        // entry; `record_logits` has a prefix equal to `executed`. Errors are
+        // still propagated rather than unwrapped, because a failed step beats a
+        // panic if that reasoning is ever wrong -- but the state may then be
+        // advanced, and the cache restore does not change that.
+        state.execute(branch, rows as u64)?;
         let prefix = state.frontiers(branch)?.executed;
+        debug_assert_eq!(prefix, expected_prefix);
         // The cache now describes a longer prefix, and records the lineage of
         // each prefix it gained at the moment it gained it.
-        if let Err(e) = kv.commit(state, branch) {
-            kv.truncate_layers(&lengths);
-            return Err(e);
-        }
+        kv.commit(state, branch)?;
         let retained = state.record_logits(branch, prefix)?;
 
         Ok(StepOutput {

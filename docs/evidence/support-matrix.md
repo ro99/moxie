@@ -16,14 +16,14 @@ matrix exists to prevent.
 |---|---|---|---|
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
-| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 311 unit/integration tests + 1 doctest |
+| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 312 unit/integration tests + 1 doctest |
 | `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 19 negative + 1 positive fixtures, 6 rules |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
-| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 311 unit/integration tests + 1 doctest, `ldd` shows no `libcuda` |
+| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 312 unit/integration tests + 1 doctest, `ldd` shows no `libcuda` |
 | `G-GPU-SM86` | `cargo xtask-cuda test-gpu --profile sm86` | device | passed, RTX 3090 x2 |
 | `G-GPU-SM120` | `cargo xtask-cuda test-gpu --profile sm120` | device | passed, RTX 5060 Ti |
 | `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 15 cases, both architectures qualified |
-| `G-INTERP-BF16` | `cargo test -p moxie-interp` | host | passed, 13 unit + 24 acceptance tests ([task 0003](../tasks/0003-m1-bf16-reference-interpreter.md)) |
+| `G-INTERP-BF16` | `cargo test -p moxie-interp` | host | passed, 13 unit + 25 acceptance tests ([task 0003](../tasks/0003-m1-bf16-reference-interpreter.md)) |
 | `G-TOPOLOGY` | `cargo xtask test-topology` | device | **not implemented** (M5) |
 | `G-QUALITY` | `cargo xtask quality` | device | **not implemented** (M3) |
 | `G-BENCH` | `cargo xtask bench` | device | **not implemented** (M6) |

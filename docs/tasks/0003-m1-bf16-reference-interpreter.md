@@ -290,12 +290,17 @@ what any bound over data that can be subnormal should use.
   `executed` counter is untouched, the accepted prefix is untouched, and no result is recorded. A
   cancelled step leaves the state exactly as it found it, which the acceptance tests check by
   running a full step afterwards and comparing against a never-cancelled run.
-- **Publication is ordered so it cannot half-succeed.** Every precondition -- the cache's ownership,
-  its layer coverage, the counter's headroom -- is settled before the first write. Then the undoable
-  mutation (the KV appends) happens first and is truncated back on any error, and the irreversible
-  one (`execute`) happens after it, followed only by operations whose preconditions the earlier
-  checks already established. The sixth review found the previous order writing the cache and
-  advancing the counter *before* a fallible commit, which left no way to retry.
+- **Publication cannot half-succeed, and the reason is checked rather than argued.** `state.execute`
+  cannot be taken back -- there is no `unexecute`, and the restore path puts back the *cache and
+  nothing else*. So the rule is not "undo on failure"; it is that **nothing after `execute` may be
+  able to fail**. The cache's ownership, its layer coverage, the counter's headroom, and finally the
+  cache's post-append length are all established while the state is still untouched; the KV appends,
+  being undoable, go first and are truncated back on error. Two review passes found holes in an
+  earlier version that argued this from the shape of the code instead of checking it, so the last
+  precondition is now an explicit comparison rather than an inference.
+- **A graph with no attention is refused.** It touches no sequence state, so it has nothing to
+  publish and would not advance `executed`. That is a coherent operation with different publication
+  rules, not this one; document 06 M1.4's transaction API is where it would belong.
 - `KvPages` is `RestoreCapability::Truncate`, so a rollback drops the tail. No `Explicit` component
   is in this slice's schema, and no restore evidence is therefore required — stated so that a later
   reader does not think the evidence machinery was skipped.
@@ -736,5 +741,53 @@ covers the graph-construction half.
 |---|---|---|
 | `cargo test --workspace --locked --offline` | 309 + 1 doctest | **311 + 1 doctest** |
 | device lane | 317 + 2 doctests | **319 + 2 doctests** |
+| `fmt`, `clippy -D warnings`, `arch-check`, `spec-check`, no-driver host build | PASS | **PASS** |
+| `cargo xtask-cuda test-gpu`, hidden-SM120 gate | PASS / exit 1 | **PASS / exit 1** |
+
+
+---
+
+## Fourth review correction, 2026-09-08
+
+The layer-mismatch path was closed, but **the same atomicity defect was still reachable through a
+graph with no attention nodes**. Reproduced as reported, with a valid
+`RoPE → VocabProjection` graph and a zero-layer cache:
+
+```text
+invalid artifact: the cache holds 0 position(s) but the branch has executed 1
+  executed after failure: 1
+  check_owner:            rejects
+```
+
+The coverage check compared counts, and zero equals zero, so it passed. My previous note that
+post-`execute` failures "restore the step" was inaccurate and the review was right to say so: the
+handler restores the **cache only**. There is no `unexecute`.
+
+Two corrections. The second is the one that removes the class rather than the instance:
+
+- **A stateless graph is refused at entry.** A step publishes sequence state; a graph that touches
+  none has nothing to publish, and advancing `executed` past a cache that can never hold anything is
+  incoherent. Attention-free execution is a reasonable thing to want — it simply does not advance the
+  frontier, which makes it a different operation with different publication rules. Refused here
+  rather than half-supported.
+- **The last precondition is now checked, not inferred.** The previous version argued that `commit`
+  could not fail because "every layer received exactly `rows` appends" — an argument that is
+  *vacuously true* when there are no layers, which is exactly how this got through. After the appends
+  and while the state is still untouched, the interpreter now compares the cache's length and
+  coherence against the prefix the counter is about to reach, and restores the cache and returns if
+  they disagree. Whatever else is wrong, `execute` is not reached with a cache that cannot satisfy
+  `commit`.
+
+The remaining `?` after `execute` are propagated rather than unwrapped, and the code says plainly
+what that means: a failed step beats a panic if the reasoning above is ever wrong, but the state may
+then be advanced and restoring the cache does not change that. That is a limitation of `moxie-state`
+having no rollback for `executed`, and it is M1.4's transaction API that should remove it — at which
+point the two separately-argued "leaves state untouched" paths, cancellation and publication, become
+one structural guarantee.
+
+| Command | Before | After |
+|---|---|---|
+| `cargo test --workspace --locked --offline` | 311 + 1 doctest | **312 + 1 doctest** |
+| device lane | 319 + 2 doctests | **320 + 2 doctests** |
 | `fmt`, `clippy -D warnings`, `arch-check`, `spec-check`, no-driver host build | PASS | **PASS** |
 | `cargo xtask-cuda test-gpu`, hidden-SM120 gate | PASS / exit 1 | **PASS / exit 1** |
