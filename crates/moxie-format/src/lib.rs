@@ -22,5 +22,9 @@
 
 pub mod affine;
 pub mod bf16;
+pub mod manifest;
 pub mod quantize;
 pub mod scale;
+pub mod sha256;
+
+pub use sha256::{StreamingSha256, sha256_hex};

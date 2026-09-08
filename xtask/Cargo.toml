@@ -20,6 +20,7 @@ cuda = [
 
 [dependencies]
 moxie-types.workspace = true
+moxie-format.workspace = true
 moxie-cuda = { workspace = true, optional = true }
 moxie-kernels = { workspace = true, optional = true }
 toml = "0.9"

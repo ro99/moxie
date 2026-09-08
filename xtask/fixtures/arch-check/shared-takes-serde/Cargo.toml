@@ -1,0 +1,14 @@
+[package]
+name = "moxie-state"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: the third-party allowlist is per crate (ADR 0005).
+# `moxie-format` may use `toml` and `serde`; every other production crate keeps
+# an empty list. A second crate taking `serde` fails on the dependency edge.
+
+[dependencies]
+serde = "1"
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden dependency"

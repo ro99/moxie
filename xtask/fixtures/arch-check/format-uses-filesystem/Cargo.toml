@@ -1,0 +1,11 @@
+[package]
+name = "moxie-format"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: moxie-format parses a `&str` and validates the value. Any
+# production source reaching the filesystem breaks the I/O-free boundary, no
+# matter how it is spelled -- here a plain `use` plus an inline path.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "format touches the filesystem"

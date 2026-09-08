@@ -28,6 +28,36 @@ pub fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
+/// Whether a raw 16-bit BF16 pattern is finite: exponent bits not all set.
+///
+/// Infinities and NaNs share the all-ones exponent; everything else is a
+/// finite weight. The bounded reader validates every element on the way
+/// through so a NaN weight is caught at load, where its provenance is still
+/// known, rather than at the first matmul.
+pub fn is_finite_bf16_bits(bits: u16) -> bool {
+    (bits & 0x7F80) != 0x7F80
+}
+
+/// Validate a little-endian BF16 payload: even length, every element finite.
+pub fn validate_bf16_payload(bytes: &[u8]) -> moxie_types::Result<()> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(moxie_types::Error::InvalidArtifact {
+            detail: format!("BF16 payload has odd length {}", bytes.len()),
+        });
+    }
+    for (i, pair) in bytes.chunks_exact(2).enumerate() {
+        let bits = u16::from_le_bytes([pair[0], pair[1]]);
+        if !is_finite_bf16_bits(bits) {
+            return Err(moxie_types::Error::InvalidArtifact {
+                detail: format!(
+                    "BF16 element {i} is 0x{bits:04x}, a non-finite weight: caught at load, not at the first matmul"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Truncating conversion, provided *only* as the thing to compare against.
 ///
 /// Never use it to build an artifact. It exists so a test can demonstrate that

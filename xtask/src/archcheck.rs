@@ -43,6 +43,8 @@ pub mod rule {
     pub const MODEL_FORBIDDEN_SOURCE: &str = "forbidden construct in model source";
     pub const UNDECLARED_CRATE: &str = "undeclared crate";
     pub const UNRESOLVABLE_DEPENDENCY: &str = "unresolvable dependency";
+    pub const FORMAT_USES_FILESYSTEM: &str = "format touches the filesystem";
+    pub const STORAGE_NAMES_MODEL: &str = "storage interprets model metadata";
 
     pub const ALL: &[&str] = &[
         FORBIDDEN_DEPENDENCY,
@@ -51,6 +53,8 @@ pub mod rule {
         MODEL_FORBIDDEN_SOURCE,
         UNDECLARED_CRATE,
         UNRESOLVABLE_DEPENDENCY,
+        FORMAT_USES_FILESYSTEM,
+        STORAGE_NAMES_MODEL,
     ];
 }
 
@@ -98,13 +102,29 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
             "moxie-format",
             Allowed {
                 workspace: &["moxie-types"],
-                third_party: NONE,
+                // ADR 0005: TOML manifest v1 is parsed with `toml` and
+                // `serde`, the same two crates `xtask` already builds with.
+                // The allowlist stays per crate: every other production
+                // crate keeps an empty list, and a fixture proves a second
+                // crate taking `serde` is rejected.
+                third_party: &["toml", "serde"],
             },
         ),
         (
             "moxie-state",
             Allowed {
                 workspace: &["moxie-types"],
+                third_party: NONE,
+            },
+        ),
+        // The bounded reader (task 0005). The only crate here that touches
+        // the filesystem: it opens the artifact directory and reads chunks.
+        // It must not interpret architecture metadata, decode weights, or
+        // name a model family -- enforced by STORAGE_NAMES_MODEL below.
+        (
+            "moxie-storage",
+            Allowed {
+                workspace: &["moxie-types", "moxie-format"],
                 third_party: NONE,
             },
         ),
@@ -160,6 +180,7 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                     "moxie-interp",
                     "moxie-oracles",
                     "moxie-state",
+                    "moxie-storage",
                     "moxie-cuda",
                     "moxie-kernels",
                 ],
@@ -733,6 +754,10 @@ struct SourceFacts {
     foreign_blocks: usize,
     /// Source pulled in by `include!`, which is code outside the module tree.
     source_includes: Vec<String>,
+    /// String literal values in code position (macro arguments included).
+    /// Doc comments are attributes, not code, and are never collected here:
+    /// prose about a boundary is not a use of what it forbids.
+    strings: Vec<String>,
     /// Child module files this file declares.
     children: Vec<PathBuf>,
     /// Module declarations that could not be resolved to a file.
@@ -850,8 +875,16 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         // A macro's arguments are unparsed tokens by definition, so this is the
         // one place a token scan is the right tool rather than a shortcut.
         collect_mentions(mac.tokens.clone(), &mut self.facts.mentions);
+        collect_strings(mac.tokens.clone(), &mut self.facts.strings);
         visit::visit_macro(self, mac);
     }
+
+    /// Attributes are never traversed for facts. Doc comments (`///`, `//!`)
+    /// arrive here as `#[doc = "..."]` literals; collecting them would turn
+    /// prose *about* a boundary ("must never name a model family") into a
+    /// violation of it. `#[cfg(test)]` gating and `#[path]` overrides are read
+    /// directly from the attribute list where they are needed.
+    fn visit_attribute(&mut self, _attr: &'ast syn::Attribute) {}
 
     fn visit_path(&mut self, path: &'ast syn::Path) {
         // Every path in every position: a call, a type, a pattern, a turbofish.
@@ -861,6 +894,16 @@ impl<'ast> Visit<'ast> for Collector<'_> {
             self.facts.mentions.push(joined.join("::"));
         }
         visit::visit_path(self, path);
+    }
+
+    fn visit_lit(&mut self, lit: &'ast syn::Lit) {
+        // String literals in code position: `const FAMILY: &str = "gemma";`
+        // names a family even with no import. Literals inside macro arguments
+        // are unparsed tokens and are collected by `collect_strings` instead.
+        if let syn::Lit::Str(s) = lit {
+            self.facts.strings.push(s.value());
+        }
+        visit::visit_lit(self, lit);
     }
 }
 
@@ -978,6 +1021,27 @@ fn collect_mentions(ts: TokenStream, out: &mut Vec<String>) {
     }
 }
 
+/// Every string literal in a token stream (macro arguments, which the AST
+/// visitor never parses). Comments are not tokens, so prose is excluded the
+/// same way it is for mentions.
+fn collect_strings(ts: TokenStream, out: &mut Vec<String>) {
+    for token in ts {
+        match token {
+            TokenTree::Group(g) => collect_strings(g.stream(), out),
+            TokenTree::Literal(lit) => {
+                let text = lit.to_string();
+                // String and byte-string literals only: numbers and chars are
+                // not names. `to_string` keeps the quotes; the substring
+                // search below does not care.
+                if text.starts_with('"') || text.starts_with("b\"") {
+                    out.push(text);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Production Rust sources of one crate, and any problem found finding them.
 ///
 /// Three sources, unioned:
@@ -1054,6 +1118,141 @@ fn path_reaches(path: &str, needle: &str) -> bool {
     match path.strip_suffix("::*") {
         Some(base) => needle == base || needle.starts_with(&format!("{base}::")),
         None => false,
+    }
+}
+
+/// Module paths moxie-format may not reach. It parses a `&str`; a path is
+/// something that exists on a filesystem, which is storage's job.
+const FORMAT_FORBIDDEN_PATHS: &[(&str, &str)] = &[
+    (
+        "std::fs",
+        "direct file I/O in moxie-format, which must stay I/O-free",
+    ),
+    (
+        "std::path",
+        "path handling in moxie-format, which must not know a path exists",
+    ),
+];
+
+/// First segments that identify graph/model metadata machinery. A storage
+/// layer that imports any of these is learning what architecture metadata
+/// means -- document 08's unenforced split, restated as a rule.
+const STORAGE_FORBIDDEN_IMPORTS: &[&str] = &["moxie_graph", "moxie_model_api", "moxie_models"];
+
+/// Family names moxie-storage must never contain in code strings. Matched
+/// case-insensitively as substrings; doc comments are excluded because the
+/// collector never visits attributes.
+const STORAGE_FORBIDDEN_NAMES: &[&str] = &[
+    "gemma",
+    "laguna",
+    "inkling",
+    "deepseek",
+    "kimi",
+    "glm",
+    "moxie-models",
+];
+
+/// Rule 5 enforcement: moxie-format production sources reach no filesystem.
+fn check_format_is_io_free(
+    doc: &toml::Value,
+    dir: &Path,
+    crate_name: &str,
+    out: &mut Vec<Violation>,
+) {
+    let (files, problems) = production_sources(doc, dir);
+    for detail in problems {
+        out.push(Violation {
+            crate_name: crate_name.to_string(),
+            rule: rule::FORMAT_USES_FILESYSTEM,
+            detail,
+        });
+    }
+    for file in files {
+        let facts = match analyse_source(&file, true) {
+            Ok(f) => f,
+            Err(e) => {
+                out.push(Violation {
+                    crate_name: crate_name.to_string(),
+                    rule: rule::FORMAT_USES_FILESYSTEM,
+                    detail: e,
+                });
+                continue;
+            }
+        };
+        for (needle, why) in FORMAT_FORBIDDEN_PATHS {
+            for path in facts.imports.iter().chain(facts.mentions.iter()) {
+                if path_reaches(path, needle) {
+                    out.push(Violation {
+                        crate_name: crate_name.to_string(),
+                        rule: rule::FORMAT_USES_FILESYSTEM,
+                        detail: format!("{}: uses `{path}`: {why}", file.display()),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Rule 6 enforcement: moxie-storage names no model family and imports no
+/// metadata machinery.
+fn check_storage_names_no_model(
+    doc: &toml::Value,
+    dir: &Path,
+    crate_name: &str,
+    out: &mut Vec<Violation>,
+) {
+    let (files, problems) = production_sources(doc, dir);
+    for detail in problems {
+        out.push(Violation {
+            crate_name: crate_name.to_string(),
+            rule: rule::STORAGE_NAMES_MODEL,
+            detail,
+        });
+    }
+    for file in files {
+        let facts = match analyse_source(&file, true) {
+            Ok(f) => f,
+            Err(e) => {
+                out.push(Violation {
+                    crate_name: crate_name.to_string(),
+                    rule: rule::STORAGE_NAMES_MODEL,
+                    detail: e,
+                });
+                continue;
+            }
+        };
+        for path in facts.imports.iter().chain(facts.mentions.iter()) {
+            let first = path.split("::").next().unwrap_or("");
+            if STORAGE_FORBIDDEN_IMPORTS
+                .iter()
+                .any(|b| first == *b || first.starts_with("moxie_models"))
+            {
+                out.push(Violation {
+                    crate_name: crate_name.to_string(),
+                    rule: rule::STORAGE_NAMES_MODEL,
+                    detail: format!(
+                        "{}: uses `{path}`: metadata machinery in the storage layer",
+                        file.display()
+                    ),
+                });
+                break;
+            }
+        }
+        for s in facts.strings.iter() {
+            let lower = s.to_lowercase();
+            if let Some(hit) = STORAGE_FORBIDDEN_NAMES.iter().find(|n| lower.contains(*n)) {
+                out.push(Violation {
+                    crate_name: crate_name.to_string(),
+                    rule: rule::STORAGE_NAMES_MODEL,
+                    detail: format!(
+                        "{}: names a model family ('{hit}'): storage reads bytes, never model semantics",
+                        file.display()
+                    ),
+                });
+                break;
+            }
+        }
     }
 }
 
@@ -1242,6 +1441,23 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
                     ));
                 }
             }
+        }
+
+        // Rule 5: moxie-format stays I/O-free. It parses a `&str` and
+        // validates the value; moxie-storage owns the filesystem half. Any
+        // production source of moxie-format reaching `std::fs` or `std::path`
+        // is a boundary breach, however it is spelled.
+        if name == "moxie-format" {
+            check_format_is_io_free(&doc, dir, &name, &mut out);
+        }
+
+        // Rule 6: moxie-storage reads bytes, never model semantics. It must
+        // not import graph/model metadata machinery or name a model family
+        // in code strings. Doc comments are excluded by construction (the
+        // collector never visits attributes), so prose about the boundary is
+        // not a use of what it forbids.
+        if name == "moxie-storage" {
+            check_storage_names_no_model(&doc, dir, &name, &mut out);
         }
     }
     Ok(out)

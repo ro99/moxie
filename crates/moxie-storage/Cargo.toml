@@ -1,5 +1,5 @@
 [package]
-name = "moxie-format"
+name = "moxie-storage"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,7 @@ publish = false
 
 [dependencies]
 moxie-types.workspace = true
-serde = { version = "1", features = ["derive"] }
-toml = "0.9"
+moxie-format.workspace = true
 
 [lints]
 workspace = true

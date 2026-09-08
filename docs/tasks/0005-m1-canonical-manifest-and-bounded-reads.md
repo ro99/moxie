@@ -224,4 +224,59 @@ which is exact. The numerical contracts of tasks 0003 and 0004 are unchanged.
 
 ## Result, filled after work
 
-*(to be completed)*
+Implemented 2026-09-08 on branch `main`, on top of task 0004's acceptance
+commit. The contract above is unchanged; only this section is filled in.
+
+What was built:
+
+- `moxie-format`: `manifest` module (TOML v1 schema, `parse` from `&str`,
+  every validation rule, `validate_chunks` for stat-supplied lengths,
+  `artifact_identity`), `sha256` module (canonical `sha256_hex` plus a
+  streaming hasher), `sha256_raw.rs` (the single included copy), finite-BF16
+  helpers in `bf16`. First third-party production dependencies: `toml` +
+  `serde` (derive), allowlisted per crate. Stays I/O-free.
+- `moxie-storage` (new): `Artifact::open` (capped manifest read, parse,
+  string-level path confinement, canonical-path + regular-file check, stat,
+  range validation; no payload byte read) and `read_tensor` into a
+  caller buffer in budget-capped slices with streaming checksum and
+  per-element finite-BF16 validation. Affine refuses naming M3; partial
+  refuses every read; short buffers error naming both sizes.
+- `arch-check`: `moxie-storage` declared; `moxie-format` allowlisted for
+  `toml`+`serde`; two new rules (`format touches the filesystem`,
+  `storage interprets model metadata`) each with a rejecting fixture, plus a
+  `shared-takes-serde` fixture proving the per-crate allowlist.
+- Deletion plan done: `sha256_hex` is defined once, in
+  `crates/moxie-format/src/sha256_raw.rs`; `xtask spec-check` consumes
+  `moxie_format::sha256_hex` (published-vector test moved with it) and
+  `moxie-kernels/build.rs` includes the raw file.
+- One committed text fixture (`crates/moxie-format/fixtures/manifest.toml`);
+  payloads are generated into temp dirs from a seed. Support matrix gains the
+  manifest-reader row (host-only, no checkpoint, loads no model).
+
+Deviations recorded, none silent:
+
+- ADR 0005's "zero packages to `Cargo.lock`" is off by one: `toml` was
+  already locked, but the `serde` facade was not, so the lock gains exactly
+  one package (`serde v1.0.229`, re-exporting the already-locked
+  `serde_core`/`serde_derive`). No other addition.
+- For affine tensors there is deliberately no
+  `product(shape) * element_size == length` check: their chunk payload has no
+  single element size, and its layout is M3's reader contract. V1 reserves
+  the byte range (checked_add, truncation, overlap, alignment) and validates
+  the closed descriptor; the reader refuses to read. Stated in `manifest.rs`.
+- The million-tensor cap test costs ~55 s in debug (1 M TOML tables parsed).
+  That is the price of proving the bound is stated rather than incidental.
+
+Gates (this machine, 2026-09-08): `fmt` PASS; `clippy -D warnings` PASS;
+`cargo test --workspace --locked --offline` PASS, 375 unit/integration + 4
+doctests (was 332 + 4); `arch-check` PASS (22 rejected + 1 accepted
+fixtures, 8 rules); `spec-check` PASS (10 documents); no-driver lane PASS
+(379, `ldd` shows no `libcuda`); device lane `test-gpu` PASS (15 cases,
+`sm_86` + `sm_120` qualified) with the `CUDA_VISIBLE_DEVICES=1,2` negative
+check exiting 1 as intended. This task touches no CUDA.
+
+Bite checks: inverting the checksum comparison fails the corruption and
+round-trip tests; relaxing overlap to `<=` fails the adjacency assertion;
+both reverted to green. No checkpoint was read, downloaded or converted;
+no importer, `mmap`, device memory or model config schema was needed.
+Stop condition not triggered.

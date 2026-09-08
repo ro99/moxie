@@ -1,0 +1,11 @@
+[package]
+name = "moxie-storage"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: storage reads bytes, never model semantics. Naming a model
+# family in code -- even as a bare string with no new dependency -- breaks the
+# boundary document 06 states directly.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "storage interprets model metadata"
