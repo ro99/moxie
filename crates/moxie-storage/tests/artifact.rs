@@ -550,6 +550,65 @@ fn peak_live_allocation_stays_within_budget_and_constant_in_tensor_size() {
 }
 
 #[test]
+fn long_pathnames_do_not_enter_the_read_budget() {
+    // Review round 2, reproduced: `read_tensor` reopened the chunk by
+    // pathname, and `File::open` allocates ~path length -- 2,054 B under ten
+    // nested 200-character directories for an 8,192 B tensor under a 1,024 B
+    // budget. Chunk files are now opened once at `Artifact::open` and read
+    // position-independently, so pathname length cannot allocate during a
+    // read. Same gate as the short-path test: fits the budget, zero heap.
+    let mut deep = test_dir("gate-longpath");
+    for _ in 0..10 {
+        deep = deep.join("d".repeat(200));
+    }
+    std::fs::create_dir_all(&deep).unwrap();
+    assert!(deep.as_os_str().len() > 2000);
+    let nbytes = 8192usize;
+    let budget = ByteBudget::new(1024).unwrap();
+    let payload = finite_bf16_bytes(23, nbytes);
+    write_artifact(
+        &deep,
+        &[TensorSpec {
+            role: "t",
+            shape: "64, 64",
+            precision: "bf16-v1",
+            chunk: "c.bin",
+            offset: 0,
+            payload: payload.clone(),
+            extra: "",
+        }],
+        complete(),
+    );
+    let art = Artifact::open_with_budget(&deep, budget).expect("open");
+    let mut warm = vec![0u8; nbytes];
+    assert_eq!(art.read_tensor("t", &mut warm).unwrap(), nbytes);
+    let mut out = vec![0u8; nbytes];
+    alloc_measure::reset_peak();
+    assert_eq!(art.read_tensor("t", &mut out).unwrap(), nbytes);
+    let peak = alloc_measure::peak_additional();
+    assert_eq!(out, payload);
+    assert!(
+        peak <= budget.bytes(),
+        "long-path read: peak live allocation was {peak} B over budget {}",
+        budget.bytes()
+    );
+    assert_eq!(
+        peak, 0,
+        "long-path read must hold zero live heap, as the short-path one does: peak was {peak} B"
+    );
+    std::fs::remove_dir_all(test_dir_parent(&deep)).ok();
+}
+
+/// The `test_dir` root a deep tree was built under, for cleanup.
+fn test_dir_parent(deep: &Path) -> PathBuf {
+    let mut p = deep;
+    for _ in 0..10 {
+        p = p.parent().unwrap();
+    }
+    p.to_path_buf()
+}
+
+#[test]
 fn chunk_references_cannot_escape_the_artifact_directory() {
     // Separator, parent traversal and absolute path: refused on the string,
     // before any path is joined.

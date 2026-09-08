@@ -29,7 +29,9 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
+#[cfg(not(unix))]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use moxie_format::StreamingSha256;
@@ -83,6 +85,10 @@ pub struct Artifact {
 #[derive(Debug)]
 struct ChunkFile {
     path: PathBuf,
+    /// Open once at `Artifact::open` and held for the artifact's lifetime.
+    /// Reads use position-independent reads on this handle, so no pathname
+    /// is opened -- and no pathname-length allocation made -- during a read.
+    file: File,
     len: u64,
 }
 
@@ -116,7 +122,10 @@ impl Artifact {
         names.dedup();
         for name in names {
             let resolved = resolve_chunk(&canonical_dir, dir, name)?;
-            let len = resolved
+            let file = File::open(&resolved).map_err(|e| Error::InvalidArtifact {
+                detail: format!("cannot open chunk '{}': {e}", resolved.display()),
+            })?;
+            let len = file
                 .metadata()
                 .map_err(|e| Error::InvalidArtifact {
                     detail: format!("cannot stat chunk '{}': {e}", resolved.display()),
@@ -127,6 +136,7 @@ impl Artifact {
                 name.clone(),
                 ChunkFile {
                     path: resolved,
+                    file,
                     len,
                 },
             );
@@ -212,7 +222,10 @@ impl Artifact {
                 detail: format!("chunk '{}' was validated but is not open", t.chunk),
             })?;
         let dest = &mut into[..need];
-        let mut source = FileRange::open(&chunk.path)?;
+        let mut source = OpenChunk {
+            file: &chunk.file,
+            path: &chunk.path,
+        };
         pump_range(
             &mut source,
             t.offset,
@@ -241,32 +254,69 @@ trait RangeSource {
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()>;
 }
 
-struct FileRange(File);
-
-impl FileRange {
-    fn open(path: &Path) -> Result<Self> {
-        File::open(path)
-            .map(FileRange)
-            .map_err(|e| Error::InvalidArtifact {
-                detail: format!("cannot open chunk '{}': {e}", path.display()),
-            })
-    }
+struct OpenChunk<'a> {
+    file: &'a File,
+    path: &'a Path,
 }
 
-impl RangeSource for FileRange {
+impl RangeSource for OpenChunk<'_> {
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        self.0
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| Error::InvalidArtifact {
-                detail: format!("cannot seek to {offset}: {e}"),
+        #[cfg(unix)]
+        {
+            // `pread`: no file offset is touched, so a shared handle serves
+            // every read with no seek, no clone and no pathname open. Short
+            // reads are retried; a zero return before the buffer fills is
+            // truncation, matching `read_exact` semantics.
+            use std::os::unix::fs::FileExt;
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                let n = self
+                    .file
+                    .read_at(&mut buf[filled..], offset + filled as u64)
+                    .map_err(|e| Error::InvalidArtifact {
+                        detail: format!(
+                            "short read of chunk '{}' at {offset} for {} bytes: truncation: {e}",
+                            self.path.display(),
+                            buf.len()
+                        ),
+                    })?;
+                if n == 0 {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!(
+                            "short read of chunk '{}' at {offset}: file ends {} bytes into a {} byte range: truncation",
+                            self.path.display(),
+                            filled,
+                            buf.len()
+                        ),
+                    });
+                }
+                filled += n;
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            // Best effort off the product platform (Linux-only): a duplicated
+            // handle keeps the shared offset untouched.
+            let mut owned = self.file.try_clone().map_err(|e| Error::InvalidArtifact {
+                detail: format!(
+                    "cannot duplicate handle for chunk '{}': {e}",
+                    self.path.display()
+                ),
             })?;
-        self.0.read_exact(buf).map_err(|e| Error::InvalidArtifact {
-            detail: format!(
-                "short read at {offset} for {} bytes: truncation: {e}",
-                buf.len()
-            ),
-        })?;
-        Ok(())
+            owned
+                .seek(SeekFrom::Start(offset))
+                .map_err(|e| Error::InvalidArtifact {
+                    detail: format!("cannot seek to {offset}: {e}"),
+                })?;
+            owned.read_exact(buf).map_err(|e| Error::InvalidArtifact {
+                detail: format!(
+                    "short read at {offset} for {} bytes: truncation: {e}",
+                    buf.len()
+                ),
+            })?;
+            Ok(())
+        }
     }
 }
 
@@ -342,9 +392,11 @@ fn resolve_chunk(canonical_dir: &Path, dir: &Path, name: &str) -> Result<PathBuf
 /// a sub-slice of the caller's `dest`, the hasher holds one 64-byte block
 /// plus eight words, the BF16 validator holds one carry byte, and checksum
 /// verification finalizes to a stack array compared against a stack-decoded
-/// expectation. The success path allocates no heap for hashing or hex: the
-/// only heap in a read is the fixed file-open cost, which the allocation
-/// gate test measures along with everything else.
+/// expectation. The success path allocates no heap at all: slices are
+/// sub-slices of the caller's buffer, hashing and hex run on stack arrays,
+/// and the chunk handle was opened once at `Artifact::open`, so pathname
+/// length cannot allocate during a read. The allocation gate tests measure
+/// this, on short and long paths alike.
 fn pump_range<S: RangeSource>(
     source: &mut S,
     offset: u64,

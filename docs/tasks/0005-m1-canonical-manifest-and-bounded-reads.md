@@ -269,9 +269,10 @@ Deviations recorded, none silent:
 
 Gates (this machine, 2026-09-08): `fmt` PASS; `clippy -D warnings` PASS;
 `cargo test --workspace --locked --offline` PASS, 375 unit/integration + 4
-doctests at first implementation (was 332 + 4), 385 + 4 after the review
-corrections below; `arch-check` PASS (22 rejected + 1 accepted fixtures,
-8 rules at first implementation; 24 + 1 after the include-rule fixes); `spec-check` PASS (10 documents); no-driver lane PASS
+doctests at first implementation (was 332 + 4), 385 + 4 after the first
+review corrections and 386 + 4 after round 2; `arch-check` PASS
+(22 rejected + 1 accepted fixtures, 8 rules at first implementation;
+24 + 1 after the include-rule fixes, 27 + 1 after round 2); `spec-check` PASS (10 documents); no-driver lane PASS
 (379, `ldd` shows no `libcuda`); device lane `test-gpu` PASS (15 cases,
 `sm_86` + `sm_120` qualified) with the `CUDA_VISIBLE_DEVICES=1,2` negative
 check exiting 1 as intended. This task touches no CUDA.
@@ -333,3 +334,37 @@ doctests; `arch-check` PASS (24 rejected + 1 accepted, 8 rules);
 device lane `test-gpu` re-run after the fixes (the shared raw file feeds
 the kernel build): PASS, 15 cases, `sm_86` + `sm_120` qualified, with the
 `CUDA_VISIBLE_DEVICES=1,2` negative check exiting 1 as intended.
+
+### Review corrections, round 2 (2026-09-08, commit `a309178` not accepted)
+
+Two findings remained; both are fixed inside this task.
+
+- **P2 — long-path reads exceeded the budget.** `read_tensor` reopened the
+  chunk by pathname, and `File::open` allocates ~path length (2,054 B under
+  ten nested 200-character directories for an 8,192 B tensor under a
+  1,024 B budget, persisting after warmup). Chunk files are now opened once
+  at `Artifact::open` and held for the artifact's lifetime; reads use
+  position-independent `pread` on the held handle (unix) with a duplicated-
+  handle fallback elsewhere, so no pathname is opened during a read.
+  Regression `long_pathnames_do_not_enter_the_read_budget` reproduces the
+  shape (2,000+ character artifact path) and asserts peak 0 B; it fails on
+  the old code and passes on the new. The short-path gate is unchanged, and
+  the earlier "zero live heap" claim now holds for both.
+- **P2 — includes hid modules.** The new-rule traversal followed nested
+  `include!` but ignored included files' `mod` children and their
+  unresolved declarations, so `lib.rs -> include!(tests/entry.rs) ->
+  #[path] mod io -> std::fs` reported zero violations. One unified
+  traversal now follows both (`Pending::Include` / `Pending::Module`, with
+  unresolved declarations propagated from include-discovered files; a bare
+  `mod` inside an include resolves against the included file's directory,
+  documented where rustc would use the including file). New fixtures
+  `format-includes-module` and `storage-includes-module` encode the exact
+  reproduced shape on each boundary, plus `format-includes-broken-module`
+  for dangling declarations inside includes.
+
+Re-verified after round 2: `fmt` PASS; `clippy -D warnings` PASS;
+`cargo test --workspace --locked --offline` PASS, 386 unit/integration + 4
+doctests; `arch-check` PASS (27 rejected + 1 accepted, 8 rules);
+`spec-check` PASS (10 documents); no-driver lane PASS (390, no `libcuda`);
+device lane `test-gpu` re-run (storage read path changed): PASS, 15 cases,
+`sm_86` + `sm_120` qualified, negative check exiting 1.

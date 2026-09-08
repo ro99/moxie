@@ -1,0 +1,11 @@
+[package]
+name = "moxie-format"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: the breach is two hops away -- an include into a
+# dev-named directory, then a module declaration inside the included file.
+# The traversal follows both, including mixed chains.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "format touches the filesystem"

@@ -1165,6 +1165,19 @@ fn production_facts_with_includes(
     doc: &toml::Value,
     dir: &Path,
 ) -> (Vec<(PathBuf, SourceFacts)>, Vec<String>) {
+    // `production_sources` follows `mod` declarations out of the Cargo
+    // targets and walks for strays; its problems stand. This loop analyses
+    // every file it names, then chases what it cannot see: `include!`
+    // targets (dev-exempt directories included -- an include makes its
+    // target production) and, from those, the `mod` declarations they carry.
+    // Mod children of mod-tree files are already in the set; re-following
+    // them here is deduplicated by `seen`.
+    //
+    // One approximation, documented: a `mod` inside an included file
+    // resolves against the included file's own directory (as `#[path]`
+    // does), where rustc would resolve a bare `mod` against the including
+    // file. The directory walk already covers in-crate files either way,
+    // and `#[path]` -- the shape that reaches outside it -- is exact.
     let (files, mut problems) = production_sources(doc, dir);
     let mut out: Vec<(PathBuf, SourceFacts)> = Vec::new();
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
@@ -1177,20 +1190,27 @@ fn production_facts_with_includes(
             Err(e) => problems.push(e),
         }
     }
-    let mut queue: Vec<(PathBuf, Vec<String>)> = out
+    // Work items from analysed files: includes to resolve, plus mod children
+    // to follow (which matters for files the mod-tree walk never visited).
+    let mut queue: Vec<Pending> = out
         .iter()
-        .map(|(f, facts)| (f.clone(), facts.source_includes.clone()))
+        .flat_map(|(f, facts)| Pending::from_facts(f.clone(), facts))
         .collect();
-    while let Some((including, args)) = queue.pop() {
-        for arg in args {
-            match resolve_include(&including, &arg) {
+    while let Some(pending) = queue.pop() {
+        match pending {
+            Pending::Include { including, arg } => match resolve_include(&including, &arg) {
                 Some(target) => {
                     if !seen.insert(target.clone()) {
                         continue;
                     }
                     match analyse_source(&target, true) {
                         Ok(facts) => {
-                            queue.push((target.clone(), facts.source_includes.clone()));
+                            // Unresolved declarations propagate from included
+                            // files exactly as from mod-tree ones; the entry
+                            // file itself arrived by include, so nothing else
+                            // reports them.
+                            problems.extend(facts.unresolved.clone());
+                            queue.extend(Pending::from_facts(target.clone(), &facts));
                             out.push((target, facts));
                         }
                         Err(e) => problems.push(e),
@@ -1200,11 +1220,64 @@ fn production_facts_with_includes(
                     "{}: `include!({arg})` resolves to no readable Rust file; included production source that cannot be found cannot be cleared",
                     including.display()
                 )),
+            },
+            Pending::Module { path } => {
+                if !seen.insert(path.clone()) {
+                    continue;
+                }
+                match analyse_source(&path, true) {
+                    Ok(facts) => {
+                        // Propagate unresolved declarations from included
+                        // files too: a `mod` that resolves nowhere is a
+                        // hiding place, wherever it is written.
+                        problems.extend(facts.unresolved.clone());
+                        queue.extend(Pending::from_facts(path.clone(), &facts));
+                        out.push((path, facts));
+                    }
+                    Err(e) => problems.push(e),
+                }
             }
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     (out, problems)
+}
+
+/// One traversal step the mod-tree walk cannot see.
+enum Pending {
+    Include {
+        including: PathBuf,
+        arg: String,
+    },
+    /// A `mod`-declared file. Only ever queued for include-discovered
+    /// files; mod-tree files arrive through `production_sources`.
+    Module {
+        path: PathBuf,
+    },
+}
+
+impl Pending {
+    fn from_facts(file: PathBuf, facts: &SourceFacts) -> Vec<Pending> {
+        let mut out: Vec<Pending> = facts
+            .source_includes
+            .iter()
+            .map(|arg| Pending::Include {
+                including: file.clone(),
+                arg: arg.clone(),
+            })
+            .collect();
+        // Children are queued as modules only when the file itself came from
+        // an include; the caller seeds the queue from analysed facts and the
+        // `seen` set already holds every mod-tree file, so re-queuing them
+        // is a no-op. This keeps one unified traversal for mixed chains.
+        out.extend(
+            facts
+                .children
+                .iter()
+                .map(|path| Pending::Module { path: path.clone() }),
+        );
+        out
+    }
 }
 
 /// Resolve one `include!` argument against the including file.

@@ -1,0 +1,10 @@
+[package]
+name = "moxie-format"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: the included file declares a module that resolves
+# nowhere. Unresolvable declarations are hiding places, wherever written.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "format touches the filesystem"
