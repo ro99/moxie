@@ -270,10 +270,11 @@ Deviations recorded, none silent:
 Gates (this machine, 2026-09-08): `fmt` PASS; `clippy -D warnings` PASS;
 `cargo test --workspace --locked --offline` PASS, 375 unit/integration + 4
 doctests at first implementation (was 332 + 4), 385 + 4 after the first
-review corrections and 386 + 4 after round 2; `arch-check` PASS
+review corrections, 386 + 4 after round 2 and 390 + 4 after round 3; `arch-check` PASS
 (22 rejected + 1 accepted fixtures, 8 rules at first implementation;
-24 + 1 after the include-rule fixes, 27 + 1 after round 2); `spec-check` PASS (10 documents); no-driver lane PASS
-(379, `ldd` shows no `libcuda`); device lane `test-gpu` PASS (15 cases,
+24 + 1 after the include-rule fixes, 27 + 1 after round 2, 29 + 3 after
+round 3); `spec-check` PASS (10 documents); no-driver lane PASS
+(394, `ldd` shows no `libcuda`); device lane `test-gpu` PASS (15 cases,
 `sm_86` + `sm_120` qualified) with the `CUDA_VISIBLE_DEVICES=1,2` negative
 check exiting 1 as intended. This task touches no CUDA.
 
@@ -368,3 +369,37 @@ doctests; `arch-check` PASS (27 rejected + 1 accepted, 8 rules);
 `spec-check` PASS (10 documents); no-driver lane PASS (390, no `libcuda`);
 device lane `test-gpu` re-run (storage read path changed): PASS, 15 cases,
 `sm_86` + `sm_120` qualified, negative check exiting 1.
+
+### Review corrections, round 3 (2026-09-08, commit `39fa5cf` not accepted)
+
+Two findings remained; both are fixed inside this task.
+
+- **P2 — wrong file inspected through mixed chains.** `Pending::Module`
+  analysed discovered modules as crate roots, so `mod inner;` in
+  `tests/outer.rs` resolved to the harmless `tests/inner.rs` instead of
+  `tests/outer/inner.rs`. Resolution context is now per-file: crate roots
+  and include targets resolve against their own directory, discovered
+  modules by the file-stem rule. New fixtures `format-include-module-
+  context` and `storage-include-module-context` encode the exact reproduced
+  shape (including the decoy file) on each boundary -- both are accepted by
+  the pre-fix checker (verified via stash) and rejected now, pointing at
+  the file rustc compiles. Positive fixtures
+  `format-with-clean-nested-modules` and
+  `storage-with-clean-include-module` guard legitimate layouts.
+- **P2 — `EINTR` reported as corruption.** The `pread` loop propagated
+  every error; an interrupted syscall became `truncation`. Reads now go
+  through `read_exact_at` (which retries internally, as the legacy
+  `CheckpointShardSet::read` does), and the pump additionally retries
+  `Interrupted` without advancing. `RangeSource` now speaks I/O errors so
+  the retry decision reads the real kind; genuine errors and premature EOF
+  stay truncation naming the chunk. Four deterministic fault tests via an
+  injected-`EINTR` source: interruption before any bytes, after partial
+  progress (exact call counts prove retry, not skip), genuine-error
+  retention, and premature EOF. Removing the retry fails the first two.
+
+Re-verified after round 3: `fmt` PASS; `clippy -D warnings` PASS;
+`cargo test --workspace --locked --offline` PASS, 390 unit/integration + 4
+doctests; `arch-check` PASS (29 rejected + 3 accepted, 8 rules);
+`spec-check` PASS (10 documents); no-driver lane PASS (394, no `libcuda`);
+device lane `test-gpu` re-run: PASS, 15 cases, `sm_86` + `sm_120`
+qualified, negative check exiting 1.

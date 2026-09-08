@@ -1,0 +1,7 @@
+[package]
+name = "moxie-format"
+version = "0.0.0"
+edition = "2024"
+
+# Must be accepted: nested modules doing only pure work. Guards the
+# resolution-context fix against rejecting legitimate layouts.

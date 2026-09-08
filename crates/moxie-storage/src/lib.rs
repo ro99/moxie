@@ -159,9 +159,14 @@ impl Artifact {
         &self.dir
     }
 
-    /// Stattached length of one chunk file, by chunk name.
+    /// Statted length of one chunk file, by chunk name.
     pub fn chunk_len(&self, chunk: &str) -> Option<u64> {
         self.chunks.get(chunk).map(|c| c.len)
+    }
+
+    /// Canonical path of one chunk file, by chunk name.
+    pub fn chunk_path(&self, chunk: &str) -> Option<&Path> {
+        self.chunks.get(chunk).map(|c| c.path.as_path())
     }
 
     pub fn read_budget(&self) -> ByteBudget {
@@ -222,10 +227,7 @@ impl Artifact {
                 detail: format!("chunk '{}' was validated but is not open", t.chunk),
             })?;
         let dest = &mut into[..need];
-        let mut source = OpenChunk {
-            file: &chunk.file,
-            path: &chunk.path,
-        };
+        let mut source = OpenChunk { file: &chunk.file };
         pump_range(
             &mut source,
             t.offset,
@@ -233,6 +235,7 @@ impl Artifact {
             &t.sha256,
             t.precision,
             self.budget,
+            &t.chunk,
         )
         .map_err(|e| match e {
             Error::InvalidArtifact { detail } => Error::InvalidArtifact {
@@ -251,71 +254,38 @@ impl Artifact {
 /// construction. The memory gate itself is measured, not asserted from slice
 /// sizes: see the allocation-counting test over `Artifact::read_tensor`.
 trait RangeSource {
-    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()>;
+    /// Fill `buf` from `offset`, exactly, or fail with an I/O error.
+    /// Implementations retry `Interrupted` internally (as the legacy
+    /// `CheckpointShardSet::read` does) and report premature EOF as
+    /// `UnexpectedEof`; the pump maps failures to truncation errors naming
+    /// the chunk.
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()>;
 }
 
 struct OpenChunk<'a> {
     file: &'a File,
-    path: &'a Path,
 }
 
 impl RangeSource for OpenChunk<'_> {
-    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
         #[cfg(unix)]
         {
-            // `pread`: no file offset is touched, so a shared handle serves
-            // every read with no seek, no clone and no pathname open. Short
-            // reads are retried; a zero return before the buffer fills is
-            // truncation, matching `read_exact` semantics.
+            // `pread` via `read_exact_at`: no file offset is touched, so a
+            // shared handle serves every read with no seek, no clone and no
+            // pathname open -- and short reads, including `Interrupted`,
+            // are retried inside `read_exact_at` rather than in another
+            // hand-rolled exact-read loop here.
             use std::os::unix::fs::FileExt;
-            let mut filled = 0usize;
-            while filled < buf.len() {
-                let n = self
-                    .file
-                    .read_at(&mut buf[filled..], offset + filled as u64)
-                    .map_err(|e| Error::InvalidArtifact {
-                        detail: format!(
-                            "short read of chunk '{}' at {offset} for {} bytes: truncation: {e}",
-                            self.path.display(),
-                            buf.len()
-                        ),
-                    })?;
-                if n == 0 {
-                    return Err(Error::InvalidArtifact {
-                        detail: format!(
-                            "short read of chunk '{}' at {offset}: file ends {} bytes into a {} byte range: truncation",
-                            self.path.display(),
-                            filled,
-                            buf.len()
-                        ),
-                    });
-                }
-                filled += n;
-            }
-            Ok(())
+            self.file.read_exact_at(buf, offset)
         }
         #[cfg(not(unix))]
         {
             // Best effort off the product platform (Linux-only): a duplicated
-            // handle keeps the shared offset untouched.
-            let mut owned = self.file.try_clone().map_err(|e| Error::InvalidArtifact {
-                detail: format!(
-                    "cannot duplicate handle for chunk '{}': {e}",
-                    self.path.display()
-                ),
-            })?;
-            owned
-                .seek(SeekFrom::Start(offset))
-                .map_err(|e| Error::InvalidArtifact {
-                    detail: format!("cannot seek to {offset}: {e}"),
-                })?;
-            owned.read_exact(buf).map_err(|e| Error::InvalidArtifact {
-                detail: format!(
-                    "short read at {offset} for {} bytes: truncation: {e}",
-                    buf.len()
-                ),
-            })?;
-            Ok(())
+            // handle keeps the shared offset untouched. `read_exact` retries
+            // `Interrupted` internally.
+            let mut owned = self.file.try_clone()?;
+            owned.seek(SeekFrom::Start(offset))?;
+            owned.read_exact(buf)
         }
     }
 }
@@ -396,7 +366,8 @@ fn resolve_chunk(canonical_dir: &Path, dir: &Path, name: &str) -> Result<PathBuf
 /// sub-slices of the caller's buffer, hashing and hex run on stack arrays,
 /// and the chunk handle was opened once at `Artifact::open`, so pathname
 /// length cannot allocate during a read. The allocation gate tests measure
-/// this, on short and long paths alike.
+/// this, on short and long paths alike. Interrupted syscalls retry without
+/// advancing; every other I/O failure is truncation naming the chunk.
 fn pump_range<S: RangeSource>(
     source: &mut S,
     offset: u64,
@@ -404,6 +375,7 @@ fn pump_range<S: RangeSource>(
     want_sha256: &str,
     precision: TensorPrecision,
     budget: ByteBudget,
+    chunk: &str,
 ) -> Result<()> {
     let mut hasher = StreamingSha256::new();
     let mut bf16 = Bf16StreamValidator::new();
@@ -418,7 +390,22 @@ fn pump_range<S: RangeSource>(
             .ok_or_else(|| Error::InvalidArtifact {
                 detail: format!("tensor offset {offset} + {done} overflows"),
             })?;
-        source.read_at(pos, buf)?;
+        // An interrupted syscall is retried without advancing: the tensor
+        // offset has not moved, so no byte is skipped or duplicated.
+        // Anything else -- including premature EOF -- is truncation naming
+        // the chunk, never a silent short read.
+        match source.read_at(pos, buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(Error::InvalidArtifact {
+                    detail: format!(
+                        "short read of chunk '{chunk}' at {pos} for {} bytes: truncation: {e}",
+                        buf.len()
+                    ),
+                });
+            }
+        }
         hasher.update(buf);
         if matches!(precision, TensorPrecision::Bf16V1) {
             bf16.feed(buf)?;
@@ -547,17 +534,68 @@ mod tests {
     }
 
     impl RangeSource for MemSource {
-        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
             let start = offset as usize;
             let end = start + buf.len();
             if end > self.data.len() {
-                return Err(Error::InvalidArtifact {
-                    detail: "short read: truncation".into(),
-                });
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "short read: truncation",
+                ));
             }
             buf.copy_from_slice(&self.data[start..end]);
             Ok(())
         }
+    }
+
+    /// Deterministic `EINTR`: fails the listed 1-based calls with
+    /// `Interrupted`, then behaves like memory. Models the fault injector
+    /// that made the first `pread64` return `EINTR`.
+    struct FlakySource {
+        data: Vec<u8>,
+        interrupt_calls: Vec<u64>,
+        calls: std::cell::Cell<u64>,
+        fail_with: Option<std::io::ErrorKind>,
+    }
+
+    impl RangeSource for FlakySource {
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            if self.interrupt_calls.contains(&call) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "injected EINTR",
+                ));
+            }
+            if let Some(kind) = self.fail_with {
+                return Err(std::io::Error::new(kind, "injected genuine error"));
+            }
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > self.data.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "short read: truncation",
+                ));
+            }
+            buf.copy_from_slice(&self.data[start..end]);
+            Ok(())
+        }
+    }
+
+    fn finite_bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut b: Vec<u8> = (0..n)
+            .map(|i| ((i * 37 + seed as usize) % 251) as u8)
+            .collect();
+        for pair in b.chunks_exact_mut(2) {
+            let mut bits = u16::from_le_bytes([pair[0], pair[1]]);
+            if (bits & 0x7F80) == 0x7F80 {
+                bits &= 0x7F7F;
+                pair.copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        b
     }
 
     /// Odd budgets split BF16 elements mid-pair; the pump must still read
@@ -589,6 +627,7 @@ mod tests {
                 &sha,
                 TensorPrecision::Bf16V1,
                 budget,
+                "c.bin",
             )
             .expect("valid payload reads");
             assert_eq!(dest, finite);
@@ -631,6 +670,7 @@ mod tests {
                 &sha,
                 TensorPrecision::Bf16V1,
                 budget,
+                "c.bin",
             )
             .unwrap_err();
             assert!(e.to_string().contains("non-finite"), "{e}");
@@ -642,5 +682,115 @@ mod tests {
         assert!(ByteBudget::new(0).is_none());
         assert!(ByteBudget::new(64 * 1024).is_some());
         assert_eq!(ByteBudget::default(), ByteBudget::DEFAULT);
+    }
+
+    /// An interrupted syscall retries without advancing: the tensor offset
+    /// has not moved, so no byte is skipped or duplicated. Mirrors the
+    /// fault injector that made the first `pread64` return `EINTR`.
+    #[test]
+    fn interruption_before_any_bytes_retries_to_success() {
+        // Budget 8 over 32 bytes: four slices. The first two attempts fail
+        // before a single byte is accepted.
+        let budget = ByteBudget::new(8).unwrap();
+        let finite = finite_bytes(41, 32);
+        let sha = sha256_hex(&finite);
+        let mut src = FlakySource {
+            data: finite.clone(),
+            interrupt_calls: vec![1, 2],
+            calls: std::cell::Cell::new(0),
+            fail_with: None,
+        };
+        let mut dest = vec![0u8; 32];
+        pump_range(
+            &mut src,
+            0,
+            &mut dest,
+            &sha,
+            TensorPrecision::Bf16V1,
+            budget,
+            "c.bin",
+        )
+        .expect("interruption retries");
+        assert_eq!(dest, finite);
+        assert_eq!(src.calls.get(), 6, "four slices plus two retries");
+    }
+
+    #[test]
+    fn interruption_after_partial_progress_retries_to_success() {
+        // Two slices (16 bytes) land, the third attempt is interrupted, the
+        // retry re-reads the same slice: five slice reads plus one retry.
+        let budget = ByteBudget::new(8).unwrap();
+        let finite = finite_bytes(42, 48);
+        let sha = sha256_hex(&finite);
+        let mut src = FlakySource {
+            data: finite.clone(),
+            interrupt_calls: vec![3],
+            calls: std::cell::Cell::new(0),
+            fail_with: None,
+        };
+        let mut dest = vec![0u8; 48];
+        pump_range(
+            &mut src,
+            0,
+            &mut dest,
+            &sha,
+            TensorPrecision::Bf16V1,
+            budget,
+            "c.bin",
+        )
+        .expect("interruption retries");
+        assert_eq!(dest, finite);
+        assert_eq!(src.calls.get(), 7, "six slices plus one retry");
+    }
+
+    #[test]
+    fn genuine_errors_are_retained_not_retried() {
+        // A non-interruption failure is truncation naming the chunk, even
+        // after partial progress -- never a silent short read.
+        let budget = ByteBudget::new(8).unwrap();
+        let finite = finite_bytes(43, 32);
+        let sha = sha256_hex(&finite);
+        let mut src = FlakySource {
+            data: finite,
+            interrupt_calls: vec![],
+            calls: std::cell::Cell::new(0),
+            fail_with: Some(std::io::ErrorKind::ConnectionReset),
+        };
+        let mut dest = vec![0u8; 32];
+        let e = pump_range(
+            &mut src,
+            0,
+            &mut dest,
+            &sha,
+            TensorPrecision::Bf16V1,
+            budget,
+            "chunk7.bin",
+        )
+        .unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("truncation"), "{msg}");
+        assert!(msg.contains("chunk7.bin"), "{msg}");
+    }
+
+    #[test]
+    fn premature_eof_is_truncation() {
+        // The source ends mid-tensor: the pump reports truncation, not a
+        // short buffer claimed as success.
+        let budget = ByteBudget::new(1024).unwrap();
+        let finite = finite_bytes(44, 16);
+        let sha = sha256_hex(&finite);
+        let mut src = MemSource { data: finite };
+        let mut dest = vec![0u8; 32];
+        let e = pump_range(
+            &mut src,
+            0,
+            &mut dest,
+            &sha,
+            TensorPrecision::Bf16V1,
+            budget,
+            "c.bin",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("truncation"), "{e}");
     }
 }

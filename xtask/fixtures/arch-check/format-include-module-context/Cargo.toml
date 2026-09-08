@@ -1,0 +1,12 @@
+[package]
+name = "moxie-format"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: a bare `mod` inside an included file resolves against the
+# included file's directory (`tests/outer.rs`), whose own `mod` then resolves
+# by the file-stem rule (`tests/outer/inner.rs`). A checker that collapses
+# the context inspects the harmless `tests/inner.rs` instead and passes.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "format touches the filesystem"

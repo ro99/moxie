@@ -1173,16 +1173,23 @@ fn production_facts_with_includes(
     // Mod children of mod-tree files are already in the set; re-following
     // them here is deduplicated by `seen`.
     //
-    // One approximation, documented: a `mod` inside an included file
-    // resolves against the included file's own directory (as `#[path]`
-    // does), where rustc would resolve a bare `mod` against the including
-    // file. The directory walk already covers in-crate files either way,
-    // and `#[path]` -- the shape that reaches outside it -- is exact.
+    // Resolution context is preserved per file, as rustc resolves it:
+    // crate roots and include targets resolve `mod` against their own
+    // directory (an include pastes tokens but keeps the included file's
+    // span, so `mod outer;` in an included `tests/entry.rs` is
+    // `tests/outer.rs`, not `src/outer.rs`); discovered modules resolve
+    // their children by the standard file-stem rule (`outer.rs` looks in
+    // `outer/`). Collapsing either context to the other inspects the wrong
+    // file -- a soundness hole, not a conservative approximation.
     let (files, mut problems) = production_sources(doc, dir);
+    let roots: BTreeSet<PathBuf> = crate_roots(doc, dir).into_iter().collect();
     let mut out: Vec<(PathBuf, SourceFacts)> = Vec::new();
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     for file in files {
-        match analyse_source(&file, true) {
+        // Same root-ness `production_sources` used, so re-derived children
+        // agree with the mod tree instead of shadowing it.
+        let is_root = roots.contains(&file);
+        match analyse_source(&file, is_root) {
             Ok(facts) => {
                 seen.insert(file.clone());
                 out.push((file, facts));
@@ -1221,11 +1228,11 @@ fn production_facts_with_includes(
                     including.display()
                 )),
             },
-            Pending::Module { path } => {
+            Pending::Module { path, is_root } => {
                 if !seen.insert(path.clone()) {
                     continue;
                 }
-                match analyse_source(&path, true) {
+                match analyse_source(&path, is_root) {
                     Ok(facts) => {
                         // Propagate unresolved declarations from included
                         // files too: a `mod` that resolves nowhere is a
@@ -1249,10 +1256,12 @@ enum Pending {
         including: PathBuf,
         arg: String,
     },
-    /// A `mod`-declared file. Only ever queued for include-discovered
-    /// files; mod-tree files arrive through `production_sources`.
+    /// A `mod`-declared file with its resolution context. Discovered
+    /// modules are never crate roots: their children follow the standard
+    /// file-stem rule, so `tests/outer.rs` looks in `tests/outer/`.
     Module {
         path: PathBuf,
+        is_root: bool,
     },
 }
 
@@ -1266,16 +1275,14 @@ impl Pending {
                 arg: arg.clone(),
             })
             .collect();
-        // Children are queued as modules only when the file itself came from
-        // an include; the caller seeds the queue from analysed facts and the
-        // `seen` set already holds every mod-tree file, so re-queuing them
-        // is a no-op. This keeps one unified traversal for mixed chains.
-        out.extend(
-            facts
-                .children
-                .iter()
-                .map(|path| Pending::Module { path: path.clone() }),
-        );
+        // Children are queued as non-root modules; the caller seeds the
+        // queue from analysed facts and the `seen` set already holds every
+        // mod-tree file, so re-queuing them is a no-op. This keeps one
+        // unified traversal for mixed chains.
+        out.extend(facts.children.iter().map(|path| Pending::Module {
+            path: path.clone(),
+            is_root: false,
+        }));
         out
     }
 }
