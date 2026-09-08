@@ -42,7 +42,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use moxie_types::{BranchId, Error, Result};
+use moxie_types::{BranchId, Error, Result, StateTransactionId};
 
 /// The kinds of state a schema can declare (document 04).
 ///
@@ -409,6 +409,37 @@ impl Branch {
     }
 }
 
+/// What one transaction must put back if it aborts.
+///
+/// A journal, not a copy. Every mutation inside a transaction is monotone --
+/// counters only rise, the lineage vector only grows, results are only added --
+/// so recording where each of them started is exact *and* `O(1)`. Cloning the
+/// branch would be equally exact and `O(context)` per step, which makes a
+/// sequence quadratic; the cheap-looking option is the wrong one here.
+#[derive(Debug, Clone)]
+struct Journal {
+    branch: BranchId,
+    frontiers: Frontiers,
+    lineage_len: usize,
+    /// Where `lineage_saved` starts. Initially the lineage's length, meaning
+    /// nothing has been discarded yet.
+    lineage_saved_from: usize,
+    /// The original lineage entries from `lineage_saved_from` up to
+    /// `lineage_len`, saved the first time a rollback inside the transaction
+    /// discards them.
+    ///
+    /// Growing entries need no saving -- truncating back to `lineage_len` undoes
+    /// an append. *Discarded* entries do: a rollback inside a transaction
+    /// truncates them away and the re-execution that follows writes different
+    /// values in their place under a new epoch, so restoring the length alone
+    /// leaves the replacements behind. Saved lazily and only downward, so a
+    /// transaction that never rolls back pays nothing.
+    lineage_saved: Vec<PrefixLineage>,
+    epoch: u64,
+    logits: Option<LogitsHandle>,
+    next_result: u64,
+}
+
 /// One sequence's state: its schema, its branches and its retained outputs.
 ///
 /// **Deliberately not `Clone`.** The third M0 review reproduced the reason: a
@@ -445,6 +476,10 @@ pub struct SequenceState {
     live: BTreeMap<ResultId, LogitsHandle>,
     next_branch: u64,
     next_result: u64,
+    /// Open transactions, by id. At most one per branch: two overlapping
+    /// journals cannot both be the truth about what to restore.
+    open: BTreeMap<StateTransactionId, Journal>,
+    next_transaction: u64,
 }
 
 /// The branch every sequence starts with.
@@ -476,6 +511,8 @@ impl SequenceState {
             live: BTreeMap::new(),
             next_branch: 1,
             next_result: 1,
+            open: BTreeMap::new(),
+            next_transaction: 1,
         }
     }
 
@@ -742,6 +779,142 @@ impl SequenceState {
         }
     }
 
+    /// Open a transaction on `branch`.
+    ///
+    /// Document 04: "`begin` creates tentative state". Everything done between
+    /// here and `commit_prefix` or `abort` can be undone exactly, which is what
+    /// makes it safe for a step -- or a speculative branch -- to materialise
+    /// work it has not accepted.
+    ///
+    /// At most one transaction may be open per branch.
+    pub fn begin(&mut self, branch: BranchId) -> Result<StateTransactionId> {
+        let b = self.get(branch)?;
+        if let Some((id, _)) = self.open.iter().find(|(_, j)| j.branch == branch) {
+            return Err(Error::InvalidRequest {
+                field: "transaction",
+                detail: format!(
+                    "{branch} already has transaction {} open; two journals cannot both \
+                     describe what to restore",
+                    id.get()
+                ),
+            });
+        }
+        let journal = Journal {
+            branch,
+            frontiers: b.frontiers,
+            lineage_len: b.lineage.len(),
+            lineage_saved_from: b.lineage.len(),
+            lineage_saved: Vec::new(),
+            epoch: b.epoch,
+            logits: b.logits,
+            next_result: self.next_result,
+        };
+        let id = StateTransactionId(self.next_transaction);
+        self.next_transaction += 1;
+        self.open.insert(id, journal);
+        Ok(id)
+    }
+
+    /// Publish `accept` token transitions and close the transaction.
+    ///
+    /// Document 04: "`commit_prefix(n)` publishes exactly n accepted token
+    /// transitions". `n = 0` is the ordinary decode case -- the executor
+    /// materialises state, and acceptance is the caller's decision after
+    /// sampling.
+    ///
+    /// The tentative work done inside the transaction is kept.
+    pub fn commit_prefix(&mut self, txn: StateTransactionId, accept: u64) -> Result<()> {
+        let journal = self.open.get(&txn).cloned().ok_or(Error::InvalidRequest {
+            field: "transaction",
+            detail: format!("no open transaction {}", txn.get()),
+        })?;
+        if accept > 0 {
+            // Accepting can overflow, and a failed commit must not close the
+            // transaction -- the caller can still abort it.
+            let b = self.get(journal.branch)?;
+            b.frontiers
+                .accepted
+                .checked_add(accept)
+                .ok_or(Error::InvalidRequest {
+                    field: "accepted",
+                    detail: "token counter overflow".into(),
+                })?;
+            self.accept(journal.branch, accept)?;
+        }
+        self.open.remove(&txn);
+        Ok(())
+    }
+
+    /// Restore the branch to exactly its state at `begin`, and close the
+    /// transaction.
+    ///
+    /// Document 04: "`abort` restores the committed prefix". Infallible apart
+    /// from an unknown id: restoration is assignment and truncation, and nothing
+    /// in it can run out of anything. That is what lets a caller abort on a
+    /// failure path without a second failure to handle.
+    pub fn abort(&mut self, txn: StateTransactionId) -> Result<()> {
+        let journal = self.open.remove(&txn).ok_or(Error::InvalidRequest {
+            field: "transaction",
+            detail: format!("no open transaction {}", txn.get()),
+        })?;
+        // Results minted inside the transaction describe work that is being
+        // undone; they cannot survive it.
+        self.live.retain(|id, _| id.get() < journal.next_result);
+        self.next_result = journal.next_result;
+        let b = self
+            .branches
+            .get_mut(&journal.branch)
+            .expect("a branch with an open transaction still exists");
+        b.frontiers = journal.frontiers;
+        // Put back anything a rollback inside the transaction discarded, then
+        // drop anything it appended.
+        b.lineage.truncate(journal.lineage_saved_from);
+        b.lineage.extend(journal.lineage_saved);
+        b.lineage.truncate(journal.lineage_len);
+        b.epoch = journal.epoch;
+        b.logits = journal.logits;
+        Ok(())
+    }
+
+    /// Before a truncation to `new_len`, hand any open transaction the original
+    /// entries it is about to lose.
+    ///
+    /// Only ever extends the saved range downward, so the earliest originals
+    /// win: a second rollback inside one transaction sees replacements above the
+    /// first save point and must not overwrite the true values with them.
+    fn save_discarded_lineage(&mut self, branch: BranchId, new_len: usize) {
+        let Some((id, from)) = self
+            .open
+            .iter()
+            .find(|(_, j)| j.branch == branch)
+            .map(|(id, j)| (*id, j.lineage_saved_from))
+        else {
+            return;
+        };
+        if new_len >= from {
+            return;
+        }
+        let Some(b) = self.branches.get(&branch) else {
+            return;
+        };
+        let head: Vec<PrefixLineage> = b.lineage[new_len..from.min(b.lineage.len())].to_vec();
+        let journal = self.open.get_mut(&id).expect("found above");
+        let mut restored = head;
+        restored.append(&mut journal.lineage_saved);
+        journal.lineage_saved = restored;
+        journal.lineage_saved_from = new_len;
+    }
+
+    /// Transactions that were opened and never resolved.
+    ///
+    /// `Drop` cannot reach the state that owns a journal, so an unresolved
+    /// transaction cannot abort itself. It is made *visible* instead: the branch
+    /// refuses a further `begin`, and this reports what is outstanding. A leak
+    /// the tests can assert on beats a silent corruption.
+    pub fn open_transactions(&self) -> Vec<(StateTransactionId, BranchId)> {
+        self.open.iter().map(|(id, j)| (*id, j.branch)).collect()
+    }
+
     /// Mint restoration evidence for one `Explicit` component.
     ///
     /// Call this at the point the restoration actually happens; the identity it
@@ -955,6 +1128,10 @@ impl SequenceState {
             }
         }
 
+        // If a transaction is open on this branch, the entries about to be
+        // discarded are the ones an abort could not otherwise reconstruct.
+        self.save_discarded_lineage(branch, prefix as usize + 1);
+
         // Results beyond the target describe state that no longer exists.
         self.live
             .retain(|_, h| !(h.branch == branch && h.prefix > prefix));
@@ -1027,6 +1204,16 @@ impl SequenceState {
             return Err(Error::InvalidRequest {
                 field: "branch",
                 detail: "the root branch cannot be discarded".into(),
+            });
+        }
+        if let Some((id, _)) = self.open.iter().find(|(_, j)| j.branch == branch) {
+            return Err(Error::InvalidRequest {
+                field: "branch",
+                detail: format!(
+                    "{branch} has transaction {} open; resolve it before discarding the \
+                     branch its journal describes",
+                    id.get()
+                ),
             });
         }
         if self.branches.remove(&branch).is_none() {
@@ -1649,6 +1836,246 @@ mod tests {
             "a component outside the schema has no state to restore"
         );
         let _ = &mut s;
+    }
+
+    #[test]
+    fn abort_restores_every_counter_including_executed() {
+        // The thing that was impossible before task 0004: `executed` had no
+        // inverse, so a failure after it could not be unwound and correctness
+        // rested on having enumerated every later failure.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 4).unwrap();
+        s.accept(ROOT, 2).unwrap();
+        s.execute(ROOT, 6).unwrap();
+        s.emit(ROOT, 1).unwrap();
+        s.record_logits(ROOT, 6).unwrap();
+        let before = s.frontiers(ROOT).unwrap();
+        let before_logits = s.retained_logits(ROOT).unwrap();
+        let before_lineage = s.lineage_at(ROOT, 6).unwrap();
+        let before_live: Vec<u64> = s.live_results().iter().map(|h| h.prefix()).collect();
+
+        let txn = s.begin(ROOT).unwrap();
+        s.execute(ROOT, 3).unwrap();
+        s.accept(ROOT, 3).unwrap();
+        s.emit(ROOT, 2).unwrap();
+        s.record_logits(ROOT, 9).unwrap();
+        assert_ne!(s.frontiers(ROOT).unwrap(), before, "the fixture must move");
+
+        s.abort(txn).unwrap();
+        assert_eq!(s.frontiers(ROOT).unwrap(), before);
+        assert_eq!(s.retained_logits(ROOT).unwrap(), before_logits);
+        assert_eq!(s.lineage_at(ROOT, 6).unwrap(), before_lineage);
+        assert_eq!(
+            s.live_results()
+                .iter()
+                .map(|h| h.prefix())
+                .collect::<Vec<_>>(),
+            before_live,
+            "results minted inside the transaction describe undone work"
+        );
+        assert!(
+            s.lineage_at(ROOT, 7).unwrap().is_none(),
+            "lineage truncated"
+        );
+        assert!(s.next_logits_valid(ROOT));
+    }
+
+    #[test]
+    fn abort_puts_back_the_epoch_so_a_later_lineage_is_unchanged() {
+        // A rollback inside a transaction bumps the epoch. If abort left the
+        // epoch advanced, positions written afterwards would get a lineage that
+        // no retained result could match -- an invisible invalidation.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 2).unwrap();
+        s.accept(ROOT, 4).unwrap();
+        s.execute(ROOT, 6).unwrap();
+        let lineage_before = s.lineage_at(ROOT, 6).unwrap();
+
+        let txn = s.begin(ROOT).unwrap();
+        s.rollback_to(ROOT, 3, &[]).unwrap();
+        s.accept(ROOT, 3).unwrap();
+        s.execute(ROOT, 3).unwrap();
+        assert_ne!(s.lineage_at(ROOT, 6).unwrap(), lineage_before);
+        s.abort(txn).unwrap();
+
+        assert_eq!(s.lineage_at(ROOT, 6).unwrap(), lineage_before);
+        // And re-executing after the abort reproduces the same lineage, which it
+        // would not if the epoch had been left advanced.
+        let mut fresh = kv_only();
+        fresh.append_prompt(ROOT, 2).unwrap();
+        fresh.accept(ROOT, 4).unwrap();
+        fresh.execute(ROOT, 6).unwrap();
+        assert_eq!(s.frontiers(ROOT).unwrap(), fresh.frontiers(ROOT).unwrap());
+    }
+
+    #[test]
+    fn commit_prefix_keeps_the_work_and_publishes_what_it_is_told_to() {
+        // Document 04: "commit_prefix(n) publishes exactly n accepted token
+        // transitions". n = 0 is the ordinary decode case -- the executor
+        // materialises state and acceptance is the caller's later decision.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 3).unwrap();
+
+        let txn = s.begin(ROOT).unwrap();
+        s.execute(ROOT, 3).unwrap();
+        s.record_logits(ROOT, 3).unwrap();
+        s.commit_prefix(txn, 0).unwrap();
+        let f = s.frontiers(ROOT).unwrap();
+        assert_eq!((f.accepted, f.executed), (3, 3));
+        assert!(s.next_logits_valid(ROOT), "the tentative work was kept");
+        assert!(s.open_transactions().is_empty());
+
+        // And a commit that accepts publishes exactly that many.
+        let txn = s.begin(ROOT).unwrap();
+        s.execute(ROOT, 2).unwrap();
+        s.commit_prefix(txn, 2).unwrap();
+        let f = s.frontiers(ROOT).unwrap();
+        assert_eq!((f.accepted, f.executed), (5, 5));
+        assert_eq!(f.completion(), 2);
+    }
+
+    #[test]
+    fn a_branch_has_at_most_one_open_transaction() {
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 1).unwrap();
+        let txn = s.begin(ROOT).unwrap();
+        let e = s.begin(ROOT).unwrap_err();
+        assert!(e.to_string().contains("already has transaction"), "{e}");
+
+        // A different branch may have its own.
+        let child = s.fork(ROOT, 1).unwrap();
+        let other = s.begin(child).unwrap();
+        assert_eq!(s.open_transactions().len(), 2);
+
+        s.abort(txn).unwrap();
+        s.commit_prefix(other, 0).unwrap();
+        assert!(s.open_transactions().is_empty());
+        // ... and the branch is free again.
+        assert!(s.begin(ROOT).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_or_resolved_transaction_is_refused() {
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 1).unwrap();
+        assert!(s.abort(StateTransactionId(999)).is_err());
+        assert!(s.commit_prefix(StateTransactionId(999), 0).is_err());
+
+        let txn = s.begin(ROOT).unwrap();
+        s.commit_prefix(txn, 0).unwrap();
+        assert!(s.abort(txn).is_err(), "already resolved");
+        assert!(s.commit_prefix(txn, 0).is_err());
+    }
+
+    #[test]
+    fn an_unresolved_transaction_is_visible_rather_than_silent() {
+        // `Drop` cannot reach the state that owns the journal, so an unresolved
+        // transaction cannot abort itself. It is made detectable instead: the
+        // branch is locked and the leak is reportable.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 1).unwrap();
+        let txn = s.begin(ROOT).unwrap();
+        s.execute(ROOT, 1).unwrap();
+        // The id is `Copy`, so "dropping" it is not what leaks -- simply never
+        // resolving it is. That is the case being tested.
+        let _ = txn;
+        assert_eq!(s.open_transactions().len(), 1);
+        assert_eq!(s.open_transactions()[0].1, ROOT);
+        assert!(s.begin(ROOT).is_err(), "the branch stays locked");
+    }
+
+    #[test]
+    fn a_failed_commit_leaves_the_transaction_open_to_abort() {
+        // A commit that cannot publish must not close the transaction, or the
+        // caller loses its only way back.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 1).unwrap();
+        let b = s.branches.get_mut(&ROOT).unwrap();
+        b.frontiers.accepted = u64::MAX - 1;
+        let txn = s.begin(ROOT).unwrap();
+        assert!(s.commit_prefix(txn, 5).is_err(), "overflow");
+        assert_eq!(s.open_transactions().len(), 1);
+        s.abort(txn).unwrap();
+        assert!(s.open_transactions().is_empty());
+    }
+
+    #[test]
+    fn abort_restores_a_lineage_that_was_rolled_back_twice_inside_the_transaction() {
+        // The saved range only ever extends downward. A second rollback sees
+        // replacement entries above the first save point, and must not overwrite
+        // the true originals with them.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 2).unwrap();
+        s.accept(ROOT, 6).unwrap();
+        s.execute(ROOT, 8).unwrap();
+        let originals: Vec<_> = (0..=8).map(|p| s.lineage_at(ROOT, p).unwrap()).collect();
+
+        let txn = s.begin(ROOT).unwrap();
+        s.rollback_to(ROOT, 6, &[]).unwrap();
+        s.accept(ROOT, 2).unwrap();
+        s.execute(ROOT, 2).unwrap();
+        s.rollback_to(ROOT, 3, &[]).unwrap();
+        s.accept(ROOT, 5).unwrap();
+        s.execute(ROOT, 5).unwrap();
+        for p in 4..=8u64 {
+            assert_ne!(s.lineage_at(ROOT, p).unwrap(), originals[p as usize]);
+        }
+        s.abort(txn).unwrap();
+
+        for p in 0..=8u64 {
+            assert_eq!(
+                s.lineage_at(ROOT, p).unwrap(),
+                originals[p as usize],
+                "prefix {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_branch_with_an_open_transaction_cannot_be_discarded() {
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 2).unwrap();
+        let child = s.fork(ROOT, 2).unwrap();
+        let txn = s.begin(child).unwrap();
+        assert!(s.discard_branch(child).is_err());
+        s.abort(txn).unwrap();
+        assert!(s.discard_branch(child).is_ok());
+    }
+
+    #[test]
+    fn abort_restores_after_every_prefix_of_a_step_s_mutations() {
+        // The generalisation of the four holes four review passes found: whatever
+        // subset of a step's work has happened, aborting puts all of it back.
+        let baseline = |s: &SequenceState| {
+            (
+                s.frontiers(ROOT).unwrap(),
+                s.retained_logits(ROOT).unwrap(),
+                s.live_results().len(),
+                s.lineage_at(ROOT, 4).unwrap(),
+            )
+        };
+        for stop_after in 0..4 {
+            let mut s = kv_only();
+            s.append_prompt(ROOT, 2).unwrap();
+            s.accept(ROOT, 2).unwrap();
+            s.execute(ROOT, 4).unwrap();
+            s.record_logits(ROOT, 4).unwrap();
+            let before = baseline(&s);
+
+            let txn = s.begin(ROOT).unwrap();
+            if stop_after > 0 {
+                s.execute(ROOT, 2).unwrap();
+            }
+            if stop_after > 1 {
+                s.record_logits(ROOT, 6).unwrap();
+            }
+            if stop_after > 2 {
+                s.accept(ROOT, 2).unwrap();
+            }
+            s.abort(txn).unwrap();
+            assert_eq!(baseline(&s), before, "stopped after {stop_after}");
+            assert!(s.next_logits_valid(ROOT), "stopped after {stop_after}");
+        }
     }
 
     #[test]

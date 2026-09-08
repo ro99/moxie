@@ -42,6 +42,13 @@ struct CacheOwner {
     stamps: Vec<PrefixLineage>,
 }
 
+/// What a cache transaction must put back if it aborts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheJournal {
+    lengths: Vec<usize>,
+    stamps: usize,
+}
+
 /// Per-layer key/value history, bound to one branch of one sequence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvCache {
@@ -156,11 +163,19 @@ impl KvCache {
             });
         }
         let executed = state.frontiers(branch)?.executed;
-        if self.len() as u64 != executed {
+        // Both halves of "the cache describes exactly this prefix". `len` reads
+        // the first layer only, so without the coherence test a cache whose
+        // layers had drifted apart would be stamped as current on the strength
+        // of layer 0. The interpreter refuses a layer-count mismatch before it
+        // writes anything, and a graph's attention layers are dense by
+        // construction, so reaching either arm means a caller supplied a cache
+        // that was already ragged. Inside a transaction that is simply an
+        // error; it does not have to be unreachable to be safe.
+        if self.len() as u64 != executed || !self.is_coherent() {
+            let lens: Vec<usize> = self.layers.iter().map(KvHistory::len).collect();
             return Err(Error::InvalidArtifact {
                 detail: format!(
-                    "the cache holds {} position(s) but the branch has executed {executed}",
-                    self.len()
+                    "the cache layers hold {lens:?} position(s), not {executed} each,                      which is what the branch has executed"
                 ),
             });
         }
@@ -179,15 +194,27 @@ impl KvCache {
         self.layers.len()
     }
 
-    /// Put every layer back to a recorded length, discarding what was appended
-    /// since. Used to undo a partially applied step.
-    pub(crate) fn truncate_layers(&mut self, lengths: &[usize]) {
-        for (l, n) in self.layers.iter_mut().zip(lengths) {
+    /// Open a transaction: record what an abort would have to put back.
+    ///
+    /// The same journal shape `moxie-state` uses, for the same reason -- the
+    /// mutations are monotone, so recording where they started is exact and
+    /// cheap. The cache is a *second participant* rather than living inside the
+    /// state crate, because `moxie-state` owns sequence state and must not reach
+    /// into a consumer's buffers; `moxie-interp` is the composition point that
+    /// opens and resolves both together.
+    pub fn begin(&self) -> CacheJournal {
+        CacheJournal {
+            lengths: self.layers.iter().map(KvHistory::len).collect(),
+            stamps: self.owner.stamps.len(),
+        }
+    }
+
+    /// Restore exactly what `begin` recorded. Infallible.
+    pub fn abort(&mut self, journal: &CacheJournal) {
+        for (l, n) in self.layers.iter_mut().zip(&journal.lengths) {
             l.truncate(*n as u64);
         }
-        if let Some(shortest) = lengths.iter().min() {
-            self.owner.stamps.truncate(shortest + 1);
-        }
+        self.owner.stamps.truncate(journal.stamps);
     }
 
     /// The stored histories, without the ownership stamp.
@@ -384,6 +411,25 @@ mod tests {
         kv.append(0, 1, vec![1.0], vec![1.0]).unwrap();
         kv.commit(&state, ROOT).unwrap();
         kv.check_owner(&state, ROOT).unwrap();
+    }
+
+    #[test]
+    fn a_cache_whose_layers_disagree_cannot_be_stamped_as_current() {
+        // `len` reads layer 0, so a ragged cache would otherwise be stamped as
+        // describing the executed prefix on the strength of that one layer, and
+        // every later `check_owner` would agree with it. Until publication
+        // became a transaction this was checked in the interpreter, before the
+        // state advanced; it belongs with the stamp it protects.
+        let (mut state, mut kv) = state_and_cache(2);
+        state.append_prompt(ROOT, 1).unwrap();
+        state.execute(ROOT, 1).unwrap();
+        kv.append(0, 0, vec![1.0], vec![1.0]).unwrap();
+        // Layer 1 is left behind. Layer 0 alone matches `executed`.
+        assert_eq!(kv.len(), 1);
+        let e = kv.commit(&state, ROOT).unwrap_err();
+        assert!(e.to_string().contains("[1, 0]"), "{e}");
+        kv.append(1, 0, vec![1.0], vec![1.0]).unwrap();
+        kv.commit(&state, ROOT).unwrap();
     }
 
     #[test]

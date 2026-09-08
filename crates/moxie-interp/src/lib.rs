@@ -43,7 +43,7 @@ use moxie_state::{LogitsHandle, SequenceState};
 use moxie_types::BranchId;
 use moxie_types::{Error, Result};
 
-pub use kv::KvCache;
+pub use kv::{CacheJournal, KvCache};
 pub use tensor::{HostTensor, Value};
 
 /// A cancellation token checked at every operation boundary.
@@ -306,70 +306,62 @@ impl Interpreter {
             });
         }
 
-        // Publication.
+        // Publication, as one transaction with two participants.
         //
-        // `state.execute` is the one mutation that cannot be taken back: there
-        // is no `unexecute`, and the restore path below puts back the *cache*
-        // and nothing else. So the rule is not "undo on failure" -- it is that
-        // **nothing after `execute` may be able to fail**, and every condition
-        // that could make one of those calls fail is checked before it.
-        //
-        // An earlier version argued that from the shape of the code, and two
-        // review passes found holes in the argument. It is now checked instead.
-        let expected_prefix =
-            before
-                .executed
-                .checked_add(rows as u64)
-                .ok_or(Error::InvalidRequest {
-                    field: "executed",
-                    detail: "token counter overflow".into(),
-                })?;
-
-        // The KV appends are the undoable half, so they go first.
-        let lengths: Vec<usize> = kv.contents().iter().map(|l| l.len()).collect();
-        for a in staged.drain(..) {
-            if let Err(e) = kv.append(a.layer, a.position, a.key, a.value) {
-                kv.truncate_layers(&lengths);
-                return Err(e);
+        // `moxie-state` journals the branch and `KvCache` journals its layers;
+        // this is the composition point that opens both and resolves both the
+        // same way. Task 0003 shipped without this, and four review passes each
+        // found a different way for a failure after `state.execute` to leave the
+        // sequence advanced with no way to retry -- because there was no
+        // `unexecute`, correctness depended on having enumerated every way the
+        // remaining calls could fail. Now a failure aborts.
+        let cache_journal = kv.begin();
+        let txn = state.begin(branch)?;
+        match self.publish(state, branch, kv, &mut staged, rows) {
+            Ok(prefix_and_handle) => {
+                state.commit_prefix(txn, 0)?;
+                let (prefix, retained) = prefix_and_handle;
+                Ok(StepOutput {
+                    logits,
+                    retained,
+                    prefix,
+                })
+            }
+            Err(e) => {
+                // Both halves, unconditionally, and neither can fail: `abort` is
+                // assignment and truncation on an id this function just opened.
+                state.abort(txn).expect("the transaction was opened above");
+                kv.abort(&cache_journal);
+                Err(e)
             }
         }
+    }
 
-        // The last thing that could make `commit` fail, checked while the state
-        // is still untouched: every layer must now hold exactly the prefix the
-        // counter is about to reach. Arguing this from "each attention node
-        // appended `rows` rows" is what let a zero-layer cache through, because
-        // the argument is vacuously true when there are no layers.
-        if kv.len() as u64 != expected_prefix || !kv.is_coherent() {
-            let lens: Vec<usize> = kv.contents().iter().map(|l| l.len()).collect();
-            kv.truncate_layers(&lengths);
-            return Err(Error::InvalidArtifact {
-                detail: format!(
-                    "after {rows} row(s) the cache layers hold {lens:?}, not \
-                     {expected_prefix} each; nothing was committed"
-                ),
-            });
+    /// The mutating half of a step, inside an open transaction.
+    ///
+    /// Every failure here is undone by the caller, so this can be written in the
+    /// order the work happens rather than in an order chosen to put the
+    /// irreversible step last. That is the whole benefit: the pre-`execute`
+    /// precondition checks that existed only because publication could not be
+    /// undone are gone.
+    fn publish(
+        &self,
+        state: &mut SequenceState,
+        branch: BranchId,
+        kv: &mut KvCache,
+        staged: &mut Vec<StagedAppend>,
+        rows: usize,
+    ) -> Result<(u64, LogitsHandle)> {
+        for a in staged.drain(..) {
+            kv.append(a.layer, a.position, a.key, a.value)?;
         }
-
-        // From here nothing can fail. `execute` has a resolved branch and a
-        // checked counter; `commit` has a cache whose length was just verified
-        // against the prefix it will see, on a sequence and branch checked at
-        // entry; `record_logits` has a prefix equal to `executed`. Errors are
-        // still propagated rather than unwrapped, because a failed step beats a
-        // panic if that reasoning is ever wrong -- but the state may then be
-        // advanced, and the cache restore does not change that.
         state.execute(branch, rows as u64)?;
         let prefix = state.frontiers(branch)?.executed;
-        debug_assert_eq!(prefix, expected_prefix);
         // The cache now describes a longer prefix, and records the lineage of
         // each prefix it gained at the moment it gained it.
         kv.commit(state, branch)?;
         let retained = state.record_logits(branch, prefix)?;
-
-        Ok(StepOutput {
-            logits,
-            retained,
-            prefix,
-        })
+        Ok((prefix, retained))
     }
 
     /// The positions any state-touching node was given.

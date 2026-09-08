@@ -147,6 +147,97 @@ test here that touches them is asserting they are *unchanged*, not re-deriving t
 - Stop condition: if this appears to need paging, a real fork, a sampler or a checkpoint, stop and
   report. Each is a different task.
 
-## Result, filled after work
+## Result
 
-*(to be completed)*
+Implemented on `main`, base commit `42e1e9c` (the contract commit above, which contains no `.rs`
+change). Nothing in the contract was adjusted once a test ran.
+
+### Commands
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | **PASS** |
+| `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | **PASS** |
+| `cargo test --workspace --locked --offline` | **PASS**, 325 unit/integration + 1 doctest (was 312 + 1) |
+| `cargo xtask arch-check` | **PASS**, 19 rejected + 1 accepted fixtures, 6 rules |
+| `cargo xtask spec-check` | **PASS**, 10 documents, digests unchanged |
+| no-driver host lane, `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | **PASS**, 325 + 1; `ldd target/debug/xtask` reports no `libcuda` |
+| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | **PASS**, 333 + 2 doctests |
+| `cargo xtask-cuda test-gpu` | **PASS**, 15 cases, `sm_86` and `sm_120` qualified |
+| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, `UNQUALIFIED sm_120`, as intended |
+
+Host counts by crate: `moxie-oracles` 114, `moxie-format` 54, `moxie-state` 38, `xtask` 30,
+`moxie-interp` 14 + 27 integration, `moxie-types` 22, `moxie-graph` 11, `moxie-cuda` 9,
+`moxie-model-api` 5, `moxie-kernels` 1.
+
+### What was built
+
+**`moxie-state` gained the transaction.** `begin` records a `Journal` — the four frontier counters,
+`lineage.len()`, the epoch, the retained `LogitsHandle`, and `next_result` — and returns a
+`StateTransactionId`. `commit_prefix(txn, n)` accepts `n` tokens and closes it; `abort(txn)` restores
+and closes it. Both refuse an unknown or already-resolved id. `open_transactions()` reports what is
+open, so an unresolved transaction is a visible leak rather than silent drift.
+
+One thing the contract's table understates, found while writing the tests: truncating the lineage to
+its recorded length is not sufficient, because `rollback_to` inside a transaction *shortens* the
+vector, and a later append then overwrites entries the journal assumed were untouched. `begin`
+therefore also records `lineage_saved_from`/`lineage_saved`, the suffix that any in-transaction
+rollback discarded, and `abort` puts that suffix back before truncating. This is still `O(changed)`
+rather than a clone — nothing is copied unless something was discarded — and
+`abort_restores_a_lineage_that_was_rolled_back_twice_inside_the_transaction` is the case that
+required it.
+
+**`KvCache` gained the matching journal.** `begin()` returns a `CacheJournal` holding the per-layer
+lengths and the stamp count; `abort(&journal)` is infallible and truncates back to them. `commit`
+stays `pub(crate)` — no caller outside the crate may re-stamp a cache — and now carries the check
+the interpreter used to do before `execute`: every layer must hold exactly the executed prefix, both
+halves of it, because `len()` reads layer 0 alone and a ragged cache would otherwise be stamped as
+current on the strength of one layer.
+
+**`moxie-interp` composes the two.** `Interpreter::run` opens `kv.begin()` and `state.begin(branch)`,
+calls the new `publish`, and on any error calls `state.abort(txn)` then `kv.abort(&journal)` — neither
+of which can fail. `publish` does the appends, `state.execute`, `kv.commit` and `state.record_logits`
+in the order the work happens, not in an order chosen to put the irreversible step last.
+
+### Temporary paths deleted, as the contract required
+
+The pre-`execute` precondition checks that existed only because publication could not be undone are
+gone: the `expected_prefix` overflow check, the manual `truncate_layers` on each append failure, and
+the "check the cache length before `execute` because `commit` must not fail" block. The comment
+block arguing that nothing after `execute` could fail is gone with them. What stays, because it is a
+statement about whether a graph and a cache belong together rather than about atomicity: the
+layer-count check and the stateless-graph refusal, both still before anything is written.
+
+### Acceptance, item by item
+
+| Requirement | Evidence |
+|---|---|
+| `arch-check`, `spec-check`, `fmt`, `clippy -D warnings`, full host lane | all PASS, above |
+| Device lane and `test-gpu` unchanged and carried forward | PASS; this task touches no CUDA |
+| Failure injection at every publication step | `a_partly_published_step_aborts_to_exactly_where_it_started` drives a step's mutations one at a time and aborts after each, comparing the four counters, the retained result, the live set, the lineage at every prefix and every KV layer; `abort_restores_after_every_prefix_of_a_step_s_mutations` does the same at the state level |
+| Cancellation at every node depth still leaves state identical, through `abort` | `a_cancelled_step_leaves_the_state_exactly_as_it_found_it`, unchanged in intent, plus `a_successful_step_leaves_no_transaction_open` which also asserts a cancelled step leaves none |
+| A second `begin` is refused | `a_branch_has_at_most_one_open_transaction` |
+| Unknown / resolved id refused | `an_unknown_or_resolved_transaction_is_refused` |
+| An unresolved transaction is visible | `an_unresolved_transaction_is_visible_rather_than_silent` |
+| `abort` restores `executed` | `abort_restores_every_counter_including_executed`, asserted directly |
+| Every task 0003 acceptance test passes unchanged in intent | 27 integration tests pass; the two added are new, none were weakened |
+| Support-matrix row updated | `G-INTERP-BF16` recounted; one capability row added for transactional publication. No checkpoint, kernel or context row touched |
+
+Further tests beyond the list: `commit_prefix_keeps_the_work_and_publishes_what_it_is_told_to`,
+`abort_puts_back_the_epoch_so_a_later_lineage_is_unchanged`,
+`a_failed_commit_leaves_the_transaction_open_to_abort`,
+`a_branch_with_an_open_transaction_cannot_be_discarded`, and
+`a_cache_whose_layers_disagree_cannot_be_stamped_as_current`.
+
+### What this does not establish
+
+- **This is not a fork.** `fork` still creates a branch with its own identity and no inherited
+  state. Copy-on-write branch state, paging and prefix reuse are M4 and untouched.
+- **Nothing here executes a model.** The interpreter is still a host BF16 reference over synthetic
+  graphs. Atomic publication makes a step safe to fail; it does not make anything faster, and it
+  does not make the reference an engine.
+- **The rest of M1.4 is not done.** Sampler history, deterministic distribution tests, the
+  generation service and the diagnostic CLI are separate tasks that consume this one.
+- **A dropped transaction still leaks.** By design, and asserted: `Drop` cannot reach the owning
+  `SequenceState`, so an unresolved transaction locks its branch and is reported by
+  `open_transactions()` rather than auto-aborting.

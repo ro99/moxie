@@ -12,18 +12,18 @@ matrix exists to prevent.
 
 ## Gate IDs
 
-| Gate | Command | Lane | Result 2026-09-07 |
+| Gate | Command | Lane | Result 2026-09-08 |
 |---|---|---|---|
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
-| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 312 unit/integration tests + 1 doctest |
+| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 325 unit/integration tests + 1 doctest |
 | `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 19 negative + 1 positive fixtures, 6 rules |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
-| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 312 unit/integration tests + 1 doctest, `ldd` shows no `libcuda` |
+| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 325 unit/integration tests + 1 doctest, `ldd` shows no `libcuda` |
 | `G-GPU-SM86` | `cargo xtask-cuda test-gpu --profile sm86` | device | passed, RTX 3090 x2 |
 | `G-GPU-SM120` | `cargo xtask-cuda test-gpu --profile sm120` | device | passed, RTX 5060 Ti |
 | `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 15 cases, both architectures qualified |
-| `G-INTERP-BF16` | `cargo test -p moxie-interp` | host | passed, 13 unit + 25 acceptance tests ([task 0003](../tasks/0003-m1-bf16-reference-interpreter.md)) |
+| `G-INTERP-BF16` | `cargo test -p moxie-interp` | host | passed, 14 unit + 27 acceptance tests ([task 0003](../tasks/0003-m1-bf16-reference-interpreter.md), [task 0004](../tasks/0004-m1-state-transactions.md)) |
 | `G-TOPOLOGY` | `cargo xtask test-topology` | device | **not implemented** (M5) |
 | `G-QUALITY` | `cargo xtask quality` | device | **not implemented** (M3) |
 | `G-BENCH` | `cargo xtask bench` | device | **not implemented** (M6) |
@@ -31,7 +31,8 @@ matrix exists to prevent.
 Device gates ran by hand on this machine. No CI runner executes them; see
 [toolchain.md](toolchain.md).
 
-Counts are from 2026-09-07 after the fourth review's corrections; see
+Counts are from 2026-09-08 after [task 0004](../tasks/0004-m1-state-transactions.md); the M0
+enforcement counts they grew from are in
 [task 0002](../tasks/0002-m0-review-and-integer-transition.md#fourth-review-corrections-2026-09-07).
 
 ## Rows
@@ -51,6 +52,7 @@ Counts are from 2026-09-07 after the fourth review's corrections; see
 | none | n/a | n/a | Flash / paged attention; host-backed exact state | **not implemented** | — | M4. `moxie-oracles::mask::attend_row` is an exact reference, not a path. |
 | none | n/a | n/a | Oversized host/disk weight streaming | **not implemented** | — | M2. No memory authority exists. |
 | none | n/a | n/a | TP / PP / expert partition | **not implemented** | — | M5. `PartitionRule::NotDetermined` fails closed today. |
+| none | n/a | n/a | Transactional publication of a step | passed | `G-INTERP-BF16` (`moxie-state` `begin`/`commit_prefix`/`abort`, `a_partly_published_step_aborts_to_exactly_where_it_started`) | Host reference only. A step's sequence-state and KV mutations commit together or restore exactly; `fork` is still identity-only, and copy-on-write branch state remains M4. |
 | none | n/a | n/a | Prefix reuse / continuation / cancellation | **not implemented** | `G-HOST-TEST` (`moxie-state`) covers frontier, result-identity and restore-evidence rules only | M4. Counters, retained-result identity and prefix lineage are typed and tested; there is no cache to reuse, and document 04's token-content prefix key is a separate identity that is **not** implemented. |
 | none | n/a | n/a | Common sampler pipeline | **partial, not integrated** | `G-HOST-TEST` (`moxie-oracles::sampler`) | Legality mask, top-k, top-p, min-p, temperature, tie rule, extreme-temperature stability and typed failures only. Penalties, DRY, n-gram ban, logit bias, typical-p and XTC are **not implemented**. |
 | none | n/a | n/a | Future entropy | **not implemented** | — | M10. Document 05 defines it; nothing here evaluates it. |

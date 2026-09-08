@@ -1433,6 +1433,108 @@ fn a_graph_that_touches_no_state_is_refused_before_anything_is_written() {
 }
 
 #[test]
+fn a_partly_published_step_aborts_to_exactly_where_it_started() {
+    // The generalisation of the four holes four review passes each found from a
+    // different direction. Rather than enumerating the ways publication could
+    // fail, this drives a step's mutations one at a time and aborts after each,
+    // asserting that *everything* is back: the four counters, the retained
+    // result, the live set, the lineage, and every KV layer.
+    //
+    // The interpreter's own publication is now unreachable-failure by
+    // construction, so the fault is injected at the mechanism it uses rather
+    // than pretended at a level that cannot reach it.
+    let f = build(A, 97);
+    let head_width = (A.heads * A.head_dim) as usize;
+
+    for stop_after in 0..3 {
+        let mut state = f.state();
+        let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
+        state.append_prompt(ROOT, 2).unwrap();
+        step(&f, &mut state, &mut kv, &[1, 2], 0, &Cancel::never()).unwrap();
+        state.accept(ROOT, 1).unwrap();
+
+        let before_frontiers = state.frontiers(ROOT).unwrap();
+        let before_logits = state.retained_logits(ROOT).unwrap();
+        let before_live: Vec<u64> = state.live_results().iter().map(|h| h.prefix()).collect();
+        let before_lineage: Vec<_> = (0..=2)
+            .map(|p| state.lineage_at(ROOT, p).unwrap())
+            .collect();
+        let before_kv = kv.contents().to_vec();
+
+        // Open both halves, exactly as `Interpreter::run` does.
+        let cache_journal = kv.begin();
+        let txn = state.begin(ROOT).unwrap();
+
+        if stop_after > 0 {
+            kv.append(0, 2, vec![0.5; head_width], vec![0.25; head_width])
+                .unwrap();
+        }
+        if stop_after > 1 {
+            // `commit` is `pub(crate)` on purpose -- no caller outside the crate
+            // may re-stamp a cache -- so this drives the state half and leaves
+            // the stamps where a mid-publication failure would leave them.
+            state.execute(ROOT, 1).unwrap();
+            state.record_logits(ROOT, 3).unwrap();
+        }
+
+        state.abort(txn).unwrap();
+        kv.abort(&cache_journal);
+
+        assert_eq!(
+            state.frontiers(ROOT).unwrap(),
+            before_frontiers,
+            "{stop_after}"
+        );
+        assert_eq!(
+            state.retained_logits(ROOT).unwrap(),
+            before_logits,
+            "{stop_after}"
+        );
+        assert_eq!(
+            state
+                .live_results()
+                .iter()
+                .map(|h| h.prefix())
+                .collect::<Vec<_>>(),
+            before_live,
+            "{stop_after}"
+        );
+        for p in 0..=2u64 {
+            assert_eq!(
+                state.lineage_at(ROOT, p).unwrap(),
+                before_lineage[p as usize],
+                "stop {stop_after}, prefix {p}"
+            );
+        }
+        assert_eq!(kv.contents(), &before_kv[..], "{stop_after}");
+        assert!(kv.check_owner(&state, ROOT).is_ok(), "{stop_after}");
+        assert!(state.open_transactions().is_empty());
+
+        // And the sequence still runs cleanly afterwards, which is the property
+        // the earlier version could not offer once `executed` had moved.
+        let out = step(&f, &mut state, &mut kv, &[3], 2, &Cancel::never()).unwrap();
+        assert_eq!(out.prefix, 3);
+        assert!(state.next_logits_valid(ROOT));
+    }
+}
+
+#[test]
+fn a_successful_step_leaves_no_transaction_open() {
+    let f = build(A, 101);
+    let mut state = f.state();
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
+    state.append_prompt(ROOT, 2).unwrap();
+    step(&f, &mut state, &mut kv, &[1, 2], 0, &Cancel::never()).unwrap();
+    assert!(state.open_transactions().is_empty());
+
+    // A cancelled step leaves none either: cancellation is an abort now, not an
+    // early return that happens to precede the mutations.
+    let e = step(&f, &mut state, &mut kv, &[3], 2, &Cancel::after(2)).unwrap_err();
+    assert_eq!(e.kind(), "cancelled");
+    assert!(state.open_transactions().is_empty());
+}
+
+#[test]
 fn generation_advances_the_state_the_way_the_contracts_require() {
     // A prompt, then three decode steps, checking the four counters and the
     // provenance rules at each boundary.
