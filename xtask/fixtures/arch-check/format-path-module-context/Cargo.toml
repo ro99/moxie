@@ -1,0 +1,13 @@
+[package]
+name = "moxie-format"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: `#[path]` confers the resolved file's parent directory
+# with no file-stem step, so `mod inner;` in the path-loaded
+# `tests/outer.rs` is `tests/inner.rs` -- verified against rustc. A checker
+# applying the stem rule inspects the harmless `tests/outer/inner.rs`
+# instead and passes.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "format touches the filesystem"

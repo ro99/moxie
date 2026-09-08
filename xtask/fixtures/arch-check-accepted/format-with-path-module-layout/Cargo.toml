@@ -1,0 +1,7 @@
+[package]
+name = "moxie-format"
+version = "0.0.0"
+edition = "2024"
+
+# Must be accepted: a `#[path]` chain doing only pure work. Guards the
+# path-context fix against rejecting the `#[path]` mechanism itself.

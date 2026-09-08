@@ -16,10 +16,10 @@ matrix exists to prevent.
 |---|---|---|---|
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
-| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 390 unit/integration tests + 4 doctests |
-| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 29 negative + 3 positive fixtures, 8 rules |
+| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 394 unit/integration tests + 4 doctests |
+| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 31 negative + 5 positive fixtures, 8 rules |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
-| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 390 unit/integration tests + 4 doctests, `ldd` shows no `libcuda` |
+| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 394 unit/integration tests + 4 doctests, `ldd` shows no `libcuda` |
 | `G-GPU-SM86` | `cargo xtask-cuda test-gpu --profile sm86` | device | passed, RTX 3090 x2 |
 | `G-GPU-SM120` | `cargo xtask-cuda test-gpu --profile sm120` | device | passed, RTX 5060 Ti |
 | `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 15 cases, both architectures qualified |

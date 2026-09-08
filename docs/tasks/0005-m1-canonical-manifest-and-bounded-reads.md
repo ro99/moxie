@@ -270,10 +270,11 @@ Deviations recorded, none silent:
 Gates (this machine, 2026-09-08): `fmt` PASS; `clippy -D warnings` PASS;
 `cargo test --workspace --locked --offline` PASS, 375 unit/integration + 4
 doctests at first implementation (was 332 + 4), 385 + 4 after the first
-review corrections, 386 + 4 after round 2 and 390 + 4 after round 3; `arch-check` PASS
+review corrections, 386 + 4 after round 2, 390 + 4 after round 3 and
+394 + 4 after round 4; `arch-check` PASS
 (22 rejected + 1 accepted fixtures, 8 rules at first implementation;
 24 + 1 after the include-rule fixes, 27 + 1 after round 2, 29 + 3 after
-round 3); `spec-check` PASS (10 documents); no-driver lane PASS
+round 3, 31 + 5 after round 4); `spec-check` PASS (10 documents); no-driver lane PASS
 (394, `ldd` shows no `libcuda`); device lane `test-gpu` PASS (15 cases,
 `sm_86` + `sm_120` qualified) with the `CUDA_VISIBLE_DEVICES=1,2` negative
 check exiting 1 as intended. This task touches no CUDA.
@@ -401,5 +402,34 @@ Re-verified after round 3: `fmt` PASS; `clippy -D warnings` PASS;
 `cargo test --workspace --locked --offline` PASS, 390 unit/integration + 4
 doctests; `arch-check` PASS (29 rejected + 3 accepted, 8 rules);
 `spec-check` PASS (10 documents); no-driver lane PASS (394, no `libcuda`);
+device lane `test-gpu` re-run: PASS, 15 cases, `sm_86` + `sm_120`
+qualified, negative check exiting 1.
+
+### Review corrections, round 4 (2026-09-08, commit `298c578` not accepted)
+
+One finding remained; fixed inside this task.
+
+- **P2 — `#[path]` module context lost.** Every discovered module was
+  queued with a universal non-root flag, applying the file-stem rule to
+  `#[path]`-loaded files too -- so `mod inner;` in path-loaded
+  `tests/outer.rs` inspected the decoy `tests/outer/inner.rs` instead of
+  the compiled `tests/inner.rs`. Resolution now carries the child base
+  decided at the declaration site (`ModuleChild { path, base }`): ordinary
+  declarations confer the stem rule, `#[path]` confers the resolved file's
+  parent with no stem step. The rule was verified against rustc first with
+  four compiling probes (path same-dir, path cross-dir, include-as-root,
+  ordinary stem control -- including the result that a cross-directory
+  `#[path]` resolves children beside the *loaded* file, not the declaring
+  one), then encoded as `rustc_picks` unit tests so checker and compiler
+  cannot agree on the wrong file. New fixtures
+  `format/storage-path-module-context` (with decoys) fail on the pre-fix
+  checker and pass now; positive `*-with-path-module-layout` counterparts
+  guard clean `#[path]` chains. `production_sources` shares the same
+  traversal, so the model rules inherit the fix.
+
+Re-verified after round 4: `fmt` PASS; `clippy -D warnings` PASS;
+`cargo test --workspace --locked --offline` PASS, 394 unit/integration + 4
+doctests; `arch-check` PASS (31 rejected + 5 accepted, 8 rules);
+`spec-check` PASS (10 documents); no-driver lane PASS (398, no `libcuda`);
 device lane `test-gpu` re-run: PASS, 15 cases, `sm_86` + `sm_120`
 qualified, negative check exiting 1.

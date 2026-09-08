@@ -758,14 +758,29 @@ struct SourceFacts {
     /// Doc comments are attributes, not code, and are never collected here:
     /// prose about a boundary is not a use of what it forbids.
     strings: Vec<String>,
-    /// Child module files this file declares.
-    children: Vec<PathBuf>,
+    /// Child module files this file declares, each with the directory its
+    /// own children resolve against (see `resolve_module`).
+    children: Vec<ModuleChild>,
     /// Module declarations that could not be resolved to a file.
     unresolved: Vec<String>,
 }
 
-/// Parse one file and collect its facts.
-fn analyse_source(file: &Path, is_crate_root: bool) -> Result<SourceFacts, String> {
+/// A `mod`-declared file plus the directory its children resolve against.
+///
+/// The base is decided at the declaration site, not from the file path:
+/// ordinary declarations confer the file-stem rule, while `#[path]`
+/// confers the resolved file's parent directory (verified against rustc).
+/// A bare path plus a universal root flag cannot express both.
+#[derive(Debug, Clone)]
+struct ModuleChild {
+    path: PathBuf,
+    base: PathBuf,
+}
+
+/// Parse one file and collect its facts, resolving `mod` children against
+/// `base` (the declaring context: crate-root/include directory, or a
+/// carried child base).
+fn analyse_source_with_base(file: &Path, base: &Path) -> Result<SourceFacts, String> {
     let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let parsed = syn::parse_file(&text).map_err(|e| {
         format!(
@@ -777,10 +792,15 @@ fn analyse_source(file: &Path, is_crate_root: bool) -> Result<SourceFacts, Strin
     let mut facts = SourceFacts::default();
     let mut collector = Collector {
         facts: &mut facts,
-        dir: children_dir(file, is_crate_root),
+        dir: base.to_path_buf(),
     };
     collector.visit_file(&parsed);
     Ok(facts)
+}
+
+/// Parse one file and collect its facts.
+fn analyse_source(file: &Path, is_crate_root: bool) -> Result<SourceFacts, String> {
+    analyse_source_with_base(file, &children_dir(file, is_crate_root))
 }
 
 /// A complete traversal of one parsed file.
@@ -933,16 +953,43 @@ fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
     }
 }
 
-/// Resolve `mod name;` to the file Cargo would compile.
-fn resolve_module(dir: &Path, name: &str, path_attr: Option<&str>) -> Option<PathBuf> {
-    let candidates = match path_attr {
-        Some(p) => vec![dir.join(p)],
-        None => vec![
-            dir.join(format!("{name}.rs")),
-            dir.join(name).join("mod.rs"),
-        ],
-    };
-    candidates.into_iter().find(|c| c.is_file())
+/// Resolve `mod name;` to the file Cargo would compile, plus the directory
+/// that file's own children resolve against.
+///
+/// Ordinary declarations confer the file-stem rule (`outer.rs` looks in
+/// `outer/`); `#[path]` confers the resolved file's parent directory with
+/// no stem step. Both shapes are verified against rustc (see the
+/// `rustc_pins_module_resolution` tests): a `#[path]`-loaded
+/// `tests/outer.rs` looks for `mod inner;` in `tests/`, never in
+/// `tests/outer/`.
+fn resolve_module(dir: &Path, name: &str, path_attr: Option<&str>) -> Option<ModuleChild> {
+    match path_attr {
+        Some(p) => {
+            let file = dir.join(p);
+            if !file.is_file() {
+                return None;
+            }
+            let base = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+            Some(ModuleChild { path: file, base })
+        }
+        None => {
+            let file = dir.join(format!("{name}.rs"));
+            if file.is_file() {
+                return Some(ModuleChild {
+                    base: dir.join(name),
+                    path: file,
+                });
+            }
+            let file = dir.join(name).join("mod.rs");
+            if file.is_file() {
+                return Some(ModuleChild {
+                    base: dir.join(name),
+                    path: file,
+                });
+            }
+            None
+        }
+    }
 }
 
 /// Flatten one `use` tree onto `prefix`.
@@ -1055,26 +1102,55 @@ fn collect_strings(ts: TokenStream, out: &mut Vec<String>) {
 ///
 /// The dev exemption is by *role*: a `tests` directory holding a declared target
 /// or a reachable module is production and is scanned.
-fn production_sources(doc: &toml::Value, manifest_dir: &Path) -> (Vec<PathBuf>, Vec<String>) {
+/// A module-tree file with the directory its children resolve against.
+/// Crate roots carry their own directory; every discovered child carries
+/// the base decided at its declaration site (see `resolve_module`).
+#[derive(Debug, Clone)]
+struct DiscoveredFile {
+    path: PathBuf,
+    base: PathBuf,
+}
+
+/// Roots plus `mod` followers with resolution context, before the
+/// directory walk for strays.
+fn discover_modules(doc: &toml::Value, manifest_dir: &Path) -> (Vec<DiscoveredFile>, Vec<String>) {
     let roots = crate_roots(doc, manifest_dir);
     let mut problems = Vec::new();
     let mut reachable: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut out = Vec::new();
 
-    let mut queue: Vec<(PathBuf, bool)> = roots.iter().map(|r| (r.clone(), true)).collect();
-    while let Some((file, is_root)) = queue.pop() {
-        if !file.is_file() || !reachable.insert(file.clone()) {
+    let parent_of = |p: &Path| p.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let mut queue: Vec<DiscoveredFile> = roots
+        .iter()
+        .map(|r| DiscoveredFile {
+            path: r.clone(),
+            base: parent_of(r),
+        })
+        .collect();
+    while let Some(found) = queue.pop() {
+        if !found.path.is_file() || !reachable.insert(found.path.clone()) {
             continue;
         }
-        match analyse_source(&file, is_root) {
+        match analyse_source_with_base(&found.path, &found.base) {
             Ok(facts) => {
                 problems.extend(facts.unresolved);
                 for c in facts.children {
-                    queue.push((c, false));
+                    queue.push(DiscoveredFile {
+                        path: c.path,
+                        base: c.base,
+                    });
                 }
             }
             Err(e) => problems.push(e),
         }
+        out.push(found);
     }
+    (out, problems)
+}
+
+fn production_sources(doc: &toml::Value, manifest_dir: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    let (mods, problems) = discover_modules(doc, manifest_dir);
+    let reachable: BTreeSet<PathBuf> = mods.iter().map(|f| f.path.clone()).collect();
 
     // The directory walk, with the exemption withdrawn from any dev-named
     // directory that actually holds production code.
@@ -1182,14 +1258,19 @@ fn production_facts_with_includes(
     // `outer/`). Collapsing either context to the other inspects the wrong
     // file -- a soundness hole, not a conservative approximation.
     let (files, mut problems) = production_sources(doc, dir);
-    let roots: BTreeSet<PathBuf> = crate_roots(doc, dir).into_iter().collect();
+    // Declaration-site bases for the mod tree, so re-analysis derives the
+    // same children `production_sources` followed. Walk strays (absent here)
+    // resolve against their own directory.
+    let (mods, _) = discover_modules(doc, dir);
+    let base_of: BTreeMap<PathBuf, PathBuf> = mods.into_iter().map(|f| (f.path, f.base)).collect();
     let mut out: Vec<(PathBuf, SourceFacts)> = Vec::new();
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     for file in files {
-        // Same root-ness `production_sources` used, so re-derived children
-        // agree with the mod tree instead of shadowing it.
-        let is_root = roots.contains(&file);
-        match analyse_source(&file, is_root) {
+        let analysed = match base_of.get(&file) {
+            Some(base) => analyse_source_with_base(&file, base),
+            None => analyse_source(&file, true),
+        };
+        match analysed {
             Ok(facts) => {
                 seen.insert(file.clone());
                 out.push((file, facts));
@@ -1228,11 +1309,11 @@ fn production_facts_with_includes(
                     including.display()
                 )),
             },
-            Pending::Module { path, is_root } => {
+            Pending::Module { path, base } => {
                 if !seen.insert(path.clone()) {
                     continue;
                 }
-                match analyse_source(&path, is_root) {
+                match analyse_source_with_base(&path, &base) {
                     Ok(facts) => {
                         // Propagate unresolved declarations from included
                         // files too: a `mod` that resolves nowhere is a
@@ -1256,12 +1337,12 @@ enum Pending {
         including: PathBuf,
         arg: String,
     },
-    /// A `mod`-declared file with its resolution context. Discovered
-    /// modules are never crate roots: their children follow the standard
-    /// file-stem rule, so `tests/outer.rs` looks in `tests/outer/`.
+    /// A `mod`-declared file with the directory its children resolve
+    /// against, decided at the declaration site (see `resolve_module`).
+    /// `#[path]` confers the resolved file's parent with no stem step.
     Module {
         path: PathBuf,
-        is_root: bool,
+        base: PathBuf,
     },
 }
 
@@ -1275,13 +1356,13 @@ impl Pending {
                 arg: arg.clone(),
             })
             .collect();
-        // Children are queued as non-root modules; the caller seeds the
-        // queue from analysed facts and the `seen` set already holds every
-        // mod-tree file, so re-queuing them is a no-op. This keeps one
-        // unified traversal for mixed chains.
-        out.extend(facts.children.iter().map(|path| Pending::Module {
-            path: path.clone(),
-            is_root: false,
+        // Children carry the base decided at their declaration site; the
+        // caller seeds the queue from analysed facts and the `seen` set
+        // already holds every mod-tree file, so re-queuing them is a no-op.
+        // This keeps one unified traversal for mixed chains.
+        out.extend(facts.children.iter().map(|c| Pending::Module {
+            path: c.path.clone(),
+            base: c.base.clone(),
         }));
         out
     }
@@ -2044,6 +2125,116 @@ mod tests {
         assert_eq!(resolve_include(&root, "\"../tests/missing.rs\""), None);
         assert_eq!(resolve_include(&root, "\"\""), None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Module resolution pinned against rustc itself.
+    ///
+    /// Each probe is a compiling crate where the right file holds valid code
+    /// and the wrong file holds `compile_error!`: a successful build proves
+    /// which file rustc loads. The negative fixtures beside them
+    /// (`format/storage-path-module-context`, `-include-module-context`)
+    /// assert the checker inspects that same file, so the two cannot agree
+    /// on the wrong one. Only `rustc` is invoked -- no registry, no lock
+    /// file, no build script -- so this stays offline-safe.
+    fn rustc_picks(expected: &str, files: &[(&str, &str)]) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("moxie-rustc-{}", n));
+        std::fs::remove_dir_all(&dir).ok();
+        for (rel, content) in files {
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, content).unwrap();
+        }
+        let out = std::process::Command::new("rustc")
+            .arg("--edition=2024")
+            .arg("--crate-type=lib")
+            .arg(dir.join("src/lib.rs"))
+            .arg("--out-dir")
+            .arg(dir.join("out"))
+            .output()
+            .expect("the pinned toolchain provides rustc");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            out.status.success(),
+            "{expected}: rustc failed, so it did not pick the valid file:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn rustc_resolves_path_module_children_beside_the_loaded_file() {
+        // The round-4 repro: `#[path]`-loaded `tests/outer.rs` looks for
+        // `mod inner;` in `tests/`, never in `tests/outer/`.
+        rustc_picks(
+            "path same-dir child",
+            &[
+                (
+                    "src/lib.rs",
+                    "include!(\"../tests/entry.rs\");\npub use outer::inner::PICKED;",
+                ),
+                ("tests/entry.rs", "#[path = \"outer.rs\"]\npub mod outer;"),
+                ("tests/outer.rs", "pub mod inner;"),
+                (
+                    "tests/outer/inner.rs",
+                    "compile_error!(\"picked outer/inner.rs\");",
+                ),
+                ("tests/inner.rs", "pub const PICKED: &str = \"inner\";"),
+            ],
+        );
+    }
+
+    #[test]
+    fn rustc_resolves_cross_directory_path_children_beside_the_loaded_file() {
+        // Declaring directory (`src/`) loses to the loaded file's directory
+        // (`tests/`): the `#[path]` stem step is skipped, not relocated.
+        rustc_picks(
+            "path cross-dir child",
+            &[
+                (
+                    "src/lib.rs",
+                    "#[path = \"../tests/reader.rs\"]\npub mod reader;\npub use reader::sub::PICKED;",
+                ),
+                ("tests/reader.rs", "pub mod sub;"),
+                ("tests/sub.rs", "pub const PICKED: &str = \"sub\";"),
+                ("src/sub.rs", "compile_error!(\"picked src/sub.rs\");"),
+            ],
+        );
+    }
+
+    #[test]
+    fn rustc_resolves_included_files_against_their_own_directory() {
+        // An include pastes tokens but keeps the included file's span: `mod
+        // outer;` in `tests/entry.rs` is `tests/outer.rs`, not `src/outer.rs`.
+        rustc_picks(
+            "include target as root",
+            &[
+                (
+                    "src/lib.rs",
+                    "include!(\"../tests/entry.rs\");\npub use outer::PICKED;",
+                ),
+                ("tests/entry.rs", "pub mod outer;"),
+                ("tests/outer.rs", "pub const PICKED: &str = \"outer\";"),
+                ("src/outer.rs", "compile_error!(\"picked src/outer.rs\");"),
+            ],
+        );
+    }
+
+    #[test]
+    fn rustc_applies_the_stem_rule_to_ordinary_modules() {
+        // Control: a normally loaded `outer.rs` looks in `outer/`.
+        rustc_picks(
+            "ordinary stem rule",
+            &[
+                (
+                    "src/lib.rs",
+                    "pub mod outer;\npub use outer::inner::PICKED;",
+                ),
+                ("src/outer.rs", "pub mod inner;"),
+                ("src/outer/inner.rs", "pub const PICKED: &str = \"inner\";"),
+                ("src/inner.rs", "compile_error!(\"picked src/inner.rs\");"),
+            ],
+        );
     }
 
     #[test]
