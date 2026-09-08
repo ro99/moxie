@@ -8,17 +8,9 @@ Written 2026-09-08 at the end of the session that produced task 0004 and task 00
 - Read-only legacy root: `/home/rodrigo/Developer/strata` @ `2dc566eb8e440fff4837ac75ca1dad1b20c2264e`.
   Never write there. Document 08 is the map into it; read the pinned references before inventing a
   replacement.
-- **`origin/main` is at `1166779`. Four local commits are unpushed and awaiting owner review:**
-
-  | Commit | What |
-  |---|---|
-  | `42c478a` | task 0005 contract + ADR 0005 (docs only, no `.rs`) |
-  | `1eca710` | fifth-review corrections to task 0004 |
-  | `6b7f5ad` | sixth-review correction (cache-journal identity) |
-  | `3aaf259` | seventh-review correction (`KvCache` not `Clone`) |
-
-  **Do not push without the owner saying so.** The owner stated this explicitly mid-session. Commit
-  locally, report, wait.
+- Task 0004 was **accepted at `3aaf259`** and everything through it is on `origin/main`.
+- **Do not push without the owner saying so.** The owner stated this explicitly mid-session. Commit
+  locally, report, wait for the instruction.
 
 - Toolchain: rustc/cargo 1.97.1 pinned, CUDA 13.0 (nvcc V13.0.88). Devices: ordinal 0 is the
   RTX 5060 Ti (sm_120, NUMA 0), ordinals 1-2 are the RTX 3090 pair (sm_86, NUMA 1).
@@ -26,8 +18,8 @@ Written 2026-09-08 at the end of the session that produced task 0004 and task 00
 
 ## Completed facts
 
-Task 0004 (M1.4 part 1, sequence-state transactions) is **implemented and gate-clean, and not yet
-accepted.** Its record is [docs/tasks/0004-m1-state-transactions.md](../tasks/0004-m1-state-transactions.md),
+Task 0004 (M1.4 part 1, sequence-state transactions) is **accepted at `3aaf259`** -- the bounded
+host slice only, not M1.4. Its record is [docs/tasks/0004-m1-state-transactions.md](../tasks/0004-m1-state-transactions.md),
 which carries the contract, the result, and three review-correction sections.
 
 What exists that did not before:
@@ -79,10 +71,11 @@ capability row for transactional publication.
 
 ## Remaining hypotheses and blockers
 
-- **Task 0004 is open until the owner accepts it.** Seven review passes have run; the last three each
-  found exactly one defect, and each was a consequence of the previous fix — identity added to the
-  journal, then the cache handing that identity out by derive. A new agent should assume an eighth
-  pass is possible and should not treat "gates pass" as acceptance.
+- **Task 0004 is accepted; M1.4 is not.** Appendable paged state, sampler integration, the generation
+  service and the diagnostic CLI are all outstanding. Seven review passes ran on this slice, and the
+  last three each found exactly one defect, each a consequence of the previous fix — identity added
+  to the journal, then the cache handing that identity out by derive. Do not treat "gates pass" as
+  acceptance on the next task either.
 - The one recurring failure shape in this crate pair: **an identity that exists to be unique, handed
   out by a derive.** It has happened twice (`SequenceState`, `KvCache`). Both now carry
   `compile_fail` doctests. Check any new identity-bearing type against that pattern before adding it.

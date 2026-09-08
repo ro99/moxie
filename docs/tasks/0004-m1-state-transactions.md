@@ -1,7 +1,15 @@
 # Task 0004 — M1.4, part 1: sequence state transactions
 
-Status: **active**. Proposed and started 2026-09-08, after
-[task 0003](0003-m1-bf16-reference-interpreter.md) was accepted at `0908f4d`.
+Status: **accepted 2026-09-08** at `3aaf259`, after three review passes and their corrections.
+
+The acceptance is of **this bounded slice** -- host-side transactional publication over sequence
+state and the KV cache -- and explicitly **not of M1.4**. Appendable paged state, sampler
+integration, the generation service and the diagnostic CLI remain outstanding. The reviewer said so
+in those words; it is recorded here so a later reader cannot mistake this record for a milestone.
+
+Accepted with CUDA gates not rerun by the reviewer. They were rerun here at `3aaf259`
+(`test-gpu` PASS, hidden-SM120 exit 1); the review's independent lanes were fmt, clippy,
+`arch-check`, `spec-check`, whitespace and the 332 + 4 host tests.
 
 **The contract below was written and committed before any implementation code**, as in task 0003.
 That commit contains no `.rs` change.
