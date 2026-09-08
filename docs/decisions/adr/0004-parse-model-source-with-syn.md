@@ -32,11 +32,20 @@ spelling:
 | `use std::{fs};` then `fs::read(p)` | the text `std::fs` appears nowhere |
 | `use std::{ /* checkpoint files */ fs };` | the hand-written parser kept the comment inside the path |
 | `#[path = "../tests/reader.rs"] pub mod reader;` | production discovery worked by directory *name* |
+| `fn f() { use std::{fs}; fs::read(p) }` | the walk matched module-level items and token-scanned the rest |
+| `fn f() { include!("../tests/read_expr.rs") }` | the include rule only looked at `Item::Macro` |
 
 The pattern is the point. Every one of these is ordinary Rust that compiles; none is malformed or
 adversarial in any interesting sense. A scanner that works on characters has to re-derive lexing —
 comments, strings, raw strings, char literals versus lifetimes — before it can answer any question
 about structure, and that re-derivation is where each defect lived.
+
+A fourth review then found the same shape one level down: the first `syn` version matched on
+*module-level* items and fell back to a token scan for anything else, so a `use` statement inside a
+function body never reached the import classifier and an `include!` in expression position never
+reached the include rule. Parsing was necessary and not sufficient; the traversal has to be complete
+too. It now uses `syn::visit::Visit`, which walks items, statements, expressions, nested blocks,
+closure bodies and `impl`/`trait` members, and **no rule in it asks where a construct appears**.
 
 `syn` answers the structural questions directly:
 
@@ -51,9 +60,14 @@ about structure, and that re-derivation is where each defect lived.
   source can be found by *following the module tree from the Cargo targets* rather than by guessing
   from directory names. Whether a file is production is a fact about the crate's structure, not
   about its parent directory's spelling.
+- **Position independence.** Every one of the above is collected by a visitor, so a `use`, an
+  `extern "C"` block, an `include!` or a `mod` is treated the same whether it sits at the top of a
+  file or eight blocks deep inside a closure.
 
-Inline paths written without an import (`std::fs::read(p)`) are recovered from the token stream, so
-they too are immune to comments and string literals.
+Inline paths written without an import (`std::fs::read(p)`) are recovered from `visit_path`, which
+fires for every path in every position -- a call, a type, a pattern, a turbofish. The one remaining
+token scan is over *macro arguments*, which are unparsed tokens by definition and so are the one
+place a token scan is the right tool rather than a shortcut.
 
 ## Cost, and why it is small
 
@@ -82,3 +96,15 @@ parses with, and the alternative was to keep writing one.
 
 These are recorded so that the next review does not have to rediscover them, and so that none of
 them is mistaken for an oversight.
+
+## Both halves of the fixture argument
+
+`xtask/fixtures/arch-check/` holds crates that must be **rejected**, each declaring the rule it
+proves. `xtask/fixtures/arch-check-accepted/` holds crates that must be **accepted**. Both are
+required and `arch-check` fails if either directory is empty: a checker with only negative fixtures
+is satisfied by rejecting everything, and one with only positive fixtures by rejecting nothing.
+
+The accepted fixture deliberately sits next to the forbidden shapes -- function-local grouped and
+renamed imports of allowed modules, a `#[cfg(test)]` harness that does use `std::fs`, a nested inline
+module, a file module, and fully-qualified allowed paths written inline. It is what stops the deeper
+traversal from being tightened into something that flags ordinary code.

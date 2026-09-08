@@ -177,7 +177,7 @@ can be tested with no driver present.
 
 Verified on 2026-09-07 by building and testing the whole workspace with
 `CUDA_HOME=/nonexistent NVCC=/nonexistent`, an unset `LD_LIBRARY_PATH` and a
-`PATH` with no CUDA directory: 218 tests passed. `ldd target/debug/xtask` on the
+`PATH` with no CUDA directory: 222 unit tests and 1 doctest passed. `ldd target/debug/xtask` on the
 host build reports no `libcuda`, and the CI workflow asserts that.
 
 **This is not a way to make the GPU lane optional.** Document 07 requires the

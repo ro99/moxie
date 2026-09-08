@@ -16,10 +16,10 @@ matrix exists to prevent.
 |---|---|---|---|
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
-| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 218 tests |
-| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 17 negative fixtures, 6 rules |
+| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 222 unit tests + 1 doctest |
+| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 19 negative + 1 positive fixtures, 6 rules |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
-| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 218 tests, `ldd` shows no `libcuda` |
+| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 222 unit tests + 1 doctest, `ldd` shows no `libcuda` |
 | `G-GPU-SM86` | `cargo xtask-cuda test-gpu --profile sm86` | device | passed, RTX 3090 x2 |
 | `G-GPU-SM120` | `cargo xtask-cuda test-gpu --profile sm120` | device | passed, RTX 5060 Ti |
 | `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 15 cases, both architectures qualified |
@@ -30,8 +30,8 @@ matrix exists to prevent.
 Device gates ran by hand on this machine. No CI runner executes them; see
 [toolchain.md](toolchain.md).
 
-Counts are from 2026-09-07 after the third review's corrections; see
-[task 0002](../tasks/0002-m0-review-and-integer-transition.md#third-review-corrections-2026-09-07).
+Counts are from 2026-09-07 after the fourth review's corrections; see
+[task 0002](../tasks/0002-m0-review-and-integer-transition.md#fourth-review-corrections-2026-09-07).
 
 ## Rows
 

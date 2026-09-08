@@ -1,0 +1,14 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# Fourth review, case B. `include!` in expression position rather than item
+# position. The included file is outside the reachable module tree, so its
+# contents are never scanned either -- the inclusion is the only place the
+# checker could have noticed. Must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden construct in model source"

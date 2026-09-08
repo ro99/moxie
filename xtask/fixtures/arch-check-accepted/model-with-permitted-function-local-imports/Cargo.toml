@@ -1,0 +1,18 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# Everything here is permitted, and the checker must say so. It exercises the
+# constructs that sit right next to the forbidden ones:
+#
+#   * function-local `use`, grouped and renamed, of allowed modules;
+#   * a `#[cfg(test)]` module that uses `std::fs` -- document 02 permits a test
+#     harness, and the exemption has to survive the traversal that now visits
+#     function bodies;
+#   * a nested inline module and a file module;
+#   * fully-qualified allowed paths written inline.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-graph = { path = "../../../../crates/moxie-graph" }
+moxie-model-api = { path = "../../../../crates/moxie-model-api" }

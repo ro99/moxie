@@ -234,6 +234,7 @@ pub fn run() -> i32 {
 
     // Negative fixtures. Document 02 requires proof that each forbidden edge
     // actually fails; a checker that has never rejected anything is not evidence.
+    // The positive fixtures below are the other half of that argument.
     //
     // Each fixture declares the rule it must trigger, under
     // `[package.metadata.moxie-arch-check] expect-rule = "..."`. Accepting "any
@@ -298,6 +299,42 @@ pub fn run() -> i32 {
         }
     }
 
+    // Positive fixtures. A checker with only negative fixtures is satisfied by
+    // rejecting everything, which would be perfectly useless and perfectly
+    // green. These crates do only what document 02 permits and must pass.
+    println!("\n== positive fixtures ==");
+    let accepted_dir = root.join("xtask/fixtures/arch-check-accepted");
+    let mut accepted: Vec<PathBuf> = match std::fs::read_dir(&accepted_dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
+        Err(e) => {
+            println!("FAIL  cannot read {}: {e}", accepted_dir.display());
+            return 1;
+        }
+    };
+    accepted.sort();
+    accepted.retain(|p| p.is_dir());
+    if accepted.is_empty() {
+        println!("FAIL  no positive fixtures present; the checker could reject everything");
+        return 1;
+    }
+    for dir in &accepted {
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        match check_tree(dir) {
+            Ok(v) if v.is_empty() => println!("PASS  fixture {name} accepted"),
+            Ok(v) => {
+                println!("FAIL  fixture {name} must be accepted but was rejected:");
+                for x in &v {
+                    println!("        {} :: {}", x.rule, x.detail);
+                }
+                failed += v.len();
+            }
+            Err(e) => {
+                println!("FAIL  fixture {name} could not be checked: {e}");
+                failed += 1;
+            }
+        }
+    }
+
     // A rule with no fixture has never been observed to fire.
     println!("\n== rule coverage ==");
     for r in rule::ALL {
@@ -313,8 +350,10 @@ pub fn run() -> i32 {
         1
     } else {
         println!(
-            "\narch-check passed: {} fixture(s), {} rule(s) exercised",
+            "\narch-check passed: {} rejected fixture(s), {} accepted fixture(s), \
+             {} rule(s) exercised",
             entries.len(),
+            accepted.len(),
             covered.len()
         );
         0
@@ -549,7 +588,7 @@ fn build_scripts(doc: &toml::Value, manifest_dir: &Path) -> Vec<String> {
 // whole class of evasion is gone rather than patched. See ADR 0004.
 
 use proc_macro2::{TokenStream, TokenTree};
-use quote::ToTokens;
+use syn::visit::{self, Visit};
 
 /// Paths the manifest declares as **production** targets.
 ///
@@ -691,67 +730,144 @@ fn analyse_source(file: &Path, is_crate_root: bool) -> Result<SourceFacts, Strin
             file.display()
         )
     })?;
-    let dir = children_dir(file, is_crate_root);
     let mut facts = SourceFacts::default();
-    walk_items(&parsed.items, &dir, &mut facts);
+    let mut collector = Collector {
+        facts: &mut facts,
+        dir: children_dir(file, is_crate_root),
+    };
+    collector.visit_file(&parsed);
     Ok(facts)
 }
 
-fn walk_items(items: &[syn::Item], dir: &Path, facts: &mut SourceFacts) {
-    for item in items {
-        match item {
-            syn::Item::Use(u) => {
-                if is_cfg_test(&u.attrs) {
-                    continue;
-                }
-                flatten_use_tree("", &u.tree, &mut facts.imports);
-                collect_mentions(u.to_token_stream(), &mut facts.mentions);
-            }
-            syn::Item::Mod(m) => {
-                if is_cfg_test(&m.attrs) {
-                    continue;
-                }
-                let over = path_attribute(&m.attrs);
-                match &m.content {
-                    // Inline module: its children live one level down, unless a
-                    // `#[path]` names the directory for them.
-                    Some((_, inner)) => {
-                        let inner_dir = match &over {
-                            Some(p) => dir.join(p),
-                            None => dir.join(m.ident.to_string()),
-                        };
-                        walk_items(inner, &inner_dir, facts);
-                    }
-                    // Declaration: resolve it to a file.
-                    None => match resolve_module(dir, &m.ident.to_string(), over.as_deref()) {
-                        Some(p) => facts.children.push(p),
-                        None => facts.unresolved.push(format!(
-                            "`mod {};` in {} resolves to no file",
-                            m.ident,
-                            dir.display()
-                        )),
-                    },
-                }
-            }
-            syn::Item::ForeignMod(f) => {
-                if is_cfg_test(&f.attrs) {
-                    continue;
-                }
-                facts.foreign_blocks += 1;
-            }
-            syn::Item::Macro(mac) => {
-                if is_cfg_test(&mac.attrs) {
-                    continue;
-                }
-                if mac.mac.path.is_ident("include") {
-                    facts
-                        .source_includes
-                        .push(mac.mac.tokens.to_string().trim().to_string());
-                }
-                collect_mentions(mac.to_token_stream(), &mut facts.mentions);
-            }
-            other => collect_mentions(other.to_token_stream(), &mut facts.mentions),
+/// A complete traversal of one parsed file.
+///
+/// `syn::visit::Visit` walks **everything** -- items, statements, expressions,
+/// nested blocks, closure bodies, `impl` and `trait` members. The fourth M0
+/// review found why that matters: an earlier version matched on module-level
+/// items and fell back to a token scan for anything else, so a `use` statement
+/// *inside a function body* never reached the import classifier and an
+/// `include!` in expression position never reached the include rule. Both are
+/// ordinary Rust, and both are visible in the AST the parser already produced.
+///
+/// The rule is now the same wherever a construct appears. Nothing here matches
+/// on "is this at the top level".
+struct Collector<'f> {
+    facts: &'f mut SourceFacts,
+    /// Where the *current* module's children live. Saved and restored around an
+    /// inline `mod`, so a nested declaration resolves against its own directory.
+    dir: PathBuf,
+}
+
+impl<'ast> Visit<'ast> for Collector<'_> {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if is_cfg_test(item_attrs(item)) {
+            return;
         }
+        visit::visit_item(self, item);
+    }
+
+    fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+        // A statement can be gated too: `#[cfg(test)] use std::fs;` inside a
+        // function is `Stmt::Item(Item::Use)`, and a gated `let` or macro
+        // statement carries its own attributes.
+        let gated = match stmt {
+            syn::Stmt::Local(l) => is_cfg_test(&l.attrs),
+            syn::Stmt::Item(i) => is_cfg_test(item_attrs(i)),
+            syn::Stmt::Macro(m) => is_cfg_test(&m.attrs),
+            syn::Stmt::Expr(..) => false,
+        };
+        if gated {
+            return;
+        }
+        visit::visit_stmt(self, stmt);
+    }
+
+    fn visit_item_use(&mut self, u: &'ast syn::ItemUse) {
+        // Reached from module level *and* from inside a function body, because
+        // the traversal does not care which.
+        flatten_use_tree("", &u.tree, &mut self.facts.imports);
+    }
+
+    fn visit_item_foreign_mod(&mut self, f: &'ast syn::ItemForeignMod) {
+        self.facts.foreign_blocks += 1;
+        visit::visit_item_foreign_mod(self, f);
+    }
+
+    fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
+        let over = path_attribute(&m.attrs);
+        match &m.content {
+            // Inline module: its children live one level down, unless a
+            // `#[path]` names the directory for them.
+            Some((_, inner)) => {
+                let inner_dir = match &over {
+                    Some(p) => self.dir.join(p),
+                    None => self.dir.join(m.ident.to_string()),
+                };
+                let outer = core::mem::replace(&mut self.dir, inner_dir);
+                for item in inner {
+                    self.visit_item(item);
+                }
+                self.dir = outer;
+            }
+            // Declaration: resolve it to a file for the traversal to follow.
+            None => match resolve_module(&self.dir, &m.ident.to_string(), over.as_deref()) {
+                Some(p) => self.facts.children.push(p),
+                None => self.facts.unresolved.push(format!(
+                    "`mod {};` in {} resolves to no file",
+                    m.ident,
+                    self.dir.display()
+                )),
+            },
+        }
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        // Item, statement and expression positions all arrive here.
+        if mac.path.is_ident("include") {
+            self.facts
+                .source_includes
+                .push(mac.tokens.to_string().trim().to_string());
+        }
+        // A macro's arguments are unparsed tokens by definition, so this is the
+        // one place a token scan is the right tool rather than a shortcut.
+        collect_mentions(mac.tokens.clone(), &mut self.facts.mentions);
+        visit::visit_macro(self, mac);
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        // Every path in every position: a call, a type, a pattern, a turbofish.
+        // `std::fs::read(p)` written inline with no import lands here.
+        if path.segments.len() > 1 {
+            let joined: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+            self.facts.mentions.push(joined.join("::"));
+        }
+        visit::visit_path(self, path);
+    }
+}
+
+/// The attributes of any item.
+///
+/// `syn::Item` has no common accessor, so this enumerates. A variant missing
+/// from the list yields no attributes, which means it is *not* skipped as
+/// test-gated -- the conservative direction.
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(i) => &i.attrs,
+        syn::Item::Enum(i) => &i.attrs,
+        syn::Item::ExternCrate(i) => &i.attrs,
+        syn::Item::Fn(i) => &i.attrs,
+        syn::Item::ForeignMod(i) => &i.attrs,
+        syn::Item::Impl(i) => &i.attrs,
+        syn::Item::Macro(i) => &i.attrs,
+        syn::Item::Mod(i) => &i.attrs,
+        syn::Item::Static(i) => &i.attrs,
+        syn::Item::Struct(i) => &i.attrs,
+        syn::Item::Trait(i) => &i.attrs,
+        syn::Item::TraitAlias(i) => &i.attrs,
+        syn::Item::Type(i) => &i.attrs,
+        syn::Item::Union(i) => &i.attrs,
+        syn::Item::Use(i) => &i.attrs,
+        _ => &[],
     }
 }
 
@@ -1422,6 +1538,67 @@ mod tests {
     }
 
     #[test]
+    fn a_forbidden_import_is_found_wherever_it_is_written() {
+        // Fourth review, case A: an earlier version matched on module-level
+        // items and fell back to a token scan for everything else, so a `use`
+        // inside a function body never reached the import classifier. The rule
+        // must not depend on where the construct sits.
+        let cases = [
+            "pub fn f(p: &str) { use std::{fs}; let _ = fs::read(p); }",
+            "pub fn f(p: &str) { use std::fs as disk; let _ = disk::read(p); }",
+            "pub fn f(p: &str) { { { use std::fs; let _ = fs::read(p); } } }",
+            "pub fn f() { let c = |p: &str| { use std::{fs}; fs::read(p) }; let _ = c; }",
+            "impl S { pub fn f(p: &str) { use std::{fs}; let _ = fs::read(p); } }",
+            "pub fn f() { mod inner { use std::fs; pub fn g() { let _ = fs::metadata(\".\"); } } }",
+            "pub fn f(p: &str) { let _ = std::fs::read(p); }",
+            "pub fn f() -> Vec<std::fs::DirEntry> { Vec::new() }",
+        ];
+        for src in cases {
+            assert!(
+                reaches_forbidden(&facts_of(src), "std::fs"),
+                "{src:?} was not recognised"
+            );
+        }
+    }
+
+    #[test]
+    fn an_extern_block_inside_a_function_is_still_a_foreign_block() {
+        assert_eq!(
+            facts_of("pub fn f() { unsafe extern \"C\" { fn g(); } }").foreign_blocks,
+            1
+        );
+    }
+
+    #[test]
+    fn included_source_is_reported_in_every_position() {
+        // Fourth review, case B: `include!` in expression position escaped a
+        // check that only looked at `Item::Macro`.
+        let cases = [
+            "include!(\"generated.rs\");\npub fn g() {}",
+            "pub fn f() -> u32 { include!(\"generated.rs\") }",
+            "pub fn f() { include!(\"generated.rs\"); }",
+            "pub fn f() { let x = include!(\"generated.rs\"); let _ = x; }",
+            "pub const X: u32 = include!(\"generated.rs\");",
+        ];
+        for src in cases {
+            assert_eq!(
+                facts_of(src).source_includes.len(),
+                1,
+                "{src:?} did not report its include"
+            );
+        }
+        assert!(facts_of("pub fn g() {}").source_includes.is_empty());
+    }
+
+    #[test]
+    fn a_path_inside_macro_arguments_is_still_seen() {
+        // A macro's arguments are unparsed tokens by definition, so the token
+        // scan is the right tool there rather than a shortcut.
+        let f = facts_of("pub fn f(p: &str) { println!(\"{:?}\", std::fs::read(p)); }");
+        assert!(reaches_forbidden(&f, "std::fs"));
+    }
+
+    #[test]
     fn an_innocent_import_is_not_flagged() {
         // A checker that flags everything is not enforcement either.
         let cases = [
@@ -1445,6 +1622,28 @@ mod tests {
                     f.mentions
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_test_exemption_survives_the_deeper_traversal() {
+        // Visiting function bodies must not turn a permitted dev harness into a
+        // violation. Each of these is inside a `cfg(test)` item.
+        let exempt = [
+            "#[cfg(test)]\nmod t { pub fn h(p: &str) { use std::{fs}; let _ = fs::read(p); } }\npub fn g() {}",
+            "#[cfg(test)]\nfn h(p: &str) { use std::fs; let _ = fs::read(p); }\npub fn g() {}",
+            "pub fn g() { #[cfg(test)] use std::fs; }",
+            "#[cfg(test)]\nfn h() { unsafe extern \"C\" { fn x(); } }\npub fn g() {}",
+        ];
+        for src in exempt {
+            let f = facts_of(src);
+            assert!(
+                !reaches_forbidden(&f, "std::fs"),
+                "{src:?} wrongly flagged: imports {:?} mentions {:?}",
+                f.imports,
+                f.mentions
+            );
+            assert_eq!(f.foreign_blocks, 0, "{src:?}");
         }
     }
 

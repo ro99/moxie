@@ -14,11 +14,11 @@ invariant could be violated by an operation no test covered. Full detail is in
 |---|---|
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | PASS |
-| `cargo test --workspace --locked` | PASS, **218** (was 210) |
+| `cargo test --workspace --locked` | PASS, **217 unit + 1 doctest** (was 210) |
 | `cargo xtask arch-check` | PASS, **17** fixtures (was 15), 6 rules |
 | `cargo xtask spec-check` | PASS, 10 documents, digests unchanged |
-| host build with no CUDA toolkit or driver reachable | PASS, 218; `ldd` shows no `libcuda` |
-| device lane | PASS, **226** + 1 doctest |
+| host build with no CUDA toolkit or driver reachable | PASS, 217 + 1; `ldd` shows no `libcuda` |
+| device lane | PASS, **225 unit + 2 doctests** |
 | `cargo xtask-cuda test-gpu` | PASS, 15 cases, both architectures qualified |
 | `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | exit 1, as intended |
 | `Cargo.lock` packages added | **zero**, despite taking a parser dependency |

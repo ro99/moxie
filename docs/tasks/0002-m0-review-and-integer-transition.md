@@ -1,9 +1,10 @@
 # Task 0002 — M0 review, corrections, and integer precision transition
 
-Status: **implemented 2026-09-07**, then corrected after a second review and again after a third.
-F1-F6 results are in [Correction results](#correction-results-2026-09-07); the second review's in
-[Second-review corrections](#second-review-corrections-2026-09-07); the third review's in
-[Third-review corrections](#third-review-corrections-2026-09-07). Review performed 2026-09-07 against Moxie `84273b0e4b41bb04d1b374f6f46f89557bba4a59`, with a clean worktree before documentation edits. The reviewer changed documentation only; the implementation that follows the review is recorded at the end of this file.
+Status: **implemented 2026-09-07**, then corrected after three successive reviews. F1-F6 results are
+in [Correction results](#correction-results-2026-09-07); the second review's in
+[Second-review corrections](#second-review-corrections-2026-09-07); the third's in
+[Third-review corrections](#third-review-corrections-2026-09-07); the fourth's in
+[Fourth-review corrections](#fourth-review-corrections-2026-09-07). Review performed 2026-09-07 against Moxie `84273b0e4b41bb04d1b374f6f46f89557bba4a59`, with a clean worktree before documentation edits. The reviewer changed documentation only; the implementation that follows the review is recorded at the end of this file.
 
 ## Verdict
 
@@ -629,8 +630,8 @@ All three are reproduced and closed below. Nothing was redesigned.
 
 | Command | Second pass | Third pass |
 |---|---|---|
-| `cargo test --workspace --locked --offline` | 210 | **218** |
-| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | 218 + 1 doctest | **226 + 1 doctest** |
+| `cargo test --workspace --locked --offline` | 210 unit | **217 unit + 1 doctest** |
+| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | 217 unit + 1 doctest | **225 unit + 2 doctests** |
 | `cargo xtask arch-check` | 15 fixtures | **17 fixtures**, 6 rules |
 | `cargo xtask spec-check` | PASS | **PASS**, digests unchanged |
 | `cargo fmt --all -- --check`, `cargo clippy ... -D warnings` | PASS | **PASS** |
@@ -760,3 +761,110 @@ restoration requiring the correct completed prefix.
 O1, O2, O4 and O5 remain **OPEN**. No importer exists. No kernel implements W4A16 or W8A16. No
 checkpoint has been imported, no inference has run, no throughput has been measured, and the device
 lane still has no CI runner.
+
+
+---
+
+# Fourth-review corrections, 2026-09-07
+
+The fourth review accepted T1 and T2 and the move to `syn`, and found that T3 was not finished: the
+parser was in place but the **traversal** was not complete. One P1, reproduced and closed.
+
+It also noted that the third pass's totals were stated as bare numbers where they mixed unit tests
+and doctests. Counts below name both. The third-pass table above is corrected: host was 217 unit + 1
+doctest and device 225 unit + 2 doctests, not "218" and "226 + 1".
+
+## Commands and results after the fourth pass
+
+| Command | Third pass | Fourth pass |
+|---|---|---|
+| `cargo test --workspace --locked --offline` | 217 unit + 1 doctest | **222 unit + 1 doctest** |
+| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | 225 unit + 2 doctests | **230 unit + 2 doctests** |
+| `cargo xtask arch-check` | 17 rejected fixtures | **19 rejected + 1 accepted**, 6 rules |
+| `cargo xtask spec-check` | PASS | **PASS**, digests unchanged |
+| `cargo fmt --all -- --check`, `cargo clippy ... -D warnings` | PASS | **PASS** |
+| host build with no CUDA toolkit or driver reachable | 217 + 1 | **222 + 1**; `ldd` shows no `libcuda` |
+| `cargo xtask-cuda test-gpu` | 15 cases | **15 cases**, both architectures qualified |
+| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | exit 1 | **exit 1** |
+| packages added to `Cargo.lock` | 0 | **0** |
+
+The two doctests are the `compile_fail` guarantees: `DeviceBuffer` cannot outlive its context
+(driver feature only, hence one on the host lane and two on the device lane) and `SequenceState`
+cannot be cloned.
+
+## Q1 - function bodies bypassed the structural rules · closed
+
+Reproduced, two model libraries that compile and were accepted with zero violations:
+
+```rust
+pub fn read_weights(p: &str) -> std::io::Result<Vec<u8>> {
+    use std::{fs};                       // never reached the UseTree classifier
+    fs::read(p)                          // token scan sees `fs::read`, not `std::fs`
+}
+```
+
+```rust
+pub fn read_weights(p: &str) -> std::io::Result<Vec<u8>> {
+    include!("../tests/read_expr.rs")    // not an `Item::Macro`, so no include rule
+}
+```
+
+The review's diagnosis was exact: parsing was necessary and not sufficient. The first `syn` version
+matched on **module-level items** and fell back to a token scan for everything else, which is the
+same "handle the reported shape" mistake in a new place. Neither case needs macro expansion or
+re-export resolution; both are plainly visible in the AST the parser had already produced.
+
+`walk_items` is replaced by a `syn::visit::Visit` implementation. It walks items, statements,
+expressions, nested blocks, closure bodies and `impl`/`trait` members, and **no rule in it asks where
+a construct appears**:
+
+| Rule | Where it now fires |
+|---|---|
+| import classification | `visit_item_use` -- module level, function body, nested block, `impl` |
+| `include!` | `visit_macro` -- item, statement and expression position alike |
+| `extern "C"` | `visit_item_foreign_mod`, including inside a function |
+| module declarations | `visit_item_mod`, with the directory saved and restored around inline modules |
+| inline paths | `visit_path` -- calls, types, patterns, turbofish |
+| `cfg(test)` exemption | `visit_item` and `visit_stmt`, so the dev-harness allowance holds at every depth |
+
+The one remaining token scan is over **macro arguments**, which are unparsed tokens by definition
+and so are the one place a token scan is the right tool rather than a shortcut.
+
+Two new negative fixtures are the reviewer's two crates:
+`model-imports-inside-a-function` and `model-includes-source-in-an-expression`.
+
+## Positive fixtures, as requested
+
+`xtask/fixtures/arch-check-accepted/` is new: crates that must be **accepted** with zero violations.
+`arch-check` now fails if either fixture directory is empty, because a checker with only negative
+fixtures is satisfied by rejecting everything and one with only positive fixtures by rejecting
+nothing.
+
+The first accepted fixture deliberately sits next to the forbidden shapes -- function-local grouped
+and renamed imports of *allowed* modules, a `#[cfg(test)]` harness that really does use `std::fs`
+and `std::thread`, a nested inline module, a file module, and fully-qualified allowed paths written
+inline. It is what stops the deeper traversal from being tightened into something that flags ordinary
+code, and it is checked on every run.
+
+Five new unit tests cover the traversal directly:
+`a_forbidden_import_is_found_wherever_it_is_written` (eight positions, including a closure body and
+an `impl`), `included_source_is_reported_in_every_position`,
+`an_extern_block_inside_a_function_is_still_a_foreign_block`,
+`a_path_inside_macro_arguments_is_still_seen`, and
+`the_test_exemption_survives_the_deeper_traversal`.
+
+[ADR 0004](../decisions/adr/0004-parse-model-source-with-syn.md) records the completed traversal, the
+fixture argument's two halves, and the unchanged limits: no re-export chains, no `macro_rules!`
+expansion, no `cfg` evaluation beyond `test`, and `include!` refused rather than followed.
+
+## Accepted by the fourth review, unchanged here
+
+T1 (`SequenceState` is not `Clone`, backed by a compile-fail test) and T2 (private restoration
+evidence qualified by sequence, branch, generation and prefix lineage). The review also accepted the
+documented distinction between an **identity binding** and **proof that restoration occurred**, with
+the note that actual snapshot/replay execution must enforce the latter once buffers and transactions
+arrive. That obligation belongs to the memory authority and is recorded in
+[task 0003](0003-m1-bf16-reference-interpreter.md)'s successors, not here.
+
+O1, O2, O4 and O5 remain **OPEN**. No importer, no W4A16/W8A16 kernel, no checkpoint imported, no
+inference, no throughput measured, no CI runner for the device lane.

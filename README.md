@@ -136,9 +136,11 @@ and two reference paths returning successful nonfinite results. Those are closed
 A third review found three more — a derived `Clone` that handed the new sequence identity to a
 second authority, restoration evidence with no branch or prefix-version identity, and source
 enforcement still missing ordinary Rust syntax — and those are closed too. The
-[first](docs/handovers/2026-09-07-m0-correction-results.md),
-[second](docs/handovers/2026-09-07-second-review-corrections.md) and
-[third](docs/handovers/2026-09-07-third-review-corrections.md) handovers are the short versions.
+A fourth found that the architecture checker's new parser was not traversing function bodies, and
+that is closed too. The [first](docs/handovers/2026-09-07-m0-correction-results.md),
+[second](docs/handovers/2026-09-07-second-review-corrections.md),
+[third](docs/handovers/2026-09-07-third-review-corrections.md) and
+[fourth](docs/handovers/2026-09-07-fourth-review-corrections.md) handovers are the short versions.
 
 The next bounded task is [task 0003](docs/tasks/0003-m1-bf16-reference-interpreter.md), the BF16 host
 reference interpreter. It is deliberately smaller than document 06's whole M1: the manifest reader,

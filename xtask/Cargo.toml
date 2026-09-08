@@ -26,7 +26,7 @@ toml = "0.9"
 # Parsing model-crate source structurally rather than by text search. See
 # ADR 0004. All three are already in the lock graph via `toml`'s `serde_derive`,
 # so this adds no new package to the build.
-syn = { version = "=3.0.3", default-features = false, features = ["full", "parsing", "printing"] }
+syn = { version = "=3.0.3", default-features = false, features = ["full", "parsing", "printing", "visit"] }
 quote = "1"
 proc-macro2 = "1"
 

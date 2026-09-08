@@ -1,0 +1,15 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# Fourth review, case A. The same grouped import as
+# `model-comments-inside-an-import`, moved inside a function body. A checker that
+# matches on module-level items and falls back to a token scan for everything
+# else never reaches the import classifier, and the token scan sees `fs::read`,
+# not `std::fs`. Must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden construct in model source"
