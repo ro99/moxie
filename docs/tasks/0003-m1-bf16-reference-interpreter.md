@@ -81,7 +81,7 @@ kernel must round in the same places or it computes something else. Per operatio
 | `Embedding` | — (a copy) | never; the stored value passes through unchanged |
 | `Linear` | products, the whole reduction, the bias add | **once**, on the final sum |
 | `RmsNorm` | squares, the mean, `+eps`, `rsqrt`, the gain multiply | **once**, after the gain |
-| `SwiGlu` | `silu(gate)` and the product with `up` | **once**, on the product |
+| `SwiGlu` | the sigmoid, `silu(gate)` and the product with `up`, **in FP64** | **once**, narrowing the product |
 | `Rope` | `sin`/`cos`, both products, the sum | **once per output element** |
 | `Residual` | the add | **once** |
 | `Attention` | scores, scale, softmax, the weighted value sum | **once**, on the output vector |
@@ -151,12 +151,16 @@ physical interleaved disk layout" — the graph takes two edges and any interlea
 problem, not this operation's.
 Distinct from `GeGlu` and from Kimi's bounded `SituGlu` (R06). Neither is implemented; requesting
 one is `UnsupportedKernel`, not a silent substitution.
-*Error: `|ŷ − y_f64| ≤ γ(4) · |y_f64|` — four rounding steps: the exponential, the add, the divide,
-the product. The exponential is bounded at 1 ulp by the platform's `expf`; the other three at 0.5 ulp
-each, so 4 full ulps bounds the composition. **The relative bound holds while the result is a normal
-FP32 number.** For strongly negative gates `σ(v)` enters the subnormal range, where gradual underflow
-costs mantissa bits and no relative bound survives; there the contract is an absolute floor of
-`f32::MIN_POSITIVE`. Stated because it is a real limit of FP32, not because a test needed room.*
+*Error: `|ŷ − y_f64| ≤ γ(2) · |y_f64|` while the **output** is a normal FP32 number; an absolute
+floor of `f32::MIN_POSITIVE` where the output itself is subnormal.*
+
+*The whole expression is evaluated in FP64 and narrowed once, so the only FP32 rounding is that
+narrowing — which is why the bound is `γ(2)` rather than the `γ(4)` an FP32 chain would need. This is
+not a refinement; it is a correction. An FP32 intermediate **cannot represent this operation's own
+output range**: `σ(−104)` is about `1e−45`, at the bottom of the subnormals, so `silu(−104)` flushes
+to zero, while `silu(−104) · 1e30` is `−7.1e−14` and perfectly normal. The fifth review found that
+100% error on an ordinary output. Rounding the intermediate was also an extra boundary the table
+above never declared: SwiGLU's single rounding is on the product.*
 *Partition: `ColumnShardable` — elementwise on the feed-forward axis.*
 *State effect: `None`.*
 
@@ -196,7 +200,13 @@ wrong" below. The sound statement is two terms, and it is data-dependent:*
 Δs   = γ(Hd) · max_k ( Σ_i |Q[q,i]·K[k,i]| ) / sqrt(Hd)      // score error
 |ô − o_f64| ≤ (e^{2·Δs} − 1) · max_k |V[k,i]|                // through the softmax
             + γ(K + 2) · Σ_k |p[q,k]·V[k,i]|                 // the weighted sum
+            + (2K + Hd + 3) · η                              // gradual underflow
 ```
+
+*where `η = 2^-150` is half the smallest FP32 subnormal. A relative model says nothing once results
+leave the normal range: the fifth review measured an absolute error 51 times the two relative terms
+with values at `2^-133`. The additive term is around `1e-44` on ordinary data, which is to say
+nothing, and is the whole bound where the data is tiny.*
 
 *Implemented as `moxie_oracles::attention::attention_error_bound`, so the contract and the tests use
 one expression rather than two that can drift apart.*
@@ -256,9 +266,11 @@ Two consequences, both stated rather than discovered later:
   asserts that; on well-conditioned data a second test asserts it stays below 1e-5. A bound that was
   merely enlarged until the counterexample fit would fail the second test.
 
-The other operations' bounds are unchanged. `Linear`'s `γ(K+1)·Σ|x·w|` is the standard Higham result
-and survives cancellation because it is normalized by term magnitude rather than by `|y|`; the norm's
-sum of squares cannot cancel; RoPE's is stated absolutely for the same reason.
+The other operations' bounds are unchanged in *shape*. `Linear`'s `γ(K+1)·Σ|x·w|` is the standard
+Higham result and survives cancellation because it is normalized by term magnitude rather than by
+`|y|`; the norm's sum of squares cannot cancel; RoPE's is stated absolutely for the same reason.
+`moxie_oracles::metric::bound(n, scale)` is the underflow-aware form — `γ(n)·scale + n·η` — and is
+what any bound over data that can be subnormal should use.
 
 ### State, transactions and cancellation
 
@@ -587,3 +599,84 @@ qualified on data whose conditioning is stated, and the cancellation regime docu
 stress is exactly where the bound is weak — correctly, because FP32 attention genuinely is. That is
 a more useful acceptance contract than the constant it replaces, but it is a different one, and any
 future kernel gate has to be written against this version.
+
+
+---
+
+## Second review corrections, 2026-09-08
+
+A second review of `663f1d1` found four further gaps. All four are reproduced and closed. Two are
+numerical contracts that were still incomplete over their stated input domain, and the review was
+right that a bound which fails anywhere in that domain is not usable for CUDA qualification.
+
+| Command | Before | After |
+|---|---|---|
+| `cargo test --workspace --locked --offline` | 303 + 1 doctest | **309 + 1 doctest** |
+| device lane | 311 + 2 doctests | **317 + 2 doctests** |
+| `fmt`, `clippy -D warnings`, `arch-check`, `spec-check`, no-driver host build | PASS | **PASS** |
+| `cargo xtask-cuda test-gpu`, hidden-SM120 gate | PASS / exit 1 | **PASS / exit 1** |
+
+### S1 — stale cache contents could be re-stamped as current · closed
+
+Reproduced: save a cache at prefix 2, rewrite position 1 in the state, then call the saved cache's
+`rollback_to(state, branch, 2)`. The truncation changed nothing, `resync` overwrote the lineage from
+the state, and the stale bytes then passed `check_owner` and carried a continuation to valid logits.
+
+The defect was a single "current" stamp that anything could reassign. A cache now records the lineage
+of **every prefix at the moment it reached that length**, `stamps[n]`, and:
+
+- `commit` is `pub(crate)` and only the interpreter calls it, after a step succeeded and the state
+  advanced — the stamp for a prefix is written when the bytes for it are;
+- `rollback_to` **checks before mutating**, comparing the stamp it recorded for the target prefix
+  against what the state says now, and refuses when those positions were rewritten;
+- `resync` is gone. There is no public way to change a cache's identity without adding the contents
+  that justify it.
+
+Making `resync` private alone would have left the `rollback_to` path, as the review said.
+
+### S2 — SwiGLU's underflow contract still failed for normal outputs · closed
+
+Reproduced: gate `−104` with `up` near `1e30` returned `0`; the reference is `−7.08791e−14`. The
+sigmoid underflows in FP32 while the product is comfortably normal, so neither the relative bound nor
+the subnormal floor applied — the floor was about the *intermediate*, and the contract is about the
+*output*.
+
+The operation is now evaluated in FP64 and narrowed once, which is also the more faithful reading of
+the rounding table: SwiGLU's single declared rounding is on the product, and rounding the
+intermediate was a boundary the contract never named. The bound tightens to `γ(2)` as a consequence,
+with the absolute floor now correctly conditioned on the output being subnormal rather than the
+intermediate. A test sweeps 512 gates with large `up` values and asserts the bound on every normal
+output, failing if fewer than 100 of them are normal so the fixture cannot go vacuous.
+
+### S3 — operand precision was checked against the declaration, not the contract · closed
+
+Reproduced: declaring an input FP32 let it into a RoPE node whose `OpContract` permits only BF16
+activations; construction and execution both succeeded. Agreement between a binding and its
+declaration is not agreement with the operation that consumes it.
+
+`GraphBuilder::node` now checks each operand's declared precision against the node's contract, by
+role — weights against `contract.weights`, activations against `contract.activations`, indices
+skipped. An operation that genuinely supports FP32 will list it; contradicting the contract silently
+is what is refused.
+
+### S4 — the attention bound omitted gradual underflow · closed
+
+Reproduced: zero queries and keys, three visible positions, values `[2^-133, 0, 0]`. Measured
+absolute error `4.671e-46` against a bound of `9.123e-48` — 51 times too small. Numerically tiny, and
+still a bound that did not hold over its stated domain.
+
+Both relative terms shrink toward zero with the data, so neither can carry a bound where the results
+are subnormal. The additive `(2K + Hd + 3) · η` term does, and `metric::bound(n, scale)` makes the
+same correction available to every other bound. A test asserts the fixture still demonstrates the gap
+— that the relative terms alone are smaller than the measured error — so it cannot quietly stop being
+a regression test.
+
+### On using these bounds for CUDA qualification
+
+Both numerical contracts are now stated over their whole input domain rather than over the
+well-behaved part of it. Two properties a kernel gate should carry forward:
+
+- **Attention is data-dependent.** The bound is weak where `Q·K` cancels, correctly. A kernel
+  qualified against it must state its data's conditioning.
+- **Both have an additive floor.** Relative bounds are silent in the subnormal range, and any gate
+  written as "relative error below X" will be wrong there for the same reason these two were.

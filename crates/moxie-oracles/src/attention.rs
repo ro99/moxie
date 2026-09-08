@@ -31,6 +31,16 @@ impl KvHistory {
         self.keys.len()
     }
 
+    /// The stored keys, for a caller assembling an error bound.
+    pub fn keys(&self) -> &[Vec<f32>] {
+        &self.keys
+    }
+
+    /// The stored values, for a caller assembling an error bound.
+    pub fn values(&self) -> &[Vec<f32>] {
+        &self.values
+    }
+
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -173,6 +183,7 @@ pub fn attend_multi_head(
 /// Δs   = γ(Hd) · max_k ( Σ_i |Q_i · K_ki| ) · scale        // score error
 /// |ô_i − o_i| ≤ (e^{2·Δs} − 1) · max_k |V_ki|              // via the softmax
 ///             + γ(K + 2) · Σ_k |p_k · V_ki|                // the weighted sum
+///             + (2K + Hd + 3) · η                          // gradual underflow
 /// ```
 ///
 /// The first term is the perturbation of the softmax weights: if every score
@@ -180,6 +191,13 @@ pub fn attend_multi_head(
 /// `[e^{−2Δs}, e^{2Δs}]`, so `‖p̂ − p‖₁ ≤ e^{2Δs} − 1`. The second is the ordinary
 /// sequential-sum bound over the `K` visible keys plus the max subtraction and
 /// the divide.
+///
+/// The third is gradual underflow, and the fifth review is why it is here: with
+/// values at `2^-133` the products are subnormal, the two relative terms both
+/// shrink toward zero with the data, and the measured absolute error was 51
+/// times the bound. A relative model says nothing once results leave the normal
+/// range, so the additive `η` term carries the bound there. It costs about
+/// `1e-44` when the data is ordinary, which is to say nothing at all.
 ///
 /// **This bound is data-dependent and it does not shrink to a constant.** When
 /// `Q·K` is well conditioned, `Δs` is tiny and the bound is a few ulps; when it
@@ -221,8 +239,10 @@ pub fn attention_error_bound(
         .map(|(p, v)| (p * v[component] as f64).abs())
         .sum();
 
+    let k = visible_keys.len() as u64;
     let softmax_term = (2.0 * delta_s).exp_m1() * max_v;
-    softmax_term + gamma(visible_keys.len() as u64 + 2) * weighted
+    let steps = 2 * k + head_dim as u64 + 3;
+    softmax_term + crate::metric::bound(k + 2, weighted) + steps as f64 * crate::metric::FP32_ETA
 }
 
 #[cfg(test)]
@@ -417,6 +437,52 @@ mod tests {
         assert!(
             bound > 0.1,
             "on data this ill-conditioned the bound must say so, got {bound:.3e}"
+        );
+    }
+
+    #[test]
+    fn subnormal_values_are_covered_by_the_underflow_term() {
+        // Fifth review, reproduced: zero queries and keys, three visible
+        // positions, and one value at 2^-133. Every product is subnormal, both
+        // relative terms shrink with the data, and the purely relative bound was
+        // 51 times too small.
+        let hd = 3usize;
+        let tiny = f32::from_bits(1 << 16); // 2^-133; `powi(-133)` overflows first
+        assert!(
+            tiny > 0.0 && tiny < f32::MIN_POSITIVE,
+            "genuinely subnormal"
+        );
+        let mut history = KvHistory::new();
+        history
+            .append(0, vec![0.0; hd], vec![tiny, 0.0, 0.0])
+            .unwrap();
+        history.append(1, vec![0.0; hd], vec![0.0; hd]).unwrap();
+        history.append(2, vec![0.0; hd], vec![0.0; hd]).unwrap();
+        let q = vec![0.0f32; hd];
+
+        let got = attend_multi_head(&q, &history, 2, 1, hd, Visibility::Causal).unwrap();
+        let (want, weights, visible) = reference(&q, &history, 2, Visibility::Causal);
+        let keys: Vec<&[f32]> = visible
+            .iter()
+            .map(|i| history.keys[*i].as_slice())
+            .collect();
+        let values: Vec<&[f32]> = visible
+            .iter()
+            .map(|i| history.values[*i].as_slice())
+            .collect();
+
+        let err = (got[0] as f64 - want[0]).abs();
+        assert!(err > 0.0, "the fixture must actually lose something");
+        let bound = attention_error_bound(&q, &keys, &values, &weights, 0);
+        assert!(err <= bound, "error {err:e} exceeded bound {bound:e}");
+
+        // The underflow term is what is carrying it: the relative terms alone
+        // would be far too small.
+        let relative_only = gamma(2 * 3 + hd as u64 + 3) * want[0].abs();
+        assert!(
+            relative_only < err,
+            "the fixture no longer demonstrates the gap: relative {relative_only:e} vs \
+             error {err:e}"
         );
     }
 

@@ -13,5 +13,8 @@ moxie-format.workspace = true
 moxie-oracles.workspace = true
 moxie-state.workspace = true
 
+[dev-dependencies]
+moxie-format.workspace = true
+
 [lints]
 workspace = true

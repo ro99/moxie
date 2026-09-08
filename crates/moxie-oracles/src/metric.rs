@@ -14,6 +14,19 @@
 /// FP32 unit roundoff, `2^-24`.
 pub const FP32_U: f64 = 5.960_464_477_539_063e-8;
 
+/// FP32 underflow unit: half the smallest subnormal, `2^-150`.
+///
+/// The relative model `fl(x∘y) = (x∘y)(1+δ)` holds only while results stay in
+/// the normal range. Under gradual underflow the correct model is
+/// `fl(x∘y) = (x∘y)(1+δ) + η` with `|η| ≤ 2^-150`, and the additive term is the
+/// only thing bounding an operation whose result is subnormal -- where a
+/// relative bound says nothing at all.
+///
+/// The fifth review disproved a bound over exactly this domain: attention with
+/// values at `2^-133` had an absolute error 51 times the purely relative bound.
+/// Tiny in magnitude, and still a bound that did not hold over its stated inputs.
+pub const FP32_ETA: f64 = 7.006_492_321_624_085e-46;
+
 /// The standard bound for `n` chained FP32 roundings: `γ(n) = n·u / (1 − n·u)`.
 ///
 /// Higham, *Accuracy and Stability of Numerical Algorithms*, §3.1. A sequential
@@ -31,6 +44,17 @@ pub fn gamma(n: u64) -> f64 {
         return f64::INFINITY;
     }
     nu / (1.0 - nu)
+}
+
+/// The underflow-aware bound for `n` chained FP32 operations over terms whose
+/// magnitudes sum to `scale`: `γ(n)·scale + n·η`.
+///
+/// Use this rather than `gamma(n) * scale` anywhere a result can be subnormal,
+/// which in practice is anywhere real data can be small. The additive term costs
+/// nothing when the result is normal -- `n·η` is around `1e-45` -- and is the
+/// whole bound when it is not.
+pub fn bound(n: u64, scale: f64) -> f64 {
+    gamma(n) * scale + n as f64 * FP32_ETA
 }
 
 /// Max, RMS and p99 of a set of errors.
@@ -154,6 +178,24 @@ mod tests {
             "{s} exceeded gamma({k}) = {:.3e}",
             gamma(k as u64)
         );
+    }
+
+    #[test]
+    fn the_underflow_term_dominates_where_the_relative_term_says_nothing() {
+        // A purely relative bound goes to zero with the scale; the real error
+        // does not, because gradual underflow is additive.
+        let tiny = f32::from_bits(1 << 16) as f64; // 2^-133, a subnormal
+        assert!(bound(12, tiny) > 12.0 * FP32_ETA * 0.99);
+        assert!(
+            bound(12, tiny) > gamma(12) * tiny,
+            "the additive term must actually be doing the work here"
+        );
+
+        // And it costs essentially nothing at ordinary magnitudes.
+        let ordinary = 1.0f64;
+        let with = bound(12, ordinary);
+        let without = gamma(12) * ordinary;
+        assert!((with - without) / without < 1e-30);
     }
 
     #[test]

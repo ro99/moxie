@@ -523,6 +523,39 @@ impl GraphBuilder {
             partition: params.partition_rule(),
             state_effect: params.state_effect(),
         };
+        // An operand's declared precision must be one the operation's contract
+        // accepts. Agreement between a binding and its declaration is not the
+        // same as agreement with the node that consumes it: the fifth review
+        // declared an input FP32 and fed it to a RoPE whose contract permits
+        // only BF16 activations, and both construction and execution succeeded.
+        for (i, v) in inputs.iter().enumerate() {
+            let spec = self.spec(*v).expect("checked above");
+            let allowed = match spec.role {
+                ValueRole::Index => continue,
+                ValueRole::Weight(w) => contract.weights.iter().any(|a| a.get() == w.get()),
+                ValueRole::Activation(a) => contract.activations.iter().any(|x| x.get() == a.get()),
+            };
+            if !allowed {
+                return Err(Error::InvalidArtifact {
+                    detail: format!(
+                        "{} input {i} is declared {:?} but the operation's contract accepts \
+                         weights {:?} and activations {:?}",
+                        contract.op.name(),
+                        spec.role,
+                        contract
+                            .weights
+                            .iter()
+                            .map(|w| w.get().name())
+                            .collect::<Vec<_>>(),
+                        contract
+                            .activations
+                            .iter()
+                            .map(|a| a.get().name())
+                            .collect::<Vec<_>>(),
+                    ),
+                });
+            }
+        }
         self.nodes.push(Node {
             id,
             params,

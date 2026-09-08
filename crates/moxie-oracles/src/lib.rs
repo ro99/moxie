@@ -46,6 +46,24 @@ pub mod template;
 use moxie_graph::{Op, OracleEvidence, OracleId, OracleRegistry};
 use moxie_types::Result;
 
+/// Round to the nearest BF16 value and back.
+///
+/// Test fixtures use it so that "a BF16-representable input" is a fact rather
+/// than a hope. The rounding contract itself lives in `moxie-format` and is
+/// tested exhaustively there; duplicating it would be a second contract.
+#[cfg(test)]
+pub(crate) fn bf16_round(v: f32) -> f32 {
+    // Reimplemented rather than depending on `moxie-format`, which sits beside
+    // this crate rather than below it in the ownership table. Round-to-nearest-
+    // even on the top 16 bits: add half an ulp plus the retained low bit.
+    let bits = v.to_bits();
+    if v.is_nan() {
+        return v;
+    }
+    let lsb = (bits >> 16) & 1;
+    f32::from_bits(((bits.wrapping_add(0x7FFF).wrapping_add(lsb)) >> 16) << 16)
+}
+
 /// The one oracle name this crate registers under.
 pub const HOST_REFERENCE: OracleId = OracleId("moxie_oracles::host_reference");
 

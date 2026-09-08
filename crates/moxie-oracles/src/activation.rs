@@ -46,7 +46,29 @@ pub fn silu(v: f32) -> f32 {
     v * sigmoid(v)
 }
 
-/// `y[i] = silu(gate[i]) · up[i]`, FP32, unrounded.
+/// The sigmoid in FP64, same sign-dependent form.
+fn sigmoid_f64(v: f64) -> f64 {
+    if v >= 0.0 {
+        1.0 / (1.0 + (-v).exp())
+    } else {
+        let e = v.exp();
+        e / (1.0 + e)
+    }
+}
+
+/// `y[i] = silu(gate[i]) · up[i]`, evaluated in FP64 and rounded **once**.
+///
+/// The intermediate is FP64 because an FP32 one cannot represent the operation's
+/// own output range. `σ(−104)` is about `1e−45`, at the very bottom of FP32's
+/// subnormals, so `silu(−104)` flushes to zero -- but multiplied by an `up` of
+/// `1e30` the true result is `−7.1e−14`, comfortably normal. The fifth review
+/// found exactly that: an intermediate underflow producing a 100% error in a
+/// perfectly ordinary output.
+///
+/// Evaluating the whole expression before narrowing is also the more faithful
+/// reading of task 0003's rounding table, which puts SwiGLU's single rounding on
+/// the product. Rounding the intermediate was an extra boundary the contract
+/// never declared.
 pub fn swiglu_row(gate: &[f32], up: &[f32]) -> Result<Vec<f32>> {
     if gate.len() != up.len() {
         return Err(Error::InvalidArtifact {
@@ -59,7 +81,14 @@ pub fn swiglu_row(gate: &[f32], up: &[f32]) -> Result<Vec<f32>> {
             detail: "an activation over zero features".into(),
         });
     }
-    Ok(gate.iter().zip(up).map(|(g, u)| silu(*g) * u).collect())
+    Ok(gate
+        .iter()
+        .zip(up)
+        .map(|(g, u)| {
+            let g = *g as f64;
+            ((g * sigmoid_f64(g)) * (*u as f64)) as f32
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -101,12 +130,33 @@ mod tests {
     }
 
     #[test]
+    fn an_intermediate_underflow_does_not_zero_a_normal_output() {
+        // Fifth review, reproduced: gate -104 makes the FP32 sigmoid flush to
+        // zero, but the product with a large `up` is a perfectly ordinary
+        // number. Neither the relative bound nor the subnormal floor covered a
+        // 100% error on a normal-sized result.
+        let up = crate::bf16_round(1e30);
+        for gate in [-104.0f32, -110.0, -120.0, -150.0, -200.0] {
+            let got = swiglu_row(&[gate], &[up]).unwrap()[0];
+            let want = swiglu_row_f64(&[gate], &[up])[0];
+            if want.abs() >= f32::MIN_POSITIVE as f64 {
+                assert_ne!(got, 0.0, "gate {gate}: output {want:e} collapsed to zero");
+                let rel = ((got as f64 - want) / want).abs();
+                assert!(rel < 1e-6, "gate {gate}: relative error {rel:e}");
+            } else {
+                // Genuinely subnormal or zero output: the absolute floor applies.
+                assert!((got as f64 - want).abs() <= f32::MIN_POSITIVE as f64);
+            }
+        }
+    }
+
+    #[test]
     fn silu_does_not_collapse_to_zero_at_a_large_negative_gate() {
         // Fourth review, reproduced: `1/(1 + e^{-v})` overflows for v around -88,
         // and the naive form returned exactly 0 where the true value is a small
         // negative number. With a large `up` the product is comfortably
         // representable, so the error was 100% of a value that mattered.
-        let up = 1e30f32;
+        let up = crate::bf16_round(1e30);
         let got = swiglu_row(&[-90.0], &[up]).unwrap()[0];
         let want = swiglu_row_f64(&[-90.0], &[up])[0];
         assert!(want < 0.0 && want.is_finite(), "the reference is {want:e}");
@@ -148,6 +198,40 @@ mod tests {
         // Monotonic across the branch boundary at zero.
         assert!(sigmoid(-1e-6) < sigmoid(0.0));
         assert!(sigmoid(0.0) < sigmoid(1e-6));
+    }
+
+    #[test]
+    fn the_operation_is_bounded_by_its_output_not_its_intermediate() {
+        // The revised statement: the relative bound is about the *output*. An
+        // intermediate that underflows is not an excuse, because the operation's
+        // declared rounding boundary is the product.
+        let n = 512usize;
+        let gate: Vec<f32> = (0..n).map(|i| -(i as f32) * 0.4).collect();
+        let up: Vec<f32> = (0..n)
+            .map(|i| crate::bf16_round(1e20 * (1.0 + i as f32)))
+            .collect();
+        let got = swiglu_row(&gate, &up).unwrap();
+        let want = swiglu_row_f64(&gate, &up);
+        let mut checked = 0;
+        for i in 0..n {
+            let e = (got[i] as f64 - want[i]).abs();
+            if want[i].abs() >= f32::MIN_POSITIVE as f64 {
+                assert!(
+                    e <= gamma(2) * want[i].abs(),
+                    "index {i}: gate {} gives {:e}, want {:e}, error {e:e}",
+                    gate[i],
+                    got[i],
+                    want[i]
+                );
+                checked += 1;
+            } else {
+                assert!(e <= f32::MIN_POSITIVE as f64, "index {i}: {e:e}");
+            }
+        }
+        assert!(
+            checked > 100,
+            "only {checked} normal outputs; fixture is too narrow"
+        );
     }
 
     #[test]

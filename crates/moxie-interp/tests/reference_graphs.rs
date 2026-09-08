@@ -1132,6 +1132,107 @@ fn a_nonfinite_weight_or_result_never_reaches_committed_state() {
 }
 
 #[test]
+fn a_stale_cache_cannot_be_certified_by_rolling_it_back() {
+    // Fifth review, reproduced: `rollback_to` re-stamped the cache from the
+    // state after truncating, including when the truncation changed nothing. A
+    // caller could take a cache saved before a rewrite, "roll it back" to the
+    // length it already had, and have its stale bytes pass `check_owner`.
+    let f = build(A, 79);
+    let mut state = f.state();
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
+
+    state.append_prompt(ROOT, 1).unwrap();
+    step(&f, &mut state, &mut kv, &[1], 0, &Cancel::never()).unwrap();
+    state.accept(ROOT, 1).unwrap();
+    step(&f, &mut state, &mut kv, &[2], 1, &Cancel::never()).unwrap();
+    let stale = kv.clone();
+    assert_eq!(stale.len(), 2);
+
+    // Rewrite position 1 with a different token.
+    state.rollback_to(ROOT, 1, &[]).unwrap();
+    kv.rollback_to(&state, ROOT, 1).unwrap();
+    state.accept(ROOT, 1).unwrap();
+    step(&f, &mut state, &mut kv, &[5], 1, &Cancel::never()).unwrap();
+    assert_ne!(stale.contents(), kv.contents(), "the bytes really differ");
+
+    // The stale cache is refused, and rolling it back to its own length does not
+    // launder it.
+    let mut restamped = stale.clone();
+    assert!(restamped.check_owner(&state, ROOT).is_err());
+    let e = restamped.rollback_to(&state, ROOT, 2).unwrap_err();
+    assert!(e.to_string().contains("different version"), "{e}");
+    assert!(restamped.check_owner(&state, ROOT).is_err());
+
+    // And it cannot be used to continue the sequence.
+    state.accept(ROOT, 1).unwrap();
+    assert!(
+        Interpreter::new()
+            .run(
+                &f.graph,
+                &f.bindings(&[6], &[2]),
+                &mut state,
+                ROOT,
+                &mut restamped,
+                &Cancel::never()
+            )
+            .is_err()
+    );
+
+    // The genuine cache still works, so the rule is about staleness rather than
+    // about rollback being forbidden.
+    step(&f, &mut state, &mut kv, &[6], 2, &Cancel::never()).unwrap();
+}
+
+#[test]
+fn an_operand_precision_the_node_contract_rejects_is_refused_at_construction() {
+    // Fifth review, reproduced: binding validation compared a tensor against its
+    // *declaration*, so declaring the input FP32 let it into an operation whose
+    // contract permits only BF16 activations. Agreement with a declaration is
+    // not agreement with the consumer.
+    let mut g = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
+    let rows = rows_symbol();
+    let pos = g.input(
+        "positions",
+        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+    );
+    let wide = g.input(
+        "x",
+        TensorSpec::new(act(Precision::F32), vec![rows.clone(), Dim::constant(8)]),
+    );
+    let e = g
+        .node(
+            OpParams::Rope {
+                heads: 2,
+                head_dim: 4,
+                rotary_dim: 4,
+                base: 10_000.0,
+            },
+            &[wide, pos],
+        )
+        .unwrap_err();
+    assert_eq!(e.kind(), "invalid_artifact");
+    assert!(e.to_string().contains("contract accepts"), "{e}");
+
+    // The same node with a BF16 operand is accepted.
+    let narrow = g.input(
+        "x_bf16",
+        TensorSpec::new(act(Precision::Bf16), vec![rows.clone(), Dim::constant(8)]),
+    );
+    assert!(
+        g.node(
+            OpParams::Rope {
+                heads: 2,
+                head_dim: 4,
+                rotary_dim: 4,
+                base: 10_000.0,
+            },
+            &[narrow, pos],
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn generation_advances_the_state_the_way_the_contracts_require() {
     // A prompt, then three decode steps, checking the four counters and the
     // provenance rules at each boundary.

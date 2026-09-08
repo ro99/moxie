@@ -276,8 +276,9 @@ impl Interpreter {
         }
         state.execute(branch, rows as u64)?;
         let prefix = state.frontiers(branch)?.executed;
-        // The cache now describes a longer prefix, so its identity moves with it.
-        kv.resync(state, branch)?;
+        // The cache now describes a longer prefix, and records the lineage of
+        // each prefix it gained at the moment it gained it.
+        kv.commit(state, branch)?;
         let retained = state.record_logits(branch, prefix)?;
 
         Ok(StepOutput {

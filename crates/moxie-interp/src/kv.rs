@@ -26,12 +26,20 @@ use moxie_types::{BranchId, Error, Result};
 /// second scheme. `PrefixLineage::root` mixes in the sequence and the branch, and
 /// the chain changes when a suffix is replaced, so one value distinguishes
 /// "another sequence", "another branch" and "the prefix that used to be here".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheOwner {
     sequence: SequenceId,
     branch: BranchId,
-    /// The lineage of the prefix the cache currently holds.
-    lineage: PrefixLineage,
+    /// `stamps[n]` is the lineage of prefix `n` **as it stood when the cache
+    /// reached that length**, one entry per prefix from 0 up to `len()`.
+    ///
+    /// A single "current" stamp is not enough, and the fifth review showed why:
+    /// re-stamping it from the state certifies whatever bytes happen to be
+    /// there. Recording the lineage at the moment each prefix was written means
+    /// a rollback can compare what the cache *remembers* about a prefix against
+    /// what the state now says, and refuse when those positions were rewritten
+    /// behind its back.
+    stamps: Vec<PrefixLineage>,
 }
 
 /// Per-layer key/value history, bound to one branch of one sequence.
@@ -44,31 +52,41 @@ pub struct KvCache {
 impl KvCache {
     /// A cache for `layers` attention layers, bound to `branch`.
     ///
-    /// It adopts the branch's current executed prefix, so a cache can be created
-    /// mid-sequence -- but it records *which* prefix, and an executor checks that
-    /// before it reads a byte.
+    /// The branch must not have executed anything yet: a cache starts empty, and
+    /// there is no operation that copies an existing history into a new one. When
+    /// forking gets its copy-on-write implementation it will need one, and it
+    /// will have to carry the stamps across with the bytes.
     pub fn for_branch(layers: usize, state: &SequenceState, branch: BranchId) -> Result<Self> {
         let at = state.frontiers(branch)?.executed;
-        let lineage = state.lineage_at(branch, at)?.ok_or(Error::InvalidRequest {
+        if at != 0 {
+            return Err(Error::InvalidRequest {
+                field: "branch",
+                detail: format!(
+                    "{branch} has already executed {at} token(s); an empty cache cannot \
+                     stand in for that history"
+                ),
+            });
+        }
+        let lineage = state.lineage_at(branch, 0)?.ok_or(Error::InvalidRequest {
             field: "branch",
-            detail: format!("prefix {at} is not occupied on {branch}"),
+            detail: format!("prefix 0 is not occupied on {branch}"),
         })?;
         Ok(Self {
             layers: vec![KvHistory::new(); layers],
             owner: CacheOwner {
                 sequence: state.id(),
                 branch,
-                lineage,
+                stamps: vec![lineage],
             },
         })
     }
 
     /// Check that this cache is the one `branch` of `state` should be reading.
     ///
-    /// Three ways it can be wrong, all of them silent before: another sequence,
-    /// another branch, or the right branch after the prefix it holds was
-    /// replaced. The length check catches a fourth -- a cache that fell behind
-    /// or ran ahead of the frontier.
+    /// Four ways it can be wrong, all of them silent before this existed:
+    /// another sequence, another branch, a length that disagrees with the
+    /// frontier, and the right branch and length after those positions were
+    /// rewritten.
     pub fn check_owner(&self, state: &SequenceState, branch: BranchId) -> Result<()> {
         if self.owner.sequence != state.id() {
             return Err(Error::InvalidRequest {
@@ -97,26 +115,63 @@ impl KvCache {
                 ),
             });
         }
-        match state.lineage_at(branch, executed)? {
-            Some(l) if l == self.owner.lineage => Ok(()),
+        self.check_stamp(state, branch, executed)
+    }
+
+    /// Compare what the cache remembers about `prefix` with what the state says.
+    fn check_stamp(&self, state: &SequenceState, branch: BranchId, prefix: u64) -> Result<()> {
+        let remembered = self
+            .owner
+            .stamps
+            .get(prefix as usize)
+            .ok_or(Error::InvalidRequest {
+                field: "kv_cache",
+                detail: format!("the cache has no record of prefix {prefix}"),
+            })?;
+        match state.lineage_at(branch, prefix)? {
+            Some(l) if l == *remembered => Ok(()),
             _ => Err(Error::InvalidRequest {
                 field: "kv_cache",
                 detail: format!(
-                    "the cache holds a different version of prefix {executed}: those \
+                    "the cache holds a different version of prefix {prefix}: those \
                      positions have been replaced since it was written"
                 ),
             }),
         }
     }
 
-    /// Re-stamp the identity after the state has advanced or rolled back.
-    pub fn resync(&mut self, state: &SequenceState, branch: BranchId) -> Result<()> {
-        let at = state.frontiers(branch)?.executed;
-        self.owner.lineage = state.lineage_at(branch, at)?.ok_or(Error::InvalidRequest {
-            field: "branch",
-            detail: format!("prefix {at} is not occupied on {branch}"),
-        })?;
-        self.owner.branch = branch;
+    /// Record that the cache now holds the branch's executed prefix.
+    ///
+    /// Called by the interpreter once a step has succeeded and the state has
+    /// advanced, and **only** then: the stamp for a prefix is written when the
+    /// bytes for it are, which is what makes a later comparison mean anything.
+    /// There is deliberately no public way to re-stamp a cache without adding
+    /// the contents that justify it -- the fifth review found that a public
+    /// re-stamp certifies whatever bytes happen to be there.
+    pub(crate) fn commit(&mut self, state: &SequenceState, branch: BranchId) -> Result<()> {
+        if self.owner.sequence != state.id() || self.owner.branch != branch {
+            return Err(Error::InvalidRequest {
+                field: "kv_cache",
+                detail: "committing to a cache that belongs to another sequence or branch".into(),
+            });
+        }
+        let executed = state.frontiers(branch)?.executed;
+        if self.len() as u64 != executed {
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "the cache holds {} position(s) but the branch has executed {executed}",
+                    self.len()
+                ),
+            });
+        }
+        while (self.owner.stamps.len() as u64) <= executed {
+            let p = self.owner.stamps.len() as u64;
+            let l = state.lineage_at(branch, p)?.ok_or(Error::InvalidArtifact {
+                detail: format!("prefix {p} is not occupied on {branch}"),
+            })?;
+            self.owner.stamps.push(l);
+        }
+        self.owner.stamps.truncate(executed as usize + 1);
         Ok(())
     }
 
@@ -173,10 +228,31 @@ impl KvCache {
         branch: BranchId,
         prefix: u64,
     ) -> Result<()> {
+        if self.owner.sequence != state.id() || self.owner.branch != branch {
+            return Err(Error::InvalidRequest {
+                field: "kv_cache",
+                detail: "rolling back a cache that belongs to another sequence or branch".into(),
+            });
+        }
+        if prefix > self.len() as u64 {
+            return Err(Error::InvalidRequest {
+                field: "prefix",
+                detail: format!(
+                    "cannot roll back to {prefix}; the cache holds {} position(s)",
+                    self.len()
+                ),
+            });
+        }
+        // Check *before* mutating: the stamp the cache recorded for this prefix
+        // must still be the state's. Truncating first and re-stamping afterwards
+        // is the bypass the fifth review found -- it certifies whatever survived
+        // the truncation, including bytes for positions that were rewritten.
+        self.check_stamp(state, branch, prefix)?;
         for l in &mut self.layers {
             l.truncate(prefix);
         }
-        self.resync(state, branch)
+        self.owner.stamps.truncate(prefix as usize + 1);
+        Ok(())
     }
 
     /// The number of positions held, which must agree across layers.
@@ -239,10 +315,11 @@ mod tests {
         let (mut state, mut kv) = state_and_cache(2);
         state.append_prompt(ROOT, 2).unwrap();
         state.accept(ROOT, 3).unwrap();
-        state.execute(ROOT, 5).unwrap();
         for p in 0..5u64 {
             kv.append(0, p, vec![p as f32], vec![-(p as f32)]).unwrap();
             kv.append(1, p, vec![p as f32 * 2.0], vec![0.0]).unwrap();
+            state.execute(ROOT, 1).unwrap();
+            kv.commit(&state, ROOT).unwrap();
         }
         assert_eq!(kv.len(), 5);
         state.rollback_to(ROOT, 3, &[]).unwrap();
@@ -258,6 +335,7 @@ mod tests {
         fresh_state.append_prompt(ROOT, 2).unwrap();
         fresh_state.accept(ROOT, 1).unwrap();
         fresh_state.execute(ROOT, 3).unwrap();
+        let _ = &fresh_state;
         for p in 0..3u64 {
             fresh
                 .append(0, p, vec![p as f32], vec![-(p as f32)])
@@ -293,7 +371,7 @@ mod tests {
         assert!(kv.check_owner(&state, ROOT).is_err());
         kv.append(0, 0, vec![1.0], vec![1.0]).unwrap();
         kv.append(0, 1, vec![1.0], vec![1.0]).unwrap();
-        kv.resync(&state, ROOT).unwrap();
+        kv.commit(&state, ROOT).unwrap();
         kv.check_owner(&state, ROOT).unwrap();
     }
 
@@ -307,7 +385,7 @@ mod tests {
         state.execute(ROOT, 2).unwrap();
         kv.append(0, 0, vec![1.0], vec![1.0]).unwrap();
         kv.append(0, 1, vec![2.0], vec![2.0]).unwrap();
-        kv.resync(&state, ROOT).unwrap();
+        kv.commit(&state, ROOT).unwrap();
         kv.check_owner(&state, ROOT).unwrap();
 
         // Roll the state back and re-execute a different token at position 1,
