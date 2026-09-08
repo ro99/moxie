@@ -1,4 +1,4 @@
-//! Module production-dependency of an included file.
+// Module production-dependency of an included file.
 
 use std::fs;
 

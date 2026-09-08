@@ -684,23 +684,6 @@ fn crate_roots(doc: &toml::Value, manifest_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// Where the child modules of `file` live.
-///
-/// A crate root and a `mod.rs` put their children beside them; any other module
-/// file puts them in a directory named after it. Getting this wrong is how a
-/// traversal silently stops one level down.
-fn children_dir(file: &Path, is_crate_root: bool) -> PathBuf {
-    let parent = file.parent().unwrap_or(Path::new(".")).to_path_buf();
-    if is_crate_root {
-        return parent;
-    }
-    match file.file_stem().and_then(|s| s.to_str()) {
-        Some("mod") => parent,
-        Some(stem) => parent.join(stem),
-        None => parent,
-    }
-}
-
 /// Whether an item is gated to test builds.
 ///
 /// Document 02 permits a test harness. Reading it from the parsed attribute
@@ -740,7 +723,7 @@ fn path_attribute(attrs: &[syn::Attribute]) -> Option<String> {
 }
 
 /// What one parsed source file contains that the ownership rules care about.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct SourceFacts {
     /// Fully-qualified paths brought into scope by `use`, with a glob written
     /// as `prefix::*`.
@@ -758,11 +741,26 @@ struct SourceFacts {
     /// Doc comments are attributes, not code, and are never collected here:
     /// prose about a boundary is not a use of what it forbids.
     strings: Vec<String>,
-    /// Child module files this file declares, each with the directory its
-    /// own children resolve against (see `resolve_module`).
-    children: Vec<ModuleChild>,
-    /// Module declarations that could not be resolved to a file.
-    unresolved: Vec<String>,
+    /// `mod` declarations in this file, as a tree mirroring inline
+    /// modules. Resolution against a directory happens in traversal (see
+    /// `resolve_mods`), once per resolution context: the same file loaded
+    /// through two declarations can resolve its children differently.
+    mods: Vec<ModItem>,
+}
+
+/// One `mod` item: a file declaration, or an inline module carrying more.
+#[derive(Debug, Clone)]
+enum ModItem {
+    /// `mod name;`, optionally with `#[path]`: loads a file.
+    Load { name: String, path: Option<String> },
+    /// `mod name { ... }`: no file of its own; nested declarations resolve
+    /// under `name` (or `path` when given), exactly as the traversal
+    /// descends textually.
+    Inline {
+        name: String,
+        path: Option<String>,
+        inner: Vec<ModItem>,
+    },
 }
 
 /// A `mod`-declared file plus the directory its children resolve against.
@@ -770,17 +768,17 @@ struct SourceFacts {
 /// The base is decided at the declaration site, not from the file path:
 /// ordinary declarations confer the file-stem rule, while `#[path]`
 /// confers the resolved file's parent directory (verified against rustc).
-/// A bare path plus a universal root flag cannot express both.
+/// A bare path plus a universal root/non-root flag cannot express both.
 #[derive(Debug, Clone)]
 struct ModuleChild {
     path: PathBuf,
     base: PathBuf,
 }
 
-/// Parse one file and collect its facts, resolving `mod` children against
-/// `base` (the declaring context: crate-root/include directory, or a
-/// carried child base).
-fn analyse_source_with_base(file: &Path, base: &Path) -> Result<SourceFacts, String> {
+/// Parse one file and collect its facts. Collection is fully
+/// base-independent: `mod` declarations are recorded, never resolved here.
+/// Resolution happens in traversal, once per visited context.
+fn analyse_source(file: &Path) -> Result<SourceFacts, String> {
     let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let parsed = syn::parse_file(&text).map_err(|e| {
         format!(
@@ -790,17 +788,9 @@ fn analyse_source_with_base(file: &Path, base: &Path) -> Result<SourceFacts, Str
         )
     })?;
     let mut facts = SourceFacts::default();
-    let mut collector = Collector {
-        facts: &mut facts,
-        dir: base.to_path_buf(),
-    };
+    let mut collector = Collector { facts: &mut facts };
     collector.visit_file(&parsed);
     Ok(facts)
-}
-
-/// Parse one file and collect its facts.
-fn analyse_source(file: &Path, is_crate_root: bool) -> Result<SourceFacts, String> {
-    analyse_source_with_base(file, &children_dir(file, is_crate_root))
 }
 
 /// A complete traversal of one parsed file.
@@ -817,9 +807,13 @@ fn analyse_source(file: &Path, is_crate_root: bool) -> Result<SourceFacts, Strin
 /// on "is this at the top level".
 struct Collector<'f> {
     facts: &'f mut SourceFacts,
-    /// Where the *current* module's children live. Saved and restored around an
-    /// inline `mod`, so a nested declaration resolves against its own directory.
-    dir: PathBuf,
+}
+
+/// Swap buffer so inline `mod { ... }` bodies collect their declarations
+/// into their own subtree rather than the enclosing level.
+#[derive(Default)]
+struct CollectorSubtree {
+    items: Vec<ModItem>,
 }
 
 impl<'ast> Visit<'ast> for Collector<'_> {
@@ -860,28 +854,28 @@ impl<'ast> Visit<'ast> for Collector<'_> {
     fn visit_item_mod(&mut self, m: &'ast syn::ItemMod) {
         let over = path_attribute(&m.attrs);
         match &m.content {
-            // Inline module: its children live one level down, unless a
-            // `#[path]` names the directory for them.
+            // Inline module: no file of its own. Nested declarations are
+            // collected into its subtree; the traversal threads the base
+            // (under `name`, or `path` when given) when resolving them.
             Some((_, inner)) => {
-                let inner_dir = match &over {
-                    Some(p) => self.dir.join(p),
-                    None => self.dir.join(m.ident.to_string()),
-                };
-                let outer = core::mem::replace(&mut self.dir, inner_dir);
+                let mut sub = CollectorSubtree::default();
+                core::mem::swap(&mut sub.items, &mut self.facts.mods);
                 for item in inner {
                     self.visit_item(item);
                 }
-                self.dir = outer;
+                let collected = core::mem::replace(&mut self.facts.mods, sub.items);
+                self.facts.mods.push(ModItem::Inline {
+                    name: m.ident.to_string(),
+                    path: over,
+                    inner: collected,
+                });
             }
-            // Declaration: resolve it to a file for the traversal to follow.
-            None => match resolve_module(&self.dir, &m.ident.to_string(), over.as_deref()) {
-                Some(p) => self.facts.children.push(p),
-                None => self.facts.unresolved.push(format!(
-                    "`mod {};` in {} resolves to no file",
-                    m.ident,
-                    self.dir.display()
-                )),
-            },
+            // Declaration: recorded with its `#[path]` override, if any.
+            // Resolution happens in traversal, once per context.
+            None => self.facts.mods.push(ModItem::Load {
+                name: m.ident.to_string(),
+                path: over,
+            }),
         }
     }
 
@@ -1102,55 +1096,122 @@ fn collect_strings(ts: TokenStream, out: &mut Vec<String>) {
 ///
 /// The dev exemption is by *role*: a `tests` directory holding a declared target
 /// or a reachable module is production and is scanned.
-/// A module-tree file with the directory its children resolve against.
-/// Crate roots carry their own directory; every discovered child carries
-/// the base decided at its declaration site (see `resolve_module`).
-#[derive(Debug, Clone)]
-struct DiscoveredFile {
-    path: PathBuf,
-    base: PathBuf,
-}
-
-/// Roots plus `mod` followers with resolution context, before the
-/// directory walk for strays.
-fn discover_modules(doc: &toml::Value, manifest_dir: &Path) -> (Vec<DiscoveredFile>, Vec<String>) {
-    let roots = crate_roots(doc, manifest_dir);
+/// Traverse production sources with full resolution context.
+///
+/// Deduplication is by source path *plus* resolution context: Rust can load
+/// the same file through two declarations with different child bases (an
+/// ordinary `mod outer;` and a `#[path = "outer.rs"] mod alias;` confer
+/// different directories on `outer.rs`'s children), and collapsing them
+/// inspects the wrong file depending on declaration order. Facts
+/// (imports, mentions, strings, includes, declarations) are
+/// base-independent and analysed once per path; children are resolved per
+/// visited context.
+///
+/// Roots resolve against their own directory, as do include targets (an
+/// include pastes tokens but keeps the included file's span). `follow_includes`
+/// additionally chases `include!` into dev-exempt directories; an include
+/// makes its target production.
+fn traverse(
+    doc: &toml::Value,
+    dir: &Path,
+    follow_includes: bool,
+) -> (BTreeMap<PathBuf, SourceFacts>, Vec<String>) {
+    fn parent_of(p: &Path) -> PathBuf {
+        p.parent().unwrap_or(Path::new(".")).to_path_buf()
+    }
+    let roots = crate_roots(doc, dir);
+    let mut facts_by_path: BTreeMap<PathBuf, SourceFacts> = BTreeMap::new();
     let mut problems = Vec::new();
-    let mut reachable: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut out = Vec::new();
-
-    let parent_of = |p: &Path| p.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let mut queue: Vec<DiscoveredFile> = roots
-        .iter()
-        .map(|r| DiscoveredFile {
-            path: r.clone(),
-            base: parent_of(r),
-        })
-        .collect();
-    while let Some(found) = queue.pop() {
-        if !found.path.is_file() || !reachable.insert(found.path.clone()) {
+    let mut seen_ctx: BTreeSet<(PathBuf, PathBuf)> = BTreeSet::new();
+    let mut queue: Vec<(PathBuf, PathBuf)> =
+        roots.iter().map(|r| (r.clone(), parent_of(r))).collect();
+    while let Some((path, base)) = queue.pop() {
+        if !seen_ctx.insert((path.clone(), base.clone())) {
             continue;
         }
-        match analyse_source_with_base(&found.path, &found.base) {
-            Ok(facts) => {
-                problems.extend(facts.unresolved);
-                for c in facts.children {
-                    queue.push(DiscoveredFile {
-                        path: c.path,
-                        base: c.base,
-                    });
+        if !path.is_file() {
+            // Declared-but-missing roots stay silent, as before; includes
+            // that miss fail closed below.
+            continue;
+        }
+        if !facts_by_path.contains_key(&path) {
+            match analyse_source(&path) {
+                Ok(facts) => {
+                    facts_by_path.insert(path.clone(), facts);
+                }
+                Err(e) => {
+                    problems.push(e);
+                    continue;
                 }
             }
-            Err(e) => problems.push(e),
         }
-        out.push(found);
+        let facts = facts_by_path[&path].clone();
+        let mut children = Vec::new();
+        let mut local = Vec::new();
+        resolve_mods(&base, &facts.mods, &mut children, &mut local);
+        problems.extend(local);
+        for c in children {
+            queue.push((c.path, c.base));
+        }
+        if follow_includes {
+            for arg in &facts.source_includes {
+                match resolve_include(&path, arg) {
+                    Some(target) => queue.push((target.clone(), parent_of(&target))),
+                    None => problems.push(format!(
+                        "{}: `include!({arg})` resolves to no readable Rust file; included production source that cannot be found cannot be cleared",
+                        path.display()
+                    )),
+                }
+            }
+        }
     }
-    (out, problems)
+    (facts_by_path, problems)
 }
 
+/// Resolve one level of declarations against `base`, threading inline
+/// modules textually (under `name`, or `path` when given).
+fn resolve_mods(
+    base: &Path,
+    mods: &[ModItem],
+    children: &mut Vec<ModuleChild>,
+    problems: &mut Vec<String>,
+) {
+    for m in mods {
+        match m {
+            ModItem::Load { name, path } => match resolve_module(base, name, path.as_deref()) {
+                Some(c) => children.push(c),
+                None => problems.push(format!(
+                    "`mod {name};` in {} resolves to no file",
+                    base.display()
+                )),
+            },
+            ModItem::Inline { name, path, inner } => {
+                let inner_base = match path {
+                    Some(p) => base.join(p),
+                    None => base.join(name),
+                };
+                resolve_mods(&inner_base, inner, children, problems);
+            }
+        }
+    }
+}
+
+/// Production Rust sources of one crate, and any problem found finding them.
+///
+/// Three sources, unioned:
+///
+/// * every module reachable from a Cargo production target, followed through
+///   `mod` declarations including `#[path]` overrides -- this is what makes a
+///   file production, regardless of which directory it sits in;
+/// * the crate roots themselves;
+/// * a walk of the crate directory excluding build output and the dev-only
+///   trees, which keeps unreachable stray files in scope.
+///
+/// The dev exemption is by *role*: a `tests` directory holding a declared target
+/// or a reachable module is production and is scanned.
 fn production_sources(doc: &toml::Value, manifest_dir: &Path) -> (Vec<PathBuf>, Vec<String>) {
-    let (mods, problems) = discover_modules(doc, manifest_dir);
-    let reachable: BTreeSet<PathBuf> = mods.iter().map(|f| f.path.clone()).collect();
+    let (scanned, problems) = traverse(doc, manifest_dir, false);
+    let reachable: BTreeSet<PathBuf> = scanned.keys().cloned().collect();
 
     // The directory walk, with the exemption withdrawn from any dev-named
     // directory that actually holds production code.
@@ -1228,144 +1289,18 @@ const STORAGE_FORBIDDEN_NAMES: &[&str] = &[
     "moxie-models",
 ];
 
-/// Production sources plus everything they pull in by `include!`, with the
-/// facts for each. The legitimate SHA implementation in moxie-format uses
-/// `include!`, so the mechanism is permitted and its targets are inspected
-/// rather than banned outright: an `include!` that resolves to a file using
-/// `std::fs` is the same breach as writing the `use` directly.
-///
-/// Include arguments are `include!` paths, hence relative to the including
-/// file. Only plain string literals resolve; anything computed (`concat!`,
-/// `env!`, …) fails closed, as does a target that is missing or unparsable.
-fn production_facts_with_includes(
+/// Facts for the include-aware rules: the unified traversal with includes.
+fn scanned_with_includes(
     doc: &toml::Value,
     dir: &Path,
 ) -> (Vec<(PathBuf, SourceFacts)>, Vec<String>) {
-    // `production_sources` follows `mod` declarations out of the Cargo
-    // targets and walks for strays; its problems stand. This loop analyses
-    // every file it names, then chases what it cannot see: `include!`
-    // targets (dev-exempt directories included -- an include makes its
-    // target production) and, from those, the `mod` declarations they carry.
-    // Mod children of mod-tree files are already in the set; re-following
-    // them here is deduplicated by `seen`.
-    //
-    // Resolution context is preserved per file, as rustc resolves it:
-    // crate roots and include targets resolve `mod` against their own
-    // directory (an include pastes tokens but keeps the included file's
-    // span, so `mod outer;` in an included `tests/entry.rs` is
-    // `tests/outer.rs`, not `src/outer.rs`); discovered modules resolve
-    // their children by the standard file-stem rule (`outer.rs` looks in
-    // `outer/`). Collapsing either context to the other inspects the wrong
-    // file -- a soundness hole, not a conservative approximation.
-    let (files, mut problems) = production_sources(doc, dir);
-    // Declaration-site bases for the mod tree, so re-analysis derives the
-    // same children `production_sources` followed. Walk strays (absent here)
-    // resolve against their own directory.
-    let (mods, _) = discover_modules(doc, dir);
-    let base_of: BTreeMap<PathBuf, PathBuf> = mods.into_iter().map(|f| (f.path, f.base)).collect();
-    let mut out: Vec<(PathBuf, SourceFacts)> = Vec::new();
-    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-    for file in files {
-        let analysed = match base_of.get(&file) {
-            Some(base) => analyse_source_with_base(&file, base),
-            None => analyse_source(&file, true),
-        };
-        match analysed {
-            Ok(facts) => {
-                seen.insert(file.clone());
-                out.push((file, facts));
-            }
-            Err(e) => problems.push(e),
-        }
-    }
-    // Work items from analysed files: includes to resolve, plus mod children
-    // to follow (which matters for files the mod-tree walk never visited).
-    let mut queue: Vec<Pending> = out
-        .iter()
-        .flat_map(|(f, facts)| Pending::from_facts(f.clone(), facts))
-        .collect();
-    while let Some(pending) = queue.pop() {
-        match pending {
-            Pending::Include { including, arg } => match resolve_include(&including, &arg) {
-                Some(target) => {
-                    if !seen.insert(target.clone()) {
-                        continue;
-                    }
-                    match analyse_source(&target, true) {
-                        Ok(facts) => {
-                            // Unresolved declarations propagate from included
-                            // files exactly as from mod-tree ones; the entry
-                            // file itself arrived by include, so nothing else
-                            // reports them.
-                            problems.extend(facts.unresolved.clone());
-                            queue.extend(Pending::from_facts(target.clone(), &facts));
-                            out.push((target, facts));
-                        }
-                        Err(e) => problems.push(e),
-                    }
-                }
-                None => problems.push(format!(
-                    "{}: `include!({arg})` resolves to no readable Rust file; included production source that cannot be found cannot be cleared",
-                    including.display()
-                )),
-            },
-            Pending::Module { path, base } => {
-                if !seen.insert(path.clone()) {
-                    continue;
-                }
-                match analyse_source_with_base(&path, &base) {
-                    Ok(facts) => {
-                        // Propagate unresolved declarations from included
-                        // files too: a `mod` that resolves nowhere is a
-                        // hiding place, wherever it is written.
-                        problems.extend(facts.unresolved.clone());
-                        queue.extend(Pending::from_facts(path.clone(), &facts));
-                        out.push((path, facts));
-                    }
-                    Err(e) => problems.push(e),
-                }
-            }
-        }
-    }
+    // The legitimate SHA implementation in moxie-format uses `include!`, so
+    // the mechanism is permitted and its targets are inspected rather than
+    // banned outright.
+    let (scanned, problems) = traverse(doc, dir, true);
+    let mut out: Vec<(PathBuf, SourceFacts)> = scanned.into_iter().collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     (out, problems)
-}
-
-/// One traversal step the mod-tree walk cannot see.
-enum Pending {
-    Include {
-        including: PathBuf,
-        arg: String,
-    },
-    /// A `mod`-declared file with the directory its children resolve
-    /// against, decided at the declaration site (see `resolve_module`).
-    /// `#[path]` confers the resolved file's parent with no stem step.
-    Module {
-        path: PathBuf,
-        base: PathBuf,
-    },
-}
-
-impl Pending {
-    fn from_facts(file: PathBuf, facts: &SourceFacts) -> Vec<Pending> {
-        let mut out: Vec<Pending> = facts
-            .source_includes
-            .iter()
-            .map(|arg| Pending::Include {
-                including: file.clone(),
-                arg: arg.clone(),
-            })
-            .collect();
-        // Children carry the base decided at their declaration site; the
-        // caller seeds the queue from analysed facts and the `seen` set
-        // already holds every mod-tree file, so re-queuing them is a no-op.
-        // This keeps one unified traversal for mixed chains.
-        out.extend(facts.children.iter().map(|c| Pending::Module {
-            path: c.path.clone(),
-            base: c.base.clone(),
-        }));
-        out
-    }
 }
 
 /// Resolve one `include!` argument against the including file.
@@ -1405,7 +1340,7 @@ fn check_format_is_io_free(
     crate_name: &str,
     out: &mut Vec<Violation>,
 ) {
-    let (scanned, problems) = production_facts_with_includes(doc, dir);
+    let (scanned, problems) = scanned_with_includes(doc, dir);
     for detail in problems {
         out.push(Violation {
             crate_name: crate_name.to_string(),
@@ -1437,7 +1372,7 @@ fn check_storage_names_no_model(
     crate_name: &str,
     out: &mut Vec<Violation>,
 ) {
-    let (scanned, problems) = production_facts_with_includes(doc, dir);
+    let (scanned, problems) = scanned_with_includes(doc, dir);
     for detail in problems {
         out.push(Violation {
             crate_name: crate_name.to_string(),
@@ -1610,7 +1545,7 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
                 });
             }
             for file in files {
-                let facts = match analyse_source(&file, true) {
+                let facts = match analyse_source(&file) {
                     Ok(f) => f,
                     Err(e) => {
                         out.push(Violation {
@@ -1955,7 +1890,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("lib.rs");
         std::fs::write(&file, src).unwrap();
-        let f = analyse_source(&file, true).expect("snippet parses");
+        let f = analyse_source(&file).expect("snippet parses");
         std::fs::remove_dir_all(&dir).ok();
         f
     }
@@ -2221,6 +2156,30 @@ mod tests {
     }
 
     #[test]
+    fn rustc_loads_both_contexts_of_a_dual_declared_file() {
+        // One file backing two modules (`alias` via `#[path]`, `outer`
+        // ordinarily) compiles *both* children: `alias::inner` beside the
+        // file, `outer::inner` under the stem. The dual-context fixtures
+        // assert the checker inspects both as well.
+        rustc_picks(
+            "dual contexts both load",
+            &[
+                (
+                    "src/lib.rs",
+                    "include!(\"../tests/entry.rs\");\npub use alias::inner::A;\npub use outer::inner::B;",
+                ),
+                (
+                    "tests/entry.rs",
+                    "#[path = \"outer.rs\"]\npub mod alias;\npub mod outer;",
+                ),
+                ("tests/outer.rs", "pub mod inner;"),
+                ("tests/inner.rs", "pub const A: &str = \"a\";"),
+                ("tests/outer/inner.rs", "pub const B: &str = \"b\";"),
+            ],
+        );
+    }
+
+    #[test]
     fn rustc_applies_the_stem_rule_to_ordinary_modules() {
         // Control: a normally loaded `outer.rs` looks in `outer/`.
         rustc_picks(
@@ -2381,7 +2340,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("lib.rs");
         std::fs::write(&f, "fn broken( {").unwrap();
-        assert!(analyse_source(&f, true).is_err());
+        assert!(analyse_source(&f).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

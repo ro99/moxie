@@ -1,0 +1,6 @@
+[package]
+name = "moxie-storage"
+version = "0.0.0"
+edition = "2024"
+
+# Must be accepted: same clean dual-context layout on the storage side.

@@ -1,0 +1,12 @@
+[package]
+name = "moxie-format"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: the same file loads through two declarations with
+# different child bases (`#[path]` first). Both `tests/inner.rs` (via the
+# path context) and `tests/outer/inner.rs` (via the ordinary context)
+# compile; the checker must inspect both regardless of declaration order.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "format touches the filesystem"

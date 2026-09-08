@@ -270,11 +270,11 @@ Deviations recorded, none silent:
 Gates (this machine, 2026-09-08): `fmt` PASS; `clippy -D warnings` PASS;
 `cargo test --workspace --locked --offline` PASS, 375 unit/integration + 4
 doctests at first implementation (was 332 + 4), 385 + 4 after the first
-review corrections, 386 + 4 after round 2, 390 + 4 after round 3 and
-394 + 4 after round 4; `arch-check` PASS
+review corrections, 386 + 4 after round 2, 390 + 4 after round 3,
+394 + 4 after round 4 and 395 + 4 after round 5; `arch-check` PASS
 (22 rejected + 1 accepted fixtures, 8 rules at first implementation;
 24 + 1 after the include-rule fixes, 27 + 1 after round 2, 29 + 3 after
-round 3, 31 + 5 after round 4); `spec-check` PASS (10 documents); no-driver lane PASS
+round 3, 31 + 5 after round 4, 35 + 7 after round 5); `spec-check` PASS (10 documents); no-driver lane PASS
 (394, `ldd` shows no `libcuda`); device lane `test-gpu` PASS (15 cases,
 `sm_86` + `sm_120` qualified) with the `CUDA_VISIBLE_DEVICES=1,2` negative
 check exiting 1 as intended. This task touches no CUDA.
@@ -431,5 +431,31 @@ Re-verified after round 4: `fmt` PASS; `clippy -D warnings` PASS;
 `cargo test --workspace --locked --offline` PASS, 394 unit/integration + 4
 doctests; `arch-check` PASS (31 rejected + 5 accepted, 8 rules);
 `spec-check` PASS (10 documents); no-driver lane PASS (398, no `libcuda`);
+device lane `test-gpu` re-run: PASS, 15 cases, `sm_86` + `sm_120`
+qualified, negative check exiting 1.
+
+### Review corrections, round 5 (2026-09-08, commit `61e59ee` not accepted)
+
+One finding remained; fixed inside this task.
+
+- **P2 — dedup discarded resolution contexts.** Traversal marked files
+  visited by pathname alone, so one file loaded through an ordinary and a
+  `#[path]` declaration kept only the first context -- order-dependently
+  missing the other. Analysis is now fully base-independent (declarations
+  recorded as a tree, never resolved during collection), and one unified
+  traversal dedups by path *plus* context while analysing once per path:
+  the same file under two bases yields both child sets. Fixtures
+  `format/storage-dual-context-path-first` and
+  `-dual-context-ordinary-first` encode both declaration orders with
+  decoys (all four compile under rustc, proving both files load); each
+  fails on the pre-fix checker and passes now. Positive
+  `*-with-dual-context-layout` counterparts guard clean dual use. A fifth
+  `rustc_picks` test pins that both contexts load. `production_sources`
+  shares the traversal, so the model rules inherit the fix.
+
+Re-verified after round 5: `fmt` PASS; `clippy -D warnings` PASS;
+`cargo test --workspace --locked --offline` PASS, 395 unit/integration + 4
+doctests; `arch-check` PASS (35 rejected + 7 accepted, 8 rules);
+`spec-check` PASS (10 documents); no-driver lane PASS (399, no `libcuda`);
 device lane `test-gpu` re-run: PASS, 15 cases, `sm_86` + `sm_120`
 qualified, negative check exiting 1.

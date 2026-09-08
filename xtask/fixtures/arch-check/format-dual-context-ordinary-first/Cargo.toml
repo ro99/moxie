@@ -1,0 +1,10 @@
+[package]
+name = "moxie-format"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: same dual-context layout with the declarations
+# reversed. Enforcement must not depend on declaration order.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "format touches the filesystem"

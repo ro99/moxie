@@ -1,5 +1,5 @@
-//! Included production source: reached from the crate root by `include!`, so it
-//! is production despite living in a dev-named directory.
+// Included production source: reached from the crate root by `include!`, so it
+// is production despite living in a dev-named directory.
 
 use std::fs;
 

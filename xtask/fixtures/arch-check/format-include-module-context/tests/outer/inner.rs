@@ -1,4 +1,4 @@
-//! The file rustc compiles. Must be inspected.
+// The file rustc compiles. Must be inspected.
 
 use std::fs;
 
