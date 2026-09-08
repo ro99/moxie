@@ -271,10 +271,10 @@ Gates (this machine, 2026-09-08): `fmt` PASS; `clippy -D warnings` PASS;
 `cargo test --workspace --locked --offline` PASS, 375 unit/integration + 4
 doctests at first implementation (was 332 + 4), 385 + 4 after the first
 review corrections, 386 + 4 after round 2, 390 + 4 after round 3,
-394 + 4 after round 4 and 395 + 4 after round 5; `arch-check` PASS
+394 + 4 after round 4, 395 + 4 after round 5 and 397 + 4 after round 6; `arch-check` PASS
 (22 rejected + 1 accepted fixtures, 8 rules at first implementation;
 24 + 1 after the include-rule fixes, 27 + 1 after round 2, 29 + 3 after
-round 3, 31 + 5 after round 4, 35 + 7 after round 5); `spec-check` PASS (10 documents); no-driver lane PASS
+round 3, 31 + 5 after round 4, 35 + 7 after round 5, 37 + 9 after round 6); `spec-check` PASS (10 documents); no-driver lane PASS
 (394, `ldd` shows no `libcuda`); device lane `test-gpu` PASS (15 cases,
 `sm_86` + `sm_120` qualified) with the `CUDA_VISIBLE_DEVICES=1,2` negative
 check exiting 1 as intended. This task touches no CUDA.
@@ -457,5 +457,31 @@ Re-verified after round 5: `fmt` PASS; `clippy -D warnings` PASS;
 `cargo test --workspace --locked --offline` PASS, 395 unit/integration + 4
 doctests; `arch-check` PASS (35 rejected + 7 accepted, 8 rules);
 `spec-check` PASS (10 documents); no-driver lane PASS (399, no `libcuda`);
+device lane `test-gpu` re-run: PASS, 15 cases, `sm_86` + `sm_120`
+qualified, negative check exiting 1.
+
+### Review corrections, round 6 (2026-09-08, commit `fb1e407` not accepted)
+
+One finding remained; fixed inside this task.
+
+- **P2 — `#[path]` used the module base.** The resolver applied one base
+  to both declaration kinds, so `#[path = "io.rs"]` in `src/outer.rs`
+  inspected the decoy `src/outer/io.rs` instead of the compiled `src/io.rs`.
+  Resolution is now split: ordinary children use the module base
+  (`resolve_child`), explicit `#[path]` uses the declaring file's directory
+  (`resolve_pathed`), each verified against rustc first -- including the
+  combination (probe E) and the cross-directory case, which resolves beside
+  the *loaded* file. The traversal threads both directories. New fixtures
+  `format/storage-path-in-ordinary-module` (with decoys, both compile) fail
+  on the old resolver and pass now; clean `*-with-path-in-module-layout`
+  counterparts guard the combination itself. A sixth `rustc_picks` test
+  pins the combination, and a systematic `checker_file_set_covers_rustc_
+  dep_info` test asserts every file rustc loads is inspected, across all
+  self-contained fixtures (verified to bite by breaking the resolver).
+
+Re-verified after round 6: `fmt` PASS; `clippy -D warnings` PASS;
+`cargo test --workspace --locked --offline` PASS, 397 unit/integration + 4
+doctests; `arch-check` PASS (37 rejected + 9 accepted, 8 rules);
+`spec-check` PASS (10 documents); no-driver lane PASS (401, no `libcuda`);
 device lane `test-gpu` re-run: PASS, 15 cases, `sm_86` + `sm_120`
 qualified, negative check exiting 1.

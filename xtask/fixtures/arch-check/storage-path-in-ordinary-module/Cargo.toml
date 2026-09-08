@@ -1,0 +1,9 @@
+[package]
+name = "moxie-storage"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: same `#[path]`-in-module rule on the storage side.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "storage interprets model metadata"

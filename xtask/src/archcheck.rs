@@ -947,43 +947,39 @@ fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
     }
 }
 
-/// Resolve `mod name;` to the file Cargo would compile, plus the directory
-/// that file's own children resolve against.
-///
-/// Ordinary declarations confer the file-stem rule (`outer.rs` looks in
-/// `outer/`); `#[path]` confers the resolved file's parent directory with
-/// no stem step. Both shapes are verified against rustc (see the
-/// `rustc_pins_module_resolution` tests): a `#[path]`-loaded
-/// `tests/outer.rs` looks for `mod inner;` in `tests/`, never in
-/// `tests/outer/`.
-fn resolve_module(dir: &Path, name: &str, path_attr: Option<&str>) -> Option<ModuleChild> {
-    match path_attr {
-        Some(p) => {
-            let file = dir.join(p);
-            if !file.is_file() {
-                return None;
-            }
-            let base = file.parent().unwrap_or(Path::new(".")).to_path_buf();
-            Some(ModuleChild { path: file, base })
-        }
-        None => {
-            let file = dir.join(format!("{name}.rs"));
-            if file.is_file() {
-                return Some(ModuleChild {
-                    base: dir.join(name),
-                    path: file,
-                });
-            }
-            let file = dir.join(name).join("mod.rs");
-            if file.is_file() {
-                return Some(ModuleChild {
-                    base: dir.join(name),
-                    path: file,
-                });
-            }
-            None
-        }
+/// Resolve an ordinary `mod name;` against the module base: `name.rs`
+/// (conferring `name/` on its children) or `name/mod.rs`. Verified against
+/// rustc: a normally loaded `outer.rs` looks for `mod inner;` in `outer/`.
+fn resolve_child(base: &Path, name: &str) -> Option<ModuleChild> {
+    let file = base.join(format!("{name}.rs"));
+    if file.is_file() {
+        return Some(ModuleChild {
+            base: base.join(name),
+            path: file,
+        });
     }
+    let file = base.join(name).join("mod.rs");
+    if file.is_file() {
+        return Some(ModuleChild {
+            base: base.join(name),
+            path: file,
+        });
+    }
+    None
+}
+
+/// Resolve `#[path = "..."] mod name;` against the declaring *file's*
+/// directory -- not the module base. Verified against rustc: `#[path =
+/// "io.rs"]` in `src/outer.rs` loads `src/io.rs`, never `src/outer/io.rs`,
+/// and a cross-directory `#[path]` resolves its children beside the loaded
+/// file. The loaded file confers its parent directory, with no stem step.
+fn resolve_pathed(file_dir: &Path, p: &str) -> Option<ModuleChild> {
+    let file = file_dir.join(p);
+    if !file.is_file() {
+        return None;
+    }
+    let base = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+    Some(ModuleChild { path: file, base })
 }
 
 /// Flatten one `use` tree onto `prefix`.
@@ -1148,7 +1144,15 @@ fn traverse(
         let facts = facts_by_path[&path].clone();
         let mut children = Vec::new();
         let mut local = Vec::new();
-        resolve_mods(&base, &facts.mods, &mut children, &mut local);
+        // Both directories: ordinary children use the context base, `#[path]`
+        // uses the file's own directory.
+        resolve_mods(
+            &parent_of(&path),
+            &base,
+            &facts.mods,
+            &mut children,
+            &mut local,
+        );
         problems.extend(local);
         for c in children {
             queue.push((c.path, c.base));
@@ -1168,9 +1172,14 @@ fn traverse(
     (facts_by_path, problems)
 }
 
-/// Resolve one level of declarations against `base`, threading inline
-/// modules textually (under `name`, or `path` when given).
+/// Resolve one level of declarations. Ordinary children resolve against
+/// `base` (the module base); explicit `#[path]` declarations resolve against
+/// `file_dir` (the directory of the file textually containing them) -- Rust
+/// distinguishes the two, and so must the traversal. Inline modules descend
+/// textually: nested ordinary declarations go under `name` (or `path`),
+/// while a nested `#[path]` still resolves against the enclosing file.
 fn resolve_mods(
+    file_dir: &Path,
     base: &Path,
     mods: &[ModItem],
     children: &mut Vec<ModuleChild>,
@@ -1178,11 +1187,21 @@ fn resolve_mods(
 ) {
     for m in mods {
         match m {
-            ModItem::Load { name, path } => match resolve_module(base, name, path.as_deref()) {
+            ModItem::Load { name, path: None } => match resolve_child(base, name) {
                 Some(c) => children.push(c),
                 None => problems.push(format!(
                     "`mod {name};` in {} resolves to no file",
                     base.display()
+                )),
+            },
+            ModItem::Load {
+                name,
+                path: Some(p),
+            } => match resolve_pathed(file_dir, p) {
+                Some(c) => children.push(c),
+                None => problems.push(format!(
+                    "`mod {name};` in {} resolves to no file",
+                    file_dir.display()
                 )),
             },
             ModItem::Inline { name, path, inner } => {
@@ -1190,7 +1209,7 @@ fn resolve_mods(
                     Some(p) => base.join(p),
                     None => base.join(name),
                 };
-                resolve_mods(&inner_base, inner, children, problems);
+                resolve_mods(file_dir, &inner_base, inner, children, problems);
             }
         }
     }
@@ -2177,6 +2196,155 @@ mod tests {
                 ("tests/outer/inner.rs", "pub const B: &str = \"b\";"),
             ],
         );
+    }
+
+    #[test]
+    fn rustc_resolves_path_inside_an_ordinary_module_beside_that_file() {
+        // The combination: `#[path]` resolves against the declaring file's
+        // directory even when that file is itself an ordinary module whose
+        // own children would use the stem rule.
+        rustc_picks(
+            "path inside ordinary module",
+            &[
+                ("src/lib.rs", "pub mod outer;\npub use outer::io::PICKED;"),
+                ("src/outer.rs", "#[path = \"io.rs\"]\npub mod io;"),
+                ("src/io.rs", "pub const PICKED: &str = \"io\";"),
+                (
+                    "src/outer/io.rs",
+                    "compile_error!(\"picked src/outer/io.rs\");",
+                ),
+            ],
+        );
+    }
+
+    /// Systematic backstop for module-resolution mismatches: for every
+    /// self-contained fixture crate, each `.rs` file rustc loads (per
+    /// `--emit=dep-info`) must be in the checker's scanned set. Fixture
+    /// assertions prove forbidden files are flagged; this proves no loaded
+    /// file escapes inspection in the first place -- in either direction of
+    /// declaration order and for every declaration kind combined.
+    ///
+    /// Skipped: `moxie-models-*` fixtures (they import workspace crates and
+    /// cannot compile standalone) and `format-includes-broken-module` (its
+    /// dangling `mod` fails compilation by design).
+    #[test]
+    fn checker_file_set_covers_rustc_dep_info() {
+        let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let tmp = std::env::temp_dir().join(format!("moxie-depinfo-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        let mut checked = 0usize;
+        for sub in ["arch-check", "arch-check-accepted"] {
+            let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(fixtures.join(sub))
+                .expect("fixture root readable")
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            dirs.sort();
+            for dir in dirs {
+                let manifest = dir.join("Cargo.toml");
+                if !manifest.is_file() {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&manifest).unwrap();
+                let doc: toml::Value = toml::from_str(&text).unwrap();
+                let name = doc
+                    .get("package")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                if name.starts_with("moxie-models") {
+                    continue;
+                }
+                if dir.file_name().and_then(|n| n.to_str()) == Some("format-includes-broken-module")
+                {
+                    continue;
+                }
+                let out = tmp.join(dir.file_name().unwrap());
+                std::fs::create_dir_all(&out).unwrap();
+                let compile = std::process::Command::new("rustc")
+                    .arg("--edition=2024")
+                    .arg("--crate-type=lib")
+                    .arg("--emit=dep-info")
+                    .arg(dir.join("src/lib.rs"))
+                    .arg("--out-dir")
+                    .arg(&out)
+                    .output()
+                    .expect("the pinned toolchain provides rustc");
+                assert!(
+                    compile.status.success(),
+                    "{name}: fixture must compile standalone:\n{}",
+                    String::from_utf8_lossy(&compile.stderr)
+                );
+                let d_path = out.join("lib.d");
+                let d_text = std::fs::read_to_string(&d_path)
+                    .unwrap_or_else(|_| panic!("{name}: no dep-info emitted"));
+                let rustc_files = parse_dep_info(&d_text, &dir);
+                assert!(
+                    !rustc_files.is_empty(),
+                    "{name}: dep-info parsed to nothing"
+                );
+                let (scanned, _) = traverse(&doc, &dir, true);
+                let scanned: std::collections::BTreeSet<std::path::PathBuf> = scanned
+                    .keys()
+                    .map(|p| {
+                        p.canonicalize().unwrap_or_else(|_| {
+                            panic!("{name}: scanned file vanished: {}", p.display())
+                        })
+                    })
+                    .collect();
+                for f in &rustc_files {
+                    assert!(
+                        scanned.contains(f),
+                        "{name}: rustc loads {} but the checker never inspects it",
+                        f.display()
+                    );
+                }
+                checked += 1;
+            }
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+        assert!(checked >= 25, "zoo too small to mean anything: {checked}");
+    }
+
+    /// Parse a `.d` dep-info file into canonicalized `.rs` paths under `dir`.
+    fn parse_dep_info(text: &str, dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        // Line continuations, then whitespace split with `\ `-escapes.
+        let flat = text.replace("\\\n", " ");
+        let mut tokens = Vec::new();
+        let mut cur = String::new();
+        let mut chars = flat.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' && chars.peek() == Some(&' ') {
+                chars.next();
+                cur.push(' ');
+            } else if c.is_whitespace() || c == ':' {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+            } else {
+                cur.push(c);
+            }
+        }
+        if !cur.is_empty() {
+            tokens.push(cur);
+        }
+        let canonical_dir = dir.canonicalize().unwrap();
+        let mut out = Vec::new();
+        for tok in tokens {
+            let p = std::path::PathBuf::from(&tok);
+            if !p.extension().is_some_and(|x| x == "rs") {
+                continue;
+            }
+            if let Ok(c) = p.canonicalize()
+                && c.starts_with(&canonical_dir)
+            {
+                out.push(c);
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     #[test]
