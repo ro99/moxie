@@ -1,5 +1,10 @@
 # Checkpoint inventory — M0
 
+Local artifact roots for current and future inspection are [`/models` and
+`/fast/models`](artifact-roots.md). The root designation is a location contract,
+not an assertion that every download is complete or approved; record exact
+subdirectories, revisions and hashes in this inventory as they are inspected.
+
 **Historical inventory under the initial NVFP4 design.** Preserve the measured source facts below. The precision options/questions here are superseded by [ADR 0003](../decisions/adr/0003-int4-int8-bf16-weight-family.md): initial execution is INT4/INT8/BF16, and no FP4-to-INT4 bulk conversion has been authorized. See [the new owner candidate metadata](quantization-candidates.md); those remote candidates have not been downloaded by this review. The presence of FP4 checkpoints on disk does not make them the mandatory starting catalog.
 
 Captured 2026-09-07 by reading `config.json`, `hf_quant_config.json` and

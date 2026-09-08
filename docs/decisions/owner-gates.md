@@ -97,11 +97,19 @@ taking a silent exception.
 converting Kimi K3 (1.5 T) does not fit anywhere as a second copy. No
 higher-precision original of Kimi K3 is known to be available.
 
-Which storage paths, disk-space budget, source checkpoints, and conversion time may be used? Is a
-higher-precision original available?
+The owner has designated `/models` and `/fast/models` as local checkpoint roots;
+see [artifact-roots](../evidence/artifact-roots.md). This records where agents
+should look, not which revisions are approved or whether a download is complete.
 
-**Blocks:** writing large converted artifacts, and downloading checkpoints. The rewrite request is
-not blanket permission for terabytes of new data.
+The location question is answered for inspection: owner-directed downloads may be placed under
+`/models` or `/fast/models`. The remaining questions are the disk-space budget, which source
+revisions are approved, conversion time, retention and whether a higher-precision original is
+available.
+
+**Blocks:** writing large converted artifacts, unapproved additional downloads, and any bulk copy or
+requantization. A task must still name the exact artifact, source revision, expected size and
+retention policy before an agent mutates storage. The rewrite request is not blanket permission for
+terabytes of new data.
 
 ## O6 — Performance limits and acceptable regression
 

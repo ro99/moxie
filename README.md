@@ -14,6 +14,9 @@ an inference engine.** Nothing here loads, imports or executes a model. The
 passes, with the exact commands, and what remains missing; the
 [support matrix](docs/evidence/support-matrix.md) is the list of claims and the gate IDs behind
 them. No model-throughput claim has been established, and no checkpoint has been imported.
+Downloaded checkpoints for later, explicitly scoped tasks are found under the owner-designated
+local roots [`/models` and `/fast/models`](docs/evidence/artifact-roots.md); their presence does not
+mean that Moxie has imported or supports them.
 
 ## Repository layout
 

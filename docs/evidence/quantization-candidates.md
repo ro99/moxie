@@ -1,6 +1,6 @@
 # Requested integer checkpoints — metadata evidence
 
-Read-only inspection on 2026-09-07. Sources: each public Hugging Face model API and the `config.json` at the immutable revision below. No checkpoint weights downloaded, no remote checkpoint code executed, no model benchmark run. These are candidates supplied by the owner, not a release catalog or a quality endorsement.
+Read-only inspection on 2026-09-07. Sources: each public Hugging Face model API and the `config.json` at the immutable revision below. These candidates may be downloaded under the owner-designated roots [`/models` and `/fast/models`](artifact-roots.md); inspect exact local files and hashes before treating a candidate as an artifact. No remote checkpoint code may be executed. These are candidates supplied by the owner, not a release catalog or a quality endorsement.
 
 ## Observed schemas
 

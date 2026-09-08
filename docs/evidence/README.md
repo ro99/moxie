@@ -2,6 +2,7 @@
 
 - `topology-p2p.md` — patched-driver topology and measurements. The CUDA peer-access API allows the 3090 pair, not every pair despite permissive nvidia-smi output. Read the actual measured pair/message size before generalizing latency or collective results.
 - `quantization-candidates.md` — pinned public configurations for the owner's ten INT4/INT8 candidates; metadata evidence only, no weights or quality claims.
+- `artifact-roots.md` — owner-designated local checkpoint roots (`/models` and `/fast/models`) and the inspection, hashing and authorization rules for using them.
 - `../tasks/0002-m0-review-and-integer-transition.md` — M0 review, reproduced checks, architecture
   bypasses and correction gates, followed by the results of two correction passes and the exact
   commands behind them. The second pass's findings are the ones to read first: each was reproduced
