@@ -1233,6 +1233,116 @@ fn an_operand_precision_the_node_contract_rejects_is_refused_at_construction() {
 }
 
 #[test]
+fn a_cache_that_does_not_cover_the_graph_is_refused_before_anything_is_written() {
+    // Sixth review, reproduced: the interpreter wrote the staged appends and
+    // advanced `executed` *before* the fallible `kv.commit`, so a graph and
+    // cache whose layers disagreed left the counter at 1, the cache lengths at
+    // [0, 1], and no way to retry cleanly. The mismatch is a property of the
+    // graph and the cache, so it is now settled before the first write.
+    let f = build(A, 83);
+    let mut state = f.state();
+    state.append_prompt(ROOT, 1).unwrap();
+
+    // The fixture graph writes one layer; give it a two-layer cache.
+    let mut wide = KvCache::for_branch(2, &state, ROOT).unwrap();
+    let before = state.frontiers(ROOT).unwrap();
+    let e = Interpreter::new()
+        .run(
+            &f.graph,
+            &f.bindings(&[1], &[0]),
+            &mut state,
+            ROOT,
+            &mut wide,
+            &Cancel::never(),
+        )
+        .unwrap_err();
+    assert_eq!(e.kind(), "invalid_artifact");
+    assert!(e.to_string().contains("layer"), "{e}");
+
+    // Nothing moved: counters, cache contents, retained results.
+    assert_eq!(state.frontiers(ROOT).unwrap(), before);
+    assert!(wide.contents().iter().all(|l| l.is_empty()));
+    assert!(!state.next_logits_valid(ROOT));
+    assert!(state.live_results().is_empty());
+
+    // And the sequence still runs cleanly with a cache that does cover it.
+    let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
+    let out = step(&f, &mut state, &mut kv, &[1], 0, &Cancel::never()).unwrap();
+    assert_eq!(out.prefix, 1);
+    assert!(state.next_logits_valid(ROOT));
+    assert!(kv.is_coherent());
+
+    // A cache with too few layers is refused the same way.
+    let mut none = KvCache::for_branch(0, &state, ROOT).unwrap_err();
+    let _ = &mut none;
+}
+
+#[test]
+fn a_graph_whose_attention_layers_are_not_dense_is_refused_at_construction() {
+    // The other half of the same defect: a graph using layer 1 and not layer 0
+    // would leave a cache layer permanently empty, so its length could never
+    // agree with the frontier. Settled when the graph is built.
+    let mut g = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
+    let rows = rows_symbol();
+    let pos = g.input(
+        "positions",
+        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+    );
+    let x = g.input(
+        "x",
+        TensorSpec::new(act(Precision::Bf16), vec![rows.clone(), Dim::constant(8)]),
+    );
+    let a = g
+        .node(
+            OpParams::Attention {
+                heads: 2,
+                head_dim: 4,
+                visibility: Visibility::Causal,
+                layer: 1,
+            },
+            &[x, x, x, pos],
+        )
+        .unwrap();
+    let e = g.finish(a, &oracles()).unwrap_err();
+    assert_eq!(e.kind(), "invalid_artifact");
+    assert!(e.to_string().contains("without gaps"), "{e}");
+
+    // Layer 0 alone is fine, and so is 0 then 1.
+    let mut g = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
+    let pos = g.input(
+        "positions",
+        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+    );
+    let x = g.input(
+        "x",
+        TensorSpec::new(act(Precision::Bf16), vec![rows.clone(), Dim::constant(8)]),
+    );
+    let a0 = g
+        .node(
+            OpParams::Attention {
+                heads: 2,
+                head_dim: 4,
+                visibility: Visibility::Causal,
+                layer: 0,
+            },
+            &[x, x, x, pos],
+        )
+        .unwrap();
+    let a1 = g
+        .node(
+            OpParams::Attention {
+                heads: 2,
+                head_dim: 4,
+                visibility: Visibility::Causal,
+                layer: 1,
+            },
+            &[a0, a0, a0, pos],
+        )
+        .unwrap();
+    assert!(g.finish(a1, &oracles()).is_ok());
+}
+
+#[test]
 fn generation_advances_the_state_the_way_the_contracts_require() {
     // A prompt, then three decode steps, checking the four counters and the
     // provenance rules at each boundary.

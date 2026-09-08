@@ -139,6 +139,23 @@ impl Interpreter {
         // of it. Without that check the provenance rules guard a counter while
         // the bytes come from anywhere.
         kv.check_owner(state, branch)?;
+        // ... and it must cover exactly the layers this graph writes. A graph
+        // whose attention sits on a layer the cache does not have, or a cache
+        // with a layer no attention writes, means the layers advance at
+        // different rates and the cache can never agree with the frontier again.
+        // The sixth review found that discovered *after* the state had advanced;
+        // it is a property of the graph and the cache, so it is checked here,
+        // before anything is written.
+        let graph_layers = graph.attention_layers().len();
+        if kv.layers() != graph_layers {
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "the cache has {} layer(s) but the graph writes {graph_layers}; every \
+                     layer must advance together or the cache cannot track the frontier",
+                    kv.layers()
+                ),
+            });
+        }
         let mut values: Vec<Option<Value>> = vec![None; graph.value_count()];
 
         // Bind inputs and weights.
@@ -270,15 +287,50 @@ impl Interpreter {
             });
         }
 
-        // Commit. Everything above either succeeded or returned without writing.
+        // Publication.
+        //
+        // Everything above either succeeded or returned without writing. What
+        // follows must not be able to half-succeed, so the order is: the one
+        // undoable mutation first, then the irreversible one, then only
+        // operations whose preconditions are already established.
+        //
+        // The last precondition to check is the counter, because `execute` is
+        // the step that cannot be taken back.
+        before
+            .executed
+            .checked_add(rows as u64)
+            .ok_or(Error::InvalidRequest {
+                field: "executed",
+                detail: "token counter overflow".into(),
+            })?;
+
+        // Undoable: remember what to truncate back to.
+        let lengths: Vec<usize> = kv.contents().iter().map(|l| l.len()).collect();
         for a in staged.drain(..) {
-            kv.append(a.layer, a.position, a.key, a.value)?;
+            if let Err(e) = kv.append(a.layer, a.position, a.key, a.value) {
+                kv.truncate_layers(&lengths);
+                return Err(e);
+            }
         }
-        state.execute(branch, rows as u64)?;
+
+        // Irreversible, and cannot fail: the branch resolved above and the
+        // counter was just checked. The two calls after it cannot fail either --
+        // `commit` because every layer received exactly `rows` appends, so the
+        // cache length now equals `executed`, and `record_logits` because its
+        // prefix *is* `executed`. Each is still propagated rather than
+        // unwrapped: if one of those arguments is ever wrong, a failed step is a
+        // better outcome than a panic, and the cache is put back either way.
+        if let Err(e) = state.execute(branch, rows as u64) {
+            kv.truncate_layers(&lengths);
+            return Err(e);
+        }
         let prefix = state.frontiers(branch)?.executed;
         // The cache now describes a longer prefix, and records the lineage of
         // each prefix it gained at the moment it gained it.
-        kv.commit(state, branch)?;
+        if let Err(e) = kv.commit(state, branch) {
+            kv.truncate_layers(&lengths);
+            return Err(e);
+        }
         let retained = state.record_logits(branch, prefix)?;
 
         Ok(StepOutput {

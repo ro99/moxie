@@ -179,6 +179,17 @@ impl KvCache {
         self.layers.len()
     }
 
+    /// Put every layer back to a recorded length, discarding what was appended
+    /// since. Used to undo a partially applied step.
+    pub(crate) fn truncate_layers(&mut self, lengths: &[usize]) {
+        for (l, n) in self.layers.iter_mut().zip(lengths) {
+            l.truncate(*n as u64);
+        }
+        if let Some(shortest) = lengths.iter().min() {
+            self.owner.stamps.truncate(shortest + 1);
+        }
+    }
+
     /// The stored histories, without the ownership stamp.
     ///
     /// For comparing what two caches *hold*. Two caches on different sequences

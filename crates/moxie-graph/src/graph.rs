@@ -374,6 +374,23 @@ impl Graph {
         self.values.len()
     }
 
+    /// The KV layers this graph's attention nodes use, ascending.
+    ///
+    /// `finish` guarantees these are exactly `0..n`, so an executor can check a
+    /// cache covers the graph by comparing one count.
+    pub fn attention_layers(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .nodes
+            .iter()
+            .filter_map(|n| match n.params {
+                OpParams::Attention { layer, .. } => Some(layer),
+                _ => None,
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     /// Every state kind this graph touches, so a caller can build the schema its
     /// sequence state needs rather than guessing.
     pub fn state_effects(&self) -> Vec<(NodeId, StateEffect)> {
@@ -737,6 +754,29 @@ impl GraphBuilder {
         }
         for n in &self.nodes {
             n.contract.check_lowerable(oracles)?;
+        }
+        // KV layers must be numbered densely from zero. `node` already refuses
+        // two attention nodes on one layer; this is the other half. A graph that
+        // used layer 1 and not layer 0 would leave a cache layer permanently
+        // empty, so the cache's length would disagree with the frontier forever
+        // -- which the sixth review hit, after the state had already advanced.
+        let mut layers: Vec<u32> = self
+            .nodes
+            .iter()
+            .filter_map(|n| match n.params {
+                OpParams::Attention { layer, .. } => Some(layer),
+                _ => None,
+            })
+            .collect();
+        layers.sort_unstable();
+        for (i, l) in layers.iter().enumerate() {
+            if *l != i as u32 {
+                return Err(Error::InvalidArtifact {
+                    detail: format!(
+                        "attention layers must be numbered from zero without gaps; got {layers:?}"
+                    ),
+                });
+            }
         }
         Ok(Graph {
             values: self.values,

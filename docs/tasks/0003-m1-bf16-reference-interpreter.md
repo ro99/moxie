@@ -290,6 +290,12 @@ what any bound over data that can be subnormal should use.
   `executed` counter is untouched, the accepted prefix is untouched, and no result is recorded. A
   cancelled step leaves the state exactly as it found it, which the acceptance tests check by
   running a full step afterwards and comparing against a never-cancelled run.
+- **Publication is ordered so it cannot half-succeed.** Every precondition -- the cache's ownership,
+  its layer coverage, the counter's headroom -- is settled before the first write. Then the undoable
+  mutation (the KV appends) happens first and is truncated back on any error, and the irreversible
+  one (`execute`) happens after it, followed only by operations whose preconditions the earlier
+  checks already established. The sixth review found the previous order writing the cache and
+  advancing the counter *before* a fallible commit, which left no way to retry.
 - `KvPages` is `RestoreCapability::Truncate`, so a rollback drops the tail. No `Explicit` component
   is in this slice's schema, and no restore evidence is therefore required — stated so that a later
   reader does not think the evidence machinery was skipped.
@@ -680,3 +686,55 @@ well-behaved part of it. Two properties a kernel gate should carry forward:
   qualified against it must state its data's conditioning.
 - **Both have an additive floor.** Relative bounds are silent in the subnormal range, and any gate
   written as "relative error below X" will be wrong there for the same reason these two were.
+
+
+---
+
+## Third review correction, 2026-09-08
+
+One P1 remained: **a failed commit could leave both the sequence state and the KV contents
+modified.**
+
+Reproduced as reported. The interpreter wrote the staged appends and advanced `executed` before
+calling the fallible `kv.commit`, so a graph writing one set of layers against a cache with a
+different set failed *after* both had moved:
+
+```text
+invalid artifact: the cache holds 0 position(s) but the branch has executed 1
+  executed:        0 -> 1
+  cache lengths:   [0, 1]
+  check_owner:     rejects, so there is no clean retry
+```
+
+That contradicted the interpreter's own promise that a failure leaves state untouched — the promise
+the cancellation tests check at every node depth, which held only because cancellation returns before
+the publication block.
+
+Two corrections, and the first is the one that matters:
+
+- **The mismatch is settled before anything is written.** Whether a cache covers a graph is a
+  property of the two of them, not something to discover mid-commit. `run` compares
+  `Graph::attention_layers()` against the cache's layer count at entry, and `GraphBuilder::finish`
+  additionally requires attention layers to be numbered densely from zero — a graph using layer 1 and
+  not layer 0 would leave a cache layer permanently empty, so its length could never agree with the
+  frontier again. The review was right that this combination has to be rejected before mutation even
+  if the slice does not support it.
+- **The publication order no longer allows a half-step.** Every precondition is checked first,
+  including the counter's headroom, which is the last thing that could make the irreversible
+  `execute` fail. The undoable mutation (the KV appends) goes first and is truncated back on any
+  error; `execute` follows it; and the two calls after `execute` have preconditions the earlier
+  checks already established — `commit` because every layer received exactly `rows` appends, so the
+  cache length now equals `executed`, and `record_logits` because its prefix *is* `executed`. Each
+  still propagates its error and restores the cache rather than being unwrapped: if that reasoning
+  is ever wrong, a failed step is a better outcome than a panic or a corrupted one.
+
+The regression test asserts what the review asked for: unchanged counters, unchanged cache contents,
+no retained result after the failure, and a clean successful execution afterwards. A second test
+covers the graph-construction half.
+
+| Command | Before | After |
+|---|---|---|
+| `cargo test --workspace --locked --offline` | 309 + 1 doctest | **311 + 1 doctest** |
+| device lane | 317 + 2 doctests | **319 + 2 doctests** |
+| `fmt`, `clippy -D warnings`, `arch-check`, `spec-check`, no-driver host build | PASS | **PASS** |
+| `cargo xtask-cuda test-gpu`, hidden-SM120 gate | PASS / exit 1 | **PASS / exit 1** |
