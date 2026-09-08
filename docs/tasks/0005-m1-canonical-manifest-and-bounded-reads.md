@@ -129,13 +129,15 @@ a stated gap rather than claiming the manifest covers it.
 ### Opening is bounded too
 
 The fifth review's point about task 0005: budgeting payload reads alone does not bound *opening*.
-Three limits, all checked before anything is deserialized or read:
+Three limits. Only the first is enforceable before deserialization; the other two are properties of
+the parsed value and are checked while traversing it, which the table says explicitly because the
+distinction is what bounds each stage:
 
-| Limit | Value | Why |
-|---|---|---|
-| `manifest.toml` file size | 4 MiB | Read with a capped reader that errors at the limit rather than reading the file and then measuring it. A manifest is kilobytes; four orders of magnitude of headroom is not a constraint on any real artifact. |
-| tensor entries | 1,048,576 | An artifact with more logical tensors than that is not a model, and the cap is what stops a manifest whose cost is in its entry count rather than its bytes. |
-| architecture-metadata nesting depth and node count | 64 deep, 65,536 nodes | The opaque tree is the one field with no schema, so it is the one that can be adversarially shaped. Depth is checked during traversal, not after building the value. |
+| Limit | Value | Enforced | Why |
+|---|---|---|---|
+| `manifest.toml` file size | 4 MiB | **before parsing** — a capped reader that errors at the limit rather than reading the file and then measuring it | It bounds the parse itself. A manifest is kilobytes; four orders of magnitude of headroom constrains no real artifact. |
+| tensor entries | 1,048,576 | **after parsing, before validation** — the first thing checked on the deserialized value | The file-size cap already bounds this indirectly; the explicit cap is what makes the bound on later `O(n)` and `O(n log n)` validation passes stated rather than incidental. |
+| architecture-metadata nesting depth and node count | 64 deep, 65,536 nodes | **during traversal** — depth is checked as the tree is walked, and the walk stops at the limit | The opaque tree is the one field with no schema, so it is the one that can be adversarially shaped, and it is walked twice: once to validate, once to hash into artifact identity. |
 
 `toml` is a non-recursive parser, so the depth limit is a bound on *our* traversal and hashing of
 the value, not a stack-overflow guard for the parser. Stated so it is not mistaken for one.

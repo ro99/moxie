@@ -42,11 +42,70 @@ struct CacheOwner {
     stamps: Vec<PrefixLineage>,
 }
 
-/// What a cache transaction must put back if it aborts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What an abort would have to put back, bound to the cache and the transaction
+/// that produced it.
+///
+/// **Not `Clone`, and both resolvers consume it**, but neither of those is what
+/// makes it safe. The sixth review reproduced why a journal of pure lengths is
+/// not enough on its own: one saved from an empty cache and already committed
+/// was applied again afterwards and deleted committed rows while the sequence
+/// stayed advanced, and one applied to a *newer* transaction resolved it and
+/// unlocked the cache. A journal is an authority to undo one specific
+/// transaction on one specific cache, so it carries both identities and is
+/// checked against them before anything is mutated.
+///
+/// Two of the three rejected cases are unreachable in safe code, and are checked
+/// anyway. A journal cannot be duplicated:
+///
+/// ```compile_fail
+/// # use moxie_interp::KvCache;
+/// # use moxie_state::{SequenceState, StateKind, ROOT};
+/// let state = SequenceState::new([StateKind::KvPages]);
+/// let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
+/// let j = kv.begin().unwrap();
+/// let copy = j.clone(); // a second authority to undo the same transaction
+/// drop(copy);
+/// ```
+///
+/// and cannot be applied twice, because resolving it consumes it:
+///
+/// ```compile_fail
+/// # use moxie_interp::KvCache;
+/// # use moxie_state::{SequenceState, StateKind, ROOT};
+/// let state = SequenceState::new([StateKind::KvPages]);
+/// let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
+/// let j = kv.begin().unwrap();
+/// kv.commit(j).unwrap();
+/// kv.abort(j).unwrap(); // moved into `commit` above
+/// ```
+///
+/// What the types cannot rule out is a journal from a *different* cache, which
+/// is why the identity check is not merely belt and braces.
+#[derive(Debug)]
 pub struct CacheJournal {
+    cache: CacheId,
+    txn: u64,
     lengths: Vec<usize>,
     stamps: usize,
+}
+
+/// Process-unique identity of one cache.
+///
+/// Allocated from a process counter for the same reason [`SequenceId`] is: a
+/// caller that supplies its own can duplicate it, and then a journal from one
+/// cache validates against another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheId(u64);
+
+impl CacheId {
+    fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 /// Per-layer key/value history, bound to one branch of one sequence.
@@ -54,7 +113,8 @@ pub struct CacheJournal {
 pub struct KvCache {
     layers: Vec<KvHistory>,
     owner: CacheOwner,
-    /// Set between `begin` and `commit`/`abort`.
+    id: CacheId,
+    /// The transaction open on this cache, if any.
     ///
     /// A cache transaction is **append-only**, and this is what enforces it. The
     /// journal records lengths, so `abort` can drop rows that were added; it
@@ -64,7 +124,10 @@ pub struct KvCache {
     /// short and fails ownership validation. `moxie-state` refuses the same
     /// operation for the same duration, so the two participants have one rule
     /// rather than two.
-    in_transaction: bool,
+    open_txn: Option<u64>,
+    /// Monotone, so a resolved transaction's number is never issued again and a
+    /// stale journal can never match a later one.
+    next_txn: u64,
 }
 
 impl KvCache {
@@ -96,7 +159,9 @@ impl KvCache {
                 branch,
                 stamps: vec![lineage],
             },
-            in_transaction: false,
+            id: CacheId::next(),
+            open_txn: None,
+            next_txn: 1,
         })
     }
 
@@ -215,32 +280,82 @@ impl KvCache {
     /// into a consumer's buffers; `moxie-interp` is the composition point that
     /// opens and resolves both together.
     pub fn begin(&mut self) -> Result<CacheJournal> {
-        if self.in_transaction {
+        if let Some(t) = self.open_txn {
             return Err(Error::InvalidRequest {
                 field: "kv_cache",
-                detail: "this cache already has a transaction open".into(),
+                detail: format!("this cache already has transaction {t} open"),
             });
         }
-        self.in_transaction = true;
+        let txn = self.next_txn;
+        self.next_txn += 1;
+        self.open_txn = Some(txn);
         Ok(CacheJournal {
+            cache: self.id,
+            txn,
             lengths: self.layers.iter().map(KvHistory::len).collect(),
             stamps: self.owner.stamps.len(),
         })
     }
 
-    /// Close a cache transaction, keeping everything it appended.
-    pub fn commit(&mut self, journal: CacheJournal) {
-        let _ = journal;
-        self.in_transaction = false;
+    /// The journal must be this cache's, and must be the transaction currently
+    /// open on it.
+    ///
+    /// Both halves, and the sixth review reproduced what each one costs when it
+    /// is missing. Transaction numbers are monotone and cleared on resolution,
+    /// so "the one currently open" also means "not already resolved" -- a
+    /// journal is a single-use authority, which is why both resolvers take it by
+    /// value and it is not `Clone`.
+    fn check_journal(&self, journal: &CacheJournal) -> Result<()> {
+        if journal.cache != self.id {
+            return Err(Error::InvalidRequest {
+                field: "kv_cache",
+                detail: format!(
+                    "this journal belongs to cache {}, not {}; a journal is an authority \
+                     to undo one transaction on one cache",
+                    journal.cache.get(),
+                    self.id.get()
+                ),
+            });
+        }
+        match self.open_txn {
+            Some(t) if t == journal.txn => Ok(()),
+            Some(t) => Err(Error::InvalidRequest {
+                field: "kv_cache",
+                detail: format!(
+                    "this journal describes transaction {}, but {t} is the one open",
+                    journal.txn
+                ),
+            }),
+            None => Err(Error::InvalidRequest {
+                field: "kv_cache",
+                detail: format!(
+                    "transaction {} is already resolved; a journal cannot be applied twice",
+                    journal.txn
+                ),
+            }),
+        }
     }
 
-    /// Restore exactly what `begin` recorded. Infallible.
-    pub fn abort(&mut self, journal: &CacheJournal) {
+    /// Close a cache transaction, keeping everything it appended.
+    pub fn commit(&mut self, journal: CacheJournal) -> Result<()> {
+        self.check_journal(&journal)?;
+        self.open_txn = None;
+        Ok(())
+    }
+
+    /// Restore exactly what `begin` recorded.
+    ///
+    /// Fails only on a journal that is not this cache's open transaction, and
+    /// **checks before mutating**, so a rejected journal changes nothing. Once
+    /// past that check the restoration itself cannot fail: it is truncation.
+    pub fn abort(&mut self, journal: CacheJournal) -> Result<()> {
+        self.check_journal(&journal)?;
         for (l, n) in self.layers.iter_mut().zip(&journal.lengths) {
             l.truncate(*n as u64);
         }
         self.owner.stamps.truncate(journal.stamps);
-        self.in_transaction = false;
+        self.open_txn = None;
+        Ok(())
     }
 
     /// The stored histories, without the ownership stamp.
@@ -298,13 +413,14 @@ impl KvCache {
                 detail: "rolling back a cache that belongs to another sequence or branch".into(),
             });
         }
-        if self.in_transaction {
+        if let Some(t) = self.open_txn {
             return Err(Error::InvalidRequest {
                 field: "kv_cache",
-                detail: "this cache has a transaction open; a cache transaction is \
-                         append-only, because its journal records lengths and cannot \
-                         put removed rows back"
-                    .into(),
+                detail: format!(
+                    "this cache has transaction {t} open; a cache transaction is \
+                     append-only, because its journal records lengths and cannot put \
+                     removed rows back"
+                ),
             });
         }
         if prefix > self.len() as u64 {
@@ -449,6 +565,62 @@ mod tests {
     }
 
     #[test]
+    fn a_journal_from_another_cache_is_refused_before_it_mutates_anything() {
+        // Sixth review, reproduced. A journal used to be pure lengths, so one
+        // saved from an empty cache and already resolved could be applied to a
+        // cache that had since committed rows -- it deleted them while the
+        // sequence stayed advanced -- and one applied to a *newer* transaction
+        // resolved it and unlocked the cache. It is now an authority to undo one
+        // transaction on one cache, checked before anything is mutated.
+        let (mut state_a, mut a) = state_and_cache(1);
+        let (_state_b, mut b) = state_and_cache(1);
+        state_a.append_prompt(ROOT, 2).unwrap();
+        for p in 0..2u64 {
+            a.append(0, p, vec![p as f32], vec![-(p as f32)]).unwrap();
+        }
+        state_a.execute(ROOT, 2).unwrap();
+        a.stamp(&state_a, ROOT).unwrap();
+        let before = a.contents().to_vec();
+
+        // `b`'s journal was taken while `b` was empty; applying it to `a` would
+        // truncate `a` to nothing.
+        let foreign = b.begin().unwrap();
+        let txn_a = a.begin().unwrap();
+        let e = a.abort(foreign).unwrap_err();
+        assert!(e.to_string().contains("belongs to cache"), "{e}");
+        assert_eq!(
+            a.contents(),
+            &before[..],
+            "a refused journal mutates nothing"
+        );
+
+        // And `a`'s own transaction is still open and still resolvable.
+        assert!(a.begin().is_err());
+        a.abort(txn_a).unwrap();
+        assert_eq!(a.contents(), &before[..]);
+        a.check_owner(&state_a, ROOT).unwrap();
+    }
+
+    #[test]
+    fn a_journal_cannot_resolve_a_transaction_that_is_not_open() {
+        // The third rejected case: the cache is right, but nothing is open.
+        // Unreachable in safe code -- resolving consumes the journal -- so this
+        // reaches it the only way left, through the private constructor, to show
+        // the check is real rather than decorative.
+        let (_state, mut kv) = state_and_cache(1);
+        let journal = kv.begin().unwrap();
+        let replica = CacheJournal {
+            cache: journal.cache,
+            txn: journal.txn,
+            lengths: journal.lengths.clone(),
+            stamps: journal.stamps,
+        };
+        kv.commit(journal).unwrap();
+        let e = kv.abort(replica).unwrap_err();
+        assert!(e.to_string().contains("already resolved"), "{e}");
+    }
+
+    #[test]
     fn a_cache_transaction_is_append_only() {
         // Fifth review, reproduced: the journal records lengths, so `abort` can
         // drop rows that were added but cannot recreate rows that were removed.
@@ -470,7 +642,7 @@ mod tests {
         let e = kv.rollback_to(&state, ROOT, 1).unwrap_err();
         assert!(e.to_string().contains("append-only"), "{e}");
         kv.append(0, 2, vec![9.0], vec![9.0]).unwrap();
-        kv.abort(&journal);
+        kv.abort(journal).unwrap();
 
         assert_eq!(kv.contents(), &before[..]);
         kv.check_owner(&state, ROOT).unwrap();

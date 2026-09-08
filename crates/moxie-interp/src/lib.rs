@@ -43,7 +43,7 @@ use moxie_state::{LogitsHandle, SequenceState};
 use moxie_types::BranchId;
 use moxie_types::{Error, Result};
 
-pub use kv::{CacheJournal, KvCache};
+pub use kv::{CacheId, CacheJournal, KvCache};
 pub use tensor::{HostTensor, Value};
 
 /// A cancellation token checked at every operation boundary.
@@ -328,14 +328,16 @@ impl Interpreter {
         let txn = match state.begin(branch) {
             Ok(t) => t,
             Err(e) => {
-                kv.abort(&cache_journal);
+                kv.abort(cache_journal)
+                    .expect("the journal was opened on this cache above");
                 return Err(e);
             }
         };
         match self.publish(state, branch, kv, &mut staged, rows, cancel) {
             Ok(prefix_and_handle) => {
                 state.commit_prefix(txn, 0)?;
-                kv.commit(cache_journal);
+                kv.commit(cache_journal)
+                    .expect("the journal was opened on this cache above");
                 let (prefix, retained) = prefix_and_handle;
                 Ok(StepOutput {
                     logits,
@@ -347,7 +349,8 @@ impl Interpreter {
                 // Both halves, unconditionally, and neither can fail: `abort` is
                 // assignment and truncation on an id this function just opened.
                 state.abort(txn).expect("the transaction was opened above");
-                kv.abort(&cache_journal);
+                kv.abort(cache_journal)
+                    .expect("the journal was opened on this cache above");
                 Err(e)
             }
         }

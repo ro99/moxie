@@ -172,9 +172,9 @@ change). Nothing in the contract was adjusted once a test ran.
 | `cargo xtask-cuda test-gpu` | **PASS**, 15 cases, `sm_86` and `sm_120` qualified |
 | `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, `UNQUALIFIED sm_120`, as intended |
 
-Host counts by crate, after the fifth review's corrections: `moxie-oracles` 114, `moxie-format` 54,
-`moxie-state` 39, `xtask` 30, `moxie-interp` 15 + 27 integration, `moxie-types` 22, `moxie-graph` 11,
-`moxie-cuda` 9, `moxie-model-api` 5, `moxie-kernels` 1.
+Host counts by crate, after the sixth review's correction: `moxie-oracles` 114, `moxie-format` 54,
+`moxie-state` 39, `xtask` 30, `moxie-interp` 17 + 27 integration, `moxie-types` 22, `moxie-graph` 11,
+`moxie-cuda` 9, `moxie-model-api` 5, `moxie-kernels` 1; 3 doctests, 2 of them `compile_fail`.
 
 ### What was built
 
@@ -353,3 +353,65 @@ The record described paging as M4. M1.4 asks for "appendable paged state **plus*
 so the initial paged implementation is an M1 requirement; M4 adds paged *device* attention,
 host-backed page streaming and growth admission on top of it. This task narrows to the transaction
 half deliberately. The support matrix now says the same.
+
+---
+
+## Sixth review corrections, 2026-09-08
+
+A sixth review of `1eca710` accepted the five transaction fixes and the rewritten failure-injection
+test, and found **one remaining blocker**: `CacheJournal` carried no identity. It was reproduced and
+closed.
+
+| Command | Before | After |
+|---|---|---|
+| `cargo test --workspace --locked --offline` | 328 + 1 doctest | **330 + 3 doctests** |
+| device lane | 336 + 2 doctests | **338 + 4 doctests** |
+| `fmt`, `clippy -D warnings`, `arch-check`, `spec-check`, no-driver host build | PASS | **PASS** |
+| `cargo xtask-cuda test-gpu`, hidden-SM120 gate | PASS / exit 1 | **PASS / exit 1** |
+
+### A journal was data; it is now an authority · closed
+
+`CacheJournal` was `Clone` and held only lengths and a stamp count. `commit` ignored its contents and
+`abort` took it by reference, so nothing tied a journal to the cache or the transaction it came from.
+Both consequences reproduce:
+
+- **A resolved journal deleted committed rows.** Take a journal from an empty cache, commit it, then
+  append two rows and execute. Applying the saved journal afterwards truncated the cache to zero
+  while the sequence stayed at prefix 2 — the exact divergence the transaction exists to prevent,
+  produced by the mechanism meant to prevent it.
+- **A stale journal resolved a newer transaction.** Open a real transaction, then `commit` the old
+  journal: `in_transaction` cleared, and `begin` succeeded again while the real transaction was
+  still outstanding. The append-only rule from the fifth review was unlocked by the same move.
+
+A journal is now an authority to undo **one transaction on one cache**, and three things enforce it,
+none of them sufficient alone — which is the review's point:
+
+| | Enforces |
+|---|---|
+| `CacheJournal` carries a process-unique `CacheId` | a journal from another cache is refused |
+| it carries the transaction number, and `next_txn` is monotone | a journal for a resolved or superseded transaction is refused; a number is never reissued |
+| it is not `Clone`, and `commit`/`abort` take it **by value** | it cannot be duplicated or applied twice |
+
+`check_journal` runs **before any mutation**, so a rejected journal changes nothing; that is
+asserted rather than argued. `commit` and `abort` now return `Result`, and `Interpreter::run`
+`expect`s on both because it opened the journal on that cache three lines earlier — the same shape
+as the existing `state.abort(txn).expect(...)`.
+
+### What is tested, and how
+
+- `a_journal_from_another_cache_is_refused_before_it_mutates_anything` — the runtime case, asserting
+  the contents are untouched and that the cache's own transaction is still open and still
+  resolvable afterwards.
+- `a_journal_cannot_resolve_a_transaction_that_is_not_open` — reaches the third arm through the
+  private constructor, because resolving consumes the journal and safe code cannot get there.
+- Two `compile_fail` doctests for the cases the type system now rules out: cloning a journal, and
+  applying one twice. Both were checked with `compile_fail` removed, and each fails with exactly
+  one error — `E0599 no method named clone` and `E0382 use of moved value` — rather than passing for
+  an unrelated reason.
+
+### Task 0005 wording, corrected
+
+The review was right that the contract claimed all three opening limits are enforced before
+deserialization. Only the manifest's file size is; the tensor-entry cap and the
+architecture-metadata depth and node counts are necessarily checked while traversing the parsed
+value. The table now says which is which.
