@@ -953,14 +953,14 @@ fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
 
 /// Resolve an ordinary `mod name;` against the module base: `name.rs`
 /// or `name/mod.rs`, conferring `name/` on the child's ordinary children.
-/// The child's path base is the resolving base unchanged: `#[path]` inside
-/// the child resolves where `#[path]` in the parent would.
-fn resolve_child(base: &Path, name: &str, pbase: &Path) -> Option<ModuleChild> {
+/// Entering a file resets its path base to that file's parent. In
+/// particular `name/mod.rs` and `name.rs` have different path bases.
+fn resolve_child(base: &Path, name: &str) -> Option<ModuleChild> {
     let file = base.join(format!("{name}.rs"));
     if file.is_file() {
         return Some(ModuleChild {
             obase: base.join(name),
-            pbase: pbase.to_path_buf(),
+            pbase: file.parent()?.to_path_buf(),
             path: file,
         });
     }
@@ -968,7 +968,7 @@ fn resolve_child(base: &Path, name: &str, pbase: &Path) -> Option<ModuleChild> {
     if file.is_file() {
         return Some(ModuleChild {
             obase: base.join(name),
-            pbase: pbase.to_path_buf(),
+            pbase: file.parent()?.to_path_buf(),
             path: file,
         });
     }
@@ -1202,7 +1202,7 @@ fn resolve_mods(
 ) {
     for m in mods {
         match m {
-            ModItem::Load { name, path: None } => match resolve_child(obase, name, pbase) {
+            ModItem::Load { name, path: None } => match resolve_child(obase, name) {
                 Some(c) => children.push(c),
                 None => problems.push(format!(
                     "`mod {name};` in {} resolves to no file",
@@ -1224,7 +1224,7 @@ fn resolve_mods(
                 // descends: ordinary children go under it, and so does a
                 // nested `#[path]` (verified against rustc, probes F/G).
                 let inner_base = match path {
-                    Some(p) => obase.join(p),
+                    Some(p) => pbase.join(p),
                     None => obase.join(name),
                 };
                 resolve_mods(&inner_base, &inner_base, inner, children, problems);
@@ -2363,6 +2363,151 @@ mod tests {
         out.sort();
         out.dedup();
         out
+    }
+
+    #[test]
+    fn generated_module_combinations_match_rustc_and_enforce_both_boundaries() {
+        // Exhaust all three-step chains, not just the last reported shape.
+        // The generator predicts a layout; rustc must actually compile it and
+        // its dependency set must equal the traversal's set. Then the leaf is
+        // made forbidden and both ownership rules must identify that leaf.
+        const KINDS: usize = 7;
+        fn write(path: &Path, text: &str) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        fn chain(
+            kinds: &[usize],
+            file: &Path,
+            ordinary: &Path,
+            pathed: &Path,
+            depth: usize,
+        ) -> (String, PathBuf) {
+            let Some((&kind, rest)) = kinds.split_first() else {
+                let leaf = pathed.join("leaf.rs");
+                write(&leaf, "pub fn leaf() {}\n");
+                return ("#[path = \"leaf.rs\"] pub mod leaf;\n".into(), leaf);
+            };
+            let name = format!("m{depth}");
+            match kind {
+                0 | 1 => {
+                    let child = if kind == 0 {
+                        ordinary.join(format!("{name}.rs"))
+                    } else {
+                        ordinary.join(&name).join("mod.rs")
+                    };
+                    let (body, leaf) = chain(
+                        rest,
+                        &child,
+                        &ordinary.join(&name),
+                        child.parent().unwrap(),
+                        depth + 1,
+                    );
+                    write(&child, &body);
+                    (format!("pub mod {name};\n"), leaf)
+                }
+                2 => {
+                    let rel = format!("rel{depth}/loaded.rs");
+                    let child = pathed.join(&rel);
+                    let base = child.parent().unwrap();
+                    let (body, leaf) = chain(rest, &child, base, base, depth + 1);
+                    write(&child, &body);
+                    (format!("#[path = {rel:?}] pub mod {name};\n"), leaf)
+                }
+                3 | 4 => {
+                    let rel = format!("inline{depth}");
+                    let base = if kind == 3 {
+                        ordinary.join(&name)
+                    } else {
+                        pathed.join(&rel)
+                    };
+                    let (body, leaf) = chain(rest, file, &base, &base, depth + 1);
+                    let attr = if kind == 4 {
+                        format!("#[path = {rel:?}] ")
+                    } else {
+                        String::new()
+                    };
+                    (format!("{attr}pub mod {name} {{\n{body}}}\n"), leaf)
+                }
+                5 | 6 => {
+                    let rel = if kind == 5 {
+                        format!("inc{depth}/entry.rs")
+                    } else {
+                        format!("inc{depth}.rs")
+                    };
+                    let child = file.parent().unwrap().join(&rel);
+                    let base = child.parent().unwrap();
+                    let (body, leaf) = chain(rest, &child, base, base, depth + 1);
+                    write(&child, &body);
+                    (format!("include!({rel:?});\n"), leaf)
+                }
+                _ => unreachable!(),
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("moxie-module-matrix-{}", std::process::id()));
+        // create_dir deliberately refuses stale/colliding test directories.
+        std::fs::create_dir(&dir).unwrap();
+        for case in 0..KINDS.pow(3) {
+            let kinds = [case / KINDS / KINDS, case / KINDS % KINDS, case % KINDS];
+            let root = dir.join(format!("case{case}"));
+            let src = root.join("src");
+            let file = src.join("lib.rs");
+            let (body, leaf) = chain(&kinds, &file, &src, &src, 0);
+            write(&file, &body);
+            let manifest =
+                "[package]\nname = \"moxie-format\"\nversion = \"0.0.0\"\nedition = \"2024\"\n";
+            write(&root.join("Cargo.toml"), manifest);
+            let compile = std::process::Command::new("rustc")
+                .args([
+                    "--edition=2024",
+                    "--crate-type=lib",
+                    "--emit=metadata,dep-info",
+                ])
+                .arg(&file)
+                .arg("--out-dir")
+                .arg(&root)
+                .output()
+                .unwrap();
+            assert!(
+                compile.status.success(),
+                "chain {kinds:?}: {}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+            let doc = toml::from_str(manifest).unwrap();
+            let (scanned, problems) = traverse(&doc, &root, true);
+            assert!(problems.is_empty(), "chain {kinds:?}: {problems:?}");
+            let actual: BTreeSet<_> = scanned.keys().map(|p| p.canonicalize().unwrap()).collect();
+            let expected: BTreeSet<_> =
+                parse_dep_info(&std::fs::read_to_string(root.join("lib.d")).unwrap(), &root)
+                    .into_iter()
+                    .collect();
+            assert_eq!(actual, expected, "chain {kinds:?}");
+            assert!(
+                check_tree(&root).unwrap().is_empty(),
+                "clean chain {kinds:?}"
+            );
+            write(
+                &leaf,
+                "pub fn leaf() { let _ = std::fs::read(\"gemma\"); }\n",
+            );
+            for (name, rule) in [
+                ("moxie-format", rule::FORMAT_USES_FILESYSTEM),
+                ("moxie-storage", rule::STORAGE_NAMES_MODEL),
+            ] {
+                write(
+                    &root.join("Cargo.toml"),
+                    &manifest.replace("moxie-format", name),
+                );
+                let violations = check_tree(&root).unwrap();
+                assert!(
+                    violations
+                        .iter()
+                        .any(|v| v.rule == rule && v.detail.contains(leaf.to_str().unwrap())),
+                    "chain {kinds:?}, {name}: {violations:?}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

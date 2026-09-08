@@ -511,3 +511,45 @@ doctests; `arch-check` PASS (39 rejected + 11 accepted, 8 rules);
 `spec-check` PASS (10 documents); no-driver lane PASS (405, no `libcuda`);
 device lane `test-gpu` re-run: PASS, 15 cases, `sm_86` + `sm_120`
 qualified, negative check exiting 1.
+
+### Implementation takeover (2026-09-08, base `05aba41`)
+
+Owner requested direct implementation of the remaining resolver corrections.
+Changes remain local for review; no commit or push was made by this pass.
+The task contract, production crates and legacy snapshot are unchanged.
+
+- Entering an ordinary module file now resets the path-attribute base to
+  the loaded file's parent, instead of inheriting the enclosing module's
+  path base. This covers both nested `name.rs` and `name/mod.rs` layouts.
+- An inline module's own `#[path]` override resolves against the path base,
+  not the ordinary-child base. Its descendants then inherit that resolved
+  inline directory for both kinds of declaration.
+- Four permanent negative fixtures cover nested file and `mod.rs` layouts
+  on both ownership boundaries, with harmless decoy files. The existing
+  compiler dependency-coverage test includes them.
+- A generated test exhausts all 343 three-declaration chains over seven
+  forms: ordinary files, `mod.rs`, cross-directory path-loaded files,
+  ordinary inline modules, path-overridden inline modules, and same- or
+  cross-directory includes. Every generated clean layout must compile with
+  `rustc --emit=metadata,dep-info`; its dependency set must exactly match
+  the checker's scanned set. Replacing its leaf with forbidden content must
+  trigger both the format/filesystem and storage/model boundary rules at
+  the actual leaf. This tests combinations, not just individual syntax
+  forms; it is not a claim to cover all Rust syntax or macro expansion.
+
+Negative experiments were run before the corresponding corrections: the
+generated test first failed on ordinary/ordinary/ordinary because the
+checker searched the crate root for the leaf. After correcting file entry,
+ordinary/ordinary/path-overridden-inline failed to compile under the
+old inline-base assumption. Correcting that assumption in the resolver and
+fixture generator made all 343 compiler-checked cases pass. No acceptance
+threshold or ownership rule was relaxed.
+
+Verification: full offline host suite PASS (402 unit/integration + 4
+doctests); architecture gate PASS (43 negative + 11 positive fixtures,
+8 rules); spec gate PASS (10 documents); formatting and clippy with denied
+warnings PASS. No-driver host build and full suite PASS (402 + 4), with
+CUDA removed from `PATH` and no `libcuda` in `ldd`.
+GPU gates were not rerun for this tooling-only correction: device code,
+shared SHA and storage are unchanged, so the preceding device results are
+carried forward, not reported as new measurements.

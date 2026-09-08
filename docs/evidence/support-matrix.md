@@ -16,10 +16,10 @@ matrix exists to prevent.
 |---|---|---|---|
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
-| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 401 unit/integration tests + 4 doctests |
-| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 39 negative + 11 positive fixtures, 8 rules |
+| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 402 unit/integration tests + 4 doctests |
+| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 43 negative + 11 positive fixtures, 8 rules; 343 generated module combinations checked against rustc by the host suite |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
-| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 401 unit/integration tests + 4 doctests, `ldd` shows no `libcuda` |
+| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 402 unit/integration tests + 4 doctests, `ldd` shows no `libcuda` |
 | `G-GPU-SM86` | `cargo xtask-cuda test-gpu --profile sm86` | device | passed, RTX 3090 x2 |
 | `G-GPU-SM120` | `cargo xtask-cuda test-gpu --profile sm120` | device | passed, RTX 5060 Ti |
 | `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 15 cases, both architectures qualified |
@@ -30,6 +30,8 @@ matrix exists to prevent.
 
 Device gates ran by hand on this machine. No CI runner executes them; see
 [toolchain.md](toolchain.md).
+Device results are carried forward from `05aba41` for the subsequent
+tooling-only resolver correction; they were not remeasured in that pass.
 
 Counts are from 2026-09-08 after [task 0005](../tasks/0005-m1-canonical-manifest-and-bounded-reads.md); the M0
 enforcement counts they grew from are in
