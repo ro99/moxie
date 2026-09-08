@@ -1,0 +1,11 @@
+[package]
+name = "moxie-format"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: a `#[path]` nested in an inline module resolves against
+# the inline module's directory (`src/outer/`), not the enclosing file --
+# `src/outer/io.rs` here (verified against rustc).
+
+[package.metadata.moxie-arch-check]
+expect-rule = "format touches the filesystem"

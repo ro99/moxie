@@ -271,10 +271,12 @@ Gates (this machine, 2026-09-08): `fmt` PASS; `clippy -D warnings` PASS;
 `cargo test --workspace --locked --offline` PASS, 375 unit/integration + 4
 doctests at first implementation (was 332 + 4), 385 + 4 after the first
 review corrections, 386 + 4 after round 2, 390 + 4 after round 3,
-394 + 4 after round 4, 395 + 4 after round 5 and 397 + 4 after round 6; `arch-check` PASS
+394 + 4 after round 4, 395 + 4 after round 5, 397 + 4 after round 6 and
+401 + 4 after round 7; `arch-check` PASS
 (22 rejected + 1 accepted fixtures, 8 rules at first implementation;
 24 + 1 after the include-rule fixes, 27 + 1 after round 2, 29 + 3 after
-round 3, 31 + 5 after round 4, 35 + 7 after round 5, 37 + 9 after round 6); `spec-check` PASS (10 documents); no-driver lane PASS
+round 3, 31 + 5 after round 4, 35 + 7 after round 5, 37 + 9 after round 6
+and 39 + 11 after round 7); `spec-check` PASS (10 documents); no-driver lane PASS
 (394, `ldd` shows no `libcuda`); device lane `test-gpu` PASS (15 cases,
 `sm_86` + `sm_120` qualified) with the `CUDA_VISIBLE_DEVICES=1,2` negative
 check exiting 1 as intended. This task touches no CUDA.
@@ -483,5 +485,29 @@ Re-verified after round 6: `fmt` PASS; `clippy -D warnings` PASS;
 `cargo test --workspace --locked --offline` PASS, 397 unit/integration + 4
 doctests; `arch-check` PASS (37 rejected + 9 accepted, 8 rules);
 `spec-check` PASS (10 documents); no-driver lane PASS (401, no `libcuda`);
+device lane `test-gpu` re-run: PASS, 15 cases, `sm_86` + `sm_120`
+qualified, negative check exiting 1.
+
+### Review corrections, round 7 (2026-09-08, commit `1178627` not accepted)
+
+One finding remained; fixed inside this task.
+
+- **P2 — inline `#[path]` used the file base.** The traversal passed the
+enclosing file's directory through inline modules unchanged, so `#[path =
+"io.rs"]` nested in `mod outer { ... }` inspected `src/io.rs` instead of
+the compiled `src/outer/io.rs`. Resolution now threads two directories:
+ordinary children use the module base, `#[path]` uses the path base, and an
+inline module establishes both equally as it descends. The rule was probed
+against rustc first (inline in root and in a file, nested inline modules,
+pathed inline modules), then encoded: four new `rustc_picks` tests cover
+inline modules in crate roots and ordinary files, nesting, and `#[path]`
+overrides. New fixtures `format/storage-inline-path-context` (with decoys)
+and clean `*-with-inline-path-layout` counterparts on each boundary; the
+dep-info coverage test exercises them automatically.
+
+Re-verified after round 7: `fmt` PASS; `clippy -D warnings` PASS;
+`cargo test --workspace --locked --offline` PASS, 401 unit/integration + 4
+doctests; `arch-check` PASS (39 rejected + 11 accepted, 8 rules);
+`spec-check` PASS (10 documents); no-driver lane PASS (405, no `libcuda`);
 device lane `test-gpu` re-run: PASS, 15 cases, `sm_86` + `sm_120`
 qualified, negative check exiting 1.

@@ -1,0 +1,6 @@
+[package]
+name = "moxie-format"
+version = "0.0.0"
+edition = "2024"
+
+# Must be accepted: clean `#[path]` nested in a clean inline module.

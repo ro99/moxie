@@ -763,16 +763,20 @@ enum ModItem {
     },
 }
 
-/// A `mod`-declared file plus the directory its children resolve against.
+/// A `mod`-declared file plus the two directories its children resolve
+/// against.
 ///
-/// The base is decided at the declaration site, not from the file path:
-/// ordinary declarations confer the file-stem rule, while `#[path]`
-/// confers the resolved file's parent directory (verified against rustc).
-/// A bare path plus a universal root/non-root flag cannot express both.
+/// Rust distinguishes them: ordinary children use the module base (`obase`;
+/// the file-stem rule), while explicit `#[path]` declarations use the path
+/// base (`pbase`). For roots, include targets and `#[path]`-loaded files
+/// the two coincide; for ordinarily loaded `outer.rs` they are `DIR/outer/`
+/// and `DIR`. An inline module establishes both equally as it descends. All
+/// shapes are verified against rustc (see the `rustc_picks` tests).
 #[derive(Debug, Clone)]
 struct ModuleChild {
     path: PathBuf,
-    base: PathBuf,
+    obase: PathBuf,
+    pbase: PathBuf,
 }
 
 /// Parse one file and collect its facts. Collection is fully
@@ -948,38 +952,46 @@ fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
 }
 
 /// Resolve an ordinary `mod name;` against the module base: `name.rs`
-/// (conferring `name/` on its children) or `name/mod.rs`. Verified against
-/// rustc: a normally loaded `outer.rs` looks for `mod inner;` in `outer/`.
-fn resolve_child(base: &Path, name: &str) -> Option<ModuleChild> {
+/// or `name/mod.rs`, conferring `name/` on the child's ordinary children.
+/// The child's path base is the resolving base unchanged: `#[path]` inside
+/// the child resolves where `#[path]` in the parent would.
+fn resolve_child(base: &Path, name: &str, pbase: &Path) -> Option<ModuleChild> {
     let file = base.join(format!("{name}.rs"));
     if file.is_file() {
         return Some(ModuleChild {
-            base: base.join(name),
+            obase: base.join(name),
+            pbase: pbase.to_path_buf(),
             path: file,
         });
     }
     let file = base.join(name).join("mod.rs");
     if file.is_file() {
         return Some(ModuleChild {
-            base: base.join(name),
+            obase: base.join(name),
+            pbase: pbase.to_path_buf(),
             path: file,
         });
     }
     None
 }
 
-/// Resolve `#[path = "..."] mod name;` against the declaring *file's*
-/// directory -- not the module base. Verified against rustc: `#[path =
-/// "io.rs"]` in `src/outer.rs` loads `src/io.rs`, never `src/outer/io.rs`,
-/// and a cross-directory `#[path]` resolves its children beside the loaded
-/// file. The loaded file confers its parent directory, with no stem step.
-fn resolve_pathed(file_dir: &Path, p: &str) -> Option<ModuleChild> {
-    let file = file_dir.join(p);
+/// Resolve `#[path = "..."] mod name;` against the path base. The loaded
+/// file confers its parent directory as *both* bases, with no stem step.
+/// Verified against rustc across four shapes: same-directory, cross-
+/// directory (beside the loaded file, not the declaring one), inside an
+/// ordinary module file (beside the declaring file, not the module base),
+/// and nested in inline modules.
+fn resolve_pathed(pbase: &Path, p: &str) -> Option<ModuleChild> {
+    let file = pbase.join(p);
     if !file.is_file() {
         return None;
     }
     let base = file.parent().unwrap_or(Path::new(".")).to_path_buf();
-    Some(ModuleChild { path: file, base })
+    Some(ModuleChild {
+        path: file,
+        obase: base.clone(),
+        pbase: base,
+    })
 }
 
 /// Flatten one `use` tree onto `prefix`.
@@ -1118,11 +1130,18 @@ fn traverse(
     let roots = crate_roots(doc, dir);
     let mut facts_by_path: BTreeMap<PathBuf, SourceFacts> = BTreeMap::new();
     let mut problems = Vec::new();
-    let mut seen_ctx: BTreeSet<(PathBuf, PathBuf)> = BTreeSet::new();
-    let mut queue: Vec<(PathBuf, PathBuf)> =
-        roots.iter().map(|r| (r.clone(), parent_of(r))).collect();
-    while let Some((path, base)) = queue.pop() {
-        if !seen_ctx.insert((path.clone(), base.clone())) {
+    // Deduplication is by path plus both bases: one file loaded through two
+    // declarations with different contexts visits twice.
+    let mut seen_ctx: BTreeSet<(PathBuf, PathBuf, PathBuf)> = BTreeSet::new();
+    let mut queue: Vec<(PathBuf, PathBuf, PathBuf)> = roots
+        .iter()
+        .map(|r| {
+            let d = parent_of(r);
+            (r.clone(), d.clone(), d)
+        })
+        .collect();
+    while let Some((path, obase, pbase)) = queue.pop() {
+        if !seen_ctx.insert((path.clone(), obase.clone(), pbase.clone())) {
             continue;
         }
         if !path.is_file() {
@@ -1144,23 +1163,20 @@ fn traverse(
         let facts = facts_by_path[&path].clone();
         let mut children = Vec::new();
         let mut local = Vec::new();
-        // Both directories: ordinary children use the context base, `#[path]`
-        // uses the file's own directory.
-        resolve_mods(
-            &parent_of(&path),
-            &base,
-            &facts.mods,
-            &mut children,
-            &mut local,
-        );
+        resolve_mods(&obase, &pbase, &facts.mods, &mut children, &mut local);
         problems.extend(local);
         for c in children {
-            queue.push((c.path, c.base));
+            queue.push((c.path, c.obase, c.pbase));
         }
         if follow_includes {
             for arg in &facts.source_includes {
                 match resolve_include(&path, arg) {
-                    Some(target) => queue.push((target.clone(), parent_of(&target))),
+                    Some(target) => {
+                        // Include targets resolve like roots: both bases are
+                        // their own directory.
+                        let d = parent_of(&target);
+                        queue.push((target, d.clone(), d));
+                    }
                     None => problems.push(format!(
                         "{}: `include!({arg})` resolves to no readable Rust file; included production source that cannot be found cannot be cleared",
                         path.display()
@@ -1172,44 +1188,46 @@ fn traverse(
     (facts_by_path, problems)
 }
 
-/// Resolve one level of declarations. Ordinary children resolve against
-/// `base` (the module base); explicit `#[path]` declarations resolve against
-/// `file_dir` (the directory of the file textually containing them) -- Rust
-/// distinguishes the two, and so must the traversal. Inline modules descend
-/// textually: nested ordinary declarations go under `name` (or `path`),
-/// while a nested `#[path]` still resolves against the enclosing file.
+/// Resolve one level of declarations against two directories. Ordinary
+/// children resolve against `obase` (the module base); explicit `#[path]`
+/// declarations resolve against `pbase` (the path base) -- Rust
+/// distinguishes the two, and so must the traversal. Inline modules
+/// establish both bases equally as they descend.
 fn resolve_mods(
-    file_dir: &Path,
-    base: &Path,
+    obase: &Path,
+    pbase: &Path,
     mods: &[ModItem],
     children: &mut Vec<ModuleChild>,
     problems: &mut Vec<String>,
 ) {
     for m in mods {
         match m {
-            ModItem::Load { name, path: None } => match resolve_child(base, name) {
+            ModItem::Load { name, path: None } => match resolve_child(obase, name, pbase) {
                 Some(c) => children.push(c),
                 None => problems.push(format!(
                     "`mod {name};` in {} resolves to no file",
-                    base.display()
+                    obase.display()
                 )),
             },
             ModItem::Load {
                 name,
                 path: Some(p),
-            } => match resolve_pathed(file_dir, p) {
+            } => match resolve_pathed(pbase, p) {
                 Some(c) => children.push(c),
                 None => problems.push(format!(
                     "`mod {name};` in {} resolves to no file",
-                    file_dir.display()
+                    pbase.display()
                 )),
             },
             ModItem::Inline { name, path, inner } => {
+                // An inline module establishes both bases equally as it
+                // descends: ordinary children go under it, and so does a
+                // nested `#[path]` (verified against rustc, probes F/G).
                 let inner_base = match path {
-                    Some(p) => base.join(p),
-                    None => base.join(name),
+                    Some(p) => obase.join(p),
+                    None => obase.join(name),
                 };
-                resolve_mods(file_dir, &inner_base, inner, children, problems);
+                resolve_mods(&inner_base, &inner_base, inner, children, problems);
             }
         }
     }
@@ -2345,6 +2363,81 @@ mod tests {
         out.sort();
         out.dedup();
         out
+    }
+
+    #[test]
+    fn rustc_resolves_path_nested_in_an_inline_module() {
+        // `#[path]` inside `mod outer { ... }` resolves against the inline
+        // module's directory, not the enclosing file.
+        rustc_picks(
+            "inline nested path, crate root",
+            &[
+                (
+                    "src/lib.rs",
+                    "pub mod outer { #[path = \"io.rs\"] pub mod io; }\npub use outer::io::PICKED;",
+                ),
+                ("src/outer/io.rs", "pub const PICKED: &str = \"io\";"),
+                ("src/io.rs", "compile_error!(\"picked src/io.rs\");"),
+            ],
+        );
+    }
+
+    #[test]
+    fn rustc_resolves_path_nested_in_an_inline_module_in_a_file() {
+        // Same rule one level deeper: the inline module's directory wins
+        // over both the enclosing file and its module base.
+        rustc_picks(
+            "inline nested path, module file",
+            &[
+                (
+                    "src/lib.rs",
+                    "pub mod outer;\npub use outer::wrap::q::PICKED;",
+                ),
+                (
+                    "src/outer.rs",
+                    "pub mod wrap { #[path = \"q.rs\"] pub mod q; }",
+                ),
+                ("src/outer/wrap/q.rs", "pub const PICKED: &str = \"q\";"),
+                ("src/q.rs", "compile_error!(\"picked src/q.rs\");"),
+                (
+                    "src/outer/q.rs",
+                    "compile_error!(\"picked src/outer/q.rs\");",
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn rustc_resolves_nested_inline_modules_textually() {
+        // Inline inside inline: each level descends textually.
+        rustc_picks(
+            "nested inline modules",
+            &[
+                (
+                    "src/lib.rs",
+                    "pub mod a { pub mod b { pub mod c; } }\npub use a::b::c::PICKED;",
+                ),
+                ("src/a/b/c.rs", "pub const PICKED: &str = \"c\";"),
+                ("src/c.rs", "compile_error!(\"picked src/c.rs\");"),
+            ],
+        );
+    }
+
+    #[test]
+    fn rustc_resolves_children_of_a_pathed_inline_module() {
+        // An inline module with its own `#[path]` override bases its
+        // children under that directory.
+        rustc_picks(
+            "inline module with path override",
+            &[
+                (
+                    "src/lib.rs",
+                    "#[path = \"sub\"] pub mod foo { pub mod x; }\npub use foo::x::PICKED;",
+                ),
+                ("src/sub/x.rs", "pub const PICKED: &str = \"x\";"),
+                ("src/foo/x.rs", "compile_error!(\"picked src/foo/x.rs\");"),
+            ],
+        );
     }
 
     #[test]
