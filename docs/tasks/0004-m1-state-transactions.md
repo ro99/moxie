@@ -172,9 +172,9 @@ change). Nothing in the contract was adjusted once a test ran.
 | `cargo xtask-cuda test-gpu` | **PASS**, 15 cases, `sm_86` and `sm_120` qualified |
 | `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, `UNQUALIFIED sm_120`, as intended |
 
-Host counts by crate, after the sixth review's correction: `moxie-oracles` 114, `moxie-format` 54,
-`moxie-state` 39, `xtask` 30, `moxie-interp` 17 + 27 integration, `moxie-types` 22, `moxie-graph` 11,
-`moxie-cuda` 9, `moxie-model-api` 5, `moxie-kernels` 1; 3 doctests, 2 of them `compile_fail`.
+Host counts by crate, after the seventh review's correction: `moxie-oracles` 114, `moxie-format` 54,
+`moxie-state` 39, `xtask` 30, `moxie-interp` 19 + 27 integration, `moxie-types` 22, `moxie-graph` 11,
+`moxie-cuda` 9, `moxie-model-api` 5, `moxie-kernels` 1; 4 doctests, 3 of them `compile_fail`.
 
 ### What was built
 
@@ -415,3 +415,64 @@ The review was right that the contract claimed all three opening limits are enfo
 deserialization. Only the manifest's file size is; the tensor-entry cap and the
 architecture-metadata depth and node counts are necessarily checked while traversing the parsed
 value. The table now says which is which.
+
+---
+
+## Seventh review corrections, 2026-09-08
+
+A seventh review of `6b7f5ad` accepted the journal-identity work and found **one remaining blocker**:
+the journal could no longer be duplicated, but the cache holding its authority still could.
+
+| Command | Before | After |
+|---|---|---|
+| `cargo test --workspace --locked --offline` | 330 + 3 doctests | **332 + 4 doctests** |
+| device lane | 338 + 4 doctests | **341 + 4 doctests** |
+| `fmt`, `clippy -D warnings`, `arch-check`, `spec-check`, no-driver host build | PASS | **PASS** |
+| `cargo xtask-cuda test-gpu`, hidden-SM120 gate | PASS / exit 1 | **PASS / exit 1** |
+
+### `KvCache` was `Clone`, so `CacheId` was not unique · closed
+
+Reproduced exactly as the review described: clone an empty cache A into B, execute two tokens
+through B, open the first transaction on each -- the numbers match because the counter was copied
+too -- and apply A's journal to B. B accepted it and truncated its committed rows to nothing while
+the sequence stayed at prefix 2, and B's own journal then failed because its transaction had been
+resolved by a cache that was not it.
+
+The sixth review's fix put a process-unique identity on the journal. A derive then handed the same
+identity to a second object, which is the same failure the third M0 review found on
+`SequenceState` -- and the reason that type carries a `compile_fail` doctest. An identity that
+exists to be unique cannot be duplicated by a derive.
+
+`Clone` is removed. `PartialEq` goes with it: two caches holding identical bytes are legitimately
+different caches, so the comparison a test wants is `contents()`, and leaving `==` in place invites
+a comparison that is now always false.
+
+### Copying contents is still a real need, so it is explicit
+
+Two tests genuinely need a saved cache -- one of them is the fifth review's own
+`a_stale_cache_cannot_be_certified_by_rolling_it_back`, which cannot demonstrate that stale bytes
+resist laundering without saving stale bytes. `KvCache::snapshot` is the operation:
+
+- copies what the cache **holds** -- the layers and the owner's sequence, branch and per-prefix
+  stamps;
+- mints a **fresh `CacheId`** and its own transaction counter, so no journal is ever valid for both;
+- is **refused while a transaction is open**, because a snapshot taken mid-transaction would copy
+  tentative rows and outlive the abort meant to remove them.
+
+The third call site did not need a copy at all -- it compared whole caches when it meant contents --
+and now takes `contents().to_vec()`.
+
+### Tested
+
+- `a_snapshot_is_a_different_cache_and_does_not_share_journals` -- the reproduction, asserting the
+  ids differ, the foreign journal is refused, nothing is truncated, and the cache's own journal
+  still resolves afterwards.
+- `a_snapshot_is_refused_while_a_transaction_is_open`.
+- A third `compile_fail` doctest, for `KvCache` not being `Clone`. All three were re-checked with
+  `compile_fail` removed, and each fails with exactly one error -- `E0599` for the two `clone` calls
+  and `E0382` for the double application -- rather than passing for an unrelated reason.
+
+Also swept the two crates for other derived `Clone` on a type that carries identity or authority.
+The remaining ones are `Branch`, `Journal` and `CacheOwner`, all private, none of which escapes the
+type that owns it; `Journal` is cloned only to read its fields while `self.open` still holds the
+canonical entry, and resolution is the `remove` rather than the clone.

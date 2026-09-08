@@ -438,13 +438,13 @@ fn a_cancelled_step_leaves_the_state_exactly_as_it_found_it() {
     // implementation would have written this step's keys.
     for depth in 0..f.graph.nodes().len() as u64 {
         let before = state.frontiers(ROOT).unwrap();
-        let kv_before = kv.clone();
+        let kv_before = kv.contents().to_vec();
         let e = step(&f, &mut state, &mut kv, &tokens, 0, &Cancel::after(depth)).unwrap_err();
         assert_eq!(e.kind(), "cancelled", "depth {depth}");
         assert_eq!(state.frontiers(ROOT).unwrap(), before, "depth {depth}");
         assert_eq!(
             kv.contents(),
-            kv_before.contents(),
+            &kv_before[..],
             "depth {depth}: a cancelled step wrote state"
         );
         assert!(!state.next_logits_valid(ROOT), "depth {depth}");
@@ -1145,7 +1145,7 @@ fn a_stale_cache_cannot_be_certified_by_rolling_it_back() {
     step(&f, &mut state, &mut kv, &[1], 0, &Cancel::never()).unwrap();
     state.accept(ROOT, 1).unwrap();
     step(&f, &mut state, &mut kv, &[2], 1, &Cancel::never()).unwrap();
-    let stale = kv.clone();
+    let stale = kv.snapshot().unwrap();
     assert_eq!(stale.len(), 2);
 
     // Rewrite position 1 with a different token.
@@ -1157,7 +1157,7 @@ fn a_stale_cache_cannot_be_certified_by_rolling_it_back() {
 
     // The stale cache is refused, and rolling it back to its own length does not
     // launder it.
-    let mut restamped = stale.clone();
+    let mut restamped = stale.snapshot().unwrap();
     assert!(restamped.check_owner(&state, ROOT).is_err());
     let e = restamped.rollback_to(&state, ROOT, 2).unwrap_err();
     assert!(e.to_string().contains("different version"), "{e}");

@@ -109,7 +109,35 @@ impl CacheId {
 }
 
 /// Per-layer key/value history, bound to one branch of one sequence.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// **Deliberately not `Clone`, and deliberately not `PartialEq`.** The seventh
+/// review reproduced the first: a derived `Clone` copied the `CacheId` and the
+/// transaction counters, so a copy and its original had the same identity and
+/// issued interchangeable journals -- the original's journal, taken while it was
+/// empty, resolved the copy's transaction and truncated the copy's committed
+/// rows to nothing while the sequence stayed advanced. That is the same
+/// ownership failure a derive already caused once, on [`SequenceState`], for the
+/// same reason: an identity that exists to be unique cannot be duplicated by a
+/// derive.
+///
+/// Copying contents is a real need -- a test that saves a cache and shows the
+/// saved bytes cannot be laundered has to save one -- so it is
+/// [`KvCache::snapshot`], which mints a fresh identity and refuses while a
+/// transaction is open.
+///
+/// `PartialEq` is gone with it: two caches holding identical bytes are
+/// legitimately different caches, so the comparison a test almost always wants
+/// is [`KvCache::contents`], which says so.
+///
+/// ```compile_fail
+/// # use moxie_interp::KvCache;
+/// # use moxie_state::{SequenceState, StateKind, ROOT};
+/// let state = SequenceState::new([StateKind::KvPages]);
+/// let a = KvCache::for_branch(1, &state, ROOT).unwrap();
+/// let b = a.clone(); // a second cache with the first one's identity
+/// drop(b);
+/// ```
+#[derive(Debug)]
 pub struct KvCache {
     layers: Vec<KvHistory>,
     owner: CacheOwner,
@@ -159,6 +187,39 @@ impl KvCache {
                 branch,
                 stamps: vec![lineage],
             },
+            id: CacheId::next(),
+            open_txn: None,
+            next_txn: 1,
+        })
+    }
+
+    /// An independent copy of this cache's contents and ownership stamp, with
+    /// its own identity.
+    ///
+    /// The replacement for the derived `Clone` the seventh review removed.
+    /// Everything that describes *what the cache holds* is copied -- the layers
+    /// and the owner's sequence, branch and per-prefix stamps -- and everything
+    /// that describes *which cache it is* is not: the copy gets a fresh
+    /// [`CacheId`] and its own transaction counter starting from zero
+    /// transactions, so no journal is ever valid for both.
+    ///
+    /// Refused while a transaction is open. A snapshot of a cache mid-transaction
+    /// would copy tentative rows and then outlive the abort that was supposed to
+    /// remove them, which is the staleness this type spends its ownership stamps
+    /// preventing.
+    pub fn snapshot(&self) -> Result<Self> {
+        if let Some(t) = self.open_txn {
+            return Err(Error::InvalidRequest {
+                field: "kv_cache",
+                detail: format!(
+                    "transaction {t} is open; a snapshot taken now would copy tentative \
+                     rows and survive the abort that removes them"
+                ),
+            });
+        }
+        Ok(Self {
+            layers: self.layers.clone(),
+            owner: self.owner.clone(),
             id: CacheId::next(),
             open_txn: None,
             next_txn: 1,
@@ -265,6 +326,11 @@ impl KvCache {
         }
         self.owner.stamps.truncate(executed as usize + 1);
         Ok(())
+    }
+
+    /// This cache's process-unique identity.
+    pub fn id(&self) -> CacheId {
+        self.id
     }
 
     pub fn layers(&self) -> usize {
@@ -562,6 +628,56 @@ mod tests {
         kv.append(0, 1, vec![1.0], vec![1.0]).unwrap();
         kv.stamp(&state, ROOT).unwrap();
         kv.check_owner(&state, ROOT).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_is_a_different_cache_and_does_not_share_journals() {
+        // Seventh review, reproduced. A derived `Clone` copied the `CacheId`
+        // and both transaction counters, so a copy and its original had the
+        // same identity and issued interchangeable journals: the original's
+        // journal, taken while it was empty, resolved the copy's transaction
+        // and truncated the copy's committed rows to nothing while the sequence
+        // stayed at prefix 2. `Clone` is gone; `snapshot` copies what the cache
+        // *holds* and mints a fresh identity.
+        let (mut state, mut a) = state_and_cache(1);
+        state.append_prompt(ROOT, 2).unwrap();
+        let mut b = a.snapshot().unwrap();
+        assert_ne!(a.id(), b.id(), "a snapshot is a different cache");
+
+        for p in 0..2u64 {
+            b.append(0, p, vec![p as f32], vec![-(p as f32)]).unwrap();
+        }
+        state.execute(ROOT, 2).unwrap();
+        b.stamp(&state, ROOT).unwrap();
+        let committed = b.contents().to_vec();
+
+        // Both caches are on their first transaction, so the numbers match and
+        // only the cache identity separates the two journals.
+        let ja = a.begin().unwrap();
+        let jb = b.begin().unwrap();
+        let e = b.abort(ja).unwrap_err();
+        assert!(e.to_string().contains("belongs to cache"), "{e}");
+        assert_eq!(b.contents(), &committed[..], "nothing was truncated");
+
+        // And `b`'s own journal still resolves, because the foreign one did not
+        // silently close its transaction.
+        b.abort(jb).unwrap();
+        assert_eq!(b.contents(), &committed[..]);
+        b.check_owner(&state, ROOT).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_is_refused_while_a_transaction_is_open() {
+        // A snapshot taken mid-transaction would copy tentative rows and
+        // survive the abort meant to remove them.
+        let (mut state, mut kv) = state_and_cache(1);
+        state.append_prompt(ROOT, 1).unwrap();
+        let journal = kv.begin().unwrap();
+        kv.append(0, 0, vec![1.0], vec![1.0]).unwrap();
+        let e = kv.snapshot().unwrap_err();
+        assert!(e.to_string().contains("is open"), "{e}");
+        kv.abort(journal).unwrap();
+        kv.snapshot().unwrap();
     }
 
     #[test]
