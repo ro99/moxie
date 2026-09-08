@@ -1,6 +1,8 @@
 # Task 0002 — M0 review, corrections, and integer precision transition
 
-Status: **implemented 2026-09-07**; F1-F6 closed, results in [Correction results](#correction-results-2026-09-07) below. Review performed 2026-09-07 against Moxie `84273b0e4b41bb04d1b374f6f46f89557bba4a59`, with a clean worktree before documentation edits. The reviewer changed documentation only; the implementation that follows the review is recorded at the end of this file.
+Status: **implemented 2026-09-07**, then corrected again after a second review. F1-F6 results are in
+[Correction results](#correction-results-2026-09-07); the second review's findings and their results
+are in [Second-review corrections](#second-review-corrections-2026-09-07). Review performed 2026-09-07 against Moxie `84273b0e4b41bb04d1b374f6f46f89557bba4a59`, with a clean worktree before documentation edits. The reviewer changed documentation only; the implementation that follows the review is recorded at the end of this file.
 
 ## Verdict
 
@@ -397,3 +399,214 @@ cache below 16 bits, no method-specific runtime, and no checkpoint was downloade
 - **No kernel** implements W4A16 or W8A16. The host decoder is a reference, not a fast path.
 - **The device lane has no CI runner.** Its results are hand-run and recorded with the hardware they
   were measured on.
+
+
+---
+
+# Second-review corrections, 2026-09-07
+
+A second review of the F1-F6 work independently reproduced the passing checks and then found six
+places where a contract still accepted an invalid state. **Every finding was reproduced here before
+being fixed**, and each now has a regression test that fails against the previous behaviour. The
+reviewer's summary -- "substantially better, but I would not close M0 yet" -- was correct.
+
+## Commands and results after the second pass
+
+| Command | Before | After |
+|---|---|---|
+| `cargo test --workspace --locked --offline` | PASS, 191 | **PASS, 210** |
+| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | PASS, 197 + 1 doctest | **PASS, 218 + 1 doctest** |
+| `cargo xtask arch-check` | PASS, 13 fixtures | **PASS, 15 fixtures**, 6 rules |
+| `cargo xtask spec-check` | PASS, 10 documents | **PASS**, digests unchanged |
+| `cargo fmt --all -- --check`, `cargo clippy ... -D warnings` | PASS | **PASS** |
+| host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | PASS, 191 | **PASS, 210**; `ldd` shows no `libcuda` |
+| `cargo xtask-cuda test-gpu` | PASS, 15 cases | **PASS, 15 cases**, both architectures qualified |
+| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | exit 1 | **exit 1**, as intended |
+
+Per-crate host counts: `moxie-types` 22, `moxie-format` 54, `moxie-graph` 11, `moxie-model-api` 5,
+`moxie-oracles` 62, `moxie-state` 25, `moxie-cuda` 9, `moxie-kernels` 1, `xtask` 21.
+
+Nothing in the "not run / unmeasured" table above changed. No checkpoint was imported, no inference
+ran, no throughput was measured, and no owner gate moved.
+
+## S1 - retained results did not identify a sequence or a prefix's contents · closed
+
+Reproduced, both halves:
+
+```text
+handle from sequence A, presented to sequence B  -> restore ok, next_logits_valid = true
+handle for a discarded suffix, after rollback and
+  re-execution to the same length                -> restore ok
+```
+
+A `(branch, prefix, generation)` triple is not an identity. Every fresh sequence starts at the same
+root branch and generation zero, and a prefix *length* says nothing about which tokens occupy those
+positions. The reviewer also noted, correctly, that the rollback test built its "saved" handle out
+of struct literals, so it tested the assertion rather than provenance.
+
+Three changes in `crates/moxie-state/src/lib.rs`:
+
+- **`SequenceId`**, allocated from a process counter rather than supplied by a caller who could
+  duplicate it. Two `SequenceState` values never share one.
+- **`ResultId` and an issued-result ledger.** `LogitsHandle`'s fields are now private with no public
+  constructor, so only `record_logits` mints one; the sequence keeps the set it has issued and not
+  invalidated, and a handle that is not in it -- fabricated, or belonging to a discarded branch --
+  is refused. The rollback test now has to record a real result and keep it.
+- **`PrefixLineage`.** A chain value over the positions of a prefix, where each position carries the
+  epoch it was written in. A rollback bumps the branch's epoch, so positions re-executed afterwards
+  contribute differently from the ones they replaced. Prefixes at or before the rollback target keep
+  their lineage, which is the other half of the requirement: replacing a suffix must not invalidate
+  results for prefixes it did not touch.
+
+It is a *lineage*, not a content digest, and the type says so. Document 04's prefix-reuse key --
+checkpoint, tokenizer/template, configuration and token IDs -- is a separate identity that composes
+with this one and is still not implemented.
+
+Tests: `a_result_from_another_sequence_is_refused`, `a_result_for_a_replaced_suffix_does_not_come_back`,
+`a_result_at_an_unchanged_prefix_survives_a_rollback`, `a_handle_cannot_be_fabricated`,
+`a_fork_does_not_inherit_the_parents_retained_result`.
+
+## S2 - an earlier snapshot was accepted as restoration to a later prefix · closed
+
+Reproduced: a snapshot `taken_at: 4` satisfied a rollback to prefix 6, and the execution frontier
+advanced to 6 over state that stopped at 4.
+
+`Restore` is now a struct carrying the component, the sequence, the generation and a
+`RestoreMethod`. The method names what the restoration **completed**, not merely what was available:
+
+```rust
+RestoreMethod::Snapshot { of_prefix }   // an exact snapshot *of* the target
+RestoreMethod::Replay   { from, to }    // recomputed from `from`, finished at `to`
+```
+
+`rollback_to` requires `completed_prefix() == target` for every `Explicit` component, plus matching
+sequence and generation, a coherent replay (`from <= to`), exactly one entry per component, no entry
+for a component outside the schema, and no entry for a truncatable one. A refused rollback changes
+nothing.
+
+Tests: `an_earlier_source_is_not_a_completed_restoration`,
+`restore_evidence_must_name_this_sequence_and_generation`,
+`every_explicit_kind_in_the_schema_must_be_covered_exactly_once`,
+`a_restore_for_a_component_outside_the_schema_is_refused`.
+
+## S3 - architecture enforcement still missed ordinary production code · closed
+
+Reproduced, using two model crates that compile:
+
+```rust
+use std::{fs};                                   // contains the text `std::fs` nowhere
+pub fn read_weights(p: &str) -> std::io::Result<Vec<u8>> { fs::read(p) }
+```
+
+```toml
+[lib]
+path = "tests/production.rs"                     # the whole library, in a skipped directory
+```
+
+Both returned zero violations. The dependency-identity work from F1 was sound; the *source* layer
+was still a substring blacklist over a directory walk that exempted by name.
+
+Two structural changes in `xtask/src/archcheck.rs`:
+
+- **Imports are classified structurally.** `use_paths` flattens `use` declarations into
+  fully-qualified paths -- nested groups, renames, globs, leading `::`, `crate`/`self`/`super` -- so
+  `use std::fs;`, `use std::{fs};`, `use std::fs as f;`, `use std::{io, fs::{read, write}};` and
+  `use std::*;` all land on the same rule. `MODEL_FORBIDDEN_PATHS` holds prefixes; `path_reaches`
+  decides whether an import reaches one, including a glob at or above it. This is a parser for one
+  construct with a small regular grammar, which is the alternative to the substring list the review
+  said not to keep extending. `MODEL_FORBIDDEN_TOKENS` keeps only the residue that is not an import:
+  an `extern "C"` block, and a fully-qualified call written inline without a `use`.
+- **Production sources come from declared targets.** `declared_target_paths` reads `[lib]`, `[[bin]]`
+  and `[[example]]` paths; `production_sources` withdraws the `tests`/`benches` exemption from any
+  directory that actually holds one, and includes a declared path even when it sits outside the
+  crate directory. The exemption document 02 grants is for the dev harness, and a declared library
+  is not one.
+
+Two new negative fixtures, `model-imports-through-a-group` and
+`model-declares-its-library-under-tests`, are the reviewer's two crates. Six new unit tests cover
+the parser directly, including `an_innocent_import_is_not_flagged` and
+`a_use_inside_a_comment_or_string_is_not_an_import` -- a checker that flags everything is not
+enforcement either.
+
+Not claimed: this classifies *imports*, not arbitrary expressions, and it does not follow
+re-export chains. Both are stated in the module.
+
+## S4 - the safe PTX entry point had no boundary · closed
+
+`ModuleImage::Ptx(&CStr)` passed its pointer to the same auto-detecting `cuModuleLoadData`. A `CStr`
+guarantees termination, not that the bytes are text, and the Rust enum label is never passed to
+CUDA -- so a NUL-terminated buffer beginning with ELF or fatbin magic reached the binary-image
+parser through what looked like the text path.
+
+New `PtxSource` type in `crates/moxie-cuda/src/driver.rs`. Constructing one requires the bytes to be
+valid UTF-8, to **not** begin with any image magic the driver recognises, and to carry the
+`.version` directive every PTX module opens with. `ModuleImage::Ptx` now takes one, so the driver's
+format sniffing cannot route this variant to the binary parser.
+
+The `.version` check is documented as **necessary, not sufficient**: it does not make the text valid
+PTX. The `non_ptx_text_rejected` GPU case now asserts both halves -- text without `.version` and
+text beginning with ELF magic are refused before any driver call, and text that *is* shaped like a
+PTX module but does not compile comes back from the real driver as `UnsupportedKernel`. It passes on
+all three devices. As before, no malformed-image crash probe was run.
+
+## S5 - publication and usage accounting · closed
+
+Reproduced: accepting and releasing one completion token, then rolling back, silently reset the
+released count to zero. The client already had that text.
+
+- `rollback_to` now **refuses** a target below `prompt + emitted`, naming the prefix through which
+  output has been released. Regeneration is a new response, not a rollback.
+- The contract mismatch the reviewer identified is resolved in favour of the specification:
+  `Frontiers::completion()` -- committed completion tokens -- is what usage counts, matching document
+  05 and `moxie-oracles::protocol`. `emitted` is a *delivery* counter, documented as such, and
+  `withheld()` is the gap a stop string opens between them.
+
+Tests: `published_output_cannot_be_unpublished_by_a_rollback`,
+`usage_counts_committed_completion_tokens_not_released_ones`.
+
+## S6 - reference paths returned successful nonfinite results · closed
+
+Both reproduced:
+
+```text
+sampler:  logits [8, 9], temperature f32::MIN_POSITIVE  -> Ok([NaN, NaN])
+affine:   code 7, scale f32::MAX                        -> Ok([inf])
+```
+
+- **Sampler.** The division happened before the stabilising subtraction, so `9.0 / f32::MIN_POSITIVE`
+  overflowed to `+inf` and `inf - inf` gave `NaN`. `normalize_with_temperature` now subtracts the
+  maximum first, bounding every numerator at zero, and `check_distribution` refuses to return
+  anything that is not finite, non-negative and normalised. A vanishing temperature now agrees with
+  greedy; a huge one flattens toward uniform.
+- **Affine.** A scale can be finite and positive and still produce an infinite product.
+  `reconstruct_row_into` now reports `InvalidArtifact` naming the position, the codes and the scale.
+  A companion test confirms the check does not fire on realistic scales.
+
+Tests: `an_extreme_temperature_stays_a_distribution`,
+`a_wide_logit_range_does_not_overflow_at_a_small_temperature`,
+`a_reconstruction_that_overflows_is_an_invalid_artifact`,
+`realistic_scales_reconstruct_without_tripping_the_overflow_check`.
+
+## Smaller corrections
+
+- **`OracleRegistry::register` mutated on rejection.** It used `insert(...).is_some()`, which wrote
+  the new evidence and *then* reported the duplicate -- so the registration it was meant to protect
+  was silently replaced. Now it checks first. Test:
+  `a_rejected_registration_leaves_the_registry_unchanged`.
+- **The recorded host compiler was a guess.** `moxie-kernels/build.rs` read `CUDAHOSTCXX` to describe
+  the compiler and never passed the selection to nvcc, so `HOST_COMPILER_VERSION` described nvcc's
+  assumed default rather than what ran. It now passes `-ccbin` explicitly and adds
+  `rerun-if-env-changed` for `CUDAHOSTCXX` and `NVCC_CCBIN`. The fatbin digests are unchanged, which
+  confirms `c++` was already the compiler in use -- it is now recorded as a fact rather than an
+  assumption.
+
+## What the second pass did not change
+
+The reviewer's own list of what was right stands: the shared affine INT4/INT8 decoder, preserved
+source scale encodings, the full INT8 decoding range, role-specific precision types, the host/CUDA
+feature separation, negative-fixture rule assertions and real architecture qualification.
+
+O1, O2, O4 and O5 remain **OPEN**. No importer exists. No kernel implements W4A16 or W8A16. The
+device lane still has no CI runner. [Task 0003](0003-m1-bf16-reference-interpreter.md) stands as the
+next bounded task, and now inherits state and provenance contracts that were tightened rather than
+the ones the second review warned against carrying forward.

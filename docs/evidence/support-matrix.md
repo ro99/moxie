@@ -16,10 +16,10 @@ matrix exists to prevent.
 |---|---|---|---|
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
-| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 191 tests |
-| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 13 negative fixtures, 6 rules |
+| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 210 tests |
+| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 15 negative fixtures, 6 rules |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
-| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 191 tests, `ldd` shows no `libcuda` |
+| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 210 tests, `ldd` shows no `libcuda` |
 | `G-GPU-SM86` | `cargo xtask-cuda test-gpu --profile sm86` | device | passed, RTX 3090 x2 |
 | `G-GPU-SM120` | `cargo xtask-cuda test-gpu --profile sm120` | device | passed, RTX 5060 Ti |
 | `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 15 cases, both architectures qualified |
@@ -29,6 +29,9 @@ matrix exists to prevent.
 
 Device gates ran by hand on this machine. No CI runner executes them; see
 [toolchain.md](toolchain.md).
+
+Counts are from 2026-09-07 after the second review's corrections; see
+[task 0002](../tasks/0002-m0-review-and-integer-transition.md#second-review-corrections-2026-09-07).
 
 ## Rows
 
@@ -45,8 +48,8 @@ Device gates ran by hand on this machine. No CI runner executes them; see
 | none | n/a | n/a | Flash / paged attention; host-backed exact state | **not implemented** | — | M4. `moxie-oracles::mask::attend_row` is an exact reference, not a path. |
 | none | n/a | n/a | Oversized host/disk weight streaming | **not implemented** | — | M2. No memory authority exists. |
 | none | n/a | n/a | TP / PP / expert partition | **not implemented** | — | M5. `PartitionRule::NotDetermined` fails closed today. |
-| none | n/a | n/a | Prefix reuse / continuation / cancellation | **not implemented** | `G-HOST-TEST` (`moxie-state`) covers frontier and provenance rules only | M4. Counters and logit provenance are typed and tested; there is no cache to reuse. |
-| none | n/a | n/a | Common sampler pipeline | **partial, not integrated** | `G-HOST-TEST` (`moxie-oracles::sampler`) | Legality mask, top-k, top-p, min-p, temperature, tie rule and typed failures only. Penalties, DRY, n-gram ban, logit bias, typical-p and XTC are **not implemented**. |
+| none | n/a | n/a | Prefix reuse / continuation / cancellation | **not implemented** | `G-HOST-TEST` (`moxie-state`) covers frontier, result-identity and restore-evidence rules only | M4. Counters, retained-result identity and prefix lineage are typed and tested; there is no cache to reuse, and document 04's token-content prefix key is a separate identity that is **not** implemented. |
+| none | n/a | n/a | Common sampler pipeline | **partial, not integrated** | `G-HOST-TEST` (`moxie-oracles::sampler`) | Legality mask, top-k, top-p, min-p, temperature, tie rule, extreme-temperature stability and typed failures only. Penalties, DRY, n-gram ban, logit bias, typical-p and XTC are **not implemented**. |
 | none | n/a | n/a | Future entropy | **not implemented** | — | M10. Document 05 defines it; nothing here evaluates it. |
 | none | n/a | n/a | Speculation, any proposer | **not implemented** | `G-HOST-TEST` (`moxie-state`) covers acceptance-frontier bookkeeping only | M9. No verifier, no proposer. |
 | none | n/a | n/a | HTTP / CLI / SSE / reasoning / tools / images | **not implemented** | `G-HOST-TEST` (`moxie-oracles::protocol`) covers frame order, usage arithmetic and stop-string holding | M8. There is no server and no client. |

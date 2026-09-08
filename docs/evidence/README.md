@@ -3,8 +3,11 @@
 - `topology-p2p.md` — patched-driver topology and measurements. The CUDA peer-access API allows the 3090 pair, not every pair despite permissive nvidia-smi output. Read the actual measured pair/message size before generalizing latency or collective results.
 - `quantization-candidates.md` — pinned public configurations for the owner's ten INT4/INT8 candidates; metadata evidence only, no weights or quality claims.
 - `../tasks/0002-m0-review-and-integer-transition.md` — M0 review, reproduced checks, architecture
-  bypasses and correction gates, followed by the correction results and the exact commands behind
-  them.
+  bypasses and correction gates, followed by the results of two correction passes and the exact
+  commands behind them. The second pass's findings are the ones to read first: each was reproduced
+  before being fixed, and each says what the fix does **not** establish.
+- `support-matrix.md` — capability claims and the gate IDs behind them. Every row that mentions a
+  checkpoint, a kernel or a context length is NOT IMPLEMENTED or unmeasured, and says so.
 - `toolchain.md` — pinned toolchain, the recorded build identity (nvcc, host compiler, fatbin
   digests), and the host/device lane split.
 - `specification-version.md` — digests of the ten normative reference documents. They are kept local

@@ -14,7 +14,8 @@ use core::ffi::c_void;
 use std::ffi::CString;
 
 use moxie_cuda::{
-    DeviceBuffer, DeviceContext, Event, Module, ModuleImage, Stream, TrustedImage, query_device,
+    DeviceBuffer, DeviceContext, Event, Module, ModuleImage, PtxSource, Stream, TrustedImage,
+    query_device,
 };
 use moxie_types::{DeviceCapability, Error};
 
@@ -485,21 +486,49 @@ fn stream_event(cap: &DeviceCapability) -> Result<Outcome, Error> {
     Ok(Outcome::Passed)
 }
 
-/// Text that is not PTX must be refused as a typed module error.
+/// The PTX boundary, in both halves, against a real driver.
 ///
-/// The safe loader accepts a `&CStr` for PTX because NUL-termination is what the
-/// C API requires -- but termination is not validity. This case proves the
-/// driver's rejection of invalid source still arrives as `UnsupportedKernel`
-/// rather than as a crash or a generic numerical error. It needs a device, so it
-/// lives in this lane rather than in a unit test.
+/// 1. Text that is not PTX, and text that begins with a binary image magic,
+///    are refused by `PtxSource` before the driver is called at all. The second
+///    half matters most: `cuModuleLoadData` sniffs the leading bytes and decides
+///    for itself which parser to use, so without that check a `&CStr` holding
+///    ELF magic reached the binary-image parser through the text path.
+/// 2. Text that *is* shaped like a PTX module but does not compile reaches the
+///    driver and comes back as a typed `UnsupportedKernel`, not as a crash or a
+///    generic numerical error.
+///
+/// It needs a device, so it lives in this lane rather than in a unit test.
 fn ptx_rejection(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    // Half one: refused before any driver call.
+    let not_ptx = CString::new("this is not ptx").expect("no interior NUL");
+    if PtxSource::new(&not_ptx).is_ok() {
+        return Ok(Outcome::Failed(
+            "text with no .version directive was accepted as PTX".into(),
+        ));
+    }
+    let elf_magic =
+        CString::new([0x7Fu8, b'E', b'L', b'F', b'\n', b'.', b'v'].as_slice()).expect("no NUL");
+    if PtxSource::new(&elf_magic).is_ok() {
+        return Ok(Outcome::Failed(
+            "a buffer beginning with ELF magic was accepted as PTX; the driver would \
+             parse it as a binary image"
+                .into(),
+        ));
+    }
+
+    // Half two: shaped like PTX, does not compile, must be typed.
     let ctx = DeviceContext::new(cap.ordinal)?;
-    let src = CString::new("this is not ptx").expect("no interior NUL");
-    match Module::load(&ctx, ModuleImage::Ptx(&src)) {
-        Ok(_) => Ok(Outcome::Failed("the driver accepted non-PTX text".into())),
+    let broken =
+        CString::new(".version 8.0\n.target sm_86\n.address_size 64\nnot_an_instruction\n")
+            .expect("no interior NUL");
+    let src = PtxSource::new(&broken)?;
+    match Module::load(&ctx, ModuleImage::Ptx(src)) {
+        Ok(_) => Ok(Outcome::Failed(
+            "the driver compiled deliberately invalid PTX".into(),
+        )),
         Err(e) if e.kind() == "unsupported_kernel" => Ok(Outcome::Passed),
         Err(e) => Ok(Outcome::Failed(format!(
-            "non-PTX text surfaced as {}: {e}",
+            "invalid PTX surfaced as {}: {e}",
             e.kind()
         ))),
     }

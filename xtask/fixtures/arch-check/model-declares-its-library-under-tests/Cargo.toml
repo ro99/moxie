@@ -1,0 +1,16 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+# Second review, case 2. The crate's entire production library lives in a
+# directory named `tests`. Cargo builds it as the lib; a checker that exempts
+# directories by name never opens it. The exemption document 02 grants is for
+# the dev harness, and this file is not one. Must be rejected.
+[lib]
+path = "tests/production.rs"
+
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden construct in model source"

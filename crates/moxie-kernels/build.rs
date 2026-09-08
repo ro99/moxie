@@ -39,6 +39,8 @@ fn main() {
     println!("cargo:rerun-if-changed=archs.rs");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=NVCC");
+    println!("cargo:rerun-if-env-changed=CUDAHOSTCXX");
+    println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
 
     println!(
         "cargo:rustc-env=MOXIE_KERNEL_TARGET_ARCHS={}",
@@ -74,16 +76,20 @@ fn main() {
     );
 
     // nvcc drives a host compiler for the C++ it emits. Recording which one is
-    // part of the build identity document 07 requires; it is reported, not
-    // pinned, because nvcc chooses it from the environment.
+    // part of the build identity document 07 requires -- but only if the
+    // recorded compiler is the one actually used. The first version read
+    // `CUDAHOSTCXX` to *describe* the compiler and then never passed that
+    // selection to nvcc, so the record was a guess about nvcc's default. It is
+    // now passed explicitly with `-ccbin`, which makes the recorded version a
+    // fact about this build rather than an assumption about the environment.
     let host_cc = std::env::var("CUDAHOSTCXX")
         .or_else(|_| std::env::var("NVCC_CCBIN"))
         .unwrap_or_else(|_| "c++".to_string());
     let host_cc_version = tool_version(&host_cc, &["--version"]);
 
     check_known_answers();
-    let full = build_fatbin(&nvcc, &out, "smoke.fatbin", ARCHS);
-    let sm86 = build_fatbin(&nvcc, &out, "smoke_sm86.fatbin", &["86"]);
+    let full = build_fatbin(&nvcc, &host_cc, &out, "smoke.fatbin", ARCHS);
+    let sm86 = build_fatbin(&nvcc, &host_cc, &out, "smoke_sm86.fatbin", &["86"]);
 
     println!(
         "cargo:rustc-env=MOXIE_SMOKE_FATBIN={}",
@@ -128,9 +134,12 @@ fn one_line(version: &str) -> String {
 }
 
 /// Compile one image and return its SHA-256, lowercase hex.
-fn build_fatbin(nvcc: &str, out: &Path, name: &str, archs: &[&str]) -> String {
+fn build_fatbin(nvcc: &str, host_cc: &str, out: &Path, name: &str, archs: &[&str]) -> String {
     let dst = out.join(name);
     let mut cmd = Command::new(nvcc);
+    // `-ccbin` names the host compiler explicitly, so `HOST_COMPILER_VERSION`
+    // records the one that actually ran.
+    cmd.arg("-ccbin").arg(host_cc);
     cmd.arg("-fatbin").arg("-O3").arg("--std=c++17");
     for a in archs {
         // SASS only, on purpose. See the module comment: adding `code=compute_NN`

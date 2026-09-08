@@ -3,37 +3,44 @@
 //! Document 02: this crate owns "Paged sequence state, forks, transactions,
 //! rollback and prefix reuse".
 //!
-//! M0 scope: the *counters and provenance rules* from document 04, expressed as
-//! types and tested. Paging, COW page tables and real recurrent snapshots land
-//! in M1/M2/M4. The rules are here first because document 06 warns that M9
-//! "must not retrofit incompatible cache ownership", and because getting them
-//! wrong is the off-by-one that silently corrupts a cache.
+//! M0 scope: the *counters, identities and provenance rules* from document 04,
+//! expressed as types and tested. Paging, COW page tables and the buffers that
+//! hold real KV, recurrent and logit data land in M1/M2/M4. The rules are here
+//! first because document 06 warns that M9 "must not retrofit incompatible cache
+//! ownership", and because getting them wrong is the off-by-one that silently
+//! corrupts a cache.
 //!
-//! ## What the M0 review corrected
+//! ## What the M0 reviews corrected
 //!
 //! The first draft had two counters, `committed` and `materialized`, and three
-//! claims that the type could not support:
+//! claims the type could not support:
 //!
-//! 1. It **forbade** materializing past the committed frontier. But document 04
-//!    says "a speculative branch may materialize unaccepted candidates beyond
-//!    the committed prefix. That is valid tentative state, not corruption, and
-//!    must never require publishing candidates before verification." The old
+//! 1. It **forbade** materializing past the committed frontier. Document 04 says
+//!    "a speculative branch may materialize unaccepted candidates beyond the
+//!    committed prefix. That is valid tentative state, not corruption, and must
+//!    never require publishing candidates before verification." The old
 //!    rejection test could only be written by committing every proposal first --
 //!    that is, by publishing tokens before verifying them.
-//! 2. It conflated accepted history with what the user was shown. Those are
-//!    separate counters: history includes the prompt, usage does not.
-//! 3. It treated **counter equality as proof that logits exist**. A fresh state
-//!    reported valid next-token logits before any forward pass, and rolling back
-//!    from 20 to 12 reported valid logits at 12 although nothing was retained or
-//!    recomputed there.
+//! 2. It conflated accepted history with what the user was shown.
+//! 3. It treated **counter equality as proof that logits exist**.
 //!
-//! So there are now four counters per branch, execution may legitimately run
-//! ahead of acceptance, and logit validity is a *retained result* qualified by
-//! `(branch, prefix, generation)` rather than an arithmetic coincidence.
+//! The second review found that fixing (3) with a `(branch, prefix, generation)`
+//! triple was still not identity. Every fresh sequence starts at the same root
+//! branch and generation, so a handle from one sequence was accepted by another;
+//! and a handle for a *discarded* suffix became valid again once the branch was
+//! re-executed to the same length. Both are reproduced as tests below. It also
+//! found that a snapshot taken at prefix 4 was accepted as restoration to prefix
+//! 6, and that a rollback silently reduced the count of tokens already published
+//! to the user.
+//!
+//! So: retained results now carry an opaque, sequence-issued identity and a
+//! **prefix lineage** that changes when a suffix is replaced; restore evidence
+//! must name the prefix it actually completed; and publication is monotonic.
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use moxie_types::{BranchId, Error, Result};
 
@@ -66,9 +73,9 @@ pub enum StateKind {
 pub enum RestoreCapability {
     /// Append-only: dropping the suffix leaves exactly the earlier state.
     Truncate,
-    /// Needs explicit evidence -- a bounded snapshot at or before the target
-    /// prefix, or a replay from a saved earlier state. The cost is real and has
-    /// to be accounted for (document 04).
+    /// Needs explicit evidence -- a snapshot *of* the target prefix, or a replay
+    /// that ran forward *to* it. The cost is real and has to be accounted for
+    /// (document 04).
     Explicit,
 }
 
@@ -108,32 +115,89 @@ impl StateKind {
     ];
 }
 
-/// Evidence that one `Explicit` state kind really was restored.
+/// How one `Explicit` component reached the rollback target.
 ///
-/// The point of requiring it is that a rollback cannot be *asserted*. Something
-/// has to have taken a snapshot or replayed a prefix, and the prefix it covers
-/// has to be at or before the target.
+/// The distinction the second review required: an *available source* is not a
+/// *completed restoration*. A snapshot taken at prefix 4 holds the state at
+/// prefix 4. Rolling back to prefix 6 with only that snapshot in hand leaves the
+/// component two tokens behind, and accepting it advances the execution frontier
+/// past state that does not exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Restore {
-    /// A bounded snapshot of this component, taken at logical prefix `taken_at`.
-    Snapshot { taken_at: u64 },
-    /// Recomputation of this component from a saved state at prefix `from`.
-    Replay { from: u64 },
+pub enum RestoreMethod {
+    /// An exact snapshot **of the target prefix** was reloaded.
+    Snapshot { of_prefix: u64 },
+    /// The component was recomputed from a saved state at `from` and replayed
+    /// forward, finishing at `to`. Both ends are named: `from` alone says where
+    /// the work started, not where it ended.
+    Replay { from: u64, to: u64 },
 }
 
-impl Restore {
-    fn covers(self, target_prefix: u64) -> bool {
+impl RestoreMethod {
+    /// The prefix this restoration actually finished at.
+    pub const fn completed_prefix(self) -> u64 {
         match self {
-            Restore::Snapshot { taken_at } => taken_at <= target_prefix,
-            Restore::Replay { from } => from <= target_prefix,
+            RestoreMethod::Snapshot { of_prefix } => of_prefix,
+            RestoreMethod::Replay { to, .. } => to,
         }
     }
 
-    fn at(self) -> u64 {
+    const fn is_coherent(self) -> bool {
         match self {
-            Restore::Snapshot { taken_at } => taken_at,
-            Restore::Replay { from } => from,
+            RestoreMethod::Snapshot { .. } => true,
+            RestoreMethod::Replay { from, to } => from <= to,
         }
+    }
+}
+
+/// Evidence that one `Explicit` component really was restored.
+///
+/// The point of requiring it is that a rollback cannot be *asserted*. Something
+/// has to have reloaded a snapshot or replayed a prefix, on this sequence, under
+/// this graph generation, and finished at the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Restore {
+    pub kind: StateKind,
+    /// The sequence whose component was restored. Checked: evidence from another
+    /// sequence's state is not evidence about this one.
+    pub sequence: SequenceId,
+    /// The generation the restored state belongs to. Checked: a snapshot taken
+    /// under a different graph or precision configuration is stale.
+    pub generation: StateGeneration,
+    pub method: RestoreMethod,
+}
+
+/// Process-unique identity of one sequence's state.
+///
+/// Two `SequenceState` values never share one, so a retained result cannot cross
+/// between them. Allocated from a process counter rather than supplied by the
+/// caller, because a caller that supplies its own can duplicate it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SequenceId(u64);
+
+impl SequenceId {
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Opaque identity of one retained forward result.
+///
+/// There is deliberately no public constructor. Only [`SequenceState::record_logits`]
+/// mints one, so a caller -- including a test -- cannot fabricate a handle for a
+/// result that was never computed. The first correction pass got this wrong: its
+/// rollback test built a "saved" handle out of struct literals and then asserted
+/// that the state accepted it, which tested the assertion rather than provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ResultId(u64);
+
+impl ResultId {
+    pub const fn get(self) -> u64 {
+        self.0
     }
 }
 
@@ -142,21 +206,91 @@ impl Restore {
 /// Document 04: "changing prefix/config invalidates outputs unless an exact
 /// saved result is restored." Anything that changes what a forward pass would
 /// compute -- graph, precision, positional configuration, tokenizer/template,
-/// checkpoint -- bumps this, and every retained logit result from an earlier
+/// checkpoint -- bumps this, and every retained result from an earlier
 /// generation becomes stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct StateGeneration(pub u64);
+pub struct StateGeneration(u64);
+
+impl StateGeneration {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// The execution lineage of a prefix.
+///
+/// A chain value over the positions `0..prefix`, where each position carries the
+/// *epoch* it was written in. Rolling back bumps the branch's epoch, so a
+/// position re-executed after a rollback contributes differently from the one it
+/// replaced. Two prefixes therefore share a lineage only when they are the same
+/// positions written by the same executions.
+///
+/// It is a lineage, **not** a content digest: it distinguishes "this suffix was
+/// replaced" from "this suffix is unchanged". Document 04's prefix-reuse key --
+/// checkpoint, tokenizer/template, configuration and token IDs -- is a separate
+/// identity that composes with this one and is not implemented here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PrefixLineage(u64);
+
+impl PrefixLineage {
+    fn root(sequence: SequenceId, branch: BranchId) -> Self {
+        Self(mix(mix(0xcbf2_9ce4_8422_2325, sequence.0), branch.get()))
+    }
+
+    fn extend(self, epoch: u64, position: u64) -> Self {
+        Self(mix(mix(self.0, epoch), position))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// FNV-1a over one `u64`. A cache/identity key, never an integrity checksum.
+fn mix(h: u64, v: u64) -> u64 {
+    let mut h = h;
+    for b in v.to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
 
 /// A retained forward result: logits that predict the token *after* `prefix`.
 ///
-/// All three fields are load-bearing. The same prefix on a different branch is a
-/// different computation; the same branch and prefix under a different
-/// generation is a different model.
+/// Every field is load-bearing, and all of them are private. The same prefix
+/// length on a different sequence, a different branch, a different graph
+/// generation or a *replaced* suffix are four different computations, and each
+/// of them was accepted by an earlier version of this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogitsHandle {
-    pub branch: BranchId,
-    pub prefix: u64,
-    pub generation: StateGeneration,
+    id: ResultId,
+    sequence: SequenceId,
+    branch: BranchId,
+    prefix: u64,
+    lineage: PrefixLineage,
+    generation: StateGeneration,
+}
+
+impl LogitsHandle {
+    pub const fn id(&self) -> ResultId {
+        self.id
+    }
+    pub const fn sequence(&self) -> SequenceId {
+        self.sequence
+    }
+    pub const fn branch(&self) -> BranchId {
+        self.branch
+    }
+    pub const fn prefix(&self) -> u64 {
+        self.prefix
+    }
+    pub const fn lineage(&self) -> PrefixLineage {
+        self.lineage
+    }
+    pub const fn generation(&self) -> StateGeneration {
+        self.generation
+    }
 }
 
 /// The counters of one branch (document 04).
@@ -166,10 +300,11 @@ pub struct LogitsHandle {
 /// * `prompt` -- prompt tokens inside the accepted prefix. Usage reports them
 ///   separately from completion tokens (document 05).
 /// * `accepted` -- the accepted logical prefix, prompt included. Only verified
-///   tokens enter it.
-/// * `emitted` -- completion tokens actually published to the user. Never more
-///   than the accepted completion tokens, and often fewer: a stop string can be
-///   held back mid-token.
+///   tokens enter it. **This is what usage counts**: document 05 bills "prompt
+///   tokens and committed completion tokens only".
+/// * `emitted` -- completion tokens actually released to the client as deltas.
+///   Never more than the accepted completion tokens, and often fewer: a stop
+///   string is held back until it is known not to be one.
 /// * `executed` -- tokens whose forward pass has run and whose state exists.
 ///
 /// `executed` may exceed `accepted`: that is a speculative or entropy branch
@@ -196,9 +331,15 @@ impl Frontiers {
         self.executed.saturating_sub(self.accepted)
     }
 
-    /// Completion tokens accepted into history.
+    /// Committed completion tokens. **This is the usage number**, not `emitted`.
     pub fn completion(self) -> u64 {
         self.accepted.saturating_sub(self.prompt)
+    }
+
+    /// Committed completion tokens not yet released to the client, because a
+    /// stop string might still be forming across them.
+    pub fn withheld(self) -> u64 {
+        self.completion().saturating_sub(self.emitted)
     }
 }
 
@@ -206,21 +347,47 @@ impl Frontiers {
 struct Branch {
     frontiers: Frontiers,
     parent: Option<BranchId>,
-    /// The one retained forward result for this branch, if any.
-    ///
-    /// One is enough for M0: decode and verification need the result at the
-    /// current prefix. A retention policy over several prefixes is a memory
-    /// authority question and arrives with it.
+    /// `lineage[n]` is the lineage of prefix `n` on this branch. Its length is
+    /// always `max(accepted, executed) + 1`.
+    lineage: Vec<PrefixLineage>,
+    /// Bumped on every rollback, so positions written afterwards differ from the
+    /// ones they replaced.
+    epoch: u64,
+    /// The result this branch is currently continuing from, if any.
     logits: Option<LogitsHandle>,
+}
+
+impl Branch {
+    fn high_water(&self) -> u64 {
+        self.frontiers.accepted.max(self.frontiers.executed)
+    }
+
+    /// Give every occupied position a lineage entry.
+    fn extend_lineage(&mut self) {
+        while (self.lineage.len() as u64) <= self.high_water() {
+            let position = self.lineage.len() as u64 - 1;
+            let next = self.lineage[position as usize].extend(self.epoch, position);
+            self.lineage.push(next);
+        }
+    }
 }
 
 /// One sequence's state: its schema, its branches and its retained outputs.
 #[derive(Debug, Clone)]
 pub struct SequenceState {
+    id: SequenceId,
     schema: Vec<StateKind>,
     generation: StateGeneration,
     branches: BTreeMap<BranchId, Branch>,
+    /// Results this sequence has issued and not invalidated.
+    ///
+    /// Membership is what makes a handle unforgeable: a value that never came
+    /// from `record_logits`, or one whose result has since been discarded, is
+    /// not in here. The buffer the result lives in belongs to the memory
+    /// authority, which does not exist yet; this is the ledger it will consult.
+    live: BTreeMap<ResultId, LogitsHandle>,
     next_branch: u64,
+    next_result: u64,
 }
 
 /// The branch every sequence starts with.
@@ -232,21 +399,31 @@ impl SequenceState {
         let mut schema: Vec<StateKind> = schema.into_iter().collect();
         schema.sort_unstable();
         schema.dedup();
+        let id = SequenceId::next();
         let mut branches = BTreeMap::new();
         branches.insert(
             ROOT,
             Branch {
                 frontiers: Frontiers::default(),
                 parent: None,
+                lineage: vec![PrefixLineage::root(id, ROOT)],
+                epoch: 0,
                 logits: None,
             },
         );
         Self {
+            id,
             schema,
-            generation: StateGeneration(0),
+            generation: StateGeneration::default(),
             branches,
+            live: BTreeMap::new(),
             next_branch: 1,
+            next_result: 1,
         }
+    }
+
+    pub fn id(&self) -> SequenceId {
+        self.id
     }
 
     pub fn schema(&self) -> &[StateKind] {
@@ -261,13 +438,27 @@ impl SequenceState {
         self.branches.keys().copied().collect()
     }
 
+    /// Results this sequence has issued and not invalidated.
+    pub fn live_results(&self) -> Vec<LogitsHandle> {
+        self.live.values().copied().collect()
+    }
+
     pub fn frontiers(&self, branch: BranchId) -> Result<Frontiers> {
         Ok(self.get(branch)?.frontiers)
     }
 
-    /// The retained forward result for `branch`, if one is still valid.
+    /// The lineage of `prefix` on `branch`, if that prefix is occupied.
+    pub fn lineage_at(&self, branch: BranchId, prefix: u64) -> Result<Option<PrefixLineage>> {
+        Ok(self.get(branch)?.lineage.get(prefix as usize).copied())
+    }
+
+    /// The result `branch` is currently continuing from, if it is still valid.
     pub fn retained_logits(&self, branch: BranchId) -> Result<Option<LogitsHandle>> {
-        Ok(self.get(branch)?.logits)
+        let b = self.get(branch)?;
+        Ok(match b.logits {
+            Some(h) if self.handle_is_live(h).is_ok() => Some(h),
+            _ => None,
+        })
     }
 
     fn get(&self, branch: BranchId) -> Result<&Branch> {
@@ -301,6 +492,7 @@ impl SequenceState {
         }
         b.frontiers.prompt = add(b.frontiers.prompt, n, "prompt")?;
         b.frontiers.accepted = add(b.frontiers.accepted, n, "accepted")?;
+        b.extend_lineage();
         Ok(())
     }
 
@@ -314,6 +506,7 @@ impl SequenceState {
     pub fn execute(&mut self, branch: BranchId, n: u64) -> Result<()> {
         let b = self.get_mut(branch)?;
         b.frontiers.executed = add(b.frontiers.executed, n, "executed")?;
+        b.extend_lineage();
         Ok(())
     }
 
@@ -324,13 +517,16 @@ impl SequenceState {
     pub fn accept(&mut self, branch: BranchId, n: u64) -> Result<()> {
         let b = self.get_mut(branch)?;
         b.frontiers.accepted = add(b.frontiers.accepted, n, "accepted")?;
+        b.extend_lineage();
         Ok(())
     }
 
-    /// Publish `n` completion tokens to the user and to usage.
+    /// Release `n` completion tokens to the client.
     ///
     /// Refused beyond the accepted completion tokens: publication follows
-    /// verification, never precedes it.
+    /// verification, never precedes it. **Monotonic within a response** -- see
+    /// `rollback_to`, which refuses to move the accepted prefix below what has
+    /// already been released.
     pub fn emit(&mut self, branch: BranchId, n: u64) -> Result<()> {
         let b = self.get_mut(branch)?;
         let next = add(b.frontiers.emitted, n, "emitted")?;
@@ -338,7 +534,7 @@ impl SequenceState {
             return Err(Error::InvalidRequest {
                 field: "emitted",
                 detail: format!(
-                    "would publish {next} completion token(s) with only {} accepted",
+                    "would release {next} completion token(s) with only {} accepted",
                     b.frontiers.completion()
                 ),
             });
@@ -350,9 +546,11 @@ impl SequenceState {
     /// Retain the forward result that predicts the token after `prefix`.
     ///
     /// Refused for a prefix that has not been executed: there is no such result
-    /// to retain.
+    /// to retain. The returned handle is the only way to name this result again.
     pub fn record_logits(&mut self, branch: BranchId, prefix: u64) -> Result<LogitsHandle> {
         let generation = self.generation;
+        let sequence = self.id;
+        let id = ResultId(self.next_result);
         let b = self.get_mut(branch)?;
         if prefix > b.frontiers.executed {
             return Err(Error::InvalidRequest {
@@ -363,57 +561,58 @@ impl SequenceState {
                 ),
             });
         }
+        let lineage = b.lineage[prefix as usize];
         let handle = LogitsHandle {
+            id,
+            sequence,
             branch,
             prefix,
+            lineage,
             generation,
         };
         b.logits = Some(handle);
+        self.next_result += 1;
+        self.live.insert(id, handle);
         Ok(handle)
     }
 
-    /// Whether the next-token logits for `branch` are valid *right now*.
-    ///
-    /// True only when a retained result exists for exactly this branch, exactly
-    /// the accepted prefix, and the current generation. Equality of counters
-    /// proves nothing: an empty state has executed nothing, and a rollback
-    /// discards the result it had.
-    pub fn next_logits_valid(&self, branch: BranchId) -> bool {
-        let Ok(b) = self.get(branch) else {
-            return false;
-        };
-        match b.logits {
-            Some(h) => {
-                h.branch == branch
-                    && h.prefix == b.frontiers.accepted
-                    && h.generation == self.generation
-            }
-            None => false,
-        }
-    }
-
-    /// Restore a previously saved forward result after a rollback or a
-    /// configuration change.
-    ///
-    /// This is the "or use a saved equivalent forward result" half of document
-    /// 04. The caller must actually hold the result; the handle it presents is
-    /// checked against the branch and the current generation, so a stale one is
-    /// refused rather than silently re-blessed.
-    pub fn restore_logits(&mut self, branch: BranchId, handle: LogitsHandle) -> Result<()> {
-        let generation = self.generation;
-        let b = self.get_mut(branch)?;
-        if handle.branch != branch {
+    /// Whether a handle still names a result this sequence holds at a prefix
+    /// whose lineage is unchanged.
+    fn handle_is_live(&self, handle: LogitsHandle) -> Result<()> {
+        if handle.sequence != self.id {
             return Err(Error::InvalidRequest {
                 field: "logits",
-                detail: format!("result belongs to {} not {branch}", handle.branch),
+                detail: format!(
+                    "result belongs to sequence {} not {}; a prefix length is not an identity",
+                    handle.sequence.0, self.id.0
+                ),
             });
         }
-        if handle.generation != generation {
+        if handle.generation != self.generation {
             return Err(Error::InvalidRequest {
                 field: "logits",
                 detail: "result was produced under a different graph/state generation".into(),
             });
         }
+        match self.live.get(&handle.id) {
+            Some(known) if *known == handle => {}
+            Some(_) => {
+                return Err(Error::InvalidRequest {
+                    field: "logits",
+                    detail: format!("result {} does not match the one issued", handle.id.0),
+                });
+            }
+            None => {
+                return Err(Error::InvalidRequest {
+                    field: "logits",
+                    detail: format!(
+                        "result {} was never issued by this sequence, or has been discarded",
+                        handle.id.0
+                    ),
+                });
+            }
+        }
+        let b = self.get(handle.branch)?;
         if handle.prefix > b.frontiers.executed {
             return Err(Error::InvalidRequest {
                 field: "logits",
@@ -423,17 +622,64 @@ impl SequenceState {
                 ),
             });
         }
-        b.logits = Some(handle);
+        match b.lineage.get(handle.prefix as usize) {
+            Some(l) if *l == handle.lineage => Ok(()),
+            _ => Err(Error::InvalidRequest {
+                field: "logits",
+                detail: format!(
+                    "prefix {} has been re-executed since this result was produced; \
+                     the tokens at those positions are not the ones it saw",
+                    handle.prefix
+                ),
+            }),
+        }
+    }
+
+    /// Whether the next-token logits for `branch` are valid *right now*.
+    ///
+    /// True only when the branch holds a live result for exactly the accepted
+    /// prefix, on this sequence, under the current generation, at an unchanged
+    /// lineage. Equality of counters proves nothing.
+    pub fn next_logits_valid(&self, branch: BranchId) -> bool {
+        let Ok(b) = self.get(branch) else {
+            return false;
+        };
+        match b.logits {
+            Some(h) => {
+                h.branch == branch
+                    && h.prefix == b.frontiers.accepted
+                    && self.handle_is_live(h).is_ok()
+            }
+            None => false,
+        }
+    }
+
+    /// Continue from a result this sequence issued earlier.
+    ///
+    /// This is the "or use a saved equivalent forward result" half of document
+    /// 04. Every provenance rule applies: the handle must be one this sequence
+    /// minted, still live, on this branch, under the current generation, at a
+    /// prefix whose lineage has not changed.
+    pub fn restore_logits(&mut self, branch: BranchId, handle: LogitsHandle) -> Result<()> {
+        if handle.branch != branch {
+            return Err(Error::InvalidRequest {
+                field: "logits",
+                detail: format!("result belongs to {} not {branch}", handle.branch),
+            });
+        }
+        self.handle_is_live(handle)?;
+        self.get_mut(branch)?.logits = Some(handle);
         Ok(())
     }
 
     /// Declare that the executing configuration changed.
     ///
-    /// Every retained result becomes stale. Nothing is deleted -- a caller that
-    /// genuinely saved an exact result may present it to `restore_logits` under
-    /// the new generation -- but nothing is valid by default either.
+    /// Every retained result becomes stale and is discarded. Nothing survives:
+    /// a result computed under a different graph, precision or positional
+    /// configuration is a different computation, whatever its prefix.
     pub fn invalidate_generation(&mut self) {
         self.generation = StateGeneration(self.generation.0 + 1);
+        self.live.clear();
         for b in self.branches.values_mut() {
             b.logits = None;
         }
@@ -442,21 +688,29 @@ impl SequenceState {
     /// Roll back `branch` to an accepted prefix, as `abort` and a speculative
     /// rejection do.
     ///
-    /// `restores` must cover every schema component whose
-    /// [`RestoreCapability`] is `Explicit`, with evidence at or before
-    /// `prefix`. Truncatable components need no entry. A rollback that cannot
-    /// name how the recurrent state got back is not a rollback.
+    /// `restores` must cover every schema component whose [`RestoreCapability`]
+    /// is `Explicit`, exactly once each, with evidence that finished **at**
+    /// `prefix` -- not merely evidence that some earlier state is available.
+    /// Truncatable components need no entry, and an entry for one is refused as
+    /// a sign that the caller is confused about what it restored.
     ///
-    /// The retained forward result is **discarded**. Truncating KV does not
-    /// bring back logits that were computed at the shorter prefix and then
-    /// thrown away; if the caller saved one, it says so with `restore_logits`.
+    /// Refused when it would move the accepted prefix below text already
+    /// released to the client: published output cannot be unpublished by
+    /// shortening a counter. Regenerating is a new response, not a rollback.
+    ///
+    /// Every result at a prefix beyond the target is discarded, and the branch's
+    /// epoch advances so that re-executing those positions produces a different
+    /// lineage. Results at or before the target survive, because those positions
+    /// did not change.
     pub fn rollback_to(
         &mut self,
         branch: BranchId,
         prefix: u64,
-        restores: &[(StateKind, Restore)],
+        restores: &[Restore],
     ) -> Result<()> {
         let schema = self.schema.clone();
+        let generation = self.generation;
+        let sequence = self.id;
         {
             let b = self.get(branch)?;
             if prefix > b.frontiers.accepted {
@@ -478,51 +732,116 @@ impl SequenceState {
                     ),
                 });
             }
+            let published_through = b.frontiers.prompt + b.frontiers.emitted;
+            if prefix < published_through {
+                return Err(Error::InvalidRequest {
+                    field: "prefix",
+                    detail: format!(
+                        "cannot roll back to {prefix}: {} completion token(s) have already \
+                         been released to the client, through prefix {published_through}. \
+                         Published output cannot be unpublished; regeneration is a new response",
+                        b.frontiers.emitted
+                    ),
+                });
+            }
         }
 
-        for kind in &schema {
-            if kind.restore_capability() != RestoreCapability::Explicit {
-                continue;
+        // Every restore must name a component of this schema, and no component
+        // may be restored twice.
+        let mut seen: BTreeSet<StateKind> = BTreeSet::new();
+        for r in restores {
+            if !schema.contains(&r.kind) {
+                return Err(Error::InvalidRequest {
+                    field: "restores",
+                    detail: format!("{:?} is not part of this sequence's schema", r.kind),
+                });
             }
-            match restores.iter().find(|(k, _)| k == kind) {
-                None => {
-                    return Err(Error::InvalidRequest {
-                        field: "restores",
-                        detail: format!(
-                            "{kind:?} cannot be restored by truncating a counter and no \
-                             snapshot or replay was supplied"
-                        ),
-                    });
-                }
-                Some((_, r)) if !r.covers(prefix) => {
-                    return Err(Error::InvalidRequest {
-                        field: "restores",
-                        detail: format!(
-                            "{kind:?} restore is at prefix {} which is after the rollback \
-                             target {prefix}",
-                            r.at()
-                        ),
-                    });
-                }
-                Some(_) => {}
+            if r.kind.restore_capability() != RestoreCapability::Explicit {
+                return Err(Error::InvalidRequest {
+                    field: "restores",
+                    detail: format!(
+                        "{:?} is restored by truncation; supplying evidence for it means \
+                         something else was restored instead",
+                        r.kind
+                    ),
+                });
+            }
+            if !seen.insert(r.kind) {
+                return Err(Error::InvalidRequest {
+                    field: "restores",
+                    detail: format!("{:?} has more than one restore", r.kind),
+                });
+            }
+            if r.sequence != sequence {
+                return Err(Error::InvalidRequest {
+                    field: "restores",
+                    detail: format!(
+                        "{:?} evidence names sequence {}, not {}",
+                        r.kind, r.sequence.0, sequence.0
+                    ),
+                });
+            }
+            if r.generation != generation {
+                return Err(Error::InvalidRequest {
+                    field: "restores",
+                    detail: format!(
+                        "{:?} evidence is from generation {}, not the current {}",
+                        r.kind, r.generation.0, generation.0
+                    ),
+                });
+            }
+            if !r.method.is_coherent() {
+                return Err(Error::InvalidRequest {
+                    field: "restores",
+                    detail: format!("{:?} replay runs backwards: {:?}", r.kind, r.method),
+                });
+            }
+            if r.method.completed_prefix() != prefix {
+                return Err(Error::InvalidRequest {
+                    field: "restores",
+                    detail: format!(
+                        "{:?} restoration finished at prefix {}, not the rollback target \
+                         {prefix}. A source at another prefix is not a completed restoration",
+                        r.kind,
+                        r.method.completed_prefix()
+                    ),
+                });
             }
         }
+        for kind in &schema {
+            if kind.restore_capability() == RestoreCapability::Explicit && !seen.contains(kind) {
+                return Err(Error::InvalidRequest {
+                    field: "restores",
+                    detail: format!(
+                        "{kind:?} cannot be restored by truncating a counter and no \
+                         snapshot or replay was supplied"
+                    ),
+                });
+            }
+        }
+
+        // Results beyond the target describe state that no longer exists.
+        self.live
+            .retain(|_, h| !(h.branch == branch && h.prefix > prefix));
 
         let b = self.get_mut(branch)?;
         b.frontiers.accepted = prefix;
         b.frontiers.executed = b.frontiers.executed.min(prefix);
-        b.frontiers.emitted = b.frontiers.emitted.min(b.frontiers.completion());
-        b.logits = None;
+        b.lineage.truncate(prefix as usize + 1);
+        b.epoch += 1;
+        if b.logits.is_some_and(|h| h.prefix > prefix) {
+            b.logits = None;
+        }
         Ok(())
     }
 
     /// Fork a copy-on-write branch sharing the prefix `at`.
     ///
     /// Used by speculation and by future-entropy lookahead. The child starts
-    /// with no retained forward result even though it shares the prefix: a
-    /// result is identified by `(branch, prefix, generation)`, and quietly
-    /// re-labelling the parent's result as the child's is exactly the kind of
-    /// provenance shortcut this module exists to prevent.
+    /// with no retained result even though it shares the prefix: a result is
+    /// identified by its branch among other things, and quietly re-labelling the
+    /// parent's result as the child's is the provenance shortcut this module
+    /// exists to prevent.
     pub fn fork(&mut self, parent: BranchId, at: u64) -> Result<BranchId> {
         let p = self.get(parent)?;
         if at > p.frontiers.accepted {
@@ -537,11 +856,13 @@ impl SequenceState {
         let frontiers = Frontiers {
             prompt: p.frontiers.prompt.min(at),
             accepted: at,
-            // Usage is per generation, not per branch: a branch that is
-            // discarded published nothing.
+            // Usage is per response, not per branch: a branch that is discarded
+            // released nothing.
             emitted: 0,
             executed: p.frontiers.executed.min(at),
         };
+        let lineage = p.lineage[..=at as usize].to_vec();
+        let epoch = p.epoch;
         let child = BranchId(self.next_branch);
         self.next_branch += 1;
         self.branches.insert(
@@ -549,6 +870,8 @@ impl SequenceState {
             Branch {
                 frontiers,
                 parent: Some(parent),
+                lineage,
+                epoch,
                 logits: None,
             },
         );
@@ -571,13 +894,14 @@ impl SequenceState {
                 detail: "the root branch cannot be discarded".into(),
             });
         }
-        self.branches
-            .remove(&branch)
-            .map(|_| ())
-            .ok_or(Error::InvalidRequest {
+        if self.branches.remove(&branch).is_none() {
+            return Err(Error::InvalidRequest {
                 field: "branch",
                 detail: format!("no such branch {branch}"),
-            })
+            });
+        }
+        self.live.retain(|_, h| h.branch != branch);
+        Ok(())
     }
 }
 
@@ -592,23 +916,26 @@ fn add(base: u64, n: u64, field: &'static str) -> Result<u64> {
 mod tests {
     use super::*;
 
-    /// A schema with one component of each kind, so a rollback has to satisfy
-    /// every restore rule at once.
+    fn kv_only() -> SequenceState {
+        SequenceState::new([StateKind::KvPages, StateKind::PositionCounter])
+    }
+
     fn full_schema() -> SequenceState {
         SequenceState::new(StateKind::ALL.iter().copied())
     }
 
-    /// The restore evidence a full-schema rollback to `prefix` needs.
-    fn restores_for(prefix: u64) -> Vec<(StateKind, Restore)> {
-        StateKind::ALL
+    /// Snapshot evidence for every `Explicit` component, finishing at `prefix`.
+    fn snapshots_at(s: &SequenceState, prefix: u64) -> Vec<Restore> {
+        s.schema()
             .iter()
             .filter(|k| k.restore_capability() == RestoreCapability::Explicit)
-            .map(|k| (*k, Restore::Snapshot { taken_at: prefix }))
+            .map(|k| Restore {
+                kind: *k,
+                sequence: s.id(),
+                generation: s.generation(),
+                method: RestoreMethod::Snapshot { of_prefix: prefix },
+            })
             .collect()
-    }
-
-    fn kv_only() -> SequenceState {
-        SequenceState::new([StateKind::KvPages, StateKind::PositionCounter])
     }
 
     #[test]
@@ -619,6 +946,7 @@ mod tests {
         assert!(!s.next_logits_valid(ROOT));
         assert_eq!(s.retained_logits(ROOT).unwrap(), None);
         assert_eq!(s.frontiers(ROOT).unwrap(), Frontiers::default());
+        assert!(s.live_results().is_empty());
     }
 
     #[test]
@@ -640,9 +968,111 @@ mod tests {
     }
 
     #[test]
+    fn a_result_from_another_sequence_is_refused() {
+        // Second review, reproduced: two fresh sequences share the root branch
+        // and generation zero, so a `(branch, prefix, generation)` triple made a
+        // handle from A valid in B. Both had `next_logits_valid == true`.
+        let mut a = kv_only();
+        a.append_prompt(ROOT, 5).unwrap();
+        a.execute(ROOT, 5).unwrap();
+        let from_a = a.record_logits(ROOT, 5).unwrap();
+
+        let mut b = kv_only();
+        b.append_prompt(ROOT, 5).unwrap();
+        b.execute(ROOT, 5).unwrap();
+
+        assert_ne!(a.id(), b.id());
+        let e = b.restore_logits(ROOT, from_a).unwrap_err();
+        assert!(e.to_string().contains("sequence"), "{e}");
+        assert!(!b.next_logits_valid(ROOT));
+
+        // Identical counters on both sides; only the identity differs.
+        assert_eq!(a.frontiers(ROOT).unwrap(), b.frontiers(ROOT).unwrap());
+    }
+
+    #[test]
+    fn a_result_for_a_replaced_suffix_does_not_come_back() {
+        // Second review, reproduced: rolling back and re-executing to the same
+        // length made the discarded result valid again, because a prefix length
+        // is not a prefix identity.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 4).unwrap();
+        s.accept(ROOT, 4).unwrap();
+        s.execute(ROOT, 8).unwrap();
+        let at_eight = s.record_logits(ROOT, 8).unwrap();
+        assert!(s.next_logits_valid(ROOT));
+
+        s.rollback_to(ROOT, 4, &[]).unwrap();
+        s.accept(ROOT, 4).unwrap(); // four *different* tokens
+        s.execute(ROOT, 4).unwrap();
+        assert_eq!(s.frontiers(ROOT).unwrap().accepted, 8);
+        assert_eq!(s.frontiers(ROOT).unwrap().executed, 8);
+
+        let e = s.restore_logits(ROOT, at_eight).unwrap_err();
+        assert!(!s.next_logits_valid(ROOT));
+        assert!(
+            e.to_string().contains("never issued") || e.to_string().contains("re-executed"),
+            "{e}"
+        );
+
+        // The lineage of prefix 8 really did change; prefix 4 did not.
+        let mut fresh = kv_only();
+        fresh.append_prompt(ROOT, 4).unwrap();
+        fresh.accept(ROOT, 4).unwrap();
+        fresh.execute(ROOT, 8).unwrap();
+        assert_ne!(
+            s.lineage_at(ROOT, 8).unwrap(),
+            fresh.lineage_at(ROOT, 8).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_result_at_an_unchanged_prefix_survives_a_rollback() {
+        // The other half of the requirement: replacing a suffix must not
+        // invalidate results for prefixes it did not touch.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 8).unwrap();
+        s.accept(ROOT, 4).unwrap(); // accepted prefix 12
+        s.execute(ROOT, 12).unwrap();
+        let at_twelve = s.record_logits(ROOT, 12).unwrap();
+        assert!(s.next_logits_valid(ROOT));
+
+        s.accept(ROOT, 8).unwrap(); // accepted prefix 20
+        s.execute(ROOT, 8).unwrap();
+        s.record_logits(ROOT, 20).unwrap();
+        assert!(s.next_logits_valid(ROOT));
+
+        s.rollback_to(ROOT, 12, &[]).unwrap();
+        assert!(!s.next_logits_valid(ROOT), "the prefix-20 result is gone");
+        assert_eq!(s.retained_logits(ROOT).unwrap(), None);
+
+        // The prefix-12 result was genuinely recorded earlier and is still live.
+        s.restore_logits(ROOT, at_twelve).unwrap();
+        assert!(s.next_logits_valid(ROOT));
+        assert_eq!(s.live_results().len(), 1);
+    }
+
+    #[test]
+    fn a_handle_cannot_be_fabricated() {
+        // `LogitsHandle`'s fields are private and only `record_logits` mints one,
+        // so a test cannot assert its way past provenance. What is checkable
+        // here is that a handle whose result has been dropped stops working.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 6).unwrap();
+        s.execute(ROOT, 6).unwrap();
+        let h = s.record_logits(ROOT, 6).unwrap();
+        assert!(s.restore_logits(ROOT, h).is_ok());
+
+        let child = s.fork(ROOT, 6).unwrap();
+        s.execute(child, 2).unwrap();
+        let child_result = s.record_logits(child, 8).unwrap();
+        s.discard_branch(child).unwrap();
+        assert!(s.restore_logits(ROOT, child_result).is_err());
+        assert_eq!(s.live_results().len(), 1);
+    }
+
+    #[test]
     fn a_committed_bonus_token_is_pending_execution_and_invalidates_the_logits() {
-        // Document 04's bonus-token case: committed to history, forward pass not
-        // yet run.
         let mut s = kv_only();
         s.append_prompt(ROOT, 10).unwrap();
         s.execute(ROOT, 10).unwrap();
@@ -667,9 +1097,6 @@ mod tests {
 
     #[test]
     fn a_branch_may_execute_tokens_it_has_not_accepted() {
-        // The invariant the old type had backwards. Verification runs the
-        // proposals *before* deciding which are accepted, and must not have to
-        // publish them first.
         let mut s = kv_only();
         s.append_prompt(ROOT, 100).unwrap();
         s.execute(ROOT, 100).unwrap();
@@ -679,7 +1106,7 @@ mod tests {
         let f = s.frontiers(draft).unwrap();
         assert_eq!(f.tentative(), 4);
         assert_eq!(f.accepted, 100);
-        assert_eq!(f.emitted, 0, "nothing was published to the user");
+        assert_eq!(f.emitted, 0, "nothing was released to the client");
     }
 
     #[test]
@@ -696,10 +1123,52 @@ mod tests {
     }
 
     #[test]
+    fn published_output_cannot_be_unpublished_by_a_rollback() {
+        // Second review, reproduced: accepting and releasing one completion
+        // token, then rolling back, silently reset `emitted` to zero. The client
+        // already has that text.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 3).unwrap();
+        s.accept(ROOT, 2).unwrap();
+        s.execute(ROOT, 5).unwrap();
+        s.emit(ROOT, 1).unwrap();
+
+        let e = s.rollback_to(ROOT, 3, &[]).unwrap_err();
+        assert!(e.to_string().contains("already"), "{e}");
+        assert_eq!(s.frontiers(ROOT).unwrap().emitted, 1);
+
+        // Rolling back over *unreleased* completion tokens is still fine.
+        s.rollback_to(ROOT, 4, &[]).unwrap();
+        let f = s.frontiers(ROOT).unwrap();
+        assert_eq!(f.accepted, 4);
+        assert_eq!(f.emitted, 1);
+        assert_eq!(f.completion(), 1);
+    }
+
+    #[test]
+    fn usage_counts_committed_completion_tokens_not_released_ones() {
+        // Document 05 bills "prompt tokens and committed completion tokens
+        // only". Stop-string withholding makes released text lag behind, and
+        // the two numbers must not be conflated.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 7).unwrap();
+        s.accept(ROOT, 4).unwrap();
+        s.execute(ROOT, 11).unwrap();
+        s.emit(ROOT, 2).unwrap(); // two more held while a stop string forms
+
+        let f = s.frontiers(ROOT).unwrap();
+        assert_eq!(
+            f.completion(),
+            4,
+            "usage counts committed completion tokens"
+        );
+        assert_eq!(f.emitted, 2, "the client has seen two");
+        assert_eq!(f.withheld(), 2);
+        assert_ne!(f.completion(), f.emitted);
+    }
+
+    #[test]
     fn rejection_at_every_depth_leaves_consistent_state_and_no_logits() {
-        // Verification proposed 4 tokens on a branch; each rejection depth must
-        // land on consistent counters, and none of them may claim logits that
-        // were never retained at that prefix.
         for accepted in 0..=4u64 {
             let mut s = kv_only();
             s.append_prompt(ROOT, 100).unwrap();
@@ -727,31 +1196,6 @@ mod tests {
     }
 
     #[test]
-    fn rollback_loses_logits_unless_an_exact_saved_result_is_restored() {
-        // The second F2 observation: 20 -> 12 used to report valid logits at 12
-        // although nothing was retained or recomputed there.
-        let mut s = kv_only();
-        s.append_prompt(ROOT, 8).unwrap();
-        s.accept(ROOT, 12).unwrap();
-        s.execute(ROOT, 20).unwrap();
-        s.record_logits(ROOT, 20).unwrap();
-        assert!(s.next_logits_valid(ROOT));
-
-        s.rollback_to(ROOT, 12, &[]).unwrap();
-        assert!(!s.next_logits_valid(ROOT));
-        assert_eq!(s.retained_logits(ROOT).unwrap(), None);
-
-        // A caller that genuinely saved the prefix-12 result may present it.
-        let saved = LogitsHandle {
-            branch: ROOT,
-            prefix: 12,
-            generation: s.generation(),
-        };
-        s.restore_logits(ROOT, saved).unwrap();
-        assert!(s.next_logits_valid(ROOT));
-    }
-
-    #[test]
     fn a_stale_or_foreign_saved_result_is_refused() {
         let mut s = kv_only();
         s.append_prompt(ROOT, 8).unwrap();
@@ -765,14 +1209,14 @@ mod tests {
             s.restore_logits(ROOT, handle).is_err(),
             "a result from the previous generation must not be re-blessed"
         );
+        assert!(s.live_results().is_empty());
 
+        // A result from another branch, presented for this one.
+        s.execute(ROOT, 0).unwrap();
         let other = s.fork(ROOT, 8).unwrap();
-        let foreign = LogitsHandle {
-            branch: other,
-            prefix: 8,
-            generation: s.generation(),
-        };
-        assert!(s.restore_logits(ROOT, foreign).is_err());
+        s.execute(other, 1).unwrap();
+        let other_result = s.record_logits(other, 9).unwrap();
+        assert!(s.restore_logits(ROOT, other_result).is_err());
     }
 
     #[test]
@@ -787,58 +1231,175 @@ mod tests {
         let e = s.rollback_to(ROOT, 10, &[]).unwrap_err();
         assert_eq!(e.kind(), "invalid_request");
 
-        // A snapshot taken *after* the target is no help either.
-        assert!(
-            s.rollback_to(
-                ROOT,
-                10,
-                &[(
-                    StateKind::RecurrentAccumulator,
-                    Restore::Snapshot { taken_at: 12 }
-                )]
-            )
-            .is_err()
-        );
-
-        // Replay from a saved earlier prefix works.
+        // A replay that ran to the target restores it.
         s.rollback_to(
             ROOT,
             10,
-            &[(StateKind::RecurrentAccumulator, Restore::Replay { from: 8 })],
+            &[Restore {
+                kind: StateKind::RecurrentAccumulator,
+                sequence: s.id(),
+                generation: s.generation(),
+                method: RestoreMethod::Replay { from: 8, to: 10 },
+            }],
         )
         .unwrap();
         assert_eq!(s.frontiers(ROOT).unwrap().accepted, 10);
     }
 
     #[test]
-    fn every_explicit_kind_in_the_schema_must_be_covered() {
+    fn an_earlier_source_is_not_a_completed_restoration() {
+        // Second review, reproduced: a snapshot taken at prefix 4 was accepted
+        // as restoration to prefix 6, and the execution frontier advanced to 6
+        // over state that stopped at 4.
+        let mut s = SequenceState::new([StateKind::RecurrentAccumulator]);
+        s.append_prompt(ROOT, 2).unwrap();
+        s.accept(ROOT, 8).unwrap();
+        s.execute(ROOT, 10).unwrap();
+
+        let early = Restore {
+            kind: StateKind::RecurrentAccumulator,
+            sequence: s.id(),
+            generation: s.generation(),
+            method: RestoreMethod::Snapshot { of_prefix: 4 },
+        };
+        let e = s.rollback_to(ROOT, 6, &[early]).unwrap_err();
+        assert!(e.to_string().contains("finished at prefix 4"), "{e}");
+        assert_eq!(
+            s.frontiers(ROOT).unwrap().executed,
+            10,
+            "a refused rollback changes nothing"
+        );
+
+        // A replay whose source is earlier but which ran *to* the target is
+        // exactly what the earlier snapshot was missing.
+        let replayed = Restore {
+            method: RestoreMethod::Replay { from: 4, to: 6 },
+            ..early
+        };
+        s.rollback_to(ROOT, 6, &[replayed]).unwrap();
+        assert_eq!(s.frontiers(ROOT).unwrap().executed, 6);
+
+        // A replay that runs backwards is incoherent.
+        let mut t = SequenceState::new([StateKind::RecurrentAccumulator]);
+        t.append_prompt(ROOT, 2).unwrap();
+        t.accept(ROOT, 8).unwrap();
+        t.execute(ROOT, 10).unwrap();
+        assert!(
+            t.rollback_to(
+                ROOT,
+                6,
+                &[Restore {
+                    kind: StateKind::RecurrentAccumulator,
+                    sequence: t.id(),
+                    generation: t.generation(),
+                    method: RestoreMethod::Replay { from: 9, to: 6 },
+                }]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn restore_evidence_must_name_this_sequence_and_generation() {
+        let mut s = SequenceState::new([StateKind::RecurrentAccumulator]);
+        s.append_prompt(ROOT, 2).unwrap();
+        s.accept(ROOT, 6).unwrap();
+        s.execute(ROOT, 8).unwrap();
+
+        let other = SequenceState::new([StateKind::RecurrentAccumulator]);
+        let good = Restore {
+            kind: StateKind::RecurrentAccumulator,
+            sequence: s.id(),
+            generation: s.generation(),
+            method: RestoreMethod::Snapshot { of_prefix: 6 },
+        };
+
+        assert!(
+            s.rollback_to(
+                ROOT,
+                6,
+                &[Restore {
+                    sequence: other.id(),
+                    ..good
+                }]
+            )
+            .is_err(),
+            "evidence from another sequence is not evidence about this one"
+        );
+        assert!(
+            s.rollback_to(
+                ROOT,
+                6,
+                &[Restore {
+                    generation: StateGeneration(99),
+                    ..good
+                }]
+            )
+            .is_err(),
+            "a snapshot from a different configuration is stale"
+        );
+        s.rollback_to(ROOT, 6, &[good]).unwrap();
+    }
+
+    #[test]
+    fn every_explicit_kind_in_the_schema_must_be_covered_exactly_once() {
         let mut s = full_schema();
         s.append_prompt(ROOT, 4).unwrap();
         s.execute(ROOT, 4).unwrap();
         s.accept(ROOT, 4).unwrap();
         s.execute(ROOT, 4).unwrap();
 
-        // Drop one entry at a time: each omission must be refused by name.
-        let full = restores_for(4);
+        let full = snapshots_at(&s, 4);
+        assert_eq!(full.len(), 5, "five explicit kinds in the full schema");
+
+        // Drop one at a time: each omission must be refused by name.
         for i in 0..full.len() {
             let mut partial = full.clone();
             let missing = partial.remove(i);
             let mut s2 = s.clone();
             let e = s2.rollback_to(ROOT, 4, &partial).unwrap_err();
             assert!(
-                e.to_string().contains(&format!("{:?}", missing.0)),
+                e.to_string().contains(&format!("{:?}", missing.kind)),
                 "omitting {:?} was not reported: {e}",
-                missing.0
+                missing.kind
             );
         }
+
+        // A duplicate, and evidence for a component that truncates, are both
+        // signs the caller does not know what it restored.
+        let mut duplicated = full.clone();
+        duplicated.push(full[0]);
+        assert!(s.clone().rollback_to(ROOT, 4, &duplicated).is_err());
+
+        let mut with_truncatable = full.clone();
+        with_truncatable.push(Restore {
+            kind: StateKind::KvPages,
+            sequence: s.id(),
+            generation: s.generation(),
+            method: RestoreMethod::Snapshot { of_prefix: 4 },
+        });
+        assert!(s.clone().rollback_to(ROOT, 4, &with_truncatable).is_err());
+
         s.rollback_to(ROOT, 4, &full).unwrap();
     }
 
     #[test]
+    fn a_restore_for_a_component_outside_the_schema_is_refused() {
+        let mut s = SequenceState::new([StateKind::RecurrentAccumulator]);
+        s.append_prompt(ROOT, 2).unwrap();
+        s.accept(ROOT, 4).unwrap();
+        s.execute(ROOT, 6).unwrap();
+        let foreign = Restore {
+            kind: StateKind::ConvolutionHistory,
+            sequence: s.id(),
+            generation: s.generation(),
+            method: RestoreMethod::Snapshot { of_prefix: 4 },
+        };
+        assert!(s.rollback_to(ROOT, 4, &[foreign]).is_err());
+    }
+
+    #[test]
     fn a_sparse_index_and_sampler_history_are_not_truncatable() {
-        // The M0 review's addition to R20: a mutable compressed index and an
-        // accumulated penalty history are not restored by shortening a counter,
-        // however "history"-like the name is.
         assert_eq!(
             StateKind::SparseIndex.restore_capability(),
             RestoreCapability::Explicit
@@ -868,8 +1429,6 @@ mod tests {
         // n+k. Replay from a saved prefix is the only way back, and this checks
         // that the state machine's rule matches that arithmetic.
         fn step(state: u64, token: u64) -> u64 {
-            // Order-dependent and non-invertible: dropping the last token cannot
-            // undo it.
             (state.wrapping_mul(1_000_003).wrapping_add(token)) % 1_000_000_007
         }
         let tokens: Vec<u64> = (1..=12).collect();
@@ -878,13 +1437,14 @@ mod tests {
             let next = step(*states.last().unwrap(), *t);
             states.push(next);
         }
-        // The saved snapshot is at prefix 8; the accepted prefix after rejection
-        // is 10. Replay covers the gap.
+        // Saved snapshot at prefix 8, accepted prefix after rejection is 10.
         let mut replayed = states[8];
         for t in &tokens[8..10] {
             replayed = step(replayed, *t);
         }
         assert_eq!(replayed, states[10]);
+        // ... and the snapshot alone, without the replay, is a different state.
+        assert_ne!(states[8], states[10]);
 
         let mut s = SequenceState::new([StateKind::RecurrentAccumulator]);
         s.append_prompt(ROOT, 4).unwrap();
@@ -893,7 +1453,12 @@ mod tests {
         s.rollback_to(
             ROOT,
             10,
-            &[(StateKind::RecurrentAccumulator, Restore::Replay { from: 8 })],
+            &[Restore {
+                kind: StateKind::RecurrentAccumulator,
+                sequence: s.id(),
+                generation: s.generation(),
+                method: RestoreMethod::Replay { from: 8, to: 10 },
+            }],
         )
         .unwrap();
         assert_eq!(s.frontiers(ROOT).unwrap().executed, 10);
@@ -901,14 +1466,13 @@ mod tests {
 
     #[test]
     fn an_entropy_branch_leaves_its_parent_unchanged() {
-        // Document 05: entropy branches are executed, read and discarded, and
-        // "confirm parent state remains unchanged".
         let mut s = kv_only();
         s.append_prompt(ROOT, 30).unwrap();
         s.execute(ROOT, 30).unwrap();
         s.record_logits(ROOT, 30).unwrap();
         let before = s.frontiers(ROOT).unwrap();
         let before_logits = s.retained_logits(ROOT).unwrap();
+        let before_lineage = s.lineage_at(ROOT, 30).unwrap();
 
         let mut children = Vec::new();
         for _ in 0..4 {
@@ -919,6 +1483,7 @@ mod tests {
         }
         assert_eq!(s.frontiers(ROOT).unwrap(), before);
         assert_eq!(s.retained_logits(ROOT).unwrap(), before_logits);
+        assert_eq!(s.lineage_at(ROOT, 30).unwrap(), before_lineage);
         assert!(s.next_logits_valid(ROOT));
 
         for c in children {
@@ -927,6 +1492,7 @@ mod tests {
         assert_eq!(s.branch_ids(), vec![ROOT]);
         assert_eq!(s.frontiers(ROOT).unwrap(), before);
         assert!(s.next_logits_valid(ROOT));
+        assert_eq!(s.live_results().len(), 1, "the children's results are gone");
     }
 
     #[test]
@@ -934,12 +1500,14 @@ mod tests {
         let mut s = kv_only();
         s.append_prompt(ROOT, 6).unwrap();
         s.execute(ROOT, 6).unwrap();
-        s.record_logits(ROOT, 6).unwrap();
+        let parent_result = s.record_logits(ROOT, 6).unwrap();
 
         let child = s.fork(ROOT, 6).unwrap();
         assert_eq!(s.retained_logits(child).unwrap(), None);
         assert!(!s.next_logits_valid(child));
         assert_eq!(s.parent_of(child).unwrap(), Some(ROOT));
+        // ... and the parent's result cannot be re-labelled as the child's.
+        assert!(s.restore_logits(child, parent_result).is_err());
     }
 
     #[test]
@@ -954,11 +1522,23 @@ mod tests {
             s.rollback_to(ROOT, 2, &[]).is_err(),
             "into the prompt: that is a re-prefill"
         );
-        s.accept(ROOT, u64::MAX - 5).unwrap();
-        assert!(s.accept(ROOT, 1).is_err());
-        assert!(s.execute(ROOT, u64::MAX).is_ok());
-        assert!(s.execute(ROOT, 1).is_err());
         assert!(s.frontiers(BranchId(999)).is_err());
+        assert!(s.lineage_at(BranchId(999), 0).is_err());
+    }
+
+    #[test]
+    fn counter_overflow_is_an_error_not_a_wrap() {
+        // Checked separately from the boundary cases: `u64::MAX` positions would
+        // make the lineage vector unrepresentable, so this uses a fresh state
+        // and only exercises the arithmetic.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 4).unwrap();
+        let b = s.branches.get_mut(&ROOT).unwrap();
+        b.frontiers.accepted = u64::MAX - 2;
+        assert!(s.accept(ROOT, 5).is_err());
+        let b = s.branches.get_mut(&ROOT).unwrap();
+        b.frontiers.executed = u64::MAX;
+        assert!(s.execute(ROOT, 1).is_err());
     }
 
     #[test]

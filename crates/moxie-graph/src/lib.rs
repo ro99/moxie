@@ -182,13 +182,20 @@ impl OracleRegistry {
     }
 
     /// Register an independent host reference for one operation.
+    ///
+    /// A rejected registration leaves the registry **unchanged**. The first
+    /// version used `insert(...).is_some()`, which wrote the new evidence and
+    /// then reported failure -- so a duplicate registration silently replaced
+    /// the entry it was supposed to protect, and a caller that ignored the error
+    /// ended up validating against whichever implementation registered last.
     pub fn register(&mut self, op: Op, id: OracleId, evidence: OracleEvidence) -> Result<()> {
-        if self.entries.insert((op, id), evidence).is_some() {
+        if self.entries.contains_key(&(op, id)) {
             return Err(Error::InvalidRequest {
                 field: "oracle",
                 detail: format!("{} already has an oracle named {}", op.name(), id.0),
             });
         }
+        self.entries.insert((op, id), evidence);
         Ok(())
     }
 
@@ -400,20 +407,29 @@ mod tests {
     }
 
     #[test]
-    fn registering_the_same_oracle_twice_is_an_error() {
+    fn a_rejected_registration_leaves_the_registry_unchanged() {
+        // Second review: the duplicate check returned an error *after* the
+        // replacement had already happened, so the evidence changed anyway.
         let mut r = registry(Op::Linear);
+        let before = r.evidence(Op::Linear, TEST_ORACLE).unwrap();
+
         assert!(
             r.register(
                 Op::Linear,
                 TEST_ORACLE,
                 OracleEvidence {
-                    implementation: "a",
-                    test_module: "b"
+                    implementation: "a_different_implementation",
+                    test_module: "a_different_test",
                 }
             )
             .is_err()
         );
         assert_eq!(r.len(), 1);
+        assert_eq!(
+            r.evidence(Op::Linear, TEST_ORACLE).unwrap(),
+            before,
+            "the rejected registration overwrote the entry it was meant to protect"
+        );
     }
 
     #[test]

@@ -661,18 +661,86 @@ impl<'a> TrustedImage<'a> {
     }
 }
 
+/// Validated PTX module text.
+///
+/// NUL-termination is what the C API requires of PTX, but it is **not** what
+/// makes a buffer PTX. `cuModuleLoadData` sniffs the leading bytes and decides
+/// for itself whether it is looking at a binary image or at source text; the
+/// Rust enum label is never passed to the driver. So a `&CStr` that happens to
+/// begin with ELF or fatbin magic would be handed to the binary-image parser
+/// through what looks like the text path -- exactly the boundary the trusted-
+/// image type exists to keep closed. The second M0 review found that hole.
+///
+/// This type closes it by construction: the bytes must be UTF-8 text, must not
+/// begin with any image magic the driver recognises, and must carry the
+/// `.version` directive that every PTX module opens with.
+///
+/// That last check is **necessary, not sufficient**. It does not make the text
+/// valid PTX -- the driver's parser decides that, and returns
+/// `CUDA_ERROR_INVALID_PTX`, which classifies as `UnsupportedKernel`. What it
+/// does guarantee is that the driver cannot take this buffer for a binary image.
+#[derive(Debug, Clone, Copy)]
+pub struct PtxSource<'a> {
+    text: &'a CStr,
+}
+
+impl<'a> PtxSource<'a> {
+    pub fn new(text: &'a CStr) -> Result<Self> {
+        let bytes = text.to_bytes();
+        if bytes.len() < 4 {
+            return Err(Error::InvalidRequest {
+                field: "ptx",
+                detail: format!("{} bytes is too short to be a PTX module", bytes.len()),
+            });
+        }
+        let head = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        if head == FATBIN_MAGIC || head == ELF_MAGIC {
+            return Err(Error::InvalidRequest {
+                field: "ptx",
+                detail: "text begins with a binary image magic; the driver would parse it                          as a cubin or fatbin, not as PTX"
+                    .into(),
+            });
+        }
+        let Ok(source) = core::str::from_utf8(bytes) else {
+            return Err(Error::InvalidRequest {
+                field: "ptx",
+                detail: "PTX is text and this is not valid UTF-8".into(),
+            });
+        };
+        // Every PTX module begins with a `.version` directive, ahead of any
+        // other directive or instruction. Comments and blank lines may precede
+        // it, so this looks for the token rather than the first byte.
+        if !source
+            .lines()
+            .any(|l| l.trim_start().starts_with(".version"))
+        {
+            return Err(Error::InvalidRequest {
+                field: "ptx",
+                detail: "no `.version` directive: a PTX module must declare its ISA version".into(),
+            });
+        }
+        Ok(Self { text })
+    }
+
+    fn as_ptr(&self) -> *const c_void {
+        self.text.as_ptr() as *const c_void
+    }
+}
+
 /// What `Module::load` accepts.
 ///
-/// Both variants satisfy `cuModuleLoadData`'s contract by construction: a
-/// `TrustedImage` carries the caller's build-time guarantee, and a `&CStr` is
-/// NUL-terminated, which is what the C API requires of PTX. An arbitrary
-/// `&[u8]` satisfies neither and is deliberately not accepted.
+/// Both variants satisfy `cuModuleLoadData`'s contract by construction, and
+/// neither can be mistaken for the other by the driver's format sniffing: a
+/// `TrustedImage` carries the caller's build-time guarantee and begins with an
+/// image magic, and a [`PtxSource`] is NUL-terminated text that is guaranteed
+/// not to. An arbitrary `&[u8]`, or a bare `&CStr`, satisfies neither and is
+/// deliberately not accepted.
 #[derive(Debug, Clone, Copy)]
 pub enum ModuleImage<'a> {
     /// A cubin or fatbin from the build.
     Binary(TrustedImage<'a>),
-    /// PTX source text, NUL-terminated.
-    Ptx(&'a CStr),
+    /// Validated PTX module text.
+    Ptx(PtxSource<'a>),
 }
 
 /// A loaded device image (fatbin, cubin or PTX).
@@ -693,12 +761,13 @@ impl<'ctx> Module<'ctx> {
     pub fn load(ctx: &'ctx DeviceContext, image: ModuleImage<'_>) -> Result<Self> {
         let ptr = match image {
             ModuleImage::Binary(b) => b.as_ptr(),
-            ModuleImage::Ptx(p) => p.as_ptr() as *const c_void,
+            ModuleImage::Ptx(p) => p.as_ptr(),
         };
         // SAFETY: `ModuleImage` cannot be constructed except from a caller's
-        // build-time guarantee about a binary image, or from a `&CStr`, which is
-        // NUL-terminated as `cuModuleLoadData` requires for PTX. Both outlive
-        // the call.
+        // build-time guarantee about a binary image, or from a `PtxSource`,
+        // which is NUL-terminated text that has been checked not to begin with
+        // an image magic. The driver's format sniffing therefore routes each
+        // variant to the parser it was built for, and both outlive the call.
         unsafe { Self::load_raw(ctx, ptr) }
     }
 
@@ -827,6 +896,36 @@ mod tests {
             assert!(TrustedImage::from_build_output(&[0u8; 3]).is_err());
             assert!(TrustedImage::from_build_output(&[0xDE, 0xAD, 0xBE, 0xEF]).is_err());
         }
+    }
+
+    #[test]
+    fn ptx_text_cannot_be_mistaken_for_a_binary_image() {
+        // Second review: `ModuleImage::Ptx(&CStr)` passed its pointer to the
+        // same auto-detecting entry point, so a short NUL-terminated buffer
+        // beginning with ELF magic reached the binary-image parser through the
+        // text path. The Rust label is not passed to CUDA.
+        let elf = CString::new([0x7Fu8, b'E', b'L', b'F', b'x'].as_slice()).unwrap();
+        assert!(PtxSource::new(&elf).is_err());
+        let fatbin = CString::new([0x50u8, 0xED, 0x55, 0xBA, b'x'].as_slice()).unwrap();
+        assert!(PtxSource::new(&fatbin).is_err());
+    }
+
+    #[test]
+    fn ptx_must_be_text_that_declares_its_version() {
+        assert!(PtxSource::new(c"").is_err());
+        assert!(PtxSource::new(c"abc").is_err());
+        assert!(
+            PtxSource::new(c"this is not ptx").is_err(),
+            "no .version directive"
+        );
+        // Non-UTF-8 is not source text.
+        let bad = CString::new([0xC3u8, 0x28, 0x2E, 0x76, 0x65].as_slice()).unwrap();
+        assert!(PtxSource::new(&bad).is_err());
+
+        // A minimal well-formed module header is accepted. This says the driver
+        // will treat it as text, not that the text compiles.
+        assert!(PtxSource::new(c"//\n.version 8.0\n.target sm_86\n").is_ok());
+        assert!(PtxSource::new(c".version 8.0\n").is_ok());
     }
 
     #[test]

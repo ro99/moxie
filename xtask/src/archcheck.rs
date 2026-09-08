@@ -167,22 +167,57 @@ const MODEL_ALLOWED_THIRD_PARTY: &[&str] = &[];
 /// Crate-name prefixes that identify a concrete model adapter.
 const MODEL_PREFIX: &str = "moxie-models-";
 
-/// Substrings that must not appear in a model crate's production source.
-/// Needles are lowercase: the haystack is lowercased before matching.
+/// Module paths a model crate may not bring into scope.
+///
+/// Matched **structurally**, against the fully-qualified paths a `use`
+/// declaration actually introduces, not as substrings. The second M0 review
+/// showed why: `use std::{fs};` followed by `fs::read(p)` contains the text
+/// `std::fs` nowhere, and a model crate written that way passed with zero
+/// violations. Grouped trees, renames and globs all reduce to paths here, so
+/// each of those spellings lands on the same rule.
+///
+/// A prefix matches itself and everything under it: `std::fs` catches
+/// `std::fs::read`, and a glob at or above it (`use std::*`) catches it too.
+///
 /// Document 09 §B: a model definition may not contain CUDA allocation/launch,
 /// device streams/events, host-mmap or disk-read pipelines, cache/eviction
 /// policy, KV page allocation, or sampling/speculation loops.
-const MODEL_FORBIDDEN_SOURCE: &[(&str, &str)] = &[
+const MODEL_FORBIDDEN_PATHS: &[(&str, &str)] = &[
+    ("std::fs", "direct file I/O in a model crate"),
+    ("std::thread", "thread management in a model crate"),
+    ("std::process", "process control in a model crate"),
+    ("std::net", "network access in a model crate"),
+    ("memmap", "memory mapping in a model crate"),
+    ("memmap2", "memory mapping in a model crate"),
+    ("libc", "raw platform bindings in a model crate"),
+];
+
+/// Raw text that must not appear in a model crate's production source.
+///
+/// The residue that is not a path: an `extern "C"` block is a token sequence,
+/// and a fully-qualified call written inline (`std::fs::read(p)`) is a path
+/// expression rather than an import. Needles are lowercase; the haystack is
+/// lowercased before matching.
+///
+/// This list is deliberately **not** the place to grow: a new *import* rule goes
+/// in `MODEL_FORBIDDEN_PATHS`, where spelling variants are handled once.
+const MODEL_FORBIDDEN_TOKENS: &[(&str, &str)] = &[
     ("extern \"c\"", "FFI declaration in a model crate"),
     ("cuda", "CUDA reference in a model crate"),
     ("std::fs", "direct file I/O in a model crate"),
     ("std::thread", "thread management in a model crate"),
+    ("std::process", "process control in a model crate"),
+    ("std::net", "network access in a model crate"),
     ("memmap", "memory mapping in a model crate"),
 ];
 
 /// Directory names that hold dev-only code, which document 02 exempts: "Test
-/// fixtures may use a harness through dev dependencies". Kept narrow on purpose
-/// -- everything else under a crate is production and is scanned.
+/// fixtures may use a harness through dev dependencies".
+///
+/// The exemption is by *role*, not by name. A directory called `tests` that a
+/// manifest declares as a production target -- `[lib] path = "tests/production.rs"`
+/// -- is production, and [`production_sources`] withdraws the exemption for it.
+/// The second review found a model crate hiding its library there.
 const DEV_ONLY_DIRS: &[&str] = &["tests", "benches"];
 
 #[derive(Debug)]
@@ -511,13 +546,54 @@ fn build_scripts(doc: &toml::Value, manifest_dir: &Path) -> Vec<String> {
     }
 }
 
+/// Paths the manifest declares as **production** targets.
+///
+/// `[lib]`, `[[bin]]` and `[[example]]` are production; `[[test]]` and
+/// `[[bench]]` are the dev harness document 02 exempts. A declared path may
+/// point anywhere, including into a directory whose name suggests it is a test
+/// tree, which is what makes this function load-bearing rather than cosmetic.
+fn declared_target_paths(doc: &toml::Value, manifest_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut push = |v: &toml::Value| {
+        if let Some(p) = v.get("path").and_then(|p| p.as_str()) {
+            out.push(manifest_dir.join(p));
+        }
+    };
+    if let Some(lib) = doc.get("lib") {
+        push(lib);
+    }
+    for section in ["bin", "example"] {
+        if let Some(arr) = doc.get(section).and_then(|v| v.as_array()) {
+            for t in arr {
+                push(t);
+            }
+        }
+    }
+    out
+}
+
 /// Production Rust sources of one crate.
 ///
-/// Everything under the crate directory except build output and the narrow
-/// dev-only trees document 02 exempts. Taking `src/` alone missed a `[lib] path`
-/// or a `[[bin]] path` pointing somewhere else entirely.
-fn production_sources(manifest_dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+/// Everything under the crate directory except build output and the dev-only
+/// trees document 02 exempts, **plus** every path the manifest declares as a
+/// production target.
+///
+/// The exemption is withdrawn from a dev-named directory that actually holds a
+/// declared production target. The second M0 review compiled a model crate whose
+/// entire library was `[lib] path = "tests/production.rs"`; that file contained
+/// `std::fs::read`, and the checker skipped the directory by name and reported
+/// no violations. A directory is dev-only because of its role, not its spelling.
+fn production_sources(doc: &toml::Value, manifest_dir: &Path) -> Vec<PathBuf> {
+    let declared = declared_target_paths(doc, manifest_dir);
+
+    // Which of the dev-named directories are genuinely dev-only here.
+    let exempt: Vec<PathBuf> = DEV_ONLY_DIRS
+        .iter()
+        .map(|d| manifest_dir.join(d))
+        .filter(|dir| !declared.iter().any(|p| p.starts_with(dir)))
+        .collect();
+
+    let mut out: Vec<PathBuf> = Vec::new();
     let mut stack = vec![manifest_dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else {
@@ -528,7 +604,7 @@ fn production_sources(manifest_dir: &Path) -> Vec<PathBuf> {
             let name = e.file_name();
             let name = name.to_string_lossy();
             if p.is_dir() {
-                if name == "target" || name == ".git" || DEV_ONLY_DIRS.contains(&name.as_ref()) {
+                if name == "target" || name == ".git" || exempt.contains(&p) {
                     continue;
                 }
                 stack.push(p);
@@ -537,8 +613,200 @@ fn production_sources(manifest_dir: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    // A declared target may sit outside the crate directory entirely.
+    for p in declared {
+        if p.extension().is_some_and(|x| x == "rs") {
+            out.push(p);
+        }
+    }
     out.sort();
+    out.dedup();
     out
+}
+
+/// Every fully-qualified path a source file's `use` declarations bring into
+/// scope.
+///
+/// A focused parser for one construct, not a general Rust parser and not an
+/// extension of the substring net. `use` has a small, regular grammar --
+/// nested groups, renames, globs, leading `::`, `crate`/`self`/`super` -- and
+/// flattening it is what turns every spelling of the same import into the same
+/// string. `use std::{fs};`, `use std::fs as f;` and `use std::fs::read;` all
+/// yield a path under `std::fs`; a substring search sees three different files.
+///
+/// A glob is reported as `prefix::*`, so a rule can decide whether the glob
+/// covers it.
+fn use_paths(src: &str) -> Vec<String> {
+    let bytes = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Skip anything a `use` keyword could hide inside.
+        if let Some(next) = skip_trivia(bytes, i) {
+            i = next;
+            continue;
+        }
+        if bytes[i..].starts_with(b"use") && is_word_boundary(bytes, i, 3) {
+            let start = i + 3;
+            if let Some(end) = find_statement_end(bytes, start) {
+                let tree = &src[start..end];
+                expand_use_tree("", tree, &mut out);
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// From `i`, skip a comment or a string/char literal; `None` if there is none.
+fn skip_trivia(b: &[u8], i: usize) -> Option<usize> {
+    match b[i] {
+        b'/' if b.get(i + 1) == Some(&b'/') => {
+            let mut j = i;
+            while j < b.len() && b[j] != b'\n' {
+                j += 1;
+            }
+            Some(j)
+        }
+        b'/' if b.get(i + 1) == Some(&b'*') => {
+            let mut j = i + 2;
+            while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
+                j += 1;
+            }
+            Some((j + 2).min(b.len()))
+        }
+        b'"' => {
+            let mut j = i + 1;
+            while j < b.len() && b[j] != b'"' {
+                if b[j] == b'\\' {
+                    j += 1;
+                }
+                j += 1;
+            }
+            Some((j + 1).min(b.len()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `b[i..i+len]` is a whole word.
+fn is_word_boundary(b: &[u8], i: usize, len: usize) -> bool {
+    let before_ok = i == 0 || !is_ident_byte(b[i - 1]);
+    let after_ok = b.get(i + len).is_none_or(|c| !is_ident_byte(*c));
+    before_ok && after_ok
+}
+
+fn is_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// The index of the `;` that ends a `use` statement, tracking brace depth.
+fn find_statement_end(b: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < b.len() {
+        match b[i] {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b';' if depth == 0 => return Some(i),
+            // A `use` statement contains no other statement, so anything that
+            // looks like a block boundary means the scan lost its place.
+            b'\n' if i > start + 4096 => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Flatten one use-tree onto `prefix`.
+fn expand_use_tree(prefix: &str, tree: &str, out: &mut Vec<String>) {
+    let tree = tree.trim();
+    if tree.is_empty() {
+        return;
+    }
+    if let Some(inner) = tree.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
+        for part in split_top_level(inner) {
+            expand_use_tree(prefix, &part, out);
+        }
+        return;
+    }
+    if let Some(brace) = find_top_level_brace(tree) {
+        let head = tree[..brace].trim().trim_end_matches(':');
+        let body = tree[brace..].trim();
+        expand_use_tree(&join_path(prefix, head), body, out);
+        return;
+    }
+    // A leaf. Drop any rename: `foo as bar` imports `foo`.
+    let leaf = match tree.split(" as ").next() {
+        Some(l) => l.trim(),
+        None => tree,
+    };
+    let path = join_path(prefix, leaf);
+    if !path.is_empty() {
+        out.push(path);
+    }
+}
+
+fn join_path(prefix: &str, tail: &str) -> String {
+    let tail = tail.trim().trim_start_matches("::");
+    if tail.is_empty() {
+        return prefix.to_string();
+    }
+    if prefix.is_empty() {
+        tail.to_string()
+    } else {
+        format!("{prefix}::{tail}")
+    }
+}
+
+fn find_top_level_brace(s: &str) -> Option<usize> {
+    s.find('{')
+}
+
+/// Split on commas that are not inside a nested group.
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for ch in s.chars() {
+        match ch {
+            '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                out.push(core::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Whether an imported `path` reaches `needle`.
+///
+/// True when the path *is* the needle, sits under it, or is a glob at or above
+/// it -- `use std::*;` brings `fs` into scope just as `use std::fs;` does.
+fn path_reaches(path: &str, needle: &str) -> bool {
+    if path == needle || path.starts_with(&format!("{needle}::")) {
+        return true;
+    }
+    match path.strip_suffix("::*") {
+        Some(base) => needle == base || needle.starts_with(&format!("{base}::")),
+        None => false,
+    }
 }
 
 /// Check every crate manifest under `root`.
@@ -654,13 +922,31 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
         }
 
         // Rule 4: forbidden constructs in a model crate's production source.
+        //
+        // Two layers. Imports are classified structurally, so every spelling of
+        // the same import lands on one rule. The token layer catches the residue
+        // that is not an import: an `extern "C"` block, and a fully-qualified
+        // call written inline without a `use`.
         if is_model {
-            for file in production_sources(dir) {
+            for file in production_sources(&doc, dir) {
                 let body = std::fs::read_to_string(&file).unwrap_or_default();
                 // Strip test modules: dev-time harness use is permitted.
                 let body = strip_cfg_test(&body);
+
+                for path in use_paths(&body) {
+                    for (needle, why) in MODEL_FORBIDDEN_PATHS {
+                        if path_reaches(&path, needle) {
+                            out.push(Violation {
+                                crate_name: name.clone(),
+                                rule: rule::MODEL_FORBIDDEN_SOURCE,
+                                detail: format!("{}: imports `{path}`: {why}", file.display()),
+                            });
+                        }
+                    }
+                }
+
                 let lower = body.to_lowercase();
-                for (needle, why) in MODEL_FORBIDDEN_SOURCE {
+                for (needle, why) in MODEL_FORBIDDEN_TOKENS {
                     if lower.contains(needle) {
                         out.push(Violation {
                             crate_name: name.clone(),
@@ -1044,6 +1330,129 @@ mod tests {
         let many =
             parse("[package]\nname = \"x\"\nversion = \"0\"\nbuild = [\"a.rs\", \"b.rs\"]\n");
         assert_eq!(build_scripts(&many, Path::new("/nonexistent")).len(), 2);
+    }
+
+    #[test]
+    fn grouped_renamed_and_globbed_imports_all_reduce_to_the_same_path() {
+        // Second review, case 1: `use std::{fs};` contains the text `std::fs`
+        // nowhere, so a substring blacklist saw nothing. Every spelling below
+        // has to land on the same rule.
+        let cases = [
+            "use std::fs;",
+            "use std::{fs};",
+            "use std::{fs, thread};",
+            "use std::fs as filesystem;",
+            "use std::fs::read;",
+            "use std::{io, fs::{read, write}};",
+            "use std::{io::Result, fs::read};",
+            "pub use std::fs;",
+            "use ::std::fs;",
+            "use std::*;",
+            "use\n    std::{\n        fs,\n    };",
+        ];
+        for src in cases {
+            let paths = use_paths(src);
+            assert!(
+                paths.iter().any(|p| path_reaches(p, "std::fs")),
+                "{src:?} produced {paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_innocent_import_is_not_flagged() {
+        // The other half: a checker that flags everything is not enforcement.
+        let cases = [
+            "use std::io::Result;",
+            "use std::collections::BTreeMap;",
+            "use crate::fs;",
+            "use self::fs::helper;",
+            "use moxie_graph::{Op, OracleRegistry};",
+            "use super::{a, b::c};",
+        ];
+        for src in cases {
+            let paths = use_paths(src);
+            for (needle, _) in MODEL_FORBIDDEN_PATHS {
+                assert!(
+                    !paths.iter().any(|p| path_reaches(p, needle)),
+                    "{src:?} was wrongly matched against {needle}: {paths:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_use_inside_a_comment_or_string_is_not_an_import() {
+        let src = r#"
+            // use std::fs;
+            /* use std::thread; */
+            const DOC: &str = "use std::process;";
+            use std::collections::BTreeMap;
+        "#;
+        let paths = use_paths(src);
+        assert_eq!(paths, vec!["std::collections::BTreeMap".to_string()]);
+    }
+
+    #[test]
+    fn nested_groups_flatten_to_full_paths() {
+        let paths = use_paths("use a::{b::{c, d as e}, f, g::*};");
+        assert_eq!(
+            paths,
+            vec![
+                "a::b::c".to_string(),
+                "a::b::d".to_string(),
+                "a::f".to_string(),
+                "a::g::*".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_glob_covers_what_it_brings_into_scope() {
+        assert!(path_reaches("std::*", "std::fs"));
+        assert!(path_reaches("std::fs::*", "std::fs"));
+        assert!(path_reaches("std::fs", "std::fs"));
+        assert!(path_reaches("std::fs::read", "std::fs"));
+        assert!(!path_reaches("std::io::*", "std::fs"));
+        assert!(!path_reaches("stdext::fs", "std::fs"));
+        assert!(!path_reaches("crate::fs", "std::fs"));
+    }
+
+    #[test]
+    fn a_declared_library_outside_src_is_production() {
+        // Second review, case 2: `[lib] path = "tests/production.rs"` put the
+        // whole library in a directory the checker skipped by name.
+        let dir = std::env::temp_dir().join(format!("moxie-archcheck-lib-{}", std::process::id()));
+        let tests = dir.join("tests");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&tests).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(tests.join("production.rs"), "pub fn f() {}").unwrap();
+        std::fs::write(tests.join("harness.rs"), "fn t() {}").unwrap();
+        std::fs::write(src.join("lib.rs"), "pub fn g() {}").unwrap();
+
+        let declared = parse(
+            r#"
+            [package]
+            name = "moxie-models-test"
+            version = "0.0.0"
+            [lib]
+            path = "tests/production.rs"
+            "#,
+        );
+        let scanned = production_sources(&declared, &dir);
+        assert!(
+            scanned.contains(&tests.join("production.rs")),
+            "the declared library was skipped: {scanned:?}"
+        );
+
+        // With no production target in `tests`, the exemption stands.
+        let ordinary = parse("[package]\nname = \"moxie-models-test\"\nversion = \"0.0.0\"\n");
+        let scanned = production_sources(&ordinary, &dir);
+        assert!(!scanned.iter().any(|p| p.starts_with(&tests)));
+        assert!(scanned.contains(&src.join("lib.rs")));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

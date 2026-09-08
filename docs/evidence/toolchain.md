@@ -38,12 +38,18 @@ top of every run:
 | Item | Value |
 |---|---|
 | `NVCC_VERSION` | `Cuda compilation tools, release 13.0, V13.0.88` |
-| `HOST_COMPILER_VERSION` | `c++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0` |
+| `HOST_COMPILER_VERSION` | `c++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0`, passed to nvcc as `-ccbin` |
 | `SMOKE_FATBIN_SHA256` | `014b6a8f1e383c64c970195b663f1d1e2443c5176972d1f2d66a75441ebd7606` |
 | `SMOKE_FATBIN_SM86_SHA256` | `e5bfb5aeece31607b5ed962c4ce1f03ebf6a83bd5bb3ca9b08d1771c5f5fd190` |
 
 Hashed with a SHA-256 implementation in `build.rs` itself, checked against the
 published FIPS 180-4 vectors at build time. No third-party crate, no shell-out.
+
+The host compiler is **passed** to nvcc with `-ccbin`, not merely described. An
+earlier version read `CUDAHOSTCXX` to fill this table in and then let nvcc pick
+its own default, so the record was an assumption about the environment. The
+digests did not change when the flag was added, which confirms `c++` was already
+the compiler in use -- it is now a fact about the build rather than a guess.
 
 Recorded 2026-09-07 on this machine. The digests are of *this* build's images;
 they change whenever `smoke.cu`, the architecture list or the toolkit changes,
@@ -104,9 +110,14 @@ after them, `is_complete()` true after synchronising, a finite non-negative
 elapsed time, and the device result verified against the host oracle. It proves
 the mechanism, not overlap, and it is **not** the event-retained lease from R07.
 
-`non-PTX rejected` feeds NUL-terminated text that is not PTX to the safe loader
-and asserts the driver's refusal arrives as `UnsupportedKernel`. Termination is
-what the C API requires; it is not validity, and the case says so.
+`non-PTX rejected` covers both halves of the PTX boundary. Text with no
+`.version` directive, and text beginning with ELF magic, are refused by
+`PtxSource` **before any driver call** -- `cuModuleLoadData` sniffs the leading
+bytes and picks a parser itself, so without that check a NUL-terminated buffer
+holding a binary image reached the image parser through the text path. Text that
+*is* shaped like a PTX module but does not compile then reaches the real driver
+and comes back as `UnsupportedKernel`. Termination is what the C API requires; it
+is not validity, and the case says so.
 
 ### The gate fails when an architecture is absent
 
@@ -157,7 +168,7 @@ can be tested with no driver present.
 
 Verified on 2026-09-07 by building and testing the whole workspace with
 `CUDA_HOME=/nonexistent NVCC=/nonexistent`, an unset `LD_LIBRARY_PATH` and a
-`PATH` with no CUDA directory: 191 tests passed. `ldd target/debug/xtask` on the
+`PATH` with no CUDA directory: 210 tests passed. `ldd target/debug/xtask` on the
 host build reports no `libcuda`, and the CI workflow asserts that.
 
 **This is not a way to make the GPU lane optional.** Document 07 requires the

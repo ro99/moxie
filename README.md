@@ -128,7 +128,13 @@ runs with no CUDA toolkit or driver, architecture enforcement resolves package i
 manifest keys, the CUDA image boundary states its trust obligation, sequence state distinguishes
 accepted history from published usage from tentative execution and requires retained logit
 provenance, and the canonical weight family is the shared INT4/INT8/BF16 affine-integer contract.
-The [handover](docs/handovers/2026-09-07-m0-correction-results.md) is the short version.
+A second review then found six contracts that still accepted an invalid state -- a retained result
+that did not identify its sequence or its prefix's contents, an earlier snapshot accepted as
+restoration to a later prefix, grouped imports and a library declared under `tests/` slipping past
+architecture enforcement, an unbounded PTX entry point, a rollback that unpublished released output,
+and two reference paths returning successful nonfinite results. Those are closed too. The
+[first](docs/handovers/2026-09-07-m0-correction-results.md) and
+[second](docs/handovers/2026-09-07-second-review-corrections.md) handovers are the short versions.
 
 The next bounded task is [task 0003](docs/tasks/0003-m1-bf16-reference-interpreter.md), the BF16 host
 reference interpreter. It is deliberately smaller than document 06's whole M1: the manifest reader,

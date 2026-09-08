@@ -1,0 +1,14 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# Second review, case 1. The manifest is clean and the source contains the text
+# `std::fs` nowhere: the import arrives through a group, and the call site names
+# only the module. This compiles, does exactly what document 09 B denies, and a
+# substring blacklist sees nothing. Must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden construct in model source"

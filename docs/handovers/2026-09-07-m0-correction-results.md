@@ -8,6 +8,12 @@ refers to are [task 0002](../tasks/0002-m0-review-and-integer-transition.md), wh
 the full results. This file is the short version: what changed, what to check first, and what is
 deliberately still missing.
 
+**Superseded in part.** A second review of this work found six contracts that still accepted an
+invalid state; they are fixed in
+[the next handover](2026-09-07-second-review-corrections.md). The counts below are this pass's and
+have since grown — 210 host tests and 15 arch-check fixtures. Read both files; this one describes
+what the corrections were *for*, and the next one describes where they did not go far enough.
+
 ## State
 
 M0's correction gates F1–F6 are closed. The M0 scaffold was kept; nothing was restarted. No

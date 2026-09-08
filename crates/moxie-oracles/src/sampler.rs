@@ -244,15 +244,26 @@ impl Pipeline {
             return Ok(SamplingDistribution { probs });
         }
 
-        let scaled: Vec<f32> = logits.iter().map(|l| l / self.temperature).collect();
-        Ok(SamplingDistribution {
-            probs: normalize(&scaled, &keep),
-        })
+        let probs = normalize_with_temperature(logits, &keep, self.temperature);
+        check_distribution(&probs)?;
+        Ok(SamplingDistribution { probs })
     }
 }
 
 /// Softmax over the entries `keep` allows; exactly zero elsewhere.
 fn normalize(logits: &[f32], keep: &[bool]) -> Vec<f32> {
+    normalize_with_temperature(logits, keep, 1.0)
+}
+
+/// Softmax of `logits / temperature`, shifting **before** the division.
+///
+/// The order matters and the second M0 review found it wrong here. Dividing
+/// first overflows for a small temperature -- `9.0 / f32::MIN_POSITIVE` is
+/// `+inf` -- and the stabilising `l - max` subtraction then evaluates
+/// `inf - inf`, so the whole distribution came back as `NaN` with an `Ok`.
+/// Subtracting the maximum first bounds every numerator at zero, so the division
+/// produces `0` or a large negative number and `exp` produces `1` or `0`.
+fn normalize_with_temperature(logits: &[f32], keep: &[bool], temperature: f32) -> Vec<f32> {
     let max = logits
         .iter()
         .enumerate()
@@ -262,10 +273,40 @@ fn normalize(logits: &[f32], keep: &[bool]) -> Vec<f32> {
     let exps: Vec<f32> = logits
         .iter()
         .enumerate()
-        .map(|(i, l)| if keep[i] { (l - max).exp() } else { 0.0 })
+        .map(|(i, l)| {
+            if keep[i] {
+                ((l - max) / temperature).exp()
+            } else {
+                0.0
+            }
+        })
         .collect();
     let sum: f32 = exps.iter().sum();
     exps.iter().map(|e| e / sum).collect()
+}
+
+/// Refuse to return a distribution that is not one.
+///
+/// Document 05: "Empty vocabulary, NaN logits and all-illegal candidate sets
+/// produce typed errors." A silently non-finite or unnormalised result is the
+/// same class of failure arriving by a different route, and this reference is
+/// what speculative verification will consume -- `max(p - q, 0)` over a `NaN`
+/// is not a recoverable situation further downstream.
+fn check_distribution(probs: &[f32]) -> Result<()> {
+    for (i, p) in probs.iter().enumerate() {
+        if !p.is_finite() || *p < 0.0 {
+            return Err(Error::Numerical {
+                detail: format!("probability {i} is {p}"),
+            });
+        }
+    }
+    let sum: f32 = probs.iter().sum();
+    if !(0.999..=1.001).contains(&sum) {
+        return Err(Error::Numerical {
+            detail: format!("distribution sums to {sum}, not one"),
+        });
+    }
+    Ok(())
 }
 
 /// Candidate ids in descending probability, lowest id first on a tie.
@@ -541,6 +582,58 @@ mod tests {
                 .kind(),
             "numerical"
         );
+    }
+
+    #[test]
+    fn an_extreme_temperature_stays_a_distribution() {
+        // Second review, reproduced: `temperature = f32::MIN_POSITIVE` returned
+        // `Ok([NaN, NaN])`, because the division overflowed before the
+        // stabilising subtraction could bound it.
+        let logits = [8.0f32, 9.0];
+        for t in [
+            f32::MIN_POSITIVE,
+            1e-30,
+            1e-6,
+            0.5,
+            1.0,
+            1e6,
+            1e30,
+            f32::MAX,
+        ] {
+            let d = Pipeline::temperature(t).distribution(&logits).unwrap();
+            assert!(
+                d.probs.iter().all(|p| p.is_finite()),
+                "temperature {t} produced {:?}",
+                d.probs
+            );
+            let s: f32 = d.probs.iter().sum();
+            assert!((s - 1.0).abs() < 1e-5, "temperature {t} summed to {s}");
+        }
+
+        // A vanishing temperature concentrates on the leader, like greedy does.
+        let cold = Pipeline::temperature(f32::MIN_POSITIVE)
+            .distribution(&logits)
+            .unwrap();
+        assert_eq!(cold.probs, vec![0.0, 1.0]);
+        assert_eq!(
+            cold.argmax(),
+            Pipeline::greedy().distribution(&logits).unwrap().argmax()
+        );
+
+        // A huge temperature flattens toward uniform rather than overflowing.
+        let hot = Pipeline::temperature(f32::MAX)
+            .distribution(&logits)
+            .unwrap();
+        assert!((hot.probs[0] - 0.5).abs() < 1e-5, "{:?}", hot.probs);
+    }
+
+    #[test]
+    fn a_wide_logit_range_does_not_overflow_at_a_small_temperature() {
+        // The same failure at the scale a real vocabulary reaches.
+        let logits: Vec<f32> = (0..64).map(|i| (i as f32) * 1e3).collect();
+        let d = Pipeline::temperature(1e-20).distribution(&logits).unwrap();
+        assert!(d.probs.iter().all(|p| p.is_finite()));
+        assert_eq!(d.support(), vec![63]);
     }
 
     #[test]

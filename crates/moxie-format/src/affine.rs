@@ -498,7 +498,22 @@ impl AffineTensor {
             // Subtraction in i32: wide enough that no (code, zero point) pair in
             // either profile can overflow, which is what document 03 means by "a
             // sufficiently wide integer type". The multiplication is FP32.
-            *slot = (q - z) as f32 * scale;
+            let w = (q - z) as f32 * scale;
+            // A scale can be finite, positive and still large enough that the
+            // product is not. The second M0 review found this returning
+            // `Ok([inf])` for a `f32::MAX` scale: a reconstruction that
+            // overflows is an invalid artifact, not a weight. Readers "reject
+            // ... NaN scales, incompatible dimensions" (document 03), and an
+            // infinite reconstructed weight belongs in the same list -- it would
+            // reach a kernel and poison a whole row's accumulation.
+            if !w.is_finite() {
+                return Err(Error::InvalidArtifact {
+                    detail: format!(
+                        "reconstruction overflows at ({o},{k}): ({q} - {z}) * {scale} = {w}"
+                    ),
+                });
+            }
+            *slot = w;
         }
         Ok(())
     }
@@ -1077,6 +1092,64 @@ mod tests {
 
         let empty = desc(IntWidth::Int4, 0, 16, Grouping::PerOutputChannel);
         assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn a_reconstruction_that_overflows_is_an_invalid_artifact() {
+        // Second review, reproduced: a `f32::MAX` scale passes scale validation
+        // -- it is finite and positive -- and then produced `Ok([inf])`.
+        let t = row_tensor(
+            IntWidth::Int4,
+            &[7, 7],
+            Grouping::PerOutputChannel,
+            vec![f32::MAX],
+            ZeroPoints::Symmetric,
+        );
+        let e = t.reconstruct().unwrap_err();
+        assert_eq!(e.kind(), "invalid_artifact");
+        assert!(e.to_string().contains("overflow"), "{e}");
+
+        // The bounded row form must refuse it too, not write a partial row.
+        let mut buf = vec![0f32; 2];
+        assert!(t.reconstruct_row_into(0, &mut buf).is_err());
+
+        // A code of zero cannot overflow whatever the scale, and must still work.
+        let zeroed = row_tensor(
+            IntWidth::Int4,
+            &[0, 0],
+            Grouping::PerOutputChannel,
+            vec![f32::MAX],
+            ZeroPoints::Symmetric,
+        );
+        assert_eq!(zeroed.reconstruct().unwrap(), vec![0.0, 0.0]);
+
+        // The zero point participates: a large scale with a large offset
+        // overflows where the code alone would not.
+        let offset = row_tensor(
+            IntWidth::Int8,
+            &[0],
+            Grouping::PerOutputChannel,
+            vec![f32::MAX / 2.0],
+            ZeroPoints::PerGroup(vec![-100]),
+        );
+        assert!(offset.reconstruct().is_err());
+    }
+
+    #[test]
+    fn realistic_scales_reconstruct_without_tripping_the_overflow_check() {
+        // The check must not fire on anything a real artifact contains. Weights
+        // are order 0.01-0.1 and INT4 group scales are correspondingly small.
+        let cols = 128;
+        let t = row_tensor(
+            IntWidth::Int4,
+            &(0..cols).map(|k| (k as i32 % 15) - 7).collect::<Vec<_>>(),
+            Grouping::Contiguous { size: 128 },
+            vec![0.0134],
+            ZeroPoints::Symmetric,
+        );
+        let w = t.reconstruct().unwrap();
+        assert_eq!(w.len(), cols);
+        assert!(w.iter().all(|v| v.abs() < 0.2));
     }
 
     #[test]
