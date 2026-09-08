@@ -1433,85 +1433,88 @@ fn a_graph_that_touches_no_state_is_refused_before_anything_is_written() {
 }
 
 #[test]
-fn a_partly_published_step_aborts_to_exactly_where_it_started() {
+fn a_step_cancelled_at_any_publication_boundary_aborts_to_exactly_where_it_started() {
     // The generalisation of the four holes four review passes each found from a
-    // different direction. Rather than enumerating the ways publication could
-    // fail, this drives a step's mutations one at a time and aborts after each,
-    // asserting that *everything* is back: the four counters, the retained
-    // result, the live set, the lineage, and every KV layer.
+    // different direction. It drives the **real** `Interpreter::run`, injects a
+    // fault after each of publication's four mutations in turn, and asserts that
+    // the real error handler put everything back: the four counters, the
+    // retained result, the live set, the lineage at every prefix, and every KV
+    // layer -- including the cache stamps, which an earlier version of this test
+    // could not reach and so did not check.
     //
-    // The interpreter's own publication is now unreachable-failure by
-    // construction, so the fault is injected at the mechanism it uses rather
-    // than pretended at a level that cannot reach it.
+    // Cancellation is the injected fault because it is the only one left. Once
+    // the preconditions moved inside the transaction, no malformed input can
+    // make publication fail halfway; a test that fed bad input would be caught
+    // at entry and would never reach the handler it claims to check. The fifth
+    // review made exactly that point about the previous version, which
+    // hand-performed a subset of the mutations and hand-called `abort`.
     let f = build(A, 97);
-    let head_width = (A.heads * A.head_dim) as usize;
 
-    for stop_after in 0..3 {
+    // How many boundaries a whole step passes: every node, then the four in
+    // publication. Derived, not hardcoded, so adding a node cannot silently
+    // stop this test covering the publication boundaries.
+    let mut probe_state = f.state();
+    let mut probe_kv = KvCache::for_branch(1, &probe_state, ROOT).unwrap();
+    probe_state.append_prompt(ROOT, 1).unwrap();
+    let counter = Cancel::after(u64::MAX - 1);
+    step(&f, &mut probe_state, &mut probe_kv, &[1], 0, &counter).unwrap();
+    let total = u64::MAX - 1 - counter.remaining();
+    let nodes = total - 4;
+    assert!(nodes > 0, "the fixture graph has nodes");
+
+    for depth in nodes..total {
         let mut state = f.state();
         let mut kv = KvCache::for_branch(1, &state, ROOT).unwrap();
         state.append_prompt(ROOT, 2).unwrap();
         step(&f, &mut state, &mut kv, &[1, 2], 0, &Cancel::never()).unwrap();
         state.accept(ROOT, 1).unwrap();
+        state.emit(ROOT, 1).unwrap();
 
         let before_frontiers = state.frontiers(ROOT).unwrap();
         let before_logits = state.retained_logits(ROOT).unwrap();
-        let before_live: Vec<u64> = state.live_results().iter().map(|h| h.prefix()).collect();
+        let before_live = state.live_results();
         let before_lineage: Vec<_> = (0..=2)
             .map(|p| state.lineage_at(ROOT, p).unwrap())
             .collect();
         let before_kv = kv.contents().to_vec();
 
-        // Open both halves, exactly as `Interpreter::run` does.
-        let cache_journal = kv.begin();
-        let txn = state.begin(ROOT).unwrap();
-
-        if stop_after > 0 {
-            kv.append(0, 2, vec![0.5; head_width], vec![0.25; head_width])
-                .unwrap();
-        }
-        if stop_after > 1 {
-            // `commit` is `pub(crate)` on purpose -- no caller outside the crate
-            // may re-stamp a cache -- so this drives the state half and leaves
-            // the stamps where a mid-publication failure would leave them.
-            state.execute(ROOT, 1).unwrap();
-            state.record_logits(ROOT, 3).unwrap();
-        }
-
-        state.abort(txn).unwrap();
-        kv.abort(&cache_journal);
+        // The real path, cancelled at one publication boundary.
+        let e = step(&f, &mut state, &mut kv, &[3], 2, &Cancel::after(depth)).unwrap_err();
+        assert_eq!(e.kind(), "cancelled", "depth {depth}: {e}");
+        assert!(
+            e.to_string().contains("publish/"),
+            "depth {depth} should land inside publication, got {e}"
+        );
 
         assert_eq!(
             state.frontiers(ROOT).unwrap(),
             before_frontiers,
-            "{stop_after}"
+            "depth {depth}"
         );
         assert_eq!(
             state.retained_logits(ROOT).unwrap(),
             before_logits,
-            "{stop_after}"
+            "depth {depth}"
         );
-        assert_eq!(
-            state
-                .live_results()
-                .iter()
-                .map(|h| h.prefix())
-                .collect::<Vec<_>>(),
-            before_live,
-            "{stop_after}"
-        );
+        assert_eq!(state.live_results(), before_live, "depth {depth}");
         for p in 0..=2u64 {
             assert_eq!(
                 state.lineage_at(ROOT, p).unwrap(),
                 before_lineage[p as usize],
-                "stop {stop_after}, prefix {p}"
+                "depth {depth}, prefix {p}"
             );
         }
-        assert_eq!(kv.contents(), &before_kv[..], "{stop_after}");
-        assert!(kv.check_owner(&state, ROOT).is_ok(), "{stop_after}");
-        assert!(state.open_transactions().is_empty());
+        assert_eq!(kv.contents(), &before_kv[..], "depth {depth}");
+        // The stamps too: `check_owner` compares them, so this is the assertion
+        // the hand-driven version was missing.
+        kv.check_owner(&state, ROOT)
+            .unwrap_or_else(|e| panic!("depth {depth}: {e}"));
+        assert!(state.open_transactions().is_empty(), "depth {depth}");
 
         // And the sequence still runs cleanly afterwards, which is the property
-        // the earlier version could not offer once `executed` had moved.
+        // the earlier version could not offer once `executed` had moved. The
+        // retry mints a *different* result identity; the discarded one stays
+        // dead.
         let out = step(&f, &mut state, &mut kv, &[3], 2, &Cancel::never()).unwrap();
         assert_eq!(out.prefix, 3);
         assert!(state.next_logits_valid(ROOT));
@@ -1527,8 +1530,8 @@ fn a_successful_step_leaves_no_transaction_open() {
     step(&f, &mut state, &mut kv, &[1, 2], 0, &Cancel::never()).unwrap();
     assert!(state.open_transactions().is_empty());
 
-    // A cancelled step leaves none either: cancellation is an abort now, not an
-    // early return that happens to precede the mutations.
+    // A cancelled step leaves none either, whether it is cancelled during node
+    // evaluation (nothing had started) or inside publication (an abort ran).
     let e = step(&f, &mut state, &mut kv, &[3], 2, &Cancel::after(2)).unwrap_err();
     assert_eq!(e.kind(), "cancelled");
     assert!(state.open_transactions().is_empty());

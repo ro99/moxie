@@ -77,6 +77,15 @@ impl Cancel {
         }
     }
 
+    /// Boundaries still allowed before this token cancels.
+    ///
+    /// Exposed so a test can *count* a step's boundaries rather than hardcode
+    /// how many there are: a test that cancels at "depth 7" stops meaning
+    /// anything the moment a node is added.
+    pub fn remaining(&self) -> u64 {
+        self.remaining.get()
+    }
+
     fn check(&self, at: &'static str) -> Result<()> {
         let left = self.remaining.get();
         if left == 0 {
@@ -315,11 +324,18 @@ impl Interpreter {
         // sequence advanced with no way to retry -- because there was no
         // `unexecute`, correctness depended on having enumerated every way the
         // remaining calls could fail. Now a failure aborts.
-        let cache_journal = kv.begin();
-        let txn = state.begin(branch)?;
-        match self.publish(state, branch, kv, &mut staged, rows) {
+        let cache_journal = kv.begin()?;
+        let txn = match state.begin(branch) {
+            Ok(t) => t,
+            Err(e) => {
+                kv.abort(&cache_journal);
+                return Err(e);
+            }
+        };
+        match self.publish(state, branch, kv, &mut staged, rows, cancel) {
             Ok(prefix_and_handle) => {
                 state.commit_prefix(txn, 0)?;
+                kv.commit(cache_journal);
                 let (prefix, retained) = prefix_and_handle;
                 Ok(StepOutput {
                     logits,
@@ -344,6 +360,19 @@ impl Interpreter {
     /// irreversible step last. That is the whole benefit: the pre-`execute`
     /// precondition checks that existed only because publication could not be
     /// undone are gone.
+    ///
+    /// `cancel` is checked **after** each of the four mutations, not only during
+    /// node evaluation. Two reasons, and the fifth review found both:
+    ///
+    /// - R08 says a cancelled step leaves the sequence untouched. Checking only
+    ///   before publication satisfies that by never having started, which is a
+    ///   weaker claim than the one the transaction exists to make. Cancellation
+    ///   is now an abort, and the record can say so truthfully.
+    /// - It is the one fault a test can inject at each publication boundary
+    ///   through the real `run`. That is deliberate: once the preconditions
+    ///   moved inside the transaction, no *malformed input* can make publication
+    ///   fail halfway any more, so a test that only feeds bad input can no
+    ///   longer reach the error handler it is supposed to be checking.
     fn publish(
         &self,
         state: &mut SequenceState,
@@ -351,16 +380,21 @@ impl Interpreter {
         kv: &mut KvCache,
         staged: &mut Vec<StagedAppend>,
         rows: usize,
+        cancel: &Cancel,
     ) -> Result<(u64, LogitsHandle)> {
         for a in staged.drain(..) {
             kv.append(a.layer, a.position, a.key, a.value)?;
         }
+        cancel.check("publish/append")?;
         state.execute(branch, rows as u64)?;
+        cancel.check("publish/execute")?;
         let prefix = state.frontiers(branch)?.executed;
         // The cache now describes a longer prefix, and records the lineage of
         // each prefix it gained at the moment it gained it.
-        kv.commit(state, branch)?;
+        kv.stamp(state, branch)?;
+        cancel.check("publish/stamp")?;
         let retained = state.record_logits(branch, prefix)?;
+        cancel.check("publish/record_logits")?;
         Ok((prefix, retained))
     }
 

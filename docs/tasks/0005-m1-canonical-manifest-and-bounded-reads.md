@@ -70,7 +70,8 @@ naming a model family and reject `moxie-format` importing `std::fs`.
 
 TOML, one `manifest.toml` per artifact directory, tensor payloads in sibling chunk files. Recorded
 as [ADR 0005](../decisions/adr/0005-toml-manifest-with-separate-chunks.md) in the same commit as
-this contract. Human-auditable, diffable, and reviewable without running the engine — which document
+this contract, and **confirmed by the fifth review**, which recommended `toml` + `serde` explicitly
+allowlisted for `moxie-format` over another hand-written parser. Human-auditable, diffable, and reviewable without running the engine — which document
 03's offline-inspection workflow requires — and it adds **zero** packages to `Cargo.lock`.
 
 ### Manifest v1, required fields
@@ -125,6 +126,36 @@ NaN scales are document 03's rule and belong here, but the scale *values* live i
 the manifest. They are checked where they are read: in M3's affine reader. This task records that as
 a stated gap rather than claiming the manifest covers it.
 
+### Opening is bounded too
+
+The fifth review's point about task 0005: budgeting payload reads alone does not bound *opening*.
+Three limits, all checked before anything is deserialized or read:
+
+| Limit | Value | Why |
+|---|---|---|
+| `manifest.toml` file size | 4 MiB | Read with a capped reader that errors at the limit rather than reading the file and then measuring it. A manifest is kilobytes; four orders of magnitude of headroom is not a constraint on any real artifact. |
+| tensor entries | 1,048,576 | An artifact with more logical tensors than that is not a model, and the cap is what stops a manifest whose cost is in its entry count rather than its bytes. |
+| architecture-metadata nesting depth and node count | 64 deep, 65,536 nodes | The opaque tree is the one field with no schema, so it is the one that can be adversarially shaped. Depth is checked during traversal, not after building the value. |
+
+`toml` is a non-recursive parser, so the depth limit is a bound on *our* traversal and hashing of
+the value, not a stack-overflow guard for the parser. Stated so it is not mistaken for one.
+
+### Chunk paths are confined to the artifact directory
+
+A manifest names its chunk files, and a manifest is data from wherever the artifact came from.
+Every chunk reference must be a **single path component**: no separator, no `.` or `..`, not
+absolute, no prefix or root component. That is checked on the string, before any path is joined,
+because a check performed after joining is a check on a path that has already escaped.
+
+After opening, the resolved file is confirmed to be a **regular file** whose canonical path is still
+inside the canonicalized artifact directory. That is what rejects a symlink pointing outside, which
+no amount of string checking can catch. Both checks exist because either alone is insufficient: the
+string check stops traversal without touching the filesystem, and the canonical check stops links.
+
+There is a race between the check and the read that this does not close. It is recorded rather than
+papered over: the artifact directory is assumed not to be mutated by another writer during an open,
+which is the same assumption document 03's atomic-publish workflow already makes.
+
 ### Bounded reads
 
 ```rust
@@ -173,6 +204,9 @@ which is exact. The numerical contracts of tasks 0003 and 0004 are unchanged.
 - A round trip: generate a tiny BF16 artifact with at least two tensors in two chunks, open it, read
   every tensor, and compare **byte for byte** against what was written.
 - One test per rejection rule in the table above, each asserting the error names the rule.
+- One test per opening limit, and one per path rule: a separator, `..`, an absolute path, and a
+  symlink out of the directory, each refused. The symlink test skips with a reported reason where
+  symlinks cannot be created, rather than passing.
 - The budget test: a tensor at least 8x the read budget is read correctly, and peak reader-owned
   allocation never exceeds the budget.
 - A corrupted payload byte is caught by the checksum, and the error says which tensor.

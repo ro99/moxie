@@ -416,28 +416,34 @@ impl Branch {
 /// so recording where each of them started is exact *and* `O(1)`. Cloning the
 /// branch would be equally exact and `O(context)` per step, which makes a
 /// sequence quadratic; the cheap-looking option is the wrong one here.
+///
+/// That "only" is a rule, not an observation. A transaction is **append-only**:
+/// while one is open on a branch, `rollback_to` and `emit` are refused, and
+/// `invalidate_generation` is refused outright. The fifth review reproduced
+/// what the alternative costs -- a rollback inside a transaction discards
+/// lineage entries *and* live results, and an earlier version of this journal
+/// restored the first but not the second, so aborting left a branch whose
+/// counters said one thing and whose retained result was gone. Journaling every
+/// discarded thing is possible; refusing the destructive operation for the
+/// duration is exact, cheap, and has no use case against it, because document
+/// 04's mechanism for keeping part of a transaction's work is
+/// `commit_prefix(n)`.
 #[derive(Debug, Clone)]
 struct Journal {
     branch: BranchId,
     frontiers: Frontiers,
     lineage_len: usize,
-    /// Where `lineage_saved` starts. Initially the lineage's length, meaning
-    /// nothing has been discarded yet.
-    lineage_saved_from: usize,
-    /// The original lineage entries from `lineage_saved_from` up to
-    /// `lineage_len`, saved the first time a rollback inside the transaction
-    /// discards them.
-    ///
-    /// Growing entries need no saving -- truncating back to `lineage_len` undoes
-    /// an append. *Discarded* entries do: a rollback inside a transaction
-    /// truncates them away and the re-execution that follows writes different
-    /// values in their place under a new epoch, so restoring the length alone
-    /// leaves the replacements behind. Saved lazily and only downward, so a
-    /// transaction that never rolls back pays nothing.
-    lineage_saved: Vec<PrefixLineage>,
     epoch: u64,
     logits: Option<LogitsHandle>,
-    next_result: u64,
+    /// The result counter at `begin`. Results with an id at or above this and
+    /// this journal's branch were minted inside the transaction.
+    ///
+    /// It is a *lower bound for identification*, never a value to restore. The
+    /// fifth review reproduced why: rewinding the counter let the next attempt
+    /// mint a handle identical in every field to one that had been discarded,
+    /// and `restore_logits` accepted it. Identities are not recycled, so an
+    /// aborted result stays dead.
+    results_from: u64,
 }
 
 /// One sequence's state: its schema, its branches and its retained outputs.
@@ -621,7 +627,24 @@ impl SequenceState {
     /// verification, never precedes it. **Monotonic within a response** -- see
     /// `rollback_to`, which refuses to move the accepted prefix below what has
     /// already been released.
+    ///
+    /// Also refused while a transaction is open on the branch. Emission is the
+    /// one mutation here that leaves the process -- once text has reached the
+    /// client, no counter can retract it -- so tentative work must not be
+    /// emitted. The fifth review reproduced the alternative: `emit` inside a
+    /// transaction moved `emitted` from 0 to 1, and `abort` moved it back,
+    /// which is a restored counter describing output the client already has.
     pub fn emit(&mut self, branch: BranchId, n: u64) -> Result<()> {
+        if let Some(id) = self.open_on(branch) {
+            return Err(Error::InvalidRequest {
+                field: "emitted",
+                detail: format!(
+                    "{branch} has transaction {} open; tentative work cannot be released \
+                     to the client, because an abort cannot retract it",
+                    id.get()
+                ),
+            });
+        }
         let b = self.get_mut(branch)?;
         let next = add(b.frontiers.emitted, n, "emitted")?;
         if next > b.frontiers.completion() {
@@ -771,12 +794,38 @@ impl SequenceState {
     /// Every retained result becomes stale and is discarded. Nothing survives:
     /// a result computed under a different graph, precision or positional
     /// configuration is a different computation, whatever its prefix.
-    pub fn invalidate_generation(&mut self) {
+    /// Refused while any transaction is open: it clears every branch's retained
+    /// result, and no journal records what it removed.
+    pub fn invalidate_generation(&mut self) -> Result<()> {
+        if let Some((id, journal)) = self.open.iter().next() {
+            return Err(Error::InvalidRequest {
+                field: "generation",
+                detail: format!(
+                    "transaction {} is open on {}; resolve it before invalidating every \
+                     retained result",
+                    id.get(),
+                    journal.branch
+                ),
+            });
+        }
         self.generation = StateGeneration(self.generation.0 + 1);
         self.live.clear();
         for b in self.branches.values_mut() {
             b.logits = None;
         }
+        Ok(())
+    }
+
+    /// The transaction open on `branch`, if any.
+    ///
+    /// A transaction is append-only, so every destructive operation asks this
+    /// first. See [`Journal`] for why refusing beats journaling the discarded
+    /// content.
+    fn open_on(&self, branch: BranchId) -> Option<StateTransactionId> {
+        self.open
+            .iter()
+            .find(|(_, j)| j.branch == branch)
+            .map(|(id, _)| *id)
     }
 
     /// Open a transaction on `branch`.
@@ -789,7 +838,7 @@ impl SequenceState {
     /// At most one transaction may be open per branch.
     pub fn begin(&mut self, branch: BranchId) -> Result<StateTransactionId> {
         let b = self.get(branch)?;
-        if let Some((id, _)) = self.open.iter().find(|(_, j)| j.branch == branch) {
+        if let Some(id) = self.open_on(branch) {
             return Err(Error::InvalidRequest {
                 field: "transaction",
                 detail: format!(
@@ -803,11 +852,9 @@ impl SequenceState {
             branch,
             frontiers: b.frontiers,
             lineage_len: b.lineage.len(),
-            lineage_saved_from: b.lineage.len(),
-            lineage_saved: Vec::new(),
             epoch: b.epoch,
             logits: b.logits,
-            next_result: self.next_result,
+            results_from: self.next_result,
         };
         let id = StateTransactionId(self.next_transaction);
         self.next_transaction += 1;
@@ -858,51 +905,30 @@ impl SequenceState {
             detail: format!("no open transaction {}", txn.get()),
         })?;
         // Results minted inside the transaction describe work that is being
-        // undone; they cannot survive it.
-        self.live.retain(|id, _| id.get() < journal.next_result);
-        self.next_result = journal.next_result;
+        // undone; they cannot survive it. Both halves of the predicate matter,
+        // and the fifth review reproduced what each one costs when it is
+        // missing:
+        //
+        // - **the branch.** `live` holds every branch's results. Filtering the
+        //   whole table by id alone deleted results another branch had already
+        //   committed, because those ids are also above this journal's mark.
+        // - **the counter.** `next_result` is *not* restored. Rewinding it let
+        //   the next attempt mint a handle equal in every field to one this
+        //   abort discarded, which `restore_logits` then accepted.
+        self.live
+            .retain(|id, h| id.get() < journal.results_from || h.branch != journal.branch);
         let b = self
             .branches
             .get_mut(&journal.branch)
             .expect("a branch with an open transaction still exists");
         b.frontiers = journal.frontiers;
-        // Put back anything a rollback inside the transaction discarded, then
-        // drop anything it appended.
-        b.lineage.truncate(journal.lineage_saved_from);
-        b.lineage.extend(journal.lineage_saved);
+        // Truncation is a complete inverse because a transaction is
+        // append-only: `rollback_to` is refused while one is open, so no entry
+        // below `lineage_len` can have been replaced.
         b.lineage.truncate(journal.lineage_len);
         b.epoch = journal.epoch;
         b.logits = journal.logits;
         Ok(())
-    }
-
-    /// Before a truncation to `new_len`, hand any open transaction the original
-    /// entries it is about to lose.
-    ///
-    /// Only ever extends the saved range downward, so the earliest originals
-    /// win: a second rollback inside one transaction sees replacements above the
-    /// first save point and must not overwrite the true values with them.
-    fn save_discarded_lineage(&mut self, branch: BranchId, new_len: usize) {
-        let Some((id, from)) = self
-            .open
-            .iter()
-            .find(|(_, j)| j.branch == branch)
-            .map(|(id, j)| (*id, j.lineage_saved_from))
-        else {
-            return;
-        };
-        if new_len >= from {
-            return;
-        }
-        let Some(b) = self.branches.get(&branch) else {
-            return;
-        };
-        let head: Vec<PrefixLineage> = b.lineage[new_len..from.min(b.lineage.len())].to_vec();
-        let journal = self.open.get_mut(&id).expect("found above");
-        let mut restored = head;
-        restored.append(&mut journal.lineage_saved);
-        journal.lineage_saved = restored;
-        journal.lineage_saved_from = new_len;
     }
 
     /// Transactions that were opened and never resolved.
@@ -991,6 +1017,16 @@ impl SequenceState {
         prefix: u64,
         restores: &[Restore],
     ) -> Result<()> {
+        if let Some(id) = self.open_on(branch) {
+            return Err(Error::InvalidRequest {
+                field: "prefix",
+                detail: format!(
+                    "{branch} has transaction {} open; a transaction is append-only, so \
+                     resolve it before discarding executed positions",
+                    id.get()
+                ),
+            });
+        }
         let schema = self.schema.clone();
         let generation = self.generation;
         let sequence = self.id;
@@ -1130,7 +1166,6 @@ impl SequenceState {
 
         // If a transaction is open on this branch, the entries about to be
         // discarded are the ones an abort could not otherwise reconstruct.
-        self.save_discarded_lineage(branch, prefix as usize + 1);
 
         // Results beyond the target describe state that no longer exists.
         self.live
@@ -1532,7 +1567,7 @@ mod tests {
         let handle = s.record_logits(ROOT, 8).unwrap();
 
         // Configuration change: same counters, different model.
-        s.invalidate_generation();
+        s.invalidate_generation().unwrap();
         assert!(!s.next_logits_valid(ROOT));
         assert!(
             s.restore_logits(ROOT, handle).is_err(),
@@ -1659,7 +1694,7 @@ mod tests {
         let before = stale_holder
             .restore_evidence(StateKind::RecurrentAccumulator, ROOT, method)
             .unwrap();
-        stale_holder.invalidate_generation();
+        stale_holder.invalidate_generation().unwrap();
         assert!(
             stale_holder.rollback_to(ROOT, 6, &[before]).is_err(),
             "a snapshot from a different configuration is stale"
@@ -1857,7 +1892,13 @@ mod tests {
         let txn = s.begin(ROOT).unwrap();
         s.execute(ROOT, 3).unwrap();
         s.accept(ROOT, 3).unwrap();
-        s.emit(ROOT, 2).unwrap();
+        // Not `emit`. The fifth review reproduced what an earlier version of
+        // this test enshrined: emitting inside a transaction and restoring the
+        // counter on abort is a retraction of output the client already has.
+        // `emitted` is in `before` and must come back **because it never
+        // moved**, which is a different guarantee from being rewound.
+        let e = s.emit(ROOT, 2).unwrap_err();
+        assert!(e.to_string().contains("cannot be released"), "{e}");
         s.record_logits(ROOT, 9).unwrap();
         assert_ne!(s.frontiers(ROOT).unwrap(), before, "the fixture must move");
 
@@ -1881,31 +1922,117 @@ mod tests {
     }
 
     #[test]
-    fn abort_puts_back_the_epoch_so_a_later_lineage_is_unchanged() {
-        // A rollback inside a transaction bumps the epoch. If abort left the
-        // epoch advanced, positions written afterwards would get a lineage that
-        // no retained result could match -- an invisible invalidation.
+    fn aborting_one_branch_leaves_another_branch_s_results_alone() {
+        // Fifth review, reproduced: `live` holds every branch's results, and
+        // filtering it by result id alone deleted results a *different* branch
+        // had already committed, because their ids are also above this
+        // journal's mark.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 2).unwrap();
+        s.execute(ROOT, 2).unwrap();
+        let child = s.fork(ROOT, 2).unwrap();
+
+        let t_root = s.begin(ROOT).unwrap();
+        let t_child = s.begin(child).unwrap();
+        s.execute(child, 1).unwrap();
+        let h = s.record_logits(child, 3).unwrap();
+        s.commit_prefix(t_child, 0).unwrap();
+        assert!(s.restore_logits(child, h).is_ok());
+
+        s.abort(t_root).unwrap();
+        assert!(
+            s.restore_logits(child, h).is_ok(),
+            "the child committed this result; the root's abort does not describe it"
+        );
+    }
+
+    #[test]
+    fn an_aborted_result_identity_is_never_reissued() {
+        // Fifth review, reproduced: `abort` used to restore `next_result`, so
+        // re-executing the same prefix minted a handle equal in every field to
+        // the discarded one -- and `restore_logits` accepted it. A restored
+        // logical state must not recycle the identities of discarded results.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 2).unwrap();
+
+        let t1 = s.begin(ROOT).unwrap();
+        s.execute(ROOT, 2).unwrap();
+        let discarded = s.record_logits(ROOT, 2).unwrap();
+        s.abort(t1).unwrap();
+        assert!(s.restore_logits(ROOT, discarded).is_err());
+
+        let t2 = s.begin(ROOT).unwrap();
+        s.execute(ROOT, 2).unwrap();
+        let fresh = s.record_logits(ROOT, 2).unwrap();
+        s.commit_prefix(t2, 0).unwrap();
+
+        assert_ne!(fresh.id(), discarded.id());
+        assert_ne!(fresh, discarded);
+        assert!(
+            s.restore_logits(ROOT, discarded).is_err(),
+            "the discarded handle stays dead after a successful retry"
+        );
+    }
+
+    #[test]
+    fn tentative_work_cannot_be_released_to_the_client() {
+        // Fifth review, reproduced: `emit` inside a transaction moved `emitted`
+        // from 0 to 1 and `abort` moved it back -- a restored counter
+        // describing text the client already has. Emission is the one mutation
+        // that leaves the process, so it is refused for the duration instead.
+        let mut s = kv_only();
+        s.append_prompt(ROOT, 1).unwrap();
+        s.execute(ROOT, 1).unwrap();
+        s.accept(ROOT, 1).unwrap();
+
+        let txn = s.begin(ROOT).unwrap();
+        let e = s.emit(ROOT, 1).unwrap_err();
+        assert!(e.to_string().contains("cannot be released"), "{e}");
+        s.abort(txn).unwrap();
+        assert_eq!(s.frontiers(ROOT).unwrap().emitted, 0);
+
+        // And it works once the transaction is resolved, in either direction.
+        s.emit(ROOT, 1).unwrap();
+        assert_eq!(s.frontiers(ROOT).unwrap().emitted, 1);
+        let txn = s.begin(ROOT).unwrap();
+        s.commit_prefix(txn, 0).unwrap();
+        s.emit(ROOT, 0).unwrap();
+    }
+
+    #[test]
+    fn a_transaction_is_append_only() {
+        // The fifth review reproduced both halves of this. A rollback inside a
+        // transaction discards lineage entries *and* live results, and an
+        // earlier journal restored the first but not the second -- so aborting
+        // left a branch whose counters said one thing and whose retained result
+        // was gone. Journaling every discarded thing is possible; refusing the
+        // destructive operation for the duration is exact and cheap, and
+        // document 04's way to keep part of a transaction's work is
+        // `commit_prefix(n)`, not a rollback inside it.
         let mut s = kv_only();
         s.append_prompt(ROOT, 2).unwrap();
         s.accept(ROOT, 4).unwrap();
         s.execute(ROOT, 6).unwrap();
+        let kept = s.record_logits(ROOT, 6).unwrap();
         let lineage_before = s.lineage_at(ROOT, 6).unwrap();
 
         let txn = s.begin(ROOT).unwrap();
-        s.rollback_to(ROOT, 3, &[]).unwrap();
-        s.accept(ROOT, 3).unwrap();
+        let e = s.rollback_to(ROOT, 3, &[]).unwrap_err();
+        assert!(e.to_string().contains("append-only"), "{e}");
+        let e = s.invalidate_generation().unwrap_err();
+        assert!(e.to_string().contains("is open"), "{e}");
         s.execute(ROOT, 3).unwrap();
-        assert_ne!(s.lineage_at(ROOT, 6).unwrap(), lineage_before);
         s.abort(txn).unwrap();
 
+        // Nothing below the journal's mark could have been replaced, so
+        // truncation is a complete inverse and the retained result survives.
         assert_eq!(s.lineage_at(ROOT, 6).unwrap(), lineage_before);
-        // And re-executing after the abort reproduces the same lineage, which it
-        // would not if the epoch had been left advanced.
-        let mut fresh = kv_only();
-        fresh.append_prompt(ROOT, 2).unwrap();
-        fresh.accept(ROOT, 4).unwrap();
-        fresh.execute(ROOT, 6).unwrap();
-        assert_eq!(s.frontiers(ROOT).unwrap(), fresh.frontiers(ROOT).unwrap());
+        assert!(s.restore_logits(ROOT, kept).is_ok());
+        assert!(s.next_logits_valid(ROOT));
+
+        // Both operations work again once the transaction is resolved.
+        s.rollback_to(ROOT, 3, &[]).unwrap();
+        s.invalidate_generation().unwrap();
     }
 
     #[test]
@@ -1997,38 +2124,6 @@ mod tests {
         assert_eq!(s.open_transactions().len(), 1);
         s.abort(txn).unwrap();
         assert!(s.open_transactions().is_empty());
-    }
-
-    #[test]
-    fn abort_restores_a_lineage_that_was_rolled_back_twice_inside_the_transaction() {
-        // The saved range only ever extends downward. A second rollback sees
-        // replacement entries above the first save point, and must not overwrite
-        // the true originals with them.
-        let mut s = kv_only();
-        s.append_prompt(ROOT, 2).unwrap();
-        s.accept(ROOT, 6).unwrap();
-        s.execute(ROOT, 8).unwrap();
-        let originals: Vec<_> = (0..=8).map(|p| s.lineage_at(ROOT, p).unwrap()).collect();
-
-        let txn = s.begin(ROOT).unwrap();
-        s.rollback_to(ROOT, 6, &[]).unwrap();
-        s.accept(ROOT, 2).unwrap();
-        s.execute(ROOT, 2).unwrap();
-        s.rollback_to(ROOT, 3, &[]).unwrap();
-        s.accept(ROOT, 5).unwrap();
-        s.execute(ROOT, 5).unwrap();
-        for p in 4..=8u64 {
-            assert_ne!(s.lineage_at(ROOT, p).unwrap(), originals[p as usize]);
-        }
-        s.abort(txn).unwrap();
-
-        for p in 0..=8u64 {
-            assert_eq!(
-                s.lineage_at(ROOT, p).unwrap(),
-                originals[p as usize],
-                "prefix {p}"
-            );
-        }
     }
 
     #[test]

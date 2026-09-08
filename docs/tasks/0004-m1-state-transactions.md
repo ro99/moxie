@@ -41,7 +41,7 @@ One outcome: **a step's publication is a single transaction that either commits 
 the sequence and its cache exactly as they were.**
 
 - Sole owning shared component: `moxie-state`, plus the publication path in `moxie-interp`.
-- Non-goals: no paging (M4), no copy-on-write fork implementation, no recurrent snapshot/replay
+- Non-goals: no paged allocator, no copy-on-write fork implementation, no recurrent snapshot/replay
   machinery beyond the evidence rules that already exist, no sampler, no service, no CLI, no CUDA,
   no checkpoint.
 - Existing consumers: `moxie-interp` is the only one. Its 25 acceptance tests must keep passing
@@ -116,6 +116,11 @@ failure path without a second failure to handle.
   makes the cache participant awkward.
 - **`fork` remains what it is.** Copy-on-write branch state is M4; `fork` still creates a branch with
   its own identity and no inherited result, and transactions are per branch.
+- **Paging is not deferred to M4.** M1.4 asks for "appendable paged state **plus** transaction API",
+  so the initial paged implementation is an M1 requirement; M4 adds paged *device* attention,
+  host-backed page streaming and the growth-admission path on top of it. This task deliberately
+  narrows to the transaction half, which is the part the task-0003 finding is about. The paged
+  allocator is the next M1.4 task and is not being re-scoped to M4 by being excluded here.
 
 ### Cancellation
 
@@ -144,7 +149,8 @@ test here that touches them is asserting they are *unchanged*, not re-deriving t
 - Every task 0003 acceptance test passes unchanged in intent.
 - Support matrix: update `G-INTERP-BF16`'s row and add nothing that mentions a checkpoint, a kernel
   or a context length.
-- Stop condition: if this appears to need paging, a real fork, a sampler or a checkpoint, stop and
+- Stop condition: if this appears to need the paged allocator, a real fork, a sampler or a
+  checkpoint, stop and
   report. Each is a different task.
 
 ## Result
@@ -166,9 +172,9 @@ change). Nothing in the contract was adjusted once a test ran.
 | `cargo xtask-cuda test-gpu` | **PASS**, 15 cases, `sm_86` and `sm_120` qualified |
 | `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, `UNQUALIFIED sm_120`, as intended |
 
-Host counts by crate: `moxie-oracles` 114, `moxie-format` 54, `moxie-state` 38, `xtask` 30,
-`moxie-interp` 14 + 27 integration, `moxie-types` 22, `moxie-graph` 11, `moxie-cuda` 9,
-`moxie-model-api` 5, `moxie-kernels` 1.
+Host counts by crate, after the fifth review's corrections: `moxie-oracles` 114, `moxie-format` 54,
+`moxie-state` 39, `xtask` 30, `moxie-interp` 15 + 27 integration, `moxie-types` 22, `moxie-graph` 11,
+`moxie-cuda` 9, `moxie-model-api` 5, `moxie-kernels` 1.
 
 ### What was built
 
@@ -214,8 +220,8 @@ layer-count check and the stateless-graph refusal, both still before anything is
 |---|---|
 | `arch-check`, `spec-check`, `fmt`, `clippy -D warnings`, full host lane | all PASS, above |
 | Device lane and `test-gpu` unchanged and carried forward | PASS; this task touches no CUDA |
-| Failure injection at every publication step | `a_partly_published_step_aborts_to_exactly_where_it_started` drives a step's mutations one at a time and aborts after each, comparing the four counters, the retained result, the live set, the lineage at every prefix and every KV layer; `abort_restores_after_every_prefix_of_a_step_s_mutations` does the same at the state level |
-| Cancellation at every node depth still leaves state identical, through `abort` | `a_cancelled_step_leaves_the_state_exactly_as_it_found_it`, unchanged in intent, plus `a_successful_step_leaves_no_transaction_open` which also asserts a cancelled step leaves none |
+| Failure injection at every publication step | `a_step_cancelled_at_any_publication_boundary_aborts_to_exactly_where_it_started` drives the real `Interpreter::run` and injects a fault after each of publication's four mutations, comparing the four counters, the retained result, the live set, the lineage at every prefix, every KV layer **and the cache stamps**; `abort_restores_after_every_prefix_of_a_step_s_mutations` does the same at the state level. **Rewritten after the fifth review**, which was right that the first version hand-performed a subset of the mutations and hand-called `abort`, so it never exercised `run`'s error handler |
+| Cancellation at every node depth still leaves state identical, through `abort` | `a_cancelled_step_leaves_the_state_exactly_as_it_found_it`, unchanged in intent, plus `a_successful_step_leaves_no_transaction_open`. **Corrected after the fifth review**: cancellation during node evaluation happens before `begin`, so until that review it satisfied the rule by never having started. `publish` now checks the token after each of its four mutations, so cancellation genuinely aborts |
 | A second `begin` is refused | `a_branch_has_at_most_one_open_transaction` |
 | Unknown / resolved id refused | `an_unknown_or_resolved_transaction_is_refused` |
 | An unresolved transaction is visible | `an_unresolved_transaction_is_visible_rather_than_silent` |
@@ -224,15 +230,16 @@ layer-count check and the stateless-graph refusal, both still before anything is
 | Support-matrix row updated | `G-INTERP-BF16` recounted; one capability row added for transactional publication. No checkpoint, kernel or context row touched |
 
 Further tests beyond the list: `commit_prefix_keeps_the_work_and_publishes_what_it_is_told_to`,
-`abort_puts_back_the_epoch_so_a_later_lineage_is_unchanged`,
-`a_failed_commit_leaves_the_transaction_open_to_abort`,
+`a_transaction_is_append_only`, `a_failed_commit_leaves_the_transaction_open_to_abort`,
 `a_branch_with_an_open_transaction_cannot_be_discarded`, and
 `a_cache_whose_layers_disagree_cannot_be_stamped_as_current`.
 
 ### What this does not establish
 
-- **This is not a fork.** `fork` still creates a branch with its own identity and no inherited
-  state. Copy-on-write branch state, paging and prefix reuse are M4 and untouched.
+- **This is not a fork, and it is not the paged allocator.** `fork` still creates a branch with its
+  own identity and no inherited state. Copy-on-write branch state and prefix reuse are M4;
+  **appendable paged state is M1.4 and still outstanding** -- excluded from this narrower task, not
+  reassigned to a later milestone.
 - **Nothing here executes a model.** The interpreter is still a host BF16 reference over synthetic
   graphs. Atomic publication makes a step safe to fail; it does not make anything faster, and it
   does not make the reference an engine.
@@ -241,3 +248,108 @@ Further tests beyond the list: `commit_prefix_keeps_the_work_and_publishes_what_
 - **A dropped transaction still leaks.** By design, and asserted: `Drop` cannot reach the owning
   `SequenceState`, so an unresolved transaction locks its branch and is reported by
   `open_transactions()` rather than auto-aborting.
+
+---
+
+## Fifth review corrections, 2026-09-08
+
+A fifth review of `1166779` reproduced **five transaction-correctness defects and one acceptance-test
+gap**, and was right about all six. Every one was reproduced here before being changed; the
+reproductions are now permanent regression tests rather than scratch files.
+
+| Command | Before | After |
+|---|---|---|
+| `cargo test --workspace --locked --offline` | 325 + 1 doctest | **328 + 1 doctest** (4 tests added, 1 removed) |
+| device lane | 333 + 2 doctests | **336 + 2 doctests** |
+| `cargo test -p moxie-interp` | 14 unit + 27 acceptance | **15 unit + 27 acceptance** |
+| `fmt`, `clippy -D warnings`, `arch-check`, `spec-check`, no-driver host build | PASS | **PASS** |
+| `cargo xtask-cuda test-gpu`, hidden-SM120 gate | PASS / exit 1 | **PASS / exit 1** |
+
+### The shape all five share
+
+Four of the five are the same mistake in different places: **`abort` was written as "put the
+recorded values back", when what it has to be is "leave the branch as if the transaction had never
+run".** Those differ exactly where a mutation touched something the journal does not describe --
+another branch's results, a counter that is not the branch's, output that has left the process, or
+content that a destructive operation removed. Restoring a field is not the same as undoing an
+effect, and each defect is one place where that gap was visible.
+
+### R1 -- aborting one branch deleted another branch's committed results · closed
+
+Reproduced: begin on root and on a child, execute and `commit_prefix` the child, abort the root; the
+child's committed handle stopped validating. `abort` filtered the whole sequence's `live` table by
+result id, and the child's ids are also above the root journal's mark.
+
+The predicate now names both halves -- `id >= results_from` **and** `branch == journal.branch`.
+`aborting_one_branch_leaves_another_branch_s_results_alone`.
+
+### R2 -- aborted result identities were reissued · closed
+
+Reproduced: abort a transaction that minted a handle, retry the same prefix, and the new handle was
+**equal in every field** to the discarded one; `restore_logits` accepted the dead handle again.
+`abort` was restoring `next_result`.
+
+`next_result` is now recorded as `results_from` and used only to *identify* what to remove. It is
+never restored, so identities are not recycled and an aborted result stays dead.
+`an_aborted_result_identity_is_never_reissued`.
+
+### R3 and R5 -- a transaction is now append-only · closed
+
+R3: a rollback inside a transaction discarded live results, and the journal saved discarded lineage
+but not those; aborting left counters at 2 and the retained result gone. R5: `KvCache::abort` only
+truncates, so it cannot put back rows a rollback removed -- abort left the sequence at prefix 2 and
+the cache at 1.
+
+Both are the same operation, and the review offered the resolution for the cache half: journal the
+discarded content, or refuse the destructive mutation while a transaction is open. **Refusing** is
+what is implemented, for both participants, because it is exact rather than approximately exact, it
+is cheap, and document 04's mechanism for keeping part of a transaction's work is `commit_prefix(n)`
+rather than a rollback inside it. `rollback_to` is refused on `SequenceState` and on `KvCache` while
+a transaction is open, and `invalidate_generation` is refused outright because it clears every
+branch's retained result and no journal records what it removed.
+
+The journal is smaller as a result: `lineage_saved`/`lineage_saved_from` are gone, and the test that
+existed only to exercise them is replaced by `a_transaction_is_append_only` and
+`a_cache_transaction_is_append_only`, which assert the refusal and that both operations work again
+once the transaction resolves.
+
+### R4 -- abort could retract emitted tokens · closed
+
+Reproduced: `emit` inside a transaction moved `emitted` 0 -> 1, and `abort` moved it back. A counter
+can be restored; text the client already has cannot. The previous test
+`abort_restores_every_counter_including_executed` asserted this behaviour, so it was not merely
+untested -- it was enshrined.
+
+`emit` is refused while a transaction is open on the branch. The test now asserts the refusal and
+that `emitted` comes back **because it never moved**, which is a different guarantee from being
+rewound. `tentative_work_cannot_be_released_to_the_client`.
+
+### R6 -- the failure injection was not through the real path · closed
+
+The review was right on both counts. The old test opened both journals by hand, performed a subset
+of the mutations by hand, called `abort` by hand, and never touched cache stamping -- so it checked
+the *participants* and not `Interpreter::run`'s error handler. And the record's claim that
+cancellation now exercises abort was inaccurate: cancellation was checked only during node
+evaluation, before `state.begin`.
+
+Both are fixed by the same change. `publish` checks the cancellation token after each of its four
+mutations, so cancellation is a genuine mid-publication failure. The new test derives the graph's
+boundary count rather than hardcoding it, then drives the real `run` cancelled at each publication
+boundary in turn and asserts the four counters, the retained result, the live set, the lineage at
+every prefix, every KV layer and `check_owner` (the stamps) are unchanged, that no transaction is
+left open, and that the sequence still runs cleanly afterwards.
+
+Cancellation is the injected fault because it is the only one left: once the preconditions moved
+inside the transaction, no malformed input can make publication fail halfway, so a test that fed bad
+input would be refused at entry and never reach the handler it claims to check. That is stated in
+the test rather than left for the next reviewer to work out.
+
+The test was checked against two deliberate mutations -- dropping `kv.abort` and dropping
+`state.abort` from `run`'s error arm -- and it fails on each, at a different assertion.
+
+### Milestone wording, corrected
+
+The record described paging as M4. M1.4 asks for "appendable paged state **plus** transaction API",
+so the initial paged implementation is an M1 requirement; M4 adds paged *device* attention,
+host-backed page streaming and growth admission on top of it. This task narrows to the transaction
+half deliberately. The support matrix now says the same.

@@ -54,6 +54,17 @@ pub struct CacheJournal {
 pub struct KvCache {
     layers: Vec<KvHistory>,
     owner: CacheOwner,
+    /// Set between `begin` and `commit`/`abort`.
+    ///
+    /// A cache transaction is **append-only**, and this is what enforces it. The
+    /// journal records lengths, so `abort` can drop rows that were added; it
+    /// cannot recreate rows that were removed. The fifth review reproduced the
+    /// gap the public API left open -- roll the cache back inside a transaction,
+    /// abort, and the sequence returns to its old prefix while the cache stays
+    /// short and fails ownership validation. `moxie-state` refuses the same
+    /// operation for the same duration, so the two participants have one rule
+    /// rather than two.
+    in_transaction: bool,
 }
 
 impl KvCache {
@@ -85,6 +96,7 @@ impl KvCache {
                 branch,
                 stamps: vec![lineage],
             },
+            in_transaction: false,
         })
     }
 
@@ -155,7 +167,7 @@ impl KvCache {
     /// There is deliberately no public way to re-stamp a cache without adding
     /// the contents that justify it -- the fifth review found that a public
     /// re-stamp certifies whatever bytes happen to be there.
-    pub(crate) fn commit(&mut self, state: &SequenceState, branch: BranchId) -> Result<()> {
+    pub(crate) fn stamp(&mut self, state: &SequenceState, branch: BranchId) -> Result<()> {
         if self.owner.sequence != state.id() || self.owner.branch != branch {
             return Err(Error::InvalidRequest {
                 field: "kv_cache",
@@ -202,11 +214,24 @@ impl KvCache {
     /// state crate, because `moxie-state` owns sequence state and must not reach
     /// into a consumer's buffers; `moxie-interp` is the composition point that
     /// opens and resolves both together.
-    pub fn begin(&self) -> CacheJournal {
-        CacheJournal {
+    pub fn begin(&mut self) -> Result<CacheJournal> {
+        if self.in_transaction {
+            return Err(Error::InvalidRequest {
+                field: "kv_cache",
+                detail: "this cache already has a transaction open".into(),
+            });
+        }
+        self.in_transaction = true;
+        Ok(CacheJournal {
             lengths: self.layers.iter().map(KvHistory::len).collect(),
             stamps: self.owner.stamps.len(),
-        }
+        })
+    }
+
+    /// Close a cache transaction, keeping everything it appended.
+    pub fn commit(&mut self, journal: CacheJournal) {
+        let _ = journal;
+        self.in_transaction = false;
     }
 
     /// Restore exactly what `begin` recorded. Infallible.
@@ -215,6 +240,7 @@ impl KvCache {
             l.truncate(*n as u64);
         }
         self.owner.stamps.truncate(journal.stamps);
+        self.in_transaction = false;
     }
 
     /// The stored histories, without the ownership stamp.
@@ -270,6 +296,15 @@ impl KvCache {
             return Err(Error::InvalidRequest {
                 field: "kv_cache",
                 detail: "rolling back a cache that belongs to another sequence or branch".into(),
+            });
+        }
+        if self.in_transaction {
+            return Err(Error::InvalidRequest {
+                field: "kv_cache",
+                detail: "this cache has a transaction open; a cache transaction is \
+                         append-only, because its journal records lengths and cannot \
+                         put removed rows back"
+                    .into(),
             });
         }
         if prefix > self.len() as u64 {
@@ -357,7 +392,7 @@ mod tests {
             kv.append(0, p, vec![p as f32], vec![-(p as f32)]).unwrap();
             kv.append(1, p, vec![p as f32 * 2.0], vec![0.0]).unwrap();
             state.execute(ROOT, 1).unwrap();
-            kv.commit(&state, ROOT).unwrap();
+            kv.stamp(&state, ROOT).unwrap();
         }
         assert_eq!(kv.len(), 5);
         state.rollback_to(ROOT, 3, &[]).unwrap();
@@ -409,8 +444,40 @@ mod tests {
         assert!(kv.check_owner(&state, ROOT).is_err());
         kv.append(0, 0, vec![1.0], vec![1.0]).unwrap();
         kv.append(0, 1, vec![1.0], vec![1.0]).unwrap();
-        kv.commit(&state, ROOT).unwrap();
+        kv.stamp(&state, ROOT).unwrap();
         kv.check_owner(&state, ROOT).unwrap();
+    }
+
+    #[test]
+    fn a_cache_transaction_is_append_only() {
+        // Fifth review, reproduced: the journal records lengths, so `abort` can
+        // drop rows that were added but cannot recreate rows that were removed.
+        // Rolling the cache back inside a transaction and then aborting left
+        // the sequence at its old prefix and the cache short. `moxie-state`
+        // refuses the same operation for the same duration, so the two
+        // participants have one rule rather than two.
+        let (mut state, mut kv) = state_and_cache(1);
+        state.append_prompt(ROOT, 2).unwrap();
+        for p in 0..2u64 {
+            kv.append(0, p, vec![p as f32], vec![-(p as f32)]).unwrap();
+        }
+        state.execute(ROOT, 2).unwrap();
+        kv.stamp(&state, ROOT).unwrap();
+        let before = kv.contents().to_vec();
+
+        let journal = kv.begin().unwrap();
+        assert!(kv.begin().is_err(), "one transaction per cache");
+        let e = kv.rollback_to(&state, ROOT, 1).unwrap_err();
+        assert!(e.to_string().contains("append-only"), "{e}");
+        kv.append(0, 2, vec![9.0], vec![9.0]).unwrap();
+        kv.abort(&journal);
+
+        assert_eq!(kv.contents(), &before[..]);
+        kv.check_owner(&state, ROOT).unwrap();
+        // Resolved, so the destructive operation is available again.
+        state.accept(ROOT, 2).unwrap();
+        kv.rollback_to(&state, ROOT, 1).unwrap();
+        assert_eq!(kv.len(), 1);
     }
 
     #[test]
@@ -426,10 +493,10 @@ mod tests {
         kv.append(0, 0, vec![1.0], vec![1.0]).unwrap();
         // Layer 1 is left behind. Layer 0 alone matches `executed`.
         assert_eq!(kv.len(), 1);
-        let e = kv.commit(&state, ROOT).unwrap_err();
+        let e = kv.stamp(&state, ROOT).unwrap_err();
         assert!(e.to_string().contains("[1, 0]"), "{e}");
         kv.append(1, 0, vec![1.0], vec![1.0]).unwrap();
-        kv.commit(&state, ROOT).unwrap();
+        kv.stamp(&state, ROOT).unwrap();
     }
 
     #[test]
@@ -442,7 +509,7 @@ mod tests {
         state.execute(ROOT, 2).unwrap();
         kv.append(0, 0, vec![1.0], vec![1.0]).unwrap();
         kv.append(0, 1, vec![2.0], vec![2.0]).unwrap();
-        kv.commit(&state, ROOT).unwrap();
+        kv.stamp(&state, ROOT).unwrap();
         kv.check_owner(&state, ROOT).unwrap();
 
         // Roll the state back and re-execute a different token at position 1,
