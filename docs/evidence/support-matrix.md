@@ -16,10 +16,10 @@ matrix exists to prevent.
 |---|---|---|---|
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
-| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 375 unit/integration tests + 4 doctests |
-| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 22 negative + 1 positive fixtures, 8 rules |
+| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 385 unit/integration tests + 4 doctests |
+| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 24 negative + 1 positive fixtures, 8 rules |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
-| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 375 unit/integration tests + 4 doctests, `ldd` shows no `libcuda` |
+| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 385 unit/integration tests + 4 doctests, `ldd` shows no `libcuda` |
 | `G-GPU-SM86` | `cargo xtask-cuda test-gpu --profile sm86` | device | passed, RTX 3090 x2 |
 | `G-GPU-SM120` | `cargo xtask-cuda test-gpu --profile sm120` | device | passed, RTX 5060 Ti |
 | `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 15 cases, both architectures qualified |
@@ -53,7 +53,7 @@ enforcement counts they grew from are in
 | none | n/a | n/a | Oversized host/disk weight streaming | **not implemented** | — | M2. No memory authority exists. |
 | none | n/a | n/a | TP / PP / expert partition | **not implemented** | — | M5. `PartitionRule::NotDetermined` fails closed today. |
 | none | n/a | n/a | Transactional publication of a step | passed | `G-INTERP-BF16` (`moxie-state` `begin`/`commit_prefix`/`abort`, `a_step_cancelled_at_any_publication_boundary_aborts_to_exactly_where_it_started`) | Host reference only. A step's sequence-state and KV mutations commit together or restore exactly, and a transaction is append-only on both. `fork` is still identity-only (COW is M4), and **appendable paged state remains an outstanding M1.4 requirement**. |
-| none | n/a | n/a | Canonical manifest v1 + bounded tensor reads | passed | `G-HOST-TEST` (`moxie-format::manifest` 26 rejection/limit tests, `moxie-storage` 13 artifact + 3 pump tests), `G-HOST-ARCH` (format/storage boundary rules + fixtures) | Host-only. Opens, validates and reads test-generated BF16 artifacts within a byte budget. **No checkpoint has been read, downloaded or converted, and nothing here loads a model:** `moxie-interp` is not rewired to disk, affine tensors refuse with M3, and `partial` refuses every read. |
+| none | n/a | n/a | Canonical manifest v1 + bounded tensor reads | passed | `G-HOST-TEST` (`moxie-format::manifest` 31 rejection/limit/collision tests, `moxie-storage` 14 artifact + 4 pump tests), `G-HOST-ARCH` (format/storage boundary + include rules with fixtures) | Host-only. Opens, validates and reads test-generated BF16 artifacts within a byte budget; the success path holds zero live heap (counting-allocator gate). **No checkpoint has been read, downloaded or converted, and nothing here loads a model:** `moxie-interp` is not rewired to disk, affine tensors refuse with M3, and `partial` refuses every read. |
 | none | n/a | n/a | Prefix reuse / continuation / cancellation | **not implemented** | `G-HOST-TEST` (`moxie-state`) covers frontier, result-identity and restore-evidence rules only | M4. Counters, retained-result identity and prefix lineage are typed and tested; there is no cache to reuse, and document 04's token-content prefix key is a separate identity that is **not** implemented. |
 | none | n/a | n/a | Common sampler pipeline | **partial, not integrated** | `G-HOST-TEST` (`moxie-oracles::sampler`) | Legality mask, top-k, top-p, min-p, temperature, tie rule, extreme-temperature stability and typed failures only. Penalties, DRY, n-gram ban, logit bias, typical-p and XTC are **not implemented**. |
 | none | n/a | n/a | Future entropy | **not implemented** | — | M10. Document 05 defines it; nothing here evaluates it. |

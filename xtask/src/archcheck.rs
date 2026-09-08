@@ -1152,6 +1152,91 @@ const STORAGE_FORBIDDEN_NAMES: &[&str] = &[
     "moxie-models",
 ];
 
+/// Production sources plus everything they pull in by `include!`, with the
+/// facts for each. The legitimate SHA implementation in moxie-format uses
+/// `include!`, so the mechanism is permitted and its targets are inspected
+/// rather than banned outright: an `include!` that resolves to a file using
+/// `std::fs` is the same breach as writing the `use` directly.
+///
+/// Include arguments are `include!` paths, hence relative to the including
+/// file. Only plain string literals resolve; anything computed (`concat!`,
+/// `env!`, …) fails closed, as does a target that is missing or unparsable.
+fn production_facts_with_includes(
+    doc: &toml::Value,
+    dir: &Path,
+) -> (Vec<(PathBuf, SourceFacts)>, Vec<String>) {
+    let (files, mut problems) = production_sources(doc, dir);
+    let mut out: Vec<(PathBuf, SourceFacts)> = Vec::new();
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    for file in files {
+        match analyse_source(&file, true) {
+            Ok(facts) => {
+                seen.insert(file.clone());
+                out.push((file, facts));
+            }
+            Err(e) => problems.push(e),
+        }
+    }
+    let mut queue: Vec<(PathBuf, Vec<String>)> = out
+        .iter()
+        .map(|(f, facts)| (f.clone(), facts.source_includes.clone()))
+        .collect();
+    while let Some((including, args)) = queue.pop() {
+        for arg in args {
+            match resolve_include(&including, &arg) {
+                Some(target) => {
+                    if !seen.insert(target.clone()) {
+                        continue;
+                    }
+                    match analyse_source(&target, true) {
+                        Ok(facts) => {
+                            queue.push((target.clone(), facts.source_includes.clone()));
+                            out.push((target, facts));
+                        }
+                        Err(e) => problems.push(e),
+                    }
+                }
+                None => problems.push(format!(
+                    "{}: `include!({arg})` resolves to no readable Rust file; included production source that cannot be found cannot be cleared",
+                    including.display()
+                )),
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    (out, problems)
+}
+
+/// Resolve one `include!` argument against the including file.
+fn resolve_include(including_file: &Path, arg: &str) -> Option<PathBuf> {
+    let rel = arg.trim().strip_prefix('"')?.strip_suffix('"')?;
+    if rel.is_empty() || rel.contains('\0') {
+        return None;
+    }
+    let joined = including_file.parent().unwrap_or(Path::new(".")).join(rel);
+    // Lexical `..`/`.` normalization, without touching the filesystem: the
+    // existence check below decides, and a display path with `..` in it
+    // would make violation messages ambiguous.
+    let mut out = PathBuf::new();
+    for comp in joined.components() {
+        use std::path::Component;
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    if out.extension().is_some_and(|x| x == "rs") && out.is_file() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 /// Rule 5 enforcement: moxie-format production sources reach no filesystem.
 fn check_format_is_io_free(
     doc: &toml::Value,
@@ -1159,7 +1244,7 @@ fn check_format_is_io_free(
     crate_name: &str,
     out: &mut Vec<Violation>,
 ) {
-    let (files, problems) = production_sources(doc, dir);
+    let (scanned, problems) = production_facts_with_includes(doc, dir);
     for detail in problems {
         out.push(Violation {
             crate_name: crate_name.to_string(),
@@ -1167,18 +1252,7 @@ fn check_format_is_io_free(
             detail,
         });
     }
-    for file in files {
-        let facts = match analyse_source(&file, true) {
-            Ok(f) => f,
-            Err(e) => {
-                out.push(Violation {
-                    crate_name: crate_name.to_string(),
-                    rule: rule::FORMAT_USES_FILESYSTEM,
-                    detail: e,
-                });
-                continue;
-            }
-        };
+    for (file, facts) in &scanned {
         for (needle, why) in FORMAT_FORBIDDEN_PATHS {
             for path in facts.imports.iter().chain(facts.mentions.iter()) {
                 if path_reaches(path, needle) {
@@ -1202,7 +1276,7 @@ fn check_storage_names_no_model(
     crate_name: &str,
     out: &mut Vec<Violation>,
 ) {
-    let (files, problems) = production_sources(doc, dir);
+    let (scanned, problems) = production_facts_with_includes(doc, dir);
     for detail in problems {
         out.push(Violation {
             crate_name: crate_name.to_string(),
@@ -1210,18 +1284,7 @@ fn check_storage_names_no_model(
             detail,
         });
     }
-    for file in files {
-        let facts = match analyse_source(&file, true) {
-            Ok(f) => f,
-            Err(e) => {
-                out.push(Violation {
-                    crate_name: crate_name.to_string(),
-                    rule: rule::STORAGE_NAMES_MODEL,
-                    detail: e,
-                });
-                continue;
-            }
-        };
+    for (file, facts) in &scanned {
         for path in facts.imports.iter().chain(facts.mentions.iter()) {
             let first = path.split("::").next().unwrap_or("");
             if STORAGE_FORBIDDEN_IMPORTS
@@ -1858,6 +1921,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn prose_about_a_boundary_is_not_a_use_of_what_it_forbids() {
+        // The storage rule scans code strings; doc comments are attributes,
+        // which the collector never visits. Without that exclusion, the
+        // rule's own documentation ("must never name a model family")
+        // would be unreadable next to a matching implementation.
+        let f = facts_of(
+            "//! Storage reads bytes, never gemma-specific model semantics.\n\
+             /// Returns the laguna chunk without interpreting it.\n\
+             pub fn f() -> u32 { 7 }",
+        );
+        assert!(f.strings.is_empty(), "{:?}", f.strings);
+        // ... while the same words in code position are collected.
+        let g = facts_of("pub const FAMILY: &str = \"gemma\";");
+        assert_eq!(g.strings, vec!["gemma".to_string()]);
+        let h = facts_of("pub fn f() { panic!(\"deepseek weights\"); }");
+        assert!(
+            h.strings.iter().any(|s| s.contains("deepseek")),
+            "{:?}",
+            h.strings
+        );
+    }
+
+    #[test]
+    fn include_arguments_resolve_from_the_including_file() {
+        let dir = std::env::temp_dir().join(format!("moxie-include-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}").unwrap();
+        std::fs::write(dir.join("tests/io.rs"), "pub fn g() {}").unwrap();
+        let root = dir.join("src/lib.rs");
+        assert_eq!(
+            resolve_include(&root, "\"../tests/io.rs\""),
+            Some(dir.join("tests/io.rs"))
+        );
+        // Computed arguments and missing targets fail closed (None).
+        assert_eq!(resolve_include(&root, "concat!(\"a\", \"b\")"), None);
+        assert_eq!(resolve_include(&root, "\"../tests/missing.rs\""), None);
+        assert_eq!(resolve_include(&root, "\"\""), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -66,62 +66,39 @@ impl StreamingSha256 {
     }
 
     fn compress(&mut self, chunk: &[u8; 64]) {
-        let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) = (
-            self.h[0], self.h[1], self.h[2], self.h[3], self.h[4], self.h[5], self.h[6], self.h[7],
-        );
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (dst, v) in self.h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-            *dst = dst.wrapping_add(v);
-        }
+        // The single hashing core, shared with the one-shot path: there is no
+        // second compression implementation to drift.
+        compress_block(&mut self.h, chunk);
     }
 
-    pub fn finalize_hex(mut self) -> String {
+    pub fn finalize_hex(self) -> String {
+        let bytes = self.finalize_bytes();
+        bytes_to_hex(&bytes)
+    }
+
+    /// Finalize to raw bytes with no heap allocation.
+    ///
+    /// The bounded reader verifies checksums on this path so that hashing a
+    /// multi-gigabyte tensor never allocates proportionally to it -- or at
+    /// all. Padding runs through `update` over a stack buffer.
+    pub fn finalize_bytes(mut self) -> [u8; 32] {
         let bit_len = self.total_len.wrapping_mul(8);
-        let mut pad = [0u8; 64];
+        let mut pad = [0u8; 128];
         pad[0] = 0x80;
+        // 0x80, zeros to ≡56 (mod 64), then the 8 length bytes.
         let pad_len = if self.buf_len < 56 {
-            56 - self.buf_len
+            64 - self.buf_len
         } else {
-            120 - self.buf_len
+            128 - self.buf_len
         };
-        let (p1, _) = pad.split_at(pad_len);
-        let mut tmp = Vec::with_capacity(p1.len() + 8);
-        tmp.extend_from_slice(p1);
-        tmp.extend_from_slice(&bit_len.to_be_bytes());
-        self.update(&tmp);
+        pad[pad_len - 8..pad_len].copy_from_slice(&bit_len.to_be_bytes());
+        self.update(&pad[..pad_len]);
         debug_assert_eq!(self.buf_len, 0);
-        self.h.iter().map(|w| format!("{w:08x}")).collect()
+        let mut out = [0u8; 32];
+        for (i, w) in self.h.iter().enumerate() {
+            out[4 * i..4 * i + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        out
     }
 }
 
@@ -129,6 +106,17 @@ impl Default for StreamingSha256 {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Lowercase hex of 32 digest bytes. No allocation beyond the returned String.
+fn bytes_to_hex(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 15) as usize] as char);
+    }
+    s
 }
 
 #[cfg(test)]
@@ -157,6 +145,25 @@ mod tests {
             sha256_hex(&[b'a'; 1000]),
             "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3"
         );
+    }
+
+    #[test]
+    fn finalize_bytes_agrees_with_finalize_hex() {
+        // The allocation-free path must be the same digest, not a second one.
+        let data: Vec<u8> = (0..300).map(|i| (i * 37 % 251) as u8).collect();
+        for len in [0, 1, 55, 56, 64, 119, 120, 300] {
+            let mut s = StreamingSha256::new();
+            s.update(&data[..len]);
+            let bytes = s.finalize_bytes();
+            let mut s2 = StreamingSha256::new();
+            s2.update(&data[..len]);
+            assert_eq!(s2.finalize_hex(), sha256_hex(&data[..len]));
+            assert_eq!(hex_of(&bytes), sha256_hex(&data[..len]));
+        }
+    }
+
+    fn hex_of(bytes: &[u8; 32]) -> String {
+        super::bytes_to_hex(bytes)
     }
 
     #[test]

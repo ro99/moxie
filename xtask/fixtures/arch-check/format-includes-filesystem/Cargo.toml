@@ -1,0 +1,12 @@
+[package]
+name = "moxie-format"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: the filesystem breach arrives by `include!` rather than by
+# a direct `use`. Included production source is production source -- the rule
+# follows the include and inspects its target instead of banning the mechanism
+# (the real crate legitimately includes its SHA implementation).
+
+[package.metadata.moxie-arch-check]
+expect-rule = "format touches the filesystem"

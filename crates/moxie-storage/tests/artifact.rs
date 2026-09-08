@@ -11,6 +11,73 @@ use std::path::{Path, PathBuf};
 use moxie_format::sha256_hex;
 use moxie_storage::{Artifact, ByteBudget};
 
+/// Thread-local live-allocation accounting for the memory gate below.
+///
+/// Global, so it observes the real `Artifact::read_tensor` path including
+/// file open, hashing and validation -- not a model of it. Thread-local, so
+/// concurrently running tests on other threads cannot pollute the measured
+/// thread's peak. Only heap `alloc`/`dealloc` pairs are counted; the
+/// caller's destination buffer is allocated before the measurement starts,
+/// because it is caller-owned, not reader-owned.
+mod alloc_measure {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static LIVE: Cell<usize> = const { Cell::new(0) };
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+        static BASE: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub struct Counting;
+
+    // SAFETY: every call forwards to the system allocator with the same
+    // layout, and the counters only observe sizes; no allocation contract
+    // is altered.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: same layout forwarded to the system allocator.
+            let p = unsafe { System.alloc(layout) };
+            if !p.is_null() && layout.size() > 0 {
+                LIVE.with(|live| {
+                    let n = live.get().saturating_add(layout.size());
+                    live.set(n);
+                    PEAK.with(|peak| {
+                        if n > peak.get() {
+                            peak.set(n);
+                        }
+                    });
+                });
+            }
+            p
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: `ptr`/`layout` are the pair a matching `alloc` handed
+            // out, forwarded unchanged.
+            unsafe { System.dealloc(ptr, layout) };
+            if layout.size() > 0 {
+                LIVE.with(|live| live.set(live.get().saturating_sub(layout.size())));
+            }
+        }
+    }
+
+    pub fn reset_peak() {
+        let live = LIVE.with(|l| l.get());
+        BASE.with(|b| b.set(live));
+        PEAK.with(|p| p.set(live));
+    }
+
+    /// Peak live heap bytes on this thread above the reset baseline.
+    pub fn peak_additional() -> usize {
+        PEAK.with(|p| p.get())
+            .saturating_sub(BASE.with(|b| b.get()))
+    }
+}
+
+#[global_allocator]
+static GLOBAL: alloc_measure::Counting = alloc_measure::Counting;
+
 const HEX_EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// Deterministic bytes from a seed. An LCG, not a quality RNG: the only
@@ -416,6 +483,70 @@ fn a_tensor_eight_times_the_budget_reads_correctly() {
     assert_eq!(art.read_tensor("big", &mut out).unwrap(), 8192);
     assert_eq!(out, payload);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn peak_live_allocation_stays_within_budget_and_constant_in_tensor_size() {
+    // The declared memory gate, measured with a counting allocator around
+    // the real `Artifact::read_tensor` -- file open, slice reads, streaming
+    // hash, BF16 validation and checksum verification included. Three
+    // properties: the peak fits the budget; it does not move when the tensor
+    // grows 8x (reader-owned allocation is O(1)); and the success path holds
+    // zero live heap -- hashing and hex run on stack arrays, so any heap
+    // byte at all is a regression (the old finalizer peaked at 128 B here).
+    // File-open costs are inside the measurement, not excluded from it.
+    //
+    // Equal-length directory names keep paths identical in length, so any
+    // size-dependent allocation would show as a peak difference.
+    let budget = ByteBudget::new(1024).unwrap();
+    let mut peaks = Vec::new();
+    for (name, seed, shape, nbytes) in [
+        ("gate-small", 21u64, "64, 64", 8192usize),
+        ("gate-large", 22u64, "128, 256", 65536usize),
+    ] {
+        assert_eq!(name.len(), 10);
+        let dir = test_dir(name);
+        let payload = finite_bf16_bytes(seed, nbytes);
+        write_artifact(
+            &dir,
+            &[TensorSpec {
+                role: "t",
+                shape,
+                precision: "bf16-v1",
+                chunk: "c.bin",
+                offset: 0,
+                payload: payload.clone(),
+                extra: "",
+            }],
+            complete(),
+        );
+        let art = Artifact::open_with_budget(&dir, budget).expect("open");
+        // Warmup outside the measurement: page cache, lazy std state.
+        let mut warm = vec![0u8; nbytes];
+        assert_eq!(art.read_tensor("t", &mut warm).unwrap(), nbytes);
+        assert_eq!(warm, payload);
+        // The destination is caller-owned: allocate it before measuring.
+        let mut out = vec![0u8; nbytes];
+        alloc_measure::reset_peak();
+        assert_eq!(art.read_tensor("t", &mut out).unwrap(), nbytes);
+        let peak = alloc_measure::peak_additional();
+        assert_eq!(out, payload);
+        assert!(
+            peak <= budget.bytes(),
+            "tensor {nbytes} B under budget {}: peak live allocation was {peak} B",
+            budget.bytes()
+        );
+        assert_eq!(
+            peak, 0,
+            "success-path heap must be zero (stack-only hashing): peak was {peak} B for a {nbytes} B tensor"
+        );
+        peaks.push(peak);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    assert_eq!(
+        peaks[0], peaks[1],
+        "peak live allocation must not move with tensor size: {peaks:?}"
+    );
 }
 
 #[test]

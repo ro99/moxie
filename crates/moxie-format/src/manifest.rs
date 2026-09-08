@@ -77,6 +77,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use moxie_types::{Error, Result};
 use serde::Deserialize;
 
+use crate::affine::{AffineDescriptor, Grouping, IntWidth};
+use crate::scale::ScaleDtype as PayloadScaleDtype;
 use crate::sha256::sha256_hex;
 
 /// Manifests this reader accepts.
@@ -110,6 +112,10 @@ pub const KNOWN_PRECISIONS: &[&str] = &[
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawManifest {
+    // Pinned by `check_version` before this schema deserializes, and required
+    // here so `deny_unknown_fields` keeps recognizing it. Never read after
+    // the gate; that is the point.
+    #[allow(dead_code)]
     schema_version: u32,
     required_features: Vec<String>,
     endianness: String,
@@ -348,6 +354,9 @@ fn invalid(detail: impl Into<String>) -> Error {
 /// completeness shape. [`validate_chunks`] finishes the job once the chunk
 /// files have been statted.
 pub fn parse(text: &str) -> Result<Manifest> {
+    // Version first: a future schema is refused by version before any v1
+    // field is looked at, even when v1's fields are missing or changed.
+    check_version(text)?;
     let raw: RawManifest = toml::from_str(text)
         .map_err(|e| invalid(format!("manifest does not parse as TOML v1: {e}")))?;
     validate_raw(raw)
@@ -379,13 +388,38 @@ pub fn validate_chunks(manifest: &Manifest, chunks: &BTreeMap<String, u64>) -> R
     Ok(())
 }
 
-fn validate_raw(raw: RawManifest) -> Result<Manifest> {
-    if raw.schema_version != SCHEMA_VERSION {
+/// The version gate, read before the version-specific schema: a future
+/// writer's artifact must be refused by version even when it no longer
+/// carries v1's fields, so this shapes only `schema_version` and tolerates
+/// every other key.
+#[derive(Debug, Deserialize)]
+struct VersionOnly {
+    schema_version: u32,
+}
+
+fn check_version(text: &str) -> Result<()> {
+    let v: VersionOnly = toml::from_str(text).map_err(|e| {
+        // Malformed TOML, or no version at all: still a rejection, and the
+        // message says which.
+        let msg = e.to_string();
+        if msg.contains("schema_version") {
+            invalid(format!("manifest carries no schema_version: {e}"))
+        } else {
+            invalid(format!("manifest does not parse as TOML v1: {e}"))
+        }
+    })?;
+    if v.schema_version != SCHEMA_VERSION {
         return Err(invalid(format!(
             "schema_version is {}, this reader accepts only version {}: refused by version before any other field",
-            raw.schema_version, SCHEMA_VERSION
+            v.schema_version, SCHEMA_VERSION
         )));
     }
+    Ok(())
+}
+
+fn validate_raw(raw: RawManifest) -> Result<Manifest> {
+    // The version was already gated by `check_version` before deserializing
+    // this schema; re-checking here would only repeat it.
     for f in &raw.required_features {
         if !KNOWN_REQUIRED_FEATURES.contains(&f.as_str()) {
             return Err(invalid(format!(
@@ -710,7 +744,12 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
                                 "tensor '{role}': group_index[{k}] is group {g}, but there are only {groups} groups"
                             )));
                         }
-                        out.push(g as u32);
+                        let g = u32::try_from(g).map_err(|_| {
+                            invalid(format!(
+                                "tensor '{role}': group_index[{k}] is group {g}, above u32"
+                            ))
+                        })?;
+                        out.push(g);
                     }
                     Some(out)
                 }
@@ -720,6 +759,58 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
             // has no single element size, and its exact layout is M3's reader
             // contract. V1 reserves the byte range and validates the
             // descriptor; the reader refuses to read the tensor.
+            //
+            // The descriptor is then checked by the shared
+            // `AffineDescriptor::validate`, not by a second copy of its
+            // rules here: manifest-level checks above exist for message
+            // quality (they name the tensor and field), but the shared
+            // validator is the authority on descriptor coherence -- e.g. a
+            // group with a scale that no input column maps to. Duplicated
+            // validation already drifted once (an all-zero group-index map
+            // passed here and failed there); the gate below is the fix.
+            let width = match precision {
+                TensorPrecision::AffineInt4V1 => IntWidth::Int4,
+                TensorPrecision::AffineInt8V1 => IntWidth::Int8,
+                TensorPrecision::Bf16V1 => unreachable!("affine branch"),
+            };
+            // Last dimension is input channels; the leading product is output
+            // channels. Both come from the already-validated positive shape.
+            // `try_from`, never `as`: truncating conversions have no place in
+            // the validator.
+            let in_features = usize::try_from(shape[shape.len() - 1])
+                .map_err(|_| invalid(format!("tensor '{role}': input dimension does not fit")))?;
+            let mut out_features: usize = 1;
+            for d in &shape[..shape.len() - 1] {
+                let d = usize::try_from(*d).map_err(|_| {
+                    invalid(format!("tensor '{role}': a leading dimension does not fit"))
+                })?;
+                out_features = out_features.checked_mul(d).ok_or_else(|| {
+                    invalid(format!(
+                        "tensor '{role}': leading-dimension product overflows"
+                    ))
+                })?;
+            }
+            let desc = AffineDescriptor {
+                width,
+                out_features,
+                in_features,
+                grouping: match group_rule {
+                    GroupRule::Contiguous32 => Grouping::Contiguous { size: 32 },
+                    GroupRule::Contiguous128 => Grouping::Contiguous { size: 128 },
+                    GroupRule::PerChannel => Grouping::PerOutputChannel,
+                },
+                group_index: group_index.clone(),
+                scale_dtype: match scale_dtype {
+                    ScaleDtype::F16 => PayloadScaleDtype::F16,
+                    ScaleDtype::Bf16 => PayloadScaleDtype::Bf16,
+                    ScaleDtype::F32 => PayloadScaleDtype::F32,
+                },
+            };
+            desc.validate().map_err(|e| {
+                invalid(format!(
+                    "tensor '{role}': shared affine descriptor rejects it: {e}"
+                ))
+            })?;
             Some(AffineFields {
                 group_rule,
                 scale_dtype,
@@ -846,38 +937,37 @@ fn check_arch_walk(value: &toml::Value, depth: usize, nodes: &mut usize) -> Resu
 /// Stable artifact identity: the descriptor fields document 03 lists, hashed
 /// with SHA-256. Architecture metadata participates through a canonical
 /// encoding with sorted keys, so key order in the TOML never changes identity.
+///
+/// Every field and collection is length-prefixed. Bare delimiters (NUL,
+/// newline) are not enough: those bytes are legal inside parsed strings, so
+/// `"x\\0y"+"z"` and `"x"+"y\\0z"` would hash identically. With each
+/// segment carrying its own length, concatenation is injective and no two
+/// distinct manifests share a digest.
 pub fn artifact_identity(manifest: &Manifest) -> String {
-    let mut s = String::new();
-    s.push_str("manifest-v1\n");
-    s.push_str(&format!("schema={}\n", SCHEMA_VERSION));
-    s.push_str(&format!(
-        "source={}\0{}\0{}\n",
-        manifest.source.model, manifest.source.revision, manifest.source.license
-    ));
+    let mut w = IdentityWriter::new();
+    w.tag("manifest-v1");
+    w.field_u64("schema", SCHEMA_VERSION as u64);
+    w.field_str("source-model", &manifest.source.model);
+    w.field_str("source-revision", &manifest.source.revision);
+    w.field_str("source-license", &manifest.source.license);
     for f in &manifest.source.files {
-        s.push_str(&format!("srcfile={}\0{}\n", f.path, f.sha256));
+        w.tag("source-file");
+        w.str(&f.path);
+        w.str(&f.sha256);
     }
-    s.push_str(&format!(
-        "tokenizer={}\0{}\0{}\n",
-        manifest.tokenizer.name, manifest.tokenizer.version, manifest.tokenizer.digest
-    ));
-    s.push_str(&format!(
-        "template={}\0{}\0{}\n",
-        manifest.template.name, manifest.template.version, manifest.template.digest
-    ));
-    s.push_str(&format!(
-        "arch={}\0{}\n",
-        manifest.architecture.name, manifest.architecture.version
-    ));
-    s.push_str("archmeta=");
-    append_canonical(&manifest.architecture.metadata.0, &mut s);
-    s.push('\n');
-    s.push_str(&format!(
-        "provenance={}\0{}\0{}\n",
-        manifest.provenance.scale_convention,
-        manifest.provenance.quantizer,
-        manifest.provenance.calibration
-    ));
+    w.field_str("tokenizer-name", &manifest.tokenizer.name);
+    w.field_str("tokenizer-version", &manifest.tokenizer.version);
+    w.field_str("tokenizer-digest", &manifest.tokenizer.digest);
+    w.field_str("template-name", &manifest.template.name);
+    w.field_str("template-version", &manifest.template.version);
+    w.field_str("template-digest", &manifest.template.digest);
+    w.field_str("arch-name", &manifest.architecture.name);
+    w.field_str("arch-version", &manifest.architecture.version);
+    w.tag("arch-metadata");
+    w.value(&manifest.architecture.metadata.0);
+    w.field_str("scale-convention", &manifest.provenance.scale_convention);
+    w.field_str("quantizer", &manifest.provenance.quantizer);
+    w.field_str("calibration", &manifest.provenance.calibration);
     let mut tensors: Vec<&Tensor> = manifest.tensors.iter().collect();
     tensors.sort_by(|a, b| {
         a.logical_order
@@ -885,78 +975,149 @@ pub fn artifact_identity(manifest: &Manifest) -> String {
             .then(a.role.cmp(&b.role))
     });
     for t in tensors {
-        s.push_str(&format!(
-            "tensor={}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\n",
-            t.role,
-            t.shape,
-            t.precision.name(),
-            t.chunk,
-            t.offset,
-            t.length,
-            t.sha256,
-            t.alignment,
-            t.logical_order
-        ));
+        w.tag("tensor");
+        w.str(&t.role);
+        w.u64(t.shape.len() as u64);
+        for d in &t.shape {
+            w.u64(*d);
+        }
+        w.str(t.precision.name());
+        w.str(&t.chunk);
+        w.u64(t.offset);
+        w.u64(t.length);
+        w.str(&t.sha256);
+        w.u64(t.alignment);
+        w.u64(t.logical_order);
         if let Some(a) = &t.affine {
-            s.push_str(&format!(
-                "affine={:?}\0{:?}\0{:?}\n",
-                a.group_rule, a.scale_dtype, a.zero_point
-            ));
-            if let Some(map) = &a.group_index {
-                s.push_str("gidx=");
-                for g in map {
-                    s.push_str(&format!("{g},"));
+            w.tag("affine");
+            w.str(match a.group_rule {
+                GroupRule::Contiguous32 => "contiguous-32",
+                GroupRule::Contiguous128 => "contiguous-128",
+                GroupRule::PerChannel => "per-channel",
+            });
+            w.str(match a.scale_dtype {
+                ScaleDtype::F16 => "f16",
+                ScaleDtype::Bf16 => "bf16",
+                ScaleDtype::F32 => "f32",
+            });
+            w.str(match a.zero_point {
+                ZeroPointMode::Symmetric => "symmetric",
+                ZeroPointMode::PerGroup => "per-group",
+            });
+            match &a.group_index {
+                None => w.tag("no-group-index"),
+                Some(map) => {
+                    w.tag("group-index");
+                    w.u64(map.len() as u64);
+                    for g in map {
+                        w.u64(*g as u64);
+                    }
                 }
-                s.push('\n');
             }
         }
     }
     let mut excl: Vec<&Excluded> = manifest.excluded.iter().collect();
     excl.sort_by(|a, b| a.role.cmp(&b.role));
     for e in excl {
-        s.push_str(&format!("excluded={}\0{}\n", e.role, e.reason));
+        w.tag("excluded");
+        w.str(&e.role);
+        w.str(&e.reason);
     }
     match &manifest.completeness {
-        Completeness::Complete => s.push_str("completeness=complete\n"),
+        Completeness::Complete => w.tag("complete"),
         Completeness::Partial { missing } => {
-            s.push_str("completeness=partial\n");
+            w.tag("partial");
             for m in missing {
-                s.push_str(&format!("missing={m}\n"));
+                w.str(m);
             }
         }
     }
-    sha256_hex(s.as_bytes())
+    sha256_hex(&w.finish())
 }
 
-fn append_canonical(v: &toml::Value, out: &mut String) {
-    match v {
-        toml::Value::String(s) => {
-            out.push_str(&format!("s{}:{s}", s.len()));
-        }
-        toml::Value::Integer(i) => out.push_str(&format!("i{i}")),
-        toml::Value::Float(f) => out.push_str(&format!("f{:016x}", f.to_bits())),
-        toml::Value::Boolean(b) => out.push_str(&format!("b{b}")),
-        toml::Value::Datetime(d) => out.push_str(&format!("d{d}")),
-        toml::Value::Array(items) => {
-            out.push_str(&format!("a{}:[", items.len()));
-            for v in items {
-                append_canonical(v, out);
-                out.push(';');
+/// Length-prefixed identity encoding: every segment carries its own byte
+/// length, so concatenation of distinct manifests can never collide.
+struct IdentityWriter {
+    buf: Vec<u8>,
+}
+
+impl IdentityWriter {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    fn u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn bytes(&mut self, b: &[u8]) {
+        self.u64(b.len() as u64);
+        self.buf.extend_from_slice(b);
+    }
+
+    fn str(&mut self, s: &str) {
+        self.bytes(s.as_bytes());
+    }
+
+    fn tag(&mut self, t: &str) {
+        self.str(t);
+    }
+
+    fn field_str(&mut self, name: &str, value: &str) {
+        self.str(name);
+        self.str(value);
+    }
+
+    fn field_u64(&mut self, name: &str, value: u64) {
+        self.str(name);
+        self.u64(value);
+    }
+
+    fn value(&mut self, v: &toml::Value) {
+        match v {
+            toml::Value::String(s) => {
+                self.buf.push(0x73);
+                self.str(s);
             }
-            out.push(']');
-        }
-        toml::Value::Table(map) => {
-            // Sorted keys: `toml::map::Map` preserves insertion order, so sort
-            // here for stability.
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push_str(&format!("t{}:{{", keys.len()));
-            for k in keys {
-                out.push_str(&format!("k{}:{k}=", k.len()));
-                append_canonical(&map[k], out);
-                out.push(';');
+            toml::Value::Integer(i) => {
+                self.buf.push(0x69);
+                self.buf.extend_from_slice(&i.to_le_bytes());
             }
-            out.push('}');
+            toml::Value::Float(f) => {
+                self.buf.push(0x66);
+                self.buf.extend_from_slice(&f.to_bits().to_le_bytes());
+            }
+            toml::Value::Boolean(b) => {
+                self.buf.push(0x62);
+                self.buf.push(u8::from(*b));
+            }
+            toml::Value::Datetime(d) => {
+                self.buf.push(0x64);
+                self.str(&d.to_string());
+            }
+            toml::Value::Array(items) => {
+                self.buf.push(0x61);
+                self.u64(items.len() as u64);
+                for v in items {
+                    self.value(v);
+                }
+            }
+            toml::Value::Table(map) => {
+                // Sorted keys: `toml::map::Map` preserves insertion order, so
+                // sort here for stability.
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                self.buf.push(0x74);
+                self.u64(keys.len() as u64);
+                for k in keys {
+                    self.str(k);
+                    self.value(&map[k]);
+                }
+            }
         }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.buf
     }
 }

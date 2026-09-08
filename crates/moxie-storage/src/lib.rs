@@ -213,7 +213,6 @@ impl Artifact {
             })?;
         let dest = &mut into[..need];
         let mut source = FileRange::open(&chunk.path)?;
-        let mut peak = 0usize;
         pump_range(
             &mut source,
             t.offset,
@@ -221,7 +220,6 @@ impl Artifact {
             &t.sha256,
             t.precision,
             self.budget,
-            &mut peak,
         )
         .map_err(|e| match e {
             Error::InvalidArtifact { detail } => Error::InvalidArtifact {
@@ -236,9 +234,9 @@ impl Artifact {
 /// A positioned byte source: one slice read at an absolute offset.
 ///
 /// The pump below only ever hands it sub-slices of the caller's destination
-/// buffer, so the peak slice length it requests -- recorded in `peak` -- is
-/// the bound on reader-driven I/O sizing. Tests drive the same pump with an
-/// in-memory source and assert the peak never exceeds the budget.
+/// buffer, so reader-driven I/O sizing stays within the budget by
+/// construction. The memory gate itself is measured, not asserted from slice
+/// sizes: see the allocation-counting test over `Artifact::read_tensor`.
 trait RangeSource {
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<()>;
 }
@@ -342,8 +340,11 @@ fn resolve_chunk(canonical_dir: &Path, dir: &Path, name: &str) -> Result<PathBuf
 ///
 /// No reader-owned buffer ever holds more than `budget` bytes: every slice is
 /// a sub-slice of the caller's `dest`, the hasher holds one 64-byte block
-/// plus eight words, and the BF16 validator holds one carry byte. `peak`
-/// records the largest slice requested, so tests count rather than trust.
+/// plus eight words, the BF16 validator holds one carry byte, and checksum
+/// verification finalizes to a stack array compared against a stack-decoded
+/// expectation. The success path allocates no heap for hashing or hex: the
+/// only heap in a read is the fixed file-open cost, which the allocation
+/// gate test measures along with everything else.
 fn pump_range<S: RangeSource>(
     source: &mut S,
     offset: u64,
@@ -351,7 +352,6 @@ fn pump_range<S: RangeSource>(
     want_sha256: &str,
     precision: TensorPrecision,
     budget: ByteBudget,
-    peak: &mut usize,
 ) -> Result<()> {
     let mut hasher = StreamingSha256::new();
     let mut bf16 = Bf16StreamValidator::new();
@@ -361,7 +361,6 @@ fn pump_range<S: RangeSource>(
     while done < total {
         let end = (done + slice).min(total);
         let buf = &mut dest[done..end];
-        *peak = (*peak).max(buf.len());
         let pos = offset
             .checked_add(done as u64)
             .ok_or_else(|| Error::InvalidArtifact {
@@ -377,15 +376,52 @@ fn pump_range<S: RangeSource>(
     if matches!(precision, TensorPrecision::Bf16V1) {
         bf16.finish()?;
     }
-    let got = hasher.finalize_hex();
-    if got != want_sha256.to_ascii_lowercase() {
+    let got = hasher.finalize_bytes();
+    let want = decode_hex32(want_sha256).map_err(|()| Error::InvalidArtifact {
+        detail: "stored checksum is not 64 hex digits".into(),
+    })?;
+    if got != want {
         return Err(Error::InvalidArtifact {
             detail: format!(
-                "checksum mismatch: expected {want_sha256}, computed {got}; the destination buffer's contents are explicitly not to be trusted"
+                "checksum mismatch: expected {want_sha256}, computed {}; the destination buffer's contents are explicitly not to be trusted",
+                str::from_utf8(&hex_of(&got)).unwrap_or("?")
             ),
         });
     }
     Ok(())
+}
+
+/// Decode 64 hex digits to 32 bytes on the stack. Case-insensitive; the
+/// manifest validator already pins lowercase, this stays liberal.
+fn decode_hex32(s: &str) -> std::result::Result<[u8; 32], ()> {
+    fn val(b: u8) -> std::result::Result<u8, ()> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err(()),
+        }
+    }
+    let b = s.as_bytes();
+    if b.len() != 64 {
+        return Err(());
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = val(b[2 * i])? << 4 | val(b[2 * i + 1])?;
+    }
+    Ok(out)
+}
+
+/// 32 digest bytes to 64 lowercase hex bytes, on the stack.
+fn hex_of(bytes: &[u8; 32]) -> [u8; 64] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    for (i, b) in bytes.iter().enumerate() {
+        out[2 * i] = HEX[(b >> 4) as usize];
+        out[2 * i + 1] = HEX[(b & 15) as usize];
+    }
+    out
 }
 
 /// Incremental finite-BF16 validation across arbitrarily split slices.
@@ -472,19 +508,15 @@ mod tests {
         }
     }
 
-    /// Peak reader-driven slice length never exceeds the budget, for a tensor
-    /// many times the budget's size -- counted, not trusted. Uses the same
-    /// pump `Artifact::read_tensor` runs.
+    /// Odd budgets split BF16 elements mid-pair; the pump must still read
+    /// exactly. (Slice sizes are capped by construction. The memory gate is
+    /// the allocation-counting test over `Artifact::read_tensor`, not an
+    /// I/O-request-size assertion.)
     #[test]
-    fn peak_slice_length_is_capped_by_the_budget() {
-        // 8 KiB tensor, budgets from 1 byte to 8 KiB: every slice the pump
-        // requests is at most the budget, including odd budgets that split
-        // BF16 elements mid-pair.
+    fn odd_budgets_still_read_exactly() {
         for budget in [1usize, 3, 7, 1023, 1024, 4096, 8192] {
             let budget = ByteBudget::new(budget).unwrap();
             let data: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
-            // Force finite BF16 so the read succeeds and the peak is what is
-            // measured, not an early validation failure.
             let mut finite = data.clone();
             for pair in finite.chunks_exact_mut(2) {
                 let mut bits = u16::from_le_bytes([pair[0], pair[1]]);
@@ -498,7 +530,6 @@ mod tests {
                 data: finite.clone(),
             };
             let mut dest = vec![0u8; 8192];
-            let mut peak = 0usize;
             pump_range(
                 &mut src,
                 0,
@@ -506,17 +537,21 @@ mod tests {
                 &sha,
                 TensorPrecision::Bf16V1,
                 budget,
-                &mut peak,
             )
             .expect("valid payload reads");
             assert_eq!(dest, finite);
-            assert!(
-                peak <= budget.bytes(),
-                "budget {}: peak slice {peak}",
-                budget.bytes()
-            );
-            assert!(peak >= 1);
         }
+    }
+
+    #[test]
+    fn hex_helpers_round_trip_on_the_stack() {
+        let sha = sha256_hex(b"artifact");
+        let bytes = decode_hex32(&sha).expect("our own hex decodes");
+        let back: [u8; 64] = sha.as_bytes().try_into().unwrap();
+        assert_eq!(hex_of(&bytes), back);
+        assert!(decode_hex32(&sha.to_uppercase()).is_ok());
+        assert!(decode_hex32("short").is_err());
+        assert!(decode_hex32(&"zz".repeat(32)).is_err());
     }
 
     #[test]
@@ -537,7 +572,6 @@ mod tests {
             let sha = sha256_hex(&finite);
             let mut src = MemSource { data: finite };
             let mut dest = vec![0u8; 512];
-            let mut peak = 0usize;
             let e = pump_range(
                 &mut src,
                 0,
@@ -545,7 +579,6 @@ mod tests {
                 &sha,
                 TensorPrecision::Bf16V1,
                 budget,
-                &mut peak,
             )
             .unwrap_err();
             assert!(e.to_string().contains("non-finite"), "{e}");

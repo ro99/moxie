@@ -139,6 +139,25 @@ fn schema_version_is_refused_by_version_before_any_other_field() {
 }
 
 #[test]
+fn a_future_version_is_refused_even_when_v1_fields_are_gone() {
+    // First review, reproduced: `parse("schema_version = 2\\n")` used to
+    // report a missing `required_features`, because full v1 deserialization
+    // ran before the version check. The version is gated first now, so a
+    // future schema with missing or changed v1 fields still fails on version.
+    err_contains(
+        manifest::parse("schema_version = 2\n"),
+        "refused by version",
+    );
+    let future = "schema_version = 99\nrequired_features = []\nendianness = \"sideways\"\n";
+    err_contains(manifest::parse(future), "refused by version");
+    // A manifest with no version at all says so, rather than failing on
+    // whatever v1 field the deserializer reaches first.
+    match manifest::parse("endianness = \"little\"\n") {
+        Ok(_) => panic!("a versionless manifest must not parse"),
+        Err(e) => assert!(e.to_string().contains("schema_version"), "{e}"),
+    }
+}
+#[test]
 fn unknown_required_features_are_refused_by_name() {
     let bad = manifest_with(&bf16_tensor("w", "2, 2", "c.bin", 0, 8, 0)).replacen(
         "required_features = []",
@@ -416,6 +435,37 @@ group_index = [{idx}]
 }
 
 #[test]
+fn a_group_index_that_orphans_a_scale_is_rejected_by_the_shared_descriptor() {
+    // First review, reproduced: `[1,64]` contiguous-32 with an all-zero map
+    // passed the manifest's own checks while `AffineDescriptor::validate`
+    // rejects it (group 1 owns a scale no column reads). The manifest now
+    // runs the shared validator, so the disagreement is a rejection here.
+    let idx: Vec<String> = (0..64).map(|_| "0".to_string()).collect();
+    let text = format!(
+        r#"[[tensors]]
+role = "q"
+shape = [1, 64]
+precision = "affine-int8-v1"
+chunk = "c.bin"
+offset = 0
+length = 64
+sha256 = "{HEX}"
+alignment = 16
+logical_order = 0
+group_rule = "contiguous-32"
+scale_dtype = "f32"
+zero_point = "per-group"
+group_index = [{}]
+"#,
+        idx.join(", ")
+    );
+    err_contains(
+        manifest::parse(&manifest_with(&text)),
+        "shared affine descriptor",
+    );
+}
+
+#[test]
 fn chunk_paths_are_confined_on_the_string_before_any_join() {
     // Literal TOML strings (single quotes): no escape processing, so what is
     // written is what the validator sees. With basic strings `\` would be
@@ -566,4 +616,115 @@ fn manifest_size_cap_is_visible_where_it_is_enforced() {
     // before parsing (a bound on the parse itself); it is asserted there with
     // a real file. This names the constant here so the two stay linked.
     assert_eq!(MAX_MANIFEST_BYTES, 4 * 1024 * 1024);
+}
+
+/// Build a manifest identical to `valid_one` except for the source identity.
+/// `model_toml`/`revision_toml` are TOML string literals (caller escapes).
+fn manifest_with_source(model_toml: &str, revision_toml: &str) -> String {
+    let mut text = valid_one();
+    text = text.replacen("model = \"example\"", &format!("model = {model_toml}"), 1);
+    text = text.replacen(
+        "revision = \"r1\"",
+        &format!("revision = {revision_toml}"),
+        1,
+    );
+    text
+}
+
+#[test]
+fn delimiter_characters_cannot_merge_two_fields_into_one_identity() {
+    // First review, reproduced: NUL and newline are legal inside parsed
+    // strings, so any delimiter-joined encoding hashes A and B identically.
+    // Length-prefixing makes concatenation injective.
+    let a = manifest::parse(&manifest_with_source(r#""x\u0000y""#, r#""z""#)).unwrap();
+    let b = manifest::parse(&manifest_with_source(r#""x""#, r#""y\u0000z""#)).unwrap();
+    assert_eq!(a.source.model, "x\0y");
+    assert_eq!(b.source.revision, "y\0z");
+    assert_ne!(
+        manifest::artifact_identity(&a),
+        manifest::artifact_identity(&b),
+        "model/revision boundary crossed by an embedded NUL"
+    );
+    // Newline variant of the same confusion.
+    let c = manifest::parse(&manifest_with_source(r#""x\ny""#, r#""z""#)).unwrap();
+    let d = manifest::parse(&manifest_with_source(r#""x""#, r#""y\nz""#)).unwrap();
+    assert_ne!(
+        manifest::artifact_identity(&c),
+        manifest::artifact_identity(&d),
+        "model/revision boundary crossed by an embedded newline"
+    );
+}
+
+#[test]
+fn every_identity_field_boundary_is_length_delimited() {
+    // The same confusion, moved across each other multi-field line the old
+    // encoding joined: tokenizer name/version, excluded role/reason, and a
+    // tensor role carrying the delimiter itself.
+    let tok = |name: &str, version: &str| {
+        valid_one()
+            .replacen("name = \"tok\"", &format!("name = {name}"), 1)
+            .replacen("version = \"1\"", &format!("version = {version}"), 1)
+    };
+    let a = manifest::parse(&tok(r#""t\u0000k""#, r#""1""#)).unwrap();
+    let b = manifest::parse(&tok(r#""t""#, r#""k\u00001""#)).unwrap();
+    assert_ne!(
+        manifest::artifact_identity(&a),
+        manifest::artifact_identity(&b),
+        "tokenizer name/version boundary"
+    );
+    let exc = |role: &str, reason: &str| {
+        valid_one()
+            .replacen("role = \"old\"", &format!("role = {role}"), 1)
+            .replacen(
+                "reason = \"removed upstream\"",
+                &format!("reason = {reason}"),
+                1,
+            )
+    };
+    let a = manifest::parse(&exc(r#""o\u0000ld""#, r#""why""#)).unwrap();
+    let b = manifest::parse(&exc(r#""o""#, r#""ld\u0000why""#)).unwrap();
+    assert_ne!(
+        manifest::artifact_identity(&a),
+        manifest::artifact_identity(&b),
+        "excluded role/reason boundary"
+    );
+    // A role carrying NUL/newline is still a distinct role, never a merge.
+    let t = |role: &str| {
+        manifest_with(&bf16_tensor("PLACEHOLDER", "1", "c.bin", 0, 2, 0)).replacen(
+            "role = \"PLACEHOLDER\"",
+            &format!("role = {role}"),
+            1,
+        )
+    };
+    let a = manifest::parse(&t(r#""w\u0000""#)).unwrap();
+    let b = manifest::parse(&t(r#""w""#)).unwrap();
+    assert_ne!(
+        manifest::artifact_identity(&a),
+        manifest::artifact_identity(&b)
+    );
+}
+
+#[test]
+fn opaque_metadata_with_delimiters_is_stable_and_distinct() {
+    // Embedded delimiters inside the opaque tree hash as data, distinctly.
+    let with_meta = |value_toml: &str| {
+        header().replacen("[architecture.metadata]\nhidden = 8", value_toml, 1)
+            + &bf16_tensor("w", "1", "c.bin", 0, 2, 0)
+            + "\n[[excluded]]\nrole = \"x\"\nreason = \"y\"\n\n[completeness]\nstatus = \"complete\"\nmissing = []\n"
+    };
+    let a = manifest::parse(&with_meta("[architecture.metadata]\ns = \"x\\u0000y\"")).unwrap();
+    let b = manifest::parse(&with_meta(
+        "[architecture.metadata]\ns = \"x\"\nt = \"y\\u0000z\"",
+    ))
+    .unwrap();
+    assert_ne!(
+        manifest::artifact_identity(&a),
+        manifest::artifact_identity(&b)
+    );
+    assert_eq!(
+        manifest::artifact_identity(&a),
+        manifest::artifact_identity(
+            &manifest::parse(&with_meta("[architecture.metadata]\ns = \"x\\u0000y\"")).unwrap()
+        )
+    );
 }

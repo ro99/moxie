@@ -269,8 +269,9 @@ Deviations recorded, none silent:
 
 Gates (this machine, 2026-09-08): `fmt` PASS; `clippy -D warnings` PASS;
 `cargo test --workspace --locked --offline` PASS, 375 unit/integration + 4
-doctests (was 332 + 4); `arch-check` PASS (22 rejected + 1 accepted
-fixtures, 8 rules); `spec-check` PASS (10 documents); no-driver lane PASS
+doctests at first implementation (was 332 + 4), 385 + 4 after the review
+corrections below; `arch-check` PASS (22 rejected + 1 accepted fixtures,
+8 rules at first implementation; 24 + 1 after the include-rule fixes); `spec-check` PASS (10 documents); no-driver lane PASS
 (379, `ldd` shows no `libcuda`); device lane `test-gpu` PASS (15 cases,
 `sm_86` + `sm_120` qualified) with the `CUDA_VISIBLE_DEVICES=1,2` negative
 check exiting 1 as intended. This task touches no CUDA.
@@ -280,3 +281,55 @@ round-trip tests; relaxing overlap to `<=` fails the adjacency assertion;
 both reverted to green. No checkpoint was read, downloaded or converted;
 no importer, `mmap`, device memory or model config schema was needed.
 Stop condition not triggered.
+
+### Review corrections, 2026-09-08 (commit `d1e2372` not accepted)
+
+The owner returned six findings against the accepted-scope implementation.
+All are fixed inside this task; the contract above is unchanged.
+
+- **P1 — identity collisions.** Delimiter-joined fields are replaced by a
+  length-prefixed `IdentityWriter` (every string/collection carries its byte
+  length; fixed-width integers; tagged value encoding; sorted table keys).
+  Regressions: the finding's NUL A/B pair, a newline variant, tokenizer
+  name/version, excluded role/reason, NUL-carrying tensor roles, and opaque
+  metadata stability/distinctness. Identity values change; none was promised
+  stable, and nothing consumed the old ones.
+- **P2 — budget measures allocations.** Checksum verification now finalizes
+  to a stack `[u8; 32]` compared against a stack-decoded expectation: the
+  read success path allocates no heap for hashing or hex. The gate is a
+  thread-local counting allocator around the real `Artifact::read_tensor`:
+  peak live heap is 0 B for 8 KiB and 64 KiB tensors alike under a 1024 B
+  budget (fits the budget, constant in tensor size, zero-heap success path).
+  Reintroducing the old `finalize_hex` comparison peaks at 128 B and fails
+  the test. The former slice-size assertion is removed as a gate; odd-budget
+  split-boundary correctness tests remain.
+- **P2 — affine descriptor drift.** The manifest builds the corresponding
+  `AffineDescriptor` and runs the shared `validate()`, so the all-zero
+  group-index map the finding exhibited is now rejected here with a
+  `shared affine descriptor` error (regression added). Manifest-level checks
+  stay for message quality; the shared validator is the coherence authority.
+  Truncating `as` casts in the validator are replaced with `try_from`.
+- **P2 — includes escape the new rules.** Both new arch rules now resolve
+  and inspect `include!` targets recursively (plain literals; computed or
+  missing targets fail closed), instead of collecting without following.
+  The legitimate `include!` of the SHA file resolves to a clean target and
+  passes. Fixtures `format-includes-filesystem` and
+  `storage-includes-model` prove each rule fires through an include; unit
+  tests pin doc-comment exclusion and include resolution.
+- **P2 — version gated after deserialization.** `parse` reads a
+  version-only shape first and refuses unknown versions before the v1 schema
+  deserializes. Regressions: bare `schema_version = 2`, a v99 schema with
+  missing/changed v1 fields (fails on version, not on fields), and a
+  versionless manifest (names `schema_version`).
+- **P2 — two SHA compression cores.** One `compress_block` in
+  `sha256_raw.rs` serves both the one-shot and streaming paths; the
+  streaming method is now a call. Added a `finalize_bytes`/`finalize_hex`
+  agreement test alongside the published vectors and split-boundary tests.
+
+Re-verified after the fixes: `fmt` PASS; `clippy -D warnings` PASS;
+`cargo test --workspace --locked --offline` PASS, 385 unit/integration + 4
+doctests; `arch-check` PASS (24 rejected + 1 accepted, 8 rules);
+`spec-check` PASS (10 documents); no-driver lane PASS (389, no `libcuda`);
+device lane `test-gpu` re-run after the fixes (the shared raw file feeds
+the kernel build): PASS, 15 cases, `sm_86` + `sm_120` qualified, with the
+`CUDA_VISIBLE_DEVICES=1,2` negative check exiting 1 as intended.
