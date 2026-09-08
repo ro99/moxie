@@ -1,0 +1,15 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# The path points nowhere this checker can read, so the package identity behind
+# the alias cannot be established. An edge that cannot be identified cannot be
+# permitted: the check fails closed rather than trusting the alias. Must be
+# rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+harmless-metadata = { path = "../../../../crates/does-not-exist" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "unresolvable dependency"

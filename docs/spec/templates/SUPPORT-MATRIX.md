@@ -6,7 +6,7 @@ Statuses: passed / failed / unmeasured / unsupported with reason / owner-deferre
 
 | Checkpoint + artifact | Hardware / topology | Actual context | Feature / combination | Status | Test / benchmark / quality IDs | Limit or fallback |
 |---|---|---|---|---|---|---|
-| | | | BF16 / INT8 / NVFP4 execution (separate rows) | | | |
+| | | | BF16 / INT8 / INT4 execution (separate rows) | | | |
 | | | | First / partial / later chunked prefill | | | |
 | | | | Flash/paged attention; host-backed exact state | | | |
 | | | | Oversized host/disk weight streaming | | | |

@@ -1,0 +1,14 @@
+[package]
+name = "moxie-engine"
+version = "0.0.0"
+edition = "2024"
+
+# A plausible-looking shared crate that is in nobody's ownership table. Document
+# 02's allowlist is the ownership graph; a crate absent from it has not been
+# placed in that graph, and admitting it by default is how a second execution
+# owner appears without anyone deciding to create one. Must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "undeclared crate"

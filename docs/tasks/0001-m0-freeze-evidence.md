@@ -1,6 +1,31 @@
 # Task 0001 — M0: freeze evidence, decisions and build boundaries
 
-Status: **accepted**
+Status: **superseded by [task 0002](0002-m0-review-and-integer-transition.md)**
+
+**Review update, 2026-09-07:** the "accepted" status this record originally carried was the
+implementation's own submission, not reviewer sign-off. [Task 0002](0002-m0-review-and-integer-transition.md)
+found closure issues and recorded the corrections required before M1. Its verified counts and
+results supersede the stale counts below. [ADR 0003](../decisions/adr/0003-int4-int8-bf16-weight-family.md)
+replaces the old NVFP4 direction; the NVFP4/MXFP4 questions below remain historical and are not
+instructions to implement those families now.
+
+**Correction update, 2026-09-07 (same day, later):** task 0002's F1-F6 corrections are implemented.
+This record is kept unedited below as the historical submission; **its exit-gate table is wrong**
+and the corrected one is in task 0002. In particular:
+
+- M0.5's "five negative fixtures, all rejected" is superseded: the checker they exercised had three
+  demonstrated bypasses, and there are now thirteen fixtures, each declaring the rule it must
+  trigger.
+- M0.5's "host CI lane written, unverified" is superseded: the lane could not have run on its
+  declared runner at all, and now does.
+- M0.6's deferral of the routed-expert, mask, recurrent, sampler, tokenizer/template and protocol
+  fixtures is **withdrawn**. The stated reason -- that they needed an executor or checkpoint
+  permission -- was wrong for tiny synthetic fixtures, and they are now in `moxie-oracles`.
+- M0.6's NVFP4 entry is historical. That codec is no longer in the active API.
+
+Precision-family preference is resolved by ADR 0003. O1 (catalog/order), O2 (quality), O4
+(intrinsic low-bit state) and O5 (storage/download) remain **OPEN** and are unaffected by any of
+this work.
 
 ## Identity and authority
 
@@ -172,11 +197,10 @@ Per AGENTS.md these are asked together, before dependent work.
 
 ## Next bounded task
 
-**Task 0002 — M1 vertical slice, part 1: reference interpreter and BF16
-operations.** Owning component `moxie-graph` plus a new host reference
-interpreter. Deliverable: `Linear`, `RmsNorm`, `SwiGlu`, `Rope` and a small exact
-attention, each with an independent FP32/FP64 oracle and a declared error metric
-*before* any optimisation, per document 07. No CUDA, no checkpoint.
+*Historical.* This record proposed an M1 slice as task 0002. That number was
+taken instead by the M0 review and correction task, which had to come first. The
+M1 slice is now proposed as [task 0003](0003-m1-bf16-reference-interpreter.md),
+narrowed by what the corrections established.
 
-Stop condition: if it needs a decision from the batch above, stop and report
-rather than assuming an answer.
+Stop condition, unchanged: if it needs a decision from the batch above, stop and
+report rather than assuming an answer.

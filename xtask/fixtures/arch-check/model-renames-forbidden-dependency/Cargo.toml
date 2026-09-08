@@ -1,0 +1,14 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# Review case B. The key reads `moxie-types`, which a model crate may depend on.
+# The package it actually resolves to is `moxie-cuda`, which it may not. Cargo
+# honours `package`; a checker reading table keys sees an allowed name. Must be
+# rejected, and rejected by identity rather than by the source scan.
+[dependencies]
+moxie-types = { package = "moxie-cuda", path = "../../../../crates/moxie-cuda" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden dependency"

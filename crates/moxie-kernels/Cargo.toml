@@ -6,10 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Off by default: compiling the fatbins needs the pinned CUDA toolkit, and
+# document 07 requires the host lane to run without one. Enabling it runs nvcc,
+# verifies its version against the pin and embeds the images.
+default = []
+fatbin = []
+
 [dependencies]
 moxie-types.workspace = true
 
 [lints]
 workspace = true
-
-

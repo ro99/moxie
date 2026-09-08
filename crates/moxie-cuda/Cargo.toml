@@ -6,6 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Off by default so the host lane never links libcuda. Enabling it compiles the
+# FFI surface and links the driver library; see src/lib.rs and document 07.
+default = []
+driver = []
+
 [dependencies]
 moxie-types.workspace = true
 

@@ -19,4 +19,7 @@ pub use ids::{
     ArtifactId, BranchId, ChunkId, DeviceId, GraphId, LayoutId, RankId, StateTransactionId,
     TensorId,
 };
-pub use precision::{AccumulationPolicy, Precision};
+pub use precision::{
+    AccumulationPolicy, ActivationPrecision, CachePrecision, ExecutionProfile, Precision,
+    WeightPrecision,
+};

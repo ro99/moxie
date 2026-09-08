@@ -13,7 +13,10 @@
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
 
-pub type CUresult = c_int;
+// Declared in `crate::status` so the classification and its tests compile with
+// no driver present; re-exported here so the FFI signatures read normally.
+pub use crate::status::{CUDA_SUCCESS, CUresult};
+
 pub type CUdevice = c_int;
 pub type CUdeviceptr = u64;
 
@@ -23,8 +26,6 @@ pub type CUstream = *mut c_void;
 pub type CUevent = *mut c_void;
 pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
-
-pub const CUDA_SUCCESS: CUresult = 0;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]

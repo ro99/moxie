@@ -1,8 +1,15 @@
 # Evidence
 
-- `topology-p2p.md` — PCIe P2P is enabled on all pairs via a **patched open kernel module**, not the
-  stock driver. Read it before assuming anything about multi-GPU transport: P2P cuts peer latency ~11x
-  but makes NCCL bulk collectives 2.6–4x *slower* above roughly 512 KB.
+- `topology-p2p.md` — patched-driver topology and measurements. The CUDA peer-access API allows the 3090 pair, not every pair despite permissive nvidia-smi output. Read the actual measured pair/message size before generalizing latency or collective results.
+- `quantization-candidates.md` — pinned public configurations for the owner's ten INT4/INT8 candidates; metadata evidence only, no weights or quality claims.
+- `../tasks/0002-m0-review-and-integer-transition.md` — M0 review, reproduced checks, architecture
+  bypasses and correction gates, followed by the correction results and the exact commands behind
+  them.
+- `toolchain.md` — pinned toolchain, the recorded build identity (nvcc, host compiler, fatbin
+  digests), and the host/device lane split.
+- `specification-version.md` — digests of the ten normative reference documents. They are kept local
+  and untracked, so this is how a fresh clone learns whether it has them. `cargo xtask spec-check`
+  verifies it; it reads and hashes only.
 - `support-matrix.md` — capability claims, each linked to a passing gate ID. Use
   [SUPPORT-MATRIX.md](../spec/templates/SUPPORT-MATRIX.md). Initial status of every row is
   NOT IMPLEMENTED, never supported.

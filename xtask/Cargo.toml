@@ -6,10 +6,22 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Default is the host lane: `arch-check` and `index` build with no CUDA toolkit
+# and no driver library (document 07). `cuda` adds the device commands and is
+# what `cargo xtask-cuda` turns on.
+default = []
+cuda = [
+    "dep:moxie-cuda",
+    "dep:moxie-kernels",
+    "moxie-cuda/driver",
+    "moxie-kernels/fatbin",
+]
+
 [dependencies]
 moxie-types.workspace = true
-moxie-cuda.workspace = true
-moxie-kernels.workspace = true
+moxie-cuda = { workspace = true, optional = true }
+moxie-kernels = { workspace = true, optional = true }
 toml = "0.9"
 
 [lints]

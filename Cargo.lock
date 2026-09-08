@@ -61,6 +61,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "moxie-oracles"
+version = "0.0.0"
+dependencies = [
+ "moxie-graph",
+ "moxie-types",
+]
+
+[[package]]
 name = "moxie-state"
 version = "0.0.0"
 dependencies = [

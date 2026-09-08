@@ -16,16 +16,26 @@ makes that mistake visible in the record rather than in a conclusion.
 
 ```json
 {
-  "case_id": "glm53-nvfp4-32k-decode",
+  "case_id": "glm53-int4-32k-decode",
   "created": "2026-09-07",
   "artifact": {
     "path": "...",
     "checksum": "sha256:...",
-    "precision_profile": "nvfp4-v1-weight-only",
-    "quantizer": "modelopt-0.45.0",
+    "precision_profile": "affine-int4-v1",
+    "quantizer": "<pinned-source-method-and-version>",
+    "serialization": "<pinned-compressed-tensors-or-autoround-packing>",
+    "normalization": "value-preserving-repack | precision-conversion",
+    "integer_contract": {
+      "bits": 4,
+      "group_size": 128,
+      "zero_point_mode": "implicit-zero",
+      "scale_dtype": "<from-tensor-header>",
+      "group_index_hash": null
+    },
     "source_checkpoint": "...",
     "source_checksum": "sha256:..."
   },
+  "execution": { "profile": "w4a16", "activation_dtype": "bf16", "accumulator_dtype": "f32" },
   "graph": { "model_graph_version": "...", "state_schema_version": "..." },
   "workload": {
     "prompt_file": "...",
@@ -118,7 +128,4 @@ with them are large. Running a legacy baseline would need a confirmed binary
 identity, an unloaded machine and owner time; per doc 06 it is therefore
 explicitly **unmeasured**, not zero and not assumed.
 
-Establishing a legacy baseline for GLM-5.3-NVFP4 at 32,768 actual tokens is the
-one baseline worth having before M6, because it is the only comparison that could
-show a rewrite regression against real hardware. It needs O5 (storage/time) and
-the machine to itself.
+Establish source-identified baselines for representative resident and streamed integer artifacts at 32,768 actual tokens before changing performance defaults. Pair prefill and decode; no single GLM/NVFP4 comparison is the only relevant baseline. Original-model quality and quantized-source import parity are separate from runtime performance. Real-model runs need the applicable storage/time authorization and an isolated machine.

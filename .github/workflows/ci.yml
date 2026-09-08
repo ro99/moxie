@@ -1,9 +1,19 @@
 # Host CI lane.
 #
-# Document 07: "Host CI can run without a checkpoint or GPU. It cannot approve a
-# CUDA optimization alone." This lane therefore runs everything that is pure, and
-# is explicit that the GPU, topology, quality and benchmark lanes are NOT run
-# here. A green tick from this workflow is not evidence about the device.
+# Document 07: "Host CI must run without a checkpoint, NVIDIA driver library or
+# CUDA toolkit. Split pure tooling/host dependencies from opt-in GPU build/run
+# features; building arch-check must not compile kernels or link libcuda."
+#
+# Everything below therefore runs in the *default* feature set, in which
+# `moxie-cuda` declares no FFI and emits no link directive, and `moxie-kernels`
+# runs no nvcc. Nothing here needs a GPU, a driver or a toolkit.
+#
+# A green tick from this workflow is not evidence about the device. Document 07
+# in the same paragraph requires "a distinct mandatory CUDA compile/real-hardware
+# lane for affected changes, so this separation does not turn unmeasured GPU work
+# into a pass." That lane is listed at the bottom and does **not** run here: no
+# CUDA runner is configured. Its results live in docs/evidence/toolchain.md with
+# the hardware identity they were measured on.
 name: host
 
 on:
@@ -30,18 +40,36 @@ jobs:
 
       - name: Architecture ownership
         # Includes the negative fixtures: a checker that has never rejected
-        # anything is not evidence (document 02).
-        run: cargo run -p xtask -- arch-check
+        # anything is not evidence (document 02). Runs through the plain `xtask`
+        # alias, which is the host build.
+        run: cargo xtask arch-check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Host tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
-      # Not run here, and not claimed by this workflow:
-      #   cargo xtask test-gpu        real devices, sm_86 and sm_120
-      #   cargo xtask test-topology   M5, needs both 3090s
-      #   cargo xtask quality         M3, needs pinned artifacts
-      #   cargo xtask bench           M6, needs the isolated benchmark box
-      # Document 07: a skipped lane is unmeasured, never passing.
+      - name: Prove the host lane links no driver
+        # If a CUDA symbol ever creeps back into the default build, this fails
+        # here rather than on a runner that happens to have libcuda installed.
+        run: |
+          set -eu
+          if ldd target/debug/xtask | grep -qi 'libcuda'; then
+            echo "the host build links libcuda; the feature split has regressed" >&2
+            exit 1
+          fi
+          echo "host xtask links no CUDA driver"
+
+  # Not run here, and not claimed by this workflow. Each needs hardware this
+  # runner does not have:
+  #
+  #   cargo xtask-cuda test-gpu                 real devices, sm_86 and sm_120
+  #   cargo xtask-cuda test-gpu --profile sm86  one architecture
+  #   cargo xtask-cuda probe                    topology inventory
+  #   cargo xtask test-topology                 M5, needs both 3090s
+  #   cargo xtask quality                       M3, needs pinned artifacts
+  #   cargo xtask bench                         M6, needs the isolated benchmark box
+  #
+  # Document 07: a skipped lane is unmeasured, never passing. Do not add a job
+  # that runs one of these on a GPU-less runner "to see it pass".

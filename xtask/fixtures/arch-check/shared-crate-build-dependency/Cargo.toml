@@ -11,3 +11,8 @@ moxie-types = { path = "../../../../crates/moxie-types" }
 
 [build-dependencies]
 cc = "1"
+
+[package.metadata.moxie-arch-check]
+# The rule this fixture proves. arch-check fails if the fixture is accepted, and
+# also if it is rejected for a different reason.
+expect-rule = "forbidden dependency"

@@ -7,3 +7,8 @@ edition = "2024"
 # checker could not see. This fixture must be rejected.
 [dependencies]
 moxie-types = { path = "../../../../crates/moxie-types" }
+
+[package.metadata.moxie-arch-check]
+# The rule this fixture proves. arch-check fails if the fixture is accepted, and
+# also if it is rejected for a different reason.
+expect-rule = "model crate has a build script"

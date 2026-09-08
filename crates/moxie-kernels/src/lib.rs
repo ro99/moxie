@@ -8,6 +8,11 @@
 //! Scope: the smoke kernels only. Real operation kernels arrive with the
 //! operations that define them.
 //!
+//! The images and their build identity are behind the **`fatbin`** feature,
+//! which is off by default: document 07 requires the host lane to build with no
+//! CUDA toolkit. What stays available without it is the *declared* target list,
+//! which is a support-matrix fact rather than a build artifact.
+//!
 //! Naming: identifiers here describe what the code *is*, never which milestone
 //! produced it. `smoke` says "toolchain and launch probe, not a product kernel"
 //! and stays true forever; a milestone tag stops meaning anything the moment the
@@ -16,47 +21,104 @@
 
 #![forbid(unsafe_code)]
 
-use moxie_types::KernelCapability;
-
-/// Fatbin containing every architecture this build targets.
-pub const SMOKE_FATBIN: &[u8] = include_bytes!(env!("MOXIE_SMOKE_FATBIN"));
-
-/// Fatbin containing SM86 only.
+/// Compute capabilities this build *targets*, as `["86", "120"]`.
 ///
-/// Used to prove that loading an image with no binary for the current device
-/// fails with a typed `UnsupportedKernel`. Do not "fix" a failure to load this
-/// on an SM120 device -- that failure is the assertion.
-pub const SMOKE_FATBIN_SM86_ONLY: &[u8] = include_bytes!(env!("MOXIE_SMOKE_FATBIN_SM86"));
+/// Declared, not measured. Targeting an architecture is not compiling for it
+/// (that needs the `fatbin` feature) and compiling for it is not qualifying it
+/// (that needs a passing `test-gpu` run on real hardware). Three different
+/// claims; document 07 keeps them separate and so does this crate.
+pub const TARGET_ARCHS: &str = env!("MOXIE_KERNEL_TARGET_ARCHS");
 
-/// Compute capabilities compiled into `SMOKE_FATBIN`, as `["86", "120"]`.
-pub const KERNEL_ARCHS: &str = env!("MOXIE_KERNEL_ARCHS");
+/// `sm_NN` strings for [`TARGET_ARCHS`].
+pub fn target_sm() -> Vec<String> {
+    split_sm(TARGET_ARCHS)
+}
 
-pub const AXPY_F32: &str = "moxie_smoke_axpy_f32";
-pub const F32_TO_BF16_BITS: &str = "moxie_smoke_f32_to_bf16_bits";
-
-/// The architectures this build qualified, as `sm_NN` capability strings.
-pub fn qualified_sm() -> Vec<String> {
-    KERNEL_ARCHS
-        .split(',')
+fn split_sm(list: &str) -> Vec<String> {
+    list.split(',')
         .filter(|s| !s.is_empty())
         .map(|a| format!("sm_{a}"))
         .collect()
 }
 
-/// Descriptor for the smoke kernel, in the same shape a real operation kernel
-/// will use: matched on capability and shape, never on a model name.
-pub fn axpy_capability() -> KernelCapability {
-    KernelCapability {
-        operation: AXPY_F32,
-        qualified_sm: qualified_sm(),
-        workspace_upper_bound_bytes: 0,
+pub const AXPY_F32: &str = "moxie_smoke_axpy_f32";
+pub const F32_TO_BF16_BITS: &str = "moxie_smoke_f32_to_bf16_bits";
+
+#[cfg(feature = "fatbin")]
+mod images {
+    use moxie_types::KernelCapability;
+
+    /// Fatbin containing every architecture this build compiled.
+    ///
+    /// These bytes are `nvcc` output embedded at build time. That provenance is
+    /// what a caller asserts when it wraps them in `moxie_cuda::TrustedImage`;
+    /// `cuModuleLoadData` receives no length and cannot check them.
+    pub const SMOKE_FATBIN: &[u8] = include_bytes!(env!("MOXIE_SMOKE_FATBIN"));
+
+    /// Fatbin containing SM86 only.
+    ///
+    /// Used to prove that loading an image with no binary for the current device
+    /// fails with a typed `UnsupportedKernel`. Do not "fix" a failure to load
+    /// this on an SM120 device -- that failure is the assertion. It is SASS-only
+    /// for the same reason: embedded PTX would let the driver JIT it anywhere.
+    pub const SMOKE_FATBIN_SM86_ONLY: &[u8] = include_bytes!(env!("MOXIE_SMOKE_FATBIN_SM86"));
+
+    /// Compute capabilities actually compiled into [`SMOKE_FATBIN`].
+    pub const KERNEL_ARCHS: &str = env!("MOXIE_KERNEL_ARCHS");
+
+    /// Build identity, for the benchmark manifest document 07 requires.
+    pub const SMOKE_FATBIN_SHA256: &str = env!("MOXIE_SMOKE_FATBIN_SHA256");
+    pub const SMOKE_FATBIN_SM86_SHA256: &str = env!("MOXIE_SMOKE_FATBIN_SM86_SHA256");
+    /// What `nvcc --version` reported, verified against the pin in `build.rs`.
+    pub const NVCC_VERSION: &str = env!("MOXIE_NVCC_VERSION");
+    /// The host compiler nvcc drove. Recorded, not pinned.
+    pub const HOST_COMPILER_VERSION: &str = env!("MOXIE_HOST_COMPILER_VERSION");
+
+    /// The architectures compiled into the image, as `sm_NN` strings.
+    ///
+    /// Compiled, **not qualified**. A capability is qualified by a passing
+    /// `test-gpu` case on a real device of that architecture; this function only
+    /// reports what nvcc emitted.
+    pub fn compiled_sm() -> Vec<String> {
+        super::split_sm(KERNEL_ARCHS)
+    }
+
+    /// Descriptor for the smoke kernel, in the same shape a real operation
+    /// kernel will use: matched on capability and shape, never on a model name.
+    ///
+    /// `qualified_sm` is populated from the compiled list because the smoke
+    /// kernel is architecture-agnostic C. A real kernel's descriptor must be
+    /// populated from the gate IDs that actually passed (document 07), not from
+    /// what the compiler accepted.
+    pub fn axpy_capability() -> KernelCapability {
+        KernelCapability {
+            operation: super::AXPY_F32,
+            qualified_sm: compiled_sm(),
+            workspace_upper_bound_bytes: 0,
+        }
     }
 }
+
+#[cfg(feature = "fatbin")]
+pub use images::{
+    HOST_COMPILER_VERSION, KERNEL_ARCHS, NVCC_VERSION, SMOKE_FATBIN, SMOKE_FATBIN_SHA256,
+    SMOKE_FATBIN_SM86_ONLY, SMOKE_FATBIN_SM86_SHA256, axpy_capability, compiled_sm,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn both_product_architectures_are_targeted() {
+        // The product claims SM86 (3090) and SM120 (5060 Ti). Losing either from
+        // the target list must break the host lane, not wait for a GPU run.
+        let sm = target_sm();
+        assert!(sm.contains(&"sm_86".to_string()), "got {sm:?}");
+        assert!(sm.contains(&"sm_120".to_string()), "got {sm:?}");
+    }
+
+    #[cfg(feature = "fatbin")]
     #[test]
     fn fatbins_are_present_and_non_trivial() {
         // A zero-length image would load as a silent no-op on some drivers.
@@ -73,17 +135,28 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fatbin")]
     #[test]
-    fn both_product_architectures_are_compiled() {
-        // The product claims SM86 (3090) and SM120 (5060 Ti). Losing either from
-        // the build must break the host lane, not wait for a GPU run.
-        let sm = qualified_sm();
-        assert!(sm.contains(&"sm_86".to_string()), "got {sm:?}");
-        assert!(sm.contains(&"sm_120".to_string()), "got {sm:?}");
+    fn every_targeted_architecture_was_compiled() {
+        // The declared target list and what nvcc actually emitted must agree.
+        // A silent divergence is how a support-matrix claim outlives its build.
+        assert_eq!(compiled_sm(), target_sm());
     }
 
+    #[cfg(feature = "fatbin")]
     #[test]
-    fn capability_matches_only_qualified_architectures() {
+    fn build_identity_is_recorded() {
+        // Document 07 requires a recorded executable/image identity.
+        assert_eq!(SMOKE_FATBIN_SHA256.len(), 64, "{SMOKE_FATBIN_SHA256}");
+        assert_eq!(SMOKE_FATBIN_SM86_SHA256.len(), 64);
+        assert_ne!(SMOKE_FATBIN_SHA256, SMOKE_FATBIN_SM86_SHA256);
+        assert!(NVCC_VERSION.contains("13.0"), "{NVCC_VERSION}");
+        assert!(!HOST_COMPILER_VERSION.is_empty());
+    }
+
+    #[cfg(feature = "fatbin")]
+    #[test]
+    fn capability_matches_only_compiled_architectures() {
         let cap = axpy_capability();
         assert!(cap.qualified_sm.contains(&"sm_86".to_string()));
         // Nothing claims sm_90: we have no Hopper and never qualified one.

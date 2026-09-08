@@ -1,0 +1,15 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+# Review case C. No file named `build.rs` exists here, so a checker looking for
+# that exact name found nothing. Cargo runs `codegen.rs` all the same, and R09
+# records that kernel compilation under a model directory is precisely what the
+# legacy layer checker could not see. Must be rejected.
+build = "codegen.rs"
+
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "model crate has a build script"

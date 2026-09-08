@@ -14,3 +14,17 @@
 # evidence identifies a GPU by UUID, per document 07.
 [env]
 CUDA_DEVICE_ORDER = { value = "PCI_BUS_ID", force = true }
+
+# Two aliases, because the two lanes are genuinely different builds and must not
+# be confused for each other (document 07).
+#
+#   cargo xtask <cmd>        host lane: no nvcc, no libcuda, no GPU.
+#   cargo xtask-cuda <cmd>   device lane: compiles fatbins, links the driver.
+#
+# `cargo xtask-cuda arch-check` would also work, but running the host checks
+# through the device build makes the host lane's independence untested. Keep
+# them apart. A fresh clone can execute both, which is the point: the commands
+# documented in README/task records are the commands that exist.
+[alias]
+xtask = "run --quiet -p xtask --"
+xtask-cuda = "run --quiet -p xtask --features cuda --"

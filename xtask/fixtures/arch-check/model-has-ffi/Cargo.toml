@@ -8,3 +8,8 @@ edition = "2024"
 # declaration inside an adapter is a hard boundary breach. Must be rejected.
 [dependencies]
 moxie-types = { path = "../../../../crates/moxie-types" }
+
+[package.metadata.moxie-arch-check]
+# The rule this fixture proves. arch-check fails if the fixture is accepted, and
+# also if it is rejected for a different reason.
+expect-rule = "forbidden construct in model source"

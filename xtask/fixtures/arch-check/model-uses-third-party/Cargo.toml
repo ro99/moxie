@@ -10,3 +10,8 @@ edition = "2024"
 moxie-types = { path = "../../../../crates/moxie-types" }
 cudarc = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[package.metadata.moxie-arch-check]
+# The rule this fixture proves. arch-check fails if the fixture is accepted, and
+# also if it is rejected for a different reason.
+expect-rule = "forbidden dependency"

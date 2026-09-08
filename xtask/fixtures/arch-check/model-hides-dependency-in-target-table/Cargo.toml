@@ -1,0 +1,18 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# Review case A. The two top-level tables are clean; the CUDA wrapper arrives
+# through a platform-specific table, which cargo builds on every Linux host just
+# like an ordinary dependency. A checker that reads only `[dependencies]` and
+# `[build-dependencies]` returned zero violations for this manifest. Must be
+# rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+
+[target.'cfg(unix)'.dependencies]
+moxie-cuda = { path = "../../../../crates/moxie-cuda" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden dependency"

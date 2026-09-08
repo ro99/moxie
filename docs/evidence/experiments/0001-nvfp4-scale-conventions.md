@@ -1,6 +1,20 @@
 # 0001 — Both NVFP4 global-scale conventions, confirmed against real weights
 
-Date: 2026-09-07. Milestone: M0. Status: **accepted**.
+Date: 2026-09-07. Milestone: M0. Status: **accepted**; the finding stands, the code it used is
+retired.
+
+**Retirement note, 2026-09-07.** [ADR 0003](../../decisions/adr/0003-int4-int8-bf16-weight-family.md)
+replaced NVFP4 with the INT4/INT8/BF16 affine-integer family, and
+`crates/moxie-format/src/nvfp4.rs` — the E2M1 and E4M3FN decoders this experiment used — was removed
+from the active API by [task 0002](../../tasks/0002-m0-review-and-integer-transition.md). It is in
+git at commit `84273b0e4b41bb04d1b374f6f46f89557bba4a59`, path
+`crates/moxie-format/src/nvfp4.rs`, with its tests.
+
+The finding below is **not** retired. R16 is about reading a stored scalar in the direction its
+exporter meant, and the integer importers face the same question with their own zero-point and scale
+conventions: document 03 requires GPTQ-style stored zero offsets and packed axis order to be
+"decoded according to the pinned exporter, never guessed from a suffix". The lesson transfers even
+though the format did not.
 
 ## Hypothesis
 
