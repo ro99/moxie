@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/moxie-types",
     "crates/moxie-graph",
+    "crates/moxie-interp",
     "crates/moxie-model-api",
     "crates/moxie-format",
     "crates/moxie-oracles",
@@ -23,6 +24,7 @@ publish = false
 [workspace.dependencies]
 moxie-types = { path = "crates/moxie-types" }
 moxie-graph = { path = "crates/moxie-graph" }
+moxie-interp = { path = "crates/moxie-interp" }
 moxie-model-api = { path = "crates/moxie-model-api" }
 moxie-format = { path = "crates/moxie-format" }
 moxie-oracles = { path = "crates/moxie-oracles" }

@@ -115,6 +115,24 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                 third_party: NONE,
             },
         ),
+        // The host reference interpreter (document 02: "Host reference
+        // evaluation is a shared graph interpreter"). It walks a graph and
+        // dispatches to the oracles; it owns no device memory and no I/O, which
+        // is why `moxie-cuda`, `moxie-kernels` and `moxie-format`'s future
+        // storage half are absent from its list.
+        (
+            "moxie-interp",
+            Allowed {
+                workspace: &[
+                    "moxie-types",
+                    "moxie-graph",
+                    "moxie-format",
+                    "moxie-oracles",
+                    "moxie-state",
+                ],
+                third_party: NONE,
+            },
+        ),
         (
             "moxie-cuda",
             Allowed {
@@ -139,6 +157,7 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                     "moxie-graph",
                     "moxie-model-api",
                     "moxie-format",
+                    "moxie-interp",
                     "moxie-oracles",
                     "moxie-state",
                     "moxie-cuda",

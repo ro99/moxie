@@ -46,6 +46,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "moxie-interp"
+version = "0.0.0"
+dependencies = [
+ "moxie-format",
+ "moxie-graph",
+ "moxie-oracles",
+ "moxie-state",
+ "moxie-types",
+]
+
+[[package]]
 name = "moxie-kernels"
 version = "0.0.0"
 dependencies = [

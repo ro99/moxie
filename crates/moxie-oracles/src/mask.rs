@@ -17,31 +17,12 @@
 use moxie_types::{Error, Result};
 
 /// Which keys a query position may attend to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Visibility {
-    /// Every key at or before the query position.
-    Causal,
-    /// The `window` most recent keys, inclusive of the query position.
-    /// A window of 1 sees only the query's own position.
-    SlidingWindow { window: u64 },
-}
-
-impl Visibility {
-    /// Whether query position `q` may attend to key position `k`.
-    ///
-    /// Positions are absolute over the whole sequence, not indices into a chunk.
-    /// R21 is about exactly this confusion: a one-page fast path that indexes
-    /// within a chunk is right at position zero and wrong everywhere after it.
-    pub const fn allows(self, q: u64, k: u64) -> bool {
-        if k > q {
-            return false;
-        }
-        match self {
-            Visibility::Causal => true,
-            Visibility::SlidingWindow { window } => q - k < window,
-        }
-    }
-}
+///
+/// Defined in `moxie-graph`, because a visibility rule is part of the attention
+/// operation's contract rather than of the reference that evaluates it
+/// (document 04's descriptor fields). Re-exported here so that this module stays
+/// the place its behaviour is pinned.
+pub use moxie_graph::Visibility;
 
 /// A prefill chunk: `len` query positions starting at absolute position `start`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

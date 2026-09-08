@@ -16,13 +16,14 @@ matrix exists to prevent.
 |---|---|---|---|
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
-| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 222 unit tests + 1 doctest |
+| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 290 unit/integration tests + 1 doctest |
 | `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 19 negative + 1 positive fixtures, 6 rules |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
-| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 222 unit tests + 1 doctest, `ldd` shows no `libcuda` |
+| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 290 unit/integration tests + 1 doctest, `ldd` shows no `libcuda` |
 | `G-GPU-SM86` | `cargo xtask-cuda test-gpu --profile sm86` | device | passed, RTX 3090 x2 |
 | `G-GPU-SM120` | `cargo xtask-cuda test-gpu --profile sm120` | device | passed, RTX 5060 Ti |
 | `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 15 cases, both architectures qualified |
+| `G-INTERP-BF16` | `cargo test -p moxie-interp` | host | passed, 10 unit + 16 acceptance tests ([task 0003](../tasks/0003-m1-bf16-reference-interpreter.md)) |
 | `G-TOPOLOGY` | `cargo xtask test-topology` | device | **not implemented** (M5) |
 | `G-QUALITY` | `cargo xtask quality` | device | **not implemented** (M3) |
 | `G-BENCH` | `cargo xtask bench` | device | **not implemented** (M6) |
@@ -44,7 +45,8 @@ Counts are from 2026-09-07 after the fourth review's corrections; see
 | none | n/a | n/a | compressed-tensors integer import | **not implemented** | — | M3, first importer. [Candidate metadata](quantization-candidates.md) is inspected, not decoded. |
 | none | n/a | n/a | AutoRound / AutoGPTQ packing import | **not implemented** | — | M3, second importer. |
 | none | n/a | n/a | NVFP4 / FP8 / W4A4 / W8A8 | **unsupported** | — | Deferred by [ADR 0003](../decisions/adr/0003-int4-int8-bf16-weight-family.md). Not a gap to close; a decision. |
-| none | n/a | n/a | First / partial / later chunked prefill | **not implemented** | `G-HOST-TEST` (`moxie-oracles::mask`) covers the *mask* arithmetic only | M1/M4. Chunk-versus-whole parity is proven on masks, not on execution. |
+| none | sm_86, sm_120 | n/a | BF16 host reference interpreter | passed | `G-INTERP-BF16` | Two synthetic graphs, eight operations, FP64-transcribed references within their declared γ bounds. **No checkpoint, no kernel, no device, no sampler.** Synthetic output is never model support (document 06 M1.5). |
+| none | n/a | n/a | First / partial / later chunked prefill | **partial** | `G-INTERP-BF16` (`whole_and_chunked_prefill_agree`, every width 1..6, logits and KV compared) | Proven on the host reference only. No device path, no paged state, no long context. |
 | none | n/a | n/a | Flash / paged attention; host-backed exact state | **not implemented** | — | M4. `moxie-oracles::mask::attend_row` is an exact reference, not a path. |
 | none | n/a | n/a | Oversized host/disk weight streaming | **not implemented** | — | M2. No memory authority exists. |
 | none | n/a | n/a | TP / PP / expert partition | **not implemented** | — | M5. `PartitionRule::NotDetermined` fails closed today. |

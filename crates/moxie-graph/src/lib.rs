@@ -26,6 +26,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attention;
+pub mod graph;
+
+pub use attention::Visibility;
+pub use graph::{
+    Bindings, Graph, GraphBuilder, Node, NodeId, OpParams, TensorSpec, ValueId, ValueRole,
+};
+
 use std::collections::BTreeMap;
 
 use moxie_types::{AccumulationPolicy, ActivationPrecision, Dim, Error, Result, WeightPrecision};

@@ -1,6 +1,6 @@
 # Task 0003 — M1, part 1: the BF16 host reference interpreter
 
-Status: **active**. Proposed 2026-09-07 after the [M0 correction
+Status: **implemented 2026-09-08**, owner review pending. Proposed 2026-09-07 after the [M0 correction
 task](0002-m0-review-and-integer-transition.md) closed F1–F6 and four review passes; started the
 same day with those gates green (`arch-check` 19 rejected + 1 accepted fixtures, `spec-check` 10
 documents, 222 host unit tests + 1 doctest, `test-gpu` 15 cases with both architectures qualified).
@@ -269,3 +269,119 @@ found M0 had not yet made.
 It also comes before any kernel on purpose. Document 07: "Missing numerical contracts block that
 primitive's optimized gate." Writing the CUDA path first would mean choosing tolerances after seeing
 what the kernel produces.
+
+
+---
+
+## Result
+
+Implemented on `main`, base commit `388d85c` (the contract commit above). The contract was fixed
+first and not touched afterwards: no threshold in it was adjusted once a test ran.
+
+### Commands
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | **PASS** |
+| `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | **PASS** |
+| `cargo test --workspace --locked --offline` | **PASS**, 290 unit/integration + 1 doctest |
+| `cargo xtask arch-check` | **PASS**, `moxie-interp` declared; 19 rejected + 1 accepted fixtures |
+| `cargo xtask spec-check` | **PASS**, 10 documents, digests unchanged |
+| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | **PASS**, 298 + 2 doctests |
+| `cargo xtask-cuda test-gpu` | **PASS**, unchanged; this slice touches no CUDA |
+
+Host counts by crate: `moxie-oracles` 104, `moxie-format` 54, `xtask` 30, `moxie-state` 28,
+`moxie-types` 22, `moxie-interp` 10 + 16 integration, `moxie-graph` 11, `moxie-cuda` 9,
+`moxie-model-api` 5, `moxie-kernels` 1. Before this task: 222 + 1.
+
+### What was built
+
+- **`moxie-graph` gained the graph.** `ValueId`, `NodeId`, `TensorSpec`, `ValueRole`, `OpParams`,
+  `Node`, `Graph`, `GraphBuilder`. Roles are three distinct types -- `Weight`, `Activation`,
+  `Index` -- so document 02's "token IDs ... are not quantized weights or floating activations" is a
+  type error rather than a convention. `Visibility` moved here from `moxie-oracles`, because a mask
+  rule is part of the attention contract rather than of the reference that evaluates it.
+- **`moxie-oracles` gained six references**: `linear` (linear, embedding, vocabulary projection),
+  `norm` (RMS, plus the LayerNorm it must not be confused with), `activation` (SwiGLU),
+  `rope`, `attention` (multi-head over an absolute-position history), `residual`, and `metric`
+  (γ and the max/RMS/p99 summary document 07 requires).
+- **`moxie-interp` is new**: `HostTensor` with the BF16-valued invariant checked rather than
+  assumed, `KvCache`, `Cancel`, and the `Interpreter` that walks a graph.
+
+### The contract's rules, as enforced behaviour
+
+| Rule | Where it now bites |
+|---|---|
+| An operation with no registered oracle cannot be lowered | `GraphBuilder::finish` refuses; the interpreter is never reached |
+| Logits stay FP32 | `OpParams::output_precision`, asserted against a fixture where some logits are provably not BF16-representable |
+| Positions are absolute (R21) | the interpreter checks them against the branch's own `executed` frontier and refuses a chunk-local index |
+| Cancellation leaves state untouched (R08) | KV appends are staged and committed only on success; tested at **every** node depth |
+| Declared shapes | bound against the actual data at run time, with `rows` bound from the step |
+| Rounding boundaries | one `HostTensor::round_to_bf16`, called exactly where the table says |
+| TP fails closed on attention | `PartitionRule::NotDetermined`, asserted per node |
+
+### Numerical results
+
+Every operation's reference is checked against an FP64 transcription of the equation, written
+separately in the test body, and reported as max/RMS/p99 against its declared γ bound. All within
+bound; nothing was retuned. The `linear` gate over the fixture's own `w_gate` (12 -> 20) reports
+through `println!` so the numbers are in the test output rather than only in an assertion.
+
+Two tests exist to stop a bound being met by accident: `a_cancelling_dot_product_is_measured_against_term_magnitude`
+constructs a dot product whose terms are ~1e12 and whose result is ~0, and
+`the_summation_order_is_part_of_the_contract` shows forward and reverse summation genuinely disagree
+on an ill-conditioned input -- so the declared order is doing work rather than describing a
+coincidence.
+
+### Acceptance, item by item
+
+| Requirement | Evidence |
+|---|---|
+| `arch-check` passes with `moxie-interp` in the ownership table | `arch-check` PASS; the checker rejected the crate until it was declared |
+| `cargo test --workspace` on the host lane, no CUDA | PASS, 291 |
+| Per-operation error metric met | every oracle test, against its γ bound |
+| Whole-versus-chunked prefill parity | `whole_and_chunked_prefill_agree`, at **every** chunk width 1..6, logits **and** KV cache compared |
+| One-token and multi-token generation, both graphs | `both_graphs_produce_logits_for_one_token_and_for_many` |
+| Cancel, then a clean generation matching an uncancelled one | `a_cancelled_step_leaves_the_state_exactly_as_it_found_it`, cancelling at every node depth |
+| An unregistered operation is refused | `an_operation_with_no_registered_oracle_cannot_be_built_into_a_graph` |
+| Two distinct shapes consume every operation | graphs A (h8/2 heads/ffn16/vocab16) and B (h12/3 heads/ffn20/vocab7) |
+| Non-divisible dimension rejected explicitly | `shape_and_divisibility_errors_are_refused_at_construction`: odd `rotary_dim` is `DimError::NotDivisible`, a head geometry that does not match its input is refused |
+| Support-matrix row added | `G-INTERP-BF16`; no checkpoint, kernel or context row touched |
+
+### What this does not establish
+
+Stated plainly, because a reference interpreter that produces logits looks more like an engine than
+it is:
+
+- **No model.** Two synthetic graph fixtures with pseudo-random weights. No checkpoint has been
+  imported, no tokenizer exists, and nothing here is evidence about any of the ten candidates.
+  Document 06 M1.5: "Never describe synthetic output as model support."
+- **No kernel, no device.** Nothing in this slice touches CUDA. The GPU lane is unchanged and its
+  result is carried forward, not re-earned.
+- **No performance meaning.** This is deliberately the slow path. It allocates per row and reduces
+  in a fixed order so that a kernel has something exact to be compared against.
+- **No sampler.** `moxie-oracles::sampler` exists and is not wired in; greedy selection in the state
+  test is a state-machine step, not sampling.
+- **One head group, full causal, one layer per KV store.** GQA/MQA head mapping, sliding windows in
+  a graph, sinks and biases, MLA, and model-defined sparse selection are document 04's later work
+  and are absent rather than approximated.
+- **No paging, no memory authority, no service.** M2 and M4 own those.
+
+### Next
+
+The M1 slice continues, and each of these is its own bounded task rather than an extension of this
+one:
+
+1. **Manifest reader for tiny BF16 artifacts** (document 06 M1.2) -- bounded tensor reads and
+   validation, feeding the same graph. This is where `moxie-format`'s storage half begins, and where
+   the owner-designated [artifact roots](../evidence/artifact-roots.md) first matter.
+2. **Rank-owned CUDA execution of one layer chain** (M1.3) -- against *this* interpreter, with the γ
+   bounds above as the comparison points. Document 07: the numerical contract exists before the
+   optimized gate, which is now true.
+3. **Appendable paged state plus the transaction API** (M1.4) -- replacing `KvCache`'s dense `Vec`
+   with the real thing, and giving `SequenceState`'s restore evidence something that can actually
+   prove a restoration happened, which the third review flagged as owed once buffers arrive.
+4. **The generation service and diagnostic CLI** (M1.4) -- the first place a sampler is wired in.
+
+Recommended order is 1, 3, 2, 4: the manifest and the state API are what the CUDA path needs to be
+compared *at*, and doing the kernel before the paged state would mean writing it twice.

@@ -29,9 +29,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod activation;
+pub mod attention;
+pub mod linear;
 pub mod mask;
+pub mod metric;
+pub mod norm;
 pub mod protocol;
 pub mod recurrent;
+pub mod residual;
+pub mod rope;
 pub mod route;
 pub mod sampler;
 pub mod template;
@@ -50,10 +57,28 @@ pub const HOST_REFERENCE: OracleId = OracleId("moxie_oracles::host_reference");
 /// over `Op::ALL`.
 pub fn register(registry: &mut OracleRegistry) -> Result<()> {
     let entries: &[(Op, &'static str, &'static str)] = &[
+        // Task 0003's slice.
+        (Op::Embedding, "moxie_oracles::linear", "linear::tests"),
+        (Op::Linear, "moxie_oracles::linear", "linear::tests"),
+        (
+            Op::VocabProjection,
+            "moxie_oracles::linear",
+            "linear::tests",
+        ),
+        (Op::RmsNorm, "moxie_oracles::norm", "norm::tests"),
+        (Op::SwiGlu, "moxie_oracles::activation", "activation::tests"),
+        (Op::Rope, "moxie_oracles::rope", "rope::tests"),
+        (
+            Op::Attention,
+            "moxie_oracles::attention",
+            "attention::tests",
+        ),
+        (Op::Residual, "moxie_oracles::residual", "residual::tests"),
+        // Fixtures from M0, whose operations have references but no interpreter
+        // consumer yet.
         (Op::Route, "moxie_oracles::route", "route::tests"),
         (Op::Dispatch, "moxie_oracles::route", "route::tests"),
         (Op::Combine, "moxie_oracles::route", "route::tests"),
-        (Op::Attention, "moxie_oracles::mask", "mask::tests"),
         (
             Op::RecurrentUpdate,
             "moxie_oracles::recurrent",
@@ -88,10 +113,17 @@ mod tests {
         register(&mut r).unwrap();
 
         for op in [
+            Op::Embedding,
+            Op::Linear,
+            Op::VocabProjection,
+            Op::RmsNorm,
+            Op::SwiGlu,
+            Op::Rope,
+            Op::Attention,
+            Op::Residual,
             Op::Route,
             Op::Dispatch,
             Op::Combine,
-            Op::Attention,
             Op::RecurrentUpdate,
             Op::ShortConv,
         ] {
@@ -102,9 +134,14 @@ mod tests {
         for op in [
             Op::MlaAttention,
             Op::SparseIndexSelect,
+            // R06: bounded in both terms, and not SwiGlu. Registering SwiGlu's
+            // reference for it would be the substitution R06 warns against.
             Op::SituGlu,
+            Op::GeGlu,
             Op::ResidualMix,
-            Op::Linear,
+            Op::LayerNorm,
+            Op::ExpertLinear,
+            Op::ExpertMlp,
         ] {
             assert!(
                 !r.has_any_oracle(op),
