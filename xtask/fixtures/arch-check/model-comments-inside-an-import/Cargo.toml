@@ -1,0 +1,15 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# Third review, case 1. The same forbidden import as
+# `model-imports-through-a-group`, with a comment inside the braces. A parser
+# working on characters keeps the comment in the path and stops recognising it;
+# a parser working on the syntax tree never sees a comment at all. Must be
+# rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden construct in model source"

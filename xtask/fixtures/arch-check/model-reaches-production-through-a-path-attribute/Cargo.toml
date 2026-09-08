@@ -1,0 +1,15 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# Third review, case 2. No Cargo target points into `tests/`, so a checker that
+# decides what is production by directory name skips it. The module declaration
+# in src/lib.rs makes it production all the same: Cargo compiles it, and the
+# reachable module tree -- not the directory's spelling -- is what says so. Must
+# be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden construct in model source"

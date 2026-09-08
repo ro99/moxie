@@ -133,8 +133,12 @@ that did not identify its sequence or its prefix's contents, an earlier snapshot
 restoration to a later prefix, grouped imports and a library declared under `tests/` slipping past
 architecture enforcement, an unbounded PTX entry point, a rollback that unpublished released output,
 and two reference paths returning successful nonfinite results. Those are closed too. The
-[first](docs/handovers/2026-09-07-m0-correction-results.md) and
-[second](docs/handovers/2026-09-07-second-review-corrections.md) handovers are the short versions.
+A third review found three more — a derived `Clone` that handed the new sequence identity to a
+second authority, restoration evidence with no branch or prefix-version identity, and source
+enforcement still missing ordinary Rust syntax — and those are closed too. The
+[first](docs/handovers/2026-09-07-m0-correction-results.md),
+[second](docs/handovers/2026-09-07-second-review-corrections.md) and
+[third](docs/handovers/2026-09-07-third-review-corrections.md) handovers are the short versions.
 
 The next bounded task is [task 0003](docs/tasks/0003-m1-bf16-reference-interpreter.md), the BF16 host
 reference interpreter. It is deliberately smaller than document 06's whole M1: the manifest reader,

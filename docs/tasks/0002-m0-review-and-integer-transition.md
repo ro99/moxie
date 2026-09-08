@@ -1,8 +1,9 @@
 # Task 0002 — M0 review, corrections, and integer precision transition
 
-Status: **implemented 2026-09-07**, then corrected again after a second review. F1-F6 results are in
-[Correction results](#correction-results-2026-09-07); the second review's findings and their results
-are in [Second-review corrections](#second-review-corrections-2026-09-07). Review performed 2026-09-07 against Moxie `84273b0e4b41bb04d1b374f6f46f89557bba4a59`, with a clean worktree before documentation edits. The reviewer changed documentation only; the implementation that follows the review is recorded at the end of this file.
+Status: **implemented 2026-09-07**, then corrected after a second review and again after a third.
+F1-F6 results are in [Correction results](#correction-results-2026-09-07); the second review's in
+[Second-review corrections](#second-review-corrections-2026-09-07); the third review's in
+[Third-review corrections](#third-review-corrections-2026-09-07). Review performed 2026-09-07 against Moxie `84273b0e4b41bb04d1b374f6f46f89557bba4a59`, with a clean worktree before documentation edits. The reviewer changed documentation only; the implementation that follows the review is recorded at the end of this file.
 
 ## Verdict
 
@@ -610,3 +611,152 @@ O1, O2, O4 and O5 remain **OPEN**. No importer exists. No kernel implements W4A1
 device lane still has no CI runner. [Task 0003](0003-m1-bf16-reference-interpreter.md) stands as the
 next bounded task, and now inherits state and provenance contracts that were tightened rather than
 the ones the second review warned against carrying forward.
+
+
+---
+
+# Third-review corrections, 2026-09-07
+
+A third review confirmed the second pass's gates independently, accepted most of it, and found three
+more places where an invariant could be violated by an operation no test covered. Its diagnosis of
+the pattern was the useful part:
+
+> tests cover the reported examples, but not every operation that can violate the invariant.
+
+All three are reproduced and closed below. Nothing was redesigned.
+
+## Commands and results after the third pass
+
+| Command | Second pass | Third pass |
+|---|---|---|
+| `cargo test --workspace --locked --offline` | 210 | **218** |
+| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | 218 + 1 doctest | **226 + 1 doctest** |
+| `cargo xtask arch-check` | 15 fixtures | **17 fixtures**, 6 rules |
+| `cargo xtask spec-check` | PASS | **PASS**, digests unchanged |
+| `cargo fmt --all -- --check`, `cargo clippy ... -D warnings` | PASS | **PASS** |
+| host build with no CUDA toolkit or driver reachable | 210 | **218**; `ldd` shows no `libcuda` |
+| `cargo xtask-cuda test-gpu` | 15 cases | **15 cases**, both architectures qualified |
+| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | exit 1 | **exit 1** |
+
+`Cargo.lock` gained **zero** packages, which matters because this pass took a parsing dependency;
+see T3.
+
+## T1 - `Clone` handed the sequence identity to a second authority · closed
+
+Reproduced:
+
+```text
+cloned_sequences_same_id=true
+independently_issued_handles_equal=true
+foreign_handle_restored=true
+```
+
+A derived `Clone` copied the sequence id, the result counter, the lineages and the issued-result
+ledger into a second, independently mutable object. Two authorities then minted identical
+`ResultId`s. Every identity rule the second pass added was intact and simply bypassed.
+
+`SequenceState` no longer derives `Clone`. A `compile_fail` doctest on the type is the regression
+test — the guarantee is a property of the type, so the test has to be one too. `fork` is the
+supported way to get a second view, and it produces a branch with its own identity inside one
+authority. If whole-state copying is ever wanted, it has to arrive as an operation that assigns a
+fresh sequence id and states what happens to retained results.
+
+Three tests that cloned the state for convenience were rewritten to build their own; that
+convenience was exactly what the derive was there for.
+
+## T2 - restoration evidence carried no branch or prefix version · closed
+
+Reproduced, both halves:
+
+```text
+root_restore_evidence_accepted_on_child=true
+old_suffix_restore_evidence_accepted=true
+```
+
+The second pass checked component, sequence, generation and completed prefix. All four are equal
+between a root branch and a child that forked from it, and between a prefix and the replacement that
+took its place, so neither case was distinguishable.
+
+`Restore` now also carries the **branch** and the **lineage of the completed prefix**, and its fields
+are private: it is built only by `SequenceState::restore_evidence`, which stamps the identity from
+the state as it stands, and `rollback_to` checks that identity again before mutating anything. A
+snapshot of one branch is not a restoration of another; sharing one would need a stated shared-prefix
+equivalence rule, which does not exist and is not assumed.
+
+What this proves is written into the type's documentation and is deliberately modest: **a binding,
+not a deed.** It cannot establish that the restoration work happened — a caller that mints evidence
+and does nothing still passes — only that the evidence names this exact place and that nothing moved
+underneath it since. The buffers that would make it checkable belong to the memory authority, which
+does not exist yet.
+
+Tests: `restore_evidence_from_another_branch_is_refused`,
+`restore_evidence_for_a_replaced_suffix_is_refused`, and
+`evidence_survives_a_rollback_that_does_not_touch_its_prefix` for the positive half — a legitimate
+snapshot-then-abort flow must still work.
+
+## T3 - source enforcement missed ordinary Rust syntax and module reachability · closed
+
+Reproduced, two more model crates that compile and were accepted:
+
+```rust
+use std::{ /* checkpoint files */ fs };          // comment kept inside the path
+```
+
+```rust
+#[path = "../tests/reader.rs"]
+pub mod reader;                                   // production, in a directory no target names
+```
+
+This is the fourth distinct evasion of the same rules, and the review was right that the previous
+answer — another special case — was the wrong shape. The full history:
+
+| Accepted with zero violations | Why |
+|---|---|
+| code after a `#[cfg(test)]` module | the stripper kept only text before the first one |
+| `use std::{fs};` then `fs::read(p)` | the text `std::fs` appears nowhere |
+| `use std::{ /* c */ fs };` | the hand-written parser kept the comment in the path |
+| `#[path = "../tests/reader.rs"] mod reader;` | production was decided by directory *name* |
+
+**Model-crate source is now parsed with `syn`** ([ADR 0004](../decisions/adr/0004-parse-model-source-with-syn.md)):
+
+- imports come from parsed `UseTree`s, so groups, renames, globs and comments are distinct AST
+  shapes and none of them can leak characters into a path;
+- inline paths (`std::fs::read(p)` with no import) come from the token stream, where a comment does
+  not exist and a string is a `Literal`;
+- `extern "C"` is `Item::ForeignMod`, not a lowercase substring a string could trip;
+- `#[cfg(test)]` is a parsed attribute, which retired the hand-written brace matcher that had to
+  skip comments and literals to find where an attributed item ended;
+- **production sources are found by following `mod` declarations from the Cargo targets**, including
+  `#[path]` overrides and both `foo.rs` and `foo/mod.rs` layouts. Whether a file is production is a
+  fact about the crate's module tree, not about its parent directory's spelling.
+
+Fail-closed additions: source that does not parse, and a `mod` declaration that resolves to no file,
+are violations rather than silent skips. `include!` is a violation rather than something to follow —
+a model crate may not carry a build script, so there is no generated source for it to include, and
+what it does do is introduce code a reader will not find by following `mod`.
+
+The dependency cost is three crates (`syn` pinned `=3.0.3`, `quote`, `proc-macro2`), all in `xtask`
+only. All three were already in the lock graph via `toml`'s `serde_derive`, so `Cargo.lock` gained
+**no** package. `arch-check` rejected the change until they were added to its own allowlist, which is
+the enforcement working on itself. No production crate has a third-party dependency, and the
+third-party allowlist for shared and model crates is still empty.
+
+Two new fixtures are the reviewer's two crates. Ten unit tests cover the analysis directly, including
+`an_innocent_import_is_not_flagged` (a checker that flags everything is not enforcement),
+`a_test_module_is_exempt_and_the_code_after_it_is_not`, and
+`module_declarations_resolve_to_the_files_cargo_compiles`.
+
+ADR 0004 records what the parser does **not** do: it does not follow re-export chains, does not
+expand `macro_rules!`, and does not evaluate `cfg` other than `test`. Those are stated so the next
+review does not have to rediscover them and so none is mistaken for an oversight.
+
+## What the third pass did not change
+
+The reviewer's list of what it accepted stands: the PTX/binary-image boundary, monotonic publication
+and the committed-token usage distinction, the sampler `NaN` and affine overflow fixes, duplicate
+oracle registration preserving the existing entry, explicit nvcc host-compiler selection, and
+restoration requiring the correct completed prefix.
+
+O1, O2, O4 and O5 remain **OPEN**. No importer exists. No kernel implements W4A16 or W8A16. No
+checkpoint has been imported, no inference has run, no throughput has been measured, and the device
+lane still has no CI runner.

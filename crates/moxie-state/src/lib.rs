@@ -152,18 +152,55 @@ impl RestoreMethod {
 /// Evidence that one `Explicit` component really was restored.
 ///
 /// The point of requiring it is that a rollback cannot be *asserted*. Something
-/// has to have reloaded a snapshot or replayed a prefix, on this sequence, under
-/// this graph generation, and finished at the target.
+/// has to have reloaded a snapshot or replayed a prefix -- for this component,
+/// on this sequence, on this branch, at this version of that prefix, under this
+/// graph generation -- and finished at the target.
+///
+/// Built only by [`SequenceState::restore_evidence`], which stamps the identity
+/// from the state as it stands when the restoration is performed. The rollback
+/// then checks that identity again. **What this proves is a binding, not a
+/// deed**: it cannot establish that the work happened, only that the evidence
+/// names this exact place and that nothing has moved underneath it since. A
+/// caller that mints evidence and does nothing still passes, and the buffers
+/// that would make it checkable belong to the memory authority, which does not
+/// exist yet.
+///
+/// What it does catch, and what the third M0 review found it did not:
+///
+/// * evidence from another branch -- a root snapshot satisfying a child's
+///   rollback, because branch identity was simply absent;
+/// * evidence for a version of the prefix that has since been replaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Restore {
-    pub kind: StateKind,
-    /// The sequence whose component was restored. Checked: evidence from another
-    /// sequence's state is not evidence about this one.
-    pub sequence: SequenceId,
-    /// The generation the restored state belongs to. Checked: a snapshot taken
-    /// under a different graph or precision configuration is stale.
-    pub generation: StateGeneration,
-    pub method: RestoreMethod,
+    kind: StateKind,
+    sequence: SequenceId,
+    branch: BranchId,
+    /// The lineage of the completed prefix, as it stood when this evidence was
+    /// minted. Replacing that prefix's contents changes it.
+    lineage: PrefixLineage,
+    generation: StateGeneration,
+    method: RestoreMethod,
+}
+
+impl Restore {
+    pub const fn kind(&self) -> StateKind {
+        self.kind
+    }
+    pub const fn sequence(&self) -> SequenceId {
+        self.sequence
+    }
+    pub const fn branch(&self) -> BranchId {
+        self.branch
+    }
+    pub const fn lineage(&self) -> PrefixLineage {
+        self.lineage
+    }
+    pub const fn generation(&self) -> StateGeneration {
+        self.generation
+    }
+    pub const fn method(&self) -> RestoreMethod {
+        self.method
+    }
 }
 
 /// Process-unique identity of one sequence's state.
@@ -373,7 +410,27 @@ impl Branch {
 }
 
 /// One sequence's state: its schema, its branches and its retained outputs.
-#[derive(Debug, Clone)]
+///
+/// **Deliberately not `Clone`.** The third M0 review reproduced the reason: a
+/// derived `Clone` copied the sequence id, the result counter, the lineages and
+/// the issued-result ledger into a second, independently mutable object. Two
+/// execution authorities then minted identical `ResultId`s, and a handle from
+/// one restored into the other -- exactly the isolation the identities exist to
+/// provide, undone by a derive.
+///
+/// Branching is what this type offers instead: [`SequenceState::fork`] creates a
+/// copy-on-write branch *inside* one authority, with its own identity. If whole-
+/// state copying is ever needed, it has to arrive as an operation that assigns a
+/// fresh sequence id and states what happens to retained results, not as a
+/// derive.
+///
+/// ```compile_fail
+/// use moxie_state::{SequenceState, StateKind};
+/// let a = SequenceState::new([StateKind::KvPages]);
+/// let b = a.clone(); // a second authority would issue the same identities
+/// drop(b);
+/// ```
+#[derive(Debug)]
 pub struct SequenceState {
     id: SequenceId,
     schema: Vec<StateKind>,
@@ -685,6 +742,59 @@ impl SequenceState {
         }
     }
 
+    /// Mint restoration evidence for one `Explicit` component.
+    ///
+    /// Call this at the point the restoration actually happens; the identity it
+    /// stamps -- sequence, branch, the lineage of the completed prefix, and the
+    /// generation -- is what `rollback_to` checks again. See [`Restore`] for
+    /// what that binding does and does not prove.
+    pub fn restore_evidence(
+        &self,
+        kind: StateKind,
+        branch: BranchId,
+        method: RestoreMethod,
+    ) -> Result<Restore> {
+        if !self.schema.contains(&kind) {
+            return Err(Error::InvalidRequest {
+                field: "restore",
+                detail: format!("{kind:?} is not part of this sequence's schema"),
+            });
+        }
+        if kind.restore_capability() != RestoreCapability::Explicit {
+            return Err(Error::InvalidRequest {
+                field: "restore",
+                detail: format!(
+                    "{kind:?} is restored by truncation; evidence for it would mean \
+                     something else was restored instead"
+                ),
+            });
+        }
+        if !method.is_coherent() {
+            return Err(Error::InvalidRequest {
+                field: "restore",
+                detail: format!("{kind:?} replay runs backwards: {method:?}"),
+            });
+        }
+        let prefix = method.completed_prefix();
+        let lineage = self
+            .lineage_at(branch, prefix)?
+            .ok_or(Error::InvalidRequest {
+                field: "restore",
+                detail: format!(
+                    "prefix {prefix} is not occupied on {branch}; there is no such state to \
+                 have restored"
+                ),
+            })?;
+        Ok(Restore {
+            kind,
+            sequence: self.id,
+            branch,
+            lineage,
+            generation: self.generation,
+            method,
+        })
+    }
+
     /// Roll back `branch` to an accepted prefix, as `abort` and a speculative
     /// rejection do.
     ///
@@ -711,6 +821,10 @@ impl SequenceState {
         let schema = self.schema.clone();
         let generation = self.generation;
         let sequence = self.id;
+        // The lineage of the target prefix as it stands now. A rollback keeps
+        // positions at or before the target, so evidence minted before this call
+        // still matches -- unless those positions were replaced in between.
+        let target_lineage = self.lineage_at(branch, prefix)?;
         {
             let b = self.get(branch)?;
             if prefix > b.frontiers.accepted {
@@ -781,6 +895,17 @@ impl SequenceState {
                     ),
                 });
             }
+            if r.branch != branch {
+                return Err(Error::InvalidRequest {
+                    field: "restores",
+                    detail: format!(
+                        "{:?} evidence was minted on {}, not {branch}. A snapshot of one \
+                         branch is not a restoration of another, however alike their \
+                         prefixes look; sharing one needs a stated equivalence rule",
+                        r.kind, r.branch
+                    ),
+                });
+            }
             if r.generation != generation {
                 return Err(Error::InvalidRequest {
                     field: "restores",
@@ -804,6 +929,16 @@ impl SequenceState {
                          {prefix}. A source at another prefix is not a completed restoration",
                         r.kind,
                         r.method.completed_prefix()
+                    ),
+                });
+            }
+            if Some(r.lineage) != target_lineage {
+                return Err(Error::InvalidRequest {
+                    field: "restores",
+                    detail: format!(
+                        "{:?} evidence describes a different version of prefix {prefix}: \
+                         those positions have been replaced since it was minted",
+                        r.kind
                     ),
                 });
             }
@@ -925,17 +1060,24 @@ mod tests {
     }
 
     /// Snapshot evidence for every `Explicit` component, finishing at `prefix`.
-    fn snapshots_at(s: &SequenceState, prefix: u64) -> Vec<Restore> {
+    fn snapshots_at(s: &SequenceState, branch: BranchId, prefix: u64) -> Vec<Restore> {
         s.schema()
             .iter()
             .filter(|k| k.restore_capability() == RestoreCapability::Explicit)
-            .map(|k| Restore {
-                kind: *k,
-                sequence: s.id(),
-                generation: s.generation(),
-                method: RestoreMethod::Snapshot { of_prefix: prefix },
+            .map(|k| {
+                s.restore_evidence(*k, branch, RestoreMethod::Snapshot { of_prefix: prefix })
+                    .expect("evidence for a schema component at an occupied prefix")
             })
             .collect()
+    }
+
+    /// A full-schema state advanced to `accepted`/`executed` of 8.
+    fn advanced_full_schema() -> SequenceState {
+        let mut s = full_schema();
+        s.append_prompt(ROOT, 4).unwrap();
+        s.accept(ROOT, 4).unwrap();
+        s.execute(ROOT, 8).unwrap();
+        s
     }
 
     #[test]
@@ -1232,17 +1374,14 @@ mod tests {
         assert_eq!(e.kind(), "invalid_request");
 
         // A replay that ran to the target restores it.
-        s.rollback_to(
-            ROOT,
-            10,
-            &[Restore {
-                kind: StateKind::RecurrentAccumulator,
-                sequence: s.id(),
-                generation: s.generation(),
-                method: RestoreMethod::Replay { from: 8, to: 10 },
-            }],
-        )
-        .unwrap();
+        let e = s
+            .restore_evidence(
+                StateKind::RecurrentAccumulator,
+                ROOT,
+                RestoreMethod::Replay { from: 8, to: 10 },
+            )
+            .unwrap();
+        s.rollback_to(ROOT, 10, &[e]).unwrap();
         assert_eq!(s.frontiers(ROOT).unwrap().accepted, 10);
     }
 
@@ -1256,12 +1395,13 @@ mod tests {
         s.accept(ROOT, 8).unwrap();
         s.execute(ROOT, 10).unwrap();
 
-        let early = Restore {
-            kind: StateKind::RecurrentAccumulator,
-            sequence: s.id(),
-            generation: s.generation(),
-            method: RestoreMethod::Snapshot { of_prefix: 4 },
-        };
+        let early = s
+            .restore_evidence(
+                StateKind::RecurrentAccumulator,
+                ROOT,
+                RestoreMethod::Snapshot { of_prefix: 4 },
+            )
+            .unwrap();
         let e = s.rollback_to(ROOT, 6, &[early]).unwrap_err();
         assert!(e.to_string().contains("finished at prefix 4"), "{e}");
         assert_eq!(
@@ -1272,10 +1412,13 @@ mod tests {
 
         // A replay whose source is earlier but which ran *to* the target is
         // exactly what the earlier snapshot was missing.
-        let replayed = Restore {
-            method: RestoreMethod::Replay { from: 4, to: 6 },
-            ..early
-        };
+        let replayed = s
+            .restore_evidence(
+                StateKind::RecurrentAccumulator,
+                ROOT,
+                RestoreMethod::Replay { from: 4, to: 6 },
+            )
+            .unwrap();
         s.rollback_to(ROOT, 6, &[replayed]).unwrap();
         assert_eq!(s.frontiers(ROOT).unwrap().executed, 6);
 
@@ -1285,17 +1428,13 @@ mod tests {
         t.accept(ROOT, 8).unwrap();
         t.execute(ROOT, 10).unwrap();
         assert!(
-            t.rollback_to(
+            t.restore_evidence(
+                StateKind::RecurrentAccumulator,
                 ROOT,
-                6,
-                &[Restore {
-                    kind: StateKind::RecurrentAccumulator,
-                    sequence: t.id(),
-                    generation: t.generation(),
-                    method: RestoreMethod::Replay { from: 9, to: 6 },
-                }]
+                RestoreMethod::Replay { from: 9, to: 6 },
             )
-            .is_err()
+            .is_err(),
+            "a backwards replay is incoherent and cannot even be minted"
         );
     }
 
@@ -1306,81 +1445,192 @@ mod tests {
         s.accept(ROOT, 6).unwrap();
         s.execute(ROOT, 8).unwrap();
 
-        let other = SequenceState::new([StateKind::RecurrentAccumulator]);
-        let good = Restore {
-            kind: StateKind::RecurrentAccumulator,
-            sequence: s.id(),
-            generation: s.generation(),
-            method: RestoreMethod::Snapshot { of_prefix: 6 },
-        };
+        let method = RestoreMethod::Snapshot { of_prefix: 6 };
+        let good = s
+            .restore_evidence(StateKind::RecurrentAccumulator, ROOT, method)
+            .unwrap();
 
+        // Evidence minted by a different sequence, at the same prefix.
+        let mut other = SequenceState::new([StateKind::RecurrentAccumulator]);
+        other.append_prompt(ROOT, 2).unwrap();
+        other.accept(ROOT, 6).unwrap();
+        other.execute(ROOT, 8).unwrap();
+        let foreign = other
+            .restore_evidence(StateKind::RecurrentAccumulator, ROOT, method)
+            .unwrap();
+        assert_ne!(s.id(), other.id());
         assert!(
-            s.rollback_to(
-                ROOT,
-                6,
-                &[Restore {
-                    sequence: other.id(),
-                    ..good
-                }]
-            )
-            .is_err(),
+            s.rollback_to(ROOT, 6, &[foreign]).is_err(),
             "evidence from another sequence is not evidence about this one"
         );
+
+        // Evidence minted before a configuration change is stale after it.
+        let mut stale_holder = SequenceState::new([StateKind::RecurrentAccumulator]);
+        stale_holder.append_prompt(ROOT, 2).unwrap();
+        stale_holder.accept(ROOT, 6).unwrap();
+        stale_holder.execute(ROOT, 8).unwrap();
+        let before = stale_holder
+            .restore_evidence(StateKind::RecurrentAccumulator, ROOT, method)
+            .unwrap();
+        stale_holder.invalidate_generation();
         assert!(
-            s.rollback_to(
-                ROOT,
-                6,
-                &[Restore {
-                    generation: StateGeneration(99),
-                    ..good
-                }]
-            )
-            .is_err(),
+            stale_holder.rollback_to(ROOT, 6, &[before]).is_err(),
             "a snapshot from a different configuration is stale"
         );
+
         s.rollback_to(ROOT, 6, &[good]).unwrap();
     }
 
     #[test]
     fn every_explicit_kind_in_the_schema_must_be_covered_exactly_once() {
-        let mut s = full_schema();
-        s.append_prompt(ROOT, 4).unwrap();
-        s.execute(ROOT, 4).unwrap();
-        s.accept(ROOT, 4).unwrap();
-        s.execute(ROOT, 4).unwrap();
-
-        let full = snapshots_at(&s, 4);
+        // Each case builds its own state: `SequenceState` is not `Clone`, and
+        // copying one for test convenience is what defeated identity before.
+        let base = advanced_full_schema();
+        let full = snapshots_at(&base, ROOT, 8);
         assert_eq!(full.len(), 5, "five explicit kinds in the full schema");
 
         // Drop one at a time: each omission must be refused by name.
         for i in 0..full.len() {
-            let mut partial = full.clone();
+            let mut s = advanced_full_schema();
+            let mut partial = snapshots_at(&s, ROOT, 8);
             let missing = partial.remove(i);
-            let mut s2 = s.clone();
-            let e = s2.rollback_to(ROOT, 4, &partial).unwrap_err();
+            let e = s.rollback_to(ROOT, 8, &partial).unwrap_err();
             assert!(
-                e.to_string().contains(&format!("{:?}", missing.kind)),
+                e.to_string().contains(&format!("{:?}", missing.kind())),
                 "omitting {:?} was not reported: {e}",
-                missing.kind
+                missing.kind()
             );
         }
 
-        // A duplicate, and evidence for a component that truncates, are both
-        // signs the caller does not know what it restored.
-        let mut duplicated = full.clone();
-        duplicated.push(full[0]);
-        assert!(s.clone().rollback_to(ROOT, 4, &duplicated).is_err());
+        // A duplicate is a sign the caller does not know what it restored.
+        let mut s = advanced_full_schema();
+        let mut duplicated = snapshots_at(&s, ROOT, 8);
+        duplicated.push(duplicated[0]);
+        assert!(s.rollback_to(ROOT, 8, &duplicated).is_err());
 
-        let mut with_truncatable = full.clone();
-        with_truncatable.push(Restore {
-            kind: StateKind::KvPages,
-            sequence: s.id(),
-            generation: s.generation(),
-            method: RestoreMethod::Snapshot { of_prefix: 4 },
-        });
-        assert!(s.clone().rollback_to(ROOT, 4, &with_truncatable).is_err());
+        // Evidence for a truncatable component cannot even be minted.
+        let s = advanced_full_schema();
+        assert!(
+            s.restore_evidence(
+                StateKind::KvPages,
+                ROOT,
+                RestoreMethod::Snapshot { of_prefix: 8 }
+            )
+            .is_err()
+        );
 
-        s.rollback_to(ROOT, 4, &full).unwrap();
+        let mut s = advanced_full_schema();
+        let full = snapshots_at(&s, ROOT, 8);
+        s.rollback_to(ROOT, 8, &full).unwrap();
+    }
+
+    #[test]
+    fn restore_evidence_from_another_branch_is_refused() {
+        // Third review, reproduced: root-branch snapshot evidence satisfied a
+        // rollback on a child branch, because branch identity was absent.
+        // Sequence, generation and prefix length were all equal.
+        let mut s = SequenceState::new([StateKind::RecurrentAccumulator]);
+        s.append_prompt(ROOT, 4).unwrap();
+        s.accept(ROOT, 4).unwrap();
+        s.execute(ROOT, 8).unwrap();
+
+        let from_root = s
+            .restore_evidence(
+                StateKind::RecurrentAccumulator,
+                ROOT,
+                RestoreMethod::Snapshot { of_prefix: 6 },
+            )
+            .unwrap();
+
+        let child = s.fork(ROOT, 8).unwrap();
+        s.accept(child, 2).unwrap();
+        s.execute(child, 2).unwrap();
+
+        let e = s.rollback_to(child, 6, &[from_root]).unwrap_err();
+        assert!(e.to_string().contains("minted on"), "{e}");
+        assert_eq!(
+            s.frontiers(child).unwrap().executed,
+            10,
+            "a refused rollback changes nothing"
+        );
+
+        // The child's own evidence works, so the rule is about identity rather
+        // than about forks being unrollbackable.
+        let own = s
+            .restore_evidence(
+                StateKind::RecurrentAccumulator,
+                child,
+                RestoreMethod::Snapshot { of_prefix: 6 },
+            )
+            .unwrap();
+        s.rollback_to(child, 6, &[own]).unwrap();
+        assert_eq!(s.frontiers(child).unwrap().executed, 6);
+    }
+
+    #[test]
+    fn restore_evidence_for_a_replaced_suffix_is_refused() {
+        // Third review, reproduced: evidence was reused after rolling back and
+        // replacing the very suffix it described. Same sequence, same branch,
+        // same generation, same prefix length.
+        let mut s = SequenceState::new([StateKind::RecurrentAccumulator]);
+        s.append_prompt(ROOT, 4).unwrap();
+        s.accept(ROOT, 6).unwrap();
+        s.execute(ROOT, 10).unwrap();
+
+        let stale = s
+            .restore_evidence(
+                StateKind::RecurrentAccumulator,
+                ROOT,
+                RestoreMethod::Replay { from: 6, to: 10 },
+            )
+            .unwrap();
+
+        // Replace positions 8 and 9 with different tokens.
+        let to_eight = s
+            .restore_evidence(
+                StateKind::RecurrentAccumulator,
+                ROOT,
+                RestoreMethod::Snapshot { of_prefix: 8 },
+            )
+            .unwrap();
+        s.rollback_to(ROOT, 8, &[to_eight]).unwrap();
+        s.accept(ROOT, 2).unwrap();
+        s.execute(ROOT, 2).unwrap();
+        assert_eq!(s.frontiers(ROOT).unwrap().executed, 10);
+
+        let e = s.rollback_to(ROOT, 10, &[stale]).unwrap_err();
+        assert!(e.to_string().contains("different version"), "{e}");
+
+        // Freshly minted evidence for the prefix that now exists is accepted.
+        let current = s
+            .restore_evidence(
+                StateKind::RecurrentAccumulator,
+                ROOT,
+                RestoreMethod::Replay { from: 8, to: 10 },
+            )
+            .unwrap();
+        s.rollback_to(ROOT, 10, &[current]).unwrap();
+    }
+
+    #[test]
+    fn evidence_survives_a_rollback_that_does_not_touch_its_prefix() {
+        // The positive half: minting evidence, then rolling back *to* that
+        // prefix, must work. Positions at or before the target keep their
+        // lineage, so a legitimate flow -- snapshot, then abort back to it --
+        // is not caught by the replacement rule.
+        let mut s = SequenceState::new([StateKind::RecurrentAccumulator]);
+        s.append_prompt(ROOT, 2).unwrap();
+        s.accept(ROOT, 8).unwrap();
+        s.execute(ROOT, 10).unwrap();
+        let e = s
+            .restore_evidence(
+                StateKind::RecurrentAccumulator,
+                ROOT,
+                RestoreMethod::Snapshot { of_prefix: 6 },
+            )
+            .unwrap();
+        s.rollback_to(ROOT, 6, &[e]).unwrap();
+        assert_eq!(s.frontiers(ROOT).unwrap().executed, 6);
     }
 
     #[test]
@@ -1389,13 +1639,16 @@ mod tests {
         s.append_prompt(ROOT, 2).unwrap();
         s.accept(ROOT, 4).unwrap();
         s.execute(ROOT, 6).unwrap();
-        let foreign = Restore {
-            kind: StateKind::ConvolutionHistory,
-            sequence: s.id(),
-            generation: s.generation(),
-            method: RestoreMethod::Snapshot { of_prefix: 4 },
-        };
-        assert!(s.rollback_to(ROOT, 4, &[foreign]).is_err());
+        assert!(
+            s.restore_evidence(
+                StateKind::ConvolutionHistory,
+                ROOT,
+                RestoreMethod::Snapshot { of_prefix: 4 }
+            )
+            .is_err(),
+            "a component outside the schema has no state to restore"
+        );
+        let _ = &mut s;
     }
 
     #[test]
@@ -1450,17 +1703,14 @@ mod tests {
         s.append_prompt(ROOT, 4).unwrap();
         s.accept(ROOT, 8).unwrap();
         s.execute(ROOT, 12).unwrap();
-        s.rollback_to(
-            ROOT,
-            10,
-            &[Restore {
-                kind: StateKind::RecurrentAccumulator,
-                sequence: s.id(),
-                generation: s.generation(),
-                method: RestoreMethod::Replay { from: 8, to: 10 },
-            }],
-        )
-        .unwrap();
+        let e = s
+            .restore_evidence(
+                StateKind::RecurrentAccumulator,
+                ROOT,
+                RestoreMethod::Replay { from: 8, to: 10 },
+            )
+            .unwrap();
+        s.rollback_to(ROOT, 10, &[e]).unwrap();
         assert_eq!(s.frontiers(ROOT).unwrap().executed, 10);
     }
 

@@ -30,7 +30,7 @@
 //! writable directory, and none of that belongs in a check that has to run
 //! offline on an untrusted tree. Nothing here executes a build script.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Stable rule identifiers. A fixture names the rule it must trigger, and the
@@ -144,8 +144,11 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                     "moxie-cuda",
                     "moxie-kernels",
                 ],
-                // Manifest parsing for this checker. Nothing else.
-                third_party: &["toml"],
+                // What this checker needs to read manifests and to parse model
+                // source structurally: `toml`, and `syn` with the two crates it
+                // is built on. Nothing else, and none of them is reachable from
+                // a production crate. See ADR 0004.
+                third_party: &["toml", "syn", "quote", "proc-macro2"],
             },
         ),
     ])
@@ -167,14 +170,15 @@ const MODEL_ALLOWED_THIRD_PARTY: &[&str] = &[];
 /// Crate-name prefixes that identify a concrete model adapter.
 const MODEL_PREFIX: &str = "moxie-models-";
 
-/// Module paths a model crate may not bring into scope.
+/// Module paths a model crate may not reach.
 ///
-/// Matched **structurally**, against the fully-qualified paths a `use`
-/// declaration actually introduces, not as substrings. The second M0 review
-/// showed why: `use std::{fs};` followed by `fs::read(p)` contains the text
-/// `std::fs` nowhere, and a model crate written that way passed with zero
-/// violations. Grouped trees, renames and globs all reduce to paths here, so
-/// each of those spellings lands on the same rule.
+/// Matched **structurally**, against paths recovered from the parsed source:
+/// the fully-qualified names a `use` declaration introduces, and every
+/// `a::b`-shaped path in the token stream. Never against text. Two M0 reviews
+/// showed why -- `use std::{fs};` followed by `fs::read(p)` contains the string
+/// `std::fs` nowhere, and `use std::{ /* comment */ fs };` defeats a hand-
+/// written parser that works on characters. Groups, renames, globs, comments and
+/// inline calls all reduce to the same path here.
 ///
 /// A prefix matches itself and everything under it: `std::fs` catches
 /// `std::fs::read`, and a glob at or above it (`use std::*`) catches it too.
@@ -190,25 +194,6 @@ const MODEL_FORBIDDEN_PATHS: &[(&str, &str)] = &[
     ("memmap", "memory mapping in a model crate"),
     ("memmap2", "memory mapping in a model crate"),
     ("libc", "raw platform bindings in a model crate"),
-];
-
-/// Raw text that must not appear in a model crate's production source.
-///
-/// The residue that is not a path: an `extern "C"` block is a token sequence,
-/// and a fully-qualified call written inline (`std::fs::read(p)`) is a path
-/// expression rather than an import. Needles are lowercase; the haystack is
-/// lowercased before matching.
-///
-/// This list is deliberately **not** the place to grow: a new *import* rule goes
-/// in `MODEL_FORBIDDEN_PATHS`, where spelling variants are handled once.
-const MODEL_FORBIDDEN_TOKENS: &[(&str, &str)] = &[
-    ("extern \"c\"", "FFI declaration in a model crate"),
-    ("cuda", "CUDA reference in a model crate"),
-    ("std::fs", "direct file I/O in a model crate"),
-    ("std::thread", "thread management in a model crate"),
-    ("std::process", "process control in a model crate"),
-    ("std::net", "network access in a model crate"),
-    ("memmap", "memory mapping in a model crate"),
 ];
 
 /// Directory names that hold dev-only code, which document 02 exempts: "Test
@@ -546,6 +531,26 @@ fn build_scripts(doc: &toml::Value, manifest_dir: &Path) -> Vec<String> {
     }
 }
 
+// --- production source discovery and structural analysis ---------------------
+//
+// The third M0 review compiled two model crates that this checker accepted:
+//
+//     use std::{ /* checkpoint files */ fs };   // comment retained in the path
+//     #[path = "../tests/reader.rs"] pub mod reader;   // module outside any target dir
+//
+// Both are ordinary Rust. The first defeated a hand-written import parser that
+// scanned text; the second defeated a directory walk that decided what was
+// production by directory *name*. Neither is the documented re-export
+// limitation, and neither is fixable by another special case.
+//
+// So imports and module declarations are now parsed with `syn`, and production
+// sources are found by following module declarations from the crate's Cargo
+// targets. Comments and string literals cannot survive tokenisation, so that
+// whole class of evasion is gone rather than patched. See ADR 0004.
+
+use proc_macro2::{TokenStream, TokenTree};
+use quote::ToTokens;
+
 /// Paths the manifest declares as **production** targets.
 ///
 /// `[lib]`, `[[bin]]` and `[[example]]` are production; `[[test]]` and
@@ -572,28 +577,315 @@ fn declared_target_paths(doc: &toml::Value, manifest_dir: &Path) -> Vec<PathBuf>
     out
 }
 
-/// Production Rust sources of one crate.
+/// The crate roots to start module traversal from.
 ///
-/// Everything under the crate directory except build output and the dev-only
-/// trees document 02 exempts, **plus** every path the manifest declares as a
-/// production target.
-///
-/// The exemption is withdrawn from a dev-named directory that actually holds a
-/// declared production target. The second M0 review compiled a model crate whose
-/// entire library was `[lib] path = "tests/production.rs"`; that file contained
-/// `std::fs::read`, and the checker skipped the directory by name and reported
-/// no violations. A directory is dev-only because of its role, not its spelling.
-fn production_sources(doc: &toml::Value, manifest_dir: &Path) -> Vec<PathBuf> {
-    let declared = declared_target_paths(doc, manifest_dir);
+/// Declared targets when the manifest names any, plus Cargo's default layout.
+/// Both, not either: a manifest may declare `[[bin]]` explicitly and still have
+/// an implicit `src/lib.rs`.
+fn crate_roots(doc: &toml::Value, manifest_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = declared_target_paths(doc, manifest_dir);
+    for default in ["src/lib.rs", "src/main.rs"] {
+        let p = manifest_dir.join(default);
+        if p.is_file() {
+            roots.push(p);
+        }
+    }
+    for dir in ["src/bin", "examples"] {
+        if let Ok(rd) = std::fs::read_dir(manifest_dir.join(dir)) {
+            for e in rd.filter_map(|e| e.ok()) {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "rs") {
+                    roots.push(p);
+                }
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
 
-    // Which of the dev-named directories are genuinely dev-only here.
+/// Where the child modules of `file` live.
+///
+/// A crate root and a `mod.rs` put their children beside them; any other module
+/// file puts them in a directory named after it. Getting this wrong is how a
+/// traversal silently stops one level down.
+fn children_dir(file: &Path, is_crate_root: bool) -> PathBuf {
+    let parent = file.parent().unwrap_or(Path::new(".")).to_path_buf();
+    if is_crate_root {
+        return parent;
+    }
+    match file.file_stem().and_then(|s| s.to_str()) {
+        Some("mod") => parent,
+        Some(stem) => parent.join(stem),
+        None => parent,
+    }
+}
+
+/// Whether an item is gated to test builds.
+///
+/// Document 02 permits a test harness. Reading it from the parsed attribute
+/// replaces a hand-written brace matcher that had to skip comments, strings and
+/// char literals to find where the attributed item ended.
+fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|a| {
+        a.path().is_ident("cfg")
+            && match &a.meta {
+                syn::Meta::List(l) => l
+                    .tokens
+                    .clone()
+                    .into_iter()
+                    .any(|t| matches!(&t, TokenTree::Ident(i) if i == "test")),
+                _ => false,
+            }
+    })
+}
+
+/// The `#[path = "..."]` override on a module declaration, if present.
+fn path_attribute(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|a| {
+        if !a.path().is_ident("path") {
+            return None;
+        }
+        match &a.meta {
+            syn::Meta::NameValue(nv) => match &nv.value {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(s),
+                    ..
+                }) => Some(s.value()),
+                _ => None,
+            },
+            _ => None,
+        }
+    })
+}
+
+/// What one parsed source file contains that the ownership rules care about.
+#[derive(Debug, Default)]
+struct SourceFacts {
+    /// Fully-qualified paths brought into scope by `use`, with a glob written
+    /// as `prefix::*`.
+    imports: Vec<String>,
+    /// Every `a::b`-shaped path mentioned anywhere in non-test items, from the
+    /// token stream. This is what catches `std::fs::read(p)` written inline with
+    /// no import, and it cannot be fooled by a comment because comments are not
+    /// tokens.
+    mentions: Vec<String>,
+    /// `extern "C"` blocks.
+    foreign_blocks: usize,
+    /// Source pulled in by `include!`, which is code outside the module tree.
+    source_includes: Vec<String>,
+    /// Child module files this file declares.
+    children: Vec<PathBuf>,
+    /// Module declarations that could not be resolved to a file.
+    unresolved: Vec<String>,
+}
+
+/// Parse one file and collect its facts.
+fn analyse_source(file: &Path, is_crate_root: bool) -> Result<SourceFacts, String> {
+    let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let parsed = syn::parse_file(&text).map_err(|e| {
+        format!(
+            "{}: cannot parse as Rust ({e}); a model crate whose source does not parse \
+             cannot be checked",
+            file.display()
+        )
+    })?;
+    let dir = children_dir(file, is_crate_root);
+    let mut facts = SourceFacts::default();
+    walk_items(&parsed.items, &dir, &mut facts);
+    Ok(facts)
+}
+
+fn walk_items(items: &[syn::Item], dir: &Path, facts: &mut SourceFacts) {
+    for item in items {
+        match item {
+            syn::Item::Use(u) => {
+                if is_cfg_test(&u.attrs) {
+                    continue;
+                }
+                flatten_use_tree("", &u.tree, &mut facts.imports);
+                collect_mentions(u.to_token_stream(), &mut facts.mentions);
+            }
+            syn::Item::Mod(m) => {
+                if is_cfg_test(&m.attrs) {
+                    continue;
+                }
+                let over = path_attribute(&m.attrs);
+                match &m.content {
+                    // Inline module: its children live one level down, unless a
+                    // `#[path]` names the directory for them.
+                    Some((_, inner)) => {
+                        let inner_dir = match &over {
+                            Some(p) => dir.join(p),
+                            None => dir.join(m.ident.to_string()),
+                        };
+                        walk_items(inner, &inner_dir, facts);
+                    }
+                    // Declaration: resolve it to a file.
+                    None => match resolve_module(dir, &m.ident.to_string(), over.as_deref()) {
+                        Some(p) => facts.children.push(p),
+                        None => facts.unresolved.push(format!(
+                            "`mod {};` in {} resolves to no file",
+                            m.ident,
+                            dir.display()
+                        )),
+                    },
+                }
+            }
+            syn::Item::ForeignMod(f) => {
+                if is_cfg_test(&f.attrs) {
+                    continue;
+                }
+                facts.foreign_blocks += 1;
+            }
+            syn::Item::Macro(mac) => {
+                if is_cfg_test(&mac.attrs) {
+                    continue;
+                }
+                if mac.mac.path.is_ident("include") {
+                    facts
+                        .source_includes
+                        .push(mac.mac.tokens.to_string().trim().to_string());
+                }
+                collect_mentions(mac.to_token_stream(), &mut facts.mentions);
+            }
+            other => collect_mentions(other.to_token_stream(), &mut facts.mentions),
+        }
+    }
+}
+
+/// Resolve `mod name;` to the file Cargo would compile.
+fn resolve_module(dir: &Path, name: &str, path_attr: Option<&str>) -> Option<PathBuf> {
+    let candidates = match path_attr {
+        Some(p) => vec![dir.join(p)],
+        None => vec![
+            dir.join(format!("{name}.rs")),
+            dir.join(name).join("mod.rs"),
+        ],
+    };
+    candidates.into_iter().find(|c| c.is_file())
+}
+
+/// Flatten one `use` tree onto `prefix`.
+///
+/// Operating on the parsed tree rather than on text is the whole point: a
+/// comment inside the braces, a rename, a nested group and a glob are all
+/// distinct AST shapes here, and none of them can leak characters into a path.
+fn flatten_use_tree(prefix: &str, tree: &syn::UseTree, out: &mut Vec<String>) {
+    match tree {
+        syn::UseTree::Path(p) => {
+            flatten_use_tree(&join_path(prefix, &p.ident.to_string()), &p.tree, out)
+        }
+        syn::UseTree::Name(n) => out.push(join_path(prefix, &n.ident.to_string())),
+        // A rename imports the original item; the local name is irrelevant here.
+        syn::UseTree::Rename(r) => out.push(join_path(prefix, &r.ident.to_string())),
+        syn::UseTree::Glob(_) => out.push(join_path(prefix, "*")),
+        syn::UseTree::Group(g) => {
+            for t in &g.items {
+                flatten_use_tree(prefix, t, out);
+            }
+        }
+    }
+}
+
+fn join_path(prefix: &str, tail: &str) -> String {
+    if prefix.is_empty() {
+        tail.to_string()
+    } else {
+        format!("{prefix}::{tail}")
+    }
+}
+
+/// Every `a::b`-shaped path in a token stream.
+///
+/// Walks tokens, so a path inside a comment does not exist and a path inside a
+/// string literal is a `Literal`, not a sequence of idents. Both were false
+/// positives or false negatives for a text scan, depending on which way it erred.
+fn collect_mentions(ts: TokenStream, out: &mut Vec<String>) {
+    let tokens: Vec<TokenTree> = ts.into_iter().collect();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if let TokenTree::Group(g) = &tokens[i] {
+            collect_mentions(g.stream(), out);
+            i += 1;
+            continue;
+        }
+        let TokenTree::Ident(first) = &tokens[i] else {
+            i += 1;
+            continue;
+        };
+        // `ident (:: ident)+`
+        let mut path = first.to_string();
+        let mut j = i + 1;
+        let mut segments = 1;
+        while j + 2 < tokens.len() + 1 {
+            let is_colon2 = matches!((tokens.get(j), tokens.get(j + 1)),
+                (Some(TokenTree::Punct(a)), Some(TokenTree::Punct(b)))
+                    if a.as_char() == ':' && b.as_char() == ':');
+            if !is_colon2 {
+                break;
+            }
+            match tokens.get(j + 2) {
+                Some(TokenTree::Ident(next)) => {
+                    path.push_str("::");
+                    path.push_str(&next.to_string());
+                    segments += 1;
+                    j += 3;
+                }
+                _ => break,
+            }
+        }
+        if segments > 1 {
+            out.push(path);
+        }
+        i = j.max(i + 1);
+    }
+}
+
+/// Production Rust sources of one crate, and any problem found finding them.
+///
+/// Three sources, unioned:
+///
+/// * every module reachable from a Cargo production target, followed through
+///   `mod` declarations including `#[path]` overrides -- this is what makes a
+///   file production, regardless of which directory it sits in;
+/// * the crate roots themselves;
+/// * a walk of the crate directory excluding build output and the dev-only
+///   trees, which keeps unreachable stray files in scope.
+///
+/// The dev exemption is by *role*: a `tests` directory holding a declared target
+/// or a reachable module is production and is scanned.
+fn production_sources(doc: &toml::Value, manifest_dir: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    let roots = crate_roots(doc, manifest_dir);
+    let mut problems = Vec::new();
+    let mut reachable: BTreeSet<PathBuf> = BTreeSet::new();
+
+    let mut queue: Vec<(PathBuf, bool)> = roots.iter().map(|r| (r.clone(), true)).collect();
+    while let Some((file, is_root)) = queue.pop() {
+        if !file.is_file() || !reachable.insert(file.clone()) {
+            continue;
+        }
+        match analyse_source(&file, is_root) {
+            Ok(facts) => {
+                problems.extend(facts.unresolved);
+                for c in facts.children {
+                    queue.push((c, false));
+                }
+            }
+            Err(e) => problems.push(e),
+        }
+    }
+
+    // The directory walk, with the exemption withdrawn from any dev-named
+    // directory that actually holds production code.
     let exempt: Vec<PathBuf> = DEV_ONLY_DIRS
         .iter()
         .map(|d| manifest_dir.join(d))
-        .filter(|dir| !declared.iter().any(|p| p.starts_with(dir)))
+        .filter(|dir| !reachable.iter().any(|p| p.starts_with(dir)))
         .collect();
 
-    let mut out: Vec<PathBuf> = Vec::new();
+    let mut out: BTreeSet<PathBuf> = reachable;
     let mut stack = vec![manifest_dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else {
@@ -609,190 +901,11 @@ fn production_sources(doc: &toml::Value, manifest_dir: &Path) -> Vec<PathBuf> {
                 }
                 stack.push(p);
             } else if p.extension().is_some_and(|x| x == "rs") {
-                out.push(p);
+                out.insert(p);
             }
         }
     }
-    // A declared target may sit outside the crate directory entirely.
-    for p in declared {
-        if p.extension().is_some_and(|x| x == "rs") {
-            out.push(p);
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// Every fully-qualified path a source file's `use` declarations bring into
-/// scope.
-///
-/// A focused parser for one construct, not a general Rust parser and not an
-/// extension of the substring net. `use` has a small, regular grammar --
-/// nested groups, renames, globs, leading `::`, `crate`/`self`/`super` -- and
-/// flattening it is what turns every spelling of the same import into the same
-/// string. `use std::{fs};`, `use std::fs as f;` and `use std::fs::read;` all
-/// yield a path under `std::fs`; a substring search sees three different files.
-///
-/// A glob is reported as `prefix::*`, so a rule can decide whether the glob
-/// covers it.
-fn use_paths(src: &str) -> Vec<String> {
-    let bytes = src.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        // Skip anything a `use` keyword could hide inside.
-        if let Some(next) = skip_trivia(bytes, i) {
-            i = next;
-            continue;
-        }
-        if bytes[i..].starts_with(b"use") && is_word_boundary(bytes, i, 3) {
-            let start = i + 3;
-            if let Some(end) = find_statement_end(bytes, start) {
-                let tree = &src[start..end];
-                expand_use_tree("", tree, &mut out);
-                i = end + 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// From `i`, skip a comment or a string/char literal; `None` if there is none.
-fn skip_trivia(b: &[u8], i: usize) -> Option<usize> {
-    match b[i] {
-        b'/' if b.get(i + 1) == Some(&b'/') => {
-            let mut j = i;
-            while j < b.len() && b[j] != b'\n' {
-                j += 1;
-            }
-            Some(j)
-        }
-        b'/' if b.get(i + 1) == Some(&b'*') => {
-            let mut j = i + 2;
-            while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
-                j += 1;
-            }
-            Some((j + 2).min(b.len()))
-        }
-        b'"' => {
-            let mut j = i + 1;
-            while j < b.len() && b[j] != b'"' {
-                if b[j] == b'\\' {
-                    j += 1;
-                }
-                j += 1;
-            }
-            Some((j + 1).min(b.len()))
-        }
-        _ => None,
-    }
-}
-
-/// Whether `b[i..i+len]` is a whole word.
-fn is_word_boundary(b: &[u8], i: usize, len: usize) -> bool {
-    let before_ok = i == 0 || !is_ident_byte(b[i - 1]);
-    let after_ok = b.get(i + len).is_none_or(|c| !is_ident_byte(*c));
-    before_ok && after_ok
-}
-
-fn is_ident_byte(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_'
-}
-
-/// The index of the `;` that ends a `use` statement, tracking brace depth.
-fn find_statement_end(b: &[u8], start: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut i = start;
-    while i < b.len() {
-        match b[i] {
-            b'{' => depth += 1,
-            b'}' => depth = depth.saturating_sub(1),
-            b';' if depth == 0 => return Some(i),
-            // A `use` statement contains no other statement, so anything that
-            // looks like a block boundary means the scan lost its place.
-            b'\n' if i > start + 4096 => return None,
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Flatten one use-tree onto `prefix`.
-fn expand_use_tree(prefix: &str, tree: &str, out: &mut Vec<String>) {
-    let tree = tree.trim();
-    if tree.is_empty() {
-        return;
-    }
-    if let Some(inner) = tree.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
-        for part in split_top_level(inner) {
-            expand_use_tree(prefix, &part, out);
-        }
-        return;
-    }
-    if let Some(brace) = find_top_level_brace(tree) {
-        let head = tree[..brace].trim().trim_end_matches(':');
-        let body = tree[brace..].trim();
-        expand_use_tree(&join_path(prefix, head), body, out);
-        return;
-    }
-    // A leaf. Drop any rename: `foo as bar` imports `foo`.
-    let leaf = match tree.split(" as ").next() {
-        Some(l) => l.trim(),
-        None => tree,
-    };
-    let path = join_path(prefix, leaf);
-    if !path.is_empty() {
-        out.push(path);
-    }
-}
-
-fn join_path(prefix: &str, tail: &str) -> String {
-    let tail = tail.trim().trim_start_matches("::");
-    if tail.is_empty() {
-        return prefix.to_string();
-    }
-    if prefix.is_empty() {
-        tail.to_string()
-    } else {
-        format!("{prefix}::{tail}")
-    }
-}
-
-fn find_top_level_brace(s: &str) -> Option<usize> {
-    s.find('{')
-}
-
-/// Split on commas that are not inside a nested group.
-fn split_top_level(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut depth = 0usize;
-    let mut current = String::new();
-    for ch in s.chars() {
-        match ch {
-            '{' => {
-                depth += 1;
-                current.push(ch);
-            }
-            '}' => {
-                depth = depth.saturating_sub(1);
-                current.push(ch);
-            }
-            ',' if depth == 0 => {
-                out.push(core::mem::take(&mut current));
-            }
-            _ => current.push(ch),
-        }
-    }
-    if !current.trim().is_empty() {
-        out.push(current);
-    }
-    out
+    (out.into_iter().collect(), problems)
 }
 
 /// Whether an imported `path` reaches `needle`.
@@ -923,37 +1036,75 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
 
         // Rule 4: forbidden constructs in a model crate's production source.
         //
-        // Two layers. Imports are classified structurally, so every spelling of
-        // the same import lands on one rule. The token layer catches the residue
-        // that is not an import: an `extern "C"` block, and a fully-qualified
-        // call written inline without a `use`.
+        // Structural throughout. Imports come from parsed `use` trees, inline
+        // paths from the token stream, `extern "C"` from a foreign-module item,
+        // and the files to look at from following `mod` declarations out of the
+        // Cargo targets. A comment or a string cannot influence any of them.
         if is_model {
-            for file in production_sources(&doc, dir) {
-                let body = std::fs::read_to_string(&file).unwrap_or_default();
-                // Strip test modules: dev-time harness use is permitted.
-                let body = strip_cfg_test(&body);
-
-                for path in use_paths(&body) {
-                    for (needle, why) in MODEL_FORBIDDEN_PATHS {
-                        if path_reaches(&path, needle) {
-                            out.push(Violation {
-                                crate_name: name.clone(),
-                                rule: rule::MODEL_FORBIDDEN_SOURCE,
-                                detail: format!("{}: imports `{path}`: {why}", file.display()),
-                            });
-                        }
-                    }
-                }
-
-                let lower = body.to_lowercase();
-                for (needle, why) in MODEL_FORBIDDEN_TOKENS {
-                    if lower.contains(needle) {
+            let (files, problems) = production_sources(&doc, dir);
+            for detail in problems {
+                // Fail closed: source that cannot be found or parsed cannot be
+                // cleared.
+                out.push(Violation {
+                    crate_name: name.clone(),
+                    rule: rule::MODEL_FORBIDDEN_SOURCE,
+                    detail,
+                });
+            }
+            for file in files {
+                let facts = match analyse_source(&file, true) {
+                    Ok(f) => f,
+                    Err(e) => {
                         out.push(Violation {
                             crate_name: name.clone(),
                             rule: rule::MODEL_FORBIDDEN_SOURCE,
-                            detail: format!("{}: {why}", file.display()),
+                            detail: e,
                         });
+                        continue;
                     }
+                };
+                let mut report = |detail: String| {
+                    out.push(Violation {
+                        crate_name: name.clone(),
+                        rule: rule::MODEL_FORBIDDEN_SOURCE,
+                        detail,
+                    });
+                };
+
+                for (needle, why) in MODEL_FORBIDDEN_PATHS {
+                    for path in facts.imports.iter().chain(facts.mentions.iter()) {
+                        if path_reaches(path, needle) {
+                            report(format!("{}: uses `{path}`: {why}", file.display()));
+                            break;
+                        }
+                    }
+                }
+                if facts.foreign_blocks > 0 {
+                    report(format!(
+                        "{}: {} `extern` block(s): FFI declaration in a model crate",
+                        file.display(),
+                        facts.foreign_blocks
+                    ));
+                }
+                for inc in &facts.source_includes {
+                    // A model crate may not carry a build script, so there is no
+                    // generated source for this to pull in; what it does do is
+                    // introduce code a reader will not find by following `mod`.
+                    report(format!(
+                        "{}: `include!({inc})` brings in source outside the module tree",
+                        file.display()
+                    ));
+                }
+
+                // The one deliberately broad net that is not a path rule: a
+                // model crate mentioning CUDA at all is a boundary breach, and
+                // it is worth catching in a comment or a string too.
+                let text = std::fs::read_to_string(&file).unwrap_or_default();
+                if text.to_lowercase().contains("cuda") {
+                    report(format!(
+                        "{}: CUDA reference in a model crate",
+                        file.display()
+                    ));
                 }
             }
         }
@@ -987,120 +1138,6 @@ fn find_manifests(root: &Path) -> Result<Vec<PathBuf>, String> {
     }
     out.sort();
     Ok(out)
-}
-
-/// Remove `#[cfg(test)]` items, keeping everything else.
-///
-/// An earlier version used `split("#[cfg(test)]").next()`, which kept only the
-/// text *before the first* test module and silently discarded every line after
-/// it. A model crate could put FFI declarations, file I/O and a cache below a
-/// test module and pass the check. This brace-matches instead, so only the
-/// attributed item is removed.
-///
-/// The matcher skips line comments, block comments and string/char literals so
-/// that a brace inside one does not throw off the count. A raw string with an
-/// unbalanced brace and a `#` delimiter could still fool it; this scan is a
-/// secondary net behind the dependency rules, not the only barrier, and it is
-/// deliberately not being grown into a Rust parser.
-fn strip_cfg_test(src: &str) -> String {
-    const ATTR: &str = "#[cfg(test)]";
-    let bytes = src.as_bytes();
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0;
-    while i < src.len() {
-        if src[i..].starts_with(ATTR) {
-            // Find the item's opening brace, then its match.
-            match find_item_end(bytes, i + ATTR.len()) {
-                Some(end) => {
-                    i = end;
-                    continue;
-                }
-                // No brace found (e.g. `#[cfg(test)] use ...;`): drop just the
-                // attribute and carry on.
-                None => {
-                    i += ATTR.len();
-                    continue;
-                }
-            }
-        }
-        let ch = src[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
-
-/// From `start`, find the first `{` and return the index just past its match.
-fn find_item_end(b: &[u8], start: usize) -> Option<usize> {
-    let mut i = start;
-    // Locate the opening brace, bailing out if a `;` ends the item first.
-    while i < b.len() && b[i] != b'{' {
-        if b[i] == b';' {
-            return None;
-        }
-        i += 1;
-    }
-    if i >= b.len() {
-        return None;
-    }
-    let mut depth = 0usize;
-    while i < b.len() {
-        match b[i] {
-            b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                    i += 1;
-                }
-                i += 2;
-            }
-            b'"' => {
-                i += 1;
-                while i < b.len() && b[i] != b'"' {
-                    if b[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'\'' => {
-                // A char literal, or a lifetime like `'a`. Only skip when it
-                // closes within a few bytes, which a lifetime never does.
-                let mut j = i + 1;
-                let mut closed = false;
-                while j < b.len() && j <= i + 4 {
-                    if b[j] == b'\\' {
-                        j += 2;
-                        continue;
-                    }
-                    if b[j] == b'\'' {
-                        closed = true;
-                        break;
-                    }
-                    j += 1;
-                }
-                i = if closed { j + 1 } else { i + 1 };
-            }
-            b'{' => {
-                depth += 1;
-                i += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                i += 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -1332,11 +1369,33 @@ mod tests {
         assert_eq!(build_scripts(&many, Path::new("/nonexistent")).len(), 2);
     }
 
+    /// Parse a snippet as a crate root and return its facts.
+    ///
+    /// Each call gets its own directory: these tests run in parallel, and two
+    /// sharing a path would delete each other's file.
+    fn facts_of(src: &str) -> SourceFacts {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("moxie-facts-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, src).unwrap();
+        let f = analyse_source(&file, true).expect("snippet parses");
+        std::fs::remove_dir_all(&dir).ok();
+        f
+    }
+
+    fn reaches_forbidden(f: &SourceFacts, needle: &str) -> bool {
+        f.imports
+            .iter()
+            .chain(f.mentions.iter())
+            .any(|p| path_reaches(p, needle))
+    }
+
     #[test]
-    fn grouped_renamed_and_globbed_imports_all_reduce_to_the_same_path() {
-        // Second review, case 1: `use std::{fs};` contains the text `std::fs`
-        // nowhere, so a substring blacklist saw nothing. Every spelling below
-        // has to land on the same rule.
+    fn every_spelling_of_a_forbidden_import_lands_on_one_rule() {
+        // Two reviews' worth of evasions, plus the shapes around them. The last
+        // two are the ones a character-level parser could not survive.
         let cases = [
             "use std::fs;",
             "use std::{fs};",
@@ -1344,60 +1403,74 @@ mod tests {
             "use std::fs as filesystem;",
             "use std::fs::read;",
             "use std::{io, fs::{read, write}};",
-            "use std::{io::Result, fs::read};",
             "pub use std::fs;",
             "use ::std::fs;",
             "use std::*;",
             "use\n    std::{\n        fs,\n    };",
+            "use std::{ /* checkpoint files */ fs };",
+            "use std::{\n  // the weights live on disk\n  fs,\n};",
+            "use std :: fs ;",
+            "fn f(p: &str) { let _ = std::fs::read(p); }",
+            "fn f(p: &str) { let _ = /* here */ std::fs::read(p); }",
         ];
         for src in cases {
-            let paths = use_paths(src);
             assert!(
-                paths.iter().any(|p| path_reaches(p, "std::fs")),
-                "{src:?} produced {paths:?}"
+                reaches_forbidden(&facts_of(src), "std::fs"),
+                "{src:?} was not recognised"
             );
         }
     }
 
     #[test]
     fn an_innocent_import_is_not_flagged() {
-        // The other half: a checker that flags everything is not enforcement.
+        // A checker that flags everything is not enforcement either.
         let cases = [
             "use std::io::Result;",
             "use std::collections::BTreeMap;",
-            "use crate::fs;",
-            "use self::fs::helper;",
+            "mod fs { pub fn read() {} }\nuse crate::fs;",
             "use moxie_graph::{Op, OracleRegistry};",
-            "use super::{a, b::c};",
+            "const DOC: &str = \"use std::fs; std::thread::spawn\";",
+            "// use std::fs;\nfn f() {}",
+            "/* use std::process; */\nfn f() {}",
+            "const R: &str = r#\"std::fs::read\"#;",
         ];
         for src in cases {
-            let paths = use_paths(src);
+            let f = facts_of(src);
             for (needle, _) in MODEL_FORBIDDEN_PATHS {
                 assert!(
-                    !paths.iter().any(|p| path_reaches(p, needle)),
-                    "{src:?} was wrongly matched against {needle}: {paths:?}"
+                    !reaches_forbidden(&f, needle),
+                    "{src:?} was wrongly matched against {needle}: \
+                     imports {:?} mentions {:?}",
+                    f.imports,
+                    f.mentions
                 );
             }
         }
     }
 
     #[test]
-    fn a_use_inside_a_comment_or_string_is_not_an_import() {
-        let src = r#"
-            // use std::fs;
-            /* use std::thread; */
-            const DOC: &str = "use std::process;";
-            use std::collections::BTreeMap;
-        "#;
-        let paths = use_paths(src);
-        assert_eq!(paths, vec!["std::collections::BTreeMap".to_string()]);
+    fn a_test_module_is_exempt_and_the_code_after_it_is_not() {
+        // Document 02 permits a dev harness. The exemption must cover the test
+        // module and stop there -- the failure the very first review found.
+        let f = facts_of(
+            "#[cfg(test)]\nmod tests { use std::fs; }\npub fn after(p: &str) { let _ = std::fs::read(p); }",
+        );
+        assert!(reaches_forbidden(&f, "std::fs"));
+
+        let only_tests =
+            facts_of("#[cfg(test)]\nmod tests { use std::fs; fn t() {} }\npub fn g() {}");
+        assert!(!reaches_forbidden(&only_tests, "std::fs"));
+
+        let gated_use = facts_of("#[cfg(test)]\nuse std::fs;\npub fn g() {}");
+        assert!(!reaches_forbidden(&gated_use, "std::fs"));
     }
 
     #[test]
     fn nested_groups_flatten_to_full_paths() {
-        let paths = use_paths("use a::{b::{c, d as e}, f, g::*};");
+        let mut got = facts_of("use a::{b::{c, d as e}, f, g::*};").imports;
+        got.sort();
         assert_eq!(
-            paths,
+            got,
             vec![
                 "a::b::c".to_string(),
                 "a::b::d".to_string(),
@@ -1405,6 +1478,31 @@ mod tests {
                 "a::g::*".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn an_extern_block_is_found_as_an_item_not_as_text() {
+        assert_eq!(
+            facts_of("unsafe extern \"C\" { fn f(); }").foreign_blocks,
+            1
+        );
+        // ... and a string that merely says so is not one.
+        assert_eq!(
+            facts_of("const S: &str = \"extern \\\"C\\\"\";").foreign_blocks,
+            0
+        );
+        // A test-gated block is the dev harness.
+        assert_eq!(
+            facts_of("#[cfg(test)]\nunsafe extern \"C\" { fn f(); }").foreign_blocks,
+            0
+        );
+    }
+
+    #[test]
+    fn included_source_is_reported_because_it_leaves_the_module_tree() {
+        let f = facts_of("include!(\"generated.rs\");\npub fn g() {}");
+        assert_eq!(f.source_includes.len(), 1);
+        assert!(facts_of("pub fn g() {}").source_includes.is_empty());
     }
 
     #[test]
@@ -1416,6 +1514,64 @@ mod tests {
         assert!(!path_reaches("std::io::*", "std::fs"));
         assert!(!path_reaches("stdext::fs", "std::fs"));
         assert!(!path_reaches("crate::fs", "std::fs"));
+    }
+
+    #[test]
+    fn module_declarations_resolve_to_the_files_cargo_compiles() {
+        // Third review, case 2: a `#[path]` module pointing into a directory no
+        // Cargo target names. Also the two ordinary layouts, so the traversal is
+        // not only correct for the evasion.
+        let dir = std::env::temp_dir().join(format!("moxie-mods-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("src/inner")).unwrap();
+        std::fs::create_dir_all(dir.join("tests")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "#[path = \"../tests/reader.rs\"]\npub mod reader;\npub mod sibling;\npub mod inner;\n#[cfg(test)]\nmod tests;\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/sibling.rs"), "pub fn s() {}").unwrap();
+        std::fs::write(dir.join("src/inner/mod.rs"), "pub fn i() {}").unwrap();
+        std::fs::write(dir.join("tests/reader.rs"), "pub fn r() {}").unwrap();
+        std::fs::write(dir.join("tests/harness.rs"), "fn h() {}").unwrap();
+
+        let manifest = parse("[package]\nname = \"moxie-models-test\"\nversion = \"0.0.0\"\n");
+        let (files, problems) = production_sources(&manifest, &dir);
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let has = |rel: &str| files.iter().any(|f| f.ends_with(rel));
+        assert!(has("tests/reader.rs"), "the #[path] module: {files:?}");
+        assert!(has("src/sibling.rs"), "foo.rs layout: {files:?}");
+        assert!(has("inner/mod.rs"), "foo/mod.rs layout: {files:?}");
+        assert!(
+            !has("tests/harness.rs"),
+            "an unreachable file in a dev directory stays exempt: {files:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unresolvable_module_declaration_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("moxie-badmod-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub mod missing;\n").unwrap();
+        let manifest = parse("[package]\nname = \"moxie-models-test\"\nversion = \"0.0.0\"\n");
+        let (_, problems) = production_sources(&manifest, &dir);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("missing"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn source_that_does_not_parse_is_refused_rather_than_skipped() {
+        let dir = std::env::temp_dir().join(format!("moxie-badsrc-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("lib.rs");
+        std::fs::write(&f, "fn broken( {").unwrap();
+        assert!(analyse_source(&f, true).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1440,7 +1596,7 @@ mod tests {
             path = "tests/production.rs"
             "#,
         );
-        let scanned = production_sources(&declared, &dir);
+        let (scanned, _) = production_sources(&declared, &dir);
         assert!(
             scanned.contains(&tests.join("production.rs")),
             "the declared library was skipped: {scanned:?}"
@@ -1448,7 +1604,7 @@ mod tests {
 
         // With no production target in `tests`, the exemption stands.
         let ordinary = parse("[package]\nname = \"moxie-models-test\"\nversion = \"0.0.0\"\n");
-        let scanned = production_sources(&ordinary, &dir);
+        let (scanned, _) = production_sources(&ordinary, &dir);
         assert!(!scanned.iter().any(|p| p.starts_with(&tests)));
         assert!(scanned.contains(&src.join("lib.rs")));
 
@@ -1462,14 +1618,5 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(before, names.len(), "duplicate rule identifier");
-    }
-
-    #[test]
-    fn cfg_test_stripping_keeps_code_after_the_test_module() {
-        let src = "fn a() {}\n#[cfg(test)]\nmod t { fn hidden() { let _ = \"cuda\"; } }\nfn b() { let _ = \"cuda\"; }\n";
-        let stripped = strip_cfg_test(src);
-        assert!(!stripped.contains("hidden"));
-        assert!(stripped.contains("fn b()"));
-        assert_eq!(stripped.matches("cuda").count(), 1);
     }
 }

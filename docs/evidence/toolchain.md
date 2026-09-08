@@ -76,9 +76,18 @@ CUDA state behind rank-owned contexts." `build.rs` deliberately does not search
 **Hand-written FFI, no Rust CUDA wrapper crate.** See
 [ADR 0001](../decisions/adr/0001-hand-written-cuda-ffi.md).
 
-**Third-party crates: one.** `toml` 0.9, used only by `xtask` to parse manifests
-for `arch-check`. No production crate has a third-party dependency. Document 03:
-"do not adopt a large dependency only from its README."
+**Third-party crates: four, all tooling, all in `xtask`.** `toml` 0.9 parses
+manifests; `syn` (pinned `=3.0.3`) with `quote` and `proc-macro2` parse model
+crate source structurally for `arch-check`, per
+[ADR 0004](../decisions/adr/0004-parse-model-source-with-syn.md). **No production
+crate has a third-party dependency**, and `arch-check` enforces an empty
+third-party allowlist for every shared crate and every model crate.
+
+All three parsing crates were already in the lock graph via `toml`'s
+`serde_derive`, so making them direct dependencies of `xtask` added no package to
+the build: `Cargo.lock` gained no `name =` entry. Document 03 warns "do not adopt
+a large dependency only from its README"; ADR 0004 records why this is not that,
+and what the parser does *not* do.
 
 **No Python anywhere in the build or the product.** Document 03 forbids "a
 required Python interpreter in the production server". Python was used during M0
@@ -168,7 +177,7 @@ can be tested with no driver present.
 
 Verified on 2026-09-07 by building and testing the whole workspace with
 `CUDA_HOME=/nonexistent NVCC=/nonexistent`, an unset `LD_LIBRARY_PATH` and a
-`PATH` with no CUDA directory: 210 tests passed. `ldd target/debug/xtask` on the
+`PATH` with no CUDA directory: 218 tests passed. `ldd target/debug/xtask` on the
 host build reports no `libcuda`, and the CI workflow asserts that.
 
 **This is not a way to make the GPU lane optional.** Document 07 requires the

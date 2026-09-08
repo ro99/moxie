@@ -5,7 +5,13 @@ Date: 2026-09-07. From: implementation agent (Claude). Base commit: `88fd983`, b
 The first correction pass is in [its own handover](2026-09-07-m0-correction-results.md). A second
 review reproduced those results and then found six contracts that still accepted an invalid state.
 Its verdict — "substantially better, but I would not close M0 yet" — was right. This pass closes
-those six. Full detail, with the reproductions, is in
+those six.
+
+**Superseded in part.** A third review then found three more: a derived `Clone` that handed the new
+sequence identity to a second authority, restoration evidence with no branch or prefix-version
+identity, and source enforcement still missing ordinary Rust syntax. Those are closed in
+[the next handover](2026-09-07-third-review-corrections.md), and the counts below have since grown
+to 218 host tests and 17 arch-check fixtures. Full detail, with the reproductions, is in
 [task 0002](../tasks/0002-m0-review-and-integer-transition.md#second-review-corrections-2026-09-07).
 
 ## State
