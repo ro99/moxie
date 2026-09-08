@@ -1,6 +1,12 @@
 # Task 0003 — M1, part 1: the BF16 host reference interpreter
 
-Status: **implemented 2026-09-08**, corrected after review the same day; owner review pending. Proposed 2026-09-07 after the [M0 correction
+Status: **accepted 2026-09-08** at `0908f4d`, after four review passes and their corrections.
+
+The acceptance is of **this bounded task only** — the BF16 host reference interpreter and its
+numerical contracts. It is explicitly *not* acceptance of the M1 milestone, nor of any checkpoint,
+GPU-performance or model-quality claim. The reviewer's closing note is carried into
+[task 0004](0004-m1-state-transactions.md): M1.4 should make publication transactional, keeping the
+regressions below as acceptance tests. Proposed 2026-09-07 after the [M0 correction
 task](0002-m0-review-and-integer-transition.md) closed F1–F6 and four review passes; started the
 same day with those gates green (`arch-check` 19 rejected + 1 accepted fixtures, `spec-check` 10
 documents, 222 host unit tests + 1 doctest, `test-gpu` 15 cases with both architectures qualified).
