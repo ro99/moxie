@@ -73,9 +73,17 @@ pub(crate) fn claim(uuid: DeviceUuid, rank: RankId) -> Result<()> {
     Ok(())
 }
 
-/// Drop a claim that was never attached to a context.
+/// Drop a claim that was never backed by a retained context.
+///
+/// A `TeardownFailed` claim is **never** erased here. The device is withheld
+/// because a context reference is unresolved, and that does not stop being true
+/// because an outer error path also wants to clean up. Only the caller that
+/// knows nothing was retained may abandon, and this refuses to let it be wrong.
 pub(crate) fn abandon(uuid: DeviceUuid) {
-    table().remove(&uuid);
+    let mut held = table();
+    if matches!(held.get(&uuid), Some(Claim::Held(_))) {
+        held.remove(&uuid);
+    }
 }
 
 /// Release `uuid`, running `teardown` **while the claim is still held**.
@@ -162,6 +170,40 @@ mod tests {
         // ...and available immediately afterwards.
         claim(d, RankId(105)).unwrap();
         release_with(d, RankId(105), || Ok(()));
+    }
+
+    #[test]
+    fn a_failed_attach_that_cleaned_up_leaves_the_device_available() {
+        // The attach sequence, at the level where the policy lives: the claim is
+        // taken, a reference is retained, attaching fails, the cleanup release
+        // succeeds. The card is free, and the outer error path's `abandon` is
+        // harmless because the claim is already gone.
+        let (d, r) = (uuid(7), RankId(110));
+        claim(d, r).unwrap();
+        release_with(d, r, || Ok(()));
+        abandon(d);
+        claim(d, RankId(111)).unwrap();
+        release_with(d, RankId(111), || Ok(()));
+    }
+
+    #[test]
+    fn an_abandon_cannot_erase_a_failed_teardown() {
+        // The failed-attach path abandons a claim it believes was never backed
+        // by a retained context. If a cleanup release failed, the claim is
+        // withheld for a reason, and an outer error path wanting to tidy up does
+        // not make that reason go away.
+        let (d, r) = (uuid(6), RankId(108));
+        claim(d, r).unwrap();
+        release_with(d, r, || {
+            Err(Error::DeviceLost {
+                device: 0,
+                detail: "cleanup release failed".into(),
+            })
+        });
+        abandon(d);
+        let e = claim(d, RankId(109))
+            .expect_err("an abandon must not hand out a device with an unresolved reference");
+        assert!(e.to_string().contains("teardown"), "{e}");
     }
 
     #[test]

@@ -192,6 +192,22 @@ pub struct RankContext {
     capability: DeviceCapability,
 }
 
+/// How a failed `attach` left the rank claim.
+///
+/// The distinction is the whole of the error path's correctness: whether a
+/// context reference was ever retained decides whether the claim may simply be
+/// dropped, and if one was, whether its cleanup succeeded decides whether the
+/// device may be handed to anyone else.
+enum AttachError {
+    /// Nothing was retained. The claim is untouched and the caller must drop it.
+    ClaimUntouched(Error),
+    /// A reference was retained and the claim has already been resolved through
+    /// the fail-closed release path. The caller must not touch it.
+    ClaimResolved(Error),
+}
+
+type AttachResult = std::result::Result<RankContext, AttachError>;
+
 impl RankContext {
     /// Acquire `ordinal`'s context for `rank`.
     ///
@@ -207,44 +223,58 @@ impl RankContext {
         claims::claim(uuid, rank)?;
         match Self::attach(rank, capability) {
             Ok(ctx) => Ok(ctx),
-            Err(e) => {
-                // The claim must not outlive a failed attach, or the card is
-                // stranded for the life of the process. Nothing was retained,
-                // so there is no teardown to order against.
+            // Nothing was retained, so the claim is this function's to drop --
+            // otherwise a transient driver error strands the card for the life
+            // of the process.
+            Err(AttachError::ClaimUntouched(e)) => {
                 claims::abandon(uuid);
                 Err(e)
             }
+            // A reference was retained and `attach` already resolved the claim
+            // through the same fail-closed path `Drop` uses: removed if the
+            // cleanup release succeeded, withheld if it did not. Touching it
+            // here would undo exactly that decision.
+            Err(AttachError::ClaimResolved(e)) => Err(e),
         }
     }
 
-    fn attach(rank: RankId, capability: DeviceCapability) -> Result<Self> {
+    fn attach(rank: RankId, capability: DeviceCapability) -> AttachResult {
+        let uuid = capability.uuid;
         let mut device: ffi::CUdevice = 0;
         check(
             // SAFETY: valid out-parameter; the driver validates the ordinal.
             unsafe { ffi::cuDeviceGet(&mut device, capability.ordinal as c_int) },
             "cuDeviceGet",
-        )?;
+        )
+        .map_err(AttachError::ClaimUntouched)?;
         let mut ctx: ffi::CUcontext = core::ptr::null_mut();
         check(
             // SAFETY: valid out-parameter. The primary context is reference-counted
             // by the driver; `Drop` releases exactly the reference taken here.
             unsafe { ffi::cuDevicePrimaryCtxRetain(&mut ctx, device) },
             "cuDevicePrimaryCtxRetain",
-        )?;
-        // From here the retain must be balanced on **every** path. An earlier
+        )
+        .map_err(AttachError::ClaimUntouched)?;
+
+        // A reference now exists, and from here every failure path must balance
+        // it *and* resolve the claim the same way `Drop` does. An earlier
         // version returned the `cuCtxSetCurrent` error directly and leaked the
-        // reference, which keeps the primary context alive for the life of the
-        // process and pins its memory.
+        // reference; the version after that released it but ignored the result
+        // and let the caller abandon the claim regardless, which handed the next
+        // rank a device whose reference was still outstanding.
         if let Err(e) = check(
             // SAFETY: `ctx` is a live context we just retained.
             unsafe { ffi::cuCtxSetCurrent(ctx) },
             "cuCtxSetCurrent",
         ) {
-            // SAFETY: releases exactly the reference taken immediately above.
-            unsafe {
-                let _ = ffi::cuDevicePrimaryCtxRelease_v2(device);
-            }
-            return Err(e);
+            claims::release_with(uuid, rank, || {
+                check(
+                    // SAFETY: releases exactly the reference retained above.
+                    unsafe { ffi::cuDevicePrimaryCtxRelease_v2(device) },
+                    "cuDevicePrimaryCtxRelease",
+                )
+            });
+            return Err(AttachError::ClaimResolved(e));
         }
         Ok(Self {
             device,

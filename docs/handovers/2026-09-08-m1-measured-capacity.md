@@ -54,11 +54,11 @@ Gates, all run at the implementation state on this machine:
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | PASS |
 | the same **with device features** | PASS — new to the gate list, see below |
-| `cargo test --workspace --locked --offline` | PASS, 468 unit/integration + 6 doctests |
+| `cargo test --workspace --locked --offline` | PASS, 470 unit/integration + 6 doctests |
 | `cargo xtask arch-check` | PASS, 46 rejected + 12 accepted fixtures, 10 rules |
 | `cargo xtask spec-check` | PASS, 10 documents |
-| no-driver host lane | PASS, 468 + 6; `ldd` on an **explicitly rebuilt** `xtask` shows no `libcuda` |
-| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | PASS, 476 + 8 |
+| no-driver host lane | PASS, 470 + 6; `ldd` on an **explicitly rebuilt** `xtask` shows no `libcuda` |
+| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | PASS, 478 + 8 |
 | `cargo xtask-cuda test-gpu` | PASS, 24 cases, `sm_86` and `sm_120` qualified |
 | `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, `UNQUALIFIED sm_120`, as intended |
 | `cargo xtask-cuda capacity` | PASS, 3 devices |
@@ -103,6 +103,10 @@ number was produced anywhere in this repository.
 - **After a rename, re-run the bite check on every `compile_fail` doctest, not only new ones.** A
   rename left one calling a function that no longer existed, so it passed on `E0599` instead of the
   lifetime error it exists to pin.
+- **Every exit from a function that retained a resource is a teardown, error paths included.** Two
+  review rounds on `RankContext` were the same defect twice: the first fixed `Drop`'s ordering and
+  left the failed-attach cleanup ignoring its own release result, and the second found it there.
+  When a fail-closed path is introduced, walk every `return` above it.
 - Owner gates O1-O7 remain OPEN. None blocked this task.
 
 ## Next task

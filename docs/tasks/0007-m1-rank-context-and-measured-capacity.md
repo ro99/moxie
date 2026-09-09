@@ -340,3 +340,64 @@ Re-verified after the corrections:
 | `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, as intended |
 | `cargo xtask-cuda capacity` | PASS, 3 devices |
 | the reviewer's `drop_race`, `lifetime_corrected`, `lifetime_stale`, `thread_bound` | all give the expected result |
+
+### Review corrections, round 2 (2026-09-08, commit `a8969e6` not accepted)
+
+One finding, and it is round 1's finding in the error path round 1 did not
+route through the new mechanism.
+
+- **P2 — the failed-attach cleanup bypassed the fail-closed teardown.** When
+  `cuDevicePrimaryCtxRetain` succeeded and `cuCtxSetCurrent` then failed,
+  `attach` released the reference, **ignored the result**, and `acquire`
+  unconditionally called `claims::abandon`. If that cleanup release failed, the
+  next rank was handed a device whose context reference was still outstanding.
+  The comment claiming "nothing was retained" was true of two paths out of three
+  and wrong about the one that mattered.
+
+  A failed attach now has three distinguishable outcomes, carried by a private
+  `AttachError`:
+
+  | Outcome | Claim |
+  |---|---|
+  | failed before the retain | `ClaimUntouched` — the caller drops it, so a transient error does not strand the card |
+  | retained, cleanup release succeeded | `ClaimResolved` — already removed by `release_with` |
+  | retained, cleanup release failed | `ClaimResolved` — already marked `TeardownFailed` by `release_with` |
+
+  The retained-context cleanup goes through **the same `claims::release_with`**
+  that `Drop` uses, so there is one fail-closed path rather than two spellings of
+  one. And `claims::abandon` is now hardened independently: it removes only a
+  `Held` claim and never erases a `TeardownFailed` one, so a caller that is wrong
+  about whether anything was retained cannot hand out a quarantined device.
+
+  Regressions, both host-lane: `an_abandon_cannot_erase_a_failed_teardown`
+  (failed before the fix) and
+  `a_failed_attach_that_cleaned_up_leaves_the_device_available`, which mirror the
+  two retained outcomes at the level where the policy lives. Bite check: making
+  `abandon` unconditional again fails the first.
+
+  **Stated limit:** the FFI branch itself — retain succeeds, `cuCtxSetCurrent`
+  fails — is not reachable from an in-repo test without symbol interposition. The
+  policy it delegates to is host-tested; the branch is exercised by the
+  reviewer's `attach_cleanup` binary, which now reports `false`. That is a gap in
+  this repository's own coverage and is recorded rather than papered over.
+
+Re-verified after round 2:
+
+| Lane | Result |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `clippy -D warnings`, host and device features | PASS |
+| `cargo test --workspace --locked --offline` | PASS, 470 unit/integration + 6 doctests |
+| `cargo xtask arch-check` | PASS, 46 rejected + 12 accepted fixtures, 10 rules |
+| `cargo xtask spec-check` | PASS, 10 documents |
+| no-driver host lane, `xtask` rebuilt before `ldd` | PASS, 470 + 6, no `libcuda` |
+| device lane | PASS, 478 + 8 |
+| `cargo xtask-cuda test-gpu` | PASS, 24 cases, both architectures qualified |
+| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, as intended |
+| `cargo xtask-cuda capacity` | PASS, 3 devices |
+| the reviewer's `attach_cleanup` and `drop_race` | both report `false` and exit 0 |
+
+The pattern across both rounds, worth carrying: **every exit from a function that
+retained a resource is a teardown, including the error paths, and each one needs
+the same ordering and the same fail-closed rule.** Round 1 fixed `Drop` and left
+the error path; round 2 found it there.

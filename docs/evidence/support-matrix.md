@@ -17,10 +17,10 @@ matrix exists to prevent.
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
 | `G-DEVICE-CLIPPY` | the same with `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | device build | passed; **new at [task 0007](../tasks/0007-m1-rank-context-and-measured-capacity.md)**, which found and fixed two pre-existing `undocumented_unsafe_blocks` findings the lane had never been run against |
-| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 468 unit/integration tests + 6 doctests |
+| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 470 unit/integration tests + 6 doctests |
 | `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 45 negative + 12 positive fixtures, 10 rules; 343 generated module combinations checked against rustc by the host suite, each against all four crate boundaries |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
-| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH`; **`cargo build -p xtask` before `ldd`** | host | passed, 468 unit/integration tests + 6 doctests, `ldd` shows no `libcuda`. The explicit build is load-bearing: without it `ldd` can read a device-lane artifact left in the shared `target/`, which it did once on 2026-09-08 ([toolchain.md](toolchain.md)) |
+| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH`; **`cargo build -p xtask` before `ldd`** | host | passed, 470 unit/integration tests + 6 doctests, `ldd` shows no `libcuda`. The explicit build is load-bearing: without it `ldd` can read a device-lane artifact left in the shared `target/`, which it did once on 2026-09-08 ([toolchain.md](toolchain.md)) |
 | `G-GPU-CAPACITY` | `cargo xtask-cuda capacity` | device | passed, 3 devices measured and admitted against; also passed with `CUDA_VISIBLE_DEVICES` reversed, each UUID keeping its own memory total |
 | `G-GPU-SM86` | `cargo xtask-cuda test-gpu --profile sm86` | device | passed, RTX 3090 x2 |
 | `G-GPU-SM120` | `cargo xtask-cuda test-gpu --profile sm120` | device | passed, RTX 5060 Ti |
