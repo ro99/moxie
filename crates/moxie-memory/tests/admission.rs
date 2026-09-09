@@ -1297,3 +1297,63 @@ fn a_scope_failure_looks_at_every_movable_contributor_not_the_largest_one() {
         "spilling 20 of the 80 KV bytes clears the 20 B shortfall"
     );
 }
+
+// --- review corrections, round 4 --------------------------------------------
+
+/// Round-4 finding: a movable buffer at one tied peak, immovable overhead at the
+/// other. The advice must not depend on which of the two got reported.
+fn assert_no_host_fallback_across_a_tie(kv_first: bool) {
+    let d = gpu(1);
+    let request = |kv_bytes: u64| {
+        let (kv_stage, headroom_stage) = if kv_first { (0, 1) } else { (1, 0) };
+        let mut plan = PlanRequest::new("tied host fallback", ["a", "b"]).unwrap();
+        plan.buffer(BufferRequest::new(
+            "kv",
+            d,
+            KV,
+            kv_bytes,
+            StageSpan::at(kv_stage),
+        ))
+        .unwrap()
+        .buffer(BufferRequest::new(
+            "headroom",
+            d,
+            Tier::Device(DeviceTier::SafetyHeadroom),
+            200,
+            StageSpan::at(headroom_stage),
+        ))
+        .unwrap();
+        plan
+    };
+
+    let mut ledger = Ledger::new([device_snapshot(d, 100), host_snapshot(1_100, 100)]).unwrap();
+    // The premise: removing every KV byte leaves the device peak untouched.
+    let peak = |plan: &PlanRequest| {
+        ledger
+            .preview(plan)
+            .unwrap()
+            .scope(d)
+            .unwrap()
+            .request_peak_bytes
+    };
+    assert_eq!(peak(&request(200)), 200);
+    assert_eq!(peak(&request(0)), 200);
+
+    let e = ledger.admit(&request(200)).unwrap_err();
+    assert!(
+        !rejection(&e)
+            .alternatives
+            .contains(&LegalAlternative::HostBackedExecution),
+        "moving all KV to the host cannot reduce a 200 B peak made of device headroom"
+    );
+}
+
+#[test]
+fn a_host_fallback_is_refused_when_a_tied_immovable_peak_survives_it() {
+    assert_no_host_fallback_across_a_tie(true);
+}
+
+#[test]
+fn a_host_fallback_answer_does_not_depend_on_which_tied_stage_was_reported() {
+    assert_no_host_fallback_across_a_tie(false);
+}

@@ -218,6 +218,10 @@ tier that would receive it -- state spills to `StateSpill`, execution needs `Cpu
 bounds what it can take, where an absent cap keeps its documented meaning of "bounded by the scope
 budget". For a scope-budget failure that means every movable contributor, not the one named in
 `BindingConstraint::tier`, which is a diagnostic label rather than a claim about what can move.
+Capacity is necessary and not sufficient: the relocation must also be recomputed over the whole
+timeline and shown to lower the failing ceiling. The bar differs from the two scaling rows on
+purpose -- a caller chooses how much to lower context by, so a strict decrease is worth naming,
+while host-backed execution is a switch and must close the whole shortfall.
 
 A generic menu of five is worse than nothing, because it invites the caller to try a change that
 cannot help. The ledger **never applies** an alternative: document 03 forbids automatically
@@ -555,3 +559,47 @@ PASS (10 documents); no-driver lane PASS (455 + 6, no `libcuda`). Device lane an
 `test-gpu` carried forward from `a486930`: this round touches `moxie-memory`
 only and changed no device code, kernel or FFI path. The reviewer's eleven tests
 across three rounds, run unmodified from outside the repository, all pass.
+
+### Review corrections, round 4 (2026-09-08, commit `eee2272` not accepted)
+
+One finding, and it is round 2's finding in the one place round 2 did not
+reach.
+
+- **P2 — the host fallback still answered from a single stage.** `host_absorbable`
+  looks at contributors at `c.peak_stage`, and capacity was the whole test. With
+  200 B of movable KV at one stage and 200 B of immovable device headroom at the
+  other, against a 100 B device budget and a roomy host, the ledger offered
+  `HostBackedExecution` -- and moving *every* KV byte leaves the device peak at
+  200 B. Reversing the two stages suppressed the offer, which is the diagnosis:
+  the advice depended on which of two tied peaks happened to be reported.
+  Host-backed execution is now answered the way the scaling alternatives are,
+  by recomputation. One counterfactual per failing device scope relocates
+  everything in it that has a host destination, and the alternative is offered
+  only when all three of the host's remaining budget, the destination tiers'
+  capacity, and the recomputed reduction cover the shortfall. Regressions:
+  `a_host_fallback_is_refused_when_a_tied_immovable_peak_survives_it` and
+  `a_host_fallback_answer_does_not_depend_on_which_tied_stage_was_reported`,
+  which assert the premise (removing all KV leaves the peak at 200 B) before
+  asserting the advice.
+
+`peaks` now takes a predicate rather than a scaling class, so the base pass, the
+two scaling counterfactuals and the relocation counterfactual are one function
+called four ways.
+
+The bar is deliberately not the same as the scaling rows'. A caller chooses how
+much to lower context by, so a strict decrease means the knob is connected to
+the failure and is worth naming. Host-backed execution is a switch: it either
+clears the constraint or leaves the caller where they were, so it must be able
+to close the whole shortfall. That asymmetry is stated in the code.
+
+Bite checks, reverted to green: dropping the recomputed reduction and keeping
+only the capacity tests fails the tied-peak regression; letting immovable tiers
+relocate in the counterfactual fails it too.
+
+Re-verified after round 4: `fmt` PASS; `clippy -D warnings` PASS;
+`cargo test --workspace --locked --offline` PASS, 457 unit/integration + 6
+doctests; `arch-check` PASS (45 rejected + 12 accepted, 10 rules); `spec-check`
+PASS (10 documents); no-driver lane PASS (457 + 6, no `libcuda`). Device lane and
+`test-gpu` carried forward from `a486930`: this round touches `moxie-memory`
+only. The reviewer's thirteen tests across four rounds, run unmodified from
+outside the repository, all pass.

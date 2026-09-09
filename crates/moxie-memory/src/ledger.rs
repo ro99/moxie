@@ -15,7 +15,7 @@ use crate::report::{
     AdmissionReport, BindingConstraint, BindingKind, LegalAlternative, Rejection, ScopeReport,
     TierReport,
 };
-use crate::request::{PlanRequest, ReserveRule, Scaling};
+use crate::request::{BufferRequest, PlanRequest, ReserveRule, Scaling};
 use crate::snapshot::CapacitySnapshot;
 
 /// One ledger's process-unique identity, so a reservation cannot be released
@@ -414,7 +414,7 @@ impl Ledger {
             }
         }
 
-        let base = peaks(request, None)?;
+        let base = peaks(request, &|_| false)?;
 
         let mut charges: Vec<(Scope, Tier, u64)> = base
             .tier
@@ -543,6 +543,13 @@ impl Ledger {
     /// largest buffer of its tier, so shrinking one member of a tie leaves the
     /// reserve exactly where it was. Both look like contributions and neither
     /// is one.
+    ///
+    /// The bar differs between the two kinds of alternative, deliberately. A
+    /// caller chooses *how much* to lower context by, so a strict decrease means
+    /// the knob is connected to the failure and is worth naming. Host-backed
+    /// execution is a switch: it either clears the constraint or leaves the
+    /// caller where they were, so it must be able to close the whole shortfall
+    /// before it is offered.
     fn alternatives(
         &self,
         request: &PlanRequest,
@@ -565,7 +572,7 @@ impl Ledger {
             {
                 continue;
             }
-            let without = peaks(request, Some(scaling))?;
+            let without = peaks(request, &|b| b.scales_with == Some(scaling))?;
             let helps = binding.iter().any(|c| match c.kind {
                 BindingKind::TierCap => {
                     without.tier_peak(c.scope, c.tier).0 < base.tier_peak(c.scope, c.tier).0
@@ -599,10 +606,13 @@ impl Ledger {
             out.insert(LegalAlternative::DifferentTopology);
         }
 
-        // Moving work to the host is only an alternative if the host has room
-        // for it *after* everything this same request already asks the host for,
-        // and if there is something in the failing scope that can actually move,
-        // into the tier that would hold it.
+        // Moving work to the host has to clear the constraint on three counts,
+        // and each one alone has been wrong: the host must have room after
+        // everything this same request already asks of it; the tiers that would
+        // receive the bytes must be able to take them; and the relocation must
+        // actually lower the failing ceiling, which is a question about the
+        // whole timeline rather than about the stage that happened to be
+        // reported.
         if let Some(host) = self.scopes.get(&Scope::Host)
             && !binding.iter().any(|c| c.scope == Scope::Host)
         {
@@ -611,12 +621,48 @@ impl Ledger {
                 .admissible_bytes()
                 .saturating_sub(self.scope_committed(Scope::Host))
                 .saturating_sub(base.scope_peak(Scope::Host).0);
-            if binding.iter().any(|c| {
+
+            // One counterfactual per failing scope: everything in it that has a
+            // host destination, moved.
+            let mut relocated: BTreeMap<Scope, Peaks> = BTreeMap::new();
+            for scope in binding
+                .iter()
+                .filter(|c| c.scope.kind() == ScopeKind::Device)
+                .map(|c| c.scope)
+                .collect::<BTreeSet<Scope>>()
+            {
+                relocated.insert(
+                    scope,
+                    peaks(request, &|b| {
+                        b.scope == scope && host_destination(b.tier).is_some()
+                    })?,
+                );
+            }
+
+            let clears = |c: &BindingConstraint| {
                 let need = c.shortfall_bytes();
-                c.scope.kind() == ScopeKind::Device
-                    && available >= need
+                let Some(without) = relocated.get(&c.scope) else {
+                    return false;
+                };
+                let reduction = match c.kind {
+                    BindingKind::TierCap => base
+                        .tier_peak(c.scope, c.tier)
+                        .0
+                        .saturating_sub(without.tier_peak(c.scope, c.tier).0),
+                    BindingKind::ScopeBudget => base
+                        .scope_peak(c.scope)
+                        .0
+                        .saturating_sub(without.scope_peak(c.scope).0),
+                };
+                available >= need
                     && self.host_absorbable(base, host, c) >= need
-            }) {
+                    && reduction >= need
+            };
+
+            if binding
+                .iter()
+                .any(|c| c.scope.kind() == ScopeKind::Device && clears(c))
+            {
                 out.insert(LegalAlternative::HostBackedExecution);
             }
         }
@@ -721,24 +767,18 @@ impl Peaks {
     }
 }
 
-/// Compute a request's peaks, optionally with every buffer of one scaling class
-/// at zero bytes.
+/// Compute a request's peaks, with every buffer `zero` selects contributing zero
+/// bytes.
 ///
-/// `zero` is what makes an alternative answerable: the counterfactual is the
-/// same arithmetic on the same declaration, so a derived reserve is re-derived
-/// and a tie between stages is re-resolved rather than assumed away. A zeroed
-/// buffer still exists, so a reserve's arity check is unaffected and the
-/// counterfactual cannot fail where the base pass succeeded.
-fn peaks(request: &PlanRequest, zero: Option<Scaling>) -> Result<Peaks> {
+/// That predicate is what makes an alternative answerable: the counterfactual is
+/// the same arithmetic on the same declaration, so a derived reserve is
+/// re-derived and a tie between stages is re-resolved rather than assumed away.
+/// A zeroed buffer still exists, so a reserve's arity check is unaffected and
+/// the counterfactual cannot fail where the base pass succeeded.
+fn peaks(request: &PlanRequest, zero: &dyn Fn(&BufferRequest) -> bool) -> Result<Peaks> {
     let stage_count = request.stages().len();
     let overflow = || Error::Dim(moxie_types::DimError::Overflow);
-    let bytes_of = |b: &crate::request::BufferRequest| {
-        if zero.is_some() && b.scales_with == zero {
-            0
-        } else {
-            b.bytes
-        }
-    };
+    let bytes_of = |b: &BufferRequest| if zero(b) { 0 } else { b.bytes };
 
     let mut live: BTreeMap<(Scope, Tier), Vec<u64>> = BTreeMap::new();
     let mut virtual_live: BTreeMap<(Scope, Tier), Vec<u64>> = BTreeMap::new();
