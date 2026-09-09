@@ -190,6 +190,17 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                 third_party: NONE,
             },
         ),
+        // Rank-local execution leases (task 0009). Binds the ledger's
+        // reservations to the rank context's ordered stream work: it needs
+        // both vocabularies and nothing else. A model crate reaching this
+        // row is a second execution owner; a fixture proves the edge refused.
+        (
+            "moxie-executor",
+            Allowed {
+                workspace: &["moxie-types", "moxie-memory", "moxie-cuda"],
+                third_party: NONE,
+            },
+        ),
         (
             "moxie-kernels",
             Allowed {
@@ -215,6 +226,7 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                     "moxie-storage",
                     "moxie-cuda",
                     "moxie-kernels",
+                    "moxie-executor",
                 ],
                 // What this checker needs to read manifests and to parse model
                 // source structurally: `toml`, and `syn` with the two crates it

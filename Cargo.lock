@@ -32,6 +32,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "moxie-executor"
+version = "0.0.0"
+dependencies = [
+ "moxie-cuda",
+ "moxie-memory",
+ "moxie-types",
+]
+
+[[package]]
 name = "moxie-format"
 version = "0.0.0"
 dependencies = [
@@ -245,6 +254,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "moxie-cuda",
+ "moxie-executor",
  "moxie-format",
  "moxie-host",
  "moxie-kernels",

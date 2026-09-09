@@ -1,0 +1,16 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: a model definition owns metadata and graph composition,
+# never rank-local execution. Reaching the lease authority is a second
+# execution owner (document 02, task 0009).
+
+[dependencies]
+moxie-executor = { path = "../../../../crates/moxie-executor" }
+
+[package.metadata.moxie-arch-check]
+# The rule this fixture proves. arch-check fails if the fixture is accepted, and
+# also if it is rejected for a different reason.
+expect-rule = "forbidden dependency"

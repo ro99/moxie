@@ -96,16 +96,16 @@ release_turn()               // sweep: retire every completed lease; report the 
 - Turn boundaries sweep: `release_turn` retires everything complete and names what
   is still held, so a turn that ends with no next token cannot leak the way
   experiment 0125's KV leases did (R08).
-
 ### Failure and cancellation
 
-- Event query returning not-ready is a state, never an error (`Event::is_complete`
-  already types it so).
+- `Event` query returning not-ready is a state, never an error
+  (`Event::is_complete` already types it so).
 - A failed or lost context fails closed: affected leases report `DeviceLost` and are
   withheld from reuse, following the rank-claim teardown precedent from task 0007.
 - A `retire` before completion is refused with the lease's identity and stream, not
   a silent wait: blocking is the caller's explicit `synchronize`, never hidden
   inside release.
+
 
 ### Reading is real; the state machine is host-tested
 
@@ -152,4 +152,65 @@ and 0007 are unchanged.
 
 ## Result, filled after work
 
-(Empty until implementation lands.)
+Implemented 2026-09-09 on branch `main`, on top of the contract commit for this
+task. The contract above is unchanged; only this section is filled in.
+
+What was built:
+
+- `moxie-executor` (new, depends on `moxie-types`, `moxie-memory`, `moxie-cuda`;
+  `driver` feature forwards to `moxie-cuda/driver` so the host lane never links
+  `libcuda`): `Lease` over an owned `Reservation` bound to one `Completion`
+  source, `retire` that queries and hands the lease back on refusal, `Turn`
+  with `release_turn` reporting retired vs held, `ManualCompletion` test double,
+  and `Completion for moxie_cuda::Event` plus `Lease::use_on` behind `driver`.
+- `arch-check`: `moxie-executor` row (`moxie-types`, `moxie-memory`,
+  `moxie-cuda`) and the `xtask` composition-root edge, with rejecting fixture
+  `model-reaches-executor` proving a model crate cannot reach execution.
+- `xtask/cuda` gains `dep:moxie-executor` + `moxie-executor/driver`; `test-gpu`
+  gains `event_backed_lease` (two leased async uploads, one retired directly,
+  one via a turn sweep, sources reused only after retirement, bytes verified).
+- The device lane feature list gains `moxie-executor/driver`, recorded in the
+  support matrix.
+
+Bite checks, each reverted to green:
+
+- Deleting the completion query in `retire` fails five host tests (refusal,
+  reuse-after-refusal, both-sided release, turn naming, wait-is-no-backdoor).
+- Deleting `lease_a.synchronize()` in the GPU case fails `event_backed_lease`
+  on two of three devices with still-`InFlight` refusal — the third won the
+  race, which is itself the point: refusal is observed on hardware, and the
+  deterministic refusal proof lives in the host tests.
+
+Deviations recorded, none silent:
+
+- `Turn::synchronize` and `Lease::synchronize` are small additions beyond the
+  contract's four named operations: retirement never blocks, so the caller's
+  explicit wait needed a typed home, and the turn sweep needed one for the
+  same reason. Both are pure observation, never release.
+- `LostInfo` is boxed so the context-loss record does not inflate every live
+  lease (`result_large_err`); the public API is unchanged by it.
+
+Gates (this machine, 2026-09-09; nothing loosened):
+
+| Lane | Result |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `clippy -D warnings`, host and device features | PASS (device lane with `moxie-executor/driver`) |
+| `cargo test --workspace --locked --offline` | PASS, 506 unit/integration + 6 doctests (was 492 + 6; +14 lease retirement) |
+| `cargo xtask arch-check` | PASS, 52 rejected + 14 accepted fixtures, 12 rules (was 51 + 14) |
+| `cargo xtask spec-check` | PASS, 10 documents |
+| no-driver host lane, `xtask` rebuilt before `ldd` | PASS, 506 + 6, no `libcuda` |
+| device lane | PASS, 514 + 8 (was 497 + 8) |
+| `cargo xtask-cuda test-gpu` | PASS, 27 cases, `sm_86` and `sm_120` qualified (was 24; +`event_backed_lease`) |
+| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, as intended (`sm_120` unqualified) |
+| `cargo xtask-cuda capacity` | PASS, the host and 3 devices, every scope to zero |
+
+Nothing failed. Nothing was skipped. `Cargo.lock` gains only the
+`moxie-executor` package and the `xtask` edge: no new third-party packages.
+No checkpoint was read, downloaded or converted; nothing was allocated, mapped
+or reclaimed; no swap entered any budget; and no performance number was
+produced. The stop condition was not triggered.
+
+Remaining blockers and next bounded task: the spending half continues — the
+basic allocator (suballocating admitted envelopes into live ranges), the
+admitted execution plan, and the device-resident layer chain.

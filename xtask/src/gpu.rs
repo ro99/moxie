@@ -17,7 +17,9 @@ use moxie_cuda::{
     DeviceBuffer, Event, Module, ModuleImage, PtxSource, RankContext, Stream, TrustedImage,
     query_device,
 };
-use moxie_types::{DeviceCapability, Error, RankId};
+use moxie_executor::{Lease, Turn};
+use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSpan};
+use moxie_types::{DeviceCapability, DeviceTier, Error, RankId, Scope, Tier};
 
 /// Wrap the build's own fatbin as a trusted image.
 ///
@@ -62,6 +64,7 @@ const CASES: &[&str] = &[
     "bf16_round_trip",
     "arch_mismatch_is_typed",
     "stream_event_completion",
+    "event_backed_lease",
     "non_ptx_text_rejected",
     "rank_context_is_exclusive",
     "concurrent_handoff_is_exclusive",
@@ -163,6 +166,7 @@ pub fn run(profile: Option<&str>) -> i32 {
         results.push(case(&cap, "bf16_round_trip", bf16(&cap)));
         results.push(case(&cap, "arch_mismatch_is_typed", arch_mismatch(&cap)));
         results.push(case(&cap, "stream_event_completion", stream_event(&cap)));
+        results.push(case(&cap, "event_backed_lease", backed_lease(&cap)));
         results.push(case(&cap, "non_ptx_text_rejected", ptx_rejection(&cap)));
         results.push(case(
             &cap,
@@ -495,6 +499,108 @@ fn stream_event(cap: &DeviceCapability) -> Result<Outcome, Error> {
             return Ok(Outcome::Failed(format!(
                 "index {i}: got {}, want {want} after stream/event path",
                 out[i]
+            )));
+        }
+    }
+    Ok(Outcome::Passed)
+}
+
+/// Admit one upload envelope against the live device reading. A free function
+/// rather than a closure so each call borrows the ledger briefly instead of
+/// holding it across the leases below.
+fn admit_upload(
+    ledger: &mut Ledger,
+    scope: Scope,
+    label: &str,
+    bytes: u64,
+) -> Result<moxie_memory::Reservation, Error> {
+    let mut req = PlanRequest::new(label, ["run"])?;
+    req.buffer(BufferRequest::new(
+        format!("{label}-buf"),
+        scope,
+        Tier::Device(DeviceTier::TransferStaging),
+        bytes,
+        StageSpan { first: 0, last: 0 },
+    ))?;
+    Ok(ledger.admit(&req)?)
+}
+
+/// The event-retained lease, against a real driver (task 0009, R07/R08).
+///
+/// Two async uploads on one stream, each bound to a lease by the event
+/// recorded after it. The source buffers are reused only after their lease
+/// retires — one directly, one through a turn sweep — and the device bytes
+/// are read back against the host values. Refusal-before-completion is
+/// timing-dependent on hardware and is proven by the host retirement tests
+/// instead; what this proves is that the mechanism binds real bytes to real
+/// completion and releases both sides.
+fn backed_lease(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    const N: usize = 1024;
+    const BYTES: usize = N * 4;
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let measurement = ctx.measure()?;
+    let scope = Scope::Device(measurement.uuid);
+    let snapshot = CapacitySnapshot::measured(&measurement, 1 << 20)?;
+    let mut ledger = Ledger::new([snapshot])?;
+
+    let stream = Stream::new(&ctx)?;
+    let upload = |src: &[f32]| -> Result<DeviceBuffer<'_>, Error> {
+        let mut buf = DeviceBuffer::alloc(&ctx, BYTES)?;
+        // SAFETY: `src` and `buf` outlive the enqueue below. Both stay
+        // untouched until the lease recorded after the copy retires, which is
+        // exactly the obligation R07 records — discharged here by the lease,
+        // not by caller discipline.
+        unsafe { buf.copy_from_host_async(bytemuck_f32(src), &stream)? };
+        Ok(buf)
+    };
+
+    // First upload: retired directly after its event is observed.
+    let src_a: Vec<f32> = (0..N).map(|i| i as f32).collect();
+    let buf_a = upload(&src_a)?;
+    let mut lease_a = Lease::acquire(
+        admit_upload(&mut ledger, scope, "upload-a", BYTES as u64)?,
+        "upload-a",
+    )?;
+    lease_a.use_on(&stream, Event::new(&ctx)?)?;
+    // The explicit wait: deleting it must fail this case at retire time,
+    // because retirement never blocks.
+    lease_a.synchronize()?;
+    lease_a.retire(&mut ledger).map_err(|r| r.error)?;
+
+    // Second upload: retired through a turn sweep, the R08 shape.
+    let src_b: Vec<f32> = (0..N).map(|i| 1.0 + i as f32).collect();
+    let buf_b = upload(&src_b)?;
+    let mut lease_b = Lease::acquire(
+        admit_upload(&mut ledger, scope, "upload-b", BYTES as u64)?,
+        "upload-b",
+    )?;
+    lease_b.use_on(&stream, Event::new(&ctx)?)?;
+    let mut turn = Turn::new("upload-turn")?;
+    turn.hold(lease_b);
+    turn.synchronize()?;
+    let report = turn.release_turn(&mut ledger);
+    if !report.is_clean() {
+        return Ok(Outcome::Failed(format!(
+            "turn sweep held {} lease(s): {:?}",
+            report.held.len(),
+            report.held.iter().map(|h| &h.label).collect::<Vec<_>>()
+        )));
+    }
+    if !ledger.outstanding().is_empty() {
+        return Ok(Outcome::Failed(
+            "leases retired but bytes still charged".into(),
+        ));
+    }
+
+    // Reuse the sources only now that both events retired, then verify.
+    let mut out_a = vec![0f32; N];
+    let mut out_b = vec![0f32; N];
+    buf_a.copy_to_host(bytemuck_f32_mut(&mut out_a))?;
+    buf_b.copy_to_host(bytemuck_f32_mut(&mut out_b))?;
+    for i in 0..N {
+        if out_a[i] != src_a[i] || out_b[i] != src_b[i] {
+            return Ok(Outcome::Failed(format!(
+                "index {i}: device bytes differ after leased upload"
             )));
         }
     }

@@ -1,0 +1,22 @@
+[package]
+name = "moxie-executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# Off by default so the host lane never links libcuda. `driver` binds leases
+# to real completion events; without it only the pure retirement machine and
+# the manual test double compile.
+default = []
+driver = ["moxie-cuda/driver"]
+
+[dependencies]
+moxie-types.workspace = true
+moxie-memory.workspace = true
+moxie-cuda.workspace = true
+
+[lints]
+workspace = true
