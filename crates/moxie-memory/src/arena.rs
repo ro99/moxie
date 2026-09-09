@@ -171,7 +171,6 @@ pub struct Arena {
     base_alignment: u64,
     free: Vec<FreeRange>,
     live: BTreeMap<AllocationId, LiveRecord>,
-    generations: BTreeMap<u64, u64>,
     next_allocation: u64,
 }
 
@@ -200,7 +199,6 @@ impl Arena {
                 bytes: capacity,
             }],
             live: BTreeMap::new(),
-            generations: BTreeMap::new(),
             next_allocation: 1,
         })
     }
@@ -307,15 +305,9 @@ impl Arena {
 
         // Compute every fallible identity change before mutating the free list:
         // a refused allocation is byte-for-byte atomic.
-        let generation = self
-            .generations
-            .get(&offset)
-            .copied()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| {
-                self.refusal(invalid("generation", "allocation generation overflowed"))
-            })?;
+        // Arena-wide identity also supplies a strictly increasing generation.
+        // No historical offsets survive release, even in long-lived arenas.
+        let generation = self.next_allocation;
         let next_allocation = self
             .next_allocation
             .checked_add(1)
@@ -330,7 +322,6 @@ impl Arena {
                 bytes: remaining,
             };
         }
-        self.generations.insert(offset, generation);
         let id = AllocationId(self.next_allocation);
         self.next_allocation = next_allocation;
         let record = LiveRecord {
@@ -572,6 +563,18 @@ mod tests {
         }
         assert!(arena.allocate(u64::MAX, 256, "overflow").is_err());
         assert_eq!(arena.occupancy(), before);
+
+        arena.next_allocation = u64::MAX;
+        assert_eq!(
+            arena
+                .allocate(1, 1, "generation exhausted")
+                .unwrap_err()
+                .error
+                .kind(),
+            "invalid_request"
+        );
+        assert_eq!(arena.occupancy(), before);
+        assert_eq!(arena.next_allocation, u64::MAX);
 
         let mut huge = Arena::new("checked", u64::MAX - 1, 2).unwrap();
         let _prefix = huge.allocate(1, 1, "prefix").unwrap();

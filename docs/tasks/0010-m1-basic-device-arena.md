@@ -224,3 +224,50 @@ Real-device identities: RTX 5060 Ti
 `GPU-81fe4578-59b2-37c4-421e-287cdac78704`. Local verification logs are under
 `/tmp/moxie-task0010-final/`; the reproducible commands and outcomes above are
 the tracked evidence, since temporary logs are not a durable dependency.
+
+### Independent-review corrections — 2026-09-09
+
+The [independent review](../handovers/2026-09-09-task0010-independent-review.md)
+requested R1/R2 changes against `4037fcc`. Its findings are preserved unchanged;
+the original passing tests did not establish bounded generation metadata or
+controlled pending-work sweeps on every device. Acceptance remains pending
+independent re-review; the fixed contract above is unchanged.
+
+R1: removed the per-offset generation history. The existing checked arena-wide
+allocation sequence now supplies generations; exhaustion refuses atomically
+before free-list mutation. Reusing any offset strictly increases generation.
+`arena_history` uses an independent counting global allocator in a single-test
+executable: after warming the fixed live-set free-list capacity, 100,000 distinct
+offset cycles with at most two live ranges retain **zero additional requested heap
+bytes**. The arena ends completely free. The original review measured 3,429,296
+bytes of retained history. This is a metadata resource result, not RSS or inference
+performance. The atomic-refusal test also covers exhausted generation identity.
+The reviewer's unchanged standalone probe, rebuilt against the corrected library,
+reports **944 bytes** from initial arena creation (fixed free-list/tree warm-up
+capacity), versus its original 3,429,296 bytes. The regression warms that same
+fixed live-set capacity before checking that further history retains zero bytes.
+
+R2: replaced the timing-dependent aggregate flag with a test-only real CUDA
+stream gate on each UUID. Symbol interposition enqueues `cuLaunchHostFunc` just
+before the actual completion event; the callback calls no CUDA API, is released
+by an unwind-safe guard, and has a ten-second failure timeout. Timeout fails the
+test, never qualifies an early completion. Cancellation and the first
+`OperationTurn` sweep must return exactly one held actual range/source and no
+retired resource. Once the gate opens, synchronization and the second sweep
+return the resource without a next token. Existing readback, transfer, explicit
+release, full-arena coalescing/reuse and ledger/free-memory reconciliation remain.
+All three UUIDs printed a separate controlled-pending/cancel/two-sweep pass.
+
+Production ownership/FFI APIs, CUDA kernels and reference documents are unchanged
+by these corrections. The test gate remains only in the integration executable;
+it creates no production injection switch or fabricated event result.
+
+Correction validation: **passed** full locked/offline host (533 tests + 8
+doctests) and device-feature workspace suites (543 tests + 10 doctests), the
+focused memory suite including generation exhaustion, all 33 GPU harness cases,
+format, host/device clippy with warnings denied, architecture (52 negative/14
+positive fixtures, 12 rules) and all 10 unchanged-reference checks. Local logs:
+`/tmp/moxie-task0010-corrections/`. **Failed:** no final correction gate.
+**Not rerun:** isolated no-driver build/ldd and capacity/visibility probes; their
+earlier task/review results remain recorded separately. **Unmeasured:** model,
+context, quality and paired performance gates remain outside this correction.
