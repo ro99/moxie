@@ -1,6 +1,9 @@
 # Task 0006 — M1.3: resource ledger and admission
 
-Status: **contract proposed**, 2026-09-08, after [task 0005](0005-m1-canonical-manifest-and-bounded-reads.md)
+Status: **accepted**, 2026-09-08 at `b6ad977`, after five rounds of review corrections. The owner's
+reviewer approved *the accounting and admission slice*, explicitly not all of M1.3.
+
+Contract proposed 2026-09-08, after [task 0005](0005-m1-canonical-manifest-and-bounded-reads.md)
 delivered the bounded reader.
 
 **This contract is committed before any implementation code**, as in tasks 0003, 0004 and 0005. That
@@ -659,3 +662,30 @@ PASS (10 documents); no-driver lane PASS (460 + 6, no `libcuda`). Device lane an
 `test-gpu` carried forward from `a486930`: this round touches `moxie-memory`
 only. The reviewer's sixteen tests across five rounds, run unmodified from
 outside the repository, all pass.
+
+### Acceptance, 2026-09-08 (`b6ad977`)
+
+The reviewer found no further blocking issue and recommended acceptance. Their
+verification, recorded here because it is evidence this repository does not
+otherwise hold:
+
+- 460 unit/integration tests and 6 doctests; `fmt`, `clippy`, `arch-check` and
+  `spec-check`, all passed.
+- All sixteen external regressions from rounds 1-5, unmodified, passed.
+- **An independent exhaustive oracle over 6,048 small resource configurations.**
+  Every one of the 1,731 configurations where the ledger offered
+  `HostBackedExecution` had a feasible split. That is an independent check of the
+  property the last three rounds were about, and it is stronger evidence than the
+  regression tests alone.
+- The isolated no-driver and GPU lanes were not re-run by the reviewer; carrying
+  the device evidence forward was agreed for a memory-only change.
+
+Recorded as a limit of the accepted behaviour, in the reviewer's words: the
+documented conservatisms mean **an absent suggestion does not prove that no
+host-backed plan exists.** A caller may not read a missing `HostBackedExecution`
+as "the host cannot help".
+
+What this acceptance does *not* cover: M1.3's remaining parts. Measured capacity,
+the rank-owned CUDA context, event-backed leases, the basic allocator, the
+admitted execution plan and the device-resident layer chain are all still
+outstanding, and the next task needs fresh device validation of its own.

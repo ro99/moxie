@@ -19,14 +19,21 @@ Written 2026-09-08 at the end of the session that implemented task 0006.
 
 **Task 0005 (M1.2, canonical manifest v1 and bounded tensor reads)** is implemented and committed at
 `712271c`, after seven review rounds and one implementation takeover. Owner acceptance is still
-pending; treat "gates pass" as gates passing, not as acceptance.
+pending for it; treat "gates pass" as gates passing, not as acceptance.
 
 **Task 0006 (M1.3 part 1, the resource ledger and admission)** was contracted at `305c765` — a commit
 with no `.rs` change, as tasks 0003, 0004 and 0005 did — implemented at `a486930`, and then
 corrected against five rounds of review findings — four, then two, then one area in two halves, then one, then one. Its record,
 [docs/tasks/0006-m1-resource-ledger-and-admission.md](../tasks/0006-m1-resource-ledger-and-admission.md),
 carries the contract, the result, six recorded deviations, the bite checks and all five
-review-correction rounds. Owner acceptance is pending for this task too.
+review-correction rounds. It was **accepted at `b6ad977`** for the accounting and admission slice
+only, explicitly not for M1.3 as a whole, and everything through it is on `origin/main`.
+
+The reviewer's acceptance added evidence worth carrying: an independent exhaustive oracle over 6,048
+small resource configurations found a feasible split behind every one of the 1,731 host-fallback
+suggestions the ledger made. It also recorded a limit of the accepted behaviour -- because the
+relocation greedy is conservative, **an absent suggestion does not prove that no host-backed plan
+exists**, and no caller may read it that way.
 
 One of those findings was a **contract** defect, not only an implementation one: the contract
 excluded resident mapped pages from the host budget. It is struck in place rather than rewritten, so
