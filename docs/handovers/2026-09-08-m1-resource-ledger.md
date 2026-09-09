@@ -23,9 +23,9 @@ pending; treat "gates pass" as gates passing, not as acceptance.
 
 **Task 0006 (M1.3 part 1, the resource ledger and admission)** was contracted at `305c765` — a commit
 with no `.rs` change, as tasks 0003, 0004 and 0005 did — implemented at `a486930`, and then
-corrected against two rounds of review findings — four, then two. Its record,
+corrected against three rounds of review findings — four, then two, then one area in two halves. Its record,
 [docs/tasks/0006-m1-resource-ledger-and-admission.md](../tasks/0006-m1-resource-ledger-and-admission.md),
-carries the contract, the result, six recorded deviations, the bite checks and both
+carries the contract, the result, six recorded deviations, the bite checks and all three
 review-correction rounds. Owner acceptance is pending for this task too.
 
 One of those findings was a **contract** defect, not only an implementation one: the contract
@@ -58,10 +58,10 @@ FFI path:
 |---|---|
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | PASS |
-| `cargo test --workspace --locked --offline` | PASS, 452 unit/integration + 6 doctests |
+| `cargo test --workspace --locked --offline` | PASS, 455 unit/integration + 6 doctests |
 | `cargo xtask arch-check` | PASS, 45 rejected + 12 accepted fixtures, 10 rules |
 | `cargo xtask spec-check` | PASS, 10 documents |
-| no-driver host lane | PASS, 452 + 6; `ldd target/debug/xtask` shows no `libcuda` |
+| no-driver host lane | PASS, 455 + 6; `ldd target/debug/xtask` shows no `libcuda` |
 | device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` (carried forward from `a486930`) | PASS, 450 + 7 |
 | `cargo xtask-cuda test-gpu` (carried forward from `a486930`) | PASS, 15 cases, `sm_86` and `sm_120` qualified |
 | `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` (carried forward from `a486930`) | **exit 1**, `UNQUALIFIED sm_120`, as intended |
@@ -115,7 +115,10 @@ exists and which does not.
   fallback into memory the same request had taken, then one checked against an unrelated tier's cap;
   and a tier excluded from a budget it physically occupies. The lesson the second round added is
   sharper than the first: **attribution is not an answer, recomputation is.** Any advice the engine
-  gives a caller must be tested by computing what happens if they follow it.
+  gives a caller must be tested by computing what happens if they follow it. Round 3 added the
+  companion rule: **a label is not a resource.** `BindingConstraint::tier` on a scope failure names
+  the largest contributor so a person knows where to look; deciding anything from it -- what can
+  move, where it would go -- reads a diagnostic as a fact about the world.
 
 ## Next task
 

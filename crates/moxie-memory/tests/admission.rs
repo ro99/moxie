@@ -1227,3 +1227,73 @@ fn an_uncapped_spill_is_not_blocked_by_an_unrelated_workspace_cap() {
         "state spill is uncapped and the host has room; the workspace cap is irrelevant"
     );
 }
+
+// --- review corrections, round 3 --------------------------------------------
+
+/// Round-3 finding: device overhead is not work that can move to host RAM.
+fn assert_no_host_fallback_for(tier: DeviceTier) {
+    let d = gpu(1);
+    let mut ledger = Ledger::new([device_snapshot(d, 100), host_snapshot(1_100, 100)]).unwrap();
+    let mut plan = PlanRequest::new("device overhead", ["run"]).unwrap();
+    plan.buffer(BufferRequest::new(
+        "overhead",
+        d,
+        Tier::Device(tier),
+        200,
+        StageSpan::at(0),
+    ))
+    .unwrap();
+    let e = ledger.admit(&plan).unwrap_err();
+    assert!(
+        !rejection(&e)
+            .alternatives
+            .contains(&LegalAlternative::HostBackedExecution),
+        "{tier:?} is device-local overhead; there is nothing to move to the host"
+    );
+}
+
+#[test]
+fn device_safety_headroom_cannot_move_to_the_host() {
+    assert_no_host_fallback_for(DeviceTier::SafetyHeadroom);
+}
+
+#[test]
+fn device_fragmentation_cannot_move_to_the_host() {
+    assert_no_host_fallback_for(DeviceTier::AllocatorFragmentation);
+}
+
+#[test]
+fn a_scope_failure_looks_at_every_movable_contributor_not_the_largest_one() {
+    // Round-3 finding, the other direction. `BindingConstraint::tier` on a
+    // scope-budget failure is a diagnostic label -- the largest contributor --
+    // and eligibility must not be decided from it. Here the largest contributor
+    // is immovable headroom, and the smaller KV buffer is exactly what could
+    // spill.
+    let d = gpu(1);
+    let host = host_snapshot(1_100, 100)
+        .with_tier_cap(Tier::Host(HostTier::CpuWorkspace), 0)
+        .unwrap();
+    let mut ledger = Ledger::new([device_snapshot(d, 150), host]).unwrap();
+    let mut plan = PlanRequest::new("scope peak", ["run"]).unwrap();
+    plan.buffer(BufferRequest::new(
+        "headroom",
+        d,
+        Tier::Device(DeviceTier::SafetyHeadroom),
+        90,
+        StageSpan::at(0),
+    ))
+    .unwrap()
+    .buffer(BufferRequest::new("kv", d, KV, 80, StageSpan::at(0)))
+    .unwrap();
+    let e = ledger.admit(&plan).unwrap_err();
+    assert_eq!(
+        rejection(&e).worst().tier,
+        Tier::Device(DeviceTier::SafetyHeadroom)
+    );
+    assert!(
+        rejection(&e)
+            .alternatives
+            .contains(&LegalAlternative::HostBackedExecution),
+        "spilling 20 of the 80 KV bytes clears the 20 B shortfall"
+    );
+}

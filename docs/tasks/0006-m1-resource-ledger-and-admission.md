@@ -211,10 +211,13 @@ was tried twice and was wrong twice -- first accepting any scaling buffer in a f
 accepting one live at the reported peak stage. Neither test survives a tie: two stages can hold the
 same total, and a derived reserve takes the largest buffer of its tier, so removing one member of a
 tie moves nothing. The `HostBackedExecution` row subtracts this request's own host peak as well as
-earlier commitments, declines when any host constraint binds, and checks the cap of the host tier
-that would actually receive the bytes -- state spills to `StateSpill`, everything else on a device
-needs `CpuWorkspace` -- where an absent cap keeps its documented meaning of "bounded by the scope
-budget".
+earlier commitments, declines when any host constraint binds, and asks how many of the failing
+constraint's bytes could actually be held on the host: each contributing tier is routed to the host
+tier that would receive it -- state spills to `StateSpill`, execution needs `CpuWorkspace`, and
+`SafetyHeadroom` and `AllocatorFragmentation` have nowhere to go -- and each destination's own cap
+bounds what it can take, where an absent cap keeps its documented meaning of "bounded by the scope
+budget". For a scope-budget failure that means every movable contributor, not the one named in
+`BindingConstraint::tier`, which is a diagnostic label rather than a claim about what can move.
 
 A generic menu of five is worse than nothing, because it invites the caller to try a change that
 cannot help. The ledger **never applies** an alternative: document 03 forbids automatically
@@ -515,3 +518,40 @@ and `test-gpu` carried forward from `a486930`: these corrections touch
 `moxie-memory` and the documentation only, and changed no device code, kernel or
 FFI path. The reviewer's eight tests, run unmodified from outside the
 repository, all pass.
+
+### Review corrections, round 3 (2026-09-08, commit `28faf13` not accepted)
+
+One area remained, both halves of it in host-fallback eligibility. Both
+reproduced before any fix.
+
+- **P2 — a reporting tier is not a resource that can move.** `host_destination`
+  was total on device tiers, so its catch-all sent `SafetyHeadroom` and
+  `AllocatorFragmentation` to `CpuWorkspace`. Neither is work or state: one is
+  deliberate slack in that device's memory and the other is bytes its allocator
+  cannot hand out, and 200 B of either over a 100 B device budget was answered
+  with "ask for host-backed execution". The mapping now returns `Option<Tier>`
+  and those two return `None`, as does any host tier, which is already where it
+  would move to.
+
+- **P2 — eligibility was decided from a diagnostic label.** On a scope-budget
+  failure `BindingConstraint::tier` names the largest contributor at the peak
+  stage, which round 2 then treated as the thing that would move. With 90 B of
+  immovable headroom and 80 B of KV against a 150 B budget, the 20 B shortfall is
+  covered by spilling a quarter of the KV, but the check looked at the
+  headroom's destination and declined. Eligibility is now computed over **every**
+  contributor at the binding stage: each is routed to its own destination, the
+  destination's cap bounds what it can take, and the alternative is offered when
+  the total the host could absorb covers the shortfall. A tier-cap failure keeps
+  its single tier, because there only that tier's bytes are over the line.
+
+Bite checks, reverted to green: deleting the `None` arm so overhead is movable
+again fails both overhead regressions; narrowing the contributor scan to
+`c.tier` for every constraint kind fails the scope-contributor regression.
+
+Re-verified after round 3: `fmt` PASS; `clippy -D warnings` PASS;
+`cargo test --workspace --locked --offline` PASS, 455 unit/integration + 6
+doctests; `arch-check` PASS (45 rejected + 12 accepted, 10 rules); `spec-check`
+PASS (10 documents); no-driver lane PASS (455 + 6, no `libcuda`). Device lane and
+`test-gpu` carried forward from `a486930`: this round touches `moxie-memory`
+only and changed no device code, kernel or FFI path. The reviewer's eleven tests
+across three rounds, run unmodified from outside the repository, all pass.

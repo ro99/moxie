@@ -601,9 +601,8 @@ impl Ledger {
 
         // Moving work to the host is only an alternative if the host has room
         // for it *after* everything this same request already asks the host for,
-        // and in the tier that would actually hold it. A cap on CPU workspace
-        // says nothing about room for persistent sequence state, in either
-        // direction.
+        // and if there is something in the failing scope that can actually move,
+        // into the tier that would hold it.
         if let Some(host) = self.scopes.get(&Scope::Host)
             && !binding.iter().any(|c| c.scope == Scope::Host)
         {
@@ -612,43 +611,80 @@ impl Ledger {
                 .admissible_bytes()
                 .saturating_sub(self.scope_committed(Scope::Host))
                 .saturating_sub(base.scope_peak(Scope::Host).0);
-            let fits = |c: &BindingConstraint| {
+            if binding.iter().any(|c| {
                 let need = c.shortfall_bytes();
-                if available < need {
-                    return false;
-                }
-                let destination = host_destination(c.tier);
-                match host.snapshot.tier_cap(destination) {
-                    // An absent cap means the tier is bounded by the scope
-                    // budget, which was just checked.
-                    None => true,
-                    Some(cap) => {
-                        let used = self.committed(Scope::Host, destination)
-                            + base.tier_peak(Scope::Host, destination).0;
-                        cap.saturating_sub(used) >= need
-                    }
-                }
-            };
-            if binding
-                .iter()
-                .any(|c| c.scope.kind() == ScopeKind::Device && fits(c))
-            {
+                c.scope.kind() == ScopeKind::Device
+                    && available >= need
+                    && self.host_absorbable(base, host, c) >= need
+            }) {
                 out.insert(LegalAlternative::HostBackedExecution);
             }
         }
 
         Ok(out.into_iter().collect())
     }
+
+    /// How many of a failing constraint's bytes could actually be held on the
+    /// host, given what can move and where it would go.
+    ///
+    /// Two things are deliberately not consulted. `BindingConstraint::tier` on a
+    /// scope-budget failure is a **diagnostic label** -- the largest contributor
+    /// at the peak stage -- so eligibility is decided over every contributor
+    /// instead: the largest one may be immovable while a smaller one covers the
+    /// whole shortfall. And a tier with no host destination contributes nothing,
+    /// however large it is: device safety headroom and allocator fragmentation
+    /// are properties of that device's memory, not work or state with somewhere
+    /// else to be.
+    fn host_absorbable(&self, base: &Peaks, host: &ScopeState, c: &BindingConstraint) -> u64 {
+        let mut movable: BTreeMap<Tier, u64> = BTreeMap::new();
+        for ((scope, tier), row) in &base.live {
+            if *scope != c.scope {
+                continue;
+            }
+            if c.kind == BindingKind::TierCap && *tier != c.tier {
+                continue;
+            }
+            let bytes = row[c.peak_stage as usize];
+            if bytes == 0 {
+                continue;
+            }
+            if let Some(destination) = host_destination(*tier) {
+                *movable.entry(destination).or_insert(0) += bytes;
+            }
+        }
+
+        let mut absorbable: u64 = 0;
+        for (destination, bytes) in movable {
+            let room = match host.snapshot.tier_cap(destination) {
+                // An absent cap means the tier is bounded by the scope budget,
+                // which the caller checks separately.
+                None => bytes,
+                Some(cap) => {
+                    let used = self.committed(Scope::Host, destination)
+                        + base.tier_peak(Scope::Host, destination).0;
+                    bytes.min(cap.saturating_sub(used))
+                }
+            };
+            absorbable = absorbable.saturating_add(room);
+        }
+        absorbable
+    }
 }
 
-/// Where a device tier's bytes would go if its work moved to the host.
+/// Where a device tier's bytes would go if its work moved to the host, or
+/// `None` when they cannot move at all.
 ///
-/// Sequence state spills; everything else on a device needs CPU-side workspace
-/// to be executed there. The mapping is total on device tiers so that no binding
-/// constraint silently loses the alternative, and it is deliberately coarse:
-/// a host weight arena of its own (R11) is a residency question, and residency
-/// is M2. When that arrives, this is the function that gains a row.
-fn host_destination(tier: Tier) -> Tier {
+/// Sequence state spills; the tensors and scratch of execution need CPU-side
+/// workspace to be executed there. Two device tiers have **no** host
+/// destination: `SafetyHeadroom` is deliberate slack in that device's memory and
+/// `AllocatorFragmentation` is bytes its allocator cannot hand out. Neither is
+/// work or state, so neither can be relocated -- offering a host fallback for
+/// them would be advice that cannot be followed.
+///
+/// The mapping is otherwise deliberately coarse: a host weight arena of its own
+/// (R11) is a residency question, and residency is M2. When that arrives, this
+/// is the function that gains a row.
+fn host_destination(tier: Tier) -> Option<Tier> {
     match tier {
         Tier::Device(
             DeviceTier::KvStatePages
@@ -656,10 +692,11 @@ fn host_destination(tier: Tier) -> Tier {
             | DeviceTier::SpeculativeTargetState
             | DeviceTier::SpeculativeDraftState
             | DeviceTier::EntropyBranches,
-        ) => Tier::Host(HostTier::StateSpill),
-        Tier::Device(_) => Tier::Host(HostTier::CpuWorkspace),
-        // A host tier is already where it would move to.
-        Tier::Host(t) => Tier::Host(t),
+        ) => Some(Tier::Host(HostTier::StateSpill)),
+        Tier::Device(DeviceTier::SafetyHeadroom | DeviceTier::AllocatorFragmentation) => None,
+        Tier::Device(_) => Some(Tier::Host(HostTier::CpuWorkspace)),
+        // A host tier is already on the host; there is nowhere to move it to.
+        Tier::Host(_) => None,
     }
 }
 
