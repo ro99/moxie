@@ -17,14 +17,14 @@ matrix exists to prevent.
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
 | `G-DEVICE-CLIPPY` | the same with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | device build | passed; **new at [task 0007](../tasks/0007-m1-rank-context-and-measured-capacity.md)**, which found and fixed two pre-existing `undocumented_unsafe_blocks` findings the lane had never been run against; extended at [task 0009](../tasks/0009-m1-event-backed-leases.md) with `moxie-executor/driver` |
-| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 515 unit/integration tests + 6 doctests |
+| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 521 unit/integration tests + 6 doctests |
 | `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 52 negative + 14 accepted fixtures, 12 rules; 343 generated module combinations checked against rustc by the host suite, each against all four crate boundaries |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
-| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH`; **`cargo build -p xtask` before `ldd`** | host | passed, 515 unit/integration tests + 6 doctests, `ldd` shows no `libcuda`. The explicit build is load-bearing: without it `ldd` can read a device-lane artifact left in the shared `target/`, which it did once on 2026-09-08 ([toolchain.md](toolchain.md)) |
+| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH`; **`cargo build -p xtask` before `ldd`** | host | passed, 521 unit/integration tests + 6 doctests, `ldd` shows no `libcuda`. The explicit build is load-bearing: without it `ldd` can read a device-lane artifact left in the shared `target/`, which it did once on 2026-09-08 ([toolchain.md](toolchain.md)) |
 | `G-GPU-CAPACITY` | `cargo xtask-cuda capacity` | device | passed, **the host and** 3 devices measured and admitted against in one ledger; also passed with `CUDA_VISIBLE_DEVICES` reversed, each UUID keeping its own memory total |
 | `G-GPU-SM86` | `cargo xtask-cuda test-gpu --profile sm86` | device | passed, RTX 3090 x2 |
 | `G-GPU-SM120` | `cargo xtask-cuda test-gpu --profile sm120` | device | passed, RTX 5060 Ti |
-| `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 27 cases, both architectures qualified |
+| `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 30 cases, both architectures qualified |
 | `G-INTERP-BF16` | `cargo test -p moxie-interp` | host | passed, 19 unit + 27 acceptance tests + 3 compile-fail doctests ([task 0003](../tasks/0003-m1-bf16-reference-interpreter.md), [task 0004](../tasks/0004-m1-state-transactions.md)) |
 | `G-TOPOLOGY` | `cargo xtask test-topology` | device | **not implemented** (M5) |
 | `G-QUALITY` | `cargo xtask quality` | device | **not implemented** (M3) |

@@ -4,9 +4,15 @@
 //! event is one implementation of `Completion`, and the machine cannot tell it
 //! from the doubles used here.
 
-use moxie_executor::{Lease, LeaseState, ManualCompletion, Script, ScriptedCompletion, Turn};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use moxie_executor::{
+    Lease, LeaseState, ManualCompletion, Script, ScriptedCompletion, SettledResource, Turn,
+    check_fit,
+};
 use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, Reservation, StageSpan};
-use moxie_types::{HostTier, Scope, Tier};
+use moxie_types::{DeviceUuid, HostTier, Scope, Tier};
 
 fn host_ledger() -> Ledger {
     Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 30, 1 << 20).unwrap()]).unwrap()
@@ -38,6 +44,36 @@ fn outstanding_ids(ledger: &Ledger) -> Vec<moxie_memory::ReservationId> {
     ledger.outstanding().iter().map(|o| o.id).collect()
 }
 
+/// A resource that counts its own destructions: the only way to observe
+/// whether a dropped lease freed early or withheld.
+#[derive(Debug)]
+struct CountedDrop {
+    drops: Arc<AtomicUsize>,
+}
+
+impl CountedDrop {
+    fn new() -> (Self, Arc<AtomicUsize>) {
+        let drops = Arc::new(AtomicUsize::new(0));
+        (
+            CountedDrop {
+                drops: drops.clone(),
+            },
+            drops,
+        )
+    }
+}
+
+impl Drop for CountedDrop {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl SettledResource for CountedDrop {
+    type Settled = ();
+    fn settle(self) {}
+}
+
 #[test]
 fn acquire_binds_the_admitted_scope_and_bytes() {
     let mut ledger = host_ledger();
@@ -45,6 +81,23 @@ fn acquire_binds_the_admitted_scope_and_bytes() {
     let lease = Lease::<ManualCompletion>::acquire(&ledger, reservation, "bound").unwrap();
     assert_eq!(lease.admitted(), &[(Scope::Host, 1 << 20)]);
     assert_eq!(lease.admitted_bytes(), 1 << 20);
+}
+
+#[test]
+fn check_fit_refuses_wrong_scope_and_over_budget() {
+    let admitted = vec![(Scope::Host, 512u64)];
+    assert!(check_fit(&admitted, Scope::Host, 512).is_ok());
+    assert!(
+        check_fit(&admitted, Scope::Host, 4096)
+            .unwrap_err()
+            .to_string()
+            .contains("4096")
+    );
+    let dev = Scope::Device(DeviceUuid::parse("GPU-00000000-0000-0000-0000-000000000001").unwrap());
+    let e = check_fit(&admitted, dev, 8).unwrap_err();
+    assert_eq!(e.kind(), "invalid_request");
+    let e = check_fit(&admitted, Scope::Host, 4096).unwrap_err();
+    assert_eq!(e.kind(), "capacity_exceeded");
 }
 
 #[test]
@@ -70,11 +123,12 @@ fn acquire_refuses_a_reservation_from_another_ledger() {
     // Still charged where it belongs, untouched elsewhere — and reusable.
     assert_eq!(outstanding_ids(&ledger).len(), 1);
     assert!(outstanding_ids(&other).is_empty());
-    let _reacquired = Lease::<ManualCompletion>::acquire(&ledger, refused.reservation, "foreign");
+    let _reacquired =
+        Lease::<ManualCompletion>::acquire(&ledger, refused.reservation, "foreign").unwrap();
 }
 
 #[test]
-fn acquire_use_retire_releases_both_sides_and_returns_the_resource() {
+fn acquire_use_retire_releases_both_sides_and_settles_the_resource() {
     let mut ledger = host_ledger();
     let (lease, completion) = tracked_lease(&mut ledger, "upload");
     assert_eq!(lease.state(), LeaseState::InFlight);
@@ -87,7 +141,7 @@ fn acquire_use_retire_releases_both_sides_and_returns_the_resource() {
     assert_eq!(refused.error.kind(), "invalid_request");
     assert!(refused.error.to_string().contains("not observed"));
 
-    // Observed complete: both sides release, resource returned.
+    // Observed complete: both sides release, resource settled.
     completion.complete();
     let (retired, ()) = refused.lease.retire(&mut ledger).unwrap();
     assert_eq!(retired, id);
@@ -136,6 +190,80 @@ fn synchronize_is_an_explicit_wait_not_a_backdoor() {
     refused.lease.synchronize().unwrap();
     refused.lease.retire(&mut ledger).unwrap();
     assert!(ledger.outstanding().is_empty());
+}
+
+#[test]
+fn a_dropped_live_lease_frees_its_unsubmitted_resource() {
+    // No completion was ever tracked, so nothing was submitted: normal drop.
+    // This is the only droppable shape, and the abandon path relies on it.
+    let mut ledger = host_ledger();
+    let reservation = admit(&mut ledger, "live-drop", 1 << 20);
+    let (resource, drops) = CountedDrop::new();
+    let lease = Lease::<ManualCompletion>::acquire(&ledger, reservation, "live-drop")
+        .unwrap()
+        .retain(resource);
+    drop(lease);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_dropped_inflight_lease_withholds_its_resource() {
+    let mut ledger = host_ledger();
+    let reservation = admit(&mut ledger, "inflight-drop", 1 << 20);
+    let (resource, drops) = CountedDrop::new();
+    let completion = ManualCompletion::new();
+    let mut lease = Lease::<ManualCompletion>::acquire(&ledger, reservation, "inflight-drop")
+        .unwrap()
+        .retain(resource);
+    lease.track_manual(completion).unwrap();
+    let rid = lease.reservation_id().unwrap();
+    drop(lease);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "an in-flight resource must survive the lease drop"
+    );
+    assert_eq!(outstanding_ids(&ledger), vec![rid]);
+}
+
+#[test]
+fn a_dropped_cancelled_lease_withholds_its_resource() {
+    let mut ledger = host_ledger();
+    let reservation = admit(&mut ledger, "cancelled-drop", 1 << 20);
+    let (resource, drops) = CountedDrop::new();
+    let completion = ManualCompletion::new();
+    let mut lease = Lease::<ManualCompletion>::acquire(&ledger, reservation, "cancelled-drop")
+        .unwrap()
+        .retain(resource);
+    lease.track_manual(completion).unwrap();
+    lease.cancel();
+    drop(lease);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "a cancelled-but-unobserved resource must survive the lease drop"
+    );
+    assert_eq!(outstanding_ids(&ledger).len(), 1);
+}
+
+#[test]
+fn a_dropped_lost_lease_withholds_its_resource() {
+    let mut ledger = host_ledger();
+    let reservation = admit(&mut ledger, "lost-drop", 1 << 20);
+    let (resource, drops) = CountedDrop::new();
+    let completion = ManualCompletion::new();
+    let mut lease = Lease::<ManualCompletion>::acquire(&ledger, reservation, "lost-drop")
+        .unwrap()
+        .retain(resource);
+    lease.track_manual(completion).unwrap();
+    lease.mark_lost(0, "transport error");
+    drop(lease);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "a lost resource must survive the lease drop"
+    );
+    assert_eq!(outstanding_ids(&ledger).len(), 1);
 }
 
 #[test]
@@ -191,6 +319,24 @@ fn a_turn_sweep_retires_the_completed_and_returns_the_rest() {
     assert_eq!(report.held[0].id, held_id);
     assert_eq!(report.held[0].label, "held");
     assert!(!report.is_clean());
+}
+
+#[test]
+fn a_sweep_returns_retained_resources_with_the_release() {
+    let mut ledger = host_ledger();
+    let reservation = admit(&mut ledger, "kept", 1 << 20);
+    let lease = Lease::<ManualCompletion>::acquire(&ledger, reservation, "kept").unwrap();
+    let completion = ManualCompletion::new();
+    let mut lease = lease.retain(vec![9u8; 4]);
+    lease.track_manual(completion.clone()).unwrap();
+    completion.complete();
+    let mut turn = Turn::new("sweep-kept").unwrap();
+    turn.hold(lease);
+    let report = turn.release_turn(&mut ledger);
+    assert!(report.is_clean());
+    assert_eq!(report.retired.len(), 1);
+    assert_eq!(report.retired[0].resource, vec![9u8; 4]);
+    assert!(ledger.outstanding().is_empty());
 }
 
 #[test]
@@ -307,6 +453,7 @@ fn observed_loss_persists_past_a_racing_completion() {
     assert!(refused.error.to_string().contains("withheld"));
     assert_eq!(outstanding_ids(&ledger).len(), 1);
 }
+
 #[test]
 fn observed_loss_through_synchronize_persists_too() {
     // A wait whose handle reports loss must withhold exactly like a query

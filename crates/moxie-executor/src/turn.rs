@@ -28,19 +28,21 @@ pub struct HeldLease<C = ManualCompletion, R = ()> {
     pub lease: Lease<C, R>,
 }
 
-/// A lease the turn sweep retired, with its released resource.
+/// A lease the turn sweep retired, with its settled resource.
 #[derive(Debug)]
 pub struct RetiredLease<R = ()> {
     /// Which lease retired.
     pub id: LeaseId,
-    /// The resource retirement returned: safe to reuse from here.
+    /// What settlement returned: safe to reuse from here.
     pub resource: R,
 }
-/// What a turn sweep did.
+
+/// What a turn sweep did. `R` is the retained resource still held; `S` is
+/// what retirement settled the released ones into.
 #[derive(Debug)]
-pub struct TurnReport<C = ManualCompletion, R = ()> {
-    /// Leases retired into the ledger, in sweep order, resources returned.
-    pub retired: Vec<RetiredLease<R>>,
+pub struct TurnReport<C = ManualCompletion, R = (), S = ()> {
+    /// Leases retired into the ledger, in sweep order, resources settled.
+    pub retired: Vec<RetiredLease<S>>,
     /// Leases still charged, each named with its reason and its handle.
     pub held: Vec<HeldLease<C, R>>,
 }
@@ -58,7 +60,7 @@ pub struct Turn<C = ManualCompletion, R = ()> {
     leases: Vec<Lease<C, R>>,
 }
 
-impl<C, R> TurnReport<C, R> {
+impl<C, R, S> TurnReport<C, R, S> {
     /// Whether every lease the turn held was retired.
     pub fn is_clean(&self) -> bool {
         self.held.is_empty()
@@ -87,11 +89,11 @@ impl<C: Completion, R> Turn<C, R> {
         &self.label
     }
 
-    /// How many leases this turn holds.
-    pub fn len(&self) -> usize {
-        self.leases.len()
+    /// The leases this turn holds, in hold order. Owner reads (like a
+    /// pre-sweep readback) go through here.
+    pub fn leases(&self) -> &[Lease<C, R>] {
+        &self.leases
     }
-
     /// Whether this turn holds no lease.
     pub fn is_empty(&self) -> bool {
         self.leases.is_empty()
@@ -112,11 +114,18 @@ impl<C: Completion, R> Turn<C, R> {
         Ok(())
     }
 
-    /// Retire every held lease into `ledger`. Completed leases release;
-    /// anything still in flight, cancelled-but-incomplete, or lost comes back
-    /// in the report by identity, with its reason and its handle, and stays
-    /// charged. Consumes the turn; hold the returned leases in the next one.
-    pub fn release_turn(self, ledger: &mut Ledger) -> TurnReport<C, R> {
+    /// Retire every held lease into `ledger`, settling retired resources.
+    /// Completed leases release; anything still in flight,
+    /// cancelled-but-incomplete, or lost comes back in the report by identity,
+    /// with its reason and its handle, and stays charged. Consumes the turn;
+    /// hold the returned leases in the next one.
+    pub fn release_turn(
+        self,
+        ledger: &mut Ledger,
+    ) -> TurnReport<C, R, <R as crate::lease::SettledResource>::Settled>
+    where
+        R: crate::lease::SettledResource,
+    {
         let mut report = TurnReport {
             retired: Vec::new(),
             held: Vec::new(),

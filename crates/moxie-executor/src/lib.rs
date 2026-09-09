@@ -33,7 +33,7 @@
 pub mod lease;
 pub use lease::{
     AcquireRefused, Completion, Lease, LeaseId, LeaseState, ManualCompletion, RetireRefused,
-    Script, ScriptedCompletion, TrackableManual,
+    Script, ScriptedCompletion, SettledResource, TrackableManual, check_fit,
 };
 pub mod turn;
 

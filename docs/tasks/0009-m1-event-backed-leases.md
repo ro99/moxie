@@ -196,12 +196,12 @@ Gates (this machine, 2026-09-09; nothing loosened):
 |---|---|
 | `cargo fmt --all -- --check` | PASS |
 | `clippy -D warnings`, host and device features | PASS (device lane with `moxie-executor/driver`) |
-| `cargo test --workspace --locked --offline` | PASS, 515 unit/integration + 6 doctests (was 506 + 6; +9 ownership and recovery rules) |
+| `cargo test --workspace --locked --offline` | PASS, 521 unit/integration + 6 doctests (was 515 + 6; +6 drop-withhold, fit, sweep-resource rules) |
 | `cargo xtask arch-check` | PASS, 52 rejected + 14 accepted fixtures, 12 rules, unchanged |
 | `cargo xtask spec-check` | PASS, 10 documents |
-| no-driver host lane, `xtask` rebuilt before `ldd` | PASS, 515 + 6, no `libcuda` |
-| device lane | PASS, 523 + 8 (was 514 + 8) |
-| `cargo xtask-cuda test-gpu` | PASS, 27 cases, `sm_86` and `sm_120` qualified (was 24; +`event_backed_lease`) |
+| no-driver host lane, `xtask` rebuilt before `ldd` | PASS, 521 + 6, no `libcuda` |
+| device lane | PASS, 529 + 8 (was 523 + 8) |
+| `cargo xtask-cuda test-gpu` | PASS, 30 cases, `sm_86` and `sm_120` qualified (was 27; +`lease_quarantine_on_cross_context_record`) |
 | `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, as intended (`sm_120` unqualified) |
 | `cargo xtask-cuda capacity` | PASS, the host and 3 devices, every scope to zero |
 
@@ -215,47 +215,60 @@ Remaining blockers and next bounded task: the spending half continues — the
 basic allocator (suballocating admitted envelopes into live ranges), the
 admitted execution plan, and the device-resident layer chain.
 
-## Review corrections, 2026-09-09
+## Review corrections, 2026-09-09 (two rounds)
 
-Review of the committed tree found five ownership and recovery gaps; all
-reproduced by the reviewer against `f7d1f6b`. The contract above is preserved
-as written — what follows corrects the implementation toward its guarantees.
+Review of the committed tree found ownership and recovery gaps, all reproduced
+by the reviewer — first five against `f7d1f6b`, then three deeper ones against
+`361049e` on submission, destruction, and accounting lifetimes. The contract
+above is preserved as written; what follows corrects the implementation toward
+its guarantees.
 
-**P1 — the lease retains its resources.** `Lease<C, R>` now owns the operation
-resource alongside the reservation: `retain` moves it in exactly once
-(enforced by type, only from `Lease<C, ()>`), and `retire` returns it with
-the release. `Upload::stage` allocates and enqueues the copy, keeping source
-and buffer together until retirement; admission precedes both. A
-`compile_fail` doctest proves a retained source has no early-mutation alias.
-`acquire` takes the ledger, binds the admitted scope charges read from it,
-and returns `AcquireRefused` (reservation included) on an empty label or a
-foreign reservation.
+**Leases own their resources.** `Lease<C, R>` carries the operation resource
+alongside the reservation: `retain` moves it in exactly once (enforced by
+type, only from `Lease<C, ()>`), and retirement settles it through
+`SettledResource` — transient `()` and host bytes to themselves, `Upload` to
+its source with the device allocation freed at the observed completion, so no
+live allocation outlives its charge. A `compile_fail` doctest proves a
+retained source has no early-mutation alias. `acquire` takes the ledger, binds
+the admitted scope charges read from it, and returns `AcquireRefused`
+(reservation included) on an empty label or a foreign reservation.
 
-**P1 — sweeps return pending leases.** `HeldLease` carries the lease back, and
-`TurnReport` returns retired resources instead of dropping them. Covered by a
-sweep → complete → sweep-again test with no next token, including the
-cancelled variant.
+**Submission is one operation.** `Upload::prepare` allocates without
+enqueueing; `Lease::submit` checks the admitted budget (`check_fit`, pure and
+host-tested), runs the async copy, records the event, tracks it, and retains
+— with nothing submitted untracked at any step. Admission precedes allocation.
+A 4,096-byte upload against a 512-byte reservation is refused with
+`CapacityExceeded` before any driver call.
 
-**P1 — failed records quarantine.** `use_on` takes the context for failure
-attribution; a failed record marks the lease `Lost` (submission may already
-have happened) and refuses. Bare events can no longer reach tracking:
-`track` is now `track_manual`, gated by the `TrackableManual` marker the
-doubles implement and `Event` does not.
+**Drops withhold, sweeps return.** A dropped lease with a tracked completion —
+in flight, cancelled, or lost — deliberately withholds its retained resource
+instead of freeing it early; the reservation still drops into its charged and
+visible state. Only provably unsubmitted (Live, untracked) drops normally.
+Destructor-counting tests cover all four shapes. `HeldLease` carries the lease
+back, and sweeps return settled resources: sweep → complete → sweep-again
+releases with no next token, including the cancelled variant.
 
-**P2 — observed loss persists.** Query and synchronize errors of kind
-`DeviceLost` transition the lease to `Lost`; later observations, including a
-racing `Ok(true)`, never reopen it. `ScriptedCompletion` plays the
-loss-then-complete race deterministically; transient failures stay usable.
-`synchronize` takes `&mut self` for the same persistence.
-
-**P2 — failed acquisition returns the handle.** Covered above under
-`AcquireRefused`, with a reuse-after-refusal test on both paths.
+**Failed records quarantine; loss persists.** `use_on` and `submit` take the
+context for failure attribution; a failed record marks the lease `Lost`
+(submission may already have happened) and refuses. Bare events can no longer
+reach tracking: `track` is now `track_manual`, gated by the `TrackableManual`
+marker the doubles implement and `Event` does not. Query and synchronize
+errors of kind `DeviceLost` transition to `Lost`; later observations,
+including a racing `Ok(true)`, never reopen it (`ScriptedCompletion` plays
+the race; transient failures stay usable). Deterministic hardware proof:
+`lease_quarantine_on_cross_context_record` records across two live contexts
+and asserts `Lost`, `device_lost`, and still-charged bytes on every device.
 
 Bite checks, each reverted to green:
 
 - Deleting the completion query in `retire` fails seven host tests.
-- Deleting `lease_a.synchronize()` in the GPU case fails
-  `event_backed_lease` on all three devices with still-`InFlight` refusal.
+- Deleting `lease_a.synchronize()` failed `event_backed_lease` on two of three
+  devices, then three of three after the first corrections — still-`InFlight`
+  refusal in every failing case. Under the final flow the bite no longer
+  bites: readback is a synchronous copy before retirement, so it observes
+  completion first — the refusal proof moved to the host suite (deterministic)
+  and the quarantine case (on hardware). A bite that stops biting when the
+  design removes the hazard is the mechanism working, not coverage lost.
 
 Gates for the corrections (this machine, 2026-09-09; nothing loosened) are
 recorded in the lane table below, updated in place.
