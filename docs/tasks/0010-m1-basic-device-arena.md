@@ -1,6 +1,6 @@
 # Task 0010 — M1.3: basic admitted device arena
 
-Status: **implemented; independent review pending**, 2026-09-09, after
+Status: **accepted by owner at `0cc61c7` after independent re-review**, 2026-09-09, after
 [task 0009](0009-m1-event-backed-leases.md) was independently reviewed and accepted for its
 transient-upload slice.
 
@@ -10,7 +10,7 @@ or deviations belong in the Result section rather than rewritten acceptance crit
 
 ## Identity and authority
 
-- Task ID / milestone / owner: 0010 / M1.3 / implementation agent, owner review pending.
+- Task ID / milestone / owner: 0010 / M1.3 / implementation agent, owner acceptance recorded below.
 - Writable root: `/home/rodrigo/Developer/moxie`, branch `main`, base commit `7c36658`, initially
   clean. Local commits are allowed by the assignment; no push is authorized.
 - Read-only legacy root: `/home/rodrigo/Developer/strata` at
@@ -271,3 +271,18 @@ positive fixtures, 12 rules) and all 10 unchanged-reference checks. Local logs:
 **Not rerun:** isolated no-driver build/ldd and capacity/visibility probes; their
 earlier task/review results remain recorded separately. **Unmeasured:** model,
 context, quality and paired performance gates remain outside this correction.
+
+### Owner acceptance — 2026-09-09
+
+The owner accepted task 0010's bounded M1.3 arena slice at `0cc61c7` after the
+[independent correction review](../handovers/2026-09-09-task0010-correction-review.md).
+R1 and R2 are closed; no new actionable defect was found. Independent verification
+passed 533 host tests + 8 doctests, 543 device tests + 10 doctests, all 33 GPU cases,
+format, both clippy lanes, architecture and specification checks. The pending-review
+statements earlier in this result and prior handovers describe their historical
+state and are superseded by this acceptance.
+
+The separately scoped admitted-execution-plan task may proceed through its own
+contract. This acceptance does not complete all of M1.3 or M1. The owner authorized
+documenting and pushing the task's commits; the re-review handover is preserved
+unchanged, and no implementation change accompanies this acceptance record.

@@ -42,6 +42,12 @@ Counts are from 2026-09-09 after [task 0010](../tasks/0010-m1-basic-device-arena
 enforcement counts they grew from are in
 [task 0002](../tasks/0002-m0-review-and-integer-transition.md#fourth-review-corrections-2026-09-07).
 
+The owner accepted task 0010's bounded arena slice at `0cc61c7` after
+[independent re-review](../handovers/2026-09-09-task0010-correction-review.md).
+`G-ARENA-HISTORY` and `G-ARENA-PENDING` close the two original findings. This
+acceptance leaves the remaining M1.3/M1 requirements and the separately scoped
+admitted-execution-plan task open.
+
 ## Rows
 
 | Checkpoint + artifact | Hardware / topology | Actual context | Feature / combination | Status | Test / benchmark / quality IDs | Limit or fallback |
