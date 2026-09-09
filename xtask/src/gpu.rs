@@ -64,6 +64,7 @@ const CASES: &[&str] = &[
     "stream_event_completion",
     "non_ptx_text_rejected",
     "rank_context_is_exclusive",
+    "concurrent_handoff_is_exclusive",
     "measurement_is_live",
 ];
 
@@ -167,6 +168,11 @@ pub fn run(profile: Option<&str>) -> i32 {
             &cap,
             "rank_context_is_exclusive",
             rank_exclusivity(&cap),
+        ));
+        results.push(case(
+            &cap,
+            "concurrent_handoff_is_exclusive",
+            concurrent_handoff(&cap),
         ));
         results.push(case(&cap, "measurement_is_live", measurement_is_live(&cap)));
     }
@@ -664,5 +670,73 @@ fn measurement_is_live(cap: &DeviceCapability) -> Result<Outcome, Error> {
         });
     }
     drop(buffer);
+    Ok(Outcome::Passed)
+}
+
+/// A device held on one thread is refused on another, and handed over cleanly
+/// once the holder is gone.
+///
+/// The exclusivity *window* -- that the claim outlives the driver teardown -- is
+/// proved deterministically by `moxie_cuda::claims`' host tests, which can pause
+/// inside the teardown. This case proves the same property across real threads
+/// on real hardware, where the timing is not ours to choose.
+fn concurrent_handoff(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    use std::sync::mpsc;
+
+    let ordinal = cap.ordinal;
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel();
+
+    // The context is `!Send`, so it is acquired, held and dropped entirely
+    // inside the thread that owns it.
+    let holder = std::thread::spawn(move || -> Result<(), Error> {
+        let ctx = RankContext::acquire(RankId(20), ordinal)?;
+        let uuid = ctx.uuid();
+        ready_tx.send(uuid).expect("the main thread is waiting");
+        go_rx
+            .recv()
+            .expect("the main thread signals before joining");
+        drop(ctx);
+        Ok(())
+    });
+
+    let uuid = ready_rx.recv().map_err(|_| Error::Numerical {
+        detail: "the holding thread failed before it acquired the device".into(),
+    })?;
+
+    // Held by another thread: refused, and the refusal names the holder.
+    match RankContext::acquire(RankId(21), ordinal) {
+        Ok(_) => {
+            let _ = go_tx.send(());
+            let _ = holder.join();
+            return Err(Error::Numerical {
+                detail: "a second thread acquired a device another rank holds".into(),
+            });
+        }
+        Err(e) => {
+            let text = e.to_string();
+            if !text.contains("rank 20") {
+                let _ = go_tx.send(());
+                let _ = holder.join();
+                return Err(Error::Numerical {
+                    detail: format!("the refusal does not name the holding rank: {text}"),
+                });
+            }
+        }
+    }
+
+    go_tx.send(()).expect("the holder is waiting");
+    holder.join().map_err(|_| Error::Numerical {
+        detail: "the holding thread panicked".into(),
+    })??;
+
+    // The handover completed: the card is available, and usable.
+    let taken = RankContext::acquire(RankId(21), ordinal)?;
+    if taken.uuid() != uuid {
+        return Err(Error::Numerical {
+            detail: "the handed-over device is not the one that was released".into(),
+        });
+    }
+    taken.measure()?;
     Ok(Outcome::Passed)
 }

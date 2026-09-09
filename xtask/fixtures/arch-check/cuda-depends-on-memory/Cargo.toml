@@ -3,11 +3,11 @@ name = "moxie-cuda"
 version = "0.0.0"
 edition = "2024"
 
-# Must be rejected: document 02's graph puts `memory` above `cuda`. The driver
-# wrapper takes a reading and hands it back as a plain descriptor; turning that
-# reading into a budget is the memory authority's rule, and joining the two is
-# the composition root's job. A dependency the other way would let the device
-# layer decide what a device may spend.
+# Must be rejected. Document 02 permits `memory` -> `cuda` and forbids the
+# reverse, so this edge is the wrong way up: the driver wrapper takes a reading
+# and hands it back as a plain descriptor, turning that reading into a budget is
+# the memory authority's rule, and joining the two is the composition root's job.
+# This edge would let the device layer decide what a device may spend.
 
 [package.metadata.moxie-arch-check]
 expect-rule = "forbidden dependency"

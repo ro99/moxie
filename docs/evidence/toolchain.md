@@ -180,6 +180,23 @@ Verified on 2026-09-07 by building and testing the whole workspace with
 `PATH` with no CUDA directory: 222 unit tests and 1 doctest passed. `ldd target/debug/xtask` on the
 host build reports no `libcuda`, and the CI workflow asserts that.
 
+**The `ldd` step needs an explicit build, and until 2026-09-08 it did not have
+one.** `cargo test --workspace` builds test harnesses, not the plain `xtask`
+binary, so `ldd target/debug/xtask` can read an artifact a previous *device*-lane
+build left in the shared `target/`. Running the lanes in the other order exposed
+it: the check reported `libcuda` present in a host-lane run, from a binary the
+host lane had not produced. The procedure is therefore:
+
+```text
+cargo test --workspace --locked --offline   # the suite
+cargo build -p xtask --locked --offline     # the artifact ldd will read
+ldd target/debug/xtask | grep -i libcuda    # must find nothing
+```
+
+Every earlier `G-HOST-NODRIVER` result happened to be taken with the host build
+last, so the conclusion held; the *method* did not, and a green result from an
+unrebuilt artifact is the "unmeasured is not a pass" trap in miniature.
+
 **This is not a way to make the GPU lane optional.** Document 07 requires the
 separation *and* a distinct mandatory CUDA lane, "so this separation does not
 turn unmeasured GPU work into a pass". Three things enforce that:

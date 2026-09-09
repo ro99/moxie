@@ -92,8 +92,11 @@ impl DeviceCapability {
 /// remaining headroom", and only the first of those is a constant.
 ///
 /// It lives here, at the bottom of the dependency graph, because the crate that
-/// takes the reading and the crate that turns it into a budget sit on opposite
-/// sides of `memory` -> `cuda` and neither may import the other (document 02).
+/// takes the reading sits *below* the crate that turns it into a budget:
+/// document 02 permits `memory` -> `cuda` and forbids the reverse, so `cuda`
+/// cannot name a `CapacitySnapshot`. Putting the descriptor in `types` lets both
+/// sides use it without `cuda` reaching upward, and leaves the composition root
+/// free to do the wiring.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeasuredDevice {
     /// The device's identity. Every decision and every record keys on this.

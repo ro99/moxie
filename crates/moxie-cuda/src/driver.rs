@@ -13,12 +13,11 @@
 //!   freeing memory that an in-flight copy may still be reading.
 
 use core::ffi::{CStr, c_char, c_int, c_uint, c_void};
-use std::collections::BTreeMap;
 use std::ffi::CString;
-use std::sync::{LazyLock, Mutex};
 
 use moxie_types::{DeviceCapability, DeviceUuid, Error, MeasuredDevice, RankId, Result};
 
+use crate::claims;
 use crate::ffi;
 use crate::status::classify;
 
@@ -193,19 +192,6 @@ pub struct RankContext {
     capability: DeviceCapability,
 }
 
-/// Which rank holds which device, process-wide.
-///
-/// A registry rather than a convention: two contexts on one card is exactly the
-/// shared mutable CUDA state that rank ownership exists to remove, and nothing
-/// in the driver prevents it.
-fn claims() -> std::sync::MutexGuard<'static, BTreeMap<DeviceUuid, RankId>> {
-    static CLAIMS: LazyLock<Mutex<BTreeMap<DeviceUuid, RankId>>> =
-        LazyLock::new(|| Mutex::new(BTreeMap::new()));
-    // A poisoned registry still describes which devices are held. Refusing to
-    // read it would strand every card in the process.
-    CLAIMS.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 impl RankContext {
     /// Acquire `ordinal`'s context for `rank`.
     ///
@@ -218,32 +204,14 @@ impl RankContext {
         let capability = query_device(ordinal)?;
         let uuid = capability.uuid;
 
-        {
-            let mut held = claims();
-            if let Some(holder) = held.get(&uuid) {
-                return Err(Error::Unsupported {
-                    capability: "rank_context",
-                    reason: format!("{uuid} is already held by rank {}", holder.get()),
-                });
-            }
-            if let Some((other, _)) = held.iter().find(|(_, r)| **r == rank) {
-                return Err(Error::Unsupported {
-                    capability: "rank_context",
-                    reason: format!(
-                        "rank {} already holds {other}; one rank owns one device",
-                        rank.get()
-                    ),
-                });
-            }
-            held.insert(uuid, rank);
-        }
-
+        claims::claim(uuid, rank)?;
         match Self::attach(rank, capability) {
             Ok(ctx) => Ok(ctx),
             Err(e) => {
                 // The claim must not outlive a failed attach, or the card is
-                // stranded for the life of the process.
-                claims().remove(&uuid);
+                // stranded for the life of the process. Nothing was retained,
+                // so there is no teardown to order against.
+                claims::abandon(uuid);
                 Err(e)
             }
         }
@@ -371,13 +339,20 @@ impl RankContext {
 
 impl Drop for RankContext {
     fn drop(&mut self) {
-        claims().remove(&self.capability.uuid);
-        // SAFETY: releases exactly the primary-context reference taken in
-        // `attach`. Errors during teardown are not actionable and must not
-        // panic.
-        unsafe {
-            let _ = ffi::cuDevicePrimaryCtxRelease_v2(self.device);
-        }
+        let device = self.device;
+        // The claim is released *after* the driver reference, not before. A
+        // release-then-teardown order lets another rank acquire the card while
+        // this context reference is still outstanding, and two live primary
+        // contexts on one device is the state rank ownership exists to prevent.
+        // A failed teardown withholds the device rather than advertising it.
+        claims::release_with(self.capability.uuid, self.rank, || {
+            check(
+                // SAFETY: releases exactly the primary-context reference taken
+                // in `attach`.
+                unsafe { ffi::cuDevicePrimaryCtxRelease_v2(device) },
+                "cuDevicePrimaryCtxRelease",
+            )
+        });
     }
 }
 
@@ -527,8 +502,9 @@ impl Drop for Event<'_> {
 ///
 /// ```compile_fail
 /// use moxie_cuda::{DeviceBuffer, RankContext};
+/// use moxie_types::RankId;
 /// let escaped = {
-///     let ctx = RankContext::new(0).unwrap();
+///     let ctx = RankContext::acquire(RankId(0), 0).unwrap();
 ///     DeviceBuffer::alloc(&ctx, 16).unwrap()
 /// }; // `ctx` dropped here, releasing the primary context
 /// drop(escaped); // would free into a released context

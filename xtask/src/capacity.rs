@@ -1,8 +1,8 @@
 //! `capacity` — measure every visible device and admit a plan against it.
 //!
-//! This is the composition root for task 0007. Document 02 puts `memory` above
-//! `cuda` in the ownership graph, so neither crate may import the other's side
-//! of this: `moxie-cuda` takes the reading, `moxie-memory` turns it into a
+//! This is the composition root for task 0007. Document 02 permits
+//! `memory` -> `cuda` and forbids the reverse, so `moxie-cuda` may not name a
+//! `CapacitySnapshot`: it takes the reading, `moxie-memory` turns it into a
 //! budget, and the wiring happens here, where a composition root is allowed to
 //! know both.
 //!

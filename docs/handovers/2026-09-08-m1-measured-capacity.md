@@ -37,7 +37,9 @@ Its record is [docs/tasks/0007-m1-rank-context-and-measured-capacity.md](../task
 What exists that did not before:
 
 - `RankContext`: one rank, one GPU, enforced by a process-wide claim keyed by `DeviceUuid`. A second
-  rank is refused a held device, one rank cannot hold two, and the claim is released on drop.
+  rank is refused a held device, one rank cannot hold two, and the claim is released **after** the
+  driver teardown, not before. A teardown that fails withholds the device rather than advertising
+  it. The bookkeeping lives in `moxie_cuda::claims`, compiled in both lanes and host-tested.
 - `MeasuredDevice` in `moxie-types` and `RankContext::measure()`: a device's own account of itself,
   read through the live context so the context's own cost is already gone from `free_bytes`.
 - `CapacitySnapshot::measured`: the rule that turns a reading into a budget, pure and host-tested.
@@ -52,12 +54,12 @@ Gates, all run at the implementation state on this machine:
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | PASS |
 | the same **with device features** | PASS — new to the gate list, see below |
-| `cargo test --workspace --locked --offline` | PASS, 464 unit/integration + 6 doctests |
+| `cargo test --workspace --locked --offline` | PASS, 468 unit/integration + 6 doctests |
 | `cargo xtask arch-check` | PASS, 46 rejected + 12 accepted fixtures, 10 rules |
 | `cargo xtask spec-check` | PASS, 10 documents |
-| no-driver host lane | PASS, 464 + 6; `ldd target/debug/xtask` shows no `libcuda` |
-| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | PASS, 472 + 8 |
-| `cargo xtask-cuda test-gpu` | PASS, 21 cases, `sm_86` and `sm_120` qualified |
+| no-driver host lane | PASS, 468 + 6; `ldd` on an **explicitly rebuilt** `xtask` shows no `libcuda` |
+| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | PASS, 476 + 8 |
+| `cargo xtask-cuda test-gpu` | PASS, 24 cases, `sm_86` and `sm_120` qualified |
 | `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, `UNQUALIFIED sm_120`, as intended |
 | `cargo xtask-cuda capacity` | PASS, 3 devices |
 | `CUDA_VISIBLE_DEVICES=2,1,0 cargo xtask-cuda capacity` | PASS, identity travelled with the UUID |
@@ -67,11 +69,12 @@ number was produced anywhere in this repository.
 
 ## Decisions
 
-- `MeasuredDevice` lives in `moxie-types`. Document 02's graph puts `memory` above `cuda`, so the
-  crate that takes a reading and the crate that turns it into a budget cannot import each other; the
-  descriptor goes to the bottom and the composition root does the wiring. A new arch-check fixture
-  refuses a `moxie-cuda` -> `moxie-memory` dependency, so the next agent finds this out from the
-  checker rather than from a reviewer. No ADR: this amends no reference document.
+- `MeasuredDevice` lives in `moxie-types`. The constraint is one-directional: document 02 **permits**
+  `moxie-memory` -> `moxie-cuda` and forbids the reverse, so `moxie-cuda` may not name a
+  `CapacitySnapshot`. Putting the descriptor at the bottom keeps `cuda` from reaching upward and
+  leaves the composition root to do the wiring. A new arch-check fixture refuses a
+  `moxie-cuda` -> `moxie-memory` dependency, so the next agent finds this out from the checker rather
+  than from a reviewer. No ADR: this amends no reference document.
 - Rank ownership is a **registry**, not a convention. The driver will hand out a second context for
   one card, and that is the shared mutable state document 01 asks to isolate.
 - A measurement is a reading. Every doc comment, the support-matrix row and the command's own output
@@ -82,28 +85,36 @@ number was produced anywhere in this repository.
 
 ## Remaining hypotheses and blockers
 
-- **Host capacity is unmeasured, and it is blocked on an ownership question, not on effort.**
-  Document 03 requires host admission to reserve headroom from *measured* available memory. Reading
-  `/proc/meminfo` is filesystem access: `moxie-memory` is forbidden it by an arch-check rule,
-  `moxie-storage` owns the filesystem but has no business owning host telemetry, and `moxie-cuda` is
-  the wrong layer entirely. Answer that before writing the code, in the next task's contract.
+- **Host capacity is unmeasured.** Document 03 requires host admission to reserve headroom from
+  *measured* available memory, and reading `/proc/meminfo` is filesystem access that `moxie-memory`
+  is forbidden by an arch-check rule. Where that measurement belongs is a **normal technical choice
+  for the implementing agent** -- resolve it from document 02's ownership table and record the
+  reasoning in the next contract. It is not an owner gate and must not be presented as one.
 - **A reading can go stale between the snapshot and the admission.** Document 03's answer is a
   replan on a memory-pressure event, which is M2's. Today it is a documented limit and nothing
   detects it.
 - The device lane had **never been run under `clippy -D warnings`** until this task, and it had two
-  real findings. Assume the same of any lane that is not in the gate table: absence of a result is
-  not a pass. `G-DEVICE-CLIPPY` is now a gate.
+  real findings. `G-DEVICE-CLIPPY` is now a gate.
+- The `G-HOST-NODRIVER` `ldd` step had **no explicit build**, so it read whatever the last build left
+  in the shared `target/`. Running the device lane first made it report `libcuda` in a host-lane run.
+  Corrected in [toolchain.md](../evidence/toolchain.md). Both of these are the same lesson: a green
+  result whose method was never examined is not evidence. Check how a gate is *taken*, not only what
+  it printed.
+- **After a rename, re-run the bite check on every `compile_fail` doctest, not only new ones.** A
+  rename left one calling a function that no longer existed, so it passed on `E0599` instead of the
+  lifetime error it exists to pin.
 - Owner gates O1-O7 remain OPEN. None blocked this task.
 
 ## Next task
 
 **M1.3 part 3: measured host capacity — but the contract answers the ownership question first.**
 
-- **Before any code**: name the component that may read host memory telemetry, and say why it is not
-  `moxie-memory` (forbidden the filesystem) or `moxie-storage` (owns artifacts, not the machine).
-  A small `moxie-host` crate at the bottom of the graph and a new arch-check rule confining it is one
-  answer; the composition root reading it and passing a `MeasuredHost` descriptor is another. Pick
-  one in the contract, with the reason.
+- **Decide the owner in the contract, yourself.** Name the component that may read host memory
+  telemetry and say why it is not `moxie-memory` (forbidden the filesystem) or `moxie-storage`
+  (owns artifacts, not the machine). A small `moxie-host` crate at the bottom of the graph with a
+  new arch-check rule confining it is one answer; the composition root reading it and passing a
+  `MeasuredHost` descriptor is another. This is an ordinary technical choice — resolve it from
+  document 02 and the arch-check rules, do not ask the owner.
 - **One outcome**: a host `CapacitySnapshot` built from measured available memory with a declared
   OS-and-application reserve, admitted alongside the three device snapshots in one ledger.
 - **Required reading**: document 03 (host admission, the 251 GB warning, mapped resident pages),

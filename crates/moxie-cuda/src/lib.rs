@@ -19,6 +19,13 @@
 
 pub mod status;
 
+// Compiled in both lanes on purpose. Only the `driver` half calls it, but the
+// rank-exclusivity bookkeeping is where the guarantee actually lives, and its
+// ordering rule cannot be observed from outside without pausing a CUDA call --
+// so it is tested here, with no GPU present.
+#[cfg_attr(not(feature = "driver"), allow(dead_code))]
+mod claims;
+
 pub use status::{CUDA_SUCCESS, CUresult, classify};
 
 #[cfg(feature = "driver")]

@@ -41,8 +41,10 @@ admits corresponds to a device. After this task it does.
   to end, on this machine's three GPUs. Nothing is allocated through the context.
 - **Sole owning components:** `moxie-cuda` owns the context and the measurement; `moxie-memory` owns
   the rule that turns a measurement into a snapshot; `moxie-types` owns the descriptor that passes
-  between them, because document 02's graph puts `memory` above `cuda` and neither may import the
-  other's higher layer. The composition root — the `xtask` device command — wires them.
+  between them. Document 02 permits `memory` -> `cuda` and forbids the reverse, so the constraint is
+  one-directional: `moxie-cuda` may not name a `CapacitySnapshot`. The descriptor goes to the bottom
+  of the graph so `cuda` never reaches upward, and the composition root — the `xtask` device
+  command — does the wiring.
 - **Allowed production files:** `crates/moxie-cuda/src/**`, `crates/moxie-types/src/**`,
   `crates/moxie-memory/src/snapshot.rs`, `xtask/src/gpu.rs` and `xtask/src/main.rs`, plus manifests
   and `xtask/fixtures/**`.
@@ -162,9 +164,9 @@ What was built:
 
 - `moxie-types`: `MeasuredDevice` (uuid, ordinal *label*, name, sm, bus id, SM
   count, total and free bytes) and `DeviceCapability::uuid` typed as
-  `DeviceUuid`. The descriptor sits at the bottom of the graph because the crate
-  that takes the reading and the crate that turns it into a budget are on
-  opposite sides of `memory` -> `cuda`.
+  `DeviceUuid`. The descriptor sits at the bottom of the graph because
+  `moxie-cuda` may not name a `CapacitySnapshot`: document 02 permits
+  `memory` -> `cuda` and forbids the reverse.
 - `moxie-cuda`: `RankContext` replaces `DeviceContext`. `acquire(rank, ordinal)`
   registers the claim in a process-wide map keyed by `DeviceUuid`, refuses a
   device another rank holds and a second device for a rank that has one, and
@@ -255,3 +257,86 @@ and which component may read `/proc/meminfo` is the open ownership question that
 task's contract has to answer first. After it, M1.3 continues with event-backed
 leases and the basic allocator -- the first things that will charge real bytes to
 this ledger.
+
+### Review corrections, 2026-09-08 (commit `15d136c` not accepted)
+
+Two findings, both reproduced before any fix.
+
+- **P2 — the rank claim was released before the CUDA teardown finished.**
+  `Drop` removed the registry entry and *then* called
+  `cuDevicePrimaryCtxRelease_v2`, so another thread could acquire the card while
+  the previous rank's primary-context reference was still outstanding. Two live
+  primary contexts on one device is precisely the state rank ownership exists to
+  prevent, and it can also defeat the reset that happens when the last reference
+  goes. The reviewer demonstrated it by pausing the old release through an
+  interposed symbol.
+
+  The bookkeeping moved to a new `moxie_cuda::claims` module, compiled in **both**
+  lanes and touching no driver symbol, whose `release_with(uuid, rank, teardown)`
+  runs the teardown **while the claim is still held** and only then removes it.
+  The mutex is deliberately not held across the teardown -- the claim's presence
+  is what excludes another rank, not the lock -- so a teardown that consults the
+  registry cannot deadlock.
+
+  Teardown now **fails closed**: a release that errors leaves the device marked
+  `TeardownFailed`, and a later `acquire` is refused with the reason and the
+  previous holder's rank rather than being handed a card whose context is in an
+  unknown state. Withholding a device is recoverable by restarting the process;
+  handing out a half-released one is not.
+
+  Regressions: `the_device_stays_held_until_teardown_has_finished` and
+  `a_device_whose_teardown_failed_is_not_handed_out`, both **host-lane** tests
+  that need no GPU, because the ordering window cannot be observed from outside
+  without pausing a CUDA call. Both failed against the old order before the fix.
+  Plus a device case, `concurrent_handoff_is_exclusive`, which proves the same
+  property across real threads on real hardware where the timing is not ours to
+  choose. The reviewer's own `drop_race` binary now reports `false` and exits 0.
+
+- **P2 — the buffer-lifetime `compile_fail` doctest passed for the wrong reason.**
+  Renaming `DeviceContext` to `RankContext` left the example calling
+  `RankContext::new(0)`, which does not exist, so it failed with `E0599` instead
+  of the lifetime error it exists to pin. My mistake and my process failure: I
+  ran the prescribed bite check on the doctest I *added* and not on the one the
+  rename touched. The example now calls `RankContext::acquire(RankId(0), 0)`,
+  and every `compile_fail` doctest in the crate was rebuilt without
+  `compile_fail`: `E0597 ctx does not live long enough` for the buffer lifetime,
+  `E0277 *mut c_void cannot be sent between threads safely` for the thread
+  binding. The rule this earns: **after a rename, re-run the bite check on every
+  compile_fail doctest, not only on new ones.**
+
+Two documentation corrections the reviewer also asked for:
+
+- Document 02 **permits** `moxie-memory` -> `moxie-cuda` and forbids only the
+  reverse. Four places said "neither may import the other", which is wrong. The
+  real constraint is one-directional -- `moxie-cuda` may not name a
+  `CapacitySnapshot` -- and that is why the descriptor sits in `moxie-types`.
+- Host telemetry ownership is a **normal technical choice for the implementing
+  agent**, resolvable from document 02's ownership table, not an owner gate. The
+  handover said "answer it in the contract" but framed it as an open question;
+  it now says plainly that the agent decides it and does not ask the owner.
+
+**A third defect, found while re-running the gates and not reported by anyone:**
+the `G-HOST-NODRIVER` `ldd` step had no explicit build. `cargo test --workspace`
+builds test harnesses, not the plain `xtask` binary, so `ldd target/debug/xtask`
+read whatever the last build left in the shared `target/`. Running the device
+lane first this time made it report `libcuda` present in a host-lane run, from a
+binary the host lane had not produced. Every earlier result happened to be taken
+with the host build last, so the conclusion held and the method did not. The
+procedure now builds `xtask` explicitly before `ldd`, in
+[toolchain.md](../evidence/toolchain.md) and in the support matrix.
+
+Re-verified after the corrections:
+
+| Lane | Result |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `clippy -D warnings`, host and device features | PASS |
+| `cargo test --workspace --locked --offline` | PASS, 468 unit/integration + 6 doctests |
+| `cargo xtask arch-check` | PASS, 46 rejected + 12 accepted fixtures, 10 rules |
+| `cargo xtask spec-check` | PASS, 10 documents |
+| no-driver host lane, with the corrected `ldd` procedure | PASS, 468 + 6, no `libcuda` |
+| device lane | PASS, 476 + 8 |
+| `cargo xtask-cuda test-gpu` | PASS, 24 cases, both architectures qualified |
+| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, as intended |
+| `cargo xtask-cuda capacity` | PASS, 3 devices |
+| the reviewer's `drop_race`, `lifetime_corrected`, `lifetime_stale`, `thread_bound` | all give the expected result |
