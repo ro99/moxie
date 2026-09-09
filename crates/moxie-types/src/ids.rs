@@ -81,6 +81,11 @@ impl DeviceUuid {
     /// a UUID that round-trips through a lenient parser is a UUID that can be
     /// written two ways, and two spellings of one device is exactly the identity
     /// collision this type exists to prevent.
+    ///
+    /// Works over bytes rather than characters. A length in bytes is not a
+    /// character boundary, and slicing a `&str` by one panics on any multi-byte
+    /// character -- a malformed identifier must be a typed error like every
+    /// other malformed identifier.
     pub fn parse(s: &str) -> crate::Result<Self> {
         let bad = |detail: String| crate::Error::InvalidRequest {
             field: "device_uuid",
@@ -91,39 +96,51 @@ impl DeviceUuid {
                 "{s:?} does not start with the canonical `GPU-` prefix"
             ))
         })?;
+        let body = body.as_bytes();
         let mut bytes = [0u8; 16];
         let mut out = 0usize;
-        let mut rest = body;
+        let mut at = 0usize;
         for (i, width) in Self::GROUPS.iter().enumerate() {
             if i > 0 {
-                rest = rest.strip_prefix('-').ok_or_else(|| {
-                    bad(format!("{s:?} is missing the separator before group {i}"))
-                })?;
+                if body.get(at) != Some(&b'-') {
+                    return Err(bad(format!(
+                        "{s:?} is missing the separator before group {i}"
+                    )));
+                }
+                at += 1;
             }
-            if rest.len() < *width {
+            if body.len() < at + width {
                 return Err(bad(format!("{s:?} is truncated in group {i}")));
             }
-            let (group, tail) = rest.split_at(*width);
-            rest = tail;
-            let mut chars = group.chars();
             for _ in 0..width / 2 {
                 // Two hex digits per byte; every group has an even width.
-                let hi = chars.next().expect("group width checked above");
-                let lo = chars.next().expect("group width checked above");
-                let digit = |c: char| {
-                    c.to_digit(16)
-                        .filter(|_| !c.is_ascii_uppercase())
-                        .ok_or_else(|| bad(format!("{s:?} has non-canonical hex digit {c:?}")))
-                };
-                bytes[out] = (digit(hi)? * 16 + digit(lo)?) as u8;
+                let hi = hex_digit(body[at])
+                    .ok_or_else(|| bad(format!("{s:?} has a non-canonical digit in group {i}")))?;
+                let lo = hex_digit(body[at + 1])
+                    .ok_or_else(|| bad(format!("{s:?} has a non-canonical digit in group {i}")))?;
+                bytes[out] = hi * 16 + lo;
                 out += 1;
+                at += 2;
             }
         }
-        if !rest.is_empty() {
-            return Err(bad(format!("{s:?} has trailing characters {rest:?}")));
+        if at != body.len() {
+            return Err(bad(format!(
+                "{s:?} has {} trailing byte(s)",
+                body.len() - at
+            )));
         }
         debug_assert_eq!(out, 16);
         Ok(DeviceUuid(bytes))
+    }
+}
+
+/// One lower-case hexadecimal digit. Upper case is refused deliberately: CUDA
+/// prints lower case, and accepting both would give one device two spellings.
+const fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
     }
 }
 
@@ -195,5 +212,21 @@ mod tests {
         // An ordinal is not identity: the same ordinal may name either of these
         // depending on CUDA_VISIBLE_DEVICES, which is why DeviceId keys nothing.
         assert_eq!(DeviceId(0).get(), 0);
+    }
+
+    #[test]
+    fn a_malformed_multibyte_uuid_is_refused_rather_than_panicking() {
+        // Review finding 4: the parser sliced by byte length, which cuts through
+        // a multi-byte character and panics. A malformed identifier is a typed
+        // error like every other malformed identifier.
+        for bad in [
+            "GPU-0000000\u{e9}-0000-0000-0000-000000000000",
+            "GPU-\u{e9}0000000-0000-0000-0000-000000000000",
+            "GPU-00000000-0000-0000-0000-00000000000\u{e9}",
+            "GPU-\u{4e2d}\u{6587}00-0000-0000-0000-000000000000",
+        ] {
+            let e = DeviceUuid::parse(bad).unwrap_err();
+            assert_eq!(e.kind(), "invalid_request", "{bad:?} must be refused");
+        }
     }
 }

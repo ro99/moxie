@@ -22,9 +22,16 @@ Written 2026-09-08 at the end of the session that implemented task 0006.
 pending; treat "gates pass" as gates passing, not as acceptance.
 
 **Task 0006 (M1.3 part 1, the resource ledger and admission)** was contracted at `305c765` — a commit
-with no `.rs` change, as tasks 0003, 0004 and 0005 did — and implemented on top of it. Its record,
+with no `.rs` change, as tasks 0003, 0004 and 0005 did — implemented at `a486930`, and then
+corrected against four review findings. Its record,
 [docs/tasks/0006-m1-resource-ledger-and-admission.md](../tasks/0006-m1-resource-ledger-and-admission.md),
-carries the contract, the result, six recorded deviations and the bite checks.
+carries the contract, the result, six recorded deviations, the bite checks and the review-correction
+round. Owner acceptance is pending for this task too.
+
+One of those findings was a **contract** defect, not only an implementation one: the contract
+excluded resident mapped pages from the host budget. It is struck in place rather than rewritten, so
+the error stays legible. Resident pages are charged; a mapping's virtual extent is the separate,
+uncharged quantity, declared per buffer.
 
 What exists that did not before:
 
@@ -45,10 +52,10 @@ Gates, all run at the implementation state on this machine:
 |---|---|
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | PASS |
-| `cargo test --workspace --locked --offline` | PASS, 442 unit/integration + 6 doctests |
+| `cargo test --workspace --locked --offline` | PASS, 448 unit/integration + 6 doctests |
 | `cargo xtask arch-check` | PASS, 45 rejected + 12 accepted fixtures, 10 rules |
 | `cargo xtask spec-check` | PASS, 10 documents |
-| no-driver host lane | PASS, 442 + 6; `ldd target/debug/xtask` shows no `libcuda` |
+| no-driver host lane | PASS, 448 + 6; `ldd target/debug/xtask` shows no `libcuda` |
 | device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | PASS, 450 + 7 |
 | `cargo xtask-cuda test-gpu` | PASS, 15 cases, `sm_86` and `sm_120` qualified |
 | `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, `UNQUALIFIED sm_120`, as intended |
@@ -95,6 +102,11 @@ exists and which does not.
   new one against the same pattern before adding it.
 - A second shape is now worth naming: **an error path that consumes the only handle to a live
   resource.** `Ledger::release` originally did, and it would have leaked exactly the way R08 did.
+- A third, from the review: **a diagnostic that names a knob without checking that turning it would
+  move the number that failed.** Three of the four findings were that shape — an alternative offered
+  for a buffer not live at the binding stage, a host fallback into memory the same request had
+  taken, and a tier excluded from a budget it physically occupies. Any new advice the engine gives
+  a caller needs the same test: what changes if they follow it?
 
 ## Next task
 

@@ -74,7 +74,8 @@ real device or host figure belongs to the next task, which owns the CUDA context
 ### Scope and device identity
 
 `Scope::Host` and `Scope::Device(DeviceUuid)`. `DeviceUuid` is a 16-byte value parsed from and
-rendered back to the canonical `GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form. AGENTS.md: ordinals
+rendered back to the canonical `GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form. Parsing is over
+bytes: a malformed identifier is a typed error, never a panic, whatever it contains. AGENTS.md: ordinals
 are diagnostics only and evidence identifies a GPU by UUID. An ordinal may be attached as a
 **label** for reporting; it is never identity and there is no lookup by it.
 
@@ -92,10 +93,19 @@ HostTier:   Pageable, Pinned, MappedResident, CpuWorkspace, StateSpill, Conversi
 device tier requested in the host scope, or a host tier in a device scope, is `InvalidRequest`, not a
 coerced default.
 
-`HostTier::MappedResident` is reported in its own row and **does not consume the committed host
+~~`HostTier::MappedResident` is reported in its own row and **does not consume the committed host
 budget**: document 03 says mapped virtual bytes do not equal committed host RAM, and that neither is
 free. It is charged against its own declared per-tier cap and shown separately, so a large mapping
-is visible without being counted twice.
+is visible without being counted twice.~~
+
+**Corrected by review, 2026-09-08** (finding 1; struck text above is what the contract said, kept so
+the error is legible). Resident pages of a mapping are physical RAM and are charged against the host
+budget like every other byte. What is not charged is the mapping's **virtual extent**, which a
+buffer declares separately through `BufferRequest::virtual_extent` and which is reported beside the
+resident figure. Only a `MappedResident` buffer may declare one, and it may not be smaller than the
+resident set. The struck rule did not prevent double counting; it permitted under-counting, and let
+1,600 B of resident pages into a 900 B host budget. Document 03 requires resident mapping pressure
+to be reconciled with the host budget, not excused from it.
 
 ### Capacity snapshot
 
@@ -139,6 +149,8 @@ live(scope, tier, s) = sum of bytes of buffers of that scope and tier live at s
 tier_peak(scope, tier) = max over s of live(scope, tier, s)
 scope_peak(scope)      = max over s of ( sum over tiers of live(scope, tier, s) )
 ```
+
+Every tier is in that sum, including `MappedResident`, per the correction above.
 
 The scope figure is the stage-wise total, **not** the sum of the per-tier peaks, which would
 over-reserve mutually exclusive buffers — document 03 requires the peak overlapping live set. The
@@ -185,11 +197,22 @@ An alternative is listed only when the request itself makes it legal:
 
 | Alternative | Listed only when |
 |---|---|
-| `LowerContext` | some binding buffer declared `scales_with = Context` |
-| `FewerBranches` | some binding buffer declared `scales_with = Branches` |
+| `LowerContext` | some buffer **contributing to a failed constraint** declared `scales_with = Context` |
+| `FewerBranches` | some buffer contributing to a failed constraint declared `scales_with = Branches` |
 | `OtherWeightPrecisionOrArtifact` | the binding tier is `PackedResidentWeights` or `ExpertCache` |
 | `DifferentTopology` | more than one device scope is declared |
-| `HostBackedExecution` | the binding scope is a device and host headroom covers the shortfall |
+| `HostBackedExecution` | the binding scope is a device, no host constraint binds, and host headroom **after this request's own host demand** covers the shortfall |
+
+**Corrected by review, 2026-09-08** (findings 2 and 3). A buffer *contributes to* a failed
+constraint when it is live at the stage where that constraint's peak occurred, in the same scope,
+and -- for a tier cap -- in the same tier; a derived reserve live at that stage contributes through
+the buffers whose sizes it was computed from. The first two rows previously accepted any scaling
+buffer anywhere in a failing scope, which offered `LowerContext` for a KV buffer that was not live
+at the binding stage and so could not move the peak however much of it was removed. The
+`HostBackedExecution` row previously subtracted only earlier commitments from host headroom, so it
+offered a fallback into memory the same request had already spoken for; it now also subtracts this
+request's host peak, refuses when the host itself binds, and respects a declared cap on
+`StateSpill` or `CpuWorkspace` when one exists.
 
 A generic menu of five is worse than nothing, because it invites the caller to try a change that
 cannot help. The ledger **never applies** an alternative: document 03 forbids automatically
@@ -355,3 +378,76 @@ CUDA context, which is the first thing that can *measure* a capacity snapshot
 and the first consumer that charges real bytes to this ledger. Event-backed
 leases, the basic allocator and the admitted execution plan follow it. The
 ledger's measuring half does not exist and must not be claimed.
+
+### Review corrections, 2026-09-08 (commit `a486930` not accepted)
+
+The reviewer returned four findings against the accepted-scope implementation,
+each with a reproduction. All four reproduced inside this repository before any
+fix, and each reproduction is kept as a named regression test. One finding is
+also a **contract** defect and the contract above is corrected in place, struck
+rather than rewritten, at the reviewer's direction.
+
+- **P1 — resident mapped pages escaped the physical host budget.** The contract
+  excluded `HostTier::MappedResident` from the scope budget on the grounds that
+  mapped virtual bytes are not committed RAM. That conflated a mapping's virtual
+  extent with its resident pages: the resident pages are physical RAM. With a
+  900 B host budget the ledger admitted 800 B pinned **plus** 800 B resident.
+  Every tier is now charged, `Tier::charges_scope_budget` is gone, and the
+  uncharged quantity is the mapping's virtual extent, declared per buffer with
+  `BufferRequest::virtual_extent`, reported in `TierReport::virtual_extent_bytes`
+  and binding nothing. Only a `MappedResident` buffer may declare one, and it may
+  not be smaller than the resident set. Regressions:
+  `resident_mapped_pages_share_the_physical_host_budget`,
+  `a_mappings_virtual_extent_is_reported_and_charged_to_nothing`,
+  `a_virtual_extent_is_refused_where_it_would_be_meaningless_or_impossible`, and
+  `mapped_resident_is_the_only_tier_with_a_virtual_extent` in `moxie-types`.
+  The test that enforced the old rule is deleted, not weakened.
+
+- **P2 — host-backed execution was offered into memory the same request had
+  already taken.** The headroom calculation subtracted earlier commitments but
+  not this request's own host demand, so a plan needing 900 B of CPU workspace
+  from a 900 B host budget was still told it could fall back to the host. The
+  calculation now also subtracts the request's host scope peak, declines
+  entirely when any host constraint is among the binding ones, and honours a
+  declared cap on `StateSpill` or `CpuWorkspace` when one exists. Regression:
+  `host_backed_execution_accounts_for_this_requests_own_host_working_set`.
+
+- **P2 — context and branch alternatives ignored when the buffer was live.** Any
+  scaling buffer in a failing scope qualified, including one live only in a
+  stage that did not bind. A 200 B fixed prefill workspace over a 100 B budget
+  was answered with "lower the requested context" for a 50 B decode-stage KV
+  buffer, when removing all of it changes the 200 B peak by nothing. A buffer now
+  contributes to a constraint only when it is live at that constraint's peak
+  stage, in the same scope, and -- for a tier cap -- the same tier; a derived
+  reserve live at that stage contributes through the buffers whose sizes it was
+  computed from, so shrinking the largest expert is correctly credited with
+  shrinking the incoming-expert reserve. Regressions:
+  `a_context_alternative_must_be_able_to_move_the_binding_peak` (which also
+  asserts the positive case, so it tests the liveness rule rather than the
+  alternative being unreachable) and
+  `a_branch_alternative_must_be_able_to_move_the_binding_peak`.
+
+- **P2 — a malformed multi-byte UUID panicked.** `DeviceUuid::parse` checked a
+  length in bytes and then sliced the `&str`, which cuts through a multi-byte
+  character: `"GPU-0000000é-..."` panicked with "byte index 8 is not a char
+  boundary" instead of returning the typed error every other malformed
+  identifier returns. Parsing is now over `&[u8]` throughout, with an explicit
+  lower-case-only hex digit helper. Regression:
+  `a_malformed_multibyte_uuid_is_refused_rather_than_panicking`, covering a
+  multi-byte character at the start, middle and end of the identifier and a
+  two-character CJK group.
+
+Bite checks for the corrections, each reverted to green: dropping the liveness
+condition fails both alternative regressions; not subtracting the request's own
+host peak fails the host regression; re-excluding `MappedResident` from the
+scope total fails both mapping regressions. The reviewer's own four tests, run
+unmodified from outside the repository, pass.
+
+Re-verified after the corrections: `fmt` PASS; `clippy -D warnings` PASS;
+`cargo test --workspace --locked --offline` PASS, 448 unit/integration + 6
+doctests (was 442 + 6: five net new tests in `moxie-memory`, one in
+`moxie-types`); `arch-check` PASS (45 rejected + 12 accepted, 10 rules);
+`spec-check` PASS (10 documents); no-driver lane PASS (448 + 6, no `libcuda`). The device
+lane and `test-gpu` were re-run for the previous round and are carried forward
+here: these corrections touch `moxie-types`'s UUID parser and `moxie-memory`
+only, and no device code, kernel or FFI path changed.

@@ -59,8 +59,11 @@ pub enum HostTier {
     /// Pinned memory. Bounded on purpose: pinning is an option, not a universal
     /// speed claim (R12), and an unbounded pinned region starves the system.
     Pinned,
-    /// Resident pages of a mapping. Reported, and **not** charged against the
-    /// committed host budget -- see [`Tier::charges_scope_budget`].
+    /// Resident pages of a mapping. These are physical RAM and are charged like
+    /// any other host bytes. What is *not* charged is a mapping's virtual
+    /// extent, which a buffer declares separately: document 03 distinguishes the
+    /// two, and requires resident mapping pressure to be reconciled with the
+    /// host budget rather than excused from it.
     MappedResident,
     /// CPU-side compute workspace, for host expert execution and conversion.
     CpuWorkspace,
@@ -225,15 +228,18 @@ impl Tier {
         }
     }
 
-    /// Whether bytes in this tier count against the scope's committed budget.
+    /// Whether a buffer in this tier may declare a virtual extent distinct from
+    /// its resident bytes.
     ///
-    /// False for exactly one tier. Document 03: "Mapped virtual bytes do not
-    /// equal committed host RAM; neither is free." A mapping's resident pages
-    /// are real pressure and are reported in their own row against their own
-    /// cap, but charging them to the same budget as pinned and pageable
-    /// allocations would double-count bytes the process never committed.
-    pub const fn charges_scope_budget(self) -> bool {
-        !matches!(self, Tier::Host(HostTier::MappedResident))
+    /// True for exactly one tier. Document 03: "Mapped virtual bytes do not
+    /// equal committed host RAM; neither is free." The resident pages are
+    /// charged like everything else; the virtual extent is reported beside them
+    /// and charged to nothing, because it is address space rather than memory.
+    /// An earlier version of this crate excluded the whole tier from the budget,
+    /// which did not prevent double counting -- it permitted under-counting, and
+    /// let 1,600 B of resident pages into a 900 B host budget.
+    pub const fn has_virtual_extent(self) -> bool {
+        matches!(self, Tier::Host(HostTier::MappedResident))
     }
 
     /// The tiers valid in a scope, in `ALL` order.
@@ -287,15 +293,17 @@ mod tests {
     }
 
     #[test]
-    fn mapped_resident_is_the_only_uncharged_tier() {
-        // If a second tier ever stops being charged, that is a decision about
-        // what admission means, and it should fail this test first.
-        let uncharged: Vec<&str> = Tier::ALL
+    fn mapped_resident_is_the_only_tier_with_a_virtual_extent() {
+        // Every tier's bytes are charged. Exactly one tier has a second,
+        // uncharged quantity -- the mapping's address range. If that ever grows
+        // to a second tier, it is a decision about what admission means and it
+        // should fail this test first.
+        let with_extent: Vec<&str> = Tier::ALL
             .iter()
-            .filter(|t| !t.charges_scope_budget())
+            .filter(|t| t.has_virtual_extent())
             .map(|t| t.name())
             .collect();
-        assert_eq!(uncharged, vec!["host.mapped_resident"]);
+        assert_eq!(with_extent, vec!["host.mapped_resident"]);
     }
 
     #[test]

@@ -27,10 +27,11 @@ pub struct TierReport {
     /// the tier is bounded by the scope instead, and the scope row says by how
     /// much.
     pub remaining_headroom_bytes: Option<u64>,
-    /// Whether these bytes count against the scope's committed budget. False
-    /// only for `host.mapped_resident` -- mapped virtual bytes are not
-    /// committed host RAM (document 03).
-    pub charged_to_scope: bool,
+    /// The peak virtual extent declared in this tier, which is reported and
+    /// charged to nothing. Non-zero only for `host.mapped_resident`: mapped
+    /// virtual bytes are not committed host RAM (document 03), while the
+    /// resident pages counted in `request_peak_bytes` are.
+    pub virtual_extent_bytes: u64,
 }
 
 /// One scope's totals, and every tier valid in it.
@@ -40,12 +41,11 @@ pub struct ScopeReport {
     pub physical_bytes: u64,
     pub system_headroom_bytes: u64,
     pub admissible_bytes: u64,
-    /// Charged bytes already committed here: the sum of the admitted plans'
-    /// scope peaks.
+    /// Bytes already committed here: the sum of the admitted plans' scope peaks.
     pub committed_bytes: u64,
-    /// This request's peak, summed across charged tiers **at one stage** -- not
-    /// the sum of the per-tier peaks, which would reserve buffers that are never
-    /// live together.
+    /// This request's peak, summed across tiers **at one stage** -- not the sum
+    /// of the per-tier peaks, which would reserve buffers that are never live
+    /// together.
     pub request_peak_bytes: u64,
     pub peak_stage: u32,
     pub remaining_headroom_bytes: u64,
@@ -101,7 +101,11 @@ impl fmt::Display for AdmissionReport {
                 s.remaining_headroom_bytes,
             )?;
             for t in &s.tiers {
-                if t.cap_bytes.is_none() && t.committed_bytes == 0 && t.request_peak_bytes == 0 {
+                if t.cap_bytes.is_none()
+                    && t.committed_bytes == 0
+                    && t.request_peak_bytes == 0
+                    && t.virtual_extent_bytes == 0
+                {
                     continue;
                 }
                 write!(
@@ -120,8 +124,12 @@ impl fmt::Display for AdmissionReport {
                     )?,
                     None => write!(f, ", uncapped")?,
                 }
-                if !t.charged_to_scope {
-                    write!(f, " (not charged to the scope budget)")?;
+                if t.virtual_extent_bytes > 0 {
+                    write!(
+                        f,
+                        " (mapping {} B of address space, charged to nothing)",
+                        t.virtual_extent_bytes
+                    )?;
                 }
                 writeln!(f)?;
             }

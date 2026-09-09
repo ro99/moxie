@@ -57,9 +57,15 @@ pub struct BufferRequest {
     pub label: String,
     pub scope: Scope,
     pub tier: Tier,
+    /// Physical bytes. For a mapping this is its **resident** set, which is
+    /// charged like every other byte.
     pub bytes: u64,
     pub live: StageSpan,
     pub scales_with: Option<Scaling>,
+    /// A mapping's virtual extent, when it differs from the resident set.
+    /// Reported, never charged, and never a binding constraint: address space is
+    /// not memory. Only [`Tier::has_virtual_extent`] tiers may declare one.
+    pub virtual_bytes: Option<u64>,
 }
 
 impl BufferRequest {
@@ -77,11 +83,20 @@ impl BufferRequest {
             bytes,
             live,
             scales_with: None,
+            virtual_bytes: None,
         }
     }
 
     pub fn scaling(mut self, with: Scaling) -> Self {
         self.scales_with = Some(with);
+        self
+    }
+
+    /// Declare the mapping's virtual extent. It must be at least the resident
+    /// set: a resident set larger than its own mapping is a contradiction, not a
+    /// conservative estimate.
+    pub fn virtual_extent(mut self, bytes: u64) -> Self {
+        self.virtual_bytes = Some(bytes);
         self
     }
 }
@@ -183,6 +198,27 @@ impl PlanRequest {
 
     pub fn buffer(&mut self, buffer: BufferRequest) -> Result<&mut Self> {
         self.check(buffer.scope, buffer.tier, buffer.live, &buffer.label)?;
+        if let Some(virtual_bytes) = buffer.virtual_bytes {
+            if !buffer.tier.has_virtual_extent() {
+                return Err(Error::InvalidRequest {
+                    field: "virtual_bytes",
+                    detail: format!(
+                        "{}: {} has no virtual extent distinct from its bytes",
+                        buffer.label,
+                        buffer.tier.name()
+                    ),
+                });
+            }
+            if virtual_bytes < buffer.bytes {
+                return Err(Error::InvalidRequest {
+                    field: "virtual_bytes",
+                    detail: format!(
+                        "{}: {virtual_bytes} B of address space cannot hold {} B resident",
+                        buffer.label, buffer.bytes
+                    ),
+                });
+            }
+        }
         self.buffers.push(buffer);
         Ok(self)
     }

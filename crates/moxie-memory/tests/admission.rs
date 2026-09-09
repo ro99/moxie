@@ -559,9 +559,11 @@ fn a_reserve_over_more_buffers_than_exist_is_an_error_not_a_clamp() {
 }
 
 #[test]
-fn mapped_resident_bytes_are_reported_without_consuming_the_host_budget() {
+fn a_mappings_virtual_extent_is_reported_and_charged_to_nothing() {
     // Document 03: "Mapped virtual bytes do not equal committed host RAM;
-    // neither is free."
+    // neither is free." The resident pages are charged like every other byte
+    // (see `resident_mapped_pages_share_the_physical_host_budget`); the address
+    // range they sit in is reported beside them and charged to nothing.
     let mut ledger = Ledger::new([host_snapshot(1_000, 100)]).unwrap();
     let mut plan = PlanRequest::new("mapped", ["prefill"]).unwrap();
     plan.buffer(BufferRequest::new(
@@ -572,35 +574,57 @@ fn mapped_resident_bytes_are_reported_without_consuming_the_host_budget() {
         StageSpan::at(0),
     ))
     .unwrap()
-    .buffer(BufferRequest::new(
-        "mapping",
-        Scope::Host,
-        MAPPED,
-        100_000,
-        StageSpan::at(0),
-    ))
+    .buffer(
+        BufferRequest::new("mapping", Scope::Host, MAPPED, 50, StageSpan::at(0))
+            .virtual_extent(100_000),
+    )
     .unwrap();
 
     let reserved = ledger
         .admit(&plan)
-        .expect("the mapping is not committed RAM");
+        .expect("850 B resident fits; the 100 kB of address space is not memory");
     let report = ledger
         .preview(&PlanRequest::new("empty", ["prefill"]).unwrap())
         .unwrap();
     let host = report.scope(Scope::Host).unwrap();
-    assert_eq!(
-        host.committed_bytes, 800,
-        "only the pinned bytes are charged"
-    );
-    assert_eq!(
-        ledger.committed(Scope::Host, MAPPED),
-        100_000,
-        "but it is tracked"
-    );
-    assert!(!host.tier(MAPPED).unwrap().charged_to_scope);
-    assert!(host.tier(PINNED).unwrap().charged_to_scope);
+    assert_eq!(host.committed_bytes, 850, "both resident sets are charged");
+    assert_eq!(ledger.committed(Scope::Host, MAPPED), 50);
+
+    let mapped_row = ledger
+        .preview(&plan)
+        .unwrap()
+        .scope(Scope::Host)
+        .unwrap()
+        .tier(MAPPED)
+        .unwrap()
+        .clone();
+    assert_eq!(mapped_row.request_peak_bytes, 50);
+    assert_eq!(mapped_row.virtual_extent_bytes, 100_000);
+
     ledger.release(reserved).unwrap();
     assert_eq!(ledger.committed(Scope::Host, MAPPED), 0);
+}
+
+#[test]
+fn a_virtual_extent_is_refused_where_it_would_be_meaningless_or_impossible() {
+    let mut plan = PlanRequest::new("mapped", ["prefill"]).unwrap();
+    // Only a mapping has an extent distinct from its bytes.
+    let e = plan
+        .buffer(
+            BufferRequest::new("pinned", Scope::Host, PINNED, 10, StageSpan::at(0))
+                .virtual_extent(100),
+        )
+        .unwrap_err();
+    assert_eq!(e.kind(), "invalid_request");
+    // And a resident set cannot exceed the mapping it is resident in.
+    let e = plan
+        .buffer(
+            BufferRequest::new("mapping", Scope::Host, MAPPED, 100, StageSpan::at(0))
+                .virtual_extent(10),
+        )
+        .unwrap_err();
+    assert_eq!(e.kind(), "invalid_request");
+    assert!(plan.buffers().is_empty());
 }
 
 #[test]
@@ -970,4 +994,124 @@ fn an_oversized_moe_workload_admits_and_then_binds_on_its_own_tier() {
     ledger.release(held).unwrap();
     assert_eq!(ledger.scope_committed(a), 0);
     assert_eq!(ledger.scope_committed(Scope::Host), 0);
+}
+
+// --- review corrections, 2026-09-08 -----------------------------------------
+
+#[test]
+fn resident_mapped_pages_share_the_physical_host_budget() {
+    // Review finding 1. Resident pages of a mapping are physical RAM. The
+    // distinction document 03 draws is between a mapping's *virtual extent* and
+    // its resident pages; excluding the whole tier from the budget did not
+    // prevent double counting, it permitted under-counting.
+    let mut ledger = Ledger::new([host_snapshot(1_000, 100)]).unwrap();
+    let mut plan = PlanRequest::new("mapped", ["run"]).unwrap();
+    plan.buffer(BufferRequest::new(
+        "pinned",
+        Scope::Host,
+        PINNED,
+        800,
+        StageSpan::at(0),
+    ))
+    .unwrap()
+    .buffer(BufferRequest::new(
+        "resident",
+        Scope::Host,
+        MAPPED,
+        800,
+        StageSpan::at(0),
+    ))
+    .unwrap();
+    let e = ledger
+        .admit(&plan)
+        .expect_err("1600 B resident cannot fit a 900 B budget");
+    let r = rejection(&e);
+    assert_eq!(r.worst().needed_bytes, 1_600);
+    assert_eq!(r.worst().available_bytes, 900);
+}
+
+#[test]
+fn host_backed_execution_accounts_for_this_requests_own_host_working_set() {
+    // Review finding 2. The host headroom subtracted earlier commitments but
+    // ignored what this very request already asks the host for.
+    let d = gpu(1);
+    let mut ledger = Ledger::new([host_snapshot(1_000, 100), device_snapshot(d, 100)]).unwrap();
+    let mut plan = PlanRequest::new("spill", ["run"]).unwrap();
+    plan.buffer(BufferRequest::new(
+        "workspace",
+        Scope::Host,
+        Tier::Host(HostTier::CpuWorkspace),
+        900,
+        StageSpan::at(0),
+    ))
+    .unwrap()
+    .buffer(BufferRequest::new("kv", d, KV, 500, StageSpan::at(0)))
+    .unwrap();
+    let e = ledger.admit(&plan).unwrap_err();
+    assert!(
+        !rejection(&e)
+            .alternatives
+            .contains(&LegalAlternative::HostBackedExecution),
+        "the host is already fully occupied by this same request"
+    );
+}
+
+#[test]
+fn a_context_alternative_must_be_able_to_move_the_binding_peak() {
+    // Review finding 3. A scaling buffer that is not live at the binding stage
+    // contributes nothing to the peak that failed, so lowering context cannot
+    // help however much of it is removed.
+    let d = gpu(1);
+    let mut ledger = Ledger::new([device_snapshot(d, 100)]).unwrap();
+    let mut plan = PlanRequest::new("stages", ["prefill", "decode"]).unwrap();
+    plan.buffer(BufferRequest::new("fixed", d, WORK, 200, StageSpan::at(0)))
+        .unwrap()
+        .buffer(BufferRequest::new("kv", d, KV, 50, StageSpan::at(1)).scaling(Scaling::Context))
+        .unwrap();
+    let e = ledger.admit(&plan).unwrap_err();
+    assert!(
+        !rejection(&e)
+            .alternatives
+            .contains(&LegalAlternative::LowerContext),
+        "removing every KV byte leaves the 200 B prefill peak exactly where it is"
+    );
+
+    // The same buffer live at the binding stage does qualify, so this is a test
+    // of the liveness rule and not of the alternative being unreachable.
+    let mut overlapping = PlanRequest::new("overlapping", ["prefill", "decode"]).unwrap();
+    overlapping
+        .buffer(BufferRequest::new("fixed", d, WORK, 200, StageSpan::at(0)))
+        .unwrap()
+        .buffer(
+            BufferRequest::new("kv", d, KV, 50, StageSpan::inclusive(0, 1))
+                .scaling(Scaling::Context),
+        )
+        .unwrap();
+    let e = ledger.admit(&overlapping).unwrap_err();
+    assert!(
+        rejection(&e)
+            .alternatives
+            .contains(&LegalAlternative::LowerContext)
+    );
+}
+
+#[test]
+fn a_branch_alternative_must_be_able_to_move_the_binding_peak() {
+    // Review finding 3, the other half: the branch rule shares the code path.
+    let d = gpu(1);
+    let mut ledger = Ledger::new([device_snapshot(d, 100)]).unwrap();
+    let mut plan = PlanRequest::new("stages", ["prefill", "decode"]).unwrap();
+    plan.buffer(BufferRequest::new("fixed", d, WORK, 200, StageSpan::at(0)))
+        .unwrap()
+        .buffer(
+            BufferRequest::new("entropy", d, BRANCHES, 50, StageSpan::at(1))
+                .scaling(Scaling::Branches),
+        )
+        .unwrap();
+    let e = ledger.admit(&plan).unwrap_err();
+    assert!(
+        !rejection(&e)
+            .alternatives
+            .contains(&LegalAlternative::FewerBranches)
+    );
 }

@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use moxie_types::{DeviceTier, Error, Result, Scope, ScopeKind, Tier};
+use moxie_types::{DeviceTier, Error, HostTier, Result, Scope, ScopeKind, Tier};
 
 use crate::report::{
     AdmissionReport, BindingConstraint, BindingKind, LegalAlternative, Rejection, ScopeReport,
@@ -213,6 +213,9 @@ struct Evaluation {
     /// totals of the per-tier peaks above.
     scope_charges: Vec<(Scope, u64)>,
     binding: Vec<BindingConstraint>,
+    /// The changes this request makes capable of helping. Empty when nothing
+    /// binds.
+    alternatives: Vec<LegalAlternative>,
 }
 
 impl Ledger {
@@ -315,12 +318,11 @@ impl Ledger {
                 .map(BindingConstraint::shortfall_bytes)
                 .max()
                 .unwrap_or(0);
-            let alternatives = self.alternatives(request, &evaluation.binding);
             return Err(AdmitError::Rejected(Box::new(Rejection {
                 report: evaluation.report,
                 binding: evaluation.binding,
                 shortfall_bytes: shortfall,
-                alternatives,
+                alternatives: evaluation.alternatives,
             })));
         }
 
@@ -413,8 +415,11 @@ impl Ledger {
             }
         }
 
-        // Per (scope, tier), the bytes live at each stage.
+        // Per (scope, tier), the bytes live at each stage. Every tier's bytes
+        // are charged; a mapping's *virtual extent* is the separate quantity,
+        // accumulated beside them and charged to nothing.
         let mut live: BTreeMap<(Scope, Tier), Vec<u64>> = BTreeMap::new();
+        let mut virtual_live: BTreeMap<(Scope, Tier), Vec<u64>> = BTreeMap::new();
         for b in request.buffers() {
             let row = live
                 .entry((b.scope, b.tier))
@@ -425,16 +430,32 @@ impl Ledger {
                     .checked_add(b.bytes)
                     .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
             }
+            if let Some(extent) = b.virtual_bytes {
+                let row = virtual_live
+                    .entry((b.scope, b.tier))
+                    .or_insert_with(|| vec![0; stage_count]);
+                for stage in b.live.first..=b.live.last {
+                    let slot = &mut row[stage as usize];
+                    *slot = slot
+                        .checked_add(extent)
+                        .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+                }
+            }
         }
 
+        // Which buffers fed each derived reserve, so a refusal can say that
+        // lowering context would shrink the reserve as well as the buffer.
+        let mut reserve_sources: Vec<Vec<usize>> = Vec::with_capacity(request.reserves().len());
+
         for r in request.reserves() {
-            let mut sizes: Vec<u64> = request
+            let mut sizes: Vec<(u64, usize)> = request
                 .buffers()
                 .iter()
-                .filter(|b| b.scope == r.scope && b.tier == r.tier)
-                .map(|b| b.bytes)
+                .enumerate()
+                .filter(|(_, b)| b.scope == r.scope && b.tier == r.tier)
+                .map(|(i, b)| (b.bytes, i))
                 .collect();
-            sizes.sort_unstable_by(|a, b| b.cmp(a));
+            sizes.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
             let wanted = match r.rule {
                 ReserveRule::LargestBufferOfTier => 1,
                 ReserveRule::NLargestBuffersOfTier(n) => n as usize,
@@ -453,11 +474,12 @@ impl Ledger {
                 });
             }
             let mut bytes: u64 = 0;
-            for size in &sizes[..wanted] {
+            for (size, _) in &sizes[..wanted] {
                 bytes = bytes
                     .checked_add(*size)
                     .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
             }
+            reserve_sources.push(sizes[..wanted].iter().map(|(_, i)| *i).collect());
             let row = live
                 .entry((r.scope, r.tier))
                 .or_insert_with(|| vec![0; stage_count]);
@@ -500,8 +522,8 @@ impl Ledger {
             let (mut scope_peak, mut scope_peak_stage) = (0u64, 0u32);
             for stage in 0..stage_count {
                 let mut total: u64 = 0;
-                for ((s, tier), row) in &live {
-                    if s == scope && tier.charges_scope_budget() {
+                for ((s, _), row) in &live {
+                    if s == scope {
                         total = total
                             .checked_add(row[stage])
                             .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
@@ -546,7 +568,10 @@ impl Ledger {
                     request_peak_bytes: peak,
                     peak_stage,
                     remaining_headroom_bytes: cap.map(|c| c.saturating_sub(tier_needed)),
-                    charged_to_scope: tier.charges_scope_budget(),
+                    virtual_extent_bytes: virtual_live
+                        .get(&(*scope, tier))
+                        .and_then(|row| row.iter().copied().max())
+                        .unwrap_or(0),
                 });
             }
 
@@ -556,7 +581,7 @@ impl Ledger {
                 // break on `Tier::ALL` order, so the answer is deterministic.
                 let largest = live
                     .iter()
-                    .filter(|((s, tier), _)| s == scope && tier.charges_scope_budget())
+                    .filter(|((s, _), _)| s == scope)
                     .map(|((_, tier), row)| (row[scope_peak_stage as usize], *tier))
                     .max_by(|a, b| {
                         a.0.cmp(&b.0).then_with(|| {
@@ -593,6 +618,19 @@ impl Ledger {
             });
         }
 
+        let host_request_peak = scope_charges
+            .iter()
+            .find(|(s, _)| *s == Scope::Host)
+            .map(|(_, b)| *b)
+            .unwrap_or(0);
+        let alternatives = self.alternatives(
+            request,
+            &binding,
+            &reserve_sources,
+            &tier_peak,
+            host_request_peak,
+        );
+
         Ok(Evaluation {
             report: AdmissionReport {
                 stages: request.stages().to_vec(),
@@ -601,42 +639,39 @@ impl Ledger {
             charges,
             scope_charges,
             binding,
+            alternatives,
         })
     }
 
     /// The changes this request makes capable of helping. Never applied.
+    ///
+    /// "Capable of helping" is the whole bar, and it is stricter than "mentions
+    /// the right knob". A buffer that scales with context but is not live at the
+    /// stage where the budget failed contributes nothing to that peak, so
+    /// removing every byte of it would leave the refusal exactly where it is.
+    /// Offering it is worse than offering nothing, because the caller spends a
+    /// round trip finding that out.
     fn alternatives(
         &self,
         request: &PlanRequest,
         binding: &[BindingConstraint],
+        reserve_sources: &[Vec<usize>],
+        tier_peak: &BTreeMap<(Scope, Tier), (u64, u32)>,
+        host_request_peak: u64,
     ) -> Vec<LegalAlternative> {
-        let tier_bound: BTreeSet<(Scope, Tier)> = binding
-            .iter()
-            .filter(|c| c.kind == BindingKind::TierCap)
-            .map(|c| (c.scope, c.tier))
-            .collect();
-        let scope_bound: BTreeSet<Scope> = binding
-            .iter()
-            .filter(|c| c.kind == BindingKind::ScopeBudget)
-            .map(|c| c.scope)
-            .collect();
-
         let mut out: BTreeSet<LegalAlternative> = BTreeSet::new();
 
-        for b in request.buffers() {
-            let binds = tier_bound.contains(&(b.scope, b.tier))
-                || (scope_bound.contains(&b.scope) && b.tier.charges_scope_budget());
-            if !binds {
-                continue;
-            }
-            match b.scales_with {
-                Some(Scaling::Context) => {
-                    out.insert(LegalAlternative::LowerContext);
+        for c in binding {
+            for i in contributing_buffers(request, reserve_sources, c) {
+                match request.buffers()[i].scales_with {
+                    Some(Scaling::Context) => {
+                        out.insert(LegalAlternative::LowerContext);
+                    }
+                    Some(Scaling::Branches) => {
+                        out.insert(LegalAlternative::FewerBranches);
+                    }
+                    None => {}
                 }
-                Some(Scaling::Branches) => {
-                    out.insert(LegalAlternative::FewerBranches);
-                }
-                None => {}
             }
         }
 
@@ -660,13 +695,39 @@ impl Ledger {
             out.insert(LegalAlternative::DifferentTopology);
         }
 
-        if let Some(host) = self.scopes.get(&Scope::Host) {
-            let host_headroom = host
+        // Moving work to the host is only an alternative if the host has room
+        // for it *after* everything this same request already asks the host for.
+        // Subtracting only earlier commitments would offer a fallback into
+        // memory this plan has itself spoken for.
+        if let Some(host) = self.scopes.get(&Scope::Host)
+            && !binding.iter().any(|c| c.scope == Scope::Host)
+        {
+            let available = host
                 .snapshot
                 .admissible_bytes()
-                .saturating_sub(self.scope_committed(Scope::Host));
+                .saturating_sub(self.scope_committed(Scope::Host))
+                .saturating_sub(host_request_peak);
+            let capped: Vec<(Tier, u64)> = HOST_BACKED_TIERS
+                .iter()
+                .filter_map(|t| host.snapshot.tier_cap(*t).map(|cap| (*t, cap)))
+                .collect();
+            let fits_a_cap = |need: u64| {
+                // A cap only constrains the fallback if one was declared on a
+                // tier that could hold it.
+                capped.is_empty()
+                    || capped.iter().any(|(tier, cap)| {
+                        let used = self.committed(Scope::Host, *tier)
+                            + tier_peak
+                                .get(&(Scope::Host, *tier))
+                                .map(|(bytes, _)| *bytes)
+                                .unwrap_or(0);
+                        cap.saturating_sub(used) >= need
+                    })
+            };
             if binding.iter().any(|c| {
-                c.scope.kind() == ScopeKind::Device && host_headroom >= c.shortfall_bytes()
+                c.scope.kind() == ScopeKind::Device
+                    && available >= c.shortfall_bytes()
+                    && fits_a_cap(c.shortfall_bytes())
             }) {
                 out.insert(LegalAlternative::HostBackedExecution);
             }
@@ -674,6 +735,41 @@ impl Ledger {
 
         out.into_iter().collect()
     }
+}
+
+/// The host tiers that could absorb work moved off a device: state held on the
+/// host, and CPU-side compute workspace (document 03's host-backed execution and
+/// shared CPU expert execution).
+const HOST_BACKED_TIERS: &[Tier] = &[
+    Tier::Host(HostTier::StateSpill),
+    Tier::Host(HostTier::CpuWorkspace),
+];
+
+/// Which of the request's buffers actually feed one failed constraint.
+///
+/// A buffer counts when it is live at the stage where that constraint's peak
+/// occurred, in the same scope, and -- for a tier cap -- in the same tier. A
+/// derived reserve live at that stage counts too, through the buffers whose
+/// sizes it was computed from: shrinking the largest expert shrinks the reserve
+/// that leaves room for the next one.
+fn contributing_buffers(
+    request: &PlanRequest,
+    reserve_sources: &[Vec<usize>],
+    c: &BindingConstraint,
+) -> BTreeSet<usize> {
+    let tier_matches = |tier: Tier| c.kind == BindingKind::ScopeBudget || tier == c.tier;
+    let mut out = BTreeSet::new();
+    for (i, b) in request.buffers().iter().enumerate() {
+        if b.scope == c.scope && tier_matches(b.tier) && b.live.covers(c.peak_stage) {
+            out.insert(i);
+        }
+    }
+    for (r, sources) in request.reserves().iter().zip(reserve_sources) {
+        if r.scope == c.scope && tier_matches(r.tier) && r.live.covers(c.peak_stage) {
+            out.extend(sources.iter().copied());
+        }
+    }
+    out
 }
 
 /// A tier's index in `Tier::ALL`, for deterministic tie-breaking.
