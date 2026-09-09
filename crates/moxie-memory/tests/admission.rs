@@ -1115,3 +1115,115 @@ fn a_branch_alternative_must_be_able_to_move_the_binding_peak() {
             .contains(&LegalAlternative::FewerBranches)
     );
 }
+
+// --- review corrections, round 2 --------------------------------------------
+
+#[test]
+fn a_context_alternative_is_refused_when_a_tied_peak_survives_it() {
+    // Round-2 finding 1. Contributing to the peak that was *reported* is not
+    // enough: another stage holds the same total, so removing every context
+    // byte leaves the failing maximum exactly where it was.
+    let d = gpu(1);
+    let mut ledger = Ledger::new([device_snapshot(d, 100)]).unwrap();
+    let mut plan = PlanRequest::new("tie", ["a", "b"]).unwrap();
+    plan.buffer(BufferRequest::new("kv", d, KV, 200, StageSpan::at(0)).scaling(Scaling::Context))
+        .unwrap()
+        .buffer(BufferRequest::new("fixed", d, WORK, 200, StageSpan::at(1)))
+        .unwrap();
+    let e = ledger.admit(&plan).unwrap_err();
+    assert!(
+        !rejection(&e)
+            .alternatives
+            .contains(&LegalAlternative::LowerContext),
+        "the fixed second peak stays at 200 B however much KV is removed"
+    );
+}
+
+#[test]
+fn a_context_alternative_is_refused_when_a_tied_reserve_survives_it() {
+    // Round-2 finding 1, the derived-reserve half. The reserve takes the
+    // largest expert; a tie means the fixed expert holds it at 80 B whatever
+    // happens to the scaled one, and the binding stage is the reserve's.
+    let d = gpu(1);
+    let mut ledger = Ledger::new([device_snapshot(d, 100)]).unwrap();
+    let mut plan = PlanRequest::new("tie-reserve", ["a", "b", "c"]).unwrap();
+    plan.buffer(
+        BufferRequest::new("scaled", d, EXPERTS, 80, StageSpan::at(0)).scaling(Scaling::Context),
+    )
+    .unwrap()
+    .buffer(BufferRequest::new(
+        "fixed",
+        d,
+        EXPERTS,
+        80,
+        StageSpan::at(1),
+    ))
+    .unwrap()
+    .buffer(BufferRequest::new(
+        "workspace",
+        d,
+        WORK,
+        80,
+        StageSpan::at(2),
+    ))
+    .unwrap()
+    .reserve(DerivedReserve::new(
+        "incoming",
+        d,
+        EXPERTS,
+        ReserveRule::LargestBufferOfTier,
+        StageSpan::at(2),
+    ))
+    .unwrap();
+    let e = ledger.admit(&plan).unwrap_err();
+    assert!(
+        !rejection(&e)
+            .alternatives
+            .contains(&LegalAlternative::LowerContext),
+        "stage c stays at 160 B: the fixed expert still determines the reserve"
+    );
+}
+
+#[test]
+fn a_kv_spill_cannot_borrow_the_cpu_workspace_allowance() {
+    // Round-2 finding 2. A cap on the tier that would hold CPU workspace says
+    // nothing about room for persistent sequence state.
+    let d = gpu(1);
+    let host = host_snapshot(1_100, 100)
+        .with_tier_cap(SPILL, 0)
+        .unwrap()
+        .with_tier_cap(Tier::Host(HostTier::CpuWorkspace), 1_000)
+        .unwrap();
+    let mut ledger = Ledger::new([host, device_snapshot(d, 100)]).unwrap();
+    let mut plan = PlanRequest::new("kv", ["run"]).unwrap();
+    plan.buffer(BufferRequest::new("kv", d, KV, 500, StageSpan::at(0)))
+        .unwrap();
+    let e = ledger.admit(&plan).unwrap_err();
+    assert!(
+        !rejection(&e)
+            .alternatives
+            .contains(&LegalAlternative::HostBackedExecution),
+        "state spill is capped at zero; a workspace allowance cannot hold state"
+    );
+}
+
+#[test]
+fn an_uncapped_spill_is_not_blocked_by_an_unrelated_workspace_cap() {
+    // Round-2 finding 2, the other direction. An absent cap means "bounded by
+    // the scope budget", not "no room".
+    let d = gpu(1);
+    let host = host_snapshot(1_100, 100)
+        .with_tier_cap(Tier::Host(HostTier::CpuWorkspace), 0)
+        .unwrap();
+    let mut ledger = Ledger::new([host, device_snapshot(d, 100)]).unwrap();
+    let mut plan = PlanRequest::new("kv", ["run"]).unwrap();
+    plan.buffer(BufferRequest::new("kv", d, KV, 500, StageSpan::at(0)))
+        .unwrap();
+    let e = ledger.admit(&plan).unwrap_err();
+    assert!(
+        rejection(&e)
+            .alternatives
+            .contains(&LegalAlternative::HostBackedExecution),
+        "state spill is uncapped and the host has room; the workspace cap is irrelevant"
+    );
+}

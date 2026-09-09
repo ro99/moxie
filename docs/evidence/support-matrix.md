@@ -16,10 +16,10 @@ matrix exists to prevent.
 |---|---|---|---|
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
-| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 448 unit/integration tests + 6 doctests |
+| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 452 unit/integration tests + 6 doctests |
 | `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 45 negative + 12 positive fixtures, 10 rules; 343 generated module combinations checked against rustc by the host suite, each against all four crate boundaries |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
-| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 448 unit/integration tests + 6 doctests, `ldd` shows no `libcuda` |
+| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 452 unit/integration tests + 6 doctests, `ldd` shows no `libcuda` |
 | `G-GPU-SM86` | `cargo xtask-cuda test-gpu --profile sm86` | device | passed, RTX 3090 x2 |
 | `G-GPU-SM120` | `cargo xtask-cuda test-gpu --profile sm120` | device | passed, RTX 5060 Ti |
 | `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 15 cases, both architectures qualified |
@@ -30,9 +30,10 @@ matrix exists to prevent.
 
 Device gates ran by hand on this machine. No CI runner executes them; see
 [toolchain.md](toolchain.md).
-Device results below were remeasured for [task 0006](../tasks/0006-m1-resource-ledger-and-admission.md),
-because it changed the tier field of the typed capacity error that
-`moxie-cuda`'s status mapping constructs.
+Device results were remeasured at task 0006's implementation commit `a486930`, because it changed
+the tier field of the typed capacity error that `moxie-cuda`'s status mapping constructs. The two
+review-correction rounds after it are carried forward: they changed `moxie-types`'s UUID parser,
+`moxie-memory` and documentation only, and no device code, kernel or FFI path.
 
 Counts are from 2026-09-08 after [task 0006](../tasks/0006-m1-resource-ledger-and-admission.md); the M0
 enforcement counts they grew from are in
@@ -57,7 +58,7 @@ enforcement counts they grew from are in
 | none | n/a | n/a | TP / PP / expert partition | **not implemented** | — | M5. `PartitionRule::NotDetermined` fails closed today. |
 | none | n/a | n/a | Transactional publication of a step | passed | `G-INTERP-BF16` (`moxie-state` `begin`/`commit_prefix`/`abort`, `a_step_cancelled_at_any_publication_boundary_aborts_to_exactly_where_it_started`) | Host reference only. A step's sequence-state and KV mutations commit together or restore exactly, and a transaction is append-only on both. `fork` is still identity-only (COW is M4), and **appendable paged state remains an outstanding M1.4 requirement**. |
 | none | n/a | n/a | Canonical manifest v1 + bounded tensor reads | passed | `G-HOST-TEST` (`moxie-format::manifest` 31 rejection/limit/collision tests, `moxie-storage` 15 artifact + 8 pump tests), `G-HOST-ARCH` (format/storage boundary + include/module rules with fixtures, incl. positive layouts) | Host-only. Opens, validates and reads test-generated BF16 artifacts within a byte budget; chunk files are opened once and read position-independently, and the success path holds zero live heap on short and long paths alike (counting-allocator gate). **No checkpoint has been read, downloaded or converted, and nothing here loads a model:** `moxie-interp` is not rewired to disk, affine tensors refuse with M3, and `partial` refuses every read. |
-| none | n/a | n/a | Resource ledger, admission and refusal | passed | `G-HOST-TEST` (`moxie-memory` 30 acceptance + 8 unit tests + 2 compile-fail doctests; `moxie-types::tier` and `::ids` exhaustiveness, identity and malformed-input tests), `G-HOST-ARCH` (memory/filesystem and memory/model-name boundary rules, each with a rejecting fixture and a clean accepted one) | Host-only integer accounting over byte counts the caller declares. **It allocates nothing, maps nothing, measures nothing, and names no model.** Capacity comes in as a snapshot measured elsewhere; admission reserves the peak overlapping live set atomically, or refuses with a per-tier breakdown and only the alternatives that could actually move the constraint that failed -- it never shrinks a request. A mapping's resident pages are charged against the host budget; only its virtual extent is reported uncharged. No device or host memory has been allocated anywhere in this repository, and no capacity figure here came from real hardware. |
+| none | n/a | n/a | Resource ledger, admission and refusal | passed | `G-HOST-TEST` (`moxie-memory` 34 acceptance + 8 unit tests + 2 compile-fail doctests; `moxie-types::tier` and `::ids` exhaustiveness, identity and malformed-input tests), `G-HOST-ARCH` (memory/filesystem and memory/model-name boundary rules, each with a rejecting fixture and a clean accepted one) | Host-only integer accounting over byte counts the caller declares. **It allocates nothing, maps nothing, measures nothing, and names no model.** Capacity comes in as a snapshot measured elsewhere; admission reserves the peak overlapping live set atomically, or refuses with a per-tier breakdown and only the alternatives a recomputation shows could actually move a constraint that failed -- it never shrinks a request. A mapping's resident pages are charged against the host budget; only its virtual extent is reported uncharged. No device or host memory has been allocated anywhere in this repository, and no capacity figure here came from real hardware. |
 | none | n/a | n/a | Prefix reuse / continuation / cancellation | **not implemented** | `G-HOST-TEST` (`moxie-state`) covers frontier, result-identity and restore-evidence rules only | M4. Counters, retained-result identity and prefix lineage are typed and tested; there is no cache to reuse, and document 04's token-content prefix key is a separate identity that is **not** implemented. |
 | none | n/a | n/a | Common sampler pipeline | **partial, not integrated** | `G-HOST-TEST` (`moxie-oracles::sampler`) | Legality mask, top-k, top-p, min-p, temperature, tie rule, extreme-temperature stability and typed failures only. Penalties, DRY, n-gram ban, logit bias, typical-p and XTC are **not implemented**. |
 | none | n/a | n/a | Future entropy | **not implemented** | — | M10. Document 05 defines it; nothing here evaluates it. |

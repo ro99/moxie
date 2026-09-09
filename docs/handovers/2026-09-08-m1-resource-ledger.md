@@ -23,10 +23,10 @@ pending; treat "gates pass" as gates passing, not as acceptance.
 
 **Task 0006 (M1.3 part 1, the resource ledger and admission)** was contracted at `305c765` — a commit
 with no `.rs` change, as tasks 0003, 0004 and 0005 did — implemented at `a486930`, and then
-corrected against four review findings. Its record,
+corrected against two rounds of review findings — four, then two. Its record,
 [docs/tasks/0006-m1-resource-ledger-and-admission.md](../tasks/0006-m1-resource-ledger-and-admission.md),
-carries the contract, the result, six recorded deviations, the bite checks and the review-correction
-round. Owner acceptance is pending for this task too.
+carries the contract, the result, six recorded deviations, the bite checks and both
+review-correction rounds. Owner acceptance is pending for this task too.
 
 One of those findings was a **contract** defect, not only an implementation one: the contract
 excluded resident mapped pages from the host budget. It is struck in place rather than rewritten, so
@@ -36,29 +36,35 @@ uncharged quantity, declared per buffer.
 What exists that did not before:
 
 - `moxie-types::tier`: the closed tier vocabulary — document 03's fifteen device tiers and six host
-  tiers, `Scope`, `ScopeKind`, an exhaustive `ALL`, and the one tier that is reported without being
-  charged (`host.mapped_resident`).
+  tiers, `Scope`, `ScopeKind`, an exhaustive `ALL`. Every tier's bytes are charged; the one tier
+  that also carries an *uncharged* quantity is `host.mapped_resident`, whose virtual extent is
+  reported beside its resident pages.
 - `moxie-types::ids::DeviceUuid`: a GPU's identity as 16 bytes, parsed strictly from the canonical
   `GPU-` form. It keys maps; `DeviceId` still cannot, and that asymmetry is the point.
 - `moxie-memory`: `CapacitySnapshot`, `PlanRequest` with liveness spans over ordered stages,
   derived reserves computed from the request's own buffers, and the `Ledger` — peak overlapping live
-  set, atomic admission, typed refusal with a per-tier breakdown, explicit release.
+  set, atomic admission, typed refusal with a per-tier breakdown, explicit release. A refusal's
+  alternatives are decided by **recomputing** the peaks with the relevant buffers at zero, not by
+  attributing bytes to the reported peak.
 - `arch-check`: two new rules for the memory boundary, the two crate-specific checks generalised into
   tables, and the 343-chain generated test now exercising four crate boundaries per chain.
 
-Gates, all run at the implementation state on this machine:
+Gates on this machine. The host lanes were re-run after the second review round; the device lanes
+were measured at `a486930` and are **carried forward**, because the two correction rounds since
+touched `moxie-types`'s UUID parser and `moxie-memory` only, and changed no device code, kernel or
+FFI path:
 
 | Lane | Result |
 |---|---|
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | PASS |
-| `cargo test --workspace --locked --offline` | PASS, 448 unit/integration + 6 doctests |
+| `cargo test --workspace --locked --offline` | PASS, 452 unit/integration + 6 doctests |
 | `cargo xtask arch-check` | PASS, 45 rejected + 12 accepted fixtures, 10 rules |
 | `cargo xtask spec-check` | PASS, 10 documents |
-| no-driver host lane | PASS, 448 + 6; `ldd target/debug/xtask` shows no `libcuda` |
-| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | PASS, 450 + 7 |
-| `cargo xtask-cuda test-gpu` | PASS, 15 cases, `sm_86` and `sm_120` qualified |
-| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, `UNQUALIFIED sm_120`, as intended |
+| no-driver host lane | PASS, 452 + 6; `ldd target/debug/xtask` shows no `libcuda` |
+| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` (carried forward from `a486930`) | PASS, 450 + 7 |
+| `cargo xtask-cuda test-gpu` (carried forward from `a486930`) | PASS, 15 cases, `sm_86` and `sm_120` qualified |
+| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` (carried forward from `a486930`) | **exit 1**, `UNQUALIFIED sm_120`, as intended |
 
 Nothing failed. Nothing was skipped. No checkpoint was read, downloaded or converted, no byte was
 allocated or copied, and no capacity was measured.
@@ -103,10 +109,13 @@ exists and which does not.
 - A second shape is now worth naming: **an error path that consumes the only handle to a live
   resource.** `Ledger::release` originally did, and it would have leaked exactly the way R08 did.
 - A third, from the review: **a diagnostic that names a knob without checking that turning it would
-  move the number that failed.** Three of the four findings were that shape — an alternative offered
-  for a buffer not live at the binding stage, a host fallback into memory the same request had
-  taken, and a tier excluded from a budget it physically occupies. Any new advice the engine gives
-  a caller needs the same test: what changes if they follow it?
+  move the number that failed.** Five of the six findings across two rounds were that shape — an
+  alternative offered for a buffer not live at the binding stage, then for a buffer live at a *tied*
+  peak that survives its removal, then for one whose derived reserve a tie holds up anyway; a host
+  fallback into memory the same request had taken, then one checked against an unrelated tier's cap;
+  and a tier excluded from a budget it physically occupies. The lesson the second round added is
+  sharper than the first: **attribution is not an answer, recomputation is.** Any advice the engine
+  gives a caller must be tested by computing what happens if they follow it.
 
 ## Next task
 

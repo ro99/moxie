@@ -203,16 +203,18 @@ An alternative is listed only when the request itself makes it legal:
 | `DifferentTopology` | more than one device scope is declared |
 | `HostBackedExecution` | the binding scope is a device, no host constraint binds, and host headroom **after this request's own host demand** covers the shortfall |
 
-**Corrected by review, 2026-09-08** (findings 2 and 3). A buffer *contributes to* a failed
-constraint when it is live at the stage where that constraint's peak occurred, in the same scope,
-and -- for a tier cap -- in the same tier; a derived reserve live at that stage contributes through
-the buffers whose sizes it was computed from. The first two rows previously accepted any scaling
-buffer anywhere in a failing scope, which offered `LowerContext` for a KV buffer that was not live
-at the binding stage and so could not move the peak however much of it was removed. The
-`HostBackedExecution` row previously subtracted only earlier commitments from host headroom, so it
-offered a fallback into memory the same request had already spoken for; it now also subtracts this
-request's host peak, refuses when the host itself binds, and respects a declared cap on
-`StateSpill` or `CpuWorkspace` when one exists.
+**Corrected by review, 2026-09-08** (round 1 findings 2 and 3; round 2 findings 1 and 2). The first
+two rows are decided by **recomputation, not attribution**: for each scaling class the request uses,
+the peaks are computed again with every buffer of that class at zero bytes, and the alternative is
+offered only when some failing constraint is strictly smaller in that counterfactual. Attribution
+was tried twice and was wrong twice -- first accepting any scaling buffer in a failing scope, then
+accepting one live at the reported peak stage. Neither test survives a tie: two stages can hold the
+same total, and a derived reserve takes the largest buffer of its tier, so removing one member of a
+tie moves nothing. The `HostBackedExecution` row subtracts this request's own host peak as well as
+earlier commitments, declines when any host constraint binds, and checks the cap of the host tier
+that would actually receive the bytes -- state spills to `StateSpill`, everything else on a device
+needs `CpuWorkspace` -- where an absent cap keeps its documented meaning of "bounded by the scope
+budget".
 
 A generic menu of five is worse than nothing, because it invites the caller to try a change that
 cannot help. The ledger **never applies** an alternative: document 03 forbids automatically
@@ -451,3 +453,65 @@ doctests (was 442 + 6: five net new tests in `moxie-memory`, one in
 lane and `test-gpu` were re-run for the previous round and are carried forward
 here: these corrections touch `moxie-types`'s UUID parser and `moxie-memory`
 only, and no device code, kernel or FFI path changed.
+
+### Review corrections, round 2 (2026-09-08, commit `a036afc` not accepted)
+
+Two findings remained, both in the refusal's advice rather than in its
+arithmetic. Both reproduced before any fix and both reproductions are kept.
+
+- **P2 — attribution cannot answer "would this help?".** Round 1 replaced "any
+  scaling buffer in a failing scope" with "a buffer live at the binding
+  constraint's peak stage". That is still attribution, and it is still wrong
+  under a tie. Two stages can hold the same total, so a context-scaled buffer
+  live at the reported peak can be removed entirely while the maximum stays put
+  (200 B of KV at one stage, 200 B of fixed workspace at another, in a 100 B
+  budget). A derived reserve takes the largest buffer of its tier, so shrinking
+  one member of a tied pair leaves the reserve exactly where the other member
+  holds it. The rule is now **recomputation**: for each scaling class the request
+  declares, the peaks are computed again with every buffer of that class at zero
+  bytes, and the alternative is offered only when some failing constraint is
+  strictly smaller in that counterfactual. Derived reserves are re-derived and
+  stage ties are re-resolved by construction, because it is the same arithmetic
+  on the same declaration. `contributing_buffers` and the reserve-source
+  bookkeeping it needed are deleted. Regressions:
+  `a_context_alternative_is_refused_when_a_tied_peak_survives_it` and
+  `a_context_alternative_is_refused_when_a_tied_reserve_survives_it`.
+
+- **P2 — host-backed execution checked an unrelated tier's cap.** The check
+  accepted any of `StateSpill` or `CpuWorkspace` having room, which was wrong in
+  both directions: a 1,000 B workspace allowance was accepted as somewhere to
+  put sequence state whose spill tier was capped at zero, and a zero workspace
+  cap suppressed a KV spill whose own tier was uncapped and whose scope had
+  room. The alternative is now routed to the tier that would actually receive
+  the bytes -- sequence state, recurrent state, speculative state and entropy
+  branches spill to `StateSpill`; every other device tier needs `CpuWorkspace`
+  to execute on the host -- and only that tier's cap is consulted. An absent cap
+  keeps its documented meaning, "bounded by the scope budget", which was already
+  checked. `host_destination` is total on device tiers so no binding constraint
+  silently loses the alternative, and it is deliberately coarse: a host weight
+  arena of its own (R11) is a residency question, and residency is M2.
+  Regressions: `a_kv_spill_cannot_borrow_the_cpu_workspace_allowance` and
+  `an_uncapped_spill_is_not_blocked_by_an_unrelated_workspace_cap`.
+
+Two documentation defects the reviewer also found are fixed: the handover still
+described `MappedResident` as uncharged, and its gate table claimed every lane
+ran at the implementation state when the device lanes were carried forward. Both
+now say what actually happened.
+
+Bite checks, reverted to green: disabling the counterfactual (computing the
+"without" peaks with nothing zeroed) fails four tests, including both positive
+alternative cases and the dense consumer, which shows the recomputation is what
+makes the advice work rather than a filter bolted beside it; pinning the host
+destination to `CpuWorkspace` regardless of the binding tier fails both
+destination regressions. The round-1 attribution rule is not re-testable as a
+mutation because it was deleted, so the two tied-peak regressions -- which
+failed against it before the fix -- are its bite check.
+
+Re-verified after round 2: `fmt` PASS; `clippy -D warnings` PASS;
+`cargo test --workspace --locked --offline` PASS, 452 unit/integration + 6
+doctests; `arch-check` PASS (45 rejected + 12 accepted, 10 rules); `spec-check`
+PASS (10 documents); no-driver lane PASS (452 + 6, no `libcuda`). Device lane
+and `test-gpu` carried forward from `a486930`: these corrections touch
+`moxie-memory` and the documentation only, and changed no device code, kernel or
+FFI path. The reviewer's eight tests, run unmodified from outside the
+repository, all pass.
