@@ -606,57 +606,58 @@ impl Ledger {
             out.insert(LegalAlternative::DifferentTopology);
         }
 
-        // Moving work to the host has to clear the constraint on three counts,
-        // and each one alone has been wrong: the host must have room after
-        // everything this same request already asks of it; the tiers that would
-        // receive the bytes must be able to take them; and the relocation must
-        // actually lower the failing ceiling, which is a question about the
-        // whole timeline rather than about the stage that happened to be
-        // reported.
+        // Moving work to the host is offered only when one **concrete**
+        // relocation both fits on the host and clears the constraint. Bounding
+        // the two sides separately does not do it: an upper bound on what the
+        // host could take and an upper bound on what the device could shed can
+        // each be satisfied by a different, incompatible move.
         if let Some(host) = self.scopes.get(&Scope::Host)
             && !binding.iter().any(|c| c.scope == Scope::Host)
         {
-            let available = host
-                .snapshot
-                .admissible_bytes()
-                .saturating_sub(self.scope_committed(Scope::Host))
-                .saturating_sub(base.scope_peak(Scope::Host).0);
-
-            // One counterfactual per failing scope: everything in it that has a
-            // host destination, moved.
-            let mut relocated: BTreeMap<Scope, Peaks> = BTreeMap::new();
+            let mut moved: BTreeMap<Scope, Peaks> = BTreeMap::new();
             for scope in binding
                 .iter()
                 .filter(|c| c.scope.kind() == ScopeKind::Device)
                 .map(|c| c.scope)
                 .collect::<BTreeSet<Scope>>()
             {
-                relocated.insert(
-                    scope,
-                    peaks(request, &|b| {
-                        b.scope == scope && host_destination(b.tier).is_some()
-                    })?,
-                );
+                if let Some(peaks) = self.relocate_to_host(request, base, host, scope)? {
+                    moved.insert(scope, peaks);
+                }
             }
 
             let clears = |c: &BindingConstraint| {
-                let need = c.shortfall_bytes();
-                let Some(without) = relocated.get(&c.scope) else {
+                let Some(after) = moved.get(&c.scope) else {
                     return false;
                 };
-                let reduction = match c.kind {
-                    BindingKind::TierCap => base
-                        .tier_peak(c.scope, c.tier)
-                        .0
-                        .saturating_sub(without.tier_peak(c.scope, c.tier).0),
-                    BindingKind::ScopeBudget => base
-                        .scope_peak(c.scope)
-                        .0
-                        .saturating_sub(without.scope_peak(c.scope).0),
+                // The same relocation, checked on both sides: the host holds
+                // what it received, and the device constraint is no longer over
+                // its ceiling.
+                let host_fits = self
+                    .scope_committed(Scope::Host)
+                    .saturating_add(after.scope_peak(Scope::Host).0)
+                    <= host.snapshot.admissible_bytes()
+                    && Tier::valid_in(ScopeKind::Host).all(|t| match host.snapshot.tier_cap(t) {
+                        None => true,
+                        Some(cap) => {
+                            self.committed(Scope::Host, t)
+                                .saturating_add(after.tier_peak(Scope::Host, t).0)
+                                <= cap
+                        }
+                    });
+                let device_clears = match c.kind {
+                    BindingKind::TierCap => {
+                        self.committed(c.scope, c.tier)
+                            .saturating_add(after.tier_peak(c.scope, c.tier).0)
+                            <= c.available_bytes
+                    }
+                    BindingKind::ScopeBudget => {
+                        self.scope_committed(c.scope)
+                            .saturating_add(after.scope_peak(c.scope).0)
+                            <= c.available_bytes
+                    }
                 };
-                available >= need
-                    && self.host_absorbable(base, host, c) >= need
-                    && reduction >= need
+                host_fits && device_clears
             };
 
             if binding
@@ -670,50 +671,109 @@ impl Ledger {
         Ok(out.into_iter().collect())
     }
 
-    /// How many of a failing constraint's bytes could actually be held on the
-    /// host, given what can move and where it would go.
+    /// Build one concrete relocation of `scope`'s movable bytes onto the host,
+    /// and return the peaks of the plan that results. `None` when nothing moves.
     ///
-    /// Two things are deliberately not consulted. `BindingConstraint::tier` on a
-    /// scope-budget failure is a **diagnostic label** -- the largest contributor
-    /// at the peak stage -- so eligibility is decided over every contributor
-    /// instead: the largest one may be immovable while a smaller one covers the
-    /// whole shortfall. And a tier with no host destination contributes nothing,
-    /// however large it is: device safety headroom and allocator fragmentation
-    /// are properties of that device's memory, not work or state with somewhere
-    /// else to be.
-    fn host_absorbable(&self, base: &Peaks, host: &ScopeState, c: &BindingConstraint) -> u64 {
-        let mut movable: BTreeMap<Tier, u64> = BTreeMap::new();
-        for ((scope, tier), row) in &base.live {
-            if *scope != c.scope {
+    /// The relocation is greedy and deterministic: each movable buffer, in
+    /// declaration order, gives up as much as its destination tier and the host
+    /// budget still have free **at every stage it is live**, so what comes back
+    /// is a plan the host can hold rather than a bound on one. The caller then
+    /// checks the same plan on both sides. Two upper bounds -- what the host
+    /// could take, what the device could shed -- can each be met by a different
+    /// move and together prove nothing.
+    ///
+    /// Two deliberate conservatisms, both of which can only withhold an
+    /// alternative and never invent one:
+    ///
+    /// * A tier that a derived reserve is computed over does not move. Splitting
+    ///   such a tier would shrink the reserve on the device while modelling no
+    ///   equivalent on the host, and what a host-side cache reserves is a
+    ///   residency question this task does not own (R03, R11; residency is M2).
+    /// * The greedy takes one pass in declaration order. A different split might
+    ///   clear a constraint this one leaves binding.
+    fn relocate_to_host(
+        &self,
+        request: &PlanRequest,
+        base: &Peaks,
+        host: &ScopeState,
+        scope: Scope,
+    ) -> Result<Option<Peaks>> {
+        let stage_count = request.stages().len();
+        let reserved: BTreeSet<(Scope, Tier)> = request
+            .reserves()
+            .iter()
+            .map(|r| (r.scope, r.tier))
+            .collect();
+
+        // What the host has spare, before anything moves.
+        let scope_room = host
+            .snapshot
+            .admissible_bytes()
+            .saturating_sub(self.scope_committed(Scope::Host))
+            .saturating_sub(base.scope_peak(Scope::Host).0);
+        let room_of = |destination: Tier| match host.snapshot.tier_cap(destination) {
+            None => scope_room,
+            Some(cap) => cap
+                .saturating_sub(self.committed(Scope::Host, destination))
+                .saturating_sub(base.tier_peak(Scope::Host, destination).0)
+                .min(scope_room),
+        };
+
+        let mut free_in: BTreeMap<Tier, Vec<u64>> = BTreeMap::new();
+        let mut free_scope = vec![scope_room; stage_count];
+        let mut relocated = PlanRequest::new(request.label(), request.stages().to_vec())?;
+        let mut any = false;
+
+        for b in request.buffers() {
+            let destination = if b.scope == scope && !reserved.contains(&(b.scope, b.tier)) {
+                host_destination(b.tier)
+            } else {
+                None
+            };
+            let Some(destination) = destination else {
+                relocated.buffer(b.clone())?;
+                continue;
+            };
+            let free = free_in
+                .entry(destination)
+                .or_insert_with(|| vec![room_of(destination); stage_count]);
+            let mut take = b.bytes;
+            for stage in b.live.first..=b.live.last {
+                take = take
+                    .min(free[stage as usize])
+                    .min(free_scope[stage as usize]);
+            }
+            if take == 0 {
+                relocated.buffer(b.clone())?;
                 continue;
             }
-            if c.kind == BindingKind::TierCap && *tier != c.tier {
-                continue;
+            for stage in b.live.first..=b.live.last {
+                free[stage as usize] -= take;
+                free_scope[stage as usize] -= take;
             }
-            let bytes = row[c.peak_stage as usize];
-            if bytes == 0 {
-                continue;
+            any = true;
+            if take < b.bytes {
+                let mut stays = b.clone();
+                stays.bytes -= take;
+                relocated.buffer(stays)?;
             }
-            if let Some(destination) = host_destination(*tier) {
-                *movable.entry(destination).or_insert(0) += bytes;
-            }
+            let mut goes = b.clone();
+            goes.label = format!("{} (host)", b.label);
+            goes.scope = Scope::Host;
+            goes.tier = destination;
+            goes.bytes = take;
+            goes.scales_with = None;
+            relocated.buffer(goes)?;
         }
 
-        let mut absorbable: u64 = 0;
-        for (destination, bytes) in movable {
-            let room = match host.snapshot.tier_cap(destination) {
-                // An absent cap means the tier is bounded by the scope budget,
-                // which the caller checks separately.
-                None => bytes,
-                Some(cap) => {
-                    let used = self.committed(Scope::Host, destination)
-                        + base.tier_peak(Scope::Host, destination).0;
-                    bytes.min(cap.saturating_sub(used))
-                }
-            };
-            absorbable = absorbable.saturating_add(room);
+        for r in request.reserves() {
+            relocated.reserve(r.clone())?;
         }
-        absorbable
+
+        if !any {
+            return Ok(None);
+        }
+        Ok(Some(peaks(&relocated, &|_| false)?))
     }
 }
 

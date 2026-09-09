@@ -1357,3 +1357,64 @@ fn a_host_fallback_is_refused_when_a_tied_immovable_peak_survives_it() {
 fn a_host_fallback_answer_does_not_depend_on_which_tied_stage_was_reported() {
     assert_no_host_fallback_across_a_tie(false);
 }
+
+// --- review corrections, round 5 --------------------------------------------
+
+/// Round-5 finding: two device tiers whose bytes go to *different* host tiers,
+/// at two tied stages. Clearing the device peak needs bytes moved at both
+/// stages, so both destinations must have room for the same relocation.
+fn assert_host_fallback_across_destinations(kv_first: bool, cpu_workspace_cap: u64) {
+    let d = gpu(1);
+    let host = host_snapshot(1_100, 100)
+        .with_tier_cap(SPILL, 100)
+        .unwrap()
+        .with_tier_cap(Tier::Host(HostTier::CpuWorkspace), cpu_workspace_cap)
+        .unwrap();
+    let mut ledger = Ledger::new([device_snapshot(d, 100), host]).unwrap();
+
+    let (kv_stage, work_stage) = if kv_first { (0, 1) } else { (1, 0) };
+    let mut plan = PlanRequest::new("different destinations", ["a", "b"]).unwrap();
+    plan.buffer(BufferRequest::new(
+        "kv",
+        d,
+        KV,
+        200,
+        StageSpan::at(kv_stage),
+    ))
+    .unwrap()
+    .buffer(BufferRequest::new(
+        "workspace",
+        d,
+        WORK,
+        200,
+        StageSpan::at(work_stage),
+    ))
+    .unwrap();
+
+    let e = ledger.admit(&plan).unwrap_err();
+    let r = rejection(&e);
+    assert_eq!(r.binding.len(), 1);
+    assert_eq!(r.shortfall_bytes, 100);
+    assert_eq!(
+        r.alternatives
+            .contains(&LegalAlternative::HostBackedExecution),
+        cpu_workspace_cap >= 100,
+        "the relocation whose device reduction is claimed is the one whose host \
+         capacity must be checked, at every stage it touches"
+    );
+}
+
+#[test]
+fn a_host_fallback_needs_room_in_every_destination_the_relocation_uses() {
+    assert_host_fallback_across_destinations(true, 0);
+}
+
+#[test]
+fn a_multi_destination_fallback_answer_is_independent_of_stage_order() {
+    assert_host_fallback_across_destinations(false, 0);
+}
+
+#[test]
+fn a_host_fallback_is_offered_when_every_destination_has_room() {
+    assert_host_fallback_across_destinations(true, 100);
+}

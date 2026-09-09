@@ -23,9 +23,9 @@ pending; treat "gates pass" as gates passing, not as acceptance.
 
 **Task 0006 (M1.3 part 1, the resource ledger and admission)** was contracted at `305c765` — a commit
 with no `.rs` change, as tasks 0003, 0004 and 0005 did — implemented at `a486930`, and then
-corrected against four rounds of review findings — four, then two, then one area in two halves, then one. Its record,
+corrected against five rounds of review findings — four, then two, then one area in two halves, then one, then one. Its record,
 [docs/tasks/0006-m1-resource-ledger-and-admission.md](../tasks/0006-m1-resource-ledger-and-admission.md),
-carries the contract, the result, six recorded deviations, the bite checks and all four
+carries the contract, the result, six recorded deviations, the bite checks and all five
 review-correction rounds. Owner acceptance is pending for this task too.
 
 One of those findings was a **contract** defect, not only an implementation one: the contract
@@ -58,10 +58,10 @@ FFI path:
 |---|---|
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | PASS |
-| `cargo test --workspace --locked --offline` | PASS, 457 unit/integration + 6 doctests |
+| `cargo test --workspace --locked --offline` | PASS, 460 unit/integration + 6 doctests |
 | `cargo xtask arch-check` | PASS, 45 rejected + 12 accepted fixtures, 10 rules |
 | `cargo xtask spec-check` | PASS, 10 documents |
-| no-driver host lane | PASS, 457 + 6; `ldd target/debug/xtask` shows no `libcuda` |
+| no-driver host lane | PASS, 460 + 6; `ldd target/debug/xtask` shows no `libcuda` |
 | device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` (carried forward from `a486930`) | PASS, 450 + 7 |
 | `cargo xtask-cuda test-gpu` (carried forward from `a486930`) | PASS, 15 cases, `sm_86` and `sm_120` qualified |
 | `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` (carried forward from `a486930`) | **exit 1**, `UNQUALIFIED sm_120`, as intended |
@@ -122,7 +122,11 @@ exists and which does not.
   rule had been applied unevenly: the host fallback was still answered from one stage's capacity
   after the scaling alternatives had moved to recomputation, and it gave a different answer when the
   two tied stages were swapped. When a rule like "recompute, do not attribute" is adopted, apply it
-  to **every** place that gives advice in the same pass, not only the one the finding named.
+  to **every** place that gives advice in the same pass, not only the one the finding named. Round 5
+  closed the series with the sharpest form of it: **two bounds are not a plan.** An upper bound on
+  what the host could accept and an upper bound on what the device could shed can each be met by a
+  different, incompatible move. Advice about a change has to name one concrete change and check that
+  same one everywhere it lands.
 
 ## Next task
 

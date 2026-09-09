@@ -218,8 +218,9 @@ tier that would receive it -- state spills to `StateSpill`, execution needs `Cpu
 bounds what it can take, where an absent cap keeps its documented meaning of "bounded by the scope
 budget". For a scope-budget failure that means every movable contributor, not the one named in
 `BindingConstraint::tier`, which is a diagnostic label rather than a claim about what can move.
-Capacity is necessary and not sufficient: the relocation must also be recomputed over the whole
-timeline and shown to lower the failing ceiling. The bar differs from the two scaling rows on
+`HostBackedExecution` is decided by building **one concrete relocation** and checking that same plan
+on both sides: what the host received fits its budget and every one of its caps, and the device
+constraint is no longer over its ceiling. The bar differs from the two scaling rows on
 purpose -- a caller chooses how much to lower context by, so a strict decrease is worth naming,
 while host-backed execution is a switch and must close the whole shortfall.
 
@@ -602,4 +603,59 @@ doctests; `arch-check` PASS (45 rejected + 12 accepted, 10 rules); `spec-check`
 PASS (10 documents); no-driver lane PASS (457 + 6, no `libcuda`). Device lane and
 `test-gpu` carried forward from `a486930`: this round touches `moxie-memory`
 only. The reviewer's thirteen tests across four rounds, run unmodified from
+outside the repository, all pass.
+
+### Review corrections, round 5 (2026-09-08, commit `1a556ac` not accepted)
+
+One finding. Round 4 answered the host fallback with two independent bounds --
+what the host could absorb at the reported stage, and what the device could shed
+if everything movable moved -- and each can be satisfied by a *different* move.
+Two bounds are not a plan.
+
+- **P2 — the reduction and the capacity check described different relocations.**
+  With a 100 B device budget, 200 B of KV at one stage whose `StateSpill` cap is
+  100 B, and 200 B of workspace at the other stage whose `CpuWorkspace` cap is
+  zero, the ledger offered `HostBackedExecution`: the shortfall is 100 B, stage A
+  can spill 100 B, and removing both device buffers looked like reduction enough.
+  Stage B can move nothing, so its 200 B stays and the constraint cannot clear.
+  Reversing the stages suppressed the offer, which is the same tied-peak
+  signature as round 4 one level further in.
+
+  The fix is to stop combining bounds. `relocate_to_host` now builds one concrete
+  relocation -- each movable buffer, in declaration order, gives up as much as
+  its destination tier and the host budget still have free **at every stage it is
+  live** -- and returns the peaks of the plan that results. The caller checks that
+  one plan on both sides: the host holds what it received within its scope budget
+  and every tier cap, and the device constraint is no longer over its ceiling.
+  `host_absorbable` is deleted; there is one mechanism where there were two
+  bounds. Regressions:
+  `a_host_fallback_needs_room_in_every_destination_the_relocation_uses`,
+  `a_multi_destination_fallback_answer_is_independent_of_stage_order`, and the
+  positive `a_host_fallback_is_offered_when_every_destination_has_room`, which
+  differs from the first only in the second destination's cap.
+
+Two conservatisms are deliberate and documented at the function, because both
+can only withhold an alternative and never invent one: a tier that a derived
+reserve is computed over does not move at all (splitting it would shrink the
+reserve on the device while modelling no equivalent on the host, and what a
+host-side cache reserves is a residency question this task does not own -- R03,
+R11, residency is M2); and the greedy takes a single pass in declaration order,
+so a different split might clear a constraint this one leaves binding.
+
+Bite checks: ignoring the destination tier's own room while building the
+relocation fails the positive regression, because the host-side check then
+refuses an over-assigned plan rather than advising it. Removing the host-side
+check **alone** fails nothing -- the greedy respects the caps while constructing,
+so the verification is redundant against its own output -- and that is reported
+rather than claimed as a bite. Removing both together produces exactly the
+reported defect: three tests fail, including the two round-5 regressions and
+round 2's `a_kv_spill_cannot_borrow_the_cpu_workspace_allowance`. The host-side
+check is kept as the guard on a future construction that stops respecting caps.
+
+Re-verified after round 5: `fmt` PASS; `clippy -D warnings` PASS;
+`cargo test --workspace --locked --offline` PASS, 460 unit/integration + 6
+doctests; `arch-check` PASS (45 rejected + 12 accepted, 10 rules); `spec-check`
+PASS (10 documents); no-driver lane PASS (460 + 6, no `libcuda`). Device lane and
+`test-gpu` carried forward from `a486930`: this round touches `moxie-memory`
+only. The reviewer's sixteen tests across five rounds, run unmodified from
 outside the repository, all pass.
