@@ -1,0 +1,11 @@
+[package]
+name = "moxie-memory"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: the ledger is told what capacity is, it does not go and
+# look. Reading /proc/meminfo here would make the authority its own measuring
+# instrument, and would put the filesystem behind a second owner.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "memory touches the filesystem"

@@ -31,10 +31,12 @@ pub fn classify(code: CUresult, detail: String) -> Result<()> {
         return Ok(());
     }
     match code {
-        // CUDA_ERROR_OUT_OF_MEMORY. The byte counts are filled in by the
-        // allocator, which knows what it asked for.
+        // CUDA_ERROR_OUT_OF_MEMORY. The byte counts and the tier are filled in
+        // by the allocator, which knows what it asked for and what for. This
+        // classifier sees a driver code and nothing else, so it attributes
+        // nothing rather than guessing a tier.
         2 => Err(Error::CapacityExceeded {
-            tier: "device",
+            tier: None,
             requested_bytes: 0,
             available_bytes: 0,
         }),
@@ -180,7 +182,10 @@ mod tests {
     #[test]
     fn variant_comes_from_the_code_not_the_message() {
         match classify(2, "alloc".into()).unwrap_err() {
-            Error::CapacityExceeded { tier, .. } => assert_eq!(tier, "device"),
+            Error::CapacityExceeded { tier, .. } => assert_eq!(
+                tier, None,
+                "the driver code carries no tier; only the allocator can attribute one"
+            ),
             other => panic!("wrong variant: {other:?}"),
         }
         // Same text, different code, different variant: proof the message is

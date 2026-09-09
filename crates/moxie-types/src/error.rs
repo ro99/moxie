@@ -14,8 +14,14 @@ pub enum Error {
     /// A resource request exceeds a tier's physical capacity or admitted budget.
     /// Carries the breakdown so the caller can report legal alternatives rather
     /// than silently shrinking context (document 03).
+    ///
+    /// `tier` is `None` only where the failure came from the driver itself and
+    /// nothing has attributed it yet -- a raw `cuMemAlloc` knows how many bytes
+    /// it asked for but not what they were for. The memory authority always
+    /// names a tier. `None` says the attribution is missing; it never stands in
+    /// for a guessed tier.
     CapacityExceeded {
-        tier: &'static str,
+        tier: Option<crate::tier::Tier>,
         requested_bytes: u64,
         available_bytes: u64,
     },
@@ -80,10 +86,16 @@ impl fmt::Display for Error {
                 tier,
                 requested_bytes,
                 available_bytes,
-            } => write!(
-                f,
-                "capacity exceeded on {tier}: requested {requested_bytes} B, {available_bytes} B available"
-            ),
+            } => match tier {
+                Some(tier) => write!(
+                    f,
+                    "capacity exceeded on {tier}: requested {requested_bytes} B, {available_bytes} B available"
+                ),
+                None => write!(
+                    f,
+                    "capacity exceeded on an unattributed allocation: requested {requested_bytes} B, {available_bytes} B available"
+                ),
+            },
             Error::UnsupportedKernel { operation, detail } => {
                 write!(f, "no kernel for operation {operation}: {detail}")
             }
@@ -120,7 +132,9 @@ mod tests {
     fn kind_is_stable_and_distinct() {
         let all = [
             Error::CapacityExceeded {
-                tier: "device",
+                tier: Some(crate::Tier::Device(
+                    crate::DeviceTier::PackedResidentWeights,
+                )),
                 requested_bytes: 1,
                 available_bytes: 0,
             },
@@ -161,7 +175,7 @@ mod tests {
         // Retrying an over-budget request unchanged just fails again. The caller
         // has to lower context, branches or precision -- document 03.
         let e = Error::CapacityExceeded {
-            tier: "device:1",
+            tier: Some(crate::Tier::Device(crate::DeviceTier::KvStatePages)),
             requested_bytes: 1 << 40,
             available_bytes: 1 << 30,
         };

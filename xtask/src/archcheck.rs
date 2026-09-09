@@ -45,6 +45,8 @@ pub mod rule {
     pub const UNRESOLVABLE_DEPENDENCY: &str = "unresolvable dependency";
     pub const FORMAT_USES_FILESYSTEM: &str = "format touches the filesystem";
     pub const STORAGE_NAMES_MODEL: &str = "storage interprets model metadata";
+    pub const MEMORY_USES_FILESYSTEM: &str = "memory touches the filesystem";
+    pub const MEMORY_NAMES_MODEL: &str = "memory branches on a model name";
 
     pub const ALL: &[&str] = &[
         FORBIDDEN_DEPENDENCY,
@@ -55,6 +57,8 @@ pub mod rule {
         UNRESOLVABLE_DEPENDENCY,
         FORMAT_USES_FILESYSTEM,
         STORAGE_NAMES_MODEL,
+        MEMORY_USES_FILESYSTEM,
+        MEMORY_NAMES_MODEL,
     ];
 }
 
@@ -112,6 +116,18 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
         ),
         (
             "moxie-state",
+            Allowed {
+                workspace: &["moxie-types"],
+                third_party: NONE,
+            },
+        ),
+        // The resource authority (task 0006). Pure accounting: it is given a
+        // measured capacity snapshot and a declared plan. It allocates nothing,
+        // so it needs neither storage nor CUDA today; document 02 allows
+        // `memory` to call CUDA allocation APIs later, and widening this row is
+        // how that arrives, visibly.
+        (
+            "moxie-memory",
             Allowed {
                 workspace: &["moxie-types"],
                 third_party: NONE,
@@ -1295,28 +1311,38 @@ fn path_reaches(path: &str, needle: &str) -> bool {
     }
 }
 
-/// Module paths moxie-format may not reach. It parses a `&str`; a path is
+/// Module paths an I/O-free crate may not reach. `moxie-format` parses a `&str`; a path is
 /// something that exists on a filesystem, which is storage's job.
-const FORMAT_FORBIDDEN_PATHS: &[(&str, &str)] = &[
-    (
-        "std::fs",
-        "direct file I/O in moxie-format, which must stay I/O-free",
-    ),
-    (
-        "std::path",
-        "path handling in moxie-format, which must not know a path exists",
-    ),
+const IO_FORBIDDEN_PATHS: &[(&str, &str)] = &[
+    ("std::fs", "direct file I/O"),
+    ("std::path", "path handling"),
+];
+
+/// The crates that must stay I/O-free, and the rule each one's breach reports.
+/// `moxie-storage` owns the filesystem; nobody else here opens anything.
+const IO_FREE_CRATES: &[(&str, &str)] = &[
+    ("moxie-format", rule::FORMAT_USES_FILESYSTEM),
+    ("moxie-memory", rule::MEMORY_USES_FILESYSTEM),
+];
+
+/// The crates that must never name a model family, and the rule each one's
+/// breach reports. Storage reads bytes; the ledger counts them. Neither may
+/// branch on which model the bytes belong to -- document 02 forbids
+/// "model-name branches" in the memory authority in those words.
+const MODEL_FREE_CRATES: &[(&str, &str)] = &[
+    ("moxie-storage", rule::STORAGE_NAMES_MODEL),
+    ("moxie-memory", rule::MEMORY_NAMES_MODEL),
 ];
 
 /// First segments that identify graph/model metadata machinery. A storage
 /// layer that imports any of these is learning what architecture metadata
 /// means -- document 08's unenforced split, restated as a rule.
-const STORAGE_FORBIDDEN_IMPORTS: &[&str] = &["moxie_graph", "moxie_model_api", "moxie_models"];
+const MODEL_FORBIDDEN_IMPORTS: &[&str] = &["moxie_graph", "moxie_model_api", "moxie_models"];
 
-/// Family names moxie-storage must never contain in code strings. Matched
+/// Family names these crates must never contain in code strings. Matched
 /// case-insensitively as substrings; doc comments are excluded because the
 /// collector never visits attributes.
-const STORAGE_FORBIDDEN_NAMES: &[&str] = &[
+const MODEL_FORBIDDEN_NAMES: &[&str] = &[
     "gemma",
     "laguna",
     "inkling",
@@ -1370,29 +1396,36 @@ fn resolve_include(including_file: &Path, arg: &str) -> Option<PathBuf> {
     }
 }
 
-/// Rule 5 enforcement: moxie-format production sources reach no filesystem.
-fn check_format_is_io_free(
+/// Rule 5 enforcement: an I/O-free crate's production sources reach no
+/// filesystem. One implementation, one rule identifier per crate, so a second
+/// boundary is a row in `IO_FREE_CRATES` rather than a second copy of this.
+fn check_is_io_free(
     doc: &toml::Value,
     dir: &Path,
     crate_name: &str,
+    rule: &'static str,
     out: &mut Vec<Violation>,
 ) {
     let (scanned, problems) = scanned_with_includes(doc, dir);
     for detail in problems {
         out.push(Violation {
             crate_name: crate_name.to_string(),
-            rule: rule::FORMAT_USES_FILESYSTEM,
+            rule,
             detail,
         });
     }
     for (file, facts) in &scanned {
-        for (needle, why) in FORMAT_FORBIDDEN_PATHS {
+        for (needle, why) in IO_FORBIDDEN_PATHS {
             for path in facts.imports.iter().chain(facts.mentions.iter()) {
                 if path_reaches(path, needle) {
                     out.push(Violation {
                         crate_name: crate_name.to_string(),
-                        rule: rule::FORMAT_USES_FILESYSTEM,
-                        detail: format!("{}: uses `{path}`: {why}", file.display()),
+                        rule,
+                        detail: format!(
+                            "{}: uses `{path}`: {why} in {crate_name}, which must not touch the \
+                             filesystem",
+                            file.display()
+                        ),
                     });
                     break;
                 }
@@ -1401,34 +1434,35 @@ fn check_format_is_io_free(
     }
 }
 
-/// Rule 6 enforcement: moxie-storage names no model family and imports no
-/// metadata machinery.
-fn check_storage_names_no_model(
+/// Rule 6 enforcement: the crate names no model family and imports no metadata
+/// machinery.
+fn check_names_no_model(
     doc: &toml::Value,
     dir: &Path,
     crate_name: &str,
+    rule: &'static str,
     out: &mut Vec<Violation>,
 ) {
     let (scanned, problems) = scanned_with_includes(doc, dir);
     for detail in problems {
         out.push(Violation {
             crate_name: crate_name.to_string(),
-            rule: rule::STORAGE_NAMES_MODEL,
+            rule,
             detail,
         });
     }
     for (file, facts) in &scanned {
         for path in facts.imports.iter().chain(facts.mentions.iter()) {
             let first = path.split("::").next().unwrap_or("");
-            if STORAGE_FORBIDDEN_IMPORTS
+            if MODEL_FORBIDDEN_IMPORTS
                 .iter()
                 .any(|b| first == *b || first.starts_with("moxie_models"))
             {
                 out.push(Violation {
                     crate_name: crate_name.to_string(),
-                    rule: rule::STORAGE_NAMES_MODEL,
+                    rule,
                     detail: format!(
-                        "{}: uses `{path}`: metadata machinery in the storage layer",
+                        "{}: uses `{path}`: metadata machinery in {crate_name}",
                         file.display()
                     ),
                 });
@@ -1437,12 +1471,13 @@ fn check_storage_names_no_model(
         }
         for s in facts.strings.iter() {
             let lower = s.to_lowercase();
-            if let Some(hit) = STORAGE_FORBIDDEN_NAMES.iter().find(|n| lower.contains(*n)) {
+            if let Some(hit) = MODEL_FORBIDDEN_NAMES.iter().find(|n| lower.contains(*n)) {
                 out.push(Violation {
                     crate_name: crate_name.to_string(),
-                    rule: rule::STORAGE_NAMES_MODEL,
+                    rule,
                     detail: format!(
-                        "{}: names a model family ('{hit}'): storage reads bytes, never model semantics",
+                        "{}: names a model family ('{hit}'): {crate_name} never branches on which \
+                         model the bytes belong to",
                         file.display()
                     ),
                 });
@@ -1639,21 +1674,22 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
             }
         }
 
-        // Rule 5: moxie-format stays I/O-free. It parses a `&str` and
-        // validates the value; moxie-storage owns the filesystem half. Any
-        // production source of moxie-format reaching `std::fs` or `std::path`
-        // is a boundary breach, however it is spelled.
-        if name == "moxie-format" {
-            check_format_is_io_free(&doc, dir, &name, &mut out);
+        // Rule 5: the I/O-free crates. moxie-format parses a `&str` and
+        // validates the value; moxie-memory counts bytes it is told about.
+        // moxie-storage owns the filesystem half. Any production source of an
+        // I/O-free crate reaching `std::fs` or `std::path` is a boundary
+        // breach, however it is spelled.
+        if let Some((_, rule)) = IO_FREE_CRATES.iter().find(|(c, _)| *c == name) {
+            check_is_io_free(&doc, dir, &name, rule, &mut out);
         }
 
-        // Rule 6: moxie-storage reads bytes, never model semantics. It must
-        // not import graph/model metadata machinery or name a model family
-        // in code strings. Doc comments are excluded by construction (the
-        // collector never visits attributes), so prose about the boundary is
-        // not a use of what it forbids.
-        if name == "moxie-storage" {
-            check_storage_names_no_model(&doc, dir, &name, &mut out);
+        // Rule 6: the model-free crates. moxie-storage reads bytes and
+        // moxie-memory counts them; neither may import graph/model metadata
+        // machinery or name a model family in code strings. Doc comments are
+        // excluded by construction (the collector never visits attributes), so
+        // prose about the boundary is not a use of what it forbids.
+        if let Some((_, rule)) = MODEL_FREE_CRATES.iter().find(|(c, _)| *c == name) {
+            check_names_no_model(&doc, dir, &name, rule, &mut out);
         }
     }
     Ok(out)
@@ -2493,6 +2529,8 @@ mod tests {
             for (name, rule) in [
                 ("moxie-format", rule::FORMAT_USES_FILESYSTEM),
                 ("moxie-storage", rule::STORAGE_NAMES_MODEL),
+                ("moxie-memory", rule::MEMORY_USES_FILESYSTEM),
+                ("moxie-memory", rule::MEMORY_NAMES_MODEL),
             ] {
                 write(
                     &root.join("Cargo.toml"),

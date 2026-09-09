@@ -66,6 +66,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "moxie-memory"
+version = "0.0.0"
+dependencies = [
+ "moxie-types",
+]
+
+[[package]]
 name = "moxie-model-api"
 version = "0.0.0"
 dependencies = [

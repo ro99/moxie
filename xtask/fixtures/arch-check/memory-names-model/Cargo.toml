@@ -1,0 +1,11 @@
+[package]
+name = "moxie-memory"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: document 02 forbids "model-name branches" in the memory
+# authority in those words, and R03 is what that prevents -- five cache
+# implementations, one per family, each with its own reserve.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "memory branches on a model name"

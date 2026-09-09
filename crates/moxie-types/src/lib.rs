@@ -11,15 +11,17 @@ pub mod dim;
 pub mod error;
 pub mod ids;
 pub mod precision;
+pub mod tier;
 
 pub use capability::{DeviceCapability, KernelCapability, StrategyControl};
 pub use dim::{Dim, DimError, SymbolId, SymbolTable};
 pub use error::{Error, Result};
 pub use ids::{
-    ArtifactId, BranchId, ChunkId, DeviceId, GraphId, LayoutId, RankId, StateTransactionId,
-    TensorId,
+    ArtifactId, BranchId, ChunkId, DeviceId, DeviceUuid, GraphId, LayoutId, RankId,
+    StateTransactionId, TensorId,
 };
 pub use precision::{
     AccumulationPolicy, ActivationPrecision, CachePrecision, ExecutionProfile, Precision,
     WeightPrecision,
 };
+pub use tier::{DeviceTier, HostTier, Scope, ScopeKind, Tier};

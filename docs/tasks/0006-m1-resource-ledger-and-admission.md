@@ -243,4 +243,115 @@ count supplied by the caller, and every sum is checked for overflow. The numeric
 
 ## Result, filled after work
 
-To be filled in after implementation, keeping passed, failed and skipped separate.
+Implemented 2026-09-08 on branch `main`, on top of the contract commit `305c765`.
+The contract above is unchanged; only this section is filled in.
+
+What was built:
+
+- `moxie-types` gains `tier` (the closed `DeviceTier`/`HostTier`/`Tier`/`Scope`/
+  `ScopeKind` descriptors, exactly document 03's two lists, with an exhaustive
+  `ALL`, stable names, the scope-kind rule and `charges_scope_budget`) and
+  `DeviceUuid` in `ids` (16 bytes, strict canonical `GPU-...` parse and render).
+- `moxie-memory` (new, depends only on `moxie-types`): `CapacitySnapshot`
+  (caller-measured capacity, refused headroom rules, per-tier caps),
+  `PlanRequest` / `BufferRequest` / `DerivedReserve` / `StageSpan` / `Scaling`
+  (declaration and its validation), the `Ledger` (peak-overlapping-live-set
+  evaluation, atomic `admit`, `preview`, explicit `release`, `outstanding`), and
+  the report types (`AdmissionReport`, `BindingConstraint`, `LegalAlternative`,
+  `Rejection`, with a readable `Display` for each).
+- `arch-check`: `moxie-memory` declared (workspace `moxie-types`, no third
+  party); the two crate-specific checks generalised into `IO_FREE_CRATES` and
+  `MODEL_FREE_CRATES` tables so a second boundary is a row rather than a second
+  copy; two new rules (`memory touches the filesystem`, `memory branches on a
+  model name`), each with a rejecting fixture and a clean accepted one. The
+  existing 343-chain generated test now checks all four crate boundaries per
+  chain instead of two.
+- Deletion done: `Error::CapacityExceeded` no longer carries a `&'static str`
+  tier, and `moxie-cuda`'s `"device"` literal is gone. There is one spelling of
+  a tier in the workspace.
+- `Cargo.lock` gains exactly one entry, the new workspace crate, and zero
+  third-party packages: `moxie-memory` depends on `moxie-types` alone.
+
+Deviations recorded, none silent:
+
+- The contract said the error's tier field "becomes the closed `Tier`". It became
+  `Option<Tier>`. `moxie-cuda::status::classify` sees a CUDA result code and
+  nothing else, so it has no tier to name; `None` states that the attribution is
+  missing, where picking any variant would be a fabrication the report would
+  then repeat. The ledger always names one. The deletion the contract asked for
+  is complete either way.
+- `Rejection.binding` is a `Vec<BindingConstraint>` rather than a
+  `Vec<(Scope, Tier)>`. Each constraint still carries its scope and tier, and
+  adds which ceiling it hit, the needed and available bytes, and the peak stage.
+  The pair alone cannot distinguish a tier cap from the scope budget, and the
+  contract's requirement -- every failing constraint, not only the first -- is
+  what the type had to serve.
+- No ordinal label is attached to a device scope. The contract permitted one
+  ("may"); no API in this crate takes an ordinal, so a field that exists only to
+  be ignored would be worse than its absence. Identity is the UUID and nothing
+  else.
+- A scope keeps **two** counters, not one: per-tier commitments, which the tier
+  caps constrain, and a scope commitment, which is the sum of the admitted
+  plans' *scope peaks*. The first version summed the per-tier commitments for
+  the scope figure, which contradicted the peak-not-sum rule admission checks
+  with. The two differ because tiers live at different stages inside one plan,
+  while separate plans share no timeline and so their peaks add.
+- `Ledger::release` returns the reservation inside `ReleaseRefused` when it
+  refuses, rather than consuming it. Consuming a reservation on the error path
+  destroys the only handle to bytes that are still charged, which is an
+  R08-shaped leak manufactured by the error path.
+- `ReserveRule::LargestBufferOfTier` over a tier with no buffers is an error, on
+  the same reasoning the contract gave for `NLargestBuffersOfTier`: a reserve
+  derived from nothing is a zero pretending to be a reservation.
+
+Gates (this machine, 2026-09-08):
+
+| Lane | Result |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | PASS |
+| `cargo test --workspace --locked --offline` | PASS, 442 unit/integration + 6 doctests (was 402 + 4) |
+| `cargo xtask arch-check` | PASS, 45 rejected + 12 accepted fixtures, 10 rules |
+| `cargo xtask spec-check` | PASS, 10 documents |
+| no-driver host lane | PASS, 442 + 6; `ldd target/debug/xtask` shows no `libcuda` |
+| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | PASS, 450 + 7 |
+| `cargo xtask-cuda test-gpu` | PASS, 15 cases, `sm_86` and `sm_120` qualified |
+| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, `UNQUALIFIED sm_120`, as intended |
+
+Nothing failed. Nothing was skipped. The device gates were re-run rather than
+carried forward, because this task changed the tier field of the error
+`moxie-cuda`'s status mapping constructs.
+
+`moxie-memory` itself: 25 acceptance tests, 8 unit tests, 2 compile-fail
+doctests.
+
+Bite checks, each reverted to green:
+
+- Both `compile_fail` doctests were rebuilt with `compile_fail` removed and fail
+  for the intended reasons: `E0599 no method named clone`, and `E0382 use of
+  moved value` on the second release.
+- Replacing the stage maximum with a sum over stages fails four tests, including
+  both synthetic consumers and the barrier-coexistence test.
+- Offering `LowerContext` unconditionally fails
+  `lower_context_is_offered_only_when_a_binding_buffer_says_it_scales_with_context`,
+  which is the test that stops a generic five-item menu.
+
+Negative result worth keeping: the first implementation derived a scope's
+committed total by summing its per-tier commitments. That is not the peak
+overlapping live set, and
+`the_peak_is_the_stage_maximum_and_not_the_sum` caught it before any of the
+consumer tests were written. The fix is the two-counter design above; the
+tempting alternative -- charging the sum and calling it conservative -- would
+have made the ledger refuse plans that fit, which is the same class of error as
+admitting plans that do not.
+
+No checkpoint was read, downloaded or converted; no byte was allocated, mapped
+or copied; no capacity was measured. The stop condition was not triggered: this
+needed no device query, no CUDA call, no allocator, no eviction decision, no
+lease over a real buffer and no model config.
+
+Remaining blockers and next bounded task: M1.3 continues with the rank-owned
+CUDA context, which is the first thing that can *measure* a capacity snapshot
+and the first consumer that charges real bytes to this ledger. Event-backed
+leases, the basic allocator and the admitted execution plan follow it. The
+ledger's measuring half does not exist and must not be claimed.
