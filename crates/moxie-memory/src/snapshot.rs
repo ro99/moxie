@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use moxie_types::{Error, MeasuredDevice, Result, Scope, Tier};
+use moxie_types::{Error, MeasuredDevice, MeasuredHost, Result, Scope, Tier};
 
 /// One scope's physical capacity and the headroom that must stay unspent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +101,54 @@ impl CapacitySnapshot {
         )
     }
 
+    /// A snapshot for the host, from a reading of this machine.
+    ///
+    /// ```text
+    /// physical_bytes  = total
+    /// system_headroom = (total - available) + extra_reserve
+    /// admissible      = available - extra_reserve
+    /// ```
+    ///
+    /// The same shape as [`CapacitySnapshot::measured`], and the same warning:
+    /// `available` is a reading at an instant, not a reservation.
+    ///
+    /// Two things the reading has already decided, and this must not undo.
+    /// `available` is `MemAvailable` -- reclaimable page cache included, because
+    /// the kernel counts it as obtainable -- and swap is **not** in it at all
+    /// (document 03). Neither appears here: the sensor's job is what the number
+    /// means, and this crate's job is what may be spent from it.
+    ///
+    /// The non-zero host headroom rule in [`CapacitySnapshot::new`] is
+    /// load-bearing here. On a real machine `total - available` is never zero,
+    /// so admission always reserves what the operating system already holds --
+    /// which is document 03's requirement that the host not be treated as one
+    /// large expert cache, enforced rather than hoped for.
+    pub fn measured_host(measurement: &MeasuredHost, extra_reserve_bytes: u64) -> Result<Self> {
+        let bad = |detail: String| Error::InvalidRequest {
+            field: "measurement",
+            detail,
+        };
+        let taken = measurement
+            .total_bytes
+            .checked_sub(measurement.available_bytes)
+            .ok_or_else(|| {
+                bad(format!(
+                    "host: {} B available of {} B total",
+                    measurement.available_bytes, measurement.total_bytes
+                ))
+            })?;
+        if extra_reserve_bytes > measurement.available_bytes {
+            return Err(bad(format!(
+                "host: a {extra_reserve_bytes} B reserve does not fit {} B of available memory",
+                measurement.available_bytes
+            )));
+        }
+        let headroom = taken
+            .checked_add(extra_reserve_bytes)
+            .ok_or_else(|| bad("host: headroom overflows".to_string()))?;
+        CapacitySnapshot::new(Scope::Host, measurement.total_bytes, headroom)
+    }
+
     /// Cap one tier below what the scope alone would allow. Absent means the
     /// tier is bounded only by the scope.
     pub fn with_tier_cap(mut self, tier: Tier, cap_bytes: u64) -> Result<Self> {
@@ -177,6 +225,62 @@ mod tests {
             total_bytes: total,
             free_bytes: free,
         }
+    }
+
+    fn host_measurement(total: u64, available: u64) -> MeasuredHost {
+        MeasuredHost {
+            total_bytes: total,
+            available_bytes: available,
+            machine_total_bytes: total,
+            machine_available_bytes: available,
+            free_bytes: available / 2,
+            buffers_bytes: 0,
+            cached_bytes: available / 4,
+            // Deliberately enormous: it must reach no arithmetic below.
+            swap_total_bytes: u64::MAX / 2,
+            swap_free_bytes: u64::MAX / 2,
+            limit: moxie_types::HostLimit::Machine,
+        }
+    }
+
+    #[test]
+    fn a_measured_host_spends_available_memory_and_reserves_the_rest() {
+        let s = CapacitySnapshot::measured_host(&host_measurement(100_000, 80_000), 5_000).unwrap();
+        assert_eq!(s.scope(), Scope::Host);
+        assert_eq!(s.physical_bytes(), 100_000);
+        // 20,000 already held by the operating system, plus the 5,000 reserved.
+        assert_eq!(s.system_headroom_bytes(), 25_000);
+        assert_eq!(s.admissible_bytes(), 75_000);
+    }
+
+    #[test]
+    fn a_host_reserve_larger_than_available_memory_is_refused() {
+        let e =
+            CapacitySnapshot::measured_host(&host_measurement(100_000, 1_000), 2_000).unwrap_err();
+        assert_eq!(e.kind(), "invalid_request");
+        let s = CapacitySnapshot::measured_host(&host_measurement(100_000, 1_000), 1_000).unwrap();
+        assert_eq!(s.admissible_bytes(), 0);
+    }
+
+    #[test]
+    fn a_host_reading_with_more_available_than_total_is_an_error_not_a_wrap() {
+        let e = CapacitySnapshot::measured_host(&host_measurement(1_000, 2_000), 0).unwrap_err();
+        assert_eq!(e.kind(), "invalid_request");
+    }
+
+    #[test]
+    fn a_host_with_nothing_in_use_and_no_reserve_is_still_refused() {
+        // Document 03 in as many words: host admission "must not treat all
+        // 251 GB as an expert cache". A machine that reports every byte
+        // available is not a licence to spend every byte.
+        let e =
+            CapacitySnapshot::measured_host(&host_measurement(100_000, 100_000), 0).unwrap_err();
+        assert_eq!(e.kind(), "invalid_request");
+        assert!(e.to_string().contains("headroom"), "{e}");
+        // Declaring a reserve makes it admissible again, which is the point:
+        // the decision has to be stated.
+        let s = CapacitySnapshot::measured_host(&host_measurement(100_000, 100_000), 1).unwrap();
+        assert_eq!(s.admissible_bytes(), 99_999);
     }
 
     #[test]

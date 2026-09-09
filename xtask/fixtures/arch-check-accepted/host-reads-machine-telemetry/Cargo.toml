@@ -1,0 +1,8 @@
+[package]
+name = "moxie-host"
+version = "0.0.0"
+edition = "2024"
+
+# Must be accepted: the one crate that may name these paths, doing exactly what
+# ADR 0006 gives it. The negative fixtures beside it are the same code in a
+# crate that has a different job.

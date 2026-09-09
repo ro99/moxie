@@ -116,6 +116,56 @@ pub struct MeasuredDevice {
     pub free_bytes: u64,
 }
 
+/// Which view of host memory a reading was taken through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostLimit {
+    /// No cgroup limit applies; the machine's own figures govern.
+    Machine,
+    /// A cgroup v2 limit binds, from this cgroup or one of its ancestors.
+    Cgroup {
+        /// The cgroup path the binding limit was found at.
+        path: String,
+        limit_bytes: u64,
+        current_bytes: u64,
+    },
+}
+
+/// The host's memory capacity as the kernel reported it at one instant.
+///
+/// A reading, on the same terms as [`MeasuredDevice`]: another process can take
+/// memory a moment later and this will not know. Document 03's answer to that is
+/// a pressure-driven replan, which is M2's.
+///
+/// Only `total_bytes` and `available_bytes` are budget. Everything else is a
+/// diagnostic, and two of them are deliberately excluded: **swap is never
+/// budget** (document 03 forbids relying on it as an invisible fourth execution
+/// tier), and the machine-view pair is kept only so a report can show what a
+/// cgroup limit cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeasuredHost {
+    /// Effective total, after any cgroup limit.
+    pub total_bytes: u64,
+    /// Effective available, after any cgroup limit. This is `MemAvailable`, not
+    /// `MemFree`: the kernel's own estimate of what a new allocation can obtain
+    /// without swapping, which already accounts for reclaimable page cache.
+    pub available_bytes: u64,
+    /// What the machine reports before any cgroup limit is applied.
+    pub machine_total_bytes: u64,
+    pub machine_available_bytes: u64,
+    /// Completely unused memory. Small on a healthy system, and **not** the
+    /// budget input -- most of a busy machine's spendable memory is reclaimable
+    /// cache rather than free.
+    pub free_bytes: u64,
+    pub buffers_bytes: u64,
+    /// Page cache. Reported so page-cache pressure is visible; managing it is
+    /// M2's (document 03).
+    pub cached_bytes: u64,
+    /// Reported, and never in any budget.
+    pub swap_total_bytes: u64,
+    pub swap_free_bytes: u64,
+    pub limit: HostLimit,
+}
+
 /// A kernel's declared applicability. The planner matches against this rather
 /// than against a model name (document 02).
 #[derive(Debug, Clone, PartialEq, Eq)]

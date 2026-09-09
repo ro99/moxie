@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected. The checker's own source is exempt from the telemetry rule
+# because it *declares* the forbidden paths, and this fixture is the proof that
+# the exemption is one file rather than one crate: the composition root reading
+# telemetry for itself is exactly the option ADR 0006 examined and rejected.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "machine telemetry outside moxie-host"

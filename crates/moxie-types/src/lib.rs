@@ -13,7 +13,9 @@ pub mod ids;
 pub mod precision;
 pub mod tier;
 
-pub use capability::{DeviceCapability, KernelCapability, MeasuredDevice, StrategyControl};
+pub use capability::{
+    DeviceCapability, HostLimit, KernelCapability, MeasuredDevice, MeasuredHost, StrategyControl,
+};
 pub use dim::{Dim, DimError, SymbolId, SymbolTable};
 pub use error::{Error, Result};
 pub use ids::{

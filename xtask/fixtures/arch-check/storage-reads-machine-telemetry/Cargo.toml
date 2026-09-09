@@ -1,0 +1,12 @@
+[package]
+name = "moxie-storage"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: this machine's telemetry has one reader, `moxie-host`
+# (ADR 0006). Storage owns artifacts, and a second component that knows how to
+# ask the machine about its memory is a second owner of a shared semantic --
+# `MemAvailable` versus `MemFree`, the cgroup limit, the swap rule.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "machine telemetry outside moxie-host"

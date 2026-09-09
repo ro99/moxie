@@ -181,4 +181,98 @@ is checked. The numerical contracts of tasks 0003, 0004, 0006 and 0007 are uncha
 
 ## Result, filled after work
 
-To be filled in after implementation, keeping passed, failed and skipped separate.
+Implemented 2026-09-09 on branch `main`, on top of the contract commit `00fe7df`.
+The contract above is unchanged; only this section is filled in.
+
+What was built:
+
+- `moxie-types`: `MeasuredHost` and `HostLimit`, beside `MeasuredDevice`.
+- `moxie-host` (new, depends only on `moxie-types`): `read()` and
+  `read_under(root)`. Parses the required `meminfo` fields with checked kB
+  conversion, walks the cgroup v2 hierarchy from `/proc/self/cgroup` and takes
+  the **smallest** `memory.max` over the chain, and applies it to both the total
+  and the available figure. Absence at every level is the machine view, not an
+  error.
+- `moxie-memory`: `CapacitySnapshot::measured_host`, pure and host-tested.
+- `arch-check`: `moxie-host` declared, plus the two rules ADR 0006 promised —
+  `machine telemetry outside moxie-host` and `memory depends on the host sensor`
+  — with three rejecting fixtures and one accepted one.
+- `xtask capacity` now measures the host as well as the three devices, and
+  admits one plan spanning both tiers: weights and KV on a device, state spill
+  and CPU workspace on the host.
+
+This machine, read 2026-09-09 (a reading, not a reservation, and not a
+performance number):
+
+| Field | Value |
+|---|---|
+| `MemTotal` | 264,005,080 kB = 251.8 GiB |
+| `MemAvailable` | ~256.8 M kB = ~244.9 GiB — **the budget input** |
+| `MemFree` | ~251.6 M kB = ~239.9 GiB — 5 GiB lower, and not used |
+| `Cached` + `Buffers` | ~6.5 GiB, reclaimable, already inside `MemAvailable` |
+| `SwapTotal` | 2,097,148 kB = 2 GiB — reported, in no budget |
+| cgroup v2 | mounted; `memory.max` is `max` at the session scope, `user-1000.slice` and `user.slice`, so no limit applies and the machine view governs |
+
+`cargo xtask-cuda capacity` admits 242,241 MiB on the host after an 8 GiB
+placeholder reserve, alongside 15,683 / 23,794 / 23,794 MiB on the three GPUs,
+and every scope returns to zero on release.
+
+Deviations recorded, none silent:
+
+- `HOST_RESERVE_BYTES` (8 GiB) in `xtask capacity` is a **placeholder constant**,
+  named and documented as one, exactly like the device-side 64 MiB. It is not a
+  derived reservation, and no production crate contains it.
+- The contract said the parser refuses "a malformed unit, a non-numeric value,
+  and a truncated file". It refuses all three, and the truncated fixture is a
+  file cut off before `SwapTotal` rather than one cut mid-token: a mid-token cut
+  is indistinguishable from the malformed-value case the fixture beside it
+  already covers.
+
+Gates (this machine, 2026-09-09):
+
+| Lane | Result |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `clippy -D warnings`, host and device features | PASS |
+| `cargo test --workspace --locked --offline` | PASS, 485 unit/integration + 6 doctests (was 470 + 6) |
+| `cargo xtask arch-check` | PASS, 49 rejected + 13 accepted fixtures, 12 rules |
+| `cargo xtask spec-check` | PASS, 10 documents |
+| no-driver host lane, `xtask` rebuilt before `ldd` | PASS, 485 + 6, no `libcuda` |
+| device lane | PASS, 493 + 8 |
+| `cargo xtask-cuda test-gpu` | PASS, 24 cases, `sm_86` and `sm_120` qualified |
+| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, as intended |
+| `cargo xtask-cuda capacity` | PASS, the host and 3 devices |
+
+Nothing failed. Nothing was skipped.
+
+Bite checks, each reverted to green:
+
+- Taking the budget from `MemFree` instead of `MemAvailable` fails four tests.
+- Counting `SwapFree` as budget fails four tests, including the swap rule's own.
+- **A bite check that did not bite, and what it found.** Replacing "keep the
+  smallest limit on the chain" with "keep the last one found" failed *nothing*:
+  the walk runs leaf-to-root, so "last" is the outermost limited level, and the
+  ancestor fixture's binding limit was the ancestor. The two rules agreed on
+  every fixture that existed. A new fixture, `cgroup-leaf-tighter` — a 4 GiB leaf
+  under a 16 GiB slice — tells them apart, and the mutation now fails it. The
+  coverage gap was real and the bite check is what exposed it.
+
+The rule-vocabulary exemption is worth naming. The telemetry rule is the first
+content rule that applies to *every* crate rather than to named ones, so it is
+the first to match its own definition: `TELEMETRY_PATHS` in `archcheck.rs`
+contains the literal `"/proc"`. The exemption is **one file**, the checker's own
+source, where every rule's forbidden vocabulary is declared. A fixture named
+`xtask` proves the exemption is file-scoped rather than crate-scoped, so the
+composition root reading telemetry for itself — ADR 0006's rejected option 3 —
+is still caught.
+
+No checkpoint was read, downloaded or converted; nothing was allocated, mapped
+or reclaimed; no swap entered any budget; and no performance number was
+produced. The stop condition was not triggered.
+
+Remaining blockers and next bounded task: M1.3's accounting half is complete —
+the ledger now admits against measured capacity on both tiers. What remains is
+the half that spends it: event-backed leases, the basic allocator, the admitted
+execution plan and the device-resident layer chain. The first of those is the
+next bounded task, and it is the first that will charge *real* bytes rather than
+declared ones.

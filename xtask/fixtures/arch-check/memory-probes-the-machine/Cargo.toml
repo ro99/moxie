@@ -1,0 +1,16 @@
+[package]
+name = "moxie-memory"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: the ledger is given a reading, it does not take one. Task
+# 0006 documents `Ledger::preview` as pure with respect to live resources; a
+# path from the ledger to the sensor makes that a promise about how the code is
+# written rather than a property of what it can reach.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "memory depends on the host sensor"
+
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-host = { path = "../../../../crates/moxie-host" }

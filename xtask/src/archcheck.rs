@@ -47,6 +47,8 @@ pub mod rule {
     pub const STORAGE_NAMES_MODEL: &str = "storage interprets model metadata";
     pub const MEMORY_USES_FILESYSTEM: &str = "memory touches the filesystem";
     pub const MEMORY_NAMES_MODEL: &str = "memory branches on a model name";
+    pub const TELEMETRY_OUTSIDE_HOST: &str = "machine telemetry outside moxie-host";
+    pub const MEMORY_PROBES_THE_MACHINE: &str = "memory depends on the host sensor";
 
     pub const ALL: &[&str] = &[
         FORBIDDEN_DEPENDENCY,
@@ -59,6 +61,8 @@ pub mod rule {
         STORAGE_NAMES_MODEL,
         MEMORY_USES_FILESYSTEM,
         MEMORY_NAMES_MODEL,
+        TELEMETRY_OUTSIDE_HOST,
+        MEMORY_PROBES_THE_MACHINE,
     ];
 }
 
@@ -133,6 +137,16 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                 third_party: NONE,
             },
         ),
+        // The host sensor (task 0008, ADR 0006). The only crate that may read
+        // machine telemetry, and the rules below are what make that true rather
+        // than customary.
+        (
+            "moxie-host",
+            Allowed {
+                workspace: &["moxie-types"],
+                third_party: NONE,
+            },
+        ),
         // The bounded reader (task 0005). The only crate here that touches
         // the filesystem: it opens the artifact directory and reads chunks.
         // It must not interpret architecture metadata, decode weights, or
@@ -197,6 +211,7 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                     "moxie-oracles",
                     "moxie-state",
                     "moxie-memory",
+                    "moxie-host",
                     "moxie-storage",
                     "moxie-cuda",
                     "moxie-kernels",
@@ -1335,6 +1350,28 @@ const MODEL_FREE_CRATES: &[(&str, &str)] = &[
     ("moxie-memory", rule::MEMORY_NAMES_MODEL),
 ];
 
+/// Path prefixes that name this machine's own telemetry. Only `moxie-host` may
+/// mention one (ADR 0006): telemetry has one reader, and a second one appearing
+/// in a crate that already has a different job is how a shared responsibility
+/// acquires a second owner.
+const TELEMETRY_PATHS: &[&str] = &["/proc", "/sys"];
+
+/// The crate that owns machine telemetry. Everything else is checked against
+/// `TELEMETRY_PATHS`.
+const TELEMETRY_OWNER: &str = "moxie-host";
+
+/// The checker's own source, where every rule's forbidden vocabulary is
+/// declared -- model family names, forbidden import prefixes, and the telemetry
+/// paths above.
+///
+/// Declaring what is forbidden is not a use of it, and this is the first content
+/// rule that applies to every crate rather than to named ones, so it is the
+/// first to meet its own definition. The exemption is **one file**, not one
+/// crate: a telemetry path anywhere else in `xtask` is still a violation, and a
+/// fixture proves it. Widening this to the crate would let the composition root
+/// quietly become the second telemetry reader that ADR 0006 rejected.
+const RULE_VOCABULARY_FILE: &str = "xtask/src/archcheck.rs";
+
 /// First segments that identify graph/model metadata machinery. A storage
 /// layer that imports any of these is learning what architecture metadata
 /// means -- document 08's unenforced split, restated as a rule.
@@ -1479,6 +1516,47 @@ fn check_names_no_model(
                     detail: format!(
                         "{}: names a model family ('{hit}'): {crate_name} never branches on which \
                          model the bytes belong to",
+                        file.display()
+                    ),
+                });
+                break;
+            }
+        }
+    }
+}
+
+/// Rule 7 enforcement: only `moxie-host` names a `/proc` or `/sys` path.
+///
+/// A string rule, and it can be one because the sensor takes its root as an
+/// argument: a crate that wanted to read telemetry would have to write the path
+/// down. Doc comments are excluded by construction -- the collector never visits
+/// attributes -- so prose about the boundary is not a breach of it.
+fn check_no_machine_telemetry(
+    doc: &toml::Value,
+    dir: &Path,
+    crate_name: &str,
+    out: &mut Vec<Violation>,
+) {
+    let (scanned, problems) = scanned_with_includes(doc, dir);
+    for detail in problems {
+        out.push(Violation {
+            crate_name: crate_name.to_string(),
+            rule: rule::TELEMETRY_OUTSIDE_HOST,
+            detail,
+        });
+    }
+    for (file, facts) in &scanned {
+        if file.ends_with(Path::new(RULE_VOCABULARY_FILE)) {
+            continue;
+        }
+        for s in facts.strings.iter() {
+            if let Some(hit) = TELEMETRY_PATHS.iter().find(|p| s.starts_with(**p)) {
+                out.push(Violation {
+                    crate_name: crate_name.to_string(),
+                    rule: rule::TELEMETRY_OUTSIDE_HOST,
+                    detail: format!(
+                        "{}: names {hit:?}: this machine's telemetry has one reader, {TELEMETRY_OWNER} \
+                         (ADR 0006)",
                         file.display()
                     ),
                 });
@@ -1691,6 +1769,34 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
         // prose about the boundary is not a use of what it forbids.
         if let Some((_, rule)) = MODEL_FREE_CRATES.iter().find(|(c, _)| *c == name) {
             check_names_no_model(&doc, dir, &name, rule, &mut out);
+        }
+
+        // Rule 7: machine telemetry has one reader. ADR 0006 puts it in
+        // `moxie-host` so the confinement can be checked rather than reviewed.
+        if name != TELEMETRY_OWNER {
+            check_no_machine_telemetry(&doc, dir, &name, &mut out);
+        }
+
+        // Rule 8: the ledger never probes. `moxie-memory` may not reach the
+        // sensor, because task 0006 documents `Ledger::preview` as pure with
+        // respect to live resources and a path to a sensor makes that a promise
+        // about how the code is written rather than a property of what it can
+        // reach. This is narrower than rule 1 on purpose: the edge would
+        // otherwise be a plausible-looking allowlist widening.
+        if name == "moxie-memory" {
+            for edge in production_deps(&doc, dir, workspace.as_ref()) {
+                if edge.identities.iter().any(|n| n == "moxie-host") {
+                    out.push(Violation {
+                        crate_name: name.clone(),
+                        rule: rule::MEMORY_PROBES_THE_MACHINE,
+                        detail: format!(
+                            "{}: depends on moxie-host; the ledger is given a reading, it does not \
+                             take one (ADR 0006)",
+                            edge.section
+                        ),
+                    });
+                }
+            }
         }
     }
     Ok(out)

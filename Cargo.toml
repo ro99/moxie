@@ -9,6 +9,7 @@ members = [
     "crates/moxie-oracles",
     "crates/moxie-state",
     "crates/moxie-memory",
+    "crates/moxie-host",
     "crates/moxie-storage",
     "crates/moxie-cuda",
     "crates/moxie-kernels",
@@ -32,6 +33,7 @@ moxie-format = { path = "crates/moxie-format" }
 moxie-oracles = { path = "crates/moxie-oracles" }
 moxie-state = { path = "crates/moxie-state" }
 moxie-memory = { path = "crates/moxie-memory" }
+moxie-host = { path = "crates/moxie-host" }
 moxie-storage = { path = "crates/moxie-storage" }
 moxie-cuda = { path = "crates/moxie-cuda" }
 moxie-kernels = { path = "crates/moxie-kernels" }
