@@ -1,0 +1,4 @@
+This directory stands in for an unreadable proc/self/cgroup: reading a
+directory fails with an I/O error other than NotFound, so the sensor must
+refuse rather than fall back to the machine view. Do not replace it with a
+regular file.

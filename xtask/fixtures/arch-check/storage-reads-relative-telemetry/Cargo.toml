@@ -1,0 +1,11 @@
+[package]
+name = "moxie-storage"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: a relative telemetry path is the same breach as an
+# absolute one. The sensor reads root.join("proc/meminfo"); a second crate
+# copying that spelling is a second owner (ADR 0006).
+
+[package.metadata.moxie-arch-check]
+expect-rule = "machine telemetry outside moxie-host"

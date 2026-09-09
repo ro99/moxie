@@ -276,3 +276,94 @@ the half that spends it: event-backed leases, the basic allocator, the admitted
 execution plan and the device-resident layer chain. The first of those is the
 next bounded task, and it is the first that will charge *real* bytes rather than
 declared ones.
+
+## Review corrections, 2026-09-09 (ADR 0007)
+
+Two review agents reproduced three defects in the accepted slice; both
+recommended stopping before event-backed leases. The contract above is
+preserved as written — what follows corrects it, with the counterexample kept
+in the record.
+
+**P1 — headroom minimised the wrong quantity.** The sensor kept the smallest
+`memory.max` and read headroom off that level. Counterexample, now fixture
+`cgroup-sibling-pressure`: leaf 20 GiB / 9 GiB current (11 GiB headroom),
+ancestor 100 GiB / 99 GiB current (1 GiB left, 90 GiB on a sibling scope).
+Reported 11 GiB; obtainable 1 GiB; error in the over-admitting direction.
+Existing fixtures could not separate the rules: when the ancestor is tighter
+the two minima coincide, and `cgroup-leaf-tighter` gave its ancestor 15 GiB
+of slack. Fix per ADR 0007: total from `min(limit)`, available from
+`min(limit - current)` saturating independently; `HostLimit::Cgroup` now
+records both bindings (`path/limit/current` plus
+`avail_path/avail_limit/avail_current`); `capacity` reports which level bound
+which figure.
+
+**P2 — missing usage became zero; malformed limits became `max`.**
+`read_u64_or_max(...).unwrap_or(0)` reported a finite limit with no readable
+`memory.current` as wholly available (fixture `cgroup-current-missing`: 8 GiB
+limit, no usage file). Any `memory.max` that was neither numeric nor `max`
+likewise collapsed into "no limit". Fix: `cgroup_limit` returns `Result`;
+finite limit without numeric usage refuses; malformed/unreadable `memory.max`
+(other than `NotFound`, which remains "no limit at this level") refuses with
+the file named. New fixture `cgroup-bad-limit` proves the second half.
+
+**P2 — telemetry rule missed relative paths.** `starts_with("/proc","/sys")`
+accepted `root.join("proc/meminfo")` — the sensor's own spelling, and the one
+a future crate would copy. Fix: full-segment match with literal decoration
+stripped, so `proc/meminfo` and `sys/fs/cgroup` hit with or without a leading
+slash, in code and macro strings, while `artifacts/manifest.toml`,
+`models/proc_weights` and `/procfoo` do not. New rejecting fixtures
+`storage-reads-relative-telemetry` and
+`storage-reads-relative-sys-telemetry`; new accepting
+`storage-reads-artifact-path`; unit test
+`telemetry_matches_segments_not_prefixes` locks the edges.
+
+**P3 — stale counts.** `support-matrix.md` G-HOST-ARCH row said 45 + 12, 10
+rules; actual at acceptance was 49 + 13, 12, and after this correction 51 +
+14, 12. Corrected with the row's limit wording (two minima, not one).
+
+Follow-up corrections, 2026-09-09. Review of the uncommitted tree found two
+more defects in the same slice; both reproduced by the reviewer.
+
+**Membership errors fell back to the machine view.** Any failure reading
+`proc/self/cgroup` returned `HostLimit::Machine`, so an unreadable or
+non-UTF-8 membership file against an 8 GiB cap reported ~245 GiB available.
+Fix: `NotFound` (unmounted hierarchy) and a missing `0::` line (cgroup v1)
+stay the machine view; any other read failure refuses with the file named —
+the same distinction as `memory.max`. New fixtures
+`cgroup-membership-unreadable` (a directory at the membership path) and
+`cgroup-membership-invalid-utf8`.
+
+**Coherence test mixed scopes.** `free_bytes <= total_bytes` compared
+machine-wide `MemFree` against a cgroup-capped total; the 8 GiB leaf fixture
+carries ~240 GiB machine-free, so the assertion failed on correct telemetry.
+Fix: compare `free_bytes` against `machine_total_bytes`. The assertions now
+live in `assert_coherent`, exercised against both the live machine and the
+capped `cgroup-leaf-limit` fixture, which additionally pins
+`free_bytes > total_bytes` so the scope distinction cannot regress.
+
+Gates after follow-up (this machine, 2026-09-09; nothing loosened). Rerun
+means executed after the membership/coherence changes; carried forward means
+measured in the prior correction rerun over code this round does not touch
+(`moxie-cuda`/`moxie-kernels`/device paths are unchanged since).
+
+| Lane | Result | Status |
+|---|---|---|
+| `cargo fmt --all -- --check` | PASS | rerun |
+| `clippy -D warnings`, host lane | PASS | rerun |
+| `clippy -D warnings`, device features | PASS | carried forward |
+| `cargo test --workspace --locked --offline` | PASS, 492 unit/integration + 6 doctests (was 489 + 6; +2 membership refusals, +1 capped coherence) | rerun |
+| `cargo xtask arch-check` | PASS, 51 rejected + 14 accepted fixtures, 12 rules, unchanged | rerun |
+| `cargo xtask spec-check` | PASS, 10 documents | rerun |
+| no-driver host lane, `xtask` rebuilt before `ldd` | PASS, 492 + 6, no `libcuda` | rerun |
+| `cargo test -p moxie-memory` | PASS, 58 tests + 2 doctests | rerun |
+| device lane suite | PASS, 497 + 8 | carried forward |
+| `cargo xtask-cuda test-gpu` | PASS, 24 cases, `sm_86` and `sm_120` qualified | carried forward |
+| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, as intended (`sm_120` unqualified) | carried forward |
+| `cargo xtask-cuda capacity` | PASS, the host (no cgroup limit on this machine) and 3 devices, every scope to zero | rerun |
+
+Nothing failed. GPU kernel tests and the device lane were carried forward, not
+rerun: this round changes `moxie-host` error paths and its tests only.
+`Cargo.lock` unchanged: no new third-party packages.
+No checkpoint was read, downloaded or converted; nothing was allocated, mapped
+or reclaimed; no swap entered any budget; and no performance number was
+produced. The stop condition was not triggered.

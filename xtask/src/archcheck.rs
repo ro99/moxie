@@ -1350,10 +1350,16 @@ const MODEL_FREE_CRATES: &[(&str, &str)] = &[
     ("moxie-memory", rule::MEMORY_NAMES_MODEL),
 ];
 
-/// Path prefixes that name this machine's own telemetry. Only `moxie-host` may
+/// Path segments that name this machine's own telemetry. Only `moxie-host` may
 /// mention one (ADR 0006): telemetry has one reader, and a second one appearing
 /// in a crate that already has a different job is how a shared responsibility
 /// acquires a second owner.
+///
+/// Matched as a full `/`-separated segment, with or without a leading slash,
+/// so `root.join("proc/meminfo")` is the same breach as `"/proc/meminfo"`.
+/// A prefix match would miss the sensor's own injectable-root spelling and
+/// would also catch `/procfoo`; the segment match catches both spellings and
+/// neither false positive.
 const TELEMETRY_PATHS: &[&str] = &["/proc", "/sys"];
 
 /// The crate that owns machine telemetry. Everything else is checked against
@@ -1525,12 +1531,18 @@ fn check_names_no_model(
     }
 }
 
-/// Rule 7 enforcement: only `moxie-host` names a `/proc` or `/sys` path.
+/// Rule 7 enforcement: only `moxie-host` names a `proc` or `sys` telemetry path.
 ///
 /// A string rule, and it can be one because the sensor takes its root as an
 /// argument: a crate that wanted to read telemetry would have to write the path
 /// down. Doc comments are excluded by construction -- the collector never visits
 /// attributes -- so prose about the boundary is not a breach of it.
+///
+/// Strings are matched as full `/`-separated segments, not prefixes: the
+/// sensor reads `root.join("proc/meminfo")`, which no prefix match sees, and
+/// that relative spelling is what a future crate would copy. Macro-token
+/// strings keep their quotes, so decoration is stripped before the segment
+/// comparison; `/procfoo` is not a hit.
 fn check_no_machine_telemetry(
     doc: &toml::Value,
     dir: &Path,
@@ -1550,7 +1562,7 @@ fn check_no_machine_telemetry(
             continue;
         }
         for s in facts.strings.iter() {
-            if let Some(hit) = TELEMETRY_PATHS.iter().find(|p| s.starts_with(**p)) {
+            if let Some(hit) = telemetry_hit(s) {
                 out.push(Violation {
                     crate_name: crate_name.to_string(),
                     rule: rule::TELEMETRY_OUTSIDE_HOST,
@@ -1564,6 +1576,30 @@ fn check_no_machine_telemetry(
             }
         }
     }
+}
+
+/// Which telemetry path a string literal names, if any.
+///
+/// Splits on `/` and compares full segments, so `"/proc/meminfo"` and
+/// `"proc/meminfo"` both hit while `"artifacts/manifest.toml"` and
+/// `"/procfoo/bar"` do not. Leading macro-literal decoration (`"`, `b"`,
+/// whitespace) and `./` noise are stripped per segment; doc comments never
+/// reach here.
+fn telemetry_hit(s: &str) -> Option<&'static str> {
+    for piece in s.split('/') {
+        let seg = piece
+            .trim()
+            .trim_matches(['"', '\'', ' ', '\t', '(', ')', ';', ',', '.', '\\'])
+            .trim_start_matches(['b', 'r', '#', '"', '\''])
+            .trim_end_matches(['"', '\'']);
+        if let Some(hit) = TELEMETRY_PATHS
+            .iter()
+            .find(|p| seg == p.trim_start_matches('/'))
+        {
+            return Some(*hit);
+        }
+    }
+    None
 }
 
 /// Check every crate manifest under `root`.
@@ -2930,6 +2966,21 @@ mod tests {
         assert!(scanned.contains(&src.join("lib.rs")));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn telemetry_matches_segments_not_prefixes() {
+        // The sensor's own spelling is relative; `/procfoo` must not hit.
+        assert_eq!(telemetry_hit("/proc/meminfo"), Some("/proc"));
+        assert_eq!(telemetry_hit("proc/meminfo"), Some("/proc"));
+        assert_eq!(telemetry_hit("proc/self/cgroup"), Some("/proc"));
+        assert_eq!(telemetry_hit("/sys/fs/cgroup/memory.max"), Some("/sys"));
+        assert_eq!(telemetry_hit("sys/fs/cgroup/memory.max"), Some("/sys"));
+        assert_eq!(telemetry_hit("\"/proc/meminfo\""), Some("/proc"));
+        assert_eq!(telemetry_hit("./proc/meminfo"), Some("/proc"));
+        assert_eq!(telemetry_hit("artifacts/manifest.toml"), None);
+        assert_eq!(telemetry_hit("/procfoo/bar"), None);
+        assert_eq!(telemetry_hit("models/proc_weights"), None);
     }
 
     #[test]

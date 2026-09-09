@@ -122,11 +122,28 @@ pub enum HostLimit {
     /// No cgroup limit applies; the machine's own figures govern.
     Machine,
     /// A cgroup v2 limit binds, from this cgroup or one of its ancestors.
+    ///
+    /// Total and available headroom minimise independently over the chain and
+    /// can bind at different levels: the smallest `memory.max` caps the total,
+    /// while the smallest saturating `memory.max - memory.current` caps what
+    /// a new allocation can obtain. A sibling scope holding most of an
+    /// ancestor slice is the ordinary shape where they diverge, so both
+    /// binding points are recorded rather than reading headroom off the
+    /// tightest limit.
     Cgroup {
-        /// The cgroup path the binding limit was found at.
+        /// Path of the smallest `memory.max`; binds the total.
         path: String,
+        /// The smallest `memory.max` on the chain.
         limit_bytes: u64,
+        /// Usage at `path`, diagnostic only; not a budget input.
         current_bytes: u64,
+        /// Path of the smallest saturating `memory.max - memory.current`;
+        /// binds the available figure. Equals `path` when one level binds both.
+        avail_path: String,
+        /// The `memory.max` at `avail_path`.
+        avail_limit_bytes: u64,
+        /// The `memory.current` at `avail_path`.
+        avail_current_bytes: u64,
     },
 }
 

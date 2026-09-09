@@ -56,10 +56,16 @@ fn a_leaf_cgroup_limit_binds_and_max_ancestors_are_skipped() {
             path,
             limit_bytes,
             current_bytes,
+            avail_path,
+            avail_limit_bytes,
+            avail_current_bytes,
         } => {
             assert_eq!(path, "/user.slice/session.scope");
             assert_eq!(*limit_bytes, 8 * GIB);
             assert_eq!(*current_bytes, GIB);
+            assert_eq!(avail_path, "/user.slice/session.scope");
+            assert_eq!(*avail_limit_bytes, 8 * GIB);
+            assert_eq!(*avail_current_bytes, GIB);
         }
         other => panic!("expected a cgroup limit, got {other:?}"),
     }
@@ -80,10 +86,16 @@ fn the_smallest_limit_on_the_chain_binds_even_when_it_is_an_ancestor() {
             path,
             limit_bytes,
             current_bytes,
+            avail_path,
+            avail_limit_bytes,
+            avail_current_bytes,
         } => {
             assert_eq!(path, "/user.slice");
             assert_eq!(*limit_bytes, 4 * GIB);
             assert_eq!(*current_bytes, 2 * GIB);
+            assert_eq!(avail_path, "/user.slice");
+            assert_eq!(*avail_limit_bytes, 4 * GIB);
+            assert_eq!(*avail_current_bytes, 2 * GIB);
         }
         other => panic!("expected the ancestor's limit, got {other:?}"),
     }
@@ -101,10 +113,19 @@ fn the_smallest_limit_binds_when_it_is_the_leaf_too() {
     let host = read("cgroup-leaf-tighter");
     match &host.limit {
         HostLimit::Cgroup {
-            path, limit_bytes, ..
+            path,
+            limit_bytes,
+            current_bytes,
+            avail_path,
+            avail_limit_bytes,
+            avail_current_bytes,
         } => {
             assert_eq!(path, "/user.slice/session.scope");
             assert_eq!(*limit_bytes, 4 * GIB, "the 16 GiB ancestor must not win");
+            assert_eq!(*current_bytes, GIB);
+            assert_eq!(avail_path, "/user.slice/session.scope");
+            assert_eq!(*avail_limit_bytes, 4 * GIB);
+            assert_eq!(*avail_current_bytes, GIB);
         }
         other => panic!("expected the leaf's limit, got {other:?}"),
     }
@@ -176,15 +197,124 @@ fn an_unreadable_meminfo_is_refused() {
     assert!(e.to_string().contains("meminfo"), "{e}");
 }
 
+fn assert_coherent(host: &moxie_types::MeasuredHost) {
+    // Effective figures are capped by the cgroup chain; machine-wide figures
+    // are not. `free_bytes` is `MemFree` for the whole machine, so it is only
+    // comparable against `machine_total_bytes`, never against a capped total.
+    assert!(host.total_bytes > 0);
+    assert!(host.available_bytes <= host.total_bytes);
+    assert!(host.free_bytes <= host.machine_total_bytes);
+    assert!(host.machine_available_bytes <= host.machine_total_bytes);
+    assert!(host.total_bytes <= host.machine_total_bytes);
+    assert!(host.available_bytes <= host.machine_available_bytes);
+}
+
 #[test]
 fn this_machine_answers_and_its_answer_is_coherent() {
     // The one case that touches the real `/proc`. It asserts shape, not values:
     // the numbers move between runs, and a test that pinned them would be
     // pinning the weather.
     let host = moxie_host::read().expect("this machine has a readable /proc/meminfo");
-    assert!(host.total_bytes > 0);
-    assert!(host.available_bytes <= host.total_bytes);
-    assert!(host.free_bytes <= host.total_bytes);
-    assert!(host.machine_available_bytes <= host.machine_total_bytes);
-    assert!(host.total_bytes <= host.machine_total_bytes);
+    assert_coherent(&host);
+}
+
+#[test]
+fn coherence_holds_under_a_cgroup_cap() {
+    // The 8 GiB leaf cap leaves ~240 GiB of machine-wide free memory: the old
+    // `free_bytes <= total_bytes` comparison failed here despite correct
+    // telemetry, because the two quantities live in different scopes.
+    let host = read("cgroup-leaf-limit");
+    assert_coherent(&host);
+    assert!(
+        host.free_bytes > host.total_bytes,
+        "machine-wide free {} exceeds the capped total {}",
+        host.free_bytes,
+        host.total_bytes
+    );
+}
+
+#[test]
+fn headroom_is_minimised_over_the_chain_and_not_read_off_the_tightest_limit() {
+    // Review finding P1. Two different quantities are minimised over the chain,
+    // and they can bind at different levels. Here the leaf has the smaller
+    // *limit* (20 GiB against 100 GiB) while the slice above it has almost no
+    // room left, because a sibling scope holds 90 GiB of its 100 GiB.
+    //
+    // A cgroup's `memory.current` includes its descendants', so this is an
+    // ordinary shape on any machine with more than one scope under a slice --
+    // not a contrived one.
+    let host = read("cgroup-sibling-pressure");
+    match &host.limit {
+        HostLimit::Cgroup {
+            path,
+            limit_bytes,
+            avail_path,
+            avail_limit_bytes,
+            avail_current_bytes,
+            ..
+        } => {
+            assert_eq!(
+                path, "/user.slice/session.scope",
+                "smallest limit binds total"
+            );
+            assert_eq!(*limit_bytes, 20 * GIB);
+            assert_eq!(
+                avail_path, "/user.slice",
+                "tightest headroom binds available"
+            );
+            assert_eq!(*avail_limit_bytes, 100 * GIB);
+            assert_eq!(*avail_current_bytes, 106_300_440_576);
+        }
+        other => panic!("expected a cgroup limit, got {other:?}"),
+    }
+    assert_eq!(
+        host.total_bytes,
+        20 * GIB,
+        "the smallest limit caps the total"
+    );
+    assert_eq!(
+        host.available_bytes, GIB,
+        "the ancestor has 1 GiB left; reading headroom off the tightest limit \
+         would promise 11 GiB and the eleventh would die in the kernel"
+    );
+}
+
+#[test]
+fn an_unreadable_membership_file_is_refused_rather_than_unlimited() {
+    // `proc/self/cgroup` as a directory fails with an I/O error other than
+    // NotFound. Falling back to the machine view here would report ~245 GiB
+    // available against an 8 GiB cap: inability to discover a limit is not
+    // evidence that none applies.
+    let e = moxie_host::read_under(&tree("cgroup-membership-unreadable")).unwrap_err();
+    assert_eq!(e.kind(), "invalid_request");
+    assert!(e.to_string().contains("self/cgroup"), "{e}");
+}
+
+#[test]
+fn a_non_utf8_membership_file_is_refused_rather_than_unlimited() {
+    // `read_to_string` fails with InvalidData on non-UTF-8 bytes. Same
+    // direction, same refusal: the hierarchy cannot be walked, so no bound is
+    // known.
+    let e = moxie_host::read_under(&tree("cgroup-membership-invalid-utf8")).unwrap_err();
+    assert_eq!(e.kind(), "invalid_request");
+    assert!(e.to_string().contains("self/cgroup"), "{e}");
+}
+
+#[test]
+fn a_level_with_a_limit_but_no_readable_usage_is_refused() {
+    // Review finding P3. Treating an unreadable `memory.current` as zero is the
+    // same guess this crate refuses for `MemAvailable`, in the same optimistic
+    // direction: it would report the whole 8 GiB limit as available.
+    let e = moxie_host::read_under(&tree("cgroup-current-missing")).unwrap_err();
+    assert_eq!(e.kind(), "invalid_request");
+    assert!(e.to_string().contains("memory.current"), "{e}");
+}
+
+#[test]
+fn a_malformed_limit_is_refused_rather_than_treated_as_max() {
+    // A `memory.max` that is neither a number nor `max` must not collapse into
+    // "no limit": that spelling would silently admit against the machine view.
+    let e = moxie_host::read_under(&tree("cgroup-bad-limit")).unwrap_err();
+    assert_eq!(e.kind(), "invalid_request");
+    assert!(e.to_string().contains("memory.max"), "{e}");
 }

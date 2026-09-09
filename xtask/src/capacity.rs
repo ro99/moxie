@@ -107,12 +107,25 @@ pub fn run() -> i32 {
             path,
             limit_bytes,
             current_bytes,
+            avail_path,
+            avail_limit_bytes,
+            avail_current_bytes,
         } => {
             println!(
-                "  cgroup {path} limits this process to {} MiB, {} MiB of it in use",
+                "  cgroup {path} sets the smallest limit: {} MiB total, {} MiB of it in use",
                 limit_bytes / (1024 * 1024),
                 current_bytes / (1024 * 1024),
             );
+            let headroom = avail_limit_bytes.saturating_sub(*avail_current_bytes) / (1024 * 1024);
+            if avail_path == path {
+                println!("  it also binds headroom: {headroom} MiB for new allocation");
+            } else {
+                println!(
+                    "  headroom binds at {avail_path}: {} MiB limit, {} MiB in use, {headroom} MiB for new allocation",
+                    avail_limit_bytes / (1024 * 1024),
+                    avail_current_bytes / (1024 * 1024),
+                );
+            }
             println!(
                 "  the machine itself has {} MiB total and {} MiB available",
                 host.machine_total_bytes / (1024 * 1024),

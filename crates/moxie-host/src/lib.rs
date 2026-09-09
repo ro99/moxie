@@ -84,16 +84,17 @@ pub fn read_under(root: &Path) -> Result<MeasuredHost> {
         ));
     }
 
-    let limit = cgroup_limit(root);
+    let limit = cgroup_limit(root)?;
     let (total_bytes, available_bytes) = match &limit {
         HostLimit::Machine => (machine_total_bytes, machine_available_bytes),
         HostLimit::Cgroup {
             limit_bytes,
-            current_bytes,
+            avail_limit_bytes,
+            avail_current_bytes,
             ..
         } => (
             machine_total_bytes.min(*limit_bytes),
-            machine_available_bytes.min(limit_bytes.saturating_sub(*current_bytes)),
+            machine_available_bytes.min(avail_limit_bytes.saturating_sub(*avail_current_bytes)),
         ),
     };
 
@@ -160,37 +161,74 @@ fn parse_meminfo(text: &str) -> Result<Vec<(String, u64)>> {
     }
     Ok(out)
 }
-
-/// The binding cgroup v2 limit, or [`HostLimit::Machine`].
+/// The binding cgroup v2 limits, or [`HostLimit::Machine`].
 ///
-/// A limit set on an ancestor binds just as hard as one on the leaf, so this
-/// walks up and takes the smallest. Absence at every step is not an error: a
-/// cgroup v1 machine, an unmounted hierarchy or an unreadable file all mean the
-/// machine's own figures govern, and the descriptor records which view was used.
-fn cgroup_limit(root: &Path) -> HostLimit {
-    let Ok(text) = std::fs::read_to_string(root.join("proc/self/cgroup")) else {
-        return HostLimit::Machine;
+/// Total and headroom minimise independently over the process's own cgroup and
+/// every ancestor: the smallest `memory.max` caps the total, and the smallest
+/// saturating `memory.max - memory.current` caps new allocation. Either can
+/// bind at a different level -- a sibling scope holding most of an ancestor
+/// slice leaves the leaf with the smaller limit and the ancestor with almost
+/// no room -- so both minima are tracked and both binding paths recorded.
+///
+/// Absence of a hierarchy is not an error: a cgroup v1 machine (no `0::` line)
+/// or an unmounted hierarchy (no membership file, `NotFound`) means the
+/// machine's own figures govern. An incomplete hierarchy is an error: an
+/// unreadable membership file for any other reason, a finite `memory.max`
+/// with no readable `memory.current`, or a `memory.max` that is neither a
+/// number nor `max`, refuses rather than guessing spendable capacity in the
+/// optimistic direction. A missing file at a level (`NotFound`) means no
+/// limit there; any other I/O failure or a malformed value is a refused
+/// measurement.
+fn cgroup_limit(root: &Path) -> Result<HostLimit> {
+    // Absence is the machine view: no hierarchy mounted, or nothing to read
+    // under this root. Any other failure refuses: inability to discover a
+    // limit is not evidence that none applies, and falling back to the
+    // machine view would present up to hundreds of GiB that the kernel will
+    // refuse as spendable.
+    let text = match std::fs::read_to_string(root.join("proc/self/cgroup")) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HostLimit::Machine),
+        Err(e) => {
+            return Err(invalid(
+                "cgroup",
+                format!(
+                    "proc/self/cgroup unreadable ({}): {e}",
+                    root.join("proc/self/cgroup").display()
+                ),
+            ));
+        }
     };
     // cgroup v2 is the single `0::<path>` line. A v1-only machine has none.
     let Some(rel) = text
         .lines()
         .find_map(|l| l.strip_prefix("0::").map(str::trim))
     else {
-        return HostLimit::Machine;
+        return Ok(HostLimit::Machine);
     };
 
     let base = root.join("sys/fs/cgroup");
     let mut here = PathBuf::from(rel.trim_start_matches('/'));
-    let mut binding: Option<(String, u64, u64)> = None;
+    let mut total_binding: Option<(String, u64, u64)> = None;
+    let mut headroom_binding: Option<(String, u64, u64, u64)> = None;
     loop {
         let dir = base.join(&here);
-        if let Some(limit) = read_u64_or_max(&dir.join("memory.max")) {
-            let current = read_u64_or_max(&dir.join("memory.current")).unwrap_or(0);
+        let cgroup_path = {
             let path = format!("/{}", here.display());
-            let path = if path == "/." { "/".to_string() } else { path };
-            // The smallest limit on the chain is the one that binds.
-            if binding.as_ref().is_none_or(|(_, l, _)| limit < *l) {
-                binding = Some((path, limit, current));
+            if path == "/." { "/".to_string() } else { path }
+        };
+        if let Some(limit) = read_limit(&dir.join("memory.max"), &cgroup_path)? {
+            let current = read_current(&dir.join("memory.current"), &cgroup_path)?;
+            let headroom = limit.saturating_sub(current);
+            // Strictly smaller wins, so ties keep the leaf-most level: the walk
+            // runs leaf to root.
+            if total_binding.as_ref().is_none_or(|(_, l, _)| limit < *l) {
+                total_binding = Some((cgroup_path.clone(), limit, current));
+            }
+            if headroom_binding
+                .as_ref()
+                .is_none_or(|(_, _, _, h)| headroom < *h)
+            {
+                headroom_binding = Some((cgroup_path, limit, current, headroom));
             }
         }
         if !here.pop() {
@@ -198,22 +236,79 @@ fn cgroup_limit(root: &Path) -> HostLimit {
         }
     }
 
-    match binding {
-        None => HostLimit::Machine,
-        Some((path, limit_bytes, current_bytes)) => HostLimit::Cgroup {
+    match (total_binding, headroom_binding) {
+        (None, None) => Ok(HostLimit::Machine),
+        (
+            Some((path, limit_bytes, current_bytes)),
+            Some((avail_path, avail_limit_bytes, avail_current_bytes, _)),
+        ) => Ok(HostLimit::Cgroup {
             path,
             limit_bytes,
             current_bytes,
-        },
+            avail_path,
+            avail_limit_bytes,
+            avail_current_bytes,
+        }),
+        // Unreachable: every finite limit yields a headroom candidate at the
+        // same level, so both are set together. Fail closed if it ever happens.
+        _ => Err(invalid(
+            "cgroup",
+            "cgroup limits disagree: a total bound without a headroom bound".to_string(),
+        )),
     }
 }
 
-/// A cgroup byte file: a number, or `max` meaning no limit at this level.
-fn read_u64_or_max(path: &Path) -> Option<u64> {
-    let text = std::fs::read_to_string(path).ok()?;
+/// A `memory.max` file: a number (a finite limit at this level), or `max`
+/// (no limit here, `None`). A missing file is also no limit here; anything
+/// else unreadable or malformed refuses the measurement rather than silently
+/// treating a limit as absent.
+fn read_limit(path: &Path, cgroup_path: &str) -> Result<Option<u64>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(invalid(
+                "cgroup",
+                format!(
+                    "{cgroup_path} memory.max unreadable ({}): {e}",
+                    path.display()
+                ),
+            ));
+        }
+    };
     let text = text.trim();
     if text == "max" {
-        return None;
+        return Ok(None);
     }
-    text.parse().ok()
+    match text.parse::<u64>() {
+        Ok(n) => Ok(Some(n)),
+        Err(e) => Err(invalid(
+            "cgroup",
+            format!("{cgroup_path} memory.max is neither a byte count nor `max` ({text:?}): {e}"),
+        )),
+    }
+}
+
+/// A `memory.current` file where a finite limit applies. Always required:
+/// treating unreadable usage as zero would report the whole limit as
+/// available, the same optimistic guess this crate refuses for `MemAvailable`.
+fn read_current(path: &Path, cgroup_path: &str) -> Result<u64> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        invalid(
+            "cgroup",
+            format!(
+                "{cgroup_path} memory.current unreadable with a finite memory.max ({}): {e}",
+                path.display()
+            ),
+        )
+    })?;
+    text.trim().parse::<u64>().map_err(|e| {
+        invalid(
+            "cgroup",
+            format!(
+                "{cgroup_path} memory.current is not a byte count ({:?}): {e}",
+                text.trim()
+            ),
+        )
+    })
 }
