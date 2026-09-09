@@ -6,7 +6,8 @@
 
 use std::fmt::Write as _;
 
-use moxie_cuda::{DeviceBuffer, DeviceContext, query_device};
+use moxie_cuda::{DeviceBuffer, RankContext, query_device};
+use moxie_types::RankId;
 
 /// Bytes moved per host-to-device timing sample. 64 MiB is large enough to leave
 /// per-call overhead behind and small enough to be harmless on a 16 GiB card.
@@ -117,7 +118,7 @@ pub fn run(out: Option<&str>) -> i32 {
 }
 
 fn measure_h2d(ordinal: u32) -> Result<(f64, f64, f64), moxie_types::Error> {
-    let ctx = DeviceContext::new(ordinal)?;
+    let ctx = RankContext::acquire(RankId(ordinal), ordinal)?;
     let host = vec![0u8; XFER_BYTES];
     let mut dev = DeviceBuffer::alloc(&ctx, XFER_BYTES)?;
 

@@ -19,7 +19,7 @@
 
 pub mod status;
 
-pub use status::{CUDA_SUCCESS, CUresult, classify, format_uuid};
+pub use status::{CUDA_SUCCESS, CUresult, classify};
 
 #[cfg(feature = "driver")]
 pub mod ffi;
@@ -29,6 +29,6 @@ mod driver;
 
 #[cfg(feature = "driver")]
 pub use driver::{
-    DeviceBuffer, DeviceContext, Event, Function, Module, ModuleImage, PtxSource, Stream,
+    DeviceBuffer, Event, Function, Module, ModuleImage, PtxSource, RankContext, Stream,
     TrustedImage, device_count, init, query_device,
 };

@@ -9,6 +9,8 @@
 
 use core::fmt;
 
+use crate::ids::DeviceUuid;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StrategyControl {
     /// Never select this strategy.
@@ -46,9 +48,11 @@ impl fmt::Display for StrategyControl {
 /// inferred from a marketing name (document 03).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceCapability {
+    /// Diagnostic only. Valid inside one process's visible device set and
+    /// nowhere else; a plan, a manifest or a result names the UUID (AGENTS.md).
     pub ordinal: u32,
     /// Stable identity. Evidence records this, not the ordinal (document 07).
-    pub uuid: String,
+    pub uuid: DeviceUuid,
     pub name: String,
     pub compute_major: u32,
     pub compute_minor: u32,
@@ -79,6 +83,36 @@ impl DeviceCapability {
     }
 }
 
+/// One device's capacity as the driver reported it at one instant.
+///
+/// This is a **reading**, not a reservation and not a property of the card.
+/// `free_bytes` includes whatever other processes hold, and re-measuring may
+/// return something different; document 03 is explicit that an admission report
+/// shows "physical capacity, already committed resources, reserved peak, and
+/// remaining headroom", and only the first of those is a constant.
+///
+/// It lives here, at the bottom of the dependency graph, because the crate that
+/// takes the reading and the crate that turns it into a budget sit on opposite
+/// sides of `memory` -> `cuda` and neither may import the other (document 02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeasuredDevice {
+    /// The device's identity. Every decision and every record keys on this.
+    pub uuid: DeviceUuid,
+    /// The ordinal this reading was taken through, for reconciling a log with
+    /// `nvidia-smi`. Never an identity, never a map key.
+    pub ordinal_label: u32,
+    pub name: String,
+    /// `sm_86`, `sm_120`, ... A kernel dispatch key, not a marketing name.
+    pub sm: String,
+    pub pci_bus_id: String,
+    pub multiprocessor_count: u32,
+    /// Total device memory.
+    pub total_bytes: u64,
+    /// Free device memory at the moment of the reading, other processes
+    /// included.
+    pub free_bytes: u64,
+}
+
 /// A kernel's declared applicability. The planner matches against this rather
 /// than against a model name (document 02).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +138,7 @@ mod tests {
     fn dev(major: u32, minor: u32) -> DeviceCapability {
         DeviceCapability {
             ordinal: 0,
-            uuid: "GPU-test".into(),
+            uuid: DeviceUuid::from_bytes([0; 16]),
             name: "test".into(),
             compute_major: major,
             compute_minor: minor,

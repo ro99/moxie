@@ -14,10 +14,10 @@ use core::ffi::c_void;
 use std::ffi::CString;
 
 use moxie_cuda::{
-    DeviceBuffer, DeviceContext, Event, Module, ModuleImage, PtxSource, Stream, TrustedImage,
+    DeviceBuffer, Event, Module, ModuleImage, PtxSource, RankContext, Stream, TrustedImage,
     query_device,
 };
-use moxie_types::{DeviceCapability, Error};
+use moxie_types::{DeviceCapability, Error, RankId};
 
 /// Wrap the build's own fatbin as a trusted image.
 ///
@@ -63,6 +63,8 @@ const CASES: &[&str] = &[
     "arch_mismatch_is_typed",
     "stream_event_completion",
     "non_ptx_text_rejected",
+    "rank_context_is_exclusive",
+    "measurement_is_live",
 ];
 
 /// Run every GPU case on every visible device.
@@ -161,6 +163,12 @@ pub fn run(profile: Option<&str>) -> i32 {
         results.push(case(&cap, "arch_mismatch_is_typed", arch_mismatch(&cap)));
         results.push(case(&cap, "stream_event_completion", stream_event(&cap)));
         results.push(case(&cap, "non_ptx_text_rejected", ptx_rejection(&cap)));
+        results.push(case(
+            &cap,
+            "rank_context_is_exclusive",
+            rank_exclusivity(&cap),
+        ));
+        results.push(case(&cap, "measurement_is_live", measurement_is_live(&cap)));
     }
 
     println!("\n--- results ---");
@@ -247,7 +255,7 @@ fn case(cap: &DeviceCapability, name: &'static str, r: Result<Outcome, Error>) -
 /// Allocate, copy, launch, copy back, verify against a host oracle.
 fn axpy(cap: &DeviceCapability) -> Result<Outcome, Error> {
     const N: usize = 4096;
-    let ctx = DeviceContext::new(cap.ordinal)?;
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
     let module = Module::load(
         &ctx,
         ModuleImage::Binary(smoke_image(moxie_kernels::SMOKE_FATBIN)?),
@@ -315,7 +323,7 @@ fn bf16(cap: &DeviceCapability) -> Result<Outcome, Error> {
     ];
     let n = inputs.len();
 
-    let ctx = DeviceContext::new(cap.ordinal)?;
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
     let module = Module::load(
         &ctx,
         ModuleImage::Binary(smoke_image(moxie_kernels::SMOKE_FATBIN)?),
@@ -374,7 +382,7 @@ fn host_f32_to_bf16_bits(v: f32) -> u16 {
 
 /// Loading an image with no binary for this device must be a typed error.
 fn arch_mismatch(cap: &DeviceCapability) -> Result<Outcome, Error> {
-    let ctx = DeviceContext::new(cap.ordinal)?;
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
     let image = ModuleImage::Binary(smoke_image(moxie_kernels::SMOKE_FATBIN_SM86_ONLY)?);
     let r = Module::load(&ctx, image);
     let is_sm86 = cap.sm() == "sm_86";
@@ -413,7 +421,7 @@ fn arch_mismatch(cap: &DeviceCapability) -> Result<Outcome, Error> {
 /// measure overlap.
 fn stream_event(cap: &DeviceCapability) -> Result<Outcome, Error> {
     const N: usize = 1024;
-    let ctx = DeviceContext::new(cap.ordinal)?;
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
     let module = Module::load(
         &ctx,
         ModuleImage::Binary(smoke_image(moxie_kernels::SMOKE_FATBIN)?),
@@ -432,8 +440,8 @@ fn stream_event(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let mut dy = DeviceBuffer::alloc(&ctx, N * 4)?;
 
     start.record(&stream)?;
-    // SAFETY of both async copies: `x`, `y_in` and both device buffers are live
-    // until after `done.synchronize()` below, which is the completion the
+    // SAFETY: for both async copies, `x`, `y_in` and both device buffers are
+    // live until after `done.synchronize()` below, which is the completion the
     // contract requires. Nothing reads or moves them in between.
     unsafe {
         dx.copy_from_host_async(bytemuck_f32(&x), &stream)?;
@@ -450,10 +458,11 @@ fn stream_event(cap: &DeviceCapability) -> Result<Outcome, Error> {
         (&raw mut pa).cast(),
         (&raw mut pn).cast(),
     ];
-    // SAFETY: same signature match as `axpy`. This launch is on the default
-    // stream and blocks, which orders it after the stream work only because
-    // `stream.synchronize()` runs first.
+    // This launch is on the default stream and blocks, which orders it after the
+    // stream work only because the synchronise below runs first.
     stream.synchronize()?;
+    // SAFETY: same signature match as `axpy`, and the stream work above has
+    // completed, so nothing this launch touches is still in flight.
     unsafe {
         func.launch_blocking((N.div_ceil(256) as u32, 1, 1), (256, 1, 1), 0, &mut params)?;
     }
@@ -517,7 +526,7 @@ fn ptx_rejection(cap: &DeviceCapability) -> Result<Outcome, Error> {
     }
 
     // Half two: shaped like PTX, does not compile, must be typed.
-    let ctx = DeviceContext::new(cap.ordinal)?;
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
     let broken =
         CString::new(".version 8.0\n.target sm_86\n.address_size 64\nnot_an_instruction\n")
             .expect("no interior NUL");
@@ -554,4 +563,106 @@ fn bytemuck_u16_mut(v: &mut [u16]) -> &mut [u8] {
     unsafe {
         core::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), core::mem::size_of_val(v))
     }
+}
+
+/// One rank, one GPU, and the claim released when the context drops.
+///
+/// Document 01 asks for unsafe CUDA state to be isolated behind rank-owned
+/// contexts. A second context on one card is exactly the shared state that
+/// isolation removes, and the driver will happily hand one out, so this proves
+/// the engine refuses instead.
+fn rank_exclusivity(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    let held = RankContext::acquire(RankId(0), cap.ordinal)?;
+    if held.uuid() != cap.uuid {
+        return Err(Error::Numerical {
+            detail: format!("acquired {} while querying {}", held.uuid(), cap.uuid),
+        });
+    }
+
+    // A second rank cannot take a device that rank 0 holds.
+    match RankContext::acquire(RankId(1), cap.ordinal) {
+        Ok(_) => {
+            return Err(Error::Numerical {
+                detail: "a second rank acquired a device rank 0 already holds".into(),
+            });
+        }
+        Err(e) => {
+            let text = e.to_string();
+            if !text.contains(&cap.uuid.to_string()) || !text.contains("rank 0") {
+                return Err(Error::Numerical {
+                    detail: format!("refusal names neither the device nor the holder: {text}"),
+                });
+            }
+        }
+    }
+
+    // The refusal left the first context usable.
+    let (free, total) = held.memory_info()?;
+    if total == 0 || free > total {
+        return Err(Error::Numerical {
+            detail: format!("holder unusable after the refusal: {free} free of {total}"),
+        });
+    }
+
+    // Rank 0 already holds this device, so it may not take another one.
+    if moxie_cuda::device_count()? > 1 {
+        let other = (cap.ordinal + 1) % moxie_cuda::device_count()?;
+        if RankContext::acquire(RankId(0), other).is_ok() {
+            return Err(Error::Numerical {
+                detail: "one rank acquired two devices".into(),
+            });
+        }
+    }
+
+    // Dropping releases the claim, and a later rank takes the card.
+    drop(held);
+    let next = RankContext::acquire(RankId(7), cap.ordinal)?;
+    if next.rank() != RankId(7) || next.uuid() != cap.uuid {
+        return Err(Error::Numerical {
+            detail: "the released device came back as a different rank or device".into(),
+        });
+    }
+    Ok(Outcome::Passed)
+}
+
+/// A measurement is a reading, not a constant.
+///
+/// Allocating on the device must move `free_bytes`. If it does not, the number
+/// reaching the ledger is decoration, and every admission decision made from it
+/// would be fiction.
+fn measurement_is_live(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    const BYTES: usize = 64 * 1024 * 1024;
+    let ctx = RankContext::acquire(RankId(0), cap.ordinal)?;
+    let before = ctx.measure()?;
+    if before.uuid != cap.uuid || before.ordinal_label != cap.ordinal {
+        return Err(Error::Numerical {
+            detail: "the measurement does not identify the device it came from".into(),
+        });
+    }
+    if before.total_bytes == 0 || before.free_bytes > before.total_bytes {
+        return Err(Error::Numerical {
+            detail: format!(
+                "{} B free of {} B total",
+                before.free_bytes, before.total_bytes
+            ),
+        });
+    }
+
+    let buffer = DeviceBuffer::alloc(&ctx, BYTES)?;
+    let after = ctx.measure()?;
+    if after.total_bytes != before.total_bytes {
+        return Err(Error::Numerical {
+            detail: "total memory changed under an allocation".into(),
+        });
+    }
+    if after.free_bytes >= before.free_bytes {
+        return Err(Error::Numerical {
+            detail: format!(
+                "allocating {BYTES} B did not reduce free memory: {} then {}",
+                before.free_bytes, after.free_bytes
+            ),
+        });
+    }
+    drop(buffer);
+    Ok(Outcome::Passed)
 }

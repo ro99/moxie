@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use moxie_types::{Error, Result, Scope, Tier};
+use moxie_types::{Error, MeasuredDevice, Result, Scope, Tier};
 
 /// One scope's physical capacity and the headroom that must stay unspent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +51,54 @@ impl CapacitySnapshot {
             system_headroom_bytes,
             per_tier_cap: BTreeMap::new(),
         })
+    }
+
+    /// A snapshot for one device, from a reading the driver gave.
+    ///
+    /// ```text
+    /// physical_bytes  = total
+    /// system_headroom = (total - free) + extra_reserve
+    /// admissible      = free - extra_reserve
+    /// ```
+    ///
+    /// The headroom carries two different things on purpose. `total - free` is
+    /// what is *already gone* on this card -- this process's own context, and
+    /// anything another process holds. `extra_reserve_bytes` is what this engine
+    /// chooses to leave alone on top of that. Both must stay unspent, and only
+    /// the second is a decision.
+    ///
+    /// The result inherits the reading's nature: it is capacity at an instant,
+    /// not a promise. Another process can take memory a moment later, and this
+    /// snapshot will not know. Document 03's answer to that is a replan on a
+    /// memory-pressure event, which is M2's; here it is a documented limit.
+    pub fn measured(measurement: &MeasuredDevice, extra_reserve_bytes: u64) -> Result<Self> {
+        let bad = |detail: String| Error::InvalidRequest {
+            field: "measurement",
+            detail,
+        };
+        let taken = measurement
+            .total_bytes
+            .checked_sub(measurement.free_bytes)
+            .ok_or_else(|| {
+                bad(format!(
+                    "{}: {} B free of {} B total",
+                    measurement.uuid, measurement.free_bytes, measurement.total_bytes
+                ))
+            })?;
+        if extra_reserve_bytes > measurement.free_bytes {
+            return Err(bad(format!(
+                "{}: a {extra_reserve_bytes} B reserve does not fit {} B of free memory",
+                measurement.uuid, measurement.free_bytes
+            )));
+        }
+        let headroom = taken
+            .checked_add(extra_reserve_bytes)
+            .ok_or_else(|| bad(format!("{}: headroom overflows", measurement.uuid)))?;
+        CapacitySnapshot::new(
+            Scope::Device(measurement.uuid),
+            measurement.total_bytes,
+            headroom,
+        )
     }
 
     /// Cap one tier below what the scope alone would allow. Absent means the
@@ -116,6 +164,56 @@ mod tests {
                 .admissible_bytes(),
             600
         );
+    }
+
+    fn measurement(total: u64, free: u64) -> MeasuredDevice {
+        MeasuredDevice {
+            uuid: DeviceUuid::parse("GPU-00000000-0000-0000-0000-000000000001").unwrap(),
+            ordinal_label: 2,
+            name: "test device".into(),
+            sm: "sm_86".into(),
+            pci_bus_id: "0000:83:00.0".into(),
+            multiprocessor_count: 82,
+            total_bytes: total,
+            free_bytes: free,
+        }
+    }
+
+    #[test]
+    fn a_measured_snapshot_spends_free_memory_and_reserves_the_rest() {
+        let s = CapacitySnapshot::measured(&measurement(24_000, 20_000), 1_000).unwrap();
+        assert_eq!(s.physical_bytes(), 24_000);
+        // 4,000 B already gone on the card, plus the 1,000 B this engine leaves.
+        assert_eq!(s.system_headroom_bytes(), 5_000);
+        assert_eq!(s.admissible_bytes(), 19_000);
+        // Identity is the UUID; the ordinal the reading came through is not in
+        // the snapshot at all.
+        assert_eq!(s.scope(), Scope::Device(measurement(1, 1).uuid));
+    }
+
+    #[test]
+    fn a_reserve_larger_than_free_memory_is_refused() {
+        let e = CapacitySnapshot::measured(&measurement(24_000, 1_000), 2_000).unwrap_err();
+        assert_eq!(e.kind(), "invalid_request");
+        // Exactly all of it is legal, and leaves nothing to admit.
+        let s = CapacitySnapshot::measured(&measurement(24_000, 1_000), 1_000).unwrap();
+        assert_eq!(s.admissible_bytes(), 0);
+    }
+
+    #[test]
+    fn a_driver_reporting_more_free_than_total_is_an_error_not_a_wrap() {
+        let e = CapacitySnapshot::measured(&measurement(1_000, 2_000), 0).unwrap_err();
+        assert_eq!(e.kind(), "invalid_request");
+    }
+
+    #[test]
+    fn a_fully_occupied_device_measures_as_zero_rather_than_failing() {
+        // A card with nothing free is a legal snapshot that admits nothing. It
+        // is not an error: refusing to describe it would leave the ledger
+        // unable to say *why* a plan does not fit.
+        let s = CapacitySnapshot::measured(&measurement(24_000, 0), 0).unwrap();
+        assert_eq!(s.admissible_bytes(), 0);
+        assert_eq!(s.system_headroom_bytes(), 24_000);
     }
 
     #[test]

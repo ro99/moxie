@@ -155,4 +155,103 @@ GPU".
 
 ## Result, filled after work
 
-To be filled in after implementation, keeping passed, failed and skipped separate.
+Implemented 2026-09-08 on branch `main`, on top of the contract commit `689f58f`.
+The contract above is unchanged; only this section is filled in.
+
+What was built:
+
+- `moxie-types`: `MeasuredDevice` (uuid, ordinal *label*, name, sm, bus id, SM
+  count, total and free bytes) and `DeviceCapability::uuid` typed as
+  `DeviceUuid`. The descriptor sits at the bottom of the graph because the crate
+  that takes the reading and the crate that turns it into a budget are on
+  opposite sides of `memory` -> `cuda`.
+- `moxie-cuda`: `RankContext` replaces `DeviceContext`. `acquire(rank, ordinal)`
+  registers the claim in a process-wide map keyed by `DeviceUuid`, refuses a
+  device another rank holds and a second device for a rank that has one, and
+  releases the claim on drop. A failed attach removes the claim rather than
+  stranding the card. `measure()` reads through the live context.
+- `moxie-memory`: `CapacitySnapshot::measured`, pure and host-tested. The
+  headroom carries what is already gone on the card *and* what this engine
+  chooses to leave alone, and says which is which.
+- `xtask capacity`: the composition root. It measures every visible device,
+  builds a ledger from the measurements, admits a declared plan against each
+  device, prints the breakdown, releases, and fails if a byte is still held.
+- Deletion done: `format_uuid` no longer exists. `DeviceUuid`'s `Display` and
+  `parse` are the only way a device identity is written; the published byte
+  vector moved to `moxie-cuda::status`'s tests, next to the code that receives
+  those bytes from the driver.
+
+Measured on this machine (readings, not reservations, and not performance):
+
+| Device | UUID | total | free | admissible after a 64 MiB reserve |
+|---|---|---|---|---|
+| RTX 5060 Ti, `sm_120`, ordinal 0 | `GPU-97fe4889-...-2e72c4a3` | 15,886 MiB | 15,747 MiB | 15,683 MiB |
+| RTX 3090, `sm_86`, ordinal 1 | `GPU-3032cfa3-...-4911e0b9` | 24,123 MiB | 23,858 MiB | 23,794 MiB |
+| RTX 3090, `sm_86`, ordinal 2 | `GPU-81fe4578-...-dac78704` | 24,123 MiB | 23,858 MiB | 23,794 MiB |
+
+Each admitted a 3,920 MiB weights + 1,960 MiB KV plan and released it in full.
+
+Deviations recorded, none silent:
+
+- The 64 MiB engine reserve in `xtask capacity` is a **placeholder constant**,
+  named `ENGINE_RESERVE_BYTES` and documented as one. Document 03 requires the
+  legacy 48 MiB and two-largest-linears constants to become derived
+  reservations, and this is neither: it exists so the command demonstrates a
+  non-zero engine reserve reaching the ledger. Nothing in a production crate
+  contains it.
+- One **pre-existing defect found and fixed**: the device lane had never been run
+  under `clippy -D warnings`, and two `unsafe` blocks in `xtask/src/gpu.rs`
+  failed `undocumented_unsafe_blocks` -- one comment said "SAFETY of both async
+  copies" without the colon the lint looks for, and one had a statement between
+  the comment and its block. Both are in this task's allowed files. Confirmed
+  pre-existing by running the lint at `4bbe659` before any change: two findings,
+  the same two. The device lane is now clippy-clean and should stay in the gate
+  list.
+- `xtask` gains `moxie-memory` as a dependency, which the arch-check allowlist
+  now permits for `xtask` only. A new rejecting fixture proves the same edge is
+  refused for `moxie-cuda`.
+
+Gates (this machine, 2026-09-08):
+
+| Lane | Result |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | PASS |
+| the same clippy **with the device features** | PASS (new to the gate list; it had never been run) |
+| `cargo test --workspace --locked --offline` | PASS, 464 unit/integration + 6 doctests (was 460 + 6) |
+| `cargo xtask arch-check` | PASS, 46 rejected + 12 accepted fixtures, 10 rules |
+| `cargo xtask spec-check` | PASS, 10 documents |
+| no-driver host lane | PASS, 464 + 6; `ldd target/debug/xtask` shows no `libcuda` |
+| device lane, `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | PASS, 472 + 8 |
+| `cargo xtask-cuda test-gpu` | PASS, **21 cases** (7 per device, up from 5), `sm_86` and `sm_120` qualified |
+| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, `UNQUALIFIED sm_120`, as intended |
+| `cargo xtask-cuda capacity` | PASS, 3 devices measured and admitted against |
+| `CUDA_VISIBLE_DEVICES=2,1,0 cargo xtask-cuda capacity` | PASS, and each UUID kept its own memory total |
+
+Nothing failed. Nothing was skipped.
+
+The reordering result is the one worth reading twice. With the visible set
+reversed, ordinal 0 is `GPU-81fe4578` at 24,123 MiB and ordinal 2 is the 5060 Ti
+at 15,886 MiB -- the ordinals moved and no capacity moved with them. That is
+AGENTS.md's warning turned into a passing case rather than a comment.
+
+The two new device cases:
+
+- `rank_context_is_exclusive`: a second rank is refused a held device and the
+  refusal names both the device and the holder; the holder is still usable
+  afterwards; one rank cannot take a second device; dropping releases the claim
+  and rank 7 acquires the same card.
+- `measurement_is_live`: allocating 64 MiB on the device makes the next reading
+  report less free memory, and total memory does not move. Without this, the
+  number reaching the ledger could be a constant and every admission decision
+  made from it would be fiction.
+
+No checkpoint was read, downloaded or converted. Nothing was allocated through
+the ledger, and no performance number was produced: every figure here is a byte
+count of capacity. The stop condition was not triggered.
+
+Remaining blockers and next bounded task: **host capacity is still unmeasured**,
+and which component may read `/proc/meminfo` is the open ownership question that
+task's contract has to answer first. After it, M1.3 continues with event-backed
+leases and the basic allocator -- the first things that will charge real bytes to
+this ledger.

@@ -196,6 +196,7 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                     "moxie-interp",
                     "moxie-oracles",
                     "moxie-state",
+                    "moxie-memory",
                     "moxie-storage",
                     "moxie-cuda",
                     "moxie-kernels",

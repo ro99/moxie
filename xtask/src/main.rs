@@ -18,6 +18,8 @@
 
 mod archcheck;
 #[cfg(feature = "cuda")]
+mod capacity;
+#[cfg(feature = "cuda")]
 mod gpu;
 #[cfg(feature = "cuda")]
 mod probe;
@@ -37,6 +39,8 @@ Device lane (needs `cargo xtask-cuda`):
                           Real CUDA launches on every visible device; a required
                           architecture with no passing case fails the gate
   probe [--out <path>]    Hardware/topology inventory; writes markdown when --out given
+  capacity                Measure every device and admit a plan against the ledger;
+                          allocates nothing
 
 Not yet implemented; they land with the milestone that defines them:
   test-topology           M5   TP/PP/expert transport, failure and cancellation
@@ -87,9 +91,11 @@ fn main() -> std::process::ExitCode {
         "test-gpu" => gpu::run(flag("--profile")),
         #[cfg(feature = "cuda")]
         "probe" => probe::run(flag("--out")),
+        #[cfg(feature = "cuda")]
+        "capacity" => capacity::run(),
 
         #[cfg(not(feature = "cuda"))]
-        "test-gpu" | "probe" => device_command_unavailable(cmd),
+        "test-gpu" | "probe" | "capacity" => device_command_unavailable(cmd),
 
         "index" | "help" | "-h" | "--help" => {
             print!("{USAGE}");

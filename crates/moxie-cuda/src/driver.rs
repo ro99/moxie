@@ -13,12 +13,14 @@
 //!   freeing memory that an in-flight copy may still be reading.
 
 use core::ffi::{CStr, c_char, c_int, c_uint, c_void};
+use std::collections::BTreeMap;
 use std::ffi::CString;
+use std::sync::{LazyLock, Mutex};
 
-use moxie_types::{DeviceCapability, Error, Result};
+use moxie_types::{DeviceCapability, DeviceUuid, Error, MeasuredDevice, RankId, Result};
 
 use crate::ffi;
-use crate::status::{classify, format_uuid};
+use crate::status::classify;
 
 /// Attach the driver's own message to a failing code, then classify by code.
 fn check(code: ffi::CUresult, context: &str) -> Result<()> {
@@ -109,7 +111,7 @@ pub fn query_device(ordinal: u32) -> Result<DeviceCapability> {
     for (dst, src) in uuid_bytes.iter_mut().zip(uuid.bytes.iter()) {
         *dst = *src as u8;
     }
-    let uuid = format_uuid(&uuid_bytes);
+    let uuid = DeviceUuid::from_bytes(uuid_bytes);
 
     let mut bus_buf = [0 as c_char; 32];
     check(
@@ -162,25 +164,96 @@ pub fn query_device(ordinal: u32) -> Result<DeviceCapability> {
     })
 }
 
-/// A rank-owned device context.
+/// A rank-owned device context: one rank, one GPU, one context.
 ///
 /// Document 01: "Local single-process control with one rank execution thread per
 /// GPU is the initial topology. Isolate unsafe CUDA state behind rank-owned
-/// contexts." Holding this type is what makes a device current for the thread.
+/// contexts." Isolation is the point, so the pairing is enforced rather than
+/// assumed. A second context for a device another rank holds is refused and
+/// names the holder; so is a second device for a rank that already has one. The
+/// claim is released when the context drops, so a later rank can take the card.
+///
+/// The context stays on the thread that acquired it -- it is `!Send` and
+/// `!Sync`, and that is deliberate rather than incidental:
+///
+/// ```compile_fail
+/// use moxie_cuda::RankContext;
+/// use moxie_types::RankId;
+/// let ctx = RankContext::acquire(RankId(0), 0).unwrap();
+/// std::thread::spawn(move || {
+///     // A context made current on one thread, used from another.
+///     let _ = ctx.make_current();
+/// });
+/// ```
 #[derive(Debug)]
-pub struct DeviceContext {
+pub struct RankContext {
     device: ffi::CUdevice,
     ctx: ffi::CUcontext,
-    ordinal: u32,
+    rank: RankId,
+    capability: DeviceCapability,
 }
 
-impl DeviceContext {
-    pub fn new(ordinal: u32) -> Result<Self> {
+/// Which rank holds which device, process-wide.
+///
+/// A registry rather than a convention: two contexts on one card is exactly the
+/// shared mutable CUDA state that rank ownership exists to remove, and nothing
+/// in the driver prevents it.
+fn claims() -> std::sync::MutexGuard<'static, BTreeMap<DeviceUuid, RankId>> {
+    static CLAIMS: LazyLock<Mutex<BTreeMap<DeviceUuid, RankId>>> =
+        LazyLock::new(|| Mutex::new(BTreeMap::new()));
+    // A poisoned registry still describes which devices are held. Refusing to
+    // read it would strand every card in the process.
+    CLAIMS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl RankContext {
+    /// Acquire `ordinal`'s context for `rank`.
+    ///
+    /// The ordinal selects the card; everything afterwards identifies it by
+    /// UUID. Under a different `CUDA_VISIBLE_DEVICES` the same ordinal is a
+    /// different device, and this is the last place in the engine where that
+    /// matters (AGENTS.md).
+    pub fn acquire(rank: RankId, ordinal: u32) -> Result<Self> {
         init()?;
+        let capability = query_device(ordinal)?;
+        let uuid = capability.uuid;
+
+        {
+            let mut held = claims();
+            if let Some(holder) = held.get(&uuid) {
+                return Err(Error::Unsupported {
+                    capability: "rank_context",
+                    reason: format!("{uuid} is already held by rank {}", holder.get()),
+                });
+            }
+            if let Some((other, _)) = held.iter().find(|(_, r)| **r == rank) {
+                return Err(Error::Unsupported {
+                    capability: "rank_context",
+                    reason: format!(
+                        "rank {} already holds {other}; one rank owns one device",
+                        rank.get()
+                    ),
+                });
+            }
+            held.insert(uuid, rank);
+        }
+
+        match Self::attach(rank, capability) {
+            Ok(ctx) => Ok(ctx),
+            Err(e) => {
+                // The claim must not outlive a failed attach, or the card is
+                // stranded for the life of the process.
+                claims().remove(&uuid);
+                Err(e)
+            }
+        }
+    }
+
+    fn attach(rank: RankId, capability: DeviceCapability) -> Result<Self> {
         let mut device: ffi::CUdevice = 0;
         check(
             // SAFETY: valid out-parameter; the driver validates the ordinal.
-            unsafe { ffi::cuDeviceGet(&mut device, ordinal as c_int) },
+            unsafe { ffi::cuDeviceGet(&mut device, capability.ordinal as c_int) },
             "cuDeviceGet",
         )?;
         let mut ctx: ffi::CUcontext = core::ptr::null_mut();
@@ -208,12 +281,27 @@ impl DeviceContext {
         Ok(Self {
             device,
             ctx,
-            ordinal,
+            rank,
+            capability,
         })
     }
 
+    pub fn rank(&self) -> RankId {
+        self.rank
+    }
+
+    /// The device's identity. What every plan, record and map key uses.
+    pub fn uuid(&self) -> DeviceUuid {
+        self.capability.uuid
+    }
+
+    pub fn capability(&self) -> &DeviceCapability {
+        &self.capability
+    }
+
+    /// Diagnostic only, for reconciling a log with `nvidia-smi`.
     pub fn ordinal(&self) -> u32 {
-        self.ordinal
+        self.capability.ordinal
     }
 
     /// The raw context handle, for sibling types in this crate that must make
@@ -248,6 +336,29 @@ impl DeviceContext {
         Ok((free as u64, total as u64))
     }
 
+    /// One reading of this device's capacity, for the resource ledger.
+    ///
+    /// Taken **through the live context**, so what the context itself costs is
+    /// already gone from `free_bytes`. A reading taken before the context
+    /// existed would over-promise by exactly that much.
+    ///
+    /// It is a reading and not a reservation: another process can take memory a
+    /// moment later, and re-measuring may return something different. Nothing
+    /// downstream may treat one reading as a property of the card.
+    pub fn measure(&self) -> Result<MeasuredDevice> {
+        let (free_bytes, total_bytes) = self.memory_info()?;
+        Ok(MeasuredDevice {
+            uuid: self.capability.uuid,
+            ordinal_label: self.capability.ordinal,
+            name: self.capability.name.clone(),
+            sm: self.capability.sm(),
+            pci_bus_id: self.capability.pci_bus_id.clone(),
+            multiprocessor_count: self.capability.multiprocessor_count,
+            total_bytes,
+            free_bytes,
+        })
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         self.make_current()?;
         check(
@@ -258,10 +369,12 @@ impl DeviceContext {
     }
 }
 
-impl Drop for DeviceContext {
+impl Drop for RankContext {
     fn drop(&mut self) {
-        // SAFETY: releases exactly the primary-context reference taken in `new`.
-        // Errors during teardown are not actionable and must not panic.
+        claims().remove(&self.capability.uuid);
+        // SAFETY: releases exactly the primary-context reference taken in
+        // `attach`. Errors during teardown are not actionable and must not
+        // panic.
         unsafe {
             let _ = ffi::cuDevicePrimaryCtxRelease_v2(self.device);
         }
@@ -277,11 +390,11 @@ impl Drop for DeviceContext {
 #[derive(Debug)]
 pub struct Stream<'ctx> {
     stream: ffi::CUstream,
-    ctx: &'ctx DeviceContext,
+    ctx: &'ctx RankContext,
 }
 
 impl<'ctx> Stream<'ctx> {
-    pub fn new(ctx: &'ctx DeviceContext) -> Result<Self> {
+    pub fn new(ctx: &'ctx RankContext) -> Result<Self> {
         ctx.make_current()?;
         let mut stream: ffi::CUstream = core::ptr::null_mut();
         check(
@@ -327,11 +440,11 @@ impl Drop for Stream<'_> {
 #[derive(Debug)]
 pub struct Event<'ctx> {
     event: ffi::CUevent,
-    ctx: &'ctx DeviceContext,
+    ctx: &'ctx RankContext,
 }
 
 impl<'ctx> Event<'ctx> {
-    pub fn new(ctx: &'ctx DeviceContext) -> Result<Self> {
+    pub fn new(ctx: &'ctx RankContext) -> Result<Self> {
         ctx.make_current()?;
         let mut event: ffi::CUevent = core::ptr::null_mut();
         check(
@@ -413,9 +526,9 @@ impl Drop for Event<'_> {
 /// A buffer cannot outlive the context that owns it. The compiler enforces it:
 ///
 /// ```compile_fail
-/// use moxie_cuda::{DeviceBuffer, DeviceContext};
+/// use moxie_cuda::{DeviceBuffer, RankContext};
 /// let escaped = {
-///     let ctx = DeviceContext::new(0).unwrap();
+///     let ctx = RankContext::new(0).unwrap();
 ///     DeviceBuffer::alloc(&ctx, 16).unwrap()
 /// }; // `ctx` dropped here, releasing the primary context
 /// drop(escaped); // would free into a released context
@@ -431,11 +544,11 @@ pub struct DeviceBuffer<'ctx> {
     /// `cuDevicePrimaryCtxRelease`, and `Drop` would synchronise whatever
     /// context happened to be current on the dropping thread -- protecting the
     /// wrong stream while freeing into the wrong context.
-    ctx: &'ctx DeviceContext,
+    ctx: &'ctx RankContext,
 }
 
 impl<'ctx> DeviceBuffer<'ctx> {
-    pub fn alloc(ctx: &'ctx DeviceContext, len: usize) -> Result<Self> {
+    pub fn alloc(ctx: &'ctx RankContext, len: usize) -> Result<Self> {
         ctx.make_current()?;
         if len == 0 {
             return Ok(Self {
@@ -749,7 +862,7 @@ pub struct Module<'ctx> {
     module: ffi::CUmodule,
     /// The context that owns this module, for the same reason as
     /// `DeviceBuffer::ctx`.
-    ctx: &'ctx DeviceContext,
+    ctx: &'ctx RankContext,
 }
 
 impl<'ctx> Module<'ctx> {
@@ -758,7 +871,7 @@ impl<'ctx> Module<'ctx> {
     /// A fatbin with no binary for the current device fails here with
     /// `UnsupportedKernel`, which is the behaviour M0 asserts: an architecture
     /// we did not compile for must be an error, never a silent no-op.
-    pub fn load(ctx: &'ctx DeviceContext, image: ModuleImage<'_>) -> Result<Self> {
+    pub fn load(ctx: &'ctx RankContext, image: ModuleImage<'_>) -> Result<Self> {
         let ptr = match image {
             ModuleImage::Binary(b) => b.as_ptr(),
             ModuleImage::Ptx(p) => p.as_ptr(),
@@ -778,7 +891,7 @@ impl<'ctx> Module<'ctx> {
     /// NUL-terminated PTX, and must remain valid for the duration of the call.
     /// The driver receives no length and will read as far as the image's own
     /// headers direct.
-    pub unsafe fn load_raw(ctx: &'ctx DeviceContext, image: *const c_void) -> Result<Self> {
+    pub unsafe fn load_raw(ctx: &'ctx RankContext, image: *const c_void) -> Result<Self> {
         ctx.make_current()?;
         let mut module: ffi::CUmodule = core::ptr::null_mut();
         check(
@@ -831,7 +944,7 @@ pub struct Function<'m> {
     func: ffi::CUfunction,
     /// Borrowed from the owning `Module`, which borrows it from the context.
     /// A `Function` therefore cannot outlive either.
-    ctx: &'m DeviceContext,
+    ctx: &'m RankContext,
 }
 
 impl Function<'_> {

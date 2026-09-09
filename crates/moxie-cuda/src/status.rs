@@ -70,33 +70,6 @@ pub fn classify(code: CUresult, detail: String) -> Result<()> {
     }
 }
 
-/// Format a device UUID as the canonical `GPU-...` string.
-///
-/// Pure, and tested without a device: the driver hands back sixteen raw bytes
-/// and the grouping below is ours, so a transposition here would silently
-/// rename every GPU in every evidence record.
-pub fn format_uuid(b: &[u8; 16]) -> String {
-    format!(
-        "GPU-{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0],
-        b[1],
-        b[2],
-        b[3],
-        b[4],
-        b[5],
-        b[6],
-        b[7],
-        b[8],
-        b[9],
-        b[10],
-        b[11],
-        b[12],
-        b[13],
-        b[14],
-        b[15]
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,14 +170,20 @@ mod tests {
     }
 
     #[test]
-    fn uuid_formats_as_the_canonical_gpu_string() {
+    fn the_drivers_bytes_map_to_the_canonical_gpu_string() {
+        // The driver hands back sixteen raw bytes and the grouping is ours, so
+        // a transposition would silently rename every GPU in every evidence
+        // record. The grouping now lives on `DeviceUuid`; this keeps the
+        // published vector next to the code that receives those bytes.
         let bytes = [
             0x97u8, 0xfe, 0x48, 0x89, 0x48, 0x74, 0xa3, 0x78, 0x19, 0x8e, 0x95, 0x5d, 0x2e, 0x72,
             0xc3, 0xa3,
         ];
+        let uuid = moxie_types::DeviceUuid::from_bytes(bytes);
+        assert_eq!(uuid.to_string(), "GPU-97fe4889-4874-a378-198e-955d2e72c3a3");
         assert_eq!(
-            format_uuid(&bytes),
-            "GPU-97fe4889-4874-a378-198e-955d2e72c3a3"
+            moxie_types::DeviceUuid::parse(&uuid.to_string()).unwrap(),
+            uuid
         );
     }
 }

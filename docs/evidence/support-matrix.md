@@ -16,13 +16,15 @@ matrix exists to prevent.
 |---|---|---|---|
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
-| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 460 unit/integration tests + 6 doctests |
+| `G-DEVICE-CLIPPY` | the same with `--features moxie-cuda/driver,moxie-kernels/fatbin,xtask/cuda` | device build | passed; **new at [task 0007](../tasks/0007-m1-rank-context-and-measured-capacity.md)**, which found and fixed two pre-existing `undocumented_unsafe_blocks` findings the lane had never been run against |
+| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 464 unit/integration tests + 6 doctests |
 | `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 45 negative + 12 positive fixtures, 10 rules; 343 generated module combinations checked against rustc by the host suite, each against all four crate boundaries |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
-| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 460 unit/integration tests + 6 doctests, `ldd` shows no `libcuda` |
+| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH` | host | passed, 464 unit/integration tests + 6 doctests, `ldd` shows no `libcuda` |
+| `G-GPU-CAPACITY` | `cargo xtask-cuda capacity` | device | passed, 3 devices measured and admitted against; also passed with `CUDA_VISIBLE_DEVICES` reversed, each UUID keeping its own memory total |
 | `G-GPU-SM86` | `cargo xtask-cuda test-gpu --profile sm86` | device | passed, RTX 3090 x2 |
 | `G-GPU-SM120` | `cargo xtask-cuda test-gpu --profile sm120` | device | passed, RTX 5060 Ti |
-| `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 15 cases, both architectures qualified |
+| `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 21 cases, both architectures qualified |
 | `G-INTERP-BF16` | `cargo test -p moxie-interp` | host | passed, 19 unit + 27 acceptance tests + 3 compile-fail doctests ([task 0003](../tasks/0003-m1-bf16-reference-interpreter.md), [task 0004](../tasks/0004-m1-state-transactions.md)) |
 | `G-TOPOLOGY` | `cargo xtask test-topology` | device | **not implemented** (M5) |
 | `G-QUALITY` | `cargo xtask quality` | device | **not implemented** (M3) |
@@ -30,12 +32,10 @@ matrix exists to prevent.
 
 Device gates ran by hand on this machine. No CI runner executes them; see
 [toolchain.md](toolchain.md).
-Device results were remeasured at task 0006's implementation commit `a486930`, because it changed
-the tier field of the typed capacity error that `moxie-cuda`'s status mapping constructs. The two
-review-correction rounds after it are carried forward: they changed `moxie-types`'s UUID parser,
-`moxie-memory` and documentation only, and no device code, kernel or FFI path.
+Device results were remeasured in full at [task 0007](../tasks/0007-m1-rank-context-and-measured-capacity.md),
+which changed the context type every device case uses.
 
-Counts are from 2026-09-08 after [task 0006](../tasks/0006-m1-resource-ledger-and-admission.md); the M0
+Counts are from 2026-09-08 after [task 0007](../tasks/0007-m1-rank-context-and-measured-capacity.md); the M0
 enforcement counts they grew from are in
 [task 0002](../tasks/0002-m0-review-and-integer-transition.md#fourth-review-corrections-2026-09-07).
 
@@ -59,6 +59,7 @@ enforcement counts they grew from are in
 | none | n/a | n/a | Transactional publication of a step | passed | `G-INTERP-BF16` (`moxie-state` `begin`/`commit_prefix`/`abort`, `a_step_cancelled_at_any_publication_boundary_aborts_to_exactly_where_it_started`) | Host reference only. A step's sequence-state and KV mutations commit together or restore exactly, and a transaction is append-only on both. `fork` is still identity-only (COW is M4), and **appendable paged state remains an outstanding M1.4 requirement**. |
 | none | n/a | n/a | Canonical manifest v1 + bounded tensor reads | passed | `G-HOST-TEST` (`moxie-format::manifest` 31 rejection/limit/collision tests, `moxie-storage` 15 artifact + 8 pump tests), `G-HOST-ARCH` (format/storage boundary + include/module rules with fixtures, incl. positive layouts) | Host-only. Opens, validates and reads test-generated BF16 artifacts within a byte budget; chunk files are opened once and read position-independently, and the success path holds zero live heap on short and long paths alike (counting-allocator gate). **No checkpoint has been read, downloaded or converted, and nothing here loads a model:** `moxie-interp` is not rewired to disk, affine tensors refuse with M3, and `partial` refuses every read. |
 | none | n/a | n/a | Resource ledger, admission and refusal | passed | `G-HOST-TEST` (`moxie-memory` 42 acceptance + 8 unit tests + 2 compile-fail doctests; `moxie-types::tier` and `::ids` exhaustiveness, identity and malformed-input tests), `G-HOST-ARCH` (memory/filesystem and memory/model-name boundary rules, each with a rejecting fixture and a clean accepted one) | Host-only integer accounting over byte counts the caller declares. **It allocates nothing, maps nothing, measures nothing, and names no model.** Capacity comes in as a snapshot measured elsewhere; admission reserves the peak overlapping live set atomically, or refuses with a per-tier breakdown and only the alternatives a recomputation shows could actually move a constraint that failed -- it never shrinks a request. A mapping's resident pages are charged against the host budget; only its virtual extent is reported uncharged. No device or host memory has been allocated anywhere in this repository, and no capacity figure here came from real hardware. |
+| none | sm_86 x2, sm_120 | n/a | Measured device capacity, and rank-owned contexts | passed | `G-GPU-CAPACITY`, `G-GPU-ALL` (`rank_context_is_exclusive`, `measurement_is_live`), `G-HOST-TEST` (`moxie-memory::snapshot::measured` rules on synthetic readings), `G-HOST-ARCH` (a `moxie-cuda` -> `moxie-memory` dependency is refused) | One rank owns one GPU, and a device's free/total memory reaches the ledger as a `CapacitySnapshot` keyed by UUID. **Nothing is allocated through it.** A measurement is a reading at one instant, not a reservation: another process can take memory a moment later and the snapshot will not know. **Host capacity is still unmeasured** -- the host snapshot is caller-supplied, and which component may read `/proc/meminfo` is an open ownership question. The figures are byte counts of capacity and are not performance results (O6 untouched). |
 | none | n/a | n/a | Prefix reuse / continuation / cancellation | **not implemented** | `G-HOST-TEST` (`moxie-state`) covers frontier, result-identity and restore-evidence rules only | M4. Counters, retained-result identity and prefix lineage are typed and tested; there is no cache to reuse, and document 04's token-content prefix key is a separate identity that is **not** implemented. |
 | none | n/a | n/a | Common sampler pipeline | **partial, not integrated** | `G-HOST-TEST` (`moxie-oracles::sampler`) | Legality mask, top-k, top-p, min-p, temperature, tie rule, extreme-temperature stability and typed failures only. Penalties, DRY, n-gram ban, logit bias, typical-p and XTC are **not implemented**. |
 | none | n/a | n/a | Future entropy | **not implemented** | — | M10. Document 05 defines it; nothing here evaluates it. |
@@ -75,9 +76,11 @@ enforcement counts they grew from are in
   uninspected at the byte level.
 - A passing GPU gate means the toolchain compiles, launches and reports errors correctly on both
   architectures. It is a probe. It qualifies no operation kernel, because none exists.
+- A passing capacity gate means three GPUs answered a question about themselves and the ledger
+  admitted a plan against the answer. It is not evidence that a byte was allocated on any of them,
+  that a plan was executed, or that the free-memory figure will still hold a second later.
 - A passing ledger gate means the accounting arithmetic and the refusal rules are right for byte
-  counts a test declared. It is not evidence that a byte was allocated, that any capacity number
-  matches this machine, or that a plan exists to admit. The measuring half of admission -- asking a
-  device or the host what it actually has -- is not implemented.
+  counts a test or a driver supplied. It is not evidence that a byte was allocated or that a plan exists to
+  execute. Device capacity is measured as of task 0007; **host capacity is not**.
 - `G-HOST-NODRIVER` means host CI can run anywhere. It is not evidence about any device, and
   document 07 forbids reading it as such.

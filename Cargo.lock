@@ -240,6 +240,7 @@ dependencies = [
  "moxie-cuda",
  "moxie-format",
  "moxie-kernels",
+ "moxie-memory",
  "moxie-types",
  "proc-macro2",
  "quote",
