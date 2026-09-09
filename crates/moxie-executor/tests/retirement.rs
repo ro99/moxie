@@ -1,10 +1,10 @@
-//! Retirement rules over an injected completion source.
+//! Retirement rules over injected completion sources.
 //!
 //! Every transition the contract promises, with no GPU present: the driver
 //! event is one implementation of `Completion`, and the machine cannot tell it
-//! from the manual source used here.
+//! from the doubles used here.
 
-use moxie_executor::{Lease, LeaseState, ManualCompletion, Turn};
+use moxie_executor::{Lease, LeaseState, ManualCompletion, Script, ScriptedCompletion, Turn};
 use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, Reservation, StageSpan};
 use moxie_types::{HostTier, Scope, Tier};
 
@@ -25,21 +25,58 @@ fn admit(ledger: &mut Ledger, label: &str, bytes: u64) -> Reservation {
     ledger.admit(&req).unwrap()
 }
 
-fn lease(ledger: &mut Ledger, label: &str) -> (Lease, ManualCompletion) {
+fn tracked_lease(ledger: &mut Ledger, label: &str) -> (Lease, ManualCompletion) {
     let reservation = admit(ledger, label, 1 << 20);
+    let lease = Lease::<ManualCompletion>::acquire(ledger, reservation, label).unwrap();
     let completion = ManualCompletion::new();
-    let mut lease = Lease::<ManualCompletion>::acquire(reservation, label).unwrap();
-    lease.track(completion.clone()).unwrap();
+    let mut lease = lease;
+    lease.track_manual(completion.clone()).unwrap();
     (lease, completion)
 }
+
 fn outstanding_ids(ledger: &Ledger) -> Vec<moxie_memory::ReservationId> {
     ledger.outstanding().iter().map(|o| o.id).collect()
 }
 
 #[test]
-fn acquire_use_retire_releases_both_sides() {
+fn acquire_binds_the_admitted_scope_and_bytes() {
     let mut ledger = host_ledger();
-    let (lease, completion) = lease(&mut ledger, "upload");
+    let reservation = admit(&mut ledger, "bound", 1 << 20);
+    let lease = Lease::<ManualCompletion>::acquire(&ledger, reservation, "bound").unwrap();
+    assert_eq!(lease.admitted(), &[(Scope::Host, 1 << 20)]);
+    assert_eq!(lease.admitted_bytes(), 1 << 20);
+}
+
+#[test]
+fn acquire_refuses_an_empty_label_and_returns_the_reservation() {
+    let mut ledger = host_ledger();
+    let reservation = admit(&mut ledger, "labelled", 1 << 20);
+    let rid = reservation.id();
+    let refused = Lease::<ManualCompletion>::acquire(&ledger, reservation, "").unwrap_err();
+    assert_eq!(refused.error.kind(), "invalid_request");
+    // The reservation comes back usable: the refusal stranded nothing.
+    let lease =
+        Lease::<ManualCompletion>::acquire(&ledger, refused.reservation, "labelled").unwrap();
+    assert_eq!(lease.reservation_id(), Some(rid));
+}
+
+#[test]
+fn acquire_refuses_a_reservation_from_another_ledger() {
+    let mut ledger = host_ledger();
+    let other = host_ledger();
+    let reservation = admit(&mut ledger, "foreign", 1 << 20);
+    let refused = Lease::<ManualCompletion>::acquire(&other, reservation, "foreign").unwrap_err();
+    assert!(refused.error.to_string().contains("not outstanding"));
+    // Still charged where it belongs, untouched elsewhere — and reusable.
+    assert_eq!(outstanding_ids(&ledger).len(), 1);
+    assert!(outstanding_ids(&other).is_empty());
+    let _reacquired = Lease::<ManualCompletion>::acquire(&ledger, refused.reservation, "foreign");
+}
+
+#[test]
+fn acquire_use_retire_releases_both_sides_and_returns_the_resource() {
+    let mut ledger = host_ledger();
+    let (lease, completion) = tracked_lease(&mut ledger, "upload");
     assert_eq!(lease.state(), LeaseState::InFlight);
     let id = lease.id();
     let rid = lease.reservation_id().unwrap();
@@ -50,9 +87,39 @@ fn acquire_use_retire_releases_both_sides() {
     assert_eq!(refused.error.kind(), "invalid_request");
     assert!(refused.error.to_string().contains("not observed"));
 
-    // Observed complete: both sides release.
+    // Observed complete: both sides release, resource returned.
     completion.complete();
-    assert_eq!(refused.lease.retire(&mut ledger).unwrap(), id);
+    let (retired, ()) = refused.lease.retire(&mut ledger).unwrap();
+    assert_eq!(retired, id);
+    assert!(ledger.outstanding().is_empty());
+}
+
+#[test]
+fn a_retained_source_comes_back_only_at_retirement() {
+    let mut ledger = host_ledger();
+    let reservation = admit(&mut ledger, "src", 1 << 20);
+    let lease = Lease::<ManualCompletion>::acquire(&ledger, reservation, "src").unwrap();
+    let completion = ManualCompletion::new();
+    let mut lease = lease.retain(vec![7u8; 8]);
+    lease.track_manual(completion.clone()).unwrap();
+    // From here the caller names no source: it moved. Retirement returns it.
+    completion.complete();
+    let (_, src) = lease.retire(&mut ledger).unwrap();
+    assert_eq!(src, vec![7u8; 8]);
+}
+
+#[test]
+fn a_refused_lease_stays_usable() {
+    // The bite check: retire without querying completion must fail this test.
+    // Deleting the event query turns the refusal below into a release.
+    let mut ledger = host_ledger();
+    let (lease, completion) = tracked_lease(&mut ledger, "use");
+    let id = lease.id();
+    let refused = lease.retire(&mut ledger).unwrap_err();
+    assert_eq!(refused.lease.id(), id);
+    assert_eq!(refused.lease.state(), LeaseState::InFlight);
+    completion.complete();
+    assert_eq!(refused.lease.retire(&mut ledger).unwrap().0, id);
     assert!(ledger.outstanding().is_empty());
 }
 
@@ -62,9 +129,9 @@ fn synchronize_is_an_explicit_wait_not_a_backdoor() {
     // source itself reports complete. On the driver this is the visible wait
     // before retire; here it must be a silent no-op that refuses the same way.
     let mut ledger = host_ledger();
-    let (lease, completion) = lease(&mut ledger, "wait");
+    let (mut lease, completion) = tracked_lease(&mut ledger, "wait");
     lease.synchronize().unwrap();
-    let refused = lease.retire(&mut ledger).unwrap_err();
+    let mut refused = lease.retire(&mut ledger).unwrap_err();
     completion.complete();
     refused.lease.synchronize().unwrap();
     refused.lease.retire(&mut ledger).unwrap();
@@ -72,24 +139,9 @@ fn synchronize_is_an_explicit_wait_not_a_backdoor() {
 }
 
 #[test]
-fn a_refused_lease_stays_usable() {
-    // The bite check: retire without querying completion must fail this test.
-    // Deleting the event query turns the refusal below into a release.
-    let mut ledger = host_ledger();
-    let (lease, completion) = lease(&mut ledger, "use");
-    let id = lease.id();
-    let refused = lease.retire(&mut ledger).unwrap_err();
-    assert_eq!(refused.lease.id(), id);
-    assert_eq!(refused.lease.state(), LeaseState::InFlight);
-    completion.complete();
-    assert_eq!(refused.lease.retire(&mut ledger).unwrap(), id);
-    assert!(ledger.outstanding().is_empty());
-}
-
-#[test]
 fn a_dropped_lease_stays_charged_and_visible() {
     let mut ledger = host_ledger();
-    let (lease, _completion) = lease(&mut ledger, "dropped");
+    let (lease, _completion) = tracked_lease(&mut ledger, "dropped");
     let rid = lease.reservation_id().unwrap();
     drop(lease);
     let ids = outstanding_ids(&ledger);
@@ -105,7 +157,7 @@ fn retiring_an_untracked_lease_releases_without_an_event() {
     // The abandon path: acquired, nothing enqueued, nothing in flight.
     let mut ledger = host_ledger();
     let reservation = admit(&mut ledger, "abandon", 1 << 20);
-    let lease = Lease::<ManualCompletion>::acquire(reservation, "abandon").unwrap();
+    let lease = Lease::<ManualCompletion>::acquire(&ledger, reservation, "abandon").unwrap();
     assert_eq!(lease.state(), LeaseState::Live);
     lease.retire(&mut ledger).unwrap();
     assert!(ledger.outstanding().is_empty());
@@ -114,43 +166,58 @@ fn retiring_an_untracked_lease_releases_without_an_event() {
 #[test]
 fn tracking_twice_is_refused() {
     let mut ledger = host_ledger();
-    let (mut lease, _) = lease(&mut ledger, "double-track");
-    let e = lease.track(ManualCompletion::new()).unwrap_err();
+    let (mut lease, _) = tracked_lease(&mut ledger, "double-track");
+    let e = lease.track_manual(ManualCompletion::new()).unwrap_err();
     assert_eq!(e.kind(), "invalid_request");
     assert!(e.to_string().contains("InFlight"));
 }
 
 #[test]
-fn an_empty_label_is_refused_at_acquire_and_at_turn() {
+fn a_turn_sweep_retires_the_completed_and_returns_the_rest() {
     let mut ledger = host_ledger();
-    let reservation = admit(&mut ledger, "labelled", 1 << 20);
-    let e = Lease::<ManualCompletion>::acquire(reservation, "").unwrap_err();
-    assert_eq!(e.kind(), "invalid_request");
-    let e = Turn::<ManualCompletion>::new("").unwrap_err();
-    assert_eq!(e.kind(), "invalid_request");
-}
-
-#[test]
-fn a_turn_sweep_retires_the_completed_and_names_the_held() {
-    let mut ledger = host_ledger();
-    let (done, done_flag) = lease(&mut ledger, "done");
-    let (held, _) = lease(&mut ledger, "held");
+    let (done, done_flag) = tracked_lease(&mut ledger, "done");
+    let (held, _) = tracked_lease(&mut ledger, "held");
     let done_id = done.id();
     let held_id = held.id();
-    let held_rid = held.reservation_id().unwrap();
     done_flag.complete();
 
     let mut turn = Turn::new("decode").unwrap();
     turn.hold(done);
     turn.hold(held);
     let report = turn.release_turn(&mut ledger);
-    assert_eq!(report.retired, vec![done_id]);
+    assert_eq!(report.retired.len(), 1);
+    assert_eq!(report.retired[0].id, done_id);
     assert_eq!(report.held.len(), 1);
     assert_eq!(report.held[0].id, held_id);
     assert_eq!(report.held[0].label, "held");
     assert!(!report.is_clean());
-    // The held lease was dropped by the sweep and stays charged.
-    assert_eq!(outstanding_ids(&ledger), vec![held_rid]);
+}
+
+#[test]
+fn a_second_sweep_after_completion_releases_with_no_next_token() {
+    // P1's repro shape: the first sweep names the hold and returns the
+    // handle; the event completes; a second sweep with no new work releases.
+    let mut ledger = host_ledger();
+    let (lease, completion) = tracked_lease(&mut ledger, "late");
+    let id = lease.id();
+    let mut first = Turn::new("turn-1").unwrap();
+    first.hold(lease);
+    let report = first.release_turn(&mut ledger);
+    assert!(!report.is_clean());
+    assert_eq!(outstanding_ids(&ledger).len(), 1);
+
+    completion.complete();
+    let mut second = Turn::new("turn-2").unwrap();
+    second.hold(report.held.into_iter().next().unwrap().lease);
+    let report = second.release_turn(&mut ledger);
+    assert!(
+        report.is_clean(),
+        "held: {:?}",
+        report.held.iter().map(|h| &h.label).collect::<Vec<_>>()
+    );
+    assert_eq!(report.retired.len(), 1);
+    assert_eq!(report.retired[0].id, id);
+    assert!(ledger.outstanding().is_empty());
 }
 
 #[test]
@@ -159,15 +226,17 @@ fn a_turn_with_no_next_token_releases_everything_completable() {
     // release, and the sweep must still retire all of it.
     let mut ledger = host_ledger();
     let mut turn = Turn::new("prefill").unwrap();
-    let mut ids = Vec::new();
     for i in 0..3 {
-        let (lease, flag) = lease(&mut ledger, &format!("buf-{i}"));
-        ids.push(lease.id());
+        let (lease, flag) = tracked_lease(&mut ledger, &format!("buf-{i}"));
         flag.complete();
         turn.hold(lease);
     }
     let report = turn.release_turn(&mut ledger);
-    assert!(report.is_clean(), "held: {:?}", report.held);
+    assert!(
+        report.is_clean(),
+        "held: {:?}",
+        report.held.iter().map(|h| &h.label).collect::<Vec<_>>()
+    );
     assert_eq!(report.retired.len(), 3);
     assert!(ledger.outstanding().is_empty());
 }
@@ -175,7 +244,7 @@ fn a_turn_with_no_next_token_releases_everything_completable() {
 #[test]
 fn a_cancelled_lease_withholds_bytes_until_completion() {
     let mut ledger = host_ledger();
-    let (mut lease, completion) = lease(&mut ledger, "cancelled");
+    let (mut lease, completion) = tracked_lease(&mut ledger, "cancelled");
     lease.cancel();
     assert_eq!(lease.state(), LeaseState::Cancelled);
     // Intent retired, bytes not: still in flight, still refused.
@@ -188,21 +257,116 @@ fn a_cancelled_lease_withholds_bytes_until_completion() {
 }
 
 #[test]
+fn cancellation_then_completion_then_sweep_releases() {
+    // The reviewer-named sequence: cancel, complete, sweep again — no next
+    // token arrives in between, and nothing may strand.
+    let mut ledger = host_ledger();
+    let (mut lease, completion) = tracked_lease(&mut ledger, "cancel-sweep");
+    lease.cancel();
+    let mut turn = Turn::new("turn-1").unwrap();
+    turn.hold(lease);
+    let report = turn.release_turn(&mut ledger);
+    assert!(!report.is_clean());
+    completion.complete();
+    let mut turn = Turn::new("turn-2").unwrap();
+    turn.hold(report.held.into_iter().next().unwrap().lease);
+    let report = turn.release_turn(&mut ledger);
+    assert!(report.is_clean());
+    assert!(ledger.outstanding().is_empty());
+}
+
+#[test]
 fn a_cancelled_untracked_lease_releases_at_once() {
     // Cancelled before anything was enqueued: nothing is in flight, so there
     // is nothing to withhold.
     let mut ledger = host_ledger();
     let reservation = admit(&mut ledger, "cancel-early", 1 << 20);
-    let mut lease = Lease::<ManualCompletion>::acquire(reservation, "cancel-early").unwrap();
+    let mut lease =
+        Lease::<ManualCompletion>::acquire(&ledger, reservation, "cancel-early").unwrap();
     lease.cancel();
     lease.retire(&mut ledger).unwrap();
     assert!(ledger.outstanding().is_empty());
 }
 
 #[test]
+fn observed_loss_persists_past_a_racing_completion() {
+    // P2's repro: the source reports loss, then completion. The lease must
+    // stay withheld; the returned handle must stay unusable.
+    let mut ledger = host_ledger();
+    let script = ScriptedCompletion::new([
+        Script::Lost(0, "transport error".into()),
+        Script::Ready(true),
+    ]);
+    let reservation = admit(&mut ledger, "race", 1 << 20);
+    let mut lease = Lease::<ScriptedCompletion>::acquire(&ledger, reservation, "race").unwrap();
+    lease.track_manual(script).unwrap();
+    let refused = lease.retire(&mut ledger).unwrap_err();
+    assert_eq!(refused.error.kind(), "device_lost");
+    let refused = refused.lease.retire(&mut ledger).unwrap_err();
+    assert_eq!(refused.error.kind(), "device_lost");
+    assert!(refused.error.to_string().contains("withheld"));
+    assert_eq!(outstanding_ids(&ledger).len(), 1);
+}
+#[test]
+fn observed_loss_through_synchronize_persists_too() {
+    // A wait whose handle reports loss must withhold exactly like a query
+    // that does: the lease below never completes, it only loses.
+    #[derive(Debug)]
+    struct LossyWait;
+    impl moxie_executor::Completion for LossyWait {
+        fn query_complete(&self) -> Result<bool, moxie_types::Error> {
+            Ok(false)
+        }
+        fn synchronize(&self) -> Result<(), moxie_types::Error> {
+            Err(moxie_types::Error::DeviceLost {
+                device: 1,
+                detail: "wait observed the loss".into(),
+            })
+        }
+        fn describe(&self) -> String {
+            "lossy wait".into()
+        }
+    }
+    impl moxie_executor::TrackableManual for LossyWait {
+        fn into_tracked(self) -> Self {
+            self
+        }
+    }
+    let mut ledger = host_ledger();
+    let reservation = admit(&mut ledger, "race-sync", 1 << 20);
+    let mut lease = Lease::<LossyWait>::acquire(&ledger, reservation, "race-sync").unwrap();
+    lease.track_manual(LossyWait).unwrap();
+    let e = lease.synchronize().unwrap_err();
+    assert_eq!(e.kind(), "device_lost");
+    assert_eq!(lease.state(), LeaseState::Lost);
+    let refused = lease.retire(&mut ledger).unwrap_err();
+    assert_eq!(refused.error.kind(), "device_lost");
+}
+
+#[test]
+fn a_transient_source_failure_does_not_withhold() {
+    // Only device loss persists. A broken source refuses this observation and
+    // stays usable for the next one.
+    let mut ledger = host_ledger();
+    let script = ScriptedCompletion::new([
+        Script::Broken("query transport hiccup".into()),
+        Script::Ready(true),
+    ]);
+    let reservation = admit(&mut ledger, "flaky", 1 << 20);
+    let mut lease = Lease::<ScriptedCompletion>::acquire(&ledger, reservation, "flaky").unwrap();
+    lease.track_manual(script).unwrap();
+    let id = lease.id();
+    let refused = lease.retire(&mut ledger).unwrap_err();
+    assert_eq!(refused.error.kind(), "invalid_request");
+    let (retired, ()) = refused.lease.retire(&mut ledger).unwrap();
+    assert_eq!(retired, id);
+    assert!(ledger.outstanding().is_empty());
+}
+
+#[test]
 fn a_lost_context_withholds_forever() {
     let mut ledger = host_ledger();
-    let (mut lease, completion) = lease(&mut ledger, "lost");
+    let (mut lease, completion) = tracked_lease(&mut ledger, "lost");
     let rid = lease.reservation_id().unwrap();
     lease.mark_lost(0, "transport error");
     assert_eq!(lease.state(), LeaseState::Lost);
@@ -218,7 +382,7 @@ fn a_lost_context_withholds_forever() {
 fn cancellation_does_not_unlose_a_lease() {
     // Withholding wins over cancellation, in that order too.
     let mut ledger = host_ledger();
-    let (mut lease, _) = lease(&mut ledger, "lost-then-cancel");
+    let (mut lease, _) = tracked_lease(&mut ledger, "lost-then-cancel");
     lease.mark_lost(1, "transport error");
     lease.cancel();
     assert_eq!(lease.state(), LeaseState::Lost);
@@ -232,10 +396,10 @@ fn cancellation_does_not_unlose_a_lease() {
 fn retiring_into_the_wrong_ledger_hands_the_lease_back() {
     let mut ledger = host_ledger();
     let mut other = host_ledger();
-    let (lease, completion) = lease(&mut ledger, "wrong-ledger");
+    let (lease, completion) = tracked_lease(&mut ledger, "wrong-ledger");
     completion.complete();
     let refused = lease.retire(&mut other).unwrap_err();
-    assert!(outstanding_ids(&ledger).len() == 1);
+    assert_eq!(outstanding_ids(&ledger).len(), 1);
     assert!(outstanding_ids(&other).is_empty());
     // And the handed-back lease still retires where it belongs.
     refused.lease.retire(&mut ledger).unwrap();

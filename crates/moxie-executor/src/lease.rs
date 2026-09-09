@@ -1,29 +1,41 @@
-//! One lease: admitted bytes bound to one observed completion.
+//! One lease: admitted bytes bound to one observed completion, retaining
+//! the operation's own resources until then.
 //!
-//! Acquire against a [`Reservation`], track exactly one completion source,
-//! retire only when that source reports complete. The two rules that matter:
+//! Acquire against a [`Reservation`] in a [`Ledger`], retain the operation's
+//! buffers, track exactly one completion source, retire only when that source
+//! reports complete. The rules that matter:
 //!
-//! * A failed [`Lease::retire`] hands the lease back. Consuming the lease on a
-//!   refusal would strand charged bytes with no handle — the error-path version
-//!   of R08.
-//! * Dropping a lease releases nothing. The owned reservation drops with it and
-//!   stays charged and visible in [`Ledger::outstanding`], which is the failure
-//!   mode that can be found.
+//! * The lease owns what it accounts for. A retained source cannot be mutated
+//!   or reused early because the caller no longer names it — R07's
+//!   source-retention rule, encoded in moves rather than comments. Retirement
+//!   hands the resources back with the release.
+//! * A failed [`Lease::retire`] hands the lease back, resources included.
+//!   Consuming the lease on a refusal would strand charged bytes with no
+//!   handle — the error-path version of R08.
+//! * Dropping a lease releases nothing. The owned reservation drops with it
+//!   and stays charged and visible in [`Ledger::outstanding`], which is the
+//!   failure mode that can be found.
+//! * Observed device loss persists. Once a completion source reports the
+//!   context lost, no later observation — including a racing `Ok(true)` —
+//!   reopens the lease.
 //!
 //! [`Ledger::outstanding`]: moxie_memory::Ledger::outstanding
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use moxie_memory::{Ledger, Reservation};
-use moxie_types::{Error, Result};
+use moxie_types::{Error, Result, Scope};
 
 /// Observed completion truth for one recorded operation.
 ///
 /// A CUDA event is one implementation (behind the `driver` feature);
-/// [`ManualCompletion`] is the host-testable one. Not-ready is a state the
-/// caller observes through [`Lease::retire`], never an error smuggled out of
-/// this trait: implementations must map their not-ready signal to `Ok(false)`,
-/// as [`Event::is_complete`] already does for code 600.
+/// [`ManualCompletion`] and [`ScriptedCompletion`] are the host-testable ones.
+/// Not-ready is a state the caller observes through [`Lease::retire`], never
+/// an error smuggled out of this trait: implementations must map their
+/// not-ready signal to `Ok(false)`, as [`Event::is_complete`] already does for
+/// code 600.
 ///
 /// [`Event::is_complete`]: moxie_cuda::Event::is_complete
 pub trait Completion: core::fmt::Debug {
@@ -47,7 +59,7 @@ pub trait Completion: core::fmt::Debug {
 /// makes every transition below testable with no GPU present.
 #[derive(Debug, Clone, Default)]
 pub struct ManualCompletion {
-    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ManualCompletion {
@@ -77,18 +89,67 @@ impl Completion for ManualCompletion {
     }
 }
 
-#[cfg(feature = "driver")]
-impl Completion for moxie_cuda::Event<'_> {
-    fn query_complete(&self) -> Result<bool> {
-        self.is_complete()
+/// One scripted observation step for [`ScriptedCompletion`].
+#[derive(Debug, Clone)]
+pub enum Script {
+    /// Report this completion state.
+    Ready(bool),
+    /// Fail with device loss. The lease persists it: no later step reopens.
+    Lost(u32, String),
+    /// Fail transiently. The lease stays usable and a later step may complete.
+    Broken(String),
+}
+
+/// A programmed completion source for host tests: loss-then-complete races,
+/// transient failures, and exhaustion, all deterministically.
+///
+/// A test double, documented as one. Production completions are driver events
+/// and manual flags; nothing outside tests should script the truth.
+#[derive(Debug, Default)]
+pub struct ScriptedCompletion {
+    script: Mutex<VecDeque<Script>>,
+}
+
+impl ScriptedCompletion {
+    /// Play these steps in order, one per query.
+    pub fn new(steps: impl IntoIterator<Item = Script>) -> Self {
+        ScriptedCompletion {
+            script: Mutex::new(steps.into_iter().collect()),
+        }
     }
 
-    fn synchronize(&self) -> Result<()> {
-        self.synchronize()
+    /// Steps not yet observed.
+    pub fn remaining(&self) -> usize {
+        self.script.lock().map(|s| s.len()).unwrap_or(0)
+    }
+}
+
+impl Completion for ScriptedCompletion {
+    fn query_complete(&self) -> Result<bool> {
+        let step = self
+            .script
+            .lock()
+            .map_err(|_| Error::InvalidRequest {
+                field: "completion",
+                detail: "scripted completion is unusable".into(),
+            })?
+            .pop_front();
+        match step {
+            Some(Script::Ready(done)) => Ok(done),
+            Some(Script::Lost(device, detail)) => Err(Error::DeviceLost { device, detail }),
+            Some(Script::Broken(detail)) => Err(Error::InvalidRequest {
+                field: "completion",
+                detail,
+            }),
+            None => Err(Error::InvalidRequest {
+                field: "completion",
+                detail: "scripted completion exhausted its steps".into(),
+            }),
+        }
     }
 
     fn describe(&self) -> String {
-        "cuda event".to_string()
+        format!("scripted ({} steps left)", self.remaining())
     }
 }
 
@@ -126,7 +187,8 @@ pub enum LeaseState {
     /// Cancellation retired the intent. The bytes stay held until completion
     /// or loss is observed — R08.
     Cancelled,
-    /// The context is known lost. Withheld from every future use.
+    /// The context is known lost, or recording failed with submission state
+    /// unknown. Withheld from every future use.
     Lost,
 }
 
@@ -140,18 +202,36 @@ struct LostInfo {
 
 /// One event-retained lease over an admitted reservation.
 ///
+/// `C` is the completion source; `R` is the operation resource retained until
+/// retirement — the upload source, the device allocation, or `()` when the
+/// lease guards accounting alone. Retirement returns the resource with the
+/// release, so premature reuse is a move error, not a rule in a comment:
+///
+/// ```compile_fail
+/// # use moxie_executor::Lease;
+/// # fn acquire() -> Lease { todo!() }
+/// let lease = acquire();
+/// let src = vec![0u8; 4];
+/// let lease = lease.retain(src);
+/// src.clear(); // moved into the lease: no alias to mutate early
+/// ```
+///
 /// Deliberately not `Clone`: a second handle is a second authority to retire
 /// the same bytes. [`Lease::retire`] consumes the lease on success and hands
 /// it back on refusal, so neither path duplicates or strands it.
 #[derive(Debug)]
 #[must_use = "a lease that is never retired stays charged; retire it explicitly"]
-pub struct Lease<C = ManualCompletion> {
+pub struct Lease<C = ManualCompletion, R = ()> {
     id: LeaseId,
     label: String,
     reservation: Option<Reservation>,
+    /// The admitted scope charges bound at acquisition: what this lease may
+    /// spend, and where. Read from the ledger, never declared by the caller.
+    admitted: Vec<(Scope, u64)>,
     completion: Option<C>,
+    retained: Option<R>,
     state: LeaseState,
-    /// Set on [`Lease::mark_lost`]: which device was lost and why.
+    /// Set when loss is observed or recording fails with submission unknown.
     lost: Option<Box<LostInfo>>,
 }
 
@@ -162,25 +242,109 @@ fn empty_label(field: &'static str) -> Error {
     }
 }
 
-impl<C: Completion> Lease<C> {
-    /// Acquire a lease against an admitted reservation. The reservation moves
-    /// in: from here until retirement there is exactly one authority over
-    /// these bytes.
-    pub fn acquire(reservation: Reservation, label: impl Into<String>) -> Result<Self> {
+/// A refusal to acquire, carrying the reservation back.
+///
+/// The reservation moves into `acquire` before its ledger binding is known;
+/// consuming it on a failed acquisition would strand charged bytes with no
+/// handle — the same shape as R08, one step earlier.
+#[derive(Debug)]
+#[must_use = "the reservation is still charged; acquire again with a valid label and ledger"]
+pub struct AcquireRefused {
+    /// The reservation, never admitted under a lease.
+    pub reservation: Reservation,
+    /// Why acquisition did not happen.
+    pub error: Error,
+}
+
+impl core::fmt::Display for AcquireRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for AcquireRefused {}
+
+impl<C: Completion> Lease<C, ()> {
+    /// Acquire a lease against an admitted reservation in `ledger`. The
+    /// admitted scope charges are read from the ledger and bound here, so the
+    /// lease names real budget rather than a caller declaration. The label is
+    /// validated before anything else: a refusal returns the reservation.
+    pub fn acquire(
+        ledger: &Ledger,
+        reservation: Reservation,
+        label: impl Into<String>,
+    ) -> std::result::Result<Self, AcquireRefused> {
         let label = label.into();
         if label.is_empty() {
-            return Err(empty_label("label"));
+            return Err(AcquireRefused {
+                reservation,
+                error: empty_label("label"),
+            });
         }
+        let admitted = match ledger
+            .outstanding()
+            .iter()
+            .find(|o| o.id == reservation.id())
+        {
+            Some(record) => record.scope_charges.clone(),
+            None => {
+                return Err(AcquireRefused {
+                    reservation,
+                    error: Error::InvalidRequest {
+                        field: "reservation",
+                        detail: "reservation is not outstanding in this ledger".into(),
+                    },
+                });
+            }
+        };
         Ok(Lease {
             id: LeaseId::next(),
             label,
             reservation: Some(reservation),
+            admitted,
             completion: None,
+            retained: Some(()),
             state: LeaseState::Live,
             lost: None,
         })
     }
 
+    /// Move the operation resource under this lease. Exactly once, enforced by
+    /// type: only a resourceless lease retains, so a second retention cannot
+    /// be written and the caller keeps no alias.
+    pub fn retain<R>(self, resource: R) -> Lease<C, R> {
+        let Lease {
+            id,
+            label,
+            reservation,
+            admitted,
+            completion,
+            state,
+            lost,
+            ..
+        } = self;
+        Lease {
+            id,
+            label,
+            reservation,
+            admitted,
+            completion,
+            retained: Some(resource),
+            state,
+            lost,
+        }
+    }
+}
+
+impl From<AcquireRefused> for Error {
+    /// The reason, without the returned handle. Use the struct itself when
+    /// the reservation must survive the error.
+    fn from(refused: AcquireRefused) -> Error {
+        refused.error
+    }
+}
+
+impl<C: Completion, R> Lease<C, R> {
     /// Identity, for reports.
     pub const fn id(&self) -> LeaseId {
         self.id
@@ -202,10 +366,28 @@ impl<C: Completion> Lease<C> {
         self.reservation.as_ref().map(Reservation::id)
     }
 
+    /// Admitted scope charges bound at acquisition: `(scope, bytes)` pairs
+    /// read from the ledger, the budget this lease may spend.
+    pub fn admitted(&self) -> &[(Scope, u64)] {
+        &self.admitted
+    }
+
+    /// Admitted bytes across all scopes.
+    pub fn admitted_bytes(&self) -> u64 {
+        self.admitted.iter().map(|(_, b)| b).sum()
+    }
+
     /// Track one completion source for the recorded operation. Exactly one:
     /// a second source would leave two authorities over when the bytes are
     /// free. Only from [`LeaseState::Live`].
-    pub fn track(&mut self, completion: C) -> Result<()> {
+    ///
+    /// Host-side and test completions only. Driver events bind through
+    /// [`Lease::use_on`], which records before tracking — a bare, unrecorded
+    /// event must never reach retirement.
+    pub fn track_manual(&mut self, completion: C) -> Result<()>
+    where
+        C: TrackableManual,
+    {
         if self.state != LeaseState::Live {
             return Err(Error::InvalidRequest {
                 field: "lease",
@@ -215,20 +397,11 @@ impl<C: Completion> Lease<C> {
                 ),
             });
         }
-        self.completion = Some(completion);
+        self.completion = Some(completion.into_tracked());
         self.state = LeaseState::InFlight;
         Ok(())
     }
-    /// Block until the tracked completion is observable. The caller's explicit
-    /// wait before [`Lease::retire`]: retirement itself never blocks, so a
-    /// missing wait fails loudly at retire time rather than stalling inside
-    /// release. Untracked leases have nothing to wait for.
-    pub fn synchronize(&self) -> Result<()> {
-        match self.completion.as_ref() {
-            None => Ok(()),
-            Some(c) => c.synchronize(),
-        }
-    }
+
     /// Cancel the intent behind this lease. Further tracking is refused, but
     /// the bytes stay held: cancellation retires what was *meant*, never what
     /// is in flight. Withholding wins over cancellation — a lost lease stays
@@ -250,23 +423,57 @@ impl<C: Completion> Lease<C> {
         }));
     }
 
+    /// Block until the tracked completion is observable. The caller's explicit
+    /// wait before [`Lease::retire`]: retirement itself never blocks, so a
+    /// missing wait fails loudly at retire time rather than stalling inside
+    /// release. Untracked leases have nothing to wait for. Observed loss
+    /// persists, exactly as in retirement.
+    pub fn synchronize(&mut self) -> Result<()> {
+        let observed = match self.completion.as_ref() {
+            None => return Ok(()),
+            Some(c) => c.synchronize(),
+        };
+        if let Err(e) = observed {
+            self.persist_loss(e.clone());
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Record observed device loss permanently. A racing later observation —
+    /// including `Ok(true)` — never reopens the lease.
+    fn persist_loss(&mut self, error: Error) {
+        if let Error::DeviceLost { device, detail } = error {
+            self.state = LeaseState::Lost;
+            self.lost = Some(Box::new(LostInfo { device, detail }));
+        }
+    }
+
     fn take_reservation(&mut self) -> Reservation {
         self.reservation
             .take()
             .expect("a lease always holds its reservation until retirement")
     }
 
+    fn take_retained(&mut self) -> R {
+        self.retained
+            .take()
+            .expect("a lease always holds its retained resource until retirement")
+    }
+
     /// Retire when the recorded completion is observed complete, releasing the
-    /// reservation into `ledger`. Consumes the lease on success; hands it back
-    /// with the error on any refusal, so no path strands charged bytes.
-    ///
-    /// * [`LeaseState::Live`] with no tracked operation holds no in-flight
-    ///   work and releases immediately — the abandon path.
-    /// * [`LeaseState::InFlight`] and [`LeaseState::Cancelled`] query the
-    ///   source: complete releases, incomplete refuses, an unusable source
-    ///   returns the lease with that error.
+    /// reservation into `ledger` and returning the retained resource for legal
+    /// reuse. Consumes the lease on success; hands it back — resources
+    /// included — on any refusal, so no path strands charged bytes.
     /// * [`LeaseState::Lost`] reports the loss. Withheld, never released.
-    pub fn retire(mut self, ledger: &mut Ledger) -> std::result::Result<LeaseId, RetireRefused<C>> {
+    // The refused lease comes back whole by design (R08): its size is the
+    // guarantee, not an accident, so boxing it to satisfy the lint would only
+    // hide what every refusal carries.
+    #[allow(clippy::result_large_err)]
+    pub fn retire(
+        mut self,
+        ledger: &mut Ledger,
+    ) -> std::result::Result<(LeaseId, R), RetireRefused<C, R>> {
         let fail = |lease: Self, error: Error| RetireRefused { lease, error };
         match self.state {
             LeaseState::Lost => {
@@ -290,7 +497,10 @@ impl<C: Completion> Lease<C> {
                     None => true,
                     Some(c) => match c.query_complete() {
                         Ok(done) => done,
-                        Err(e) => return Err(fail(self, e)),
+                        Err(e) => {
+                            self.persist_loss(e.clone());
+                            return Err(fail(self, e));
+                        }
                     },
                 };
                 if !complete {
@@ -310,7 +520,10 @@ impl<C: Completion> Lease<C> {
                 let id = self.id;
                 let reservation = self.take_reservation();
                 match ledger.release(reservation) {
-                    Ok(()) => Ok(id),
+                    Ok(()) => {
+                        let resource = self.take_retained();
+                        Ok((id, resource))
+                    }
                     Err(refused) => {
                         self.reservation = Some(refused.reservation);
                         Err(fail(self, refused.error))
@@ -321,32 +534,149 @@ impl<C: Completion> Lease<C> {
     }
 }
 
-#[cfg(feature = "driver")]
-impl<'ctx> Lease<moxie_cuda::Event<'ctx>> {
-    /// Record the lease's completion after the caller's operation on `stream`:
-    /// the event is recorded into the stream's ordered work and the lease
-    /// tracks it. This is the contract's `use` step — enqueue first, then bind
-    /// the lease to what comes after. Only from [`LeaseState::Live`].
-    pub fn use_on(
-        &mut self,
-        stream: &moxie_cuda::Stream<'ctx>,
-        event: moxie_cuda::Event<'ctx>,
-    ) -> Result<()> {
-        if self.state != LeaseState::Live {
-            return Err(Error::InvalidRequest {
-                field: "lease",
-                detail: format!(
-                    "{} ({}) cannot bind a stream while {:?}",
-                    self.id, self.label, self.state
-                ),
-            });
-        }
-        event.record(stream)?;
-        self.completion = Some(event);
-        self.state = LeaseState::InFlight;
-        Ok(())
+/// Marker for completions trackable without a driver record step: the manual
+/// and scripted test doubles. Driver events are excluded by construction, so
+/// no public path binds a bare, unrecorded event — [`Lease::use_on`] records
+/// first.
+pub trait TrackableManual: Completion {
+    /// Wrap into the tracked slot. Identity for the doubles.
+    fn into_tracked(self) -> Self;
+}
+
+impl TrackableManual for ManualCompletion {
+    fn into_tracked(self) -> Self {
+        self
     }
 }
+
+impl TrackableManual for ScriptedCompletion {
+    fn into_tracked(self) -> Self {
+        self
+    }
+}
+
+#[cfg(feature = "driver")]
+mod driver_binding {
+    use super::{Completion, Lease, LeaseState};
+    use moxie_types::{Error, Result};
+
+    /// A staged host-to-device upload, retained by its lease until the copy
+    /// completes: the device allocation and the source bytes travel together,
+    /// so neither can be freed, mutated or reused early.
+    #[derive(Debug)]
+    pub struct Upload<'ctx> {
+        buffer: moxie_cuda::DeviceBuffer<'ctx>,
+        source: Vec<u8>,
+    }
+
+    impl<'ctx> Upload<'ctx> {
+        /// Allocate room and enqueue the copy on `stream`, keeping the source.
+        /// The copy is ordered in the stream; completion is observed through
+        /// the lease that retains this upload.
+        pub fn stage(
+            ctx: &'ctx moxie_cuda::RankContext,
+            stream: &moxie_cuda::Stream<'ctx>,
+            source: Vec<u8>,
+        ) -> Result<Self> {
+            if source.is_empty() {
+                return Err(Error::InvalidRequest {
+                    field: "source",
+                    detail: "an upload stages bytes, not an empty source".into(),
+                });
+            }
+            let mut buffer = moxie_cuda::DeviceBuffer::alloc(ctx, source.len())?;
+            // SAFETY: `source` outlives the enqueue — it moves into this
+            // upload below, which its lease retains until retirement — and
+            // `buffer` holds at least `source.len()` bytes by construction.
+            unsafe { buffer.copy_from_host_async(&source, stream)? };
+            Ok(Upload { buffer, source })
+        }
+
+        /// Staged byte count.
+        pub fn len(&self) -> usize {
+            self.source.len()
+        }
+
+        /// Whether nothing was staged. Never true from [`Upload::stage`].
+        pub fn is_empty(&self) -> bool {
+            self.source.is_empty()
+        }
+
+        /// The device allocation under lease.
+        pub fn buffer(&self) -> &moxie_cuda::DeviceBuffer<'ctx> {
+            &self.buffer
+        }
+
+        /// The retained source. Readable throughout; mutable only after
+        /// retirement returns the upload.
+        pub fn source(&self) -> &[u8] {
+            &self.source
+        }
+    }
+
+    impl<'ctx, R> Lease<moxie_cuda::Event<'ctx>, R> {
+        /// Record the lease's completion after the caller's operation on
+        /// `stream`: the event is recorded into the stream's ordered work and
+        /// the lease tracks it. This is the contract's `use` step — enqueue
+        /// first, then bind the lease to what comes after. Only from
+        /// [`LeaseState::Live`].
+        ///
+        /// A failed record quarantines the lease: the operation may already be
+        /// submitted, so nothing is provably free and retirement must never
+        /// release. The context ordinal names the loss.
+        pub fn use_on(
+            &mut self,
+            ctx: &moxie_cuda::RankContext,
+            stream: &moxie_cuda::Stream<'ctx>,
+            event: moxie_cuda::Event<'ctx>,
+        ) -> Result<()> {
+            if self.state != LeaseState::Live {
+                return Err(Error::InvalidRequest {
+                    field: "lease",
+                    detail: format!(
+                        "{} ({}) cannot bind a stream while {:?}",
+                        self.id, self.label, self.state
+                    ),
+                });
+            }
+            if let Err(e) = event.record(stream) {
+                let device = ctx.ordinal();
+                self.state = LeaseState::Lost;
+                self.lost = Some(Box::new(super::LostInfo {
+                    device,
+                    detail: format!("event record failed, submission state unknown: {e}"),
+                }));
+                return Err(Error::InvalidRequest {
+                    field: "lease",
+                    detail: format!(
+                        "{} ({}) is quarantined: event record failed: {e}",
+                        self.id, self.label
+                    ),
+                });
+            }
+            self.completion = Some(event);
+            self.state = LeaseState::InFlight;
+            Ok(())
+        }
+    }
+
+    impl Completion for moxie_cuda::Event<'_> {
+        fn query_complete(&self) -> Result<bool> {
+            self.is_complete()
+        }
+
+        fn synchronize(&self) -> Result<()> {
+            self.synchronize()
+        }
+
+        fn describe(&self) -> String {
+            "cuda event".to_string()
+        }
+    }
+}
+
+#[cfg(feature = "driver")]
+pub use driver_binding::Upload;
 
 /// A retirement the lease refused, carrying the lease back.
 ///
@@ -355,17 +685,17 @@ impl<'ctx> Lease<moxie_cuda::Event<'ctx>> {
 /// observes completion by other means and retries, cancels, or reports.
 #[derive(Debug)]
 #[must_use = "the lease is still charged; observe completion and retry, or report it"]
-pub struct RetireRefused<C = ManualCompletion> {
-    /// The lease, still holding its reservation.
-    pub lease: Lease<C>,
+pub struct RetireRefused<C = ManualCompletion, R = ()> {
+    /// The lease, still holding its reservation and resources.
+    pub lease: Lease<C, R>,
     /// Why retirement did not happen.
     pub error: Error,
 }
 
-impl<C> core::fmt::Display for RetireRefused<C> {
+impl<C: core::fmt::Debug, R> core::fmt::Display for RetireRefused<C, R> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.error)
     }
 }
 
-impl<C: core::fmt::Debug> std::error::Error for RetireRefused<C> {}
+impl<C: core::fmt::Debug, R: core::fmt::Debug> std::error::Error for RetireRefused<C, R> {}

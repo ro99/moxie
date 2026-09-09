@@ -196,11 +196,11 @@ Gates (this machine, 2026-09-09; nothing loosened):
 |---|---|
 | `cargo fmt --all -- --check` | PASS |
 | `clippy -D warnings`, host and device features | PASS (device lane with `moxie-executor/driver`) |
-| `cargo test --workspace --locked --offline` | PASS, 506 unit/integration + 6 doctests (was 492 + 6; +14 lease retirement) |
-| `cargo xtask arch-check` | PASS, 52 rejected + 14 accepted fixtures, 12 rules (was 51 + 14) |
+| `cargo test --workspace --locked --offline` | PASS, 515 unit/integration + 6 doctests (was 506 + 6; +9 ownership and recovery rules) |
+| `cargo xtask arch-check` | PASS, 52 rejected + 14 accepted fixtures, 12 rules, unchanged |
 | `cargo xtask spec-check` | PASS, 10 documents |
-| no-driver host lane, `xtask` rebuilt before `ldd` | PASS, 506 + 6, no `libcuda` |
-| device lane | PASS, 514 + 8 (was 497 + 8) |
+| no-driver host lane, `xtask` rebuilt before `ldd` | PASS, 515 + 6, no `libcuda` |
+| device lane | PASS, 523 + 8 (was 514 + 8) |
 | `cargo xtask-cuda test-gpu` | PASS, 27 cases, `sm_86` and `sm_120` qualified (was 24; +`event_backed_lease`) |
 | `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | **exit 1**, as intended (`sm_120` unqualified) |
 | `cargo xtask-cuda capacity` | PASS, the host and 3 devices, every scope to zero |
@@ -214,3 +214,48 @@ produced. The stop condition was not triggered.
 Remaining blockers and next bounded task: the spending half continues — the
 basic allocator (suballocating admitted envelopes into live ranges), the
 admitted execution plan, and the device-resident layer chain.
+
+## Review corrections, 2026-09-09
+
+Review of the committed tree found five ownership and recovery gaps; all
+reproduced by the reviewer against `f7d1f6b`. The contract above is preserved
+as written — what follows corrects the implementation toward its guarantees.
+
+**P1 — the lease retains its resources.** `Lease<C, R>` now owns the operation
+resource alongside the reservation: `retain` moves it in exactly once
+(enforced by type, only from `Lease<C, ()>`), and `retire` returns it with
+the release. `Upload::stage` allocates and enqueues the copy, keeping source
+and buffer together until retirement; admission precedes both. A
+`compile_fail` doctest proves a retained source has no early-mutation alias.
+`acquire` takes the ledger, binds the admitted scope charges read from it,
+and returns `AcquireRefused` (reservation included) on an empty label or a
+foreign reservation.
+
+**P1 — sweeps return pending leases.** `HeldLease` carries the lease back, and
+`TurnReport` returns retired resources instead of dropping them. Covered by a
+sweep → complete → sweep-again test with no next token, including the
+cancelled variant.
+
+**P1 — failed records quarantine.** `use_on` takes the context for failure
+attribution; a failed record marks the lease `Lost` (submission may already
+have happened) and refuses. Bare events can no longer reach tracking:
+`track` is now `track_manual`, gated by the `TrackableManual` marker the
+doubles implement and `Event` does not.
+
+**P2 — observed loss persists.** Query and synchronize errors of kind
+`DeviceLost` transition the lease to `Lost`; later observations, including a
+racing `Ok(true)`, never reopen it. `ScriptedCompletion` plays the
+loss-then-complete race deterministically; transient failures stay usable.
+`synchronize` takes `&mut self` for the same persistence.
+
+**P2 — failed acquisition returns the handle.** Covered above under
+`AcquireRefused`, with a reuse-after-refusal test on both paths.
+
+Bite checks, each reverted to green:
+
+- Deleting the completion query in `retire` fails seven host tests.
+- Deleting `lease_a.synchronize()` in the GPU case fails
+  `event_backed_lease` on all three devices with still-`InFlight` refusal.
+
+Gates for the corrections (this machine, 2026-09-09; nothing loosened) are
+recorded in the lane table below, updated in place.

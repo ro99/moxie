@@ -28,10 +28,16 @@
 //! [`Ledger::outstanding`]: moxie_memory::Ledger::outstanding
 //! [`Reservation`]: moxie_memory::Reservation
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "driver"), forbid(unsafe_code))]
 
 pub mod lease;
+pub use lease::{
+    AcquireRefused, Completion, Lease, LeaseId, LeaseState, ManualCompletion, RetireRefused,
+    Script, ScriptedCompletion, TrackableManual,
+};
 pub mod turn;
 
-pub use lease::{Completion, Lease, LeaseId, LeaseState, ManualCompletion, RetireRefused};
-pub use turn::{HeldLease, Turn, TurnReport};
+pub use turn::{HeldLease, RetiredLease, Turn, TurnReport};
+
+#[cfg(feature = "driver")]
+pub use lease::Upload;
