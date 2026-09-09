@@ -8,8 +8,9 @@ Written 2026-09-08 at the end of the session that implemented task 0007.
   ships in. Everything through task 0006's acceptance is on `origin/main` at `4bbe659`.
 - Read-only legacy root: `/home/rodrigo/Developer/strata` @ `2dc566eb8e440fff4837ac75ca1dad1b20c2264e`.
   Never write there. Document 08 is the map into it.
-- **Do not push without the owner saying so.** They authorised the push of `4bbe659` explicitly and
-  for that state. Commit locally, report, wait.
+- **Do not push without the owner saying so.** They authorised the push of `4bbe659`, and then of
+  task 0007's acceptance state, each explicitly and for that state only. Commit locally, report,
+  wait.
 - Toolchain: rustc/cargo 1.97.1 pinned, CUDA 13.0 (nvcc V13.0.88).
   `CUDA_DEVICE_ORDER=PCI_BUS_ID` is forced in `.cargo/config.toml`.
 
@@ -31,8 +32,16 @@ admission slice only, after five review rounds. Its record is
 [docs/tasks/0006-m1-resource-ledger-and-admission.md](../tasks/0006-m1-resource-ledger-and-admission.md).
 
 **Task 0007 (M1.3 part 2, rank-owned context and measured device capacity)** was contracted at
-`689f58f` — a commit with no `.rs` change — and implemented on top of it. Owner review is pending.
-Its record is [docs/tasks/0007-m1-rank-context-and-measured-capacity.md](../tasks/0007-m1-rank-context-and-measured-capacity.md).
+`689f58f` — a commit with no `.rs` change — implemented, corrected against two review rounds, and
+**accepted at `68d573a`** for that slice only. Its record is
+[docs/tasks/0007-m1-rank-context-and-measured-capacity.md](../tasks/0007-m1-rank-context-and-measured-capacity.md),
+which carries the contract, the result, both correction rounds and the acceptance.
+
+The reviewer's acceptance added evidence this repository cannot produce on its own: fault injection
+across four attach and teardown scenarios — the teardown race, a failed attach whose cleanup also
+failed, a failed attach whose cleanup succeeded, and a failure before the retain. **That branch
+still has no in-repository regression**, and the gap is named rather than closed: the policy it
+delegates to is host-tested in `moxie_cuda::claims`, the branch itself needs symbol interposition.
 
 What exists that did not before:
 

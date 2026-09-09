@@ -1,7 +1,11 @@
 # Task 0007 — M1.3: rank-owned CUDA context and measured device capacity
 
-Status: **contract proposed**, 2026-09-08, after [task 0006](0006-m1-resource-ledger-and-admission.md)
-was accepted for the accounting and admission slice.
+Status: **accepted**, 2026-09-08 at `68d573a`, after two rounds of review corrections. The owner's
+reviewer approved *the rank-owned context and measured device-capacity slice*, explicitly not all of
+M1.3.
+
+Contract proposed 2026-09-08, after [task 0006](0006-m1-resource-ledger-and-admission.md) was
+accepted for the accounting and admission slice.
 
 **This contract is committed before any implementation code**, as in tasks 0003–0006. That commit
 contains no `.rs` change. Nothing below is to be adjusted once a test has run.
@@ -401,3 +405,32 @@ The pattern across both rounds, worth carrying: **every exit from a function tha
 retained a resource is a teardown, including the error paths, and each one needs
 the same ordering and the same fail-closed rule.** Round 1 fixed `Drop` and left
 the error path; round 2 found it there.
+
+### Acceptance, 2026-09-08 (`68d573a`)
+
+The reviewer found no further blocking issue and recommended acceptance. Their
+verification, recorded here because parts of it are evidence this repository
+cannot produce on its own:
+
+- **Fault injection across four attach and teardown scenarios**: the teardown
+  race, a failed attach whose cleanup also failed, a failed attach whose cleanup
+  succeeded, and a failure before the retain. That is the branch this repository
+  cannot reach without symbol interposition, and it is the strongest evidence
+  the error paths have.
+- Host suite 470 tests + 6 doctests; device suite 478 + 8; 24 GPU cases; the
+  capacity command on all three GPUs; the expected restricted-visibility
+  rejection; `fmt`, `clippy` on both lanes, `arch-check` and `spec-check`.
+- The lifetime and thread-binding `compile_fail` examples fail for the intended
+  compiler errors.
+- After explicitly rebuilding the host `xtask`, its linkage contains no
+  `libcuda`. The reviewer did **not** re-run the fully isolated no-driver
+  environment; that result is this session's.
+
+Recorded as an accepted limitation: the CUDA attach-failure branch relies on
+external fault-injection harnesses rather than an in-repository regression. The
+harnesses passed, and the policy the branch delegates to is host-tested, but the
+gap is real and stays named.
+
+What this acceptance does *not* cover: M1.3's remaining parts. Host capacity is
+still unmeasured, and event-backed leases, the basic allocator, the admitted
+execution plan and the device-resident layer chain are all outstanding.
