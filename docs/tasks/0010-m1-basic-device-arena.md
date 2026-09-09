@@ -1,6 +1,6 @@
 # Task 0010 — M1.3: basic admitted device arena
 
-Status: **contract proposed**, 2026-09-09, after
+Status: **implemented; independent review pending**, 2026-09-09, after
 [task 0009](0009-m1-event-backed-leases.md) was independently reviewed and accepted for its
 transient-upload slice.
 
@@ -161,4 +161,66 @@ alignment.
 
 ## Result, filled after work
 
-Pending implementation and independent review.
+Contract committed separately as `0bab91b`, with no Rust change. Implementation
+adds pure range metadata in `moxie-memory`, one admitted physical arena in
+`moxie-executor`, and checked offset copies in `moxie-cuda`. Reservation leases
+and range operation leases share one completion/loss implementation. Existing
+transient upload consumers remain covered by the full device suite.
+
+The basic arena retains at most one host upload source at a time, charging its
+full Vec capacity against the parent reservation's host Pageable tier. A source
+returns to the caller at retirement; its range remains allocated until explicit
+release. This restriction bounds source overlap until a later task introduces
+multiple concurrent sources and event fan-in. Arena creation additionally rejects
+reservations charging another device UUID before allocation. Other unmaterialized
+charges remain reserved until the one arena closes; no second consumer can obtain
+the consumed reservation.
+
+Final audit corrected right-neighbor coalescing when a live separator prevents a
+left merge. The fragmentation test now covers that release order. It also found
+that a returned failed-close arena must refuse new allocations: quarantine now
+blocks allocation as well as repeated close, with a real-driver regression.
+
+### Validation
+
+- Passed: locked/offline host and full device-feature workspace tests; focused
+  allocator and executor tests; format; both host and full device-feature clippy
+  with `-D warnings`; architecture checks (52 rejected, 14 accepted fixtures,
+  12 rules); unchanged-reference checks (10 documents).
+- Host totals: 532 unit/integration tests and 8 doctests; the same totals passed
+  in the isolated no-driver lane. The final focused memory run includes the
+  additional coalescing release order; the focused executor run includes dropped
+  in-flight range withholding.
+- Full device-feature totals: 542 unit/integration tests and 10 doctests.
+- Passed: real-device arena and allocation/copy/record/free fault tests on all
+  three UUIDs. `test-gpu` passes 33 cases across sm_86 and sm_120. The real arena
+  test observes early retirement refusal, distinct offset readbacks, cancellation,
+  persistent owner transfer, generation change, and physical/ledger reconciliation.
+- Passed: isolated host suite with CUDA tools excluded and explicit plain xtask
+  build; `ldd` contains no `libcuda`.
+- Passed negative qualification: `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda
+  test-gpu` exits 1 with sm_120 explicitly unqualified despite all visible sm_86
+  cases passing.
+- Passed: `cargo xtask-cuda capacity` with normal visibility and with
+  `CUDA_VISIBLE_DEVICES=2,1,0`; host and all three UUIDs measured and admitted.
+- Negative experiments: bypassing operation completion made the deterministic
+  cancellation/reuse test fail (exit 101); the mutation was reverted. An initial
+  overflow fixture produced a capacity refusal instead of arithmetic overflow;
+  the fixture was corrected to exercise an actual checked-add overflow. Initial
+  formatting differences were corrected. No acceptance threshold was loosened.
+- Skipped/unmeasured: model quality, context execution, topology communication,
+  paired inference performance, residency/eviction and kernels; these are outside
+  this bounded task. No checkpoint was accessed or transformed.
+
+No production path was deleted. Task 0009's conservative upload path expires only
+after a later integration task passes its replacement gates. Ambiguous failures
+deliberately retain allocations and charges until process teardown; no recovery
+or performance claim is made. Independent review remains required before accepting
+this slice or starting its dependent implementation.
+
+Real-device identities: RTX 5060 Ti
+`GPU-97fe4889-4874-a378-198e-955d2e72c4a3`, RTX 3090
+`GPU-3032cfa3-19df-028f-5ebd-43314911e0b9`, RTX 3090
+`GPU-81fe4578-59b2-37c4-421e-287cdac78704`. Local verification logs are under
+`/tmp/moxie-task0010-final/`; the reproducible commands and outcomes above are
+the tracked evidence, since temporary logs are not a durable dependency.

@@ -158,7 +158,7 @@ impl Completion for ScriptedCompletion {
 pub struct LeaseId(u64);
 
 impl LeaseId {
-    fn next() -> Self {
+    pub(crate) fn next() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         LeaseId(NEXT.fetch_add(1, Ordering::Relaxed))
     }
@@ -200,6 +200,116 @@ struct LostInfo {
     detail: String,
 }
 
+/// The one completion/loss state machine shared by whole-reservation leases
+/// and suballocated-range operation leases. Resource settlement differs; the
+/// question "may these bytes be reused yet?" must not.
+#[derive(Debug)]
+pub(crate) struct Lifecycle<C> {
+    completion: Option<C>,
+    state: LeaseState,
+    lost: Option<Box<LostInfo>>,
+}
+
+impl<C> Lifecycle<C> {
+    pub(crate) fn new() -> Self {
+        Self {
+            completion: None,
+            state: LeaseState::Live,
+            lost: None,
+        }
+    }
+
+    pub(crate) const fn state(&self) -> LeaseState {
+        self.state
+    }
+
+    pub(crate) fn is_tracked_or_lost(&self) -> bool {
+        self.completion.is_some() || self.state == LeaseState::Lost
+    }
+
+    pub(crate) fn submit(&mut self, completion: C) {
+        self.completion = Some(completion);
+        self.state = LeaseState::InFlight;
+    }
+
+    pub(crate) fn track_manual(&mut self, completion: C, description: &str) -> Result<()>
+    where
+        C: TrackableManual,
+    {
+        if self.state != LeaseState::Live {
+            return Err(Error::InvalidRequest {
+                field: "lease",
+                detail: format!(
+                    "{description} cannot track a completion while {:?}",
+                    self.state
+                ),
+            });
+        }
+        self.submit(completion.into_tracked());
+        Ok(())
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        if self.state == LeaseState::Live || self.state == LeaseState::InFlight {
+            self.state = LeaseState::Cancelled;
+        }
+    }
+
+    pub(crate) fn mark_lost(&mut self, device: u32, detail: impl Into<String>) {
+        self.state = LeaseState::Lost;
+        self.lost = Some(Box::new(LostInfo {
+            device,
+            detail: detail.into(),
+        }));
+    }
+
+    pub(crate) fn persist_loss(&mut self, error: Error) {
+        if let Error::DeviceLost { device, detail } = error {
+            self.mark_lost(device, detail);
+        }
+    }
+
+    pub(crate) fn synchronize(&mut self) -> Result<()>
+    where
+        C: Completion,
+    {
+        let observed = match self.completion.as_ref() {
+            None => return Ok(()),
+            Some(c) => c.synchronize(),
+        };
+        if let Err(error) = observed {
+            self.persist_loss(error.clone());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe_complete(&mut self) -> Result<bool>
+    where
+        C: Completion,
+    {
+        let observed = match self.completion.as_ref() {
+            None => Ok(true),
+            Some(completion) => completion.query_complete(),
+        };
+        if let Err(error) = &observed {
+            self.persist_loss(error.clone());
+        }
+        observed
+    }
+
+    pub(crate) fn lost_error(&self, description: &str) -> Error {
+        let lost = self.lost.clone().unwrap_or(Box::new(LostInfo {
+            device: u32::MAX,
+            detail: "unknown".into(),
+        }));
+        Error::DeviceLost {
+            device: lost.device,
+            detail: format!("{description} is withheld: {}", lost.detail),
+        }
+    }
+}
+
 /// One event-retained lease over an admitted reservation.
 ///
 /// `C` is the completion source; `R` is the operation resource retained until
@@ -232,11 +342,8 @@ pub struct Lease<C = ManualCompletion, R = ()> {
     /// spend, and where. Read from the ledger, never declared by the caller.
     admitted: Vec<(Scope, u64)>,
     admitted_tiers: Vec<(Scope, Tier, u64)>,
-    completion: Option<C>,
+    lifecycle: Lifecycle<C>,
     retained: Option<R>,
-    state: LeaseState,
-    /// Set when loss is observed or recording fails with submission unknown.
-    lost: Option<Box<LostInfo>>,
 }
 
 /// A resource the lease retains until retirement, and what retirement makes
@@ -329,7 +436,7 @@ impl<C, R> Drop for Lease<C, R> {
         // without an event. Its retained resource is
         // deliberately withheld rather than freed early. The reservation drops
         // normally and stays charged and visible, naming the hold.
-        let submitted = self.completion.is_some() || self.state == LeaseState::Lost;
+        let submitted = self.lifecycle.is_tracked_or_lost();
         if submitted {
             std::mem::forget(self.retained.take());
         }
@@ -405,10 +512,8 @@ impl<C: Completion> Lease<C, ()> {
             ledger: ledger.id(),
             admitted,
             admitted_tiers,
-            completion: None,
+            lifecycle: Lifecycle::new(),
             retained: Some(()),
-            state: LeaseState::Live,
-            lost: None,
         })
     }
 
@@ -426,10 +531,8 @@ impl<C: Completion> Lease<C, ()> {
             ledger: self.ledger,
             admitted: std::mem::take(&mut self.admitted),
             admitted_tiers: std::mem::take(&mut self.admitted_tiers),
-            completion: self.completion.take(),
+            lifecycle: std::mem::replace(&mut self.lifecycle, Lifecycle::new()),
             retained: Some(resource),
-            state: self.state,
-            lost: self.lost.take(),
         }
     }
 }
@@ -455,7 +558,7 @@ impl<C: Completion, R> Lease<C, R> {
     /// The current state. Completion is observed, not stored: use
     /// [`Lease::retire`] to act on it.
     pub const fn state(&self) -> LeaseState {
-        self.state
+        self.lifecycle.state()
     }
 
     /// The reservation this lease holds, while it holds one.
@@ -492,18 +595,8 @@ impl<C: Completion, R> Lease<C, R> {
     where
         C: TrackableManual,
     {
-        if self.state != LeaseState::Live {
-            return Err(Error::InvalidRequest {
-                field: "lease",
-                detail: format!(
-                    "{} ({}) cannot track a completion while {:?}",
-                    self.id, self.label, self.state
-                ),
-            });
-        }
-        self.completion = Some(completion.into_tracked());
-        self.state = LeaseState::InFlight;
-        Ok(())
+        self.lifecycle
+            .track_manual(completion, &format!("{} ({})", self.id, self.label))
     }
 
     /// Cancel the intent behind this lease. Further tracking is refused, but
@@ -511,20 +604,14 @@ impl<C: Completion, R> Lease<C, R> {
     /// is in flight. Withholding wins over cancellation — a lost lease stays
     /// lost.
     pub fn cancel(&mut self) {
-        if self.state == LeaseState::Live || self.state == LeaseState::InFlight {
-            self.state = LeaseState::Cancelled;
-        }
+        self.lifecycle.cancel();
     }
 
     /// Record that the owning context is lost. Nothing on this lease is ever
     /// reusable again; retirement reports the loss rather than freeing into
     /// it. Fail closed, following the rank-claim teardown precedent.
     pub fn mark_lost(&mut self, device: u32, detail: impl Into<String>) {
-        self.state = LeaseState::Lost;
-        self.lost = Some(Box::new(LostInfo {
-            device,
-            detail: detail.into(),
-        }));
+        self.lifecycle.mark_lost(device, detail);
     }
 
     /// Block until the tracked completion is observable. The caller's explicit
@@ -533,24 +620,14 @@ impl<C: Completion, R> Lease<C, R> {
     /// release. Untracked leases have nothing to wait for. Observed loss
     /// persists, exactly as in retirement.
     pub fn synchronize(&mut self) -> Result<()> {
-        let observed = match self.completion.as_ref() {
-            None => return Ok(()),
-            Some(c) => c.synchronize(),
-        };
-        if let Err(e) = observed {
-            self.persist_loss(e.clone());
-            return Err(e);
-        }
-        Ok(())
+        self.lifecycle.synchronize()
     }
 
     /// Record observed device loss permanently. A racing later observation —
     /// including `Ok(true)` — never reopens the lease.
+    #[cfg_attr(not(feature = "driver"), allow(dead_code))]
     fn persist_loss(&mut self, error: Error) {
-        if let Error::DeviceLost { device, detail } = error {
-            self.state = LeaseState::Lost;
-            self.lost = Some(Box::new(LostInfo { device, detail }));
-        }
+        self.lifecycle.persist_loss(error);
     }
 
     fn take_reservation(&mut self) -> Reservation {
@@ -590,38 +667,22 @@ impl<C: Completion, R> Lease<C, R> {
                 },
             ));
         }
-        match self.state {
+        match self.lifecycle.state() {
             LeaseState::Lost => {
-                let lost = self.lost.clone().unwrap_or(Box::new(LostInfo {
-                    device: u32::MAX,
-                    detail: "unknown".into(),
-                }));
                 let id = self.id;
                 let label = self.label.clone();
-                Err(fail(
-                    self,
-                    Error::DeviceLost {
-                        device: lost.device,
-                        detail: format!("{id} ({label}) is withheld: {}", lost.detail),
-                    },
-                ))
+                let error = self.lifecycle.lost_error(&format!("{id} ({label})"));
+                Err(fail(self, error))
             }
             LeaseState::Live | LeaseState::InFlight | LeaseState::Cancelled => {
-                let complete = match self.completion.as_ref() {
-                    // Nothing recorded: nothing in flight.
-                    None => true,
-                    Some(c) => match c.query_complete() {
-                        Ok(done) => done,
-                        Err(e) => {
-                            self.persist_loss(e.clone());
-                            return Err(fail(self, e));
-                        }
-                    },
+                let complete = match self.lifecycle.observe_complete() {
+                    Ok(done) => done,
+                    Err(error) => return Err(fail(self, error)),
                 };
                 if !complete {
                     let id = self.id;
                     let label = self.label.clone();
-                    let state = self.state;
+                    let state = self.lifecycle.state();
                     return Err(fail(
                         self,
                         Error::InvalidRequest {
@@ -737,7 +798,7 @@ mod driver_binding {
             ctx: &'ctx RankContext,
             source: Vec<u8>,
         ) -> std::result::Result<Lease<Event<'ctx>, Upload<'ctx>>, PrepareRefused<'ctx>> {
-            let checked = if self.state != LeaseState::Live || source.is_empty() {
+            let checked = if self.lifecycle.state() != LeaseState::Live || source.is_empty() {
                 Err(Error::InvalidRequest {
                     field: "upload",
                     detail: "preparation requires a live lease and nonempty source".into(),
@@ -781,10 +842,10 @@ mod driver_binding {
         /// all driver calls. Copy/record failures quarantine because submission
         /// state can no longer be proven absent (including asynchronous errors).
         pub fn submit(&mut self, stream: &Stream<'ctx>, event: Event<'ctx>) -> Result<()> {
-            if self.state != LeaseState::Live {
+            if self.lifecycle.state() != LeaseState::Live {
                 return Err(Error::InvalidRequest {
                     field: "lease",
-                    detail: format!("cannot submit while {:?}", self.state),
+                    detail: format!("cannot submit while {:?}", self.lifecycle.state()),
                 });
             }
             let upload = self.retained.as_mut().expect("lease retains upload");
@@ -804,15 +865,16 @@ mod driver_binding {
                 self.mark_lost(device, format!("submission failed: {error}"));
                 return Err(error);
             }
-            self.completion = Some(event);
-            self.state = LeaseState::InFlight;
+            self.lifecycle.submit(event);
             Ok(())
         }
 
         /// Explicit synchronous validation readback. It waits on this lease's
         /// event and does not enqueue additional asynchronous consumers.
         pub fn readback(&mut self, destination: &mut [u8]) -> Result<()> {
-            if self.state != LeaseState::InFlight && self.state != LeaseState::Cancelled {
+            if self.lifecycle.state() != LeaseState::InFlight
+                && self.lifecycle.state() != LeaseState::Cancelled
+            {
                 return Err(Error::InvalidRequest {
                     field: "lease",
                     detail: "readback requires a submitted, non-lost upload".into(),

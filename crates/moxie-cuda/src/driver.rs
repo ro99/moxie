@@ -535,9 +535,10 @@ impl Drop for Event<'_> {
 /// R07 and document 02: "A kernel launch leases its inputs/outputs/workspace
 /// until completion. Retirement is event-driven; Rust `Drop` alone must not free
 /// in-flight CUDA memory." This type discharges that obligation the blunt way
-/// -- it synchronises the context before freeing. The real engine replaces this
-/// with an event-retained lease; the invariant is the same, and this type must
-/// not be "optimised" by simply deleting the synchronise.
+/// -- it synchronises the context before freeing. The executor's admitted arena
+/// owns the checked event-retained path; other consumers keep this conservative
+/// fallback. The invariant is the same, and this type must not be "optimised"
+/// by simply deleting the synchronise.
 /// A buffer cannot outlive the context that owns it. The compiler enforces it:
 ///
 /// ```compile_fail
@@ -602,6 +603,11 @@ impl<'ctx> DeviceBuffer<'ctx> {
         self.len == 0
     }
 
+    /// Stable device identity of this allocation.
+    pub fn device_uuid(&self) -> DeviceUuid {
+        self.ctx.uuid()
+    }
+
     pub fn device_ptr(&self) -> ffi::CUdeviceptr {
         self.ptr
     }
@@ -635,16 +641,55 @@ impl<'ctx> DeviceBuffer<'ctx> {
     /// recorded after the copy has completed. That is exactly the obligation
     /// R07 records as the one the legacy engine got wrong; there is no lease
     /// mechanism at M0 to discharge it automatically, so it is the caller's.
-    pub unsafe fn copy_from_host_async(&mut self, src: &[u8], stream: &Stream<'ctx>) -> Result<()> {
-        if src.len() > self.len {
+    pub unsafe fn copy_from_host_async(&self, src: &[u8], stream: &Stream<'ctx>) -> Result<()> {
+        // SAFETY: this method's source-lifetime obligation is forwarded
+        // unchanged; offset zero is within every allocation.
+        unsafe { self.copy_from_host_async_at(0, src, stream) }
+    }
+
+    /// Enqueue a host-to-device copy into a checked byte range.
+    ///
+    /// # Safety
+    /// As [`DeviceBuffer::copy_from_host_async`]: `src` and this allocation
+    /// must remain live and unmodified until a following event completes.
+    pub unsafe fn copy_from_host_async_at(
+        &self,
+        offset: usize,
+        src: &[u8],
+        stream: &Stream<'ctx>,
+    ) -> Result<()> {
+        let end = offset
+            .checked_add(src.len())
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "src",
+                detail: "copy range overflowed".into(),
+            })?;
+        if end > self.len {
             return Err(Error::InvalidRequest {
                 field: "src",
-                detail: format!("{} bytes into a {}-byte buffer", src.len(), self.len),
+                detail: format!(
+                    "{} bytes at offset {offset} into a {}-byte buffer",
+                    src.len(),
+                    self.len
+                ),
+            });
+        }
+        if stream.device_uuid() != self.device_uuid() {
+            return Err(Error::InvalidRequest {
+                field: "stream",
+                detail: "copy stream belongs to another device".into(),
             });
         }
         if src.is_empty() {
             return Ok(());
         }
+        let destination =
+            self.ptr
+                .checked_add(offset as u64)
+                .ok_or_else(|| Error::InvalidRequest {
+                    field: "src",
+                    detail: "device address overflowed".into(),
+                })?;
         self.ctx.make_current()?;
         check(
             // SAFETY: bounds checked above; the source-lifetime obligation is
@@ -652,7 +697,7 @@ impl<'ctx> DeviceBuffer<'ctx> {
             // accepted.
             unsafe {
                 ffi::cuMemcpyHtoDAsync_v2(
-                    self.ptr,
+                    destination,
                     src.as_ptr() as *const c_void,
                     src.len(),
                     stream.raw(),
@@ -663,20 +708,42 @@ impl<'ctx> DeviceBuffer<'ctx> {
     }
 
     pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<()> {
-        if dst.len() > self.len {
+        self.copy_to_host_at(0, dst)
+    }
+
+    /// Synchronously copy a checked byte range to the host.
+    pub fn copy_to_host_at(&self, offset: usize, dst: &mut [u8]) -> Result<()> {
+        let end = offset
+            .checked_add(dst.len())
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "dst",
+                detail: "copy range overflowed".into(),
+            })?;
+        if end > self.len {
             return Err(Error::InvalidRequest {
                 field: "dst",
-                detail: format!("{} bytes out of a {}-byte buffer", dst.len(), self.len),
+                detail: format!(
+                    "{} bytes at offset {offset} out of a {}-byte buffer",
+                    dst.len(),
+                    self.len
+                ),
             });
         }
         if dst.is_empty() {
             return Ok(());
         }
+        let source = self
+            .ptr
+            .checked_add(offset as u64)
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "dst",
+                detail: "device address overflowed".into(),
+            })?;
         self.ctx.make_current()?;
         check(
             // SAFETY: `dst` is a valid writable slice of `dst.len()` bytes and the
             // source holds at least that many, checked above.
-            unsafe { ffi::cuMemcpyDtoH_v2(dst.as_mut_ptr() as *mut c_void, self.ptr, dst.len()) },
+            unsafe { ffi::cuMemcpyDtoH_v2(dst.as_mut_ptr() as *mut c_void, source, dst.len()) },
             "cuMemcpyDtoH",
         )
     }

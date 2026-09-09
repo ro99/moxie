@@ -21,9 +21,13 @@
 //!   held until completion or loss is observed. A lost context withholds
 //!   forever rather than advertising memory nothing can recover.
 //!
+//! This crate also binds one admitted reservation to a physical `DeviceArena`
+//! behind the `driver` feature. `moxie-memory` owns its pure range metadata;
+//! operation leases reuse the same completion lifecycle described above.
+//!
 //! What this crate deliberately does not do: admit envelopes (the ledger's
-//! job), allocate or suballocate (the next task's allocator), choose victims,
-//! plan execution, or know what a model is.
+//! job), choose victims, manage residency, plan execution, or know what a model
+//! is.
 //!
 //! [`Ledger::outstanding`]: moxie_memory::Ledger::outstanding
 //! [`Reservation`]: moxie_memory::Reservation
@@ -36,6 +40,18 @@ pub use lease::{
     Script, ScriptedCompletion, SettledResource, TrackableManual, check_fit, check_upload_fit,
 };
 pub mod turn;
+
+pub mod arena;
+pub use arena::{
+    OperationAcquireRefused, OperationHeld, OperationLease, OperationRetireRefused,
+    OperationRetired, OperationTurn, OperationTurnReport,
+};
+
+#[cfg(feature = "driver")]
+pub use arena::{
+    ArenaCloseRefused, ArenaCreateRefused, ArenaUpload, DeviceArena, DeviceRange,
+    PrepareArenaUploadRefused, RangeReleaseRefused, RangeTransferRefused,
+};
 
 pub use turn::{HeldLease, RetiredLease, Turn, TurnReport};
 

@@ -17,7 +17,7 @@ use moxie_cuda::{
     DeviceBuffer, Event, Module, ModuleImage, PtxSource, RankContext, Stream, TrustedImage,
     query_device,
 };
-use moxie_executor::{Lease, Turn, Upload};
+use moxie_executor::{DeviceArena, Lease, Turn, Upload};
 use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSpan};
 use moxie_types::{DeviceCapability, DeviceTier, Error, HostTier, RankId, Scope, Tier};
 
@@ -65,6 +65,7 @@ const CASES: &[&str] = &[
     "arch_mismatch_is_typed",
     "stream_event_completion",
     "event_backed_lease",
+    "admitted_device_arena",
     "lease_rejects_foreign_completion",
     "non_ptx_text_rejected",
     "rank_context_is_exclusive",
@@ -168,6 +169,11 @@ pub fn run(profile: Option<&str>) -> i32 {
         results.push(case(&cap, "arch_mismatch_is_typed", arch_mismatch(&cap)));
         results.push(case(&cap, "stream_event_completion", stream_event(&cap)));
         results.push(case(&cap, "event_backed_lease", backed_lease(&cap)));
+        results.push(case(
+            &cap,
+            "admitted_device_arena",
+            admitted_device_arena(&cap),
+        ));
         results.push(case(
             &cap,
             "lease_rejects_foreign_completion",
@@ -452,8 +458,8 @@ fn stream_event(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let y_in = vec![1.0f32; N];
     let a = 2.0f32;
 
-    let mut dx = DeviceBuffer::alloc(&ctx, N * 4)?;
-    let mut dy = DeviceBuffer::alloc(&ctx, N * 4)?;
+    let dx = DeviceBuffer::alloc(&ctx, N * 4)?;
+    let dy = DeviceBuffer::alloc(&ctx, N * 4)?;
 
     start.record(&stream)?;
     // SAFETY: for both async copies, `x`, `y_in` and both device buffers are
@@ -614,6 +620,126 @@ fn backed_lease(cap: &DeviceCapability) -> Result<Outcome, Error> {
         return Ok(Outcome::Failed("sweep did not return the source".into()));
     }
     Ok(Outcome::Passed)
+}
+
+/// One admitted physical allocation, three bounded ranges, and no per-range
+/// allocation fallback (task 0010). Distinct patterns prove checked offsets;
+/// transfer and generation checks prove persistent identity and safe reuse.
+fn admitted_device_arena(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    const ARENA_BYTES: u64 = 4096;
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let measurement = ctx.measure()?;
+    let scope = Scope::Device(measurement.uuid);
+    let snapshot = CapacitySnapshot::measured(&measurement, 1 << 20)?;
+    let host = moxie_host::read()?;
+    let host_snapshot = CapacitySnapshot::measured_host(&host, 1 << 20)?;
+    let mut ledger = Ledger::new([snapshot, host_snapshot])?;
+    let mut request = PlanRequest::new("device arena", ["resident"])?;
+    request.buffer(BufferRequest::new(
+        "physical arena",
+        scope,
+        Tier::Device(DeviceTier::PackedResidentWeights),
+        ARENA_BYTES,
+        StageSpan { first: 0, last: 0 },
+    ))?;
+    request.buffer(BufferRequest::new(
+        "one retained source",
+        Scope::Host,
+        Tier::Host(HostTier::Pageable),
+        1792,
+        StageSpan { first: 0, last: 0 },
+    ))?;
+    let reservation = ledger.admit(&request)?;
+    let mut arena = DeviceArena::create(
+        &ledger,
+        reservation,
+        &ctx,
+        DeviceTier::PackedResidentWeights,
+        ARENA_BYTES,
+        "test-gpu arena",
+    )
+    .map_err(|r| r.error)?;
+    let stream = Stream::new(&ctx)?;
+
+    let first = arena.allocate(1024, 256, "importer").map_err(|r| r.error)?;
+    let generation = first.key().generation;
+    let second = arena
+        .allocate(1280, 128, "workspace")
+        .map_err(|r| r.error)?;
+    let third = arena
+        .allocate(1792, 64, "persistent")
+        .map_err(|r| r.error)?;
+    let refused = arena.allocate(1, 1, "must refuse").unwrap_err();
+    if refused.occupancy.free_bytes != 0 {
+        return Ok(Outcome::Failed(
+            "arena exhaustion did not report zero free bytes".into(),
+        ));
+    }
+
+    let first = upload_arena_range(first, vec![0x11; 1024], &stream, &ctx, false)?;
+    let first_key = first.key();
+    let first = arena.transfer(first, "executor").map_err(|r| r.error)?;
+    if first.key() != first_key || first.owner() != "executor" {
+        return Ok(Outcome::Failed(
+            "persistent transfer changed identity or missed its owner".into(),
+        ));
+    }
+    let second = upload_arena_range(second, vec![0x22; 1280], &stream, &ctx, true)?;
+    let third = upload_arena_range(third, vec![0x33; 1792], &stream, &ctx, false)?;
+
+    arena.release(second).map_err(|r| r.error)?;
+    arena.release(first).map_err(|r| r.error)?;
+    arena.release(third).map_err(|r| r.error)?;
+    let whole = arena
+        .allocate(ARENA_BYTES, 256, "coalesced")
+        .map_err(|r| r.error)?;
+    if whole.offset() != 0 || whole.key().generation <= generation {
+        return Ok(Outcome::Failed(
+            "coalesced full-range reuse did not advance its generation".into(),
+        ));
+    }
+    arena.release(whole).map_err(|r| r.error)?;
+    arena.close(&mut ledger).map_err(|r| r.error)?;
+    if !ledger.outstanding().is_empty() {
+        return Ok(Outcome::Failed(
+            "closed arena left its parent reservation charged".into(),
+        ));
+    }
+    Ok(Outcome::Passed)
+}
+
+fn upload_arena_range<'ctx>(
+    range: moxie_executor::DeviceRange<'ctx>,
+    source: Vec<u8>,
+    stream: &Stream<'ctx>,
+    ctx: &'ctx RankContext,
+    cancel: bool,
+) -> Result<moxie_executor::DeviceRange<'ctx>, Error> {
+    let expected = source.clone();
+    let mut lease = range
+        .prepare_upload(source, "test-gpu range upload")
+        .map_err(|r| r.error)?;
+    lease.submit(stream, Event::new(ctx)?)?;
+    if cancel {
+        lease.cancel();
+    }
+    let mut readback = vec![0; expected.len()];
+    lease.readback(&mut readback)?;
+    if readback != expected {
+        return Err(Error::InvalidRequest {
+            field: "arena",
+            detail: "range readback differs at its checked offset".into(),
+        });
+    }
+    let (_, upload) = lease.retire().map_err(|r| r.error)?;
+    let (range, returned) = upload.finish();
+    if returned != expected {
+        return Err(Error::InvalidRequest {
+            field: "arena",
+            detail: "retirement did not return the retained source".into(),
+        });
+    }
+    Ok(range)
 }
 
 /// Admit one upload envelope, prepare its staging, and submit both under a
