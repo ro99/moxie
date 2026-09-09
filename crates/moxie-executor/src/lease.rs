@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use moxie_memory::{Ledger, Reservation};
-use moxie_types::{Error, Result, Scope};
+use moxie_types::{DeviceTier, Error, HostTier, Result, Scope, Tier};
 
 /// Observed completion truth for one recorded operation.
 ///
@@ -211,7 +211,7 @@ struct LostInfo {
 /// # use moxie_executor::Lease;
 /// # fn acquire() -> Lease { todo!() }
 /// let lease = acquire();
-/// let src = vec![0u8; 4];
+/// let mut src = vec![0u8; 4];
 /// let lease = lease.retain(src);
 /// src.clear(); // moved into the lease: no alias to mutate early
 /// ```
@@ -225,9 +225,13 @@ pub struct Lease<C = ManualCompletion, R = ()> {
     id: LeaseId,
     label: String,
     reservation: Option<Reservation>,
+    /// The ledger the reservation was outstanding in. Retirement into any
+    /// other ledger is refused before any side effect.
+    ledger: moxie_memory::LedgerId,
     /// The admitted scope charges bound at acquisition: what this lease may
     /// spend, and where. Read from the ledger, never declared by the caller.
     admitted: Vec<(Scope, u64)>,
+    admitted_tiers: Vec<(Scope, Tier, u64)>,
     completion: Option<C>,
     retained: Option<R>,
     state: LeaseState,
@@ -246,21 +250,59 @@ pub struct Lease<C = ManualCompletion, R = ()> {
 pub trait SettledResource: core::fmt::Debug {
     /// What successful retirement hands back for legal reuse.
     type Settled: core::fmt::Debug;
-    /// End the operation: free what must not outlive the budget, return what
-    /// is safe to reuse.
-    fn settle(self) -> Self::Settled;
+    /// Free the operation's allocation after completion was observed. On failure,
+    /// return the resource intact for quarantine; do not retry cleanup in Drop.
+    fn settle(self) -> std::result::Result<Self::Settled, (Self, Error)>
+    where
+        Self: Sized;
 }
 
 impl SettledResource for () {
     type Settled = ();
-    fn settle(self) -> Self::Settled {}
+    fn settle(self) -> std::result::Result<(), (Self, Error)> {
+        Ok(())
+    }
 }
 
 impl SettledResource for Vec<u8> {
     type Settled = Vec<u8>;
-    fn settle(self) -> Self::Settled {
-        self
+    fn settle(self) -> std::result::Result<Self::Settled, (Self, Error)> {
+        Ok(self)
     }
+}
+
+/// Validate the complete transient upload footprint before allocation. The host
+/// input is charged by capacity, because unused Vec capacity is still live RAM.
+pub fn check_upload_fit(
+    scopes: &[(Scope, u64)],
+    tiers: &[(Scope, Tier, u64)],
+    device: moxie_types::DeviceUuid,
+    device_bytes: u64,
+    host_bytes: u64,
+) -> Result<()> {
+    for (scope, tier, bytes) in [
+        (
+            Scope::Device(device),
+            Tier::Device(DeviceTier::TransferStaging),
+            device_bytes,
+        ),
+        (Scope::Host, Tier::Host(HostTier::Pageable), host_bytes),
+    ] {
+        check_fit(scopes, scope, bytes)?;
+        let budget = tiers
+            .iter()
+            .find(|(s, t, _)| *s == scope && *t == tier)
+            .map(|(_, _, b)| *b)
+            .unwrap_or(0);
+        if bytes > budget {
+            return Err(Error::CapacityExceeded {
+                tier: Some(tier),
+                requested_bytes: bytes,
+                available_bytes: budget,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Whether `bytes` in `scope` fit the admitted charges. Pure, so the check
@@ -282,10 +324,9 @@ pub fn check_fit(admitted: &[(Scope, u64)], scope: Scope, bytes: u64) -> Result<
 
 impl<C, R> Drop for Lease<C, R> {
     fn drop(&mut self) {
-        // A lease with no tracked completion submitted nothing provable: a
-        // Live abandon, or a Lost lease quarantined before anything could be
-        // enqueued. Everything else may still be in flight — including work
-        // submitted before a failed record — so the retained resource is
+        // Only an untracked, non-lost lease is provably unsubmitted. A lost
+        // lease may have copied before recording failed, or failed cleanup
+        // without an event. Its retained resource is
         // deliberately withheld rather than freed early. The reservation drops
         // normally and stays charged and visible, naming the hold.
         let submitted = self.completion.is_some() || self.state == LeaseState::Lost;
@@ -341,12 +382,12 @@ impl<C: Completion> Lease<C, ()> {
                 error: empty_label("label"),
             });
         }
-        let admitted = match ledger
+        let (admitted, admitted_tiers) = match ledger
             .outstanding()
             .iter()
             .find(|o| o.id == reservation.id())
         {
-            Some(record) => record.scope_charges.clone(),
+            Some(record) => (record.scope_charges.clone(), record.charges.clone()),
             None => {
                 return Err(AcquireRefused {
                     reservation,
@@ -361,7 +402,9 @@ impl<C: Completion> Lease<C, ()> {
             id: LeaseId::next(),
             label,
             reservation: Some(reservation),
+            ledger: ledger.id(),
             admitted,
+            admitted_tiers,
             completion: None,
             retained: Some(()),
             state: LeaseState::Live,
@@ -380,7 +423,9 @@ impl<C: Completion> Lease<C, ()> {
             id: self.id,
             label: std::mem::take(&mut self.label),
             reservation: self.reservation.take(),
+            ledger: self.ledger,
             admitted: std::mem::take(&mut self.admitted),
+            admitted_tiers: std::mem::take(&mut self.admitted_tiers),
             completion: self.completion.take(),
             retained: Some(resource),
             state: self.state,
@@ -441,7 +486,7 @@ impl<C: Completion, R> Lease<C, R> {
     /// free. Only from [`LeaseState::Live`].
     ///
     /// Host-side and test completions only. Driver events bind through
-    /// [`Lease::use_on`], which records before tracking — a bare, unrecorded
+    /// [`Lease::submit`], which records before tracking — a bare, unrecorded
     /// event must never reach retirement.
     pub fn track_manual(&mut self, completion: C) -> Result<()>
     where
@@ -514,16 +559,6 @@ impl<C: Completion, R> Lease<C, R> {
             .expect("a lease always holds its reservation until retirement")
     }
 
-    fn take_retained(&mut self) -> R::Settled
-    where
-        R: SettledResource,
-    {
-        self.retained
-            .take()
-            .expect("a lease always holds its retained resource until retirement")
-            .settle()
-    }
-
     /// Retire when the recorded completion is observed complete, releasing the
     /// reservation into `ledger` and settling the retained resource for legal
     /// reuse. Settlement ends the allocation where the budget ends: a device
@@ -543,6 +578,18 @@ impl<C: Completion, R> Lease<C, R> {
         R: SettledResource,
     {
         let fail = |lease: Self, error: Error| RetireRefused { lease, error };
+        // Wrong ledger is refused before any side effect: nothing has been
+        // queried, settled, or released, so the lease comes back whole.
+        if ledger.id() != self.ledger {
+            let id = self.id;
+            return Err(fail(
+                self,
+                Error::InvalidRequest {
+                    field: "reservation",
+                    detail: format!("{id} is not outstanding in this ledger"),
+                },
+            ));
+        }
         match self.state {
             LeaseState::Lost => {
                 let lost = self.lost.clone().unwrap_or(Box::new(LostInfo {
@@ -585,18 +632,22 @@ impl<C: Completion, R> Lease<C, R> {
                         },
                     ));
                 }
+                let resource = self.retained.take().expect("lease retains its resource");
+                let settled = match resource.settle() {
+                    Ok(settled) => settled,
+                    Err((resource, error)) => {
+                        self.retained = Some(resource);
+                        self.mark_lost(u32::MAX, format!("settlement failed: {error}"));
+                        return Err(fail(self, error));
+                    }
+                };
                 let id = self.id;
-                let reservation = self.take_reservation();
-                match ledger.release(reservation) {
-                    Ok(()) => {
-                        let resource = self.take_retained();
-                        Ok((id, resource))
-                    }
-                    Err(refused) => {
-                        self.reservation = Some(refused.reservation);
-                        Err(fail(self, refused.error))
-                    }
-                }
+                // The owned, non-Clone reservation and checked ledger identity
+                // make this release infallible. Cleanup ran while fully charged.
+                ledger
+                    .release(self.take_reservation())
+                    .expect("validated ledger owns the live reservation");
+                Ok((id, settled))
             }
         }
     }
@@ -604,7 +655,7 @@ impl<C: Completion, R> Lease<C, R> {
 
 /// Marker for completions trackable without a driver record step: the manual
 /// and scripted test doubles. Driver events are excluded by construction, so
-/// no public path binds a bare, unrecorded event — [`Lease::use_on`] records
+/// no public path binds a bare, unrecorded event — [`Lease::submit`] records
 /// first.
 pub trait TrackableManual: Completion {
     /// Wrap into the tracked slot. Identity for the doubles.
@@ -626,67 +677,25 @@ impl TrackableManual for ScriptedCompletion {
 #[cfg(feature = "driver")]
 mod driver_binding {
     use super::{Completion, Lease, LeaseState, SettledResource};
+    use moxie_cuda::{DeviceBuffer, Event, RankContext, Stream};
     use moxie_types::{Error, Result};
 
-    /// A staged host-to-device upload, retained by its lease from submission
-    /// through retirement: the device allocation and the source bytes travel
-    /// together, so neither can be freed, mutated or reused early.
-    ///
-    /// Settlement drops the device allocation — the event is complete by then,
-    /// allocation never outlives its budget: there is not yet another
-    /// accounted owner to transfer it to.
+    /// A transient upload. Only an admitted lease can construct one. It never
+    /// exposes the allocation for additional untracked asynchronous work.
     #[derive(Debug)]
     pub struct Upload<'ctx> {
-        buffer: moxie_cuda::DeviceBuffer<'ctx>,
+        buffer: DeviceBuffer<'ctx>,
         source: Vec<u8>,
-        scope: moxie_types::Scope,
+        ctx: &'ctx RankContext,
     }
 
-    impl<'ctx> Upload<'ctx> {
-        /// Allocate room for `source` without enqueueing anything. The upload
-        /// provably has no submitted work until [`Lease::submit`] runs, which
-        /// is what makes the pre-submission state droppable without a hold.
-        pub fn prepare(
-            ctx: &'ctx moxie_cuda::RankContext,
-            scope: moxie_types::Scope,
-            source: Vec<u8>,
-        ) -> Result<Self> {
-            if source.is_empty() {
-                return Err(Error::InvalidRequest {
-                    field: "source",
-                    detail: "an upload stages bytes, not an empty source".into(),
-                });
-            }
-            let buffer = moxie_cuda::DeviceBuffer::alloc(ctx, source.len())?;
-            Ok(Upload {
-                buffer,
-                source,
-                scope,
-            })
-        }
-
-        /// Staged byte count.
+    impl Upload<'_> {
         pub fn len(&self) -> usize {
             self.source.len()
         }
-
-        /// Whether nothing was staged. Never true from [`Upload::prepare`].
         pub fn is_empty(&self) -> bool {
             self.source.is_empty()
         }
-
-        /// The scope this upload will spend against, checked at submission.
-        pub fn scope(&self) -> moxie_types::Scope {
-            self.scope
-        }
-
-        /// The device allocation under lease.
-        pub fn buffer(&self) -> &moxie_cuda::DeviceBuffer<'ctx> {
-            &self.buffer
-        }
-
-        /// The retained source. Readable throughout; ownership returns at
-        /// retirement.
         pub fn source(&self) -> &[u8] {
             &self.source
         }
@@ -694,145 +703,150 @@ mod driver_binding {
 
     impl SettledResource for Upload<'_> {
         type Settled = Vec<u8>;
-        fn settle(self) -> Vec<u8> {
-            // `buffer` drops here, after observed completion: freeing is safe
-            // and the accounting released alongside covers nothing live.
-            self.source
+        fn settle(mut self) -> std::result::Result<Vec<u8>, (Self, Error)> {
+            // SAFETY: Upload has no public constructor or mutable buffer access.
+            // Its lease either submitted nothing or observed its sole event;
+            // no other operation can use this allocation. Failure preserves it.
+            if let Err(error) = unsafe { self.buffer.try_free() } {
+                return Err((self, error));
+            }
+            Ok(self.source)
         }
     }
 
-    impl<'ctx> Lease<moxie_cuda::Event<'ctx>, Upload<'ctx>> {
-        /// Submit the retained upload as one operation: check the admitted
-        /// budget, run the async copy, record the completion event, and track
-        /// it. Pending state and its actual completion dependency are
-        /// established together — there is no step at which submitted work is
-        /// untracked, and staging never precedes admission because the lease
-        /// only exists after it. Only from [`LeaseState::Live`].
-        ///
-        /// A failed record quarantines the lease: the copy may already be
-        /// submitted, so nothing is provably free and retirement must never
-        /// release. Anything earlier fails with everything in place.
-        pub fn submit(
-            &mut self,
-            ctx: &moxie_cuda::RankContext,
-            stream: &moxie_cuda::Stream<'ctx>,
-            event: moxie_cuda::Event<'ctx>,
-        ) -> Result<()> {
-            if self.state != LeaseState::Live {
-                return Err(Error::InvalidRequest {
-                    field: "lease",
-                    detail: format!(
-                        "{} ({}) cannot submit while {:?}",
-                        self.id, self.label, self.state
-                    ),
+    /// A preparation refusal keeps the unsubmitted lease and caller's source.
+    #[derive(Debug)]
+    pub struct PrepareRefused<'ctx> {
+        pub lease: Lease<Event<'ctx>>,
+        pub source: Vec<u8>,
+        pub error: Error,
+    }
+    impl core::fmt::Display for PrepareRefused<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "{}", self.error)
+        }
+    }
+    impl std::error::Error for PrepareRefused<'_> {}
+
+    impl<'ctx> Lease<Event<'ctx>> {
+        /// Validate device and host tier/scope charges before any CUDA allocation.
+        /// The source is caller-owned on refusal and again after retirement.
+        #[allow(clippy::result_large_err)]
+        pub fn prepare_upload(
+            self,
+            ctx: &'ctx RankContext,
+            source: Vec<u8>,
+        ) -> std::result::Result<Lease<Event<'ctx>, Upload<'ctx>>, PrepareRefused<'ctx>> {
+            let checked = if self.state != LeaseState::Live || source.is_empty() {
+                Err(Error::InvalidRequest {
+                    field: "upload",
+                    detail: "preparation requires a live lease and nonempty source".into(),
+                })
+            } else {
+                super::check_upload_fit(
+                    &self.admitted,
+                    &self.admitted_tiers,
+                    ctx.uuid(),
+                    source.len() as u64,
+                    source.capacity() as u64,
+                )
+            };
+            if let Err(error) = checked {
+                return Err(PrepareRefused {
+                    lease: self,
+                    source,
+                    error,
                 });
             }
-            let (scope, bytes) = match self.retained.as_ref() {
-                Some(upload) => (upload.scope(), upload.len() as u64),
-                None => {
-                    return Err(Error::InvalidRequest {
-                        field: "lease",
-                        detail: format!(
-                            "{} ({}) has no retained upload to submit",
-                            self.id, self.label
-                        ),
+            let buffer = match DeviceBuffer::alloc(ctx, source.len()) {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    return Err(PrepareRefused {
+                        lease: self,
+                        source,
+                        error,
                     });
                 }
             };
-            super::check_fit(&self.admitted, scope, bytes)?;
-            // The upload is retained by this lease until retirement, so source
-            // and buffer outlive the enqueue; the buffer holds at least the
-            // source length by construction in `Upload::prepare`. The borrow
-            // ends before any mutation below.
-            let upload = self.retained.as_mut().expect("checked above");
-            // SAFETY: bounds checked by construction above; the source lives
-            // in the retained upload and the destination holds it.
-            unsafe { upload.buffer.copy_from_host_async(&upload.source, stream)? };
-            // The copy is submitted; from here only quarantine or tracking
-            // follow. Record before anything else so a failed record cannot
-            // leave submitted work untracked.
-            if let Err(error) = event.record(stream) {
-                let device = ctx.ordinal();
-                self.state = LeaseState::Lost;
-                self.lost = Some(Box::new(super::LostInfo {
-                    device,
-                    detail: format!("event record failed, submission state unknown: {error}"),
-                }));
-                return Err(Error::InvalidRequest {
-                    field: "lease",
-                    detail: format!(
-                        "{} ({}) is quarantined: event record failed: {error}",
-                        self.id, self.label
-                    ),
-                });
-            }
-            self.completion = Some(event);
-            self.state = LeaseState::InFlight;
-            Ok(())
-        }
-
-        /// Record the lease's completion after the caller's own operation on
-        /// `stream`: the event is recorded into the stream's ordered work and
-        /// the lease tracks it. For operations the caller enqueues itself
-        /// (launches); uploads go through [`Lease::submit`], which ties the
-        /// stream. Only from [`LeaseState::Live`].
-        ///
-        /// A failed record quarantines the lease: the operation may already be
-        /// submitted, so nothing is provably free and retirement must never
-        /// release. The context ordinal names the loss.
-        pub fn use_on(
-            &mut self,
-            ctx: &moxie_cuda::RankContext,
-            stream: &moxie_cuda::Stream<'ctx>,
-            event: moxie_cuda::Event<'ctx>,
-        ) -> Result<()> {
-            if self.state != LeaseState::Live {
-                return Err(Error::InvalidRequest {
-                    field: "lease",
-                    detail: format!(
-                        "{} ({}) cannot bind a stream while {:?}",
-                        self.id, self.label, self.state
-                    ),
-                });
-            }
-            if let Err(e) = event.record(stream) {
-                let device = ctx.ordinal();
-                self.state = LeaseState::Lost;
-                self.lost = Some(Box::new(super::LostInfo {
-                    device,
-                    detail: format!("event record failed, submission state unknown: {e}"),
-                }));
-                return Err(Error::InvalidRequest {
-                    field: "lease",
-                    detail: format!(
-                        "{} ({}) is quarantined: event record failed: {e}",
-                        self.id, self.label
-                    ),
-                });
-            }
-            self.completion = Some(event);
-            self.state = LeaseState::InFlight;
-            Ok(())
+            Ok(self.retain(Upload {
+                buffer,
+                source,
+                ctx,
+            }))
         }
     }
 
-    impl Completion for moxie_cuda::Event<'_> {
+    impl<'ctx> Lease<Event<'ctx>, Upload<'ctx>> {
+        /// Submit once on the upload's own device. Argument validation precedes
+        /// all driver calls. Copy/record failures quarantine because submission
+        /// state can no longer be proven absent (including asynchronous errors).
+        pub fn submit(&mut self, stream: &Stream<'ctx>, event: Event<'ctx>) -> Result<()> {
+            if self.state != LeaseState::Live {
+                return Err(Error::InvalidRequest {
+                    field: "lease",
+                    detail: format!("cannot submit while {:?}", self.state),
+                });
+            }
+            let upload = self.retained.as_mut().expect("lease retains upload");
+            let uuid = upload.ctx.uuid();
+            if stream.device_uuid() != uuid || event.device_uuid() != uuid {
+                return Err(Error::InvalidRequest {
+                    field: "upload",
+                    detail: "stream and event must belong to the upload's device".into(),
+                });
+            }
+            let device = upload.ctx.ordinal();
+            // SAFETY: the source and allocation stay owned by this lease through
+            // completion or quarantine. Stream identity and bounds are checked.
+            let result = unsafe { upload.buffer.copy_from_host_async(&upload.source, stream) }
+                .and_then(|()| event.record(stream));
+            if let Err(error) = result {
+                self.mark_lost(device, format!("submission failed: {error}"));
+                return Err(error);
+            }
+            self.completion = Some(event);
+            self.state = LeaseState::InFlight;
+            Ok(())
+        }
+
+        /// Explicit synchronous validation readback. It waits on this lease's
+        /// event and does not enqueue additional asynchronous consumers.
+        pub fn readback(&mut self, destination: &mut [u8]) -> Result<()> {
+            if self.state != LeaseState::InFlight && self.state != LeaseState::Cancelled {
+                return Err(Error::InvalidRequest {
+                    field: "lease",
+                    detail: "readback requires a submitted, non-lost upload".into(),
+                });
+            }
+            self.synchronize()?;
+            let result = self
+                .retained
+                .as_ref()
+                .expect("lease retains upload")
+                .buffer
+                .copy_to_host(destination);
+            if let Err(error) = &result {
+                self.persist_loss(error.clone());
+            }
+            result
+        }
+    }
+
+    impl Completion for Event<'_> {
         fn query_complete(&self) -> Result<bool> {
             self.is_complete()
         }
-
         fn synchronize(&self) -> Result<()> {
             self.synchronize()
         }
-
         fn describe(&self) -> String {
-            "cuda event".to_string()
+            format!("cuda event on {}", self.device_uuid())
         }
     }
 }
 
 #[cfg(feature = "driver")]
-pub use driver_binding::Upload;
+pub use driver_binding::{PrepareRefused, Upload};
 
 /// A retirement the lease refused, carrying the lease back.
 ///

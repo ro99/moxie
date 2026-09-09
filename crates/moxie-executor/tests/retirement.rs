@@ -71,7 +71,9 @@ impl Drop for CountedDrop {
 
 impl SettledResource for CountedDrop {
     type Settled = ();
-    fn settle(self) {}
+    fn settle(self) -> Result<(), (Self, moxie_types::Error)> {
+        Ok(())
+    }
 }
 
 #[test]
@@ -550,5 +552,102 @@ fn retiring_into_the_wrong_ledger_hands_the_lease_back() {
     assert!(outstanding_ids(&other).is_empty());
     // And the handed-back lease still retires where it belongs.
     refused.lease.retire(&mut ledger).unwrap();
+    assert!(ledger.outstanding().is_empty());
+}
+
+#[test]
+fn upload_budget_requires_both_scopes_and_the_actual_tiers() {
+    use moxie_executor::check_upload_fit;
+    use moxie_types::DeviceTier;
+    let uuid = DeviceUuid::parse("GPU-00000000-0000-0000-0000-000000000001").unwrap();
+    let device = Scope::Device(uuid);
+    let scopes = [(device, 512), (Scope::Host, 1024)];
+    let tiers = [
+        (device, Tier::Device(DeviceTier::TransferStaging), 512),
+        (Scope::Host, Tier::Host(HostTier::Pageable), 1024),
+    ];
+    assert!(check_upload_fit(&scopes, &tiers, uuid, 512, 1024).is_ok());
+    assert!(check_upload_fit(&scopes[..1], &tiers, uuid, 512, 1024).is_err());
+    assert!(check_upload_fit(&scopes[1..], &tiers, uuid, 512, 1024).is_err());
+    assert!(check_upload_fit(&scopes, &tiers, uuid, 4096, 1024).is_err());
+    assert!(check_upload_fit(&scopes, &tiers, uuid, 512, 2048).is_err());
+    let wrong_tiers = [
+        (device, Tier::Device(DeviceTier::PackedResidentWeights), 512),
+        (Scope::Host, Tier::Host(HostTier::CpuWorkspace), 1024),
+    ];
+    assert!(check_upload_fit(&scopes, &wrong_tiers, uuid, 512, 1024).is_err());
+    // Scope and tier bounds are independent; spare scope room cannot borrow a tier cap.
+    assert!(
+        check_upload_fit(
+            &[(device, 4096), (Scope::Host, 4096)],
+            &tiers,
+            uuid,
+            1024,
+            1024
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn settlement_failure_preserves_resource_and_charge_and_does_not_retry() {
+    #[derive(Debug)]
+    struct FailedFree {
+        calls: Arc<AtomicUsize>,
+        resource: CountedDrop,
+    }
+    impl SettledResource for FailedFree {
+        type Settled = ();
+        fn settle(self) -> Result<(), (Self, moxie_types::Error)> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err((
+                self,
+                moxie_types::Error::InvalidRequest {
+                    field: "free",
+                    detail: "injected free failure".into(),
+                },
+            ))
+        }
+    }
+    let mut ledger = host_ledger();
+    let reservation = admit(&mut ledger, "free-failure", 512);
+    let (resource, drops) = CountedDrop::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let lease = Lease::<ManualCompletion>::acquire(&ledger, reservation, "free-failure")
+        .unwrap()
+        .retain(FailedFree {
+            calls: calls.clone(),
+            resource,
+        });
+    // Cleanup failure must quarantine even an unsubmitted allocation.
+    let refused = lease.retire(&mut ledger).unwrap_err();
+    assert_eq!(refused.lease.state(), LeaseState::Lost);
+    assert_eq!(ledger.outstanding().len(), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    let refused = refused.lease.retire(&mut ledger).unwrap_err();
+    assert_eq!(refused.error.kind(), "device_lost");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // Ensure this is the same retained resource, not a replacement on failure.
+    assert!(Arc::ptr_eq(
+        &refused.lease.retained().unwrap().resource.drops,
+        &drops
+    ));
+    drop(refused);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn wrong_ledger_never_settles_a_resource() {
+    let mut ledger = host_ledger();
+    let mut other = host_ledger();
+    let reservation = admit(&mut ledger, "wrong-owner", 512);
+    let (resource, drops) = CountedDrop::new();
+    let lease = Lease::<ManualCompletion>::acquire(&ledger, reservation, "wrong-owner")
+        .unwrap()
+        .retain(resource);
+    let refused = lease.retire(&mut other).unwrap_err();
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    refused.lease.retire(&mut ledger).unwrap();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert!(ledger.outstanding().is_empty());
 }

@@ -3,16 +3,16 @@
 //! Document 02 gives this crate rank-local execution, events and transfers. It
 //! binds the two halves task 0006–0008 built: the ledger's [`Reservation`] and
 //! the rank context's ordered stream work. A lease is acquired against admitted
-//! bytes, tracks one completion source, and retires only when that source
-//! lease-until-completion launch rule, encoded in the API rather than in caller
-//! comments.
+//! bytes, tracks one completion source, and retires only after observed completion
+//! and checked cleanup. The upload source and destination remain owned together.
 //!
 //! Three properties carry over from the ledger, because the failure modes are
 //! the same:
 //!
 //! * **Event-driven retirement.** [`Lease::retire`] queries the recorded
-//!   completion and refuses while work is in flight. `Drop` alone never frees
-//!   anything: a dropped lease's reservation stays charged and visible in
+//!   completion and refuses while work is in flight. Dropping submitted or lost
+//!   leases withholds their resources; an unsubmitted resource can drop normally.
+//!   Every dropped lease's reservation stays charged and visible in
 //!   [`Ledger::outstanding`], exactly like a dropped `Reservation`.
 //! * **Refusal returns the handle.** A failed `retire` hands the lease back,
 //!   so the error path cannot strand charged bytes the way R08's "next token"
@@ -33,11 +33,11 @@
 pub mod lease;
 pub use lease::{
     AcquireRefused, Completion, Lease, LeaseId, LeaseState, ManualCompletion, RetireRefused,
-    Script, ScriptedCompletion, SettledResource, TrackableManual, check_fit,
+    Script, ScriptedCompletion, SettledResource, TrackableManual, check_fit, check_upload_fit,
 };
 pub mod turn;
 
 pub use turn::{HeldLease, RetiredLease, Turn, TurnReport};
 
 #[cfg(feature = "driver")]
-pub use lease::Upload;
+pub use lease::{PrepareRefused, Upload};

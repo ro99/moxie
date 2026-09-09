@@ -19,7 +19,7 @@ use moxie_cuda::{
 };
 use moxie_executor::{Lease, Turn, Upload};
 use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSpan};
-use moxie_types::{DeviceCapability, DeviceTier, Error, RankId, Scope, Tier};
+use moxie_types::{DeviceCapability, DeviceTier, Error, HostTier, RankId, Scope, Tier};
 
 /// Wrap the build's own fatbin as a trusted image.
 ///
@@ -65,7 +65,7 @@ const CASES: &[&str] = &[
     "arch_mismatch_is_typed",
     "stream_event_completion",
     "event_backed_lease",
-    "lease_quarantine_on_cross_context_record",
+    "lease_rejects_foreign_completion",
     "non_ptx_text_rejected",
     "rank_context_is_exclusive",
     "concurrent_handoff_is_exclusive",
@@ -170,7 +170,7 @@ pub fn run(profile: Option<&str>) -> i32 {
         results.push(case(&cap, "event_backed_lease", backed_lease(&cap)));
         results.push(case(
             &cap,
-            "lease_quarantine_on_cross_context_record",
+            "lease_rejects_foreign_completion",
             lease_quarantine(&cap),
         ));
         results.push(case(&cap, "non_ptx_text_rejected", ptx_rejection(&cap)));
@@ -528,6 +528,13 @@ fn admit_upload(
         bytes,
         StageSpan { first: 0, last: 0 },
     ))?;
+    req.buffer(BufferRequest::new(
+        format!("{label}-source"),
+        Scope::Host,
+        Tier::Host(HostTier::Pageable),
+        bytes,
+        StageSpan { first: 0, last: 0 },
+    ))?;
     Ok(ledger.admit(&req)?)
 }
 
@@ -547,7 +554,9 @@ fn backed_lease(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let measurement = ctx.measure()?;
     let scope = Scope::Device(measurement.uuid);
     let snapshot = CapacitySnapshot::measured(&measurement, 1 << 20)?;
-    let mut ledger = Ledger::new([snapshot])?;
+    let host = moxie_host::read()?;
+    let host_snapshot = CapacitySnapshot::measured_host(&host, 1 << 20)?;
+    let mut ledger = Ledger::new([snapshot, host_snapshot])?;
     let stream = Stream::new(&ctx)?;
 
     // First upload: retired directly after its event is observed. Readback
@@ -557,17 +566,7 @@ fn backed_lease(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let mut lease_a = stage_upload(&mut ledger, &ctx, &stream, scope, "upload-a", &want_a)?;
     lease_a.synchronize()?;
     let mut out_a = vec![0f32; N];
-    let staged_a = lease_a
-        .retained()
-        .expect("a submitted lease retains its upload");
-    staged_a
-        .buffer()
-        .copy_to_host(bytemuck_f32_mut(&mut out_a))?;
-    if bytemuck_f32(&out_a) != staged_a.source() {
-        return Ok(Outcome::Failed(
-            "device bytes differ from the retained upload source".into(),
-        ));
-    }
+    lease_a.readback(bytemuck_f32_mut(&mut out_a))?;
     for (i, (&got, &want)) in out_a.iter().zip(want_a.iter()).enumerate() {
         if got != want {
             return Ok(Outcome::Failed(format!(
@@ -584,13 +583,11 @@ fn backed_lease(cap: &DeviceCapability) -> Result<Outcome, Error> {
 
     // Second upload: retired through a turn sweep, the R08 shape.
     let want_b: Vec<f32> = (0..N).map(|i| 1.0 + i as f32).collect();
-    let lease_b = stage_upload(&mut ledger, &ctx, &stream, scope, "upload-b", &want_b)?;
+    let mut lease_b = stage_upload(&mut ledger, &ctx, &stream, scope, "upload-b", &want_b)?;
+    let mut out_b = vec![0f32; N];
+    lease_b.readback(bytemuck_f32_mut(&mut out_b))?;
     let mut turn = Turn::new("upload-turn")?;
     turn.hold(lease_b);
-    turn.synchronize()?;
-    let mut out_b = vec![0f32; N];
-    let staged_b = turn_held_buffer(&turn)?;
-    staged_b.copy_to_host(bytemuck_f32_mut(&mut out_b))?;
     for (i, (&got, &want)) in out_b.iter().zip(want_b.iter()).enumerate() {
         if got != want {
             return Ok(Outcome::Failed(format!(
@@ -619,26 +616,6 @@ fn backed_lease(cap: &DeviceCapability) -> Result<Outcome, Error> {
     Ok(Outcome::Passed)
 }
 
-/// The retained upload's device buffer for a pre-retirement readback. The
-/// turn holds exactly one lease here; a helper keeps the case linear.
-fn turn_held_buffer<'t, 'ctx>(
-    turn: &'t Turn<moxie_cuda::Event<'ctx>, moxie_executor::Upload<'ctx>>,
-) -> Result<&'t moxie_cuda::DeviceBuffer<'ctx>, Error> {
-    let Some(lease) = turn.leases().first() else {
-        return Err(Error::InvalidRequest {
-            field: "turn",
-            detail: "expected the swept upload lease".into(),
-        });
-    };
-    let Some(upload) = lease.retained() else {
-        return Err(Error::InvalidRequest {
-            field: "lease",
-            detail: "expected the swept lease to retain its upload".into(),
-        });
-    };
-    Ok(upload.buffer())
-}
-
 /// Admit one upload envelope, prepare its staging, and submit both under a
 /// lease, in that order: admission first, then allocation, then the single
 /// submit that enqueues, records, tracks and retains together. A free
@@ -653,21 +630,16 @@ fn stage_upload<'ctx>(
     values: &[f32],
 ) -> Result<Lease<Event<'ctx>, Upload<'ctx>>, Error> {
     let reservation = admit_upload(ledger, scope, label, (values.len() * 4) as u64)?;
-    let upload = Upload::prepare(ctx, scope, bytemuck_f32(values).to_vec())?;
     let lease = Lease::acquire(ledger, reservation, label)?;
-    let mut lease = lease.retain(upload);
-    lease.submit(ctx, stream, Event::new(ctx)?)?;
+    let mut lease = lease
+        .prepare_upload(ctx, bytemuck_f32(values).to_vec())
+        .map_err(|r| r.error)?;
+    lease.submit(stream, Event::new(ctx)?)?;
     Ok(lease)
 }
 
-/// A failed event record quarantines instead of releasing (task 0009, P1).
-///
-/// Recording an event from one context into another context's stream is
-/// refused by the driver (`invalid resource handle`). The lease must enter
-/// `Lost` with its upload retained, and retirement must withhold rather than
-/// release — the shape the reviewer's probe produced against the old code,
-/// where the lease stayed `Live` and retired cleanly. Needs a second device;
-/// a lone GPU skips, unmeasured rather than passed.
+/// Foreign completion is refused before copying, and the unsubmitted lease
+/// remains recoverable. Post-copy record failure is covered by driver_faults.
 fn lease_quarantine(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let count = moxie_cuda::device_count()?;
     if count < 2 {
@@ -680,7 +652,9 @@ fn lease_quarantine(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let measurement = ctx.measure()?;
     let scope = Scope::Device(measurement.uuid);
     let snapshot = CapacitySnapshot::measured(&measurement, 1 << 20)?;
-    let mut ledger = Ledger::new([snapshot])?;
+    let host = moxie_host::read()?;
+    let host_snapshot = CapacitySnapshot::measured_host(&host, 1 << 20)?;
+    let mut ledger = Ledger::new([snapshot, host_snapshot])?;
     let stream = Stream::new(&ctx)?;
     // A second live context on another device. Rank and device both differ,
     // so neither exclusivity rule fires.
@@ -688,33 +662,23 @@ fn lease_quarantine(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let foreign = Event::new(&ctx2)?;
 
     let reservation = admit_upload(&mut ledger, scope, "quarantine", 64)?;
-    let upload = Upload::prepare(&ctx, scope, vec![3u8; 64])?;
-    let lease = Lease::acquire(&ledger, reservation, "quarantine")?;
-    let mut lease = lease.retain(upload);
-    match lease.use_on(&ctx, &stream, foreign) {
-        Ok(()) => {
-            return Ok(Outcome::Failed(
-                "cross-context event record unexpectedly succeeded".into(),
-            ));
-        }
-        Err(e) if e.to_string().contains("quarantined") => {}
-        Err(e) => return Ok(Outcome::Failed(format!("wrong refusal: {e}"))),
-    }
-    if lease.state() != moxie_executor::LeaseState::Lost {
+    let lease = Lease::acquire(&ledger, reservation, "foreign-event")?;
+    let mut lease = lease
+        .prepare_upload(&ctx, vec![3u8; 64])
+        .map_err(|r| r.error)?;
+    let error = lease
+        .submit(&stream, foreign)
+        .expect_err("foreign event must refuse");
+    if error.kind() != "invalid_request" || lease.state() != moxie_executor::LeaseState::Live {
         return Ok(Outcome::Failed(format!(
-            "quarantined lease is {:?}, not Lost",
-            lease.state()
+            "wrong pre-submission refusal: {error}"
         )));
     }
-    let refused = lease.retire(&mut ledger).unwrap_err();
-    if refused.error.kind() != "device_lost" {
-        return Ok(Outcome::Failed(format!(
-            "quarantined retire reported {}, not device_lost",
-            refused.error.kind()
-        )));
-    }
-    if ledger.outstanding().is_empty() {
-        return Ok(Outcome::Failed("quarantined bytes left the ledger".into()));
+    lease.retire(&mut ledger).map_err(|r| r.error)?;
+    if !ledger.outstanding().is_empty() {
+        return Ok(Outcome::Failed(
+            "unsubmitted lease failed to release".into(),
+        ));
     }
     Ok(Outcome::Passed)
 }

@@ -399,6 +399,11 @@ pub struct Stream<'ctx> {
 }
 
 impl<'ctx> Stream<'ctx> {
+    /// Stable identity of the device owning this handle.
+    pub fn device_uuid(&self) -> DeviceUuid {
+        self.ctx.uuid()
+    }
+
     pub fn new(ctx: &'ctx RankContext) -> Result<Self> {
         ctx.make_current()?;
         let mut stream: ffi::CUstream = core::ptr::null_mut();
@@ -449,6 +454,11 @@ pub struct Event<'ctx> {
 }
 
 impl<'ctx> Event<'ctx> {
+    /// Stable identity of the device owning this handle.
+    pub fn device_uuid(&self) -> DeviceUuid {
+        self.ctx.uuid()
+    }
+
     pub fn new(ctx: &'ctx RankContext) -> Result<Self> {
         ctx.make_current()?;
         let mut event: ffi::CUevent = core::ptr::null_mut();
@@ -701,6 +711,29 @@ impl<'ctx> DeviceBuffer<'ctx> {
             },
             "cuMemcpyDtoHAsync",
         )
+    }
+    /// Free this allocation, checked, without synchronizing. The caller must
+    /// have ordered all prior work — an observed event, never hope: freeing
+    /// unordered work hands live pages to the next allocation (R07). Failure
+    /// leaves the allocation live for quarantine. On failure the owner must
+    /// withhold it rather than run the conservative destructor's retry.
+    ///
+    /// # Safety
+    /// All uses of this allocation must have completed, or nothing was submitted.
+    /// No caller may use its raw pointer again after success.
+    pub unsafe fn try_free(&mut self) -> Result<()> {
+        if self.ptr == 0 {
+            return Ok(());
+        }
+        self.ctx.make_current()?;
+        check(
+            // SAFETY: live allocation on the current context; ordering is the
+            // caller's documented obligation.
+            unsafe { ffi::cuMemFree_v2(self.ptr) },
+            "cuMemFree",
+        )?;
+        self.ptr = 0;
+        Ok(())
     }
 }
 

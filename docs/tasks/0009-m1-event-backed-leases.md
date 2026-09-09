@@ -207,9 +207,9 @@ Gates (this machine, 2026-09-09; nothing loosened):
 
 Nothing failed. Nothing was skipped. `Cargo.lock` gains only the
 `moxie-executor` package and the `xtask` edge: no new third-party packages.
-No checkpoint was read, downloaded or converted; nothing was allocated, mapped
-or reclaimed; no swap entered any budget; and no performance number was
-produced. The stop condition was not triggered.
+No checkpoint was read, downloaded or converted; ~~nothing was allocated, mapped
+or reclaimed~~ (incorrect: the GPU tests allocate and free real upload buffers);
+no swap entered any budget, and no performance number was produced. The stop condition was not triggered.
 
 Remaining blockers and next bounded task: the spending half continues — the
 basic allocator (suballocating admitted envelopes into live ranges), the
@@ -272,3 +272,115 @@ Bite checks, each reverted to green:
 
 Gates for the corrections (this machine, 2026-09-09; nothing loosened) are
 recorded in the lane table below, updated in place.
+
+## Takeover contract — admission and checked teardown (2026-09-09)
+
+Codex takes over the interrupted Muse implementation at the owner's request, on
+`main` at `d525d07`. Muse stopped on provider rate limiting with partial edits in
+`moxie-cuda/src/driver.rs` and `moxie-executor/src/lease.rs`. Those edits are retained
+and completed, including the pre-settlement ledger identity check.
+
+The bounded correction remains task 0009, not the allocator: one transient upload
+per owned reservation. The executor validates the owning context's UUID, device
+`TransferStaging` and host `Pageable` charges, plus both scope peaks, before CUDA
+allocation. The host input is caller-owned before entry and after successful
+retirement; while retained, its full Vec capacity is charged. A preparation refusal
+returns the original lease and source. There is no public unadmitted `Upload`
+constructor, caller-selected upload scope, or separate caller-enqueued `use_on`.
+Preparation allocates only; submission validates stream/event identity and owns
+copy plus event recording. Any failure after calling the copy quarantines the
+lease. Pre-submission validation failure remains recoverable.
+
+Retirement first validates ledger ownership and observes completion, then performs
+checked allocation cleanup, then releases the reservation. Cleanup failure returns
+the retained resource, quarantines it and preserves the charge. The CUDA checked
+free has an explicit unsafe ordering contract and does not add a context-wide
+synchronize. The old DeviceBuffer destructor remains the conservative fallback for
+other consumers. Persistent allocation transfer remains the allocator's next task.
+
+Acceptance adds host tests for both tiers/scopes, oversized host capacity, failed
+settlement and wrong-ledger ordering; real-driver symbol-interposition regressions
+for allocation-before-refusal, copy/record errors and failed free; plus all existing
+host, architecture, specification, no-driver and real-device gates. The actual FFI
+branches must be exercised, not only their policy doubles. Superseded upload entry
+points are deleted; original contract text and failed experiments remain visible.
+
+
+### Takeover results — complete, local only
+
+All three remaining findings are fixed. Muse's checked-free work is completed with
+an **unsafe ordering contract**, and its ledger identity check now runs before any
+retirement side effect. The executor's private upload owner discharges that contract.
+The infallible settlement API is replaced with a resource-returning refusal; the
+ledger charge ends only after cleanup succeeds. Sources are returned to their caller,
+not to an unaccounted engine cache. No bare upload constructor, caller-supplied GPU
+scope, exposed device buffer or separate `use_on` path remains.
+
+`driver_faults` exercises the actual FFI branches on all three UUIDs, without changing
+the driver or adding production injection hooks. The test executable interposes and
+forwards CUDA symbols, injecting errors only in its own process. Assertions confirm
+that the interceptors run on the happy path. Over-budget, absent-scope, wrong-tier
+and oversized-Vec-capacity preparations make **zero allocation calls**. Lost and
+non-loss copy/record/free errors quarantine, retain the original charge and do not
+retry free on drop. A successful free occurs once, with **zero explicit context
+synchronization calls during retirement**. CUDA allocator latency itself is not
+measured or promised. Fault tests deliberately withhold six small allocations and
+sources per device; these remain named until process teardown.
+
+The cross-context GPU case now rejects a foreign event *before* copying and allows
+safe abandonment; it is named `lease_rejects_foreign_completion`. Real post-copy
+record failures are covered by the fault test. This replaces the earlier artificial
+`use_on` quarantine probe, not its failure coverage.
+
+| Gate rerun on final implementation | Result |
+|---|---|
+| fmt | PASS |
+| clippy `--workspace --all-targets --locked --offline -- -D warnings`, host and full device features | PASS both |
+| `cargo test --workspace --locked --offline` | PASS, 523 unit/integration + 7 doctests |
+| Same with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | PASS, 532 unit/integration + 9 doctests, including real-driver fault injection |
+| arch-check / spec-check | PASS, 52 rejected + 14 accepted / 12 rules; 10 unchanged documents |
+| Isolated no-driver target, `CUDA_HOME=/nonexistent NVCC=/nonexistent`, sanitized PATH, unset LD_LIBRARY_PATH | PASS, 523 + 7; explicit xtask build then ldd, no libcuda |
+| `cargo xtask-cuda test-gpu` | PASS, 30 cases, all 3 devices, sm_86 and sm_120 qualified |
+| `CUDA_VISIBLE_DEVICES=1,2 cargo xtask-cuda test-gpu` | Expected exit 1, sm_120 unqualified |
+| `cargo xtask-cuda capacity`, normal and reversed visibility | PASS, host and 3 devices |
+
+Counts above distinguish integration tests from doctests from Cargo's output; the
+older records classified one doctest as a unit/integration test. No required gate
+was skipped or carried forward. Quality, model execution and performance remain
+unmeasured and outside this slice.
+
+Negative checks, with all mutations restored:
+
+- Removing the pre-allocation budget check makes the driver regression accept an
+  oversized upload and fail (exit 101).
+- Removing copy-error quarantine leaves the lease Live instead of Lost and fails
+  the driver regression (exit 101).
+- Releasing the ledger before settlement loses the charge on failed free and fails
+  the driver regression (exit 101).
+- The retained-source doctest, with `compile_fail` removed, fails with **E0382**.
+  Removing the retaining move makes the control compile. Its source is now mutable,
+  so an unrelated immutable-variable error cannot satisfy the test.
+- An initial device-suite compilation failed while adding the interceptor-liveness
+  assertion (missing local `copies`); corrected before the successful full rerun.
+
+The next bounded task is the basic allocator, as detailed in the
+[handover](../handovers/2026-09-09-task0009-checked-upload-retirement.md). No push is
+performed by this takeover.
+
+Raw logs are in `/tmp/moxie-task0009-takeover/` on this machine, retained for the
+owner's review (temporary, not a permanent artifact store). Regression sources and
+commands are version-controlled so the evidence can be regenerated. Log hashes:
+
+| Log | SHA-256 |
+|---|---|
+| `host-tests.log` | `e574b9b54efec550bfecb140b68d9d81f19e2052fc7deaf6d0a83cc2d66b15f3` |
+| `device-tests.log` | `d9fe2403c748e57b84c20263d7c7ce2b86a830923793c9e63b9f03dc4579a26e` |
+| `no-driver-tests.log` | `bd184035923c79559d6aa336a9423d07c0e5fca6ac7f52142db1b20a9efbdba6` |
+| `no-driver-ldd.log` | `84ba98abde130c3b3ae400c88b7a566da10bf1b17b937ef16997104d087187be` |
+| `gpu.log` | `a3822473f6581cb58a58a43accb46bb32888b817b748870bd2f4187a69cba306` |
+| `gpu-negative.log` | `cac359779414b398572463f3d68a236d7506665c545dbd28798ad94690243429` |
+| `capacity.log` | `57454ba0c89a7dbfa453b3526319f73f99ab836e58a14657edc783e355ba3f09` |
+| `capacity-reversed.log` | `9f024105f2dc0d2c3d1b951944fa963eaab7feefe36b7cd688f4dca8ad592b89` |
+| `bite-admission.log` | `4fdb331eaaab583bb6cba3a4466d9b32a99972b3668e51a7bb462536cabbd89d` |
+| `bite-copy_quarantine.log` | `4974942b7820a0c651d121ebd7903280b4baf92cce38869f5e0d389b31e5800f` |
+| `bite-settlement_order.log` | `98c4415c4c6d28af6c181778cef7ea6c3bfb76334445d7d7e156a807487dec72` |
