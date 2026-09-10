@@ -273,6 +273,9 @@ impl<C> Lifecycle<C> {
     where
         C: Completion,
     {
+        if self.state == LeaseState::Lost {
+            return Err(self.lost_error("completion observation"));
+        }
         let observed = match self.completion.as_ref() {
             None => return Ok(()),
             Some(c) => c.synchronize(),

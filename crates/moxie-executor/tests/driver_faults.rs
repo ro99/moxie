@@ -1124,6 +1124,76 @@ fn real_driver_admission_submission_and_cleanup_are_fail_closed() {
             drop(refused);
         }
 
+        // A fatal asynchronous status first surfaced by final readback is a
+        // permanent loss even though the completion event was already ready.
+        // Retry, direct retirement and turn sweeping must all keep the one
+        // plan and its reservation quarantined. The nonfatal retry above
+        // remains the contrasting recoverable path.
+        let fatal_candidate = lower_selected(
+            &selected,
+            selected_workload(&selected, &ctx),
+            &capability,
+            &catalogue,
+        )
+        .unwrap();
+        let mut fatal_ledger = test_ledger(&ctx);
+        let fatal_plan = SelectedReservedPlan::admit(
+            fatal_candidate,
+            &selected,
+            &capability,
+            &catalogue,
+            &mut fatal_ledger,
+            &ctx,
+        )
+        .unwrap();
+        let fatal_lease = fatal_plan
+            .launch(
+                &selected,
+                &capability,
+                &catalogue,
+                &ctx,
+                &stream,
+                selected_bindings(&ctx, x, weight, gain, true),
+            )
+            .unwrap();
+        READBACK_ERROR.store(700, SeqCst);
+        let fatal = fatal_lease.finish().unwrap_err();
+        READBACK_ERROR.store(0, SeqCst);
+        assert_eq!(fatal.error.kind(), "device_lost");
+        assert!(fatal.error.to_string().contains("final output readback"));
+        assert_eq!(fatal.lease.state(), LeaseState::Lost);
+        assert_eq!(fatal_ledger.outstanding().len(), 1);
+
+        let readbacks_after_loss = READBACKS.load(SeqCst);
+        let event_syncs_after_loss = EVENT_SYNCS.load(SeqCst);
+        let fatal = fatal.lease.finish().unwrap_err();
+        assert_eq!(fatal.error.kind(), "device_lost");
+        assert_eq!(fatal.lease.state(), LeaseState::Lost);
+        assert_eq!(READBACKS.load(SeqCst), readbacks_after_loss);
+        assert_eq!(EVENT_SYNCS.load(SeqCst), event_syncs_after_loss);
+        assert_eq!(fatal_ledger.outstanding().len(), 1);
+
+        let fatal = fatal.lease.retire().unwrap_err();
+        assert_eq!(fatal.error.kind(), "device_lost");
+        assert_eq!(fatal.lease.state(), LeaseState::Lost);
+        assert_eq!(fatal_ledger.outstanding().len(), 1);
+
+        let frees_before_fatal_sweep = FREES.load(SeqCst);
+        let mut fatal_turn = OperationTurn::new("fatal readback quarantine").unwrap();
+        fatal_turn.hold(fatal.lease);
+        let fatal_report = fatal_turn.release_turn();
+        assert!(fatal_report.retired.is_empty());
+        assert_eq!(fatal_report.held.len(), 1);
+        assert_eq!(fatal_report.held[0].lease.state(), LeaseState::Lost);
+        assert!(
+            fatal_report.held[0]
+                .reason
+                .contains("final output readback")
+        );
+        drop(fatal_report);
+        assert_eq!(FREES.load(SeqCst), frees_before_fatal_sweep);
+        assert_eq!(fatal_ledger.outstanding().len(), 1);
+
         let candidate = lower_selected(
             &selected,
             selected_workload(&selected, &ctx),

@@ -541,6 +541,11 @@ impl<'ctx> OperationLease<SelectedCompletion<'ctx>, ChainOperation<'ctx>> {
                     .candidate(),
                 "final output readback",
             );
+            // A readback can surface an asynchronous fatal device status even
+            // after the event synchronized successfully. Persist that
+            // classification through the shared lifecycle before handing the
+            // sole ownership token back. Nonfatal refusals remain retryable.
+            self.persist_loss(error.clone());
             return Err(OperationRetireRefused { lease: self, error });
         }
         if output

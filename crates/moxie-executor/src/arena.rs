@@ -105,6 +105,11 @@ impl<C: Completion, R> OperationLease<C, R> {
         self.lifecycle.mark_lost(device, detail);
     }
 
+    #[cfg(feature = "driver")]
+    pub(crate) fn persist_loss(&mut self, error: Error) {
+        self.lifecycle.persist_loss(error);
+    }
+
     pub fn synchronize(&mut self) -> Result<()> {
         self.lifecycle.synchronize()
     }

@@ -999,7 +999,11 @@ fn selected_bf16_device_chain(cap: &DeviceCapability) -> Result<Outcome, Error> 
             rows * 4
         );
     }
-    selected_bf16_overflow_is_numerical(cap)
+    let overflow = selected_bf16_overflow_is_numerical(cap)?;
+    if overflow != Outcome::Passed {
+        return Ok(overflow);
+    }
+    selected_bf16_underflows_are_numerical(cap)
 }
 
 /// Finite BF16 operands can overflow the FP32 RMS reduction. The selected
@@ -1007,9 +1011,69 @@ fn selected_bf16_device_chain(cap: &DeviceCapability) -> Result<Outcome, Error> 
 /// return a typed numerical refusal, and remain explicitly recoverable only
 /// after the completion event has been observed.
 fn selected_bf16_overflow_is_numerical(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    let x = vec![1.0; 8];
+    let weight = vec![2.0f32.powi(60); 64];
+    let gain = vec![1.0; 8];
+    let fixture = chain_graph(8, 1e-5)?;
+    let oracle_error = interpreter_chain(&fixture, 1, 8, &x, &weight, &gain)
+        .expect_err("the interpreter must reject an infinite RMS denominator");
+    if oracle_error.kind() != "numerical" {
+        return Ok(Outcome::Failed(format!(
+            "RMS overflow oracle returned {} instead of numerical",
+            oracle_error.kind()
+        )));
+    }
+    selected_bf16_invalid_rms_is_numerical(cap, "RMS-overflow", 1e-5, &x, &weight, &gain)
+}
+
+/// Underflow is outside the fixed relative-error proof even when every
+/// external BF16 value and the eventual device result are finite. Refuse both
+/// owner-reproduced cases instead of accepting an output past the fixed bound.
+fn selected_bf16_underflows_are_numerical(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    let mut weight = vec![0.0; 64];
+    for diagonal in 0..8 {
+        weight[diagonal * 8 + diagonal] = 1.0;
+    }
+    for (label, input, gain, epsilon) in [
+        (
+            "RMS-reduction-underflow",
+            2.0f32.powi(-75),
+            1.0,
+            f32::from_bits(1),
+        ),
+        (
+            "RMS-scaling-underflow",
+            2.0f32.powi(-80),
+            2.0f32.powi(-70),
+            2.0f32.powi(-126),
+        ),
+    ] {
+        let outcome = selected_bf16_invalid_rms_is_numerical(
+            cap,
+            label,
+            epsilon,
+            &[input; 8],
+            &weight,
+            &[gain; 8],
+        )?;
+        if outcome != Outcome::Passed {
+            return Ok(outcome);
+        }
+    }
+    Ok(Outcome::Passed)
+}
+
+fn selected_bf16_invalid_rms_is_numerical(
+    cap: &DeviceCapability,
+    label: &'static str,
+    epsilon: f32,
+    x: &[f32],
+    weight: &[f32],
+    gain: &[f32],
+) -> Result<Outcome, Error> {
     let rows = 1usize;
     let hidden = 8usize;
-    let fixture = chain_graph(hidden as u64, 1e-5)?;
+    let fixture = chain_graph(hidden as u64, epsilon)?;
     let workload = ResourceWorkload {
         phase: Phase::Decode,
         rows: rows as u64,
@@ -1020,17 +1084,6 @@ fn selected_bf16_overflow_is_numerical(cap: &DeviceCapability) -> Result<Outcome
     };
     let catalogue = moxie_kernels::bf16_chain_catalogue();
     let candidate = lower_selected(&fixture.graph, workload, cap, &catalogue)?;
-    let x = vec![1.0; hidden];
-    let weight = vec![2.0f32.powi(60); hidden * hidden];
-    let gain = vec![1.0; hidden];
-    let oracle_error = interpreter_chain(&fixture, rows, hidden, &x, &weight, &gain)
-        .expect_err("the interpreter must reject an infinite RMS denominator");
-    if oracle_error.kind() != "numerical" {
-        return Ok(Outcome::Failed(format!(
-            "RMS overflow oracle returned {} instead of numerical",
-            oracle_error.kind()
-        )));
-    }
 
     let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
     let stream = Stream::new(&ctx)?;
@@ -1056,50 +1109,50 @@ fn selected_bf16_overflow_is_numerical(cap: &DeviceCapability) -> Result<Outcome
             ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
             vec![rows as u64, hidden as u64],
             cap,
-            &x,
+            x,
         ),
         owned_binding(
             fixture.weight,
             ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
             vec![hidden as u64, hidden as u64],
             cap,
-            &weight,
+            weight,
         ),
         owned_binding(
             fixture.gain,
             ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
             vec![hidden as u64],
             cap,
-            &gain,
+            gain,
         ),
     ];
     let refusal = plan
         .launch(&fixture.graph, cap, &catalogue, &ctx, &stream, bindings)
         .map_err(|refused| refused.error)?
         .finish()
-        .expect_err("RMS overflow must not become a successful finite result");
+        .expect_err("an invalid RMS intermediate must not become a successful finite result");
     if refusal.error.kind() != "numerical" {
         return Ok(Outcome::Failed(format!(
-            "RMS overflow returned {} instead of numerical",
+            "{label} returned {} instead of numerical",
             refusal.error.kind()
         )));
     }
     let (_, operation) = refusal.lease.retire().map_err(|refused| refused.error)?;
     let (plan, returned_inputs) = operation.into_parts();
     if plan.bound_weight_count() != 2 || returned_inputs.len() != 1 {
-        return Ok(Outcome::Failed(
-            "RMS overflow recovery lost its completed binding ownership".into(),
-        ));
+        return Ok(Outcome::Failed(format!(
+            "{label} recovery lost its completed binding ownership"
+        )));
     }
     plan.close(&mut ledger).map_err(|refused| refused.error)?;
     if !ledger.outstanding().is_empty() {
-        return Ok(Outcome::Failed(
-            "RMS overflow recovery left its reservation charged".into(),
-        ));
+        return Ok(Outcome::Failed(format!(
+            "{label} recovery left its reservation charged"
+        )));
     }
     println!(
-        "  selected chain {} RMS-overflow=typed-numerical recovered_weights=2",
-        cap.uuid
+        "  selected chain {} {label}=typed-numerical recovered_weights=2",
+        cap.uuid,
     );
     Ok(Outcome::Passed)
 }
@@ -1352,6 +1405,56 @@ fn bf16_semantic_numerics(cap: &DeviceCapability) -> Result<Outcome, Error> {
         }
     }
     println!("  numerical {} RMS-overflow=typed-numerical", cap.uuid);
+
+    // The first two fixtures are the independently reproduced failures. The
+    // third keeps the square reduction normal so the scaling-underflow guard
+    // is exercised independently rather than being masked by the row marker.
+    for (label, input, gain, epsilon) in [
+        (
+            "RMS-reduction-underflow",
+            2.0f32.powi(-75),
+            1.0,
+            f32::from_bits(1),
+        ),
+        (
+            "RMS-scaling-underflow",
+            2.0f32.powi(-80),
+            2.0f32.powi(-70),
+            2.0f32.powi(-126),
+        ),
+        (
+            "RMS-scaling-underflow-isolated",
+            2.0f32.powi(-60),
+            2.0f32.powi(-90),
+            2.0f32.powi(-126),
+        ),
+    ] {
+        let input = vec![input; 8];
+        let gain = vec![gain; 8];
+        let (want, bounds) = rms_equation(1, 8, epsilon, &input, &gain);
+        if want.iter().any(|value| !value.is_finite())
+            || bounds.iter().any(|value| !value.is_finite())
+        {
+            return Ok(Outcome::Failed(format!(
+                "{label} fixture has a nonfinite independent reference"
+            )));
+        }
+        match launch_rms(&ctx, &module, 1, 8, epsilon, &input, &gain) {
+            Err(error) if error.kind() == "numerical" => {}
+            Err(error) => {
+                return Ok(Outcome::Failed(format!(
+                    "primitive {label} returned {} instead of numerical",
+                    error.kind()
+                )));
+            }
+            Ok(_) => {
+                return Ok(Outcome::Failed(format!(
+                    "primitive {label} became a successful output"
+                )));
+            }
+        }
+        println!("  numerical {} {label}=typed-numerical", cap.uuid);
+    }
     Ok(Outcome::Passed)
 }
 
