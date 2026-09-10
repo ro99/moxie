@@ -15,6 +15,9 @@ cuda = [
     "dep:moxie-cuda",
     "dep:moxie-kernels",
     "dep:moxie-executor",
+    "dep:moxie-graph",
+    "dep:moxie-plan",
+    "dep:moxie-interp",
     "moxie-cuda/driver",
     "moxie-kernels/fatbin",
     "moxie-executor/driver",
@@ -28,6 +31,9 @@ moxie-host.workspace = true
 moxie-cuda = { workspace = true, optional = true }
 moxie-kernels = { workspace = true, optional = true }
 moxie-executor = { workspace = true, optional = true }
+moxie-graph = { workspace = true, optional = true }
+moxie-plan = { workspace = true, optional = true }
+moxie-interp = { workspace = true, optional = true }
 toml = "0.9"
 # Parsing model-crate source structurally rather than by text search. See
 # ADR 0004. All three are already in the lock graph via `toml`'s `serde_derive`,

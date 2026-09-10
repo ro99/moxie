@@ -35,6 +35,9 @@
 
 #![cfg_attr(not(feature = "driver"), forbid(unsafe_code))]
 
+#[cfg(all(test, feature = "driver"))]
+pub(crate) static DRIVER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub mod lease;
 pub use lease::{
     AcquireRefused, Completion, Lease, LeaseId, LeaseState, ManualCompletion, RetireRefused,
@@ -60,6 +63,15 @@ pub use arena::{
 };
 
 pub use turn::{HeldLease, RetiredLease, Turn, TurnReport};
+
+#[cfg(feature = "driver")]
+mod chain;
+#[cfg(feature = "driver")]
+pub use chain::{
+    ChainOperation, ChainResult, OwnedBinding, SelectedAdmitRefused, SelectedCloseRefused,
+    SelectedCompletion, SelectedHeldResource, SelectedLaunchRefused, SelectedReservedPlan,
+    selected_resource_request,
+};
 
 #[cfg(feature = "driver")]
 pub use lease::{PrepareRefused, Upload};

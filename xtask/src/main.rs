@@ -38,6 +38,7 @@ Device lane (needs `cargo xtask-cuda`):
   test-gpu [--profile sm_NN]
                           Real CUDA launches on every visible device; a required
                           architecture with no passing case fails the gate
+  test-bf16-chain         Reduced H8/H17 semantic chain for CUDA sanitizers
   probe [--out <path>]    Hardware/topology inventory; writes markdown when --out given
   capacity                Measure every device and admit a plan against the ledger;
                           allocates nothing
@@ -90,12 +91,14 @@ fn main() -> std::process::ExitCode {
         #[cfg(feature = "cuda")]
         "test-gpu" => gpu::run(flag("--profile")),
         #[cfg(feature = "cuda")]
+        "test-bf16-chain" => gpu::run_chain(),
+        #[cfg(feature = "cuda")]
         "probe" => probe::run(flag("--out")),
         #[cfg(feature = "cuda")]
         "capacity" => capacity::run(),
 
         #[cfg(not(feature = "cuda"))]
-        "test-gpu" | "probe" | "capacity" => device_command_unavailable(cmd),
+        "test-gpu" | "test-bf16-chain" | "probe" | "capacity" => device_command_unavailable(cmd),
 
         "index" | "help" | "-h" | "--help" => {
             print!("{USAGE}");

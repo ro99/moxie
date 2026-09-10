@@ -5,15 +5,23 @@
 //! assigns non-overlapping logical values to deterministic physical slots. The
 //! executor may then admit and materialize that immutable candidate.
 //!
-//! Semantic kernel selection is deliberately absent. A resource plan is the
-//! prerequisite for execution, not evidence that an operation kernel exists.
+//! Task 0012 adds pure semantic kernel selection from an injected immutable
+//! catalogue. Planning still owns no package, allocation, admission or device
+//! query: the selected descriptor identity is evidence for execution to bind,
+//! not authority to launch by itself.
 
 #![forbid(unsafe_code)]
+
+mod selected;
+pub use selected::{
+    PlannedValue, PlannedWorkspace, SelectedNode, SelectedPlanCandidate, StorageRegion,
+    lower_selected,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use moxie_graph::{Graph, GraphId, IndexEncoding, ValueId, ValueRole};
+pub use moxie_graph::{Graph, GraphId, IndexEncoding, OpParams, ValueId, ValueRole};
 use moxie_graph::{GraphSignature, StateEffect, TensorSpec};
 use moxie_types::{DeviceUuid, Error, Precision, Result, SymbolTable, TensorLayout};
 

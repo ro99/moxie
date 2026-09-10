@@ -9,7 +9,177 @@
 
 use core::fmt;
 
-use crate::ids::DeviceUuid;
+use crate::{
+    AccumulationPolicy, ActivationPrecision, TensorLayout, WeightPrecision, ids::DeviceUuid,
+};
+
+/// Stable identity of one audited semantic kernel implementation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KernelId(pub String);
+
+/// Closed semantic operations that may cross the planning/execution boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SemanticKernelOp {
+    Linear,
+    RmsNorm,
+    Residual,
+}
+
+impl SemanticKernelOp {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::RmsNorm => "rms_norm",
+            Self::Residual => "residual",
+        }
+    }
+}
+
+/// Operand role and stored precision accepted by a descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum KernelOperand {
+    Activation(ActivationPrecision),
+    Weight(WeightPrecision),
+}
+
+/// The one output-rounding boundary qualified by task 0012.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RoundingProfile {
+    FinalBf16Rne,
+}
+
+/// Hardware identity used for dispatch. Device names and ordinals are absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SmVersion {
+    pub major: u32,
+    pub minor: u32,
+}
+
+impl SmVersion {
+    pub const SM86: Self = Self { major: 8, minor: 6 };
+    pub const SM120: Self = Self {
+        major: 12,
+        minor: 0,
+    };
+
+    pub fn name(self) -> String {
+        format!("sm_{}{}", self.major, self.minor)
+    }
+}
+
+/// Checked shape domain of the initial BF16 semantic package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KernelShapeBounds {
+    pub max_rows: u64,
+    pub max_input: u64,
+    pub max_output: u64,
+}
+
+/// Exact logical workspace expression, evaluated by the pure planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WorkspaceExpression {
+    Zero,
+    RowsTimesF32,
+}
+
+impl WorkspaceExpression {
+    pub fn evaluate(self, rows: u64) -> Option<u64> {
+        match self {
+            Self::Zero => Some(0),
+            Self::RowsTimesF32 => rows.checked_mul(4),
+        }
+    }
+}
+
+/// Ordered symbols needed to execute one semantic node.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KernelSymbol(pub String);
+
+/// Immutable data selected by the pure planner. It carries no callback, image
+/// pointer, model identity or device ordinal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticKernelDescriptor {
+    pub id: KernelId,
+    pub abi_version: u32,
+    pub operation: SemanticKernelOp,
+    pub inputs: Vec<KernelOperand>,
+    pub output: ActivationPrecision,
+    pub accumulation: AccumulationPolicy,
+    pub rounding: RoundingProfile,
+    pub layout: TensorLayout,
+    pub shape: KernelShapeBounds,
+    pub sm: SmVersion,
+    pub workspace: WorkspaceExpression,
+    pub image_sha256: [u8; 32],
+    pub symbols: Vec<KernelSymbol>,
+}
+
+/// Read-only, closed catalogue injected into planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelCatalogue {
+    descriptors: Vec<SemanticKernelDescriptor>,
+    digest: [u8; 32],
+}
+
+impl KernelCatalogue {
+    pub fn new(mut descriptors: Vec<SemanticKernelDescriptor>) -> crate::Result<Self> {
+        descriptors.sort_by(|a, b| a.id.cmp(&b.id));
+        for (index, first) in descriptors.iter().enumerate() {
+            for second in &descriptors[index + 1..] {
+                if first.id == second.id || indistinguishable(first, second) {
+                    return Err(crate::Error::InvalidArtifact {
+                        detail: format!(
+                            "duplicate or indistinguishable kernel descriptors {} and {}",
+                            first.id.0, second.id.0
+                        ),
+                    });
+                }
+            }
+        }
+        let digest = catalogue_digest(&descriptors);
+        Ok(Self {
+            descriptors,
+            digest,
+        })
+    }
+
+    pub fn descriptors(&self) -> &[SemanticKernelDescriptor] {
+        &self.descriptors
+    }
+
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+}
+
+fn indistinguishable(a: &SemanticKernelDescriptor, b: &SemanticKernelDescriptor) -> bool {
+    a.operation == b.operation
+        && a.inputs == b.inputs
+        && a.output == b.output
+        && a.accumulation == b.accumulation
+        && a.rounding == b.rounding
+        && a.layout == b.layout
+        && a.shape == b.shape
+        && a.sm == b.sm
+        && a.workspace == b.workspace
+}
+
+fn catalogue_digest(descriptors: &[SemanticKernelDescriptor]) -> [u8; 32] {
+    // Four domain-separated FNV-1a lanes over an explicit Debug rendering.
+    // This is an identity digest, not a security boundary; image integrity is
+    // separately the build-produced SHA-256 in every descriptor.
+    let bytes = format!("{descriptors:?}");
+    let mut out = [0u8; 32];
+    for lane in 0..4u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64 ^ lane.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        for byte in bytes.as_bytes() {
+            h ^= u64::from(*byte);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        out[(lane as usize) * 8..(lane as usize + 1) * 8].copy_from_slice(&h.to_le_bytes());
+    }
+    out
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StrategyControl {

@@ -35,6 +35,7 @@ const PINNED_NVCC_RELEASE: &str = "release 13.0, V13.0.88";
 
 fn main() {
     println!("cargo:rerun-if-changed=cuda/smoke.cu");
+    println!("cargo:rerun-if-changed=cuda/bf16_chain.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=archs.rs");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -97,6 +98,14 @@ fn main() {
     );
     let full = build_fatbin(&nvcc, &host_cc, &out, "smoke.fatbin", ARCHS);
     let sm86 = build_fatbin(&nvcc, &host_cc, &out, "smoke_sm86.fatbin", &["86"]);
+    let semantic = build_source_fatbin(
+        &nvcc,
+        &host_cc,
+        &out,
+        "bf16_chain.fatbin",
+        "cuda/bf16_chain.cu",
+        ARCHS,
+    );
 
     println!(
         "cargo:rustc-env=MOXIE_SMOKE_FATBIN={}",
@@ -109,6 +118,11 @@ fn main() {
     println!("cargo:rustc-env=MOXIE_KERNEL_ARCHS={}", ARCHS.join(","));
     println!("cargo:rustc-env=MOXIE_SMOKE_FATBIN_SHA256={full}");
     println!("cargo:rustc-env=MOXIE_SMOKE_FATBIN_SM86_SHA256={sm86}");
+    println!(
+        "cargo:rustc-env=MOXIE_BF16_CHAIN_FATBIN={}",
+        out.join("bf16_chain.fatbin").display()
+    );
+    println!("cargo:rustc-env=MOXIE_BF16_CHAIN_FATBIN_SHA256={semantic}");
     println!(
         "cargo:rustc-env=MOXIE_NVCC_VERSION={}",
         one_line(&nvcc_version)
@@ -142,6 +156,17 @@ fn one_line(version: &str) -> String {
 
 /// Compile one image and return its SHA-256, lowercase hex.
 fn build_fatbin(nvcc: &str, host_cc: &str, out: &Path, name: &str, archs: &[&str]) -> String {
+    build_source_fatbin(nvcc, host_cc, out, name, "cuda/smoke.cu", archs)
+}
+
+fn build_source_fatbin(
+    nvcc: &str,
+    host_cc: &str,
+    out: &Path,
+    name: &str,
+    source: &str,
+    archs: &[&str],
+) -> String {
     let dst = out.join(name);
     let mut cmd = Command::new(nvcc);
     // `-ccbin` names the host compiler explicitly, so `HOST_COMPILER_VERSION`
@@ -155,7 +180,7 @@ fn build_fatbin(nvcc: &str, host_cc: &str, out: &Path, name: &str, archs: &[&str
         cmd.arg("-gencode")
             .arg(format!("arch=compute_{a},code=sm_{a}"));
     }
-    cmd.arg("cuda/smoke.cu").arg("-o").arg(&dst);
+    cmd.arg(source).arg("-o").arg(&dst);
 
     let status = cmd
         .status()

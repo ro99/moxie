@@ -73,12 +73,28 @@ impl<C: Completion, R> OperationLease<C, R> {
             .expect("operation lease retains its resource until retirement")
     }
 
+    #[cfg(feature = "driver")]
+    pub(crate) fn resource_mut(&mut self) -> &mut R {
+        self.resource
+            .as_mut()
+            .expect("operation lease retains its resource until retirement")
+    }
+
     pub fn track_manual(&mut self, completion: C) -> Result<()>
     where
         C: TrackableManual,
     {
         self.lifecycle
             .track_manual(completion, &format!("{} ({})", self.id, self.label))
+    }
+
+    #[cfg(feature = "driver")]
+    pub(crate) fn submit_tracked(&mut self, completion: C) -> Result<()> {
+        if self.lifecycle.state() != LeaseState::Live {
+            return Err(invalid("lease", "completion can only be recorded once"));
+        }
+        self.lifecycle.submit(completion);
+        Ok(())
     }
 
     pub fn cancel(&mut self) {
@@ -313,6 +329,47 @@ mod driver_binding {
             self.core.buffer.device_uuid()
         }
 
+        pub(crate) fn device_address(&self) -> moxie_types::Result<u64> {
+            self.core
+                .buffer
+                .device_ptr()
+                .checked_add(self.offset())
+                .ok_or_else(|| invalid("range", "device address overflowed"))
+        }
+
+        /// Enqueue a checked copy while a higher-level operation lease owns
+        /// this range and `source` through its completion event.
+        pub(crate) unsafe fn copy_from_host_async(
+            &self,
+            source: &[u8],
+            stream: &Stream<'ctx>,
+        ) -> moxie_types::Result<()> {
+            if source.len() as u64 > self.bytes() {
+                return Err(invalid("source", "binding exceeds its admitted range"));
+            }
+            let offset = usize::try_from(self.offset())
+                .map_err(|_| invalid("range", "range offset is not addressable"))?;
+            // SAFETY: forwarded to the caller; the chain operation lease owns
+            // source and this range until its recorded event completes.
+            unsafe {
+                self.core
+                    .buffer
+                    .copy_from_host_async_at(offset, source, stream)
+            }
+        }
+
+        pub(crate) fn copy_to_host(&self, destination: &mut [u8]) -> moxie_types::Result<()> {
+            if destination.len() as u64 > self.bytes() {
+                return Err(invalid(
+                    "destination",
+                    "readback exceeds its admitted range",
+                ));
+            }
+            let offset = usize::try_from(self.offset())
+                .map_err(|_| invalid("range", "range offset is not addressable"))?;
+            self.core.buffer.copy_to_host_at(offset, destination)
+        }
+
         #[allow(clippy::result_large_err)]
         pub fn prepare_upload(
             self,
@@ -415,6 +472,158 @@ mod driver_binding {
     }
 
     impl<'ctx> DeviceArena<'ctx> {
+        /// Materialize one physical allocation whose charged regions span
+        /// multiple device tiers. The region byte sum is exact and every tier
+        /// is validated against the same parent reservation before allocation.
+        pub(crate) fn create_partitioned(
+            ledger: &Ledger,
+            reservation: Reservation,
+            ctx: &'ctx RankContext,
+            regions: &[(DeviceTier, u64)],
+            capacity: u64,
+            label: impl Into<String>,
+        ) -> std::result::Result<Self, ArenaCreateRefused> {
+            let fail = |reservation, error| ArenaCreateRefused { reservation, error };
+            let scope = Scope::Device(ctx.uuid());
+            if reservation.ledger() != ledger.id() {
+                return Err(fail(
+                    reservation,
+                    invalid("reservation", "reservation belongs to another ledger"),
+                ));
+            }
+            if regions.is_empty() {
+                return Err(fail(
+                    reservation,
+                    invalid("regions", "a partitioned arena needs charged regions"),
+                ));
+            }
+            let mut total = 0u64;
+            let mut seen = std::collections::BTreeSet::new();
+            for (tier, bytes) in regions {
+                if *bytes == 0
+                    || !seen.insert(*tier)
+                    || matches!(
+                        tier,
+                        DeviceTier::SafetyHeadroom | DeviceTier::AllocatorFragmentation
+                    )
+                {
+                    return Err(fail(
+                        reservation,
+                        invalid("regions", "regions must be unique, nonzero payload tiers"),
+                    ));
+                }
+                total = match total.checked_add(*bytes) {
+                    Some(total) => total,
+                    None => {
+                        return Err(fail(
+                            reservation,
+                            invalid("regions", "region byte sum overflowed"),
+                        ));
+                    }
+                };
+            }
+            if total != capacity
+                || capacity == 0
+                || !capacity.is_multiple_of(DEVICE_ARENA_ALIGNMENT)
+                || capacity > usize::MAX as u64
+            {
+                return Err(fail(
+                    reservation,
+                    invalid(
+                        "capacity",
+                        "partitioned region sum must equal one aligned addressable arena",
+                    ),
+                ));
+            }
+            let Some(record) = ledger
+                .outstanding()
+                .into_iter()
+                .find(|record| record.id == reservation.id())
+            else {
+                return Err(fail(
+                    reservation,
+                    invalid("reservation", "reservation is not outstanding"),
+                ));
+            };
+            if record.scope_charges.iter().any(|(candidate, bytes)| {
+                matches!(candidate, Scope::Device(_)) && *candidate != scope && *bytes != 0
+            }) {
+                return Err(fail(
+                    reservation,
+                    invalid(
+                        "reservation",
+                        "one device arena cannot own another UUID's charge",
+                    ),
+                ));
+            }
+            let scope_budget = record
+                .scope_charges
+                .iter()
+                .find(|(candidate, _)| *candidate == scope)
+                .map(|(_, bytes)| *bytes)
+                .unwrap_or(0);
+            if capacity > scope_budget {
+                return Err(fail(
+                    reservation,
+                    Error::CapacityExceeded {
+                        tier: None,
+                        requested_bytes: capacity,
+                        available_bytes: scope_budget,
+                    },
+                ));
+            }
+            for (tier, bytes) in regions {
+                let tier_budget = record
+                    .charges
+                    .iter()
+                    .find(|(candidate, candidate_tier, _)| {
+                        *candidate == scope && *candidate_tier == Tier::Device(*tier)
+                    })
+                    .map(|(_, _, bytes)| *bytes)
+                    .unwrap_or(0);
+                if *bytes > tier_budget {
+                    return Err(fail(
+                        reservation,
+                        Error::CapacityExceeded {
+                            tier: Some(Tier::Device(*tier)),
+                            requested_bytes: *bytes,
+                            available_bytes: tier_budget,
+                        },
+                    ));
+                }
+            }
+            let metadata = match Arena::new(label, capacity, DEVICE_ARENA_ALIGNMENT) {
+                Ok(arena) => arena,
+                Err(error) => return Err(fail(reservation, error)),
+            };
+            let host_pageable_budget = record
+                .charges
+                .iter()
+                .find(|(candidate, candidate_tier, _)| {
+                    *candidate == Scope::Host && *candidate_tier == Tier::Host(HostTier::Pageable)
+                })
+                .map(|(_, _, bytes)| *bytes)
+                .unwrap_or(0);
+            let buffer = match DeviceBuffer::alloc(ctx, capacity as usize) {
+                Ok(buffer) => buffer,
+                Err(error) => return Err(fail(reservation, error)),
+            };
+            Ok(Self {
+                metadata,
+                core: Some(Rc::new(ArenaCore {
+                    buffer,
+                    device_ordinal: ctx.ordinal(),
+                    active_upload: Cell::new(false),
+                    host_pageable_budget,
+                })),
+                reservation: Some(reservation),
+                ledger: ledger.id(),
+                scope,
+                tier: regions[0].0,
+                quarantined: None,
+            })
+        }
+
         pub fn create(
             ledger: &Ledger,
             reservation: Reservation,

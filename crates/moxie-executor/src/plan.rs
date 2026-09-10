@@ -510,6 +510,7 @@ mod driver_binding {
 
         #[test]
         fn integrated_slot_failure_returns_candidate_and_unwinds_the_arena() {
+            let _serial = crate::DRIVER_TEST_LOCK.lock().unwrap();
             let count = moxie_cuda::device_count().expect("device lane requires the CUDA driver");
             assert!(count > 0, "device lane requires real hardware");
             for ordinal in 0..count {

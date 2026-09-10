@@ -207,7 +207,16 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
         (
             "moxie-executor",
             Allowed {
-                workspace: &["moxie-types", "moxie-memory", "moxie-cuda", "moxie-plan"],
+                // Task 0012 adds the sole package edge: executor loads the
+                // selected immutable fatbin/descriptors. Kernels still cannot
+                // reach planning, execution or models.
+                workspace: &[
+                    "moxie-types",
+                    "moxie-memory",
+                    "moxie-cuda",
+                    "moxie-plan",
+                    "moxie-kernels",
+                ],
                 third_party: NONE,
             },
         ),
@@ -3013,5 +3022,26 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(before, names.len(), "duplicate rule identifier");
+    }
+
+    #[test]
+    fn selected_package_adds_only_the_executor_to_kernels_edge() {
+        let allow = allowlist();
+        let planner = allow["moxie-plan"].workspace;
+        assert_eq!(planner, ["moxie-types", "moxie-graph"]);
+        for forbidden in ["moxie-kernels", "moxie-cuda", "moxie-memory"] {
+            assert!(!planner.contains(&forbidden));
+        }
+
+        let executor = allow["moxie-executor"].workspace;
+        assert!(executor.contains(&"moxie-kernels"));
+        let kernels = allow["moxie-kernels"].workspace;
+        assert_eq!(kernels, ["moxie-types"]);
+        for forbidden in ["moxie-plan", "moxie-executor", "moxie-model-api"] {
+            assert!(!kernels.contains(&forbidden));
+        }
+        for forbidden in ["moxie-plan", "moxie-kernels", "moxie-executor"] {
+            assert!(!MODEL_ALLOWED.contains(&forbidden));
+        }
     }
 }

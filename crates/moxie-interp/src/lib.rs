@@ -37,7 +37,7 @@
 pub mod kv;
 pub mod tensor;
 
-use moxie_graph::{Bindings, Graph, Node, OpParams};
+use moxie_graph::{Bindings, Graph, Node, OpParams, ValueId};
 use moxie_oracles::{activation, attention, linear, norm, residual, rope};
 use moxie_state::{LogitsHandle, SequenceState};
 use moxie_types::BranchId;
@@ -117,9 +117,132 @@ pub struct StepOutput {
 #[derive(Debug)]
 pub struct Interpreter;
 
+/// Every node result from one state-free graph walk, plus its final value.
+/// Values are retained in graph order so device qualification can compare
+/// semantic boundaries without reimplementing the interpreter dispatcher.
+#[derive(Debug, Clone)]
+pub struct StatelessTrace {
+    node_outputs: Vec<(ValueId, Value)>,
+    output: Value,
+}
+
+impl StatelessTrace {
+    pub fn node_outputs(&self) -> &[(ValueId, Value)] {
+        &self.node_outputs
+    }
+
+    pub fn node_output(&self, value: ValueId) -> Option<&Value> {
+        self.node_outputs
+            .iter()
+            .find_map(|(candidate, output)| (*candidate == value).then_some(output))
+    }
+
+    pub fn output(&self) -> &Value {
+        &self.output
+    }
+}
+
 impl Interpreter {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Walk a graph that has no state effects, using the same primitive oracle
+    /// dispatch and BF16 boundaries as [`Self::run`] but without publishing a
+    /// sequence transaction. This is the reference consumer for qualification
+    /// of small stateless device subgraphs.
+    pub fn run_stateless(
+        &self,
+        graph: &Graph,
+        bindings: &Bindings<Value>,
+    ) -> Result<StatelessTrace> {
+        if !graph.state_effects().is_empty() {
+            return Err(Error::InvalidRequest {
+                field: "graph",
+                detail: "run_stateless refuses a graph with state effects".into(),
+            });
+        }
+        if bindings.len() != graph.inputs().len() + graph.weights().len() {
+            return Err(Error::InvalidRequest {
+                field: "bindings",
+                detail: "stateless bindings must name exactly every input and weight".into(),
+            });
+        }
+        let first = *graph
+            .inputs()
+            .first()
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "graph",
+                detail: "a stateless graph needs an input".into(),
+            })?;
+        let rows = bindings
+            .get(first)
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "bindings",
+                detail: "the first graph input is not bound".into(),
+            })?
+            .rows();
+        let mut symbols = moxie_types::SymbolTable::new();
+        symbols.declare(graph.rows_symbol(), "rows");
+        symbols.bind(graph.rows_symbol(), rows as u64);
+        let mut values: Vec<Option<Value>> = vec![None; graph.value_count()];
+        for value in graph.inputs().iter().chain(graph.weights()) {
+            let bound = bindings.get(*value).ok_or_else(|| Error::InvalidRequest {
+                field: "bindings",
+                detail: format!("value {} is not bound", value.0),
+            })?;
+            let spec = graph.spec(*value).expect("validated graph value");
+            let expected = spec.extent(&symbols)?;
+            let actual: Vec<u64> = match bound {
+                Value::Float(tensor) => tensor.shape().iter().map(|dim| *dim as u64).collect(),
+                Value::Index(index) => vec![index.len() as u64],
+            };
+            if actual != expected || bound_precision(bound) != spec.role.precision() {
+                return Err(Error::InvalidArtifact {
+                    detail: format!(
+                        "binding {} shape or precision differs from the graph",
+                        value.0
+                    ),
+                });
+            }
+            if let Value::Float(tensor) = bound
+                && tensor.data().iter().any(|element| !element.is_finite())
+            {
+                return Err(Error::InvalidArtifact {
+                    detail: format!("binding {} contains a nonfinite value", value.0),
+                });
+            }
+            values[value.0 as usize] = Some(bound.clone());
+        }
+
+        // Stateless nodes never consult either object, but sharing `eval`
+        // avoids a second graph dispatcher or a second copy of any equation.
+        let state = SequenceState::new([]);
+        let kv = KvCache::for_branch(0, &state, moxie_state::ROOT)?;
+        let mut staged = Vec::new();
+        let mut node_outputs = Vec::with_capacity(graph.nodes().len());
+        for node in graph.nodes() {
+            let output = self.eval(node, &values, &kv, &mut staged, &[])?;
+            if let Value::Float(tensor) = &output
+                && tensor.data().iter().any(|element| !element.is_finite())
+            {
+                return Err(Error::Numerical {
+                    detail: format!("{} produced a nonfinite value", node.params.op().name()),
+                });
+            }
+            node_outputs.push((node.output, output.clone()));
+            values[node.output.0 as usize] = Some(output);
+        }
+        let output = values[graph.output().0 as usize]
+            .as_ref()
+            .ok_or_else(|| Error::InvalidArtifact {
+                detail: "the stateless graph output was never produced".into(),
+            })?
+            .clone();
+        Ok(StatelessTrace {
+            node_outputs,
+            output,
+        })
     }
 
     /// Execute one step.
@@ -608,6 +731,13 @@ impl Interpreter {
             }
         };
         Ok(out)
+    }
+}
+
+fn bound_precision(value: &Value) -> Option<moxie_types::Precision> {
+    match value {
+        Value::Float(tensor) => Some(tensor.precision()),
+        Value::Index(_) => None,
     }
 }
 

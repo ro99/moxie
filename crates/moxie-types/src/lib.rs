@@ -15,7 +15,9 @@ pub mod precision;
 pub mod tier;
 
 pub use capability::{
-    DeviceCapability, HostLimit, KernelCapability, MeasuredDevice, MeasuredHost, StrategyControl,
+    DeviceCapability, HostLimit, KernelCapability, KernelCatalogue, KernelId, KernelOperand,
+    KernelShapeBounds, KernelSymbol, MeasuredDevice, MeasuredHost, RoundingProfile,
+    SemanticKernelDescriptor, SemanticKernelOp, SmVersion, StrategyControl, WorkspaceExpression,
 };
 pub use dim::{Dim, DimError, SymbolId, SymbolTable};
 pub use error::{Error, Result};

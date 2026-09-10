@@ -1032,6 +1032,28 @@ impl<'ctx> Module<'ctx> {
             ctx: self.ctx,
         })
     }
+
+    /// Resolve a complete ordered symbol set before any launch and retain the
+    /// module beside the raw function handles. This avoids per-node lookup and
+    /// keeps the image loaded until the caller's completion lease retires.
+    pub fn resolve_all(self, names: &[String]) -> Result<ResolvedModule<'ctx>> {
+        if names.is_empty() {
+            return Err(Error::InvalidRequest {
+                field: "kernel_symbols",
+                detail: "a kernel package must resolve at least one symbol".into(),
+            });
+        }
+        let mut functions = Vec::with_capacity(names.len());
+        for name in names {
+            let function = self.function(name)?;
+            functions.push(function.func);
+        }
+        Ok(ResolvedModule {
+            module: self,
+            names: names.to_vec(),
+            functions,
+        })
+    }
 }
 
 impl Drop for Module<'_> {
@@ -1051,6 +1073,70 @@ pub struct Function<'m> {
     /// Borrowed from the owning `Module`, which borrows it from the context.
     /// A `Function` therefore cannot outlive either.
     ctx: &'m RankContext,
+}
+
+/// One loaded image with every required symbol resolved in declared order.
+#[derive(Debug)]
+pub struct ResolvedModule<'ctx> {
+    module: Module<'ctx>,
+    names: Vec<String>,
+    functions: Vec<ffi::CUfunction>,
+}
+
+impl ResolvedModule<'_> {
+    pub fn symbols(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Enqueue one already-resolved function on a caller-owned stream.
+    ///
+    /// # Safety
+    /// `params` must exactly match the selected symbol ABI, and every device
+    /// address must remain valid until a later event on `stream` completes.
+    pub unsafe fn launch_async(
+        &self,
+        index: usize,
+        stream: &Stream<'_>,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared_bytes: u32,
+        params: &mut [*mut c_void],
+    ) -> Result<()> {
+        if stream.device_uuid() != self.module.ctx.uuid() {
+            return Err(Error::InvalidRequest {
+                field: "stream",
+                detail: "kernel package and stream belong to different devices".into(),
+            });
+        }
+        let function = *self
+            .functions
+            .get(index)
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "kernel_symbol",
+                detail: format!("resolved symbol index {index} is out of range"),
+            })?;
+        self.module.ctx.make_current()?;
+        check(
+            // SAFETY: delegated to this method's contract. The function came
+            // from the retained live module and the stream/device was checked.
+            unsafe {
+                ffi::cuLaunchKernel(
+                    function,
+                    grid.0 as c_uint,
+                    grid.1 as c_uint,
+                    grid.2 as c_uint,
+                    block.0 as c_uint,
+                    block.1 as c_uint,
+                    block.2 as c_uint,
+                    shared_bytes as c_uint,
+                    stream.raw(),
+                    params.as_mut_ptr(),
+                    core::ptr::null_mut(),
+                )
+            },
+            "cuLaunchKernel",
+        )
+    }
 }
 
 impl Function<'_> {

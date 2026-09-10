@@ -5,8 +5,9 @@
 //! discovery. It exposes *images and descriptors*; loading and launching belong
 //! to `moxie-cuda` and, later, to the executor.
 //!
-//! Scope: the smoke kernels only. Real operation kernels arrive with the
-//! operations that define them.
+//! Scope: toolchain smoke kernels plus the narrowly qualified BF16 Linear,
+//! RMSNorm and Residual package. More operations arrive only with their own
+//! semantic and numerical contracts.
 //!
 //! The images and their build identity are behind the **`fatbin`** feature,
 //! which is off by default: document 07 requires the host lane to build with no
@@ -43,10 +44,20 @@ fn split_sm(list: &str) -> Vec<String> {
 
 pub const AXPY_F32: &str = "moxie_smoke_axpy_f32";
 pub const F32_TO_BF16_BITS: &str = "moxie_smoke_f32_to_bf16_bits";
+pub const BF16_LINEAR: &str = "moxie_bf16_linear_v1";
+pub const BF16_RMS_SUM: &str = "moxie_bf16_rms_sum_v1";
+pub const BF16_RMS_APPLY: &str = "moxie_bf16_rms_apply_v1";
+pub const BF16_RESIDUAL: &str = "moxie_bf16_residual_v1";
+pub const BF16_CHAIN_ABI: u32 = 1;
 
 #[cfg(feature = "fatbin")]
 mod images {
-    use moxie_types::KernelCapability;
+    use moxie_types::{
+        AccumulationPolicy, ActivationPrecision, KernelCapability, KernelCatalogue, KernelId,
+        KernelOperand, KernelShapeBounds, KernelSymbol, Precision, RoundingProfile,
+        SemanticKernelDescriptor, SemanticKernelOp, SmVersion, TensorLayout, WeightPrecision,
+        WorkspaceExpression,
+    };
 
     /// Fatbin containing every architecture this build compiled.
     ///
@@ -62,6 +73,7 @@ mod images {
     /// this on an SM120 device -- that failure is the assertion. It is SASS-only
     /// for the same reason: embedded PTX would let the driver JIT it anywhere.
     pub const SMOKE_FATBIN_SM86_ONLY: &[u8] = include_bytes!(env!("MOXIE_SMOKE_FATBIN_SM86"));
+    pub const BF16_CHAIN_FATBIN: &[u8] = include_bytes!(env!("MOXIE_BF16_CHAIN_FATBIN"));
 
     /// Compute capabilities actually compiled into [`SMOKE_FATBIN`].
     pub const KERNEL_ARCHS: &str = env!("MOXIE_KERNEL_ARCHS");
@@ -69,6 +81,7 @@ mod images {
     /// Build identity, for the benchmark manifest document 07 requires.
     pub const SMOKE_FATBIN_SHA256: &str = env!("MOXIE_SMOKE_FATBIN_SHA256");
     pub const SMOKE_FATBIN_SM86_SHA256: &str = env!("MOXIE_SMOKE_FATBIN_SM86_SHA256");
+    pub const BF16_CHAIN_FATBIN_SHA256: &str = env!("MOXIE_BF16_CHAIN_FATBIN_SHA256");
     /// What `nvcc --version` reported, verified against the pin in `build.rs`.
     pub const NVCC_VERSION: &str = env!("MOXIE_NVCC_VERSION");
     /// The host compiler nvcc drove. Recorded, not pinned.
@@ -97,12 +110,103 @@ mod images {
             workspace_upper_bound_bytes: 0,
         }
     }
+
+    /// The closed task-0012 package. Each SM has a distinct identity so
+    /// qualification cannot leak from Ampere to Blackwell or vice versa.
+    pub fn bf16_chain_catalogue() -> KernelCatalogue {
+        let hash = parse_sha256(BF16_CHAIN_FATBIN_SHA256);
+        let mut descriptors = Vec::new();
+        for sm in [SmVersion::SM86, SmVersion::SM120] {
+            let suffix = sm.name();
+            descriptors.push(descriptor(
+                format!("bf16-linear-v1-{suffix}"),
+                SemanticKernelOp::Linear,
+                vec![
+                    KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                    KernelOperand::Weight(WeightPrecision::expect(Precision::Bf16)),
+                ],
+                sm,
+                WorkspaceExpression::Zero,
+                hash,
+                &[super::BF16_LINEAR],
+            ));
+            descriptors.push(descriptor(
+                format!("bf16-rms-norm-v1-{suffix}"),
+                SemanticKernelOp::RmsNorm,
+                vec![
+                    KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                    KernelOperand::Weight(WeightPrecision::expect(Precision::Bf16)),
+                ],
+                sm,
+                WorkspaceExpression::RowsTimesF32,
+                hash,
+                &[super::BF16_RMS_SUM, super::BF16_RMS_APPLY],
+            ));
+            descriptors.push(descriptor(
+                format!("bf16-residual-v1-{suffix}"),
+                SemanticKernelOp::Residual,
+                vec![
+                    KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                    KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                ],
+                sm,
+                WorkspaceExpression::Zero,
+                hash,
+                &[super::BF16_RESIDUAL],
+            ));
+        }
+        KernelCatalogue::new(descriptors).expect("built-in descriptors are unique")
+    }
+
+    fn descriptor(
+        id: String,
+        operation: SemanticKernelOp,
+        inputs: Vec<KernelOperand>,
+        sm: SmVersion,
+        workspace: WorkspaceExpression,
+        image_sha256: [u8; 32],
+        symbols: &[&str],
+    ) -> SemanticKernelDescriptor {
+        SemanticKernelDescriptor {
+            id: KernelId(id),
+            abi_version: super::BF16_CHAIN_ABI,
+            operation,
+            inputs,
+            output: ActivationPrecision::expect(Precision::Bf16),
+            accumulation: AccumulationPolicy::Bf16InF32Acc,
+            rounding: RoundingProfile::FinalBf16Rne,
+            layout: TensorLayout::ContiguousRowMajorV1,
+            shape: KernelShapeBounds {
+                max_rows: 64,
+                max_input: 1024,
+                max_output: 1024,
+            },
+            sm,
+            workspace,
+            image_sha256,
+            symbols: symbols
+                .iter()
+                .map(|name| KernelSymbol((*name).to_string()))
+                .collect(),
+        }
+    }
+
+    fn parse_sha256(value: &str) -> [u8; 32] {
+        assert_eq!(value.len(), 64, "build emitted malformed SHA-256");
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16)
+                .expect("build emitted non-hex SHA-256");
+        }
+        out
+    }
 }
 
 #[cfg(feature = "fatbin")]
 pub use images::{
-    HOST_COMPILER_VERSION, KERNEL_ARCHS, NVCC_VERSION, SMOKE_FATBIN, SMOKE_FATBIN_SHA256,
-    SMOKE_FATBIN_SM86_ONLY, SMOKE_FATBIN_SM86_SHA256, axpy_capability, compiled_sm,
+    BF16_CHAIN_FATBIN, BF16_CHAIN_FATBIN_SHA256, HOST_COMPILER_VERSION, KERNEL_ARCHS, NVCC_VERSION,
+    SMOKE_FATBIN, SMOKE_FATBIN_SHA256, SMOKE_FATBIN_SM86_ONLY, SMOKE_FATBIN_SM86_SHA256,
+    axpy_capability, bf16_chain_catalogue, compiled_sm,
 };
 
 #[cfg(test)]
@@ -124,6 +228,7 @@ mod tests {
         // A zero-length image would load as a silent no-op on some drivers.
         assert!(SMOKE_FATBIN.len() > 1024, "fatbin looks empty");
         assert!(SMOKE_FATBIN_SM86_ONLY.len() > 512);
+        assert!(BF16_CHAIN_FATBIN.len() > 1024);
         // The multi-arch image must be the larger of the two: it carries strictly
         // more code. If this ever inverts, the build lost an architecture.
         assert!(
@@ -150,6 +255,7 @@ mod tests {
         assert_eq!(SMOKE_FATBIN_SHA256.len(), 64, "{SMOKE_FATBIN_SHA256}");
         assert_eq!(SMOKE_FATBIN_SM86_SHA256.len(), 64);
         assert_ne!(SMOKE_FATBIN_SHA256, SMOKE_FATBIN_SM86_SHA256);
+        assert_eq!(BF16_CHAIN_FATBIN_SHA256.len(), 64);
         assert!(NVCC_VERSION.contains("13.0"), "{NVCC_VERSION}");
         assert!(!HOST_COMPILER_VERSION.is_empty());
     }

@@ -1,0 +1,10 @@
+[package]
+name = "moxie-plan"
+version = "0.0.0"
+edition = "2024"
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden dependency"
+
+[dependencies]
+moxie-kernels = { path = "../../../../crates/moxie-kernels" }

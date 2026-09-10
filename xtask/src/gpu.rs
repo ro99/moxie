@@ -17,9 +17,20 @@ use moxie_cuda::{
     DeviceBuffer, Event, Module, ModuleImage, PtxSource, RankContext, Stream, TrustedImage,
     query_device,
 };
-use moxie_executor::{DeviceArena, Lease, Turn, Upload};
+use moxie_executor::{
+    DeviceArena, Lease, OwnedBinding, SelectedAdmitRefused, SelectedReservedPlan, Turn, Upload,
+};
+use moxie_graph::{
+    Bindings, Graph, GraphBuilder, Op, OpParams, OracleEvidence, OracleId, OracleRegistry,
+    TensorSpec, ValueId, ValueRole,
+};
+use moxie_interp::{HostTensor, Interpreter, Value};
 use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSpan};
-use moxie_types::{DeviceCapability, DeviceTier, Error, HostTier, RankId, Scope, Tier};
+use moxie_plan::{Phase, ResourceWorkload, lower_selected};
+use moxie_types::{
+    ActivationPrecision, DeviceCapability, DeviceTier, Dim, Error, HostTier, Precision, RankId,
+    Scope, SymbolId, TensorLayout, Tier, WeightPrecision,
+};
 
 /// Wrap the build's own fatbin as a trusted image.
 ///
@@ -66,6 +77,8 @@ const CASES: &[&str] = &[
     "stream_event_completion",
     "event_backed_lease",
     "admitted_device_arena",
+    "selected_bf16_device_chain",
+    "bf16_semantic_numerics",
     "lease_rejects_foreign_completion",
     "non_ptx_text_rejected",
     "rank_context_is_exclusive",
@@ -176,6 +189,16 @@ pub fn run(profile: Option<&str>) -> i32 {
         ));
         results.push(case(
             &cap,
+            "selected_bf16_device_chain",
+            selected_bf16_device_chain(&cap),
+        ));
+        results.push(case(
+            &cap,
+            "bf16_semantic_numerics",
+            bf16_semantic_numerics(&cap),
+        ));
+        results.push(case(
+            &cap,
             "lease_rejects_foreign_completion",
             lease_quarantine(&cap),
         ));
@@ -257,6 +280,45 @@ pub fn run(profile: Option<&str>) -> i32 {
         required.len()
     );
     0
+}
+
+/// Reduced real-chain entry point for Compute Sanitizer. It deliberately runs
+/// no smoke/fault cases, so memcheck observes exactly the H8/H17 plan path.
+pub fn run_chain() -> i32 {
+    let count = match moxie_cuda::device_count() {
+        Ok(count) if count > 0 => count,
+        Ok(_) => {
+            eprintln!("no CUDA devices visible: chain sanitizer measured nothing");
+            return 2;
+        }
+        Err(error) => {
+            eprintln!("cannot enumerate devices: {error}");
+            return 2;
+        }
+    };
+    let mut failed = 0;
+    for ordinal in 0..count {
+        let cap = match query_device(ordinal) {
+            Ok(cap) => cap,
+            Err(error) => {
+                eprintln!("FAIL device {ordinal}: {error}");
+                failed += 1;
+                continue;
+            }
+        };
+        match selected_bf16_device_chain(&cap) {
+            Ok(Outcome::Passed) => println!("PASS {} {} reduced BF16 chain", cap.uuid, cap.sm()),
+            Ok(other) => {
+                eprintln!("FAIL {} {}: {other:?}", cap.uuid, cap.sm());
+                failed += 1;
+            }
+            Err(error) => {
+                eprintln!("FAIL {} {}: {error}", cap.uuid, cap.sm());
+                failed += 1;
+            }
+        }
+    }
+    if failed == 0 { 0 } else { 1 }
 }
 
 /// Accept `sm86`, `86` and `sm_86` for the same profile.
@@ -708,6 +770,729 @@ fn admitted_device_arena(cap: &DeviceCapability) -> Result<Outcome, Error> {
     Ok(Outcome::Passed)
 }
 
+const CHAIN_ROWS: SymbolId = SymbolId(1_212);
+const CHAIN_ORACLE: OracleId = OracleId("task-0012-device-chain");
+
+struct ChainFixture {
+    graph: Graph,
+    x: ValueId,
+    weight: ValueId,
+    gain: ValueId,
+}
+
+fn chain_graph(hidden: u64, eps: f32) -> Result<ChainFixture, Error> {
+    let mut registry = OracleRegistry::new();
+    for op in [Op::Linear, Op::RmsNorm, Op::Residual] {
+        registry.register(
+            op,
+            CHAIN_ORACLE,
+            OracleEvidence {
+                implementation: "moxie-oracles",
+                test_module: "task-0012-device-chain",
+            },
+        )?;
+    }
+    let activation = |shape| {
+        TensorSpec::new(
+            ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
+            shape,
+        )
+    };
+    let weight_spec = |shape| {
+        TensorSpec::new(
+            ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
+            shape,
+        )
+    };
+    let mut builder = GraphBuilder::new(CHAIN_ORACLE, CHAIN_ROWS);
+    let x = builder.input(
+        "x",
+        activation(vec![Dim::symbol(CHAIN_ROWS), Dim::constant(hidden)]),
+    );
+    let weight = builder.weight(
+        "weight",
+        weight_spec(vec![Dim::constant(hidden), Dim::constant(hidden)]),
+    )?;
+    let linear = builder.node(
+        OpParams::Linear {
+            in_features: hidden,
+            out_features: hidden,
+            bias: false,
+        },
+        &[x, weight],
+    )?;
+    let gain = builder.weight("gain", weight_spec(vec![Dim::constant(hidden)]))?;
+    let norm = builder.node(OpParams::RmsNorm { hidden, eps }, &[linear, gain])?;
+    let output = builder.node(OpParams::Residual, &[x, norm])?;
+    Ok(ChainFixture {
+        graph: builder.finish(output, &registry)?,
+        x,
+        weight,
+        gain,
+    })
+}
+
+/// The first selected semantic chain (task 0012), on every visible UUID.
+///
+/// It covers the exact decode and odd-tail prefill shapes, retained uploads,
+/// one event, final-only readback, immutable weight reuse and explicit close.
+fn selected_bf16_device_chain(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    for (rows, hidden, eps, exact) in [(1usize, 8usize, 3.5f32, true), (5, 17, 1e-5, false)] {
+        let fixture = chain_graph(hidden as u64, eps)?;
+        let workload = ResourceWorkload {
+            phase: if rows == 1 {
+                Phase::Decode
+            } else {
+                Phase::Prefill
+            },
+            rows: rows as u64,
+            visible_tokens: if rows == 5 { 32_768 } else { 1 },
+            branch_rows: rows as u64,
+            output: fixture.graph.output(),
+            device: cap.uuid,
+        };
+        let catalogue = moxie_kernels::bf16_chain_catalogue();
+        let candidate = lower_selected(&fixture.graph, workload, cap, &catalogue)?;
+        let expected_total = if hidden == 8 { 1536 } else { 2048 };
+        if candidate.combined_arena_bytes() != expected_total
+            || candidate.workspace().logical_bytes != (rows * 4) as u64
+            || candidate.workspace().physical_bytes != 256
+        {
+            return Ok(Outcome::Failed(format!(
+                "rows={rows} H={hidden}: wrong selected bytes: total={}, workspace={}/{}",
+                candidate.combined_arena_bytes(),
+                candidate.workspace().logical_bytes,
+                candidate.workspace().physical_bytes
+            )));
+        }
+
+        let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+        let stream = Stream::new(&ctx)?;
+        let measurement = ctx.measure()?;
+        let device_snapshot = CapacitySnapshot::measured(&measurement, 1 << 20)?;
+        let host_snapshot = CapacitySnapshot::measured_host(&moxie_host::read()?, 1 << 20)?;
+        let mut ledger = Ledger::new([device_snapshot, host_snapshot])?;
+        let before = ctx.memory_info()?.0;
+        let mut plan = match SelectedReservedPlan::admit(
+            candidate,
+            &fixture.graph,
+            cap,
+            &catalogue,
+            &mut ledger,
+            &ctx,
+        ) {
+            Ok(plan) => plan,
+            Err(SelectedAdmitRefused::Invalid { error, .. })
+            | Err(SelectedAdmitRefused::Held { error, .. }) => return Err(error),
+            Err(SelectedAdmitRefused::Rejected { rejection, .. }) => {
+                return Err((*rejection).into());
+            }
+        };
+        let during = ctx.memory_info()?.0;
+        if during >= before {
+            return Ok(Outcome::Failed(format!(
+                "rows={rows} H={hidden}: the admitted physical arena spent no visible device memory"
+            )));
+        }
+
+        let (x, weight, gain) = chain_values(rows, hidden, exact);
+        let want = interpreter_chain(&fixture, rows, hidden, &x, &weight, &gain)?;
+        let bindings = vec![
+            owned_binding(
+                fixture.x,
+                ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                vec![rows as u64, hidden as u64],
+                cap,
+                &x,
+            ),
+            owned_binding(
+                fixture.weight,
+                ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
+                vec![hidden as u64, hidden as u64],
+                cap,
+                &weight,
+            ),
+            owned_binding(
+                fixture.gain,
+                ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
+                vec![hidden as u64],
+                cap,
+                &gain,
+            ),
+        ];
+        let lease = plan
+            .launch(&fixture.graph, cap, &catalogue, &ctx, &stream, bindings)
+            .map_err(|refused| refused.error)?;
+        let first = lease.finish().map_err(|refused| refused.error)?;
+        if first.launch_order != ["linear", "rms-reduce", "rms-apply", "residual"] {
+            return Ok(Outcome::Failed(format!(
+                "rows={rows} H={hidden}: launch order was {:?}",
+                first.launch_order
+            )));
+        }
+        let first_bits = decode_u16(&first.output);
+        let distances: Vec<u16> = first_bits
+            .iter()
+            .zip(&want.residual)
+            .map(|(got, want)| bf16_ulp_distance(*got, *want))
+            .collect();
+        let (max_ulp, rms_ulp, p99_ulp) = ulp_summary(&distances);
+        if (exact && first_bits != want.residual) || (!exact && max_ulp > 1) {
+            return Ok(Outcome::Failed(format!(
+                "rows={rows} H={hidden}: final output max ULP {max_ulp}, exact={exact}"
+            )));
+        }
+        plan = first.plan;
+        if plan.bound_weight_count() != 2 || first.returned_inputs.len() != 1 {
+            return Ok(Outcome::Failed(format!(
+                "rows={rows} H={hidden}: completion retained {} weights and returned {} inputs",
+                plan.bound_weight_count(),
+                first.returned_inputs.len()
+            )));
+        }
+
+        // The second execution supplies x only. The immutable device weights
+        // remain plan-owned and cannot be uploaded or rebound a second time.
+        let second_bindings = vec![owned_binding(
+            fixture.x,
+            ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
+            vec![rows as u64, hidden as u64],
+            cap,
+            &x,
+        )];
+        let second = plan
+            .launch(
+                &fixture.graph,
+                cap,
+                &catalogue,
+                &ctx,
+                &stream,
+                second_bindings,
+            )
+            .map_err(|refused| refused.error)?
+            .finish()
+            .map_err(|refused| refused.error)?;
+        if decode_u16(&second.output) != first_bits || second.plan.bound_weight_count() != 2 {
+            return Ok(Outcome::Failed(format!(
+                "rows={rows} H={hidden}: immutable-weight reuse changed the result"
+            )));
+        }
+        second
+            .plan
+            .close(&mut ledger)
+            .map_err(|refused| refused.error)?;
+        if !ledger.outstanding().is_empty() {
+            return Ok(Outcome::Failed(format!(
+                "rows={rows} H={hidden}: close left {} reservations",
+                ledger.outstanding().len()
+            )));
+        }
+        let after = ctx.memory_info()?.0;
+        if after < during.saturating_add(expected_total) {
+            return Ok(Outcome::Failed(format!(
+                "rows={rows} H={hidden}: close did not reconcile the {expected_total}-byte arena"
+            )));
+        }
+        println!(
+            "  selected chain {} rows={rows} H={hidden} arena={expected_total} B workspace={}/256 B ULP[max={max_ulp} rms={rms_ulp:.6} p99={p99_ulp}] second_execution=reused_weights",
+            cap.uuid,
+            rows * 4
+        );
+    }
+    Ok(Outcome::Passed)
+}
+
+fn chain_values(rows: usize, hidden: usize, exact: bool) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    if exact {
+        let x = (0..rows * hidden)
+            .map(|i| if i % 2 == 0 { 3.0 } else { 4.0 })
+            .collect();
+        let weight = (0..hidden * hidden)
+            .map(|i| if i / hidden == i % hidden { 1.0 } else { 0.0 })
+            .collect();
+        return (x, weight, vec![1.0; hidden]);
+    }
+    let x = (0..rows * hidden)
+        .map(|i| {
+            let raw = ((i * 29 + 7) % 31) as f32 - 15.0;
+            bf16_value(host_f32_to_bf16_bits(raw / 8.0))
+        })
+        .collect();
+    let weight = (0..hidden * hidden)
+        .map(|i| {
+            let raw = ((i * 17 + i / hidden * 3) % 13) as f32 - 6.0;
+            bf16_value(host_f32_to_bf16_bits(raw / 8.0))
+        })
+        .collect();
+    let gain = (0..hidden)
+        .map(|i| [0.5, 0.75, 1.0, 1.25, -0.5][i % 5])
+        .collect();
+    (x, weight, gain)
+}
+
+struct InterpreterChain {
+    linear: Vec<u16>,
+    norm: Vec<u16>,
+    residual: Vec<u16>,
+}
+
+fn interpreter_chain(
+    fixture: &ChainFixture,
+    rows: usize,
+    hidden: usize,
+    x: &[f32],
+    weight: &[f32],
+    gain: &[f32],
+) -> Result<InterpreterChain, Error> {
+    let mut bindings = Bindings::new();
+    bindings.set(
+        fixture.x,
+        Value::Float(HostTensor::bf16(x.to_vec(), vec![rows, hidden])?),
+    );
+    bindings.set(
+        fixture.weight,
+        Value::Float(HostTensor::bf16(weight.to_vec(), vec![hidden, hidden])?),
+    );
+    bindings.set(
+        fixture.gain,
+        Value::Float(HostTensor::bf16(gain.to_vec(), vec![hidden])?),
+    );
+    let trace = Interpreter::new().run_stateless(&fixture.graph, &bindings)?;
+    let bits = |value: ValueId| -> Result<Vec<u16>, Error> {
+        Ok(trace
+            .node_output(value)
+            .ok_or_else(|| Error::InvalidArtifact {
+                detail: format!("interpreter trace omitted value {}", value.0),
+            })?
+            .as_float()?
+            .data()
+            .iter()
+            .map(|value| host_f32_to_bf16_bits(*value))
+            .collect())
+    };
+    Ok(InterpreterChain {
+        linear: bits(fixture.graph.nodes()[0].output)?,
+        norm: bits(fixture.graph.nodes()[1].output)?,
+        residual: bits(fixture.graph.nodes()[2].output)?,
+    })
+}
+
+fn owned_binding(
+    value: ValueId,
+    role: ValueRole,
+    shape: Vec<u64>,
+    cap: &DeviceCapability,
+    values: &[f32],
+) -> OwnedBinding {
+    OwnedBinding {
+        value,
+        role,
+        shape,
+        layout: TensorLayout::ContiguousRowMajorV1,
+        device: cap.uuid,
+        bytes: encode_bf16(values),
+    }
+}
+
+fn encode_bf16(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 2);
+    for value in values {
+        bytes.extend_from_slice(&host_f32_to_bf16_bits(*value).to_le_bytes());
+    }
+    bytes
+}
+
+fn decode_u16(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(2)
+        .map(|word| u16::from_le_bytes([word[0], word[1]]))
+        .collect()
+}
+
+fn bf16_value(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+fn bf16_ulp_distance(left: u16, right: u16) -> u16 {
+    fn ordered(value: u16) -> i32 {
+        if value & 0x8000 == 0 {
+            0x8000 + value as i32
+        } else {
+            0x8000 - (value & 0x7fff) as i32
+        }
+    }
+    (ordered(left) - ordered(right)).unsigned_abs() as u16
+}
+
+fn ulp_summary(distances: &[u16]) -> (u16, f64, u16) {
+    let max = distances.iter().copied().max().unwrap_or(u16::MAX);
+    let rms = (distances
+        .iter()
+        .map(|distance| f64::from(*distance).powi(2))
+        .sum::<f64>()
+        / distances.len() as f64)
+        .sqrt();
+    let mut sorted = distances.to_vec();
+    sorted.sort_unstable();
+    let p99 = sorted[((sorted.len() - 1) * 99).div_ceil(100)];
+    (max, rms, p99)
+}
+
+#[derive(Clone, Copy)]
+struct BoundSummary {
+    count: usize,
+    max_abs: f64,
+    rms_abs: f64,
+    p99_abs: f64,
+    max_normalized: f64,
+}
+
+impl core::fmt::Display for BoundSummary {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "count={} max={:.3e} rms={:.3e} p99={:.3e} normalized_max={:.6}",
+            self.count, self.max_abs, self.rms_abs, self.p99_abs, self.max_normalized
+        )
+    }
+}
+
+/// Per-primitive FP64 equation gates. These intentionally use separate
+/// readbacks from the integrated chain case, whose one-D2H census stays exact.
+fn bf16_semantic_numerics(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let module = Module::load(
+        &ctx,
+        ModuleImage::Binary(smoke_image(moxie_kernels::BF16_CHAIN_FATBIN)?),
+    )?;
+    for (rows, hidden, eps, exact) in [
+        (1usize, 8usize, 3.5f32, true),
+        (5, 17, 1e-5, false),
+        (64, 1024, 1e-5, false),
+    ] {
+        let (x, weight, gain) = chain_values(rows, hidden, exact);
+        let fixture = chain_graph(hidden as u64, eps)?;
+        let interpreter = interpreter_chain(&fixture, rows, hidden, &x, &weight, &gain)?;
+        let linear_bits = launch_linear(&ctx, &module, rows, hidden, &x, &weight)?;
+        let linear = decode_bf16(&linear_bits);
+        let (linear_want, linear_bounds) = linear_equation(rows, hidden, &x, &weight);
+        let linear_summary = bound_summary(&linear, &linear_want, &linear_bounds);
+        if !primitive_accepted(
+            &linear_bits,
+            &linear_want,
+            &linear_bounds,
+            exact.then_some(interpreter.linear.as_slice()),
+        ) {
+            return Ok(Outcome::Failed(format!(
+                "rows={rows} H={hidden} Linear exceeded its fixed bound: {linear_summary}"
+            )));
+        }
+
+        let norm_bits = launch_rms(&ctx, &module, rows, hidden, eps, &linear, &gain)?;
+        let norm = decode_bf16(&norm_bits);
+        let (norm_want, norm_bounds) = rms_equation(rows, hidden, eps, &linear, &gain);
+        let norm_summary = bound_summary(&norm, &norm_want, &norm_bounds);
+        if !primitive_accepted(
+            &norm_bits,
+            &norm_want,
+            &norm_bounds,
+            exact.then_some(interpreter.norm.as_slice()),
+        ) {
+            return Ok(Outcome::Failed(format!(
+                "rows={rows} H={hidden} RMSNorm exceeded its fixed bound: {norm_summary}"
+            )));
+        }
+
+        let residual_bits = launch_residual(&ctx, &module, &x, &norm)?;
+        let residual = decode_bf16(&residual_bits);
+        let (residual_want, residual_bounds) = residual_equation(&x, &norm);
+        let residual_summary = bound_summary(&residual, &residual_want, &residual_bounds);
+        if !primitive_accepted(
+            &residual_bits,
+            &residual_want,
+            &residual_bounds,
+            exact.then_some(interpreter.residual.as_slice()),
+        ) {
+            return Ok(Outcome::Failed(format!(
+                "rows={rows} H={hidden} Residual exceeded its fixed bound: {residual_summary}"
+            )));
+        }
+        println!(
+            "  numerical {} rows={rows} H={hidden}: Linear [{linear_summary}]; RMSNorm [{norm_summary}]; Residual [{residual_summary}]",
+            cap.uuid
+        );
+    }
+    Ok(Outcome::Passed)
+}
+
+fn launch_linear(
+    ctx: &RankContext,
+    module: &Module<'_>,
+    rows: usize,
+    hidden: usize,
+    x: &[f32],
+    weight: &[f32],
+) -> Result<Vec<u16>, Error> {
+    let x_bytes = encode_bf16(x);
+    let weight_bytes = encode_bf16(weight);
+    let mut dx = DeviceBuffer::alloc(ctx, x_bytes.len())?;
+    let mut dw = DeviceBuffer::alloc(ctx, weight_bytes.len())?;
+    let out_bytes = rows * hidden * 2;
+    let output = DeviceBuffer::alloc(ctx, out_bytes)?;
+    dx.copy_from_host(&x_bytes)?;
+    dw.copy_from_host(&weight_bytes)?;
+    let mut px = dx.device_ptr();
+    let mut pw = dw.device_ptr();
+    let mut po = output.device_ptr();
+    let mut prows = rows as u64;
+    let mut phidden = hidden as u64;
+    let mut poutput = hidden as u64;
+    let mut params: [*mut c_void; 6] = [
+        (&raw mut px).cast(),
+        (&raw mut pw).cast(),
+        (&raw mut po).cast(),
+        (&raw mut prows).cast(),
+        (&raw mut phidden).cast(),
+        (&raw mut poutput).cast(),
+    ];
+    let function = module.function(moxie_kernels::BF16_LINEAR)?;
+    // SAFETY: the buffers and dimensions match the closed v1 symbol ABI.
+    unsafe {
+        function.launch_blocking(
+            ((rows * hidden).div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &mut params,
+        )?;
+    }
+    let mut bits = vec![0u16; rows * hidden];
+    output.copy_to_host(bytemuck_u16_mut(&mut bits))?;
+    Ok(bits)
+}
+
+fn launch_rms(
+    ctx: &RankContext,
+    module: &Module<'_>,
+    rows: usize,
+    hidden: usize,
+    eps: f32,
+    input: &[f32],
+    gain: &[f32],
+) -> Result<Vec<u16>, Error> {
+    let input_bytes = encode_bf16(input);
+    let gain_bytes = encode_bf16(gain);
+    let mut di = DeviceBuffer::alloc(ctx, input_bytes.len())?;
+    let mut dg = DeviceBuffer::alloc(ctx, gain_bytes.len())?;
+    let sums = DeviceBuffer::alloc(ctx, rows * 4)?;
+    let output = DeviceBuffer::alloc(ctx, rows * hidden * 2)?;
+    di.copy_from_host(&input_bytes)?;
+    dg.copy_from_host(&gain_bytes)?;
+    let mut pi = di.device_ptr();
+    let mut ps = sums.device_ptr();
+    let mut prows = rows as u64;
+    let mut phidden = hidden as u64;
+    let mut reduce: [*mut c_void; 4] = [
+        (&raw mut pi).cast(),
+        (&raw mut ps).cast(),
+        (&raw mut prows).cast(),
+        (&raw mut phidden).cast(),
+    ];
+    // SAFETY: the buffers and dimensions match the closed RMS-sum v1 ABI.
+    unsafe {
+        module
+            .function(moxie_kernels::BF16_RMS_SUM)?
+            .launch_blocking((rows.div_ceil(64) as u32, 1, 1), (64, 1, 1), 0, &mut reduce)?;
+    }
+    let mut pg = dg.device_ptr();
+    let mut po = output.device_ptr();
+    let mut peps = eps;
+    let mut apply: [*mut c_void; 7] = [
+        (&raw mut pi).cast(),
+        (&raw mut pg).cast(),
+        (&raw mut ps).cast(),
+        (&raw mut po).cast(),
+        (&raw mut prows).cast(),
+        (&raw mut phidden).cast(),
+        (&raw mut peps).cast(),
+    ];
+    // SAFETY: the buffers and dimensions match the closed RMS-apply v1 ABI.
+    unsafe {
+        module
+            .function(moxie_kernels::BF16_RMS_APPLY)?
+            .launch_blocking(
+                ((rows * hidden).div_ceil(256) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut apply,
+            )?;
+    }
+    let mut bits = vec![0u16; rows * hidden];
+    output.copy_to_host(bytemuck_u16_mut(&mut bits))?;
+    Ok(bits)
+}
+
+fn launch_residual(
+    ctx: &RankContext,
+    module: &Module<'_>,
+    left: &[f32],
+    right: &[f32],
+) -> Result<Vec<u16>, Error> {
+    let left_bytes = encode_bf16(left);
+    let right_bytes = encode_bf16(right);
+    let mut dl = DeviceBuffer::alloc(ctx, left_bytes.len())?;
+    let mut dr = DeviceBuffer::alloc(ctx, right_bytes.len())?;
+    let output = DeviceBuffer::alloc(ctx, left_bytes.len())?;
+    dl.copy_from_host(&left_bytes)?;
+    dr.copy_from_host(&right_bytes)?;
+    let mut pl = dl.device_ptr();
+    let mut pr = dr.device_ptr();
+    let mut po = output.device_ptr();
+    let mut elements = left.len() as u64;
+    let mut params: [*mut c_void; 4] = [
+        (&raw mut pl).cast(),
+        (&raw mut pr).cast(),
+        (&raw mut po).cast(),
+        (&raw mut elements).cast(),
+    ];
+    // SAFETY: the buffers and element count match the closed residual v1 ABI.
+    unsafe {
+        module
+            .function(moxie_kernels::BF16_RESIDUAL)?
+            .launch_blocking(
+                (left.len().div_ceil(256) as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                &mut params,
+            )?;
+    }
+    let mut bits = vec![0u16; left.len()];
+    output.copy_to_host(bytemuck_u16_mut(&mut bits))?;
+    Ok(bits)
+}
+
+fn linear_equation(rows: usize, hidden: usize, x: &[f32], weight: &[f32]) -> (Vec<f64>, Vec<f64>) {
+    let mut want = Vec::with_capacity(rows * hidden);
+    let mut bounds = Vec::with_capacity(rows * hidden);
+    for row in 0..rows {
+        for output in 0..hidden {
+            let mut sum = 0.0f64;
+            let mut scale = 0.0f64;
+            for k in 0..hidden {
+                let term = x[row * hidden + k] as f64 * weight[output * hidden + k] as f64;
+                sum += term;
+                scale += term.abs();
+            }
+            want.push(sum);
+            bounds.push(gamma(hidden as u64 + 1) * scale + BF16_U * sum.abs() + BF16_ETA);
+        }
+    }
+    (want, bounds)
+}
+
+fn rms_equation(
+    rows: usize,
+    hidden: usize,
+    eps: f32,
+    input: &[f32],
+    gain: &[f32],
+) -> (Vec<f64>, Vec<f64>) {
+    let mut want = Vec::with_capacity(rows * hidden);
+    let mut bounds = Vec::with_capacity(rows * hidden);
+    for row in 0..rows {
+        let mut sum = 0.0f64;
+        for k in 0..hidden {
+            let value = input[row * hidden + k] as f64;
+            sum += value * value;
+        }
+        let denom = (sum / hidden as f64 + eps as f64).sqrt();
+        for k in 0..hidden {
+            let value = input[row * hidden + k] as f64 * gain[k] as f64 / denom;
+            want.push(value);
+            bounds.push((gamma(hidden as u64 + 4) + BF16_U) * value.abs() + BF16_ETA);
+        }
+    }
+    (want, bounds)
+}
+
+fn residual_equation(left: &[f32], right: &[f32]) -> (Vec<f64>, Vec<f64>) {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| {
+            let want = *left as f64 + *right as f64;
+            let bound = gamma(1) * ((*left as f64).abs() + (*right as f64).abs())
+                + BF16_U * want.abs()
+                + BF16_ETA;
+            (want, bound)
+        })
+        .unzip()
+}
+
+const BF16_U: f64 = 1.0 / 256.0;
+const BF16_ETA: f64 = 4.591_774_807_899_561e-41;
+
+fn gamma(steps: u64) -> f64 {
+    let product = steps as f64 * 2.0f64.powi(-24);
+    product / (1.0 - product)
+}
+
+fn decode_bf16(bits: &[u16]) -> Vec<f32> {
+    bits.iter().map(|value| bf16_value(*value)).collect()
+}
+
+fn bound_summary(got: &[f32], want: &[f64], bounds: &[f64]) -> BoundSummary {
+    if got.iter().any(|value| !value.is_finite())
+        || want.iter().any(|value| !value.is_finite())
+        || bounds
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return BoundSummary {
+            count: got.len(),
+            max_abs: f64::INFINITY,
+            rms_abs: f64::INFINITY,
+            p99_abs: f64::INFINITY,
+            max_normalized: f64::INFINITY,
+        };
+    }
+    let mut absolute: Vec<f64> = got
+        .iter()
+        .zip(want)
+        .map(|(got, want)| (*got as f64 - *want).abs())
+        .collect();
+    let max_abs = absolute.iter().copied().fold(0.0, f64::max);
+    let rms_abs =
+        (absolute.iter().map(|value| value * value).sum::<f64>() / absolute.len() as f64).sqrt();
+    absolute.sort_by(f64::total_cmp);
+    let p99_index = ((absolute.len() - 1) * 99).div_ceil(100);
+    let max_normalized = got
+        .iter()
+        .zip(want)
+        .zip(bounds)
+        .map(|((got, want), bound)| (*got as f64 - *want).abs() / *bound)
+        .fold(0.0, f64::max);
+    BoundSummary {
+        count: got.len(),
+        max_abs,
+        rms_abs,
+        p99_abs: absolute[p99_index],
+        max_normalized,
+    }
+}
+
+fn primitive_accepted(
+    got_bits: &[u16],
+    want: &[f64],
+    bounds: &[f64],
+    exact_bits: Option<&[u16]>,
+) -> bool {
+    if got_bits.len() != want.len() || want.len() != bounds.len() {
+        return false;
+    }
+    let got = decode_bf16(got_bits);
+    let summary = bound_summary(&got, want, bounds);
+    summary.max_normalized <= 1.0 && exact_bits.is_none_or(|expected| got_bits == expected)
+}
+
 fn upload_arena_range<'ctx>(
     range: moxie_executor::DeviceRange<'ctx>,
     source: Vec<u8>,
@@ -1046,4 +1831,122 @@ fn concurrent_handoff(cap: &DeviceCapability) -> Result<Outcome, Error> {
     }
     taken.measure()?;
     Ok(Outcome::Passed)
+}
+
+#[cfg(test)]
+mod task_0012_negative_fixtures {
+    use super::*;
+
+    #[test]
+    fn nonfinite_metrics_fail_closed() {
+        let summary = bound_summary(&[f32::NAN], &[0.0], &[1.0]);
+        assert!(summary.max_normalized.is_infinite());
+        let summary = bound_summary(&[0.0], &[f64::INFINITY], &[1.0]);
+        assert!(summary.max_normalized.is_infinite());
+    }
+
+    #[test]
+    fn forbidden_semantic_substitutions_fail_the_real_acceptance_gate() {
+        // This BF16 vector lands exactly on a BF16 tie in ascending FP32
+        // accumulation. Reversing the adds nudges it above the tie, changing
+        // the stored BF16 bit pattern even though both results satisfy the
+        // ordinary analytical rounding bound.
+        let terms = [
+            6.1875f32,
+            f32::from_bits(0x3580_0000), // 2^-20
+            7.375,
+            4.875,
+            f32::from_bits(0x3600_0000), // 2^-19
+            7.0625,
+            1.375,
+            7.75,
+        ];
+        let mut ascending = 0.0f32;
+        for value in &terms {
+            ascending += *value;
+        }
+        let mut reversed = 0.0f32;
+        for value in terms.iter().rev() {
+            reversed += *value;
+        }
+        let mut ascending_bits = vec![0; 8];
+        ascending_bits[0] = host_f32_to_bf16_bits(ascending);
+        let mut reversed_bits = vec![0; 8];
+        reversed_bits[0] = host_f32_to_bf16_bits(reversed);
+        let mut identity_row = vec![0.0; 64];
+        identity_row[..8].fill(1.0);
+        let (linear_want, linear_bounds) = linear_equation(1, 8, &terms, &identity_row);
+        assert!(primitive_accepted(
+            &ascending_bits,
+            &linear_want,
+            &linear_bounds,
+            Some(&ascending_bits),
+        ));
+        assert!(!primitive_accepted(
+            &reversed_bits,
+            &linear_want,
+            &linear_bounds,
+            Some(&ascending_bits),
+        ));
+
+        // Feed a deliberately unrounded Linear result into RMSNorm. The same
+        // per-node fixed-bound gate used above rejects the substituted output.
+        let unrounded = [-2.312_744_1f32, 1.878_906_2];
+        let rounded: Vec<_> = unrounded
+            .iter()
+            .map(|value| bf16_value(host_f32_to_bf16_bits(*value)))
+            .collect();
+        let mut sum = 0.0f32;
+        for value in unrounded {
+            sum += value * value;
+        }
+        let denom = (sum / 2.0 + 1e-5).sqrt();
+        let omitted_boundary_bits: Vec<_> = unrounded
+            .iter()
+            .map(|value| host_f32_to_bf16_bits(*value / denom))
+            .collect();
+        let (rms_want, rms_bounds) = rms_equation(1, 2, 1e-5, &rounded, &[1.0, 1.0]);
+        assert!(!primitive_accepted(
+            &omitted_boundary_bits,
+            &rms_want,
+            &rms_bounds,
+            None,
+        ));
+
+        let norm_input = [10.0f32, 11.0, 12.0, 13.0];
+        let (rms_want, rms_bounds) = rms_equation(1, 4, 1e-5, &norm_input, &[1.0; 4]);
+        let mean = norm_input.iter().sum::<f32>() / 4.0;
+        let variance = norm_input
+            .iter()
+            .map(|value| (*value - mean) * (*value - mean))
+            .sum::<f32>()
+            / 4.0;
+        let layer_denom = (variance + 1e-5).sqrt();
+        let layer_bits: Vec<_> = norm_input
+            .iter()
+            .map(|value| host_f32_to_bf16_bits((*value - mean) / layer_denom))
+            .collect();
+        assert!(!primitive_accepted(
+            &layer_bits,
+            &rms_want,
+            &rms_bounds,
+            None,
+        ));
+
+        let input = [1.0f32, -2.0];
+        let residual = [10.0f32, 20.0];
+        let once: Vec<_> = input.iter().zip(residual).map(|(a, b)| *a + b).collect();
+        let twice: Vec<_> = once.iter().zip(residual).map(|(a, b)| *a + b).collect();
+        let twice_bits: Vec<_> = twice
+            .iter()
+            .map(|value| host_f32_to_bf16_bits(*value))
+            .collect();
+        let (residual_want, residual_bounds) = residual_equation(&input, &residual);
+        assert!(!primitive_accepted(
+            &twice_bits,
+            &residual_want,
+            &residual_bounds,
+            None,
+        ));
+    }
 }

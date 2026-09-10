@@ -1628,3 +1628,84 @@ fn a_rollback_drops_the_kv_tail_and_the_retained_result() {
     let live: Vec<u64> = state.live_results().iter().map(|h| h.prefix()).collect();
     assert_eq!(live, vec![2, 4]);
 }
+
+#[test]
+fn stateless_trace_reports_each_bf16_semantic_boundary_in_graph_order() {
+    let mut graph = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(77));
+    let activation = |shape| TensorSpec::new(act(Precision::Bf16), shape);
+    let weight_spec = |shape| TensorSpec::new(weight(), shape);
+    let rows = Dim::symbol(SymbolId(77));
+    let x = graph.input("x", activation(vec![rows.clone(), Dim::constant(2)]));
+    let w = graph
+        .weight("w", weight_spec(vec![Dim::constant(2), Dim::constant(2)]))
+        .unwrap();
+    let linear = graph
+        .node(
+            OpParams::Linear {
+                in_features: 2,
+                out_features: 2,
+                bias: false,
+            },
+            &[x, w],
+        )
+        .unwrap();
+    let gain = graph
+        .weight("gain", weight_spec(vec![Dim::constant(2)]))
+        .unwrap();
+    let norm = graph
+        .node(
+            OpParams::RmsNorm {
+                hidden: 2,
+                eps: 3.5,
+            },
+            &[linear, gain],
+        )
+        .unwrap();
+    let residual = graph.node(OpParams::Residual, &[x, norm]).unwrap();
+    let graph = graph.finish(residual, &oracles()).unwrap();
+
+    let mut bindings = Bindings::new();
+    bindings.set(
+        x,
+        Value::Float(HostTensor::bf16(vec![3.0, 4.0], vec![1, 2]).unwrap()),
+    );
+    bindings.set(
+        w,
+        Value::Float(HostTensor::bf16(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]).unwrap()),
+    );
+    bindings.set(
+        gain,
+        Value::Float(HostTensor::bf16(vec![1.0, 1.0], vec![2]).unwrap()),
+    );
+
+    let trace = Interpreter::new().run_stateless(&graph, &bindings).unwrap();
+    let ids: Vec<_> = trace
+        .node_outputs()
+        .iter()
+        .map(|(value, _)| *value)
+        .collect();
+    assert_eq!(ids, [linear, norm, residual]);
+    assert_eq!(
+        trace
+            .node_output(linear)
+            .unwrap()
+            .as_float()
+            .unwrap()
+            .data(),
+        [3.0, 4.0]
+    );
+    assert_eq!(trace.output().as_float().unwrap().shape(), [1, 2]);
+
+    let mut incomplete = Bindings::new();
+    incomplete.set(
+        x,
+        Value::Float(HostTensor::bf16(vec![3.0, 4.0], vec![1, 2]).unwrap()),
+    );
+    assert_eq!(
+        Interpreter::new()
+            .run_stateless(&graph, &incomplete)
+            .unwrap_err()
+            .kind(),
+        "invalid_request"
+    );
+}
