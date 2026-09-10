@@ -127,9 +127,10 @@ link widths and simultaneous-transfer behavior to be measured rather than assume
 ## Current state and the next assignment
 
 [Task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md) is the **final planned M1.3
-assignment**. Its selected BF16 device chain is implemented at `6305f9d`; host, all-device,
-fault-injection, numerical and sanitizer gates pass. It is awaiting owner review and is not yet
-accepted, so M1.3 remains open.
+assignment**. Its selected BF16 device chain is implemented at `6305f9d`; the three owner-review
+findings are corrected at `eaf8846`, and the affected all-device, fault-injection, numerical,
+resource and sanitizer gates pass. It is awaiting owner re-review and is not yet accepted, so M1.3
+remains open.
 
 Review corrections remain in task 0012; they do not become task 0013 or another preparatory M1.3
 slice. After owner acceptance, update this section and the living records to say **M1.3 complete;

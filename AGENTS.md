@@ -5,11 +5,12 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 ## Active assignment
 
 [Task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md) is the final planned M1.3 task. Its
-implementation and required evidence are complete at `6305f9d`; owner review/acceptance remains
-open. Keep any corrections in task 0012 rather than creating another preparatory M1.3 task. When it
-is accepted, record M1.3 complete and update this section. The next bounded assignment is then M1.4
-appendable paged state bound to [task 0004's](docs/tasks/0004-m1-state-transactions.md) accepted
-transaction mechanism. See the [active handover](docs/handovers/2026-09-10-m1.3-closure-to-m1.4.md).
+implementation is at `6305f9d`, and all three owner-review findings are corrected at `eaf8846` with
+the affected evidence rerun; owner re-review/acceptance remains open. Keep any further corrections
+in task 0012 rather than creating another preparatory M1.3 task. When it is accepted, record M1.3
+complete and update this section. The next bounded assignment is then M1.4 appendable paged state
+bound to [task 0004's](docs/tasks/0004-m1-state-transactions.md) accepted transaction mechanism. See
+the [active handover](docs/handovers/2026-09-10-m1.3-closure-to-m1.4.md).
 
 ## Read before editing
 
