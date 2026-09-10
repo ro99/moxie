@@ -1,8 +1,8 @@
 # Task 0012 — M1.3: selected BF16 device layer chain
 
-Status: **implementation complete at `6305f9d`; owner-review corrections at `eaf8846` and `1138a2a`;
-awaiting owner re-review/acceptance**, 2026-09-10, after the owner accepted [task
-0011](0011-m1-admitted-graph-resource-plan.md) at `64899c2` following independent re-review.
+Status: **accepted by the owner, 2026-09-10; M1.3 complete; M1.4 active**.
+Accepted implementation `6305f9d`, corrections `eaf8846` and `1138a2a`, and evidence through
+`ce7548d`, following independent re-review with no remaining acceptance blockers.
 
 **Milestone closure assignment.** This is the final planned M1.3 task. The next implementation
 agent working on Moxie owns task 0012 through implementation, required evidence, independent review
@@ -339,10 +339,29 @@ bounded inside M1.4.
 
 ## Result, filled after work
 
+### Owner acceptance — 2026-09-10
+
+The owner authorized recording acceptance and pushing after independent review found no remaining
+blockers. Task 0012 is accepted and closes M1.3. M1.4 is active; its next bounded assignment is
+appendable paged state bound to task 0004's accepted transaction mechanism.
+
+Independent verification passed: host workspace 556 tests plus 8 doctests; device-feature workspace
+572 tests plus 11 doctests; aggregate GPU qualification 39/39 across all three UUIDs; additional
+numerical boundary probes on all GPUs; memcheck with zero errors on all three GPUs; SM120
+racecheck/initcheck with zero hazards/errors; clippy, architecture, specification and formatting.
+Mean and normalization underflow were independently confirmed to refuse, while exact zeros and
+small-normal inputs pass. Prior separate per-profile and isolated no-driver evidence remains
+applicable; those lanes were not independently repeated in this final review.
+
+All five findings are resolved. Conservative refusal of unqualified RMS underflow is accepted for
+this bounded slice without changing numerical bounds. Acceptance establishes no checkpoint/model
+execution, actual-context support, model quality or performance. The earlier review-stage records
+below preserve the evidence and stop conditions as they stood before acceptance.
+
 ### Second owner-review corrections — `1138a2a`
 
-The two additional findings stay within task 0012. M1.3 remains open pending owner re-review and
-acceptance. The original three corrections at `eaf8846` remain in place.
+At this correction stage the two additional findings stayed within task 0012, with M1.3 open
+pending owner re-review and acceptance (now recorded above). The original three corrections at `eaf8846` remain in place.
 
 - Fatal final-readback errors now persist their attributed `DeviceLost` status through the existing
   lifecycle before returning the lease. Shared synchronization refuses an already lost lifecycle
@@ -461,7 +480,5 @@ acceptance. The original three corrections at `eaf8846` remain in place.
   state, actual-context inference, sampling, generation, model quality, topology communication and
   paired performance remain unimplemented or unmeasured. `visible_tokens=32_768` is selection
   metadata only and is not a long-context result.
-- Remaining blocker and next bounded task: owner re-review/acceptance is still required. Do not mark
-  M1.3 complete or create task 0013 from this implementation record. After owner acceptance, update
-  the active records and define M1.4 appendable paged state bound to task 0004's transaction
-  mechanism.
+- Final disposition: owner acceptance is recorded above; M1.3 is complete and M1.4 is active.
+  The next bounded assignment is appendable paged state bound to task 0004's transaction mechanism.

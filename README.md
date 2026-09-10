@@ -126,22 +126,17 @@ link widths and simultaneous-transfer behavior to be measured rather than assume
 
 ## Current state and the next assignment
 
-[Task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md) is the **final planned M1.3
-assignment**. Its selected BF16 device chain is implemented at `6305f9d`; the three owner-review
-findings are corrected at `eaf8846`, and the affected all-device, fault-injection, numerical,
-resource and sanitizer gates pass. It is awaiting owner re-review and is not yet accepted, so M1.3
-remains open. Further fatal-readback and RMS-underflow corrections are at `1138a2a`, with affected
-fault, numerical and sanitizer gates passing; underflow outside the qualified arithmetic is
-explicitly refused with a typed numerical error.
+**M1.3 complete; M1.4 active.** The owner accepted
+[task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md) on 2026-09-10 after independent
+verification of the selected BF16 device chain and all five review corrections through `1138a2a`.
+The accepted scope includes explicit refusal of unqualified RMS underflow; it establishes no
+model execution, actual-context support or performance claim.
 
-Review corrections remain in task 0012; they do not become task 0013 or another preparatory M1.3
-slice. After owner acceptance, update this section and the living records to say **M1.3 complete;
-M1.4 active**.
-The next bounded assignment must then implement M1.4 appendable paged state bound to
-[task 0004's](docs/tasks/0004-m1-state-transactions.md) accepted transaction mechanism. Sampler
-history, deterministic greedy/temperature tests, the generation service and the diagnostic CLI are
-subsequent M1.4 work. The [active handover](docs/handovers/2026-09-10-m1.3-closure-to-m1.4.md)
-records this sequencing and its stop condition.
+The next bounded assignment is appendable paged state bound to
+[task 0004's](docs/tasks/0004-m1-state-transactions.md) accepted transaction mechanism.
+Its task contract must precede implementation. Sampler history, deterministic greedy/temperature
+tests, generation service and diagnostic CLI remain subsequent M1.4 work.
+The [active handover](docs/handovers/2026-09-10-m1.3-closure-to-m1.4.md) records this sequencing.
 
 Assignments use [TASK.md](docs/spec/templates/TASK.md), never "do everything necessary to make model
 X fast." Each task names a shared owner, a bounded deliverable, its consumers, tests, and stop
