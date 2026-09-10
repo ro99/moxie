@@ -305,6 +305,7 @@ fn lower_with_ids(
         let value = ValueId(index as u32);
         let shape = shape.clone();
         if inputs.contains(&value) {
+            validate_external_input(spec.role, &shape)?;
             bindings.push(ValueBinding::ExternalInput(ExternalInput {
                 value,
                 shape,
@@ -496,11 +497,7 @@ fn concrete_shape(spec: &TensorSpec, symbols: &SymbolTable) -> Result<Vec<u64>> 
 }
 
 fn tensor_bytes(role: ValueRole, shape: &[u64]) -> Result<u64> {
-    let elements = shape.iter().try_fold(1u64, |total, extent| {
-        total
-            .checked_mul(*extent)
-            .ok_or_else(|| invalid("shape", "tensor element count overflowed"))
-    })?;
+    let elements = tensor_elements(shape)?;
     let precision = match role {
         ValueRole::Activation(precision) => precision.get(),
         ValueRole::Weight(precision) => {
@@ -529,6 +526,27 @@ fn tensor_bytes(role: ValueRole, shape: &[u64]) -> Result<u64> {
     elements
         .checked_mul(bytes_per_element)
         .ok_or_else(|| invalid("shape", "tensor byte count overflowed"))
+}
+
+fn tensor_elements(shape: &[u64]) -> Result<u64> {
+    shape.iter().try_fold(1u64, |total, extent| {
+        total
+            .checked_mul(*extent)
+            .ok_or_else(|| invalid("shape", "tensor element count overflowed"))
+    })
+}
+
+fn validate_external_input(role: ValueRole, shape: &[u64]) -> Result<()> {
+    match role {
+        ValueRole::Weight(_) => Err(invalid(
+            "role",
+            "a weight-role value must be declared as a graph weight and charged",
+        )),
+        ValueRole::Activation(_) => tensor_bytes(role, shape).map(|_| ()),
+        // Index storage width is deliberately absent from the graph contract.
+        // Validate its addressable element extent without inventing byte size.
+        ValueRole::Index => tensor_elements(shape).map(|_| ()),
+    }
 }
 
 fn align_up(value: u64, alignment: u64) -> Result<u64> {
@@ -811,6 +829,51 @@ mod tests {
             lower(&stateful, workload(&stateful, 2)).unwrap_err().kind(),
             "unsupported"
         );
+    }
+
+    #[test]
+    fn external_operands_cannot_bypass_weight_charges_or_byte_overflow() {
+        let rows = Dim::symbol(ROWS);
+        let mut builder = GraphBuilder::new(ORACLE, ROWS);
+        let input = builder.input("x", activation(rows.clone(), 8));
+        let disguised_weight = builder.input("w", weight(8, 8));
+        let output = builder
+            .node(
+                OpParams::Linear {
+                    in_features: 8,
+                    out_features: 8,
+                    bias: false,
+                },
+                &[input, disguised_weight],
+            )
+            .unwrap();
+        let disguised = builder.finish(output, &registry()).unwrap();
+        let error = lower(&disguised, workload(&disguised, 1)).unwrap_err();
+        assert_eq!(error.kind(), "invalid_request");
+        assert!(
+            error
+                .to_string()
+                .contains("must be declared as a graph weight")
+        );
+
+        let mut builder = GraphBuilder::new(ORACLE, ROWS);
+        let overflowing_input = builder.input("huge", activation(rows, u64::MAX));
+        let disguised_weight = builder.input("w", weight(8, u64::MAX));
+        let output = builder
+            .node(
+                OpParams::Linear {
+                    in_features: u64::MAX,
+                    out_features: 8,
+                    bias: false,
+                },
+                &[overflowing_input, disguised_weight],
+            )
+            .unwrap();
+        let overflowing = builder.finish(output, &registry()).unwrap();
+        let error = lower(&overflowing, workload(&overflowing, 1)).unwrap_err();
+        assert_eq!(error.kind(), "invalid_request");
+        assert!(error.to_string().contains("byte count overflowed"));
+        assert!(validate_external_input(ValueRole::Index, &[u64::MAX, 2]).is_err());
     }
 
     #[test]

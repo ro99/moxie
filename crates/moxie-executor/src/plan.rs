@@ -105,19 +105,50 @@ mod driver_binding {
     use super::{invalid, resource_request, validate_plan_binding, validate_request};
     use crate::{ArenaCloseRefused, DeviceArena, DeviceRange, RangeReleaseRefused};
 
-    /// A metadata view over one plan-owned range. It cannot outlive the plan.
+    /// A read-only metadata view over one plan-owned range. It cannot outlive
+    /// the plan, and callers cannot rewrite its checked descriptor.
+    ///
+    /// ```compile_fail,E0616
+    /// fn corrupt(handle: &mut moxie_executor::TensorHandle<'_, '_>) {
+    ///     handle.bytes = u64::MAX;
+    /// }
+    /// ```
     #[derive(Debug)]
     pub struct TensorHandle<'plan, 'ctx> {
-        pub value: ValueId,
-        pub shape: &'plan [u64],
-        pub role: ValueRole,
-        pub layout: TensorLayout,
-        pub offset: u64,
-        pub bytes: u64,
+        value: ValueId,
+        shape: &'plan [u64],
+        role: ValueRole,
+        layout: TensorLayout,
+        offset: u64,
+        bytes: u64,
         range: &'plan DeviceRange<'ctx>,
     }
 
     impl TensorHandle<'_, '_> {
+        pub const fn value(&self) -> ValueId {
+            self.value
+        }
+
+        pub fn shape(&self) -> &[u64] {
+            self.shape
+        }
+
+        pub const fn role(&self) -> ValueRole {
+            self.role
+        }
+
+        pub const fn layout(&self) -> TensorLayout {
+            self.layout
+        }
+
+        pub const fn offset(&self) -> u64 {
+            self.offset
+        }
+
+        pub const fn bytes(&self) -> u64 {
+            self.bytes
+        }
+
         pub fn allocation_key(&self) -> moxie_memory::AllocationKey {
             self.range.key()
         }
@@ -182,6 +213,30 @@ mod driver_binding {
             ledger: &mut Ledger,
             ctx: &'ctx RankContext,
         ) -> std::result::Result<Self, PlanAdmitRefused<'ctx>> {
+            Self::admit_with(
+                candidate,
+                graph,
+                ledger,
+                ctx,
+                |arena, bytes, alignment, owner| arena.allocate(bytes, alignment, owner),
+            )
+        }
+
+        fn admit_with<F>(
+            candidate: PlanCandidate,
+            graph: &Graph,
+            ledger: &mut Ledger,
+            ctx: &'ctx RankContext,
+            mut allocate_slot: F,
+        ) -> std::result::Result<Self, PlanAdmitRefused<'ctx>>
+        where
+            F: FnMut(
+                &mut DeviceArena<'ctx>,
+                u64,
+                u64,
+                String,
+            ) -> std::result::Result<DeviceRange<'ctx>, AllocateRefused>,
+        {
             let invalid_candidate = |candidate, error| PlanAdmitRefused::Invalid {
                 candidate: Box::new(candidate),
                 error,
@@ -229,7 +284,8 @@ mod driver_binding {
 
             let mut ranges = Vec::with_capacity(candidate.slots().len());
             for slot in candidate.slots() {
-                match arena.allocate(
+                match allocate_slot(
+                    &mut arena,
                     slot.bytes,
                     slot.alignment,
                     format!("plan-{}-slot-{}", candidate.id().get(), slot.id),
@@ -394,13 +450,66 @@ mod driver_binding {
     #[cfg(test)]
     mod tests {
         use moxie_cuda::RankContext;
-        use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSpan};
-        use moxie_types::{DeviceTier, RankId, Scope, Tier};
+        use moxie_graph::{
+            Graph, GraphBuilder, Op, OpParams, OracleEvidence, OracleId, OracleRegistry,
+            TensorSpec, ValueRole,
+        };
+        use moxie_memory::{CapacitySnapshot, Ledger};
+        use moxie_plan::{Phase, ResourceWorkload, lower};
+        use moxie_types::{ActivationPrecision, Dim, Precision, RankId, SymbolId, WeightPrecision};
 
-        use super::{DeviceArena, unwind};
+        use super::{PlanAdmitRefused, ReservedPlan};
+
+        const ROWS: SymbolId = SymbolId(211);
+        const ORACLE: OracleId = OracleId("integrated-slot-fault");
+
+        fn graph() -> Graph {
+            let mut registry = OracleRegistry::new();
+            registry
+                .register(
+                    Op::Linear,
+                    ORACLE,
+                    OracleEvidence {
+                        implementation: "executor::plan::driver_binding::tests",
+                        test_module: "executor::plan::driver_binding::tests",
+                    },
+                )
+                .unwrap();
+            let mut builder = GraphBuilder::new(ORACLE, ROWS);
+            let input = builder.input(
+                "x",
+                TensorSpec::new(
+                    ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                    vec![Dim::symbol(ROWS), Dim::constant(8)],
+                ),
+            );
+            let mut previous = input;
+            for index in 0..3 {
+                let weight = builder
+                    .weight(
+                        &format!("w{index}"),
+                        TensorSpec::new(
+                            ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
+                            vec![Dim::constant(8), Dim::constant(8)],
+                        ),
+                    )
+                    .unwrap();
+                previous = builder
+                    .node(
+                        OpParams::Linear {
+                            in_features: 8,
+                            out_features: 8,
+                            bias: false,
+                        },
+                        &[previous, weight],
+                    )
+                    .unwrap();
+            }
+            builder.finish(previous, &registry).unwrap()
+        }
 
         #[test]
-        fn slot_exhaustion_unwinds_prior_ranges_and_the_physical_arena() {
+        fn integrated_slot_failure_returns_candidate_and_unwinds_the_arena() {
             let count = moxie_cuda::device_count().expect("device lane requires the CUDA driver");
             assert!(count > 0, "device lane requires real hardware");
             for ordinal in 0..count {
@@ -409,31 +518,41 @@ mod driver_binding {
                 let before = ctx.memory_info().unwrap().0;
                 let snapshot = CapacitySnapshot::measured(&measurement, 64 * 1024 * 1024).unwrap();
                 let mut ledger = Ledger::new([snapshot]).unwrap();
-                let mut request = PlanRequest::new("slot unwind", ["bind"]).unwrap();
-                request
-                    .buffer(BufferRequest::new(
-                        "activation arena",
-                        Scope::Device(ctx.uuid()),
-                        Tier::Device(DeviceTier::Activations),
-                        512,
-                        StageSpan::inclusive(0, 0),
-                    ))
-                    .unwrap();
-                let reservation = ledger.admit(&request).unwrap();
-                let mut arena = DeviceArena::create(
-                    &ledger,
-                    reservation,
+                let graph = graph();
+                let workload = ResourceWorkload {
+                    phase: Phase::Prefill,
+                    rows: 2,
+                    visible_tokens: 32_768,
+                    branch_rows: 2,
+                    output: graph.output(),
+                    device: ctx.uuid(),
+                };
+                let candidate = lower(&graph, workload).unwrap();
+                let candidate_id = candidate.id();
+                let unavailable_bytes = candidate.activation_arena_bytes() + 256;
+                let mut slot = 0;
+                let refusal = ReservedPlan::admit_with(
+                    candidate,
+                    &graph,
+                    &mut ledger,
                     &ctx,
-                    DeviceTier::Activations,
-                    512,
-                    "slot unwind",
+                    |arena, bytes, alignment, owner| {
+                        slot += 1;
+                        if slot == 2 {
+                            arena.allocate(unavailable_bytes, alignment, owner)
+                        } else {
+                            arena.allocate(bytes, alignment, owner)
+                        }
+                    },
                 )
-                .unwrap();
-                let first = arena.allocate(256, 256, "first slot").unwrap();
-                let refused = arena.allocate(512, 256, "forced exhaustion").unwrap_err();
-                assert_eq!(refused.error.kind(), "capacity_exceeded");
-
-                assert!(unwind(arena, vec![(0, first)], &mut ledger).is_ok());
+                .unwrap_err();
+                let PlanAdmitRefused::Invalid { candidate, error } = refusal else {
+                    panic!("successful cleanup must return the unchanged candidate");
+                };
+                assert_eq!(candidate.id(), candidate_id);
+                assert!(candidate.matches_graph(&graph));
+                assert_eq!(error.kind(), "capacity_exceeded");
+                assert_eq!(slot, 2);
                 assert!(ledger.outstanding().is_empty());
                 assert_eq!(ctx.memory_info().unwrap().0, before);
             }
@@ -531,7 +650,8 @@ mod tests {
     #[test]
     fn request_charges_one_physical_arena_and_exact_weights() {
         let graph = graph(8);
-        let candidate = lower(&graph, workload(&graph, uuid(1))).unwrap();
+        let device = uuid(1);
+        let candidate = lower(&graph, workload(&graph, device)).unwrap();
         let request = resource_request(&candidate).unwrap();
         assert_eq!(request.stages(), &["node-0-linear", "terminal-output"]);
         assert_eq!(request.buffers().len(), 2);
@@ -542,6 +662,19 @@ mod tests {
         let weight = &request.buffers()[1];
         assert_eq!(weight.bytes, 8 * 8 * 2);
         assert_eq!(weight.tier, Tier::Device(DeviceTier::PackedResidentWeights));
+
+        let snapshot = CapacitySnapshot::new(Scope::Device(device), 4096, 0).unwrap();
+        let mut ledger = Ledger::new([snapshot]).unwrap();
+        let reservation = ledger.admit(&request).unwrap();
+        assert_eq!(
+            ledger.committed(
+                Scope::Device(device),
+                Tier::Device(DeviceTier::PackedResidentWeights)
+            ),
+            8 * 8 * 2
+        );
+        ledger.release(reservation).unwrap();
+        assert!(ledger.outstanding().is_empty());
     }
 
     #[test]

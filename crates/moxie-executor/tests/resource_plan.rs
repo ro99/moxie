@@ -11,7 +11,8 @@ use moxie_graph::{
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_plan::{Phase, ResourceWorkload, lower};
 use moxie_types::{
-    ActivationPrecision, DeviceUuid, Dim, Precision, RankId, SymbolId, WeightPrecision,
+    ActivationPrecision, DeviceUuid, Dim, Precision, RankId, SymbolId, TensorLayout,
+    WeightPrecision,
 };
 
 const ROWS: SymbolId = SymbolId(71);
@@ -99,12 +100,18 @@ fn graph_resource_plan_binds_and_closes_on_every_device() {
         let first = plan.tensor(values[0]).unwrap();
         let second = plan.tensor(values[1]).unwrap();
         let third = plan.tensor(values[2]).unwrap();
-        assert_eq!(first.shape, &[3, 32]);
-        assert_eq!(first.bytes, 3 * 32 * 2);
+        assert_eq!(first.value(), values[0]);
+        assert_eq!(first.shape(), &[3, 32]);
+        assert_eq!(
+            first.role(),
+            ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16))
+        );
+        assert_eq!(first.layout(), TensorLayout::ContiguousRowMajorV1);
+        assert_eq!(first.bytes(), 3 * 32 * 2);
         assert_eq!(first.device_uuid(), ctx.uuid());
         assert_eq!(first.allocation_key(), third.allocation_key());
         assert_ne!(first.allocation_key(), second.allocation_key());
-        assert_eq!(first.offset, third.offset);
+        assert_eq!(first.offset(), third.offset());
         assert!(
             plan.validate_execution_request(&graph, admitted_workload)
                 .is_err_and(|error| error.kind() == "unsupported_kernel")
