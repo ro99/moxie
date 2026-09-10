@@ -134,14 +134,25 @@ impl<'ctx> ChainOperation<'ctx> {
         self.plan.is_some()
     }
 
+    fn settle_sources(&mut self) -> (SelectedReservedPlan<'ctx>, Vec<OwnedBinding>) {
+        let mut plan = self.plan.take().expect("chain operation retains its plan");
+        let mut returned_inputs = Vec::new();
+        for binding in self.sources.drain(..) {
+            if matches!(binding.role, ValueRole::Weight(_)) {
+                plan.bound_weights.insert(binding.value, binding);
+            } else {
+                returned_inputs.push(binding);
+            }
+        }
+        (plan, returned_inputs)
+    }
+
     /// Recover a completed operation retired by the shared turn sweep. The
-    /// sweep has already observed its event, so these resources may be closed
-    /// or rebound explicitly by their next owner.
+    /// sweep has already observed its event, so uploaded weights become the
+    /// plan's immutable bindings exactly as on normal completion; only the
+    /// caller-owned per-step inputs are handed back.
     pub fn into_parts(mut self) -> (SelectedReservedPlan<'ctx>, Vec<OwnedBinding>) {
-        (
-            self.plan.take().expect("chain operation retains its plan"),
-            std::mem::take(&mut self.sources),
-        )
+        self.settle_sources()
     }
 }
 
@@ -544,20 +555,16 @@ impl<'ctx> OperationLease<SelectedCompletion<'ctx>, ChainOperation<'ctx>> {
             });
         }
         let (_, mut operation) = self.retire()?;
-        let mut plan = operation.plan.take().expect("operation retains plan");
-        let mut returned_inputs = Vec::new();
-        for binding in operation.sources.drain(..) {
-            if matches!(binding.role, ValueRole::Weight(_)) {
-                plan.bound_weights.insert(binding.value, binding);
-            } else {
-                returned_inputs.push(binding);
-            }
-        }
+        let launch_order = std::mem::take(&mut operation.launch_order);
+        let (plan, returned_inputs) = operation.settle_sources();
+        // The reservation covered the output allocation while every upload
+        // source was still retained. Returning this owned Vec is the explicit
+        // handoff from engine-accounted transient storage to the caller.
         Ok(ChainResult {
             plan,
             output,
             returned_inputs,
-            launch_order: operation.launch_order,
+            launch_order,
         })
     }
 }
@@ -618,7 +625,18 @@ pub fn selected_resource_request(candidate: &SelectedPlanCandidate) -> Result<Pl
         Scope::Host,
         Tier::Host(HostTier::Pageable),
         host_bytes,
-        StageSpan::inclusive(0, 3),
+        StageSpan::inclusive(0, 4),
+    ))?;
+    let output_bytes = candidate
+        .value(candidate.workload().output)
+        .ok_or_else(|| invalid("output", "selected output is absent from the physical plan"))?
+        .logical_bytes;
+    request.buffer(BufferRequest::new(
+        "final-output-readback",
+        Scope::Host,
+        Tier::Host(HostTier::Pageable),
+        output_bytes,
+        StageSpan::at(4),
     ))?;
     Ok(request)
 }

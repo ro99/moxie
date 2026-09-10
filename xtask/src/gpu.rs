@@ -999,6 +999,108 @@ fn selected_bf16_device_chain(cap: &DeviceCapability) -> Result<Outcome, Error> 
             rows * 4
         );
     }
+    selected_bf16_overflow_is_numerical(cap)
+}
+
+/// Finite BF16 operands can overflow the FP32 RMS reduction. The selected
+/// chain must carry that invalid intermediate to the final bounded readback,
+/// return a typed numerical refusal, and remain explicitly recoverable only
+/// after the completion event has been observed.
+fn selected_bf16_overflow_is_numerical(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    let rows = 1usize;
+    let hidden = 8usize;
+    let fixture = chain_graph(hidden as u64, 1e-5)?;
+    let workload = ResourceWorkload {
+        phase: Phase::Decode,
+        rows: rows as u64,
+        visible_tokens: 1,
+        branch_rows: rows as u64,
+        output: fixture.graph.output(),
+        device: cap.uuid,
+    };
+    let catalogue = moxie_kernels::bf16_chain_catalogue();
+    let candidate = lower_selected(&fixture.graph, workload, cap, &catalogue)?;
+    let x = vec![1.0; hidden];
+    let weight = vec![2.0f32.powi(60); hidden * hidden];
+    let gain = vec![1.0; hidden];
+    let oracle_error = interpreter_chain(&fixture, rows, hidden, &x, &weight, &gain)
+        .expect_err("the interpreter must reject an infinite RMS denominator");
+    if oracle_error.kind() != "numerical" {
+        return Ok(Outcome::Failed(format!(
+            "RMS overflow oracle returned {} instead of numerical",
+            oracle_error.kind()
+        )));
+    }
+
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let stream = Stream::new(&ctx)?;
+    let device_snapshot = CapacitySnapshot::measured(&ctx.measure()?, 1 << 20)?;
+    let host_snapshot = CapacitySnapshot::measured_host(&moxie_host::read()?, 1 << 20)?;
+    let mut ledger = Ledger::new([device_snapshot, host_snapshot])?;
+    let plan = match SelectedReservedPlan::admit(
+        candidate,
+        &fixture.graph,
+        cap,
+        &catalogue,
+        &mut ledger,
+        &ctx,
+    ) {
+        Ok(plan) => plan,
+        Err(SelectedAdmitRefused::Invalid { error, .. })
+        | Err(SelectedAdmitRefused::Held { error, .. }) => return Err(error),
+        Err(SelectedAdmitRefused::Rejected { rejection, .. }) => return Err((*rejection).into()),
+    };
+    let bindings = vec![
+        owned_binding(
+            fixture.x,
+            ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
+            vec![rows as u64, hidden as u64],
+            cap,
+            &x,
+        ),
+        owned_binding(
+            fixture.weight,
+            ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
+            vec![hidden as u64, hidden as u64],
+            cap,
+            &weight,
+        ),
+        owned_binding(
+            fixture.gain,
+            ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
+            vec![hidden as u64],
+            cap,
+            &gain,
+        ),
+    ];
+    let refusal = plan
+        .launch(&fixture.graph, cap, &catalogue, &ctx, &stream, bindings)
+        .map_err(|refused| refused.error)?
+        .finish()
+        .expect_err("RMS overflow must not become a successful finite result");
+    if refusal.error.kind() != "numerical" {
+        return Ok(Outcome::Failed(format!(
+            "RMS overflow returned {} instead of numerical",
+            refusal.error.kind()
+        )));
+    }
+    let (_, operation) = refusal.lease.retire().map_err(|refused| refused.error)?;
+    let (plan, returned_inputs) = operation.into_parts();
+    if plan.bound_weight_count() != 2 || returned_inputs.len() != 1 {
+        return Ok(Outcome::Failed(
+            "RMS overflow recovery lost its completed binding ownership".into(),
+        ));
+    }
+    plan.close(&mut ledger).map_err(|refused| refused.error)?;
+    if !ledger.outstanding().is_empty() {
+        return Ok(Outcome::Failed(
+            "RMS overflow recovery left its reservation charged".into(),
+        ));
+    }
+    println!(
+        "  selected chain {} RMS-overflow=typed-numerical recovered_weights=2",
+        cap.uuid
+    );
     Ok(Outcome::Passed)
 }
 
@@ -1030,6 +1132,7 @@ fn chain_values(rows: usize, hidden: usize, exact: bool) -> (Vec<f32>, Vec<f32>,
     (x, weight, gain)
 }
 
+#[derive(Debug)]
 struct InterpreterChain {
     linear: Vec<u16>,
     norm: Vec<u16>,
@@ -1222,6 +1325,33 @@ fn bf16_semantic_numerics(cap: &DeviceCapability) -> Result<Outcome, Error> {
             cap.uuid
         );
     }
+
+    let overflow_x = vec![1.0; 8];
+    let overflow_weight = vec![2.0f32.powi(60); 64];
+    let overflow_gain = vec![1.0; 8];
+    let overflow_linear = decode_bf16(&launch_linear(
+        &ctx,
+        &module,
+        1,
+        8,
+        &overflow_x,
+        &overflow_weight,
+    )?);
+    match launch_rms(&ctx, &module, 1, 8, 1e-5, &overflow_linear, &overflow_gain) {
+        Err(error) if error.kind() == "numerical" => {}
+        Err(error) => {
+            return Ok(Outcome::Failed(format!(
+                "primitive RMS overflow returned {} instead of numerical",
+                error.kind()
+            )));
+        }
+        Ok(_) => {
+            return Ok(Outcome::Failed(
+                "primitive RMS overflow became a successful output".into(),
+            ));
+        }
+    }
+    println!("  numerical {} RMS-overflow=typed-numerical", cap.uuid);
     Ok(Outcome::Passed)
 }
 
@@ -1267,7 +1397,7 @@ fn launch_linear(
     }
     let mut bits = vec![0u16; rows * hidden];
     output.copy_to_host(bytemuck_u16_mut(&mut bits))?;
-    Ok(bits)
+    finite_primitive("Linear", bits)
 }
 
 fn launch_rms(
@@ -1328,7 +1458,7 @@ fn launch_rms(
     }
     let mut bits = vec![0u16; rows * hidden];
     output.copy_to_host(bytemuck_u16_mut(&mut bits))?;
-    Ok(bits)
+    finite_primitive("RMSNorm", bits)
 }
 
 fn launch_residual(
@@ -1367,6 +1497,15 @@ fn launch_residual(
     }
     let mut bits = vec![0u16; left.len()];
     output.copy_to_host(bytemuck_u16_mut(&mut bits))?;
+    finite_primitive("Residual", bits)
+}
+
+fn finite_primitive(operation: &'static str, bits: Vec<u16>) -> Result<Vec<u16>, Error> {
+    if bits.iter().any(|value| !bf16_value(*value).is_finite()) {
+        return Err(Error::Numerical {
+            detail: format!("{operation} produced a nonfinite BF16 primitive output"),
+        });
+    }
     Ok(bits)
 }
 

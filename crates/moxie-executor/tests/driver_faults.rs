@@ -6,7 +6,7 @@
 use moxie_cuda::{Event, RankContext, Stream, query_device};
 use moxie_executor::{
     DeviceArena, Lease, LeaseState, OperationTurn, OwnedBinding, PlanAdmitRefused, ReservedPlan,
-    SelectedReservedPlan, selected_resource_request,
+    SelectedAdmitRefused, SelectedReservedPlan, selected_resource_request,
 };
 use moxie_graph::{
     Graph, GraphBuilder, Op, OpParams, OracleEvidence, OracleId, OracleRegistry, TensorSpec,
@@ -1169,7 +1169,14 @@ fn real_driver_admission_submission_and_cleanup_are_fail_closed() {
                 Scope::Host,
                 Tier::Host(HostTier::Pageable),
                 160,
-                StageSpan::inclusive(0, 3),
+                StageSpan::inclusive(0, 4),
+            ),
+            (
+                "final-output-readback",
+                Scope::Host,
+                Tier::Host(HostTier::Pageable),
+                16,
+                StageSpan::at(4),
             ),
         ];
         assert_eq!(request.buffers().len(), expected_request.len());
@@ -1185,6 +1192,41 @@ fn real_driver_admission_submission_and_cleanup_are_fail_closed() {
                 expected
             );
         }
+
+        // The output is allocated while all upload sources are still owned by
+        // the operation. Exactly 160 usable host bytes therefore rejects this
+        // 176-byte peak before the one physical device allocation is attempted.
+        let tight_candidate = lower_selected(
+            &selected,
+            selected_workload(&selected, &ctx),
+            &capability,
+            &catalogue,
+        )
+        .unwrap();
+        let mut tight_ledger = Ledger::new([
+            CapacitySnapshot::new(Scope::Device(ctx.uuid()), 1 << 20, 1024).unwrap(),
+            CapacitySnapshot::new(Scope::Host, 161, 1).unwrap(),
+        ])
+        .unwrap();
+        let allocations_before_tight_refusal = ALLOCS.load(SeqCst);
+        let refusal = SelectedReservedPlan::admit(
+            tight_candidate,
+            &selected,
+            &capability,
+            &catalogue,
+            &mut tight_ledger,
+            &ctx,
+        )
+        .unwrap_err();
+        let SelectedAdmitRefused::Rejected { rejection, .. } = refusal else {
+            panic!("the exact host peak must be an admission rejection")
+        };
+        let host_refusal = rejection.report.scope(Scope::Host).unwrap();
+        assert_eq!(host_refusal.admissible_bytes, 160);
+        assert_eq!(host_refusal.request_peak_bytes, 176);
+        assert_eq!(ALLOCS.load(SeqCst), allocations_before_tight_refusal);
+        assert!(tight_ledger.outstanding().is_empty());
+
         let mut selected_ledger = test_ledger(&ctx);
         let counts = (
             ALLOCS.load(SeqCst),
@@ -1210,7 +1252,7 @@ fn real_driver_admission_submission_and_cleanup_are_fail_closed() {
         assert_eq!(outstanding.len(), 1);
         let record = &outstanding[0];
         assert_eq!(record.scope_charges.len(), 2);
-        assert!(record.scope_charges.contains(&(Scope::Host, 160)));
+        assert!(record.scope_charges.contains(&(Scope::Host, 176)));
         assert!(
             record
                 .scope_charges
@@ -1218,7 +1260,7 @@ fn real_driver_admission_submission_and_cleanup_are_fail_closed() {
         );
         assert_eq!(record.charges.len(), 4);
         for charge in [
-            (Scope::Host, Tier::Host(HostTier::Pageable), 160),
+            (Scope::Host, Tier::Host(HostTier::Pageable), 176),
             (
                 Scope::Device(ctx.uuid()),
                 Tier::Device(DeviceTier::PackedResidentWeights),
@@ -1353,8 +1395,42 @@ fn real_driver_admission_submission_and_cleanup_are_fail_closed() {
         assert!(operation.has_plan());
         assert_eq!(operation.retained_source_count(), 3);
         let (plan, sources) = operation.into_parts();
-        assert_eq!(sources.len(), 3);
-        plan.close(&mut cancellation_ledger).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(plan.bound_weight_count(), 2);
+
+        // Sweep recovery has the same immutable-weight handoff as `finish`:
+        // rebinding is refused, while an input-only execution reuses them.
+        let copies_before_rebind = COPIES.load(SeqCst);
+        let launches_before_rebind = LAUNCHES.load(SeqCst);
+        let refused = plan
+            .launch(
+                &selected,
+                &capability,
+                &catalogue,
+                &ctx,
+                &stream,
+                selected_bindings(&ctx, x, weight, gain, true),
+            )
+            .unwrap_err();
+        assert_eq!(refused.error.kind(), "invalid_request");
+        assert_eq!(COPIES.load(SeqCst), copies_before_rebind);
+        assert_eq!(LAUNCHES.load(SeqCst), launches_before_rebind);
+        let recovered = refused
+            .plan
+            .unwrap()
+            .launch(
+                &selected,
+                &capability,
+                &catalogue,
+                &ctx,
+                &stream,
+                selected_bindings(&ctx, x, weight, gain, false),
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert_eq!(recovered.plan.bound_weight_count(), 2);
+        recovered.plan.close(&mut cancellation_ledger).unwrap();
         assert!(cancellation_ledger.outstanding().is_empty());
         eprintln!(
             "PASS selected chain census and controlled cancellation on {}",

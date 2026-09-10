@@ -51,8 +51,17 @@ extern "C" __global__ void moxie_bf16_rms_apply_v1(
     const float scaled = __fmul_rn(
         __bfloat162float(input[index]),
         __bfloat162float(gain[index % hidden]));
+    if (!isfinite(row_sums[row]) || !isfinite(denom) || denom <= 0.0F ||
+        !isfinite(scaled)) {
+        // A finite BF16 input can overflow the FP32 reduction or scaling.
+        // Preserve that failure through the residual and bounded final
+        // readback instead of turning finite / infinity into a silent zero.
+        output[index] = __float2bfloat16_rn(__uint_as_float(0x7fc00000U));
+        return;
+    }
     const float normalized = __fdiv_rn(scaled, denom);
-    output[index] = __float2bfloat16_rn(normalized);
+    output[index] = __float2bfloat16_rn(
+        isfinite(normalized) ? normalized : __uint_as_float(0x7fc00000U));
 }
 
 extern "C" __global__ void moxie_bf16_residual_v1(
