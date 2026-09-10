@@ -318,3 +318,28 @@ unchanged. No synthetic graph result is a quality or model-support result.
   arithmetic, actual-context inference, state, quality, topology communication and paired
   prefill/decode performance remain outside this task. Independent re-review is still required
   before task acceptance.
+
+## Second independent-review correction — 2026-09-10
+
+- The first correction's statement that an external index could remain without a byte width was
+  wrong under the precommitted contract. Source commit `64899c2` replaces the unit index role with
+  explicit `IndexEncoding::U64`, matching the shared host reference's `Vec<u64>` representation.
+  Floating activation and quantized-weight precision remain separate types and are not consulted to
+  derive the index width.
+- `ExternalInput` now retains both the encoded role and its checked `required_bytes`. Every external
+  activation or index passes through the same checked shape-product and element-byte multiplication
+  before a binding is emitted. An ordinary three-token embedding lowers with `Index(U64)` and 24
+  required bytes; the independently reproduced `2^62`-row embedding now refuses pure lowering with
+  a typed byte-count overflow.
+- Final validation passed without an unexpected failure: format; host and full device-feature
+  clippy with warnings denied; locked/offline host workspace (549 unit/integration tests plus 8
+  doctests); locked/offline full device-feature workspace (561 plus 11); focused graph, planner and
+  interpreter suites; architecture check (55 rejecting fixtures, 14 accepted fixtures, 12 rules);
+  and specification integrity (10 unchanged reference documents). GPU qualification passed 33/33
+  across `sm_86` and `sm_120`; normal and reordered capacity passed; restricted two-3090 visibility
+  exited 1 with the absent `sm_120` explicitly unqualified. A fresh no-toolkit/no-driver target
+  passed 549 plus 8, and its explicitly rebuilt `xtask` had no `libcuda` dependency in `ldd`.
+- No allocation, lifetime or cleanup code changed. No checkpoint or model was accessed. Semantic
+  execution, actual-context inference, state, quality, topology communication and paired
+  performance remain skipped or unmeasured as outside this task. Independent re-review remains the
+  acceptance gate.
