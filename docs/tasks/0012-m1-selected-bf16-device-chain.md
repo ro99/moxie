@@ -3,6 +3,15 @@
 Status: **contract proposed**, 2026-09-10, after the owner accepted
 [task 0011](0011-m1-admitted-graph-resource-plan.md) at `64899c2` following independent re-review.
 
+**Milestone closure assignment.** This is the final planned M1.3 task. The next implementation
+agent working on Moxie owns task 0012 through implementation, required evidence, independent review
+corrections and acceptance. Review corrections stay in this task; do not create task 0013 or
+another preparatory M1.3 slice for work already required below. Once this task is accepted, record
+M1.3 complete and make the next bounded implementation assignment M1.4 appendable paged state bound
+to the accepted transaction mechanism in
+[task 0004](0004-m1-state-transactions.md). Only a demonstrated defect in already accepted M1.3
+scope or a defined stop condition can interrupt that handoff.
+
 **This contract is committed before implementation code.** Its numerical and resource gates are
 fixed before a semantic kernel is written or run. Later corrections and deviations belong in the
 Result section; they do not rewrite the gate that was attempted.
@@ -11,10 +20,10 @@ Result section; they do not rewrite the gate that was attempted.
 
 - Task ID / milestone / owner-reviewer: 0012 / M1.3 / implementation agent; independent review is
   required before acceptance.
-- Writable root: `/home/rodrigo/Developer/moxie`, branch `main`, base commit `4ed80be`, initially
-  clean and eight commits ahead of `origin/main`. The owner authorized committing and pushing this
-  contract together with task 0011's acceptance record. No implementation has begun in this
-  documentation assignment.
+- Writable root: `/home/rodrigo/Developer/moxie`, branch `main`. Contract authoring began from
+  `4ed80be`; task 0011 acceptance and this contract were committed and pushed at `9ab7a86`. No
+  implementation had begun when the contract was committed. The implementation agent must confirm
+  the current branch, writable root and dirty state before work.
 - Read-only legacy root: `/home/rodrigo/Developer/strata` at
   `2dc566eb8e440fff4837ac75ca1dad1b20c2264e`; its existing untracked `.pi/` and `tests/p2p/`
   paths remain untouched.
@@ -319,6 +328,13 @@ summary. Timing may be printed only as a diagnostic and cannot be cited as perfo
   operational setting change or owner decision. The smallest next task after acceptance is M1.4's
   appendable paged-state allocation bound to the existing transaction mechanism. Generation and
   model integration remain later bounded tasks.
+
+Passing every required gate above closes M1.3. Do not add another M1.3 task merely to package,
+refactor or re-review this implementation: include necessary fixes in task 0012 and repeat the
+affected gates. After acceptance, update this status, `AGENTS.md`, the root and task indexes, the
+support matrix and the active handover to say **M1.3 complete; M1.4 active**, then define the
+appendable paged-state assignment. M1.4's later sampler, service and CLI work may remain separately
+bounded inside M1.4.
 
 ## Result, filled after work
 

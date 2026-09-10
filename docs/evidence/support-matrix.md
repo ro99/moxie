@@ -53,7 +53,9 @@ compile-fail checks on all three GPUs, device clippy, architecture, specificatio
 diff gates. It did not independently repeat the full device workspace, aggregate GPU
 qualification, visibility/capacity matrix or isolated no-driver build; those remain separately
 recorded implementation evidence. [Task 0012](../tasks/0012-m1-selected-bf16-device-chain.md)
-defines semantic kernel selection and execution as the next separate M1.3 slice.
+defines semantic kernel selection and execution as the **final planned M1.3 closure task**. Its
+implementation, evidence and review corrections remain one assignment. After its acceptance, record
+M1.3 complete and begin M1.4 appendable paged state; do not insert another preparatory M1.3 task.
 
 ## Rows
 

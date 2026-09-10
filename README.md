@@ -125,37 +125,24 @@ link widths and simultaneous-transfer behavior to be measured rather than assume
 
 ## Current state and the next assignment
 
-M0's deliverables are in, and the corrections its
-[review](docs/tasks/0002-m0-review-and-integer-transition.md) required are implemented: the host lane
-runs with no CUDA toolkit or driver, architecture enforcement resolves package identity rather than
-manifest keys, the CUDA image boundary states its trust obligation, sequence state distinguishes
-accepted history from published usage from tentative execution and requires retained logit
-provenance, and the canonical weight family is the shared INT4/INT8/BF16 affine-integer contract.
-A second review then found six contracts that still accepted an invalid state -- a retained result
-that did not identify its sequence or its prefix's contents, an earlier snapshot accepted as
-restoration to a later prefix, grouped imports and a library declared under `tests/` slipping past
-architecture enforcement, an unbounded PTX entry point, a rollback that unpublished released output,
-and two reference paths returning successful nonfinite results. Those are closed too. The
-A third review found three more — a derived `Clone` that handed the new sequence identity to a
-second authority, restoration evidence with no branch or prefix-version identity, and source
-enforcement still missing ordinary Rust syntax — and those are closed too. The
-A fourth found that the architecture checker's new parser was not traversing function bodies, and
-that is closed too. The [first](docs/handovers/2026-09-07-m0-correction-results.md),
-[second](docs/handovers/2026-09-07-second-review-corrections.md),
-[third](docs/handovers/2026-09-07-third-review-corrections.md) and
-[fourth](docs/handovers/2026-09-07-fourth-review-corrections.md) handovers are the short versions.
+[Task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md) is the **final planned M1.3
+assignment**. Tasks 0006–0011 have already established the accepted resource ledger, measured host
+and device capacity, rank-owned CUDA context, event-backed leases, basic admitted device arena and
+admitted graph/resource plan. M1.3 still lacks its one required admitted device-resident layer chain
+without intermediate device-to-host transfers.
 
-The next bounded task is [task 0003](docs/tasks/0003-m1-bf16-reference-interpreter.md), the BF16 host
-reference interpreter. It is deliberately smaller than document 06's whole M1: the manifest reader,
-the rank-owned CUDA path, paged state and the generation service are separate tasks that consume it.
+The next implementation agent must implement, validate, correct and close task 0012. Review
+corrections remain in task 0012; they do not become task 0013 or another preparatory M1.3 slice.
+After acceptance, update this section and the living records to say **M1.3 complete; M1.4 active**.
+The next bounded assignment must then implement M1.4 appendable paged state bound to
+[task 0004's](docs/tasks/0004-m1-state-transactions.md) accepted transaction mechanism. Sampler
+history, deterministic greedy/temperature tests, the generation service and the diagnostic CLI are
+subsequent M1.4 work. The [active handover](docs/handovers/2026-09-10-m1.3-closure-to-m1.4.md)
+records this sequencing and its stop condition.
 
 Assignments use [TASK.md](docs/spec/templates/TASK.md), never "do everything necessary to make model
 X fast." Each task names a shared owner, a bounded deliverable, its consumers, tests, and stop
 conditions.
-
-The original M0 assignment, kept for the record:
-
-> Read AGENTS.md and documents 01–09. Execute M0 only from the roadmap. Inventory the actual hardware, checkpoints, licenses, storage, legacy behavior, and pinned build dependencies. Create the Rust workspace skeleton, architecture checks, decision register, benchmark manifest, and tiny source-linked numerical fixtures. Do not begin a model-specific runtime. Do not convert the full checkpoint library or promise throughput. Report every unresolved gate and the exact M1 task proposed next. Preserve the legacy checkout.
 
 ## Meaning of "first-class"
 

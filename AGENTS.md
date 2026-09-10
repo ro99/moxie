@@ -2,6 +2,15 @@
 
 This repository builds one NVIDIA inference engine for one interactive user, including models larger than VRAM and large context. It does not build independent engines per model.
 
+## Active assignment
+
+[Task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md) is the final planned M1.3 task. The
+next implementation agent must take it through implementation, required evidence, review
+corrections and acceptance; do not turn its corrections into another preparatory M1.3 task. When it
+is accepted, record M1.3 complete and update this section. The next bounded assignment is then M1.4
+appendable paged state bound to [task 0004's](docs/tasks/0004-m1-state-transactions.md) accepted
+transaction mechanism. See the [active handover](docs/handovers/2026-09-10-m1.3-closure-to-m1.4.md).
+
 ## Read before editing
 
 Read [README.md](README.md), [product boundaries](docs/spec/01-product-and-decisions.md), [common API](docs/spec/02-architecture-and-common-api.md), [agent playbooks](docs/spec/09-agent-playbooks.md), and the assigned milestone in [the roadmap](docs/spec/06-implementation-roadmap.md). Then read the relevant memory, attention/state, sampling/application and validation contracts linked there, and their actual legacy source references. These documents are normative; this short file is their discovery entry point.

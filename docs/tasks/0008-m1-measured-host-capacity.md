@@ -1,14 +1,16 @@
 # Task 0008 — M1.3: measured host capacity
 
-Status: **contract proposed**, 2026-09-09, after [task 0007](0007-m1-rank-context-and-measured-capacity.md)
-was accepted for the rank-owned context and measured device-capacity slice.
+Status: **accepted for the measured host-capacity slice at `b6b4de4` after review corrections**,
+2026-09-09. [Task 0007](0007-m1-rank-context-and-measured-capacity.md) was already accepted for
+the rank-owned context and measured device-capacity slice.
 
 **This contract is committed before any implementation code**, as in tasks 0003–0007. That commit
 contains no `.rs` change. Nothing below is to be adjusted once a test has run.
 
 ## Identity and authority
 
-- Task ID / milestone / owner: 0008 / M1.3 / implementation agent (Claude), owner review pending
+- Task ID / milestone / owner: 0008 / M1.3 / implementation agent (Claude); bounded-slice
+  acceptance is recorded above
 - Writable root: `/home/rodrigo/Developer/moxie`, branch `main`, base commit `e8c5e4a`, tree clean
 - Read-only legacy root: `/home/rodrigo/Developer/strata` @ `2dc566eb8e440fff4837ac75ca1dad1b20c2264e`
 - Required documents: 03 (host admission, the 251 GB warning, page-cache pressure, the swap rule),

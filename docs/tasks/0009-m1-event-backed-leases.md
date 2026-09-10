@@ -1,14 +1,16 @@
 # Task 0009 — M1.3: event-backed leases
 
-Status: **contract proposed**, 2026-09-09, after [task 0008](0008-m1-measured-host-capacity.md)
-was accepted for the measured host-capacity slice.
+Status: **accepted for the event-retained transient-upload slice at `9b24eeb` after independent
+review recorded at `7c36658`**, 2026-09-09. [Task 0008](0008-m1-measured-host-capacity.md) was
+already accepted for the measured host-capacity slice.
 
 **This contract is committed before any implementation code**, as in tasks 0003–0008. That commit
 contains no `.rs` change. Nothing below is to be adjusted once a test has run.
 
 ## Identity and authority
 
-- Task ID / milestone / owner: 0009 / M1.3 / implementation agent, owner review pending
+- Task ID / milestone / owner: 0009 / M1.3 / implementation agent; bounded-slice acceptance is
+  recorded above
 - Writable root: `/home/rodrigo/Developer/moxie`, branch `main`, base commit `b6b4de4`, tree clean
 - Read-only legacy root: `/home/rodrigo/Developer/strata` @ `2dc566eb8e440fff4837ac75ca1dad1b20c2264e`
 - Required documents: 02 (ownership table — `moxie-memory` owns leases, `moxie-executor`
