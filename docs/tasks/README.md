@@ -4,7 +4,8 @@
 
 [Task 0012](0012-m1-selected-bf16-device-chain.md) is the **final planned M1.3 assignment**. Its
 implementation is at `6305f9d`; all three owner-review findings are corrected at `eaf8846` with the
-affected evidence rerun. Owner re-review/acceptance remains open. Corrections remain part of task
+affected evidence rerun. Two additional findings are corrected at `1138a2a` (persistent fatal-readback
+loss and explicit RMS-underflow refusal). Owner re-review/acceptance remains open. Corrections remain part of task
 0012 rather than becoming another preparatory M1.3 task.
 
 When task 0012 is accepted, record **M1.3 complete**. The next bounded assignment must be **M1.4:

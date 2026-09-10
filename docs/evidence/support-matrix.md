@@ -12,6 +12,15 @@ matrix exists to prevent.
 
 ## Gate IDs
 
+Task 0012's second corrections at `1138a2a` extend `G-BF16-DEVICE-CHAIN` and `G-LEASE-FAULTS`:
+fatal readback permanently retains the lease and reservation; unqualified RMS FP32 underflow
+returns typed `Numerical`. Both owner underflow cases pass primitive and integrated refusal tests
+on every UUID, with an additional isolated scaling test. Aggregate and both per-SM profiles remain
+39/39, and the reduced chain passes memcheck on SM86/SM120 plus SM120 racecheck/initcheck.
+The qualified RMS path conservatively refuses nonzero square, mean, scaling and normalized
+intermediates that round to zero or FP32 subnormals. It does not claim successful execution for all
+finite BF16 operands. Task acceptance and M1.3 closure remain pending owner re-review.
+
 | Gate | Command | Lane | Result 2026-09-10 |
 |---|---|---|---|
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |

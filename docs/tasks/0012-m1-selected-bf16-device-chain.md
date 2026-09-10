@@ -1,6 +1,6 @@
 # Task 0012 — M1.3: selected BF16 device layer chain
 
-Status: **implementation complete at `6305f9d`; owner-review corrections complete at `eaf8846`;
+Status: **implementation complete at `6305f9d`; owner-review corrections at `eaf8846` and `1138a2a`;
 awaiting owner re-review/acceptance**, 2026-09-10, after the owner accepted [task
 0011](0011-m1-admitted-graph-resource-plan.md) at `64899c2` following independent re-review.
 
@@ -338,6 +338,45 @@ appendable paged-state assignment. M1.4's later sampler, service and CLI work ma
 bounded inside M1.4.
 
 ## Result, filled after work
+
+### Second owner-review corrections — `1138a2a`
+
+The two additional findings stay within task 0012. M1.3 remains open pending owner re-review and
+acceptance. The original three corrections at `eaf8846` remain in place.
+
+- Fatal final-readback errors now persist their attributed `DeviceLost` status through the existing
+  lifecycle before returning the lease. Shared synchronization refuses an already lost lifecycle
+  before consulting its completion source. On all three UUIDs, injected CUDA status 700 at readback
+  leaves the lease `Lost`; retry performs no further synchronization/readback, retirement refuses,
+  turn sweeping returns the held lease, and dropping the held report neither frees the allocation
+  nor releases its reservation. The existing nonfatal status-1 retry still succeeds and closes.
+- RMS retains the declared sequential FP32 arithmetic and fixed numerical bounds. It explicitly
+  refuses unqualified underflow: a nonzero square, mean, scaling product or normalization result
+  that rounds to zero or a FP32 subnormal propagates a numerical marker to final readback. Exact
+  zero operands remain valid. This conservative refusal can reject values whose eventual answer
+  would happen to satisfy the bound; no universal finite-input RMS support is claimed.
+- Both owner reproductions are now primitive and integrated regressions: input `2^-75`, gain 1,
+  epsilon `2^-149`; and input `2^-80`, gain `2^-70`, epsilon `2^-126`. Each returns typed
+  `Numerical` on all three UUIDs. A further primitive case (input `2^-60`, gain `2^-90`, epsilon
+  `2^-126`) isolates scaling underflow while keeping the square reduction normal. Numerical
+  refusal permits completed resource recovery and preserves the two immutable weight bindings.
+- Passed: full locked/offline host workspace (556 tests plus 8 doctests) and device-feature
+  workspace suite; focused driver fault harness;
+  xtask tests; host and device workspace clippy with warnings denied; host doctests; formatting,
+  architecture (60 rejecting / 15 accepted fixtures) and specification checks. Aggregate GPU
+  qualification and both SM86/SM120 profiles each passed 39/39. Normal numerical maxima remain
+  Linear `0.386110`, RMSNorm `0.960743`, Residual `0.996094`, with integrated H8/H17 ULP zero.
+  Compute Sanitizer memcheck passed on SM120 and SM86, and SM120 racecheck/initcheck passed,
+  including integrated underflow cases. No sanitizer lane was skipped.
+- Negative evidence preserved: the owner's earlier probes measured normalized errors `57.49`
+  and `255.95`, and fatal readback incorrectly reopened after clearing status 700. During correction,
+  clippy found redundant slice borrows and an unguarded driver-only helper in the host build;
+  both were corrected before the final passing checks. No numerical threshold changed.
+- Not repeated this round: isolated no-toolkit/no-driver build, restricted-visibility failure and
+  capacity reordering probes; their prior evidence remains recorded below. Model execution, actual
+  context, quality and paired performance remain unavailable or unmeasured.
+
+### Initial implementation and first owner-review corrections
 
 - Changed shared owners and consumers; implementation commit: `6305f9d`; owner-review correction
   commit: `eaf8846`. `moxie-types` now owns the closed
