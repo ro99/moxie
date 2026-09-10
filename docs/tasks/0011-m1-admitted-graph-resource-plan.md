@@ -1,7 +1,7 @@
 # Task 0011 — M1.3: admitted graph/resource plan
 
-Status: **implementation complete; independent review pending**, 2026-09-09, after task 0010's
-basic device arena was accepted by the owner at `0cc61c7` following independent re-review.
+Status: **review corrections complete; independent re-review pending**, 2026-09-10, after task
+0010's basic device arena was accepted by the owner at `0cc61c7` following independent re-review.
 
 **This contract is committed before implementation code.** Its acceptance criteria are fixed before
 tests run. Later corrections and deviations belong in the Result section; they do not rewrite the
@@ -283,3 +283,38 @@ unchanged. No synthetic graph result is a quality or model-support result.
   exact workspace inclusion in this reservation, and one real device layer chain using operation
   leases. Stop before model/checkpoint loading, residency/eviction policy, paged state, generation,
   multi-device execution, quality claims or performance claims.
+
+## Independent-review corrections — 2026-09-10
+
+- Source commit `78d90be` closes all three contract violations and the requested coverage gap.
+  Lowering now rejects a weight-role value declared as a per-step graph input, validates checked
+  element products for every external operand, and validates the role-specific byte extent for
+  external activations. Index inputs validate their element extent without inventing a byte width
+  absent from the graph contract. A regression reproduces both the disguised BF16 weight and the
+  overflowing live external operand; the executor's ledger test admits the valid counterpart and
+  observes the exact 128-byte packed-weight charge.
+- `TensorHandle` descriptor fields are private and exposed only through read-only accessors. The
+  driver-feature doctest proves an external caller cannot rewrite a returned handle's byte bounds,
+  and the real-device binding test reads every descriptor field through the public accessors while
+  retaining the checked allocation identity.
+- The slot-failure test now enters the same admission implementation as `ReservedPlan::admit`,
+  injects failure on the second planned slot, and checks the returned unchanged candidate, typed
+  capacity error, empty ledger and exact device-memory reconciliation on all three UUIDs. The
+  public method is a thin call into this tested implementation with the ordinary arena allocator.
+- Final validation passed: format; host and full device-feature clippy with `-D warnings`; the
+  locked/offline host workspace (548 unit/integration tests plus 8 doctests); the locked/offline
+  full device-feature workspace (560 plus 11 doctests); focused plan and executor suites;
+  architecture check (55 rejecting fixtures, 14 accepted fixtures, 12 rules); specification check
+  (10 unchanged reference documents); GPU qualification (33/33 across `sm_86` and `sm_120`);
+  normal and reordered capacity; and the restricted two-3090 negative qualification, which exited
+  1 with `sm_120` explicitly unqualified. A fresh no-toolkit/no-driver target passed 548 plus 8,
+  and its explicitly rebuilt `xtask` had no `libcuda` dependency in `ldd`.
+- Failed during correction, then fixed before the final runs: the first injected allocation used
+  `u64::MAX`, which correctly failed alignment validation before reaching the intended capacity
+  branch; a finite over-capacity request now exercises that branch. An earlier driver attempt in a
+  restricted execution environment could not see CUDA; the fully authorized rerun exercised all
+  three GPUs. No acceptance threshold or test was weakened.
+- Skipped and unmeasured remain unchanged: no checkpoint or model was accessed; semantic CUDA
+  arithmetic, actual-context inference, state, quality, topology communication and paired
+  prefill/decode performance remain outside this task. Independent re-review is still required
+  before task acceptance.
