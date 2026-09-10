@@ -1,7 +1,7 @@
 # Task 0011 — M1.3: admitted graph/resource plan
 
-Status: **active**, 2026-09-09, after task 0010's basic device arena was accepted by the owner at
-`0cc61c7` following independent re-review.
+Status: **implementation complete; independent review pending**, 2026-09-09, after task 0010's
+basic device arena was accepted by the owner at `0cc61c7` following independent re-review.
 
 **This contract is committed before implementation code.** Its acceptance criteria are fixed before
 tests run. Later corrections and deviations belong in the Result section; they do not rewrite the
@@ -249,8 +249,37 @@ unchanged. No synthetic graph result is a quality or model-support result.
 
 ## Result, filled after work
 
-- Changed shared owners and consumers; source commit:
-- Commands and result IDs; passed / failed / skipped separately:
-- Measured effect and uncertainty:
-- Deleted/replaced paths:
-- Remaining blockers and next bounded task:
+- Changed shared owners and consumers; source commits: contract `96f20fe`; implementation
+  `a95fa3a`; final forced slot-unwind evidence `1e87bb4`. `moxie-graph` now owns checked immutable
+  graph identity and exact structural summaries. New pure crate `moxie-plan` derives concrete
+  workload shapes, BF16/F32 bytes, liveness and deterministic physical slots. `moxie-executor`
+  converts the candidate to the shared ledger envelope, materializes one task-0010 activation
+  arena, returns bounded tensor metadata, and refuses semantic execution without kernels.
+- Passed: format; host and full device-feature clippy with `-D warnings`; locked/offline host suite
+  (547 unit/integration tests plus 8 doctests); locked/offline full device-feature suite (559 plus
+  10 doctests); focused graph/plan/executor suites; architecture check (55 rejecting fixtures, 14
+  accepted fixtures, 12 rules); and unchanged-reference check (10 documents).
+- Passed device evidence: resource-plan admission/binding/close and forced slot-exhaustion unwind on
+  every visible UUID; interposed allocation/free failures on every UUID; aggregate `test-gpu` 33/33
+  across `sm_86` and `sm_120`; normal and `CUDA_VISIBLE_DEVICES=2,1,0` capacity probes. The
+  restricted `CUDA_VISIBLE_DEVICES=1,2` qualification exited 1 as required, with `sm_120`
+  explicitly unqualified. The isolated no-toolkit/no-driver suite passed 547 plus 8, and an
+  explicitly rebuilt `xtask` had no `libcuda` dependency in `ldd`.
+- Failed during development, then corrected before the final gates: the first host clippy run found
+  one unused feature-gated import and one index loop; the first device clippy run found oversized
+  inline refusal variants; and the first forced-unwind test compile needed a non-`Debug` assertion
+  rewritten. No final validation command failed and no acceptance threshold changed.
+- Measured effect and uncertainty: each real-device plan test allocated and freed one small
+  activation arena, observed aliasing only for non-overlapping values, rejected graph/UUID mismatch
+  before another allocation, and reconciled driver free memory with an empty ledger. This is exact
+  resource/lifetime evidence only. Model quality, actual context, topology communication, semantic
+  CUDA arithmetic and paired prefill/decode performance were skipped as outside this task and
+  remain unmeasured. No checkpoint was accessed or transformed.
+- Deleted/replaced paths: the unused freely constructible `moxie-types::GraphId` was replaced by
+  `moxie-graph::GraphId`, which only successful graph construction can issue. No execution,
+  allocator, cache or legacy path was deleted; the legacy checkout was unchanged.
+- Remaining blockers and next bounded task: independent review is required before acceptance.
+  After acceptance, write a separate M1.3 task for registry-backed semantic capability selection,
+  exact workspace inclusion in this reservation, and one real device layer chain using operation
+  leases. Stop before model/checkpoint loading, residency/eviction policy, paged state, generation,
+  multi-device execution, quality claims or performance claims.
