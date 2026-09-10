@@ -1,0 +1,16 @@
+[package]
+name = "moxie-plan"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: planning is pure over graph/resource descriptors. The
+# executor turns its output into a memory-authority request and performs
+# admission, so the planner cannot reserve bytes for itself.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden dependency"
+
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-graph = { path = "../../../../crates/moxie-graph" }
+moxie-memory = { path = "../../../../crates/moxie-memory" }

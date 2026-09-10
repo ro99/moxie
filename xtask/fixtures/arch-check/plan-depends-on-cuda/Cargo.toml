@@ -1,0 +1,15 @@
+[package]
+name = "moxie-plan"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: a resource candidate is pure. Device allocation and queries
+# belong to the rank context and executor, after planning has completed.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden dependency"
+
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-graph = { path = "../../../../crates/moxie-graph" }
+moxie-cuda = { path = "../../../../crates/moxie-cuda" }

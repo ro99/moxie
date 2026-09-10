@@ -17,6 +17,10 @@ driver = ["moxie-cuda/driver"]
 moxie-types.workspace = true
 moxie-memory.workspace = true
 moxie-cuda.workspace = true
+moxie-plan.workspace = true
+
+[dev-dependencies]
+moxie-graph.workspace = true
 
 [lints]
 workspace = true

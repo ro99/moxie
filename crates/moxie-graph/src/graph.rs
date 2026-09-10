@@ -26,6 +26,7 @@
 //! dimensions use checked padding or explicit unsupported combinations."
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use moxie_types::{
     AccumulationPolicy, ActivationPrecision, Dim, Error, Precision, Result, SymbolId, SymbolTable,
@@ -33,6 +34,61 @@ use moxie_types::{
 };
 
 use crate::{Op, OpContract, OracleId, OracleRegistry, PartitionRule, StateEffect, Visibility};
+
+/// Process-unique identity of one immutable validated graph.
+///
+/// The field is private: callers can retain and compare an identity, but only a
+/// successful [`GraphBuilder::finish`] can create one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GraphId(u64);
+
+impl GraphId {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl core::fmt::Display for GraphId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "GraphId({})", self.0)
+    }
+}
+
+#[derive(Debug)]
+struct GraphIdAllocator {
+    next: AtomicU64,
+}
+
+impl GraphIdAllocator {
+    const fn new(next: u64) -> Self {
+        Self {
+            next: AtomicU64::new(next),
+        }
+    }
+
+    fn allocate(&self) -> Result<GraphId> {
+        let mut current = self.next.load(Ordering::Relaxed);
+        loop {
+            if current == 0 || current == u64::MAX {
+                return Err(Error::InvalidRequest {
+                    field: "graph_id",
+                    detail: "process graph identity space is exhausted".into(),
+                });
+            }
+            match self.next.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(GraphId(current)),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+static GRAPH_IDS: GraphIdAllocator = GraphIdAllocator::new(1);
 
 /// A value flowing through the graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -303,7 +359,7 @@ fn position_operand(params: &OpParams) -> Option<usize> {
 }
 
 /// One node: an operation, its parameters, its inputs and its output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     pub id: NodeId,
     pub params: OpParams,
@@ -317,8 +373,9 @@ pub struct Node {
 /// Construction is the only way to get one, and construction validates, so a
 /// `Graph` in hand is evidence that its shapes agree, its roles are right, its
 /// state effects are declared and every operation has a registered oracle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Graph {
+    id: GraphId,
     values: Vec<TensorSpec>,
     names: BTreeMap<ValueId, String>,
     nodes: Vec<Node>,
@@ -330,6 +387,31 @@ pub struct Graph {
 }
 
 impl Graph {
+    pub const fn id(&self) -> GraphId {
+        self.id
+    }
+
+    /// Exact graph structure excluding process identity.
+    ///
+    /// A plan compares this together with [`GraphId`]. Identity catches an
+    /// accidental graph substitution cheaply; structure prevents a bare ID
+    /// from becoming authority if a future deserializer is defective.
+    pub fn signature(&self) -> GraphSignature {
+        GraphSignature {
+            values: self.values.clone(),
+            names: self.names.clone(),
+            nodes: self.nodes.clone(),
+            inputs: self.inputs.clone(),
+            weights: self.weights.clone(),
+            output: self.output,
+            rows: self.rows,
+            positions: self.positions,
+        }
+    }
+
+    pub fn values(&self) -> &[TensorSpec] {
+        &self.values
+    }
     /// The single value every position-consuming node reads.
     ///
     /// One binding, enforced when the graph is built. Two nodes reading
@@ -400,6 +482,19 @@ impl Graph {
             .map(|n| (n.id, n.params.state_effect()))
             .collect()
     }
+}
+
+/// Exact immutable graph summary retained by a resource plan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphSignature {
+    values: Vec<TensorSpec>,
+    names: BTreeMap<ValueId, String>,
+    nodes: Vec<Node>,
+    inputs: Vec<ValueId>,
+    weights: Vec<ValueId>,
+    output: ValueId,
+    rows: SymbolId,
+    positions: Option<ValueId>,
 }
 
 /// Builds and validates a graph.
@@ -741,6 +836,15 @@ impl GraphBuilder {
     /// declaration: an operation with no oracle cannot reach an interpreter,
     /// because it cannot reach a `Graph`.
     pub fn finish(self, output: ValueId, oracles: &OracleRegistry) -> Result<Graph> {
+        self.finish_with_ids(output, oracles, &GRAPH_IDS)
+    }
+
+    fn finish_with_ids(
+        self,
+        output: ValueId,
+        oracles: &OracleRegistry,
+        ids: &GraphIdAllocator,
+    ) -> Result<Graph> {
         if output.0 as usize >= self.values.len() {
             return Err(Error::InvalidRequest {
                 field: "output",
@@ -778,7 +882,9 @@ impl GraphBuilder {
                 });
             }
         }
+        let id = ids.allocate()?;
         Ok(Graph {
+            id,
             values: self.values,
             names: self.names,
             nodes: self.nodes,
@@ -818,5 +924,88 @@ impl<T> Bindings<T> {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::OracleEvidence;
+    use moxie_types::{ActivationPrecision, Precision};
+
+    const ORACLE: OracleId = OracleId("graph-id-test");
+    const ROWS: SymbolId = SymbolId(91);
+
+    fn registry() -> OracleRegistry {
+        let mut out = OracleRegistry::new();
+        out.register(
+            Op::Residual,
+            ORACLE,
+            OracleEvidence {
+                implementation: "identity_tests",
+                test_module: "identity_tests",
+            },
+        )
+        .unwrap();
+        out
+    }
+
+    fn builder() -> (GraphBuilder, ValueId) {
+        let mut builder = GraphBuilder::new(ORACLE, ROWS);
+        let spec = TensorSpec::new(
+            ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
+            vec![Dim::symbol(ROWS), Dim::constant(2)],
+        );
+        let left = builder.input("left", spec.clone());
+        let right = builder.input("right", spec);
+        let output = builder.node(OpParams::Residual, &[left, right]).unwrap();
+        (builder, output)
+    }
+
+    #[test]
+    fn identity_is_assigned_only_after_validation() {
+        let ids = GraphIdAllocator::new(7);
+        let (bad, output) = builder();
+        assert!(
+            bad.finish_with_ids(output, &OracleRegistry::new(), &ids)
+                .is_err()
+        );
+
+        let (good, output) = builder();
+        assert_eq!(
+            good.finish_with_ids(output, &registry(), &ids)
+                .unwrap()
+                .id(),
+            GraphId(7)
+        );
+    }
+
+    #[test]
+    fn identity_exhaustion_refuses_instead_of_wrapping() {
+        let ids = GraphIdAllocator::new(u64::MAX - 1);
+        let (last, output) = builder();
+        assert_eq!(
+            last.finish_with_ids(output, &registry(), &ids)
+                .unwrap()
+                .id(),
+            GraphId(u64::MAX - 1)
+        );
+        let (overflow, output) = builder();
+        let error = overflow
+            .finish_with_ids(output, &registry(), &ids)
+            .unwrap_err();
+        assert_eq!(error.kind(), "invalid_request");
+    }
+
+    #[test]
+    fn clones_share_identity_and_separate_graphs_do_not() {
+        let (first, output) = builder();
+        let first = first.finish(output, &registry()).unwrap();
+        assert_eq!(first.id(), first.clone().id());
+        assert_eq!(first.signature(), first.clone().signature());
+
+        let (second, output) = builder();
+        let second = second.finish(output, &registry()).unwrap();
+        assert_ne!(first.id(), second.id());
     }
 }

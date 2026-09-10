@@ -38,9 +38,6 @@ opaque_id!(
     /// version). Deliberately *not* interchangeable with `ChunkId` -- see R17.
     LayoutId, u64);
 opaque_id!(
-    /// A compiled semantic graph.
-    GraphId, u64);
-opaque_id!(
     /// A copy-on-write branch of sequence state.
     BranchId, u64);
 opaque_id!(

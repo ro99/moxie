@@ -31,7 +31,8 @@ pub mod graph;
 
 pub use attention::Visibility;
 pub use graph::{
-    Bindings, Graph, GraphBuilder, Node, NodeId, OpParams, TensorSpec, ValueId, ValueRole,
+    Bindings, Graph, GraphBuilder, GraphId, GraphSignature, Node, NodeId, OpParams, TensorSpec,
+    ValueId, ValueRole,
 };
 
 use std::collections::BTreeMap;
@@ -281,7 +282,7 @@ pub enum StateEffect {
 /// This carries the machine-checkable subset. Shapes, layout independence, tie
 /// behaviour and rounding boundaries are **not** here yet; `check_lowerable`
 /// says so rather than passing silently.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OpContract {
     pub op: Op,
     /// Precisions the weight operands may be stored in. Empty for an operation

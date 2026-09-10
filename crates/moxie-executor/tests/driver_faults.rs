@@ -4,9 +4,17 @@
 #![cfg(feature = "driver")]
 
 use moxie_cuda::{Event, RankContext, Stream};
-use moxie_executor::{DeviceArena, Lease, LeaseState};
+use moxie_executor::{DeviceArena, Lease, LeaseState, PlanAdmitRefused, ReservedPlan};
+use moxie_graph::{
+    Graph, GraphBuilder, Op, OpParams, OracleEvidence, OracleId, OracleRegistry, TensorSpec,
+    ValueRole,
+};
 use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSpan};
-use moxie_types::{DeviceTier, HostTier, RankId, Scope, Tier};
+use moxie_plan::{Phase, ResourceWorkload, lower};
+use moxie_types::{
+    ActivationPrecision, DeviceTier, Dim, HostTier, Precision, RankId, Scope, SymbolId, Tier,
+    WeightPrecision,
+};
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering::SeqCst};
 
@@ -171,6 +179,62 @@ fn arena_reservation(
     ledger.admit(&request).unwrap()
 }
 
+const PLAN_ROWS: SymbolId = SymbolId(93);
+const PLAN_ORACLE: OracleId = OracleId("driver-plan-fault");
+
+fn resource_graph() -> Graph {
+    let mut registry = OracleRegistry::new();
+    registry
+        .register(
+            Op::Linear,
+            PLAN_ORACLE,
+            OracleEvidence {
+                implementation: "driver_faults",
+                test_module: "driver_faults",
+            },
+        )
+        .unwrap();
+    let mut builder = GraphBuilder::new(PLAN_ORACLE, PLAN_ROWS);
+    let input = builder.input(
+        "x",
+        TensorSpec::new(
+            ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
+            vec![Dim::symbol(PLAN_ROWS), Dim::constant(8)],
+        ),
+    );
+    let weight = builder
+        .weight(
+            "w",
+            TensorSpec::new(
+                ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
+                vec![Dim::constant(8), Dim::constant(8)],
+            ),
+        )
+        .unwrap();
+    let output = builder
+        .node(
+            OpParams::Linear {
+                in_features: 8,
+                out_features: 8,
+                bias: false,
+            },
+            &[input, weight],
+        )
+        .unwrap();
+    builder.finish(output, &registry).unwrap()
+}
+
+fn resource_workload(graph: &Graph, ctx: &RankContext) -> ResourceWorkload {
+    ResourceWorkload {
+        phase: Phase::Prefill,
+        rows: 2,
+        visible_tokens: 32_768,
+        branch_rows: 2,
+        output: graph.output(),
+        device: ctx.uuid(),
+    }
+}
+
 #[test]
 fn real_driver_admission_submission_and_cleanup_are_fail_closed() {
     let count = moxie_cuda::device_count().unwrap();
@@ -179,6 +243,62 @@ fn real_driver_admission_submission_and_cleanup_are_fail_closed() {
         let ctx = RankContext::acquire(RankId(ordinal), ordinal).unwrap();
         let stream = Stream::new(&ctx).unwrap();
         let mut ledger = test_ledger(&ctx);
+
+        // A graph/UUID validation refusal occurs before the resource-plan path
+        // can call cuMemAlloc.
+        let graph = resource_graph();
+        let other = resource_graph();
+        let candidate = lower(&graph, resource_workload(&graph, &ctx)).unwrap();
+        let allocations = ALLOCS.load(SeqCst);
+        assert!(matches!(
+            ReservedPlan::admit(candidate, &other, &mut ledger, &ctx),
+            Err(PlanAdmitRefused::Invalid { .. })
+        ));
+        assert_eq!(ALLOCS.load(SeqCst), allocations);
+        assert!(ledger.outstanding().is_empty());
+
+        // A physical activation-arena allocation failure returns the candidate
+        // and releases the just-admitted reservation.
+        let candidate = lower(&graph, resource_workload(&graph, &ctx)).unwrap();
+        ALLOC_ERROR.store(2, SeqCst);
+        let allocations = ALLOCS.load(SeqCst);
+        assert!(matches!(
+            ReservedPlan::admit(candidate, &graph, &mut ledger, &ctx),
+            Err(PlanAdmitRefused::Invalid { .. })
+        ));
+        ALLOC_ERROR.store(0, SeqCst);
+        assert_eq!(ALLOCS.load(SeqCst), allocations + 1);
+        assert!(ledger.outstanding().is_empty());
+
+        // Final plan free is checked before releasing the full envelope. A
+        // failed free quarantines the arena and a second close cannot retry it.
+        let mut plan_fault_ledger = test_ledger(&ctx);
+        let candidate = lower(&graph, resource_workload(&graph, &ctx)).unwrap();
+        let plan = ReservedPlan::admit(candidate, &graph, &mut plan_fault_ledger, &ctx).unwrap();
+        FREE_ERROR.store(1, SeqCst);
+        let frees = FREES.load(SeqCst);
+        let refused = plan.close(&mut plan_fault_ledger).unwrap_err();
+        FREE_ERROR.store(0, SeqCst);
+        assert_eq!(FREES.load(SeqCst), frees + 1);
+        assert_eq!(plan_fault_ledger.outstanding().len(), 1);
+        let refused = refused.plan.close(&mut plan_fault_ledger).unwrap_err();
+        assert_eq!(refused.error.kind(), "device_lost");
+        assert_eq!(FREES.load(SeqCst), frees + 1);
+        drop(refused);
+
+        // A separate happy plan closes with one free and no context-wide sync.
+        let mut happy_ledger = test_ledger(&ctx);
+        let candidate = lower(&graph, resource_workload(&graph, &ctx)).unwrap();
+        let allocations = ALLOCS.load(SeqCst);
+        let plan = ReservedPlan::admit(candidate, &graph, &mut happy_ledger, &ctx).unwrap();
+        assert_eq!(ALLOCS.load(SeqCst), allocations + 1);
+        let frees = FREES.load(SeqCst);
+        let syncs = SYNCS.load(SeqCst);
+        plan.close(&mut happy_ledger).unwrap();
+        assert_eq!(FREES.load(SeqCst), frees + 1);
+        assert_eq!(SYNCS.load(SeqCst), syncs);
+        assert!(happy_ledger.outstanding().is_empty());
+
         // The real cuMemAlloc entry point must not run before refusal. Capacity
         // exceeds length in the final variant: account allocated host RAM too.
         for (device, host, wrong_tier, capacity) in [

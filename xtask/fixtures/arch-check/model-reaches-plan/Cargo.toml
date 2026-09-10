@@ -1,0 +1,13 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: a model composes mathematics and metadata. Reaching the
+# planner would let it choose placement or resource schedules for itself.
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden dependency"
+
+[dependencies]
+moxie-plan = { path = "../../../../crates/moxie-plan" }

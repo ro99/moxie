@@ -10,6 +10,7 @@ pub mod capability;
 pub mod dim;
 pub mod error;
 pub mod ids;
+pub mod layout;
 pub mod precision;
 pub mod tier;
 
@@ -19,9 +20,10 @@ pub use capability::{
 pub use dim::{Dim, DimError, SymbolId, SymbolTable};
 pub use error::{Error, Result};
 pub use ids::{
-    ArtifactId, BranchId, ChunkId, DeviceId, DeviceUuid, GraphId, LayoutId, RankId,
-    StateTransactionId, TensorId,
+    ArtifactId, BranchId, ChunkId, DeviceId, DeviceUuid, LayoutId, RankId, StateTransactionId,
+    TensorId,
 };
+pub use layout::TensorLayout;
 pub use precision::{
     AccumulationPolicy, ActivationPrecision, CachePrecision, ExecutionProfile, Precision,
     WeightPrecision,

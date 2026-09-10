@@ -190,6 +190,16 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                 third_party: NONE,
             },
         ),
+        // Pure graph/resource lowering (task 0011). It consumes semantic graph
+        // descriptors but cannot admit, allocate or query a device. Those
+        // effects remain in memory/executor and are pinned by negative fixtures.
+        (
+            "moxie-plan",
+            Allowed {
+                workspace: &["moxie-types", "moxie-graph"],
+                third_party: NONE,
+            },
+        ),
         // Rank-local execution leases (task 0009). Binds the ledger's
         // reservations to the rank context's ordered stream work: it needs
         // both vocabularies and nothing else. A model crate reaching this
@@ -197,7 +207,7 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
         (
             "moxie-executor",
             Allowed {
-                workspace: &["moxie-types", "moxie-memory", "moxie-cuda"],
+                workspace: &["moxie-types", "moxie-memory", "moxie-cuda", "moxie-plan"],
                 third_party: NONE,
             },
         ),
@@ -226,6 +236,7 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                     "moxie-storage",
                     "moxie-cuda",
                     "moxie-kernels",
+                    "moxie-plan",
                     "moxie-executor",
                 ],
                 // What this checker needs to read manifests and to parse model

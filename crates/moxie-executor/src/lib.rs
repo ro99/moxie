@@ -25,9 +25,10 @@
 //! behind the `driver` feature. `moxie-memory` owns its pure range metadata;
 //! operation leases reuse the same completion lifecycle described above.
 //!
-//! What this crate deliberately does not do: admit envelopes (the ledger's
-//! job), choose victims, manage residency, plan execution, or know what a model
-//! is.
+//! This crate now admits and materializes a pure graph resource candidate, but
+//! it still does not derive the envelope (the planner's job), choose victims,
+//! manage residency, select semantic kernels, execute a graph, or know what a
+//! model is.
 //!
 //! [`Ledger::outstanding`]: moxie_memory::Ledger::outstanding
 //! [`Reservation`]: moxie_memory::Reservation
@@ -39,13 +40,18 @@ pub use lease::{
     AcquireRefused, Completion, Lease, LeaseId, LeaseState, ManualCompletion, RetireRefused,
     Script, ScriptedCompletion, SettledResource, TrackableManual, check_fit, check_upload_fit,
 };
+pub mod plan;
 pub mod turn;
+pub use plan::{resource_request, validate_plan_binding};
 
 pub mod arena;
 pub use arena::{
     OperationAcquireRefused, OperationHeld, OperationLease, OperationRetireRefused,
     OperationRetired, OperationTurn, OperationTurnReport,
 };
+
+#[cfg(feature = "driver")]
+pub use plan::{HeldPlanResource, PlanAdmitRefused, PlanCloseRefused, ReservedPlan, TensorHandle};
 
 #[cfg(feature = "driver")]
 pub use arena::{

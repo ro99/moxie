@@ -13,6 +13,7 @@ members = [
     "crates/moxie-storage",
     "crates/moxie-cuda",
     "crates/moxie-kernels",
+    "crates/moxie-plan",
     "crates/moxie-executor",
     "xtask",
 ]
@@ -38,6 +39,7 @@ moxie-host = { path = "crates/moxie-host" }
 moxie-storage = { path = "crates/moxie-storage" }
 moxie-cuda = { path = "crates/moxie-cuda" }
 moxie-kernels = { path = "crates/moxie-kernels" }
+moxie-plan = { path = "crates/moxie-plan" }
 moxie-executor = { path = "crates/moxie-executor" }
 
 [profile.release]
