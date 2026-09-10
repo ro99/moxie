@@ -87,6 +87,7 @@ through the device build would leave that independence untested.
 | `cargo xtask index` | nothing | The command contracts and their required lanes |
 | `cargo test --workspace` | nothing | Host semantics, formats, state, sampling, protocol |
 | `cargo xtask-cuda test-gpu [--profile sm_NN]` | CUDA 13.0 + the cards | Real launches on every visible device; **fails** when a required architecture has no passing device |
+| `cargo xtask-cuda test-bf16-chain` | CUDA 13.0 + one card | Reduced H8/H17 selected semantic chain used by Compute Sanitizer |
 | `cargo xtask-cuda probe [--out <path>]` | CUDA 13.0 + the cards | Bounded hardware and topology inventory |
 
 `cargo xtask` builds with no CUDA feature: it links no driver and runs no `nvcc`. `cargo xtask-cuda`
@@ -126,14 +127,13 @@ link widths and simultaneous-transfer behavior to be measured rather than assume
 ## Current state and the next assignment
 
 [Task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md) is the **final planned M1.3
-assignment**. Tasks 0006–0011 have already established the accepted resource ledger, measured host
-and device capacity, rank-owned CUDA context, event-backed leases, basic admitted device arena and
-admitted graph/resource plan. M1.3 still lacks its one required admitted device-resident layer chain
-without intermediate device-to-host transfers.
+assignment**. Its selected BF16 device chain is implemented at `6305f9d`; host, all-device,
+fault-injection, numerical and sanitizer gates pass. It is awaiting owner review and is not yet
+accepted, so M1.3 remains open.
 
-The next implementation agent must implement, validate, correct and close task 0012. Review
-corrections remain in task 0012; they do not become task 0013 or another preparatory M1.3 slice.
-After acceptance, update this section and the living records to say **M1.3 complete; M1.4 active**.
+Review corrections remain in task 0012; they do not become task 0013 or another preparatory M1.3
+slice. After owner acceptance, update this section and the living records to say **M1.3 complete;
+M1.4 active**.
 The next bounded assignment must then implement M1.4 appendable paged state bound to
 [task 0004's](docs/tasks/0004-m1-state-transactions.md) accepted transaction mechanism. Sampler
 history, deterministic greedy/temperature tests, the generation service and the diagnostic CLI are

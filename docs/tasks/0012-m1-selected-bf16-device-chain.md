@@ -1,6 +1,6 @@
 # Task 0012 — M1.3: selected BF16 device layer chain
 
-Status: **contract proposed**, 2026-09-10, after the owner accepted
+Status: **implementation complete at `6305f9d`; awaiting owner review**, 2026-09-10, after the owner accepted
 [task 0011](0011-m1-admitted-graph-resource-plan.md) at `64899c2` following independent re-review.
 
 **Milestone closure assignment.** This is the final planned M1.3 task. The next implementation
@@ -338,8 +338,68 @@ bounded inside M1.4.
 
 ## Result, filled after work
 
-- Changed shared owners and consumers; source commit:
-- Commands and result IDs; passed / failed / skipped separately:
-- Measured effect and uncertainty:
-- Deleted/replaced paths:
-- Remaining blockers and next bounded task:
+- Changed shared owners and consumers; source commit: `6305f9d`. `moxie-types` now owns the closed
+  semantic-kernel descriptor/catalogue vocabulary. `moxie-kernels` owns an immutable SM86/SM120
+  BF16 package and the Linear, RMS-reduce/apply and Residual CUDA symbols. `moxie-plan` owns exact
+  topology validation, deterministic descriptor selection and weight/activation/workspace
+  lowering. `moxie-executor` binds that selected candidate to one admitted partitioned arena and
+  one event-retained operation. `moxie-cuda` resolves a complete symbol set before launch.
+  `xtask` consumes both required graph shapes and the largest admitted primitive shape.
+- Recorded scope deviation for owner review: `moxie-interp` was not named in the allowed-production
+  file list, but the every-node interpreter gate could not be represented through its stateful
+  public `run`. The implementation adds `run_stateless`/`StatelessTrace`, reusing the existing
+  private dispatcher and oracle calls without changing an equation. A focused test proves graph
+  order, every-node values and missing-binding refusal. This is an API/trace addition, not a second
+  oracle, and remains part of the review range rather than being silently treated as pre-authorized.
+- Passed host/build evidence: format and diff checks; host and device-feature workspace clippy with
+  warnings denied; a fresh locked/offline no-toolkit/no-driver all-target suite (556 unit/integration
+  tests) plus focused interpreter doctests (3); the full locked/offline device-feature all-target
+  suite (572 unit/integration tests); focused planner, interpreter, executor and xtask tests;
+  architecture check (60 rejecting fixtures, 15 accepted fixtures, 12 rules); and specification
+  check (10 unchanged reference documents). The fresh host `xtask` linked only `libgcc_s`, `libc`
+  and the ELF loader in `ldd`, with no `libcuda`.
+- Passed device evidence: `cargo xtask-cuda test-gpu`, `--profile sm86` and `--profile sm120` each
+  reported 39 passed, 0 failed and 0 skipped/unmeasured across UUIDs
+  `GPU-97fe4889-4874-a378-198e-955d2e72c4a3`,
+  `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` and
+  `GPU-81fe4578-59b2-37c4-421e-287cdac78704`; both SM architectures qualified. Normal and reordered
+  capacity probes passed. Restricting visibility to one SM86 while requiring SM120 exited nonzero,
+  reported the absent architecture unqualified and separately reported one foreign-completion
+  case skipped because only one device was visible; that negative run is not counted as a passing
+  qualification lane.
+- Numerical result: selected H8/rows1 and H17/rows5 chains were bit-identical to the interpreter on
+  every GPU (final max/RMS/p99 ULP all zero). The representable primitive graph matched the
+  interpreter at Linear, RMSNorm and Residual boundaries. Across H8, H17 and H1024/rows64, worst
+  normalized errors were Linear `0.386110`, RMSNorm `0.960743` and Residual `0.996094`, all within
+  the fixed bound. Negative fixtures feed reversed accumulation, an omitted BF16 boundary,
+  LayerNorm substitution and residual-twice results through the same acceptance predicate and
+  observe rejection; nonfinite metrics fail closed.
+- Resource/lifetime result: rows1/H8 admits 512 B weights, 768 B activations and 256 B workspace in
+  one 1536 B allocation; rows5/H17 admits 1024 B, 768 B and 256 B in one 2048 B allocation. The RMS
+  logical workspace is respectively 4 B and 20 B. Interposed driver census on every UUID observes
+  one allocation, three first-use uploads, four launches, one event, no intermediate readback or
+  synchronization, and one final readback; the second execution uploads only `x`. Binding,
+  selection, range-unwind, launch, event create/record/query/sync, final-readback and free failures
+  retain or quarantine the declared owner. Cancellation before event completion withholds the
+  plan/ranges/sources through the first no-next-token sweep and returns them after completion.
+- CUDA validation passed: Compute Sanitizer memcheck reported zero errors on SM120 and SM86 for the
+  reduced H8/H17 chain; SM120 racecheck reported zero hazards and initcheck reported zero errors.
+  No sanitizer lane was skipped.
+- Failed during development and corrected before the final evidence: early numerical negatives
+  compared only pre-BF16 arithmetic; the final fixtures use biting stored outputs and the real gate.
+  Early integrated oracle evidence observed only the final value; the stateless trace now exposes
+  every node. Exact graph edges, external-binding membership and descriptor workspace expressions
+  were tightened. Completion attribution now wraps the event before the lifecycle can persist
+  driver loss, and exact request charges/spans plus forced range unwind are inspected. Intermediate
+  compile/clippy/assertion failures were corrected without changing a numerical threshold.
+- Deleted/replaced paths: selected graphs replace task 0011's unconditional
+  `UnsupportedKernel` result only for the exact admitted chain. No allocator, transaction, cache,
+  model, checkpoint or legacy path was deleted; the legacy checkout was unchanged.
+- Skipped/unmeasured outside the bounded claim: no checkpoint or model was read; attention, paged
+  state, actual-context inference, sampling, generation, model quality, topology communication and
+  paired performance remain unimplemented or unmeasured. `visible_tokens=32_768` is selection
+  metadata only and is not a long-context result.
+- Remaining blocker and next bounded task: owner review/acceptance is still required. Do not mark
+  M1.3 complete or create task 0013 from this implementation record. After owner acceptance, update
+  the active records and define M1.4 appendable paged state bound to task 0004's transaction
+  mechanism.

@@ -17,19 +17,20 @@ matrix exists to prevent.
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
 | `G-DEVICE-CLIPPY` | the same with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | device build | passed; **new at [task 0007](../tasks/0007-m1-rank-context-and-measured-capacity.md)**, which found and fixed two pre-existing `undocumented_unsafe_blocks` findings the lane had never been run against; extended at [task 0009](../tasks/0009-m1-event-backed-leases.md) with `moxie-executor/driver` |
-| `G-HOST-TEST` | `cargo test --workspace --locked` | host | passed, 549 unit/integration tests + 8 doctests after task 0011 index-encoding correction |
-| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 55 negative + 14 accepted fixtures, 12 rules; 343 generated module combinations checked against rustc by the host suite, each against all four crate boundaries |
+| `G-HOST-TEST` | `cargo test --workspace --all-targets --locked --offline`; `cargo test --workspace --doc --locked --offline` | host | passed, 556 unit/integration tests + 8 doctests after task 0012 implementation |
+| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 60 negative + 15 accepted fixtures, 12 rules; 343 generated module combinations checked against rustc by the host suite, each against all four crate boundaries |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
-| `G-HOST-NODRIVER` | host build with `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH`; **`cargo build -p xtask` before `ldd`** | host | passed, 549 unit/integration tests + 8 doctests, `ldd` shows no `libcuda`. The explicit build is load-bearing: without it `ldd` can read a device-lane artifact left in the shared `target/`, which it did once on 2026-09-08 ([toolchain.md](toolchain.md)) |
+| `G-HOST-NODRIVER` | fresh target, `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH`; **`cargo build -p xtask` before `ldd`** | host | passed, 556 unit/integration tests; focused interpreter doctests passed separately. `ldd` shows no `libcuda`. The explicit build is load-bearing: without it `ldd` can read a device-lane artifact left in the shared `target/`, which it did once on 2026-09-08 ([toolchain.md](toolchain.md)) |
 | `G-GPU-CAPACITY` | `cargo xtask-cuda capacity` | device | passed, **the host and** 3 devices measured and admitted against in one ledger; also passed with `CUDA_VISIBLE_DEVICES` reversed, each UUID keeping its own memory total |
 | `G-GPU-SM86` | `cargo xtask-cuda test-gpu --profile sm86` | device | passed, RTX 3090 x2 |
 | `G-GPU-SM120` | `cargo xtask-cuda test-gpu --profile sm120` | device | passed, RTX 5060 Ti |
-| `G-LEASE-FAULTS` | `cargo test -p moxie-executor --features driver --test driver_faults -- --nocapture` | device | passed, actual allocation/copy/record/free boundary faults for transient leases, device arenas and admitted resource plans on all 3 UUIDs; test-only symbol interposition |
-| `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 33 cases, both architectures qualified |
+| `G-LEASE-FAULTS` | `cargo test -p moxie-executor --features driver --test driver_faults -- --nocapture` | device | passed, actual allocation/copy/launch/event-query/event-sync/record/readback/free boundary faults for transient leases, device arenas, admitted resource plans and the selected chain on all 3 UUIDs; test-only symbol interposition |
+| `G-GPU-ALL` | `cargo xtask-cuda test-gpu` | device | passed, 39 cases, both architectures qualified |
+| `G-BF16-DEVICE-CHAIN` | `cargo xtask-cuda test-gpu`; SM86/SM120 profile runs; `compute-sanitizer` memcheck on each SM plus racecheck/initcheck | device | passed implementation evidence at `6305f9d`, awaiting task acceptance; exact synthetic BF16 Linear/RmsNorm/Residual H8 rows1 and H17 rows5 chains on all 3 UUIDs, primitive bounds through H1024 rows64; sanitizer clean |
 | `G-ARENA-HISTORY` | `cargo test -p moxie-memory --test arena_history` | host | passed; zero retained requested-heap growth after 100,000 variable-offset cycles with at most two live ranges |
 | `G-ARENA-PENDING` | `cargo test -p moxie-executor --features driver --test device_arena -- --nocapture` | device | passed on every UUID; controlled pending work, cancellation, first-sweep withholding and second-sweep return of the actual range/source; ten-second watchdog fails closed |
 | `G-RESOURCE-PLAN` | `cargo test -p moxie-executor --features driver --test resource_plan -- --nocapture` | device | passed on every UUID; exact graph/workload binding, activation slot identities and reuse, refusal before semantic execution, and physical/ledger reconciliation |
-| `G-INTERP-BF16` | `cargo test -p moxie-interp` | host | passed, 19 unit + 27 acceptance tests + 3 compile-fail doctests ([task 0003](../tasks/0003-m1-bf16-reference-interpreter.md), [task 0004](../tasks/0004-m1-state-transactions.md)) |
+| `G-INTERP-BF16` | `cargo test -p moxie-interp` | host | passed, 19 unit + 28 acceptance tests + 3 compile-fail doctests ([task 0003](../tasks/0003-m1-bf16-reference-interpreter.md), [task 0004](../tasks/0004-m1-state-transactions.md), task 0012 stateless trace) |
 | `G-TOPOLOGY` | `cargo xtask test-topology` | device | **not implemented** (M5) |
 | `G-QUALITY` | `cargo xtask quality` | device | **not implemented** (M3) |
 | `G-BENCH` | `cargo xtask bench` | device | **not implemented** (M6) |
@@ -39,7 +40,7 @@ Device gates ran by hand on this machine. No CI runner executes them; see
 Device results were remeasured in full at [task 0007](../tasks/0007-m1-rank-context-and-measured-capacity.md),
 which changed the context type every device case uses.
 
-Counts are from 2026-09-10 after [task 0011](../tasks/0011-m1-admitted-graph-resource-plan.md) review corrections; the M0
+Counts are from 2026-09-10 after [task 0012](../tasks/0012-m1-selected-bf16-device-chain.md) implementation; the M0
 enforcement counts they grew from are in
 [task 0002](../tasks/0002-m0-review-and-integer-transition.md#fourth-review-corrections-2026-09-07).
 
@@ -53,9 +54,10 @@ compile-fail checks on all three GPUs, device clippy, architecture, specificatio
 diff gates. It did not independently repeat the full device workspace, aggregate GPU
 qualification, visibility/capacity matrix or isolated no-driver build; those remain separately
 recorded implementation evidence. [Task 0012](../tasks/0012-m1-selected-bf16-device-chain.md)
-defines semantic kernel selection and execution as the **final planned M1.3 closure task**. Its
-implementation, evidence and review corrections remain one assignment. After its acceptance, record
-M1.3 complete and begin M1.4 appendable paged state; do not insert another preparatory M1.3 task.
+implements semantic kernel selection and execution as the **final planned M1.3 closure task** at
+`6305f9d`. Its host, GPU, fault and sanitizer evidence passes, but owner review/acceptance remains
+open. After acceptance, record M1.3 complete and begin M1.4 appendable paged state; do not insert
+another preparatory M1.3 task.
 
 ## Rows
 
@@ -75,6 +77,7 @@ M1.3 complete and begin M1.4 appendable paged state; do not insert another prepa
 | none | sm_86 x2, sm_120 | n/a | Event-retained transient uploads | passed, bounded task 0009 slice | `G-HOST-TEST` (retirement, returned sweeps, both-scope/tier bounds and failed settlement), `G-GPU-ALL` (real uploads, foreign-completion refusal), `G-LEASE-FAULTS` | One upload per reservation, host `Pageable` capacity and UUID-owned device `TransferStaging` charged before allocation. Only observed completion permits checked free; copy/record/free failures quarantine with charges retained. Retired source ownership returns to the caller; device allocation is freed. No allocator, persistent residency transfer, kernel-chain lease, multi-stream fan-in or model execution is implemented. |
 | none | sm_86 x2, sm_120 | n/a | Admitted basic device arena | passed, bounded task 0010 slice | `G-HOST-TEST` (`moxie-memory::arena` exact ranges/generations and `moxie-executor::arena` completion/cancel/sweep), `G-GPU-ALL` (`admitted_device_arena` on all 3 UUIDs), `G-LEASE-FAULTS` (real allocation/copy/record/free branches) | One physical allocation per reservation, deterministic aligned first-fit ranges, explicit release/coalescing, persistent owner transfer, and event-gated upload reuse. Copy/record/final-free ambiguity quarantines physical bytes and the parent charge. The basic slice permits one retained host source per arena and one completion event per use. No eviction, residency lifecycle, multi-stream fan-in, plan lowering, kernel chain or model execution. |
 | none | sm_86 x2, sm_120 | n/a | Admitted graph/resource plan | **passed, bounded task 0011 slice** | `G-HOST-TEST` (`moxie-graph` graph identity and explicit index encoding, `moxie-plan` exact lowering/liveness/reuse/external-operand refusals, `moxie-executor::plan` exact ledger envelope and immutable-handle compile failure), `G-HOST-ARCH` (pure planner boundary), `G-RESOURCE-PLAN`, `G-LEASE-FAULTS`; owner acceptance at `64899c2` after independent re-review | A synthetic stateless graph and one UUID-bound row bucket lower to checked shapes, bytes, lifetimes, layouts and deterministic arena slots. External indices explicitly retain the supported `U64` encoding and checked byte extent; weight-role per-step inputs are refused, and the shared ledger admits one activation arena plus exact declared BF16 weight requirements. Read-only handles bind checked descriptors to allocation identity. Execution always refuses with `UnsupportedKernel`. No weight is loaded or resident, and no state, sampling, generation, semantic kernel, model or performance is supported. |
+| none | sm_86 x2, sm_120 | n/a | Selected BF16 Linear → RmsNorm → Residual device chain | **implementation gates passed; awaiting task 0012 owner acceptance** | `G-BF16-DEVICE-CHAIN`, `G-LEASE-FAULTS`, `G-HOST-ARCH`; source `6305f9d` | Closed SM86/SM120 descriptors select exact stateless H8 rows1 and H17 rows5 graphs. One admitted allocation contains separately charged weights, activations and RMS workspace; one stream retains uploads/ranges through one event and performs one final readback. Every-node representable results are bit-identical to the interpreter and general results satisfy the fixed bounds. This qualifies only these synthetic BF16 operations/shapes and primitive bounds through rows64/H1024. **No checkpoint/model, attention/state, actual context, generation, quality or performance is qualified.** |
 | none | n/a | n/a | Oversized host/disk weight streaming | **not implemented** | — | M2. The accounting core, transient leases and one basic device arena exist, but no residency lifecycle, host cache, demand readiness, eviction or storage integration does. |
 | none | n/a | n/a | TP / PP / expert partition | **not implemented** | — | M5. `PartitionRule::NotDetermined` fails closed today. |
 | none | n/a | n/a | Transactional publication of a step | passed | `G-INTERP-BF16` (`moxie-state` `begin`/`commit_prefix`/`abort`, `a_step_cancelled_at_any_publication_boundary_aborts_to_exactly_where_it_started`) | Host reference only. A step's sequence-state and KV mutations commit together or restore exactly, and a transaction is append-only on both. `fork` is still identity-only (COW is M4), and **appendable paged state remains an outstanding M1.4 requirement**. |
@@ -96,16 +99,17 @@ M1.3 complete and begin M1.4 appendable paged state; do not insert another prepa
   does not mean any of the ten [candidate checkpoints](quantization-candidates.md) can be loaded:
   their tensor headers, zero-point packing, activation-order maps and exclusion lists are
   uninspected at the byte level.
-- A passing GPU gate means the toolchain compiles, launches and reports errors correctly on both
-  architectures. It is a probe. It qualifies no operation kernel, because none exists.
+- The task 0005 smoke cases remain toolchain probes. `G-BF16-DEVICE-CHAIN` additionally qualifies
+  the narrowly named synthetic BF16 operations, shapes and SM images above. It does not qualify a
+  checkpoint, model graph, attention/state path, actual context, generation, quality or throughput.
 - A passing capacity gate means this machine and three GPUs answered a question about themselves and
   the ledger admitted a plan against the answers. Task 0010 separately proves one small admitted
   device arena allocates; the capacity probe itself still allocates no payload and proves no plan
   execution. Either capacity figure can change a second later. The host figure in particular is
   `MemAvailable`, which includes cache the kernel expects to reclaim.
 - A passing ledger gate means the accounting arithmetic and refusal rules are right for supplied byte
-  counts. The resource-plan gate derives and admits a synthetic graph's activation and weight byte
-  envelope, then materializes only its activation arena. It has no semantic kernels, resident weights,
-  state, residency pipeline, host cache or model run.
+  counts. The selected-chain gate derives and admits one synthetic graph's exact weight,
+  activation and workspace envelope and materializes it in one allocation. It has no reusable
+  residency pipeline, host cache, state, attention or model run.
 - `G-HOST-NODRIVER` means host CI can run anywhere. It is not evidence about any device, and
   document 07 forbids reading it as such.
