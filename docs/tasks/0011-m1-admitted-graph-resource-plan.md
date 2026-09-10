@@ -1,6 +1,6 @@
 # Task 0011 — M1.3: admitted graph/resource plan
 
-Status: **review corrections complete; independent re-review pending**, 2026-09-10, after task
+Status: **accepted by owner at `64899c2` after independent re-review**, 2026-09-10, after task
 0010's basic device arena was accepted by the owner at `0cc61c7` following independent re-review.
 
 **This contract is committed before implementation code.** Its acceptance criteria are fixed before
@@ -9,8 +9,8 @@ gate that was attempted.
 
 ## Identity and authority
 
-- Task ID / milestone / owner: 0011 / M1.3 / implementation agent; independent review required
-  before acceptance.
+- Task ID / milestone / owner: 0011 / M1.3 / implementation agent; owner acceptance recorded
+  below after independent re-review.
 - Writable root: `/home/rodrigo/Developer/moxie`, branch `main`, base commit `9e14eeb`, initially
   clean and equal to `origin/main`. Local commits are allowed by the continuing assignment; no push
   is authorized.
@@ -343,3 +343,31 @@ unchanged. No synthetic graph result is a quality or model-support result.
   execution, actual-context inference, state, quality, topology communication and paired
   performance remain skipped or unmeasured as outside this task. Independent re-review remains the
   acceptance gate.
+
+## Owner acceptance — 2026-09-10
+
+The owner accepted task 0011's bounded admitted graph/resource-plan slice at `64899c2` after an
+independent re-review of `8b2fbd2..4ed80be`. No new actionable finding surfaced. The review
+confirmed that `IndexEncoding::U64` explicitly matches the interpreter's `Vec<u64>`, external
+bindings retain the encoding and checked byte extent, three indices require exactly 24 bytes, the
+`2^62` case refuses with byte-count overflow, and encoding participates in the structural graph
+signature. The prior weight-accounting, immutable-handle and admission-cleanup corrections remain
+intact.
+
+Independent verification passed the full host workspace (549 unit/integration tests plus 8
+doctests), the focused executor driver tests for binding, faults and integrated unwind on all three
+GPUs, compile-fail checks, device-feature workspace clippy with warnings denied, architecture and
+specification checks, formatting and diff checks. The reviewer did not independently repeat the
+full device-feature workspace suite, aggregate GPU qualification, visibility/capacity matrix or
+isolated no-driver build; those lanes retain the implementation record's separately stated
+evidence and are not represented as independently repeated.
+
+The pending-review statements earlier in this result and prior handovers describe their historical
+state and are superseded by this acceptance. [Task 0012](0012-m1-selected-bf16-device-chain.md)
+may proceed under its own precommitted contract for shared kernel selection, exact workspace
+admission and one
+device-resident layer chain with event-retained operands and independent numerical validation.
+This acceptance covers the resource-plan slice only. M1's device execution, state, generation and
+model-integration requirements remain outstanding, and no checkpoint, model, actual context,
+quality or performance claim is accepted here. The owner authorized documenting and pushing the
+acceptance and next task; no implementation change accompanies this record.
