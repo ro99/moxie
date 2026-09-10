@@ -98,6 +98,25 @@ pub struct ValueId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u32);
 
+/// The stored integer representation of an index-role value.
+///
+/// This is separate from floating activation and quantized-weight precision.
+/// The shared host reference stores indices as `u64`, which is the one encoding
+/// supported until a kernel contract adds and validates another representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IndexEncoding {
+    /// Unsigned 64-bit indices, matching the shared host reference value.
+    U64,
+}
+
+impl IndexEncoding {
+    pub const fn bytes_per_element(self) -> u64 {
+        match self {
+            Self::U64 => 8,
+        }
+    }
+}
+
 /// What kind of thing a value is.
 ///
 /// Document 02: "Token IDs, positions, page/group/sparse indices and masks also
@@ -115,12 +134,12 @@ pub enum ValueRole {
     /// An activation flowing between operations.
     Activation(ActivationPrecision),
     /// Token ids, positions, page or expert indices. Integer, never quantised.
-    Index,
+    Index(IndexEncoding),
 }
 
 impl ValueRole {
     pub fn is_index(self) -> bool {
-        matches!(self, ValueRole::Index)
+        matches!(self, ValueRole::Index(_))
     }
 
     /// The stored element encoding, for a float role.
@@ -128,7 +147,7 @@ impl ValueRole {
         match self {
             ValueRole::Weight(w) => Some(w.get()),
             ValueRole::Activation(a) => Some(a.get()),
-            ValueRole::Index => None,
+            ValueRole::Index(_) => None,
         }
     }
 }
@@ -643,7 +662,7 @@ impl GraphBuilder {
         for (i, v) in inputs.iter().enumerate() {
             let spec = self.spec(*v).expect("checked above");
             let allowed = match spec.role {
-                ValueRole::Index => continue,
+                ValueRole::Index(_) => continue,
                 ValueRole::Weight(w) => contract.weights.iter().any(|a| a.get() == w.get()),
                 ValueRole::Activation(a) => contract.activations.iter().any(|x| x.get() == a.get()),
             };

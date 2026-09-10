@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use moxie_graph::{Graph, GraphId, ValueId, ValueRole};
+pub use moxie_graph::{Graph, GraphId, IndexEncoding, ValueId, ValueRole};
 use moxie_graph::{GraphSignature, StateEffect, TensorSpec};
 use moxie_types::{DeviceUuid, Error, Precision, Result, SymbolTable, TensorLayout};
 
@@ -109,12 +109,14 @@ pub struct LiveRange {
     pub last: u32,
 }
 
-/// One external per-step input. It receives no device allocation in this task.
+/// One external per-step input with a checked encoded byte extent. It receives
+/// no device allocation in this task.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExternalInput {
     pub value: ValueId,
     pub shape: Vec<u64>,
     pub role: ValueRole,
+    pub required_bytes: u64,
 }
 
 /// One external immutable weight requirement.
@@ -305,11 +307,12 @@ fn lower_with_ids(
         let value = ValueId(index as u32);
         let shape = shape.clone();
         if inputs.contains(&value) {
-            validate_external_input(spec.role, &shape)?;
+            let required_bytes = validate_external_input(spec.role, &shape)?;
             bindings.push(ValueBinding::ExternalInput(ExternalInput {
                 value,
                 shape,
                 role: spec.role,
+                required_bytes,
             }));
             continue;
         }
@@ -498,8 +501,14 @@ fn concrete_shape(spec: &TensorSpec, symbols: &SymbolTable) -> Result<Vec<u64>> 
 
 fn tensor_bytes(role: ValueRole, shape: &[u64]) -> Result<u64> {
     let elements = tensor_elements(shape)?;
-    let precision = match role {
-        ValueRole::Activation(precision) => precision.get(),
+    let bytes_per_element = match role {
+        ValueRole::Activation(precision) => match precision.get() {
+            Precision::Bf16 | Precision::F16 => 2,
+            Precision::F32 => 4,
+            Precision::Int4 | Precision::Int8 => {
+                unreachable!("integer activation precision is rejected by its typed constructor")
+            }
+        },
         ValueRole::Weight(precision) => {
             let precision = precision.get();
             if precision.is_integer() {
@@ -509,19 +518,15 @@ fn tensor_bytes(role: ValueRole, shape: &[u64]) -> Result<u64> {
                         .into(),
                 });
             }
-            precision
+            match precision {
+                Precision::Bf16 | Precision::F16 => 2,
+                Precision::F32 => 4,
+                Precision::Int4 | Precision::Int8 => {
+                    unreachable!("integer weights refused above")
+                }
+            }
         }
-        ValueRole::Index => {
-            return Err(invalid(
-                "role",
-                "index values are external and have no implicit element width",
-            ));
-        }
-    };
-    let bytes_per_element = match precision {
-        Precision::Bf16 | Precision::F16 => 2,
-        Precision::F32 => 4,
-        Precision::Int4 | Precision::Int8 => unreachable!("integer weights refused above"),
+        ValueRole::Index(encoding) => encoding.bytes_per_element(),
     };
     elements
         .checked_mul(bytes_per_element)
@@ -536,16 +541,13 @@ fn tensor_elements(shape: &[u64]) -> Result<u64> {
     })
 }
 
-fn validate_external_input(role: ValueRole, shape: &[u64]) -> Result<()> {
+fn validate_external_input(role: ValueRole, shape: &[u64]) -> Result<u64> {
     match role {
         ValueRole::Weight(_) => Err(invalid(
             "role",
             "a weight-role value must be declared as a graph weight and charged",
         )),
-        ValueRole::Activation(_) => tensor_bytes(role, shape).map(|_| ()),
-        // Index storage width is deliberately absent from the graph contract.
-        // Validate its addressable element extent without inventing byte size.
-        ValueRole::Index => tensor_elements(shape).map(|_| ()),
+        ValueRole::Activation(_) | ValueRole::Index(_) => tensor_bytes(role, shape),
     }
 }
 
@@ -583,7 +585,13 @@ mod tests {
 
     fn registry() -> OracleRegistry {
         let mut registry = OracleRegistry::new();
-        for op in [Op::Linear, Op::Residual, Op::VocabProjection, Op::Attention] {
+        for op in [
+            Op::Embedding,
+            Op::Linear,
+            Op::Residual,
+            Op::VocabProjection,
+            Op::Attention,
+        ] {
             registry
                 .register(
                     op,
@@ -812,7 +820,10 @@ mod tests {
         let q = builder.input("q", activation(rows.clone(), 4));
         let k = builder.input("k", activation(rows.clone(), 4));
         let v = builder.input("v", activation(rows.clone(), 4));
-        let positions = builder.input("positions", TensorSpec::new(ValueRole::Index, vec![rows]));
+        let positions = builder.input(
+            "positions",
+            TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows]),
+        );
         let output = builder
             .node(
                 OpParams::Attention {
@@ -873,7 +884,42 @@ mod tests {
         let error = lower(&overflowing, workload(&overflowing, 1)).unwrap_err();
         assert_eq!(error.kind(), "invalid_request");
         assert!(error.to_string().contains("byte count overflowed"));
-        assert!(validate_external_input(ValueRole::Index, &[u64::MAX, 2]).is_err());
+    }
+
+    #[test]
+    fn index_encoding_and_checked_byte_extent_survive_lowering() {
+        let rows = Dim::symbol(ROWS);
+        let mut builder = GraphBuilder::new(ORACLE, ROWS);
+        let tokens = builder.input(
+            "tokens",
+            TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows]),
+        );
+        let table = builder.weight("table", weight(32, 1)).unwrap();
+        let output = builder
+            .node(
+                OpParams::Embedding {
+                    vocab: 32,
+                    hidden: 1,
+                },
+                &[tokens, table],
+            )
+            .unwrap();
+        let graph = builder.finish(output, &registry()).unwrap();
+        let plan = lower(&graph, workload(&graph, 3)).unwrap();
+        let ValueBinding::ExternalInput(input) = plan.binding(tokens).unwrap() else {
+            panic!("tokens must remain an external input");
+        };
+        assert_eq!(input.shape, [3]);
+        assert_eq!(input.role, ValueRole::Index(IndexEncoding::U64));
+        assert_eq!(
+            input.required_bytes,
+            3 * IndexEncoding::U64.bytes_per_element()
+        );
+
+        let overflowing_rows = 1u64 << 62;
+        let error = lower(&graph, workload(&graph, overflowing_rows)).unwrap_err();
+        assert_eq!(error.kind(), "invalid_request");
+        assert!(error.to_string().contains("byte count overflowed"));
     }
 
     #[test]

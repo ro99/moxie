@@ -31,8 +31,8 @@ pub mod graph;
 
 pub use attention::Visibility;
 pub use graph::{
-    Bindings, Graph, GraphBuilder, GraphId, GraphSignature, Node, NodeId, OpParams, TensorSpec,
-    ValueId, ValueRole,
+    Bindings, Graph, GraphBuilder, GraphId, GraphSignature, IndexEncoding, Node, NodeId, OpParams,
+    TensorSpec, ValueId, ValueRole,
 };
 
 use std::collections::BTreeMap;

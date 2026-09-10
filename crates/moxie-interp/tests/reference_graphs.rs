@@ -8,8 +8,8 @@
 //! contracts, and adds that synthetic output is never described as model support.
 
 use moxie_graph::{
-    Bindings, Graph, GraphBuilder, OpParams, OracleRegistry, PartitionRule, StateEffect,
-    TensorSpec, ValueId, ValueRole, Visibility,
+    Bindings, Graph, GraphBuilder, IndexEncoding, OpParams, OracleRegistry, PartitionRule,
+    StateEffect, TensorSpec, ValueId, ValueRole, Visibility,
 };
 use moxie_interp::{Cancel, HostTensor, Interpreter, KvCache, Value};
 use moxie_oracles::metric::{ErrorSummary, gamma};
@@ -100,11 +100,11 @@ fn build(dims: Dims, seed: u64) -> Fixture {
     let rows = rows_symbol();
     let tokens_id = g.input(
         "tokens",
-        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
     );
     let positions_id = g.input(
         "positions",
-        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
     );
 
     let param = |g: &mut GraphBuilder,
@@ -528,7 +528,7 @@ fn an_operation_with_no_registered_oracle_cannot_be_built_into_a_graph() {
     let rows = rows_symbol();
     let tokens = g.input(
         "tokens",
-        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
     );
     let table = g
         .weight(
@@ -559,7 +559,7 @@ fn shape_and_divisibility_errors_are_refused_at_construction() {
     let rows = rows_symbol();
     let pos = g.input(
         "positions",
-        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
     );
     let x = g
         .weight(
@@ -585,7 +585,7 @@ fn shape_and_divisibility_errors_are_refused_at_construction() {
     let mut g = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
     let pos = g.input(
         "positions",
-        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
     );
     let narrow = g
         .weight(
@@ -610,7 +610,7 @@ fn shape_and_divisibility_errors_are_refused_at_construction() {
     let mut g = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
     let pos = g.input(
         "positions",
-        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
     );
     let t = g.input(
         "x",
@@ -627,7 +627,10 @@ fn shape_and_divisibility_errors_are_refused_at_construction() {
 
     // An index where a float is expected, and the reverse.
     let mut g = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
-    let idx = g.input("i", TensorSpec::new(ValueRole::Index, vec![rows.clone()]));
+    let idx = g.input(
+        "i",
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
+    );
     let f = g
         .weight(
             "w",
@@ -1000,11 +1003,11 @@ fn every_position_operand_is_the_same_binding() {
     let rows = rows_symbol();
     let p1 = g.input(
         "positions",
-        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
     );
     let p2 = g.input(
         "other_positions",
-        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
     );
     let x = g.input(
         "x",
@@ -1193,7 +1196,7 @@ fn an_operand_precision_the_node_contract_rejects_is_refused_at_construction() {
     let rows = rows_symbol();
     let pos = g.input(
         "positions",
-        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
     );
     let wide = g.input(
         "x",
@@ -1286,7 +1289,7 @@ fn a_graph_whose_attention_layers_are_not_dense_is_refused_at_construction() {
     let rows = rows_symbol();
     let pos = g.input(
         "positions",
-        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
     );
     let x = g.input(
         "x",
@@ -1311,7 +1314,7 @@ fn a_graph_whose_attention_layers_are_not_dense_is_refused_at_construction() {
     let mut g = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
     let pos = g.input(
         "positions",
-        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
     );
     let x = g.input(
         "x",
@@ -1349,7 +1352,7 @@ fn stateless_graph() -> (Graph, ValueId, ValueId, ValueId) {
     let rows = rows_symbol();
     let pos = g.input(
         "positions",
-        TensorSpec::new(ValueRole::Index, vec![rows.clone()]),
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
     );
     let x = g.input(
         "x",
