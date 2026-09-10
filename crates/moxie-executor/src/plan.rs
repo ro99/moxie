@@ -390,6 +390,55 @@ mod driver_binding {
             })),
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use moxie_cuda::RankContext;
+        use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSpan};
+        use moxie_types::{DeviceTier, RankId, Scope, Tier};
+
+        use super::{DeviceArena, unwind};
+
+        #[test]
+        fn slot_exhaustion_unwinds_prior_ranges_and_the_physical_arena() {
+            let count = moxie_cuda::device_count().expect("device lane requires the CUDA driver");
+            assert!(count > 0, "device lane requires real hardware");
+            for ordinal in 0..count {
+                let ctx = RankContext::acquire(RankId(200 + ordinal), ordinal).unwrap();
+                let measurement = ctx.measure().unwrap();
+                let before = ctx.memory_info().unwrap().0;
+                let snapshot = CapacitySnapshot::measured(&measurement, 64 * 1024 * 1024).unwrap();
+                let mut ledger = Ledger::new([snapshot]).unwrap();
+                let mut request = PlanRequest::new("slot unwind", ["bind"]).unwrap();
+                request
+                    .buffer(BufferRequest::new(
+                        "activation arena",
+                        Scope::Device(ctx.uuid()),
+                        Tier::Device(DeviceTier::Activations),
+                        512,
+                        StageSpan::inclusive(0, 0),
+                    ))
+                    .unwrap();
+                let reservation = ledger.admit(&request).unwrap();
+                let mut arena = DeviceArena::create(
+                    &ledger,
+                    reservation,
+                    &ctx,
+                    DeviceTier::Activations,
+                    512,
+                    "slot unwind",
+                )
+                .unwrap();
+                let first = arena.allocate(256, 256, "first slot").unwrap();
+                let refused = arena.allocate(512, 256, "forced exhaustion").unwrap_err();
+                assert_eq!(refused.error.kind(), "capacity_exceeded");
+
+                assert!(unwind(arena, vec![(0, first)], &mut ledger).is_ok());
+                assert!(ledger.outstanding().is_empty());
+                assert_eq!(ctx.memory_info().unwrap().0, before);
+            }
+        }
+    }
 }
 
 #[cfg(feature = "driver")]
