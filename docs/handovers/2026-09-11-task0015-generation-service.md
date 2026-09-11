@@ -1,11 +1,12 @@
-# Handover — task 0015 corrections ready for re-review
+# Handover — task 0015 final correction ready for re-review
 
 ## Workspace identity
 
 Writable `/home/rodrigo/Developer/moxie`, `main`, clean task base `c0f61a7`.
 Contract `2fbacec` precedes implementation `f7cff56`; final evidence is a separate
 documentation commit. Independent-review correction `5990f2a` makes generation
-execution fail closed. No unrelated source changes were present or overwritten.
+execution fail closed; correction `7a08adf` closes the remaining direct-API
+transaction rollback gap. No unrelated source changes were present or overwritten.
 Read-only legacy `/home/rodrigo/Developer/strata` remains at
 `2dc566eb8e440fff4837ac75ca1dad1b20c2264e`, with `.pi/` and `tests/p2p/` untouched.
 
@@ -43,6 +44,16 @@ count before charging. A `PagedExecution` holds immutable graph/weight borrows a
 the sequence-issued execution authority, so a second configuration cannot extend
 existing KV. Regressions cover all three behaviors.
 
+Independent re-review found one remaining boundary: weight/input preparation in
+`PagedExecution::run` still preceded the interpreter's abort handler. Correction
+`7a08adf` validates transaction authority first, then runs configuration validation,
+fallible preparation and interpretation under one abort guard. Its direct allocator
+regression first publishes one tentative row and logits, fails the next 262,144-byte
+weight copy in the same transaction, and verifies zero rows, baseline frontiers, no
+live logits or journal, and a successful two-row retry. Final gates pass with 593+9
+host and 609+12 device-feature tests, 39/39 GPU cases, both clippy lanes, formatting,
+specification, and 71 rejecting/20 accepted architecture fixtures.
+
 ## Decisions and limits
 
 The profile is explicitly `host-reference`: requested context <=256, graph values
@@ -65,9 +76,10 @@ was introduced for ignored evidence.
 
 ## Next task
 
-Independently re-review `5990f2a` against the three findings, `2fbacec`, ADR 0011
-and the task's retained gates. Corrections stay in task 0015. **M1.4 remains active
-until owner acceptance.**
+Independently re-review `7a08adf` against the remaining rollback finding and review
+the cumulative corrections from `5990f2a`, contract `2fbacec`, ADR 0011 and the
+task's retained gates. Corrections stay in task 0015. **M1.4 remains active until
+owner acceptance.**
 After acceptance, record M1.4 closure and define the bounded M1.5 model graph/
 integration assignment, inspecting exact local artifact revisions before any model
 claim and stopping at dependent owner gates. Device attention remains M4 scope;

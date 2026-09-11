@@ -1,8 +1,8 @@
 # Task 0015 — M1.4 shared generation service and diagnostic CLI
 
-Status: **independent findings corrected; re-review and owner acceptance pending**,
-2026-09-11. Contract `2fbacec` preceded implementation `f7cff56`; correction
-`5990f2a` follows independent review.
+Status: **independent re-review finding corrected; final re-review and owner
+acceptance pending**, 2026-09-11. Contract `2fbacec` preceded implementation
+`f7cff56`; corrections `5990f2a` and `7a08adf` follow independent review.
 
 ## Identity and authority
 
@@ -131,10 +131,10 @@ check the bound at worst supported representative shapes and every release path.
 ## Result, filled after work
 
 Implementation `f7cff56`, with architecture-fixture correction `3c346e6` and
-independent-review correction `5990f2a`.
+independent-review corrections `5990f2a` and `7a08adf`.
 [ADR 0011](../decisions/adr/0011-host-reference-generation-service.md) records the
 ownership and reference-profile decisions. No task requirement or numerical gate
-was relaxed. M1.4 remains active pending re-review and owner acceptance.
+was relaxed. M1.4 remains active pending final re-review and owner acceptance.
 
 ### Shared owners and behavior
 
@@ -159,7 +159,7 @@ was relaxed. M1.4 remains active pending re-review and owner acceptance.
 
 Runtime source began at `f7cff56`; `3c346e6` only renames the undeclared-owner
 fixture so its name remains outside the now-extended allowlist. Correction
-`5990f2a` changes runtime behavior and is the identity for every correction gate.
+`5990f2a` changes runtime behavior; `7a08adf` is the identity for the final gates.
 
 | Gate / exact command | Result |
 |---|---|
@@ -169,9 +169,9 @@ fixture so its name remains outside the now-extended allowlist. Correction
 | Same clippy command with the device feature list above | passed |
 | `cargo fmt --all -- --check`; `cargo xtask spec-check`; `git diff --check` | passed; all ten specification digests unchanged |
 | `cargo xtask-cuda test-gpu` | 39/39 real GPU cases passed; no skipped cases |
-| `cargo xtask arch-check` on a clean archive of `5990f2a` | 71 rejecting + 20 accepted fixtures, 12 rules |
+| `cargo xtask arch-check` on a clean archive of `7a08adf` | 71 rejecting + 20 accepted fixtures, 12 rules |
 | `cargo test -p moxie-cli --locked --offline --test generation` | eight tests; two shapes, exact dense/paged prefill and decode logits, whole/chunked/tail/page parity, seeded CLI/service agreement, provenance, immutable program ownership, all executed-row admission, busy/refusal, failure/disconnect and cancellation |
-| `cargo test -p moxie-cli --locked --offline --test allocation -- --nocapture` | one isolated counting/failing allocator test; peak bound, 1,000 cancellation/restart cycles without retained growth, complete admission/allocation failure cleanup including the post-admission 262,144-byte forward fault |
+| `cargo test -p moxie-cli --locked --offline --test allocation -- --nocapture` | one isolated counting/failing allocator test; peak bound, 1,000 cancellation/restart cycles without retained growth, complete admission/allocation failure cleanup, and direct paged-API rollback/retry after a 262,144-byte preparation fault |
 
 The two primary shapes are heads/dimension/vocabulary/layers `(2,4,16,1)` and
 `(3,4,7,2)`. Prompt length 19 uses chunk sizes 1/3/7/8/19/32 and temperatures
@@ -214,6 +214,13 @@ with the additional live-result control reserve.
   execution with a sequence-issued immutable-program authority. The exact forward
   fault now returns `CapacityExceeded(CpuWorkspace, 262144, 0)`, releases every
   charge and reservation, and permits a successful retry.
+- Independent re-review then showed that the public `PagedExecution::run` performed
+  those fallible copies before entering the interpreter's abort handler. A second
+  call in an already-mutated transaction could fail preparation and leave its first
+  row, logits and journal live. Correction `7a08adf` validates transaction authority
+  first and puts program validation, preparation and interpretation under one abort
+  guard. The direct regression proves exact row/frontier/logits restoration, no open
+  transaction, and successful retry through the same immutable execution binding.
 - One correction validation attempt mistakenly overlapped the device-feature
   workspace with the aggregate GPU gate. The resource-plan test correctly failed
   its exclusive device claim. That log is retained as
@@ -238,7 +245,7 @@ with the additional live-result control reserve.
   renames it `moxie-unregistered-owner`, preserving its dependency and expected rule.
 - Local architecture scans also find four pre-existing findings from the retained
   task 0014 independent probe crate under `results/`. That evidence is unchanged.
-  Final product architecture validation uses `git archive 5990f2a` and
+  Final product architecture validation uses `git archive 7a08adf` and
   `cargo run --manifest-path <archive>/xtask/Cargo.toml --locked --offline -- arch-check`.
   No architecture exemption or allowlist relaxation was made for ignored evidence.
 
@@ -284,6 +291,27 @@ correction-gpu.log                     debfa6b0a6bd2f53a86b1953c22122ff20c92509c
 correction-allocation-reproducer.log   dc93dbb2aa68ab55b767e8af0de7fa77b6879a67080c81cb0cb19044984fcfe0
 correction-device-concurrent-gpu-failure.log c3eb75cf0df355353221d3ace3dce5770f5a2d3ac0c3d48e90c582709452278c
 ```
+
+Final rollback-correction evidence SHA-256 values:
+
+```text
+correction-r2-host.log                 accb898506e5b0210cf4482a5e44276484d125ca1cc7775bf4d12c38b2175653
+correction-r2-device.log               3cf4e54258fad893d5b32c1b9f6afa5480b4195edd0e3d8fc7bd8a8627b8c775
+correction-r2-clippy.log               3e5423039034cf749c43298a4517b103cb8263400c0d493f0afba0c809318407
+correction-r2-device-clippy.log        338e86e5b40731ddfc9de0a6aff477455dd9bbb804774fad2be104bfc36527b5
+correction-r2-spec.log                 7ee9b3fc6c1a5e5a612b078e860e08a5d6cb468f3fb849798dbf3c6df79207e9
+correction-r2-arch.log                 f6e11fe4845f4bec1a129d695eaf35f652f665511e8a2bc05d492c3d0164f4bf
+correction-r2-gpu.log                  debfa6b0a6bd2f53a86b1953c22122ff20c92509c7ee84977c8426c55bbea1ea
+correction-r2-allocation.log           5f4eb0094b47ec006fdb810cf658672bdde114767c9829da8de6a377e97f12dc
+correction-r2-generation.log           0f5ec9396cb24c52cf7d23aa57fde16ebb03d47f2c6711dc77c8b6cb5bc792ef
+```
+
+The first final spec-check invocation reused an xtask artifact compiled in the
+clean archive and therefore looked for the untracked specification under `/tmp`.
+Its expected missing-specification failure is retained as
+`correction-r2-spec-stale-artifact-failure.log` (SHA-256
+`b84a7475ee26aaba422bd888550929a80bfe437a2210a0577cf15094c6876d98`).
+After `cargo clean -p xtask`, the recorded local-root specification check passed.
 
 ### Deletion, remaining scope and next task
 

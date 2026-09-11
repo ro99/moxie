@@ -22,7 +22,9 @@ the remaining M1.4 generation-service/minimal diagnostic-CLI integration. Contra
 `2fbacec` precedes implementation `f7cff56`. It uses the accepted shared interpreter,
 paged transactions, memory authority and sampler, with an explicit host-reference
 profile. Correction `5990f2a` addresses the independent review's allocation-failure,
-executed-row-shape and immutable paged-program findings. Re-review and owner
+executed-row-shape and immutable paged-program findings. Re-review found one
+remaining direct-API rollback gap; correction `7a08adf` moves
+all paged preparation under the transaction abort guard. Final re-review and owner
 acceptance are pending; M1.4 remains active.
 M1.5 model integration and M4 device attention remain separate. See the
 [active handover](docs/handovers/2026-09-11-task0015-generation-service.md).

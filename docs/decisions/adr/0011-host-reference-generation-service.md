@@ -1,6 +1,6 @@
 # ADR 0011 — Shared host-reference generation service
 
-Status: independent-review corrections implemented; re-review and owner acceptance pending.
+Status: independent-review corrections implemented; final re-review and owner acceptance pending.
 
 ## Context and decision
 
@@ -46,6 +46,10 @@ row count the request will actually execute, including a partial prefill tail an
 one-row decode. Reference payload and arithmetic scratch copies use fallible reserve
 and report `CpuWorkspace` capacity exhaustion, so a post-admission forward failure
 aborts the shared transaction and reaches the service's existing cleanup/restart path.
+Correction `7a08adf` places transaction validation before those fallible copies and
+encloses preparation plus interpretation in one abort-on-error path. A failure on a
+later call in the same transaction therefore restores earlier tentative rows,
+frontiers and logits before returning.
 
 Pull delivery provides bounded backpressure: no event queue and no work until
 the next pull. Only committed tokens are returned. Commit is the linearization
