@@ -12,12 +12,13 @@ independent review through `0f39cf5`; its contract `a80ff2c` preceded implementa
 `c14e32a`, and correction `c9a4b33` fixed the sole reported issue.
 
 The active bounded assignment is [task 0014](docs/tasks/0014-m1-transactional-sampler-history.md),
-M1.4 sampler history and deterministic greedy/temperature distribution.
+M1.4 sampler history and deterministic greedy/temperature distribution, implemented
+after contract `4054dd7` and awaiting independent review and owner acceptance.
 Its history and rollback must use
 [task 0004's](docs/tasks/0004-m1-state-transactions.md) accepted transaction mechanism;
 the task contract precedes implementation. Service/CLI and device
 attention remain later scope. See the
-[active handover](docs/handovers/2026-09-10-task0013-acceptance-to-sampler-history.md).
+[active handover](docs/handovers/2026-09-11-task0014-sampler-history.md).
 
 ## Read before editing
 

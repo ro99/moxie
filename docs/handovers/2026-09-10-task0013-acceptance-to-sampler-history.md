@@ -1,5 +1,7 @@
 # Handover — task 0013 acceptance to sampler history
 
+Superseded by [task 0014's implementation handover](2026-09-11-task0014-sampler-history.md).
+
 ## Workspace identity
 
 Writable root `/home/rodrigo/Developer/moxie`, branch `main`. Task 0013 contract

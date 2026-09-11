@@ -12,6 +12,15 @@ matrix exists to prevent.
 
 ## Gate IDs
 
+[Task 0014](../tasks/0014-m1-transactional-sampler-history.md), implementation `23a7a40`
+after contract `4054dd7`, adds shared base distributions/RNG and admitted history
+bound to the existing paged transaction. Owner acceptance is pending. Final gates:
+**584 host tests + 9 doctests**, **600 device-feature tests + 12 doctests**, both
+clippy lanes, **65 rejecting + 18 accepted architecture fixtures**, and **39/39**
+real GPU regression cases after the owner repaired the driver mismatch. History
+storage reaches 32,768 entries with zero token-path allocations and complete cleanup;
+this is not model generation, attention context or GPU sampler qualification.
+
 Task 0013 (`c14e32a`, contract `a80ff2c`) adds admitted host paging bound to the
 existing sequence transactions and was accepted after independent review through
 `0f39cf5`. `G-PAGED-HOST` and `G-PAGED-ALLOCATION` pass. After correction
@@ -40,8 +49,8 @@ and isolated no-driver runs retain their previously recorded evidence.
 | `G-HOST-FMT` | `cargo fmt --all -- --check` | host | passed |
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
 | `G-DEVICE-CLIPPY` | the same with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | device build | passed; **new at [task 0007](../tasks/0007-m1-rank-context-and-measured-capacity.md)**, which found and fixed two pre-existing `undocumented_unsafe_blocks` findings the lane had never been run against; extended at [task 0009](../tasks/0009-m1-event-backed-leases.md) with `moxie-executor/driver` |
-| `G-HOST-TEST` | `cargo test --workspace --all-targets --locked --offline`; `cargo test --workspace --doc --locked --offline` | host | passed, 570 unit/integration tests + 8 doctests after task 0013 correction `c9a4b33` |
-| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 61 negative + 16 accepted fixtures, 12 rules; 343 generated module combinations checked against rustc by the host suite, each against all four crate boundaries |
+| `G-HOST-TEST` | `cargo test --workspace --all-targets --locked --offline`; `cargo test --workspace --doc --locked --offline` | host | passed, 584 unit/integration tests + 9 doctests at task 0014 `23a7a40` |
+| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed, 65 negative + 18 accepted fixtures, 12 rules; 343 generated module combinations checked against rustc by the host suite, each against all four crate boundaries |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
 | `G-HOST-NODRIVER` | fresh target, `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH`; **`cargo build -p xtask` before `ldd`** | host | passed, 556 unit/integration tests; focused interpreter doctests passed separately. `ldd` shows no `libcuda`. The explicit build is load-bearing: without it `ldd` can read a device-lane artifact left in the shared `target/`, which it did once on 2026-09-08 ([toolchain.md](toolchain.md)) |
 | `G-GPU-CAPACITY` | `cargo xtask-cuda capacity` | device | passed, **the host and** 3 devices measured and admitted against in one ledger; also passed with `CUDA_VISIBLE_DEVICES` reversed, each UUID keeping its own memory total |
@@ -56,6 +65,8 @@ and isolated no-driver runs retain their previously recorded evidence.
 | `G-INTERP-BF16` | `cargo test -p moxie-interp` | host | passed, 19 unit + 28 acceptance tests + 3 compile-fail doctests ([task 0003](../tasks/0003-m1-bf16-reference-interpreter.md), [task 0004](../tasks/0004-m1-state-transactions.md), task 0012 stateless trace) |
 | `G-PAGED-HOST` | `cargo test -p moxie-state -p moxie-memory --locked --offline` | host | passed, task 0013 plus correction `c9a4b33`; complete per-layer encoded rows across page boundaries, whole/chunk/later parity, partial acceptance/truncation, every cancellation boundary, sequence-unique transactions, exact post-admission lineage-exhaustion classification/cleanup, admission/cleanup and explicit unsupported forks |
 | `G-PAGED-ALLOCATION` | `cargo test -p moxie-state --test paged_allocation --locked --offline -- --nocapture` | host | passed; 32,768 actual stored rows, 662,725 B admitted backing/control, zero append allocations, no retained growth after 10,000 aborts and zero charge after close; storage only |
+| `G-SAMPLING-HOST` | `cargo test -p moxie-sampling -p moxie-state -p moxie-memory --locked --offline -- --nocapture` | host | passed, task 0014; exhaustive FP64 probabilities, Philox known answers and statistical bins, generated-only counts, pending materialization, partial acceptance/replay, every participant/commit cancellation boundary and foreign/stale refusal |
+| `G-SAMPLING-ALLOCATION` | `cargo test -p moxie-state --test sampling_allocation --locked --offline -- --nocapture` | host | passed; 32,768 generated entries + 32,769 physical rows, 1,187,358 B admitted, zero token-path allocations, 10,000 aborts with no growth, exact allocation failures and complete cleanup |
 | `G-TOPOLOGY` | `cargo xtask test-topology` | device | **not implemented** (M5) |
 | `G-QUALITY` | `cargo xtask quality` | device | **not implemented** (M3) |
 | `G-BENCH` | `cargo xtask bench` | device | **not implemented** (M6) |
@@ -65,7 +76,7 @@ Device gates ran by hand on this machine. No CI runner executes them; see
 Device results were remeasured in full at [task 0007](../tasks/0007-m1-rank-context-and-measured-capacity.md),
 which changed the context type every device case uses.
 
-Current host/paging counts include [task 0013](../tasks/0013-m1-appendable-paged-state.md) on 2026-09-10; historical task-specific counts retain their scope. The M0
+Current workspace counts include [task 0014](../tasks/0014-m1-transactional-sampler-history.md) on 2026-09-11; historical task-specific counts and allocation envelopes retain their source scope. The M0
 enforcement counts they grew from are in
 [task 0002](../tasks/0002-m0-review-and-integer-transition.md#fourth-review-corrections-2026-09-07).
 
@@ -83,8 +94,8 @@ implements semantic kernel selection and execution as the **final planned M1.3 c
 `6305f9d`; all three owner-review findings are corrected at `eaf8846`, with the affected GPU, fault,
 resource and sanitizer evidence passing. The two further findings are corrected at `1138a2a`.
 Owner acceptance is recorded in task 0012: **M1.3 complete; M1.4 active**. Task 0013
-implements accepted appendable host paged state bound to task 0004. The next bounded
-M1.4 assignment is sampler history and deterministic greedy/temperature distribution;
+implements accepted appendable host paged state bound to task 0004. Task 0014 now
+implements sampler history and deterministic greedy/temperature distribution, awaiting review;
 no additional preparatory M1.3 task is needed.
 
 ## Rows
@@ -115,7 +126,8 @@ no additional preparatory M1.3 task is needed.
 | none | this host | n/a | Measured host capacity | passed | `G-GPU-CAPACITY`, `G-HOST-TEST` (`moxie-host` 17 tests over committed fixture trees — cgroup limits on a leaf, on an ancestor, leaf-tighter, and sibling-pressure where total and headroom bind at different levels, `max`, no hierarchy, cgroup v1, large swap, coherence under both the machine view and a cap, and seven refusals including missing usage with a finite limit, a malformed limit, and unreadable/non-UTF-8 membership; `moxie-memory::snapshot::measured_host` rules), `G-HOST-ARCH` (telemetry outside `moxie-host` refused in absolute and relative `proc`/`sys` spellings with an artifact-path accepted counterpart, and a `moxie-memory` -> `moxie-host` dependency refused) | `MemAvailable` after the smallest cgroup v2 limit for total and the smallest headroom for available, minimised independently over the process's chain, less a declared reserve. **Nothing is allocated, mapped or reclaimed.** **Swap is excluded from every budget on purpose** (document 03) and reported so the exclusion is visible; page-cache pressure is reported, not managed — managing it is M2. A reading is not a reservation: another process can take memory a moment later and the snapshot will not know, and no pressure-driven replan exists. On this machine no cgroup limit applies, so the limited paths are proven by fixtures rather than by the machine. |
 | none | sm_86 x2, sm_120 | n/a | Measured device capacity, and rank-owned contexts | passed | `G-GPU-CAPACITY`, `G-GPU-ALL` (`rank_context_is_exclusive`, `concurrent_handoff_is_exclusive`, `measurement_is_live`), `G-HOST-TEST` (`moxie-cuda::claims`, which proves the claim outlives the driver teardown without a GPU present), `G-HOST-TEST` (`moxie-memory::snapshot::measured` rules on synthetic readings), `G-HOST-ARCH` (a `moxie-cuda` -> `moxie-memory` dependency is refused) | One rank owns one GPU, and a device's free/total memory reaches the ledger as a `CapacitySnapshot` keyed by UUID. Transient uploads and the bounded device arena consume admitted budgets (tasks 0009–0010). A measurement is a reading at one instant, not a reservation: another process can take memory a moment later and the snapshot will not know. Host capacity is measured too. The figures are byte counts of capacity and are not performance results (O6 untouched). |
 | none | n/a | n/a | Prefix reuse / COW state branches | **not implemented** | `G-HOST-TEST` (`moxie-state`) covers frontier, result-identity and restore-evidence rules only | M4. Counters, retained-result identity and prefix lineage are typed and tested; the new host page pool has no COW/prefix-sharing integration, and document 04's token-content prefix key is a separate identity that is **not** implemented. |
-| none | n/a | n/a | Common sampler pipeline | **partial, not integrated** | `G-HOST-TEST` (`moxie-oracles::sampler`) | Legality mask, top-k, top-p, min-p, temperature, tie rule, extreme-temperature stability and typed failures only. Penalties, DRY, n-gram ban, logit bias, typical-p and XTC are **not implemented**. |
+| none | host | 32,768 history entries; no attention | Base sampler and transactional history | **implemented task 0014; owner review pending** | `G-SAMPLING-HOST`, `G-SAMPLING-ALLOCATION`, `G-HOST-ARCH` | One generation with fixed capacity, FP64 greedy/temperature distributions, explicit legality, Philox target draws, generated-token positions and tentative/committed counts. Shared journal restores rows/frontiers/history; replay evidence follows actual count rebuilding. No model-output provenance, GPU sampling, service/CLI, speculation or entropy integration. |
+| none | n/a | n/a | Complete common sampler pipeline | **partial** | `G-HOST-TEST` (`moxie-oracles::sampler`), `G-SAMPLING-HOST` | Base legality/greedy/temperature/RNG/history are implemented under task 0014. Top-k/top-p/min-p remain oracle-only. Penalties, DRY, n-gram ban, logit bias, typical-p and XTC are **not implemented**. |
 | none | n/a | n/a | Future entropy | **not implemented** | — | M10. Document 05 defines it; nothing here evaluates it. |
 | none | n/a | n/a | Speculation, any proposer | **not implemented** | `G-HOST-TEST` (`moxie-state`) covers acceptance-frontier bookkeeping only | M9. No verifier, no proposer. |
 | none | n/a | n/a | HTTP / CLI / SSE / reasoning / tools / images | **not implemented** | `G-HOST-TEST` (`moxie-oracles::protocol`) covers frame order, usage arithmetic and stop-string holding | M8. There is no server and no client. |

@@ -1,7 +1,7 @@
 # Task 0014 — M1.4 transactional sampler history and base distributions
 
-Status: **active contract; implementation not started** (2026-09-11).
-This contract must be committed before implementation. Task 0013 is accepted;
+Status: **implementation and validation complete; owner review pending**
+(2026-09-11). Contract `4054dd7` preceded implementation. Task 0013 is accepted;
 M1.4 remains active.
 
 ## Identity and authority
@@ -162,6 +162,16 @@ requests. A second generation after explicit close must start with empty history
 
 ### Resources and lifetimes
 
+Implementation layout fixed before allocator work: append `16*H + 16*V` state
+bytes and `8*V` CPU workspace bytes to the existing physical KV allocation. Each
+history entry is little-endian `(position:u64, token:u32, padding:u32)`; two u64
+count tables hold tentative and committed counts. Workspace stores FP64 bits in
+little-endian bytes, accessed without aligned pointer casts. One allocation and
+one ledger reservation cover KV plus sampler state (StateSpill), probabilities
+(CpuWorkspace), and the existing checked control expression (Pageable), extended
+for the enlarged facade/journal and second schema entry. No additional heap-backed
+sampler metadata is necessary. H must be positive and no larger than KV capacity.
+
 Admit all simultaneous sampler storage with the existing ledger before allocation:
 bounded generated token/position storage, count table, probability workspace and
 participant undo metadata. Publish an exact checked byte expression before writing
@@ -235,5 +245,150 @@ existing visible-charge policy. No sampler-specific allocation authority is adde
 
 ## Result, filled after work
 
-Contract authoring only. No implementation, sampler qualification or new GPU/
-performance result is claimed. Implementation commits must follow this contract.
+Implemented at `23a7a40` after contract `4054dd7`. [ADR 0008](../decisions/adr/0008-transactional-base-sampling.md)
+records the shared owners, physical layout and numerical/RNG choices. Implementation
+source identity and final gate results are recorded below for independent review.
+
+### Changed owners and behavior
+
+- `moxie-sampling`: pure FP64 greedy/temperature distribution, explicit legality,
+  lowest-ID ties, Philox4x32-10 target draws, generated token/position storage,
+  tentative/committed count tables and bounded window views. It imports only
+  `moxie-types` in production; `moxie-oracles` remains a dev-only independent oracle.
+- `PagedSequence::with_sampling`: binds that history to the existing
+  `SequenceState` journal using one length mark and the existing transaction ID.
+  No second journal or mutable raw-state escape is introduced. Distribution
+  preparation holds an exclusive sequence borrow through staging; a compile-fail
+  test proves abort cannot invalidate a prepared sample while it remains usable.
+- Commit publishes frontiers and the accepted sampler prefix while the original
+  journal is open, then resolves it with zero additional accepted transitions.
+  Cancellable commit observes every participant boundary; abort restores both
+  count tables, token/position entries, lineage/frontiers and physical rows.
+  Partial acceptance preserves executed work until explicit resolved rollback.
+  That rollback rebuilds counts before minting existing explicit replay evidence.
+- `HostBuffer::allocate_with_workspace`: one physical pool and reservation with
+  StateSpill, CpuWorkspace and Pageable charges. CPU workspace does not advertise
+  context scaling. A mixed state/workspace allocation failure names all requested
+  bytes and `tier: None`; a workspace-only failure names CpuWorkspace. Lineage
+  failure names Pageable, retaining task 0013's correction and regression.
+
+The one-generation host facade accepts synthetic logits for a checked materialized
+logical prefix. It does not certify a model-produced logits handle or execute
+attention. A sampled token can be committed while pending execution; materializing
+it with zero additional acceptance does not duplicate history. Anonymous generated
+acceptance, prompt growth under generated history, unsupported forks and stale/
+foreign transaction identities are refused.
+
+### Independent numerical and RNG evidence
+
+Exhaustive {-2,0,2}^V logits for V=1..5, every mask and temperatures
+{0,0.25,1,2,10} pass the frozen gates: exact greedy/support/errors, max absolute
+FP64 probability and normalization error <=1e-12. Ordinary fixtures agree with the
+existing FP32 oracle within 1e-6. Additional cases cover finite FP32 extrema,
+subnormal positive temperatures and vocabularies 32,768/100,000/131,072.
+
+The initial plain FP64 sum refused a valid 100,000-token uniform distribution.
+The retained failing test demonstrates that problem; ascending-order compensated
+reductions now pass the same 1e-12 bound. No threshold was loosened. Three external
+Philox known-answer vectors, exact counter/domain assignment and word-to-uniform
+mapping pass. The source pin is recorded in ADR 0008 and the test itself.
+
+Fixed seed 33377335, 100,000 draws per distribution, epsilon
+`0.009239482424894198` from the predeclared 13-bin bound:
+
+| Expected probabilities | Observed counts |
+|---|---|
+| (1/3,1/3,1/3) | 33123, 33361, 33516 |
+| (1/7) repeated 7 times | 14104, 14227, 14397, 14238, 14404, 14304, 14326 |
+| (1/2,1/4,1/4) | 49913, 24970, 25117 |
+
+Every bin passes. Exact inverse-CDF interval tests supplement these statistical
+results; sampled-text agreement is not the distribution oracle.
+
+### Physical resource evidence
+
+The counting-allocator executable stores **32,768 generated entries and 32,769 KV
+rows**, vocabulary 7, H=32,769, two BF16 layers, K dimension 2/V dimension 1,
+page width 127 and KV capacity 32,770. Extra history/count storage is **524,416 B**,
+workspace **56 B**, complete physical backing **921,260 B**, and complete
+admission including control **1,187,358 B**. Distribution, draw, history and KV
+append allocate zero heap. Ten thousand abort/retry cycles retain zero growth;
+close returns the requested heap delta and every ledger charge to zero.
+
+Faults targeted at the combined backing and lineage requests both return exact
+`CapacityExceeded` fields and zero outstanding/tier charges. There are no new
+separate sampler heap allocations. Existing sequence/ledger bookkeeping remains
+under the accepted control/headroom contract. This measures requested heap and
+stored history, not RSS, long-context attention or product performance.
+
+### Failed controls and environment failures
+
+Removing count undo, changing CDF `>` to `>=`, and allowing foreign-ID history
+mutation each made the required regression fail (exit 101). The prompt-contamination
+mutation initially passed an end-of-transaction check because zero-accept commit
+removed it; the test now checks tentative history immediately after prompt append,
+and the identical mutation fails. Both attempts are retained. All deliberate code
+mutations were removed before final validation.
+
+The first device workspace attempt failed on CUDA error 803; another test then
+observed the poisoned test mutex. `nvidia-smi` independently reported a driver/library
+mismatch: loaded module 610.43.02, CUDA/NVML libraries 610.57.04. Aggregate GPU
+enumeration exited 2 for that same environment issue. The owner repaired the driver;
+all three UUIDs now report 610.57.04. No driver or system configuration was changed
+by this task. Final post-repair results are recorded separately below. A focused
+Cargo invocation selecting packages without the named device features was rejected
+before compilation; it is not a test pass and is retained as command-error evidence.
+
+### Final validation and retention
+
+| Gate | Exact command / final result |
+|---|---|
+| Host workspace | `cargo test --workspace --locked --offline`: **584 tests + 9 doctests**, zero failed/ignored |
+| Device-feature workspace | `cargo test --workspace --features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda --locked --offline`: **600 tests + 12 doctests**, zero failed/ignored |
+| Focused sampler/state/memory | `cargo test -p moxie-sampling -p moxie-state -p moxie-memory --locked --offline -- --nocapture`: passed, including all retained bins and allocation metrics |
+| Host clippy | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`: passed |
+| Device clippy | Same workspace/all-targets command with the device feature list above: passed |
+| Architecture | `cargo xtask arch-check`: **65 rejecting + 18 accepted fixtures**, 12 rules |
+| GPU regression | `cargo xtask-cuda test-gpu`: **39 passed, zero failed/skipped**, SM86/SM120 qualified after driver repair |
+| Format / specification | `cargo fmt --all -- --check`, `cargo xtask spec-check`, `git diff --check`: passed; all 10 normative documents unchanged |
+
+GPU identities: 5060 Ti `GPU-97fe4889-4874-a378-198e-955d2e72c4a3`; 3090
+`GPU-3032cfa3-19df-028f-5ebd-43314911e0b9`; 3090
+`GPU-81fe4578-59b2-37c4-421e-287cdac78704`. PCI_BUS_ID ordering was applied by
+Cargo configuration (and explicitly to standalone driver diagnostics). Driver
+610.57.04 is the final observed environment. No new CUDA sampler, topology,
+sanitizer, model-quality or paired performance result is claimed.
+
+Raw logs
+are retained outside git in `/home/rodrigo/Developer/moxie/results/task0014/`, through
+owner review and M1 closure. `SHA256SUMS` records every retained log, including
+negative experiments and the resolved environment failures.
+
+The final log manifest SHA-256 is
+`a924caff370c9240f6383ef7513b65b853d095d95f22f0ce25c0c64cfb361f8a`;
+`sha256sum --check --status SHA256SUMS` passes. Final full lanes are `review-host.log`,
+`review-device.log`, `review-gpu.log`, `review-clippy.log`,
+`review-device-clippy.log`, `review-arch.log`, `review-spec.log` and
+`review-fmt.log`; numerical/bin/allocation output is in `final-focused.log`.
+Earlier runs remain labeled separately, including the initial GPU environment
+failures and the rejected focused feature command.
+
+Build identities at `23a7a40`: CUDA xtask
+`target/debug/deps/xtask-ab778877d540f843`, SHA-256
+`1e15adec592366b510f990ae61954cb7ccffd7b56bf252e550da10d700d9b8cd`;
+host xtask `target/debug/deps/xtask-1b2a551c0290ffef`, SHA-256
+`5fb0463d416c9130cd8d2fa21575716b9362c805074d409caa0ad12af23cf45a`.
+Build outputs may expire on clean; source, log hashes and tracked conclusions remain.
+
+### Deletion and remaining scope
+
+The first implementation's plain reductions were replaced by compensated sums;
+there is no competing production sampler or generation loop to retire. The dense
+interpreter and sampling oracle remain mathematical references. No legacy path,
+processor, public surface or accepted test was removed.
+
+This implements the bounded sampler/history slice. Owner review remains required;
+M1.4 stays active. After acceptance, define the shared generation-service and minimal
+diagnostic-CLI integration task. Device attention, full sampler processors, model
+execution, quality, topology and paired prefill/decode performance retain their
+separate gates; none is claimed by this host sampler result.

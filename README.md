@@ -141,9 +141,10 @@ actual stored rows; this establishes no attention, model or long-context executi
 The active bounded assignment is
 [task 0014](docs/tasks/0014-m1-transactional-sampler-history.md): sampler history and
 deterministic greedy/temperature distribution, with history and rollback using
-task 0004's accepted transactions. Its contract is defined before implementation.
+task 0004's accepted transactions. Implementation follows contract `4054dd7` and
+awaits independent review and owner acceptance.
 Generation service, diagnostic CLI and device attention remain subsequent M1.4 work.
-The [active handover](docs/handovers/2026-09-10-task0013-acceptance-to-sampler-history.md)
+The [active handover](docs/handovers/2026-09-11-task0014-sampler-history.md)
 records the limits and task-contract boundary.
 
 Assignments use [TASK.md](docs/spec/templates/TASK.md), never "do everything necessary to make model
