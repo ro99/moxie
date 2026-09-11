@@ -21,7 +21,7 @@ SHA-256 of the raw file bytes:
 | `docs/spec/03-memory-formats-and-cuda.md` | `1432619b97750185cd2679902df14ab902470601a3a66d87425a95f4529e4c5b` |
 | `docs/spec/04-attention-parallelism-and-speculation.md` | `f13963ae01f14ae18ae9e8eedb0f3d1807ca560e4182ee887c79c5c38322c612` |
 | `docs/spec/05-sampling-api-and-cli.md` | `a5eb36d86efaf6532d40a18791e96a2dca4dc288f0ecfb77e63637b6c6c5f61a` |
-| `docs/spec/06-implementation-roadmap.md` | `47c7ed6ce3da90fc7012f880478cec8e7d8b595d045f860babefafe5a5550d1b` |
+| `docs/spec/06-implementation-roadmap.md` | `a5d8ec79291578d3b4087de306e33777f1a17ac3448d515e80f23ff4813cb266` |
 | `docs/spec/07-validation-and-performance.md` | `1838291d4b53baeefd98353ef383986ce922669ecab396eb99e97c123517442a` |
 | `docs/spec/08-strata-reference-map.md` | `a21e754a2d1aebcc215b9a5a50b4ebccdbd5761325cea2918f9f5ec8cd6774a6` |
 | `docs/spec/09-agent-playbooks.md` | `96efdaa3d9297d5214c223b49c4101db827e6ba46c79578d88ba6f75ab47d631` |
