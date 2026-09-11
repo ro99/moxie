@@ -132,11 +132,15 @@ verification of the selected BF16 device chain and all five review corrections t
 The accepted scope includes explicit refusal of unqualified RMS underflow; it establishes no
 model execution, actual-context support or performance claim.
 
-The next bounded assignment is appendable paged state bound to
-[task 0004's](docs/tasks/0004-m1-state-transactions.md) accepted transaction mechanism.
-Its task contract must precede implementation. Sampler history, deterministic greedy/temperature
-tests, generation service and diagnostic CLI remain subsequent M1.4 work.
-The [active handover](docs/handovers/2026-09-10-m1.3-closure-to-m1.4.md) records this sequencing.
+[Task 0013](docs/tasks/0013-m1-appendable-paged-state.md) implements appendable host
+paged state bound to task 0004's accepted transactions, with owner review pending.
+Its contract `a80ff2c` preceded implementation `c14e32a`. Tests cover physical byte
+preservation, admission, rollback, cancellation and 32,768 actual stored rows;
+this establishes no attention, model or long-context execution claim.
+Sampler history, deterministic greedy/temperature tests, generation service and
+diagnostic CLI remain subsequent M1.4 work. The
+[active handover](docs/handovers/2026-09-10-task0013-paged-state.md) records the limits
+and next bounded assignment.
 
 Assignments use [TASK.md](docs/spec/templates/TASK.md), never "do everything necessary to make model
 X fast." Each task names a shared owner, a bounded deliverable, its consumers, tests, and stop

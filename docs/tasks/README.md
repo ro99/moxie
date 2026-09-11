@@ -6,10 +6,11 @@
 [task 0012](0012-m1-selected-bf16-device-chain.md) on 2026-09-10, including corrections through
 `1138a2a` and their evidence at `ce7548d`.
 
-The next bounded assignment is **M1.4: appendable paged state bound to task 0004's accepted
-transaction mechanism**. Define its task contract before implementation. Subsequent sampler,
-generation-service and diagnostic-CLI assignments remain within M1.4. Reopen M1.3 only for a
-demonstrated defect in its accepted scope.
+[Task 0013](0013-m1-appendable-paged-state.md) implements **M1.4 appendable host
+paged state bound to task 0004's accepted transactions**, with owner review pending.
+Contract `a80ff2c` preceded implementation `c14e32a`. After review/acceptance,
+sampler history, generation service and diagnostic CLI remain within M1.4.
+Reopen M1.3 only for a demonstrated defect in its accepted scope.
 
 One file per bounded assignment, `NNNN-slug.md`. Use [TASK.md](../spec/templates/TASK.md).
 

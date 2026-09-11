@@ -2,9 +2,9 @@
 
 ## Active handover
 
-[Close M1.3, then begin M1.4](2026-09-10-m1.3-closure-to-m1.4.md) is the current continuation. Task
-0012 is the final planned M1.3 assignment; after its acceptance, the next task starts M1.4
-appendable paged state.
+[Task 0013 paged state](2026-09-10-task0013-paged-state.md) is the current continuation.
+M1.3 is complete. Task 0013 implements the bounded M1.4 host paging slice and awaits
+owner review; sampler history, service and CLI remain subsequent M1.4 work.
 
 One file per bounded continuation, `YYYY-MM-DD-slug.md`. Use
 [HANDOVER.md](../spec/templates/HANDOVER.md).

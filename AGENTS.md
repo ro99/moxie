@@ -7,10 +7,12 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 **M1.3 complete; M1.4 active.** The owner accepted [task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md)
 on 2026-09-10 after independent verification of implementation `6305f9d` and corrections
 `eaf8846` / `1138a2a` (reviewed record `ce7548d`).
-The next bounded assignment is M1.4 appendable paged state bound to
-[task 0004's](docs/tasks/0004-m1-state-transactions.md) accepted transaction mechanism.
-Define its task contract before implementation; do not add another preparatory M1.3 task.
-See the [active handover](docs/handovers/2026-09-10-m1.3-closure-to-m1.4.md).
+[Task 0013](docs/tasks/0013-m1-appendable-paged-state.md) implements M1.4 appendable
+host paged state bound to [task 0004's](docs/tasks/0004-m1-state-transactions.md)
+accepted transaction mechanism; owner review is pending. Its contract `a80ff2c`
+precedes implementation `c14e32a`. Review this bounded slice before the next M1.4
+sampler-history assignment; do not add another preparatory M1.3 task.
+See the [active handover](docs/handovers/2026-09-10-task0013-paged-state.md).
 
 ## Read before editing
 

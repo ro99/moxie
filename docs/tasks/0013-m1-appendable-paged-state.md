@@ -1,6 +1,7 @@
 # Task 0013 — M1.4 appendable paged state
 
-Status: **active**. Contract recorded before implementation; owner review pending.
+Status: **active, implementation and validation complete; owner review pending**.
+Contract committed at `a80ff2c` before implementation `c14e32a`.
 
 ## Identity and authority
 
@@ -107,4 +108,108 @@ the mathematical oracle remains. No temporary production bridge is introduced.
 
 ## Result, filled after work
 
-Pending implementation and validation.
+Implementation: `c14e32a` (2026-09-10). No model code, kernels or device execution
+path changed. The shared owners are:
+
+- `moxie-memory::HostBuffer`: admits padded backing and the control reserve in
+  one ledger envelope, allocates synchronously, and frees before releasing the
+  reservation. Wrong-ledger release preserves the authority. Allocation failure
+  after admission unwinds the charge; accidental drop remains visible.
+- `moxie-state::PagedSequence`: owns one root sequence, checked geometry and
+  page table. It delegates transaction/frontier/lineage changes to `SequenceState`;
+  there is no second journal or transaction counter. Append copies complete K/V
+  rows, and failure aborts prior work plus partial copies through the same path.
+- `SequenceState::begin`: IDs are now process-unique, with checked exhaustion.
+  Previously two separate sequences issued ID 1 and could resolve each other's
+  first journal. Existing consumers inherit this correction. Three eagerly built
+  error messages became lazy so successful row append allocates no heap.
+
+The fixed pool is reserved at construction. Truncation deactivates/zeros the
+suffix; those bytes remain charged and available inside the admitted pool until
+close. It does not release pages to the global ledger individually or grow the
+pool. `commit_prefix(n)` retains task 0004's accepted semantics: n additional
+accepted tokens, executed work retained. Partial verification then calls the
+existing rollback at the resolved boundary. No sampler/verifier is implemented.
+
+**Storage evidence:** the counting-allocator executable stored 32,768 actual rows
+with two BF16 layers, one KV head, K dimension 2/V dimension 1, 127 tokens/page and
+maximum 32,769 tokens. Backing is **396,788 B**, including **2,072 B** of page table;
+control reserve is **265,937 B**, for **662,725 B** total admitted. There were zero
+allocations inside append, zero retained growth after 10,000 abort/retry cycles,
+and zero remaining allocation/ledger delta after close. This is a requested-heap
+test, not RSS or a performance measurement. Existing journal allocation is per
+transaction, bounded by the reserve; no payload/lineage allocation is per row.
+The fixed control bound was checked against the pinned Rust 1.97.1
+`library/alloc/src/collections/btree/node.rs` (B=6, 11 entries, 12 edges) and the
+counted live-transaction footprint. Allocator and authority bookkeeping use the
+existing host headroom contract.
+
+Additional source/test checks: frozen `tests/test_glm53_manifest.cpp:106` exercises
+paged rows/COW; `tests/test_kimi_k3_kv_cache.cpp:90` refuses recurrent truncation.
+The new slice carries forward append/truncate and the recurrent refusal boundary,
+without claiming COW support. The earlier searched filename
+`tests/test_glm53_sequence.cpp` does not exist at the frozen commit.
+
+### Verification
+
+| Gate | Exact command / result |
+|---|---|
+| Host | `cargo test --workspace --locked --offline`: **569 unit/integration tests + 8 doctests passed**, no failures/ignored tests |
+| Focused storage/state | `cargo test -p moxie-state -p moxie-memory --locked --offline`: passed, including 11 new paging/identity tests and two new host-buffer tests |
+| Actual stored rows / allocation | `cargo test -p moxie-state --test paged_allocation --locked --offline -- --nocapture`: passed with the figures above |
+| Architecture | `cargo xtask arch-check`: **61 rejecting + 16 accepted fixtures**, 12 rules; new state→memory accepted fixture and state→CUDA rejecting fixture |
+| Format / lint | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`; `git diff --check`: passed |
+| Isolated host build | Fresh `CARGO_TARGET_DIR=target/task0013-host-isolated`, `CUDA_HOME=/nonexistent NVCC=/nonexistent PATH=/home/rodrigo/.cargo/bin:/usr/bin:/bin cargo build -p xtask --locked --offline`: passed; `ldd` reports no libcuda. Full host tests were run in the normal host target, not repeated in this isolated target. |
+| Device-feature workspace | `cargo test --workspace --features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda --locked --offline`: **585 tests + 11 doctests passed**, zero failed/ignored. Device clippy with the same feature list and `--all-targets -- -D warnings` also passed. |
+| Real GPU regression | `cargo xtask-cuda test-gpu`: **39 passed, zero failed/skipped**, SM86 and SM120 qualified on the UUIDs below. PCI_BUS_ID ordering supplied by the Cargo configuration. |
+| Specification | `cargo xtask spec-check`: all 10 normative documents present and unchanged. |
+
+| Hardware | UUID |
+|---|---|
+| RTX 5060 Ti / SM120 | `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` |
+| RTX 3090 / SM86 | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` |
+| RTX 3090 / SM86 | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` |
+
+These GPU runs are regression evidence for accepted device behavior; they do not
+turn the host paged store into device state. Separate per-SM/restricted-visibility
+qualification and Compute Sanitizer were not repeated for this host-only change.
+
+**Deliberately failing controls:** forcing both sequences' first transaction IDs
+to 1 makes `transaction_ids_cannot_resolve_another_sequences_journal` fail (exit
+101). Removing physical truncation from abort makes the real-path cancellation
+test fail on backing bytes (exit 101). Both mutations were restored and the
+focused suite passed again. These are test-sensitivity evidence, not unresolved
+product failures. No acceptance test or numerical threshold was weakened.
+
+**Unmeasured/skipped:** no new topology, sanitizer, checkpoint-quality or paired
+prefill/decode benchmark. No CUDA code changed. No long-context attention,
+checkpoint, COW branch, service or sampler support is established. O1–O7 remain
+open and M1.4 remains active.
+
+**Deletion:** removed the per-sequence transaction counter and eager error-message
+allocation from successful state append. No production bridge or competing state
+transaction mechanism was introduced. The existing dense interpreter cache stays
+as the mathematical reference; production attention must consume shared paged
+state when it is integrated.
+
+Next: independent review of this task, then a bounded M1.4 sampler-history and
+deterministic greedy/temperature distribution task. Service/CLI follow that work;
+M1.3 remains complete.
+
+### Raw evidence retention
+
+Logs are at `/home/rodrigo/Developer/moxie/results/task0013/`, outside git. Retain
+through task review and M1 closure, then retain the tracked conclusions/hashes.
+`SHA256SUMS` lists every log's digest; its own SHA-256 is
+`2fa9385904e4d922782ff54988ca237ae7b82e9e93839971d3f2260a1bb726f2`.
+The manifest covers `host`, `focused`, `allocation`, `arch`, `clippy`, `spec`,
+`isolated-host`, `device`, `device-clippy`, `gpu`, `negative-identity` and
+`negative-abort` `.log` files.
+
+Build identities at implementation `c14e32a`: CUDA xtask
+`target/debug/deps/xtask-f6925ac3b8aa5987`, SHA-256
+`c0a7912fa03f762f4e185941a1cd435352b564fd266fa490686dac294683150d`;
+host xtask `target/debug/deps/xtask-1b2a551c0290ffef`, SHA-256
+`2a107fba9639d95dfcd368f94acaa4118e110d462ce4d31c637b181dc54cf74a`.
+Build outputs are regenerable and may expire on clean; the source, task contract,
+log hashes and result record are the retained evidence.
