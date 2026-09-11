@@ -1,8 +1,8 @@
 # Task 0013 — M1.4 appendable paged state
 
-Status: **active, implementation and validation complete; owner review pending**.
-Contract committed at `a80ff2c` before implementation `c14e32a`; first review
-correction `c9a4b33`.
+Status: **accepted by the owner, 2026-09-10; M1.4 remains active**.
+Contract committed at `a80ff2c` before implementation `c14e32a`; correction
+`c9a4b33`; independent review and retained evidence through `0f39cf5`.
 
 ## Identity and authority
 
@@ -215,9 +215,25 @@ transaction mechanism was introduced. The existing dense interpreter cache stays
 as the mathematical reference; production attention must consume shared paged
 state when it is integrated.
 
-Next: independent review of this task, then a bounded M1.4 sampler-history and
-deterministic greedy/temperature distribution task. Service/CLI follow that work;
-M1.3 remains complete.
+### Owner acceptance, 2026-09-10
+
+The owner accepted task 0013 after independent review through `0f39cf5`. The review
+found no remaining code-review blockers, paging corruption, transaction-isolation
+defect or competing resource owner. It confirmed that correction `c9a4b33` reports
+the exact 8,008-byte pageable lineage allocation failure as `CapacityExceeded` and
+releases the outstanding reservation and both tier charges before returning.
+
+The reviewer ran the allocation regression against the previous implementation and
+observed the intended failure specifically on `invalid_request` versus
+`capacity_exceeded`; the corrected implementation passes. State/memory tests, the
+regression with device features, formatting, host clippy, architecture and
+specification checks passed independently. The retained full-workspace and aggregate
+GPU logs and hashes matched; those full runs were not repeated during final review.
+
+Task 0013 is closed. M1.4 remains active. The next bounded assignment is sampler
+history and deterministic greedy/temperature distribution, with history and rollback
+using task 0004's accepted transaction mechanism. Service/CLI and device attention
+remain later scope.
 
 ### Raw evidence retention
 

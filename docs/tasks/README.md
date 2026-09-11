@@ -6,12 +6,14 @@
 [task 0012](0012-m1-selected-bf16-device-chain.md) on 2026-09-10, including corrections through
 `1138a2a` and their evidence at `ce7548d`.
 
-[Task 0013](0013-m1-appendable-paged-state.md) implements **M1.4 appendable host
-paged state bound to task 0004's accepted transactions**, with owner review pending.
-Contract `a80ff2c` preceded implementation `c14e32a`; review correction `c9a4b33`
-fixes the sole reported error-classification issue. After review/acceptance,
-sampler history, generation service and diagnostic CLI remain within M1.4.
-Reopen M1.3 only for a demonstrated defect in its accepted scope.
+[Task 0013](0013-m1-appendable-paged-state.md) is accepted after independent review
+through `0f39cf5`. Contract `a80ff2c` preceded implementation `c14e32a`; correction
+`c9a4b33` fixes the sole reported error-classification issue.
+
+The next bounded M1.4 assignment is sampler history and deterministic
+greedy/temperature distribution, using task 0004's accepted transaction mechanism for
+history rollback. Generation service, diagnostic CLI and device attention remain later
+scope. Reopen M1.3 or task 0013 only for a demonstrated defect in accepted scope.
 
 One file per bounded assignment, `NNNN-slug.md`. Use [TASK.md](../spec/templates/TASK.md).
 

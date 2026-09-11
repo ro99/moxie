@@ -1,5 +1,8 @@
 # Handover — task 0013 appendable paged state
 
+Superseded after owner acceptance by
+[the sampler-history continuation](2026-09-10-task0013-acceptance-to-sampler-history.md).
+
 ## Workspace identity
 
 Writable root `/home/rodrigo/Developer/moxie`, branch `main`; clean base `b0f06fc`.
@@ -49,8 +52,9 @@ needed.
 ## Decisions
 
 M1.3 remains complete under the owner's task 0012 acceptance. **M1.4 is active**;
-task 0013 implementation is not owner acceptance. O1–O7 remain open, and this work
-requires no ruling on them. No default numerical bound, strategy or surface changed.
+task 0013 was accepted on 2026-09-10 after this implementation handover was issued.
+O1–O7 remain open, and this work requires no ruling on them. No default numerical
+bound, strategy or surface changed.
 
 Paging currently permits one root branch and one fixed, fully charged host pool.
 Truncation returns suffix capacity inside that pool; close returns its entire
@@ -61,15 +65,15 @@ without physical rows. Async integration must consume the accepted event leases.
 
 ## Remaining hypotheses and blockers
 
-Owner review of task 0013 remains. No actual attention at 32K, model execution,
+Owner review was completed on 2026-09-10 through `0f39cf5`, with no remaining
+code-review blockers. No actual attention at 32K, model execution,
 quality, speed, COW/prefix reuse, sampler history, service or CLI is established.
 The support matrix keeps these limits separate. New GPU sanitizer/topology/model
 and paired performance lanes are unmeasured for this host storage slice.
 
 ## Next task
 
-Review task 0013 against its frozen contract and acceptance evidence first. After
-acceptance, define one bounded **M1.4 sampler-history and deterministic
+Task 0013 is accepted. Define one bounded **M1.4 sampler-history and deterministic
 greedy/temperature distribution** task before implementation. Shared sampling
 owns distributions/history, and its rollback must consume the existing state
 mechanism. Read documents 04/05/07, task 0004, this paging contract, frozen

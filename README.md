@@ -132,16 +132,17 @@ verification of the selected BF16 device chain and all five review corrections t
 The accepted scope includes explicit refusal of unqualified RMS underflow; it establishes no
 model execution, actual-context support or performance claim.
 
-[Task 0013](docs/tasks/0013-m1-appendable-paged-state.md) implements appendable host
-paged state bound to task 0004's accepted transactions, with owner review pending.
-Its contract `a80ff2c` preceded implementation `c14e32a`; correction `c9a4b33`
-classifies lineage allocation exhaustion as capacity failure. Tests cover physical byte
-preservation, admission, rollback, cancellation and 32,768 actual stored rows;
-this establishes no attention, model or long-context execution claim.
-Sampler history, deterministic greedy/temperature tests, generation service and
-diagnostic CLI remain subsequent M1.4 work. The
-[active handover](docs/handovers/2026-09-10-task0013-paged-state.md) records the limits
-and next bounded assignment.
+[Task 0013](docs/tasks/0013-m1-appendable-paged-state.md) is accepted after independent
+review through `0f39cf5`. Its contract `a80ff2c` preceded implementation `c14e32a`;
+correction `c9a4b33` classifies lineage allocation exhaustion as capacity failure.
+Tests cover physical byte preservation, admission, rollback, cancellation and 32,768
+actual stored rows; this establishes no attention, model or long-context execution claim.
+
+The next bounded assignment is sampler history and deterministic greedy/temperature
+distribution, with history and rollback using task 0004's accepted transactions.
+Generation service, diagnostic CLI and device attention remain subsequent M1.4 work.
+The [active handover](docs/handovers/2026-09-10-task0013-acceptance-to-sampler-history.md)
+records the limits and task-contract boundary.
 
 Assignments use [TASK.md](docs/spec/templates/TASK.md), never "do everything necessary to make model
 X fast." Each task names a shared owner, a bounded deliverable, its consumers, tests, and stop
