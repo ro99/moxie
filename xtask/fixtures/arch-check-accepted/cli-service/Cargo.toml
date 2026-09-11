@@ -1,0 +1,12 @@
+[package]
+name = "moxie-cli"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+moxie-engine = { path = "../../../../crates/moxie-engine" }
+moxie-graph = { path = "../../../../crates/moxie-graph" }
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-memory = { path = "../../../../crates/moxie-memory" }
+moxie-host = { path = "../../../../crates/moxie-host" }
+moxie-oracles = { path = "../../../../crates/moxie-oracles" }

@@ -1,0 +1,20 @@
+[package]
+name = "moxie-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+moxie-types.workspace = true
+moxie-graph.workspace = true
+moxie-interp.workspace = true
+moxie-state.workspace = true
+moxie-memory.workspace = true
+
+[dev-dependencies]
+moxie-oracles.workspace = true
+
+[lints]
+workspace = true

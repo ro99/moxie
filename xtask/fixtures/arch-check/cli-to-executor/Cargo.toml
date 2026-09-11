@@ -1,0 +1,10 @@
+[package]
+name = "moxie-cli"
+version = "0.0.0"
+edition = "2024"
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden dependency"
+
+[dependencies]
+moxie-executor = { path = "../../../../crates/moxie-executor" }

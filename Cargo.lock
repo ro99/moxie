@@ -25,9 +25,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "moxie-cli"
+version = "0.0.0"
+dependencies = [
+ "moxie-engine",
+ "moxie-graph",
+ "moxie-host",
+ "moxie-interp",
+ "moxie-memory",
+ "moxie-oracles",
+ "moxie-state",
+ "moxie-types",
+]
+
+[[package]]
 name = "moxie-cuda"
 version = "0.0.0"
 dependencies = [
+ "moxie-types",
+]
+
+[[package]]
+name = "moxie-engine"
+version = "0.0.0"
+dependencies = [
+ "moxie-graph",
+ "moxie-interp",
+ "moxie-memory",
+ "moxie-oracles",
+ "moxie-state",
  "moxie-types",
 ]
 

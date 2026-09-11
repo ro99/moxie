@@ -16,6 +16,8 @@ members = [
     "crates/moxie-kernels",
     "crates/moxie-plan",
     "crates/moxie-executor",
+    "crates/moxie-engine",
+    "crates/moxie-cli",
     "xtask",
 ]
 exclude = ["xtask/fixtures"]
@@ -43,6 +45,7 @@ moxie-cuda = { path = "crates/moxie-cuda" }
 moxie-kernels = { path = "crates/moxie-kernels" }
 moxie-plan = { path = "crates/moxie-plan" }
 moxie-executor = { path = "crates/moxie-executor" }
+moxie-engine = { path = "crates/moxie-engine" }
 
 [profile.release]
 debug = 1

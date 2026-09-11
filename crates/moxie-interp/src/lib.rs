@@ -35,6 +35,7 @@
 #![forbid(unsafe_code)]
 
 pub mod kv;
+pub mod paged;
 pub mod tensor;
 
 use moxie_graph::{Bindings, Graph, Node, OpParams, ValueId};
@@ -57,9 +58,23 @@ pub use tensor::{HostTensor, Value};
 /// The budget form is deliberate: a boolean flipped by another thread cannot be
 /// tested deterministically, and a test that cancels "somewhere" proves less
 /// than one that cancels at a named operation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Cancel {
     remaining: std::cell::Cell<u64>,
+    signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    local: std::sync::atomic::AtomicBool,
+}
+
+impl Clone for Cancel {
+    fn clone(&self) -> Self {
+        Self {
+            remaining: self.remaining.clone(),
+            signal: self.signal.clone(),
+            local: std::sync::atomic::AtomicBool::new(
+                self.local.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
 }
 
 impl Cancel {
@@ -67,6 +82,8 @@ impl Cancel {
     pub fn never() -> Self {
         Self {
             remaining: std::cell::Cell::new(u64::MAX),
+            signal: None,
+            local: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -74,6 +91,8 @@ impl Cancel {
     pub fn after(n: u64) -> Self {
         Self {
             remaining: std::cell::Cell::new(n),
+            signal: None,
+            local: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -86,9 +105,21 @@ impl Cancel {
         self.remaining.get()
     }
 
-    fn check(&self, at: &'static str) -> Result<()> {
+    pub fn with_signal(signal: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            remaining: std::cell::Cell::new(u64::MAX),
+            signal: Some(signal),
+            local: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn signal(&self) -> &std::sync::atomic::AtomicBool {
+        self.signal.as_deref().unwrap_or(&self.local)
+    }
+
+    pub fn check(&self, at: &'static str) -> Result<()> {
         let left = self.remaining.get();
-        if left == 0 {
+        if left == 0 || self.signal().load(std::sync::atomic::Ordering::Relaxed) {
             return Err(Error::Cancelled { at });
         }
         if left != u64::MAX {
@@ -557,7 +588,7 @@ impl Interpreter {
         &self,
         node: &Node,
         values: &[Option<Value>],
-        kv: &KvCache,
+        kv: &impl paged::HistorySource,
         staged: &mut Vec<StagedAppend>,
         positions: &[u64],
     ) -> Result<Value> {
@@ -675,7 +706,7 @@ impl Interpreter {
                 // the committed history plus this step's staged appends, which
                 // is what lets a multi-row prefill attend to its own earlier
                 // rows without those rows having been committed yet.
-                let mut history = kv.history(layer)?.clone();
+                let mut history = kv.read_history(layer)?;
                 for a in staged.iter().filter(|a| a.layer == layer) {
                     history.append(a.position, a.key.clone(), a.value.clone())?;
                 }

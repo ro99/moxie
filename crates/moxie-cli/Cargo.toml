@@ -1,0 +1,26 @@
+[package]
+name = "moxie-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "moxie"
+path = "src/main.rs"
+
+[dependencies]
+moxie-engine.workspace = true
+moxie-graph.workspace = true
+moxie-types.workspace = true
+moxie-memory.workspace = true
+moxie-host.workspace = true
+moxie-oracles.workspace = true
+
+[dev-dependencies]
+moxie-interp.workspace = true
+moxie-state.workspace = true
+
+[lints]
+workspace = true

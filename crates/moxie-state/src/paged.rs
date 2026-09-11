@@ -93,7 +93,8 @@ impl KvGeometry {
                 + size_of::<PagedSequence>()
                 + size_of::<StateKind>()
                 + node_bound(size_of::<(BranchId, Branch)>())
-                + node_bound(size_of::<(StateTransactionId, Journal)>()),
+                + node_bound(size_of::<(StateTransactionId, Journal)>())
+                + node_bound(size_of::<(crate::ResultId, crate::LogitsHandle)>()),
         )?;
         if backing_bytes > isize::MAX as usize || control_bytes > isize::MAX as usize {
             return Err(DimError::Overflow.into());
@@ -324,6 +325,30 @@ impl PagedSequence {
 
     pub fn state(&self) -> &SequenceState {
         &self.state
+    }
+
+    /// Validate authority before an executor reads or publishes this transaction.
+    pub fn validate_transaction(&self, txn: StateTransactionId) -> Result<()> {
+        self.check_transaction(txn)
+    }
+
+    /// Retain at most one result in this bounded facade. The executor must bind
+    /// the returned identity to the immutable logits it actually computed.
+    pub fn record_logits(&mut self, txn: StateTransactionId) -> Result<crate::LogitsHandle> {
+        self.check_transaction(txn)?;
+        if !self.state.live.is_empty() {
+            return Err(invalid(
+                "logits",
+                "clear the previous result before beginning forward",
+            ));
+        }
+        self.state.record_logits(ROOT, self.rows as u64)
+    }
+
+    /// Retire the previous forward result before executing another. Existing
+    /// generation invalidation refuses an open transaction and stales all handles.
+    pub fn clear_logits(&mut self) -> Result<()> {
+        self.state.invalidate_generation()
     }
 
     pub fn geometry(&self) -> KvGeometry {

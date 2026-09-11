@@ -193,6 +193,36 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
             },
         ),
         (
+            "moxie-engine",
+            Allowed {
+                // ADR 0011: explicit bounded host-reference generation.
+                workspace: &[
+                    "moxie-types",
+                    "moxie-graph",
+                    "moxie-interp",
+                    "moxie-state",
+                    "moxie-memory",
+                ],
+                third_party: NONE,
+            },
+        ),
+        (
+            "moxie-cli",
+            Allowed {
+                // Composition and presentation only; no direct state, sampler,
+                // interpreter or device executor dependency.
+                workspace: &[
+                    "moxie-engine",
+                    "moxie-graph",
+                    "moxie-types",
+                    "moxie-memory",
+                    "moxie-host",
+                    "moxie-oracles",
+                ],
+                third_party: NONE,
+            },
+        ),
+        (
             "moxie-cuda",
             Allowed {
                 workspace: &["moxie-types"],

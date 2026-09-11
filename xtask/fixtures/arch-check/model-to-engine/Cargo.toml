@@ -1,0 +1,10 @@
+[package]
+name = "moxie-models-fake"
+version = "0.0.0"
+edition = "2024"
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden dependency"
+
+[dependencies]
+moxie-engine = { path = "../../../../crates/moxie-engine" }

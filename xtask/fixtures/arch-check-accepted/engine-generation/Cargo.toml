@@ -1,0 +1,11 @@
+[package]
+name = "moxie-engine"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-graph = { path = "../../../../crates/moxie-graph" }
+moxie-interp = { path = "../../../../crates/moxie-interp" }
+moxie-state = { path = "../../../../crates/moxie-state" }
+moxie-memory = { path = "../../../../crates/moxie-memory" }
