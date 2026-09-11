@@ -67,20 +67,30 @@ impl<'a> PagedExecution<'a> {
         positions: &[u64],
         cancel: &Cancel,
     ) -> Result<PagedOutput> {
-        sequence.validate_execution(self.binding)?;
-        let mut bindings = Bindings::new();
-        for id in self.graph.weights() {
-            bindings.set(
-                *id,
-                self.weights
-                    .get(*id)
-                    .expect("validated immutable program")
-                    .try_clone()?,
-            );
+        // Establish transaction authority before doing fallible preparation.
+        // Every later error belongs to this transaction and therefore restores
+        // all earlier work in it, including work from a prior successful call.
+        sequence.validate_transaction(txn)?;
+        let result = (|| {
+            sequence.validate_execution(self.binding)?;
+            let mut bindings = Bindings::new();
+            for id in self.graph.weights() {
+                bindings.set(
+                    *id,
+                    self.weights
+                        .get(*id)
+                        .expect("validated immutable program")
+                        .try_clone()?,
+                );
+            }
+            bindings.set(self.tokens, Value::Index(try_clone_slice(tokens)?));
+            bindings.set(self.positions, Value::Index(try_clone_slice(positions)?));
+            Interpreter::new().evaluate_paged(self.graph, &bindings, sequence, txn, cancel)
+        })();
+        if result.is_err() && sequence.validate_transaction(txn).is_ok() {
+            sequence.abort(txn).expect("validated local transaction");
         }
-        bindings.set(self.tokens, Value::Index(try_clone_slice(tokens)?));
-        bindings.set(self.positions, Value::Index(try_clone_slice(positions)?));
-        Interpreter::new().run_paged(self.graph, &bindings, sequence, self.binding, txn, cancel)
+        result
     }
 }
 
@@ -167,28 +177,6 @@ fn invalid(field: &'static str, detail: &str) -> Error {
 }
 
 impl Interpreter {
-    /// Execute within the caller's existing paged transaction. Any failure with
-    /// a valid ID aborts it, including prior work in that transaction. Success
-    /// leaves it open for the caller's zero-prefix commit. The caller admits
-    /// bounded reference scratch before calling; this is not a production CUDA path.
-    fn run_paged(
-        &self,
-        graph: &Graph,
-        bindings: &Bindings<Value>,
-        sequence: &mut PagedSequence,
-        binding: PagedExecutionBinding,
-        txn: StateTransactionId,
-        cancel: &Cancel,
-    ) -> Result<PagedOutput> {
-        sequence.validate_transaction(txn)?;
-        sequence.validate_execution(binding)?;
-        let result = self.evaluate_paged(graph, bindings, sequence, txn, cancel);
-        if result.is_err() && sequence.validate_transaction(txn).is_ok() {
-            sequence.abort(txn).expect("validated local transaction");
-        }
-        result
-    }
-
     fn evaluate_paged(
         &self,
         graph: &Graph,

@@ -4,8 +4,10 @@ use moxie_engine::{
     Cancel, GenerationEvent, GenerationRequest,
     service::{GenerationService, StartError},
 };
+use moxie_interp::paged::PagedExecution;
 use moxie_memory::{CapacitySnapshot, Ledger};
-use moxie_types::{Error, HostTier, Scope, Tier};
+use moxie_state::{KvGeometry, PagedSequence, ROOT};
+use moxie_types::{Error, HostTier, Precision, Scope, Tier};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
@@ -146,6 +148,64 @@ fn admitted_peak_cleanup_repeated_generations_and_allocation_failure() {
     }
     drop(wide_service);
     assert!(wide_owner.outstanding().is_empty());
+
+    // Direct API regression: preparation failure on a later call must abort
+    // the entire already-mutated transaction, not only the failing call.
+    let direct = fixture::build(4, 64, 256, 1).unwrap();
+    let geometry = KvGeometry {
+        layers: 1,
+        kv_heads: 4,
+        key_dim: 64,
+        value_dim: 64,
+        precision: Precision::Bf16,
+        page_tokens: 7,
+        max_tokens: 8,
+    };
+    let mut direct_owner = ledger(1 << 30);
+    let mut pages = PagedSequence::with_sampling(&mut direct_owner, geometry, 256, 4, 0).unwrap();
+    pages.append_prompt(2).unwrap();
+    let baseline = pages.state().frontiers(ROOT).unwrap();
+    let execution = PagedExecution::bind(
+        &direct.graph,
+        &direct.weights,
+        direct.tokens,
+        direct.positions,
+        &mut pages,
+    )
+    .unwrap();
+    let txn = pages.begin().unwrap();
+    execution
+        .run(&mut pages, txn, &[0], &[0], &Cancel::never())
+        .unwrap();
+    assert_eq!(pages.usage().rows, 1);
+    assert_eq!(pages.state().frontiers(ROOT).unwrap().executed, 1);
+    assert_eq!(pages.state().live_results().len(), 1);
+    FAIL.store(262_144, SeqCst);
+    assert!(matches!(
+        execution.run(&mut pages, txn, &[1], &[1], &Cancel::never()),
+        Err(Error::CapacityExceeded {
+            tier: Some(Tier::Host(HostTier::CpuWorkspace)),
+            requested_bytes: 262_144,
+            available_bytes: 0,
+        })
+    ));
+    assert_eq!(FAIL.swap(0, SeqCst), 0, "direct fault was not injected");
+    assert_eq!(pages.usage().rows, 0);
+    assert!(pages.row(0, 0).is_err());
+    assert_eq!(pages.state().frontiers(ROOT).unwrap(), baseline);
+    assert!(pages.state().live_results().is_empty());
+    assert!(pages.state().open_transactions().is_empty());
+
+    let retry = pages.begin().unwrap();
+    execution
+        .run(&mut pages, retry, &[0, 1], &[0, 1], &Cancel::never())
+        .unwrap();
+    pages.commit_prefix(retry, 0).unwrap();
+    assert_eq!(pages.usage().rows, 2);
+    assert_eq!(pages.state().frontiers(ROOT).unwrap().executed, 2);
+    assert!(pages.state().open_transactions().is_empty());
+    pages.close(&mut direct_owner).unwrap();
+    assert!(direct_owner.outstanding().is_empty());
 
     // Fail only the newly owned prompt payload and the existing paged lineage
     // allocation after both admissions. Check the original error attribution.
