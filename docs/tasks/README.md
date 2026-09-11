@@ -10,8 +10,10 @@
 through `0f39cf5`. Contract `a80ff2c` preceded implementation `c14e32a`; correction
 `c9a4b33` fixes the sole reported error-classification issue.
 
-The next bounded M1.4 assignment is sampler history and deterministic
-greedy/temperature distribution, using task 0004's accepted transaction mechanism for
+The active bounded M1.4 assignment is
+[task 0014](0014-m1-transactional-sampler-history.md), whose contract precedes
+implementation: sampler history and deterministic greedy/temperature distribution,
+using task 0004's accepted transaction mechanism for
 history rollback. Generation service, diagnostic CLI and device attention remain later
 scope. Reopen M1.3 or task 0013 only for a demonstrated defect in accepted scope.
 

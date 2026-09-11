@@ -51,7 +51,9 @@ may create a competing journal or advance state independently.
 
 ## Remaining hypotheses and blockers
 
-The exact sampler-history contract has not been written. Existing
+The sampler-history contract is now recorded in
+[task 0014](../tasks/0014-m1-transactional-sampler-history.md) (2026-09-11),
+before implementation. Existing
 `moxie-oracles::sampler` coverage is partial: legality, top-k, top-p, min-p,
 temperature, ties, extreme-temperature stability and typed failures exist, while
 penalties, DRY, n-gram bans, logit bias, typical-p and XTC remain unimplemented. The
@@ -64,8 +66,9 @@ silently enables an unqualified processor or introduces model-owned sampling.
 
 ## Next task
 
-Define and commit one bounded **M1.4 sampler-history and deterministic
-greedy/temperature distribution** task before implementation. Read documents 04,
+Implement [task 0014](../tasks/0014-m1-transactional-sampler-history.md) after its
+contract commit: bounded **M1.4 sampler history and deterministic
+greedy/temperature distribution**. Read documents 04,
 05 and 07; tasks 0004 and 0013; the current sampling oracle; and frozen legacy
 `sampling.hpp`, `sampling.cpp` and `test_sampling.cpp`. Name the shared owner,
 history/resource/cancellation contract, consumers, allowed files, deletion plan and

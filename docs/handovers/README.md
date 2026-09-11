@@ -4,8 +4,10 @@
 
 [Task 0013 acceptance to sampler history](2026-09-10-task0013-acceptance-to-sampler-history.md)
 is the current continuation. M1.3 is complete and task 0013 is accepted. The next
-bounded M1.4 assignment is sampler history and deterministic greedy/temperature
-distribution; service/CLI and device attention remain later work.
+bounded M1.4 assignment is now defined in
+[task 0014](../tasks/0014-m1-transactional-sampler-history.md), sampler history and
+deterministic greedy/temperature distribution. Its contract precedes implementation;
+service/CLI and device attention remain later work.
 
 One file per bounded continuation, `YYYY-MM-DD-slug.md`. Use
 [HANDOVER.md](../spec/templates/HANDOVER.md).

@@ -11,10 +11,11 @@ on 2026-09-10 after independent verification of implementation `6305f9d` and cor
 independent review through `0f39cf5`; its contract `a80ff2c` preceded implementation
 `c14e32a`, and correction `c9a4b33` fixed the sole reported issue.
 
-The next bounded assignment is M1.4 sampler history and deterministic
-greedy/temperature distribution. Its history and rollback must use
+The active bounded assignment is [task 0014](docs/tasks/0014-m1-transactional-sampler-history.md),
+M1.4 sampler history and deterministic greedy/temperature distribution.
+Its history and rollback must use
 [task 0004's](docs/tasks/0004-m1-state-transactions.md) accepted transaction mechanism;
-define and commit the task contract before implementation. Service/CLI and device
+the task contract precedes implementation. Service/CLI and device
 attention remain later scope. See the
 [active handover](docs/handovers/2026-09-10-task0013-acceptance-to-sampler-history.md).
 
