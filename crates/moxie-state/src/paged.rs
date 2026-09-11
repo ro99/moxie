@@ -8,7 +8,9 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use moxie_memory::{HostBuffer, Ledger};
-use moxie_types::{BranchId, DimError, Error, Precision, Result, StateTransactionId};
+use moxie_types::{
+    BranchId, DimError, Error, HostTier, Precision, Result, StateTransactionId, Tier,
+};
 
 use crate::{Branch, Journal, PrefixLineage, ROOT, SequenceState, StateKind};
 
@@ -160,15 +162,18 @@ impl PagedSequence {
         let mut state = SequenceState::new([StateKind::KvPages]);
         let lineage = &mut state.branches.get_mut(&ROOT).expect("root exists").lineage;
         let capacity = geometry.max_tokens + 1; // checked by layout
+        let lineage_bytes =
+            u64::try_from(capacity * size_of::<PrefixLineage>()).map_err(|_| DimError::Overflow)?; // product checked by layout
         if lineage.try_reserve_exact(capacity - lineage.len()).is_err()
             || lineage.capacity() != capacity
         {
             drop(state);
             backing.release(ledger).expect("admitting ledger");
-            return Err(invalid(
-                "lineage",
-                "cannot allocate admitted lineage capacity",
-            ));
+            return Err(Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::Pageable)),
+                requested_bytes: lineage_bytes,
+                available_bytes: 0,
+            });
         }
         // Immutable page table. Pages are statically partitioned in this first
         // exclusive-owner implementation; no per-row allocation or dense
