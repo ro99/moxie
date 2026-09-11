@@ -25,21 +25,43 @@ impl HostBuffer {
         data_bytes: usize,
         control_bytes: usize,
     ) -> Result<Self> {
+        Self::allocate_with_workspace(ledger, label, data_bytes, 0, control_bytes)
+    }
+
+    /// One physical allocation with separately charged state and CPU workspace.
+    /// The workspace is the suffix after `state_bytes`; no raw pointer escapes.
+    pub fn allocate_with_workspace(
+        ledger: &mut Ledger,
+        label: &str,
+        state_bytes: usize,
+        workspace_bytes: usize,
+        control_bytes: usize,
+    ) -> Result<Self> {
+        let data_bytes = state_bytes
+            .checked_add(workspace_bytes)
+            .ok_or(moxie_types::DimError::Overflow)?;
         let mut plan = PlanRequest::new(label, ["live"])?;
         for (name, tier, bytes) in [
-            ("host backing", HostTier::StateSpill, data_bytes),
+            ("host backing", HostTier::StateSpill, state_bytes),
+            ("cpu workspace", HostTier::CpuWorkspace, workspace_bytes),
             ("bounded control", HostTier::Pageable, control_bytes),
         ] {
-            plan.buffer(
-                BufferRequest::new(
-                    name,
-                    Scope::Host,
-                    Tier::Host(tier),
-                    u64::try_from(bytes).map_err(|_| moxie_types::DimError::Overflow)?,
-                    StageSpan::at(0),
-                )
-                .scaling(Scaling::Context),
-            )?;
+            if bytes == 0 {
+                continue;
+            }
+            let request = BufferRequest::new(
+                name,
+                Scope::Host,
+                Tier::Host(tier),
+                u64::try_from(bytes).map_err(|_| moxie_types::DimError::Overflow)?,
+                StageSpan::at(0),
+            );
+            // Vocabulary workspace does not shrink with requested context.
+            plan.buffer(if tier == HostTier::CpuWorkspace {
+                request
+            } else {
+                request.scaling(Scaling::Context)
+            })?;
         }
         let reservation = ledger.admit(&plan).map_err(Error::from)?;
         let mut data = Vec::new();
@@ -48,7 +70,11 @@ impl HostBuffer {
             drop(data);
             ledger.release(reservation).expect("the admitting ledger");
             return Err(Error::CapacityExceeded {
-                tier: Some(Tier::Host(HostTier::StateSpill)),
+                tier: match (state_bytes != 0, workspace_bytes != 0) {
+                    (true, false) => Some(Tier::Host(HostTier::StateSpill)),
+                    (false, true) => Some(Tier::Host(HostTier::CpuWorkspace)),
+                    _ => None,
+                },
                 requested_bytes: data_bytes as u64,
                 available_bytes: 0,
             });
@@ -97,6 +123,41 @@ mod tests {
 
     fn ledger(bytes: u64) -> Ledger {
         Ledger::new([CapacitySnapshot::new(Scope::Host, bytes + 1, 1).unwrap()]).unwrap()
+    }
+
+    #[test]
+    fn workspace_is_charged_separately_and_its_allocation_failure_names_its_tier() {
+        let mut owner = ledger(256);
+        let mut buffer =
+            HostBuffer::allocate_with_workspace(&mut owner, "state and probabilities", 80, 40, 16)
+                .unwrap();
+        assert_eq!(buffer.bytes().len(), 120);
+        assert_eq!(
+            owner.committed(Scope::Host, Tier::Host(HostTier::StateSpill)),
+            80
+        );
+        assert_eq!(
+            owner.committed(Scope::Host, Tier::Host(HostTier::CpuWorkspace)),
+            40
+        );
+        assert_eq!(
+            owner.committed(Scope::Host, Tier::Host(HostTier::Pageable)),
+            16
+        );
+        buffer.release(&mut owner).unwrap();
+        assert!(owner.outstanding().is_empty());
+        let mut owner = ledger(u64::MAX - 1);
+        let bytes = isize::MAX as usize + 1;
+        assert_eq!(
+            HostBuffer::allocate_with_workspace(&mut owner, "workspace only", 0, bytes, 0)
+                .unwrap_err(),
+            Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::CpuWorkspace)),
+                requested_bytes: bytes as u64,
+                available_bytes: 0
+            }
+        );
+        assert!(owner.outstanding().is_empty());
     }
 
     #[test]

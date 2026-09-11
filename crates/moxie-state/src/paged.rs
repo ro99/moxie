@@ -8,6 +8,7 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use moxie_memory::{HostBuffer, Ledger};
+use moxie_sampling::{Distribution, History, HistoryView, Layout as SamplingLayout};
 use moxie_types::{
     BranchId, DimError, Error, HostTier, Precision, Result, StateTransactionId, Tier,
 };
@@ -141,6 +142,80 @@ pub struct PagedSequence {
     layout: Layout,
     backing: HostBuffer,
     rows: usize,
+    sampler: Option<Sampler>,
+}
+
+#[derive(Debug)]
+struct Sampler {
+    history: History,
+    seed: u64,
+}
+
+/// A prepared distribution holds the exclusive sequence borrow. Its prefix and
+/// transaction cannot change between preparation and staging. Numerical copies
+/// have no authority to publish a generated token.
+///
+/// ```compile_fail
+/// use moxie_state::PagedSequence;
+/// use moxie_types::StateTransactionId;
+/// use std::sync::atomic::AtomicBool;
+/// fn stale(s: &mut PagedSequence, txn: StateTransactionId) {
+///     let prepared = s.prepare_sample(txn, 1, &[0.0; 3], None, 1.0).unwrap();
+///     s.abort(txn).unwrap();
+///     prepared.stage(&AtomicBool::new(false)).unwrap();
+/// }
+/// ```
+#[derive(Debug)]
+pub struct PreparedSample<'a> {
+    sequence: &'a mut PagedSequence,
+    txn: StateTransactionId,
+    prefix: u64,
+    greedy: bool,
+}
+
+impl PreparedSample<'_> {
+    pub fn distribution(&self) -> Distribution<'_> {
+        Distribution::from_bytes(self.sequence.workspace()).expect("prepared probabilities")
+    }
+    pub fn draw(&self) -> Result<u32> {
+        let sampler = self.sequence.sampler.as_ref().expect("sampling session");
+        self.distribution()
+            .draw(sampler.seed, sampler.history.len() as u64, self.greedy)
+    }
+    pub fn stage(self, cancelled: &AtomicBool) -> Result<u32> {
+        self.stage_checked(|| {
+            if cancelled.load(Ordering::Relaxed) {
+                Err(Error::Cancelled {
+                    at: "sample publication",
+                })
+            } else {
+                Ok(())
+            }
+        })
+    }
+    fn stage_checked(self, mut checkpoint: impl FnMut() -> Result<()>) -> Result<u32> {
+        self.sequence.check_transaction(self.txn)?;
+        let result = (|| {
+            checkpoint()?;
+            let token = self.draw()?;
+            let start = self.sequence.layout.backing_bytes;
+            let sampler = self.sequence.sampler.as_mut().expect("sampling session");
+            let end = start + sampler.history.layout().state_bytes();
+            sampler.history.append(
+                &mut self.sequence.backing.bytes_mut()[start..end],
+                self.prefix,
+                token,
+            )?;
+            checkpoint()?;
+            Ok(token)
+        })();
+        if result.is_err() {
+            self.sequence
+                .abort(self.txn)
+                .expect("validated transaction");
+        }
+        result
+    }
 }
 
 /// A refused close retains the entire sequence, including release authority.
@@ -152,14 +227,59 @@ pub struct PagedCloseRefused {
 
 impl PagedSequence {
     pub fn new(ledger: &mut Ledger, geometry: KvGeometry) -> Result<Self> {
+        Self::construct(ledger, geometry, None)
+    }
+
+    /// One generation, with fixed vocabulary/history capacity and an explicit seed.
+    pub fn with_sampling(
+        ledger: &mut Ledger,
+        geometry: KvGeometry,
+        vocabulary: usize,
+        history_capacity: usize,
+        seed: u64,
+    ) -> Result<Self> {
+        if history_capacity > geometry.max_tokens {
+            return Err(invalid(
+                "history_capacity",
+                "history exceeds sequence capacity",
+            ));
+        }
+        Self::construct(
+            ledger,
+            geometry,
+            Some((SamplingLayout::new(vocabulary, history_capacity)?, seed)),
+        )
+    }
+
+    fn construct(
+        ledger: &mut Ledger,
+        geometry: KvGeometry,
+        sampling: Option<(SamplingLayout, u64)>,
+    ) -> Result<Self> {
         let layout = geometry.layout()?;
-        let mut backing = HostBuffer::allocate(
+        let history_bytes = sampling.map_or(0, |(s, _)| s.state_bytes());
+        let workspace_bytes = sampling.map_or(0, |(s, _)| s.workspace_bytes());
+        let control_bytes = add(
+            layout.control_bytes,
+            if sampling.is_some() {
+                size_of::<StateKind>()
+            } else {
+                0
+            },
+        )?;
+        let mut backing = HostBuffer::allocate_with_workspace(
             ledger,
             "paged sequence",
-            layout.backing_bytes,
-            layout.control_bytes,
+            add(layout.backing_bytes, history_bytes)?,
+            workspace_bytes,
+            control_bytes,
         )?;
-        let mut state = SequenceState::new([StateKind::KvPages]);
+        let schema = [StateKind::KvPages, StateKind::SamplerHistory];
+        let mut state = SequenceState::new(
+            schema[..if sampling.is_some() { 2 } else { 1 }]
+                .iter()
+                .copied(),
+        );
         let lineage = &mut state.branches.get_mut(&ROOT).expect("root exists").lineage;
         let capacity = geometry.max_tokens + 1; // checked by layout
         let lineage_bytes =
@@ -183,12 +303,22 @@ impl PagedSequence {
             backing.bytes_mut()[page * 8..page * 8 + 8]
                 .copy_from_slice(&(offset as u64).to_le_bytes());
         }
+        let sampler = sampling.map(|(sampling, seed)| Sampler {
+            history: History::new(
+                sampling,
+                &mut backing.bytes_mut()
+                    [layout.backing_bytes..layout.backing_bytes + history_bytes],
+            )
+            .expect("checked layout"),
+            seed,
+        });
         Ok(Self {
             state,
             geometry,
             layout,
             backing,
             rows: 0,
+            sampler,
         })
     }
 
@@ -227,11 +357,23 @@ impl PagedSequence {
     }
 
     pub fn append_prompt(&mut self, n: u64) -> Result<()> {
+        if self.sampler.as_ref().is_some_and(|s| !s.history.is_empty()) {
+            return Err(invalid(
+                "prompt",
+                "one generation: prompt must precede generated history",
+            ));
+        }
         self.check_frontier(self.state.frontiers(ROOT)?.accepted, n)?;
         self.state.append_prompt(ROOT, n)
     }
 
     pub fn accept(&mut self, n: u64) -> Result<()> {
+        if self.sampler.is_some() {
+            return Err(invalid(
+                "accept",
+                "sampling sessions publish token identities through commit_prefix",
+            ));
+        }
         self.check_frontier(self.state.frontiers(ROOT)?.accepted, n)?;
         self.state.accept(ROOT, n)
     }
@@ -241,26 +383,126 @@ impl PagedSequence {
     }
 
     pub fn begin(&mut self) -> Result<StateTransactionId> {
-        self.state.begin(ROOT)
+        let txn = self.state.begin(ROOT)?;
+        self.state
+            .open
+            .get_mut(&txn)
+            .expect("opened journal")
+            .sampler_len = self.sampler.as_ref().map_or(0, |s| s.history.len());
+        Ok(txn)
     }
 
     /// Task 0004 semantics: accept n additional tokens, keep executed work,
     /// close. Verification truncates an unwanted executed suffix explicitly
     /// with `rollback_to` after resolving; a zero commit keeps materialization.
     pub fn commit_prefix(&mut self, txn: StateTransactionId, n: u64) -> Result<()> {
+        self.commit_checked(txn, n, || Ok(()))
+    }
+
+    /// Observe cancellation through publication of both participants, before
+    /// closing the shared journal. A later cancellation cannot retract emitted
+    /// output; emission is a separate operation after successful commit.
+    pub fn commit_prefix_cancellable(
+        &mut self,
+        txn: StateTransactionId,
+        n: u64,
+        cancelled: &AtomicBool,
+    ) -> Result<()> {
+        self.commit_checked(txn, n, || {
+            if cancelled.load(Ordering::Relaxed) {
+                Err(Error::Cancelled {
+                    at: "sample commit",
+                })
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn commit_checked(
+        &mut self,
+        txn: StateTransactionId,
+        n: u64,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         self.check_transaction(txn)?;
         self.check_frontier(self.state.frontiers(ROOT)?.accepted, n)?;
-        self.state.commit_prefix(txn, n)
+        let publish = if let Some(s) = &self.sampler {
+            let n = usize::try_from(n).map_err(|_| DimError::Overflow)?;
+            let publish = add(s.history.committed_len(), n)?;
+            if publish > s.history.len() {
+                return Err(invalid("accepted", "no matching staged token identities"));
+            }
+            Some(publish)
+        } else {
+            None
+        };
+        // Keep the existing journal open until both participants are published.
+        // Its frontier and sampler marks undo either intermediate state.
+        // Validation above is nonmutating; a failed validation remains abortable.
+        let result = (|| {
+            checkpoint()?;
+            self.state.accept(ROOT, n)?;
+            checkpoint()?;
+            if let Some(len) = publish {
+                self.update_history(|h, b| h.publish(b, len));
+            }
+            checkpoint()?;
+            self.state.commit_prefix(txn, 0)
+        })();
+        if result.is_err() {
+            self.abort(txn).expect("validated open publication journal");
+        }
+        result
     }
 
     pub fn abort(&mut self, txn: StateTransactionId) -> Result<()> {
+        self.check_transaction(txn)?;
+        let len = self.state.open[&txn].sampler_len;
         self.state.abort(txn)?;
+        if self.sampler.is_some() {
+            self.update_history(|h, b| h.truncate(b, len));
+        }
         self.truncate(self.state.frontiers(ROOT)?.executed as usize);
         Ok(())
     }
 
     pub fn rollback_to(&mut self, prefix: u64) -> Result<()> {
-        self.state.rollback_to(ROOT, prefix, &[])?;
+        if self.sampler.is_some() {
+            // Prevalidate every destructive refusal before applying count undo.
+            // The facade owns the schema and has no mutable raw-state escape.
+            let f = self.state.frontiers(ROOT)?;
+            if self.state.open_on(ROOT).is_some()
+                || prefix > f.accepted
+                || prefix < f.prompt
+                || prefix < f.prompt + f.emitted
+                || self.state.lineage_at(ROOT, prefix)?.is_none()
+            {
+                return Err(invalid(
+                    "prefix",
+                    "rollback target is open, unaccepted, inside prompt or already emitted",
+                ));
+            }
+            let len = self
+                .history(true)?
+                .entries(0)
+                .take_while(|(p, _)| *p < prefix)
+                .count();
+            self.update_history(|h, b| h.replay_prefix(b, len));
+            let evidence = self.state.restore_evidence(
+                StateKind::SamplerHistory,
+                ROOT,
+                crate::RestoreMethod::Replay {
+                    from: f.prompt,
+                    to: prefix,
+                },
+            )?;
+            self.state
+                .rollback_to(ROOT, prefix, &[evidence])
+                .expect("validated exclusive schema and completed restoration");
+        } else {
+            self.state.rollback_to(ROOT, prefix, &[])?;
+        }
         self.truncate(self.state.frontiers(ROOT)?.executed as usize);
         Ok(())
     }
@@ -280,6 +522,84 @@ impl PagedSequence {
             ));
         }
         Ok(())
+    }
+
+    fn update_history(&mut self, f: impl FnOnce(&mut History, &mut [u8]) -> Result<()>) {
+        let s = self.sampler.as_mut().expect("sampling session");
+        let start = self.layout.backing_bytes;
+        let end = start + s.history.layout().state_bytes();
+        f(&mut s.history, &mut self.backing.bytes_mut()[start..end])
+            .expect("validated participant transition");
+    }
+    pub fn history(&self, committed: bool) -> Result<HistoryView<'_>> {
+        let s = self
+            .sampler
+            .as_ref()
+            .ok_or_else(|| invalid("sampler", "no sampling session"))?;
+        let start = self.layout.backing_bytes;
+        s.history.view(
+            &self.backing.bytes()[start..start + s.history.layout().state_bytes()],
+            committed,
+        )
+    }
+    /// Additional bytes beyond the existing paged usage envelope.
+    pub fn sampling_bytes(&self) -> (usize, usize, usize) {
+        self.sampler.as_ref().map_or((0, 0, 0), |s| {
+            (
+                s.history.layout().state_bytes(),
+                s.history.layout().workspace_bytes(),
+                size_of::<StateKind>(),
+            )
+        })
+    }
+    fn workspace(&self) -> &[u8] {
+        let s = self.sampler.as_ref().expect("sampling session");
+        &self.backing.bytes()[self.layout.backing_bytes + s.history.layout().state_bytes()..]
+    }
+    /// Synthetic producers name the materialized prefix explicitly. This API
+    /// checks storage frontiers; it does not certify model-output provenance.
+    pub fn prepare_sample(
+        &mut self,
+        txn: StateTransactionId,
+        prefix: u64,
+        logits: &[f32],
+        legal: Option<&[bool]>,
+        temperature: f64,
+    ) -> Result<PreparedSample<'_>> {
+        self.check_transaction(txn)?;
+        let s = self
+            .sampler
+            .as_ref()
+            .ok_or_else(|| invalid("sampler", "no sampling session"))?;
+        let f = self.state.frontiers(ROOT)?;
+        let logical = f
+            .accepted
+            .checked_add((s.history.len() - s.history.committed_len()) as u64)
+            .ok_or(DimError::Overflow)?;
+        if prefix == 0
+            || prefix != logical
+            || prefix != f.executed
+            || logits.len() != s.history.layout().vocabulary()
+        {
+            return Err(invalid(
+                "sampling_prefix",
+                "logits must name the current materialized logical prefix and vocabulary",
+            ));
+        }
+        self.check_frontier(prefix, 1)?;
+        let start = self.layout.backing_bytes + s.history.layout().state_bytes();
+        moxie_sampling::distribution(
+            logits,
+            legal,
+            temperature,
+            &mut self.backing.bytes_mut()[start..],
+        )?;
+        Ok(PreparedSample {
+            sequence: self,
+            txn,
+            prefix,
+            greedy: temperature == 0.0,
+        })
     }
 
     /// Append one complete token across all layers. A failure with a valid ID
@@ -408,6 +728,165 @@ mod tests {
     use super::*;
     use moxie_memory::CapacitySnapshot;
     use moxie_types::Scope;
+
+    #[test]
+    fn cancelled_commit_restores_frontiers_counts_and_rows_at_every_boundary() {
+        for accept in 0..=3 {
+            for fail_at in 0..3 {
+                let mut ledger =
+                    Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 20, 1024).unwrap()])
+                        .unwrap();
+                let g = KvGeometry {
+                    layers: 1,
+                    kv_heads: 1,
+                    key_dim: 1,
+                    value_dim: 1,
+                    precision: Precision::Bf16,
+                    page_tokens: 2,
+                    max_tokens: 16,
+                };
+                let mut s = PagedSequence::with_sampling(&mut ledger, g, 3, 8, 77).unwrap();
+                let rows = [KvRow {
+                    key: &[1, 2],
+                    value: &[3, 4],
+                }];
+                let cancel = AtomicBool::new(false);
+                let txn = s.begin().unwrap();
+                s.append_prompt(1).unwrap();
+                s.append(txn, 0, &rows, &cancel).unwrap();
+                // Include one pre-existing generated count in the restore target.
+                s.prepare_sample(txn, 1, &[0.; 3], None, 1.)
+                    .unwrap()
+                    .stage(&cancel)
+                    .unwrap();
+                s.append(txn, 1, &rows, &cancel).unwrap();
+                s.commit_prefix(txn, 1).unwrap();
+                let end = s.layout.backing_bytes
+                    + s.sampler.as_ref().unwrap().history.layout().state_bytes();
+                let bytes = s.backing.bytes()[..end].to_vec();
+                let frontiers = s.state.frontiers(ROOT).unwrap();
+                let lineage = s.state.branches[&ROOT].lineage.clone();
+                let txn = s.begin().unwrap();
+                for prefix in 2..5 {
+                    s.prepare_sample(txn, prefix, &[0.; 3], None, 1.)
+                        .unwrap()
+                        .stage(&cancel)
+                        .unwrap();
+                    s.append(txn, prefix, &rows, &cancel).unwrap();
+                }
+                let mut boundary = 0;
+                let result = s.commit_checked(txn, accept, || {
+                    let fail = boundary == fail_at;
+                    boundary += 1;
+                    if fail {
+                        Err(Error::Cancelled {
+                            at: "injected commit boundary",
+                        })
+                    } else {
+                        Ok(())
+                    }
+                });
+                assert!(result.is_err());
+                assert_eq!(s.state.frontiers(ROOT).unwrap(), frontiers);
+                assert_eq!(s.state.branches[&ROOT].lineage, lineage);
+                assert_eq!(&s.backing.bytes()[..end], &bytes);
+                assert_eq!(s.history(true).unwrap().len(), 1);
+                assert_eq!(s.history(false).unwrap().len(), 1);
+                assert!(s.state.open_transactions().is_empty());
+                s.close(&mut ledger).unwrap();
+                assert!(ledger.outstanding().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn sampling_faults_after_each_mutation_restore_all_participants() {
+        for v in [3, 7] {
+            for start in [2, 3] {
+                // Entry, every layer copy and frontier update; then separately
+                // entry/after count+history mutation in the sampling path.
+                for sample_fault in [false, true] {
+                    let boundaries = if sample_fault { 2 } else { 5 };
+                    for fail_at in 0..boundaries {
+                        let mut ledger =
+                            Ledger::new([
+                                CapacitySnapshot::new(Scope::Host, 1 << 20, 1024).unwrap()
+                            ])
+                            .unwrap();
+                        let g = KvGeometry {
+                            layers: 3,
+                            kv_heads: 1,
+                            key_dim: 2,
+                            value_dim: 1,
+                            precision: Precision::Bf16,
+                            page_tokens: 2,
+                            max_tokens: 32,
+                        };
+                        let mut s =
+                            PagedSequence::with_sampling(&mut ledger, g, v, 16, 77).unwrap();
+                        let rows = [KvRow {
+                            key: &[1, 2, 3, 4],
+                            value: &[5, 6],
+                        }; 3];
+                        let cancel = AtomicBool::new(false);
+                        let txn = s.begin().unwrap();
+                        s.append_prompt(start).unwrap();
+                        for p in 0..start {
+                            s.append(txn, p, &rows, &cancel).unwrap();
+                        }
+                        s.commit_prefix(txn, 0).unwrap();
+                        let end = s.layout.backing_bytes
+                            + s.sampler.as_ref().unwrap().history.layout().state_bytes();
+                        let bytes = s.backing.bytes()[..end].to_vec();
+                        let f = s.state.frontiers(ROOT).unwrap();
+                        let lineage = s.state.branches[&ROOT].lineage.clone();
+                        let charge = ledger.scope_committed(Scope::Host);
+                        let txn = s.begin().unwrap();
+                        s.prepare_sample(txn, start, &vec![0.; v], None, 1.)
+                            .unwrap()
+                            .stage(&cancel)
+                            .unwrap();
+                        s.append(txn, start, &rows, &cancel).unwrap();
+                        let mut boundary = 0;
+                        let checkpoint = || {
+                            let fail = boundary == fail_at;
+                            boundary += 1;
+                            if fail {
+                                Err(Error::Cancelled {
+                                    at: "injected sampler/paged mutation",
+                                })
+                            } else {
+                                Ok(())
+                            }
+                        };
+                        if sample_fault {
+                            assert!(
+                                s.prepare_sample(txn, start + 1, &vec![0.; v], None, 1.)
+                                    .unwrap()
+                                    .stage_checked(checkpoint)
+                                    .is_err()
+                            );
+                        } else {
+                            s.prepare_sample(txn, start + 1, &vec![0.; v], None, 1.)
+                                .unwrap()
+                                .stage(&cancel)
+                                .unwrap();
+                            assert!(s.append_checked(txn, start + 1, &rows, checkpoint).is_err());
+                        }
+                        assert_eq!(&s.backing.bytes()[..end], &bytes);
+                        assert_eq!(s.state.frontiers(ROOT).unwrap(), f);
+                        assert_eq!(s.state.branches[&ROOT].lineage, lineage);
+                        assert!(s.state.open_transactions().is_empty());
+                        assert!(s.history(false).unwrap().is_empty());
+                        assert!(s.history(true).unwrap().is_empty());
+                        assert_eq!(ledger.scope_committed(Scope::Host), charge);
+                        s.close(&mut ledger).unwrap();
+                        assert!(ledger.outstanding().is_empty());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn cancellation_at_every_publication_boundary_restores_physical_and_logical_state() {

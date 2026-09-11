@@ -122,7 +122,14 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
             "moxie-state",
             Allowed {
                 // Task 0013: physical paged state consumes admitted host storage.
-                workspace: &["moxie-types", "moxie-memory"],
+                workspace: &["moxie-types", "moxie-memory", "moxie-sampling"],
+                third_party: NONE,
+            },
+        ),
+        (
+            "moxie-sampling",
+            Allowed {
+                workspace: &["moxie-types"],
                 third_party: NONE,
             },
         ),

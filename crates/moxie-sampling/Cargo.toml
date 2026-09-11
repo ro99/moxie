@@ -1,5 +1,5 @@
 [package]
-name = "moxie-state"
+name = "moxie-sampling"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,9 @@ publish = false
 
 [dependencies]
 moxie-types.workspace = true
-moxie-memory.workspace = true
-moxie-sampling.workspace = true
+
+[dev-dependencies]
+moxie-oracles.workspace = true
 
 [lints]
 workspace = true

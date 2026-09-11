@@ -117,10 +117,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "moxie-sampling"
+version = "0.0.0"
+dependencies = [
+ "moxie-oracles",
+ "moxie-types",
+]
+
+[[package]]
 name = "moxie-state"
 version = "0.0.0"
 dependencies = [
  "moxie-memory",
+ "moxie-sampling",
  "moxie-types",
 ]
 

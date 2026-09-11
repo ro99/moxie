@@ -434,6 +434,9 @@ impl Branch {
 /// `commit_prefix(n)`.
 #[derive(Debug, Clone)]
 struct Journal {
+    /// Restore mark for the optional physical sampler participant. It shares
+    /// this journal's identity and can never be resolved independently.
+    sampler_len: usize,
     branch: BranchId,
     frontiers: Frontiers,
     lineage_len: usize,
@@ -855,6 +858,7 @@ impl SequenceState {
             });
         }
         let journal = Journal {
+            sampler_len: 0,
             branch,
             frontiers: b.frontiers,
             lineage_len: b.lineage.len(),
