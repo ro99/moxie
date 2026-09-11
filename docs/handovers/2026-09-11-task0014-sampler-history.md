@@ -1,4 +1,4 @@
-# Handover — task 0014 sampler history ready for review
+# Handover — task 0014 sampler history accepted
 
 ## Workspace identity
 
@@ -42,8 +42,13 @@ UUIDs and retained hashes are in the task result.
 
 ## Decisions
 
-Task 0013 remains accepted. Task 0014 is implemented and awaits independent review
-and owner acceptance. **M1.4 remains active.** O1–O7 are unchanged. No numerical
+Task 0013 remains accepted. The owner accepted task 0014 on 2026-09-11 after
+independent review of `23a7a40` / `1e6f253`. The reviewer repeated all final gates
+and passed 272 additional state combinations, finding no code blocker. The exact
+layout paragraph is now explicitly identified as recorded after implementation;
+the tracked record does not prove it preceded allocator work. The task's acceptance
+section records this auditability gap and the independent evidence manifest hash.
+**M1.4 remains active.** O1–O7 are unchanged. No numerical
 threshold, public default or legacy compatibility requirement was relaxed.
 
 One generation, fixed vocabulary/history capacity and one root host paged pool are
@@ -53,7 +58,7 @@ full history processors, speculation and entropy integration remain future work.
 
 ## Remaining hypotheses and blockers
 
-Independent review is outstanding. No product throughput, checkpoint quality,
+Independent review is complete. No product throughput, checkpoint quality,
 actual-context attention, GPU sampling or distributed-vocabulary claim is supported.
 The prepared distribution's exclusive borrow is the publication authority; copied
 probabilities do not confer it. Future engine integration must bind real output
@@ -61,10 +66,9 @@ provenance while preserving this single state/history transaction mechanism.
 
 ## Next task
 
-Review task 0014 against contract `4054dd7`, its implementation, ADR 0008 and retained
-gate evidence. Corrections stay within task 0014. After owner acceptance, define
-one bounded shared generation-service/minimal diagnostic-CLI integration assignment;
-read documents 02/04/05/07, the accepted interpreter and state contracts, and the
+Define one bounded shared generation-service/minimal diagnostic-CLI integration
+assignment; no successor task contract has yet been authored.
+Read documents 02/04/05/07, the accepted interpreter and state contracts, and the
 source-linked application fixtures first. Do not create a client-private token loop
 or sampler, claim M1.4 complete from this slice, or loosen a gate to bypass a review
 finding. Stop at any dependent O1–O7 ruling and present the smallest needed decision.

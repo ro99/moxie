@@ -1,6 +1,6 @@
 # Task 0014 — M1.4 transactional sampler history and base distributions
 
-Status: **implementation and validation complete; owner review pending**
+Status: **accepted by owner after independent review**
 (2026-09-11). Contract `4054dd7` preceded implementation. Task 0013 is accepted;
 M1.4 remains active.
 
@@ -162,7 +162,9 @@ requests. A second generation after explicit close must start with empty history
 
 ### Resources and lifetimes
 
-Implementation layout fixed before allocator work: append `16*H + 16*V` state
+Implemented layout (first recorded here in evidence commit `1e6f253`, after
+implementation; this paragraph does not establish a pre-allocator design record):
+append `16*H + 16*V` state
 bytes and `8*V` CPU workspace bytes to the existing physical KV allocation. Each
 history entry is little-endian `(position:u64, token:u32, padding:u32)`; two u64
 count tables hold tentative and committed counts. Workspace stores FP64 bits in
@@ -387,8 +389,44 @@ there is no competing production sampler or generation loop to retire. The dense
 interpreter and sampling oracle remain mathematical references. No legacy path,
 processor, public surface or accepted test was removed.
 
-This implements the bounded sampler/history slice. Owner review remains required;
-M1.4 stays active. After acceptance, define the shared generation-service and minimal
+This completes the accepted bounded sampler/history slice.
+M1.4 stays active. Next, define the shared generation-service and minimal
 diagnostic-CLI integration task. Device attention, full sampler processors, model
 execution, quality, topology and paired prefill/decode performance retain their
 separate gates; none is claimed by this host sampler result.
+
+### Independent review and owner acceptance — 2026-09-11
+
+The owner accepted the bounded task following independent review of `23a7a40`
+and `1e6f253`, and directed “Document and Push.” The reviewer found no blocking
+correctness bug or ownership violation. Independently repeated gates passed:
+584 host tests + 9 doctests, 600 device-feature tests + 12 doctests, 39/39 GPU
+cases across all three GPUs, 65 rejecting + 18 accepted architecture fixtures,
+both clippy lanes, formatting and specification. An additional 272 independent
+partial-commit/rollback/pending-materialization combinations passed. Allocation
+tests passed at 32,768 history entries and 10,000 abort/retry cycles.
+
+The sole documentation finding concerned chronology: the exact layout paragraph
+first appeared in `1e6f253`, not the pre-implementation contract `4054dd7`.
+It is now qualified above. The earlier contract required publication before
+allocator work, but the tracked record does not substantiate that timing for the
+exact expression. Acceptance acknowledges this auditability gap; the correction
+changes no code, numerical gate or tested allocation mechanism.
+
+Independent logs and probe source are retained through M1 closure at
+`results/task0014-independent-review-2026-09-11/`. Its `SHA256SUMS` manifest hashes
+both logs and probe sources; manifest SHA-256:
+`15b309b81d4e2c4690508d75a52c4ba7f657a0b349ecb7ee41c272b6092d342b`.
+`sha256sum --check --status SHA256SUMS` passed when recording acceptance.
+These are reviewer runs, not new implementation-agent reruns. Service/CLI,
+device attention, model-output provenance and remaining sampler processors stay
+outstanding; M1.4 remains active and O1–O7 remain unchanged.
+
+Acceptance documentation checks: specification digests and `git diff --check`
+passed. The local `cargo xtask arch-check` rejected the retained review probe
+crate under `results/` as undeclared (four findings); all architecture fixtures
+passed. Checking a clean `git archive` of integration HEAD `d7c9c33` with
+`cargo run --manifest-path <archive>/xtask/Cargo.toml --locked --offline -- arch-check`
+passed 65 rejecting / 18 accepted fixtures and 12 rules. The probe evidence is
+preserved unchanged; no architecture allowlist was relaxed. Full host/device/GPU
+lanes were not repeated for this documentation-only acceptance update.

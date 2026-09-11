@@ -10,12 +10,13 @@
 through `0f39cf5`. Contract `a80ff2c` preceded implementation `c14e32a`; correction
 `c9a4b33` fixes the sole reported error-classification issue.
 
-The active bounded M1.4 assignment is
-[task 0014](0014-m1-transactional-sampler-history.md), implemented after contract
-`4054dd7` and awaiting independent review: sampler history and deterministic greedy/temperature distribution,
+The owner accepted the bounded M1.4
+[task 0014](0014-m1-transactional-sampler-history.md) on 2026-09-11 after independent
+review of `23a7a40` / `1e6f253` (contract `4054dd7`): sampler history and deterministic greedy/temperature distribution,
 using task 0004's accepted transaction mechanism for
 history rollback. Generation service, diagnostic CLI and device attention remain later
-scope. Reopen M1.3 or task 0013 only for a demonstrated defect in accepted scope.
+scope. Next, author the bounded shared generation-service/minimal diagnostic-CLI
+contract. Reopen accepted tasks only for a demonstrated defect in accepted scope.
 
 One file per bounded assignment, `NNNN-slug.md`. Use [TASK.md](../spec/templates/TASK.md).
 

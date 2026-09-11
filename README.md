@@ -138,11 +138,13 @@ correction `c9a4b33` classifies lineage allocation exhaustion as capacity failur
 Tests cover physical byte preservation, admission, rollback, cancellation and 32,768
 actual stored rows; this establishes no attention, model or long-context execution claim.
 
-The active bounded assignment is
+The owner accepted
 [task 0014](docs/tasks/0014-m1-transactional-sampler-history.md): sampler history and
 deterministic greedy/temperature distribution, with history and rollback using
 task 0004's accepted transactions. Implementation follows contract `4054dd7` and
-awaits independent review and owner acceptance.
+was independently reviewed at `23a7a40` / `1e6f253` and accepted on 2026-09-11.
+The task record qualifies the review's layout-chronology documentation finding.
+Next, define the bounded shared generation-service/minimal diagnostic-CLI contract.
 Generation service, diagnostic CLI and device attention remain subsequent M1.4 work.
 The [active handover](docs/handovers/2026-09-11-task0014-sampler-history.md)
 records the limits and task-contract boundary.
