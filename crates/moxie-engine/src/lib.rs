@@ -4,8 +4,8 @@
 pub mod service;
 
 use moxie_graph::{Bindings, Graph, OpParams, ValueId};
+use moxie_interp::paged::{PagedExecution, PagedOutput};
 pub use moxie_interp::{Cancel, HostTensor, Value};
-use moxie_interp::{Interpreter, paged::PagedOutput};
 use moxie_memory::{BufferRequest, HostBuffer, Ledger, PlanRequest, Reservation, StageSpan};
 use moxie_state::{KvGeometry, PagedSequence};
 use moxie_types::{DimError, Error, HostTier, Precision, Result, Scope, SymbolTable, Tier};
@@ -83,6 +83,23 @@ fn add(a: usize, b: usize) -> Result<usize> {
 fn mul(a: usize, b: usize) -> Result<usize> {
     a.checked_mul(b).ok_or(DimError::Overflow.into())
 }
+fn try_vec<T>(capacity: usize) -> Result<Vec<T>> {
+    let requested_bytes = mul(capacity, std::mem::size_of::<T>())?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|_| Error::CapacityExceeded {
+            tier: Some(Tier::Host(HostTier::CpuWorkspace)),
+            requested_bytes: requested_bytes as u64,
+            available_bytes: 0,
+        })?;
+    Ok(out)
+}
+
+fn try_clone_slice<T: Clone>(values: &[T]) -> Result<Vec<T>> {
+    let mut out = try_vec(values.len())?;
+    out.extend_from_slice(values);
+    Ok(out)
+}
 
 #[derive(Debug)]
 struct Envelope {
@@ -122,26 +139,50 @@ impl Program<'_> {
                 "exact token/position inputs and weight bindings required",
             ));
         }
+        let full = request.prefill_chunk.min(request.prompt.len());
+        let tail = request.prompt.len() % request.prefill_chunk;
+        let mut row_counts = [0usize; 3];
+        let mut row_count_len = 0;
+        for rows in [full, tail, usize::from(request.max_new_tokens > 1)] {
+            if rows != 0 && !row_counts[..row_count_len].contains(&rows) {
+                row_counts[row_count_len] = rows;
+                row_count_len += 1;
+            }
+        }
+        let row_counts = &row_counts[..row_count_len];
+        let maximum_rows = *row_counts.iter().max().expect("nonempty prompt");
         let mut symbols = SymbolTable::new();
         symbols.declare(self.graph.rows_symbol(), "rows");
-        symbols.bind(self.graph.rows_symbol(), request.prefill_chunk as u64);
+        symbols.bind(self.graph.rows_symbol(), maximum_rows as u64);
         let mut elements = 0;
-        for spec in self.graph.values() {
-            let shape = spec.extent(&symbols)?;
-            let count = shape.iter().try_fold(1usize, |n, x| {
-                mul(n, usize::try_from(*x).map_err(|_| DimError::Overflow)?)
-            })?;
-            if shape.is_empty() || shape.len() > 4 || count == 0 || count > 65_536 {
-                return Err(unsupported("tensor rank 1..4 and extent 1..65536 required"));
+        for rows in row_counts {
+            symbols.bind(self.graph.rows_symbol(), *rows as u64);
+            let mut row_elements = 0;
+            for spec in self.graph.values() {
+                let shape = spec.extent(&symbols)?;
+                let count = shape.iter().try_fold(1usize, |n, x| {
+                    mul(n, usize::try_from(*x).map_err(|_| DimError::Overflow)?)
+                })?;
+                if shape.is_empty() || shape.len() > 4 || count == 0 || count > 65_536 {
+                    return Err(unsupported("tensor rank 1..4 and extent 1..65536 required"));
+                }
+                row_elements = add(row_elements, count)?;
             }
-            elements = add(elements, count)?;
+            elements = elements.max(row_elements);
         }
-        for id in [self.tokens, self.positions] {
-            let spec = self.graph.spec(id).expect("graph input");
-            if !spec.role.is_index() || spec.extent(&symbols)? != [request.prefill_chunk as u64] {
-                return Err(invalid("program", "inputs must be row-shaped indices"));
+        for rows in row_counts {
+            symbols.bind(self.graph.rows_symbol(), *rows as u64);
+            for id in [self.tokens, self.positions] {
+                let spec = self.graph.spec(id).expect("graph input");
+                if !spec.role.is_index() || spec.extent(&symbols)? != [*rows as u64] {
+                    return Err(invalid(
+                        "program",
+                        "token/position inputs must match every prefill tail and decode row count",
+                    ));
+                }
             }
         }
+        symbols.bind(self.graph.rows_symbol(), maximum_rows as u64);
         for id in self.graph.weights() {
             let spec = self.graph.spec(*id).expect("graph weight");
             let value = self
@@ -149,10 +190,13 @@ impl Program<'_> {
                 .get(*id)
                 .ok_or_else(|| invalid("weights", "missing weight"))?
                 .as_float()?;
+            let value_shape = try_clone_slice(value.shape())?;
             if value.precision() != Precision::Bf16
                 || spec.role.precision() != Some(Precision::Bf16)
-                || value.shape().iter().map(|x| *x as u64).collect::<Vec<_>>()
-                    != spec.extent(&symbols)?
+                || !value_shape
+                    .iter()
+                    .map(|x| *x as u64)
+                    .eq(spec.extent(&symbols)?)
                 || value.data().iter().any(|x| !x.is_finite())
             {
                 return Err(invalid(
@@ -160,16 +204,17 @@ impl Program<'_> {
                     "finite BF16 weights of the exact graph shape required",
                 ));
             }
-            // Weight dimensions must not vary with the number of executed rows.
+            // Weight dimensions must not depend on the dynamic row symbol, even
+            // when this particular request happens to execute only one row count.
             let expected = spec.extent(&symbols)?;
             symbols.bind(
                 self.graph.rows_symbol(),
-                if request.prefill_chunk == 1 { 2 } else { 1 },
+                if maximum_rows == 1 { 2 } else { 1 },
             );
             if spec.extent(&symbols)? != expected {
                 return Err(unsupported("row-dependent weight"));
             }
-            symbols.bind(self.graph.rows_symbol(), request.prefill_chunk as u64);
+            symbols.bind(self.graph.rows_symbol(), maximum_rows as u64);
         }
         let Some(output) = self
             .graph
@@ -242,8 +287,9 @@ impl Program<'_> {
 }
 
 #[derive(Debug)]
-struct Session {
+struct Session<'program> {
     sequence: Option<PagedSequence>,
+    execution: PagedExecution<'program>,
     prompt: HostBuffer,
     reserve: Option<Reservation>,
     output: Option<PagedOutput>,
@@ -259,9 +305,9 @@ struct Session {
     pending: Option<u32>,
 }
 
-impl Session {
+impl<'program> Session<'program> {
     fn create(
-        program: Program<'_>,
+        program: Program<'program>,
         request: GenerationRequest<'_>,
         ledger: &mut Ledger,
     ) -> Result<Self> {
@@ -304,8 +350,30 @@ impl Session {
         sequence
             .append_prompt(request.prompt.len() as u64)
             .expect("validated prompt capacity");
+        let execution = match PagedExecution::bind(
+            program.graph,
+            program.weights,
+            program.tokens,
+            program.positions,
+            &mut sequence,
+        ) {
+            Ok(execution) => execution,
+            Err(error) => {
+                sequence
+                    .close(ledger)
+                    .expect("service holds the admitting ledger");
+                prompt
+                    .release(ledger)
+                    .expect("service holds the admitting ledger");
+                ledger
+                    .release(reserve)
+                    .expect("service holds the admitting ledger");
+                return Err(error);
+            }
+        };
         Ok(Self {
             sequence: Some(sequence),
+            execution,
             prompt,
             reserve: Some(reserve),
             output: None,
@@ -331,21 +399,19 @@ impl Session {
 
     fn forward(
         &mut self,
-        program: Program<'_>,
-        tokens: Vec<u64>,
+        tokens: &[u64],
         cancel: &Cancel,
         txn: moxie_types::StateTransactionId,
     ) -> Result<PagedOutput> {
         let sequence = self.sequence.as_mut().expect("live session");
         let start = sequence.usage().rows as u64;
-        let positions = (start..start + tokens.len() as u64).collect();
-        let mut bindings = program.weights.clone();
-        bindings.set(program.tokens, Value::Index(tokens));
-        bindings.set(program.positions, Value::Index(positions));
-        Interpreter::new().run_paged(program.graph, &bindings, sequence, txn, cancel)
+        let mut positions = try_vec(tokens.len())?;
+        positions.extend(start..start + tokens.len() as u64);
+        self.execution
+            .run(sequence, txn, tokens, &positions, cancel)
     }
 
-    fn step(&mut self, program: Program<'_>, cancel: &Cancel) -> Result<GenerationEvent> {
+    fn step(&mut self, cancel: &Cancel) -> Result<GenerationEvent> {
         if !self.admitted {
             self.admitted = true;
             return Ok(GenerationEvent::Admitted {
@@ -369,15 +435,17 @@ impl Session {
         cancel.check("generation/step")?;
         if self.processed < self.prompt_len {
             let end = (self.processed + self.chunk).min(self.prompt_len);
-            let tokens = self.prompt.bytes()[self.processed * 4..end * 4]
-                .chunks_exact(4)
-                .map(|b| u32::from_le_bytes(b.try_into().expect("four bytes")) as u64)
-                .collect();
+            let mut tokens = try_vec(end - self.processed)?;
+            tokens.extend(
+                self.prompt.bytes()[self.processed * 4..end * 4]
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes(b.try_into().expect("four bytes")) as u64),
+            );
             self.output = None;
             self.sequence.as_mut().unwrap().clear_logits()?;
             let txn = self.sequence.as_mut().unwrap().begin()?;
             let result = (|| {
-                let output = self.forward(program, tokens, cancel, txn)?;
+                let output = self.forward(&tokens, cancel, txn)?;
                 cancel.check("prefill/before_commit")?;
                 self.sequence.as_mut().unwrap().commit_prefix_cancellable(
                     txn,
@@ -406,7 +474,7 @@ impl Session {
         let txn = self.sequence.as_mut().unwrap().begin()?;
         let result = (|| {
             if let Some(token) = self.pending {
-                self.output = Some(self.forward(program, vec![token as u64], cancel, txn)?);
+                self.output = Some(self.forward(&[token as u64], cancel, txn)?);
             }
             let sequence = self.sequence.as_mut().unwrap();
             let token = self

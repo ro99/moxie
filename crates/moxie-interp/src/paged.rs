@@ -1,12 +1,88 @@
 //! Host reference execution against the admitted physical pages. Dense histories
 //! below are ephemeral oracle scratch, never another persistent cache or journal.
 use moxie_format::bf16::{bf16_bits_to_f32, f32_to_bf16_bits};
-use moxie_graph::{Bindings, Graph, OpParams};
+use moxie_graph::{Bindings, Graph, OpParams, ValueId};
 use moxie_oracles::attention::KvHistory;
-use moxie_state::{KvRow, LogitsHandle, PagedSequence, ROOT};
+use moxie_state::{KvRow, LogitsHandle, PagedExecutionBinding, PagedSequence, ROOT};
 use moxie_types::{Error, Precision, Result, StateTransactionId, SymbolTable};
 
-use crate::{Cancel, HostTensor, Interpreter, KvCache, Value, bound_precision};
+use crate::{
+    Cancel, HostTensor, Interpreter, KvCache, Value, bound_precision, try_clone_slice, try_vec,
+};
+
+/// One immutable graph/weight configuration with sole authority to extend a
+/// particular paged sequence. Shared borrows keep the graph and weight payloads
+/// immutable for the binding's lifetime; a second configuration cannot claim
+/// the sequence after rows exist.
+#[derive(Debug)]
+pub struct PagedExecution<'a> {
+    graph: &'a Graph,
+    weights: &'a Bindings<Value>,
+    tokens: ValueId,
+    positions: ValueId,
+    binding: PagedExecutionBinding,
+}
+
+impl<'a> PagedExecution<'a> {
+    pub fn bind(
+        graph: &'a Graph,
+        weights: &'a Bindings<Value>,
+        tokens: ValueId,
+        positions: ValueId,
+        sequence: &mut PagedSequence,
+    ) -> Result<Self> {
+        if tokens == positions
+            || graph.inputs().len() != 2
+            || !graph.inputs().contains(&tokens)
+            || !graph.inputs().contains(&positions)
+            || weights.len() != graph.weights().len()
+        {
+            return Err(invalid(
+                "program",
+                "exact token/position inputs and weight bindings required",
+            ));
+        }
+        for id in graph.weights() {
+            if weights.get(*id).is_none() {
+                return Err(invalid("weights", "missing graph weight"));
+            }
+        }
+        let binding = sequence.claim_execution()?;
+        Ok(Self {
+            graph,
+            weights,
+            tokens,
+            positions,
+            binding,
+        })
+    }
+
+    /// Execute dynamic input rows with fallible payload copies. Any failure
+    /// after a valid transaction is presented aborts that transaction.
+    pub fn run(
+        &self,
+        sequence: &mut PagedSequence,
+        txn: StateTransactionId,
+        tokens: &[u64],
+        positions: &[u64],
+        cancel: &Cancel,
+    ) -> Result<PagedOutput> {
+        sequence.validate_execution(self.binding)?;
+        let mut bindings = Bindings::new();
+        for id in self.graph.weights() {
+            bindings.set(
+                *id,
+                self.weights
+                    .get(*id)
+                    .expect("validated immutable program")
+                    .try_clone()?,
+            );
+        }
+        bindings.set(self.tokens, Value::Index(try_clone_slice(tokens)?));
+        bindings.set(self.positions, Value::Index(try_clone_slice(positions)?));
+        Interpreter::new().run_paged(self.graph, &bindings, sequence, self.binding, txn, cancel)
+    }
+}
 
 pub(crate) trait HistorySource {
     fn read_history(&self, layer: u32) -> Result<KvHistory>;
@@ -18,16 +94,19 @@ impl HistorySource for KvCache {
 }
 impl HistorySource for PagedSequence {
     fn read_history(&self, layer: u32) -> Result<KvHistory> {
-        let mut history = KvHistory::new();
+        let mut history = KvHistory::try_with_capacity(self.usage().rows)?;
         for position in 0..self.usage().rows as u64 {
             let row = self.row(layer as usize, position)?;
-            let decode = |bytes: &[u8]| {
-                bytes
-                    .chunks_exact(2)
-                    .map(|b| bf16_bits_to_f32(u16::from_le_bytes([b[0], b[1]])))
-                    .collect()
+            let decode = |bytes: &[u8]| -> Result<Vec<f32>> {
+                let mut decoded = try_vec(bytes.len() / 2)?;
+                decoded.extend(
+                    bytes
+                        .chunks_exact(2)
+                        .map(|b| bf16_bits_to_f32(u16::from_le_bytes([b[0], b[1]]))),
+                );
+                Ok(decoded)
             };
-            history.append(position, decode(row.key), decode(row.value))?;
+            history.append(position, decode(row.key)?, decode(row.value)?)?;
         }
         Ok(history)
     }
@@ -92,15 +171,17 @@ impl Interpreter {
     /// a valid ID aborts it, including prior work in that transaction. Success
     /// leaves it open for the caller's zero-prefix commit. The caller admits
     /// bounded reference scratch before calling; this is not a production CUDA path.
-    pub fn run_paged(
+    fn run_paged(
         &self,
         graph: &Graph,
         bindings: &Bindings<Value>,
         sequence: &mut PagedSequence,
+        binding: PagedExecutionBinding,
         txn: StateTransactionId,
         cancel: &Cancel,
     ) -> Result<PagedOutput> {
         sequence.validate_transaction(txn)?;
+        sequence.validate_execution(binding)?;
         let result = self.evaluate_paged(graph, bindings, sequence, txn, cancel);
         if result.is_err() && sequence.validate_transaction(txn).is_ok() {
             sequence.abort(txn).expect("validated local transaction");
@@ -151,13 +232,14 @@ impl Interpreter {
                 "exact graph input and weight bindings required",
             ));
         }
-        let mut values = vec![None; graph.value_count()];
+        let mut values = try_vec(graph.value_count())?;
+        values.resize_with(graph.value_count(), || None);
         for id in graph.inputs().iter().chain(graph.weights()) {
             values[id.0 as usize] = Some(
                 bindings
                     .get(*id)
                     .ok_or_else(|| invalid("bindings", "missing graph value"))?
-                    .clone(),
+                    .try_clone()?,
             );
         }
         let positions = self.positions_of(graph, &values)?;
@@ -184,8 +266,16 @@ impl Interpreter {
             let value = values[id.0 as usize].as_ref().expect("bound above");
             let spec = graph.spec(*id).expect("graph value");
             let shape: Vec<u64> = match value {
-                Value::Float(t) => t.shape().iter().map(|x| *x as u64).collect(),
-                Value::Index(v) => vec![v.len() as u64],
+                Value::Float(t) => {
+                    let mut shape = try_vec(t.shape().len())?;
+                    shape.extend(t.shape().iter().map(|x| *x as u64));
+                    shape
+                }
+                Value::Index(v) => {
+                    let mut shape = try_vec(1)?;
+                    shape.push(v.len() as u64);
+                    shape
+                }
             };
             if shape != spec.extent(&symbols)? || bound_precision(value) != spec.role.precision() {
                 return Err(invalid("bindings", "shape or precision differs from graph"));
@@ -198,7 +288,10 @@ impl Interpreter {
                 });
             }
         }
-        let mut staged = Vec::new();
+        let mut staged = try_vec(
+            rows.checked_mul(geometry.layers)
+                .ok_or(moxie_types::DimError::Overflow)?,
+        )?;
         for node in graph.nodes() {
             cancel.check(node.params.op().name())?;
             let value = self.eval(node, &values, sequence, &mut staged, &positions)?;
@@ -215,7 +308,7 @@ impl Interpreter {
             .take()
             .ok_or_else(|| invalid("graph", "no output"))?
             .as_float()?
-            .clone();
+            .try_clone()?;
         if logits.rows() != rows || logits.precision() != Precision::F32 {
             return Err(invalid(
                 "logits",
@@ -223,23 +316,25 @@ impl Interpreter {
             ));
         }
         for position in positions {
-            let mut encoded = Vec::with_capacity(geometry.layers);
+            let mut encoded = try_vec(geometry.layers)?;
             for layer in 0..geometry.layers {
                 let row = staged
                     .iter()
                     .find(|a| a.layer == layer as u32 && a.position == position)
                     .ok_or_else(|| invalid("graph", "missing layer row"))?;
-                let encode = |data: &[f32]| -> Vec<u8> {
-                    data.iter()
-                        .flat_map(|x| f32_to_bf16_bits(*x).to_le_bytes())
-                        .collect()
+                let encode = |data: &[f32]| -> Result<Vec<u8>> {
+                    let mut out = try_vec(
+                        data.len()
+                            .checked_mul(2)
+                            .ok_or(moxie_types::DimError::Overflow)?,
+                    )?;
+                    out.extend(data.iter().flat_map(|x| f32_to_bf16_bits(*x).to_le_bytes()));
+                    Ok(out)
                 };
-                encoded.push((encode(&row.key), encode(&row.value)));
+                encoded.push((encode(&row.key)?, encode(&row.value)?));
             }
-            let views: Vec<_> = encoded
-                .iter()
-                .map(|(k, v)| KvRow { key: k, value: v })
-                .collect();
+            let mut views = try_vec(encoded.len())?;
+            views.extend(encoded.iter().map(|(k, v)| KvRow { key: k, value: v }));
             cancel.check("forward/before_append")?;
             sequence.append(txn, position, &views, cancel.signal())?;
             cancel.check("forward/after_append")?;

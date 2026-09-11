@@ -48,7 +48,7 @@ pub fn linear_row(
         });
     }
 
-    let mut out = Vec::with_capacity(out_features);
+    let mut out = crate::try_vec(out_features)?;
     for o in 0..out_features {
         // Sequential ascending k, FP32 accumulator. Not reassociated, not
         // fused-multiply-added into a different rounding pattern.
@@ -119,7 +119,7 @@ pub fn embedding_row(
             detail: format!("token {t} is outside a vocabulary of {vocab}"),
         });
     }
-    Ok(table[t * hidden..(t + 1) * hidden].to_vec())
+    crate::try_clone_slice(&table[t * hidden..(t + 1) * hidden])
 }
 
 #[cfg(test)]

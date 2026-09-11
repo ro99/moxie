@@ -3,7 +3,7 @@ use moxie_engine::{
     Cancel, GenerationEvent as Event, GenerationRequest as Request, HostTensor, Value,
     service::{GenerationService, StartError},
 };
-use moxie_interp::{Interpreter, KvCache};
+use moxie_interp::{Interpreter, KvCache, paged::PagedExecution};
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_state::{KvGeometry, PagedSequence, ROOT, SequenceState, StateKind};
 use moxie_types::{Error, Precision, Scope};
@@ -59,6 +59,92 @@ fn whole_chunked_decode_seed_and_repeated_generation_agree() {
 }
 
 #[test]
+fn admission_rejects_a_graph_that_cannot_execute_tail_or_decode_rows() {
+    let fixed = fixture::build_fixed_rows(2, 4, 16, 1, 2).unwrap();
+    let mut owner = ledger();
+    let mut service = GenerationService::new(&mut owner, fixed.program());
+    let request = Request {
+        prompt: &[0, 1],
+        max_new_tokens: 2,
+        prefill_chunk: 2,
+        temperature: 0.0,
+        seed: 0,
+    };
+    assert!(matches!(
+        service.start(request),
+        Err(StartError::Rejected(Error::InvalidRequest {
+            field: "program",
+            ..
+        }))
+    ));
+    assert!(service.is_idle());
+    assert_eq!(service.charged_bytes(), 0);
+
+    // A fixed two-row graph is coherent when no tail or decode row is needed.
+    let one_token = Request {
+        max_new_tokens: 1,
+        ..request
+    };
+    service.start(one_token).unwrap();
+    assert_eq!(tokens(&mut service).len(), 1);
+}
+
+#[test]
+fn paged_history_is_owned_by_one_immutable_program() {
+    let first = fixture::build(2, 4, 16, 1).unwrap();
+    let second = fixture::build(2, 4, 16, 1).unwrap();
+    let mut owner = ledger();
+    let geometry = KvGeometry {
+        layers: 1,
+        kv_heads: 2,
+        key_dim: 4,
+        value_dim: 4,
+        precision: Precision::Bf16,
+        page_tokens: 3,
+        max_tokens: 4,
+    };
+    let mut pages = PagedSequence::with_sampling(&mut owner, geometry, 16, 2, 0).unwrap();
+    pages.append_prompt(2).unwrap();
+    let execution = PagedExecution::bind(
+        &first.graph,
+        &first.weights,
+        first.tokens,
+        first.positions,
+        &mut pages,
+    )
+    .unwrap();
+    let txn = pages.begin().unwrap();
+    execution
+        .run(&mut pages, txn, &[0], &[0], &Cancel::never())
+        .unwrap();
+    pages.commit_prefix(txn, 0).unwrap();
+    pages.clear_logits().unwrap();
+
+    let error = PagedExecution::bind(
+        &second.graph,
+        &second.weights,
+        second.tokens,
+        second.positions,
+        &mut pages,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::InvalidRequest {
+            field: "execution_configuration",
+            ..
+        }
+    ));
+    let txn = pages.begin().unwrap();
+    execution
+        .run(&mut pages, txn, &[1], &[1], &Cancel::never())
+        .unwrap();
+    pages.commit_prefix(txn, 0).unwrap();
+    pages.close(&mut owner).unwrap();
+    assert!(owner.outstanding().is_empty());
+}
+
+#[test]
 fn forward_cancellation_restores_existing_rows_frontiers_and_lineage() {
     for (heads, dim, vocab, layers) in [(2, 4, 16, 1), (3, 4, 7, 2)] {
         let fixture = fixture::build(heads, dim, vocab, layers).unwrap();
@@ -75,12 +161,17 @@ fn forward_cancellation_restores_existing_rows_frontiers_and_lineage() {
         let mut pages =
             PagedSequence::with_sampling(&mut owner, geometry, vocab as usize, 4, 0).unwrap();
         pages.append_prompt(8).unwrap();
-        let mut bindings = fixture.weights.clone();
-        bindings.set(fixture.tokens, Value::Index(vec![0, 1]));
-        bindings.set(fixture.positions, Value::Index(vec![0, 1]));
+        let execution = PagedExecution::bind(
+            &fixture.graph,
+            &fixture.weights,
+            fixture.tokens,
+            fixture.positions,
+            &mut pages,
+        )
+        .unwrap();
         let txn = pages.begin().unwrap();
-        Interpreter::new()
-            .run_paged(&fixture.graph, &bindings, &mut pages, txn, &Cancel::never())
+        execution
+            .run(&mut pages, txn, &[0, 1], &[0, 1], &Cancel::never())
             .unwrap();
         assert!(pages.clear_logits().is_err());
         assert!(pages.record_logits(txn).is_err()); // at most one live result
@@ -95,23 +186,23 @@ fn forward_cancellation_restores_existing_rows_frontiers_and_lineage() {
                 (row.key.to_vec(), row.value.to_vec())
             })
             .collect();
-        bindings.set(fixture.tokens, Value::Index(vec![2, 3, 4, 5, 6, 0]));
-        bindings.set(fixture.positions, Value::Index(vec![2, 3, 4, 5, 6, 7]));
+        let continuation = [2, 3, 4, 5, 6, 0];
+        let positions = [2, 3, 4, 5, 6, 7];
         let counter = Cancel::after(1000);
         let txn = pages.begin().unwrap();
-        Interpreter::new()
-            .run_paged(&fixture.graph, &bindings, &mut pages, txn, &counter)
+        execution
+            .run(&mut pages, txn, &continuation, &positions, &counter)
             .unwrap();
         pages.abort(txn).unwrap();
         let boundaries = 1000 - counter.remaining();
         for stop in 0..boundaries {
             let txn = pages.begin().unwrap();
-            let error = Interpreter::new()
-                .run_paged(
-                    &fixture.graph,
-                    &bindings,
+            let error = execution
+                .run(
                     &mut pages,
                     txn,
+                    &continuation,
+                    &positions,
                     &Cancel::after(stop),
                 )
                 .unwrap_err();
@@ -152,6 +243,14 @@ fn paged_forward_is_bit_exact_with_dense_reference_and_rejects_stale_outputs() {
             let mut dense = SequenceState::new([StateKind::KvPages]);
             let mut cache = KvCache::for_branch(layers as usize, &dense, ROOT).unwrap();
             pages.append_prompt(19).unwrap();
+            let execution = PagedExecution::bind(
+                &fixture.graph,
+                &fixture.weights,
+                fixture.tokens,
+                fixture.positions,
+                &mut pages,
+            )
+            .unwrap();
             dense.append_prompt(ROOT, 19).unwrap();
             let mut last = None;
             for start in (0..19).step_by(chunk) {
@@ -177,8 +276,16 @@ fn paged_forward_is_bit_exact_with_dense_reference_and_rejects_stale_outputs() {
                     .unwrap();
                 pages.clear_logits().unwrap();
                 let txn = pages.begin().unwrap();
-                let actual = Interpreter::new()
-                    .run_paged(&fixture.graph, &bindings, &mut pages, txn, &Cancel::never())
+                let input_tokens: Vec<_> = (start..end).map(|i| i as u64 % vocab).collect();
+                let input_positions: Vec<_> = (start as u64..end as u64).collect();
+                let actual = execution
+                    .run(
+                        &mut pages,
+                        txn,
+                        &input_tokens,
+                        &input_positions,
+                        &Cancel::never(),
+                    )
                     .unwrap();
                 assert_eq!(reference.logits.data(), actual.logits().data());
                 pages.commit_prefix(txn, 0).unwrap();
@@ -224,8 +331,8 @@ fn paged_forward_is_bit_exact_with_dense_reference_and_rejects_stale_outputs() {
                 .unwrap();
             pages.clear_logits().unwrap();
             let txn = pages.begin().unwrap();
-            let actual = Interpreter::new()
-                .run_paged(&fixture.graph, &bindings, &mut pages, txn, &Cancel::never())
+            let actual = execution
+                .run(&mut pages, txn, &[token as u64], &[19], &Cancel::never())
                 .unwrap();
             assert_eq!(reference.logits.data(), actual.logits().data());
             assert!(
@@ -244,8 +351,8 @@ fn paged_forward_is_bit_exact_with_dense_reference_and_rejects_stale_outputs() {
             // Same numerical prefix after replay is a different result. A
             // counter-only guard would now accept the aborted output.
             let txn = pages.begin().unwrap();
-            let fresh = Interpreter::new()
-                .run_paged(&fixture.graph, &bindings, &mut pages, txn, &Cancel::never())
+            let fresh = execution
+                .run(&mut pages, txn, &[token as u64], &[19], &Cancel::never())
                 .unwrap();
             assert!(
                 actual

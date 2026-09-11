@@ -43,6 +43,26 @@ pub mod route;
 pub mod sampler;
 pub mod template;
 
+pub(crate) fn try_vec<T>(capacity: usize) -> moxie_types::Result<Vec<T>> {
+    let requested_bytes = capacity
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or(moxie_types::DimError::Overflow)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|_| moxie_types::Error::CapacityExceeded {
+            tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::CpuWorkspace)),
+            requested_bytes: requested_bytes as u64,
+            available_bytes: 0,
+        })?;
+    Ok(out)
+}
+
+pub(crate) fn try_clone_slice<T: Clone>(values: &[T]) -> moxie_types::Result<Vec<T>> {
+    let mut out = try_vec(values.len())?;
+    out.extend_from_slice(values);
+    Ok(out)
+}
+
 use moxie_graph::{Op, OracleEvidence, OracleId, OracleRegistry};
 use moxie_types::Result;
 

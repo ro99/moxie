@@ -81,14 +81,12 @@ pub fn swiglu_row(gate: &[f32], up: &[f32]) -> Result<Vec<f32>> {
             detail: "an activation over zero features".into(),
         });
     }
-    Ok(gate
-        .iter()
-        .zip(up)
-        .map(|(g, u)| {
-            let g = *g as f64;
-            ((g * sigmoid_f64(g)) * (*u as f64)) as f32
-        })
-        .collect())
+    let mut out = crate::try_vec(gate.len())?;
+    out.extend(gate.iter().zip(up).map(|(g, u)| {
+        let g = *g as f64;
+        ((g * sigmoid_f64(g)) * (*u as f64)) as f32
+    }));
+    Ok(out)
 }
 
 #[cfg(test)]

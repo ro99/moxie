@@ -27,6 +27,13 @@ impl KvHistory {
         Self::default()
     }
 
+    pub fn try_with_capacity(capacity: usize) -> Result<Self> {
+        Ok(Self {
+            keys: crate::try_vec(capacity)?,
+            values: crate::try_vec(capacity)?,
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.keys.len()
     }
@@ -65,6 +72,20 @@ impl KvHistory {
                 detail: format!("key has {} elements, value {}", key.len(), value.len()),
             });
         }
+        self.keys
+            .try_reserve(1)
+            .map_err(|_| Error::CapacityExceeded {
+                tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::CpuWorkspace)),
+                requested_bytes: std::mem::size_of::<Vec<f32>>() as u64,
+                available_bytes: 0,
+            })?;
+        self.values
+            .try_reserve(1)
+            .map_err(|_| Error::CapacityExceeded {
+                tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::CpuWorkspace)),
+                requested_bytes: std::mem::size_of::<Vec<f32>>() as u64,
+                available_bytes: 0,
+            })?;
         self.keys.push(key);
         self.values.push(value);
         Ok(())
@@ -143,23 +164,24 @@ pub fn attend_multi_head(
     }
 
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let allowed: Vec<bool> = (0..history.len())
-        .map(|k| visibility.allows(position, k as u64))
-        .collect();
+    let mut allowed = crate::try_vec(history.len())?;
+    allowed.extend((0..history.len()).map(|k| visibility.allows(position, k as u64)));
 
-    let mut out = Vec::with_capacity(query.len());
+    let mut out = crate::try_vec(query.len())?;
     for h in 0..heads {
         let q = KvHistory::head_slice(query, h, head_dim, heads)?;
-        let keys: Vec<Vec<f32>> = history
-            .keys
-            .iter()
-            .map(|k| KvHistory::head_slice(k, h, head_dim, heads).map(<[f32]>::to_vec))
-            .collect::<Result<_>>()?;
-        let values: Vec<Vec<f32>> = history
-            .values
-            .iter()
-            .map(|v| KvHistory::head_slice(v, h, head_dim, heads).map(<[f32]>::to_vec))
-            .collect::<Result<_>>()?;
+        let mut keys = crate::try_vec(history.keys.len())?;
+        for key in &history.keys {
+            keys.push(crate::try_clone_slice(KvHistory::head_slice(
+                key, h, head_dim, heads,
+            )?)?);
+        }
+        let mut values = crate::try_vec(history.values.len())?;
+        for value in &history.values {
+            values.push(crate::try_clone_slice(KvHistory::head_slice(
+                value, h, head_dim, heads,
+            )?)?);
+        }
         out.extend(attend_row(q, &keys, &values, &allowed, scale)?);
     }
     Ok(out)

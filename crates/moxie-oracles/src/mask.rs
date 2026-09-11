@@ -107,7 +107,8 @@ pub fn attend_row(
             ),
         });
     }
-    let visible: Vec<usize> = (0..keys.len()).filter(|i| allowed[*i]).collect();
+    let mut visible = crate::try_vec(keys.len())?;
+    visible.extend((0..keys.len()).filter(|i| allowed[*i]));
     if visible.is_empty() {
         return Err(Error::Numerical {
             detail: "no visible key for this query position".into(),
@@ -115,7 +116,7 @@ pub fn attend_row(
     }
     let value_dim = values[visible[0]].len();
 
-    let mut scores = Vec::with_capacity(visible.len());
+    let mut scores = crate::try_vec(visible.len())?;
     for i in &visible {
         if keys[*i].len() != query.len() {
             return Err(Error::InvalidRequest {
@@ -127,10 +128,12 @@ pub fn attend_row(
         scores.push(dot * scale);
     }
     let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+    let mut exps = crate::try_vec(scores.len())?;
+    exps.extend(scores.iter().map(|s| (s - max).exp()));
     let denom: f32 = exps.iter().sum();
 
-    let mut out = vec![0f32; value_dim];
+    let mut out = crate::try_vec(value_dim)?;
+    out.resize(value_dim, 0f32);
     for (n, i) in visible.iter().enumerate() {
         if values[*i].len() != value_dim {
             return Err(Error::InvalidRequest {

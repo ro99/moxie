@@ -21,7 +21,9 @@ pub fn residual_row(a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
             detail: "a residual over zero features".into(),
         });
     }
-    Ok(a.iter().zip(b).map(|(x, y)| x + y).collect())
+    let mut out = crate::try_vec(a.len())?;
+    out.extend(a.iter().zip(b).map(|(x, y)| x + y));
+    Ok(out)
 }
 
 #[cfg(test)]

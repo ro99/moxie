@@ -109,6 +109,44 @@ fn admitted_peak_cleanup_repeated_generations_and_allocation_failure() {
     }
     drop(service);
     assert!(owner.outstanding().is_empty());
+
+    // Review regression: the widest fixture has a 65,536-element BF16-valued
+    // weight payload. Fail its 262,144-byte forward clone after admission. The
+    // service must return a typed terminal event, close, and accept a retry.
+    let wide = fixture::build(4, 64, 256, 8).unwrap();
+    let wide_prompt: Vec<_> = (0..255).map(|i| i as u32).collect();
+    let mut wide_owner = ledger(1 << 30);
+    let mut wide_service = GenerationService::new(&mut wide_owner, wide.program());
+    wide_service.start(req(&wide_prompt, 255, 1)).unwrap();
+    assert!(matches!(
+        wide_service.next_event(&Cancel::never()),
+        Some(GenerationEvent::Admitted { .. })
+    ));
+    FAIL.store(262_144, SeqCst);
+    assert!(matches!(
+        wide_service.next_event(&Cancel::never()),
+        Some(GenerationEvent::Failed {
+            error: Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::CpuWorkspace)),
+                requested_bytes: 262_144,
+                available_bytes: 0,
+            },
+            ..
+        })
+    ));
+    assert_eq!(FAIL.swap(0, SeqCst), 0, "forward fault was not injected");
+    assert!(wide_service.is_idle());
+    assert_eq!(wide_service.charged_bytes(), 0);
+    wide_service.start(req(&wide_prompt, 255, 1)).unwrap();
+    while let Some(event) = wide_service.next_event(&Cancel::never()) {
+        assert!(!matches!(
+            event,
+            GenerationEvent::Failed { .. } | GenerationEvent::Cancelled { .. }
+        ));
+    }
+    drop(wide_service);
+    assert!(wide_owner.outstanding().is_empty());
+
     // Fail only the newly owned prompt payload and the existing paged lineage
     // allocation after both admissions. Check the original error attribution.
     // Use extents distinct from the planner's small metadata allocations.

@@ -35,6 +35,13 @@ pub fn is_bf16_valued(v: f32) -> bool {
 }
 
 impl HostTensor {
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            data: crate::try_clone_slice(&self.data)?,
+            shape: crate::try_clone_slice(&self.shape)?,
+            precision: self.precision,
+        })
+    }
     fn checked(data: Vec<f32>, shape: Vec<usize>, precision: Precision) -> Result<Self> {
         let want: usize = shape.iter().product();
         if data.len() != want {
@@ -73,12 +80,11 @@ impl HostTensor {
     /// This is the *only* rounding boundary. Task 0003's table says where each
     /// operation crosses it, and every crossing goes through here so that a
     /// second rounding rule cannot appear somewhere else.
-    pub fn round_to_bf16(data: Vec<f32>, shape: Vec<usize>) -> Result<Self> {
-        Self::checked(
-            data.into_iter().map(to_bf16).collect(),
-            shape,
-            Precision::Bf16,
-        )
+    pub fn round_to_bf16(mut data: Vec<f32>, shape: Vec<usize>) -> Result<Self> {
+        for value in &mut data {
+            *value = to_bf16(*value);
+        }
+        Self::checked(data, shape, Precision::Bf16)
     }
 
     /// An FP32 tensor. Used only where the contract says not to round: the
@@ -139,6 +145,12 @@ pub enum Value {
 }
 
 impl Value {
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        Ok(match self {
+            Self::Float(tensor) => Self::Float(tensor.try_clone()?),
+            Self::Index(indices) => Self::Index(crate::try_clone_slice(indices)?),
+        })
+    }
     pub fn as_float(&self) -> Result<&HostTensor> {
         match self {
             Value::Float(t) => Ok(t),

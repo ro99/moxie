@@ -26,12 +26,25 @@ impl Fixture {
 }
 
 pub fn build(heads: u64, dim: u64, vocab: u64, layers: u32) -> Result<Fixture> {
+    build_with_rows(heads, dim, vocab, layers, Dim::symbol(SymbolId(0)))
+}
+
+/// Review fixture for admission: a fixed-row graph may be legal for its first
+/// prefill chunk but cannot serve a tail or one-row decode.
+pub fn build_fixed_rows(
+    heads: u64,
+    dim: u64,
+    vocab: u64,
+    layers: u32,
+    rows: u64,
+) -> Result<Fixture> {
+    build_with_rows(heads, dim, vocab, layers, Dim::constant(rows))
+}
+
+fn build_with_rows(heads: u64, dim: u64, vocab: u64, layers: u32, rows: Dim) -> Result<Fixture> {
     let width = heads * dim;
     let mut graph = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
-    let input = TensorSpec::new(
-        ValueRole::Index(IndexEncoding::U64),
-        vec![Dim::symbol(SymbolId(0))],
-    );
+    let input = TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows]);
     let tokens = graph.input("tokens", input.clone());
     let positions = graph.input("absolute positions", input);
     let mut weights = Bindings::new();

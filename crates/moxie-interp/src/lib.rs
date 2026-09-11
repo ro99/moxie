@@ -47,6 +47,32 @@ use moxie_types::{Error, Result};
 pub use kv::{CacheId, CacheJournal, KvCache};
 pub use tensor::{HostTensor, Value};
 
+pub(crate) fn try_vec<T>(capacity: usize) -> Result<Vec<T>> {
+    let requested_bytes = capacity
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or(moxie_types::DimError::Overflow)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|_| Error::CapacityExceeded {
+            tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::CpuWorkspace)),
+            requested_bytes: requested_bytes as u64,
+            available_bytes: 0,
+        })?;
+    Ok(out)
+}
+
+pub(crate) fn try_clone_slice<T: Clone>(values: &[T]) -> Result<Vec<T>> {
+    let mut out = try_vec(values.len())?;
+    out.extend_from_slice(values);
+    Ok(out)
+}
+
+fn try_shape2(first: usize, second: usize) -> Result<Vec<usize>> {
+    let mut shape = try_vec(2)?;
+    shape.extend([first, second]);
+    Ok(shape)
+}
+
 /// A cancellation token checked at every operation boundary.
 ///
 /// R08: "Memory leases are released at turn boundaries and cancellation even if
@@ -565,7 +591,7 @@ impl Interpreter {
                         detail: "attention positions are not bound".into(),
                     }
                 })?;
-                return Ok(v.as_index()?.to_vec());
+                return try_clone_slice(v.as_index()?);
             }
             if let OpParams::Rope { .. } = node.params {
                 let v = values[node.inputs[1].0 as usize].as_ref().ok_or_else(|| {
@@ -574,7 +600,7 @@ impl Interpreter {
                         detail: "rope positions are not bound".into(),
                     }
                 })?;
-                return Ok(v.as_index()?.to_vec());
+                return try_clone_slice(v.as_index()?);
             }
         }
         Err(Error::InvalidArtifact {
@@ -607,7 +633,7 @@ impl Interpreter {
             OpParams::Embedding { vocab, hidden } => {
                 let tokens = input(0)?.as_index()?;
                 let table = input(1)?.as_float()?;
-                let mut out = Vec::with_capacity(tokens.len() * hidden as usize);
+                let mut out = try_vec(tokens.len() * hidden as usize)?;
                 for t in tokens {
                     let id = u32::try_from(*t).map_err(|_| Error::InvalidRequest {
                         field: "token",
@@ -623,7 +649,10 @@ impl Interpreter {
                 // A copy: the stored value passes through unchanged, so this is
                 // `bf16` rather than `round_to_bf16`, and it would fail loudly
                 // if the table were not BF16-valued.
-                Value::Float(HostTensor::bf16(out, vec![tokens.len(), hidden as usize])?)
+                Value::Float(HostTensor::bf16(
+                    out,
+                    try_shape2(tokens.len(), hidden as usize)?,
+                )?)
             }
             OpParams::Linear {
                 out_features, bias, ..
@@ -631,11 +660,11 @@ impl Interpreter {
                 let x = input(0)?.as_float()?;
                 let w = input(1)?.as_float()?;
                 let b = if bias {
-                    Some(input(2)?.as_float()?.data().to_vec())
+                    Some(try_clone_slice(input(2)?.as_float()?.data())?)
                 } else {
                     None
                 };
-                let mut out = Vec::with_capacity(x.rows() * out_features as usize);
+                let mut out = try_vec(x.rows() * out_features as usize)?;
                 for r in 0..x.rows() {
                     out.extend(linear::linear_row(
                         x.row(r)?,
@@ -646,26 +675,29 @@ impl Interpreter {
                 }
                 Value::Float(HostTensor::round_to_bf16(
                     out,
-                    vec![x.rows(), out_features as usize],
+                    try_shape2(x.rows(), out_features as usize)?,
                 )?)
             }
             OpParams::RmsNorm { eps, .. } => {
                 let x = input(0)?.as_float()?;
                 let g = input(1)?.as_float()?;
-                let mut out = Vec::with_capacity(x.data().len());
+                let mut out = try_vec(x.data().len())?;
                 for r in 0..x.rows() {
                     out.extend(norm::rms_norm_row(x.row(r)?, g.data(), eps)?);
                 }
-                Value::Float(HostTensor::round_to_bf16(out, x.shape().to_vec())?)
+                Value::Float(HostTensor::round_to_bf16(out, try_clone_slice(x.shape())?)?)
             }
             OpParams::SwiGlu { .. } => {
                 let gate = input(0)?.as_float()?;
                 let up = input(1)?.as_float()?;
-                let mut out = Vec::with_capacity(gate.data().len());
+                let mut out = try_vec(gate.data().len())?;
                 for r in 0..gate.rows() {
                     out.extend(activation::swiglu_row(gate.row(r)?, up.row(r)?)?);
                 }
-                Value::Float(HostTensor::round_to_bf16(out, gate.shape().to_vec())?)
+                Value::Float(HostTensor::round_to_bf16(
+                    out,
+                    try_clone_slice(gate.shape())?,
+                )?)
             }
             OpParams::Rope {
                 heads,
@@ -680,7 +712,7 @@ impl Interpreter {
                         detail: format!("{} positions for {} rows", pos.len(), x.rows()),
                     });
                 }
-                let mut out = Vec::with_capacity(x.data().len());
+                let mut out = try_vec(x.data().len())?;
                 for (r, p) in pos.iter().enumerate().take(x.rows()) {
                     out.extend(rope::rope_row(
                         x.row(r)?,
@@ -691,7 +723,7 @@ impl Interpreter {
                         rotary_dim as usize,
                     )?);
                 }
-                Value::Float(HostTensor::round_to_bf16(out, x.shape().to_vec())?)
+                Value::Float(HostTensor::round_to_bf16(out, try_clone_slice(x.shape())?)?)
             }
             OpParams::Attention {
                 heads,
@@ -708,17 +740,26 @@ impl Interpreter {
                 // rows without those rows having been committed yet.
                 let mut history = kv.read_history(layer)?;
                 for a in staged.iter().filter(|a| a.layer == layer) {
-                    history.append(a.position, a.key.clone(), a.value.clone())?;
+                    history.append(
+                        a.position,
+                        try_clone_slice(&a.key)?,
+                        try_clone_slice(&a.value)?,
+                    )?;
                 }
-                let mut out = Vec::with_capacity(q.data().len());
+                let mut out = try_vec(q.data().len())?;
                 for (r, position) in positions.iter().enumerate().take(q.rows()) {
                     let position = *position;
-                    let (key, value) = (k.row(r)?.to_vec(), v.row(r)?.to_vec());
+                    let (key, value) = (try_clone_slice(k.row(r)?)?, try_clone_slice(v.row(r)?)?);
                     // A causal query attends to itself, so this row's key and
                     // value join the history before it is read. They also join
                     // the staged list, so a later row of the same prefill sees
                     // them and a failed step never writes them.
-                    history.append(position, key.clone(), value.clone())?;
+                    history.append(position, try_clone_slice(&key)?, try_clone_slice(&value)?)?;
+                    staged.try_reserve(1).map_err(|_| Error::CapacityExceeded {
+                        tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::CpuWorkspace)),
+                        requested_bytes: std::mem::size_of::<StagedAppend>() as u64,
+                        available_bytes: 0,
+                    })?;
                     staged.push(StagedAppend {
                         layer,
                         position,
@@ -734,21 +775,21 @@ impl Interpreter {
                         visibility,
                     )?);
                 }
-                Value::Float(HostTensor::round_to_bf16(out, q.shape().to_vec())?)
+                Value::Float(HostTensor::round_to_bf16(out, try_clone_slice(q.shape())?)?)
             }
             OpParams::Residual => {
                 let a = input(0)?.as_float()?;
                 let b = input(1)?.as_float()?;
-                let mut out = Vec::with_capacity(a.data().len());
+                let mut out = try_vec(a.data().len())?;
                 for r in 0..a.rows() {
                     out.extend(residual::residual_row(a.row(r)?, b.row(r)?)?);
                 }
-                Value::Float(HostTensor::round_to_bf16(out, a.shape().to_vec())?)
+                Value::Float(HostTensor::round_to_bf16(out, try_clone_slice(a.shape())?)?)
             }
             OpParams::VocabProjection { vocab, .. } => {
                 let h = input(0)?.as_float()?;
                 let w = input(1)?.as_float()?;
-                let mut out = Vec::with_capacity(h.rows() * vocab as usize);
+                let mut out = try_vec(h.rows() * vocab as usize)?;
                 for r in 0..h.rows() {
                     out.extend(linear::linear_row(
                         h.row(r)?,
@@ -758,7 +799,7 @@ impl Interpreter {
                     )?);
                 }
                 // Not rounded. See `StepOutput::logits`.
-                Value::Float(HostTensor::f32(out, vec![h.rows(), vocab as usize])?)
+                Value::Float(HostTensor::f32(out, try_shape2(h.rows(), vocab as usize)?)?)
             }
         };
         Ok(out)

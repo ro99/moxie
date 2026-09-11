@@ -47,7 +47,9 @@ pub fn rms_norm_row(x: &[f32], gain: &[f32], eps: f32) -> Result<Vec<f32>> {
             detail: format!("rms denominator is {denom}"),
         });
     }
-    Ok(x.iter().zip(gain).map(|(v, g)| v * g / denom).collect())
+    let mut out = crate::try_vec(x.len())?;
+    out.extend(x.iter().zip(gain).map(|(v, g)| v * g / denom));
+    Ok(out)
 }
 
 /// `y[i] = (x[i] − mean(x)) · g[i] / sqrt(var(x) + ε) + b[i]`.

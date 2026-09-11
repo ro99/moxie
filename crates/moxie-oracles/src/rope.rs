@@ -46,7 +46,7 @@ pub fn rope_head(x: &[f32], pos: u64, base: f32, rotary_dim: usize) -> Result<Ve
             detail: format!("base must be finite and > 1, got {base}"),
         });
     }
-    let mut out = x.to_vec();
+    let mut out = crate::try_clone_slice(x)?;
     let half = rotary_dim / 2;
     for j in 0..half {
         let inv_freq = (base as f64).powf(-2.0 * j as f64 / rotary_dim as f64);
@@ -74,7 +74,7 @@ pub fn rope_row(
             detail: format!("row has {} elements, expected {heads}x{head_dim}", x.len()),
         });
     }
-    let mut out = Vec::with_capacity(x.len());
+    let mut out = crate::try_vec(x.len())?;
     for h in 0..heads {
         let head = &x[h * head_dim..(h + 1) * head_dim];
         out.extend(rope_head(head, pos, base, rotary_dim)?);

@@ -144,7 +144,14 @@ pub struct PagedSequence {
     backing: HostBuffer,
     rows: usize,
     sampler: Option<Sampler>,
+    execution: Option<PagedExecutionBinding>,
 }
+
+/// Opaque authority for the one immutable execution configuration bound to a
+/// paged sequence. Only [`PagedSequence::claim_execution`] can mint one, and a
+/// second claimant is refused even when its graph has compatible geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagedExecutionBinding(u64);
 
 #[derive(Debug)]
 struct Sampler {
@@ -320,7 +327,48 @@ impl PagedSequence {
             backing,
             rows: 0,
             sampler,
+            execution: None,
         })
+    }
+
+    /// Bind this sequence to one immutable executor before any physical row is
+    /// written. The prompt frontier may already be declared, but no second
+    /// program can acquire the existing authority.
+    pub fn claim_execution(&mut self) -> Result<PagedExecutionBinding> {
+        if self.execution.is_some() {
+            return Err(invalid(
+                "execution_configuration",
+                "paged sequence is already bound to an immutable program",
+            ));
+        }
+        if self.rows != 0 || !self.state.open_transactions().is_empty() {
+            return Err(invalid(
+                "execution_configuration",
+                "bind before physical execution and outside a transaction",
+            ));
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| {
+                invalid(
+                    "execution_configuration",
+                    "process execution binding identity space is exhausted",
+                )
+            })?;
+        let binding = PagedExecutionBinding(id);
+        self.execution = Some(binding);
+        Ok(binding)
+    }
+
+    pub fn validate_execution(&self, binding: PagedExecutionBinding) -> Result<()> {
+        if self.execution != Some(binding) {
+            return Err(invalid(
+                "execution_configuration",
+                "program does not own this paged history",
+            ));
+        }
+        Ok(())
     }
 
     pub fn state(&self) -> &SequenceState {

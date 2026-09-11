@@ -23,7 +23,7 @@ impl std::error::Error for StartError {}
 pub struct GenerationService<'ledger, 'program> {
     ledger: &'ledger mut Ledger,
     program: Program<'program>,
-    active: Option<Session>,
+    active: Option<Session<'program>>,
 }
 impl<'ledger, 'program> GenerationService<'ledger, 'program> {
     pub fn new(ledger: &'ledger mut Ledger, program: Program<'program>) -> Self {
@@ -50,7 +50,7 @@ impl<'ledger, 'program> GenerationService<'ledger, 'program> {
     }
     pub fn next_event(&mut self, cancel: &Cancel) -> Option<GenerationEvent> {
         let session = self.active.as_mut()?;
-        let event = match session.step(self.program, cancel) {
+        let event = match session.step(cancel) {
             Ok(event) => event,
             Err(Error::Cancelled { .. }) => GenerationEvent::Cancelled {
                 usage: session.usage(),

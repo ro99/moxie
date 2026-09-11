@@ -41,7 +41,9 @@
 #![forbid(unsafe_code)]
 
 pub mod paged;
-pub use paged::{KvGeometry, KvRow, PagedCloseRefused, PagedSequence, PagedUsage};
+pub use paged::{
+    KvGeometry, KvRow, PagedCloseRefused, PagedExecutionBinding, PagedSequence, PagedUsage,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
