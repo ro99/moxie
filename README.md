@@ -8,8 +8,10 @@ Prepared for the owner's September 2026 requirements. Canonical weight families 
 and BF16**, using the shared affine-integer contract in [ADR 0003](docs/decisions/adr/0003-int4-int8-bf16-weight-family.md). NVIDIA only. One interactive user. OpenAI-compatible HTTP API and CLI chat. Large
 context, good prefill and decode, and models larger than VRAM are simultaneous requirements.
 
-This repository contains an M0 Rust/CUDA scaffold, tests, specification and roadmap; **it is not yet
-an inference engine.** Nothing here loads, imports or executes a model. The
+This repository contains shared Rust/CUDA execution components and a bounded
+host-reference generation service; **it does not yet execute a checkpoint-backed
+model.** The diagnostic CLI emits synthetic token IDs. Nothing here loads,
+imports or executes a released model. The
 [M0 review and correction task](docs/tasks/0002-m0-review-and-integer-transition.md) records what
 passes, with the exact commands, and what remains missing; the
 [support matrix](docs/evidence/support-matrix.md) is the list of claims and the gate IDs behind
@@ -86,6 +88,7 @@ through the device build would leave that independence untested.
 | `cargo xtask spec-check [--update]` | nothing | The normative specification is present and unmodified |
 | `cargo xtask index` | nothing | The command contracts and their required lanes |
 | `cargo test --workspace` | nothing | Host semantics, formats, state, sampling, protocol |
+| `cargo run -p moxie-cli -- diagnostic --shape b --prompt 0,1,2,3 --max-new 4 --chunk 3 --temperature 1 --seed 42` | host telemetry | Synthetic token-ID generation through the shared host-reference service; no checkpoint or GPU attention |
 | `cargo xtask-cuda test-gpu [--profile sm_NN]` | CUDA 13.0 + the cards | Real launches on every visible device; **fails** when a required architecture has no passing device |
 | `cargo xtask-cuda test-bf16-chain` | CUDA 13.0 + one card | Reduced H8/H17 selected semantic chain used by Compute Sanitizer |
 | `cargo xtask-cuda probe [--out <path>]` | CUDA 13.0 + the cards | Bounded hardware and topology inventory |
@@ -144,10 +147,19 @@ deterministic greedy/temperature distribution, with history and rollback using
 task 0004's accepted transactions. Implementation follows contract `4054dd7` and
 was independently reviewed at `23a7a40` / `1e6f253` and accepted on 2026-09-11.
 The task record qualifies the review's layout-chronology documentation finding.
-Next, define the bounded shared generation-service/minimal diagnostic-CLI contract.
-Generation service, diagnostic CLI and device attention remain subsequent M1.4 work.
-The [active handover](docs/handovers/2026-09-11-task0014-sampler-history.md)
-records the limits and task-contract boundary.
+
+[Task 0015](docs/tasks/0015-m1-generation-service-diagnostic-cli.md) implements the
+remaining M1.4 service/diagnostic-CLI slice at `f7cff56`, after contract `2fbacec`.
+The service executes synthetic graphs through the shared host interpreter, physical
+paged state and sampler; it commits token events and releases resources on finish,
+cancellation, failure or disconnect. Its explicit `host-reference` profile is
+limited to 256 requested context tokens, with bounded graph/scratch sizes.
+It has no tokenizer, text stop/EOS, HTTP or checkpoint support. Use `--help` for the
+diagnostic CLI and `--cancel-after N` for deterministic cancellation testing.
+Independent review and owner acceptance remain pending; **M1.4 stays active**.
+M1.5 model integration and M4 device attention are separate work.
+The [active handover](docs/handovers/2026-09-11-task0015-generation-service.md)
+records the review scope and evidence.
 
 Assignments use [TASK.md](docs/spec/templates/TASK.md), never "do everything necessary to make model
 X fast." Each task names a shared owner, a bounded deliverable, its consumers, tests, and stop

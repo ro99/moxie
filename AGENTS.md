@@ -15,13 +15,15 @@ The owner accepted [task 0014](docs/tasks/0014-m1-transactional-sampler-history.
 M1.4 sampler history and deterministic greedy/temperature distribution, implemented
 after contract `4054dd7`, on 2026-09-11 following independent review of `23a7a40`
 and `1e6f253`. The review's layout-chronology documentation finding is qualified
-in the task record. The next bounded contract is shared generation-service and
-minimal diagnostic-CLI integration; it has not yet been authored.
-Its history and rollback must use
-[task 0004's](docs/tasks/0004-m1-state-transactions.md) accepted transaction mechanism;
-the task contract precedes implementation. Service/CLI and device
-attention remain later scope. See the
-[active handover](docs/handovers/2026-09-11-task0014-sampler-history.md).
+in the task record.
+
+The active bounded assignment is [task 0015](docs/tasks/0015-m1-generation-service-diagnostic-cli.md),
+the remaining M1.4 generation-service/minimal diagnostic-CLI integration. Contract
+`2fbacec` precedes implementation `f7cff56`. It uses the accepted shared interpreter,
+paged transactions, memory authority and sampler, with an explicit host-reference
+profile. Independent review and owner acceptance are pending; M1.4 remains active.
+M1.5 model integration and M4 device attention remain separate. See the
+[active handover](docs/handovers/2026-09-11-task0015-generation-service.md).
 
 ## Read before editing
 

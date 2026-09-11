@@ -1,5 +1,8 @@
 # Handover — task 0014 sampler history accepted
 
+Superseded for continuation by [task 0015's handover](2026-09-11-task0015-generation-service.md).
+The task 0014 acceptance and evidence below remain historical records.
+
 ## Workspace identity
 
 Writable root `/home/rodrigo/Developer/moxie`, branch `main`; task contract

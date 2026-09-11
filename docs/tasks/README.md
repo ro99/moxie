@@ -14,9 +14,14 @@ The owner accepted the bounded M1.4
 [task 0014](0014-m1-transactional-sampler-history.md) on 2026-09-11 after independent
 review of `23a7a40` / `1e6f253` (contract `4054dd7`): sampler history and deterministic greedy/temperature distribution,
 using task 0004's accepted transaction mechanism for
-history rollback. Generation service, diagnostic CLI and device attention remain later
-scope. Next, author the bounded shared generation-service/minimal diagnostic-CLI
-contract. Reopen accepted tasks only for a demonstrated defect in accepted scope.
+history rollback.
+
+The active assignment is [task 0015](0015-m1-generation-service-diagnostic-cli.md),
+shared generation service and minimal diagnostic CLI, implemented at `f7cff56`
+after contract `2fbacec` and awaiting independent review and owner acceptance.
+This is the remaining M1.4 deliverable; M1.5 model integration and M4 device
+attention are separate gates. Reopen accepted tasks only for a demonstrated defect
+in accepted scope.
 
 One file per bounded assignment, `NNNN-slug.md`. Use [TASK.md](../spec/templates/TASK.md).
 

@@ -2,11 +2,11 @@
 
 ## Active handover
 
-[Task 0014 sampler history](2026-09-11-task0014-sampler-history.md) is the current
-continuation. M1.3 is complete and task 0013 is accepted. Task 0014 implements the
-bounded M1.4 sampler/history slice and was accepted by the owner on 2026-09-11
-after independent review. Next is the bounded generation-service/diagnostic-CLI contract.
-Service/CLI and device attention remain later work.
+[Task 0015 generation service](2026-09-11-task0015-generation-service.md) is the
+current continuation. M1.3 is complete; tasks 0013 and 0014 are accepted. Task 0015
+implements the remaining M1.4 shared-service/diagnostic-CLI slice and awaits
+independent review and owner acceptance. M1.4 remains active. Model integration
+and device attention retain their M1.5/M4 gates.
 
 One file per bounded continuation, `YYYY-MM-DD-slug.md`. Use
 [HANDOVER.md](../spec/templates/HANDOVER.md).
