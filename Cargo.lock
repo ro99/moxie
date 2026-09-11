@@ -120,6 +120,7 @@ dependencies = [
 name = "moxie-state"
 version = "0.0.0"
 dependencies = [
+ "moxie-memory",
  "moxie-types",
 ]
 

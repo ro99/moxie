@@ -3,9 +3,10 @@
 //! Document 02: this crate owns "Paged sequence state, forks, transactions,
 //! rollback and prefix reuse".
 //!
-//! M0 scope: the *counters, identities and provenance rules* from document 04,
-//! expressed as types and tested. Paging, COW page tables and the buffers that
-//! hold real KV, recurrent and logit data land in M1/M2/M4. The rules are here
+//! The original M0 scope supplies the *counters, identities and provenance
+//! rules* from document 04. [`PagedSequence`] now binds those transactions to
+//! admitted, exclusively owned host KV pages (task 0013). COW, device attention,
+//! recurrent and logit buffers remain subsequent work. The rules were here
 //! first because document 06 warns that M9 "must not retrofit incompatible cache
 //! ownership", and because getting them wrong is the off-by-one that silently
 //! corrupts a cache.
@@ -38,6 +39,9 @@
 //! must name the prefix it actually completed; and publication is monotonic.
 
 #![forbid(unsafe_code)]
+
+pub mod paged;
+pub use paged::{KvGeometry, KvRow, PagedCloseRefused, PagedSequence, PagedUsage};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -485,7 +489,6 @@ pub struct SequenceState {
     /// Open transactions, by id. At most one per branch: two overlapping
     /// journals cannot both be the truth about what to restore.
     open: BTreeMap<StateTransactionId, Journal>,
-    next_transaction: u64,
 }
 
 /// The branch every sequence starts with.
@@ -518,7 +521,6 @@ impl SequenceState {
             next_branch: 1,
             next_result: 1,
             open: BTreeMap::new(),
-            next_transaction: 1,
         }
     }
 
@@ -562,17 +564,21 @@ impl SequenceState {
     }
 
     fn get(&self, branch: BranchId) -> Result<&Branch> {
-        self.branches.get(&branch).ok_or(Error::InvalidRequest {
-            field: "branch",
-            detail: format!("no such branch {branch}"),
-        })
+        self.branches
+            .get(&branch)
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "branch",
+                detail: format!("no such branch {branch}"),
+            })
     }
 
     fn get_mut(&mut self, branch: BranchId) -> Result<&mut Branch> {
-        self.branches.get_mut(&branch).ok_or(Error::InvalidRequest {
-            field: "branch",
-            detail: format!("no such branch {branch}"),
-        })
+        self.branches
+            .get_mut(&branch)
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "branch",
+                detail: format!("no such branch {branch}"),
+            })
     }
 
     /// Admit `n` prompt tokens into the accepted prefix.
@@ -856,8 +862,18 @@ impl SequenceState {
             logits: b.logits,
             results_from: self.next_result,
         };
-        let id = StateTransactionId(self.next_transaction);
-        self.next_transaction += 1;
+        // Transaction IDs name authorities, not branch-local ordinals. Two
+        // sequences can have an open transaction simultaneously, and a foreign
+        // ID must not resolve the other's journal (task 0013).
+        static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
+        let id = StateTransactionId(
+            NEXT_TRANSACTION
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .map_err(|_| Error::InvalidRequest {
+                    field: "transaction",
+                    detail: "transaction identity exhausted".into(),
+                })?,
+        );
         self.open.insert(id, journal);
         Ok(id)
     }
@@ -1263,7 +1279,7 @@ impl SequenceState {
 }
 
 fn add(base: u64, n: u64, field: &'static str) -> Result<u64> {
-    base.checked_add(n).ok_or(Error::InvalidRequest {
+    base.checked_add(n).ok_or_else(|| Error::InvalidRequest {
         field,
         detail: "token counter overflow".into(),
     })

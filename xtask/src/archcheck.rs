@@ -121,13 +121,15 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
         (
             "moxie-state",
             Allowed {
-                workspace: &["moxie-types"],
+                // Task 0013: physical paged state consumes admitted host storage.
+                workspace: &["moxie-types", "moxie-memory"],
                 third_party: NONE,
             },
         ),
         // The resource authority (task 0006). Pure accounting: it is given a
-        // measured capacity snapshot and a declared plan. It allocates nothing,
-        // so it needs neither storage nor CUDA today; document 02 allows
+        // measured capacity snapshot and a declared plan. Task 0013 adds
+        // admitted synchronous host backing; it needs neither storage nor
+        // CUDA today. Document 02 allows
         // `memory` to call CUDA allocation APIs later, and widening this row is
         // how that arrives, visibly.
         (

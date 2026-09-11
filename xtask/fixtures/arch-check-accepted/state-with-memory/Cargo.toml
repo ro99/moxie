@@ -1,0 +1,8 @@
+[package]
+name = "moxie-state"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-memory = { path = "../../../../crates/moxie-memory" }
