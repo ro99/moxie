@@ -1,5 +1,5 @@
 [package]
-name = "moxie-engine"
+name = "moxie-unregistered-owner"
 version = "0.0.0"
 edition = "2024"
 
@@ -7,6 +7,8 @@ edition = "2024"
 # 02's allowlist is the ownership graph; a crate absent from it has not been
 # placed in that graph, and admitting it by default is how a second execution
 # owner appears without anyone deciding to create one. Must be rejected.
+# Task 0015 registers the real moxie-engine, so this fixture uses a name that
+# remains undeclared. Its expected rule and dependency stay unchanged.
 [dependencies]
 moxie-types = { path = "../../../../crates/moxie-types" }
 
