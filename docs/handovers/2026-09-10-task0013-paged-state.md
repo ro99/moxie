@@ -3,8 +3,9 @@
 ## Workspace identity
 
 Writable root `/home/rodrigo/Developer/moxie`, branch `main`; clean base `b0f06fc`.
-Contract `a80ff2c` preceded implementation `c14e32a`. This record and the task
-result follow those local commits; no push was performed. Confirm current HEAD
+Contract `a80ff2c` preceded implementation `c14e32a`; first review correction
+`c9a4b33` fixes the sole reported issue. This record and the task result follow
+those local commits; no push was performed. Confirm current HEAD
 and dirty paths before continuing. All changes in this assignment belong to
 task 0013; no unrelated writable-tree changes were present.
 
@@ -27,15 +28,23 @@ cleanup pass. The allocation gate stored 32,768 actual rows using 662,725 B of
 admitted backing/control capacity, with zero allocations inside append and no
 retained growth after 10,000 abort/retry cycles. This is storage evidence only.
 
-Host workspace: 569 tests + 8 doctests passed. Architecture: 61 rejecting and
+Host workspace after correction: 570 tests + 8 doctests passed. Architecture: 61 rejecting and
 16 accepted fixtures, 12 rules. Host clippy/format/specification passed. A fresh
 build with CUDA tooling disabled links no libcuda. Deliberately broken identity
 and physical abort controls fail; restored focused tests pass. The device-feature
-workspace passes **585 tests + 11 doctests** and device clippy. Aggregate real GPU
+workspace passes **586 tests + 11 doctests** and device clippy. Aggregate real GPU
 qualification passes **39/39** on the two 3090 UUIDs and 5060 Ti UUID. There are no
 failed or ignored normal tests. The task result records UUIDs, exact commands,
 binary hashes and the raw-log manifest under `results/task0013/` (retain through
 review and M1 closure).
+
+Independent review found one P2 error-classification issue and otherwise found
+the bounded contract satisfied. Valid lineage allocation exhaustion was reported
+as `InvalidRequest`. Correction `c9a4b33` returns exact
+`CapacityExceeded(HostTier::Pageable)` and adds a one-shot 8,008-byte allocation
+failure regression. It proves the outstanding set and total/StateSpill/Pageable
+charges all return to zero. No architectural redesign or contract change was
+needed.
 
 ## Decisions
 

@@ -1,7 +1,8 @@
 # Task 0013 — M1.4 appendable paged state
 
 Status: **active, implementation and validation complete; owner review pending**.
-Contract committed at `a80ff2c` before implementation `c14e32a`.
+Contract committed at `a80ff2c` before implementation `c14e32a`; first review
+correction `c9a4b33`.
 
 ## Identity and authority
 
@@ -154,13 +155,13 @@ without claiming COW support. The earlier searched filename
 
 | Gate | Exact command / result |
 |---|---|
-| Host | `cargo test --workspace --locked --offline`: **569 unit/integration tests + 8 doctests passed**, no failures/ignored tests |
-| Focused storage/state | `cargo test -p moxie-state -p moxie-memory --locked --offline`: passed, including 11 new paging/identity tests and two new host-buffer tests |
+| Host | `cargo test --workspace --locked --offline`: **570 unit/integration tests + 8 doctests passed**, no failures/ignored tests after correction `c9a4b33` |
+| Focused storage/state | `cargo test -p moxie-state -p moxie-memory --locked --offline`: passed, including 12 paging/identity/allocation tests and two new host-buffer tests |
 | Actual stored rows / allocation | `cargo test -p moxie-state --test paged_allocation --locked --offline -- --nocapture`: passed with the figures above |
 | Architecture | `cargo xtask arch-check`: **61 rejecting + 16 accepted fixtures**, 12 rules; new state→memory accepted fixture and state→CUDA rejecting fixture |
 | Format / lint | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`; `git diff --check`: passed |
 | Isolated host build | Fresh `CARGO_TARGET_DIR=target/task0013-host-isolated`, `CUDA_HOME=/nonexistent NVCC=/nonexistent PATH=/home/rodrigo/.cargo/bin:/usr/bin:/bin cargo build -p xtask --locked --offline`: passed; `ldd` reports no libcuda. Full host tests were run in the normal host target, not repeated in this isolated target. |
-| Device-feature workspace | `cargo test --workspace --features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda --locked --offline`: **585 tests + 11 doctests passed**, zero failed/ignored. Device clippy with the same feature list and `--all-targets -- -D warnings` also passed. |
+| Device-feature workspace | `cargo test --workspace --features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda --locked --offline`: **586 tests + 11 doctests passed**, zero failed/ignored after correction `c9a4b33`. Device clippy with the same feature list and `--all-targets -- -D warnings` also passed. |
 | Real GPU regression | `cargo xtask-cuda test-gpu`: **39 passed, zero failed/skipped**, SM86 and SM120 qualified on the UUIDs below. PCI_BUS_ID ordering supplied by the Cargo configuration. |
 | Specification | `cargo xtask spec-check`: all 10 normative documents present and unchanged. |
 
@@ -173,6 +174,28 @@ without claiming COW support. The earlier searched filename
 These GPU runs are regression evidence for accepted device behavior; they do not
 turn the host paged store into device state. Separate per-SM/restricted-visibility
 qualification and Compute Sanitizer were not repeated for this host-only change.
+
+### First review correction, 2026-09-10
+
+Independent review found one P2 issue and no paging corruption, transaction
+isolation defect or competing resource owner. A valid 1,000-token geometry whose
+8,008-byte lineage allocation failed returned `InvalidRequest("lineage")`. The
+geometry was valid; the failed allocation was the admitted pageable control
+resource, so callers could not distinguish exhaustion from malformed input.
+
+Correction `c9a4b33` returns `CapacityExceeded` naming
+`HostTier::Pageable`, the exact requested lineage bytes and zero allocator
+availability, consistent with `HostBuffer`'s post-admission allocation failures.
+The constructor still drops the partial `SequenceState`, releases the backing
+through the admitting ledger, and only then returns the error.
+
+`paged_allocation_failure` is a separate executable with a one-shot global
+allocator fault aimed only at the 8,008-byte lineage request. It asserts the
+exact error variant and fields, that the intended allocation failed once, and
+that outstanding reservations, total host charge, `StateSpill` and `Pageable`
+charges are all zero. It passes normally; returning the old `InvalidRequest`
+would fail its exact error assertion. No contract, numerical threshold or
+accepted test was weakened.
 
 **Deliberately failing controls:** forcing both sequences' first transaction IDs
 to 1 makes `transaction_ids_cannot_resolve_another_sequences_journal` fail (exit
@@ -200,15 +223,17 @@ M1.3 remains complete.
 
 Logs are at `/home/rodrigo/Developer/moxie/results/task0013/`, outside git. Retain
 through task review and M1 closure, then retain the tracked conclusions/hashes.
-`SHA256SUMS` lists every log's digest; its own SHA-256 is
-`2fa9385904e4d922782ff54988ca237ae7b82e9e93839971d3f2260a1bb726f2`.
+`SHA256SUMS` lists every log's digest; after the first review correction its own
+SHA-256 is
+`c257a105312bc4b18309158444b570d964bc30731aa5e68542ebeb16fd45ae9b`.
 The manifest covers `host`, `focused`, `allocation`, `arch`, `clippy`, `spec`,
 `isolated-host`, `device`, `device-clippy`, `gpu`, `negative-identity` and
-`negative-abort` `.log` files.
+`negative-abort` `.log` files, plus correction host/device/clippy/architecture/
+specification/GPU logs and `correction-allocation-failure.log`.
 
-Build identities at implementation `c14e32a`: CUDA xtask
+Build identities after correction `c9a4b33`: CUDA xtask
 `target/debug/deps/xtask-f6925ac3b8aa5987`, SHA-256
-`c0a7912fa03f762f4e185941a1cd435352b564fd266fa490686dac294683150d`;
+`485f6af5132396e7fb63877e2c6836d6c975838a91dd2355acd9aa6425190096`;
 host xtask `target/debug/deps/xtask-1b2a551c0290ffef`, SHA-256
 `2a107fba9639d95dfcd368f94acaa4118e110d462ce4d31c637b181dc54cf74a`.
 Build outputs are regenerable and may expire on clean; the source, task contract,

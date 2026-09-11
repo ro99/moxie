@@ -8,7 +8,8 @@
 
 [Task 0013](0013-m1-appendable-paged-state.md) implements **M1.4 appendable host
 paged state bound to task 0004's accepted transactions**, with owner review pending.
-Contract `a80ff2c` preceded implementation `c14e32a`. After review/acceptance,
+Contract `a80ff2c` preceded implementation `c14e32a`; review correction `c9a4b33`
+fixes the sole reported error-classification issue. After review/acceptance,
 sampler history, generation service and diagnostic CLI remain within M1.4.
 Reopen M1.3 only for a demonstrated defect in its accepted scope.
 

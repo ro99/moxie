@@ -10,7 +10,8 @@ on 2026-09-10 after independent verification of implementation `6305f9d` and cor
 [Task 0013](docs/tasks/0013-m1-appendable-paged-state.md) implements M1.4 appendable
 host paged state bound to [task 0004's](docs/tasks/0004-m1-state-transactions.md)
 accepted transaction mechanism; owner review is pending. Its contract `a80ff2c`
-precedes implementation `c14e32a`. Review this bounded slice before the next M1.4
+precedes implementation `c14e32a`; review correction `c9a4b33` fixes the sole
+reported error-classification issue. Review this bounded slice before the next M1.4
 sampler-history assignment; do not add another preparatory M1.3 task.
 See the [active handover](docs/handovers/2026-09-10-task0013-paged-state.md).
 

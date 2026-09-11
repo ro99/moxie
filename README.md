@@ -134,7 +134,8 @@ model execution, actual-context support or performance claim.
 
 [Task 0013](docs/tasks/0013-m1-appendable-paged-state.md) implements appendable host
 paged state bound to task 0004's accepted transactions, with owner review pending.
-Its contract `a80ff2c` preceded implementation `c14e32a`. Tests cover physical byte
+Its contract `a80ff2c` preceded implementation `c14e32a`; correction `c9a4b33`
+classifies lineage allocation exhaustion as capacity failure. Tests cover physical byte
 preservation, admission, rollback, cancellation and 32,768 actual stored rows;
 this establishes no attention, model or long-context execution claim.
 Sampler history, deterministic greedy/temperature tests, generation service and
