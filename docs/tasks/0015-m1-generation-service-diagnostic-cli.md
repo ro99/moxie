@@ -1,7 +1,8 @@
 # Task 0015 — M1.4 shared generation service and diagnostic CLI
 
-Status: **implementation and validation complete; independent review and owner
-acceptance pending**, 2026-09-11. Contract `2fbacec` preceded implementation `f7cff56`.
+Status: **independent findings corrected; re-review and owner acceptance pending**,
+2026-09-11. Contract `2fbacec` preceded implementation `f7cff56`; correction
+`5990f2a` follows independent review.
 
 ## Identity and authority
 
@@ -129,10 +130,11 @@ check the bound at worst supported representative shapes and every release path.
 
 ## Result, filled after work
 
-Implementation `f7cff56`, with architecture-fixture correction `3c346e6`.
+Implementation `f7cff56`, with architecture-fixture correction `3c346e6` and
+independent-review correction `5990f2a`.
 [ADR 0011](../decisions/adr/0011-host-reference-generation-service.md) records the
 ownership and reference-profile decisions. No task requirement or numerical gate
-was relaxed. M1.4 remains active pending review and owner acceptance.
+was relaxed. M1.4 remains active pending re-review and owner acceptance.
 
 ### Shared owners and behavior
 
@@ -155,21 +157,21 @@ was relaxed. M1.4 remains active pending review and owner acceptance.
 
 ### Validation and resource evidence
 
-Runtime source `f7cff56`; `3c346e6` only renames the undeclared-owner fixture so
-its name remains outside the now-extended allowlist. Full runtime lanes therefore
-retain `f7cff56` identities; final architecture checks use `3c346e6`.
+Runtime source began at `f7cff56`; `3c346e6` only renames the undeclared-owner
+fixture so its name remains outside the now-extended allowlist. Correction
+`5990f2a` changes runtime behavior and is the identity for every correction gate.
 
 | Gate / exact command | Result |
 |---|---|
-| `cargo test --workspace --locked --offline` | 591 unit/integration tests + 9 doctests, zero failed/ignored |
-| Same command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | 607 tests + 12 doctests, zero failed/ignored |
+| `cargo test --workspace --locked --offline` | 593 unit/integration tests + 9 doctests, zero failed/ignored |
+| Same command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | 609 tests + 12 doctests, zero failed/ignored |
 | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | passed |
 | Same clippy command with the device feature list above | passed |
 | `cargo fmt --all -- --check`; `cargo xtask spec-check`; `git diff --check` | passed; all ten specification digests unchanged |
 | `cargo xtask-cuda test-gpu` | 39/39 real GPU cases passed; no skipped cases |
-| `cargo xtask arch-check` on a clean archive of `3c346e6` | 71 rejecting + 20 accepted fixtures, 12 rules |
-| `cargo test -p moxie-cli --locked --offline --test generation` | six tests; two shapes, exact dense/paged prefill and decode logits, whole/chunked/tail/page parity, seeded CLI/service agreement, provenance, busy/refusal, failure/disconnect and cancellation |
-| `cargo test -p moxie-cli --locked --offline --test allocation -- --nocapture` | one isolated counting/failing allocator test; peak bound, 1,000 cancellation/restart cycles without retained growth, complete admission/allocation failure cleanup |
+| `cargo xtask arch-check` on a clean archive of `5990f2a` | 71 rejecting + 20 accepted fixtures, 12 rules |
+| `cargo test -p moxie-cli --locked --offline --test generation` | eight tests; two shapes, exact dense/paged prefill and decode logits, whole/chunked/tail/page parity, seeded CLI/service agreement, provenance, immutable program ownership, all executed-row admission, busy/refusal, failure/disconnect and cancellation |
+| `cargo test -p moxie-cli --locked --offline --test allocation -- --nocapture` | one isolated counting/failing allocator test; peak bound, 1,000 cancellation/restart cycles without retained growth, complete admission/allocation failure cleanup including the post-admission 262,144-byte forward fault |
 
 The two primary shapes are heads/dimension/vocabulary/layers `(2,4,16,1)` and
 `(3,4,7,2)`. Prompt length 19 uses chunk sizes 1/3/7/8/19/32 and temperatures
@@ -204,6 +206,19 @@ with the additional live-result control reserve.
 
 ### Failures, corrections and retained evidence
 
+- Independent review reproduced a 262,144-byte infallible weight-payload clone,
+  admission of a fixed two-row program that later failed one-row decode, and
+  reuse of existing KV with changed weights through the public paged interpreter.
+  Correction `5990f2a` makes generation payload/oracle scratch allocation fallible,
+  validates all row counts a request executes, and replaces public unbound paged
+  execution with a sequence-issued immutable-program authority. The exact forward
+  fault now returns `CapacityExceeded(CpuWorkspace, 262144, 0)`, releases every
+  charge and reservation, and permits a successful retry.
+- One correction validation attempt mistakenly overlapped the device-feature
+  workspace with the aggregate GPU gate. The resource-plan test correctly failed
+  its exclusive device claim. That log is retained as
+  `correction-device-concurrent-gpu-failure.log`; the same device lane was rerun
+  after GPU release for the recorded passing result.
 - Deliberately omitting paged-forward abort makes the transaction/row restoration
   test fail. Deliberately bypassing output-identity validation makes the same-prefix
   replay test accept a stale result and fail. Both mutations were restored.
@@ -223,7 +238,7 @@ with the additional live-result control reserve.
   renames it `moxie-unregistered-owner`, preserving its dependency and expected rule.
 - Local architecture scans also find four pre-existing findings from the retained
   task 0014 independent probe crate under `results/`. That evidence is unchanged.
-  Final product architecture validation uses `git archive 3c346e6` and
+  Final product architecture validation uses `git archive 5990f2a` and
   `cargo run --manifest-path <archive>/xtask/Cargo.toml --locked --offline -- arch-check`.
   No architecture exemption or allowlist relaxation was made for ignored evidence.
 
@@ -233,6 +248,11 @@ and M1 closure. `host-final.log`, `device.log`, `gpu.log`, `clippy.log`,
 `generation-qualified.log` are the principal final evidence. Earlier logs retain
 negative controls, harness failures and pre-correction architecture results.
 The final manifest hash is recorded below after all evidence is sealed.
+
+Correction logs use the `correction-` prefix. They cover the exact independent
+allocation reproducer, focused regressions, both full workspace lanes, both clippy
+lanes, specification/format checks, a clean-archive architecture scan and all three
+real GPUs. The original evidence remains retained rather than overwritten.
 
 Final evidence SHA-256 values:
 
@@ -251,11 +271,27 @@ The logs are retained outside git under `results/task0015/`; these hashes identi
 the exact local review inputs without making transient build output part of the
 living record.
 
+Correction evidence SHA-256 values:
+
+```text
+correction-host.log                    f4829ca6d48340f93eab3f28014fde04adb8c87108f347c2b7b7bf0e6480914d
+correction-device.log                  5a15743f08e337fd2410fbfbd72bbf7389dc2b5b89fdddbe59ccf0ed67e03834
+correction-clippy.log                  33467752b5fdc3a496b3564cd399e49c5ca10e0d4cb781421fdd7c502bfe918e
+correction-device-clippy.log           996ab3f3a259d927b6d2c2bf2d4efc51d6eff7eceb4cfedc04293e5da158b30e
+correction-spec.log                    7ee9b3fc6c1a5e5a612b078e860e08a5d6cb468f3fb849798dbf3c6df79207e9
+correction-arch.log                    d23f2ff0700f2645fdb2d8a17317d9955ccbba41a2a800c71e6691c1624fe0a7
+correction-gpu.log                     debfa6b0a6bd2f53a86b1953c22122ff20c92509c7ee84977c8426c55bbea1ea
+correction-allocation-reproducer.log   dc93dbb2aa68ab55b767e8af0de7fa77b6879a67080c81cb0cb19044984fcfe0
+correction-device-concurrent-gpu-failure.log c3eb75cf0df355353221d3ace3dce5770f5a2d3ac0c3d48e90c582709452278c
+```
+
 ### Deletion, remaining scope and next task
 
-No legacy source, accepted oracle, sampler stage or public compatibility surface
-was removed. No duplicate generation/cache path was introduced. The old dense
-interpreter remains a reference consumer, sharing arithmetic with the new path.
+No legacy source, accepted oracle or sampler stage was removed. The unbound public
+`Interpreter::run_paged` entry point was replaced by `PagedExecution`, which binds
+one immutable configuration to a sequence before it has physical rows. No duplicate
+generation/cache path was introduced. The old dense interpreter remains a reference
+consumer, sharing arithmetic with the new path.
 
 This implements the remaining bounded M1.4 service/CLI deliverable. Independent
 review and owner acceptance precede recording milestone closure. M1.5 graph/model

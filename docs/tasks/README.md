@@ -18,7 +18,8 @@ history rollback.
 
 The active assignment is [task 0015](0015-m1-generation-service-diagnostic-cli.md),
 shared generation service and minimal diagnostic CLI, implemented at `f7cff56`
-after contract `2fbacec` and awaiting independent review and owner acceptance.
+after contract `2fbacec` and corrected at `5990f2a` after independent review;
+re-review and owner acceptance remain pending.
 This is the remaining M1.4 deliverable; M1.5 model integration and M4 device
 attention are separate gates. Reopen accepted tasks only for a demonstrated defect
 in accepted scope.

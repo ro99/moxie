@@ -1,10 +1,11 @@
-# Handover — task 0015 generation service ready for review
+# Handover — task 0015 corrections ready for re-review
 
 ## Workspace identity
 
 Writable `/home/rodrigo/Developer/moxie`, `main`, clean task base `c0f61a7`.
 Contract `2fbacec` precedes implementation `f7cff56`; final evidence is a separate
-documentation commit. No unrelated source changes were present or overwritten.
+documentation commit. Independent-review correction `5990f2a` makes generation
+execution fail closed. No unrelated source changes were present or overwritten.
 Read-only legacy `/home/rodrigo/Developer/strata` remains at
 `2dc566eb8e440fff4837ac75ca1dad1b20c2264e`, with `.pi/` and `tests/p2p/` untouched.
 
@@ -34,6 +35,14 @@ prefix. Allocation tests cover the diagnostic context limit, 1,000 cancellation/
 restart cycles, admission refusal and three targeted physical allocation failures.
 Full gate commands, counts, failure history and retained hashes are in the task.
 
+Independent review found three reproducible gaps. Correction `5990f2a` converts
+the 262,144-byte weight-payload clone and subsequent reference arithmetic scratch
+to fallible `CpuWorkspace` allocations; failure aborts, closes all reservations and
+allows a new request. Admission now validates each distinct first/tail/decode row
+count before charging. A `PagedExecution` holds immutable graph/weight borrows and
+the sequence-issued execution authority, so a second configuration cannot extend
+existing KV. Regressions cover all three behaviors.
+
 ## Decisions and limits
 
 The profile is explicitly `host-reference`: requested context <=256, graph values
@@ -56,8 +65,9 @@ was introduced for ignored evidence.
 
 ## Next task
 
-Independently review `f7cff56` against `2fbacec`, ADR 0011 and the task's retained
-gates. Corrections stay in task 0015. **M1.4 remains active until owner acceptance.**
+Independently re-review `5990f2a` against the three findings, `2fbacec`, ADR 0011
+and the task's retained gates. Corrections stay in task 0015. **M1.4 remains active
+until owner acceptance.**
 After acceptance, record M1.4 closure and define the bounded M1.5 model graph/
 integration assignment, inspecting exact local artifact revisions before any model
 claim and stopping at dependent owner gates. Device attention remains M4 scope;

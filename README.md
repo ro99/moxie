@@ -150,13 +150,16 @@ The task record qualifies the review's layout-chronology documentation finding.
 
 [Task 0015](docs/tasks/0015-m1-generation-service-diagnostic-cli.md) implements the
 remaining M1.4 service/diagnostic-CLI slice at `f7cff56`, after contract `2fbacec`.
+Correction `5990f2a` makes forward payload allocation failures typed and recoverable,
+validates every row count a request executes, and binds paged history to one immutable
+program configuration.
 The service executes synthetic graphs through the shared host interpreter, physical
 paged state and sampler; it commits token events and releases resources on finish,
 cancellation, failure or disconnect. Its explicit `host-reference` profile is
 limited to 256 requested context tokens, with bounded graph/scratch sizes.
 It has no tokenizer, text stop/EOS, HTTP or checkpoint support. Use `--help` for the
 diagnostic CLI and `--cancel-after N` for deterministic cancellation testing.
-Independent review and owner acceptance remain pending; **M1.4 stays active**.
+Independent re-review and owner acceptance remain pending; **M1.4 stays active**.
 M1.5 model integration and M4 device attention are separate work.
 The [active handover](docs/handovers/2026-09-11-task0015-generation-service.md)
 records the review scope and evidence.

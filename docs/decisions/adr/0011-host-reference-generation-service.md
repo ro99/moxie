@@ -1,6 +1,6 @@
 # ADR 0011 — Shared host-reference generation service
 
-Status: implemented for task 0015; independent review and owner acceptance pending.
+Status: independent-review corrections implemented; re-review and owner acceptance pending.
 
 ## Context and decision
 
@@ -38,6 +38,14 @@ CpuWorkspace without allocating an unused mirror. The prompt is admitted physica
 storage; paged state retains its own existing reservation. Partial admission
 failure releases earlier reservations. Borrowed graph/weight inputs are immutable
 composition-root fixtures; building those inputs precedes generation admission.
+
+Correction `5990f2a` makes that immutability an enforced paged-execution authority:
+one graph and borrowed weight set claims an empty sequence before physical execution,
+and only that authority can extend its KV history. Admission evaluates every distinct
+row count the request will actually execute, including a partial prefill tail and
+one-row decode. Reference payload and arithmetic scratch copies use fallible reserve
+and report `CpuWorkspace` capacity exhaustion, so a post-admission forward failure
+aborts the shared transaction and reaches the service's existing cleanup/restart path.
 
 Pull delivery provides bounded backpressure: no event queue and no work until
 the next pull. Only committed tokens are returned. Commit is the linearization
