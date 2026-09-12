@@ -484,10 +484,19 @@ and it belongs to the owner with O2, not to a default chosen here.
 
 ## Result, filled after work
 
-Status: **implemented and corrected through three rounds of independent review;
-awaiting re-review and owner acceptance.** Contract committed at `b63d931`
-before implementation `2608b5e`; corrections at `136341c` (round 1), `0ce89a0`
-(round 2) and the commit this record accompanies (round 3).
+Status: **accepted, 2026-09-12**, after three rounds of independent review, the
+third reporting "no remaining blocker in task 0019's bounded scope". The owner
+directed completion be recorded: *"mark as completed what is complete"*.
+
+Contract committed at `b63d931` before implementation `2608b5e`; corrections at
+`136341c` (round 1), `0ce89a0` (round 2) and `7309571` (round 3).
+
+**This acceptance closes task 0019 only.** It does not close M2, whose exit
+still requires a real out-of-device-memory working set executing without OOM or
+hidden allocations; that needs the residency authority (**task 0020**, item 2),
+CPU fallback and grouped GPU plans (item 3), and Laguna metadata (item 4).
+Nothing here executes a checkpoint, and a routed synthetic graph is not MoE
+model support.
 
 ### Independent review, and what it changed
 

@@ -4,10 +4,23 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 
 ## Active assignment
 
-**M1 complete (M1.5 closed 2026-09-12); M2 active.** See the
+**M1 complete (M1.5 closed 2026-09-12); M2 active, item 1 accepted.** See the
 [closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
 M1's exit evidence gate by gate and the batched O1/O5 question M2's sequencing
 waits on.
+
+**M2 item 1's routed-expert mathematics is accepted**
+([task 0019](docs/tasks/0019-m2-routed-expert-semantics.md), 2026-09-12, after
+three rounds of independent review): `Route`, `ExpertMlp` and `Combine` as
+shared operations with FP64 oracles, the pinned BF16 boundaries that decide
+which experts a row selects, and two consumers carrying opposite routing
+parameters. **It establishes no residency capability and executes no
+checkpoint.** **Task 0020 is next**: M2 item 2's residency authority — one
+production weight-residency owner connected to storage reads, host cache, upload
+readiness, leases, eviction and demand/prefetch classes. Its contract is
+specified in
+[the task 0019 handover](docs/handovers/2026-09-12-task0019-routed-expert-semantics.md)
+and has not been authored.
 
 M1's accepted work: shared semantic tensors/graph and the bounded host
 interpreter, sequence transactions, canonical manifest and bounded reads, the
@@ -49,11 +62,19 @@ one `experts.down_proj` holding all 128 — and **every layer carries a dense
 `mlp` beside the routed experts**, so routing semantics must model a shared
 expert explicitly. At 51.6 GB it fits aggregate VRAM but no single 24 GiB
 device, and M2 item 4's restricted budget makes it oversized by construction.
+Task 0019 composed its routed block over synthetic weights at reduced scale and
+recorded the artifact's inventory in
+[the bring-up record](docs/models/gemma4.md#the-26b-a4b-moe-variant); **nothing
+runs it**, which is what task 0020 exists to make possible.
 
-`hy3-w4a16-mtp` is in scope. A Laguna checkpoint is being downloaded to
-`/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4`; it was **incomplete** when this
-was written and must be verified complete before it is inspected, and its
-`configuration_laguna.py` is remote code that document 03 forbids executing.
+`hy3-w4a16-mtp` is in scope. The Laguna checkpoint at
+`/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4` **finished downloading and was
+verified complete on 2026-09-12** — all 15 shards, each satisfying
+`8 + header + payload_end == file size`, payload ends summing to the index's
+`total_size` of 76,813,095,232 B. That check is all that has been done to it:
+**no metadata has been interpreted and no tensor read**, and its
+`configuration_laguna.py` and `modeling_laguna.py` are remote code that document
+03 forbids executing. M2 item 4 is unblocked on availability, not on inspection.
 None of the three is approved for quality, conversion or requantization: O1's
 catalog and O5's storage questions stay open.
 

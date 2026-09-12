@@ -18,16 +18,20 @@ Gemma graph), [0017](0017-m4-per-layer-kv-geometry-and-window-eviction.md)
 [0018](0018-m3-compressed-tensors-int8-importer.md) (compressed-tensors
 importer, accepted 2026-09-12 within its import-only scope).
 
-[Task 0019](0019-m2-routed-expert-semantics.md) is **implemented and corrected
-after independent review; awaiting re-review**: M2 item 1's
+[Task 0019](0019-m2-routed-expert-semantics.md) is **accepted, 2026-09-12**,
+after three rounds of independent review: M2 item 1's
 routed-expert mathematics — router score transform with its tie rule,
 selection, renormalization and per-expert coefficient scale; grouped compute
 over a fused expert tensor; and an ordered combination — with FP64 oracles and
 two independent consumers. It deliberately excludes M2 item 2's residency
 authority, which is task 0020, because the authority admits against a demand set
 the routing equation defines. **Nothing executes a checkpoint**, and a routed
-synthetic graph is not MoE model support. Task 0020 is named in
-[its handover](../handovers/2026-09-12-task0019-routed-expert-semantics.md).
+synthetic graph is not MoE model support. The acceptance closes task 0019 only,
+not M2.
+
+**Task 0020 is next**: M2 item 2's residency authority, specified in
+[the task 0019 handover](../handovers/2026-09-12-task0019-routed-expert-semantics.md#next-task).
+Its contract has not been authored.
 
 Reopen accepted tasks only for a demonstrated defect in accepted scope.
 

@@ -1,4 +1,8 @@
-# Handover — task 0019 implemented; task 0020 is M2's residency authority
+# Handover — task 0019 accepted; task 0020 is M2's residency authority
+
+**Task 0019 was accepted on 2026-09-12**, after three rounds of independent
+review. The acceptance closes task 0019 only; M2 items 2–5 are outstanding and
+the next of them is specified under [Next task](#next-task).
 
 ## Workspace identity
 

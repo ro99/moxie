@@ -272,8 +272,8 @@ is actually brought up.
 ## The 26B-A4B MoE variant
 
 Status: **inventory 2026-09-12; routed graph composed by
-[task 0019](../tasks/0019-m2-routed-expert-semantics.md) over synthetic
-weights.** The checkpoint is **not imported and not executed.** This record
+[task 0019](../tasks/0019-m2-routed-expert-semantics.md) over synthetic weights,
+accepted 2026-09-12.** The checkpoint is **not imported and not executed.** This record
 exists because roadmap M2 needs a real BF16 MoE and document 09 §B requires the
 mathematical inventory before implementation. It resolves no owner gate and
 makes no support claim.
