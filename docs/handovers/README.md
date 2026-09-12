@@ -2,19 +2,15 @@
 
 ## Active handover
 
-[Task 0018, compressed-tensors pack-quantized import](2026-09-12-task0018-compressed-tensors-import.md)
-is the current continuation. **M1.4 complete; M1.5 active; M3 and M4 open.**
-The owner **accepted task 0018 on 2026-09-12** within its import-only scope.
-Task 0017, per-layer paged geometry and window reclamation, has had its review
-corrections completed and pushed; the owner directed the next task rather than
-stating a separate acceptance, so it is recorded as awaiting one.
+[M1 complete (M1.5 closed); M2 active](2026-09-12-m1-closure-to-m2.md) is the
+current continuation. The owner closed M1.5 on 2026-09-12 on the reduced Gemma
+graph plus the accepted importer, with the remaining blockers recorded: the
+Gemma 4 artifact is 32.7 GiB against a 24 GiB largest GPU, so executing it needs
+M3 plus M2 or M5.
 
-**Nothing executes a checkpoint**: the W8A16 path, the repacker and the manifest
-write are M3's, and vision is M11.
-
-This entry was stale until task 0017: it still named the M1.4 closure handover
-after [the M1.5 Gemma operation gap](2026-09-12-m1.5-gemma-operation-gap.md) had
-become the active one. Update it with the handover, not afterwards.
+**Nothing executes a checkpoint.** M2's sequencing waits on a batched O1/O5
+question about whether a BF16 MoE may be downloaded; no download may be made
+before it is answered.
 
 One file per bounded continuation, `YYYY-MM-DD-slug.md`. Use
 [HANDOVER.md](../spec/templates/HANDOVER.md).

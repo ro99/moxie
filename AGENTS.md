@@ -4,90 +4,43 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 
 ## Active assignment
 
-**M1.4 complete; M1.5 active.** The owner accepted [task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md)
-on 2026-09-10 after independent verification of implementation `6305f9d` and corrections
-`eaf8846` / `1138a2a` (reviewed record `ce7548d`). The owner accepted
-[task 0013](docs/tasks/0013-m1-appendable-paged-state.md) on 2026-09-10 after
-independent review through `0f39cf5`; its contract `a80ff2c` preceded implementation
-`c14e32a`, and correction `c9a4b33` fixed the sole reported issue.
+**M1 complete (M1.5 closed 2026-09-12); M2 active.** See the
+[closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
+M1's exit evidence gate by gate and the batched O1/O5 question M2's sequencing
+waits on.
 
-The owner accepted [task 0014](docs/tasks/0014-m1-transactional-sampler-history.md),
-M1.4 sampler history and deterministic greedy/temperature distribution, implemented
-after contract `4054dd7`, on 2026-09-11 following independent review of `23a7a40`
-and `1e6f253`. The review's layout-chronology documentation finding is qualified
-in the task record.
+M1's accepted work: shared semantic tensors/graph and the bounded host
+interpreter, sequence transactions, canonical manifest and bounded reads, the
+resource ledger and admission, event-backed leases, the device arena, the
+admitted graph resource plan, the selected BF16 device chain, appendable paged
+state, transactional sampler history, the generation service and diagnostic CLI
+(tasks 0003–0015), the reduced Gemma graph
+([0016](docs/tasks/0016-m1-gemma-reduced-graph.md)), per-layer paged geometry and
+window reclamation ([0017](docs/tasks/0017-m4-per-layer-kv-geometry-and-window-eviction.md),
+awaiting a separate acceptance statement), and the compressed-tensors importer
+([0018](docs/tasks/0018-m3-compressed-tensors-int8-importer.md), accepted
+2026-09-12 within its import-only scope).
 
-The owner accepted [task 0015](docs/tasks/0015-m1-generation-service-diagnostic-cli.md),
-the final M1.4 generation-service/minimal diagnostic-CLI integration, on 2026-09-11.
-Contract
-`2fbacec` precedes implementation `f7cff56`. It uses the accepted shared interpreter,
-paged transactions, memory authority and sampler, with an explicit host-reference
-profile. Correction `5990f2a` addresses the independent review's allocation-failure,
-executed-row-shape and immutable paged-program findings. Re-review found one
-remaining direct-API rollback gap; correction `7a08adf` moves all paged preparation
-under the transaction abort guard. Final independent review through `3f13784` found
-no remaining blocker. This acceptance closes M1.4 within its synthetic
-host-reference bounds.
+**M1.5 closed on the reduced graph, and the arithmetic is why.** Roadmap M1 item
+5 qualifies its second clause as "actual checkpoint execution, **when
+available/admitted**". The Gemma 4 artifact is **32.7 GiB** of tensor payload
+against a **24 GiB** largest single GPU, so it fits on no device here: executing
+it needs M3's W8A16 path *and* either M5's TP2 or M2's host-backed residency.
 
-The owner accepted [task 0016](docs/tasks/0016-m1-gemma-reduced-graph.md),
-which opens M1.5, on 2026-09-12 after independent re-review found no remaining
-blocking correctness or architecture issue in its declared synthetic scope.
-Contract `1199267` follows the artifact-inspection evidence `1e1867c` and
-precedes implementation `c7dd153`; corrections `4e7ad56` address the review's
-two P1 numerical boundary omissions — a dropped BF16 rounding in the scaled
-residual and in the logit softcap — plus an unchecked extent product and an
-incomplete acceptance claim. A following commit isolates the key/value overflow
-guard the re-review found untested.
+**Nothing executes a checkpoint.** The reduced graph is a synthetic contract
+fixture over invented weights and may not be described as model support; the
+importer produces canonical tensors that nothing runs, and its packed-word lane
+order is cited from the pinned reader rather than verified, so **no quality
+claim follows from a successful import** — that needs paired output against the
+released model, which is O2. M4 still owns device paged attention, COW forks and
+page streaming. M11 owns vision.
 
-**This acceptance does not close M1.5.** It covers the reduced synthetic graph
-only. It makes seven family-mathematics parameters explicit
-([ADR 0012](docs/decisions/adr/0012-explicit-family-operation-parameters.md)) and
-adds `moxie-models` with a `gemma4` module — one crate with a module per family,
-at the owner's direction during implementation
-([ADR 0013](docs/decisions/adr/0013-one-model-crate-with-family-modules.md)).
-
-The owner selected **M4's paged state schema** as
-[task 0017](docs/tasks/0017-m4-per-layer-kv-geometry-and-window-eviction.md) from
-that handover's three candidates. It is **implemented and awaiting owner
-review**: per-layer key/value geometry and per-layer retention, one ring per
-layer, reclamation by overwrite, and bounded tentative-undo headroom
-([ADR 0014](docs/decisions/adr/0014-bounded-tentative-undo-headroom.md)). Its
-numerical claim is exact: reclaiming outside a layer's window changes no output
-bit. **It closes neither M4 nor M1.5** — device paged attention, COW forks,
-host-backed page streaming and recurrent state are still M4's, and the artifact
-still cannot execute. It does clear two of the reduced graph's four reductions:
-sliding and global layers now compose at their own widths and sliding layers
-keep only what they can see. Contract `b748536` precedes implementation.
-
-**The owner accepted [task 0018](docs/tasks/0018-m3-compressed-tensors-int8-importer.md)
-on 2026-09-12, within its declared import-only scope**, after five rounds of
-independent review found no remaining blocking correctness or architecture
-issue. It adds a bounded safetensors reader and a compressed-tensors
-`pack-quantized` importer that turns the Gemma 4 artifact's real INT8 weights
-into the accepted canonical `AffineTensor`, verified on three of its modules
-read-only. `moxie-format` takes `serde_json` for the header parse
-([ADR 0015](docs/decisions/adr/0015-serde-json-for-safetensors-headers.md)).
-Contract `db9529e` precedes implementation `2cab2c0`; corrections `a71ad3e`,
-`0007563`, `ba102cb`, `beced4b` and `c7c6f5b` close the review's findings. Four
-of those five rounds were one defect in different clothes — a resource bound
-asserted rather than established — and the handover says so, because the next
-importer will face the same question.
-
-[Task 0017](docs/tasks/0017-m4-per-layer-kv-geometry-and-window-eviction.md),
-M4's per-layer key/value geometry and window reclamation, has had its review
-corrections completed and pushed. The owner directed the next task rather than
-stating a separate acceptance, so it is recorded as **awaiting one**.
-
-**It still executes no checkpoint, and an import is not support.** The
-acceptance states its own limits: **M3 and M1.5 remain open, no checkpoint
-executes, and source lane-order verification remains outstanding.** There is no
-W8A16 path, no repacker and no canonical manifest write; all three are M3's. The
-lane order inside a packed word is taken from the pinned reader and **cannot**
-be verified against this artifact, so no quality claim follows from a successful
-import — that needs paired output against the released model, which is O2. The
-reduced graph remains a synthetic contract fixture. M11 owns vision. See the
-[active handover](docs/handovers/2026-09-12-task0018-compressed-tensors-import.md),
-whose next bounded task is the shared W8A16 execution path.
+**M2 is entered but its sequencing is gated.** Routing, residency and a
+synthetic BF16 MoE consumer can begin; M2's exit needs a real oversized MoE, and
+every MoE on this machine is INT4 or MXFP4 while M2 asks for BF16 initially. A
+BF16 copy of any local MoE family is 541–652 GB of routed experts alone. That is
+an O1 and O5 question, batched to the owner in the closure handover, and no
+download may be made before it is answered.
 
 ## Read before editing
 

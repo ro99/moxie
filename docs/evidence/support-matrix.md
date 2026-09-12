@@ -132,10 +132,17 @@ resource and sanitizer evidence passing. The two further findings are corrected 
 Task 0012 closed M1.3. Tasks 0013 and 0014 add the accepted paged-state and
 transactional sampler slices; accepted task 0015 adds their shared service/CLI
 integration and closes M1.4. Task 0016 opens M1.5 with the reduced Gemma graph,
-and [task 0017](../tasks/0017-m4-per-layer-kv-geometry-and-window-eviction.md)
-gives the paged store per-layer key/value geometry and window reclamation —
-**M4 state-schema work taken early because it blocked M1.5's real Gemma graph.
-It closes neither M4 nor M1.5.** **M1.5 is active.**
+[task 0017](../tasks/0017-m4-per-layer-kv-geometry-and-window-eviction.md) gives
+the paged store per-layer key/value geometry and window reclamation, and
+accepted [task 0018](../tasks/0018-m3-compressed-tensors-int8-importer.md)
+imports the Gemma 4 artifact's real INT8 weights to canonical form.
+
+**The owner closed M1.5, and with it M1, on 2026-09-12; M2 is active.** The
+closure is on the reduced graph plus the importer, with the remaining blockers
+recorded: the artifact is 32.7 GiB against a 24 GiB largest single GPU, so
+executing it needs M3's W8A16 path *and* either M5's TP2 or M2's host-backed
+residency. See [the closure handover](../handovers/2026-09-12-m1-closure-to-m2.md).
+**Nothing in this matrix is a checkpoint execution or a quality claim.**
 
 ## Rows
 

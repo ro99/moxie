@@ -35,8 +35,24 @@ checkpoint on this machine: Gemma, Laguna, Inkling, GLM-5.2, DeepSeek. Present:
 Kimi K3, GLM-5.3-NVFP4, GLM-5.3-Flash-NVFP4. This blocks the *bring-up order*,
 not only the final catalog. See [checkpoint-inventory](../evidence/checkpoint-inventory.md).
 
+**M2 sequencing evidence (2026-09-12), asked with O5 below.** M2 item 1 says
+"Use BF16 initially to isolate residency correctness from quantization" and its
+exit needs a real out-of-device-memory MoE working set. **Every MoE on this
+machine is INT4 or MXFP4**, and no Laguna checkpoint exists at all:
+
+| Artifact | Experts / top-k | On disk | Precision | vs 63.9 GiB VRAM |
+|---|---|---:|---|---:|
+| `canada-quant/glm-5.3-w4a16-mtp` | 288 / 8 | 178 GB | W4A16 | 2.6x |
+| `Intel/GLM-5.3-Flash-W4A16-AutoRound` | 288 / 8 | 170 GB | W4A16 | 2.5x |
+| `canada-quant/hy3-w4a16-mtp` | 192 / 8 | 161 GB | W4A16 | 2.4x |
+| `cyankiwi/Inkling-Small-AWQ-INT4` | 256 / 6 | 152 GB | INT4 | 2.2x |
+| `/data/kimi-k3` | — | 1.5 TB | MXFP4 | 23x |
+
 Which exact checkpoint revisions are the initial release catalog, and in what order? Include
 image-capable and native speculative-head variants.
+
+**And, for M2 specifically: is a BF16 MoE in the catalog at all, or does M2's
+residency work proceed against the local integer artifacts once M3 lands?**
 
 **Blocks:** final catalog commitment, bulk conversion, and declaring all legacy behavior migrated.
 The provisional bring-up order in M1–M11 is for architectural stress coverage only, not an approved
@@ -106,10 +122,40 @@ The location question is answered for inspection: owner-directed downloads may b
 revisions are approved, conversion time, retention and whether a higher-precision original is
 available.
 
+**M2 sequencing question (2026-09-12).** M2's exit needs a real oversized MoE
+in BF16, and none is present. A BF16 copy of any local MoE family, computed from
+its own declared geometry, is **541–652 GB of routed experts alone**:
+
+| Family | Routed experts in BF16 | Local INT4 copy |
+|---|---:|---:|
+| GLM-5.3, 288 experts | 652 GB | 178 GB |
+| hy3, 192 experts | 580 GB | 161 GB |
+| Inkling-Small, 256 experts | 541 GB | 152 GB |
+
+Free space today: `/fast` **1,073 GB**, `/archive` **1,262 GB**, `/data` 286 GB,
+`/` 106 GB. One such download fits on `/fast` or `/archive` and would consume
+most of it.
+
+The four questions the agent needs answered, and will not decide:
+
+1. **May a BF16 MoE be downloaded for M2 at all?** If yes, which family and
+   revision — this is O1 as much as O5.
+2. If the answer is a **smaller** BF16 MoE instead, that is a legitimate option:
+   anything above roughly 64 GB is already out-of-device on this hardware, so a
+   90–120 GB BF16 MoE would satisfy M2's exit at a fifth of the storage.
+3. If the answer is **no download**, does M2's real-artifact exit wait for M3's
+   integer path, or is it met on a synthetic BF16 MoE with the real-artifact
+   half deferred and recorded as unmet?
+4. `hy3-w4a16-mtp` is present locally and appears in no tracked record. Is it in
+   scope, and what is it?
+
+**Nothing has been downloaded, copied or converted.** The agent stopped here.
+
 **Blocks:** writing large converted artifacts, unapproved additional downloads, and any bulk copy or
 requantization. A task must still name the exact artifact, source revision, expected size and
 retention policy before an agent mutates storage. The rewrite request is not blanket permission for
-terabytes of new data.
+terabytes of new data. **It also now blocks M2's sequencing**, per the four
+questions above.
 
 ## O6 — Performance limits and acceptable regression
 
