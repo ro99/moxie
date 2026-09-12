@@ -729,3 +729,107 @@ fn truncation_at_open_names_the_short_chunk() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Task 0018 corrections: the header is a budgeted, bounded resource of its own.
+///
+/// Independent review opened a shard with a sixteen-byte [`ByteBudget`] and
+/// observed a 65,575-byte header allocation, because the payload budget does
+/// not govern the header. It has its own budget now, checked -- along with the
+/// file length -- **before** anything is allocated.
+mod shard_header_budget {
+    use std::io::Write;
+
+    use moxie_storage::{ByteBudget, HeaderBudget, Shard};
+    use moxie_types::Error;
+
+    /// A shard whose header is deliberately large: many small tensors.
+    fn big_header_shard(dir: &std::path::Path, tensors: usize) -> std::path::PathBuf {
+        let mut json = String::from("{");
+        for i in 0..tensors {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(
+                "\"tensor_with_a_deliberately_long_name_{i:06}\":\
+                 {{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[{i},{}]}}",
+                i + 1
+            ));
+        }
+        json.push('}');
+        let path = dir.join("shard.safetensors");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(json.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(json.as_bytes()).unwrap();
+        f.write_all(&vec![0u8; tensors]).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_header_larger_than_its_budget_is_refused_before_it_is_allocated() {
+        let dir = tempdir("shard-header-budget");
+        let path = big_header_shard(&dir, 600);
+        let declared = {
+            let mut prefix = [0u8; 8];
+            use std::io::Read;
+            std::fs::File::open(&path)
+                .unwrap()
+                .read_exact(&mut prefix)
+                .unwrap();
+            u64::from_le_bytes(prefix) + 8
+        };
+        assert!(declared > 16, "the fixture must have a nontrivial header");
+
+        // The payload budget does not govern the header, and no longer pretends
+        // to: a tiny payload budget opens this file fine.
+        let tiny_payload = ByteBudget::new(16).unwrap();
+        assert!(Shard::open_with_budget(&path, tiny_payload).is_ok());
+
+        // The header budget does govern it, and refuses with the two numbers.
+        let small = HeaderBudget::new(declared - 1).unwrap();
+        assert!(matches!(
+            Shard::open_with_limits(&path, tiny_payload, small),
+            Err(Error::CapacityExceeded { requested_bytes, available_bytes, .. })
+                if requested_bytes == declared && available_bytes == declared - 1
+        ));
+        // Exactly enough is enough.
+        let exact = HeaderBudget::new(declared).unwrap();
+        assert!(Shard::open_with_limits(&path, tiny_payload, exact).is_ok());
+
+        // A budget above the absolute ceiling cannot be constructed at all.
+        assert!(HeaderBudget::new(0).is_none());
+        assert!(HeaderBudget::new(moxie_format::safetensors::MAX_HEADER_BYTES + 1).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A header longer than the file it claims to describe is refused before
+    /// the allocation, not after a short read.
+    #[test]
+    fn a_header_longer_than_its_file_is_refused_before_it_is_allocated() {
+        let dir = tempdir("shard-header-truncated");
+        let path = dir.join("short.safetensors");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Declares a 1 MiB header in a 16-byte file.
+        f.write_all(&(1u64 << 20).to_le_bytes()).unwrap();
+        f.write_all(&[0u8; 8]).unwrap();
+        drop(f);
+        let e = Shard::open(&path).unwrap_err();
+        assert!(
+            matches!(e, Error::InvalidArtifact { .. }),
+            "expected a typed artifact error, got {e}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn tempdir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "moxie-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+}

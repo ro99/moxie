@@ -259,6 +259,12 @@ impl Artifact {
 /// Opening reads the header and stats the file. **No payload byte is read**, so
 /// opening a 5 GB shard costs its header. Nothing is memory-mapped: a file that
 /// changed under a mapping would make a validated header a lie.
+///
+/// Two budgets, because there are two resources. [`HeaderBudget`] caps the
+/// header, which is read whole and retained; [`ByteBudget`] caps the reader's
+/// payload slicing, which is transient. Conflating them was a real defect: the
+/// first version honoured only the second and allocated whatever header the
+/// file declared.
 #[derive(Debug)]
 pub struct Shard {
     path: PathBuf,
@@ -266,14 +272,67 @@ pub struct Shard {
     header: SafeHeader,
     len: u64,
     budget: ByteBudget,
+    header_budget: HeaderBudget,
+}
+
+/// What a shard may spend on its header, separate from the payload budget.
+///
+/// [`ByteBudget`] caps the reader's *payload slicing* -- how much it holds while
+/// pumping a tensor into a caller's buffer -- and a header is a different
+/// resource: it is read whole, because it has to be parsed whole, and it is
+/// retained for the shard's life.
+///
+/// Independent review found the distinction unstated and the header simply
+/// unbudgeted: a shard opened with a sixteen-byte `ByteBudget` allocated
+/// 65,575 bytes for its header. Naming it separately is the fix -- a caller can
+/// now refuse a shard whose header it will not pay for, and the default is
+/// stated rather than implied by a constant buried in the parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderBudget {
+    bytes: u64,
+}
+
+impl HeaderBudget {
+    /// 8 MiB. The Gemma 4 shards' headers are a few hundred kilobytes, so this
+    /// is far above any inspected artifact and far below a denial of service.
+    /// It is also below `moxie_format::safetensors::MAX_HEADER_BYTES`, which
+    /// remains the absolute ceiling no budget may exceed.
+    pub const DEFAULT: Self = Self { bytes: 8 << 20 };
+
+    pub const fn new(bytes: u64) -> Option<Self> {
+        if bytes == 0 || bytes > moxie_format::safetensors::MAX_HEADER_BYTES {
+            return None;
+        }
+        Some(Self { bytes })
+    }
+
+    pub const fn bytes(self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Default for HeaderBudget {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 impl Shard {
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_budget(path, ByteBudget::DEFAULT)
+        Self::open_with_limits(path, ByteBudget::DEFAULT, HeaderBudget::DEFAULT)
     }
 
+    /// Open with an explicit payload-read budget and the default header budget.
     pub fn open_with_budget(path: &Path, budget: ByteBudget) -> Result<Self> {
+        Self::open_with_limits(path, budget, HeaderBudget::DEFAULT)
+    }
+
+    /// Open with both budgets stated.
+    pub fn open_with_limits(
+        path: &Path,
+        budget: ByteBudget,
+        header_budget: HeaderBudget,
+    ) -> Result<Self> {
         let file = File::open(path).map_err(|e| Error::InvalidArtifact {
             detail: format!("cannot open {}: {e}", path.display()),
         })?;
@@ -293,6 +352,24 @@ impl Shard {
                 detail: format!("cannot read the length prefix of {}: {e}", path.display()),
             })?;
         let prefix_len = SafeHeader::prefix_len(&prefix)?;
+        // Both bounds before the allocation, not after. A header longer than
+        // the file cannot be read at all, and one larger than the budget is a
+        // resource the caller declined to spend.
+        if prefix_len > len {
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "{} declares a {prefix_len}-byte header in a {len}-byte file",
+                    path.display()
+                ),
+            });
+        }
+        if prefix_len > header_budget.bytes() {
+            return Err(Error::CapacityExceeded {
+                tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::Pageable)),
+                requested_bytes: prefix_len,
+                available_bytes: header_budget.bytes(),
+            });
+        }
         let mut bytes = crate::try_vec::<u8>(usize::try_from(prefix_len).map_err(|_| {
             Error::InvalidArtifact {
                 detail: "header length does not fit this platform".into(),
@@ -311,7 +388,13 @@ impl Shard {
             header,
             len,
             budget,
+            header_budget,
         })
+    }
+
+    /// The header bytes this shard was admitted for.
+    pub fn header_budget(&self) -> HeaderBudget {
+        self.header_budget
     }
 
     pub fn header(&self) -> &SafeHeader {

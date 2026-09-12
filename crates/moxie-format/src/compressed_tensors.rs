@@ -86,12 +86,24 @@ impl PackQuantizedSpec {
 }
 
 /// The three tensors a `pack-quantized` weight is serialized as.
+///
+/// Each payload is accompanied by its **declared shape**, because byte counts
+/// alone do not establish the axes. Independent review imported a logical
+/// `[2, 64]` from a packed tensor declared `[16, 2]` instead of `[2, 16]` and a
+/// scale declared `[1, 4]` instead of `[2, 2]`: the byte counts matched, so
+/// nothing noticed that the axes were transposed and the weights were silently
+/// wrong. The shapes are checked in [`import`] against the logical shape, which
+/// `weight_shape` is the authority for.
 #[derive(Debug, Clone, Copy)]
 pub struct TensorTriple<'a> {
     /// `weight_packed`, Safetensors `I32`.
     pub packed: &'a [u8],
+    /// `weight_packed`'s declared shape, `[out_features, packed_columns]`.
+    pub packed_shape: &'a [u64],
     /// `weight_scale`, whose dtype is read from **its own header entry**.
     pub scale: &'a [u8],
+    /// `weight_scale`'s declared shape.
+    pub scale_shape: &'a [u64],
     pub scale_dtype: ScaleDtype,
     /// Logical `[out_features, in_features]`, from the `weight_shape` payload.
     pub logical: (usize, usize),
@@ -195,6 +207,17 @@ pub fn import(spec: &PackQuantizedSpec, triple: TensorTriple<'_>) -> Result<Affi
     }
     let per_word = spec.values_per_word();
     let packed_columns = in_features.div_ceil(per_word);
+    // The declared axes, before the byte counts. A transposed or otherwise
+    // incompatible shape can have exactly the right number of bytes.
+    let want_packed = [out_features as u64, packed_columns as u64];
+    if triple.packed_shape != want_packed {
+        return Err(invalid(format!(
+            "weight_packed is declared {:?}; {out_features}x{in_features} at {} bit(s) \
+             requires {want_packed:?}",
+            triple.packed_shape,
+            spec.width.bits()
+        )));
+    }
     let need_words = packed_columns
         .checked_mul(out_features)
         .ok_or_else(|| invalid("packed word count overflows usize"))?;
@@ -228,6 +251,19 @@ pub fn import(spec: &PackQuantizedSpec, triple: TensorTriple<'_>) -> Result<Affi
     desc.validate()?;
 
     let entries = desc.group_entries()?;
+    let groups_per_row = desc.groups_per_row()?;
+    // Per-channel sources serialize the scale as `[out, 1]`; some writers emit
+    // `[out]`. Both are accepted, and nothing else is: a scale whose rows do
+    // not match the output channels is a different tensor, not a reshape.
+    let scale_ok = triple.scale_shape == [out_features as u64, groups_per_row as u64]
+        || (groups_per_row == 1 && triple.scale_shape == [out_features as u64]);
+    if !scale_ok {
+        return Err(invalid(format!(
+            "weight_scale is declared {:?}; {out_features} output channel(s) with \
+             {groups_per_row} group(s) each requires [{out_features}, {groups_per_row}]",
+            triple.scale_shape
+        )));
+    }
     let need_scale = entries
         .checked_mul(triple.scale_dtype.bytes())
         .ok_or_else(|| invalid("scale byte count overflows usize"))?;
@@ -261,9 +297,10 @@ pub fn import(spec: &PackQuantizedSpec, triple: TensorTriple<'_>) -> Result<Affi
             let raw = (word >> (lane as u32 * bits)) & mask;
             codes.push(rebias_code(spec.width, raw)?);
         }
-        let row = crate::affine::pack_row(spec.width, &codes)?;
-        let stride = row.len();
-        out[o * stride..(o + 1) * stride].copy_from_slice(&row);
+        // Into the already reserved destination: no per-row allocation, so
+        // there is no infallible allocation anywhere on this path.
+        let stride = spec.width.row_stride(in_features);
+        crate::affine::pack_row_into(spec.width, &codes, &mut out[o * stride..(o + 1) * stride])?;
     }
 
     let scales = decode_scales(triple.scale, triple.scale_dtype, entries)?;
@@ -366,6 +403,19 @@ mod tests {
         out
     }
 
+    fn packed_shape(width: IntWidth, rows: usize, columns: usize) -> Vec<u64> {
+        let per_word = 32 / width.bits() as usize;
+        vec![rows as u64, columns.div_ceil(per_word) as u64]
+    }
+
+    fn scale_shape(granularity: Granularity, rows: usize, columns: usize) -> Vec<u64> {
+        let groups = match granularity {
+            Granularity::Channel => 1,
+            Granularity::Group { size } => columns.div_ceil(size as usize),
+        };
+        vec![rows as u64, groups as u64]
+    }
+
     fn bf16_scales(entries: usize) -> Vec<u8> {
         let mut out = Vec::new();
         for i in 0..entries {
@@ -376,72 +426,96 @@ mod tests {
         out
     }
 
-    /// Every INT8 code, in every lane of a word, against the oracle.
+    /// **Every INT8 code in every lane**, against the oracle.
+    ///
+    /// Independent review found the earlier version short of the claim it made:
+    /// three row shifts over four lanes reached 768 of the 1,024 code/lane
+    /// pairs, and the tracker counted codes alone, so the gap was invisible.
+    /// The row count is now the lane count, and the tracker is two-dimensional.
     #[test]
     fn all_256_int8_codes_round_trip_in_every_lane() {
-        let (rows, columns) = (3usize, 256usize);
         let spec = PackQuantizedSpec {
             width: IntWidth::Int8,
             granularity: Granularity::Group { size: 32 },
             symmetric: true,
         };
-        // Column k carries code k - 128, so all 256 appear, and each appears in
-        // lane k % 4 -- over 256 columns every code meets every lane across rows.
+        let per_word = spec.values_per_word();
+        // One row per lane offset: row `o` puts code `c` in lane
+        // `(c - o) mod per_word`, so the rows together cover every pair.
+        let (rows, columns) = (per_word, 256usize);
         let packed = pack(IntWidth::Int8, rows, columns, |o, k| {
             ((k + o) % 256) as i32 - 128
         });
         let scale = bf16_scales(rows * columns.div_ceil(32));
         let triple = TensorTriple {
             packed: &packed,
+            packed_shape: &packed_shape(IntWidth::Int8, rows, columns),
             scale: &scale,
+            scale_shape: &scale_shape(Granularity::Group { size: 32 }, rows, columns),
             scale_dtype: ScaleDtype::Bf16,
             logical: (rows, columns),
         };
         let tensor = import(&spec, triple).unwrap();
-        let mut seen = [false; 256];
+        let mut seen = vec![[false; 4]; 256];
         for o in 0..rows {
             let row = tensor.reconstruct_row(o).unwrap();
-            for k in 0..columns {
+            for (k, value) in row.iter().enumerate() {
                 assert_eq!(
-                    row[k].to_bits(),
+                    value.to_bits(),
                     oracle(&spec, triple, o, k).to_bits(),
                     "row {o} column {k}"
                 );
-                seen[(tensor.code(o, k).unwrap() + 128) as usize] = true;
+                seen[(tensor.code(o, k).unwrap() + 128) as usize][k % per_word] = true;
             }
         }
-        assert!(seen.iter().all(|s| *s), "every INT8 code must be exercised");
+        let covered: usize = seen.iter().flatten().filter(|s| **s).count();
+        assert_eq!(
+            covered,
+            256 * per_word,
+            "every one of the {} INT8 code/lane pairs must be exercised",
+            256 * per_word
+        );
     }
 
-    /// Every INT4 code, in every one of the eight lanes.
+    /// **Every INT4 code in every one of the eight lanes**, with the same
+    /// two-dimensional coverage assertion.
     #[test]
     fn all_16_int4_codes_round_trip_in_every_lane() {
-        let (rows, columns) = (5usize, 128usize);
         let spec = PackQuantizedSpec {
             width: IntWidth::Int4,
             granularity: Granularity::Group { size: 32 },
             symmetric: true,
         };
+        let per_word = spec.values_per_word();
+        let (rows, columns) = (per_word, 128usize);
         let packed = pack(IntWidth::Int4, rows, columns, |o, k| {
             ((k + o) % 16) as i32 - 8
         });
         let scale = bf16_scales(rows * columns.div_ceil(32));
         let triple = TensorTriple {
             packed: &packed,
+            packed_shape: &packed_shape(IntWidth::Int4, rows, columns),
             scale: &scale,
+            scale_shape: &scale_shape(Granularity::Group { size: 32 }, rows, columns),
             scale_dtype: ScaleDtype::Bf16,
             logical: (rows, columns),
         };
         let tensor = import(&spec, triple).unwrap();
-        let mut seen = [false; 16];
+        let mut seen = [[false; 8]; 16];
         for o in 0..rows {
             let row = tensor.reconstruct_row(o).unwrap();
-            for k in 0..columns {
-                assert_eq!(row[k].to_bits(), oracle(&spec, triple, o, k).to_bits());
-                seen[(tensor.code(o, k).unwrap() + 8) as usize] = true;
+            for (k, value) in row.iter().enumerate() {
+                assert_eq!(value.to_bits(), oracle(&spec, triple, o, k).to_bits());
+                seen[(tensor.code(o, k).unwrap() + 8) as usize][k % per_word] = true;
             }
         }
-        assert!(seen.iter().all(|s| *s));
+        let covered: usize = seen.iter().flatten().filter(|s| **s).count();
+        assert_eq!(
+            covered,
+            16 * per_word,
+            "every one of the {} INT4 code/lane pairs must be exercised",
+            16 * per_word
+        );
     }
 
     /// Group tails, per-channel granularity, and all three scale encodings.
@@ -488,7 +562,9 @@ mod tests {
                         };
                         let triple = TensorTriple {
                             packed: &packed,
+                            packed_shape: &packed_shape(width, rows, columns),
                             scale: &scale,
+                            scale_shape: &scale_shape(granularity, rows, columns),
                             scale_dtype: dtype,
                             logical: (rows, columns),
                         };
@@ -519,9 +595,13 @@ mod tests {
         };
         let packed = pack(IntWidth::Int8, 2, 64, |_, _| 1);
         let scale = bf16_scales(4);
+        let ps = packed_shape(IntWidth::Int8, 2, 64);
+        let ss = scale_shape(Granularity::Group { size: 32 }, 2, 64);
         let good = TensorTriple {
             packed: &packed,
+            packed_shape: &ps,
             scale: &scale,
+            scale_shape: &ss,
             scale_dtype: ScaleDtype::Bf16,
             logical: (2, 64),
         };
@@ -575,6 +655,80 @@ mod tests {
         }
     }
 
+    /// Byte counts do not establish axes. Every one of these has exactly the
+    /// right number of bytes and the wrong shape.
+    #[test]
+    fn declared_shapes_that_are_byte_compatible_but_axis_incompatible_are_refused() {
+        let spec = PackQuantizedSpec {
+            width: IntWidth::Int8,
+            granularity: Granularity::Group { size: 32 },
+            symmetric: true,
+        };
+        let (rows, columns) = (2usize, 64usize);
+        let packed = pack(IntWidth::Int8, rows, columns, |_, k| (k % 200) as i32 - 100);
+        let scale = bf16_scales(rows * columns / 32);
+        let ps = packed_shape(IntWidth::Int8, rows, columns); // [2, 16]
+        let ss = scale_shape(Granularity::Group { size: 32 }, rows, columns); // [2, 2]
+        let good = TensorTriple {
+            packed: &packed,
+            packed_shape: &ps,
+            scale: &scale,
+            scale_shape: &ss,
+            scale_dtype: ScaleDtype::Bf16,
+            logical: (rows, columns),
+        };
+        assert!(import(&spec, good).is_ok(), "the control must import");
+
+        // Transposed packed axes, same 128 bytes.
+        for bad in [&[16u64, 2][..], &[32, 1][..], &[2, 16, 1][..], &[32][..]] {
+            assert!(
+                import(
+                    &spec,
+                    TensorTriple {
+                        packed_shape: bad,
+                        ..good
+                    }
+                )
+                .is_err(),
+                "packed shape {bad:?} must be refused"
+            );
+        }
+        // Transposed or regrouped scale axes, same four values.
+        for bad in [&[1u64, 4][..], &[4, 1][..], &[2, 2, 1][..], &[2][..]] {
+            assert!(
+                import(
+                    &spec,
+                    TensorTriple {
+                        scale_shape: bad,
+                        ..good
+                    }
+                )
+                .is_err(),
+                "scale shape {bad:?} must be refused"
+            );
+        }
+        // Per-channel sources may serialize the scale as [out] or [out, 1].
+        let channel = PackQuantizedSpec {
+            granularity: Granularity::Channel,
+            ..spec.clone()
+        };
+        let one = bf16_scales(rows);
+        for shape in [&[2u64, 1][..], &[2][..]] {
+            assert!(
+                import(
+                    &channel,
+                    TensorTriple {
+                        scale: &one,
+                        scale_shape: shape,
+                        ..good
+                    }
+                )
+                .is_ok(),
+                "per-channel scale shape {shape:?} must be accepted"
+            );
+        }
+    }
+
     #[test]
     fn weight_shape_is_two_positive_little_endian_i64_values() {
         let mut ok = 8192i64.to_le_bytes().to_vec();
@@ -624,7 +778,9 @@ mod tests {
                 &spec,
                 TensorTriple {
                     packed: &packed,
+                    packed_shape: &[1, 1],
                     scale: &scale,
+                    scale_shape: &[1, 1],
                     scale_dtype: ScaleDtype::Bf16,
                     logical,
                 },

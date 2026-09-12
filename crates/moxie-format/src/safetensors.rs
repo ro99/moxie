@@ -163,11 +163,61 @@ pub struct Header {
     pub payload_len: u64,
 }
 
+/// The three fields a tensor entry must carry.
+///
+/// Deserialized **directly** from the header's map, never through an
+/// intermediate `serde_json::Value`. That is load-bearing: building a `Value`
+/// first collapses a duplicated `"dtype"` into whichever copy came last, so a
+/// header declaring an unsupported dtype and then overwriting it with a
+/// supported one would be accepted. Deserializing straight into this struct
+/// makes serde's own duplicate-field rejection apply.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawEntry {
     dtype: String,
     shape: Vec<u64>,
     data_offsets: [u64; 2],
+}
+
+/// What one key in the header's top-level map turned out to be.
+enum RawItem {
+    Tensor(RawEntry),
+    Metadata(BTreeMap<String, String>),
+}
+
+/// The header's entries **in declaration order, duplicates preserved**.
+///
+/// A `BTreeMap` would silently keep one of two tensors sharing a name, and the
+/// discarded one's bytes would vanish from every later check. Collecting into a
+/// sequence first is what lets [`Header::parse`] refuse the duplicate instead.
+struct RawHeader(Vec<(String, RawItem)>);
+
+impl<'de> serde::Deserialize<'de> for RawHeader {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = RawHeader;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a safetensors header object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<RawHeader, A::Error> {
+                let mut out = Vec::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let item = if key == "__metadata__" {
+                        RawItem::Metadata(map.next_value()?)
+                    } else {
+                        RawItem::Tensor(map.next_value()?)
+                    };
+                    out.push((key, item));
+                }
+                Ok(RawHeader(out))
+            }
+        }
+        d.deserialize_map(V)
+    }
 }
 
 impl Header {
@@ -211,25 +261,37 @@ impl Header {
         }
         let payload_len = file_len - payload_start;
 
-        let raw: BTreeMap<String, serde_json::Value> = serde_json::from_slice(&prefix[8..])
-            .map_err(|e| invalid(format!("safetensors header is not a JSON object: {e}")))?;
+        let RawHeader(raw) = serde_json::from_slice(&prefix[8..]).map_err(|e| {
+            invalid(format!(
+                "safetensors header is not a valid tensor object: {e}"
+            ))
+        })?;
 
-        let mut tensors = BTreeMap::new();
+        let mut tensors: BTreeMap<String, TensorEntry> = BTreeMap::new();
         let mut metadata = BTreeMap::new();
+        let mut seen_metadata = false;
         // Sorted by start, to check overlap in one pass rather than pairwise.
         let mut spans: Vec<(u64, u64, String)> = Vec::new();
-        for (name, value) in raw {
-            if name == "__metadata__" {
-                let map: BTreeMap<String, String> = serde_json::from_value(value)
-                    .map_err(|e| invalid(format!("__metadata__ is not a string map: {e}")))?;
-                metadata = map;
-                continue;
+        for (name, item) in raw {
+            let entry = match item {
+                RawItem::Metadata(map) => {
+                    if seen_metadata {
+                        return Err(invalid("the header declares __metadata__ twice"));
+                    }
+                    seen_metadata = true;
+                    metadata = map;
+                    continue;
+                }
+                RawItem::Tensor(entry) => entry,
+            };
+            // A duplicate name is ambiguous, not a last-one-wins choice: the
+            // discarded entry's bytes would disappear from the overlap and
+            // coverage checks below while the file still contains them.
+            if tensors.contains_key(&name) {
+                return Err(invalid(format!(
+                    "the header declares tensor {name:?} twice"
+                )));
             }
-            let entry: RawEntry = serde_json::from_value(value).map_err(|e| {
-                invalid(format!(
-                    "tensor {name:?} is missing a required header field: {e}"
-                ))
-            })?;
             let dtype = Dtype::parse(&entry.dtype)?;
             let [begin, end] = entry.data_offsets;
             if begin > end {
@@ -439,6 +501,58 @@ mod tests {
         let mut ok = MAX_HEADER_BYTES.to_le_bytes().to_vec();
         ok.resize(16, 0);
         assert!(Header::parse(&ok, 16).is_err());
+    }
+
+    /// Duplicates are ambiguous and are refused, not resolved last-one-wins.
+    ///
+    /// Independent review found both cases accepted: two tensors sharing a
+    /// name collapsed into one, and a `"dtype":"FP8"` overwritten by
+    /// `"dtype":"U8"` was parsed as `U8` -- so an unsupported dtype could be
+    /// smuggled past the check that exists to refuse it.
+    #[test]
+    fn duplicate_names_and_duplicate_fields_are_both_refused() {
+        let raw = |json: &str, payload: usize| {
+            let mut b = (json.len() as u64).to_le_bytes().to_vec();
+            b.extend_from_slice(json.as_bytes());
+            b.resize(b.len() + payload, 0);
+            b
+        };
+        let parse = |b: &[u8]| {
+            let p = Header::prefix_len(b).unwrap() as usize;
+            Header::parse(&b[..p], b.len() as u64)
+        };
+        // Two tensors with one name. The second would have hidden the first.
+        let b = raw(
+            r#"{"a":{"dtype":"U8","shape":[4],"data_offsets":[0,4]},"a":{"dtype":"U8","shape":[8],"data_offsets":[0,8]}}"#,
+            8,
+        );
+        assert!(parse(&b).is_err());
+        // An unsupported dtype overwritten by a supported one.
+        let b = raw(
+            r#"{"a":{"dtype":"FP8","dtype":"U8","shape":[4],"data_offsets":[0,4]}}"#,
+            4,
+        );
+        assert!(parse(&b).is_err());
+        // The same for the other two structural fields, and for __metadata__.
+        for json in [
+            r#"{"a":{"dtype":"U8","shape":[4],"shape":[8],"data_offsets":[0,4]}}"#,
+            r#"{"a":{"dtype":"U8","shape":[4],"data_offsets":[0,8],"data_offsets":[0,4]}}"#,
+            r#"{"__metadata__":{"f":"a"},"__metadata__":{"f":"b"},"a":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}"#,
+        ] {
+            assert!(parse(&raw(json, 8)).is_err(), "{json}");
+        }
+        // A field the schema does not define is refused rather than ignored.
+        let b = raw(
+            r#"{"a":{"dtype":"U8","shape":[4],"data_offsets":[0,4],"extra":1}}"#,
+            4,
+        );
+        assert!(parse(&b).is_err());
+        // The negative control: the same header without a duplicate parses.
+        let b = raw(
+            r#"{"a":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}"#,
+            4,
+        );
+        assert!(parse(&b).is_ok());
     }
 
     #[test]

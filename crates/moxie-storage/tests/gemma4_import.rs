@@ -153,7 +153,11 @@ fn real_pack_quantized_tensors_import_to_canonical_affine_form() {
                 &spec(),
                 TensorTriple {
                     packed: &packed,
+                    // The shapes the header declared, so the importer checks
+                    // the axes rather than trusting the byte counts.
+                    packed_shape: &packed_shape,
                     scale: &scale,
+                    scale_shape: &scale_shape,
                     scale_dtype,
                     logical,
                 },

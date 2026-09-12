@@ -10,12 +10,22 @@ context, good prefill and decode, and models larger than VRAM are simultaneous r
 
 This repository contains shared Rust/CUDA execution components and a bounded
 host-reference generation service; **it does not yet execute a checkpoint-backed
-model.** The diagnostic CLI emits synthetic token IDs. Nothing here loads,
-imports or executes a released model. The
+model.** The diagnostic CLI emits synthetic token IDs. **Nothing here executes a
+released model**, and no model-throughput or model-quality claim has been
+established.
+
+[Task 0018](docs/tasks/0018-m3-compressed-tensors-int8-importer.md) imports
+compressed-tensors `pack-quantized` INT8 weights -- including real tensors from a
+local Gemma 4 artifact -- into canonical affine form. **An import is not
+support**: nothing runs those weights, because the W8A16 execution path, the
+repacker and the canonical manifest write are all still M3's, and the reduced
+Gemma graph remains a synthetic fixture over invented weights.
+
+The
 [M0 review and correction task](docs/tasks/0002-m0-review-and-integer-transition.md) records what
 passes, with the exact commands, and what remains missing; the
 [support matrix](docs/evidence/support-matrix.md) is the list of claims and the gate IDs behind
-them. No model-throughput claim has been established, and no checkpoint has been imported.
+them.
 Downloaded checkpoints for later, explicitly scoped tasks are found under the owner-designated
 local roots [`/models` and `/fast/models`](docs/evidence/artifact-roots.md); their presence does not
 mean that Moxie has imported or supports them.

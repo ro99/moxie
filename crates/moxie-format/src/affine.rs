@@ -560,10 +560,20 @@ pub fn pack_row(width: IntWidth, codes: &[i32]) -> Result<Vec<u8>> {
             });
         }
     }
-    Ok(match width {
-        IntWidth::Int8 => codes.iter().map(|c| *c as i8 as u8).collect(),
+    // Fallible, because an importer sizes this from an artifact's own header:
+    // this is one of the allocations a corrupt or hostile file reaches, and it
+    // must report `CapacityExceeded` rather than take the infallible
+    // allocator's abort. Independent review reproduced a `SIGABRT` here on a
+    // seventeen-byte row.
+    let mut out = crate::try_vec::<u8>(width.row_stride(codes.len()))?;
+    out.resize(width.row_stride(codes.len()), 0);
+    match width {
+        IntWidth::Int8 => {
+            for (k, c) in codes.iter().enumerate() {
+                out[k] = *c as i8 as u8;
+            }
+        }
         IntWidth::Int4 => {
-            let mut out = vec![0u8; codes.len().div_ceil(2)];
             for (k, c) in codes.iter().enumerate() {
                 let nib = (*c as i8 as u8) & 0x0F;
                 if k.is_multiple_of(2) {
@@ -572,9 +582,55 @@ pub fn pack_row(width: IntWidth, codes: &[i32]) -> Result<Vec<u8>> {
                     out[k / 2] |= nib << 4;
                 }
             }
-            out
         }
-    })
+    }
+    Ok(out)
+}
+
+/// Pack a row into an already reserved destination.
+///
+/// The importer's hot path: one destination is reserved for the whole tensor
+/// and each row is written into its slice, so a per-row allocation never
+/// happens at all.
+pub fn pack_row_into(width: IntWidth, codes: &[i32], out: &mut [u8]) -> Result<()> {
+    let need = width.row_stride(codes.len());
+    if out.len() != need {
+        return Err(Error::InvalidArtifact {
+            detail: format!(
+                "a {} row of {} code(s) needs {need} byte(s), got {}",
+                width.profile(),
+                codes.len(),
+                out.len()
+            ),
+        });
+    }
+    let (lo, hi) = width.code_range();
+    for (k, c) in codes.iter().enumerate() {
+        if *c < lo || *c > hi {
+            return Err(Error::InvalidArtifact {
+                detail: format!("code {c} at column {k} is outside [{lo}, {hi}]"),
+            });
+        }
+    }
+    out.fill(0);
+    match width {
+        IntWidth::Int8 => {
+            for (k, c) in codes.iter().enumerate() {
+                out[k] = *c as i8 as u8;
+            }
+        }
+        IntWidth::Int4 => {
+            for (k, c) in codes.iter().enumerate() {
+                let nib = (*c as i8 as u8) & 0x0F;
+                if k.is_multiple_of(2) {
+                    out[k / 2] |= nib;
+                } else {
+                    out[k / 2] |= nib << 4;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Rebias an unsigned source code to the canonical signed one: `q = u - bias`.

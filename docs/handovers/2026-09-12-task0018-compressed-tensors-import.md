@@ -24,6 +24,15 @@ packing was verified against the artifact before the contract was authored —
 document 03 requires inspecting "pinned config, tensor index and bounded tensor
 headers before an importer claim".
 
+**Independent review requested changes and found five defects plus a
+documentation contradiction. All were reproduced before any change and all are
+fixed**; the task record carries each one. The two P1s are worth carrying
+forward: `import` took byte slices, so a transposed packed shape with the right
+byte count imported silently wrong weights; and the importer's own reservations
+were fallible while the `pack_row` it called was not, so a row-sized allocation
+failure aborted the process. **Fallible allocation is a property of a whole
+path, not of the function you happened to write.**
+
 Three new owners: `moxie-format::safetensors` for the container,
 `moxie-format::compressed_tensors` for the `pack-quantized` decode, and
 `moxie-storage::Shard` for bounded positioned reads. The decode produces the
@@ -33,14 +42,15 @@ decoder and no runtime decode path.
 
 | Lane | Command | Result |
 |---|---|---|
-| Host workspace | `cargo test --workspace --locked --offline` | **681 + 9 doctests passed**, 0 failed, 0 ignored |
-| Importer | `cargo test -p moxie-format --locked --offline` | **100 passed** |
+| Host workspace | `cargo test --workspace --locked --offline` | **686 + 9 doctests passed**, 0 failed, 0 ignored |
+| Importer | `cargo test -p moxie-format --locked --offline` | **102 passed** |
+| Import allocation | `cargo test -p moxie-format --test import_allocation --locked --offline -- --nocapture` | **1 passed**; 3 allocations at 4, 64 and 512 rows, against 7/67/515 for its control |
 | Real artifact | `cargo test -p moxie-storage --test gemma4_import --locked --offline -- --nocapture` | **3 passed** |
 | Host clippy | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | passed |
 | Format / diff | `cargo fmt --all -- --check`; `git diff --check` | passed |
 | Specification | `cargo xtask spec-check` | passed, 10 digests unchanged |
 | Architecture | `cargo xtask arch-check` | **74 rejecting + 21 accepted**, 12 rules |
-| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **697 + 12 doctests passed**, 0 failed |
+| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **702 + 12 doctests passed**, 0 failed |
 | Device clippy | the clippy command with the same features | passed |
 | Real GPU | `cargo xtask-cuda test-gpu` | **39/39**, 0 failed, 0 skipped; sm_86 and sm_120 qualified |
 
@@ -108,7 +118,18 @@ biased-unsigned and `raw - 128` is right; two's-complement bytes would have been
 edge-heavy. The full `[-128, 127]` range appears in real data, including `-128`,
 which document 03 forbids a decoder from rejecting.
 
-Worth knowing: `arch-check` **rejected** the `serde_json` edge before it was
+Worth knowing, from the review corrections: `ByteBudget` caps the reader's
+*payload slicing*, and a header is a different resource -- read whole because it
+must be parsed whole, and retained for the shard's life. It has its own
+`HeaderBudget` now. A budget that covers one resource is not a budget for
+another that happens to live in the same reader.
+
+And: deserializing untrusted JSON into a map collapses duplicate keys before any
+validation runs, so a header could declare an unsupported dtype and overwrite it
+with a supported one. Parse straight into the target struct and keep the
+top-level entries in declaration order.
+
+Also: `arch-check` **rejected** the `serde_json` edge before it was
 declared, which is the allowlist working rather than an obstacle. A new
 `shared-takes-serde-json` fixture keeps a second crate from taking it, so the
 header contract keeps one owner.

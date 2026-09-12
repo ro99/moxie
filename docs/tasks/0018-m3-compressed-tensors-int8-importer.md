@@ -1,6 +1,7 @@
 # Task 0018 — M3 compressed-tensors pack-quantized importer
 
-Status: **implemented, awaiting owner review**. Contract and
+Status: **implemented and corrected after independent review, awaiting owner
+re-review**. Contract and
 [ADR 0015](../decisions/adr/0015-serde-json-for-safetensors-headers.md)
 committed at `db9529e`, before implementation.
 
@@ -307,14 +308,15 @@ artifact is absent, so a fresh clone stays green.
 
 | Gate | Exact command / result |
 |---|---|
-| Host workspace | `cargo test --workspace --locked --offline`: **681 unit/integration + 9 doctests passed**, 0 failed, 0 ignored |
-| Importer | `cargo test -p moxie-format --locked --offline`: **100 passed** (69 unit + 31 integration), including the exhaustive code, tail, granularity, scale-dtype and rejection cases |
+| Host workspace | `cargo test --workspace --locked --offline`: **686 unit/integration + 9 doctests passed**, 0 failed, 0 ignored (681 + 9 before the review corrections) |
+| Importer | `cargo test -p moxie-format --locked --offline`: **102 passed**, including the exhaustive code/lane pairs, tails, granularities, scale dtypes, axis mismatches and header rejections |
+| Import allocation | `cargo test -p moxie-format --test import_allocation --locked --offline -- --nocapture`: **1 passed**; 3 allocations at 4, 64 and 512 rows |
 | Real artifact | `cargo test -p moxie-storage --test gemma4_import --locked --offline -- --nocapture`: **3 passed**, figures above |
 | Host clippy | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`: passed |
 | Format / diff | `cargo fmt --all -- --check`; `git diff --check`: passed |
 | Specification | `cargo xtask spec-check`: passed, 10 documents unchanged |
 | Architecture | `cargo xtask arch-check`: **74 rejecting + 21 accepted fixtures**, 12 rules. The undeclared `serde_json` edge was **rejected before it was declared**, which is the allowlist working; the new `shared-takes-serde-json` fixture keeps a second crate from taking it |
-| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`: **697 + 12 doctests passed**, 0 failed |
+| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`: **702 + 12 doctests passed**, 0 failed |
 | Device clippy | the clippy command with the same features: passed |
 | Real GPU | `cargo xtask-cuda test-gpu`: **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 
@@ -347,6 +349,67 @@ forbids guessing a zero offset "from a suffix". The canonical descriptor already
 carries `ZeroPoints::PerGroup`, so what is missing is a **verified source
 contract**, not a canonical capability. A test asserts the refusal is
 `Unsupported` and not `InvalidArtifact` — the source is fine; we cannot read it.
+
+### Independent review corrections
+
+The review requested changes and found five defects plus a documentation
+contradiction. **All were reproduced before any change and all are fixed.** The
+review confirmed the ownership split, the deferral of execution and quality, and
+the lane-order disclosure.
+
+**P1 — the importer accepted incompatible axes.** `import` took byte slices, so
+declared shapes were invisible to it, and `triple_entries` never cross-checked
+them against the logical shape. Reproduced: a logical `[2, 64]` imported
+successfully from a packed tensor declared `[16, 2]` instead of `[2, 16]` and a
+scale declared `[1, 4]` instead of `[2, 2]` — equal byte counts concealed
+transposed axes and the weights were silently wrong. `TensorTriple` now carries
+`packed_shape` and `scale_shape`, and `import` checks both against the logical
+shape before decoding.
+`declared_shapes_that_are_byte_compatible_but_axis_incompatible_are_refused`
+covers four wrong packed shapes and four wrong scale shapes, each with exactly
+the right byte count, plus a control that imports and the two scale shapes a
+per-channel source may legitimately use (`[out]` and `[out, 1]`).
+
+**P1 — a payload-sized allocation still aborted the process.** The importer's
+own reservations were fallible, but it then called `affine::pack_row`, which
+allocated a row through the infallible allocator. The review injected failure
+into a seventeen-byte row allocation and got `SIGABRT`. `pack_row` is now
+fallible, and the importer does not call it: `pack_row_into` writes into the
+destination reserved once for the whole tensor, so the allocation that aborted
+no longer exists. `import_allocation` — its own executable, because the counter
+is a global allocator — measures **3 allocations at 4, 64 and 512 rows**. Its
+control, restoring the per-row call, measures **7, 67 and 515**.
+
+**P2 — the header allocation bypassed the reader budget.** `open_with_budget`
+allocated and read the whole header without consulting `ByteBudget`; the review
+opened a shard with a sixteen-byte budget while observing a 65,575-byte
+allocation. `ByteBudget` caps *payload slicing* and a header is a different
+resource — read whole because it must be parsed whole, and retained for the
+shard's life — so it has its own `HeaderBudget`, checked along with the file
+length **before** anything is allocated. `Shard::open_with_limits` states both.
+Two regressions cover the refusal with its exact numbers and a header longer
+than its own file.
+
+**P2 — duplicate JSON keys bypassed validation.** Deserializing into
+`BTreeMap<String, Value>` collapsed duplicates before any check ran: two tensors
+sharing a name became one, and `"dtype":"FP8","dtype":"U8"` parsed as `U8`, so
+an unsupported dtype could be smuggled past the check that exists to refuse it.
+Both reproduced. The header now deserializes through a visitor that preserves
+declaration order, refuses a repeated tensor name and a repeated `__metadata__`,
+and builds each entry **directly** into its struct so serde's own duplicate-field
+rejection applies. `deny_unknown_fields` refuses a field the schema does not
+define. Six cases plus a control.
+
+**P2 — the "every code in every lane" claim was not met.** The INT8 test used
+three row shifts over four lanes, reaching 768 of 1,024 code/lane pairs, and its
+tracker counted codes alone so the gap was invisible; INT4 reached 80 of 128.
+Both now use one row per lane offset and a **two-dimensional** tracker asserting
+`256 x 4` and `16 x 8` pairs exactly.
+
+**Documentation contradiction.** The support matrix still carried a
+"compressed-tensors integer import — **not implemented**" row beside the new
+passing one, and the README still said nothing imports checkpoint data. Both are
+corrected, and both now say plainly that an import is not an execution.
 
 ### Deletion
 
