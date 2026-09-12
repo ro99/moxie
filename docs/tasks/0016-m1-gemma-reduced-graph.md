@@ -1,6 +1,8 @@
 # Task 0016 — M1.5 Gemma operation gap and reduced dense graph
 
-Status: **proposed**. This contract precedes implementation.
+Status: **accepted by the owner, 2026-09-12.** Contract `1199267` precedes
+implementation `c7dd153`; review corrections `4e7ad56` and the guard-isolation
+test improvement follow. M1.5 remains active — this task does not close it.
 
 ## Identity and authority
 
@@ -311,10 +313,11 @@ Stop and report, rather than proceeding, if any of these occur:
 
 ## Result, filled after work
 
-Status on completion: **implemented, then corrected after independent review;
-awaiting re-review and owner acceptance.** Contract `1199267` precedes
-implementation `c7dd153`; the review corrections follow it and are recorded in
-their own section below.
+Status on completion: **accepted by the owner on 2026-09-12**, after independent
+re-review found no remaining blocking correctness or architecture issue within
+the task's declared synthetic scope. Contract `1199267` precedes implementation
+`c7dd153`; the review corrections follow it and are recorded in their own
+section below, with the acceptance record at the end.
 [ADR 0012](../decisions/adr/0012-explicit-family-operation-parameters.md) records
 the parameter-explicitness decision;
 [ADR 0013](../decisions/adr/0013-one-model-crate-with-family-modules.md) records
@@ -466,6 +469,17 @@ correction-allocation.log      5dbd5cd1616ce963723f1b62796abcadf8869b4d67e9f4893
 `correction-gpu.log` and `correction-spec.log` again hash identically to task
 0015's, which is the intended result for both.
 
+The acceptance commit's guard-isolation change was validated again; the GPU and
+device lanes were not repeated for it, because it changes only a test in
+`moxie-models`, which no device lane exercises.
+
+```text
+acceptance-host.log       6506c001b4d4eaeb229e589b00bbfd0d2c4c745c751b2ef0ba6e773849bd1345
+acceptance-models.log     b794fa058436ae138f63868bec2afedc403ffdd1378591ead9e58440102ca332
+acceptance-clippy.log     c92508a29848820f033cd2ea015c85dde0953c88b07cc967ce34b7c08f610549
+acceptance-arch-clean.log 357e888e81eb78b7298771c5030a2b5d8a4d1abe65d394efb0392d3ff9febe9e
+```
+
 ### Measured effect and uncertainty
 
 The allocation harness prints, for each shape, the peak requested heap above the
@@ -602,6 +616,41 @@ No test expectation was adjusted to accommodate the new values — the parity,
 cancellation and allocation tests compare the implementation against itself or
 against a bound, and the two fixed equations are pinned against the source
 rather than against the implementation.
+
+### Independent re-review and owner acceptance — 2026-09-12
+
+The owner accepted task 0016 and directed "Document and Push" after independent
+re-review confirmed all four findings were addressed and found **no remaining
+blocking correctness or architecture issue within the declared synthetic scope**.
+The reviewer re-ran the original numerical and overflow probes against the
+corrected libraries: the residual reproduces 0.875 with both BF16 boundaries
+preserved, the softcap reproduces 11.8125 including the final rounding before
+FP32 storage, and the original overflowing configuration returns an error
+without panicking.
+
+Independent verification passed the full host workspace suite, both clippy
+lanes, formatting, specification and diff checks, clean-archive architecture
+checks (73 rejecting / 21 accepted) and 39/39 real GPU cases across all three
+cards. The reviewer did not repeat the full device-feature suite or the
+checkpoint shard hashing; those remain separately recorded implementation
+evidence.
+
+**One non-blocking test improvement was reported and is fixed here rather than
+deferred.** The overflow regression's `kv_heads` case also overflowed `heads`,
+so the query-width guard rejected it first and the key/value guard was never
+exercised. Each case now names the guard it must reach and asserts the error
+came from that guard, so a configuration refused by an earlier one fails the
+test instead of passing it. The `kv_heads` case perturbs only `kv_heads`, which
+genuinely reaches the multiplication because `TextConfig::check` does not
+require `kv_heads <= heads` — that belongs to `OpParams::check_params`, which
+runs after these products are formed. A negative control confirms the
+assertion bites: replacing the checked `kv_heads * head_dim` with a wrapping
+multiply makes the case fail with a different error rather than pass.
+
+**Acceptance is limited to task 0016's reduced synthetic graph, and does not
+close M1.5.** Actual checkpoint execution, heterogeneous per-layer state
+geometry and model-quality validation all remain outstanding. No owner gate was
+resolved; O1–O7 remain open.
 
 ### Remaining blockers and next bounded task
 

@@ -911,33 +911,57 @@ mod tests {
                 )
                 .unwrap();
         }
-        for (field, mutate) in [
+        // Each case names the guard it must reach, so a configuration refused
+        // by an *earlier* guard fails the test instead of quietly passing it.
+        // Re-review found exactly that: the `kv_heads` case also overflowed
+        // `heads`, so the query-width guard rejected it first and the
+        // key/value guard was never exercised. `TextConfig::check` does not
+        // require `kv_heads <= heads` -- that belongs to
+        // `OpParams::check_params`, which runs after these products are formed
+        // -- so a lone oversized `kv_heads` really does reach the
+        // multiplication.
+        for (field, mutate, expect) in [
             (
                 "heads",
                 (|c: &mut TextConfig| c.heads = 1 << 63) as fn(&mut TextConfig),
+                "heads * head_dim",
             ),
-            ("kv_heads", |c: &mut TextConfig| {
-                c.heads = 1 << 63;
-                c.kv_heads = 1 << 62;
-            }),
-            ("head_dim", |c: &mut TextConfig| c.head_dim = 1 << 60),
-            ("vocab", |c: &mut TextConfig| c.vocab = u64::MAX),
-            ("intermediate", |c: &mut TextConfig| {
-                c.intermediate = u64::MAX
-            }),
+            (
+                "kv_heads",
+                |c: &mut TextConfig| c.kv_heads = 1 << 60,
+                "kv_heads * head_dim",
+            ),
+            (
+                "head_dim",
+                |c: &mut TextConfig| c.head_dim = 1 << 60,
+                "heads * head_dim",
+            ),
+            (
+                "vocab",
+                |c: &mut TextConfig| c.vocab = u64::MAX,
+                "does not fit a u32",
+            ),
+            (
+                "intermediate",
+                |c: &mut TextConfig| c.intermediate = u64::MAX,
+                "intermediate * hidden",
+            ),
         ] {
             let mut config = reduced_config();
             mutate(&mut config);
             // Refusal at either stage is correct -- `vocab` is already rejected
             // by the metadata's `u32` conversion. What must not happen is a
             // wrapped extent or a panic.
-            let refused = match Gemma4Text::reduced(config, "overflow") {
-                Err(_) => true,
-                Ok(model) => model.compose(&oracles, SymbolId(0)).is_err(),
+            let error = match Gemma4Text::reduced(config, "overflow") {
+                Err(e) => e,
+                Ok(model) => model
+                    .compose(&oracles, SymbolId(0))
+                    .expect_err("construction must refuse rather than wrap or panic"),
             };
+            let detail = format!("{error}");
             assert!(
-                refused,
-                "{field}: construction must refuse rather than wrap or panic"
+                detail.contains(expect),
+                "{field}: refused by the wrong guard -- wanted {expect:?}, got {detail:?}"
             );
         }
     }

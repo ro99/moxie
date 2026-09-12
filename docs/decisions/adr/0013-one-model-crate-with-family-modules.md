@@ -1,6 +1,6 @@
 # ADR 0013 — One model crate with a module per family
 
-- ID / date / author / status: 0013, 2026-09-12, implementation agent; **accepted with task 0016**.
+- ID / date / author / status: 0013, 2026-09-12, implementation agent; **accepted with task 0016 on 2026-09-12**.
 - Classification: measured implementation choice.
 - Scope and owning shared component: `crates/moxie-models`, and `arch-check`'s
   model-crate rules in `xtask/src/archcheck.rs`.

@@ -1,6 +1,6 @@
 # ADR 0012 — Family mathematics is explicit operation parameters, not defaults
 
-- ID / date / author / status: 0012, 2026-09-12, implementation agent; **accepted with task 0016**.
+- ID / date / author / status: 0012, 2026-09-12, implementation agent; **accepted with task 0016 on 2026-09-12**.
 - Classification: measured implementation choice.
 - Scope and owning shared component: `moxie-graph`'s `OpParams` and the
   `moxie-oracles` references they are validated against.
