@@ -1,9 +1,9 @@
 //! Host reference execution against the admitted physical pages. Dense histories
 //! below are ephemeral oracle scratch, never another persistent cache or journal.
 use moxie_format::bf16::{bf16_bits_to_f32, f32_to_bf16_bits};
-use moxie_graph::{Bindings, Graph, OpParams, ValueId};
+use moxie_graph::{Bindings, Graph, OpParams, ValueId, Visibility};
 use moxie_oracles::attention::KvHistory;
-use moxie_state::{KvRow, LogitsHandle, PagedExecutionBinding, PagedSequence, ROOT};
+use moxie_state::{KvRow, LogitsHandle, PagedExecutionBinding, PagedSequence, ROOT, Retention};
 use moxie_types::{Error, Precision, Result, StateTransactionId, SymbolTable};
 
 use crate::{
@@ -103,9 +103,19 @@ impl HistorySource for KvCache {
     }
 }
 impl HistorySource for PagedSequence {
+    /// A layer's **retained** rows, carrying the absolute position they start
+    /// at.
+    ///
+    /// Not `0..rows`: a windowed layer has reclaimed everything below its
+    /// window, and asking for those positions is `Error::Reclaimed`, not a
+    /// zero row. The base goes with the rows, because the mask is applied to
+    /// absolute positions -- handing back the retained rows renumbered from
+    /// zero would move every key under the query.
     fn read_history(&self, layer: u32) -> Result<KvHistory> {
-        let mut history = KvHistory::try_with_capacity(self.usage().rows)?;
-        for position in 0..self.usage().rows as u64 {
+        let retained = self.retained_range(layer as usize)?;
+        let mut history =
+            KvHistory::try_with_base(retained.start, (retained.end - retained.start) as usize)?;
+        for position in retained {
             let row = self.row(layer as usize, position)?;
             let decode = |bytes: &[u8]| -> Result<Vec<f32>> {
                 let mut decoded = try_vec(bytes.len() / 2)?;
@@ -186,10 +196,10 @@ impl Interpreter {
         cancel: &Cancel,
     ) -> Result<PagedOutput> {
         cancel.check("forward/start")?;
-        let geometry = sequence.geometry();
+        let geometry = sequence.geometry().clone();
         if geometry.precision != Precision::Bf16
             || graph.attention_layers().is_empty()
-            || graph.attention_layers().len() != geometry.layers
+            || graph.attention_layers().len() != geometry.layers.len()
         {
             return Err(invalid(
                 "graph",
@@ -201,21 +211,40 @@ impl Interpreter {
             // under GQA there are fewer of those than there are query heads.
             // The two coincided while every graph was multi-head, which is how
             // this read `heads` and still passed.
+            //
+            // Per layer, and including retention: a store that kept fewer rows
+            // than its layer's mask admits would silently drop keys, and one
+            // that kept more would spend the memory the window exists to save.
             if let OpParams::Attention {
                 kv_heads,
                 head_dim,
                 layer,
+                visibility,
                 ..
             } = node.params
-                && (kv_heads as usize != geometry.kv_heads
-                    || head_dim as usize != geometry.key_dim
-                    || head_dim as usize != geometry.value_dim
-                    || layer as usize >= geometry.layers)
             {
-                return Err(invalid(
-                    "graph",
-                    "attention geometry differs from physical pages",
-                ));
+                let Some(l) = geometry.layers.get(layer as usize) else {
+                    return Err(invalid(
+                        "graph",
+                        "attention layer is outside the physical pages",
+                    ));
+                };
+                let retention = match visibility {
+                    Visibility::Causal => Retention::All,
+                    Visibility::SlidingWindow { window } => Retention::Window {
+                        window: window as usize,
+                    },
+                };
+                if kv_heads as usize != l.kv_heads
+                    || head_dim as usize != l.key_dim
+                    || head_dim as usize != l.value_dim
+                    || l.retention != retention
+                {
+                    return Err(invalid(
+                        "graph",
+                        "attention geometry or visibility differs from physical pages",
+                    ));
+                }
             }
         }
         if bindings.len() != graph.inputs().len() + graph.weights().len() {
@@ -281,7 +310,7 @@ impl Interpreter {
             }
         }
         let mut staged = try_vec(
-            rows.checked_mul(geometry.layers)
+            rows.checked_mul(geometry.layers.len())
                 .ok_or(moxie_types::DimError::Overflow)?,
         )?;
         for node in graph.nodes() {
@@ -308,8 +337,8 @@ impl Interpreter {
             ));
         }
         for position in positions {
-            let mut encoded = try_vec(geometry.layers)?;
-            for layer in 0..geometry.layers {
+            let mut encoded = try_vec(geometry.layers.len())?;
+            for layer in 0..geometry.layers.len() {
                 let row = staged
                     .iter()
                     .find(|a| a.layer == layer as u32 && a.position == position)

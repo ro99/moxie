@@ -2,7 +2,9 @@
 use std::sync::atomic::AtomicBool;
 
 use moxie_memory::{CapacitySnapshot, Ledger};
-use moxie_state::{KvGeometry, KvRow, PagedSequence, ROOT, SequenceState, StateKind};
+use moxie_state::{
+    KvGeometry, KvRow, LayerKv, PagedSequence, ROOT, Retention, SequenceState, StateKind,
+};
 use moxie_types::{Error, HostTier, Precision, Scope, StateTransactionId, Tier};
 
 fn ledger(capacity: u64) -> Ledger {
@@ -10,35 +12,47 @@ fn ledger(capacity: u64) -> Ledger {
 }
 
 fn geometry() -> KvGeometry {
-    KvGeometry {
-        layers: 2,
-        kv_heads: 1,
-        key_dim: 2,
-        value_dim: 3,
-        precision: Precision::Bf16,
-        page_tokens: 3,
-        max_tokens: 17,
-    }
+    KvGeometry::uniform(2, 1, 2, 3, Precision::Bf16, 3, 17)
 }
 
 // A flat, separately generated logical oracle, with distinct bytes at every
-// layer/position/channel and in K versus V. Layout equations are not reused.
-fn encoded(g: KvGeometry, position: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+// layer/position/channel and in K versus V, and at each layer's **own** width.
+// Layout equations are not reused.
+fn encoded(g: &KvGeometry, position: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     let element_bytes = g.precision.bits() as usize / 8;
-    (0..g.layers)
-        .map(|layer| {
+    g.layers
+        .iter()
+        .enumerate()
+        .map(|(layer, l)| {
             let bytes = |width, salt| {
-                (0..g.kv_heads * width * element_bytes)
+                (0..l.kv_heads * width * element_bytes)
                     .map(|channel| ((position * 37 + layer * 19 + channel * 7 + salt) % 256) as u8)
                     .collect()
             };
-            (bytes(g.key_dim, 17), bytes(g.value_dim, 173))
+            (bytes(l.key_dim, 17), bytes(l.value_dim, 173))
         })
         .collect()
 }
 
+/// Total admitted backing, summed per layer from the declared geometry rather
+/// than from the store's own layout.
+fn backing(g: &KvGeometry) -> usize {
+    let element = g.precision.bits() as usize / 8;
+    g.layers
+        .iter()
+        .map(|l| {
+            let needed = match l.retention {
+                Retention::All => g.max_tokens,
+                Retention::Window { window } => (window + g.tentative_rows).min(g.max_tokens),
+            };
+            let pages = needed.div_ceil(g.page_tokens);
+            pages * (8 + g.page_tokens * l.kv_heads * (l.key_dim + l.value_dim) * element)
+        })
+        .sum()
+}
+
 fn append(s: &mut PagedSequence, txn: StateTransactionId, position: usize) {
-    let data = encoded(s.geometry(), position);
+    let data = encoded(&s.geometry().clone(), position);
     let rows: Vec<_> = data
         .iter()
         .map(|(key, value)| KvRow { key, value })
@@ -50,15 +64,25 @@ fn append(s: &mut PagedSequence, txn: StateTransactionId, position: usize) {
 fn check_rows(s: &PagedSequence, count: usize) {
     assert_eq!(s.usage().rows, count);
     assert_eq!(s.state().frontiers(ROOT).unwrap().executed, count as u64);
+    let g = s.geometry().clone();
     for position in 0..count {
-        for (layer, (key, value)) in encoded(s.geometry(), position).iter().enumerate() {
+        for (layer, (key, value)) in encoded(&g, position).iter().enumerate() {
+            let retained = s.retained_range(layer).unwrap();
+            if !retained.contains(&(position as u64)) {
+                // A reclaimed row is refused as reclaimed, and says from where.
+                assert!(matches!(
+                    s.row(layer, position as u64),
+                    Err(Error::Reclaimed { retained_from, .. }) if retained_from == retained.start
+                ));
+                continue;
+            }
             let actual = s.row(layer, position as u64).unwrap();
             assert_eq!(actual.key, key);
             assert_eq!(actual.value, value);
         }
     }
     assert!(s.row(0, count as u64).is_err());
-    assert!(s.row(s.geometry().layers, 0).is_err());
+    assert!(s.row(s.layer_count(), 0).is_err());
     assert!(s.row(0, u64::MAX).is_err());
 }
 
@@ -70,19 +94,11 @@ fn whole_and_every_chunk_width_preserve_all_bytes_across_two_geometries_and_enco
                 precision,
                 ..geometry()
             },
-            KvGeometry {
-                layers: 3,
-                kv_heads: 2,
-                key_dim: 3,
-                value_dim: 1,
-                page_tokens: 4,
-                precision,
-                ..geometry()
-            },
+            KvGeometry::uniform(3, 2, 3, 1, precision, 4, 17),
         ] {
             for chunk in 1..=g.max_tokens {
                 let mut owner = ledger(1 << 20);
-                let mut sequence = PagedSequence::new(&mut owner, g).unwrap();
+                let mut sequence = PagedSequence::new(&mut owner, g.clone()).unwrap();
                 for start in (0..g.max_tokens).step_by(chunk) {
                     let end = (start + chunk).min(g.max_tokens);
                     // Admission of later prompt chunks participates in abort.
@@ -96,11 +112,16 @@ fn whole_and_every_chunk_width_preserve_all_bytes_across_two_geometries_and_enco
                 }
                 let usage = sequence.usage();
                 let pages = g.max_tokens.div_ceil(g.page_tokens);
-                let row_bytes =
-                    g.layers * g.kv_heads * (g.key_dim + g.value_dim) * g.precision.bits() as usize
-                        / 8;
-                assert_eq!(usage.live_pages, pages);
-                assert_eq!(usage.backing_bytes, pages * (g.page_tokens * row_bytes + 8));
+                let row_bytes: usize = g
+                    .layers
+                    .iter()
+                    .map(|l| l.kv_heads * (l.key_dim + l.value_dim))
+                    .sum::<usize>()
+                    * g.precision.bits() as usize
+                    / 8;
+                assert_eq!(usage.live_pages, pages * g.layers.len());
+                assert_eq!(usage.backing_bytes, backing(&g));
+                assert_eq!(usage.retained_rows, g.max_tokens * g.layers.len());
                 assert_eq!(usage.logical_kv_bytes, g.max_tokens * row_bytes);
                 assert_eq!(
                     owner.committed(Scope::Host, Tier::Host(HostTier::StateSpill)),
@@ -243,7 +264,7 @@ fn malformed_rows_positions_and_cancellation_abort_all_prior_appends() {
         sequence.commit_prefix(txn, 1).unwrap();
         let txn = sequence.begin().unwrap();
         append(&mut sequence, txn, 1);
-        let data = encoded(geometry(), 2);
+        let data = encoded(&geometry(), 2);
         let mut rows: Vec<_> = data
             .iter()
             .map(|(key, value)| KvRow { key, value })
@@ -288,7 +309,7 @@ fn full_context_failed_commit_and_unsupported_fork_never_change_capacity_or_prec
         ..geometry()
     };
     let mut owner = ledger(1 << 20);
-    let mut sequence = PagedSequence::new(&mut owner, g).unwrap();
+    let mut sequence = PagedSequence::new(&mut owner, g.clone()).unwrap();
     let txn = sequence.begin().unwrap();
     for position in 0..4 {
         append(&mut sequence, txn, position);
@@ -297,7 +318,7 @@ fn full_context_failed_commit_and_unsupported_fork_never_change_capacity_or_prec
     assert_eq!(sequence.state().open_transactions(), [(txn, ROOT)]);
     sequence.commit_prefix(txn, 4).unwrap();
     let txn = sequence.begin().unwrap();
-    let data = encoded(g, 4);
+    let data = encoded(&g, 4);
     let rows: Vec<_> = data
         .iter()
         .map(|(key, value)| KvRow { key, value })
@@ -311,7 +332,7 @@ fn full_context_failed_commit_and_unsupported_fork_never_change_capacity_or_prec
     assert!(sequence.append_prompt(1).is_err());
     assert!(sequence.accept(u64::MAX).is_err());
     assert!(matches!(sequence.fork(4), Err(Error::Unsupported { .. })));
-    assert_eq!(sequence.geometry(), g);
+    assert_eq!(sequence.geometry(), &g);
     sequence.close(&mut owner).unwrap();
 }
 
@@ -319,51 +340,70 @@ fn full_context_failed_commit_and_unsupported_fork_never_change_capacity_or_prec
 fn invalid_geometry_and_insufficient_budget_fail_before_retaining_any_charge() {
     let mut owner = ledger(1 << 20);
     let g = geometry();
+    let zero_width = |f: fn(&mut LayerKv)| {
+        let mut g = geometry();
+        f(&mut g.layers[1]);
+        g
+    };
     for bad in [
-        KvGeometry { layers: 0, ..g },
-        KvGeometry { kv_heads: 0, ..g },
-        KvGeometry { key_dim: 0, ..g },
-        KvGeometry { value_dim: 0, ..g },
+        KvGeometry {
+            layers: Vec::new(),
+            ..geometry()
+        },
+        zero_width(|l| l.kv_heads = 0),
+        zero_width(|l| l.key_dim = 0),
+        zero_width(|l| l.value_dim = 0),
+        zero_width(|l| l.retention = Retention::Window { window: 0 }),
         KvGeometry {
             page_tokens: 0,
-            ..g
+            ..geometry()
         },
-        KvGeometry { max_tokens: 0, ..g },
+        KvGeometry {
+            max_tokens: 0,
+            ..geometry()
+        },
+        KvGeometry {
+            tentative_rows: 0,
+            ..geometry()
+        },
         KvGeometry {
             precision: Precision::Int4,
-            ..g
+            ..geometry()
         },
         KvGeometry {
             precision: Precision::Int8,
-            ..g
+            ..geometry()
         },
-        KvGeometry {
-            layers: usize::MAX,
-            ..g
-        },
+        // No huge-layer-count case: the geometry *is* the per-layer vector, so
+        // a layer count large enough to overflow the control reserve cannot be
+        // constructed without allocating it first. The reachable overflows are
+        // per-layer widths and the context, which are below.
         KvGeometry {
             page_tokens: usize::MAX,
-            ..g
+            ..geometry()
         },
         KvGeometry {
             max_tokens: usize::MAX,
-            ..g
+            ..geometry()
         },
+        zero_width(|l| l.key_dim = usize::MAX),
+        zero_width(|l| l.kv_heads = usize::MAX),
     ] {
         assert!(PagedSequence::new(&mut owner, bad).is_err());
         assert!(owner.outstanding().is_empty());
     }
-    let sequence = PagedSequence::new(&mut owner, g).unwrap();
+    let sequence = PagedSequence::new(&mut owner, g.clone()).unwrap();
     let u = sequence.usage();
     let cost = (u.backing_bytes + u.control_reserve_bytes) as u64;
+    assert_eq!(u.backing_bytes, backing(&g));
     sequence.close(&mut owner).unwrap();
     let mut exact = ledger(cost);
-    let sequence = PagedSequence::new(&mut exact, g).unwrap();
-    assert!(PagedSequence::new(&mut exact, g).is_err());
+    let sequence = PagedSequence::new(&mut exact, g.clone()).unwrap();
+    assert!(PagedSequence::new(&mut exact, g.clone()).is_err());
     sequence.close(&mut exact).unwrap();
     let mut short = ledger(cost - 1);
     assert!(matches!(
-        PagedSequence::new(&mut short, g),
+        PagedSequence::new(&mut short, g.clone()),
         Err(Error::CapacityExceeded { .. })
     ));
     assert!(short.outstanding().is_empty());

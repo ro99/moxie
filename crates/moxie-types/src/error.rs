@@ -53,6 +53,22 @@ pub enum Error {
     /// A request was malformed. Distinct from `Numerical`, which is an execution
     /// failure (document 05).
     InvalidRequest { field: &'static str, detail: String },
+    /// The state a request needs has been reclaimed by a sliding window and
+    /// cannot be recovered in place.
+    ///
+    /// Distinct from `InvalidRequest`, and the distinction is the point: the
+    /// request is well formed and was legal earlier. Document 04 requires that
+    /// when history has been released the engine "recompute or report that the
+    /// requested operation needs re-prefill", never silently change results, so
+    /// a caller has to be able to tell "you asked for the impossible" from
+    /// "that history is gone, re-prefill to get it back".
+    ///
+    /// `retained_from` is the first absolute position the layer still holds.
+    Reclaimed {
+        layer: u32,
+        position: u64,
+        retained_from: u64,
+    },
 }
 
 impl Error {
@@ -69,6 +85,7 @@ impl Error {
             Error::Dim(_) => "dim",
             Error::Numerical { .. } => "numerical",
             Error::InvalidRequest { .. } => "invalid_request",
+            Error::Reclaimed { .. } => "reclaimed",
         }
     }
 
@@ -112,6 +129,15 @@ impl fmt::Display for Error {
             Error::InvalidRequest { field, detail } => {
                 write!(f, "invalid request field {field}: {detail}")
             }
+            Error::Reclaimed {
+                layer,
+                position,
+                retained_from,
+            } => write!(
+                f,
+                "layer {layer} position {position} was reclaimed by its sliding window; \
+                 it retains from {retained_from} and the request needs re-prefill"
+            ),
         }
     }
 }
@@ -162,6 +188,11 @@ mod tests {
                 field: "top_k",
                 detail: String::new(),
             },
+            Error::Reclaimed {
+                layer: 0,
+                position: 0,
+                retained_from: 0,
+            },
         ];
         let mut kinds: Vec<_> = all.iter().map(|e| e.kind()).collect();
         kinds.sort_unstable();
@@ -181,5 +212,15 @@ mod tests {
         };
         assert!(!e.is_retryable());
         assert!(Error::Cancelled { at: "decode" }.is_retryable());
+        // Nor is reclaimed state: the identical read fails identically until
+        // the caller re-prefills the prefix it wants.
+        assert!(
+            !Error::Reclaimed {
+                layer: 1,
+                position: 7,
+                retained_from: 12,
+            }
+            .is_retryable()
+        );
     }
 }

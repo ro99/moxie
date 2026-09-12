@@ -1,6 +1,8 @@
 # Task 0017 — M4 per-layer key/value geometry and window eviction
 
-Status: **proposed**.
+Status: **implemented, awaiting owner review**. Contract and
+[ADR 0014](../decisions/adr/0014-bounded-tentative-undo-headroom.md) committed at
+`b748536`, before implementation.
 
 ## Identity and authority
 
@@ -285,4 +287,169 @@ tolerance; sub-16-bit state (O4); any checkpoint byte, conversion or download
 
 ## Result, filled after work
 
-Not started.
+Implementation follows contract `b748536`. No CUDA, kernel, checkpoint,
+importer or device execution path changed. The shared owners are:
+
+- **`moxie-state::paged`** owns the schema. `KvGeometry` is now a per-layer
+  `Vec<LayerKv>` plus the shared `precision`, `page_tokens`, `max_tokens` and
+  `tentative_rows`; each `LayerKv` carries its own `kv_heads`, `key_dim`,
+  `value_dim` and `Retention`. It is no longer `Copy`, and `geometry()` returns
+  a borrow. `KvGeometry::uniform` builds the all-`Retention::All` shape every
+  previous consumer had, which is byte-identical to the old behaviour.
+- Pages belong to **one layer**. Each layer gets its own ring of
+  `ceil(min(window + tentative_rows, max_tokens) / page_tokens)` pages; row `r`
+  of layer `L` is page `(r / page_tokens) mod pages(L)`. Reclamation *is* the
+  ring overwrite -- there is no eviction pass, no memmove and no page free, and
+  appending costs the same whether the ring has wrapped or not.
+- `high_water`, monotone, records the greatest frontier ever reached, so a
+  rollback can tell whether its target's window survived. `retained_range` and
+  `row` refuse below it.
+- `moxie-types::Error::Reclaimed { layer, position, retained_from }` is a new
+  variant, not a reuse of `InvalidRequest`. `kind()` is `"reclaimed"` and it is
+  not retryable. `moxie-executor`'s deliberately exhaustive `attribute_error`
+  passes it through rather than wrapping it, because its structured fields are
+  the attribution and no free-text field could carry them.
+- **`moxie-oracles::attention::KvHistory`** gained an absolute base position and
+  `evict_before`, and `attend_multi_head` masks on `base + index`. `new()` and
+  `try_with_capacity` keep base 0, so every existing caller is unchanged.
+- **`moxie-interp::paged`** reads a layer's retained range with its base, and
+  validates each attention node's geometry **and visibility** against that
+  layer's pages. A store whose retention disagrees with its mask is refused.
+- **`moxie-engine`** builds per-layer geometry from the graph's attention nodes,
+  rejects a duplicate or absent layer index by position, and sets
+  `tentative_rows` from the request's prefill chunk. Its uniform-geometry
+  refusal is **deleted**.
+- **`moxie-models::gemma4`** carries `local_kv_heads`/`local_head_dim` and
+  `global_kv_heads`/`global_head_dim`; `layer_geometry(layer)` is the single
+  place the layer-type branch resolves. `compose` uses each layer's own query
+  and key/value widths. `Reduction` lost `uniform_kv_geometry` and
+  `sliding_layers_retain_full_history`; the CLI's disclosure line lost the two
+  labels with them and a test asserts they are gone rather than merely absent.
+
+Both reduced CLI shapes now differ between layer types, in opposite directions
+so neither is load-bearing by accident: shape A is 2 heads of 16 sliding and 1
+of 32 global; shape B is 2 of 8 sliding and 3 of 12 global.
+
+### The numerical claim, and what proves it
+
+**Reclaiming outside a layer's window changes no output bit.**
+`reclaiming_a_sliding_layers_window_changes_no_logit_bit` runs both reduced
+shapes against the full-retention dense `KvCache` reference at five
+page-size/chunk combinations, comparing raw FP32 bit patterns, and asserts that
+reclamation actually happened on every sliding layer and on no global one -- a
+windowed layer that never reached capacity would make the test pass while
+proving nothing. No tolerance was introduced and none was relaxed.
+
+The oracle is independent rather than a transcription: `KvHistory` reclaims by
+absolute position over a dense `Vec`, the store reclaims by ring overwrite, and
+`evicting_outside_the_window_changes_no_output_bit` pins the oracle's own half
+over four windows and every query position.
+
+**A finding worth carrying forward.** A sliding window is *shift invariant*:
+renumber the retained rows and the query by the same amount and the answer is
+identical, because the mask only reads `q - k`. So the retention frontier
+**cannot** be validated by comparing outputs, and a store one row short still
+answers every query correctly -- the interpreter reads a layer's history before
+appending the chunk's own rows, so there is exactly one row of slack at the read
+boundary. Shortening the frontier by one passed the numerical parity test; by
+two it failed. The frontier is therefore pinned by an exact assertion in
+`paged_window::check`, not by parity, and both facts are recorded in the code.
+
+That one row of slack is deliberate and documented: `rows - window` retains the
+row a query at `rows - 1` would need, so the most recently executed position can
+be re-executed without re-prefilling.
+
+### Storage evidence
+
+Not a context claim and not model support: no attention runs in these, and
+32,768 *stored rows* is storage capacity, not attention over 32,768 tokens.
+
+| Case | Admitted backing | Page table | Control reserve |
+|---|---|---|---|
+| Two layers, full retention, 32,768 rows | **398,860 B** | 4,144 B | 267,129 B |
+| Same, one layer windowed at 1,024 | **206,360 B** | 2,144 B | 267,129 B |
+
+Zero allocations inside `append` in both, including while reclaiming; zero
+retained growth after 10,000 abort/retry cycles; zero allocation and ledger
+delta after close. Task 0013 recorded 396,788 B of backing for the same
+geometry; the difference is the page table, which now has one entry per
+`(layer, page)` rather than one shared entry per page, because a page belongs to
+one layer. The pools themselves are unchanged.
+
+### Verification
+
+| Gate | Exact command / result |
+|---|---|
+| Host workspace | `cargo test --workspace --locked --offline`: **663 unit/integration + 9 doctests passed**, 0 failed, 0 ignored |
+| Retention | `cargo test -p moxie-state --test paged_window --locked --offline`: **9 passed** |
+| Storage / allocation | `cargo test -p moxie-state --test paged_allocation --test paged_window_allocation --locked --offline -- --nocapture`: **2 passed**, figures above |
+| Gemma integration | `cargo test -p moxie-cli --test gemma --locked --offline`: **16 passed** |
+| Allocation | `cargo test -p moxie-cli --test allocation --locked --offline -- --nocapture`: **1 passed**; six shapes within their admitted envelopes |
+| Host clippy | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`: passed |
+| Format / diff | `cargo fmt --all -- --check`; `git diff --check`: passed |
+| Specification | `cargo xtask spec-check`: passed, 10 documents unchanged |
+| Architecture | `cargo xtask arch-check` on a clean `git archive` of the tree: **73 rejecting + 21 accepted fixtures, 12 rules**, unchanged from task 0016. No new crate edge was introduced, so no new fixture was needed |
+| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`: **679 + 12 doctests passed**, 0 failed |
+| Device clippy | the clippy command with the same features: passed |
+| Real GPU | `cargo xtask-cuda test-gpu`: **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
+
+| Hardware | UUID |
+|---|---|
+| RTX 5060 Ti / SM120 | `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` |
+| RTX 3090 / SM86 | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` |
+| RTX 3090 / SM86 | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` |
+
+**The GPU result is unchanged from tasks 0015 and 0016, which is the expected
+outcome: this task adds no device behaviour.** It is regression evidence for
+already-accepted device work and is not evidence for this task's mechanism.
+
+The device lane earned its keep anyway. `moxie-executor::attribute_error` is a
+deliberately exhaustive match on `Error` behind the `driver` feature, so adding
+`Reclaimed` broke the device build while the host lane stayed green. That is the
+match doing its job; the arm was added rather than a wildcard.
+
+**Unmeasured / not run:** no topology, Compute Sanitizer, checkpoint-quality or
+paired prefill/decode benchmark. No CUDA source changed. No device paged
+attention, COW fork, host-backed page streaming, recurrent or index state, and
+no checkpoint, importer or quantized weight. O1-O7 remain open; none was
+resolved or relied on.
+
+### Deliberately failing controls
+
+Each mutation was applied, observed to fail, and reverted.
+
+- Retention frontier at `window - 2`: `reclaiming_a_sliding_layers_window_changes_no_logit_bit`
+  fails on the logit bit comparison. At `window - 1` it **passes**, for the
+  shift-invariance reason above; that is why the exact frontier is asserted
+  separately.
+- `without_the_headroom_bound_an_abort_would_lose_readable_rows` and
+  `a_rollback_whose_window_survives_is_served_and_one_that_does_not_is_refused`
+  each carry their own in-test control: a full-retention sequence rolls back to
+  the same prefix successfully, so the refusal is about reclamation rather than
+  about the frontier.
+- `a_window_at_or_above_the_context_retains_everything_and_costs_the_same`
+  is the control for the envelope claim: windowing wider than the context must
+  cost exactly what full retention costs.
+
+### Deletion
+
+Removed: `moxie-engine`'s uniform-attention-geometry refusal; `Reduction`'s
+`uniform_kv_geometry` and `sliding_layers_retain_full_history` fields and their
+two CLI disclosure labels; `moxie-state`'s single shared page pool and its
+uniform width fields. Nothing was flagged off and no compatibility shim remains.
+
+The pinned legacy single-row rewind (`gemma4_runtime.cpp:1385`/`:1407`) was
+**not** carried forward; ADR 0014 records why, and the bounded headroom plus two
+explicit refusals replaces it.
+
+### Remaining blockers and next task
+
+M4 is **not** closed: device paged attention, COW forks and prefix sharing,
+host-backed page streaming with online-softmax merge, recurrent/index state
+snapshot and replay, and MLA all remain. M1.5 is **not** closed: the Gemma 4
+artifact still cannot be executed, because every language-model linear is
+compressed-tensors INT8 `pack-quantized` and its importer is M3, and it is
+`image-text-to-text` whose vision tower is M11.
+
+The next bounded task is the handover's candidate 2, M3's compressed-tensors
+INT8 importer, now that shape is no longer the blocker.

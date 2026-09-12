@@ -55,8 +55,17 @@ pub struct TextConfig {
     pub hidden: u64,
     pub layers: u32,
     pub heads: u64,
-    pub kv_heads: u64,
-    pub head_dim: u64,
+    /// Key/value heads and head dimension on a **sliding** layer.
+    ///
+    /// Separate from the global pair because the artifact's are not the same:
+    /// 16 heads of 256 on its sliding layers, 4 of 512 on its global ones. One
+    /// pair for both would describe a model that does not exist, and the query
+    /// width `heads * head_dim` differs between the two layer types with it.
+    pub local_kv_heads: u64,
+    pub local_head_dim: u64,
+    /// Key/value heads and head dimension on a **global** layer.
+    pub global_kv_heads: u64,
+    pub global_head_dim: u64,
     pub intermediate: u64,
     pub vocab: u64,
     /// A layer `l` is full-causal when `(l + 1) % global_stride == 0`; every
@@ -204,20 +213,52 @@ impl ArtifactGeometry {
     }
 }
 
+/// One layer type's key/value geometry, as the graph and the state both need it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerGeometry {
+    pub kv_heads: u64,
+    pub head_dim: u64,
+    /// `None` on a global layer, the window on a sliding one.
+    pub window: Option<u64>,
+}
+
+impl TextConfig {
+    /// The key/value geometry and visibility of one layer.
+    ///
+    /// The single place the layer-type branch is resolved, so the graph, the
+    /// admitted pages and any test all read the same answer rather than each
+    /// re-deriving `(layer + 1) % stride`.
+    pub const fn layer_geometry(&self, layer: u32) -> LayerGeometry {
+        if self.global_layer(layer) {
+            LayerGeometry {
+                kv_heads: self.global_kv_heads,
+                head_dim: self.global_head_dim,
+                window: None,
+            }
+        } else {
+            LayerGeometry {
+                kv_heads: self.local_kv_heads,
+                head_dim: self.local_head_dim,
+                window: Some(self.sliding_window),
+            }
+        }
+    }
+}
+
 /// What a reduced graph gives up, enumerated rather than described.
+///
+/// Task 0017 removed two of the four. Per-layer key/value geometry and
+/// window reclamation are no longer reductions: a reduced graph now composes
+/// its sliding and global layers at their own widths and its store keeps only
+/// what each layer can see. The two that remain are the two that need a
+/// checkpoint importer (M3) and a vision tower (M11), and neither is a
+/// synthetic-scale difference that a smaller fixture could close.
 ///
 /// Returned by [`Gemma4Text::reduction`] so that a diagnostic surface can print
 /// it. A reduced graph that could not say what it reduced would be exactly the
 /// "synthetic output described as model support" that document 06 forbids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reduction {
-    /// Uniform key/value geometry across layers. The artifact's sliding layers
-    /// are 16 heads of 256 and its global layers 4 of 512. Per-layer paged
-    /// geometry is M4.
-    pub uniform_kv_geometry: bool,
-    /// Sliding layers retain their whole history rather than a window-sized
-    /// ring. The mask is exact; the memory saving is M4.
-    pub sliding_layers_retain_full_history: bool,
     /// Weights are whatever the caller supplied. The artifact is INT8
     /// `pack-quantized` and its importer is M3.
     pub synthetic_weights: bool,
@@ -233,8 +274,6 @@ impl Reduction {
     }
 
     const ALL: Self = Self {
-        uniform_kv_geometry: true,
-        sliding_layers_retain_full_history: true,
         synthetic_weights: true,
         text_only: true,
     };
@@ -366,8 +405,17 @@ impl Gemma4Text {
         // `heads * head_dim` with `heads = 2^63` and reached a panic through a
         // public entry point, which is neither the checked arithmetic nor the
         // typed error this repository requires.
-        let query_width = width("heads * head_dim", c.heads, c.head_dim)?;
-        let kv_width = width("kv_heads * head_dim", c.kv_heads, c.head_dim)?;
+        // Checked once per layer type rather than once, because the two types
+        // no longer share a head dimension and so no longer share a query or
+        // key/value width either.
+        for (what, kv, dim) in [
+            ("local", c.local_kv_heads, c.local_head_dim),
+            ("global", c.global_kv_heads, c.global_head_dim),
+        ] {
+            let _ = what;
+            width("heads * head_dim", c.heads, dim)?;
+            width("kv_heads * head_dim", kv, dim)?;
+        }
         let mut g = GraphBuilder::new(moxie_graph::OracleId("moxie_oracles::host_reference"), rows);
         let index = TensorSpec::new(
             ValueRole::Index(IndexEncoding::U64),
@@ -429,6 +477,14 @@ impl Gemma4Text {
 
         for layer in 0..c.layers {
             let global = c.global_layer(layer);
+            // This layer's own widths. A graph that used one pair for every
+            // layer would be describing a checkpoint whose sliding and global
+            // layers agree, and Gemma 4's do not.
+            let geometry = c.layer_geometry(layer);
+            let head_dim = geometry.head_dim;
+            let kv_heads = geometry.kv_heads;
+            let query_width = width("heads * head_dim", c.heads, head_dim)?;
+            let kv_width = width("kv_heads * head_dim", kv_heads, head_dim)?;
             let attn_norm = weight(&mut g, &mut bound, "attn_norm", Some(layer), vec![c.hidden])?;
             let normed = g.node(
                 OpParams::RmsNorm {
@@ -473,8 +529,8 @@ impl Gemma4Text {
                 linear(&mut g, normed, wv, c.hidden, kv_width)?
             };
 
-            let q_norm = weight(&mut g, &mut bound, "q_norm", Some(layer), vec![c.head_dim])?;
-            let k_norm = weight(&mut g, &mut bound, "k_norm", Some(layer), vec![c.head_dim])?;
+            let q_norm = weight(&mut g, &mut bound, "q_norm", Some(layer), vec![head_dim])?;
+            let k_norm = weight(&mut g, &mut bound, "k_norm", Some(layer), vec![head_dim])?;
             // The value normalization's gain is all ones in the pinned source,
             // which passes a literal vector of them. It is a real weight here
             // rather than an implicit special case, so that "normalize V with
@@ -485,7 +541,7 @@ impl Gemma4Text {
                 &mut bound,
                 "v_norm_unit_gain",
                 Some(layer),
-                vec![c.head_dim],
+                vec![head_dim],
             )?;
             let qn = g.node(
                 OpParams::RmsNorm {
@@ -498,7 +554,7 @@ impl Gemma4Text {
             let kn = g.node(
                 OpParams::RmsNorm {
                     hidden: kv_width,
-                    group: c.kv_heads,
+                    group: kv_heads,
                     eps: c.rms_eps,
                 },
                 &[k, k_norm],
@@ -506,26 +562,26 @@ impl Gemma4Text {
             let vn = g.node(
                 OpParams::RmsNorm {
                     hidden: kv_width,
-                    group: c.kv_heads,
+                    group: kv_heads,
                     eps: c.rms_eps,
                 },
                 &[v, v_gain],
             )?;
 
             let (theta, rotary) = if global {
-                (c.global_rope_theta, c.global_partial_rotary.of(c.head_dim)?)
+                (c.global_rope_theta, c.global_partial_rotary.of(head_dim)?)
             } else {
-                (c.sliding_rope_theta, c.head_dim)
+                (c.sliding_rope_theta, head_dim)
             };
             let qr = g.node(
                 OpParams::Rope {
                     heads: c.heads,
-                    head_dim: c.head_dim,
+                    head_dim,
                     rotary_dim: rotary,
                     // The full head dimension, not the rotated width: a global
                     // layer rotates a quarter of the head and still divides by
                     // the whole of it.
-                    frequency_dim: c.head_dim,
+                    frequency_dim: head_dim,
                     base: theta,
                     layout: RopeLayout::HalfSplit,
                 },
@@ -533,10 +589,10 @@ impl Gemma4Text {
             )?;
             let kr = g.node(
                 OpParams::Rope {
-                    heads: c.kv_heads,
-                    head_dim: c.head_dim,
+                    heads: kv_heads,
+                    head_dim,
                     rotary_dim: rotary,
-                    frequency_dim: c.head_dim,
+                    frequency_dim: head_dim,
                     base: theta,
                     layout: RopeLayout::HalfSplit,
                 },
@@ -546,8 +602,8 @@ impl Gemma4Text {
             let attention = g.node(
                 OpParams::Attention {
                     heads: c.heads,
-                    kv_heads: c.kv_heads,
-                    head_dim: c.head_dim,
+                    kv_heads,
+                    head_dim,
                     // Exactly 1.0. The queries and keys were just normalized;
                     // the pinned runtime passes `scale = 1.0F` and dividing by
                     // the square root of the head dimension here would be a
@@ -802,8 +858,10 @@ mod tests {
             hidden: 24,
             layers: 6,
             heads: 4,
-            kv_heads: 2,
-            head_dim: 16,
+            local_kv_heads: 2,
+            local_head_dim: 16,
+            global_kv_heads: 1,
+            global_head_dim: 32,
             intermediate: 16,
             vocab: 11,
             global_stride: 6,
@@ -927,13 +985,23 @@ mod tests {
                 "heads * head_dim",
             ),
             (
-                "kv_heads",
-                |c: &mut TextConfig| c.kv_heads = 1 << 60,
+                "local_kv_heads",
+                |c: &mut TextConfig| c.local_kv_heads = 1 << 60,
                 "kv_heads * head_dim",
             ),
             (
-                "head_dim",
-                |c: &mut TextConfig| c.head_dim = 1 << 60,
+                "global_kv_heads",
+                |c: &mut TextConfig| c.global_kv_heads = 1 << 60,
+                "kv_heads * head_dim",
+            ),
+            (
+                "local_head_dim",
+                |c: &mut TextConfig| c.local_head_dim = 1 << 60,
+                "heads * head_dim",
+            ),
+            (
+                "global_head_dim",
+                |c: &mut TextConfig| c.global_head_dim = 1 << 60,
                 "heads * head_dim",
             ),
             (

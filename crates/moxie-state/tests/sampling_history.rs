@@ -7,15 +7,7 @@ fn ledger() -> Ledger {
     Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 24, 1024).unwrap()]).unwrap()
 }
 fn geometry(v: usize) -> KvGeometry {
-    KvGeometry {
-        layers: 2,
-        kv_heads: 1,
-        key_dim: v,
-        value_dim: 1,
-        precision: Precision::Bf16,
-        page_tokens: if v == 3 { 2 } else { 3 },
-        max_tokens: 64,
-    }
+    KvGeometry::uniform(2, 1, v, 1, Precision::Bf16, if v == 3 { 2 } else { 3 }, 64)
 }
 fn append(s: &mut PagedSequence, txn: StateTransactionId, p: u64, v: usize) {
     let key = vec![p as u8; v * 2];

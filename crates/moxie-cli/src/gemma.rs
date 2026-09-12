@@ -19,13 +19,14 @@ use moxie_types::{Dim, Error, Result, SymbolId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
     /// Six layers on the artifact's own 1-in-6 global stride, so five sliding
-    /// layers precede one full-causal layer. 4 query heads over 2 key/value
-    /// heads.
+    /// layers precede one full-causal layer. 4 query heads, over 2 key/value
+    /// heads of 16 when sliding and 1 of 32 when global -- the artifact's own
+    /// asymmetry (16x256 sliding, 4x512 global) at a size that runs.
     A,
-    /// Three layers on a 1-in-3 stride, with a different head **ratio**, head
-    /// dimension, window and residual-stream width. Shape A groups two query
-    /// heads per key/value head and this one groups three, so a grouping the
-    /// two happened to share cannot be load-bearing by accident.
+    /// Three layers on a 1-in-3 stride, with different head **ratios**, head
+    /// dimensions, window and residual-stream width. Shape A narrows its
+    /// key/value heads on a global layer and widens the head; this one widens
+    /// the heads instead, so neither direction can be load-bearing by accident.
     B,
 }
 
@@ -36,13 +37,18 @@ impl Shape {
                 hidden: 24,
                 layers: 6,
                 heads: 4,
-                kv_heads: 2,
+                local_kv_heads: 2,
                 // Sixteen, not eight. A quarter of an eight-wide head is a
                 // single rotated pair, whose inverse frequency is `base^0` --
                 // so the global theta would cancel and the geometry would
                 // silently stop testing it. Sixteen gives the global layers two
                 // angles, which is the smallest size at which the base matters.
-                head_dim: 16,
+                local_head_dim: 16,
+                // A different head count *and* a different head dimension on
+                // the global layer, so the query width, the key/value width and
+                // the paged row width all change with the layer type.
+                global_kv_heads: 1,
+                global_head_dim: 32,
                 intermediate: 16,
                 vocab: 11,
                 global_stride: 6,
@@ -61,9 +67,13 @@ impl Shape {
                 layers: 3,
                 heads: 6,
                 // Three query heads per key/value head, against shape A's two.
-                kv_heads: 2,
+                local_kv_heads: 2,
                 // Half of eight is four: two angles again, for the same reason.
-                head_dim: 8,
+                local_head_dim: 8,
+                // Two query heads per key/value head here, and a wider head:
+                // the opposite adjustment to shape A's global layer.
+                global_kv_heads: 3,
+                global_head_dim: 12,
                 intermediate: 20,
                 vocab: 7,
                 global_stride: 3,
@@ -102,12 +112,6 @@ pub fn reduction_line(r: Reduction) -> String {
     let mut parts = Vec::new();
     if r.synthetic_weights {
         parts.push("synthetic-bf16-weights");
-    }
-    if r.uniform_kv_geometry {
-        parts.push("uniform-kv-geometry");
-    }
-    if r.sliding_layers_retain_full_history {
-        parts.push("no-window-eviction");
     }
     if r.text_only {
         parts.push("text-only");

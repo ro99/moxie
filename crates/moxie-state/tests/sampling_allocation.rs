@@ -41,16 +41,8 @@ static ALLOCATOR: Counter = Counter;
 fn admitted_history_has_no_token_allocations_and_complete_fault_cleanup() {
     let mut ledger =
         Ledger::new([CapacitySnapshot::new(Scope::Host, 16 << 20, 1 << 20).unwrap()]).unwrap();
-    let g = KvGeometry {
-        layers: 2,
-        kv_heads: 1,
-        key_dim: 2,
-        value_dim: 1,
-        precision: Precision::Bf16,
-        page_tokens: 127,
-        max_tokens: 32770,
-    };
-    let warm = PagedSequence::with_sampling(&mut ledger, g, 7, 32769, 33377335).unwrap();
+    let g = KvGeometry::uniform(2, 1, 2, 1, Precision::Bf16, 127, 32770);
+    let warm = PagedSequence::with_sampling(&mut ledger, g.clone(), 7, 32769, 33377335).unwrap();
     let usage = warm.usage();
     let (history, workspace, control) = warm.sampling_bytes();
     let backing = usage.backing_bytes + history + workspace;
@@ -76,7 +68,8 @@ fn admitted_history_has_no_token_allocations_and_complete_fault_cleanup() {
         let before = LIVE.load(SeqCst);
         let failures = FAILURES.load(SeqCst);
         FAIL.store(bytes, SeqCst);
-        let error = PagedSequence::with_sampling(&mut ledger, g, 7, 32769, 33377335).unwrap_err();
+        let error =
+            PagedSequence::with_sampling(&mut ledger, g.clone(), 7, 32769, 33377335).unwrap_err();
         assert_eq!(
             error,
             Error::CapacityExceeded {
@@ -94,7 +87,7 @@ fn admitted_history_has_no_token_allocations_and_complete_fault_cleanup() {
         }
     }
     let before = LIVE.load(SeqCst);
-    let mut s = PagedSequence::with_sampling(&mut ledger, g, 7, 32769, 33377335).unwrap();
+    let mut s = PagedSequence::with_sampling(&mut ledger, g.clone(), 7, 32769, 33377335).unwrap();
     assert!(LIVE.load(SeqCst) - before <= total as isize);
     let cancel = AtomicBool::new(false);
     let rows = [KvRow {

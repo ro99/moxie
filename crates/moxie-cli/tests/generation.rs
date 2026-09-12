@@ -94,15 +94,7 @@ fn paged_history_is_owned_by_one_immutable_program() {
     let first = fixture::build(2, 4, 16, 1).unwrap();
     let second = fixture::build(2, 4, 16, 1).unwrap();
     let mut owner = ledger();
-    let geometry = KvGeometry {
-        layers: 1,
-        kv_heads: 2,
-        key_dim: 4,
-        value_dim: 4,
-        precision: Precision::Bf16,
-        page_tokens: 3,
-        max_tokens: 4,
-    };
+    let geometry = KvGeometry::uniform(1, 2, 4, 4, Precision::Bf16, 3, 4);
     let mut pages = PagedSequence::with_sampling(&mut owner, geometry, 16, 2, 0).unwrap();
     pages.append_prompt(2).unwrap();
     let execution = PagedExecution::bind(
@@ -149,15 +141,15 @@ fn forward_cancellation_restores_existing_rows_frontiers_and_lineage() {
     for (heads, dim, vocab, layers) in [(2, 4, 16, 1), (3, 4, 7, 2)] {
         let fixture = fixture::build(heads, dim, vocab, layers).unwrap();
         let mut owner = ledger();
-        let geometry = KvGeometry {
-            layers: layers as usize,
-            kv_heads: heads as usize,
-            key_dim: dim as usize,
-            value_dim: dim as usize,
-            precision: Precision::Bf16,
-            page_tokens: 3,
-            max_tokens: 16,
-        };
+        let geometry = KvGeometry::uniform(
+            layers as usize,
+            heads as usize,
+            dim as usize,
+            dim as usize,
+            Precision::Bf16,
+            3,
+            16,
+        );
         let mut pages =
             PagedSequence::with_sampling(&mut owner, geometry, vocab as usize, 4, 0).unwrap();
         pages.append_prompt(8).unwrap();
@@ -229,17 +221,18 @@ fn paged_forward_is_bit_exact_with_dense_reference_and_rejects_stale_outputs() {
         let fixture = fixture::build(heads, dim, vocab, layers).unwrap();
         for chunk in [1, 3, 7, 19] {
             let mut owner = ledger();
-            let geometry = KvGeometry {
-                layers: layers as usize,
-                kv_heads: heads as usize,
-                key_dim: dim as usize,
-                value_dim: dim as usize,
-                precision: Precision::Bf16,
-                page_tokens: 7,
-                max_tokens: 32,
-            };
+            let geometry = KvGeometry::uniform(
+                layers as usize,
+                heads as usize,
+                dim as usize,
+                dim as usize,
+                Precision::Bf16,
+                7,
+                32,
+            );
             let mut pages =
-                PagedSequence::with_sampling(&mut owner, geometry, vocab as usize, 10, 42).unwrap();
+                PagedSequence::with_sampling(&mut owner, geometry.clone(), vocab as usize, 10, 42)
+                    .unwrap();
             let mut dense = SequenceState::new([StateKind::KvPages]);
             let mut cache = KvCache::for_branch(layers as usize, &dense, ROOT).unwrap();
             pages.append_prompt(19).unwrap();
@@ -293,7 +286,8 @@ fn paged_forward_is_bit_exact_with_dense_reference_and_rejects_stale_outputs() {
             }
             let output = last.unwrap();
             let mut foreign =
-                PagedSequence::with_sampling(&mut owner, geometry, vocab as usize, 10, 42).unwrap();
+                PagedSequence::with_sampling(&mut owner, geometry.clone(), vocab as usize, 10, 42)
+                    .unwrap();
             let foreign_txn = foreign.begin().unwrap();
             assert!(
                 output

@@ -135,13 +135,16 @@ fn admitted_peak_cleanup_repeated_generations_and_allocation_failure() {
         drop(owner);
         assert!(LIVE.load(SeqCst) <= before_ledger);
         println!(
-            "shape={} layers={} heads={}/{} head_dim={} prompt={prompt_len} chunk={chunk} \
-             peak_delta={peak} admitted={charged}",
+            "shape={} layers={} heads={} local_kv={}x{} global_kv={}x{} window={} \
+             prompt={prompt_len} chunk={chunk} peak_delta={peak} admitted={charged}",
             shape.name(),
             config.layers,
             config.heads,
-            config.kv_heads,
-            config.head_dim
+            config.local_kv_heads,
+            config.local_head_dim,
+            config.global_kv_heads,
+            config.global_head_dim,
+            config.sliding_window
         );
     }
     // Repeated generations on a reduced Gemma graph retain nothing: the third
@@ -226,15 +229,7 @@ fn admitted_peak_cleanup_repeated_generations_and_allocation_failure() {
     // Direct API regression: preparation failure on a later call must abort
     // the entire already-mutated transaction, not only the failing call.
     let direct = fixture::build(4, 64, 256, 1).unwrap();
-    let geometry = KvGeometry {
-        layers: 1,
-        kv_heads: 4,
-        key_dim: 64,
-        value_dim: 64,
-        precision: Precision::Bf16,
-        page_tokens: 7,
-        max_tokens: 8,
-    };
+    let geometry = KvGeometry::uniform(1, 4, 64, 64, Precision::Bf16, 7, 8);
     let mut direct_owner = ledger(1 << 30);
     let mut pages = PagedSequence::with_sampling(&mut direct_owner, geometry, 256, 4, 0).unwrap();
     pages.append_prompt(2).unwrap();
@@ -288,9 +283,11 @@ fn admitted_peak_cleanup_repeated_generations_and_allocation_failure() {
     for (bytes, tier) in [
         (193 * 4, Some(Tier::Host(HostTier::StateSpill))),
         ((193 + 3 + 1) * 8, Some(Tier::Host(HostTier::Pageable))),
-        // 28 page-table entries + 196 rows * 2 layers * 48 K/V bytes,
-        // plus 16*(3+7) history/count bytes and 8*7 workspace bytes.
-        (28 * 8 + 196 * 2 * 48 + 16 * (3 + 7) + 8 * 7, None),
+        // 28 pages per layer, and pages now belong to one layer, so the page
+        // table has 2 * 28 entries rather than 28 shared ones. The pools are
+        // unchanged: 196 rows * 2 layers * 48 K/V bytes. Plus 16*(3+7)
+        // history/count bytes and 8*7 workspace bytes.
+        (2 * 28 * 8 + 196 * 2 * 48 + 16 * (3 + 7) + 8 * 7, None),
     ] {
         let mut service = GenerationService::new(&mut owner, fixture.program());
         FAIL.store(bytes, SeqCst);

@@ -19,8 +19,47 @@ use moxie_graph::{Bindings, Graph, OpParams, OracleRegistry, RopeLayout, ValueId
 use moxie_interp::{Interpreter, KvCache, paged::PagedExecution};
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_models::gemma4::{Fraction, Gemma4Text, TextConfig, embedding_scale};
-use moxie_state::{KvGeometry, PagedSequence, ROOT, SequenceState, StateKind};
+use moxie_state::{KvGeometry, LayerKv, PagedSequence, ROOT, Retention, SequenceState, StateKind};
 use moxie_types::{Precision, Scope, SymbolId};
+
+/// The pages a reduced Gemma configuration needs, transcribed from the
+/// configuration rather than obtained from the engine.
+///
+/// Deliberately a second implementation: the engine derives the same geometry
+/// from the composed graph's attention nodes, and a test that called into the
+/// engine to build what it then checks the engine against would be checking
+/// nothing. The two agree only if both read the configuration the same way.
+fn paged_geometry(
+    config: &TextConfig,
+    page_tokens: usize,
+    max_tokens: usize,
+    tentative_rows: usize,
+) -> KvGeometry {
+    KvGeometry {
+        layers: (0..config.layers)
+            .map(|layer| {
+                let g = config.layer_geometry(layer);
+                LayerKv {
+                    // The pages store key/value heads, which under
+                    // grouped-query attention is fewer than the query heads.
+                    kv_heads: g.kv_heads as usize,
+                    key_dim: g.head_dim as usize,
+                    value_dim: g.head_dim as usize,
+                    retention: match g.window {
+                        None => Retention::All,
+                        Some(window) => Retention::Window {
+                            window: window as usize,
+                        },
+                    },
+                }
+            })
+            .collect(),
+        precision: Precision::Bf16,
+        page_tokens,
+        max_tokens,
+        tentative_rows,
+    }
+}
 
 fn ledger() -> Ledger {
     Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 30, 1).unwrap()]).unwrap()
@@ -137,19 +176,10 @@ fn paged_and_dense_logits_are_bit_identical_across_pages_and_decode() {
         let rows = 19usize;
         for chunk in [1, 3, 7, 19] {
             let mut owner = ledger();
-            let geometry = KvGeometry {
-                layers,
-                // The pages store key/value heads, which under grouped-query
-                // attention is fewer than the query heads.
-                kv_heads: config.kv_heads as usize,
-                key_dim: config.head_dim as usize,
-                value_dim: config.head_dim as usize,
-                precision: Precision::Bf16,
-                page_tokens: 7,
-                max_tokens: 32,
-            };
+            let geometry = paged_geometry(&config, 7, 32, 19);
             let mut pages =
-                PagedSequence::with_sampling(&mut owner, geometry, vocab as usize, 10, 42).unwrap();
+                PagedSequence::with_sampling(&mut owner, geometry.clone(), vocab as usize, 10, 42)
+                    .unwrap();
             let mut dense = SequenceState::new([StateKind::KvPages]);
             let mut cache = KvCache::for_branch(layers, &dense, ROOT).unwrap();
             pages.append_prompt(rows as u64).unwrap();
@@ -191,6 +221,114 @@ fn paged_and_dense_logits_are_bit_identical_across_pages_and_decode() {
                 );
                 pages.commit_prefix(txn, 0).unwrap();
             }
+        }
+    }
+}
+
+/// Task 0017's central gate: **reclaiming changes no output bit**.
+///
+/// The dense `KvCache` reference retains every row and masks; the paged store
+/// physically reclaims what a sliding layer's window cannot see. If the two
+/// agree bit for bit, the reclamation threw away exactly what was unreachable
+/// and nothing else. A tolerance would not be a weaker version of this claim,
+/// it would be a different and much weaker one, so the comparison is on raw
+/// FP32 bits.
+///
+/// The geometry is chosen so reclamation actually happens -- the test asserts
+/// that it did, because a windowed layer that never reached its capacity would
+/// make this pass while proving nothing.
+#[test]
+fn reclaiming_a_sliding_layers_window_changes_no_logit_bit() {
+    for shape in [gemma::Shape::A, gemma::Shape::B] {
+        let config = shape.config();
+        let layers = config.layers as usize;
+        let vocab = config.vocab;
+        let fixture = gemma::build(shape).unwrap();
+        let rows = 23usize;
+        // Small pages and small headroom, so a sliding layer's ring wraps
+        // several times inside the sequence. Page sizes on either side of the
+        // window put the wrap before, on and after a page edge.
+        for (page_tokens, chunk) in [(2usize, 1usize), (2, 2), (3, 3), (4, 2), (5, 5)] {
+            let mut owner = ledger();
+            let geometry = paged_geometry(&config, page_tokens, 32, chunk);
+            let mut pages = PagedSequence::new(&mut owner, geometry).unwrap();
+            let mut dense = SequenceState::new([StateKind::KvPages]);
+            let mut cache = KvCache::for_branch(layers, &dense, ROOT).unwrap();
+            pages.append_prompt(rows as u64).unwrap();
+            dense.append_prompt(ROOT, rows as u64).unwrap();
+            let execution = PagedExecution::bind(
+                &fixture.graph,
+                &fixture.weights,
+                fixture.tokens,
+                fixture.positions,
+                &mut pages,
+            )
+            .unwrap();
+            for start in (0..rows).step_by(chunk) {
+                let end = (start + chunk).min(rows);
+                let ids: Vec<u64> = (start..end).map(|i| i as u64 % vocab).collect();
+                let positions: Vec<u64> = (start as u64..end as u64).collect();
+                let mut bindings = fixture.weights.clone();
+                bindings.set(fixture.tokens, Value::Index(ids.clone()));
+                bindings.set(fixture.positions, Value::Index(positions.clone()));
+                let reference = Interpreter::new()
+                    .run(
+                        &fixture.graph,
+                        &bindings,
+                        &mut dense,
+                        ROOT,
+                        &mut cache,
+                        &Cancel::never(),
+                    )
+                    .unwrap();
+                pages.clear_logits().unwrap();
+                let txn = pages.begin().unwrap();
+                let actual = execution
+                    .run(&mut pages, txn, &ids, &positions, &Cancel::never())
+                    .unwrap();
+                assert_eq!(
+                    reference
+                        .logits
+                        .data()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    actual
+                        .logits()
+                        .data()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    "{shape:?} pages {page_tokens} chunk {chunk} rows {start}..{end}"
+                );
+                pages.commit_prefix(txn, 0).unwrap();
+            }
+            // Reclamation happened on every sliding layer, and on no global
+            // one: otherwise the comparison above compared two full histories.
+            let mut reclaimed = 0;
+            for layer in 0..layers {
+                let start = pages.retained_range(layer).unwrap().start;
+                if config.layer_geometry(layer as u32).window.is_some() {
+                    assert!(
+                        start > 0,
+                        "{shape:?} pages {page_tokens} chunk {chunk}: sliding layer \
+                         {layer} never reclaimed, so this proved nothing"
+                    );
+                    reclaimed += 1;
+                } else {
+                    assert_eq!(start, 0, "a global layer must keep everything");
+                }
+            }
+            assert!(reclaimed > 0);
+            // And the reclaimed rows are refused rather than served stale.
+            let sliding = (0..layers)
+                .find(|l| config.layer_geometry(*l as u32).window.is_some())
+                .unwrap();
+            assert!(matches!(
+                pages.row(sliding, 0),
+                Err(moxie_types::Error::Reclaimed { .. })
+            ));
+            pages.close(&mut owner).unwrap();
         }
     }
 }
@@ -262,8 +400,24 @@ fn every_gemma_parameter_is_load_bearing() {
     // heads instead of two. The graph is rebuilt, so this also proves the
     // narrower stored rows were not incidental.
     let mut c = base.clone();
-    c.kv_heads = 4;
-    assert_ne!(reference, logits_for(c, &prompt), "kv head grouping");
+    c.local_kv_heads = 4;
+    assert_ne!(
+        reference,
+        logits_for(c, &prompt),
+        "sliding kv head grouping"
+    );
+
+    // 8. And the same on the global layers, which now have their own count.
+    // A configuration where the two layer types agreed would pass 7 and miss
+    // this entirely.
+    let mut c = base.clone();
+    c.global_kv_heads = 2;
+    assert_ne!(reference, logits_for(c, &prompt), "global kv head grouping");
+
+    // 9. The global head dimension, independent of the sliding one.
+    let mut c = base.clone();
+    c.global_head_dim = 16;
+    assert_ne!(reference, logits_for(c, &prompt), "global head dimension");
 }
 
 /// The parameters that cannot be reached through `TextConfig`, because the model
@@ -678,13 +832,14 @@ fn the_cli_selects_the_reduced_shapes_and_agrees_with_the_service() {
         assert_eq!(options.shape.name(), flag);
         // The surface says what the graph is not, before it says anything else.
         let reduction = options.shape.reduction();
-        for expected in [
-            "synthetic-bf16-weights",
-            "uniform-kv-geometry",
-            "no-window-eviction",
-            "text-only",
-        ] {
+        for expected in ["synthetic-bf16-weights", "text-only"] {
             assert!(reduction.contains(expected), "{reduction}");
+        }
+        // And the two task 0017 removed are gone, not merely unmentioned: a
+        // disclosure that still named them would be claiming a limit the store
+        // no longer has.
+        for gone in ["uniform-kv-geometry", "no-window-eviction"] {
+            assert!(!reduction.contains(gone), "{reduction}");
         }
 
         let fixture = options.shape.build().unwrap();
@@ -814,34 +969,98 @@ fn an_inadmissible_budget_leaves_no_charge() {
 }
 
 #[test]
-fn a_graph_whose_layers_disagree_on_geometry_is_refused_not_paged_at_one_width() {
-    // Uniform key/value geometry is the reduction this task declares, and the
-    // engine enforces it rather than trusting the composition root. This is
-    // what stops a future per-layer graph -- the artifact's own 16x256 sliding
-    // layers beside its 4x512 global ones -- from being silently stored at
-    // whichever width the first layer happened to use.
+fn a_graph_whose_layers_disagree_on_geometry_is_paged_at_each_layers_own_width() {
+    // Task 0016 refused this outright and recorded uniform geometry as a
+    // declared reduction. Task 0017 admits it: each layer is paged at its own
+    // width, which is what the artifact's 16x256 sliding layers beside its
+    // 4x512 global ones require.
+    //
+    // The check is on the stored rows, not on the sampled token. A greedy
+    // argmax can coincide between two different graphs, and asserting it
+    // differs would be a flaky test of nothing; the row widths are the thing
+    // the admission actually decides.
+    let head_dim = 4usize;
     let (uniform, mixed) = two_layer_graphs();
-    for (graph, admissible) in [(uniform, true), (mixed, false)] {
+    let mut reserved = Vec::new();
+    let mut logits = Vec::new();
+    for (graph, second_kv_heads) in [(uniform, 2usize), (mixed, 1usize)] {
+        // Through the service, so admission is the thing being exercised.
         let mut owner = ledger();
         let mut service = GenerationService::new(&mut owner, graph.program());
-        let started = service.start(Request {
-            prompt: &[0, 1, 2],
-            max_new_tokens: 1,
-            prefill_chunk: 2,
-            temperature: 0.0,
-            seed: 0,
-        });
-        assert_eq!(
-            started.is_ok(),
-            admissible,
-            "an admissible control and a refused mixture are both required"
-        );
-        if started.is_ok() {
-            drain(&mut service);
-        }
+        service
+            .start(Request {
+                prompt: &[0, 1, 2],
+                max_new_tokens: 1,
+                prefill_chunk: 2,
+                temperature: 0.0,
+                seed: 0,
+            })
+            .unwrap();
+        let Some(Event::Admitted { reserved_bytes, .. }) = service.next_event(&Cancel::never())
+        else {
+            panic!("the mixed graph must be admitted, not refused");
+        };
+        reserved.push(reserved_bytes);
+        drain(&mut service);
         assert!(service.is_idle());
         assert_eq!(service.charged_bytes(), 0);
+
+        // And directly, to read the stored row widths back.
+        let mut owner = ledger();
+        let geometry = KvGeometry {
+            layers: vec![
+                LayerKv {
+                    kv_heads: 2,
+                    key_dim: head_dim,
+                    value_dim: head_dim,
+                    retention: Retention::All,
+                },
+                LayerKv {
+                    kv_heads: second_kv_heads,
+                    key_dim: head_dim,
+                    value_dim: head_dim,
+                    retention: Retention::All,
+                },
+            ],
+            precision: Precision::Bf16,
+            page_tokens: 2,
+            max_tokens: 8,
+            tentative_rows: 3,
+        };
+        let mut pages = PagedSequence::new(&mut owner, geometry).unwrap();
+        pages.append_prompt(3).unwrap();
+        let execution = PagedExecution::bind(
+            &graph.graph,
+            &graph.weights,
+            graph.tokens,
+            graph.positions,
+            &mut pages,
+        )
+        .unwrap();
+        let txn = pages.begin().unwrap();
+        let output = execution
+            .run(&mut pages, txn, &[0, 1, 2], &[0, 1, 2], &Cancel::never())
+            .unwrap();
+        logits.push(output.logits().data().to_vec());
+        pages.commit_prefix(txn, 0).unwrap();
+        for position in 0..3 {
+            // Two bytes per BF16 element, `kv_heads * head_dim` elements, and
+            // the two layers disagree about how many that is.
+            assert_eq!(pages.row(0, position).unwrap().key.len(), 2 * head_dim * 2);
+            assert_eq!(
+                pages.row(1, position).unwrap().key.len(),
+                second_kv_heads * head_dim * 2
+            );
+        }
+        pages.close(&mut owner).unwrap();
     }
+    // The narrower second layer is admitted for fewer bytes, and reaches the
+    // arithmetic: same weights, different stored width, different logits.
+    assert!(
+        reserved[1] < reserved[0],
+        "a narrower second layer must be admitted for less: {reserved:?}"
+    );
+    assert_ne!(logits[0], logits[1]);
 }
 
 /// Two minimal two-layer graphs: one with a single key/value geometry, one

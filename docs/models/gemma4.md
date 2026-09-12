@@ -1,8 +1,10 @@
 # Model bring-up contract — Gemma 4 31B-IT
 
 Status: **inventory 2026-09-12; reduced synthetic graph implemented by
-[task 0016](../tasks/0016-m1-gemma-reduced-graph.md).** The checkpoint is not
-imported and not executed. This record exists because roadmap M1.5 requires a
+[task 0016](../tasks/0016-m1-gemma-reduced-graph.md), given per-layer key/value
+geometry and window reclamation by
+[task 0017](../tasks/0017-m4-per-layer-kv-geometry-and-window-eviction.md).**
+The checkpoint is still not imported and not executed. This record exists because roadmap M1.5 requires a
 Gemma text graph and document 09 §B requires the mathematical inventory *before*
 implementation. It resolves no owner gate and makes no support claim.
 
@@ -169,8 +171,12 @@ the tensor header, not the config, established that the scales are BF16.
 - Legal partitions are **not determined**. `OpParams::Attention` returns
   `PartitionRule::NotDetermined` deliberately, and M5 owns it. The
   32/16 and 32/4 query-to-KV head ratios are the relevant constraint when it is.
-- Rollback method: the accepted task 0013 paged transactions. A sliding-window
-  layer additionally needs the ring-eviction boundary tested, which M4 owns.
+- Rollback method: the accepted task 0013 paged transactions, extended by
+  [task 0017](../tasks/0017-m4-per-layer-kv-geometry-and-window-eviction.md)
+  with per-layer retention. A sliding layer's ring boundaries are now tested,
+  and a rollback whose target window has been reclaimed is refused rather than
+  served: it needs re-prefill. The device ring, host-backed page streaming and
+  the rest of M4 are still outstanding.
 
 ## Integration proof
 
@@ -215,8 +221,13 @@ normalization, global layers taking `V` from the key projection before its norm
 and rotation, GeGLU, four RMSNorms per layer, a per-layer scalar on the MLP
 residual only, the embedding output scale, tied embeddings and the logit softcap.
 
-Dropped, each with its owner: heterogeneous per-layer key/value geometry and
-sliding-window ring eviction (**M4**); INT8 import and execution (**M3**); the
+Task 0017 removed two of the four reductions. The reduced graph now composes
+sliding and global layers at **their own** key/value head counts and head
+dimensions, and its store keeps only what each layer's window can see, refusing
+anything below it. The 31B artifact's own 16x256 versus 4x512 asymmetry is
+expressible; what is still missing to run it is weights, not shape.
+
+Still dropped, each with its owner: INT8 import and execution (**M3**); the
 vision tower and the multimodal mask exemption (**M11**); real weights and real
 dimensions (**M3**, then a real admission profile). The running CLI prints this
 list before it prints anything else.

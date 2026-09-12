@@ -6,18 +6,32 @@
 //! weights sum to one over the visible set. This module is the head and history
 //! bookkeeping around it.
 //!
-//! Task 0003's slice is deliberately narrow: full causal, one head group (MHA),
-//! exact. GQA head mapping, sliding windows in the graph, sinks, biases, MLA and
-//! model-defined sparse selection are document 04's later work, and none of them
-//! is approximated here.
+//! Task 0003's slice was deliberately narrow: full causal, one head group
+//! (MHA), exact. GQA head mapping and sliding windows arrived with the
+//! operations that needed them. Sinks, biases, MLA and model-defined sparse
+//! selection are document 04's later work, and none of them is approximated
+//! here.
+//!
+//! A history carries the absolute position of its first entry, so a layer that
+//! has reclaimed what its window cannot see still masks on true positions.
+//! Task 0017 uses that to check the paged store: the store reclaims by ring
+//! overwrite, this history reclaims by absolute position over a dense `Vec`,
+//! and the two must agree bit for bit.
 
 use moxie_types::{Error, Result};
 
 use crate::mask::{Visibility, attend_row};
 
 /// One layer's key/value history, indexed by **absolute** sequence position.
+///
+/// `base` is the absolute position of entry zero. It is zero for a layer that
+/// retains its whole history, and rises as a sliding layer reclaims what its
+/// window can no longer see. Entry `k` is absolute position `base + k`, and
+/// every visibility decision is made on the absolute value -- R21 is about
+/// exactly the confusion of indexing a mask by a position within a chunk.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct KvHistory {
+    base: u64,
     keys: Vec<Vec<f32>>,
     values: Vec<Vec<f32>>,
 }
@@ -28,10 +42,50 @@ impl KvHistory {
     }
 
     pub fn try_with_capacity(capacity: usize) -> Result<Self> {
+        Self::try_with_base(0, capacity)
+    }
+
+    /// A history whose first entry is absolute position `base`.
+    ///
+    /// A windowed layer's retained rows start above zero, and the reader that
+    /// copies them out of paged storage knows where. Passing the base in is
+    /// what keeps the mask exact: the alternative, renumbering the retained
+    /// rows from zero, would move every key under the query and make a sliding
+    /// layer wrong by the amount it had reclaimed.
+    pub fn try_with_base(base: u64, capacity: usize) -> Result<Self> {
         Ok(Self {
+            base,
             keys: crate::try_vec(capacity)?,
             values: crate::try_vec(capacity)?,
         })
+    }
+
+    /// The absolute position of entry zero.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// One past the last absolute position held.
+    pub fn end(&self) -> u64 {
+        self.base + self.keys.len() as u64
+    }
+
+    /// Drop every entry below absolute position `position`, raising the base.
+    ///
+    /// This is the oracle's own reclamation, by absolute position over a dense
+    /// history. The paged store reclaims by ring overwrite instead, so
+    /// comparing the two is an independent check rather than a transcription.
+    /// Reclaiming past the end empties the history and leaves the base at
+    /// `position`, which is what a layer whose whole retained range fell
+    /// outside its window would hold.
+    pub fn evict_before(&mut self, position: u64) {
+        if position <= self.base {
+            return;
+        }
+        let drop = ((position - self.base) as usize).min(self.keys.len());
+        self.keys.drain(..drop);
+        self.values.drain(..drop);
+        self.base = position;
     }
 
     pub fn len(&self) -> usize {
@@ -58,12 +112,13 @@ impl KvHistory {
     /// executed without its state being written, which is the corruption the
     /// state crate's counters exist to make visible.
     pub fn append(&mut self, position: u64, key: Vec<f32>, value: Vec<f32>) -> Result<()> {
-        if position != self.keys.len() as u64 {
+        if position != self.end() {
             return Err(Error::InvalidRequest {
                 field: "position",
                 detail: format!(
-                    "appending position {position} to a history of {} entries leaves a gap",
-                    self.keys.len()
+                    "appending position {position} to a history holding [{}, {}) leaves a gap",
+                    self.base,
+                    self.end()
                 ),
             });
         }
@@ -97,8 +152,13 @@ impl KvHistory {
     /// that means physically: the tail is discarded, and what remains is exactly
     /// what was there before those positions were written.
     pub fn truncate(&mut self, prefix: u64) {
-        self.keys.truncate(prefix as usize);
-        self.values.truncate(prefix as usize);
+        // Saturating at the base: a prefix below it names positions this
+        // history has already reclaimed, and discarding the whole retained
+        // range is the only honest answer to that. A caller that needs those
+        // positions back has to re-prefill, which is document 04's rule.
+        let keep = prefix.saturating_sub(self.base) as usize;
+        self.keys.truncate(keep);
+        self.values.truncate(keep);
     }
 
     /// One head's lanes, checked rather than sliced blind.
@@ -207,19 +267,22 @@ pub fn attend_multi_head(
             detail: format!("score scale must be finite and positive, got {scale}"),
         });
     }
-    if (position as usize) >= history.len() {
+    if position < history.base() || position >= history.end() {
         return Err(Error::InvalidRequest {
             field: "position",
             detail: format!(
-                "position {position} has no key in a history of {}; append before attending",
-                history.len()
+                "position {position} has no key in a history holding [{}, {}); \
+                 append before attending",
+                history.base(),
+                history.end()
             ),
         });
     }
 
     let group = heads / kv_heads;
+    let base = history.base();
     let mut allowed = crate::try_vec(history.len())?;
-    allowed.extend((0..history.len()).map(|k| visibility.allows(position, k as u64)));
+    allowed.extend((0..history.len()).map(|k| visibility.allows(position, base + k as u64)));
 
     let mut out = crate::try_vec(query.len())?;
     for h in 0..heads {
@@ -885,5 +948,145 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn row(v: f32) -> Vec<f32> {
+        vec![v, v + 0.5]
+    }
+
+    /// The point of the whole reclamation contract: dropping entries a window
+    /// cannot see changes **no bit** of the output.
+    #[test]
+    fn evicting_outside_the_window_changes_no_output_bit() {
+        for window in [1u64, 2, 3, 5] {
+            let mut full = KvHistory::new();
+            for p in 0..12u64 {
+                full.append(p, row(p as f32), row(-(p as f32))).unwrap();
+            }
+            for position in 0..12u64 {
+                let reference = attend_mha(
+                    &row(1.25),
+                    &full,
+                    position,
+                    1,
+                    2,
+                    Visibility::SlidingWindow { window },
+                )
+                .unwrap();
+                // Everything strictly below the window is unreachable from this
+                // query, so a store is free to have thrown it away.
+                let mut windowed = full.clone();
+                windowed.evict_before(position + 1 - window.min(position + 1));
+                assert!(windowed.base() <= position);
+                let evicted = attend_mha(
+                    &row(1.25),
+                    &windowed,
+                    position,
+                    1,
+                    2,
+                    Visibility::SlidingWindow { window },
+                )
+                .unwrap();
+                assert_eq!(
+                    evicted.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    reference.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "window {window} at position {position}"
+                );
+            }
+        }
+    }
+
+    /// The negative control for the test above, and the exact shape of the
+    /// mistake the base prevents.
+    ///
+    /// A reader that hands back a layer's *retained* rows while leaving the
+    /// base at zero -- the obvious way to write the paged reader -- is caught
+    /// here because the mask still uses the true absolute query position, which
+    /// is past the end of a history claiming to start at zero. It is a typed
+    /// refusal, not a wrong answer.
+    ///
+    /// Worth stating because it bounds what this test can prove: a sliding
+    /// window is **shift invariant**. Renumber the retained rows *and* the
+    /// query by the same amount and the answer is identical, because the mask
+    /// only ever looks at `q - k`. So the base cannot be validated by comparing
+    /// outputs; it is validated by the range check, and by the fact that every
+    /// other consumer of a position -- RoPE, the lineage, the frontier -- reads
+    /// the absolute value. Carrying it is what keeps those agreeing.
+    #[test]
+    fn retained_rows_labelled_from_zero_do_not_answer_an_absolute_query() {
+        let mut full = KvHistory::new();
+        for p in 0..8u64 {
+            full.append(p, row(p as f32), row(-(p as f32))).unwrap();
+        }
+        let window = 3;
+        let mut retained = full.clone();
+        retained.evict_before(5);
+        assert!(
+            attend_mha(
+                &row(1.25),
+                &retained,
+                7,
+                1,
+                2,
+                Visibility::SlidingWindow { window }
+            )
+            .is_ok()
+        );
+
+        // The same three rows, relabelled 0..3 by a reader that dropped the base.
+        let mut mislabelled = KvHistory::new();
+        for (k, p) in (5..8u64).enumerate() {
+            mislabelled
+                .append(k as u64, row(p as f32), row(-(p as f32)))
+                .unwrap();
+        }
+        assert!(
+            attend_mha(
+                &row(1.25),
+                &mislabelled,
+                7,
+                1,
+                2,
+                Visibility::SlidingWindow { window }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_based_history_appends_and_attends_on_absolute_positions() {
+        let mut h = KvHistory::try_with_base(100, 4).unwrap();
+        assert_eq!((h.base(), h.end()), (100, 100));
+        // The next position is the base, not zero.
+        assert!(h.append(0, row(1.0), row(1.0)).is_err());
+        h.append(100, row(1.0), row(1.0)).unwrap();
+        h.append(101, row(2.0), row(2.0)).unwrap();
+        assert_eq!((h.base(), h.end(), h.len()), (100, 102, 2));
+        // Below the base and at the end are both absent, for the same reason.
+        assert!(attend_mha(&row(1.0), &h, 99, 1, 2, Visibility::Causal).is_err());
+        assert!(attend_mha(&row(1.0), &h, 102, 1, 2, Visibility::Causal).is_err());
+        assert!(attend_mha(&row(1.0), &h, 101, 1, 2, Visibility::Causal).is_ok());
+    }
+
+    #[test]
+    fn eviction_and_truncation_meet_at_an_empty_retained_range() {
+        let mut h = KvHistory::new();
+        for p in 0..4u64 {
+            h.append(p, row(p as f32), row(p as f32)).unwrap();
+        }
+        // Reclaiming at or below the base does nothing.
+        h.evict_before(0);
+        assert_eq!((h.base(), h.len()), (0, 4));
+        h.evict_before(2);
+        assert_eq!((h.base(), h.end()), (2, 4));
+        // Truncating below the base empties rather than pretending to restore.
+        let mut below = h.clone();
+        below.truncate(1);
+        assert_eq!((below.base(), below.len()), (2, 0));
+        // Reclaiming past the end empties and parks the base at the request.
+        h.evict_before(9);
+        assert_eq!((h.base(), h.end(), h.len()), (9, 9, 0));
+        h.append(9, row(9.0), row(9.0)).unwrap();
+        assert_eq!(h.end(), 10);
     }
 }

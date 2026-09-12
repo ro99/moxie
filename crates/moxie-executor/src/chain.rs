@@ -996,6 +996,18 @@ fn attribute_error(error: Error, device: u32, attribution: String) -> Error {
             device,
             detail: format!("{attribution}: {error}"),
         },
+        // Passed through, uniquely among these. Every other arm carries the
+        // chain attribution in a free-text field; `Reclaimed` has none, and
+        // wrapping it in one that does would destroy the distinction it exists
+        // to make -- a caller has to be able to tell "that history is gone,
+        // re-prefill" from a malformed request. Its own fields already name the
+        // layer and the position, which is the more actionable attribution.
+        //
+        // No device path produces it today: paged state is host-resident and
+        // reclamation happens in `moxie-state`. This arm is here because the
+        // match is exhaustive on purpose, so a new variant forces the decision
+        // rather than falling into a wildcard.
+        Error::Reclaimed { .. } => error,
     }
 }
 

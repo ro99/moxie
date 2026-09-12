@@ -42,15 +42,7 @@ static ALLOCATOR: FailingAllocator = FailingAllocator;
 fn lineage_allocation_failure_is_capacity_exhaustion_and_releases_the_reservation() {
     let mut ledger =
         Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 20, 1 << 10).unwrap()]).unwrap();
-    let geometry = KvGeometry {
-        layers: 1,
-        kv_heads: 1,
-        key_dim: 2,
-        value_dim: 2,
-        precision: Precision::Bf16,
-        page_tokens: 16,
-        max_tokens: 1_000,
-    };
+    let geometry = KvGeometry::uniform(1, 1, 2, 2, Precision::Bf16, 16, 1_000);
     let lineage_bytes = (geometry.max_tokens + 1) * size_of::<PrefixLineage>();
     assert_eq!(
         lineage_bytes, 8_008,

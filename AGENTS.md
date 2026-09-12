@@ -46,14 +46,27 @@ adds `moxie-models` with a `gemma4` module — one crate with a module per famil
 at the owner's direction during implementation
 ([ADR 0013](docs/decisions/adr/0013-one-model-crate-with-family-modules.md)).
 
+The owner selected **M4's paged state schema** as
+[task 0017](docs/tasks/0017-m4-per-layer-kv-geometry-and-window-eviction.md) from
+that handover's three candidates. It is **implemented and awaiting owner
+review**: per-layer key/value geometry and per-layer retention, one ring per
+layer, reclamation by overwrite, and bounded tentative-undo headroom
+([ADR 0014](docs/decisions/adr/0014-bounded-tentative-undo-headroom.md)). Its
+numerical claim is exact: reclaiming outside a layer's window changes no output
+bit. **It closes neither M4 nor M1.5** — device paged attention, COW forks,
+host-backed page streaming and recurrent state are still M4's, and the artifact
+still cannot execute. It does clear two of the reduced graph's four reductions:
+sliding and global layers now compose at their own widths and sliding layers
+keep only what they can see. Contract `b748536` precedes implementation.
+
 **It executes no checkpoint.** The Gemma 4 artifact at
 `/fast/models/cyankiwi/gemma-4-31B-it-AWQ-8bit` is inspected, hashed and
 recorded in [its bring-up record](docs/models/gemma4.md); every language-model
 linear is compressed-tensors INT8 `pack-quantized`, so its importer and execution
 path are M3. The reduced graph is a synthetic contract fixture and may not be
-described as model support. M4 owns per-layer key/value geometry and window
-eviction; M11 owns vision. See the
-[active handover](docs/handovers/2026-09-12-m1.5-gemma-operation-gap.md).
+described as model support. M11 owns vision. See the
+[active handover](docs/handovers/2026-09-12-task0017-per-layer-kv-retention.md),
+whose next bounded task is M3's compressed-tensors INT8 importer.
 
 ## Read before editing
 

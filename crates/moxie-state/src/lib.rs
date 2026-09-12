@@ -42,7 +42,8 @@
 
 pub mod paged;
 pub use paged::{
-    KvGeometry, KvRow, PagedCloseRefused, PagedExecutionBinding, PagedSequence, PagedUsage,
+    KvGeometry, KvRow, LayerKv, PagedCloseRefused, PagedExecutionBinding, PagedSequence,
+    PagedUsage, Retention,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

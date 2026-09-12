@@ -15,24 +15,114 @@ use moxie_types::{
 
 use crate::{Branch, Journal, PrefixLineage, ROOT, SequenceState, StateKind};
 
-/// Uniform geometry across layers. K and V may have different widths.
+/// How much of its history one layer keeps.
+///
+/// A layer's retention is part of its state schema, not a policy the engine
+/// applies afterwards, because it decides how many physical rows the layer is
+/// admitted for. The declared window must equal the window in the graph's
+/// `Visibility::SlidingWindow`; a store that retained less than its mask admits
+/// would be silently wrong, and one that retained more would spend memory the
+/// window was chosen to save.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KvGeometry {
-    pub layers: usize,
+pub enum Retention {
+    /// Every executed row, up to the admitted maximum.
+    All,
+    /// The `window` most recent rows, inclusive of the current position.
+    /// Older rows are reclaimed and reading one is [`Error::Reclaimed`].
+    Window { window: usize },
+}
+
+impl Retention {
+    const fn window(self) -> Option<usize> {
+        match self {
+            Retention::All => None,
+            Retention::Window { window } => Some(window),
+        }
+    }
+}
+
+/// One layer's key/value geometry and retention. K and V may have different
+/// widths, and layers need not agree with each other: Gemma 4's sliding layers
+/// are 16 heads of 256 and its global layers 4 of 512.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerKv {
     pub kv_heads: usize,
     pub key_dim: usize,
     pub value_dim: usize,
+    pub retention: Retention,
+}
+
+/// The whole sequence's page schema: one entry per layer, plus the properties
+/// every layer shares.
+///
+/// Not `Copy`: the per-layer vector is allocated once at construction and
+/// charged to the admitted control reserve, like every other byte here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvGeometry {
+    pub layers: Vec<LayerKv>,
     pub precision: Precision,
     pub page_tokens: usize,
     pub max_tokens: usize,
+    /// How many rows one transaction may append before it must commit.
+    ///
+    /// This is undo headroom, not context. A windowed layer is admitted for
+    /// `window + tentative_rows` rows so that aborting the longest legal
+    /// transaction still leaves every row its window can see; see
+    /// [ADR 0014](../../../docs/decisions/adr/0014-bounded-tentative-undo-headroom.md).
+    /// The headroom is never readable, so it cannot be mistaken for history.
+    pub tentative_rows: usize,
 }
 
+impl KvGeometry {
+    /// Every layer with the same width and full retention -- the shape every
+    /// consumer had before per-layer geometry existed, and still the right
+    /// description of a graph whose layers genuinely agree.
+    pub fn uniform(
+        layers: usize,
+        kv_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+        precision: Precision,
+        page_tokens: usize,
+        max_tokens: usize,
+    ) -> Self {
+        Self {
+            layers: vec![
+                LayerKv {
+                    kv_heads,
+                    key_dim,
+                    value_dim,
+                    retention: Retention::All,
+                };
+                layers
+            ],
+            precision,
+            page_tokens,
+            max_tokens,
+            tentative_rows: max_tokens,
+        }
+    }
+}
+
+/// One layer's resolved byte layout. Pages belong to exactly one layer: layers
+/// no longer agree on row width or on how many rows they keep, so they cannot
+/// share a page.
 #[derive(Debug, Clone, Copy)]
-struct Layout {
+struct LayerLayout {
     key_bytes: usize,
     value_bytes: usize,
-    layer_bytes: usize,
+    /// Physical rows this layer is admitted for, always a whole number of
+    /// pages and always at least `window + tentative_rows`.
+    capacity: usize,
+    pages: usize,
     page_bytes: usize,
+    /// Index of this layer's first page-table entry.
+    table_base: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Layout {
+    layers: Vec<LayerLayout>,
     table_bytes: usize,
     backing_bytes: usize,
     control_bytes: usize,
@@ -54,18 +144,18 @@ fn invalid(field: &'static str, detail: impl Into<String>) -> Error {
 }
 
 impl KvGeometry {
-    fn layout(self) -> Result<Layout> {
-        if [
-            self.layers,
-            self.kv_heads,
-            self.key_dim,
-            self.value_dim,
-            self.page_tokens,
-            self.max_tokens,
-        ]
-        .contains(&0)
-        {
-            return Err(invalid("kv_geometry", "all dimensions must be positive"));
+    fn layout(&self) -> Result<Layout> {
+        if self.layers.is_empty() || self.page_tokens == 0 || self.max_tokens == 0 {
+            return Err(invalid(
+                "kv_geometry",
+                "at least one layer, one page token and one context token",
+            ));
+        }
+        if self.tentative_rows == 0 {
+            return Err(invalid(
+                "tentative_rows",
+                "a transaction must be allowed to append at least one row",
+            ));
         }
         if !self.precision.is_legal_cache() {
             return Err(Error::Unsupported {
@@ -74,13 +164,53 @@ impl KvGeometry {
             });
         }
         let element = self.precision.bits() as usize / 8;
-        let key_bytes = mul(mul(self.kv_heads, self.key_dim)?, element)?;
-        let value_bytes = mul(mul(self.kv_heads, self.value_dim)?, element)?;
-        let layer_bytes = mul(self.page_tokens, add(key_bytes, value_bytes)?)?;
-        let page_bytes = mul(self.layers, layer_bytes)?;
-        let pages = self.max_tokens.div_ceil(self.page_tokens);
-        let table_bytes = mul(pages, size_of::<u64>())?;
-        let backing_bytes = add(table_bytes, mul(pages, page_bytes)?)?;
+        let mut layers = try_vec(self.layers.len())?;
+        let mut entries = 0usize;
+        let mut pool_bytes = 0usize;
+        for layer in &self.layers {
+            if [layer.kv_heads, layer.key_dim, layer.value_dim].contains(&0) {
+                return Err(invalid("kv_geometry", "all dimensions must be positive"));
+            }
+            let key_bytes = mul(mul(layer.kv_heads, layer.key_dim)?, element)?;
+            let value_bytes = mul(mul(layer.kv_heads, layer.value_dim)?, element)?;
+            // A windowed layer is admitted for what it can see plus the undo
+            // headroom, and never for more than the whole context -- a window
+            // wider than the context is legal and simply means full retention.
+            //
+            // The clamp is why the abort argument survives it. Capacity is
+            // `min(window + tentative_rows, max_tokens)` rounded up to a page,
+            // so it can be *below* `window + tentative_rows` only when it is at
+            // or above `max_tokens` -- and a layer with that much capacity
+            // never reclaims, because `rows` cannot exceed `max_tokens`. Where
+            // reclamation can happen at all, the headroom is fully present.
+            let needed = match layer.retention {
+                Retention::All => self.max_tokens,
+                Retention::Window { window } => {
+                    if window == 0 {
+                        return Err(invalid(
+                            "retention",
+                            "a window must retain at least one row",
+                        ));
+                    }
+                    add(window, self.tentative_rows)?.min(self.max_tokens)
+                }
+            };
+            let pages = needed.div_ceil(self.page_tokens);
+            let capacity = mul(pages, self.page_tokens)?;
+            let page_bytes = mul(self.page_tokens, add(key_bytes, value_bytes)?)?;
+            pool_bytes = add(pool_bytes, mul(pages, page_bytes)?)?;
+            layers.push(LayerLayout {
+                key_bytes,
+                value_bytes,
+                capacity,
+                pages,
+                page_bytes,
+                table_base: entries,
+            });
+            entries = add(entries, pages)?;
+        }
+        let table_bytes = mul(entries, size_of::<u64>())?;
+        let backing_bytes = add(table_bytes, pool_bytes)?;
         // The facade permits one branch, one open journal and no retained
         // results. Lineage is reserved exactly once. A conservative node bound
         // for the pinned Rust BTreeMap (11 entries, 12 edges) covers each map's
@@ -88,7 +218,15 @@ impl KvGeometry {
         // one entry. No per-token map entries can accumulate here.
         let node_bound = |entry: usize| 11 * (entry + size_of::<usize>()) + 16 * size_of::<usize>();
         let control_bytes = add(
-            mul(add(self.max_tokens, 1)?, size_of::<PrefixLineage>())?,
+            add(
+                mul(add(self.max_tokens, 1)?, size_of::<PrefixLineage>())?,
+                // The two per-layer vectors, each allocated once: the caller's
+                // declared geometry and this resolved layout.
+                add(
+                    mul(self.layers.len(), size_of::<LayerKv>())?,
+                    mul(self.layers.len(), size_of::<LayerLayout>())?,
+                )?,
+            )?,
             size_of::<Self>()
                 + size_of::<PagedSequence>()
                 + size_of::<StateKind>()
@@ -100,15 +238,23 @@ impl KvGeometry {
             return Err(DimError::Overflow.into());
         }
         Ok(Layout {
-            key_bytes,
-            value_bytes,
-            layer_bytes,
-            page_bytes,
+            layers,
             table_bytes,
             backing_bytes,
             control_bytes,
         })
     }
+}
+
+fn try_vec<T>(capacity: usize) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|_| Error::CapacityExceeded {
+            tier: Some(Tier::Host(HostTier::Pageable)),
+            requested_bytes: (capacity.saturating_mul(size_of::<T>())) as u64,
+            available_bytes: 0,
+        })?;
+    Ok(out)
 }
 
 /// Already encoded, head-major bytes for one layer at one position. The store
@@ -122,9 +268,14 @@ pub struct KvRow<'a> {
 /// Logical occupancy versus the full admitted physical envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PagedUsage {
+    /// The executed frontier: how many rows have been written.
     pub rows: usize,
+    /// Rows still readable, summed over layers. Below `rows * layers` exactly
+    /// when a windowed layer has reclaimed something.
+    pub retained_rows: usize,
     pub live_pages: usize,
     pub live_page_bytes: usize,
+    /// Encoded bytes of the rows that are still readable.
     pub logical_kv_bytes: usize,
     pub backing_bytes: usize,
     pub page_table_bytes: usize,
@@ -143,6 +294,15 @@ pub struct PagedSequence {
     layout: Layout,
     backing: HostBuffer,
     rows: usize,
+    /// The greatest `rows` ever reached. It never decreases, because a ring
+    /// slot that has been overwritten stays overwritten: truncating the logical
+    /// frontier does not bring back the row that was physically replaced. This
+    /// is what lets a rollback tell whether its target's window survives.
+    high_water: usize,
+    /// The executed frontier when the open transaction began, so an append can
+    /// refuse before it writes the row that would make the transaction too long
+    /// to undo. `None` outside a transaction.
+    tentative_base: Option<usize>,
     sampler: Option<Sampler>,
     execution: Option<PagedExecutionBinding>,
 }
@@ -303,13 +463,18 @@ impl PagedSequence {
                 available_bytes: 0,
             });
         }
-        // Immutable page table. Pages are statically partitioned in this first
-        // exclusive-owner implementation; no per-row allocation or dense
-        // history materialization is involved in addressing them.
-        for page in 0..geometry.max_tokens.div_ceil(geometry.page_tokens) {
-            let offset = layout.table_bytes + page * layout.page_bytes;
-            backing.bytes_mut()[page * 8..page * 8 + 8]
-                .copy_from_slice(&(offset as u64).to_le_bytes());
+        // Immutable page table, one contiguous pool per layer. Pages are
+        // statically partitioned in this first exclusive-owner implementation;
+        // no per-row allocation or dense history materialization is involved in
+        // addressing them.
+        let mut offset = layout.table_bytes;
+        for layer in &layout.layers {
+            for page in 0..layer.pages {
+                let entry = (layer.table_base + page) * 8;
+                backing.bytes_mut()[entry..entry + 8]
+                    .copy_from_slice(&(offset as u64).to_le_bytes());
+                offset += layer.page_bytes;
+            }
         }
         let sampler = sampling.map(|(sampling, seed)| Sampler {
             history: History::new(
@@ -326,6 +491,8 @@ impl PagedSequence {
             layout,
             backing,
             rows: 0,
+            high_water: 0,
+            tentative_base: None,
             sampler,
             execution: None,
         })
@@ -399,19 +566,68 @@ impl PagedSequence {
         self.state.invalidate_generation()
     }
 
-    pub fn geometry(&self) -> KvGeometry {
-        self.geometry
+    pub fn geometry(&self) -> &KvGeometry {
+        &self.geometry
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.geometry.layers.len()
+    }
+
+    /// The absolute positions layer `layer` still holds, as `start..rows`.
+    ///
+    /// The start is the later of what the window admits and what the ring has
+    /// already overwritten. The second term only exceeds the first after a
+    /// rollback moved the frontier back below what was reclaimed, which is the
+    /// case [`Self::rollback_to`] refuses outright.
+    ///
+    /// For a window of `w` the start is `rows - w`, which is one row wider than
+    /// the *next* query strictly needs: a query at position `rows` sees keys
+    /// from `rows - w + 1`. The extra row is the one a query at `rows - 1`
+    /// would need, so the most recently executed position can be re-executed
+    /// without re-prefilling -- which document 04's two-frontier rule makes an
+    /// ordinary operation rather than a special case. It costs one row per
+    /// windowed layer and is charged like every other row.
+    pub fn retained_range(&self, layer: usize) -> Result<std::ops::Range<u64>> {
+        if layer >= self.geometry.layers.len() {
+            return Err(invalid("kv_row", "layer is outside this sequence"));
+        }
+        Ok(self.retained_start(layer) as u64..self.rows as u64)
+    }
+
+    fn retained_start(&self, layer: usize) -> usize {
+        let evicted = self
+            .high_water
+            .saturating_sub(self.layout.layers[layer].capacity);
+        match self.geometry.layers[layer].retention.window() {
+            // `capacity >= max_tokens >= high_water`, so `evicted` is zero.
+            None => evicted,
+            Some(window) => self.rows.saturating_sub(window).max(evicted),
+        }
     }
 
     pub fn usage(&self) -> PagedUsage {
-        let live_pages = self.rows.div_ceil(self.geometry.page_tokens);
+        let mut live_pages = 0;
+        let mut live_page_bytes = 0;
+        let mut retained_rows = 0;
+        let mut logical_kv_bytes = 0;
+        for (index, layer) in self.layout.layers.iter().enumerate() {
+            let pages = self
+                .rows
+                .div_ceil(self.geometry.page_tokens)
+                .min(layer.pages);
+            live_pages += pages;
+            live_page_bytes += pages * layer.page_bytes;
+            let retained = self.rows - self.retained_start(index);
+            retained_rows += retained;
+            logical_kv_bytes += retained * (layer.key_bytes + layer.value_bytes);
+        }
         PagedUsage {
             rows: self.rows,
+            retained_rows,
             live_pages,
-            live_page_bytes: live_pages * self.layout.page_bytes,
-            logical_kv_bytes: self.rows
-                * self.geometry.layers
-                * (self.layout.key_bytes + self.layout.value_bytes),
+            live_page_bytes,
+            logical_kv_bytes,
             backing_bytes: self.layout.backing_bytes,
             page_table_bytes: self.layout.table_bytes,
             control_reserve_bytes: self.layout.control_bytes,
@@ -462,7 +678,20 @@ impl PagedSequence {
             .get_mut(&txn)
             .expect("opened journal")
             .sampler_len = self.sampler.as_ref().map_or(0, |s| s.history.len());
+        // The facade owns one branch, so at most one transaction is open and
+        // one base suffices. It is what an append measures its length against.
+        self.tentative_base = Some(self.rows);
         Ok(txn)
+    }
+
+    /// Whether any layer can reclaim. A sequence of full-retention layers is
+    /// always exactly restorable, so the tentative bound does not apply to it
+    /// and existing consumers keep their previous freedom.
+    fn reclaims(&self) -> bool {
+        self.geometry
+            .layers
+            .iter()
+            .any(|l| l.retention.window().is_some())
     }
 
     /// Task 0004 semantics: accept n additional tokens, keep executed work,
@@ -525,6 +754,8 @@ impl PagedSequence {
         })();
         if result.is_err() {
             self.abort(txn).expect("validated open publication journal");
+        } else {
+            self.tentative_base = None;
         }
         result
     }
@@ -537,10 +768,12 @@ impl PagedSequence {
             self.update_history(|h, b| h.truncate(b, len));
         }
         self.truncate(self.state.frontiers(ROOT)?.executed as usize);
+        self.tentative_base = None;
         Ok(())
     }
 
     pub fn rollback_to(&mut self, prefix: u64) -> Result<()> {
+        self.check_retained_at(prefix)?;
         if self.sampler.is_some() {
             // Prevalidate every destructive refusal before applying count undo.
             // The facade owns the schema and has no mutable raw-state escape.
@@ -577,6 +810,34 @@ impl PagedSequence {
             self.state.rollback_to(ROOT, prefix, &[])?;
         }
         self.truncate(self.state.frontiers(ROOT)?.executed as usize);
+        Ok(())
+    }
+
+    /// Refuse a rollback whose target window has already been reclaimed.
+    ///
+    /// Unlike an abort, which the tentative bound keeps exact, a rollback may
+    /// reach back across any number of committed transactions, and the rows its
+    /// target needs to see may be long overwritten. Document 04: "if history
+    /// has been released, recompute or report that the requested operation
+    /// needs re-prefill. Do not silently change results." Reported, not
+    /// silently served, and checked before anything mutates.
+    fn check_retained_at(&self, prefix: u64) -> Result<()> {
+        for (index, layer) in self.geometry.layers.iter().enumerate() {
+            let Some(window) = layer.retention.window() else {
+                continue;
+            };
+            let evicted =
+                self.high_water
+                    .saturating_sub(self.layout.layers[index].capacity) as u64;
+            let wanted = prefix.saturating_sub(window as u64);
+            if wanted < evicted {
+                return Err(Error::Reclaimed {
+                    layer: index as u32,
+                    position: wanted,
+                    retained_from: evicted,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -713,18 +974,39 @@ impl PagedSequence {
                 ));
             }
             self.check_frontier(position, 1)?;
-            if layers.len() != self.geometry.layers
-                || layers.iter().any(|r| {
-                    r.key.len() != self.layout.key_bytes || r.value.len() != self.layout.value_bytes
-                })
+            // Refuse before writing, so abort never has to fail. A transaction
+            // longer than the admitted undo headroom would overwrite rows its
+            // own abort has to put back; ADR 0014 is why this is a refusal
+            // rather than a snapshot.
+            let base = self.tentative_base.expect("validated open transaction");
+            if self.reclaims() && self.rows + 1 - base > self.geometry.tentative_rows {
+                return Err(invalid(
+                    "tentative_rows",
+                    format!(
+                        "this transaction has appended {} row(s) and a reclaiming \
+                         sequence admits {}; commit before appending more",
+                        self.rows - base,
+                        self.geometry.tentative_rows
+                    ),
+                ));
+            }
+            // Per layer, not one shared width: layers may disagree on both
+            // head count and head dimension, and a row of the wrong layer's
+            // width would otherwise be copied into the right number of bytes.
+            if layers.len() != self.layout.layers.len()
+                || layers
+                    .iter()
+                    .zip(&self.layout.layers)
+                    .any(|(r, l)| r.key.len() != l.key_bytes || r.value.len() != l.value_bytes)
             {
                 return Err(invalid(
                     "kv_rows",
-                    "every layer must supply exactly one complete K/V row",
+                    "every layer must supply exactly one complete K/V row of its own width",
                 ));
             }
             let row = self.rows;
             self.rows += 1;
+            self.high_water = self.high_water.max(self.rows);
             for (layer, values) in layers.iter().enumerate() {
                 let (key, value) = self.ranges(layer, row);
                 self.backing.bytes_mut()[key].copy_from_slice(values.key);
@@ -741,28 +1023,49 @@ impl PagedSequence {
         result
     }
 
+    /// Byte ranges of one row in one layer's own page pool.
+    ///
+    /// The page index wraps at the layer's capacity: writing row `r` reuses the
+    /// slot of row `r - capacity`, which *is* the reclamation. There is no
+    /// separate eviction pass, no memmove and no page free -- the pinned legacy
+    /// host path erases from the front of a vector
+    /// (`src/models/gemma4/gemma4_runtime.cpp:914`) while its device path
+    /// already used the ring (`:1066`), and the ring is the one that costs
+    /// nothing per token.
     fn ranges(&self, layer: usize, row: usize) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
-        let page = row / self.geometry.page_tokens;
+        let l = &self.layout.layers[layer];
+        let page = (row / self.geometry.page_tokens) % l.pages;
         let local = row % self.geometry.page_tokens;
-        let table = &self.backing.bytes()[page * 8..page * 8 + 8];
-        let base = u64::from_le_bytes(table.try_into().expect("eight-byte entry")) as usize
-            + layer * self.layout.layer_bytes;
-        let key = base + local * self.layout.key_bytes;
-        let value = base
-            + self.geometry.page_tokens * self.layout.key_bytes
-            + local * self.layout.value_bytes;
-        (
-            key..key + self.layout.key_bytes,
-            value..value + self.layout.value_bytes,
-        )
+        let entry = (l.table_base + page) * 8;
+        let table = &self.backing.bytes()[entry..entry + 8];
+        let base = u64::from_le_bytes(table.try_into().expect("eight-byte entry")) as usize;
+        let key = base + local * l.key_bytes;
+        let value = base + self.geometry.page_tokens * l.key_bytes + local * l.value_bytes;
+        (key..key + l.key_bytes, value..value + l.value_bytes)
     }
 
+    /// One retained row.
+    ///
+    /// The three outcomes are deliberately distinct. A position at or beyond
+    /// the frontier has not been executed; a position below the layer's
+    /// retained start was reclaimed by its window and needs re-prefill; a bad
+    /// layer index is a malformed request. Collapsing the middle case into
+    /// either of the others is exactly the silent wrong answer document 04
+    /// forbids.
     pub fn row(&self, layer: usize, position: u64) -> Result<KvRow<'_>> {
-        if layer >= self.geometry.layers || position >= self.rows as u64 {
-            return Err(invalid(
-                "kv_row",
-                "layer or position is outside visible state",
-            ));
+        if layer >= self.geometry.layers.len() {
+            return Err(invalid("kv_row", "layer is outside this sequence"));
+        }
+        if position >= self.rows as u64 {
+            return Err(invalid("kv_row", "position has not been executed"));
+        }
+        let start = self.retained_start(layer);
+        if position < start as u64 {
+            return Err(Error::Reclaimed {
+                layer: layer as u32,
+                position,
+                retained_from: start as u64,
+            });
         }
         let (key, value) = self.ranges(layer, position as usize);
         Ok(KvRow {
@@ -772,8 +1075,14 @@ impl PagedSequence {
     }
 
     fn truncate(&mut self, rows: usize) {
-        for row in rows..self.rows {
-            for layer in 0..self.geometry.layers {
+        for layer in 0..self.geometry.layers.len() {
+            // Only the last `capacity` discarded rows have slots of their own;
+            // anything older shares a slot with a row already zeroed here.
+            // Zeroing a slot can clear the bytes of the row `capacity` below
+            // it, which was already overwritten by the row being cleared and so
+            // is below every retained start -- nothing readable is lost.
+            let capacity = self.layout.layers[layer].capacity;
+            for row in rows.max(self.rows.saturating_sub(capacity))..self.rows {
                 let (key, value) = self.ranges(layer, row);
                 self.backing.bytes_mut()[key].fill(0);
                 self.backing.bytes_mut()[value].fill(0);
@@ -809,15 +1118,7 @@ mod tests {
                 let mut ledger =
                     Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 20, 1024).unwrap()])
                         .unwrap();
-                let g = KvGeometry {
-                    layers: 1,
-                    kv_heads: 1,
-                    key_dim: 1,
-                    value_dim: 1,
-                    precision: Precision::Bf16,
-                    page_tokens: 2,
-                    max_tokens: 16,
-                };
+                let g = KvGeometry::uniform(1, 1, 1, 1, Precision::Bf16, 2, 16);
                 let mut s = PagedSequence::with_sampling(&mut ledger, g, 3, 8, 77).unwrap();
                 let rows = [KvRow {
                     key: &[1, 2],
@@ -886,15 +1187,7 @@ mod tests {
                                 CapacitySnapshot::new(Scope::Host, 1 << 20, 1024).unwrap()
                             ])
                             .unwrap();
-                        let g = KvGeometry {
-                            layers: 3,
-                            kv_heads: 1,
-                            key_dim: 2,
-                            value_dim: 1,
-                            precision: Precision::Bf16,
-                            page_tokens: 2,
-                            max_tokens: 32,
-                        };
+                        let g = KvGeometry::uniform(3, 1, 2, 1, Precision::Bf16, 2, 32);
                         let mut s =
                             PagedSequence::with_sampling(&mut ledger, g, v, 16, 77).unwrap();
                         let rows = [KvRow {
@@ -963,23 +1256,15 @@ mod tests {
 
     #[test]
     fn cancellation_at_every_publication_boundary_restores_physical_and_logical_state() {
-        let geometry = KvGeometry {
-            layers: 3,
-            kv_heads: 1,
-            key_dim: 2,
-            value_dim: 1,
-            precision: Precision::Bf16,
-            page_tokens: 2,
-            max_tokens: 8,
-        };
+        let geometry = KvGeometry::uniform(3, 1, 2, 1, Precision::Bf16, 2, 8);
         // Entry, each layer's K/V copy, and frontier publication. Exercise both
         // a partial existing page and the first row on a new page.
         for start in [1, 2, 3] {
-            for fail_at in 0..geometry.layers + 2 {
+            for fail_at in 0..geometry.layers.len() + 2 {
                 let mut ledger =
                     Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 20, 1024).unwrap()])
                         .unwrap();
-                let mut sequence = PagedSequence::new(&mut ledger, geometry).unwrap();
+                let mut sequence = PagedSequence::new(&mut ledger, geometry.clone()).unwrap();
                 let rows = [KvRow {
                     key: &[0x80, 0x7f, 0, 0x80],
                     value: &[0xff, 0xff],

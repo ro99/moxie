@@ -3,11 +3,11 @@
 #![forbid(unsafe_code)]
 pub mod service;
 
-use moxie_graph::{Bindings, Graph, OpParams, ValueId};
+use moxie_graph::{Bindings, Graph, OpParams, ValueId, Visibility};
 use moxie_interp::paged::{PagedExecution, PagedOutput};
 pub use moxie_interp::{Cancel, HostTensor, Value};
 use moxie_memory::{BufferRequest, HostBuffer, Ledger, PlanRequest, Reservation, StageSpan};
-use moxie_state::{KvGeometry, PagedSequence};
+use moxie_state::{KvGeometry, LayerKv, PagedSequence, Retention};
 use moxie_types::{DimError, Error, HostTier, Precision, Result, Scope, SymbolTable, Tier};
 
 /// Immutable mathematical inputs supplied by the composition root. No execution
@@ -235,7 +235,11 @@ impl Program<'_> {
         if layers.is_empty() || layers.len() > 8 {
             return Err(unsupported("1..8 attention layers required"));
         }
-        let mut shape = None;
+        // One entry per attention layer, in layer order. Layers need not agree
+        // with each other any more, so each one's own width and retention is
+        // admitted; what they must agree with is their own graph node.
+        let mut per_layer: Vec<Option<LayerKv>> = try_vec(layers.len())?;
+        per_layer.resize(layers.len(), None);
         for node in self.graph.nodes() {
             match node.params {
                 OpParams::Embedding { vocab: v, .. }
@@ -247,34 +251,65 @@ impl Program<'_> {
                     return Err(invalid("graph", "rope must consume absolute positions"));
                 }
                 OpParams::Attention {
-                    heads,
                     kv_heads,
                     head_dim,
+                    layer,
+                    visibility,
                     ..
                 } => {
-                    // Uniform across layers, still: this profile stores one
-                    // page geometry for the whole sequence. A graph whose
-                    // layers disagree -- Gemma 4's sliding layers are 16x256
-                    // and its global layers 4x512 -- is refused here rather
-                    // than silently paged at the first layer's width. Per-layer
-                    // geometry is M4's state-schema work.
-                    if node.inputs[3] != self.positions
-                        || shape.is_some_and(|s| s != (heads, kv_heads, head_dim))
-                    {
-                        return Err(unsupported(
-                            "uniform attention geometry and absolute positions required",
+                    if node.inputs[3] != self.positions {
+                        return Err(unsupported("attention requires absolute positions"));
+                    }
+                    // `layers` is the sorted list of layer indices the graph
+                    // uses, so a gap or a duplicate is caught by position
+                    // rather than assumed away.
+                    let Some(slot) = layers
+                        .iter()
+                        .position(|l| *l == layer)
+                        .and_then(|i| per_layer.get_mut(i))
+                    else {
+                        return Err(invalid("graph", "attention layer is not in this graph"));
+                    };
+                    if slot.is_some() {
+                        return Err(invalid(
+                            "graph",
+                            "two attention nodes claim the same key/value layer",
                         ));
                     }
-                    shape = Some((heads, kv_heads, head_dim));
+                    // The paged rows hold keys and values, so the row width
+                    // follows the key/value heads, not the query heads. Under
+                    // GQA the two differ and charging for the query width
+                    // would over-reserve.
+                    *slot = Some(LayerKv {
+                        kv_heads: kv_heads as usize,
+                        key_dim: head_dim as usize,
+                        value_dim: head_dim as usize,
+                        // The store's retention comes from the mask, so the two
+                        // cannot drift: a layer keeps exactly what it can see.
+                        retention: match visibility {
+                            Visibility::Causal => Retention::All,
+                            Visibility::SlidingWindow { window } => Retention::Window {
+                                window: window as usize,
+                            },
+                        },
+                    });
                 }
                 _ => {}
             }
         }
-        let (_, kv_heads, dim) = shape.expect("attention layers");
-        // The paged rows hold keys and values, so the per-layer row width
-        // follows the key/value heads, not the query heads. Under GQA the two
-        // differ and charging for the query width would over-reserve.
-        let width = mul(kv_heads as usize, dim as usize)?;
+        let mut kv_layers = try_vec(layers.len())?;
+        for slot in per_layer {
+            kv_layers.push(slot.ok_or_else(|| invalid("graph", "attention layer has no node"))?);
+        }
+        // Workspace follows the widest layer: the interpreter holds one layer's
+        // dense scratch at a time, and charging the narrowest would under-admit.
+        let width = kv_layers
+            .iter()
+            .map(|l| mul(l.kv_heads, l.key_dim))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .expect("attention layers");
         let workspace = add(
             add(
                 add(1_048_576, mul(64, elements)?)?,
@@ -286,13 +321,14 @@ impl Program<'_> {
             vocabulary,
             workspace,
             geometry: KvGeometry {
-                layers: layers.len(),
-                kv_heads: kv_heads as usize,
-                key_dim: dim as usize,
-                value_dim: dim as usize,
+                layers: kv_layers,
                 precision: Precision::Bf16,
                 page_tokens: 7,
                 max_tokens: context,
+                // One prefill chunk is the longest transaction this service
+                // opens, so it is exactly the undo headroom a reclaiming layer
+                // has to be admitted for. ADR 0014.
+                tentative_rows: request.prefill_chunk.max(1),
             },
         })
     }

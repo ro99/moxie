@@ -34,23 +34,15 @@ static ALLOCATOR: Counter = Counter;
 fn actual_32768_rows_have_no_append_allocations_and_repeated_abort_retains_no_history() {
     let mut ledger =
         Ledger::new([CapacitySnapshot::new(Scope::Host, 16 << 20, 1 << 20).unwrap()]).unwrap();
-    let geometry = KvGeometry {
-        layers: 2,
-        kv_heads: 1,
-        key_dim: 2,
-        value_dim: 1,
-        precision: Precision::Bf16,
-        page_tokens: 127,
-        max_tokens: 32_769,
-    };
+    let geometry = KvGeometry::uniform(2, 1, 2, 1, Precision::Bf16, 127, 32_769);
     // Warm the ledger's persistent maps; their bookkeeping is separate from
     // this consumer's admitted envelope.
-    PagedSequence::new(&mut ledger, geometry)
+    PagedSequence::new(&mut ledger, geometry.clone())
         .unwrap()
         .close(&mut ledger)
         .unwrap();
     let before_new = LIVE.load(SeqCst);
-    let mut sequence = PagedSequence::new(&mut ledger, geometry).unwrap();
+    let mut sequence = PagedSequence::new(&mut ledger, geometry.clone()).unwrap();
     let usage = sequence.usage();
     let total = (usage.backing_bytes + usage.control_reserve_bytes) as isize;
     assert!(LIVE.load(SeqCst) - before_new <= total);
@@ -91,7 +83,10 @@ fn actual_32768_rows_have_no_append_allocations_and_repeated_abort_retains_no_hi
         }
     }
     assert_eq!(sequence.state().frontiers(ROOT).unwrap().executed, 32_768);
-    assert_eq!(sequence.usage().live_pages, 259);
+    // 259 pages per layer, and the layers no longer share them: a page belongs
+    // to one layer now, because layers need not agree on row width or capacity.
+    assert_eq!(sequence.usage().live_pages, 2 * 259);
+    assert_eq!(sequence.usage().retained_rows, 2 * 32_768);
     let retained = LIVE.load(SeqCst);
     let rows = [KvRow {
         key: &[1, 2, 3, 4],
@@ -116,8 +111,8 @@ fn actual_32768_rows_have_no_append_allocations_and_repeated_abort_retains_no_hi
         "close frees payload and control storage"
     );
     eprintln!(
-        "task0013 storage evidence: actual_rows=32768 max_tokens={} page_tokens={} \
-         backing_bytes={} table_bytes={} control_reserve_bytes={} \
+        "task0017 storage evidence (full retention): actual_rows=32768 max_tokens={} \
+         page_tokens={} backing_bytes={} table_bytes={} control_reserve_bytes={} \
          append_allocations=0 abort_cycles=10000 retained_growth=0 close_live_delta=0",
         geometry.max_tokens,
         geometry.page_tokens,
