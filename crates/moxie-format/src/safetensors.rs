@@ -368,6 +368,7 @@ impl<'de> serde::Deserialize<'de> for RawHeader {
             ) -> std::result::Result<RawHeader, A::Error> {
                 let mut out = Vec::new();
                 let mut tensors = 0usize;
+                let mut seen_metadata = false;
                 while let Some(key) = map.next_key::<String>()? {
                     // Every limit is checked as the entry is read, so a header
                     // that exceeds one never costs what it asked for.
@@ -378,7 +379,21 @@ impl<'de> serde::Deserialize<'de> for RawHeader {
                         )));
                     }
                     let item = if key == "__metadata__" {
-                        // The limit lives in `Metadata`'s visitor, so an
+                        // Refused here, before the value is read and before the
+                        // entry is appended. The duplicate check used to run in
+                        // `Header::parse`, after the whole header had been
+                        // deserialized, so a header repeating this key
+                        // accumulated thousands of entries and only then failed
+                        // -- spending memory on its way to a rejection.
+                        // **A resource bound has to cover the rejection paths
+                        // too.**
+                        if seen_metadata {
+                            return Err(serde::de::Error::custom(
+                                "the header declares __metadata__ twice",
+                            ));
+                        }
+                        seen_metadata = true;
+                        // The entry limit lives in `Metadata`'s visitor, so an
                         // oversized map is refused while it is read rather than
                         // after it has been built.
                         RawItem::Metadata(map.next_value::<Metadata>()?.0)
@@ -449,16 +464,13 @@ impl Header {
 
         let mut tensors: BTreeMap<String, TensorEntry> = BTreeMap::new();
         let mut metadata = BTreeMap::new();
-        let mut seen_metadata = false;
         // Sorted by start, to check overlap in one pass rather than pairwise.
         let mut spans: Vec<(u64, u64, String)> = Vec::new();
         for (name, item) in raw {
             let entry = match item {
+                // A second declaration cannot reach here: the visitor refuses
+                // it before reading its value.
                 RawItem::Metadata(map) => {
-                    if seen_metadata {
-                        return Err(invalid("the header declares __metadata__ twice"));
-                    }
-                    seen_metadata = true;
                     metadata = map;
                     continue;
                 }
@@ -467,6 +479,14 @@ impl Header {
             // A duplicate name is ambiguous, not a last-one-wins choice: the
             // discarded entry's bytes would disappear from the overlap and
             // coverage checks below while the file still contains them.
+            //
+            // Checked here rather than in the visitor, unlike `__metadata__`,
+            // and the difference is the cost of the abuse. A repeated tensor
+            // name costs a full tensor entry each time, so it is bounded by the
+            // ordinary tensor ratio the memory bound is derived against;
+            // detecting it earlier would need a second set of every name, which
+            // would raise the name-byte ratio to pay for a case that is already
+            // covered.
             if tensors.contains_key(&name) {
                 return Err(invalid(format!(
                     "the header declares tensor {name:?} twice"

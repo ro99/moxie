@@ -354,16 +354,17 @@ contract**, not a canonical capability. A test asserts the refusal is
 
 ### Independent review corrections
 
-Four rounds, and the last three were all the same defect: **a resource bound
-asserted rather than derived.** The first round found five defects plus a
-documentation contradiction. The second found the header budget measuring the
-wrong quantity. The third found the replacement bound fitted to sampled shapes
-and defeated it twice. The fourth found the derivation's minimum-cost term
-invalid, because the parser accepted a cheaper encoding than the derivation
-assumed, and its slopes blind to collection-capacity boundaries. **Every finding
-was reproduced before any change and all are fixed.** Every round confirmed the
-ownership split, the deferral of execution and quality, and the lane-order
-disclosure.
+Five rounds, and the last four were all the same defect wearing different
+clothes: **a resource bound asserted rather than established.** The first round
+found five defects plus a documentation contradiction. The second found the
+header budget measuring the wrong quantity. The third found the replacement
+bound fitted to sampled shapes and defeated it twice. The fourth found the
+derivation's minimum-cost term invalid — the parser accepted a cheaper encoding
+than the derivation assumed — and its slopes blind to collection-capacity
+boundaries. The fifth found a rejection path that spent memory on its way to
+refusing. **Every finding was reproduced before any change and all are fixed.**
+Every round confirmed the ownership split, the deferral of execution and
+quality, and the lane-order disclosure.
 
 **P1 — the importer accepted incompatible axes.** `import` took byte slices, so
 declared shapes were invisible to it, and `triple_entries` never cross-checked
@@ -481,6 +482,25 @@ and at scale **10.54**; the factor of 16 stands with margin.
 checked after `next_value` had built the whole map, so a 100,000-entry map was
 allocated in full and then rejected — stating a limit while paying for its
 violation. It is counted inside a `Metadata` visitor now, like `MAX_RANK`.
+
+**A fifth round found the same class once more, on a rejection path.** The
+duplicate `__metadata__` check ran in `Header::parse`, after the whole header
+had been deserialized, so a header repeating that key accumulated one entry per
+declaration and only then failed — spending the memory on its way to an error.
+Reproduced at **1,204,315 B against an admitted 1,189,104**. It is refused in
+the top-level visitor now, before the value is read and before the entry is
+appended: the excess over the input buffer is **454 B at both 4,097 and 8,193
+declarations**, flat rather than growing with the abuse. Its control restores
+the late check and fails with the original number.
+
+**A resource bound has to cover the rejection paths too**, and an `is_err()`
+assertion cannot see the difference — the regression measures the refusal.
+
+The duplicate *tensor name* check stays in `parse`, deliberately: a repeated
+name costs a full tensor entry each time, so it is bounded by the ordinary
+tensor ratio the derivation already covers, and detecting it earlier would need
+a second set of every name — raising the name-byte ratio to pay for a case that
+is already paid for.
 
 | Boundary case | Serialized | Peak | Admitted | Ratio |
 |---|---:|---:|---:|---:|

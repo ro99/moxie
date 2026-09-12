@@ -162,6 +162,15 @@ And: a limit checked after `next_value` has built the collection is not a limit.
 `MAX_METADATA_ENTRIES` was enforced only after a 100,000-entry map had been
 allocated in full. Count inside the visitor.
 
+A fifth round found the same class on a **rejection** path: the duplicate
+`__metadata__` check ran after the whole header was deserialized, so a header
+repeating that key accumulated an entry per declaration and only then failed,
+at 1,204,315 B against an admitted 1,189,104. **A resource bound has to cover
+the paths that refuse, not only the paths that succeed** -- and an `is_err()`
+assertion cannot tell a cheap refusal from an expensive one, so the regression
+measures it. Refused in the visitor, the excess over the input buffer is 454 B
+whether the header repeats the key 4,097 times or 8,193.
+
 And: deserializing untrusted JSON into a map collapses duplicate keys before any
 validation runs, so a header could declare an unsupported dtype and overwrite it
 with a supported one. Parse straight into the target struct and keep the

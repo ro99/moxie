@@ -20,6 +20,10 @@
 //! unbounded one, rank, is answered by a structural limit rather than a larger
 //! multiplier, because no multiplier survives it.
 //!
+//! Rejection paths are measured here too: a header that is refused must not
+//! spend memory on the way to the refusal, which is a separate claim from
+//! refusing it at all.
+//!
 //! A fourth round found two more holes, and both are covered here: serde's
 //! derived `Deserialize` accepted a positional array form at less than half the
 //! object form's serialized cost, which invalidated the minimum-size term the
@@ -247,6 +251,54 @@ fn a_header_costs_no_more_peak_heap_than_its_admitted_estimate() {
         eprintln!(
             "task0018 rank refusal: {tag} dims={n} serialized={serialized} refusal_peak={peak}"
         );
+    }
+
+    // **Rejection paths are budgeted too.** A header repeating `__metadata__`
+    // used to accumulate one entry per declaration and only fail once the whole
+    // thing had been deserialized, so the memory was spent on the way to an
+    // error. An `is_err()` assertion alone passed then and would pass now; the
+    // measurement is what distinguishes them.
+    for n in [4097usize, 8193] {
+        let mut json = String::from("{");
+        for i in 0..n {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str("\"__metadata__\":{}");
+        }
+        json.push_str(",\"t\":{\"dtype\":\"U8\",\"shape\":[0],\"data_offsets\":[0,0]}}");
+        let (path, serialized) = write_shard(&dir, &format!("repeated-metadata-{n}"), json, 8);
+        let estimate = HeaderBudget::estimated_peak(serialized).unwrap();
+        Shard::open(&path).unwrap_err();
+        let before = LIVE.load(SeqCst);
+        PEAK.store(before, SeqCst);
+        assert!(
+            Shard::open(&path).is_err(),
+            "a repeated __metadata__ must be refused"
+        );
+        let peak = (PEAK.load(SeqCst) - before) as u64;
+        assert!(
+            peak <= estimate,
+            "refusing {n} repeated __metadata__ declarations cost {peak} B against \
+             an admitted {estimate} B"
+        );
+        // And the refusal does not scale with the abuse. `Shard::open` reads
+        // the header whole before parsing it, so the input buffer is
+        // unavoidable; what must not grow with the number of declarations is
+        // everything on top of it. Before the fix that excess was over a
+        // megabyte at 4,097 declarations.
+        let excess = peak.saturating_sub(serialized);
+        assert!(
+            excess < 64 << 10,
+            "refusing {n} repeated declarations cost {excess} B beyond the \
+             {serialized}-byte input buffer; the refusal must stop at the second \
+             declaration rather than grow with them"
+        );
+        eprintln!(
+            "task0018 repeated-metadata refusal: n={n} serialized={serialized} \
+             refusal_peak={peak} beyond_input={excess}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     for (tag, serialized, peak, retained, estimate) in &rows {
