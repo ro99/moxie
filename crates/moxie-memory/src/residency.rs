@@ -43,7 +43,8 @@ use moxie_types::{DeviceTier, DeviceUuid, Error, HostTier, Result, Scope, Tier};
 
 use crate::arena::{Allocation, Arena};
 use crate::host::HostBuffer;
-use crate::ledger::Ledger;
+use crate::ledger::{Ledger, Reservation};
+use crate::request::{BufferRequest, PlanRequest, StageSpan};
 
 /// Alignment every cache range is placed at.
 ///
@@ -944,6 +945,9 @@ pub struct ResidencyAuthority {
     id: AuthorityId,
     label: String,
     host: HostBuffer,
+    /// The device caches' admitted envelope, one reservation covering every
+    /// declared device. Held by name; released by name.
+    device_envelope: Option<Reservation>,
     caches: BTreeMap<Scope, ScopeCache>,
     /// Identity -> placement, nested by scope.
     ///
@@ -1031,17 +1035,53 @@ impl ResidencyAuthority {
         let control = usize::try_from(control_bytes)
             .map_err(|_| invalid("max_placements", "control charge exceeds address space"))?;
 
-        // The host cache is admitted and physically allocated before any device
-        // arena exists, so a refusal cannot leave a half-built authority. The
-        // device caps are then admitted as one plan: partial device admission
-        // would be exactly the non-atomic reservation task 0006 removed.
-        let host = HostBuffer::allocate_in(
+        // The device caches are admitted **first**, as one plan covering every
+        // declared device. Two reasons, both load-bearing:
+        //
+        // * A cache whose capacity nobody reserved is a placement simulator
+        //   with a confident API -- R02 -- and document 06 names it a stop
+        //   condition for this task in the words "replace any simulated
+        //   placement with enforceable reservations".
+        // * One plan rather than one per device, because a partial device
+        //   admission is the non-atomic reservation task 0006 removed.
+        //
+        // Everything after it releases this envelope on the way out, so a
+        // refusal anywhere in `open` leaves the ledger exactly as it found it.
+        let device_envelope = if request.device_caps.is_empty() {
+            None
+        } else {
+            let mut plan = PlanRequest::new(format!("{} device caches", request.label), ["live"])?;
+            for (uuid, cap) in &request.device_caps {
+                plan.buffer(BufferRequest::new(
+                    format!("expert cache on {uuid}"),
+                    Scope::Device(*uuid),
+                    Tier::Device(DeviceTier::ExpertCache),
+                    *cap,
+                    StageSpan::at(0),
+                ))?;
+            }
+            Some(ledger.admit(&plan).map_err(Error::from)?)
+        };
+
+        let release_devices = |ledger: &mut Ledger, envelope: Option<Reservation>| {
+            if let Some(r) = envelope {
+                ledger.release(r).expect("the admitting ledger");
+            }
+        };
+
+        let host = match HostBuffer::allocate_in(
             ledger,
             &request.label,
             HostTier::Pageable,
             host_data,
             control,
-        )?;
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                release_devices(ledger, device_envelope);
+                return Err(e);
+            }
+        };
 
         // One allocation each, at their final size, before anything is served.
         let leases = request.max_leases as usize;
@@ -1052,6 +1092,7 @@ impl ResidencyAuthority {
         {
             let mut host = host;
             let _ = host.release(ledger);
+            release_devices(ledger, device_envelope);
             return Err(Error::CapacityExceeded {
                 tier: Some(Tier::Host(HostTier::Pageable)),
                 requested_bytes: u64::from(request.max_leases) * LEASE_CONTROL_BYTES,
@@ -1084,6 +1125,7 @@ impl ResidencyAuthority {
                     Err(e) => {
                         let mut host = host;
                         let _ = host.release(ledger);
+                        release_devices(ledger, device_envelope);
                         return Err(e);
                     }
                 },
@@ -1091,10 +1133,37 @@ impl ResidencyAuthority {
             },
         );
 
-        let mut built = Self {
+        for (uuid, cap) in &request.device_caps {
+            match Arena::new(
+                format!("{} device cache", request.label),
+                *cap,
+                CACHE_ALIGNMENT,
+            ) {
+                Ok(arena) => {
+                    caches.insert(
+                        Scope::Device(*uuid),
+                        ScopeCache {
+                            tier: Tier::Device(DeviceTier::ExpertCache),
+                            cap_bytes: *cap,
+                            arena,
+                            committed: 0,
+                        },
+                    );
+                }
+                Err(e) => {
+                    let mut host = host;
+                    let _ = host.release(ledger);
+                    release_devices(ledger, device_envelope);
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(Self {
             id: AuthorityId::next(),
             label: request.label.clone(),
             host,
+            device_envelope,
             caches,
             index: BTreeMap::new(),
             placements: BTreeMap::new(),
@@ -1111,33 +1180,7 @@ impl ResidencyAuthority {
             free_lease_slots,
             live_leases: 0,
             stats: ResidencyStats::default(),
-        };
-
-        for (uuid, cap) in &request.device_caps {
-            let scope = Scope::Device(*uuid);
-            match Arena::new(
-                format!("{} device cache", request.label),
-                *cap,
-                CACHE_ALIGNMENT,
-            ) {
-                Ok(arena) => {
-                    built.caches.insert(
-                        scope,
-                        ScopeCache {
-                            tier: Tier::Device(DeviceTier::ExpertCache),
-                            cap_bytes: *cap,
-                            arena,
-                            committed: 0,
-                        },
-                    );
-                }
-                Err(e) => {
-                    built.close(ledger)?;
-                    return Err(e);
-                }
-            }
-        }
-        Ok(built)
+        })
     }
 
     /// Release the envelope. Refused while anything is leased or in flight:
@@ -1159,7 +1202,11 @@ impl ResidencyAuthority {
         for key in keys {
             self.drop_placement(key);
         }
-        self.host.release(ledger)
+        self.host.release(ledger)?;
+        if let Some(envelope) = self.device_envelope.take() {
+            ledger.release(envelope).map_err(|refused| refused.error)?;
+        }
+        Ok(())
     }
 
     pub const fn id(&self) -> AuthorityId {

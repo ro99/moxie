@@ -1378,6 +1378,63 @@ fn the_cache_envelope_is_admitted_from_the_ledger_and_returned_on_close() {
 }
 
 #[test]
+fn every_device_cache_is_reserved_in_the_ledger_before_a_byte_of_it_exists() {
+    // The defect this catches was real and was in the first version of this
+    // module: the device caches had arenas and a capacity, and nothing had
+    // reserved them. That is a placement simulator with a confident API -- R02
+    // -- and document 06 names it a stop condition for this task in the words
+    // "replace any simulated placement with enforceable reservations".
+    let mut second = [0u8; 16];
+    second[15] = 8;
+    let second = DeviceUuid::from_bytes(second);
+    let mut l = Ledger::new([
+        CapacitySnapshot::new(Scope::Host, 1 << 30, 1 << 20).unwrap(),
+        CapacitySnapshot::new(Scope::Device(gpu()), 1 << 30, 0).unwrap(),
+        CapacitySnapshot::new(Scope::Device(second), 1 << 30, 0).unwrap(),
+    ])
+    .unwrap();
+    let mut a = ResidencyAuthority::open(
+        &mut l,
+        &ResidencyRequest::new("reserved", 8 * EXPERT_BYTES)
+            .device(gpu(), 2 * EXPERT_BYTES)
+            .device(second, 4 * EXPERT_BYTES),
+    )
+    .unwrap();
+    let cache = Tier::Device(DeviceTier::ExpertCache);
+    assert_eq!(l.committed(Scope::Device(gpu()), cache), 2 * EXPERT_BYTES);
+    assert_eq!(l.committed(Scope::Device(second), cache), 4 * EXPERT_BYTES);
+    a.close(&mut l).unwrap();
+    assert_eq!(l.committed(Scope::Device(gpu()), cache), 0);
+    assert_eq!(l.committed(Scope::Device(second), cache), 0);
+    assert_eq!(l.outstanding().len(), 0);
+}
+
+#[test]
+fn a_device_cache_the_ledger_cannot_admit_leaves_no_host_charge_either() {
+    // One plan for every device, and the host bytes allocated only after it is
+    // admitted: a refusal must leave the ledger exactly as it found it, not
+    // holding a host cache for an authority that does not exist.
+    let mut l = Ledger::new([
+        CapacitySnapshot::new(Scope::Host, 1 << 30, 1 << 20).unwrap(),
+        CapacitySnapshot::new(Scope::Device(gpu()), 4 * EXPERT_BYTES, 0).unwrap(),
+    ])
+    .unwrap();
+    let refused = ResidencyAuthority::open(
+        &mut l,
+        &ResidencyRequest::new("too big a device", 8 * EXPERT_BYTES)
+            .device(gpu(), 64 * EXPERT_BYTES),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(refused, Error::CapacityExceeded { .. }),
+        "{refused:?}"
+    );
+    assert_eq!(l.outstanding().len(), 0);
+    assert_eq!(l.scope_committed(Scope::Host), 0);
+    assert_eq!(l.scope_committed(Scope::Device(gpu())), 0);
+}
+
+#[test]
 fn an_envelope_larger_than_the_ledger_admits_is_refused_and_charges_nothing() {
     let mut l = Ledger::new([CapacitySnapshot::new(Scope::Host, 8_192, 4_096).unwrap()]).unwrap();
     let refused =

@@ -2,6 +2,13 @@
 
 ## Active handover
 
+[Task 0020 implemented; task 0021 is M2 item 3](2026-09-12-task0020-weight-residency-authority.md)
+is the current continuation. M2 item 2's residency authority exists and this
+artifact's own expert bytes have been read through it; **nothing executes a
+routed layer**, which is item 3.
+
+The milestone context below remains in force.
+
 [M1 complete (M1.5 closed); M2 active](2026-09-12-m1-closure-to-m2.md) is the
 current continuation. The owner closed M1.5 on 2026-09-12 on the reduced Gemma
 graph plus the accepted importer, with the remaining blockers recorded: the

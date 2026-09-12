@@ -16,8 +16,7 @@ use std::path::{Path, PathBuf};
 use moxie_executor::residency::{ChunkSource, ShardSource, drain_reads, perform_read};
 use moxie_memory::{
     AcquireRequest, Acquired, ArtifactId, CapacitySnapshot, ChunkId, Content, Ledger, LogicalRange,
-    PendingWork, ResidencyAuthority, ResidencyRequest, TensorSlot, TurnId, UseClass,
-    WorkOrder,
+    PendingWork, ResidencyAuthority, ResidencyRequest, TensorSlot, TurnId, UseClass, WorkOrder,
 };
 use moxie_storage::Shard;
 use moxie_types::{Error, Result, Scope};

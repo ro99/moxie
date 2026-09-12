@@ -29,13 +29,21 @@ the routing equation defines. **Nothing executes a checkpoint**, and a routed
 synthetic graph is not MoE model support. The acceptance closes task 0019 only,
 not M2.
 
-**[Task 0020](0020-m2-weight-residency-authority.md) is active**: M2 item 2's
-residency authority, specified in
-[the task 0019 handover](../handovers/2026-09-12-task0019-routed-expert-semantics.md#next-task).
-Its contract is authored and committed before implementation. It delivers one
-production weight-residency owner connected to bounded storage reads, a host
-cache, upload readiness, leases, eviction and demand/prefetch classes. **It does
-not close M2**, which also needs items 3–5 and a real working set that executes.
+**[Task 0020](0020-m2-weight-residency-authority.md) is implemented and awaiting
+review**: M2 item 2's residency authority — one production weight-residency
+owner connected to bounded storage reads, a host cache, real device uploads,
+leases, eviction and demand/prefetch classes, with all nine of M2 item 5's cases
+tested. Its contract was authored and committed at `d6e9170` before
+implementation. This artifact's own expert bytes were demand-read through it,
+107,053,056 B of `/fast/models/google/gemma-4-26B-A4B-it` layer 0, verified
+against an independent read. **Reading is not executing**: nothing computes with
+those bytes and no checkpoint runs. **It does not close M2**, which also needs
+items 3–5 and a real working set that executes.
+
+**Task 0021 is next**: M2 item 3's CPU expert fallback and GPU grouped candidate
+plans under one interface, specified in
+[the task 0020 handover](../handovers/2026-09-12-task0020-weight-residency-authority.md#next-task).
+Its contract has not been authored.
 
 Reopen accepted tasks only for a demonstrated defect in accepted scope.
 

@@ -273,7 +273,10 @@ is actually brought up.
 
 Status: **inventory 2026-09-12; routed graph composed by
 [task 0019](../tasks/0019-m2-routed-expert-semantics.md) over synthetic weights,
-accepted 2026-09-12.** The checkpoint is **not imported and not executed.** This record
+accepted 2026-09-12; its expert bytes demand-read through the residency
+authority by [task 0020](../tasks/0020-m2-weight-residency-authority.md),
+2026-09-12.** The checkpoint is **not imported and not executed** — task 0020
+reads bounded ranges and computes nothing with them. This record
 exists because roadmap M2 needs a real BF16 MoE and document 09 §B requires the
 mathematical inventory before implementation. It resolves no owner gate and
 makes no support claim.
@@ -463,13 +466,29 @@ weights the composition root invents.
 - **No private runtime, cache, transfer, sampler or branch evaluator: yes.** The
   routed graph runs through the accepted task 0015 service, task 0013 paged
   transactions and the task 0014 sampler.
-- Residency, expert chunk identity, demand cache, eviction and CPU fallback:
-  **not started** — task 0020 and M2 items 2 and 3.
+- **Residency, expert chunk identity, demand cache and eviction: implemented**
+  by [task 0020](../tasks/0020-m2-weight-residency-authority.md), awaiting
+  review. `moxie_memory::residency` is the one production weight-residency
+  owner. **This artifact's own expert bytes have been read through it**: nine
+  distinct experts of layer 0, demanded from routes shaped like a top-k-8 batch,
+  **107,053,056 B** read once each against a cache holding four, every range
+  verified against an independent read of the same file. That is
+  `9 × 11,894,784`, and the union is nine rather than the `3 × 8 = 24` a
+  no-overlap bound would charge.
+
+  **Reading is not executing, and this is not model support.** Nothing computed
+  with those bytes; no routed layer ran; the selected BF16 chain still refuses
+  `Route`, `ExpertMlp` and `Combine`. What made it possible is
+  `Shard::read_tensor_range`: the experts are fused, so serving one through the
+  whole-tensor reader would have read 1,522,532,352 B to use 11,894,784.
+- CPU expert fallback and grouped GPU candidate plans: **not started** — M2
+  item 3.
 - Reference quality, actual-context prefill/decode: **not started**, and O2.
 - GPU and distributed: **not applicable.** No device kernel; the selected BF16
   chain refuses all three routed operations as `UnsupportedKernel`, asserted by
   a test rather than assumed from a catch-all.
-- Support matrix updated: gate `G-MOE-ROUTING-HOST`.
+- Support matrix updated: gates `G-MOE-ROUTING-HOST`, and `G-RESIDENCY-HOST` /
+  `G-RESIDENCY-DEVICE` at task 0020.
 
 ### Blockers
 

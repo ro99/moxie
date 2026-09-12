@@ -64,8 +64,10 @@ expert explicitly. At 51.6 GB it fits aggregate VRAM but no single 24 GiB
 device, and M2 item 4's restricted budget makes it oversized by construction.
 Task 0019 composed its routed block over synthetic weights at reduced scale and
 recorded the artifact's inventory in
-[the bring-up record](docs/models/gemma4.md#the-26b-a4b-moe-variant); **nothing
-runs it**, which is what task 0020 exists to make possible.
+[the bring-up record](docs/models/gemma4.md#the-26b-a4b-moe-variant). Task 0020
+made its expert bytes resident on demand — the experts are fused per layer, so
+that needed the bounded ranged read it added — but **nothing runs it**, which is
+what M2 item 3 exists to make possible.
 
 `hy3-w4a16-mtp` is in scope. The Laguna checkpoint at
 `/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4` **finished downloading and was
