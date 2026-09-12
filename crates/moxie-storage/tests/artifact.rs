@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use moxie_format::sha256_hex;
-use moxie_storage::{Artifact, ByteBudget};
+use moxie_storage::{Artifact, ByteBudget, HeaderBudget, Shard};
 
 /// Thread-local live-allocation accounting for the memory gate below.
 ///
@@ -730,106 +730,120 @@ fn truncation_at_open_names_the_short_chunk() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Task 0018 corrections: the header is a budgeted, bounded resource of its own.
+/// Task 0018: a header longer than the file it claims to describe is refused
+/// before the allocation, not after a short read.
 ///
-/// Independent review opened a shard with a sixteen-byte [`ByteBudget`] and
-/// observed a 65,575-byte header allocation, because the payload budget does
-/// not govern the header. It has its own budget now, checked -- along with the
-/// file length -- **before** anything is allocated.
-mod shard_header_budget {
+/// The budget cases live in `tests/header_budget.rs`, which needs a global
+/// counting allocator and therefore its own executable.
+#[test]
+fn a_shard_header_longer_than_its_file_is_refused_before_it_is_allocated() {
     use std::io::Write;
+    let dir = std::env::temp_dir().join(format!(
+        "moxie-shard-truncated-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("short.safetensors");
+    let mut f = std::fs::File::create(&path).unwrap();
+    // Declares a 1 MiB header in a 16-byte file.
+    f.write_all(&(1u64 << 20).to_le_bytes()).unwrap();
+    f.write_all(&[0u8; 8]).unwrap();
+    drop(f);
+    let e = moxie_storage::Shard::open(&path).unwrap_err();
+    assert!(
+        matches!(e, moxie_types::Error::InvalidArtifact { .. }),
+        "expected a typed artifact error, got {e}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
 
-    use moxie_storage::{ByteBudget, HeaderBudget, Shard};
-    use moxie_types::Error;
+use std::io::Write as _;
 
-    /// A shard whose header is deliberately large: many small tensors.
-    fn big_header_shard(dir: &std::path::Path, tensors: usize) -> std::path::PathBuf {
-        let mut json = String::from("{");
-        for i in 0..tensors {
-            if i > 0 {
-                json.push(',');
-            }
-            json.push_str(&format!(
-                "\"tensor_with_a_deliberately_long_name_{i:06}\":\
-                 {{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[{i},{}]}}",
-                i + 1
-            ));
+fn budget_tempdir() -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!(
+        "moxie-header-admission-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+fn budget_shard(dir: &std::path::Path, tensors: usize) -> (std::path::PathBuf, u64) {
+    let mut json = String::from("{");
+    for i in 0..tensors {
+        if i > 0 {
+            json.push(',');
         }
-        json.push('}');
-        let path = dir.join("shard.safetensors");
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(&(json.len() as u64).to_le_bytes()).unwrap();
-        f.write_all(json.as_bytes()).unwrap();
-        f.write_all(&vec![0u8; tensors]).unwrap();
-        path
-    }
-
-    #[test]
-    fn a_header_larger_than_its_budget_is_refused_before_it_is_allocated() {
-        let dir = tempdir("shard-header-budget");
-        let path = big_header_shard(&dir, 600);
-        let declared = {
-            let mut prefix = [0u8; 8];
-            use std::io::Read;
-            std::fs::File::open(&path)
-                .unwrap()
-                .read_exact(&mut prefix)
-                .unwrap();
-            u64::from_le_bytes(prefix) + 8
-        };
-        assert!(declared > 16, "the fixture must have a nontrivial header");
-
-        // The payload budget does not govern the header, and no longer pretends
-        // to: a tiny payload budget opens this file fine.
-        let tiny_payload = ByteBudget::new(16).unwrap();
-        assert!(Shard::open_with_budget(&path, tiny_payload).is_ok());
-
-        // The header budget does govern it, and refuses with the two numbers.
-        let small = HeaderBudget::new(declared - 1).unwrap();
-        assert!(matches!(
-            Shard::open_with_limits(&path, tiny_payload, small),
-            Err(Error::CapacityExceeded { requested_bytes, available_bytes, .. })
-                if requested_bytes == declared && available_bytes == declared - 1
+        json.push_str(&format!(
+            "\"{i}\":{{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[{i},{}]}}",
+            i + 1
         ));
-        // Exactly enough is enough.
-        let exact = HeaderBudget::new(declared).unwrap();
-        assert!(Shard::open_with_limits(&path, tiny_payload, exact).is_ok());
-
-        // A budget above the absolute ceiling cannot be constructed at all.
-        assert!(HeaderBudget::new(0).is_none());
-        assert!(HeaderBudget::new(moxie_format::safetensors::MAX_HEADER_BYTES + 1).is_none());
-        std::fs::remove_dir_all(&dir).ok();
     }
+    json.push('}');
+    let path = dir.join("admission.safetensors");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(&(json.len() as u64).to_le_bytes()).unwrap();
+    f.write_all(json.as_bytes()).unwrap();
+    f.write_all(&vec![0u8; tensors]).unwrap();
+    (path, json.len() as u64 + 8)
+}
 
-    /// A header longer than the file it claims to describe is refused before
-    /// the allocation, not after a short read.
-    #[test]
-    fn a_header_longer_than_its_file_is_refused_before_it_is_allocated() {
-        let dir = tempdir("shard-header-truncated");
-        let path = dir.join("short.safetensors");
-        let mut f = std::fs::File::create(&path).unwrap();
-        // Declares a 1 MiB header in a 16-byte file.
-        f.write_all(&(1u64 << 20).to_le_bytes()).unwrap();
-        f.write_all(&[0u8; 8]).unwrap();
-        drop(f);
-        let e = Shard::open(&path).unwrap_err();
-        assert!(
-            matches!(e, Error::InvalidArtifact { .. }),
-            "expected a typed artifact error, got {e}"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
+/// Admission is against the estimated peak, and refuses with the estimate
+/// rather than with the serialized length a caller cannot act on.
+///
+/// No counting allocator here: this is about the rule, not the measurement.
+/// The measurement is `tests/header_budget.rs`, which needs its own executable.
+#[test]
+fn admission_refuses_against_the_estimated_peak_not_the_serialized_length() {
+    let dir = budget_tempdir();
+    let (path, serialized) = budget_shard(&dir, 1000);
+    let estimate = HeaderBudget::estimated_peak(serialized).unwrap();
+    assert!(
+        estimate > serialized * 4,
+        "the estimate must exceed the serialized length substantially, or this \
+         test is not checking anything"
+    );
 
-    fn tempdir(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "moxie-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
+    let tiny_payload = ByteBudget::new(16).unwrap();
+
+    // A budget that covers the serialized bytes but not the parse is refused,
+    // which is exactly the case the second review reproduced.
+    let serialized_only = HeaderBudget::new(serialized).unwrap();
+    assert!(matches!(
+        Shard::open_with_limits(&path, tiny_payload, serialized_only),
+        Err(moxie_types::Error::CapacityExceeded { requested_bytes, available_bytes, .. })
+            if requested_bytes == estimate && available_bytes == serialized
+    ));
+
+    // One byte below the estimate is refused; the estimate itself is enough.
+    let short = HeaderBudget::new(estimate - 1).unwrap();
+    assert!(matches!(
+        Shard::open_with_limits(&path, tiny_payload, short),
+        Err(moxie_types::Error::CapacityExceeded { .. })
+    ));
+    let exact = HeaderBudget::new(estimate).unwrap();
+    assert!(Shard::open_with_limits(&path, tiny_payload, exact).is_ok());
+
+    // And the payload budget still does not govern the header.
+    assert!(Shard::open_with_budget(&path, tiny_payload).is_ok());
+    // The budget reports the largest serialized header it admits, and this one
+    // is at that edge.
+    assert!(exact.max_serialized() + 1 > serialized);
+
+    assert!(HeaderBudget::new(0).is_none());
+    assert!(
+        HeaderBudget::new(
+            HeaderBudget::estimated_peak(moxie_format::safetensors::MAX_HEADER_BYTES).unwrap() + 1
+        )
+        .is_none()
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }

@@ -42,7 +42,7 @@ decoder and no runtime decode path.
 
 | Lane | Command | Result |
 |---|---|---|
-| Host workspace | `cargo test --workspace --locked --offline` | **686 + 9 doctests passed**, 0 failed, 0 ignored |
+| Host workspace | `cargo test --workspace --locked --offline` | **687 + 9 doctests passed**, 0 failed, 0 ignored |
 | Importer | `cargo test -p moxie-format --locked --offline` | **102 passed** |
 | Import allocation | `cargo test -p moxie-format --test import_allocation --locked --offline -- --nocapture` | **1 passed**; 3 allocations at 4, 64 and 512 rows, against 7/67/515 for its control |
 | Real artifact | `cargo test -p moxie-storage --test gemma4_import --locked --offline -- --nocapture` | **3 passed** |
@@ -50,7 +50,8 @@ decoder and no runtime decode path.
 | Format / diff | `cargo fmt --all -- --check`; `git diff --check` | passed |
 | Specification | `cargo xtask spec-check` | passed, 10 digests unchanged |
 | Architecture | `cargo xtask arch-check` | **74 rejecting + 21 accepted**, 12 rules |
-| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **702 + 12 doctests passed**, 0 failed |
+| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **703 + 12 doctests passed**, 0 failed |
+| Header cost | `cargo test -p moxie-storage --test header_budget --locked --offline -- --nocapture` | **1 passed**; measured peak heap within the admitted estimate at five header shapes |
 | Device clippy | the clippy command with the same features | passed |
 | Real GPU | `cargo xtask-cuda test-gpu` | **39/39**, 0 failed, 0 skipped; sm_86 and sm_120 qualified |
 
@@ -118,11 +119,19 @@ biased-unsigned and `raw - 128` is right; two's-complement bytes would have been
 edge-heavy. The full `[-128, 127]` range appears in real data, including `-128`,
 which document 03 forbids a decoder from rejecting.
 
-Worth knowing, from the review corrections: `ByteBudget` caps the reader's
-*payload slicing*, and a header is a different resource -- read whole because it
-must be parsed whole, and retained for the shard's life. It has its own
-`HeaderBudget` now. A budget that covers one resource is not a budget for
-another that happens to live in the same reader.
+Worth knowing, from two rounds of review corrections on the same finding.
+`ByteBudget` caps the reader's *payload slicing*, and a header is a different
+resource -- read whole because it must be parsed whole, and partly retained for
+the shard's life. Giving it its own `HeaderBudget` was the first fix and was not
+enough: that budget capped the **serialized length**, while parsing costs
+several times that in entry lists, key strings, shape vectors, temporary spans
+and the retained maps. A 54,899-byte bound admitted a 353,105-byte peak.
+
+**A budget on an input is not a budget on what that input costs.** `HeaderBudget`
+is denominated in peak heap now, admission is against a measured estimate
+(`12 x serialized + 8 KiB`, against a worst measured ratio of 7.40), and a
+regression measures the real peak against that estimate so the factor cannot
+quietly become wrong.
 
 And: deserializing untrusted JSON into a map collapses duplicate keys before any
 validation runs, so a header could declare an unsupported dtype and overwrite it

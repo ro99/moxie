@@ -308,7 +308,8 @@ artifact is absent, so a fresh clone stays green.
 
 | Gate | Exact command / result |
 |---|---|
-| Host workspace | `cargo test --workspace --locked --offline`: **686 unit/integration + 9 doctests passed**, 0 failed, 0 ignored (681 + 9 before the review corrections) |
+| Host workspace | `cargo test --workspace --locked --offline`: **687 unit/integration + 9 doctests passed**, 0 failed, 0 ignored (681 + 9 as first submitted) |
+| Header cost | `cargo test -p moxie-storage --test header_budget --locked --offline -- --nocapture`: **1 passed**; measured peaks within their admitted estimates, table above |
 | Importer | `cargo test -p moxie-format --locked --offline`: **102 passed**, including the exhaustive code/lane pairs, tails, granularities, scale dtypes, axis mismatches and header rejections |
 | Import allocation | `cargo test -p moxie-format --test import_allocation --locked --offline -- --nocapture`: **1 passed**; 3 allocations at 4, 64 and 512 rows |
 | Real artifact | `cargo test -p moxie-storage --test gemma4_import --locked --offline -- --nocapture`: **3 passed**, figures above |
@@ -316,7 +317,7 @@ artifact is absent, so a fresh clone stays green.
 | Format / diff | `cargo fmt --all -- --check`; `git diff --check`: passed |
 | Specification | `cargo xtask spec-check`: passed, 10 documents unchanged |
 | Architecture | `cargo xtask arch-check`: **74 rejecting + 21 accepted fixtures**, 12 rules. The undeclared `serde_json` edge was **rejected before it was declared**, which is the allowlist working; the new `shared-takes-serde-json` fixture keeps a second crate from taking it |
-| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`: **702 + 12 doctests passed**, 0 failed |
+| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`: **703 + 12 doctests passed**, 0 failed |
 | Device clippy | the clippy command with the same features: passed |
 | Real GPU | `cargo xtask-cuda test-gpu`: **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 
@@ -352,10 +353,11 @@ contract**, not a canonical capability. A test asserts the refusal is
 
 ### Independent review corrections
 
-The review requested changes and found five defects plus a documentation
-contradiction. **All were reproduced before any change and all are fixed.** The
-review confirmed the ownership split, the deferral of execution and quality, and
-the lane-order disclosure.
+Two rounds. The first found five defects plus a documentation contradiction; the
+second confirmed four fixed and found the fifth — the header budget — still
+measuring the wrong quantity. **Every finding was reproduced before any change
+and all are fixed.** Both rounds confirmed the ownership split, the deferral of
+execution and quality, and the lane-order disclosure.
 
 **P1 — the importer accepted incompatible axes.** `import` took byte slices, so
 declared shapes were invisible to it, and `triple_entries` never cross-checked
@@ -380,15 +382,46 @@ no longer exists. `import_allocation` — its own executable, because the counte
 is a global allocator — measures **3 allocations at 4, 64 and 512 rows**. Its
 control, restoring the per-row call, measures **7, 67 and 515**.
 
-**P2 — the header allocation bypassed the reader budget.** `open_with_budget`
-allocated and read the whole header without consulting `ByteBudget`; the review
-opened a shard with a sixteen-byte budget while observing a 65,575-byte
-allocation. `ByteBudget` caps *payload slicing* and a header is a different
-resource — read whole because it must be parsed whole, and retained for the
-shard's life — so it has its own `HeaderBudget`, checked along with the file
-length **before** anything is allocated. `Shard::open_with_limits` states both.
-Two regressions cover the refusal with its exact numbers and a header longer
-than its own file.
+**P2 — the header allocation bypassed the reader budget, and the first fix
+budgeted the wrong quantity.** `open_with_budget` originally allocated and read
+the whole header without consulting `ByteBudget`; the first review opened a
+shard with a sixteen-byte budget while observing a 65,575-byte allocation.
+`ByteBudget` caps *payload slicing* and a header is a different resource — read
+whole because it must be parsed whole, and partly retained for the shard's life
+— so it gained its own `HeaderBudget`, checked along with the file length
+**before** anything is allocated.
+
+**A second review round found that still measuring the wrong thing**, and was
+right: the budget capped the *serialized* length, while parsing allocates an
+entry list, a key string and a shape vector per tensor, a temporary span list,
+and the retained maps. Reproduced: a 54,899-byte serialized bound admitted a
+header costing 353,105 bytes of peak heap and 163,275 retained.
+
+`HeaderBudget` is now denominated in **peak heap**. Admission is against
+`HeaderBudget::estimated_peak(serialized)` = `12 x serialized + 8 KiB`, and the
+refusal reports the estimate rather than a serialized length a caller cannot
+act on. The factor comes from measurement, not from a guess: peak over
+serialized was measured at **7.40x** in the worst realistic shape — five
+thousand minimal entries, close to the most entries a byte of header can buy —
+and 4.61x to 7.05x elsewhere, with a small-header case dominated by the fixed
+term. Twelve leaves roughly a factor of 1.6 in hand.
+
+`a_header_costs_no_more_peak_heap_than_its_admitted_estimate` measures the
+**real** peak against the admitted estimate over five header shapes, so the
+factor is checked rather than asserted; its control drops the factor to 4 and it
+fails on the 100-tensor case. It has its own executable, because the counter is
+a global allocator and a second test in that binary would race with it.
+
+| Header | Serialized | Peak | Retained | Admitted estimate |
+|---|---:|---:|---:|---:|
+| 1 tensor | 61 | 1,417 | 909 | 8,924 |
+| 100 tensors | 5,481 | 38,663 | 16,676 | 73,964 |
+| 1,000 tensors | 57,682 | 353,888 | 162,313 | 700,376 |
+| 1,000 tensors, 64-char names | 118,792 | 547,106 | 233,312 | 1,433,696 |
+| 5,000 tensors | 301,682 | 2,231,602 | 817,337 | 3,628,376 |
+
+The real shards' headers are 17–64 KB, so their estimated peaks are under
+800 KB against the 8 MiB default.
 
 **P2 — duplicate JSON keys bypassed validation.** Deserializing into
 `BTreeMap<String, Value>` collapsed duplicates before any check ran: two tensors

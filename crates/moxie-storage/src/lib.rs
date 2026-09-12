@@ -275,32 +275,71 @@ pub struct Shard {
     header_budget: HeaderBudget,
 }
 
-/// What a shard may spend on its header, separate from the payload budget.
+/// What a shard may spend on its header: **peak heap while opening it**, not
+/// the header's serialized length.
 ///
 /// [`ByteBudget`] caps the reader's *payload slicing* -- how much it holds while
 /// pumping a tensor into a caller's buffer -- and a header is a different
-/// resource: it is read whole, because it has to be parsed whole, and it is
-/// retained for the shard's life.
+/// resource: it is read whole, because it has to be parsed whole, and part of
+/// it is retained for the shard's life.
 ///
-/// Independent review found the distinction unstated and the header simply
-/// unbudgeted: a shard opened with a sixteen-byte `ByteBudget` allocated
-/// 65,575 bytes for its header. Naming it separately is the fix -- a caller can
-/// now refuse a shard whose header it will not pay for, and the default is
-/// stated rather than implied by a constant buried in the parser.
+/// Two rounds of independent review shaped this. The first found the header
+/// simply unbudgeted: a shard opened with a sixteen-byte `ByteBudget` allocated
+/// 65,575 bytes for its header. The second found the fix still measuring the
+/// wrong thing -- a 54,899-byte serialized bound admitted a header whose peak
+/// heap was 353,105 bytes and whose retained heap was 163,275, because parsing
+/// allocates an entry list, a key string and a shape vector per tensor, a
+/// temporary span list, and the retained maps. **A budget on the input is not a
+/// budget on the memory that input costs.**
+///
+/// So admission is against [`HeaderBudget::estimated_peak`], and a regression
+/// measures the real peak against that estimate rather than trusting it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderBudget {
     bytes: u64,
 }
 
 impl HeaderBudget {
-    /// 8 MiB. The Gemma 4 shards' headers are a few hundred kilobytes, so this
-    /// is far above any inspected artifact and far below a denial of service.
-    /// It is also below `moxie_format::safetensors::MAX_HEADER_BYTES`, which
-    /// remains the absolute ceiling no budget may exceed.
+    /// 8 MiB of peak heap. The Gemma 4 shards' headers are 17--64 KB
+    /// serialized, so their estimated peaks are well under 1 MiB and this
+    /// leaves an order of magnitude of margin.
     pub const DEFAULT: Self = Self { bytes: 8 << 20 };
 
+    /// Multiplier on the serialized length, from measurement.
+    ///
+    /// Peak heap over serialized length was measured at **6.4x** in the worst
+    /// realistic shape -- five thousand minimal entries, which is close to the
+    /// most entries a byte of header can buy -- and 2.9x to 6.1x elsewhere. The
+    /// factor is 12 so the admitted bound stays above the measurement with
+    /// roughly a factor of two in hand for allocator and layout variation.
+    /// `a_header_costs_no_more_peak_heap_than_its_admitted_estimate` is what
+    /// keeps this honest; if it fails, this number is wrong and must move.
+    const PEAK_FACTOR: u64 = 12;
+
+    /// Fixed overhead independent of header size, for the small-header case
+    /// where per-entry costs dominate the ratio (22x at sixty-one bytes).
+    const PEAK_FIXED: u64 = 8 << 10;
+
+    /// A conservative peak-heap estimate for a header of `serialized` bytes,
+    /// including the input buffer, the parser's allocations, the temporary
+    /// validation structures and the retained maps.
+    ///
+    /// `None` when the arithmetic overflows, which is itself a refusal.
+    pub const fn estimated_peak(serialized: u64) -> Option<u64> {
+        match serialized.checked_mul(Self::PEAK_FACTOR) {
+            Some(v) => v.checked_add(Self::PEAK_FIXED),
+            None => None,
+        }
+    }
+
     pub const fn new(bytes: u64) -> Option<Self> {
-        if bytes == 0 || bytes > moxie_format::safetensors::MAX_HEADER_BYTES {
+        // The ceiling is the peak a maximum-size header could cost, not the
+        // serialized ceiling: this budget is denominated in heap.
+        let Some(ceiling) = Self::estimated_peak(moxie_format::safetensors::MAX_HEADER_BYTES)
+        else {
+            return None;
+        };
+        if bytes == 0 || bytes > ceiling {
             return None;
         }
         Some(Self { bytes })
@@ -308,6 +347,11 @@ impl HeaderBudget {
 
     pub const fn bytes(self) -> u64 {
         self.bytes
+    }
+
+    /// The largest serialized header this budget admits.
+    pub const fn max_serialized(self) -> u64 {
+        (self.bytes.saturating_sub(Self::PEAK_FIXED)) / Self::PEAK_FACTOR
     }
 }
 
@@ -363,10 +407,17 @@ impl Shard {
                 ),
             });
         }
-        if prefix_len > header_budget.bytes() {
+        // Against the estimated **peak heap**, not the serialized length: the
+        // parse costs several times what the bytes weigh.
+        let peak = HeaderBudget::estimated_peak(prefix_len).ok_or(Error::CapacityExceeded {
+            tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::Pageable)),
+            requested_bytes: u64::MAX,
+            available_bytes: header_budget.bytes(),
+        })?;
+        if peak > header_budget.bytes() {
             return Err(Error::CapacityExceeded {
                 tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::Pageable)),
-                requested_bytes: prefix_len,
+                requested_bytes: peak,
                 available_bytes: header_budget.bytes(),
             });
         }
