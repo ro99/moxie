@@ -127,11 +127,22 @@ enough: that budget capped the **serialized length**, while parsing costs
 several times that in entry lists, key strings, shape vectors, temporary spans
 and the retained maps. A 54,899-byte bound admitted a 353,105-byte peak.
 
-**A budget on an input is not a budget on what that input costs.** `HeaderBudget`
-is denominated in peak heap now, admission is against a measured estimate
-(`12 x serialized + 8 KiB`, against a worst measured ratio of 7.40), and a
-regression measures the real peak against that estimate so the factor cannot
-quietly become wrong.
+**A budget on an input is not a budget on what that input costs.** But
+denominating it in peak heap was only half the lesson: a third round defeated
+that bound too, with many tiny `__metadata__` entries and one 65,537-dimension
+tensor. **A factor fitted to sampled header shapes is not a bound.** Any shape
+you did not sample can beat it, and twice it did.
+
+The bound is derived now. Peak is linear in how a header splits its bytes among
+constructs, so `peak <= serialized x max(per-construct ratio)`, and the work is
+enumerating constructs rather than sampling shapes. Measured marginals: tensor
+entry 5.4, metadata entry 9.5, shape dimension 12.0, name byte 2.0. The shape
+dimension is both the largest and **unbounded per tensor**, which is why no
+multiplier survived it -- it gets `MAX_RANK = 8`, refused while parsing, which
+brings it to 2.8. The factor is then 16 against a largest remaining ratio of
+9.5. The regression measures **each construct at its own worst shape**, and its
+two controls -- removing the rank limit, and dropping the factor to 9 -- each
+fail.
 
 And: deserializing untrusted JSON into a map collapses duplicate keys before any
 validation runs, so a header could declare an unsupported dtype and overwrite it

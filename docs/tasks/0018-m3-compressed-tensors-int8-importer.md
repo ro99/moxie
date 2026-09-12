@@ -309,6 +309,7 @@ artifact is absent, so a fresh clone stays green.
 | Gate | Exact command / result |
 |---|---|
 | Host workspace | `cargo test --workspace --locked --offline`: **687 unit/integration + 9 doctests passed**, 0 failed, 0 ignored (681 + 9 as first submitted) |
+| Structural limits | `cargo test -p moxie-format --locked --offline safetensors`: rank, name length, tensor and metadata counts each refused while parsing |
 | Header cost | `cargo test -p moxie-storage --test header_budget --locked --offline -- --nocapture`: **1 passed**; measured peaks within their admitted estimates, table above |
 | Importer | `cargo test -p moxie-format --locked --offline`: **102 passed**, including the exhaustive code/lane pairs, tails, granularities, scale dtypes, axis mismatches and header rejections |
 | Import allocation | `cargo test -p moxie-format --test import_allocation --locked --offline -- --nocapture`: **1 passed**; 3 allocations at 4, 64 and 512 rows |
@@ -353,11 +354,13 @@ contract**, not a canonical capability. A test asserts the refusal is
 
 ### Independent review corrections
 
-Two rounds. The first found five defects plus a documentation contradiction; the
-second confirmed four fixed and found the fifth — the header budget — still
-measuring the wrong quantity. **Every finding was reproduced before any change
-and all are fixed.** Both rounds confirmed the ownership split, the deferral of
-execution and quality, and the lane-order disclosure.
+Three rounds, all on the same crate. The first found five defects plus a
+documentation contradiction. The second confirmed four fixed and found the fifth
+— the header budget — measuring the wrong quantity. The third found the
+replacement bound still unsound, with two counterexamples. **Every finding was
+reproduced before any change and all are fixed.** All three rounds confirmed the
+ownership split, the deferral of execution and quality, and the lane-order
+disclosure.
 
 **P1 — the importer accepted incompatible axes.** `import` took byte slices, so
 declared shapes were invisible to it, and `triple_entries` never cross-checked
@@ -397,28 +400,57 @@ entry list, a key string and a shape vector per tensor, a temporary span list,
 and the retained maps. Reproduced: a 54,899-byte serialized bound admitted a
 header costing 353,105 bytes of peak heap and 163,275 retained.
 
-`HeaderBudget` is now denominated in **peak heap**. Admission is against
-`HeaderBudget::estimated_peak(serialized)` = `12 x serialized + 8 KiB`, and the
-refusal reports the estimate rather than a serialized length a caller cannot
-act on. The factor comes from measurement, not from a guess: peak over
-serialized was measured at **7.40x** in the worst realistic shape — five
-thousand minimal entries, close to the most entries a byte of header can buy —
-and 4.61x to 7.05x elsewhere, with a small-header case dominated by the fixed
-term. Twelve leaves roughly a factor of 1.6 in hand.
+`HeaderBudget` became denominated in **peak heap**, with admission against an
+estimate. **A third round defeated that too**, with two shapes the five sampled
+ones did not cover: many tiny `__metadata__` entries, and one tensor of 65,537
+dimensions. Both reproduced. That is the same mistake twice — a factor fitted to
+sampled shapes is not a bound, and can always be beaten by a shape that was not
+sampled.
 
-`a_header_costs_no_more_peak_heap_than_its_admitted_estimate` measures the
-**real** peak against the admitted estimate over five header shapes, so the
-factor is checked rather than asserted; its control drops the factor to 4 and it
-fails on the 100-tensor case. It has its own executable, because the counter is
-a global allocator and a second test in that binary would race with it.
+**The bound is derived now, not fitted.** A header spends its bytes on
+constructs, and the peak is linear in that split: spending `b_i` bytes on
+construct `i` with `Σ b_i ≤ S` costs `Σ b_i·r_i ≤ S · max r_i`. So the sound
+bound is the **largest per-construct ratio**, and the work is enumerating the
+constructs. Marginal costs, measured two points apart so they are slopes rather
+than whole-header averages:
 
-| Header | Serialized | Peak | Retained | Admitted estimate |
-|---|---:|---:|---:|---:|
-| 1 tensor | 61 | 1,417 | 909 | 8,924 |
-| 100 tensors | 5,481 | 38,663 | 16,676 | 73,964 |
-| 1,000 tensors | 57,682 | 353,888 | 162,313 | 700,376 |
-| 1,000 tensors, 64-char names | 118,792 | 547,106 | 233,312 | 1,433,696 |
-| 5,000 tensors | 301,682 | 2,231,602 | 817,337 | 3,628,376 |
+| Construct | Min serialized | Peak heap | Ratio |
+|---|---:|---:|---:|
+| Tensor entry | 55 B | 297 B | 5.4 |
+| `__metadata__` entry | 9 B | 85 B | **9.5** |
+| Shape dimension | 2 B | 24 B | **12.0** |
+| Tensor-name byte | 1 B | 2 B | 2.0 |
+
+The shape dimension is the largest and is **unbounded per tensor**, which is
+exactly why no multiplier could survive it. It gets a **structural limit**
+instead: `MAX_RANK = 8`, refused *while parsing* so the dimensions are never
+allocated. Capped, a tensor's dimensions cost at most `8 × 24` peak against at
+least 69 serialized bytes — a ratio of 2.8. `MAX_NAME_BYTES`, `MAX_TENSORS` and
+`MAX_METADATA_ENTRIES` join it as explicit contract rather than arithmetic
+accident.
+
+With the rank bounded the largest ratio is the metadata entry at 9.5, and the
+factor is **16** — about 1.7× above it for allocator and layout variation.
+
+`a_header_costs_no_more_peak_heap_than_its_admitted_estimate` measures **each
+construct at its own worst shape**, which is what the derivation rests on, plus
+the earlier five shapes and the review's counterexamples:
+
+| Header | Serialized | Peak | Retained | Admitted | Ratio |
+|---|---:|---:|---:|---:|---:|
+| 1 tensor | 61 | 1,417 | 916 | 9,168 | 23.23 |
+| 1,000 tensors | 57,682 | 353,888 | 162,320 | 931,104 | 6.14 |
+| 5,000 tensors | 301,682 | 2,231,602 | 817,344 | 4,835,104 | 7.40 |
+| 8,000 minimal tensors | 484,682 | 2,869,664 | 1,305,598 | 7,763,104 | 5.92 |
+| **20,000 metadata entries** | 180,078 | 1,900,826 | 1,720,311 | 2,889,440 | **10.56** |
+| 500 × 900-byte names | 477,291 | 1,526,141 | 533,392 | 7,644,848 | 3.20 |
+| 4,000 tensors at `MAX_RANK` | 296,682 | 1,615,968 | 780,180 | 4,755,104 | 5.45 |
+
+The 65,537-dimension tensor is **refused**, and refusing it costs 131,507 B —
+essentially the input slice — against the 1.7 MB accepting it cost before.
+
+Two controls, each restored afterwards: removing `MAX_RANK` makes the test fail,
+and dropping the factor to 9 makes it fail on the metadata case, naming it.
 
 The real shards' headers are 17–64 KB, so their estimated peaks are under
 800 KB against the 8 MiB default.

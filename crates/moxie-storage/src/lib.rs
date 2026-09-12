@@ -305,24 +305,54 @@ impl HeaderBudget {
     /// leaves an order of magnitude of margin.
     pub const DEFAULT: Self = Self { bytes: 8 << 20 };
 
-    /// Multiplier on the serialized length, from measurement.
+    /// Peak heap per serialized byte, **derived** rather than fitted.
     ///
-    /// Peak heap over serialized length was measured at **6.4x** in the worst
-    /// realistic shape -- five thousand minimal entries, which is close to the
-    /// most entries a byte of header can buy -- and 2.9x to 6.1x elsewhere. The
-    /// factor is 12 so the admitted bound stays above the measurement with
-    /// roughly a factor of two in hand for allocator and layout variation.
-    /// `a_header_costs_no_more_peak_heap_than_its_admitted_estimate` is what
-    /// keeps this honest; if it fails, this number is wrong and must move.
-    const PEAK_FACTOR: u64 = 12;
+    /// A header spends its bytes on constructs, and the cost of any mix is
+    /// linear in that split: if it spends `b_i` bytes on construct `i` with
+    /// `sum b_i <= S`, the peak is `sum b_i r_i <= S * max r_i`. So the sound
+    /// bound is the **largest per-construct ratio**, and the job is to
+    /// enumerate the constructs rather than to sample header shapes.
+    ///
+    /// Sampling is what the first two attempts did, and independent review
+    /// defeated both with shapes the samples had not covered. The marginal
+    /// costs below were measured two points apart, so they are slopes and not
+    /// whole-header averages:
+    ///
+    /// | Construct | Min serialized | Peak heap | Ratio |
+    /// |---|---:|---:|---:|
+    /// | Tensor entry | 55 B | 297 B | 5.4 |
+    /// | `__metadata__` entry | 9 B | 85 B | **9.5** |
+    /// | Shape dimension | 2 B | 24 B | 12.0 |
+    /// | Tensor-name byte | 1 B | 2 B | 2.0 |
+    ///
+    /// The shape dimension is the largest, and it is the one
+    /// [`moxie_format::safetensors::MAX_RANK`] exists to bound: capped at eight
+    /// dimensions, a tensor's dimensions cost at most `8 * 24` peak against at
+    /// least 69 serialized bytes, a ratio of 2.8. That is a structural limit
+    /// rather than a larger multiplier, because no multiplier survives an
+    /// unbounded rank.
+    ///
+    /// With the rank bounded, the largest ratio is the metadata entry at 9.5.
+    /// The factor is **16**, roughly 1.7x above it, for allocator and layout
+    /// variation.
+    /// `a_header_costs_no_more_peak_heap_than_its_admitted_estimate` measures
+    /// every construct at its own worst shape and both of the review's
+    /// counterexamples against this bound. **If it fails, enumerate the
+    /// construct that beat it and bound that -- do not simply raise this
+    /// number.**
+    const PEAK_FACTOR: u64 = 16;
 
     /// Fixed overhead independent of header size, for the small-header case
-    /// where per-entry costs dominate the ratio (22x at sixty-one bytes).
+    /// where per-entry costs dominate the ratio (23x at sixty-one bytes).
     const PEAK_FIXED: u64 = 8 << 10;
 
     /// A conservative peak-heap estimate for a header of `serialized` bytes,
     /// including the input buffer, the parser's allocations, the temporary
     /// validation structures and the retained maps.
+    ///
+    /// Sound only together with the structural limits in
+    /// [`moxie_format::safetensors`]: without `MAX_RANK` the shape-dimension
+    /// ratio exceeds this factor, which is how the previous bound was defeated.
     ///
     /// `None` when the arithmetic overflows, which is itself a refusal.
     pub const fn estimated_peak(serialized: u64) -> Option<u64> {

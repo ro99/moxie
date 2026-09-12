@@ -32,6 +32,33 @@ use moxie_types::{Error, HostTier, Result, Tier};
 /// is far above any plausible real index and far below a denial of service.
 pub const MAX_HEADER_BYTES: u64 = 64 << 20;
 
+/// Most dimensions a tensor may declare.
+///
+/// A structural limit, not a stylistic one. Each dimension costs two serialized
+/// bytes (`"1,"`) and twenty-four bytes of peak heap -- a `u64` in a vector that
+/// holds its old allocation alongside the new one while it grows -- so an
+/// unbounded rank buys twelve bytes of memory per byte of header, which is more
+/// than any other construct and more than a caller's budget can be derived
+/// against. Independent review reached 1.7 MB of peak from a 131 KB header with
+/// a single 65,537-dimension tensor.
+///
+/// Eight is well above any real artifact: the Gemma 4 shards' tensors are one-
+/// and two-dimensional, and a rank above four is already unusual. Refusing the
+/// rest is honest -- a 65,537-dimension tensor is not a tensor -- and it is
+/// refused **while parsing**, before the dimensions are allocated.
+pub const MAX_RANK: usize = 8;
+
+/// Longest tensor name, in bytes. The artifact's longest is about seventy.
+pub const MAX_NAME_BYTES: usize = 1024;
+
+/// Most tensors one header may declare. A minimal entry is about 55 serialized
+/// bytes, so [`MAX_HEADER_BYTES`] already implies roughly this; stating it
+/// makes the bound a contract rather than an arithmetic accident.
+pub const MAX_TENSORS: usize = 1 << 20;
+
+/// Most `__metadata__` entries one header may declare.
+pub const MAX_METADATA_ENTRIES: usize = 1 << 16;
+
 fn invalid(detail: impl Into<String>) -> Error {
     Error::InvalidArtifact {
         detail: detail.into(),
@@ -175,8 +202,43 @@ pub struct Header {
 #[serde(deny_unknown_fields)]
 struct RawEntry {
     dtype: String,
-    shape: Vec<u64>,
+    shape: Shape,
     data_offsets: [u64; 2],
+}
+
+/// A shape, refused past [`MAX_RANK`] **as it is read**.
+///
+/// A plain `Vec<u64>` would be fully allocated before any check could run, so
+/// the limit has to live in the deserializer: this is the difference between
+/// refusing an absurd rank and paying for it first.
+struct Shape(Vec<u64>);
+
+impl<'de> serde::Deserialize<'de> for Shape {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Shape;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "at most {MAX_RANK} dimensions")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Shape, A::Error> {
+                let mut out = Vec::new();
+                while let Some(d) = seq.next_element::<u64>()? {
+                    if out.len() == MAX_RANK {
+                        return Err(serde::de::Error::custom(format!(
+                            "a tensor declares more than {MAX_RANK} dimensions"
+                        )));
+                    }
+                    out.push(d);
+                }
+                Ok(Shape(out))
+            }
+        }
+        d.deserialize_seq(V)
+    }
 }
 
 /// What one key in the header's top-level map turned out to be.
@@ -205,10 +267,33 @@ impl<'de> serde::Deserialize<'de> for RawHeader {
                 mut map: A,
             ) -> std::result::Result<RawHeader, A::Error> {
                 let mut out = Vec::new();
+                let mut tensors = 0usize;
                 while let Some(key) = map.next_key::<String>()? {
+                    // Every limit is checked as the entry is read, so a header
+                    // that exceeds one never costs what it asked for.
+                    if key.len() > MAX_NAME_BYTES && key != "__metadata__" {
+                        return Err(serde::de::Error::custom(format!(
+                            "a tensor name is {} bytes, over the {MAX_NAME_BYTES}-byte limit",
+                            key.len()
+                        )));
+                    }
                     let item = if key == "__metadata__" {
-                        RawItem::Metadata(map.next_value()?)
+                        let m: BTreeMap<String, String> = map.next_value()?;
+                        if m.len() > MAX_METADATA_ENTRIES {
+                            return Err(serde::de::Error::custom(format!(
+                                "__metadata__ has {} entries, over the \
+                                 {MAX_METADATA_ENTRIES} limit",
+                                m.len()
+                            )));
+                        }
+                        RawItem::Metadata(m)
                     } else {
+                        tensors += 1;
+                        if tensors > MAX_TENSORS {
+                            return Err(serde::de::Error::custom(format!(
+                                "the header declares more than {MAX_TENSORS} tensors"
+                            )));
+                        }
                         RawItem::Tensor(map.next_value()?)
                     };
                     out.push((key, item));
@@ -306,7 +391,7 @@ impl Header {
             }
             let tensor = TensorEntry {
                 dtype,
-                shape: entry.shape,
+                shape: entry.shape.0,
                 begin,
                 end,
             };
