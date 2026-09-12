@@ -77,10 +77,12 @@ name = "moxie-executor"
 version = "0.0.0"
 dependencies = [
  "moxie-cuda",
+ "moxie-engine",
  "moxie-graph",
  "moxie-kernels",
  "moxie-memory",
  "moxie-plan",
+ "moxie-storage",
  "moxie-types",
 ]
 

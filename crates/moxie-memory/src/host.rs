@@ -28,6 +28,22 @@ impl HostBuffer {
         Self::allocate_with_workspace(ledger, label, data_bytes, 0, control_bytes)
     }
 
+    /// The same buffer charged to a caller-named host tier.
+    ///
+    /// Document 03 tracks host bytes by what they *are*, not by who allocated
+    /// them, and a resident weight cache is not spilled sequence state. Task
+    /// 0020 needs `HostTier::Pageable`; the two constructors above keep
+    /// `StateSpill`, which is what their callers hold.
+    pub fn allocate_in(
+        ledger: &mut Ledger,
+        label: &str,
+        data_tier: HostTier,
+        data_bytes: usize,
+        control_bytes: usize,
+    ) -> Result<Self> {
+        Self::allocate_tiered(ledger, label, data_tier, data_bytes, 0, control_bytes)
+    }
+
     /// One physical allocation with separately charged state and CPU workspace.
     /// The workspace is the suffix after `state_bytes`; no raw pointer escapes.
     pub fn allocate_with_workspace(
@@ -37,14 +53,49 @@ impl HostBuffer {
         workspace_bytes: usize,
         control_bytes: usize,
     ) -> Result<Self> {
+        Self::allocate_tiered(
+            ledger,
+            label,
+            HostTier::StateSpill,
+            state_bytes,
+            workspace_bytes,
+            control_bytes,
+        )
+    }
+
+    fn allocate_tiered(
+        ledger: &mut Ledger,
+        label: &str,
+        data_tier: HostTier,
+        state_bytes: usize,
+        workspace_bytes: usize,
+        control_bytes: usize,
+    ) -> Result<Self> {
         let data_bytes = state_bytes
             .checked_add(workspace_bytes)
             .ok_or(moxie_types::DimError::Overflow)?;
         let mut plan = PlanRequest::new(label, ["live"])?;
-        for (name, tier, bytes) in [
-            ("host backing", HostTier::StateSpill, state_bytes),
-            ("cpu workspace", HostTier::CpuWorkspace, workspace_bytes),
-            ("bounded control", HostTier::Pageable, control_bytes),
+        // `Scaling::Context` is what licenses a refusal to suggest
+        // `LowerContext`, so it is declared per row rather than per tier: a
+        // vocabulary workspace does not shrink with requested context, and
+        // neither does a resident weight cache. Suggesting a shorter context
+        // for bytes a shorter context would not free is a suggestion that
+        // cannot help, which is the one thing `Scaling` exists to prevent.
+        let backing_scaling = (data_tier == HostTier::StateSpill).then_some(Scaling::Context);
+        for (name, tier, bytes, scaling) in [
+            ("host backing", data_tier, state_bytes, backing_scaling),
+            (
+                "cpu workspace",
+                HostTier::CpuWorkspace,
+                workspace_bytes,
+                None,
+            ),
+            (
+                "bounded control",
+                HostTier::Pageable,
+                control_bytes,
+                Some(Scaling::Context),
+            ),
         ] {
             if bytes == 0 {
                 continue;
@@ -56,11 +107,9 @@ impl HostBuffer {
                 u64::try_from(bytes).map_err(|_| moxie_types::DimError::Overflow)?,
                 StageSpan::at(0),
             );
-            // Vocabulary workspace does not shrink with requested context.
-            plan.buffer(if tier == HostTier::CpuWorkspace {
-                request
-            } else {
-                request.scaling(Scaling::Context)
+            plan.buffer(match scaling {
+                Some(s) => request.scaling(s),
+                None => request,
             })?;
         }
         let reservation = ledger.admit(&plan).map_err(Error::from)?;
@@ -71,7 +120,7 @@ impl HostBuffer {
             ledger.release(reservation).expect("the admitting ledger");
             return Err(Error::CapacityExceeded {
                 tier: match (state_bytes != 0, workspace_bytes != 0) {
-                    (true, false) => Some(Tier::Host(HostTier::StateSpill)),
+                    (true, false) => Some(Tier::Host(data_tier)),
                     (false, true) => Some(Tier::Host(HostTier::CpuWorkspace)),
                     _ => None,
                 },

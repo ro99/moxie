@@ -49,6 +49,7 @@ pub mod rule {
     pub const MEMORY_NAMES_MODEL: &str = "memory branches on a model name";
     pub const TELEMETRY_OUTSIDE_HOST: &str = "machine telemetry outside moxie-host";
     pub const MEMORY_PROBES_THE_MACHINE: &str = "memory depends on the host sensor";
+    pub const SECOND_RESIDENCY_OWNER: &str = "a second weight-residency owner";
 
     pub const ALL: &[&str] = &[
         FORBIDDEN_DEPENDENCY,
@@ -63,6 +64,7 @@ pub mod rule {
         MEMORY_NAMES_MODEL,
         TELEMETRY_OUTSIDE_HOST,
         MEMORY_PROBES_THE_MACHINE,
+        SECOND_RESIDENCY_OWNER,
     ];
 }
 
@@ -264,6 +266,15 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                     "moxie-cuda",
                     "moxie-plan",
                     "moxie-kernels",
+                    // Task 0020: the residency driver performs the authority's
+                    // read orders. `moxie-memory` is I/O-free by rule and
+                    // `moxie-storage` may not know what a cache is, so the one
+                    // crate that already schedules actual effects performs
+                    // them. The edge is one-way: a fixture proves storage
+                    // reaching back for the executor is still refused, and the
+                    // `second-residency-owner` rule keeps the driver from
+                    // becoming a cache of its own.
+                    "moxie-storage",
                 ],
                 third_party: NONE,
             },
@@ -870,6 +881,14 @@ struct SourceFacts {
     /// Doc comments are attributes, not code, and are never collected here:
     /// prose about a boundary is not a use of what it forbids.
     strings: Vec<String>,
+    /// Names of the types this file **defines**: `struct`, `enum`, `trait`,
+    /// `union` and `type` aliases, in non-test position.
+    ///
+    /// Defining is the thing the residency rule is about. Every crate that
+    /// drives the authority has to *name* its types, and a rule that forbade
+    /// mentioning `ResidencyAuthority` would forbid using it; what must stay
+    /// singular is the crate that declares a cache of its own.
+    definitions: Vec<String>,
     /// `mod` declarations in this file, as a tree mirroring inline
     /// modules. Resolution against a directory happens in traversal (see
     /// `resolve_mods`), once per resolution context: the same file loaded
@@ -977,6 +996,31 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         // Reached from module level *and* from inside a function body, because
         // the traversal does not care which.
         flatten_use_tree("", &u.tree, &mut self.facts.imports);
+    }
+
+    fn visit_item_struct(&mut self, i: &'ast syn::ItemStruct) {
+        self.facts.definitions.push(i.ident.to_string());
+        visit::visit_item_struct(self, i);
+    }
+
+    fn visit_item_enum(&mut self, i: &'ast syn::ItemEnum) {
+        self.facts.definitions.push(i.ident.to_string());
+        visit::visit_item_enum(self, i);
+    }
+
+    fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+        self.facts.definitions.push(i.ident.to_string());
+        visit::visit_item_trait(self, i);
+    }
+
+    fn visit_item_union(&mut self, i: &'ast syn::ItemUnion) {
+        self.facts.definitions.push(i.ident.to_string());
+        visit::visit_item_union(self, i);
+    }
+
+    fn visit_item_type(&mut self, i: &'ast syn::ItemType) {
+        self.facts.definitions.push(i.ident.to_string());
+        visit::visit_item_type(self, i);
     }
 
     fn visit_item_foreign_mod(&mut self, f: &'ast syn::ItemForeignMod) {
@@ -1463,6 +1507,40 @@ const TELEMETRY_PATHS: &[&str] = &["/proc", "/sys"];
 /// `TELEMETRY_PATHS`.
 const TELEMETRY_OWNER: &str = "moxie-host";
 
+/// Vocabulary that identifies a **weight-residency cache**, matched against the
+/// names a crate *defines*.
+///
+/// Document 06's M2 exit is one sentence: "Exactly one production
+/// weight-residency owner; no cache class in adapters." Task 0020 makes that
+/// owner `moxie-memory::residency`, and this rule is what keeps it singular.
+///
+/// The rule matches **definitions**, never mentions, and the distinction is the
+/// whole design. The executor's driver has to name `ResidencyAuthority` to
+/// perform its work orders, an engine has to name `ChunkId` to build a demand
+/// set, and a report has to name `ResidencyReport` to print one. None of those
+/// is a second owner. Declaring a type *called* an expert cache is -- it is the
+/// one thing a crate does on the way to keeping its own map of chunk to bytes,
+/// which is R02's failure restated: several caches, each correct about its own
+/// bytes and none correct about the device.
+///
+/// Matched case-insensitively as a substring of the defined name, so
+/// `ExpertCache`, `expert_cache_t` and `MyResidencyTable` all hit.
+const RESIDENCY_DEFINITION_NAMES: &[&str] = &[
+    "residencycache",
+    "residencytable",
+    "residencymap",
+    "expertcache",
+    "weightcache",
+    "chunkcache",
+    "chunktable",
+    "evictionpolicy",
+    "evictor",
+    "lrucache",
+];
+
+/// The one crate allowed to define them.
+const RESIDENCY_OWNER: &str = "moxie-memory";
+
 /// The checker's own source, where every rule's forbidden vocabulary is
 /// declared -- model family names, forbidden import prefixes, and the telemetry
 /// paths above.
@@ -1619,6 +1697,53 @@ fn check_names_no_model(
                     detail: format!(
                         "{}: names a model family ('{hit}'): {crate_name} never branches on which \
                          model the bytes belong to",
+                        file.display()
+                    ),
+                });
+                break;
+            }
+        }
+    }
+}
+
+/// Rule 13 enforcement: only `moxie-memory` defines a weight-residency cache.
+///
+/// Applies to every crate but the owner and the checker's own vocabulary file,
+/// exactly as the telemetry rule does and for the same reason: declaring what is
+/// forbidden is not a use of it.
+fn check_one_residency_owner(
+    doc: &toml::Value,
+    dir: &Path,
+    crate_name: &str,
+    out: &mut Vec<Violation>,
+) {
+    if crate_name == RESIDENCY_OWNER {
+        return;
+    }
+    let (scanned, problems) = scanned_with_includes(doc, dir);
+    for detail in problems {
+        out.push(Violation {
+            crate_name: crate_name.to_string(),
+            rule: rule::SECOND_RESIDENCY_OWNER,
+            detail,
+        });
+    }
+    for (file, facts) in &scanned {
+        if file.ends_with(RULE_VOCABULARY_FILE) {
+            continue;
+        }
+        for name in &facts.definitions {
+            let lower = name.to_lowercase();
+            if let Some(hit) = RESIDENCY_DEFINITION_NAMES
+                .iter()
+                .find(|n| lower.contains(*n))
+            {
+                out.push(Violation {
+                    crate_name: crate_name.to_string(),
+                    rule: rule::SECOND_RESIDENCY_OWNER,
+                    detail: format!(
+                        "{}: defines `{name}` ('{hit}'): there is exactly one production \
+                         weight-residency owner and it is {RESIDENCY_OWNER}",
                         file.display()
                     ),
                 });
@@ -1909,6 +2034,11 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
         if name != TELEMETRY_OWNER {
             check_no_machine_telemetry(&doc, dir, &name, &mut out);
         }
+
+        // Rule 13 (task 0020): weight residency has one owner. M2's exit says
+        // "exactly one" in those words, and the crates that drive the authority
+        // are exactly the crates most tempted to keep a small map beside it.
+        check_one_residency_owner(&doc, dir, &name, &mut out);
 
         // Rule 8: the ledger never probes. `moxie-memory` may not reach the
         // sensor, because task 0006 documents `Ledger::preview` as pure with

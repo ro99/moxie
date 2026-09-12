@@ -1,0 +1,16 @@
+[package]
+name = "moxie-models"
+version = "0.0.0"
+edition = "2024"
+
+# Document 03: "models never choose victims." A model crate needs no dependency
+# at all to write a victim-selection policy down -- a pure function over expert
+# ids is enough -- so the dependency rule alone does not cover this case. The
+# definition rule does. This fixture must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-graph = { path = "../../../../crates/moxie-graph" }
+moxie-model-api = { path = "../../../../crates/moxie-model-api" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "a second weight-residency owner"

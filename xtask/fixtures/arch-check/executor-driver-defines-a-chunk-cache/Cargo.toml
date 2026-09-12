@@ -1,0 +1,15 @@
+[package]
+name = "moxie-executor"
+version = "0.0.0"
+edition = "2024"
+
+# The executor performs the authority's read and upload orders, so it is the one
+# crate that ever holds a chunk's bytes in its hands. Caching them "just for the
+# retry" is how the driver becomes an owner. This fixture must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-memory = { path = "../../../../crates/moxie-memory" }
+moxie-storage = { path = "../../../../crates/moxie-storage" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "a second weight-residency owner"

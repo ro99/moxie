@@ -47,6 +47,9 @@ pub mod plan;
 pub mod turn;
 pub use plan::{resource_request, validate_plan_binding};
 
+pub mod residency;
+pub use residency::{ChunkSource, ShardSource, drain_reads, perform_read};
+
 pub mod arena;
 pub use arena::{
     OperationAcquireRefused, OperationHeld, OperationLease, OperationRetireRefused,

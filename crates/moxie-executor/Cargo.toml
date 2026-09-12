@@ -16,12 +16,22 @@ driver = ["moxie-cuda/driver", "moxie-kernels/fatbin"]
 [dependencies]
 moxie-types.workspace = true
 moxie-memory.workspace = true
+# Task 0020: the residency driver performs the authority's read orders through
+# the one crate that owns the filesystem. `moxie-memory` may not open a file and
+# `moxie-storage` may not know what a cache is, so the edge belongs here, where
+# the crate that already "schedules actual effects" performs them.
+moxie-storage.workspace = true
 moxie-cuda.workspace = true
 moxie-plan.workspace = true
 moxie-kernels.workspace = true
 
 [dev-dependencies]
 moxie-graph.workspace = true
+# Task 0020's real-artifact test builds its demand set the way a routed step
+# does, through the engine's route-to-chunk arithmetic. A dev dependency only:
+# the executor's production code names no engine type, and a fixture proves the
+# production edge is refused.
+moxie-engine.workspace = true
 
 [lints]
 workspace = true

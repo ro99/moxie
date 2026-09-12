@@ -1,7 +1,10 @@
 //! Single-sequence orchestration. This first profile is explicitly a bounded
 //! host-reference diagnostic, using the shared interpreter and paged transactions.
 #![forbid(unsafe_code)]
+pub mod residency;
 pub mod service;
+
+pub use residency::{ExpertRole, demand_bytes, expert_demand};
 
 use moxie_graph::{Bindings, Graph, OpParams, ValueId, Visibility};
 use moxie_interp::paged::{PagedExecution, PagedOutput};

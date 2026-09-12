@@ -30,6 +30,7 @@ pub mod host;
 pub mod ledger;
 pub mod report;
 pub mod request;
+pub mod residency;
 pub mod snapshot;
 
 pub use arena::{
@@ -45,4 +46,11 @@ pub use report::{
     TierReport,
 };
 pub use request::{BufferRequest, DerivedReserve, PlanRequest, ReserveRule, Scaling, StageSpan};
+pub use residency::{
+    AcquireRequest, Acquired, ArtifactId, AuthorityId, CapabilityKey, ChunkId, ChunkState, Content,
+    LogicalRange, Outcome, OutstandingChunk, PendingWork, PreparedId, ReleaseLeaseRefused,
+    ResidencyAuthority, ResidencyLease, ResidencyLeaseId, ResidencyRefused, ResidencyReport,
+    ResidencyRequest, ResidencyStats, TensorSlot, TicketId, TurnCleanup, TurnId, Urgency, UseClass,
+    WorkOrder,
+};
 pub use snapshot::CapacitySnapshot;

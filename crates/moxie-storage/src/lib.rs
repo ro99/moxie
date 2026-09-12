@@ -534,6 +534,68 @@ impl Shard {
         Ok(())
     }
 
+    /// Read one **bounded byte range** of one named tensor.
+    ///
+    /// This is what a residency cache demands, and it is the only shape of read
+    /// that makes a fused expert tensor usable. Task 0020's designated artifact
+    /// stores all 128 of a layer's experts in one `[128, 1408, 2816]` tensor:
+    /// serving expert `e` through [`Shard::read_tensor`] would read
+    /// 1,015,021,568 bytes to use 7,929,856 of them, and again for `down_proj`.
+    /// Here it reads exactly the range asked for.
+    ///
+    /// The range is checked against the *validated header*, not against the
+    /// file: an offset past the tensor's end is a refusal naming both, never a
+    /// read that wanders into the next tensor. The buffer must be exactly the
+    /// range's length, for the same reason `read_tensor` insists on it -- a
+    /// partial read reported as success is the defect, not the short buffer.
+    pub fn read_tensor_range(&self, name: &str, offset_bytes: u64, into: &mut [u8]) -> Result<()> {
+        let entry = self.header.get(name)?;
+        let len = entry.len();
+        let want = into.len() as u64;
+        let end = offset_bytes
+            .checked_add(want)
+            .ok_or_else(|| Error::InvalidArtifact {
+                detail: format!("range of tensor {name:?} overflows"),
+            })?;
+        if want == 0 {
+            return Err(Error::InvalidArtifact {
+                detail: format!("an empty range of tensor {name:?} is not a read"),
+            });
+        }
+        if end > len {
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "range {offset_bytes}..{end} of tensor {name:?} exceeds its {len} byte(s)"
+                ),
+            });
+        }
+        let base = entry
+            .file_offset(&self.header)
+            .checked_add(offset_bytes)
+            .ok_or_else(|| Error::InvalidArtifact {
+                detail: format!("tensor {name:?} offset overflows"),
+            })?;
+        let mut source = OpenChunk { file: &self.file };
+        let slice = self.budget.bytes().max(1);
+        let need = into.len();
+        let mut done = 0usize;
+        while done < need {
+            let stop = (done + slice).min(need);
+            let at = base
+                .checked_add(done as u64)
+                .ok_or_else(|| Error::InvalidArtifact {
+                    detail: format!("tensor {name:?} offset overflows"),
+                })?;
+            source
+                .read_at(at, &mut into[done..stop])
+                .map_err(|e| Error::InvalidArtifact {
+                    detail: format!("reading {name:?} from {}: {e}", self.path.display()),
+                })?;
+            done = stop;
+        }
+        Ok(())
+    }
+
     /// Read a tensor into a freshly allocated, fallibly sized buffer.
     pub fn tensor_bytes(&self, name: &str) -> Result<Vec<u8>> {
         let entry = self.header.get(name)?;

@@ -1,0 +1,17 @@
+[package]
+name = "moxie-engine"
+version = "0.0.0"
+edition = "2024"
+
+# The engine builds the demand set a routed step needs (task 0020's
+# `expert_demand`), so it is the crate that knows which experts a batch wants --
+# and therefore the crate most tempted to remember which of them it already
+# asked for. Document 06's M2 exit allows "exactly one production
+# weight-residency owner"; a second one starts as a small map here. This fixture
+# must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-memory = { path = "../../../../crates/moxie-memory" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "a second weight-residency owner"
