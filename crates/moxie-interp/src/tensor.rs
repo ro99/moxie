@@ -142,6 +142,84 @@ impl HostTensor {
 pub enum Value {
     Float(HostTensor),
     Index(Vec<u64>),
+    /// A routing decision per row: which experts, with what coefficients.
+    Route(RouteTable),
+}
+
+/// One step's routing decisions, `rows` by `top_k`.
+///
+/// Two parallel vectors rather than a vector of pairs, because the ids and the
+/// coefficients have different roles and different precisions and travel to
+/// different consumers: the ids decide which expert weights a step needs
+/// resident, and the coefficients only weight what comes back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteTable {
+    top_k: usize,
+    experts: Vec<u32>,
+    weights: Vec<f32>,
+}
+
+impl RouteTable {
+    /// `experts` and `weights` are row-major, `top_k` entries per row.
+    pub fn new(top_k: usize, experts: Vec<u32>, weights: Vec<f32>) -> Result<Self> {
+        if top_k == 0 {
+            return Err(Error::InvalidRequest {
+                field: "top_k",
+                detail: "a route with no selected experts".into(),
+            });
+        }
+        if experts.len() != weights.len() || !experts.len().is_multiple_of(top_k) {
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "route table has {} ids and {} coefficients, which is not a whole \
+                     number of {top_k}-wide rows",
+                    experts.len(),
+                    weights.len()
+                ),
+            });
+        }
+        Ok(Self {
+            top_k,
+            experts,
+            weights,
+        })
+    }
+
+    pub fn top_k(&self) -> usize {
+        self.top_k
+    }
+
+    pub fn rows(&self) -> usize {
+        self.experts.len() / self.top_k
+    }
+
+    pub fn experts(&self) -> &[u32] {
+        &self.experts
+    }
+
+    pub fn weights(&self) -> &[f32] {
+        &self.weights
+    }
+
+    /// One row's selected expert ids, in selection order.
+    pub fn row_experts(&self, row: usize) -> Result<&[u32]> {
+        self.slice(row).map(|(a, b)| &self.experts[a..b])
+    }
+
+    /// One row's coefficients, in the same order as [`Self::row_experts`].
+    pub fn row_weights(&self, row: usize) -> Result<&[f32]> {
+        self.slice(row).map(|(a, b)| &self.weights[a..b])
+    }
+
+    fn slice(&self, row: usize) -> Result<(usize, usize)> {
+        if row >= self.rows() {
+            return Err(Error::InvalidRequest {
+                field: "row",
+                detail: format!("row {row} of {}", self.rows()),
+            });
+        }
+        Ok((row * self.top_k, (row + 1) * self.top_k))
+    }
 }
 
 impl Value {
@@ -149,6 +227,11 @@ impl Value {
         Ok(match self {
             Self::Float(tensor) => Self::Float(tensor.try_clone()?),
             Self::Index(indices) => Self::Index(crate::try_clone_slice(indices)?),
+            Self::Route(table) => Self::Route(RouteTable::new(
+                table.top_k,
+                crate::try_clone_slice(&table.experts)?,
+                crate::try_clone_slice(&table.weights)?,
+            )?),
         })
     }
     pub fn as_float(&self) -> Result<&HostTensor> {
@@ -156,6 +239,9 @@ impl Value {
             Value::Float(t) => Ok(t),
             Value::Index(_) => Err(Error::InvalidArtifact {
                 detail: "expected a float tensor, got an index vector".into(),
+            }),
+            Value::Route(_) => Err(Error::InvalidArtifact {
+                detail: "expected a float tensor, got a route table".into(),
             }),
         }
     }
@@ -166,6 +252,21 @@ impl Value {
             Value::Float(_) => Err(Error::InvalidArtifact {
                 detail: "expected an index vector, got a float tensor".into(),
             }),
+            Value::Route(_) => Err(Error::InvalidArtifact {
+                detail: "expected an index vector, got a route table".into(),
+            }),
+        }
+    }
+
+    pub fn as_route(&self) -> Result<&RouteTable> {
+        match self {
+            Value::Route(t) => Ok(t),
+            Value::Float(_) => Err(Error::InvalidArtifact {
+                detail: "expected a route table, got a float tensor".into(),
+            }),
+            Value::Index(_) => Err(Error::InvalidArtifact {
+                detail: "expected a route table, got an index vector".into(),
+            }),
         }
     }
 
@@ -173,6 +274,7 @@ impl Value {
         match self {
             Value::Float(t) => t.rows(),
             Value::Index(v) => v.len(),
+            Value::Route(t) => t.rows(),
         }
     }
 }

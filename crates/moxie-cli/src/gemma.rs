@@ -12,7 +12,9 @@
 use crate::fixture::Fixture;
 use moxie_engine::{HostTensor, Value};
 use moxie_graph::{Bindings, OracleRegistry};
-use moxie_models::gemma4::{Fraction, Gemma4Text, Reduction, TextConfig, embedding_scale};
+use moxie_models::gemma4::{
+    Fraction, Gemma4Text, MoeGeometry, Reduction, TextConfig, embedding_scale, router_input_scale,
+};
 use moxie_types::{Dim, Error, Result, SymbolId};
 
 /// Which reduced geometry to build.
@@ -28,6 +30,14 @@ pub enum Shape {
     /// key/value heads on a global layer and widens the head; this one widens
     /// the heads instead, so neither direction can be load-bearing by accident.
     B,
+    /// Shape A's attention geometry with the designated M2 artifact's routed
+    /// block: a dense shared expert **and** routed experts in every layer, the
+    /// router reading the un-normalized residual, and the three extra norms.
+    ///
+    /// Deliberately a third shape rather than a flag on A. A and B stay dense
+    /// and bit-for-bit what tasks 0016 and 0017 gated, so a routing defect
+    /// cannot hide behind a changed baseline.
+    C,
 }
 
 impl Shape {
@@ -61,6 +71,10 @@ impl Shape {
                 layer_scalars: vec![1.0, 0.75, 1.25, 0.5, 1.5, 0.875],
                 embedding_scale: embedding_scale(24),
                 max_trained_position: 256,
+                // Dense, like the 31B this shape was built for. Shape C carries
+                // the routed block; keeping A and B dense is what lets task
+                // 0016's and 0017's gates stay bit-for-bit comparable.
+                moe: None,
             },
             Shape::B => TextConfig {
                 hidden: 12,
@@ -91,6 +105,23 @@ impl Shape {
                 layer_scalars: vec![0.625, 1.75, 1.0],
                 embedding_scale: embedding_scale(12),
                 max_trained_position: 256,
+                moe: None,
+            },
+            Shape::C => TextConfig {
+                moe: Some(MoeGeometry {
+                    // Five experts choosing two: small enough to run, and wide
+                    // enough that the union of a multi-row batch's routes is
+                    // strictly smaller than `rows * top_k`, which is the
+                    // property document 03 warns against losing.
+                    experts: 5,
+                    top_k: 2,
+                    // Narrower than the dense `intermediate` of 16, as the
+                    // artifact's 704 is narrower than its 2,112. Equal widths
+                    // would let a graph that confused the two branches pass.
+                    moe_intermediate: 6,
+                    router_input_scale: router_input_scale(24),
+                }),
+                ..Shape::A.config()
             },
         }
     }
@@ -99,6 +130,7 @@ impl Shape {
         match self {
             Shape::A => "gemma-a",
             Shape::B => "gemma-b",
+            Shape::C => "gemma-c-moe",
         }
     }
 }

@@ -426,6 +426,10 @@ fn operand(role: ValueRole) -> Result<KernelOperand, Error> {
             operation: "index",
             detail: "the BF16 chain has no index operand".into(),
         }),
+        ValueRole::Route { .. } => Err(Error::UnsupportedKernel {
+            operation: "route",
+            detail: "the BF16 chain has no routed operand".into(),
+        }),
     }
 }
 
@@ -948,6 +952,159 @@ mod tests {
                 .kind(),
             "unsupported_kernel"
         );
+    }
+
+    /// A graph whose feed-forward is routed, for the refusal below.
+    fn routed_graph(hidden: u64) -> Graph {
+        let mut registry = OracleRegistry::new();
+        for op in [Op::Linear, Op::Route, Op::ExpertMlp, Op::Combine] {
+            registry
+                .register(
+                    op,
+                    ORACLE,
+                    OracleEvidence {
+                        implementation: "moxie_plan::selected::tests",
+                        test_module: "moxie_plan::selected::tests",
+                    },
+                )
+                .unwrap();
+        }
+        let activation = |shape| {
+            TensorSpec::new(
+                ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                shape,
+            )
+        };
+        let weight = |shape| {
+            TensorSpec::new(
+                ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
+                shape,
+            )
+        };
+        const EXPERTS: u64 = 2;
+        const TOP_K: u64 = 1;
+        const INTERMEDIATE: u64 = 3;
+        let mut builder = GraphBuilder::new(ORACLE, ROWS);
+        let x = builder.input(
+            "x",
+            activation(vec![Dim::symbol(ROWS), Dim::constant(hidden)]),
+        );
+        let gain = builder
+            .weight("router gain", weight(vec![Dim::constant(hidden)]))
+            .unwrap();
+        let proj = builder
+            .weight(
+                "router projection",
+                weight(vec![Dim::constant(EXPERTS), Dim::constant(hidden)]),
+            )
+            .unwrap();
+        let route = builder
+            .node(
+                OpParams::Route {
+                    hidden,
+                    experts: EXPERTS,
+                    top_k: TOP_K,
+                    eps: 1e-6,
+                    input_scale: 1.0,
+                    per_expert_scale: false,
+                },
+                &[x, gain, proj],
+            )
+            .unwrap();
+        let gate_up = builder
+            .weight(
+                "fused gate/up",
+                weight(vec![
+                    Dim::constant(EXPERTS),
+                    Dim::constant(2 * INTERMEDIATE),
+                    Dim::constant(hidden),
+                ]),
+            )
+            .unwrap();
+        let down = builder
+            .weight(
+                "fused down",
+                weight(vec![
+                    Dim::constant(EXPERTS),
+                    Dim::constant(hidden),
+                    Dim::constant(INTERMEDIATE),
+                ]),
+            )
+            .unwrap();
+        let slots = builder
+            .node(
+                OpParams::ExpertMlp {
+                    hidden,
+                    intermediate: INTERMEDIATE,
+                    experts: EXPERTS,
+                    top_k: TOP_K,
+                    activation: moxie_graph::ExpertActivation::GeGlu,
+                },
+                &[x, route, gate_up, down],
+            )
+            .unwrap();
+        let y = builder
+            .node(
+                OpParams::Combine {
+                    hidden,
+                    top_k: TOP_K,
+                    order: moxie_graph::CombineOrder::AscendingExpertId,
+                },
+                &[route, slots],
+            )
+            .unwrap();
+        builder.finish(y, &registry).unwrap()
+    }
+
+    #[test]
+    fn the_selected_chain_refuses_routed_operations() {
+        // Task 0019 adds routing to the shared catalogue and **no** device
+        // kernel for it. The qualified BF16 chain must say so rather than
+        // acquire a routed path by falling through: a routed step that
+        // "succeeded" on a chain with no expert dispatch would be a silent
+        // wrong answer, not a fallback.
+        let graph = routed_graph(8);
+        let cap = capability(SmVersion::SM86);
+        let catalogue = catalogue(SmVersion::SM86);
+        let error = lower_selected(&graph, workload(&graph, 1), &cap, &catalogue).unwrap_err();
+        assert_eq!(error.kind(), "unsupported_kernel", "{error}");
+
+        // And the partition rules stay closed: routing is replicated by
+        // requirement, expert compute and combination are undetermined until
+        // M5 decides where an expert lives.
+        assert_eq!(
+            OpParams::Route {
+                hidden: 8,
+                experts: 2,
+                top_k: 1,
+                eps: 1e-6,
+                input_scale: 1.0,
+                per_expert_scale: false,
+            }
+            .partition_rule(),
+            moxie_graph::PartitionRule::Replicated
+        );
+        for params in [
+            OpParams::ExpertMlp {
+                hidden: 8,
+                intermediate: 3,
+                experts: 2,
+                top_k: 1,
+                activation: moxie_graph::ExpertActivation::GeGlu,
+            },
+            OpParams::Combine {
+                hidden: 8,
+                top_k: 1,
+                order: moxie_graph::CombineOrder::AscendingExpertId,
+            },
+        ] {
+            assert_eq!(
+                params.partition_rule(),
+                moxie_graph::PartitionRule::NotDetermined,
+                "{} must fail closed until M5",
+                params.op().name()
+            );
+        }
     }
 
     #[test]

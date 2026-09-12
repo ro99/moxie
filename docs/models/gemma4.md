@@ -1,4 +1,10 @@
-# Model bring-up contract — Gemma 4 31B-IT
+# Model bring-up contract — Gemma 4
+
+One record per family, per [the placement contract](../README.md). Two variants
+are inventoried here: the dense **31B-IT** below, and the routed **26B-A4B-IT**
+in [its own section](#the-26b-a4b-moe-variant) at the end. They are the same
+family — same global predicate, same layer-type asymmetry, same softcap and
+window — and neither is executed.
 
 Status: **inventory 2026-09-12; reduced synthetic graph implemented by
 [task 0016](../tasks/0016-m1-gemma-reduced-graph.md), given per-layer key/value
@@ -8,7 +14,7 @@ The checkpoint is still not imported and not executed. This record exists becaus
 Gemma text graph and document 09 §B requires the mathematical inventory *before*
 implementation. It resolves no owner gate and makes no support claim.
 
-## Identity
+## Identity — 31B dense
 
 | Property | Observed value |
 |---|---|
@@ -65,7 +71,7 @@ including the global-layer predicate `(layer + 1) % 6 == 0` at `:107`. That
 agreement is what makes the pinned legacy source usable as the equation
 reference for this artifact.
 
-## Mathematical inventory
+## Mathematical inventory — 31B dense
 
 Source citations are paths relative to the frozen legacy root
 `/home/rodrigo/Developer/strata` at `2dc566eb8e440fff4837ac75ca1dad1b20c2264e`,
@@ -106,7 +112,7 @@ Neither is a defect in the existing shared code — task 0003 pinned one convent
 against its own fixtures. They are missing *parameters*, and R06 is the standing
 instruction not to erase such differences.
 
-## Import and resources
+## Import and resources — 31B dense
 
 ### Logical tensor-role mapping
 
@@ -178,7 +184,7 @@ the tensor header, not the config, established that the scales are BF16.
   served: it needs re-prefill. The device ring, host-backed page streaming and
   the rest of M4 are still outstanding.
 
-## Integration proof
+## Integration proof — 31B dense
 
 **Nothing in this repository executes this checkpoint.** What exists after
 [task 0016](../tasks/0016-m1-gemma-reduced-graph.md) is a reduced synthetic
@@ -232,7 +238,7 @@ vision tower and the multimodal mask exemption (**M11**); real weights and real
 dimensions (**M3**, then a real admission profile). The running CLI prints this
 list before it prints anything else.
 
-## Blockers
+## Blockers — 31B dense
 
 1. **Execution of this artifact is M3-blocked.** Every language-model linear is
    INT8 `pack-quantized`.
@@ -255,9 +261,239 @@ list before it prints anything else.
 4. **O1, O2 and O5 remain open.** No catalog membership, no quality statement, no
    conversion.
 
-## Bring-up cost
+## Bring-up cost — 31B dense
 
 Not started. Inventory reading on 2026-09-12 cost one session and produced no
 code. Record engineering hours, files/lines by ownership, new versus reused
 shared operations, initial untuned performance and the O7 review when the family
 is actually brought up.
+
+
+## The 26B-A4B MoE variant
+
+Status: **inventory 2026-09-12; routed graph composed by
+[task 0019](../tasks/0019-m2-routed-expert-semantics.md) over synthetic
+weights.** The checkpoint is **not imported and not executed.** This record
+exists because roadmap M2 needs a real BF16 MoE and document 09 §B requires the
+mathematical inventory before implementation. It resolves no owner gate and
+makes no support claim.
+
+### Identity
+
+| Property | Observed value |
+|---|---|
+| Family | Gemma 4, text tower of `Gemma4ForConditionalGeneration`, **routed** |
+| Local artifact | `/fast/models/google/gemma-4-26B-A4B-it` (read-only input) |
+| Immutable revision | `4d7ae4984b7db7de8f8457170b3f1a419ee76d52` |
+| `config.json` sha256 | `ed0c1eb3633de771906e9ba004a44cc5635bcc06ee2062077c3d2e88a50707d3` |
+| `model.safetensors.index.json` sha256 | `907826a6e46ff454272bd6db1fee629d5531a2303be22986d825a0871d7dc7a7` |
+| Shard completeness | **complete.** For each shard `8 + header + payload_end` equals the file size exactly, and the two payload ends sum to the index's `total_size` of 51,611,872,412 B |
+| Base model declared | `google/gemma-4-26B-A4B` |
+| License declared in the artifact README | `apache-2.0`, link `https://ai.google.dev/gemma/docs/gemma_4_license` |
+| Pipeline declared | `image-text-to-text` |
+| Reference implementation declared | `transformers 5.5.0.dev0`, `model_type` `gemma4` / `gemma4_text` |
+| Canonical artifact profile | **BF16, unquantized.** There is no `quantization_config` |
+| Tokenizer | `tokenizer.json`, 262,144 vocabulary entries; `chat_template.jinja`, 18,683 bytes |
+| Trained positional range | `max_position_embeddings` 262,144 — **not** an admissible context here (R19) |
+| O1 catalog decision | designated as M2's BF16 MoE by the owner on 2026-09-12; the **catalog gate itself stays OPEN** |
+| O2 quality decision | OPEN. No paired quality evidence exists |
+| O5 storage/conversion authorization | OPEN. Nothing may be copied, converted or requantized |
+
+**No download was made for this task.** The artifact was already on disk when
+the owner designated it.
+
+### Declared geometry, read from `config.json`
+
+| Field | Value | Same as the 31B? |
+|---|---|---|
+| `hidden_size` / `num_hidden_layers` | 2,816 / 30 | no (5,376 / 60) |
+| `intermediate_size` (dense MLP) | 2,112 | no (21,504) |
+| `num_attention_heads` | 16 | no (32) |
+| Local: `num_key_value_heads` / `head_dim` | 8 / 256 | head dim yes, count no |
+| Global: `num_global_key_value_heads` / `global_head_dim` | 2 / 512 | head dim yes, count no |
+| `layer_types` | 25 sliding, 5 full at indices 5, 11, 17, 23, 29 | **yes — the same `(layer + 1) % 6 == 0` predicate** |
+| `sliding_window` | 1,024 | yes |
+| `rope_parameters.sliding_attention` | `default`, theta 10,000 | yes |
+| `rope_parameters.full_attention` | `proportional`, theta 1,000,000, `partial_rotary_factor` 0.25 | yes |
+| `rms_norm_eps` / `hidden_activation` | 1e-6 / `gelu_pytorch_tanh` | yes |
+| `final_logit_softcapping` / `attention_k_eq_v` / `tie_word_embeddings` | 30.0 / true / true | yes |
+| `vocab_size` | 262,144 | yes |
+| `enable_moe_block` / `num_experts` / `top_k_experts` / `moe_intermediate_size` | **true / 128 / 8 / 704** | **no — the 31B is dense** |
+| Vision tower | 27 layers, hidden 1,152, patch 16, 280 soft tokens per image | yes |
+
+That agreement is what lets task 0016's seven operation parameters and task
+0017's per-layer paged geometry transfer to this variant instead of being
+rebuilt. `_compute_proportional_rope_parameters` in the pinned
+`transformers/modeling_rope_utils.py:187` confirms task 0016's reading of the
+global layers: `rope_angles = partial_rotary_factor · head_dim // 2`, the
+exponent denominator is the **full** head dimension, and the unrotated tail is
+zero-padded, which is an identity rotation. No new RoPE gap.
+
+### Mathematical inventory — the routed delta
+
+Only the rows that differ from the dense variant are listed; everything else is
+[the 31B inventory](#mathematical-inventory--31b-dense) unchanged.
+
+**The reference is not the legacy tree.** The frozen legacy snapshot has **no
+Gemma 4 MoE** — its `gemma4` adapter is the dense path, and a search for
+`per_expert_scale`, `router.scale`, `enable_moe_block` and `gate_up_proj` across
+it returns only unrelated GLM-5.2 routing text. The pinned reference for the
+rows below is the released `transformers` source, read and **never executed**:
+`transformers/models/gemma4/modeling_gemma4.py`, classes `Gemma4TextRouter`,
+`Gemma4TextExperts` and `Gemma4TextDecoderLayer`. Three copies were compared —
+5.5.3 twice and 5.15 once — and the mathematics is identical in all three. One
+difference is recorded rather than averaged: **5.15 computes the router softmax
+in FP32 and says so ("fp32 for numerical stability"); 5.5.3 computes it in the
+input dtype.** The artifact declares 5.5.0.dev0. Task 0019 pins FP32, which is
+also what every other reference in `moxie-oracles` does; if that choice ever
+changes a *selection* rather than coefficient precision, it becomes an O2
+question rather than an implementation detail.
+
+| Component | Source equation | Common op and options | Gap task | Oracle fixture |
+|---|---|---|---|---|
+| Router score transform | `Gemma4TextRouter.forward` — scale-free RMSNorm, then `⊙ router.scale`, then `· hidden^(-1/2)`, then the `[E, H]` projection | `Route` with `eps` and an explicit `input_scale` | **gap** — task 0019 | FP64 transcription of all four stages |
+| Selection and renormalization | softmax over **all** experts, `topk`, then `w /= Σw` | `Route`, top-k with the shared **lower-id** tie rule | **gap** — task 0019 | exact selection plus a counted coefficient bound |
+| Per-expert coefficient scale | `top_k_weights * per_expert_scale[top_k_index]`, applied **after** renormalization | `Route { per_expert_scale: true }` | **gap** — task 0019 | the coefficients do **not** sum to one; a negative scale is legal |
+| Expert feed-forward | `linear(x, gate_up_proj[e]).chunk(2, -1)`, `act(gate) * up`, `linear(·, down_proj[e])` | `ExpertMlp` over the **fused** `[E, 2I, H]` / `[E, H, I]` tensors, `activation = GeGlu` | **gap** — task 0019 | per-expert FP64, plus a proof that one expert cannot read another's slice |
+| Combination | `index_add_` over `expert_hit`, which is expert-major | `Combine { order: AscendingExpertId }` | **gap** — task 0019 | both orders, on a fixture where FP32 addition is not associative |
+| Shared expert | the dense `mlp`, normalized by `post_feedforward_layernorm_1`, added to the routed branch's `post_feedforward_layernorm_2` output | **graph composition**, not a routing parameter: it takes no routing coefficient | none (composition) | a substitution test on each of the three norms |
+| Router input | the **un-normalized** post-attention residual, not `pre_feedforward_layernorm(r)` | composition; the router is the block's only consumer of the raw residual | none (composition) | a graph test asserting the `Route` node's producer is the residual |
+| Expert input | `pre_feedforward_layernorm_2(r)` — its **own** gain tensor, not the dense branch's | composition | none (composition) | binding the dense gain into the routed slot must change the logits |
+
+The block, as composed:
+
+```text
+r  = post-attention residual
+m  = mlp(pre_feedforward_layernorm(r))            the shared expert
+h1 = post_feedforward_layernorm_1(m)
+h2 = post_feedforward_layernorm_2(
+       Combine(Route(r), ExpertMlp(pre_feedforward_layernorm_2(r), Route(r))))
+r' = (r + post_feedforward_layernorm(h1 + h2)) · layer_scalar
+```
+
+### Logical tensor-role mapping — the routed tensors
+
+1,013 tensors across two shards; 657 belong to the language model. Per layer
+`L` in `0..30`, **in addition to** every dense role in the 31B table (all of
+which are present, including the whole `mlp`):
+
+| Source name | Logical role | Storage | Logical shape |
+|---|---|---|---|
+| `model.language_model.layers.L.router.scale` | `router_scale[L]` | BF16 | `[2816]` |
+| `model.language_model.layers.L.router.proj.weight` | `router_proj[L]` | BF16 | `[128, 2816]` |
+| `model.language_model.layers.L.router.per_expert_scale` | `router_per_expert_scale[L]` | BF16 | `[128]` |
+| `model.language_model.layers.L.experts.gate_up_proj` | `experts_gate_up[L]` | BF16 | `[128, 1408, 2816]` |
+| `model.language_model.layers.L.experts.down_proj` | `experts_down[L]` | BF16 | `[128, 2816, 704]` |
+| `model.language_model.layers.L.pre_feedforward_layernorm_2.weight` | `ffn_norm_2[L]` | BF16 | `[2816]` |
+| `model.language_model.layers.L.post_feedforward_layernorm_1.weight` | `ffn_out_norm_1[L]` | BF16 | `[2816]` |
+| `model.language_model.layers.L.post_feedforward_layernorm_2.weight` | `ffn_out_norm_2[L]` | BF16 | `[2816]` |
+
+Three structural facts, each read from the index rather than assumed:
+
+1. **The experts are fused per layer.** One `experts.gate_up_proj` and one
+   `experts.down_proj` hold all 128, not 128 tensors each. `1408` is `2 · 704`:
+   the gate block followed by the up block along the output axis, which is what
+   `chunk(2, dim=-1)` means in the pinned reference.
+2. **Every layer carries a dense `mlp` beside its routed experts.** The census
+   is 30 of each across 30 layers. It is a shared expert, not an alternative.
+3. **The MoE block adds three norms per layer**, not one. The routed and dense
+   branches each have their own input and output normalization.
+
+And, as in the 31B, exactly the five global layers have **no**
+`self_attn.v_proj.weight` — 25 of 30 layers carry one. That is the serialized
+form of `attention_k_eq_v`, not an incomplete download.
+
+### Resources, state and partitions
+
+Byte arithmetic from the declared geometry. **A projection, not a measured
+admission.**
+
+| Quantity | Bytes | |
+|---|---:|---|
+| One expert, one layer | 11,894,784 | 11.34 MiB |
+| All 128 experts, one layer | 1,522,532,352 | 1.42 GiB |
+| All experts, 30 layers | 45,675,970,560 | **88.5%** of the artifact |
+| Dense shared expert, 30 layers | 1,070,530,560 | |
+| Embedding (tied, also the output head) | 1,476,395,008 | |
+| Router, one layer | 726,784 | |
+| Whole artifact, declared tensor payload | 51,611,872,412 | 48.07 GiB |
+| Top-k 8 over 30 layers, one token, **no reuse** | 2,854,748,160 | |
+
+Against this machine: the largest single GPU is 24 GiB (25.77 GB) and the
+aggregate is 63.9 GiB (68.6 GB) across three unequal cards. **The artifact fits
+aggregate VRAM and no single device.** M2 item 4's "intentionally restricted
+memory budget smaller than its working weights" is therefore satisfiable by
+construction rather than by hoping.
+
+The last row is the one document 03 warns about: it is an upper bound that
+assumes no two rows of a batch share an expert. The union of experts a row batch
+actually demands is what has to be resident, and task 0019's
+`a_real_router_overlaps_routes_and_the_union_is_smaller_than_rows_times_k`
+measures that union on routes a real router produced rather than on hand-written
+ones.
+
+State per token, at BF16 cache precision: sliding layers `2 · 8 · 256 · 2 B` =
+8,192 B; global layers `2 · 2 · 512 · 2 B` = 4,096 B. Whole model per token:
+`25 · 8,192 + 5 · 4,096` = 225,280 B, a quarter of the 31B's. A sliding layer's
+history is bounded by the 1,024-token window; a global layer's is not.
+
+Legal partitions are **not determined** for the routed operations. `Route` is
+`Replicated` by requirement — two ranks that broke a tie differently would
+disagree about which expert a row needs, which is a residency divergence as well
+as a numerical one. `ExpertMlp` and `Combine` are `NotDetermined` and fail
+closed; expert partitioning is **M5**.
+
+### Integration proof
+
+**Nothing in this repository executes this checkpoint.** What exists after task
+0019 is a reduced synthetic graph with this variant's shape of mathematics, over
+weights the composition root invents.
+
+- **Adapter contains metadata/graph only: yes.** `moxie_models::gemma4` still
+  depends on `moxie-types`, `moxie-graph` and `moxie-model-api` and nothing
+  else. A new `arch-check` fixture, `models-crate-reaches-memory`, rejects a
+  model crate that reaches for the residency authority — the edge a routed
+  adapter is most tempted to add.
+- **New shared operations and second-consumer tests: done.** `Route`,
+  `ExpertMlp` and `Combine` gained parameters, oracles and interpreter support,
+  and a second synthetic MoE consumer carries the opposite value for every one
+  of them: a different expert count and top-k (`top_k == experts`), SwiGLU
+  instead of GeGLU, no shared expert, no per-expert scale, and selection-order
+  combination.
+- **No private runtime, cache, transfer, sampler or branch evaluator: yes.** The
+  routed graph runs through the accepted task 0015 service, task 0013 paged
+  transactions and the task 0014 sampler.
+- Residency, expert chunk identity, demand cache, eviction and CPU fallback:
+  **not started** — task 0020 and M2 items 2 and 3.
+- Reference quality, actual-context prefill/decode: **not started**, and O2.
+- GPU and distributed: **not applicable.** No device kernel; the selected BF16
+  chain refuses all three routed operations as `UnsupportedKernel`, asserted by
+  a test rather than assumed from a catch-all.
+- Support matrix updated: gate `G-MOE-ROUTING-HOST`.
+
+### Blockers
+
+1. **Execution of this artifact needs a residency authority it does not have.**
+   51.6 GB against a 24 GiB largest device. Task 0020 owns that, and until then
+   the routed graph runs only at reduced scale over synthetic weights.
+2. **No quality claim of any kind.** Nothing here was compared against the
+   released model; that is **O2**, and it is what would also settle the
+   5.5.3-versus-5.15 router-softmax dtype question.
+3. **One declared numerical deviation from the reference.** The pinned source
+   narrows each expert's weighted contribution to BF16 before accumulating;
+   this interpreter accumulates the `top_k` terms in FP32 and rounds once at the
+   node boundary, as every other operation in `moxie-oracles` does. The
+   reduction **order** is pinned regardless. Bounded, declared in
+   [the task contract](../tasks/0019-m2-routed-expert-semantics.md), and O2's to
+   close.
+4. **Vision and audio are out of scope** — **M11**. The artifact is
+   `image-text-to-text` and declares both towers.
+5. **O1, O2 and O5 remain open.** The owner designated this artifact for M2's
+   residency work; that is not catalog membership, a quality statement or a
+   conversion authorization.
+
+### Bring-up cost
+
+Inventory and the routed graph cost one session. No checkpoint byte was read
+beyond `config.json`, the safetensors headers and the tensor index; nothing was
+copied, converted, deleted or downloaded.

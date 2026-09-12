@@ -122,10 +122,12 @@ pub fn register(registry: &mut OracleRegistry) -> Result<()> {
             "attention::tests",
         ),
         (Op::Residual, "moxie_oracles::residual", "residual::tests"),
-        // Fixtures from M0, whose operations have references but no interpreter
-        // consumer yet.
+        // Routing. M0 seeded `Route`, `Dispatch` and `Combine` as fixtures with
+        // no interpreter consumer; task 0019 gives all four references and the
+        // first two consumers, so `ExpertMlp` joins them here.
         (Op::Route, "moxie_oracles::route", "route::tests"),
         (Op::Dispatch, "moxie_oracles::route", "route::tests"),
+        (Op::ExpertMlp, "moxie_oracles::route", "route::tests"),
         (Op::Combine, "moxie_oracles::route", "route::tests"),
         (
             Op::RecurrentUpdate,
@@ -172,6 +174,7 @@ mod tests {
             Op::GeGlu,
             Op::Route,
             Op::Dispatch,
+            Op::ExpertMlp,
             Op::Combine,
             Op::RecurrentUpdate,
             Op::ShortConv,
@@ -188,8 +191,10 @@ mod tests {
             Op::SituGlu,
             Op::ResidualMix,
             Op::LayerNorm,
+            // Distinct from `ExpertMlp`: a bare grouped linear over an expert
+            // axis has no reference here, and registering the routed
+            // feed-forward's would claim one for it.
             Op::ExpertLinear,
-            Op::ExpertMlp,
         ] {
             assert!(
                 !r.has_any_oracle(op),

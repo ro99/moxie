@@ -39,13 +39,13 @@ pub mod paged;
 pub mod tensor;
 
 use moxie_graph::{Bindings, Graph, Node, OpParams, ValueId};
-use moxie_oracles::{activation, attention, linear, norm, residual, rope};
+use moxie_oracles::{activation, attention, linear, norm, residual, rope, route};
 use moxie_state::{LogitsHandle, SequenceState};
 use moxie_types::BranchId;
 use moxie_types::{Error, Result};
 
 pub use kv::{CacheId, CacheJournal, KvCache};
-pub use tensor::{HostTensor, Value};
+pub use tensor::{HostTensor, RouteTable, Value};
 
 pub(crate) fn try_vec<T>(capacity: usize) -> Result<Vec<T>> {
     let requested_bytes = capacity
@@ -253,6 +253,15 @@ impl Interpreter {
             let actual: Vec<u64> = match bound {
                 Value::Float(tensor) => tensor.shape().iter().map(|dim| *dim as u64).collect(),
                 Value::Index(index) => vec![index.len() as u64],
+                Value::Route(_) => {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!(
+                            "value {} was bound a route table; a route is produced by a \
+                             Route operation over this step's own rows, never supplied",
+                            value.0
+                        ),
+                    });
+                }
             };
             if actual != expected || bound_precision(bound) != spec.role.precision() {
                 return Err(Error::InvalidArtifact {
@@ -417,6 +426,11 @@ impl Interpreter {
             let got: Vec<u64> = match bound {
                 Value::Float(t) => t.shape().iter().map(|d| *d as u64).collect(),
                 Value::Index(i) => vec![i.len() as u64],
+                // Unreachable through a validated graph -- `moxie-plan` refuses
+                // a route-role external input and no graph input is declared
+                // one -- but shaped rather than panicked, because "unreachable"
+                // is a claim about today's callers.
+                Value::Route(t) => vec![t.rows() as u64, t.top_k() as u64],
             };
             if got != want {
                 return Err(Error::InvalidArtifact {
@@ -442,6 +456,14 @@ impl Interpreter {
                 (Value::Index(_), Some(p)) => {
                     return Err(Error::InvalidArtifact {
                         detail: format!("{name} is declared {p} but an index was bound"),
+                    });
+                }
+                (Value::Route(_), _) => {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!(
+                            "{name} was bound a route table; a route is produced by a \
+                             Route operation over this step's own rows, never supplied"
+                        ),
                     });
                 }
                 _ => {}
@@ -837,6 +859,127 @@ impl Interpreter {
                 // Not rounded. See `StepOutput::logits`.
                 Value::Float(HostTensor::f32(out, try_shape2(h.rows(), vocab as usize)?)?)
             }
+            OpParams::Route {
+                hidden,
+                experts,
+                top_k,
+                eps,
+                input_scale,
+                per_expert_scale,
+            } => {
+                let x = input(0)?.as_float()?;
+                let gain = input(1)?.as_float()?;
+                let proj = input(2)?.as_float()?;
+                let scale = if per_expert_scale {
+                    Some(input(3)?.as_float()?)
+                } else {
+                    None
+                };
+                // `hidden` is checked structurally when the node is built; the
+                // oracle reads the row's own width.
+                debug_assert_eq!(x.row(0).map(<[f32]>::len).unwrap_or(0), hidden as usize);
+                let mut ids = try_vec(x.rows() * top_k as usize)?;
+                let mut weights = try_vec(x.rows() * top_k as usize)?;
+                for r in 0..x.rows() {
+                    let route = route::router_route_row(
+                        x.row(r)?,
+                        gain.data(),
+                        proj.data(),
+                        scale.map(|s| s.data()),
+                        route::RouterSpec {
+                            experts: experts as usize,
+                            top_k: top_k as usize,
+                            eps,
+                            input_scale,
+                        },
+                    )?;
+                    ids.extend(route.experts);
+                    weights.extend(route.weights);
+                }
+                // The coefficients are not rounded to BF16 here. The route's
+                // declared output role says FP32, for the same reason the
+                // vocabulary projection's logits stay FP32: these are a
+                // renormalised distribution's tail, and eight of them weight
+                // everything the layer produces.
+                Value::Route(RouteTable::new(top_k as usize, ids, weights)?)
+            }
+            OpParams::ExpertMlp {
+                hidden,
+                intermediate,
+                experts,
+                top_k,
+                activation,
+            } => {
+                let x = input(0)?.as_float()?;
+                let table = input(1)?.as_route()?;
+                let gate_up = input(2)?.as_float()?;
+                let down = input(3)?.as_float()?;
+                if table.rows() != x.rows() {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!(
+                            "the route table covers {} rows but {} were supplied",
+                            table.rows(),
+                            x.rows()
+                        ),
+                    });
+                }
+                let spec = route::ExpertSpec {
+                    experts: experts as usize,
+                    hidden: hidden as usize,
+                    intermediate: intermediate as usize,
+                    activation,
+                };
+                let mut out = try_vec(x.rows() * top_k as usize * hidden as usize)?;
+                for r in 0..x.rows() {
+                    // Slot-major, in the row's own selection order. A grouped
+                    // kernel is free to visit the same work expert-major -- that
+                    // is exactly what `route::dispatch` describes -- but it owes
+                    // this scatter, because slot `j` belongs to the expert the
+                    // route chose at position `j`.
+                    for e in table.row_experts(r)? {
+                        out.extend(route::expert_row(
+                            x.row(r)?,
+                            gate_up.data(),
+                            down.data(),
+                            *e,
+                            spec,
+                        )?);
+                    }
+                }
+                let shape = try_shape2(x.rows() * top_k as usize, hidden as usize)?;
+                Value::Float(HostTensor::round_to_bf16(out, shape)?)
+            }
+            OpParams::Combine {
+                hidden,
+                top_k,
+                order,
+            } => {
+                let table = input(0)?.as_route()?;
+                let slots = input(1)?.as_float()?;
+                if slots.rows() != table.rows() * top_k as usize {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!(
+                            "the slot tensor has {} rows but this route needs {}",
+                            slots.rows(),
+                            table.rows() * top_k as usize
+                        ),
+                    });
+                }
+                let width = hidden as usize;
+                let mut out = try_vec(table.rows() * width)?;
+                for r in 0..table.rows() {
+                    let base = r * top_k as usize * width;
+                    out.extend(route::combine_row(
+                        table.row_experts(r)?,
+                        table.row_weights(r)?,
+                        &slots.data()[base..base + top_k as usize * width],
+                        width,
+                        order,
+                    )?);
+                }
+                let shape = try_shape2(table.rows(), width)?;
+                Value::Float(HostTensor::round_to_bf16(out, shape)?)
+            }
         };
         Ok(out)
     }
@@ -845,7 +988,9 @@ impl Interpreter {
 fn bound_precision(value: &Value) -> Option<moxie_types::Precision> {
     match value {
         Value::Float(tensor) => Some(tensor.precision()),
-        Value::Index(_) => None,
+        // Neither has a single precision. A route carries two, and reporting
+        // either one of them would let a caller believe it had checked both.
+        Value::Index(_) | Value::Route(_) => None,
     }
 }
 

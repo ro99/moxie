@@ -103,6 +103,12 @@ fn admitted_peak_cleanup_repeated_generations_and_allocation_failure() {
         (gemma::Shape::A, 37usize, 13usize, 1usize),
         (gemma::Shape::A, 251, 65, 1),
         (gemma::Shape::B, 255, 255, 1),
+        // The routed geometry. Its per-step peak carries a routed intermediate
+        // of `rows * top_k * hidden` that the dense shapes do not have, so a
+        // reserve that only counted the dense activations would be exceeded
+        // here and the printed numbers are what shows it is not.
+        (gemma::Shape::C, 37, 13, 1),
+        (gemma::Shape::C, 251, 65, 1),
     ] {
         let config = shape.config();
         let built = gemma::build(shape).unwrap();

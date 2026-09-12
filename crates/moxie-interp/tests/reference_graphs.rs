@@ -1759,3 +1759,430 @@ fn stateless_trace_reports_each_bf16_semantic_boundary_in_graph_order() {
         "invalid_request"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 0019: the routed block, end to end against an FP64 transcription.
+// ---------------------------------------------------------------------------
+
+/// A one-layer routed graph: `Route -> ExpertMlp -> Combine`, no attention.
+///
+/// Small enough that a whole forward pass can be transcribed independently in
+/// FP64 below, which is what makes the scatter testable: a wrong slot order is
+/// invisible to a per-expert oracle and shows up only when each slot is paired
+/// with the coefficient the route chose at that position.
+struct Routed {
+    graph: Graph,
+    weights: Bindings<Value>,
+    tokens_id: ValueId,
+    positions_id: ValueId,
+    hidden: usize,
+    experts: usize,
+    top_k: usize,
+    intermediate: usize,
+    eps: f32,
+    input_scale: f32,
+    order: moxie_graph::CombineOrder,
+    embedding: Vec<f32>,
+    gain: Vec<f32>,
+    proj: Vec<f32>,
+    per_expert: Vec<f32>,
+    gate_up: Vec<f32>,
+    down: Vec<f32>,
+}
+
+fn build_routed(
+    hidden: u64,
+    experts: u64,
+    top_k: u64,
+    intermediate: u64,
+    vocab: u64,
+    order: moxie_graph::CombineOrder,
+    seed: u64,
+) -> Routed {
+    let mut g = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
+    let mut rng = Lcg::new(seed);
+    let mut weights = Bindings::new();
+    let rows = rows_symbol();
+    let tokens_id = g.input(
+        "tokens",
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
+    );
+    let positions_id = g.input(
+        "positions",
+        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows.clone()]),
+    );
+
+    let param = |g: &mut GraphBuilder,
+                 rng: &mut Lcg,
+                 weights: &mut Bindings<Value>,
+                 name: &str,
+                 shape: Vec<u64>|
+     -> (ValueId, Vec<f32>) {
+        let id = g
+            .weight(
+                name,
+                TensorSpec::new(weight(), shape.iter().map(|d| Dim::constant(*d)).collect()),
+            )
+            .expect("weight");
+        let count: u64 = shape.iter().product();
+        let data: Vec<f32> = (0..count).map(|_| rng.next_f32()).collect();
+        weights.set(
+            id,
+            Value::Float(
+                HostTensor::bf16(data.clone(), shape.iter().map(|d| *d as usize).collect())
+                    .expect("bf16"),
+            ),
+        );
+        (id, data)
+    };
+
+    let (embedding_id, embedding) = param(
+        &mut g,
+        &mut rng,
+        &mut weights,
+        "embedding",
+        vec![vocab, hidden],
+    );
+    let (gain_id, gain) = param(&mut g, &mut rng, &mut weights, "router gain", vec![hidden]);
+    let (proj_id, proj) = param(
+        &mut g,
+        &mut rng,
+        &mut weights,
+        "router projection",
+        vec![experts, hidden],
+    );
+    let (per_expert_id, per_expert) = param(
+        &mut g,
+        &mut rng,
+        &mut weights,
+        "per-expert scale",
+        vec![experts],
+    );
+    let (gate_up_id, gate_up) = param(
+        &mut g,
+        &mut rng,
+        &mut weights,
+        "fused gate/up",
+        vec![experts, 2 * intermediate, hidden],
+    );
+    let (down_id, down) = param(
+        &mut g,
+        &mut rng,
+        &mut weights,
+        "fused down",
+        vec![experts, hidden, intermediate],
+    );
+    let (projection_id, _) = param(
+        &mut g,
+        &mut rng,
+        &mut weights,
+        "vocabulary projection",
+        vec![vocab, hidden],
+    );
+
+    let eps = 1e-6f32;
+    let input_scale = (hidden as f64).sqrt().recip() as f32;
+    let embedded = g
+        .node(
+            OpParams::Embedding {
+                vocab,
+                hidden,
+                scale: 1.0,
+            },
+            &[tokens_id, embedding_id],
+        )
+        .expect("embedding");
+    // One attention node, because the interpreter refuses a stateless graph:
+    // a step that touched no sequence state would not advance the executed
+    // frontier. It is deliberately an **exact identity** on a single row --
+    // one head as wide as the residual stream, score scale 1.0, `q = k = v`,
+    // and causal visibility over a one-token history, so the softmax has a
+    // single term of exactly 1.0 and the output is `v` unchanged. That keeps
+    // the FP64 transcription below about routing rather than about attention,
+    // which task 0016's fixtures already pin.
+    let attended = g
+        .node(
+            OpParams::Attention {
+                heads: 1,
+                kv_heads: 1,
+                head_dim: hidden,
+                scale: 1.0,
+                visibility: Visibility::Causal,
+                layer: 0,
+            },
+            &[embedded, embedded, embedded, positions_id],
+        )
+        .expect("attention");
+    let route = g
+        .node(
+            OpParams::Route {
+                hidden,
+                experts,
+                top_k,
+                eps,
+                input_scale,
+                per_expert_scale: true,
+            },
+            &[attended, gain_id, proj_id, per_expert_id],
+        )
+        .expect("route");
+    let slots = g
+        .node(
+            OpParams::ExpertMlp {
+                hidden,
+                intermediate,
+                experts,
+                top_k,
+                activation: moxie_graph::ExpertActivation::GeGlu,
+            },
+            &[attended, route, gate_up_id, down_id],
+        )
+        .expect("experts");
+    let combined = g
+        .node(
+            OpParams::Combine {
+                hidden,
+                top_k,
+                order,
+            },
+            &[route, slots],
+        )
+        .expect("combine");
+    let logits = g
+        .node(
+            OpParams::VocabProjection {
+                vocab,
+                hidden,
+                softcap: None,
+            },
+            &[combined, projection_id],
+        )
+        .expect("projection");
+
+    Routed {
+        graph: g.finish(logits, &oracles()).expect("finish"),
+        weights,
+        tokens_id,
+        positions_id,
+        hidden: hidden as usize,
+        experts: experts as usize,
+        top_k: top_k as usize,
+        intermediate: intermediate as usize,
+        eps,
+        input_scale,
+        order,
+        embedding,
+        gain,
+        proj,
+        per_expert,
+        gate_up,
+        down,
+    }
+}
+
+/// The whole routed layer for one row, transcribed in FP64 from the pinned
+/// `transformers` source rather than from `moxie_oracles`.
+fn fp64_routed_row(f: &Routed, token: usize) -> Vec<f64> {
+    let h = f.hidden;
+    let x: Vec<f64> = (0..h).map(|i| f.embedding[token * h + i] as f64).collect();
+
+    // Gemma4TextRouter.forward
+    let mean_sq: f64 = x.iter().map(|v| v * v).sum::<f64>() / h as f64;
+    let inv = (mean_sq + f.eps as f64).powf(-0.5);
+    let t: Vec<f64> = (0..h)
+        .map(|i| x[i] * inv * f.gain[i] as f64 * f.input_scale as f64)
+        .collect();
+    let logits: Vec<f64> = (0..f.experts)
+        .map(|o| (0..h).map(|i| t[i] * f.proj[o * h + i] as f64).sum())
+        .collect();
+    let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let exps: Vec<f64> = logits.iter().map(|l| (l - max).exp()).collect();
+    let total: f64 = exps.iter().sum();
+    let probs: Vec<f64> = exps.iter().map(|e| e / total).collect();
+    let mut order: Vec<usize> = (0..f.experts).collect();
+    order.sort_by(|a, b| probs[*b].partial_cmp(&probs[*a]).unwrap().then(a.cmp(b)));
+    let ids: Vec<usize> = order.into_iter().take(f.top_k).collect();
+    let mass: f64 = ids.iter().map(|e| probs[*e]).sum();
+    let coefficients: Vec<f64> = ids
+        .iter()
+        .map(|e| probs[*e] / mass * f.per_expert[*e] as f64)
+        .collect();
+
+    // Gemma4TextExperts.forward, per selected slot. The BF16 boundary the
+    // interpreter puts on the slot tensor is applied here too, because it is a
+    // node output in the graph under test.
+    let slots: Vec<Vec<f64>> = ids
+        .iter()
+        .map(|e| {
+            let stride = 2 * f.intermediate * h;
+            let gu = &f.gate_up[e * stride..(e + 1) * stride];
+            let projected: Vec<f64> = (0..2 * f.intermediate)
+                .map(|o| (0..h).map(|i| x[i] * gu[o * h + i] as f64).sum())
+                .collect();
+            let activated: Vec<f64> = (0..f.intermediate)
+                .map(|i| {
+                    let gate = projected[i];
+                    let up = projected[f.intermediate + i];
+                    let gelu = 0.5
+                        * gate
+                        * (1.0
+                            + (0.797_884_560_802_865_4 * (gate + 0.044_715 * gate * gate * gate))
+                                .tanh());
+                    moxie_oracles::bf16_round(gelu as f32) as f64 * up
+                })
+                .collect();
+            let dstride = h * f.intermediate;
+            let d = &f.down[e * dstride..(e + 1) * dstride];
+            (0..h)
+                .map(|o| {
+                    let v: f64 = (0..f.intermediate)
+                        .map(|i| activated[i] * d[o * f.intermediate + i] as f64)
+                        .sum();
+                    moxie_oracles::bf16_round(v as f32) as f64
+                })
+                .collect()
+        })
+        .collect();
+
+    // The combination, in the order the parameter names.
+    let mut slot_order: Vec<usize> = (0..ids.len()).collect();
+    if f.order == moxie_graph::CombineOrder::AscendingExpertId {
+        slot_order.sort_by_key(|j| ids[*j]);
+    }
+    let mut out = vec![0f64; h];
+    for j in slot_order {
+        for (d, v) in out.iter_mut().enumerate() {
+            *v += coefficients[j] * slots[j][d];
+        }
+    }
+    out
+}
+
+#[test]
+fn a_routed_layer_matches_an_independent_fp64_transcription() {
+    // Two shapes, as the extension rule requires, and both combination orders.
+    for (hidden, experts, top_k, intermediate, vocab, order, seed) in [
+        (
+            8u64,
+            5u64,
+            2u64,
+            6u64,
+            9u64,
+            moxie_graph::CombineOrder::AscendingExpertId,
+            11u64,
+        ),
+        (
+            12,
+            3,
+            3,
+            4,
+            7,
+            moxie_graph::CombineOrder::SelectionOrder,
+            29,
+        ),
+    ] {
+        let f = build_routed(hidden, experts, top_k, intermediate, vocab, order, seed);
+        // Evaluate the combined value by projecting with an identity-free
+        // route: run the graph and read the *combined* node through a second
+        // graph would be circular, so instead compare the whole prompt's
+        // per-row combination by rebuilding it from the logits' inputs. The
+        // simplest faithful check is the interpreter's own output for a graph
+        // whose only non-transcribed step is the final projection, so the
+        // transcription covers that too.
+        // One row per run, which is what makes the attention node an exact
+        // identity and leaves routing as the only thing under test.
+        let prompt: Vec<u64> = (0..vocab.min(6)).collect();
+        let projection_of = |f: &Routed, bindings: &Bindings<Value>| -> Vec<f32> {
+            let bound = f
+                .graph
+                .weights()
+                .iter()
+                .find(|v| f.graph.name(**v) == Some("vocabulary projection"))
+                .unwrap();
+            let Some(Value::Float(t)) = bindings.get(*bound) else {
+                panic!("unbound")
+            };
+            t.data().to_vec()
+        };
+
+        let mut errors = Vec::new();
+        for token in &prompt {
+            let mut state = SequenceState::new([StateKind::KvPages]);
+            let mut cache = KvCache::for_branch(1, &state, ROOT).unwrap();
+            state.append_prompt(ROOT, 1).unwrap();
+            let mut bindings = f.weights.clone();
+            bindings.set(f.tokens_id, Value::Index(vec![*token]));
+            bindings.set(f.positions_id, Value::Index(vec![0]));
+            let got = Interpreter::new()
+                .run(
+                    &f.graph,
+                    &bindings,
+                    &mut state,
+                    ROOT,
+                    &mut cache,
+                    &Cancel::never(),
+                )
+                .unwrap();
+            let logits = got.logits.data().to_vec();
+            let projection = projection_of(&f, &bindings);
+            let combined = fp64_routed_row(&f, *token as usize);
+            // The combined value crosses a BF16 node boundary before the
+            // projection reads it.
+            let combined: Vec<f64> = combined
+                .iter()
+                .map(|v| moxie_oracles::bf16_round(*v as f32) as f64)
+                .collect();
+            for o in 0..vocab as usize {
+                let want: f64 = (0..f.hidden)
+                    .map(|i| combined[i] * projection[o * f.hidden + i] as f64)
+                    .sum();
+                let scale: f64 = (0..f.hidden)
+                    .map(|i| (combined[i] * projection[o * f.hidden + i] as f64).abs())
+                    .sum();
+                let got = logits[o] as f64;
+                // One counted chain: the projection's `hidden` terms on top of
+                // everything the transcription already reproduced exactly.
+                let bound = moxie_oracles::metric::bound(f.hidden as u64 + 2, scale.max(1e-30));
+                assert!(
+                    (got - want).abs() <= bound,
+                    "token {token} logit {o}: {:.3e} exceeded {bound:.3e}",
+                    (got - want).abs()
+                );
+                errors.push((got - want).abs());
+            }
+        }
+        let summary = ErrorSummary::absolute(
+            &errors.iter().map(|e| *e as f32).collect::<Vec<_>>(),
+            &vec![0.0; errors.len()],
+        );
+        // Document 07 asks for max, RMS and p99 rather than a maximum alone.
+        assert!(summary.max.is_finite() && summary.rms.is_finite());
+        assert!(summary.p99.is_finite());
+    }
+}
+
+#[test]
+fn the_routing_operations_declare_their_partition_and_state_contracts() {
+    let f = build_routed(
+        8,
+        4,
+        2,
+        5,
+        9,
+        moxie_graph::CombineOrder::AscendingExpertId,
+        3,
+    );
+    for node in f.graph.nodes() {
+        match node.params {
+            OpParams::Route { .. } => {
+                assert_eq!(node.contract.partition, PartitionRule::Replicated);
+                assert_eq!(node.contract.state_effect, StateEffect::None);
+            }
+            OpParams::ExpertMlp { .. } | OpParams::Combine { .. } => {
+                assert_eq!(node.contract.partition, PartitionRule::NotDetermined);
+                assert_eq!(node.contract.state_effect, StateEffect::None);
+            }
+            _ => {}
+        }
+    }
+}

@@ -308,6 +308,15 @@ impl Interpreter {
                     shape.push(v.len() as u64);
                     shape
                 }
+                Value::Route(_) => {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!(
+                            "value {} was bound a route table; a route is produced by a \
+                             Route operation over this step's own rows, never supplied",
+                            id.0
+                        ),
+                    });
+                }
             };
             if shape != spec.extent(&symbols)? || bound_precision(value) != spec.role.precision() {
                 return Err(invalid("bindings", "shape or precision differs from graph"));

@@ -1,7 +1,9 @@
 # Task 0019 — M2 shared routed-expert semantics
 
-Status: **proposed.** Contract written before implementation, per the working
-rule that produced tasks 0013–0018.
+Status: **implemented at the commit this record accompanies; awaiting
+independent review and owner acceptance.** Contract written and committed at
+`b63d931` before implementation, per the working rule that produced tasks
+0013–0018. See [Result](#result-filled-after-work).
 
 ## Identity and authority
 
@@ -428,4 +430,107 @@ and it belongs to the owner with O2, not to a default chosen here.
 
 ## Result, filled after work
 
-Not started.
+Status: **implemented, awaiting independent review and owner acceptance.**
+Contract committed at `b63d931` before implementation.
+
+### Changed shared owners and consumers
+
+| Owner | Change |
+|---|---|
+| `moxie-graph` | `OpParams::Route`, `OpParams::ExpertMlp`, `OpParams::Combine`; the `ExpertActivation` and `CombineOrder` descriptors; `ValueRole::Route { index, coefficient }` and `OpParams::output_role`, so a node's output role is no longer assumed to be an activation |
+| `moxie-oracles` | `route.rs` gains `RouterSpec`, `ExpertSpec`, `router_input_row`, `router_probabilities`, `select_top_k`, `apply_per_expert_scale`, `router_route_row`, `expert_row`, `combine_order`, `combine_row` and `combine_scale`; `Op::ExpertMlp` joins the registry. The M0 `route_row`, `dispatch`, `required_experts` and `combine` keep their behaviour, with `select_top_k` factored out so there is one tie rule |
+| `moxie-interp` | `Value::Route(RouteTable)` and the three evaluation arms; both binding validators refuse an externally supplied route |
+| `moxie-plan` | charges a route entry as its id **plus** its coefficient; refuses a route-role external input; the selected BF16 chain refuses routed operands and operations |
+| `moxie-models::gemma4` | `MoeGeometry`, `router_input_scale`, `ARTIFACT_A4B`, the eight routed tensor roles and `route_layer`. Metadata and graph composition only; the crate's dependencies are unchanged |
+| `moxie-cli` | `gemma::Shape::C` (routed Gemma-like) and `fixture::build_routed` (the second synthetic MoE), both reachable from the diagnostic surface |
+| `xtask` | negative fixture `models-crate-reaches-memory` |
+
+### Commands and results
+
+All run at the working tree described above, on 2026-09-12.
+
+| Gate | Command | Result |
+|---|---|---|
+| Format | `cargo fmt --all -- --check` | **passed**, empty diff |
+| Clippy, host lane | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed**, no warnings |
+| Host tests | `cargo test --workspace --locked --offline` | **716 passed + 9 doctests, 0 failed** |
+| Device-feature tests | the same with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **732 passed + 12 doctests, 0 failed** |
+| Real GPU | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
+| `G-MOE-ROUTING-HOST` | the four commands in the support matrix | **passed**: 164 `moxie-oracles`, 30 `moxie-interp::reference_graphs`, 14 `moxie-models`, 21 `moxie-cli::gemma` |
+| `G-GENERATION-ALLOC` | `cargo test -p moxie-cli --test allocation -- --nocapture` | **passed**, now including the routed shape |
+
+Logs are under `results/task0019/` (untracked, per the placement contract).
+
+**Failed: none. Skipped or unmeasured, kept separate:**
+
+- **`cargo xtask arch-check` reports 4 failures, all pre-existing and none from
+  this task.** They are the untracked review crate
+  `results/task0014-independent-review-2026-09-11/probes/`, which `arch-check`
+  discovers because it walks the tree and `results/` is gitignored rather than
+  excluded from the walk. The identical four lines are already recorded in
+  `results/task0015/arch-local.log`, so they predate this work. Every rule and
+  every fixture passes, including the new one:
+  `PASS fixture models-crate-reaches-memory rejected: forbidden dependency ::
+  [dependencies] moxie-models -> moxie-memory`. **Nothing under `results/` was
+  deleted to make the gate green** — that is a review artifact and removing it
+  is not this task's call.
+- **No performance measurement.** None is claimed, and none is due: this task
+  adds no device path.
+- **No quality measurement.** O2, and it needs the released model.
+
+### Measured effect and uncertainty
+
+- Admitted reserve and observed peak on the routed geometry, from
+  `G-GENERATION-ALLOC`'s own output: prompt 37 / chunk 13 peak 786,198 B against
+  13,277,846 B admitted; prompt 251 / chunk 65 peak 2,056,589 B against
+  49,188,646 B admitted. The dense shape A at the same prompts reserves
+  11,146,262 B and 43,662,502 B, so the routed intermediate is visible in the
+  reserve and the peak stays inside it.
+- Numerical agreement is stated against counted `metric::bound` chains, never an
+  invented tolerance. Selection agrees with the FP64 transcription **exactly**;
+  coefficients, expert outputs and combinations agree within their bounds, with
+  max, RMS and p99 reported.
+- **One uncertainty is structural and cannot be closed here.** The pinned
+  reference narrows each expert's weighted contribution to BF16 before
+  accumulating; this interpreter accumulates in FP32 and rounds once at the node
+  boundary. The reduction *order* is pinned either way. Which is closer to the
+  released model is O2's question.
+- **A second is a version difference, not a choice.** `transformers` 5.15
+  computes the router softmax in FP32; 5.5.3 uses the input dtype; the artifact
+  declares 5.5.0.dev0. FP32 is pinned. On every fixture here the difference is
+  coefficient precision, not selection — but "every fixture here" is synthetic,
+  and a real checkpoint could sit on a near-tie.
+
+### Deleted or replaced paths
+
+None. Nothing was superseded: the M0 routing fixtures keep their behaviour and
+their callers, and `select_top_k` was factored **out of** `route_row` rather
+than duplicating its tie rule.
+
+### Remaining blockers and the next bounded task
+
+1. **No residency capability exists.** The designated artifact is 51.6 GB
+   against a 24 GiB largest device, and nothing here makes it run. **Task 0020**
+   is M2 item 2: connect the real residency authority to storage reads, host
+   cache, upload readiness, leases, eviction, error recovery and demand/prefetch
+   classes, with expert chunk identity `(artifact, tensor/expert, logical range,
+   format version)` and an enforceable reservation replacing any simulated
+   placement. Its stop conditions are this contract's, unchanged — in particular
+   a second weight-residency owner, a cache class in an adapter, a deadlockable
+   demand path, an unbounded queue and any bulk write.
+2. **M2 item 3** — CPU expert fallback and GPU grouped candidate plans under one
+   interface, with bounded queues and NUMA-aware host placement — follows 0020.
+3. **M2 item 4's Laguna checkpoint finished downloading during this task and is
+   now verified complete.** `/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4` held 8
+   of 15 shards when this contract was written; at the end of the session all 15
+   are present and every one satisfies `8 + header + payload_end == file size`,
+   with the payload ends summing to the index's `total_size` of 76,813,095,232 B.
+   That completeness check is the only thing done to it: **no metadata was
+   interpreted, no tensor was read, and `configuration_laguna.py` and
+   `modeling_laguna.py` are remote code document 03 forbids executing.** Laguna
+   metadata and graph are M2 item 4 and belong to a later bounded task, after
+   the residency work 0020 owns.
+4. **Device routed kernels and expert partitioning** are M5/M6. The three
+   operations refuse on the selected chain and `ExpertMlp`/`Combine` fail closed
+   for partitioning.
+5. **O1, O2, O4–O7 remain open.** No gate was resolved by this task.

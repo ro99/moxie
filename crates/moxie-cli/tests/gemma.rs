@@ -129,7 +129,7 @@ fn logits_for(config: TextConfig, prompt: &[u64]) -> Vec<f32> {
 
 #[test]
 fn both_reduced_geometries_generate_through_the_shared_service() {
-    for shape in [gemma::Shape::A, gemma::Shape::B] {
+    for shape in [gemma::Shape::A, gemma::Shape::B, gemma::Shape::C] {
         let config = shape.config();
         let fixture = gemma::build(shape).unwrap();
         let prompt: Vec<u32> = (0..17).map(|i| i % config.vocab as u32).collect();
@@ -168,7 +168,7 @@ fn both_reduced_geometries_generate_through_the_shared_service() {
 
 #[test]
 fn paged_and_dense_logits_are_bit_identical_across_pages_and_decode() {
-    for shape in [gemma::Shape::A, gemma::Shape::B] {
+    for shape in [gemma::Shape::A, gemma::Shape::B, gemma::Shape::C] {
         let config = shape.config();
         let layers = config.layers as usize;
         let vocab = config.vocab;
@@ -239,7 +239,7 @@ fn paged_and_dense_logits_are_bit_identical_across_pages_and_decode() {
 /// make this pass while proving nothing.
 #[test]
 fn reclaiming_a_sliding_layers_window_changes_no_logit_bit() {
-    for shape in [gemma::Shape::A, gemma::Shape::B] {
+    for shape in [gemma::Shape::A, gemma::Shape::B, gemma::Shape::C] {
         let config = shape.config();
         let layers = config.layers as usize;
         let vocab = config.vocab;
@@ -337,7 +337,7 @@ fn reclaiming_a_sliding_layers_window_changes_no_logit_bit() {
 fn the_logit_softcap_bounds_every_logit() {
     // The cap is the only thing standing between the projection's raw output
     // and the sampler, so a graph that dropped it would be visible here.
-    for shape in [gemma::Shape::A, gemma::Shape::B] {
+    for shape in [gemma::Shape::A, gemma::Shape::B, gemma::Shape::C] {
         let config = shape.config();
         let cap = config.final_logit_softcap;
         let prompt: Vec<u64> = (0..9).map(|i| i % config.vocab).collect();
@@ -1209,4 +1209,261 @@ fn the_artifact_geometry_is_recorded_and_not_runnable_here() {
     let reduced = gemma::Shape::A.config();
     assert!(reduced.hidden < ARTIFACT.hidden);
     assert!(reduced.max_trained_position <= 256);
+}
+
+// ---------------------------------------------------------------------------
+// Task 0019: the routed block.
+// ---------------------------------------------------------------------------
+
+/// Rebuild the routed geometry, replace one bound weight, and return the logits.
+///
+/// Substitution at the *binding*, not at the configuration, so the graph is
+/// byte-identical between the two runs and only the tensor under test differs.
+fn routed_logits_with(prompt: &[u64], substitute: impl Fn(&str, &mut Vec<f32>)) -> Vec<f32> {
+    let config = gemma::Shape::C.config();
+    let layers = config.layers as usize;
+    let model = Gemma4Text::reduced(config, "synthetic-routed").unwrap();
+    let mut oracles = OracleRegistry::new();
+    moxie_oracles::register(&mut oracles).unwrap();
+    let composed = model.compose(&oracles, SymbolId(0)).unwrap();
+    let built = gemma::build(gemma::Shape::C).unwrap();
+
+    let mut weights = built.weights.clone();
+    for bound in &composed.weights {
+        let value = built
+            .weights
+            .get(bound.value)
+            .expect("every role is bound")
+            .clone();
+        let Value::Float(tensor) = value else {
+            panic!("a weight is not a tensor")
+        };
+        let mut data = tensor.data().to_vec();
+        substitute(&bound.role.name, &mut data);
+        weights.set(
+            bound.value,
+            Value::Float(moxie_engine::HostTensor::bf16(data, tensor.shape().to_vec()).unwrap()),
+        );
+    }
+    dense_logits(
+        &built.graph,
+        &weights,
+        built.tokens,
+        built.positions,
+        prompt,
+        layers,
+    )
+}
+
+#[test]
+fn every_routed_tensor_is_load_bearing() {
+    // The acceptance test the contract predeclared: substituting the
+    // conventional value for each routed parameter must change the logits. A
+    // tensor that can be replaced by ones without changing the answer is not
+    // participating, and a graph that looked right would be quietly running a
+    // different model.
+    let prompt: Vec<u64> = (0..9).collect();
+    let base = routed_logits_with(&prompt, |_, _| {});
+    assert!(base.iter().all(|v| v.is_finite()));
+
+    let ones = |target: &'static str| {
+        routed_logits_with(&prompt, move |name, data| {
+            if name == target {
+                data.fill(1.0);
+            }
+        })
+    };
+    for target in [
+        // The router's own gain, `router.scale`.
+        "router_scale",
+        // Applied after renormalisation; ones make it the identity.
+        "router_per_expert_scale",
+        // The router's projection: ones make every expert's logit equal, so
+        // the tie rule decides and every row routes identically.
+        "router_proj",
+        // The routed branch's own input and output norms, and the dense
+        // branch's output norm. Each is a separate tensor in the artifact.
+        "ffn_norm_2",
+        "ffn_out_norm_1",
+        "ffn_out_norm_2",
+        // The experts themselves.
+        "experts_gate_up",
+        "experts_down",
+    ] {
+        assert_ne!(base, ones(target), "{target} is not load-bearing");
+    }
+
+    // Swapping the gate and up halves of the fused tensor: both halves have the
+    // same shape, so nothing rejects it and only the arithmetic notices.
+    let config = gemma::Shape::C.config();
+    let moe = config.moe.unwrap();
+    let block = (moe.moe_intermediate * config.hidden) as usize;
+    let swapped = routed_logits_with(&prompt, |name, data| {
+        if name == "experts_gate_up" {
+            for e in 0..moe.experts as usize {
+                let base = e * 2 * block;
+                let (gate, up) = data[base..base + 2 * block].split_at_mut(block);
+                gate.swap_with_slice(up);
+            }
+        }
+    });
+    assert_ne!(
+        base, swapped,
+        "the fused gate/up block order is not load-bearing"
+    );
+}
+
+#[test]
+fn the_experts_and_the_shared_expert_use_different_normalisations() {
+    // `pre_feedforward_layernorm_2` is its own tensor in the artifact. Binding
+    // the dense branch's gain into the routed branch's slot must change the
+    // answer, which is what makes "the experts read their own norm" a tested
+    // fact rather than a comment.
+    let prompt: Vec<u64> = (0..7).collect();
+    let base = routed_logits_with(&prompt, |_, _| {});
+    let shared_gain = {
+        let built = gemma::build(gemma::Shape::C).unwrap();
+        let model = Gemma4Text::reduced(gemma::Shape::C.config(), "synthetic-routed").unwrap();
+        let mut oracles = OracleRegistry::new();
+        moxie_oracles::register(&mut oracles).unwrap();
+        let composed = model.compose(&oracles, SymbolId(0)).unwrap();
+        let bound = composed
+            .weights
+            .iter()
+            .find(|b| b.role.name == "ffn_norm" && b.role.layer == Some(0))
+            .unwrap();
+        let Some(Value::Float(t)) = built.weights.get(bound.value) else {
+            panic!("unbound")
+        };
+        t.data().to_vec()
+    };
+    let confused = routed_logits_with(&prompt, |name, data| {
+        if name == "ffn_norm_2" {
+            data.copy_from_slice(&shared_gain);
+        }
+    });
+    assert_ne!(base, confused);
+}
+
+#[test]
+fn the_routed_geometry_reports_its_reduction_and_generates() {
+    // The disclosure document 06 requires, on the routed shape too: the surface
+    // that produces output says what the output is not, before producing any.
+    let line = Shape::GemmaC.reduction();
+    assert!(line.contains("synthetic-bf16-weights"), "{line}");
+    assert!(line.contains("text-only"), "{line}");
+
+    let mut out = Vec::new();
+    let options = Options::parse(&[
+        "diagnostic".into(),
+        "--shape".into(),
+        "gemma-c-moe".into(),
+        "--prompt".into(),
+        "0,1,2,3".into(),
+        "--max-new".into(),
+        "3".into(),
+    ])
+    .unwrap();
+    let fixture = options.shape.build().unwrap();
+    let mut owner = ledger();
+    let mut service = GenerationService::new(&mut owner, fixture.program());
+    service
+        .start(Request {
+            prompt: &options.prompt,
+            max_new_tokens: options.maximum,
+            prefill_chunk: options.chunk,
+            temperature: options.temperature,
+            seed: options.seed,
+        })
+        .unwrap();
+    assert!(render(&mut service, &Cancel::never(), &mut out).unwrap());
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("token"), "{text}");
+}
+
+#[test]
+fn the_second_synthetic_moe_consumer_generates_and_is_not_the_gemma_one() {
+    // Document 02's extension rule wants a second consumer with different
+    // shapes; roadmap M2 item 4 wants a second synthetic MoE with a different
+    // expert count, activation, top-k and route distribution. It must actually
+    // run, not merely compile.
+    let fixture = Shape::SyntheticMoe.build().unwrap();
+    let mut owner = ledger();
+    let mut service = GenerationService::new(&mut owner, fixture.program());
+    let prompt = [0u32, 1, 2, 3, 4];
+    let whole = Request {
+        prompt: &prompt,
+        max_new_tokens: 4,
+        prefill_chunk: prompt.len(),
+        temperature: 0.0,
+        seed: 3,
+    };
+    service.start(whole).unwrap();
+    let reference = drain(&mut service);
+    assert_eq!(reference.len(), 4);
+    for chunk in [1, 2, 3, 5] {
+        service
+            .start(Request {
+                prefill_chunk: chunk,
+                ..whole
+            })
+            .unwrap();
+        assert_eq!(reference, drain(&mut service), "chunk {chunk}");
+    }
+
+    // Its routing parameters are the opposite of the Gemma-like graph's.
+    let ops: Vec<&str> = fixture
+        .graph
+        .nodes()
+        .iter()
+        .map(|n| n.params.op().name())
+        .collect();
+    assert!(ops.contains(&"route") && ops.contains(&"expert_mlp") && ops.contains(&"combine"));
+    for node in fixture.graph.nodes() {
+        match node.params {
+            OpParams::Route {
+                top_k,
+                experts,
+                per_expert_scale,
+                input_scale,
+                ..
+            } => {
+                assert_eq!(
+                    top_k, experts,
+                    "top_k == experts keeps the whole distribution"
+                );
+                assert!(!per_expert_scale);
+                assert_eq!(input_scale, 1.0);
+            }
+            OpParams::ExpertMlp { activation, .. } => {
+                assert_eq!(activation, moxie_graph::ExpertActivation::SwiGlu);
+            }
+            OpParams::Combine { order, .. } => {
+                assert_eq!(order, moxie_graph::CombineOrder::SelectionOrder);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn a_route_table_cannot_be_bound_from_outside() {
+    // The route a step uses is the one its own router produced. If a caller
+    // could supply it, it could choose which expert weights the step demands
+    // without the router ever running -- which is a residency decision made by
+    // the wrong owner as well as a wrong answer.
+    let fixture = Shape::SyntheticMoe.build().unwrap();
+    let route = fixture
+        .graph
+        .nodes()
+        .iter()
+        .find(|n| matches!(n.params, OpParams::Route { .. }))
+        .unwrap()
+        .output;
+    let spec = fixture.graph.spec(route).unwrap();
+    assert!(spec.role.is_route(), "{:?}", spec.role);
+    assert!(
+        !fixture.graph.inputs().contains(&route) && !fixture.graph.weights().contains(&route),
+        "a route table is neither a step input nor a weight"
+    );
 }

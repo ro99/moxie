@@ -1,0 +1,20 @@
+[package]
+name = "moxie-models"
+version = "0.0.0"
+edition = "2024"
+
+# M2 gives the model crate a routed-expert graph, and routed experts are the
+# first mathematics whose weights do not all fit at once. That makes the
+# residency authority the thing a model adapter is most tempted to reach for:
+# document 02 forbids "expert caches" in `moxie-models-*` and document 03 says
+# "models never choose victims". A dependency edge to `moxie-memory` is how that
+# temptation would first appear in a manifest, so it is rejected here rather
+# than noticed in review. This fixture must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-graph = { path = "../../../../crates/moxie-graph" }
+moxie-model-api = { path = "../../../../crates/moxie-model-api" }
+moxie-memory = { path = "../../../../crates/moxie-memory" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden dependency"

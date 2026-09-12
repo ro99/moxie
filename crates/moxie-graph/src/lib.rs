@@ -31,8 +31,8 @@ pub mod graph;
 
 pub use attention::{Visibility, reciprocal_sqrt_scale};
 pub use graph::{
-    Bindings, Graph, GraphBuilder, GraphId, GraphSignature, IndexEncoding, Node, NodeId, OpParams,
-    RopeLayout, TensorSpec, ValueId, ValueRole,
+    Bindings, CombineOrder, ExpertActivation, Graph, GraphBuilder, GraphId, GraphSignature,
+    IndexEncoding, Node, NodeId, OpParams, RopeLayout, TensorSpec, ValueId, ValueRole,
 };
 
 use std::collections::BTreeMap;

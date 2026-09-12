@@ -535,6 +535,24 @@ fn tensor_bytes(role: ValueRole, shape: &[u64]) -> Result<u64> {
             }
         }
         ValueRole::Index(encoding) => encoding.bytes_per_element(),
+        // A route entry is an expert id *and* its coefficient. Charging only
+        // one of them would under-reserve every routed step by the other, and
+        // the two halves are always allocated together.
+        ValueRole::Route { index, coefficient } => {
+            let coefficient = match coefficient.get() {
+                Precision::Bf16 | Precision::F16 => 2,
+                Precision::F32 => 4,
+                Precision::Int4 | Precision::Int8 => {
+                    unreachable!(
+                        "integer activation precision is rejected by its typed constructor"
+                    )
+                }
+            };
+            index
+                .bytes_per_element()
+                .checked_add(coefficient)
+                .ok_or_else(|| invalid("shape", "route entry byte count overflowed"))?
+        }
     };
     elements
         .checked_mul(bytes_per_element)
@@ -556,6 +574,14 @@ fn validate_external_input(role: ValueRole, shape: &[u64]) -> Result<u64> {
             "a weight-role value must be declared as a graph weight and charged",
         )),
         ValueRole::Activation(_) | ValueRole::Index(_) => tensor_bytes(role, shape),
+        // A route is computed, never supplied: it is the output of a `Route`
+        // node over this step's own rows. Accepting one from outside would let
+        // a caller choose which experts a step demands without the router ever
+        // running.
+        ValueRole::Route { .. } => Err(invalid(
+            "role",
+            "a route table is produced by a Route operation, not bound as an input",
+        )),
     }
 }
 

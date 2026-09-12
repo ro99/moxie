@@ -34,8 +34,8 @@
 //! What it deliberately does not preserve is in [`Reduction`].
 
 use moxie_graph::{
-    Graph, GraphBuilder, IndexEncoding, OpParams, OracleRegistry, RopeLayout, TensorSpec, ValueId,
-    ValueRole, Visibility,
+    CombineOrder, ExpertActivation, Graph, GraphBuilder, IndexEncoding, OpParams, OracleRegistry,
+    RopeLayout, TensorSpec, ValueId, ValueRole, Visibility,
 };
 use moxie_model_api::{
     GraphRequirements, ModelDefinition, ModelMetadata, TensorRequirement, TensorRole,
@@ -98,6 +98,44 @@ pub struct TextConfig {
     /// artifact's 262,144 cannot be read out of a fixture and mistaken for a
     /// supported context.
     pub max_trained_position: u64,
+    /// The routed-expert block, when the variant has one.
+    ///
+    /// `None` is the dense variant: `enable_moe_block` false, as the 31B
+    /// declares. `Some` adds routed experts **beside** the dense MLP, never
+    /// instead of it -- every layer of the routed variant carries both, and the
+    /// dense one is a shared expert outside routing.
+    pub moe: Option<MoeGeometry>,
+}
+
+/// A routed-expert block's declared geometry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MoeGeometry {
+    pub experts: u64,
+    pub top_k: u64,
+    /// One expert's intermediate width.
+    ///
+    /// Distinct from [`TextConfig::intermediate`], and in the designated
+    /// artifact much smaller: 704 against the dense MLP's 2,112. A layer
+    /// carries both, so one field could not describe it.
+    pub moe_intermediate: u64,
+    /// The scalar the router applies to its normalized, gained input.
+    ///
+    /// [`router_input_scale`] computes the family's value. Stored rather than
+    /// derived at composition time for the same reason
+    /// [`TextConfig::embedding_scale`] is: it is a family choice, and deriving
+    /// it inside a shared operation would impose Gemma's on everything else.
+    pub router_input_scale: f32,
+}
+
+/// `hidden^(-1/2)`, the factor Gemma 4's router applies to its input.
+///
+/// `Gemma4TextRouter.scalar_root_size` in the pinned `transformers` source.
+/// Computed in FP64 and narrowed once, and **not** pre-rounded to BF16: unlike
+/// the embedding scale, the pinned source keeps it a Python float and lets the
+/// multiplication carry it, so rounding it here would be a boundary the
+/// reference does not have.
+pub fn router_input_scale(hidden: u64) -> f32 {
+    (hidden as f64).sqrt().recip() as f32
 }
 
 /// An exact rational fraction of a head, so a rotary fraction is never a float
@@ -179,6 +217,47 @@ pub const ARTIFACT: ArtifactGeometry = ArtifactGeometry {
     global_rope_theta: 1_000_000.0,
     final_logit_softcap: 30.0,
     max_trained_position: 262_144,
+    moe: None,
+};
+
+/// The designated M2 artifact's declared text geometry.
+///
+/// `/fast/models/google/gemma-4-26B-A4B-it`, revision
+/// `4d7ae4984b7db7de8f8457170b3f1a419ee76d52`, read from its own `config.json`
+/// and safetensors headers on 2026-09-12. The same family as [`ARTIFACT`] --
+/// same global predicate, same layer-type asymmetry, same softcap, same window
+/// -- with a routed-expert block the 31B does not have.
+///
+/// Nothing executes this either. It is here so a caller can compare a reduced
+/// configuration against the real one, and so that the numbers in
+/// `docs/models/gemma4.md` have an executable counterpart.
+pub const ARTIFACT_A4B: ArtifactGeometry = ArtifactGeometry {
+    hidden: 2816,
+    layers: 30,
+    heads: 16,
+    local_kv_heads: 8,
+    local_head_dim: 256,
+    global_kv_heads: 2,
+    global_head_dim: 512,
+    intermediate: 2112,
+    vocab: 262_144,
+    global_stride: 6,
+    sliding_window: 1024,
+    rms_eps: 1e-6,
+    sliding_rope_theta: 10_000.0,
+    global_rope_theta: 1_000_000.0,
+    final_logit_softcap: 30.0,
+    max_trained_position: 262_144,
+    moe: Some(MoeGeometry {
+        experts: 128,
+        top_k: 8,
+        moe_intermediate: 704,
+        // `2816^(-1/2)`. A `const` cannot call `router_input_scale`, so
+        // `the_artifact_router_scale_matches_the_helper` asserts the two agree
+        // bit for bit rather than trusting this literal -- which is how the
+        // first draft's wrong digits were caught.
+        router_input_scale: 0.018_844_46,
+    }),
 };
 
 /// The artifact's numbers. Not a [`TextConfig`]: its local and global layers
@@ -204,6 +283,8 @@ pub struct ArtifactGeometry {
     pub global_rope_theta: f32,
     pub final_logit_softcap: f32,
     pub max_trained_position: u64,
+    /// The routed-expert block, when the variant declares one.
+    pub moe: Option<MoeGeometry>,
 }
 
 impl ArtifactGeometry {
@@ -369,6 +450,23 @@ impl Gemma4Text {
             if !config.global_layer(layer) {
                 tensors.push(required("v_proj", Some(layer))?);
             }
+            // The routed branch. Every layer of the routed variant has all of
+            // these *and* the dense `ffn_*` tensors above: the census over the
+            // designated artifact's index is 30 of each across 30 layers.
+            if config.moe.is_some() {
+                for name in [
+                    "router_scale",
+                    "router_proj",
+                    "router_per_expert_scale",
+                    "experts_gate_up",
+                    "experts_down",
+                    "ffn_norm_2",
+                    "ffn_out_norm_1",
+                    "ffn_out_norm_2",
+                ] {
+                    tensors.push(required(name, Some(layer))?);
+                }
+            }
         }
         Ok(Self {
             config,
@@ -425,29 +523,6 @@ impl Gemma4Text {
         let positions = g.input("absolute positions", index);
 
         let mut bound = Vec::new();
-        let weight = |g: &mut GraphBuilder,
-                      bound: &mut Vec<BoundRole>,
-                      name: &str,
-                      layer: Option<u32>,
-                      shape: Vec<u64>|
-         -> Result<ValueId> {
-            let label = match layer {
-                Some(l) => format!("{name}.{l}"),
-                None => name.to_string(),
-            };
-            let id = g.weight(
-                &label,
-                TensorSpec::new(
-                    ValueRole::Weight(WeightPrecision::new(Precision::Bf16)?),
-                    shape.into_iter().map(Dim::constant).collect(),
-                ),
-            )?;
-            bound.push(BoundRole {
-                role: role(name, layer),
-                value: id,
-            });
-            Ok(id)
-        };
 
         // Tied: the same table embeds and projects. The artifact has no
         // `lm_head` tensor, so a graph with two of them would be describing a
@@ -686,6 +761,14 @@ impl Gemma4Text {
                 &[gate, up],
             )?;
             let down = linear(&mut g, activated, w_down, c.intermediate, c.hidden)?;
+            // The dense branch's output. On the routed variant this is the
+            // shared expert's contribution, normalized on its own before it
+            // meets the routed one; on the dense variant there is no second
+            // branch and `feedforward` is this value directly.
+            let feedforward = match c.moe {
+                None => down,
+                Some(moe) => route_layer(&mut g, &mut bound, c, layer, moe, stream, down)?,
+            };
             let ffn_out_norm = weight(
                 &mut g,
                 &mut bound,
@@ -699,7 +782,7 @@ impl Gemma4Text {
                     group: 1,
                     eps: c.rms_eps,
                 },
-                &[down, ffn_out_norm],
+                &[feedforward, ffn_out_norm],
             )?;
             stream = g.node(
                 OpParams::Residual {
@@ -744,6 +827,162 @@ fn width(what: &'static str, heads: u64, head_dim: u64) -> Result<u64> {
             field: "attention",
             detail: format!("{what} = {heads} x {head_dim} is not a representable tensor extent"),
         })
+}
+
+/// Declare a BF16 weight, label it and record the role it fills.
+///
+/// The model names roles and the composition root supplies bytes; neither knows
+/// the other's file names. Shapes come from `graph.spec(value)`, so there is one
+/// description of a tensor's extent and it is the graph's.
+fn weight(
+    g: &mut GraphBuilder,
+    bound: &mut Vec<BoundRole>,
+    name: &str,
+    layer: Option<u32>,
+    shape: Vec<u64>,
+) -> Result<ValueId> {
+    let label = match layer {
+        Some(l) => format!("{name}.{l}"),
+        None => name.to_string(),
+    };
+    let id = g.weight(
+        &label,
+        TensorSpec::new(
+            ValueRole::Weight(WeightPrecision::new(Precision::Bf16)?),
+            shape.into_iter().map(Dim::constant).collect(),
+        ),
+    )?;
+    bound.push(BoundRole {
+        role: role(name, layer),
+        value: id,
+    });
+    Ok(id)
+}
+
+/// One layer's routed-expert branch, combined with the dense shared expert.
+///
+/// `stream` is the **post-attention residual**, before `pre_feedforward_layernorm`;
+/// `dense` is the dense MLP's output, before any normalization. Returns the
+/// value `post_feedforward_layernorm` consumes.
+///
+/// Transcribed from `Gemma4TextDecoderLayer.forward` in the pinned
+/// `transformers` source, where the order is:
+///
+/// ```text
+/// h1 = post_feedforward_layernorm_1(mlp(pre_feedforward_layernorm(r)))
+/// h2 = post_feedforward_layernorm_2(experts(pre_feedforward_layernorm_2(r), router(r)))
+/// out = h1 + h2
+/// ```
+///
+/// Two orderings in that are worth stating because a plausible graph gets them
+/// wrong. **The router reads `r`, not the normalized stream** -- it is the only
+/// consumer of the un-normalized residual in the block, and feeding it the
+/// normalized one routes every row on a different vector while still producing
+/// a well-shaped answer. And the **experts read a different normalization than
+/// the dense MLP does**: `pre_feedforward_layernorm_2`, its own tensor, not the
+/// one the shared expert used.
+fn route_layer(
+    g: &mut GraphBuilder,
+    bound: &mut Vec<BoundRole>,
+    c: &TextConfig,
+    layer: u32,
+    moe: MoeGeometry,
+    stream: ValueId,
+    dense: ValueId,
+) -> Result<ValueId> {
+    let norm = |g: &mut GraphBuilder, x: ValueId, gain: ValueId| -> Result<ValueId> {
+        g.node(
+            OpParams::RmsNorm {
+                hidden: c.hidden,
+                group: 1,
+                eps: c.rms_eps,
+            },
+            &[x, gain],
+        )
+    };
+
+    let out_norm_1 = weight(g, bound, "ffn_out_norm_1", Some(layer), vec![c.hidden])?;
+    let shared = norm(g, dense, out_norm_1)?;
+
+    // The router's three tensors. `router_scale` is the gain of the router's
+    // own scale-free normalization, which is why it is bound as a weight here
+    // rather than folded into a constant: the artifact stores a trained vector.
+    let router_scale = weight(g, bound, "router_scale", Some(layer), vec![c.hidden])?;
+    let router_proj = weight(
+        g,
+        bound,
+        "router_proj",
+        Some(layer),
+        vec![moe.experts, c.hidden],
+    )?;
+    let per_expert = weight(
+        g,
+        bound,
+        "router_per_expert_scale",
+        Some(layer),
+        vec![moe.experts],
+    )?;
+    let route = g.node(
+        OpParams::Route {
+            hidden: c.hidden,
+            experts: moe.experts,
+            top_k: moe.top_k,
+            eps: c.rms_eps,
+            input_scale: moe.router_input_scale,
+            per_expert_scale: true,
+        },
+        &[stream, router_scale, router_proj, per_expert],
+    )?;
+
+    let ffn_norm_2 = weight(g, bound, "ffn_norm_2", Some(layer), vec![c.hidden])?;
+    let routed_input = norm(g, stream, ffn_norm_2)?;
+    // Fused across experts, exactly as the artifact stores them: one
+    // `experts.gate_up_proj` and one `experts.down_proj` per layer holding all
+    // of them, not one tensor per expert.
+    let gate_up = weight(
+        g,
+        bound,
+        "experts_gate_up",
+        Some(layer),
+        vec![moe.experts, 2 * moe.moe_intermediate, c.hidden],
+    )?;
+    let expert_down = weight(
+        g,
+        bound,
+        "experts_down",
+        Some(layer),
+        vec![moe.experts, c.hidden, moe.moe_intermediate],
+    )?;
+    let slots = g.node(
+        OpParams::ExpertMlp {
+            hidden: c.hidden,
+            intermediate: moe.moe_intermediate,
+            experts: moe.experts,
+            top_k: moe.top_k,
+            // `hidden_activation` is `gelu_pytorch_tanh`, the same gate
+            // transform the dense MLP above uses.
+            activation: ExpertActivation::GeGlu,
+        },
+        &[routed_input, route, gate_up, expert_down],
+    )?;
+    let combined = g.node(
+        OpParams::Combine {
+            hidden: c.hidden,
+            top_k: moe.top_k,
+            // Ascending expert id: the pinned reference accumulates over
+            // `expert_hit`, which is expert-major, not over the row's selection
+            // order.
+            order: CombineOrder::AscendingExpertId,
+        },
+        &[route, slots],
+    )?;
+    let out_norm_2 = weight(g, bound, "ffn_out_norm_2", Some(layer), vec![c.hidden])?;
+    let routed = norm(g, combined, out_norm_2)?;
+
+    // Unscaled, and unnormalized: the two branches are simply added. The layer
+    // scalar belongs to the residual further down, and the dense branch takes
+    // no routing coefficient -- it is a shared expert outside routing.
+    g.node(OpParams::Residual { scale: 1.0 }, &[shared, routed])
 }
 
 fn linear(
@@ -832,18 +1071,23 @@ impl ModelDefinition for Gemma4Text {
 
     fn graph_requirements(&self) -> GraphRequirements {
         use moxie_graph::Op;
-        GraphRequirements {
-            ops: vec![
-                Op::Embedding,
-                Op::RmsNorm,
-                Op::Linear,
-                Op::Rope,
-                Op::Attention,
-                Op::Residual,
-                Op::GeGlu,
-                Op::VocabProjection,
-            ],
+        let mut ops = vec![
+            Op::Embedding,
+            Op::RmsNorm,
+            Op::Linear,
+            Op::Rope,
+            Op::Attention,
+            Op::Residual,
+            Op::GeGlu,
+            Op::VocabProjection,
+        ];
+        // Declared only when the variant actually has them, so that a dense
+        // configuration cannot be admitted against a registry that happens to
+        // carry routing references it will never use.
+        if self.config.moe.is_some() {
+            ops.extend([Op::Route, Op::ExpertMlp, Op::Combine]);
         }
+        GraphRequirements { ops }
     }
 }
 
@@ -874,6 +1118,20 @@ mod tests {
             layer_scalars: vec![1.0, 0.75, 1.25, 0.5, 1.5, 0.875],
             embedding_scale: embedding_scale(24),
             max_trained_position: 256,
+            moe: None,
+        }
+    }
+
+    /// The same reduced geometry with the designated artifact's routed block.
+    fn routed_config() -> TextConfig {
+        TextConfig {
+            moe: Some(MoeGeometry {
+                experts: 5,
+                top_k: 2,
+                moe_intermediate: 6,
+                router_input_scale: router_input_scale(24),
+            }),
+            ..reduced_config()
         }
     }
 
@@ -1032,6 +1290,237 @@ mod tests {
                 "{field}: refused by the wrong guard -- wanted {expect:?}, got {detail:?}"
             );
         }
+    }
+
+    /// A registry naming a reference for every operation this crate composes.
+    ///
+    /// Built here rather than by depending on `moxie-oracles`: a model crate's
+    /// allowed dependencies are graph, model-api and types, and reaching for
+    /// the oracle crate even in a test would be the edge `arch-check` exists to
+    /// refuse. The names are the ones `moxie-oracles` registers, so a graph
+    /// that finishes here finishes there.
+    fn oracles_registry() -> OracleRegistry {
+        let mut o = OracleRegistry::new();
+        for op in [
+            Op::Embedding,
+            Op::Linear,
+            Op::RmsNorm,
+            Op::Rope,
+            Op::Attention,
+            Op::Residual,
+            Op::GeGlu,
+            Op::VocabProjection,
+            Op::Route,
+            Op::ExpertMlp,
+            Op::Combine,
+        ] {
+            o.register(
+                op,
+                moxie_graph::OracleId("moxie_oracles::host_reference"),
+                moxie_graph::OracleEvidence {
+                    implementation: "test",
+                    test_module: "test",
+                },
+            )
+            .unwrap();
+        }
+        o
+    }
+
+    #[test]
+    fn the_a4b_artifact_geometry_matches_its_config_json() {
+        // Read from `/fast/models/google/gemma-4-26B-A4B-it/config.json`,
+        // revision `4d7ae4984b7db7de8f8457170b3f1a419ee76d52`, on 2026-09-12.
+        // Transcribed here so that a later edit to the constant has to disagree
+        // with the recorded inspection rather than with nothing.
+        let a = ARTIFACT_A4B;
+        assert_eq!((a.hidden, a.layers, a.heads), (2816, 30, 16));
+        assert_eq!((a.local_kv_heads, a.local_head_dim), (8, 256));
+        assert_eq!((a.global_kv_heads, a.global_head_dim), (2, 512));
+        assert_eq!(a.intermediate, 2112);
+        assert_eq!(a.vocab, 262_144);
+        assert_eq!((a.global_stride, a.sliding_window), (6, 1024));
+        assert_eq!(a.final_logit_softcap, 30.0);
+        let moe = a.moe.expect("the A4B variant declares enable_moe_block");
+        assert_eq!((moe.experts, moe.top_k), (128, 8));
+        assert_eq!(moe.moe_intermediate, 704);
+
+        // The same family as the 31B, which is why task 0017's per-layer
+        // geometry and task 0016's operation parameters transfer rather than
+        // being rebuilt: same predicate, same asymmetry, same softcap, same
+        // window. The five full-attention layers are 5, 11, 17, 23, 29.
+        let global: Vec<u32> = (0..a.layers).filter(|l| a.global_layer(*l)).collect();
+        assert_eq!(global, vec![5, 11, 17, 23, 29]);
+        assert_eq!(a.global_stride, ARTIFACT.global_stride);
+        assert_eq!(a.final_logit_softcap, ARTIFACT.final_logit_softcap);
+        assert_eq!(a.sliding_window, ARTIFACT.sliding_window);
+        assert!(ARTIFACT.moe.is_none(), "the 31B is dense");
+    }
+
+    #[test]
+    fn the_artifact_router_scale_matches_the_helper() {
+        // A `const` cannot call a function, so the literal is checked against
+        // the helper bit for bit. The first draft of that literal was wrong in
+        // its fifth significant digit and this is what caught it.
+        let moe = ARTIFACT_A4B.moe.unwrap();
+        assert_eq!(
+            moe.router_input_scale.to_bits(),
+            router_input_scale(ARTIFACT_A4B.hidden).to_bits(),
+            "{} vs {}",
+            moe.router_input_scale,
+            router_input_scale(ARTIFACT_A4B.hidden)
+        );
+        // It is `hidden^(-1/2)` and nothing else -- not an epsilon, not the
+        // embedding's `sqrt(hidden)`, not an attention scale.
+        assert!((router_input_scale(2816) as f64 * (2816f64).sqrt() - 1.0).abs() < 1e-6);
+        assert_ne!(router_input_scale(24), embedding_scale(24));
+    }
+
+    #[test]
+    fn a_routed_layer_declares_the_routed_roles_beside_the_dense_ones() {
+        let model = Gemma4Text::reduced(routed_config(), "synthetic-routed").unwrap();
+        let names: Vec<(&str, Option<u32>)> = model
+            .tensors()
+            .iter()
+            .map(|t| (t.role.name.as_str(), t.role.layer))
+            .collect();
+        for layer in 0..routed_config().layers {
+            for role in [
+                "router_scale",
+                "router_proj",
+                "router_per_expert_scale",
+                "experts_gate_up",
+                "experts_down",
+                "ffn_norm_2",
+                "ffn_out_norm_1",
+                "ffn_out_norm_2",
+                // Beside, never instead of: every layer of the designated
+                // artifact carries a dense `mlp` as well as its experts, and a
+                // graph that dropped it would be missing a shared expert.
+                "ffn_gate",
+                "ffn_up",
+                "ffn_down",
+                "ffn_norm",
+                "ffn_out_norm",
+            ] {
+                assert!(
+                    names.contains(&(role, Some(layer))),
+                    "layer {layer} is missing {role}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_dense_configuration_declares_no_routed_roles() {
+        let model = Gemma4Text::reduced(reduced_config(), "synthetic").unwrap();
+        for t in model.tensors() {
+            assert!(
+                !t.role.name.starts_with("router") && !t.role.name.starts_with("experts"),
+                "a dense variant declared {}",
+                t.role.name
+            );
+        }
+        assert!(!model.graph_requirements().ops.contains(&Op::Route));
+    }
+
+    #[test]
+    fn the_routed_graph_uses_the_shared_routing_operations_once_per_layer() {
+        let config = routed_config();
+        let model = Gemma4Text::reduced(config.clone(), "synthetic-routed").unwrap();
+        let composed = model.compose(&oracles_registry(), SymbolId(0)).unwrap();
+        for op in [Op::Route, Op::ExpertMlp, Op::Combine] {
+            let count = composed
+                .graph
+                .nodes()
+                .iter()
+                .filter(|n| n.params.op() == op)
+                .count();
+            assert_eq!(count, config.layers as usize, "{} nodes", op.name());
+            assert!(model.graph_requirements().ops.contains(&op));
+        }
+
+        // The fused expert tensors carry the artifact's shape: all experts in
+        // one tensor, gate and up stacked along the output axis.
+        let moe = config.moe.unwrap();
+        let shape = |name: &str| -> Vec<Dim> {
+            let bound = composed
+                .weights
+                .iter()
+                .find(|b| b.role.name == name && b.role.layer == Some(0))
+                .unwrap();
+            composed.graph.spec(bound.value).unwrap().shape.clone()
+        };
+        assert_eq!(
+            shape("experts_gate_up"),
+            vec![
+                Dim::constant(moe.experts),
+                Dim::constant(2 * moe.moe_intermediate),
+                Dim::constant(config.hidden),
+            ]
+        );
+        assert_eq!(
+            shape("experts_down"),
+            vec![
+                Dim::constant(moe.experts),
+                Dim::constant(config.hidden),
+                Dim::constant(moe.moe_intermediate),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_router_reads_the_residual_and_the_experts_read_their_own_norm() {
+        // The ordering a plausible graph gets wrong. In the pinned reference
+        // the router's argument is `residual`, taken *before*
+        // `pre_feedforward_layernorm`; the experts' argument is
+        // `pre_feedforward_layernorm_2(residual)`, its own tensor. A graph that
+        // fed the router the normalized stream is well shaped and routes every
+        // row on a different vector.
+        let config = routed_config();
+        let model = Gemma4Text::reduced(config, "synthetic-routed").unwrap();
+        let composed = model.compose(&oracles_registry(), SymbolId(0)).unwrap();
+        let nodes = composed.graph.nodes();
+        let producer = |v: ValueId| nodes.iter().find(|n| n.output == v);
+
+        let ffn_norm_2: Vec<ValueId> = composed
+            .weights
+            .iter()
+            .filter(|b| b.role.name == "ffn_norm_2")
+            .map(|b| b.value)
+            .collect();
+
+        for node in nodes.iter().filter(|n| n.params.op() == Op::Route) {
+            let source = producer(node.inputs[0]).expect("the router reads a computed value");
+            assert_eq!(
+                source.params.op(),
+                Op::Residual,
+                "the router read a {} instead of the residual stream",
+                source.params.op().name()
+            );
+        }
+        for node in nodes.iter().filter(|n| n.params.op() == Op::ExpertMlp) {
+            let source = producer(node.inputs[0]).expect("the experts read a computed value");
+            assert_eq!(source.params.op(), Op::RmsNorm);
+            assert!(
+                ffn_norm_2.contains(&source.inputs[1]),
+                "the experts were normalized with the dense branch's gain"
+            );
+            // And that norm reads the residual, not the dense branch's input.
+            let normed = producer(source.inputs[0]).unwrap();
+            assert_eq!(normed.params.op(), Op::Residual);
+        }
+    }
+
+    #[test]
+    fn the_routed_and_dense_branches_use_different_intermediate_widths() {
+        // 704 against 2112 in the artifact. Equal widths here would let a graph
+        // that confused the two branches pass every shape check.
+        let config = routed_config();
+        let moe = config.moe.unwrap();
+        assert_ne!(moe.moe_intermediate, config.intermediate);
+        let a = ARTIFACT_A4B;
+        assert_ne!(a.moe.unwrap().moe_intermediate, a.intermediate);
     }
 
     #[test]

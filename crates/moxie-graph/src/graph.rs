@@ -135,6 +135,21 @@ pub enum ValueRole {
     Activation(ActivationPrecision),
     /// Token ids, positions, page or expert indices. Integer, never quantised.
     Index(IndexEncoding),
+    /// One row's routing decision: the expert ids it selected and the
+    /// coefficient each was selected with.
+    ///
+    /// Deliberately **not** two values and deliberately not one float tensor.
+    /// Document 02 requires index roles to be separate from activations
+    /// precisely so that "page/group/sparse indices" cannot be validated by a
+    /// precision rule meant for floats; an expert id is such an index, and a
+    /// route table that stored its ids as BF16 would silently alias expert 257
+    /// onto expert 256. The two halves therefore carry their own descriptors
+    /// and travel together, because a coefficient without the id it belongs to
+    /// is not a routing decision.
+    Route {
+        index: IndexEncoding,
+        coefficient: ActivationPrecision,
+    },
 }
 
 impl ValueRole {
@@ -142,12 +157,22 @@ impl ValueRole {
         matches!(self, ValueRole::Index(_))
     }
 
+    /// Whether this value is a routing decision rather than a tensor.
+    pub fn is_route(self) -> bool {
+        matches!(self, ValueRole::Route { .. })
+    }
+
     /// The stored element encoding, for a float role.
+    ///
+    /// `None` for a route table as well as for an index: a route has *two*
+    /// encodings, and returning either one of them here would let a caller
+    /// validate a route against a single precision and believe it had checked
+    /// the whole value.
     pub fn precision(self) -> Option<Precision> {
         match self {
             ValueRole::Weight(w) => Some(w.get()),
             ValueRole::Activation(a) => Some(a.get()),
-            ValueRole::Index(_) => None,
+            ValueRole::Index(_) | ValueRole::Route { .. } => None,
         }
     }
 }
@@ -285,6 +310,109 @@ pub enum OpParams {
         /// large `c` still rounds and still costs a tanh.
         softcap: Option<f32>,
     },
+    /// Which experts a row is sent to, and with what coefficients.
+    ///
+    /// Inputs are `(rows, router gain, router projection[, per-expert scale])`
+    /// and the output is a route table of `[rows, top_k]`. The whole score
+    /// transformation lives here rather than being composed from a norm and a
+    /// linear, because document 02's `RouteSpec` makes "router score
+    /// transformation, top-k/group selection, renormalization ... biases and
+    /// scaling location" parameters of *routing*: the transform decides which
+    /// expert weights the step needs, so it is a residency decision as much as
+    /// a numerical one and cannot be left implicit in whatever a graph author
+    /// happened to wire in front of it. The unfused stages stay separately
+    /// callable in `moxie_oracles::route`, which is what document 09 requires
+    /// of anything that could have been fused.
+    ///
+    /// The tie rule is not a parameter: **the lower expert id always wins**.
+    /// Two ranks that broke a tie differently would route one row to two
+    /// different experts, which is a residency divergence as well as a
+    /// numerical one.
+    Route {
+        hidden: u64,
+        experts: u64,
+        top_k: u64,
+        /// Epsilon of the router's own RMS normalization, which is scale-free:
+        /// the gain is the bound `router.scale` tensor, applied after it.
+        eps: f32,
+        /// The scalar multiplying the normalized, gained row before projection.
+        ///
+        /// Gemma 4 uses `hidden^(-1/2)` (`Gemma4TextRouter.scalar_root_size`).
+        /// It is stated rather than derived from `hidden` because it is a
+        /// family choice, not an identity: a router without one passes 1.0, and
+        /// deriving it would silently impose Gemma's on every other family.
+        input_scale: f32,
+        /// Whether a per-expert coefficient scale is bound as input 3.
+        ///
+        /// Applied **after** renormalization and never renormalized away, so
+        /// the coefficients of a scaled router do not sum to one. A combine
+        /// that normalized them again would delete a trained parameter.
+        per_expert_scale: bool,
+    },
+    /// The gated expert feed-forward, evaluated per selected slot.
+    ///
+    /// Inputs are `(rows, route, fused gate/up, fused down)`; the output is
+    /// `[rows * top_k, hidden]`, slot-major, with slot `j` of row `r` at index
+    /// `r * top_k + j`. Emitting per-slot outputs instead of an already
+    /// combined row is what keeps [`OpParams::Combine`] independently testable.
+    ///
+    /// The expert tensors are **fused across experts**: `[experts, 2 * intermediate,
+    /// hidden]` and `[experts, hidden, intermediate]`, which is how the
+    /// designated artifact stores all 128 experts of a layer in two tensors.
+    /// Within the gate/up tensor the output axis is the whole gate block
+    /// followed by the whole up block -- `chunk(2, dim=-1)` in the pinned
+    /// reference -- not interleaved pairs.
+    ExpertMlp {
+        hidden: u64,
+        /// One expert's intermediate width. Distinct from a dense MLP's: the
+        /// designated artifact's are 704 and 2112, and a layer carries both.
+        intermediate: u64,
+        experts: u64,
+        top_k: u64,
+        activation: ExpertActivation,
+    },
+    /// The weighted sum of a row's selected expert outputs.
+    ///
+    /// Inputs are `(route, slots)`; the output is `[rows, hidden]`.
+    Combine {
+        hidden: u64,
+        top_k: u64,
+        /// The order the `top_k` terms are added in.
+        ///
+        /// A parameter rather than a scheduling detail because floating-point
+        /// addition is not associative: two orders give two different answers
+        /// at any precision, so an executor that reduced in completion order
+        /// would produce a result no oracle predicts.
+        order: CombineOrder,
+    },
+}
+
+/// The gate transform of an expert's gated feed-forward.
+///
+/// The same distinction [`OpParams::SwiGlu`] and [`OpParams::GeGlu`] draw for
+/// dense activations, carried into routed experts because the two consumers of
+/// this operation genuinely differ: the Gemma 4 family declares
+/// `gelu_pytorch_tanh`, and a family with a SiLU gate is not the same function
+/// with a flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExpertActivation {
+    /// `gelu_tanh(gate) * up`.
+    GeGlu,
+    /// `silu(gate) * up`.
+    SwiGlu,
+}
+
+/// The order a routed row's expert contributions are summed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CombineOrder {
+    /// Ascending expert id, regardless of the order the row selected them.
+    ///
+    /// What the pinned Gemma 4 reference does: `Gemma4TextExperts.forward`
+    /// iterates `expert_hit`, which is `nonzero()` over an expert-major mask,
+    /// and accumulates into the output with `index_add_`.
+    AscendingExpertId,
+    /// The row's own selection order, highest score first.
+    SelectionOrder,
 }
 
 /// Which elements of a head RoPE pairs together.
@@ -312,6 +440,9 @@ impl OpParams {
             OpParams::Attention { .. } => Op::Attention,
             OpParams::Residual { .. } => Op::Residual,
             OpParams::VocabProjection { .. } => Op::VocabProjection,
+            OpParams::Route { .. } => Op::Route,
+            OpParams::ExpertMlp { .. } => Op::ExpertMlp,
+            OpParams::Combine { .. } => Op::Combine,
         }
     }
 
@@ -336,6 +467,18 @@ impl OpParams {
             // Head ownership, GQA KV replication and the output reduction are
             // document 04's M5 work. Undetermined until then, deliberately.
             OpParams::Attention { .. } => PartitionRule::NotDetermined,
+            // Replicated, and that is a correctness requirement rather than a
+            // cost choice. Every rank must reach the same selection from the
+            // same row: a router sharded over its expert axis would reduce
+            // partial logits in a rank-dependent order, and two ranks that
+            // disagree about which expert a row needs disagree about which
+            // weights have to be resident. The router is three small tensors,
+            // so replicating them costs almost nothing.
+            OpParams::Route { .. } => PartitionRule::Replicated,
+            // Expert partitioning is M5. Failing closed here is what keeps that
+            // a lowering decision rather than something this task pre-empted:
+            // sharding experts also decides where `Combine`'s reduction happens.
+            OpParams::ExpertMlp { .. } | OpParams::Combine { .. } => PartitionRule::NotDetermined,
         }
     }
 
@@ -360,6 +503,26 @@ impl OpParams {
         }
     }
 
+    /// The role of this operation's output value.
+    ///
+    /// Everything produces an activation except [`OpParams::Route`], whose
+    /// output is a routing decision: integer expert ids beside float
+    /// coefficients. Typing it as an activation would make the ids floats.
+    pub fn output_role(&self) -> ValueRole {
+        match self {
+            OpParams::Route { .. } => ValueRole::Route {
+                index: IndexEncoding::U64,
+                // The coefficients stay FP32 for the same reason the vocabulary
+                // projection's logits do: they are a distribution's tail, and
+                // rounding eight renormalized probabilities to BF16 before they
+                // weight anything loses more than the expert outputs they
+                // multiply ever recover.
+                coefficient: ActivationPrecision::expect(Precision::F32),
+            },
+            _ => ValueRole::Activation(self.output_precision()),
+        }
+    }
+
     /// How many value inputs this operation takes.
     pub fn arity(&self) -> usize {
         match self {
@@ -372,6 +535,13 @@ impl OpParams {
             OpParams::Attention { .. } => 4, // q, k, v, positions
             OpParams::Residual { .. } => 2,
             OpParams::VocabProjection { .. } => 2, // hidden, table
+            // rows, router gain, router projection, and the per-expert scale
+            // when the family has one.
+            OpParams::Route {
+                per_expert_scale, ..
+            } => 3 + usize::from(*per_expert_scale),
+            OpParams::ExpertMlp { .. } => 4, // rows, route, gate/up, down
+            OpParams::Combine { .. } => 2,   // route, slots
         }
     }
 
@@ -517,6 +687,99 @@ impl OpParams {
                 // A group count that does not divide the width would leave a
                 // remainder of lanes normalized against nothing.
                 Dim::constant(hidden).div_exact(group).eval(&empty)?;
+                Ok(())
+            }
+            OpParams::Route {
+                hidden,
+                experts,
+                top_k,
+                eps,
+                input_scale,
+                ..
+            } => {
+                if hidden == 0 {
+                    return Err(Error::InvalidRequest {
+                        field: "hidden",
+                        detail: "a router over zero features".into(),
+                    });
+                }
+                if experts == 0 {
+                    return Err(Error::InvalidRequest {
+                        field: "experts",
+                        detail: "a router over zero experts".into(),
+                    });
+                }
+                // `top_k == experts` is legal and is a real case: it keeps the
+                // whole distribution and makes the renormalisation a no-op, so
+                // it is the fixture that proves the selection did not silently
+                // drop anything. `top_k > experts` is not legal anywhere.
+                if top_k == 0 || top_k > experts {
+                    return Err(Error::InvalidRequest {
+                        field: "top_k",
+                        detail: format!("top_k {top_k} outside 1..={experts}"),
+                    });
+                }
+                // The route table's extent is `rows * top_k`, and the slot
+                // tensor's is `rows * top_k * hidden`.
+                (Dim::constant(top_k) * Dim::constant(hidden)).eval(&empty)?;
+                (Dim::constant(experts) * Dim::constant(hidden)).eval(&empty)?;
+                if !(eps.is_finite() && eps > 0.0) {
+                    return Err(Error::InvalidRequest {
+                        field: "eps",
+                        detail: format!("epsilon must be finite and positive, got {eps}"),
+                    });
+                }
+                if !(input_scale.is_finite() && input_scale > 0.0) {
+                    return Err(Error::InvalidRequest {
+                        field: "router_input_scale",
+                        detail: format!(
+                            "router input scale must be finite and positive, got {input_scale}"
+                        ),
+                    });
+                }
+                Ok(())
+            }
+            OpParams::ExpertMlp {
+                hidden,
+                intermediate,
+                experts,
+                top_k,
+                ..
+            } => {
+                if hidden == 0 || intermediate == 0 {
+                    return Err(Error::InvalidRequest {
+                        field: "expert_mlp",
+                        detail: format!("hidden {hidden}, intermediate {intermediate}"),
+                    });
+                }
+                if experts == 0 || top_k == 0 || top_k > experts {
+                    return Err(Error::InvalidRequest {
+                        field: "top_k",
+                        detail: format!("top_k {top_k} outside 1..={experts}"),
+                    });
+                }
+                // Both fused extents, checked here because they become buffer
+                // sizes: `experts * 2 * intermediate * hidden` is the largest
+                // tensor in any routed layer and is the one a caller's own
+                // arithmetic overflows first.
+                (Dim::constant(experts)
+                    * Dim::constant(2)
+                    * Dim::constant(intermediate)
+                    * Dim::constant(hidden))
+                .eval(&empty)?;
+                (Dim::constant(experts) * Dim::constant(hidden) * Dim::constant(intermediate))
+                    .eval(&empty)?;
+                (Dim::constant(top_k) * Dim::constant(hidden)).eval(&empty)?;
+                Ok(())
+            }
+            OpParams::Combine { hidden, top_k, .. } => {
+                if hidden == 0 || top_k == 0 {
+                    return Err(Error::InvalidRequest {
+                        field: "combine",
+                        detail: format!("hidden {hidden}, top_k {top_k}"),
+                    });
+                }
+                (Dim::constant(top_k) * Dim::constant(hidden)).eval(&empty)?;
                 Ok(())
             }
             _ => Ok(()),
@@ -796,7 +1059,7 @@ impl GraphBuilder {
             }
         }
         let out_shape = self.check_shapes(&params, inputs)?;
-        let out_spec = TensorSpec::new(ValueRole::Activation(params.output_precision()), out_shape);
+        let out_spec = TensorSpec::new(params.output_role(), out_shape);
         let id = NodeId(self.nodes.len() as u32);
         let output = self.add_value(&format!("{}#{}", params.op().name(), id.0), out_spec);
         let contract = OpContract {
@@ -818,7 +1081,10 @@ impl GraphBuilder {
         for (i, v) in inputs.iter().enumerate() {
             let spec = self.spec(*v).expect("checked above");
             let allowed = match spec.role {
-                ValueRole::Index(_) => continue,
+                // Both are validated structurally by `check_shapes`, which
+                // knows which operand of which operation may be one. Neither
+                // has a single precision for the contract's allowlist to check.
+                ValueRole::Index(_) | ValueRole::Route { .. } => continue,
                 ValueRole::Weight(w) => contract.weights.iter().any(|a| a.get() == w.get()),
                 ValueRole::Activation(a) => contract.activations.iter().any(|x| x.get() == a.get()),
             };
@@ -874,8 +1140,23 @@ impl GraphBuilder {
             Ok(())
         };
         let want_float = |i: usize| -> Result<()> {
-            if s(i).role.is_index() {
-                return Err(bad(format!("input {i} must be a float role, got an index")));
+            // A route table is not a float tensor even though half of it is
+            // floating: it has no single precision, and letting it through here
+            // would let a routed value be consumed as an activation.
+            if s(i).role.is_index() || s(i).role.is_route() {
+                return Err(bad(format!(
+                    "input {i} must be a float role, got {:?}",
+                    s(i).role
+                )));
+            }
+            Ok(())
+        };
+        let want_route = |i: usize| -> Result<()> {
+            if !s(i).role.is_route() {
+                return Err(bad(format!(
+                    "input {i} must be a route table, got {:?}",
+                    s(i).role
+                )));
             }
             Ok(())
         };
@@ -1020,6 +1301,95 @@ impl GraphBuilder {
                 dim_is(1, 0, vocab)?;
                 dim_is(1, 1, hidden)?;
                 vec![s(0).shape[0].clone(), Dim::constant(vocab)]
+            }
+            OpParams::Route {
+                hidden,
+                experts,
+                top_k,
+                per_expert_scale,
+                ..
+            } => {
+                want_float(0)?;
+                rank(0, 2)?;
+                dim_is(0, 1, hidden)?;
+                // The router's own gain, one element per hidden channel. It is
+                // a bound weight rather than a folded constant so that a family
+                // whose router has no `scale` tensor binds ones and says so,
+                // the way the reduced Gemma graph already binds a unit gain for
+                // its value normalization.
+                want_float(1)?;
+                rank(1, 1)?;
+                dim_is(1, 0, hidden)?;
+                want_float(2)?;
+                rank(2, 2)?;
+                dim_is(2, 0, experts)?;
+                dim_is(2, 1, hidden)?;
+                if per_expert_scale {
+                    want_float(3)?;
+                    rank(3, 1)?;
+                    dim_is(3, 0, experts)?;
+                }
+                vec![s(0).shape[0].clone(), Dim::constant(top_k)]
+            }
+            OpParams::ExpertMlp {
+                hidden,
+                intermediate,
+                experts,
+                top_k,
+                ..
+            } => {
+                want_float(0)?;
+                rank(0, 2)?;
+                dim_is(0, 1, hidden)?;
+                want_route(1)?;
+                rank(1, 2)?;
+                dim_is(1, 1, top_k)?;
+                if s(1).shape[0] != s(0).shape[0] {
+                    return Err(bad(
+                        "the route table must have one entry per input row".into()
+                    ));
+                }
+                // Fused across experts, and rank 3 rather than a flattened
+                // rank-2 tensor so that the expert axis is visible to whatever
+                // later decides which slice has to be resident.
+                want_float(2)?;
+                rank(2, 3)?;
+                dim_is(2, 0, experts)?;
+                dim_is(
+                    2,
+                    1,
+                    (Dim::constant(2) * Dim::constant(intermediate)).eval(&SymbolTable::new())?,
+                )?;
+                dim_is(2, 2, hidden)?;
+                want_float(3)?;
+                rank(3, 3)?;
+                dim_is(3, 0, experts)?;
+                dim_is(3, 1, hidden)?;
+                dim_is(3, 2, intermediate)?;
+                vec![
+                    s(0).shape[0].clone() * Dim::constant(top_k),
+                    Dim::constant(hidden),
+                ]
+            }
+            OpParams::Combine { hidden, top_k, .. } => {
+                want_route(0)?;
+                rank(0, 2)?;
+                dim_is(0, 1, top_k)?;
+                want_float(1)?;
+                rank(1, 2)?;
+                dim_is(1, 1, hidden)?;
+                // Structural equality of the `rows * top_k` expression, not of
+                // an evaluated number: `rows` is unbound until a step runs, so
+                // a slot tensor built for a different route would differ here
+                // rather than at execution.
+                let slots = s(0).shape[0].clone() * Dim::constant(top_k);
+                if s(1).shape[0] != slots {
+                    return Err(bad(format!(
+                        "the slot tensor has {:?} rows but this route needs {slots:?}",
+                        s(1).shape[0]
+                    )));
+                }
+                vec![s(0).shape[0].clone(), Dim::constant(hidden)]
             }
         })
     }

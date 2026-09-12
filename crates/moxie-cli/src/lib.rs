@@ -6,7 +6,7 @@ pub mod gemma;
 use moxie_engine::{Cancel, GenerationEvent, GenerationRequest, service::GenerationService};
 use std::io::Write;
 
-pub const USAGE: &str = "moxie diagnostic [--shape a|b|gemma-a|gemma-b] [--prompt 0,1,2] [--max-new 4] [--chunk 2] [--temperature 0] [--seed 0] [--cancel-after N]\nExplicit host-reference synthetic token-ID diagnostics; context <=256. No checkpoint or GPU attention.\nThe gemma shapes are reduced Gemma-4-like graphs over synthetic BF16 weights: contract fixtures, not model support.";
+pub const USAGE: &str = "moxie diagnostic [--shape a|b|moe|gemma-a|gemma-b|gemma-c-moe] [--prompt 0,1,2] [--max-new 4] [--chunk 2] [--temperature 0] [--seed 0] [--cancel-after N]\nExplicit host-reference synthetic token-ID diagnostics; context <=256. No checkpoint or GPU attention.\nThe gemma shapes are reduced Gemma-4-like graphs over synthetic BF16 weights: contract fixtures, not model support.";
 
 /// Render the same typed events an API client would consume. Broken output is a
 /// disconnect: the owning caller drops the service and releases the generation.
@@ -77,8 +77,15 @@ pub enum Shape {
     /// differently.
     SyntheticA,
     SyntheticB,
+    /// A synthetic routed-expert graph: different expert count, top-k,
+    /// activation, combination order and route distribution from the Gemma-like
+    /// one, and no shared expert. The independent second consumer document 02's
+    /// extension rule requires, and roadmap M2 item 4's "second synthetic MoE
+    /// consumer".
+    SyntheticMoe,
     GemmaA,
     GemmaB,
+    GemmaC,
 }
 
 impl Shape {
@@ -86,8 +93,10 @@ impl Shape {
         match self {
             Shape::SyntheticA => "a",
             Shape::SyntheticB => "b",
+            Shape::SyntheticMoe => "moe",
             Shape::GemmaA => gemma::Shape::A.name(),
             Shape::GemmaB => gemma::Shape::B.name(),
+            Shape::GemmaC => gemma::Shape::C.name(),
         }
     }
 
@@ -95,16 +104,18 @@ impl Shape {
         match self {
             Shape::SyntheticA => fixture::build(2, 4, 16, 1),
             Shape::SyntheticB => fixture::build(3, 4, 7, 2),
+            Shape::SyntheticMoe => fixture::build_routed(),
             Shape::GemmaA => gemma::build(gemma::Shape::A),
             Shape::GemmaB => gemma::build(gemma::Shape::B),
+            Shape::GemmaC => gemma::build(gemma::Shape::C),
         }
     }
 
     /// The reduction disclosure line, empty for the non-model fixtures.
     pub fn reduction(self) -> String {
         match self {
-            Shape::SyntheticA | Shape::SyntheticB => String::new(),
-            Shape::GemmaA | Shape::GemmaB => {
+            Shape::SyntheticA | Shape::SyntheticB | Shape::SyntheticMoe => String::new(),
+            Shape::GemmaA | Shape::GemmaB | Shape::GemmaC => {
                 gemma::reduction_line(moxie_models::gemma4::Reduction::all())
             }
         }
@@ -147,8 +158,10 @@ impl Options {
                     options.shape = match value.as_str() {
                         "a" => Shape::SyntheticA,
                         "b" => Shape::SyntheticB,
+                        "moe" => Shape::SyntheticMoe,
                         "gemma-a" => Shape::GemmaA,
                         "gemma-b" => Shape::GemmaB,
+                        "gemma-c-moe" => Shape::GemmaC,
                         _ => return Err(malformed()),
                     }
                 }
