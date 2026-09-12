@@ -1,7 +1,7 @@
 # Task 0017 — M4 per-layer key/value geometry and window eviction
 
-Status: **implemented and corrected after independent review, awaiting owner
-re-review**. Contract and
+Status: **implemented and corrected through two independent review rounds,
+awaiting owner decision**. Contract and
 [ADR 0014](../decisions/adr/0014-bounded-tentative-undo-headroom.md) committed at
 `b748536`, before implementation.
 
@@ -382,6 +382,7 @@ one layer. The pools themselves are unchanged.
 | Gate | Exact command / result |
 |---|---|
 | Host workspace | `cargo test --workspace --locked --offline`: **666 unit/integration + 9 doctests passed**, 0 failed, 0 ignored (663 + 9 before the review corrections) |
+| Wrapped-ring aborts | `cargo test -p moxie-state --lib --locked --offline faults_at_every_boundary`: **1 passed**, nine fault boundaries across append, sample staging and commit |
 | Retention | `cargo test -p moxie-state --test paged_window --locked --offline`: **10 passed** |
 | Storage / allocation | `cargo test -p moxie-state --test paged_allocation --test paged_window_allocation --locked --offline -- --nocapture`: **2 passed**, figures above |
 | Gemma integration | `cargo test -p moxie-cli --test gemma --locked --offline`: **16 passed** |
@@ -474,16 +475,26 @@ publication boundary with the ring full; the window test aborted only after
 completed appends, and the boundary-injection tests all used full retention.
 `faults_at_every_boundary_of_a_wrapped_mixed_geometry_restore_all_participants`
 closes it: a mixed All/Window geometry whose ring has wrapped more than twice,
-with a fault injected at every append and sampler-publication boundary, asserting
-every readable row on both layers, both frontiers, the lineage, the committed
-sampler history and the ledger charge — then that the same append succeeds on
-retry. It compares the **readable** range rather than the whole buffer, because
-a wrapped ring's headroom legitimately holds unreachable bytes.
+asserting every readable row on both layers, both frontiers, the lineage, the
+committed sampler history and the ledger charge — then that the same append
+succeeds on retry. It compares the **readable** range rather than the whole
+buffer, because a wrapped ring's headroom legitimately holds unreachable bytes.
 
-Its deliberately failing control is the sharpest evidence in the task: dropping
-the tentative headroom from the admitted capacity makes it fail by losing
-exactly one readable row (position 12) on the windowed layer, which is the
-defect ADR 0014 exists to prevent. Restored and passing afterwards.
+A second review round found that test still incomplete, and correctly: it
+injected faults into `append_checked` and `stage_checked` but never into
+`commit_checked`, so the one operation that advances the **accepted** frontier
+and publishes committed sampler history was still only fault-injected against
+full-retention geometry. It now covers all three publishing operations and all
+nine of their boundaries — four in append, two in sample staging, three in
+commit.
+
+Two deliberately failing controls, each restored and passing afterwards.
+Dropping the tentative headroom from the admitted capacity makes the test fail
+by losing exactly one readable row (position 12) on the windowed layer, which is
+the defect ADR 0014 exists to prevent. Resolving a failed commit's journal
+without the paged and sampler undo — `state.abort` in place of the facade's
+`abort` — fails on `Commit fault at 0`, which is the branch the second round
+added.
 
 ### Deletion
 

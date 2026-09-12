@@ -25,7 +25,11 @@ was authored and committed **before** implementation, as required.
 
 **Independent review requested changes and found three defects plus an
 acceptance-test gap. All four were reproduced before any change and all four are
-fixed**; the task record carries each one. The review found no numerical-parity
+fixed**; the task record carries each one. A second round confirmed the three
+fixes and found the closing test still short of the contract — it never
+fault-injected `commit_checked`, the one operation that advances the accepted
+frontier and publishes committed sampler history — so that branch was added too.
+It found no new implementation defect. The review found no numerical-parity
 or ring-addressing defect. The most instructive is the P1: cloning `KvGeometry`
 in the interpreter put an **infallible** heap allocation inside an open
 transaction, so exhaustion there aborted the process instead of returning
@@ -51,6 +55,7 @@ reclamation actually occurred. No tolerance was added and none was relaxed.
 |---|---|---|
 | Host workspace | `cargo test --workspace --locked --offline` | **666 + 9 doctests passed**, 0 failed, 0 ignored |
 | Retention | `cargo test -p moxie-state --test paged_window --locked --offline` | **10 passed** |
+| Wrapped-ring aborts | `cargo test -p moxie-state --lib --locked --offline faults_at_every_boundary` | **1 passed**, nine boundaries across append, sample staging and commit |
 | Storage | `cargo test -p moxie-state --test paged_allocation --test paged_window_allocation --locked --offline -- --nocapture` | **2 passed** |
 | Gemma integration | `cargo test -p moxie-cli --test gemma --locked --offline` | **16 passed** |
 | Allocation | `cargo test -p moxie-cli --test allocation --locked --offline -- --nocapture` | **1 passed**, six shapes inside their envelopes |

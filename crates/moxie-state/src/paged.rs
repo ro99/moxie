@@ -1329,6 +1329,14 @@ mod tests {
         }
     }
 
+    /// Which publishing operation the injected fault interrupts.
+    #[derive(Debug, Clone, Copy)]
+    enum Fault {
+        Append,
+        Sample,
+        Commit,
+    }
+
     /// The contract's abort gate, on a ring that has actually wrapped.
     ///
     /// The three tests above inject a fault at every publication boundary but
@@ -1380,10 +1388,25 @@ mod tests {
             out
         };
 
-        // Entry, each layer's two copies, the frontier, and the sampler's own
-        // two boundaries.
-        for sample_fault in [false, true] {
-            let boundaries = if sample_fault { 2 } else { 4 };
+        // Three fault sites, because three separate operations publish on a
+        // wrapped ring and each has to undo the others' partial work:
+        //
+        //   Append: entry, each layer's two copies, the frontier.
+        //   Sample: entry, and after the count and history mutation.
+        //   Commit: entry, after the accepted frontier moves, and after the
+        //           committed sampler history is published.
+        //
+        // Independent review found the third missing: the earlier version of
+        // this test reached `append_checked` and `stage_checked` but never
+        // `commit_checked`, so the one operation that advances the *accepted*
+        // frontier and publishes sampler history was only ever fault-injected
+        // against full-retention geometry, where no row is overwritten.
+        for fault in [Fault::Append, Fault::Sample, Fault::Commit] {
+            let boundaries = match fault {
+                Fault::Append => 4,
+                Fault::Sample => 2,
+                Fault::Commit => 3,
+            };
             for fail_at in 0..boundaries {
                 let mut ledger =
                     Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 20, 1 << 14).unwrap()])
@@ -1460,49 +1483,68 @@ mod tests {
                         Ok(())
                     }
                 };
-                if sample_fault {
-                    assert!(
-                        s.prepare_sample(txn, position as u64 + 1, &[0.25, 0.5, 0.25], None, 1.)
+                match fault {
+                    Fault::Sample => {
+                        assert!(
+                            s.prepare_sample(
+                                txn,
+                                position as u64 + 1,
+                                &[0.25, 0.5, 0.25],
+                                None,
+                                1.
+                            )
                             .unwrap()
                             .stage_checked(&mut checkpoint)
                             .is_err()
-                    );
-                } else {
-                    s.prepare_sample(txn, position as u64 + 1, &[0.25, 0.5, 0.25], None, 1.)
-                        .unwrap()
-                        .stage(&cancel)
-                        .unwrap();
-                    let k0 = row(position + 1, 0, true, 4);
-                    let v0 = row(position + 1, 0, false, 2);
-                    let k1 = row(position + 1, 1, true, 3);
-                    let v1 = row(position + 1, 1, false, 2);
-                    assert!(
-                        s.append_checked(
-                            txn,
-                            position as u64 + 1,
-                            &[
-                                KvRow {
-                                    key: &k0,
-                                    value: &v0
-                                },
-                                KvRow {
-                                    key: &k1,
-                                    value: &v1
-                                },
-                            ],
-                            &mut checkpoint,
-                        )
-                        .is_err()
-                    );
+                        );
+                    }
+                    Fault::Append => {
+                        s.prepare_sample(txn, position as u64 + 1, &[0.25, 0.5, 0.25], None, 1.)
+                            .unwrap()
+                            .stage(&cancel)
+                            .unwrap();
+                        let k0 = row(position + 1, 0, true, 4);
+                        let v0 = row(position + 1, 0, false, 2);
+                        let k1 = row(position + 1, 1, true, 3);
+                        let v1 = row(position + 1, 1, false, 2);
+                        assert!(
+                            s.append_checked(
+                                txn,
+                                position as u64 + 1,
+                                &[
+                                    KvRow {
+                                        key: &k0,
+                                        value: &v0
+                                    },
+                                    KvRow {
+                                        key: &k1,
+                                        value: &v1
+                                    },
+                                ],
+                                &mut checkpoint,
+                            )
+                            .is_err()
+                        );
+                    }
+                    Fault::Commit => {
+                        // A full, legal transaction -- two staged tokens and
+                        // two appended rows, exactly the admitted headroom --
+                        // failing while it publishes. This is the only path
+                        // that moves the accepted frontier and the committed
+                        // sampler history, and it has to undo both plus every
+                        // row the appends overwrote.
+                        s.prepare_sample(txn, position as u64 + 1, &[0.25, 0.5, 0.25], None, 1.)
+                            .unwrap()
+                            .stage(&cancel)
+                            .unwrap();
+                        append(&mut s, txn, position + 1);
+                        assert!(s.commit_checked(txn, 2, &mut checkpoint).is_err());
+                    }
                 }
 
                 // Every readable row on both layers, both frontiers, the
                 // lineage, the committed sampler history and the ledger.
-                assert_eq!(
-                    readable(&s),
-                    before_rows,
-                    "sample_fault {sample_fault} at {fail_at}"
-                );
+                assert_eq!(readable(&s), before_rows, "{fault:?} fault at {fail_at}");
                 assert_eq!(s.state.frontiers(ROOT).unwrap(), frontiers);
                 assert_eq!(s.state.lineage_at(ROOT, position as u64).unwrap(), lineage);
                 assert_eq!(
