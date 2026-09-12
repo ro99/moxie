@@ -360,8 +360,14 @@ impl Gemma4Text {
     /// `OpParams` field.
     pub fn compose(&self, oracles: &OracleRegistry, rows: SymbolId) -> Result<Composition> {
         let c = &self.config;
-        let query_width = c.heads * c.head_dim;
-        let kv_width = c.kv_heads * c.head_dim;
+        // Checked, and checked *here*: these products become tensor extents and
+        // shape arguments, and `GraphBuilder` never sees them as a
+        // multiplication it could check for us. An independent review wrapped
+        // `heads * head_dim` with `heads = 2^63` and reached a panic through a
+        // public entry point, which is neither the checked arithmetic nor the
+        // typed error this repository requires.
+        let query_width = width("heads * head_dim", c.heads, c.head_dim)?;
+        let kv_width = width("kv_heads * head_dim", c.kv_heads, c.head_dim)?;
         let mut g = GraphBuilder::new(moxie_graph::OracleId("moxie_oracles::host_reference"), rows);
         let index = TensorSpec::new(
             ValueRole::Index(IndexEncoding::U64),
@@ -398,6 +404,11 @@ impl Gemma4Text {
         // Tied: the same table embeds and projects. The artifact has no
         // `lm_head` tensor, so a graph with two of them would be describing a
         // different checkpoint.
+        // The remaining extents are products too. `vocab x hidden` is the
+        // largest tensor in any real configuration, so it is the one most
+        // likely to overflow a caller's arithmetic before it reaches a shape.
+        width("vocab * hidden", c.vocab, c.hidden)?;
+        width("intermediate * hidden", c.intermediate, c.hidden)?;
         let embedding = weight(
             &mut g,
             &mut bound,
@@ -668,6 +679,17 @@ impl Gemma4Text {
     }
 }
 
+/// A head-count times head-dimension product, as a checked tensor extent.
+fn width(what: &'static str, heads: u64, head_dim: u64) -> Result<u64> {
+    heads
+        .checked_mul(head_dim)
+        .filter(|w| *w <= u64::from(u32::MAX))
+        .ok_or(Error::InvalidRequest {
+            field: "attention",
+            detail: format!("{what} = {heads} x {head_dim} is not a representable tensor extent"),
+        })
+}
+
 fn linear(
     g: &mut GraphBuilder,
     x: ValueId,
@@ -772,6 +794,7 @@ impl ModelDefinition for Gemma4Text {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moxie_graph::Op;
 
     /// A configuration small enough for the host-reference profile.
     fn reduced_config() -> TextConfig {
@@ -859,6 +882,64 @@ mod tests {
         // dimension, so no single uniform configuration describes it.
         assert_ne!(ARTIFACT.local_kv_heads, ARTIFACT.global_kv_heads);
         assert_ne!(ARTIFACT.local_head_dim, ARTIFACT.global_head_dim);
+    }
+
+    #[test]
+    fn an_overflowing_extent_is_a_typed_error_not_a_panic() {
+        // Independent review finding, reproduced. `TextConfig::check` delegates
+        // dimension validation to graph construction, so the products that
+        // precede construction have to carry their own checks.
+        let mut oracles = OracleRegistry::new();
+        for op in [
+            Op::Embedding,
+            Op::Linear,
+            Op::RmsNorm,
+            Op::Rope,
+            Op::Attention,
+            Op::Residual,
+            Op::GeGlu,
+            Op::VocabProjection,
+        ] {
+            oracles
+                .register(
+                    op,
+                    moxie_graph::OracleId("moxie_oracles::host_reference"),
+                    moxie_graph::OracleEvidence {
+                        implementation: "test",
+                        test_module: "test",
+                    },
+                )
+                .unwrap();
+        }
+        for (field, mutate) in [
+            (
+                "heads",
+                (|c: &mut TextConfig| c.heads = 1 << 63) as fn(&mut TextConfig),
+            ),
+            ("kv_heads", |c: &mut TextConfig| {
+                c.heads = 1 << 63;
+                c.kv_heads = 1 << 62;
+            }),
+            ("head_dim", |c: &mut TextConfig| c.head_dim = 1 << 60),
+            ("vocab", |c: &mut TextConfig| c.vocab = u64::MAX),
+            ("intermediate", |c: &mut TextConfig| {
+                c.intermediate = u64::MAX
+            }),
+        ] {
+            let mut config = reduced_config();
+            mutate(&mut config);
+            // Refusal at either stage is correct -- `vocab` is already rejected
+            // by the metadata's `u32` conversion. What must not happen is a
+            // wrapped extent or a panic.
+            let refused = match Gemma4Text::reduced(config, "overflow") {
+                Err(_) => true,
+                Ok(model) => model.compose(&oracles, SymbolId(0)).is_err(),
+            };
+            assert!(
+                refused,
+                "{field}: construction must refuse rather than wrap or panic"
+            );
+        }
     }
 
     #[test]

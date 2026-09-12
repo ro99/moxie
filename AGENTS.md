@@ -30,9 +30,12 @@ no remaining blocker. This acceptance closes M1.4 within its synthetic
 host-reference bounds.
 
 [Task 0016](docs/tasks/0016-m1-gemma-reduced-graph.md) opens M1.5 and is
-**implemented, awaiting independent review and owner acceptance**. Contract
-`1199267` follows the artifact-inspection evidence `1e1867c` and precedes the
-implementation. It makes seven family-mathematics parameters explicit
+**implemented, corrected after independent review, awaiting re-review and owner
+acceptance**. Contract `1199267` follows the artifact-inspection evidence
+`1e1867c` and precedes implementation `c7dd153`; review corrections follow it.
+The review found two P1 numerical boundary omissions — a dropped BF16 rounding
+in the scaled residual and in the logit softcap — plus an unchecked extent
+product and an incomplete acceptance claim. All four are fixed and recorded. It makes seven family-mathematics parameters explicit
 ([ADR 0012](docs/decisions/adr/0012-explicit-family-operation-parameters.md)) and
 adds `moxie-models` with a `gemma4` module — one crate with a module per family,
 at the owner's direction during implementation

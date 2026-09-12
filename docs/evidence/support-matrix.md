@@ -12,7 +12,10 @@ matrix exists to prevent.
 
 ## Gate IDs
 
-[Task 0016](../tasks/0016-m1-gemma-reduced-graph.md) opens M1.5. It makes seven
+[Task 0016](../tasks/0016-m1-gemma-reduced-graph.md) opens M1.5, and was
+corrected after independent review found two BF16 boundary omissions (the scaled
+residual and the logit softcap), an unchecked extent product and an incomplete
+acceptance claim. All four are fixed; the gate below reflects the corrected code. It makes seven
 family-mathematics parameters explicit
 ([ADR 0012](../decisions/adr/0012-explicit-family-operation-parameters.md)),
 adds `GeGlu` and a grouped RMSNorm with their oracles, decouples the paged row

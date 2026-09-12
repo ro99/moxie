@@ -311,8 +311,10 @@ Stop and report, rather than proceeding, if any of these occur:
 
 ## Result, filled after work
 
-Status on completion: **implemented; awaiting independent review and owner
-acceptance.** Contract `1199267` precedes the implementation.
+Status on completion: **implemented, then corrected after independent review;
+awaiting re-review and owner acceptance.** Contract `1199267` precedes
+implementation `c7dd153`; the review corrections follow it and are recorded in
+their own section below.
 [ADR 0012](../decisions/adr/0012-explicit-family-operation-parameters.md) records
 the parameter-explicitness decision;
 [ADR 0013](../decisions/adr/0013-one-model-crate-with-family-modules.md) records
@@ -445,6 +447,25 @@ checkpoint itself stays outside git.
 `results/`, so the four retained task 0014 probe findings do not appear. It is
 the product architecture result: 73 rejecting, 21 accepted, 12 rules.
 
+The review corrections were validated again in full, retained under the same
+directory with a `correction-` prefix. The pre-correction logs are kept rather
+than overwritten, because they are the evidence of what the defects produced.
+
+```text
+correction-host.log            31cbb368711584fa0d67bd1d0fa5197a034f57af72d4246e0d4066e0470409a8
+correction-device.log          c3ece1b79e2c7851330ecc9e7e9742f7bc8381a0890e82bd0a4355f41cb259bd
+correction-clippy.log          a5f4c585ee974ca44916ac30a98bbc189e067a7e0a6bc6d2e8d6bc525be724af
+correction-device-clippy.log   cb2794ab28b489f4bed6af23725861c9926dd03a72e38987daf83d288a8197e1
+correction-gpu.log             debfa6b0a6bd2f53a86b1953c22122ff20c92509c7ee84977c8426c55bbea1ea
+correction-arch-clean.log      51d23b6dd59bbeb000e5dae854365f76d184dfff35cd22f264683be4065272fc
+correction-spec.log            7ee9b3fc6c1a5e5a612b078e860e08a5d6cb468f3fb849798dbf3c6df79207e9
+correction-gemma.log           8dab7799f7108cbc8280cd94ff2973f94c85ca082ffaa1b51402ab6e076f10c4
+correction-allocation.log      5dbd5cd1616ce963723f1b62796abcadf8869b4d67e9f4893be140e5c5ba2811
+```
+
+`correction-gpu.log` and `correction-spec.log` again hash identically to task
+0015's, which is the intended result for both.
+
 ### Measured effect and uncertainty
 
 The allocation harness prints, for each shape, the peak requested heap above the
@@ -454,10 +475,15 @@ ledger baseline and the admitted generation bytes:
 |---|---:|---|---:|---|---:|---:|
 | gemma-a | 6 | 4 / 2 | 16 | 37 / 13 | 575,334 | 10,746,366 |
 | gemma-a | 6 | 4 / 2 | 16 | 251 / 65 | 1,700,117 | 42,513,398 |
-| gemma-b | 3 | 6 / 3 | 8 | 255 / 255 | 1,811,602 | 35,587,246 |
+| gemma-b | 3 | 6 / 2 | 8 | 255 / 255 | 1,619,698 | 31,606,670 |
 
 These are the conservative reference envelope's numbers, not a measured minimal
-allocation plan and not a performance result. The three task 0015 shapes retain
+allocation plan and not a performance result. The `gemma-b` figures are lower
+than first recorded because the review correction changed its grouping from
+`6/3` to `6/2`: one fewer key/value head per layer is one fewer stored lane per
+row, which the reserve follows directly. That the admitted bytes track the
+key/value head count rather than the query head count is itself the evidence
+that the row-width change landed where it should. The three task 0015 shapes retain
 their previously recorded figures unchanged.
 
 Sixty-four repeated generations on `gemma-a` retain no growth above the first
@@ -488,6 +514,94 @@ four-valued `Shape`; the two synthetic fixtures it selected are unchanged in
 behaviour and are now the independent second consumer of every new parameter.
 The unprefixed-model-crate rule replaces nothing: the `moxie-models-*` prefix is
 retained and still tested.
+
+### Independent review corrections
+
+An independent review of `218b96f..c7dd153` requested corrections before
+acceptance, reporting three reproducible defects and one acceptance-test gap.
+**All four were confirmed by reproducing the reported numbers before changing
+anything, and all four are fixed.** The review's architectural assessment —
+shared ownership, the model module composing semantic operations, explicit
+device refusals, and the disclosed synthetic-only limitation — is unchanged.
+
+**1. [P1] The scaled residual dropped a required BF16 boundary.** The contract
+and `gemma4_runtime.cpp:1230` both specify `bf16(bf16(a + b) * scale)`; the
+implementation evaluated `(a + b) * scale` in FP64 and left one rounding to the
+caller, on the reasoning that fewer roundings are more accurate. More accurate
+is not the contract. Reproduced exactly as reported: with `a = 1`,
+`b = 2^-8` and `scale = 0.875` the sum is precisely halfway between two BF16
+values, so the declared boundary gives **0.875** and the implementation gave
+**0.87890625** — an error that then entered every later layer. `residual_row`
+at `scale == 1.0` is untouched and still returns the exact FP32 sum its own
+contract promises. Two regressions: the reported probe, and the declared
+two-boundary sequence over operands whose sums are not BF16-exact.
+
+**2. [P1] The logit softcap dropped its final BF16 boundary.** The pinned
+kernel's last line is `values[index] = bf16_round(value * softcap)`; the
+implementation left that multiply unrounded, expecting the caller to round. The
+caller does not round this one — logits are stored FP32 so the sampler sees the
+pre-truncation distribution — so the boundary was lost, not deferred.
+Reproduced exactly as reported: `x = 12.5`, `cap = 30` gave **11.8359375**
+where the source gives **11.8125**. Being able to represent more precision is
+not a reason to produce it. Two regressions: the reported probe, and an
+assertion that every softcap result is a BF16 value across caps and magnitudes.
+
+The review also identified why this escaped: `the_softcap_is_the_pinned_four_step_sequence`
+transcribed the **implementation's** step sequence rather than the source's, so
+it agreed with the bug. It is rewritten from the source. This is the failure
+mode document 07 warns about, and dense-versus-paged agreement could never have
+caught either defect, because both paths share the same arithmetic.
+
+**3. [P2] Public graph composition could panic before shape validation.**
+`TextConfig::check` deliberately delegates dimension validation to
+`GraphBuilder`, but `heads * head_dim` and `kv_heads * head_dim` are computed
+before construction and never reach it as multiplications it could check.
+Reproduced with `heads = 2^63`, `head_dim = 16`. A checked `width` helper now
+covers those two products and `vocab * hidden` and `intermediate * hidden`,
+returning a typed `InvalidRequest` and additionally rejecting an extent past
+`u32::MAX`. A regression drives five overflow configurations through the public
+entry point and requires refusal at construction or composition — never a wrap
+and never a panic.
+
+**4. [P2] The "every parameter" acceptance claim was incomplete.** The test's
+name overstated its coverage: four substitutions were missing, and one geometry
+pair did not vary what the contract said it would.
+
+| Gap reported | Correction |
+|---|---|
+| `frequency_dim = rotary_dim` never substituted | `Swap::RotaryWidthDenominator`; only global layers rotate partially, so only they change |
+| SwiGLU never substituted for GeGLU | `Swap::SwiGlu`; identical shapes, different gate transform |
+| Whole-row never substituted for grouped normalization | `per_head_normalization_is_load_bearing`, with its own graph |
+| Softcap substituted a huge cap, not `None` | `Swap::NoSoftcap`; the large-cap case is retained beside it, since the contract distinguishes them |
+| Both geometries had ratio 2 (`4/2`, `6/3`) | shape B is now `6/2`, so the two group differently |
+
+The grouped-norm substitution needed its own fixture rather than a parameter
+swap, because setting `group` to 1 also changes how wide the gain must be — a
+rebuilt Gemma graph would have differed in two places at once. The new fixture
+holds the gain at all ones under both groupings, so the reduction is the only
+difference. Its first version was vacuous: every embedding row followed the same
+lane pattern, so every row normalized to the same vector and both groupings gave
+identical logits. The rows now vary within each group and between tokens.
+
+### Gates after the corrections
+
+| Gate | Result |
+|---|---|
+| `cargo test --workspace --locked --offline` | **657 passed**, 0 failed (652 before the corrections, 5 new regressions) |
+| `cargo test -p moxie-cli --test gemma` | 15 passed |
+| `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | passed |
+| `cargo fmt --all -- --check`; `git diff --check` | passed |
+| `cargo xtask spec-check` | passed, ten digests unchanged |
+| clean-archive `arch-check` | 73 rejecting + 21 accepted, 12 rules |
+| Device workspace lane | **664 passed + 12 doctests**, 0 failed |
+| Device clippy | passed |
+| `cargo xtask-cuda test-gpu` | **39/39**, 0 failed, 0 skipped; sm_86 and sm_120 qualified |
+
+The reduced graph's logits changed, which is the point: they were wrong before.
+No test expectation was adjusted to accommodate the new values — the parity,
+cancellation and allocation tests compare the implementation against itself or
+against a bound, and the two fixed equations are pinned against the source
+rather than against the implementation.
 
 ### Remaining blockers and next bounded task
 

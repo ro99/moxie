@@ -266,17 +266,30 @@ fn every_gemma_parameter_is_load_bearing() {
     assert_ne!(reference, logits_for(c, &prompt), "kv head grouping");
 }
 
-/// The two parameters that cannot be reached through `TextConfig`, because the
-/// model module fixes them: the score scale and the RoPE layout. Rebuilding the
-/// graph with the conventional values proves they are not decoration either.
+/// The parameters that cannot be reached through `TextConfig`, because the model
+/// module fixes them. Rebuilding the graph with the conventional value proves
+/// each is not decoration either.
+///
+/// Independent review found this list short of what the test's name claimed: it
+/// covered the score scale and the RoPE layout but not the inverse-frequency
+/// denominator, the activation, or an absent softcap — and the earlier softcap
+/// substitution used a very large cap, which the contract explicitly
+/// distinguishes from no cap. All of those are here now. The norm grouping,
+/// whose substitution also changes a gain's width, has its own test below.
 #[test]
-fn the_attention_scale_and_rope_layout_are_load_bearing() {
+fn the_parameters_fixed_by_the_model_module_are_load_bearing() {
     let prompt: Vec<u64> = (0..11).map(|i| i % 11).collect();
     let base = gemma::Shape::A.config();
     let reference = logits_for(base.clone(), &prompt);
     let layers = base.layers as usize;
 
-    for swap in [Swap::ConventionalScale, Swap::InterleavedRope] {
+    for swap in [
+        Swap::ConventionalScale,
+        Swap::InterleavedRope,
+        Swap::RotaryWidthDenominator,
+        Swap::SwiGlu,
+        Swap::NoSoftcap,
+    ] {
         let f = gemma::build_with_config(base.clone()).unwrap();
         let rebuilt = rebuild_with(&f.graph, swap);
         // The rebuild preserves value identity, so the original bindings still
@@ -293,6 +306,15 @@ enum Swap {
     ConventionalScale,
     /// Adjacent-pair rotation where Gemma pairs halves.
     InterleavedRope,
+    /// The rotated width as the inverse-frequency denominator, where Gemma
+    /// divides by the whole head even on a partially rotated one. Only the
+    /// global layers rotate partially, so only they change.
+    RotaryWidthDenominator,
+    /// SwiGLU where Gemma uses GeGLU. Same shapes, different gate transform.
+    SwiGlu,
+    /// No logit cap at all, which is not the same as a very large one: the
+    /// large cap still rounds four times and still costs a tanh.
+    NoSoftcap,
 }
 
 /// Rebuild a graph, transforming each node's parameters.
@@ -367,8 +389,186 @@ fn rebuild_with(graph: &Graph, swap: Swap) -> Graph {
             base,
             layout: RopeLayout::Interleaved,
         },
+        (
+            Swap::RotaryWidthDenominator,
+            OpParams::Rope {
+                heads,
+                head_dim,
+                rotary_dim,
+                base,
+                layout,
+                ..
+            },
+        ) => OpParams::Rope {
+            heads,
+            head_dim,
+            rotary_dim,
+            // Divide by the rotated width instead of the whole head. Only the
+            // global layers rotate partially, so only they change.
+            frequency_dim: rotary_dim,
+            base,
+            layout,
+        },
+        (Swap::SwiGlu, OpParams::GeGlu { width }) => OpParams::SwiGlu { width },
+        (Swap::NoSoftcap, OpParams::VocabProjection { vocab, hidden, .. }) => {
+            OpParams::VocabProjection {
+                vocab,
+                hidden,
+                softcap: None,
+            }
+        }
         (_, other) => other,
     })
+}
+
+/// Per-head normalization against whole-row normalization, with everything else
+/// held identical.
+///
+/// This one cannot be a plain parameter swap: setting `group` to 1 also changes
+/// how wide the gain must be, so a rebuilt Gemma graph would differ in two
+/// places at once. The comparison instead uses an **all-ones** gain at both
+/// widths, which makes the gain's values identical under either grouping and
+/// leaves the reduction as the only difference.
+#[test]
+fn per_head_normalization_is_load_bearing() {
+    let grouped = grouped_norm_logits(4);
+    let whole_row = grouped_norm_logits(1);
+    assert_ne!(
+        grouped, whole_row,
+        "normalizing per head and normalizing the whole row must differ"
+    );
+    // Two groups differ from four as well, so the parameter is a count rather
+    // than a grouped/ungrouped flag.
+    assert_ne!(grouped_norm_logits(2), grouped);
+    assert_ne!(grouped_norm_logits(2), whole_row);
+}
+
+/// A graph of embedding, one RMSNorm over `group` groups with a unit gain, one
+/// single-head attention (the interpreter needs a state-touching node) and a
+/// vocabulary projection. Small on purpose: the norm is the only thing that
+/// varies, and the embedding rows carry lanes of very different magnitude so a
+/// whole-row reduction visibly borrows one group's scale for the other.
+fn grouped_norm_logits(group: u64) -> Vec<f32> {
+    use moxie_graph::{GraphBuilder, IndexEncoding, TensorSpec, ValueRole};
+    use moxie_types::{Dim, WeightPrecision};
+
+    let (hidden, vocab) = (8u64, 5u64);
+    let lanes = (hidden / group) as usize;
+    let mut oracles = OracleRegistry::new();
+    moxie_oracles::register(&mut oracles).unwrap();
+    let mut g = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
+    let index = TensorSpec::new(
+        ValueRole::Index(IndexEncoding::U64),
+        vec![Dim::symbol(SymbolId(0))],
+    );
+    let tokens = g.input("tokens", index.clone());
+    let positions = g.input("absolute positions", index);
+    let mut weights = Bindings::new();
+    let bf16 = |data: Vec<f32>, shape: Vec<usize>| {
+        Value::Float(moxie_engine::HostTensor::bf16(data, shape).unwrap())
+    };
+
+    let table = g
+        .weight(
+            "embedding",
+            TensorSpec::new(
+                ValueRole::Weight(WeightPrecision::new(Precision::Bf16).unwrap()),
+                vec![Dim::constant(vocab), Dim::constant(hidden)],
+            ),
+        )
+        .unwrap();
+    // Two halves of very different magnitude, varying within each half and
+    // between tokens. Without the intra-group variation every row would
+    // normalize to the same vector and the comparison would be vacuous --
+    // which is how the first version of this fixture managed to produce
+    // identical logits under both groupings.
+    let rows: Vec<f32> = (0..vocab * hidden)
+        .map(|i| {
+            let magnitude = if i % hidden < hidden / 2 { 0.0625 } else { 8.0 };
+            magnitude * ((i % 5) + 1) as f32
+        })
+        .collect();
+    weights.set(table, bf16(rows, vec![vocab as usize, hidden as usize]));
+
+    let gain = g
+        .weight(
+            "unit gain",
+            TensorSpec::new(
+                ValueRole::Weight(WeightPrecision::new(Precision::Bf16).unwrap()),
+                vec![Dim::constant(hidden / group)],
+            ),
+        )
+        .unwrap();
+    weights.set(gain, bf16(vec![1.0; lanes], vec![lanes]));
+
+    let embedded = g
+        .node(
+            OpParams::Embedding {
+                vocab,
+                hidden,
+                scale: 1.0,
+            },
+            &[tokens, table],
+        )
+        .unwrap();
+    let normed = g
+        .node(
+            OpParams::RmsNorm {
+                hidden,
+                group,
+                eps: 1e-6,
+            },
+            &[embedded, gain],
+        )
+        .unwrap();
+    // One head as wide as the row, reading the normalized value as its own
+    // query, key and value. It carries the norm's difference into the logits
+    // without introducing a weight that could carry one of its own.
+    let attended = g
+        .node(
+            OpParams::Attention {
+                heads: 1,
+                kv_heads: 1,
+                head_dim: hidden,
+                scale: 1.0,
+                visibility: moxie_graph::Visibility::Causal,
+                layer: 0,
+            },
+            &[normed, normed, normed, positions],
+        )
+        .unwrap();
+    let logits = g
+        .node(
+            OpParams::VocabProjection {
+                vocab,
+                hidden,
+                softcap: None,
+            },
+            &[attended, table],
+        )
+        .unwrap();
+    let graph = g.finish(logits, &oracles).unwrap();
+
+    let prompt: Vec<u64> = (0..vocab).collect();
+    let mut dense = SequenceState::new([StateKind::KvPages]);
+    dense.append_prompt(ROOT, prompt.len() as u64).unwrap();
+    let mut cache = KvCache::for_branch(1, &dense, ROOT).unwrap();
+    let mut bindings = weights.clone();
+    bindings.set(tokens, Value::Index(prompt.clone()));
+    bindings.set(positions, Value::Index((0..prompt.len() as u64).collect()));
+    Interpreter::new()
+        .run(
+            &graph,
+            &bindings,
+            &mut dense,
+            ROOT,
+            &mut cache,
+            &Cancel::never(),
+        )
+        .unwrap()
+        .logits
+        .data()
+        .to_vec()
 }
 
 #[test]

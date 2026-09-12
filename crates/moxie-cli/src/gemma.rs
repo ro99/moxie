@@ -22,9 +22,10 @@ pub enum Shape {
     /// layers precede one full-causal layer. 4 query heads over 2 key/value
     /// heads.
     A,
-    /// Three layers on a 1-in-3 stride, with a different head ratio, head
-    /// dimension, window and residual-stream width. Nothing the two geometries
-    /// share is load-bearing by accident.
+    /// Three layers on a 1-in-3 stride, with a different head **ratio**, head
+    /// dimension, window and residual-stream width. Shape A groups two query
+    /// heads per key/value head and this one groups three, so a grouping the
+    /// two happened to share cannot be load-bearing by accident.
     B,
 }
 
@@ -59,7 +60,8 @@ impl Shape {
                 hidden: 12,
                 layers: 3,
                 heads: 6,
-                kv_heads: 3,
+                // Three query heads per key/value head, against shape A's two.
+                kv_heads: 2,
                 // Half of eight is four: two angles again, for the same reason.
                 head_dim: 8,
                 intermediate: 20,

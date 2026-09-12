@@ -140,14 +140,22 @@ pub fn geglu_row(gate: &[f32], up: &[f32]) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Logit soft capping, `bf16(tanh(bf16(bf16(x) / cap))) · cap`.
+/// Logit soft capping, `bf16(bf16(tanh(bf16(bf16(x) / cap))) · cap)`.
 ///
-/// Three of the four BF16 boundaries in the pinned kernel
-/// (`kernels/cuda/detail/backend_kernels.cuh:905`) are internal to the
-/// operation and appear here; the fourth is on the result and belongs to the
-/// caller. Unlike every other operation in this crate the boundaries are not
-/// optional detail: the cap exists to bend large logits, so it is evaluated
-/// exactly where the source evaluates it.
+/// **All four BF16 boundaries belong to this operation**, including the one on
+/// the result. The pinned kernel's last line is
+/// `values[index] = bf16_round(value * softcap)`
+/// (`kernels/cuda/detail/backend_kernels.cuh:905`), and unlike every other
+/// operation in this crate the caller does not supply that rounding: logits
+/// are stored FP32 so the sampler sees the pre-truncation distribution, so a
+/// boundary omitted here is a boundary lost.
+///
+/// The first version left the final multiply unrounded, on the reasoning that
+/// the caller rounds node outputs. It does not round this one. For `x = 12.5`
+/// and `cap = 30` that returned 11.8359375 where the source gives 11.8125 —
+/// a difference in the distribution the sampler draws from. FP32 storage can
+/// hold a BF16-rounded value; being able to represent more precision is not a
+/// reason to produce it.
 ///
 /// `cap` must be finite and positive. There is no cap value meaning "uncapped";
 /// absence is modelled by not calling this.
@@ -159,7 +167,8 @@ pub fn softcap(x: f32, cap: f32) -> Result<f32> {
         });
     }
     let scaled = crate::bf16_round(crate::bf16_round(x) / cap);
-    Ok(crate::bf16_round((scaled as f64).tanh() as f32) * cap)
+    let bent = crate::bf16_round((scaled as f64).tanh() as f32);
+    Ok(crate::bf16_round(bent * cap))
 }
 
 /// [`softcap`] over a row.
@@ -358,18 +367,39 @@ mod tests {
 
     #[test]
     fn the_softcap_is_the_pinned_four_step_sequence() {
-        // `kernels/cuda/detail/backend_kernels.cuh:905`, transcribed. The
-        // intermediate roundings are part of the operation: computing
-        // `cap * tanh(x / cap)` in one FP32 expression gives a different
-        // answer, and this fixture is what would catch that substitution.
+        // `kernels/cuda/detail/backend_kernels.cuh:905`, transcribed here from
+        // the source rather than from the implementation -- the earlier version
+        // of this fixture repeated the implementation's own missing final
+        // rounding and therefore agreed with the bug.
         let cap = 30.0f32;
-        for x in [12.5f32, -3.75, 41.0, 0.001] {
-            let scaled = crate::bf16_round(crate::bf16_round(x) / cap);
-            let want = crate::bf16_round((scaled as f64).tanh() as f32) * cap;
-            assert_eq!(softcap(x, cap).unwrap(), want);
+        for x in [12.5f32, -3.75, 41.0, 0.001, 7.125, -19.5] {
+            let a = crate::bf16_round(x);
+            let b = crate::bf16_round(a / cap);
+            let c = crate::bf16_round((b as f64).tanh() as f32);
+            let want = crate::bf16_round(c * cap);
+            assert_eq!(softcap(x, cap).unwrap(), want, "x={x}");
         }
         let naive = cap * (12.5f32 / cap).tanh();
         assert_ne!(softcap(12.5, cap).unwrap(), naive);
+    }
+
+    #[test]
+    fn every_softcap_result_is_a_bf16_value() {
+        // Independent review finding, reproduced: the final multiply was left
+        // unrounded, so results carried FP32 precision the source does not
+        // produce. `x = 12.5, cap = 30` is the exact probe.
+        assert_eq!(softcap(12.5, 30.0).unwrap(), 11.8125);
+        assert_ne!(softcap(12.5, 30.0).unwrap(), 11.8359375);
+        for x in [0.5f32, -2.25, 12.5, 41.0, 1e4, -1e30] {
+            for cap in [4.0f32, 30.0, 0.5] {
+                let got = softcap(x, cap).unwrap();
+                assert_eq!(
+                    got,
+                    crate::bf16_round(got),
+                    "softcap({x}, {cap}) = {got} is not a BF16 value"
+                );
+            }
+        }
     }
 
     #[test]

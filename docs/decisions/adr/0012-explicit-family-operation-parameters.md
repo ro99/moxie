@@ -87,21 +87,42 @@ BF16 rounding is part of the equation rather than storage, because the pinned
 source rounds there; the contrast with SwiGLU's single rounding on the product is
 the reason document 02 keeps the two activations separate.
 
+**Where an operation's declared boundaries sit is part of its contract, and the
+caller's rounding does not stand in for one the source applies itself.** The
+first implementation got this wrong twice, and an independent review caught
+both: the scaled residual evaluated `(a + b) * scale` in FP64 where the source
+rounds the sum first, and the softcap left its final multiply unrounded where
+the source rounds it. Neither was a missing feature — both were a boundary
+traded away for precision the released model does not have. Each operation's
+documentation now states which boundaries it owns and which it leaves to the
+caller, and the fixtures transcribe the source's sequence rather than the
+implementation's.
+
 ## Evidence and acceptance
 
 Each parameter has an FP64 transcription in `moxie-oracles` and a fixture citing
 the pinned line it transcribes. Beyond agreement, the acceptance condition is a
-**difference**: `every_gemma_parameter_is_load_bearing` and
-`the_attention_scale_and_rope_layout_are_load_bearing` in
+**difference**: `every_gemma_parameter_is_load_bearing`,
+`the_parameters_fixed_by_the_model_module_are_load_bearing` and
+`per_head_normalization_is_load_bearing` in
 `crates/moxie-cli/tests/gemma.rs` substitute the conventional value into the
 reduced Gemma graph and require the logits to change. A parameter that can be
 swapped without changing anything is a failed acceptance.
 
-That test already earned its place. The first reduced geometry used
+That test already earned its place twice. The first reduced geometry used
 `head_dim` 8 with a quarter rotary factor, which rotates a single pair whose
 inverse frequency is `base^0` — so the global RoPE base cancelled and the
 geometry silently stopped testing it. The test failed, and the geometries now use
-16 and 8, the smallest widths at which the base matters.
+16 and 8, the smallest widths at which the base matters. Independent review then
+found the same test's coverage short of its name: the inverse-frequency
+denominator, the activation, the norm grouping and an absent softcap were never
+substituted, and both geometries happened to share a query/key-value ratio. All
+five are corrected in the task record.
+
+A separate lesson from the same review: a fixture that transcribes the
+implementation's steps rather than the source's will agree with a bug. Both P1
+defects were in an operation that had a passing "matches the pinned sequence"
+test. Transcribe the source.
 
 Every existing consumer keeps its behaviour bit for bit: the host workspace
 passed 593 tests + 9 doctests before this change and the same 593 after, with the
@@ -111,6 +132,12 @@ Two device-kernel selections now refuse rather than silently dropping a factor:
 a `Residual` whose scale is not 1.0, and an `RmsNorm` whose group is not 1. There
 is no qualified kernel for either, and `moxie-plan::selected` returns
 `UnsupportedKernel` with the offending value named.
+
+Graph composition additionally checks every head-count product it turns into a
+tensor extent, rather than relying on `GraphBuilder` to check a multiplication it
+never sees. An independent review reached a panic through the public model entry
+point with `heads = 2^63`; the products are now checked and typed, with an
+overflow regression.
 
 ## Enforcement and removal
 

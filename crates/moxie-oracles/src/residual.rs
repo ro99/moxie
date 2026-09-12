@@ -13,17 +13,27 @@ pub fn residual_row(a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
     residual_row_scaled(a, b, 1.0)
 }
 
-/// `y[i] = (a[i] + b[i]) · scale`, the sum in FP64 and narrowed once.
+/// `y[i] = bf16(a[i] + b[i]) · scale`.
 ///
 /// The scale is per-residual because Gemma 4 applies a checkpoint scalar to its
 /// MLP residual and leaves its attention residual alone
 /// (`src/models/gemma4/gemma4_runtime.cpp:1230` against `:1186`). A single
 /// per-layer factor would be wrong on half the residuals in that graph.
 ///
-/// The sum is evaluated in FP64 before the multiply so the scale cannot rescue
-/// or destroy an FP32 intermediate that the unscaled sum would have overflowed:
-/// the declared boundary is one rounding on the scaled result, and two
-/// roundings would be a different contract.
+/// **The sum passes through BF16 before the multiply, and that boundary is part
+/// of the equation.** The pinned source is
+/// `bf16_round_f32(bf16_round_f32(h + n) * scalar)`: two roundings, not one.
+/// The first version of this function evaluated `(a + b) * scale` in FP64 and
+/// left the single rounding to the caller, reasoning that fewer roundings is
+/// more accurate. More accurate is not the contract. With `a = 1`,
+/// `b = 2^-8` and `scale = 0.875` the sum is exactly halfway between two BF16
+/// values, so the declared boundary rounds it to 1.0 and the result is 0.875,
+/// while carrying the extra precision gives 0.87890625 — a difference that then
+/// enters every later layer.
+///
+/// The caller still rounds the result, which is the second boundary; at
+/// `scale == 1.0` the two formulations agree, and that path is kept unrounded
+/// so [`residual_row`] remains the exact FP32 sum its own contract promises.
 pub fn residual_row_scaled(a: &[f32], b: &[f32], scale: f32) -> Result<Vec<f32>> {
     if a.len() != b.len() {
         return Err(Error::InvalidArtifact {
@@ -44,15 +54,15 @@ pub fn residual_row_scaled(a: &[f32], b: &[f32], scale: f32) -> Result<Vec<f32>>
     }
     let mut out = crate::try_vec(a.len())?;
     if scale == 1.0 {
-        // Exactly the previous contract: one FP32 addition, so a sum that was
-        // bit-exact before this parameter existed still is.
+        // One FP32 addition, so a sum that was bit-exact before this parameter
+        // existed still is. Rounding here would be equivalent -- the caller
+        // rounds anyway -- but `residual_row` promises the unrounded sum.
         out.extend(a.iter().zip(b).map(|(x, y)| x + y));
     } else {
-        let s = scale as f64;
         out.extend(
             a.iter()
                 .zip(b)
-                .map(|(x, y)| ((*x as f64 + *y as f64) * s) as f32),
+                .map(|(x, y)| crate::bf16_round(x + y) * scale),
         );
     }
     Ok(out)
@@ -103,6 +113,42 @@ mod tests {
     }
 
     #[test]
+    fn the_sum_is_rounded_to_bf16_before_the_scale_applies() {
+        // Independent review finding, reproduced. `1 + 2^-8` is exactly halfway
+        // between two BF16 values, so the declared first boundary resolves it
+        // to 1.0 and the scaled result is 0.875. Carrying FP64 precision
+        // through the multiply instead gives 0.87890625, which is a different
+        // residual stream for every later layer.
+        let (a, b, scale) = ([1.0f32], [0.00390625f32], 0.875f32);
+        let got = residual_row_scaled(&a, &b, scale).unwrap();
+        assert_eq!(
+            got,
+            vec![0.875],
+            "the intermediate BF16 boundary is missing"
+        );
+        let unrounded = ((a[0] as f64 + b[0] as f64) * scale as f64) as f32;
+        assert_eq!(crate::bf16_round(unrounded), 0.87890625);
+        assert_ne!(got[0], crate::bf16_round(unrounded));
+    }
+
+    #[test]
+    fn the_declared_two_boundary_sequence_holds_across_probes() {
+        // The equation transcribed at the call site, over operands whose sums
+        // are not BF16-exact. `bf16(bf16(a + b) * s)` is what the caller sees
+        // after its own rounding, which is the boundary this crate does not own.
+        for (a, b, s) in [
+            (1.0f32, 0.00390625f32, 0.875f32),
+            (2.0, 0.015625, 0.625),
+            (-3.5, 0.0078125, 1.75),
+            (0.125, 0.00048828125, 0.5),
+        ] {
+            let want = crate::bf16_round(crate::bf16_round(a + b) * s);
+            let got = crate::bf16_round(residual_row_scaled(&[a], &[b], s).unwrap()[0]);
+            assert_eq!(got, want, "a={a} b={b} s={s}");
+        }
+    }
+
+    #[test]
     fn a_unit_scale_is_the_unscaled_residual_bit_for_bit() {
         let a: Vec<f32> = (0..128).map(|i| (i as f32) / 7.0 - 9.0).collect();
         let b: Vec<f32> = (0..128).map(|i| -(i as f32) / 11.0 + 1e-7).collect();
@@ -116,6 +162,8 @@ mod tests {
     fn the_scale_applies_to_the_sum_not_to_each_operand() {
         // Gemma's MLP residual is `(h + f) * s`, not `h + f * s`. The two agree
         // only when `h` is zero, which is why the fixture uses a nonzero one.
+        // 5.0 is BF16-exact, so the intermediate boundary is not what this
+        // fixture is measuring.
         let (a, b, s) = ([4.0f32], [1.0f32], 0.5f32);
         assert_eq!(residual_row_scaled(&a, &b, s).unwrap(), vec![2.5]);
         assert_ne!(residual_row_scaled(&a, &b, s).unwrap(), vec![4.5]);
