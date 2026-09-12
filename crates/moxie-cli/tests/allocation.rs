@@ -232,6 +232,69 @@ fn admitted_peak_cleanup_repeated_generations_and_allocation_failure() {
     drop(wide_service);
     assert!(wide_owner.outstanding().is_empty());
 
+    // The routing path must fail the way every other step does. Before an
+    // independent review, `moxie_oracles::route::softmax` and the selection's
+    // scratch used infallible `collect()` and a stable sort: an allocation
+    // failure inside a routed step aborted the process with
+    // `memory allocation of N bytes failed`, taking the transaction rollback,
+    // the lease release and the next generation with it. Routing was an
+    // unreached M0 fixture when that code was written and became an execution
+    // path when task 0019 gave it an interpreter.
+    //
+    // The injected extent is the router's own input row, `hidden * 4` bytes,
+    // which only the routed shape allocates at this point in a step.
+    {
+        let routed = gemma::build(gemma::Shape::C).unwrap();
+        let hidden = gemma::Shape::C.config().hidden as usize;
+        let prompt: Vec<u32> = (0..11).collect();
+        let mut routed_owner = ledger(1 << 30);
+        let mut service = GenerationService::new(&mut routed_owner, routed.program());
+        service.start(req(&prompt, 11, 1)).unwrap();
+        assert!(matches!(
+            service.next_event(&Cancel::never()),
+            Some(GenerationEvent::Admitted { .. })
+        ));
+        FAIL.store(hidden * 4, SeqCst);
+        let event = service.next_event(&Cancel::never());
+        assert_eq!(
+            FAIL.swap(0, SeqCst),
+            0,
+            "routed forward fault was not injected"
+        );
+        // A typed terminal event, not a panic and not a silent success.
+        assert!(
+            matches!(
+                event,
+                Some(GenerationEvent::Failed {
+                    error: Error::CapacityExceeded {
+                        tier: Some(Tier::Host(HostTier::CpuWorkspace)),
+                        ..
+                    },
+                    ..
+                })
+            ),
+            "{event:?}"
+        );
+        // Rollback: the service is idle, every charge is released, and a second
+        // generation succeeds. R08's rule, on the routed path.
+        assert!(service.is_idle());
+        assert_eq!(service.charged_bytes(), 0);
+        service.start(req(&prompt, 11, 2)).unwrap();
+        let mut tokens = 0;
+        while let Some(event) = service.next_event(&Cancel::never()) {
+            match event {
+                GenerationEvent::Token { .. } => tokens += 1,
+                GenerationEvent::Failed { error, .. } => panic!("retry failed: {error}"),
+                GenerationEvent::Cancelled { .. } => panic!("unexpected cancellation"),
+                _ => {}
+            }
+        }
+        assert_eq!(tokens, 2, "the routed retry did not generate");
+        assert_eq!(service.charged_bytes(), 0);
+        drop(service);
+        assert!(routed_owner.outstanding().is_empty());
+    }
+
     // Direct API regression: preparation failure on a later call must abort
     // the entire already-mutated transaction, not only the failing call.
     let direct = fixture::build(4, 64, 256, 1).unwrap();

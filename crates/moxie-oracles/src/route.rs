@@ -35,11 +35,26 @@ pub struct Route {
 }
 
 /// Numerically stable softmax over router logits.
-fn softmax(logits: &[f32]) -> Vec<f32> {
+///
+/// Fallibly allocated, like everything else on this path. It used to use plain
+/// `collect()`, which was harmless while routing was an unreached M0 fixture
+/// and became a process abort the moment task 0019 put it under the
+/// interpreter: an allocation failure inside a generation step must be a typed
+/// error the transaction can roll back, not a panic that takes the rollback,
+/// the lease release and the next generation with it.
+fn softmax(logits: &[f32]) -> Result<Vec<f32>> {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
+    let mut exps = crate::try_vec(logits.len())?;
+    exps.extend(logits.iter().map(|l| (l - max).exp()));
     let sum: f32 = exps.iter().sum();
-    exps.iter().map(|e| e / sum).collect()
+    if !(sum.is_finite() && sum > 0.0) {
+        return Err(Error::Numerical {
+            detail: format!("router softmax normaliser is {sum}"),
+        });
+    }
+    let mut out = crate::try_vec(exps.len())?;
+    out.extend(exps.iter().map(|e| e / sum));
+    Ok(out)
 }
 
 /// Select the top `k` experts for one row.
@@ -72,7 +87,7 @@ pub fn route_row(logits: &[f32], k: usize) -> Result<Route> {
         });
     }
 
-    let probs = softmax(logits);
+    let probs = softmax(logits)?;
     select_top_k(&probs, k)
 }
 
@@ -101,16 +116,22 @@ pub fn select_top_k(probs: &[f32], k: usize) -> Result<Route> {
     }
     let mut order: Vec<u32> = crate::try_vec(probs.len())?;
     order.extend(0..probs.len() as u32);
-    // Descending by probability; equal probabilities keep ascending id order.
-    // `sort_by` is stable, and `order` starts in ascending id order, so an equal
-    // comparison preserves the lower id first.
-    order.sort_by(|a, b| {
+    // Descending by probability, then ascending by id. The tie-break is written
+    // into the comparator rather than left to sort stability, for two reasons:
+    // a **total** order lets this use `sort_unstable_by`, which allocates no
+    // scratch buffer -- Rust's stable sort does, and an infallible allocation
+    // has no place inside a generation step -- and the rule a reader has to
+    // trust is then visible in the comparison instead of in a property of the
+    // sort implementation.
+    order.sort_unstable_by(|a, b| {
         probs[*b as usize]
             .partial_cmp(&probs[*a as usize])
             .expect("probabilities are finite")
+            .then(a.cmp(b))
     });
 
-    let experts: Vec<u32> = order.into_iter().take(k).collect();
+    let mut experts: Vec<u32> = crate::try_vec(k)?;
+    experts.extend(order.into_iter().take(k));
     let mass: f32 = experts.iter().map(|e| probs[*e as usize]).sum();
     if mass <= 0.0 || !mass.is_finite() {
         return Err(Error::Numerical {
@@ -209,10 +230,11 @@ pub fn combine(
     Ok(rows)
 }
 
-/// The router's input transform: `n = x / rms(x)`, then `n ⊙ g`, then `· c`.
+/// The router's input transform:
+/// `bf16(bf16(bf16(x / rms(x)) · g) · c)`.
 ///
 /// Transcribed from `Gemma4TextRouter.forward` in the pinned `transformers`
-/// source. Three details are load-bearing and none of them is guessable:
+/// source. Four details are load-bearing and none of them is guessable:
 ///
 /// * the normalization is **scale-free** (`Gemma4RMSNorm(..., with_scale=False)`)
 ///   and the `router.scale` tensor is applied to its output, so `gain` here is
@@ -220,10 +242,23 @@ pub fn combine(
 /// * `c` is `hidden^(-1/2)` in this family (`scalar_root_size`) and is neither
 ///   a norm epsilon nor an attention scale;
 /// * the epsilon is added to the *mean square* before the reciprocal square
-///   root, which is where the pinned `Gemma4RMSNorm._norm` puts it.
+///   root, which is where the pinned `Gemma4RMSNorm._norm` puts it;
+/// * **the three BF16 boundaries are part of the equation.** `Gemma4RMSNorm`
+///   reduces in FP32 and returns `.type_as(hidden_states)`, and the two
+///   multiplications that follow are BF16 tensor operations.
 ///
-/// FP32 throughout and unrounded, like every other reference in this crate; the
-/// node output is the rounding boundary.
+/// The boundaries are not decoration. An independent review found, and a probe
+/// over 4,000 random BF16 rows confirmed, that dropping them changes the
+/// **selected experts** on roughly one row in 270 -- a unique winning logit, not
+/// a tie. That is a residency difference as much as a numerical one: two
+/// implementations that disagree about which expert a row needs disagree about
+/// which weights have to be resident. The first version of this function kept
+/// the chain in FP32 and declared only the combination's deviation; that was an
+/// incomplete declaration, and the fix is the boundaries rather than a longer
+/// note.
+///
+/// The reduction itself stays FP32 and unrounded, as everywhere else in this
+/// crate.
 pub fn router_input_row(x: &[f32], gain: &[f32], input_scale: f32, eps: f32) -> Result<Vec<f32>> {
     if x.is_empty() {
         return Err(Error::InvalidRequest {
@@ -264,29 +299,40 @@ pub fn router_input_row(x: &[f32], gain: &[f32], input_scale: f32, eps: f32) -> 
         });
     }
     let mut out = crate::try_vec(x.len())?;
-    out.extend(
-        x.iter()
-            .zip(gain)
-            .map(|(v, g)| (v / denom) * g * input_scale),
-    );
+    out.extend(x.iter().zip(gain).map(|(v, g)| {
+        let normed = crate::bf16_round(v / denom);
+        crate::bf16_round(crate::bf16_round(normed * g) * input_scale)
+    }));
     Ok(out)
 }
 
-/// The router's score distribution: project, then softmax over **all** experts.
+/// The router's score distribution: project to **BF16** logits, then softmax
+/// over all experts in FP32.
 ///
 /// The softmax is over the whole expert set and the top-k is taken from the
 /// resulting probabilities, not from the logits. For a plain top-k the two give
 /// the same selection, because softmax is monotonic -- but they do not give the
 /// same *coefficients*, and this router renormalises probabilities rather than
 /// re-softmaxing the selected logits.
+///
+/// Two boundaries, in the order the reference has them. `self.proj` is a BF16
+/// `nn.Linear`, so its **output is BF16** even though it accumulates wider;
+/// that rounding happens before anything compares two experts, so it decides
+/// selection. The softmax is then FP32, which is `transformers` 5.15's stated
+/// convention (`dtype=torch.float32`, "fp32 for numerical stability"); 5.5.3
+/// leaves it in the input dtype and the artifact declares 5.5.0.dev0. That
+/// difference is recorded in the bring-up record rather than averaged away.
 pub fn router_probabilities(t: &[f32], proj: &[f32], experts: usize) -> Result<Vec<f32>> {
-    let logits = crate::linear::linear_row(t, proj, experts, None)?;
+    let mut logits = crate::linear::linear_row(t, proj, experts, None)?;
+    for l in logits.iter_mut() {
+        *l = crate::bf16_round(*l);
+    }
     if let Some(bad) = logits.iter().position(|l| !l.is_finite()) {
         return Err(Error::Numerical {
             detail: format!("router logit {bad} is {}", logits[bad]),
         });
     }
-    Ok(softmax(&logits))
+    softmax(&logits)
 }
 
 /// Multiply a route's coefficients by each selected expert's own scale.
@@ -379,6 +425,25 @@ pub fn router_route_row(
 /// Slicing rather than materialising: this reads expert `e`'s window of the
 /// fused tensor in place, which is also the shape of the residency question
 /// task 0020 inherits -- a chunk of a fused tensor, not a tensor of its own.
+///
+/// ## Rounding boundaries
+///
+/// ```text
+/// gu = bf16(Σ x·GU[e])            the gate/up projection is a BF16 linear
+/// h  = bf16( act(gate) · up )     both operands are BF16 tensors
+/// y  = Σ h·D[e]                   rounded by the node output, not here
+/// ```
+///
+/// The first two are the reference's and were missing from the first version of
+/// this function, which kept the whole chain in FP32. The **gate transform's
+/// own** internal boundary is deliberately left to each activation's accepted
+/// contract rather than imposed here: [`crate::activation::geglu_row`] rounds
+/// `gelu_tanh(gate)` because `gemma4_ops.cpp:70` does, and
+/// [`crate::activation::swiglu_row`] evaluates in FP64 and rounds once because
+/// task 0003's contract says so after a review found an intermediate underflow
+/// producing a 100% error. Overriding either from here would silently rewrite
+/// an accepted numerical contract on no source at all; a family whose exporter
+/// rounds its gate differently needs its own fixture.
 pub fn expert_row(
     x: &[f32],
     gate_up: &[f32],
@@ -430,12 +495,18 @@ pub fn expert_row(
         });
     }
     let gu = &gate_up[e * gate_up_stride..(e + 1) * gate_up_stride];
-    let projected = crate::linear::linear_row(x, gu, 2 * intermediate, None)?;
+    let mut projected = crate::linear::linear_row(x, gu, 2 * intermediate, None)?;
+    for v in projected.iter_mut() {
+        *v = crate::bf16_round(*v);
+    }
     let (gate, up) = projected.split_at(intermediate);
-    let activated = match activation {
+    let mut activated = match activation {
         moxie_graph::ExpertActivation::GeGlu => crate::activation::geglu_row(gate, up)?,
         moxie_graph::ExpertActivation::SwiGlu => crate::activation::swiglu_row(gate, up)?,
     };
+    for v in activated.iter_mut() {
+        *v = crate::bf16_round(*v);
+    }
     crate::linear::linear_row(
         &activated,
         &down[e * down_stride..(e + 1) * down_stride],
@@ -468,13 +539,33 @@ pub fn combine_order(experts: &[u32], order: moxie_graph::CombineOrder) -> Resul
 /// summation order only; it never reorders the slots themselves, because a slot
 /// belongs to the expert the route selected at that position.
 ///
-/// One declared difference from the pinned reference, stated rather than
-/// discovered: `Gemma4TextExperts.forward` narrows each weighted contribution
-/// to the model dtype before accumulating (`index_add_` over a BF16 buffer),
-/// while this reference accumulates the `top_k` terms in FP32 and leaves the
-/// single rounding to the node boundary, as every other operation in this crate
-/// does. The gap is bounded by `metric::bound(top_k, Σ|w_j · y_j|)` plus one
-/// BF16 rounding. Whether it matters to output quality is O2's question and
+/// ## The one remaining difference from the pinned reference, and its real size
+///
+/// `Gemma4TextExperts.forward` narrows each weighted contribution to the model
+/// dtype before accumulating (`index_add_` over a BF16 buffer). This reference
+/// accumulates the `top_k` terms in FP32 and leaves the single rounding to the
+/// node boundary, as every other operation in this crate does.
+///
+/// **That difference is not bounded by `metric::bound`, and an earlier version
+/// of this comment wrongly claimed it was.** `metric::bound` is built from FP32
+/// unit roundoff: it bounds *this* function against exact arithmetic, which is
+/// what [`combine_scale`] and the tests use it for. It says nothing about a
+/// reference that rounds to BF16 between every addition, because BF16's unit
+/// roundoff is `2^-8`, not `2^-24`, and repeated narrowing can lose a term
+/// outright:
+///
+/// ```text
+/// coefficients [1, 1, 1], outputs [256, 1, -256], ascending expert order
+///   this reference (FP32):  256 + 1 - 256            = 1
+///   BF16 accumulation:      bf16(256 + 1) = 256, - 256 = 0
+///   the bound once claimed here:              about 9.2e-5
+/// ```
+///
+/// `combine_reference_deviation_is_not_covered_by_the_fp32_bound` is that
+/// counterexample as a test, so the claim cannot silently come back. The honest
+/// statement is: the deviation is at most one BF16 ulp of the running sum per
+/// term, which under cancellation is of the order of the **largest** term rather
+/// than of the result. Whether it matters to output quality is O2's question and
 /// needs paired output against the released model.
 pub fn combine_row(
     experts: &[u32],
@@ -566,15 +657,27 @@ mod tests {
         // hidden_states = self.norm(hidden_states)   -- with_scale = False
         let mean_sq: f64 = x.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / h as f64;
         let inv = (mean_sq + eps as f64).powf(-0.5);
-        // hidden_states = hidden_states * self.scale * self.scalar_root_size
+        // The norm returns `.type_as(hidden_states)`, so its result is BF16
+        // before anything multiplies it, and the two multiplications that
+        // follow are BF16 tensor operations. Transcribing those boundaries is
+        // the whole point of this fixture: without them the transcription
+        // agreed with an implementation that selected different experts.
         let t: Vec<f64> = x
             .iter()
             .zip(gain)
-            .map(|(v, g)| (*v as f64) * inv * (*g as f64) * (input_scale as f64))
+            .map(|(v, g)| {
+                let normed = crate::bf16_round(((*v as f64) * inv) as f32) as f64;
+                let gained = crate::bf16_round((normed * (*g as f64)) as f32) as f64;
+                crate::bf16_round((gained * (input_scale as f64)) as f32) as f64
+            })
             .collect();
-        // expert_scores = self.proj(hidden_states)
+        // expert_scores = self.proj(hidden_states) -- a BF16 linear, so its
+        // output is BF16 before any two experts are compared.
         let logits: Vec<f64> = (0..experts)
-            .map(|o| (0..h).map(|i| t[i] * proj[o * h + i] as f64).sum())
+            .map(|o| {
+                let acc: f64 = (0..h).map(|i| t[i] * proj[o * h + i] as f64).sum();
+                crate::bf16_round(acc as f32) as f64
+            })
             .collect();
         // router_probabilities = softmax(expert_scores)
         let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -626,9 +729,11 @@ mod tests {
         let gu = &gate_up[expert * stride..(expert + 1) * stride];
         let projected: Vec<f64> = (0..2 * intermediate)
             .map(|o| {
-                (0..hidden)
+                let acc: f64 = (0..hidden)
                     .map(|i| x[i] as f64 * gu[o * hidden + i] as f64)
-                    .sum()
+                    .sum();
+                // A BF16 linear's output.
+                crate::bf16_round(acc as f32) as f64
             })
             .collect();
         // current_hidden_states = self.act_fn(gate) * up
@@ -650,6 +755,8 @@ mod tests {
                     ExpertActivation::SwiGlu => (g / (1.0 + (-g).exp())) * u,
                 }
             })
+            // `act_fn(gate) * up` over two BF16 tensors.
+            .map(|v: f64| crate::bf16_round(v as f32) as f64)
             .collect();
         // current_hidden_states = linear(current_hidden_states, self.down_proj[e])
         let dstride = hidden * intermediate;
@@ -659,6 +766,63 @@ mod tests {
                 (0..intermediate)
                     .map(|i| activated[i] * d[o * intermediate + i] as f64)
                     .sum()
+            })
+            .collect()
+    }
+
+    /// `Σ|terms|` per output component of [`fp64_expert`]'s final reduction.
+    ///
+    /// The magnitude a bound on that reduction is stated against. Kept beside
+    /// the transcription rather than derived from its output, because the whole
+    /// point is that the output does not determine it.
+    fn fp64_expert_scale(
+        x: &[f32],
+        gate_up: &[f32],
+        down: &[f32],
+        expert: usize,
+        spec: ExpertSpec,
+    ) -> Vec<f64> {
+        let ExpertSpec {
+            hidden,
+            intermediate,
+            activation,
+            ..
+        } = spec;
+        let stride = 2 * intermediate * hidden;
+        let gu = &gate_up[expert * stride..(expert + 1) * stride];
+        let projected: Vec<f64> = (0..2 * intermediate)
+            .map(|o| {
+                let acc: f64 = (0..hidden)
+                    .map(|i| x[i] as f64 * gu[o * hidden + i] as f64)
+                    .sum();
+                crate::bf16_round(acc as f32) as f64
+            })
+            .collect();
+        let activated: Vec<f64> = (0..intermediate)
+            .map(|i| {
+                let g = projected[i];
+                let u = projected[intermediate + i];
+                let v = match activation {
+                    ExpertActivation::GeGlu => {
+                        let t = 0.5
+                            * g
+                            * (1.0
+                                + (0.797_884_560_802_865_4 * (g + 0.044_715 * g * g * g)).tanh());
+                        crate::bf16_round(t as f32) as f64 * u
+                    }
+                    ExpertActivation::SwiGlu => (g / (1.0 + (-g).exp())) * u,
+                };
+                crate::bf16_round(v as f32) as f64
+            })
+            .collect();
+        let dstride = hidden * intermediate;
+        let d = &down[expert * dstride..(expert + 1) * dstride];
+        (0..hidden)
+            .map(|o| {
+                (0..intermediate)
+                    .map(|i| (activated[i] * d[o * intermediate + i] as f64).abs())
+                    .sum::<f64>()
+                    .max(f64::MIN_POSITIVE)
             })
             .collect()
     }
@@ -862,11 +1026,17 @@ mod tests {
             for e in 0..experts {
                 let got = expert_row(&x, &gate_up, &down, e as u32, spec).unwrap();
                 let want = fp64_expert(&x, &gate_up, &down, e, spec);
+                let scales = fp64_expert_scale(&x, &gate_up, &down, e, spec);
                 for (d, (g, w)) in got.iter().zip(&want).enumerate() {
-                    // Two chained reductions of `hidden` and `intermediate`
-                    // terms, plus the activation.
-                    let scale = want.iter().fold(0f64, |m, v| m.max(v.abs())).max(1.0);
-                    let bound = crate::metric::bound((hidden + intermediate + 4) as u64, scale);
+                    // The scale is the **sum of the magnitudes of the terms**
+                    // entering this component's reduction, not `|y|`.
+                    // `linear::linear_row_scale` says why in its own words: a
+                    // dot product whose terms cancel has a small result and no
+                    // relative accuracy in it, so a bound stated against the
+                    // result is not a bound at all. An earlier version of this
+                    // test used `max(|want|, 1)` and would have accepted a
+                    // cancelling fixture that is wrong by its whole magnitude.
+                    let bound = crate::metric::bound((hidden + intermediate + 4) as u64, scales[d]);
                     assert!(
                         (*g as f64 - w).abs() <= bound,
                         "expert {e} component {d}: {:.3e} vs bound {bound:.3e}",
@@ -886,6 +1056,51 @@ mod tests {
             let after = expert_row(&x, &perturbed, &down, 0, spec).unwrap();
             assert_eq!(before, after, "expert 0 read expert 1's slice");
         }
+    }
+
+    #[test]
+    fn an_experts_down_projection_is_bounded_when_its_terms_cancel() {
+        // Document 07 asks for the cancelling case to be stressed rather than
+        // hidden. The small patterned weights above never produce it: their
+        // terms are all the same order, so `|y|` and `Σ|terms|` are close and a
+        // bound stated against either passes.
+        //
+        // Here the down projection's terms are `2^26`, something small, and
+        // `-2^26`. The result is dominated by cancellation, `|y|` is tiny or
+        // zero, and a bound scaled by the result would be around `5e-7` for an
+        // error that can be a whole `0.7`. Scaled by `Σ|terms|` it is correct
+        // and the implementation passes it.
+        let hidden = 1usize;
+        let intermediate = 3usize;
+        let spec = ExpertSpec {
+            experts: 1,
+            hidden,
+            intermediate,
+            activation: ExpertActivation::SwiGlu,
+        };
+        // Unit gate and up projections, so the activation sees `x` itself.
+        let gate_up = vec![1.0f32; 2 * intermediate * hidden];
+        let big = 2f32.powi(26);
+        let down = vec![big, 1.0, -big];
+        let x = vec![1.0f32];
+
+        let got = expert_row(&x, &gate_up, &down, 0, spec).unwrap();
+        let want = fp64_expert(&x, &gate_up, &down, 0, spec);
+        let scales = fp64_expert_scale(&x, &gate_up, &down, 0, spec);
+
+        // The scale really is enormous next to the result, which is the whole
+        // point: `Σ|terms|` is about `9.8e7` while the exact result is under 1.
+        assert!(scales[0] > 1e7, "scale {}", scales[0]);
+        assert!(want[0].abs() < 1.0, "result {}", want[0]);
+        let result_scaled = crate::metric::bound((hidden + intermediate + 4) as u64, 1.0);
+        let term_scaled = crate::metric::bound((hidden + intermediate + 4) as u64, scales[0]);
+        assert!(
+            term_scaled > result_scaled * 1e6,
+            "the two bounds are not far enough apart for this fixture to mean anything"
+        );
+
+        let err = (got[0] as f64 - want[0]).abs();
+        assert!(err <= term_scaled, "{err:.3e} vs {term_scaled:.3e}");
     }
 
     #[test]
@@ -1056,6 +1271,185 @@ mod tests {
     }
 
     #[test]
+    fn the_routers_bf16_boundaries_decide_which_experts_are_selected() {
+        // The regression an independent review asked for, and the reason the
+        // first version of this module was wrong. `Gemma4TextRouter` rounds to
+        // BF16 three times before any two experts are compared: the norm
+        // returns `.type_as(hidden_states)`, and the gain and scalar
+        // multiplications and the projection are BF16 tensor operations.
+        //
+        // Keeping that chain in FP32 does not merely cost precision. On this
+        // fixture -- every value BF16-representable, every logit distinct, no
+        // tie anywhere -- the two chains select **different experts**, which is
+        // a difference in which weights have to be resident as well as in the
+        // answer. A probe over 200,000 random rows at this shape found it on
+        // roughly one row in 270.
+        let x = [
+            0.652_343_75f32,
+            -0.194_335_94,
+            0.287_109_38,
+            -0.816_406_25,
+            -0.902_343_75,
+            0.209_960_94,
+            0.960_937_5,
+            0.882_812_5,
+        ];
+        let gain = [
+            0.921_875f32,
+            0.166_015_62,
+            -0.100_585_94,
+            0.433_593_75,
+            0.230_468_75,
+            0.726_562_5,
+            0.820_312_5,
+            0.335_937_5,
+        ];
+        let proj = [
+            -0.384_765_62f32,
+            -0.007_354_736_3,
+            0.478_515_62,
+            0.453_125,
+            -0.835_937_5,
+            -0.910_156_25,
+            -0.578_125,
+            -0.605_468_75,
+            -0.159_179_69,
+            -0.902_343_75,
+            0.380_859_38,
+            -0.390_625,
+            -0.738_281_25,
+            0.402_343_75,
+            0.585_937_5,
+            0.259_765_62,
+            0.890_625,
+            0.539_062_5,
+            -0.343_75,
+            0.458_984_38,
+            -0.308_593_75,
+            0.949_218_75,
+            -0.847_656_25,
+            0.093_261_72,
+            0.304_687_5,
+            0.367_187_5,
+            -0.507_812_5,
+            -0.129_882_81,
+            -0.925_781_25,
+            -0.980_468_75,
+            0.996_093_75,
+            -0.828_125,
+        ];
+        let hidden = x.len();
+        let experts = 4;
+        let eps = 1e-6f32;
+        let input_scale = (hidden as f64).sqrt().recip() as f32;
+
+        // The chain without the boundaries, transcribed here so the difference
+        // is executable rather than asserted.
+        let unrounded = {
+            let mean_sq: f64 =
+                x.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / hidden as f64;
+            let inv = (mean_sq + eps as f64).powf(-0.5);
+            let t: Vec<f64> = (0..hidden)
+                .map(|i| x[i] as f64 * inv * gain[i] as f64 * input_scale as f64)
+                .collect();
+            let logits: Vec<f64> = (0..experts)
+                .map(|o| {
+                    (0..hidden)
+                        .map(|i| t[i] * proj[o * hidden + i] as f64)
+                        .sum()
+                })
+                .collect();
+            let mut order: Vec<u32> = (0..experts as u32).collect();
+            order.sort_by(|a, b| {
+                logits[*b as usize]
+                    .partial_cmp(&logits[*a as usize])
+                    .unwrap()
+                    .then(a.cmp(b))
+            });
+            (order, logits)
+        };
+
+        let spec = RouterSpec {
+            experts,
+            top_k: 2,
+            eps,
+            input_scale,
+        };
+        let got = router_route_row(&x, &gain, &proj, None, spec).unwrap();
+
+        // No tie is doing the work: every unrounded logit is distinct.
+        let mut sorted = unrounded.1.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for pair in sorted.windows(2) {
+            assert_ne!(
+                pair[0], pair[1],
+                "the fixture has a tie, so it proves nothing"
+            );
+        }
+
+        assert_eq!(
+            unrounded.0[..2].to_vec(),
+            vec![3, 1],
+            "the unrounded chain's selection changed; the fixture needs regenerating"
+        );
+        assert_eq!(
+            got.experts,
+            vec![1, 3],
+            "the router dropped the reference's BF16 boundaries"
+        );
+    }
+
+    #[test]
+    fn combine_reference_deviation_is_not_covered_by_the_fp32_bound() {
+        // The false claim this module once carried, as a test. `metric::bound`
+        // is FP32 unit roundoff; the reference accumulates in BF16, whose unit
+        // roundoff is 2^-8. Under cancellation a whole term disappears.
+        let route = Route {
+            experts: vec![0, 1, 2],
+            weights: vec![1.0, 1.0, 1.0],
+        };
+        let slots = [256.0f32, 1.0, -256.0];
+
+        let ours = combine_row(
+            &route.experts,
+            &route.weights,
+            &slots,
+            1,
+            CombineOrder::AscendingExpertId,
+        )
+        .unwrap();
+        assert_eq!(ours, vec![1.0], "FP32 accumulation keeps the middle term");
+
+        // The reference's accumulation: narrow each contribution, then add into
+        // a BF16 buffer.
+        let mut acc = 0f32;
+        for j in combine_order(&route.experts, CombineOrder::AscendingExpertId).unwrap() {
+            acc = crate::bf16_round(acc + crate::bf16_round(route.weights[j] * slots[j]));
+        }
+        assert_eq!(acc, 0.0, "bf16(256 + 1) is 256, and 256 - 256 is 0");
+
+        // The deviation is 1. The FP32 bound is about 9.2e-5, four orders of
+        // magnitude too small, which is why the comment claiming it bounded
+        // this difference was wrong.
+        let deviation = (ours[0] - acc).abs() as f64;
+        let fp32_bound = crate::metric::bound(3, combine_scale(&route.weights, &slots, 1));
+        assert_eq!(deviation, 1.0);
+        assert!(
+            deviation > fp32_bound * 1_000.0,
+            "deviation {deviation:.3e} against the FP32 bound {fp32_bound:.3e}"
+        );
+
+        // What the FP32 bound *does* cover, and still does: this function
+        // against exact arithmetic over the same terms in the same order.
+        let exact: f64 = combine_order(&route.experts, CombineOrder::AscendingExpertId)
+            .unwrap()
+            .iter()
+            .map(|j| route.weights[*j] as f64 * slots[*j] as f64)
+            .sum();
+        assert!((ours[0] as f64 - exact).abs() <= fp32_bound);
+    }
+
+    #[test]
     fn a_real_router_overlaps_routes_and_the_union_is_smaller_than_rows_times_k() {
         // Document 03: "estimate union of required experts over a row batch ...
         // Do not multiply active experts by batch rows when routes overlap; do
@@ -1169,7 +1563,7 @@ mod tests {
 
         // Renormalisation is over the selected pair only, so the ratio of the
         // two coefficients is the ratio of their softmax probabilities.
-        let p = softmax(&logits);
+        let p = softmax(&logits).unwrap();
         assert!((r.weights[0] / r.weights[1] - p[1] / p[2]).abs() < 1e-5);
     }
 
@@ -1203,7 +1597,7 @@ mod tests {
     fn top_k_equal_to_the_expert_count_keeps_the_full_distribution() {
         let logits = [0.5f32, -0.5, 2.0];
         let r = route_row(&logits, 3).unwrap();
-        let p = softmax(&logits);
+        let p = softmax(&logits).unwrap();
         let mut got: Vec<(u32, f32)> = r
             .experts
             .iter()

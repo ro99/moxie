@@ -351,10 +351,10 @@ question rather than an implementation detail.
 
 | Component | Source equation | Common op and options | Gap task | Oracle fixture |
 |---|---|---|---|---|
-| Router score transform | `Gemma4TextRouter.forward` — scale-free RMSNorm, then `⊙ router.scale`, then `· hidden^(-1/2)`, then the `[E, H]` projection | `Route` with `eps` and an explicit `input_scale` | **gap** — task 0019 | FP64 transcription of all four stages |
+| Router score transform | `Gemma4TextRouter.forward` — scale-free RMSNorm, then `⊙ router.scale`, then `· hidden^(-1/2)`, then the `[E, H]` projection, **with a BF16 boundary after each** | `Route` with `eps` and an explicit `input_scale` | **gap** — task 0019 | FP64 transcription carrying all four boundaries, plus a fixture where dropping them selects different experts |
 | Selection and renormalization | softmax over **all** experts, `topk`, then `w /= Σw` | `Route`, top-k with the shared **lower-id** tie rule | **gap** — task 0019 | exact selection plus a counted coefficient bound |
 | Per-expert coefficient scale | `top_k_weights * per_expert_scale[top_k_index]`, applied **after** renormalization | `Route { per_expert_scale: true }` | **gap** — task 0019 | the coefficients do **not** sum to one; a negative scale is legal |
-| Expert feed-forward | `linear(x, gate_up_proj[e]).chunk(2, -1)`, `act(gate) * up`, `linear(·, down_proj[e])` | `ExpertMlp` over the **fused** `[E, 2I, H]` / `[E, H, I]` tensors, `activation = GeGlu` | **gap** — task 0019 | per-expert FP64, plus a proof that one expert cannot read another's slice |
+| Expert feed-forward | `linear(x, gate_up_proj[e]).chunk(2, -1)`, `act(gate) * up`, `linear(·, down_proj[e])`, the first two rounding to BF16 | `ExpertMlp` over the **fused** `[E, 2I, H]` / `[E, H, I]` tensors, `activation = GeGlu` | **gap** — task 0019 | per-expert FP64 with those boundaries, a cancelling fixture bounded against `Σ|terms|`, and a proof that one expert cannot read another's slice |
 | Combination | `index_add_` over `expert_hit`, which is expert-major | `Combine { order: AscendingExpertId }` | **gap** — task 0019 | both orders, on a fixture where FP32 addition is not associative |
 | Shared expert | the dense `mlp`, normalized by `post_feedforward_layernorm_1`, added to the routed branch's `post_feedforward_layernorm_2` output | **graph composition**, not a routing parameter: it takes no routing coefficient | none (composition) | a substitution test on each of the three norms |
 | Router input | the **un-normalized** post-attention residual, not `pre_feedforward_layernorm(r)` | composition; the router is the block's only consumer of the raw residual | none (composition) | a graph test asserting the `Route` node's producer is the residual |
@@ -480,12 +480,18 @@ weights the composition root invents.
    released model; that is **O2**, and it is what would also settle the
    5.5.3-versus-5.15 router-softmax dtype question.
 3. **One declared numerical deviation from the reference.** The pinned source
-   narrows each expert's weighted contribution to BF16 before accumulating;
-   this interpreter accumulates the `top_k` terms in FP32 and rounds once at the
-   node boundary, as every other operation in `moxie-oracles` does. The
-   reduction **order** is pinned regardless. Bounded, declared in
-   [the task contract](../tasks/0019-m2-routed-expert-semantics.md), and O2's to
-   close.
+   narrows each expert's weighted contribution to BF16 before accumulating; this
+   interpreter accumulates the `top_k` terms in FP32 and rounds once at the node
+   boundary, as every other operation in `moxie-oracles` does. The reduction
+   **order** is pinned regardless. It is **not** covered by the FP32
+   `metric::bound` — an earlier draft claimed it was, and a three-expert
+   counterexample disproves it — so the honest size is one BF16 ulp of the
+   running sum per term, which under cancellation is of the order of the largest
+   term. Declared in
+   [the task contract](../tasks/0019-m2-routed-expert-semantics.md); O2's to
+   close. **Every other boundary the reference has is now implemented**, after
+   an independent review found the router's and the expert's missing and a probe
+   showed that omitting them changes which experts a row selects.
 4. **Vision and audio are out of scope** — **M11**. The artifact is
    `image-text-to-text` and declares both towers.
 5. **O1, O2 and O5 remain open.** The owner designated this artifact for M2's

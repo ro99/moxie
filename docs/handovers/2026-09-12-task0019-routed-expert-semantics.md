@@ -23,18 +23,30 @@ equations and the filled-in result, and
 [the bring-up record](../models/gemma4.md#the-26b-a4b-moe-variant) for the
 artifact inventory.
 
-Measured, at the implementation commit:
+Measured after the independent-review corrections described below:
 
 | Gate | Result |
 |---|---|
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
-| `cargo test --workspace --locked --offline` | **716 passed + 9 doctests, 0 failed** |
-| Device-feature workspace tests | **732 passed + 12 doctests, 0 failed** |
+| `cargo test --workspace --locked --offline` | **720 passed + 9 doctests, 0 failed** |
+| Device-feature workspace tests | **736 passed + 12 doctests, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask arch-check` | every rule and every fixture passes, including the new `models-crate-reaches-memory`. **4 pre-existing failures remain**, all from the untracked review crate under `results/task0014-independent-review-2026-09-11/probes/`; the identical four lines are already in `results/task0015/arch-local.log` |
 
 ## Decisions
+
+**An independent review found five issues; all five were reproduced and fixed,
+and none was disputed.** Three of them were corrections to claims this work had
+made rather than plain defects: the routing path allocated infallibly and could
+abort a generation step instead of rolling it back; the router and expert chains
+dropped BF16 boundaries the reference has, and the FP64 transcription dropped
+the same ones, so their agreement proved nothing; and the stated bound on the
+remaining deviation was false. A probe over 200,000 random rows confirmed the
+second is not cosmetic — omitting those boundaries changes **which experts a row
+selects** on about one row in 270, which is a residency difference. The task
+record carries the finding-by-finding table. Two regressions now fail if the
+boundaries are dropped or the false bound returns.
 
 **Task 0019 was narrowed to item 1's mathematics, and task 0020 owns item 2.**
 The M1 closure handover named routing *and* residency for 0019. The contract
@@ -47,10 +59,11 @@ unchanged stop conditions are in the contract's own words.
 source, read and never executed**, because the frozen legacy tree has no Gemma 4
 MoE at all. Three copies were compared and agree. The one difference between them
 — 5.15's FP32 router softmax against 5.5.3's input-dtype softmax — is recorded
-rather than averaged, and FP32 is pinned.
+rather than averaged, and FP32 is pinned. Every **other** boundary the reference
+has is implemented rather than declared away.
 
-**One numerical deviation from that reference is declared rather than
-discovered.** The reference narrows each expert's weighted contribution to BF16
+**One numerical deviation from that reference remains, with its size stated
+correctly after the review disproved the first claim.** The reference narrows each expert's weighted contribution to BF16
 before accumulating; this interpreter accumulates the `top_k` terms in FP32 and
 rounds once at the node boundary, as every other operation in `moxie-oracles`
 does. The reduction **order** is pinned either way — ascending expert id for this
@@ -68,9 +81,13 @@ invented weights at reduced scale. The CLI prints its reduction list first.
 - **No residency capability exists.** The designated artifact is 51.6 GB of
   BF16 against a 24 GiB largest device and a 63.9 GiB aggregate; 88.5% of it is
   routed experts. Nothing in this repository makes it run.
-- **Device routed kernels and expert partitioning** are M5/M6. The selected BF16
-  chain refuses `Route`, `ExpertMlp` and `Combine`; `ExpertMlp` and `Combine`
-  fail closed for partitioning, while `Route` is `Replicated` by requirement.
+- **No device routed execution.** The selected BF16 chain refuses `Route`,
+  `ExpertMlp` and `Combine`; `ExpertMlp` and `Combine` fail closed for
+  partitioning, while `Route` is `Replicated` by requirement. Correcting this
+  handover's first draft, which put all of it in M5/M6: **grouped GPU expert
+  execution is M2 item 3** — the roadmap asks there for "CPU expert fallback and
+  GPU grouped candidate plans under one interface". **M5** owns expert
+  *partitioning* across ranks and **M6** the shared performance work.
 - **Quality** is O2 and needs paired output against the released model.
 - **Vision and audio** are M11; the artifact declares both towers.
 - **The Laguna checkpoint finished downloading and is now verified complete.**

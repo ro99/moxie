@@ -284,24 +284,60 @@ after both branches have been normalized, and it takes no routing coefficient.
   separately testable operation, which document 09 §D requires of anything that
   could have been fused.
 - `Combine` inputs the route table and `[rows · K, H]`; output `[rows, H]`.
-- Arithmetic follows the existing interpreter contract exactly: oracles compute
-  in FP32 with sequential ascending reductions, and the **node output** is the
-  BF16 rounding boundary. The router softmax is computed in FP32, which is the
-  5.15 reference's stated convention; the 5.5.3 delta is recorded above.
-- **One declared deviation from the reference, with its bound.** The reference
-  rounds each expert's weighted contribution to BF16 *before* accumulating
-  (`current_hidden_states.to(dtype)` then `index_add_`). This interpreter
-  accumulates the `K` terms in FP32 and rounds once at the node boundary. The
-  difference is bounded by `metric::bound(K, Σ|w_j · y_j|)` plus one BF16
-  rounding, it is declared here rather than discovered later, and it is not a
-  quality statement either way: closing it needs paired output against the
-  released model, which is **O2**. The *order* of the reduction is pinned
-  regardless, because order changes the result at any precision.
+- Reductions are FP32, sequential ascending, as everywhere else in this
+  crate. **Every BF16 boundary the reference has is part of the equation**, not
+  a storage detail left to the node output:
+
+  ```text
+  router:  t  = bf16(bf16(bf16(x / rms(x)) ⊙ s) · H^(−1/2))
+           z  = bf16(Σ t·W_r)            a BF16 linear's output
+           p  = softmax_fp32(z)          5.15's stated convention
+  expert:  gu = bf16(Σ x·GU[e])
+           h  = bf16( act(gate) ⊙ up )
+           y  = Σ h·D[e]                 rounded by the node output
+  ```
+
+  **This corrects the contract's first draft**, which kept the router and expert
+  chains in FP32 and declared only the combination's deviation. An independent
+  review showed that was not merely imprecise: a probe over 200,000 random BF16
+  rows found the FP32 chain selecting **different experts** from the
+  boundary-preserving one on about one row in 270, with distinct logits and no
+  tie involved. Selection decides which expert weights have to be resident, so
+  the boundaries are a residency contract as much as a numerical one, and
+  `the_routers_bf16_boundaries_decide_which_experts_are_selected` pins a fixture
+  where dropping them changes the answer.
+
+  The **gate transform's own** internal boundary is each activation's accepted
+  contract rather than something this task imposes: `geglu_row` rounds
+  `gelu_tanh(gate)` because `gemma4_ops.cpp:70` does, and `swiglu_row`
+  evaluates in FP64 and rounds once because task 0003's contract says so after a
+  review found an intermediate underflow producing a 100% error. Overriding
+  either from here would rewrite an accepted contract on no source.
+- **One declared deviation from the reference remains, and its size is stated
+  correctly.** The reference narrows each expert's weighted contribution to BF16
+  *before* accumulating (`current_hidden_states.to(dtype)` then `index_add_`).
+  This reference accumulates the `K` terms in FP32 and rounds once at the node
+  boundary. That difference is **not** bounded by `metric::bound`, which is built
+  from FP32 unit roundoff — the contract's first draft claimed it was, and the
+  review's counterexample disproves it: coefficients `[1,1,1]` over outputs
+  `[256, 1, -256]` give 1 in FP32 and **0** under BF16 accumulation, against a
+  claimed bound of about `9.2e-5`. The honest statement is one BF16 ulp of the
+  running sum per term, which under cancellation is of the order of the largest
+  term rather than of the result.
+  `combine_reference_deviation_is_not_covered_by_the_fp32_bound` is that
+  counterexample as a test. The reduction *order* is pinned regardless, because
+  order changes the result at any precision. Whether the deviation matters to
+  output quality is **O2**.
 - No new tolerance is invented. Selection is checked **exactly** — ids and their
   order are integers and must match the FP64 transcription bit for bit.
   Coefficients and expert outputs are checked against `moxie-oracles::metric`
   bounds assembled from the counted rounding steps of each equation, in the same
-  style as the existing attention bound.
+  style as the existing attention bound. Every such bound is stated against
+  **`Σ|terms|`**, never against `|y|`: `linear::linear_row_scale` gives the
+  reason in its own words, and the review found this task's expert-output test
+  scaling by `max(|y|, 1)` — which would have accepted a cancelling fixture that
+  is wrong by its whole magnitude.
+  `an_experts_down_projection_is_bounded_when_its_terms_cancel` is that case.
 
 ### Partition and hardware capabilities
 
@@ -347,7 +383,17 @@ batch rows overstates it whenever routes overlap.
 The three operations are pure: they touch no sequence state, so
 `Op::touches_state` stays false for all three and a cancelled step has nothing
 to roll back. The interpreter's existing per-operation cancellation boundary
-covers them. Typed failures, never a silent clamp: an empty expert set, a
+covers them.
+
+**Every allocation on the routing path is fallible.** That is a requirement, not
+a style note: an allocation failure inside a generation step must become a typed
+error the transaction can roll back. The contract's first implementation missed
+it — `softmax` used plain `collect()` and the selection used a stable sort,
+whose scratch buffer allocates infallibly — because routing was an unreached M0
+fixture when that code was written and became an execution path here. Both are
+fixed, the sort is now `sort_unstable_by` with the tie rule written into the
+comparator, and the routed step has failure-injection coverage asserting a typed
+terminal event, a released charge and a successful retry. Typed failures, never a silent clamp: an empty expert set, a
 `top_k` of zero or greater than `E`, a non-finite router logit or scale, a
 selected mass that is zero or non-finite, an expert id outside `0..E`, a fused
 tensor whose extent does not equal `E · 2I · H` or `E · H · I`, and a slot
@@ -430,8 +476,36 @@ and it belongs to the owner with O2, not to a default chosen here.
 
 ## Result, filled after work
 
-Status: **implemented, awaiting independent review and owner acceptance.**
-Contract committed at `b63d931` before implementation.
+Status: **implemented and corrected after independent review; awaiting
+re-review and owner acceptance.** Contract committed at `b63d931` before
+implementation `2608b5e`; the review corrections follow it.
+
+### Independent review, and what it changed
+
+A review of `b63d931` / `2608b5e` reported five issues. **All five were
+reproduced and all five are fixed**; none was disputed. They are listed here
+rather than quietly folded in, because three of them are corrections to claims
+this record previously made.
+
+| # | Finding | Verified how | Fix |
+|---|---|---|---|
+| 1 | The routing path allocated infallibly (`softmax`'s `collect()`, and the stable sort's scratch), so an allocation failure inside a routed step **aborted the process** instead of returning a rollback-able error | the reviewer injected a 12-byte failure and got exit 134; the code confirms it | `softmax` and the selection are fallibly allocated; the sort is `sort_unstable_by` with the tie rule in the comparator, which allocates nothing and states the rule instead of relying on stability. Failure injection added to `G-GENERATION-ALLOC` on the routed shape: typed terminal event, released charge, successful retry |
+| 2 | The router and expert chains dropped **BF16 boundaries the reference has**, and the FP64 transcription dropped them too, so the agreement proved nothing | reproduced independently: over 200,000 random BF16 rows at hidden 8 / 4 experts, the FP32 chain selects **different experts** from the boundary-preserving one on roughly one row in 270, with all logits distinct | every boundary implemented and transcribed; `the_routers_bf16_boundaries_decide_which_experts_are_selected` pins a fixture where the two chains select `[3, 1]` and `[1, 3]` |
+| 3 | The stated bound on the remaining combination deviation was **false** — `metric::bound` is FP32 unit roundoff and cannot cover BF16 accumulation | the reviewer's counterexample recomputed: `[1,1,1]` over `[256, 1, -256]` gives 1 here and 0 under BF16 accumulation, against a claimed bound of `9.2e-5` | the claim is replaced with the correct statement, and `combine_reference_deviation_is_not_covered_by_the_fp32_bound` makes the counterexample executable |
+| 4 | The expert-output test scaled its bound by `max(\|y\|, 1)`, which is invalid under cancellation and contradicts `linear_row_scale`'s own documented rule | the shape of the counterexample checks out; `linear.rs` says so in its own words | the bound is now stated against `Σ\|terms\|` propagated through both projections, and `an_experts_down_projection_is_bounded_when_its_terms_cancel` adds the cancelling fixture the patterned weights never produced |
+| 5 | `ValueRole::Route` declared `IndexEncoding::U64` while `RouteTable` stores `u32`, so the resource plan charged 12 bytes an entry for 8 | read directly | `IndexEncoding::U32` added with its own byte width; `a_routes_declared_index_encoding_matches_what_it_stores` asserts the declared encoding equals the stored width |
+
+The review also corrected this task's **milestone attribution**: grouped GPU
+expert execution is **M2 item 3**, not M5/M6. Fixed here, in the handover and in
+the support matrix.
+
+Findings 2 and 3 are the substantive ones. Both were places where this record
+**claimed more than it had**: "one declared deviation" was three, and the one
+that was declared was declared with a bound that does not hold. The lesson is
+narrower than "add boundaries" — a transcription that omits the same boundary as
+the implementation agrees with it perfectly and proves nothing, so a boundary
+needs a fixture that *fails* when it is dropped, which is what the two new
+regressions are.
 
 ### Changed shared owners and consumers
 
@@ -447,16 +521,17 @@ Contract committed at `b63d931` before implementation.
 
 ### Commands and results
 
-All run at the working tree described above, on 2026-09-12.
+All re-run after the review corrections, on 2026-09-12. The counts include the
+five regressions the review produced.
 
 | Gate | Command | Result |
 |---|---|---|
 | Format | `cargo fmt --all -- --check` | **passed**, empty diff |
 | Clippy, host lane | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed**, no warnings |
-| Host tests | `cargo test --workspace --locked --offline` | **716 passed + 9 doctests, 0 failed** |
-| Device-feature tests | the same with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **732 passed + 12 doctests, 0 failed** |
+| Host tests | `cargo test --workspace --locked --offline` | **720 passed + 9 doctests, 0 failed** |
+| Device-feature tests | the same with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **736 passed + 12 doctests, 0 failed** |
 | Real GPU | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
-| `G-MOE-ROUTING-HOST` | the four commands in the support matrix | **passed**: 164 `moxie-oracles`, 30 `moxie-interp::reference_graphs`, 14 `moxie-models`, 21 `moxie-cli::gemma` |
+| `G-MOE-ROUTING-HOST` | the four commands in the support matrix | **passed**: 167 `moxie-oracles`, 31 `moxie-interp::reference_graphs`, 14 `moxie-models`, 21 `moxie-cli::gemma` |
 | `G-GENERATION-ALLOC` | `cargo test -p moxie-cli --test allocation -- --nocapture` | **passed**, now including the routed shape |
 
 Logs are under `results/task0019/` (untracked, per the placement contract).
@@ -530,7 +605,9 @@ than duplicating its tie rule.
    `modeling_laguna.py` are remote code document 03 forbids executing.** Laguna
    metadata and graph are M2 item 4 and belong to a later bounded task, after
    the residency work 0020 owns.
-4. **Device routed kernels and expert partitioning** are M5/M6. The three
-   operations refuse on the selected chain and `ExpertMlp`/`Combine` fail closed
-   for partitioning.
+4. **No device routed execution.** The three operations refuse on the selected
+   chain and `ExpertMlp`/`Combine` fail closed for partitioning. **Grouped GPU expert execution is M2 item 3**, not M5: the roadmap asks there
+for "CPU expert fallback and GPU grouped candidate plans under one interface".
+**M5** owns expert *partitioning* across ranks and **M6** the shared performance
+work.
 5. **O1, O2, O4–O7 remain open.** No gate was resolved by this task.

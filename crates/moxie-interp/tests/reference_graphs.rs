@@ -1989,11 +1989,22 @@ fn fp64_routed_row(f: &Routed, token: usize) -> Vec<f64> {
     // Gemma4TextRouter.forward
     let mean_sq: f64 = x.iter().map(|v| v * v).sum::<f64>() / h as f64;
     let inv = (mean_sq + f.eps as f64).powf(-0.5);
+    // `.type_as(hidden_states)` after the norm, then two BF16 tensor
+    // multiplications, then a BF16 linear. These boundaries decide the
+    // selection, not just its precision -- see
+    // `the_routers_bf16_boundaries_decide_which_experts_are_selected`.
     let t: Vec<f64> = (0..h)
-        .map(|i| x[i] * inv * f.gain[i] as f64 * f.input_scale as f64)
+        .map(|i| {
+            let normed = moxie_oracles::bf16_round((x[i] * inv) as f32) as f64;
+            let gained = moxie_oracles::bf16_round((normed * f.gain[i] as f64) as f32) as f64;
+            moxie_oracles::bf16_round((gained * f.input_scale as f64) as f32) as f64
+        })
         .collect();
     let logits: Vec<f64> = (0..f.experts)
-        .map(|o| (0..h).map(|i| t[i] * f.proj[o * h + i] as f64).sum())
+        .map(|o| {
+            let acc: f64 = (0..h).map(|i| t[i] * f.proj[o * h + i] as f64).sum();
+            moxie_oracles::bf16_round(acc as f32) as f64
+        })
         .collect();
     let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let exps: Vec<f64> = logits.iter().map(|l| (l - max).exp()).collect();
@@ -2017,7 +2028,10 @@ fn fp64_routed_row(f: &Routed, token: usize) -> Vec<f64> {
             let stride = 2 * f.intermediate * h;
             let gu = &f.gate_up[e * stride..(e + 1) * stride];
             let projected: Vec<f64> = (0..2 * f.intermediate)
-                .map(|o| (0..h).map(|i| x[i] * gu[o * h + i] as f64).sum())
+                .map(|o| {
+                    let acc: f64 = (0..h).map(|i| x[i] * gu[o * h + i] as f64).sum();
+                    moxie_oracles::bf16_round(acc as f32) as f64
+                })
                 .collect();
             let activated: Vec<f64> = (0..f.intermediate)
                 .map(|i| {
@@ -2028,7 +2042,11 @@ fn fp64_routed_row(f: &Routed, token: usize) -> Vec<f64> {
                         * (1.0
                             + (0.797_884_560_802_865_4 * (gate + 0.044_715 * gate * gate * gate))
                                 .tanh());
-                    moxie_oracles::bf16_round(gelu as f32) as f64 * up
+                    // `bf16(gelu(gate))` is GeGLU's own contract; the outer
+                    // rounding is the reference's `act_fn(gate) * up` over two
+                    // BF16 tensors.
+                    let product = moxie_oracles::bf16_round(gelu as f32) as f64 * up;
+                    moxie_oracles::bf16_round(product as f32) as f64
                 })
                 .collect();
             let dstride = h * f.intermediate;
@@ -2185,4 +2203,66 @@ fn the_routing_operations_declare_their_partition_and_state_contracts() {
             _ => {}
         }
     }
+}
+
+#[test]
+fn a_routes_declared_index_encoding_matches_what_it_stores() {
+    // An independent review found the descriptor declaring `U64` while
+    // `RouteTable` stored `u32`, so the resource plan charged twelve bytes an
+    // entry for eight. It over-charged rather than under-charged, which is why
+    // nothing overflowed -- and why it would have survived until residency and
+    // transfer code consumed the same contract to size a buffer.
+    let f = build_routed(
+        8,
+        4,
+        2,
+        5,
+        9,
+        moxie_graph::CombineOrder::AscendingExpertId,
+        5,
+    );
+    let route = f
+        .graph
+        .nodes()
+        .iter()
+        .find(|n| matches!(n.params, OpParams::Route { .. }))
+        .unwrap()
+        .output;
+    let ValueRole::Route { index, coefficient } = f.graph.spec(route).unwrap().role else {
+        panic!("a Route node's output is not a route role")
+    };
+    assert_eq!(
+        index.bytes_per_element() as usize,
+        std::mem::size_of::<u32>(),
+        "the declared expert-id encoding is not the one RouteTable stores"
+    );
+    assert_eq!(coefficient.get(), Precision::F32);
+
+    // And the two halves really are that wide once a step has produced one.
+    let mut state = SequenceState::new([StateKind::KvPages]);
+    let mut cache = KvCache::for_branch(1, &state, ROOT).unwrap();
+    state.append_prompt(ROOT, 1).unwrap();
+    let mut bindings = f.weights.clone();
+    bindings.set(f.tokens_id, Value::Index(vec![0]));
+    bindings.set(f.positions_id, Value::Index(vec![0]));
+    Interpreter::new()
+        .run(
+            &f.graph,
+            &bindings,
+            &mut state,
+            ROOT,
+            &mut cache,
+            &Cancel::never(),
+        )
+        .unwrap();
+    let declared = index.bytes_per_element() as usize
+        + match coefficient.get() {
+            Precision::F32 => 4,
+            _ => panic!("unexpected coefficient precision"),
+        };
+    assert_eq!(
+        declared,
+        std::mem::size_of::<u32>() + std::mem::size_of::<f32>(),
+        "the plan's per-entry charge disagrees with the stored pair"
+    );
 }

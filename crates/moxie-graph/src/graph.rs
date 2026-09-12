@@ -106,13 +106,27 @@ pub struct NodeId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IndexEncoding {
     /// Unsigned 64-bit indices, matching the shared host reference value.
+    ///
+    /// Token ids, positions and page indices. The one encoding a *step input*
+    /// may use, because `Value::Index` stores `u64` and a caller must not be
+    /// able to declare a narrower one than the interpreter reads.
     U64,
+    /// Unsigned 32-bit indices.
+    ///
+    /// Added for expert ids, which is where a declared encoding first stopped
+    /// matching a stored one: a route table stores `u32` ids, so declaring
+    /// `U64` made the resource plan charge twelve bytes per entry for eight.
+    /// That over-charges rather than under-charges, which is why it is a
+    /// contract defect rather than an overflow -- and the contract is what
+    /// residency and transfer code will consume, so it has to be true now.
+    U32,
 }
 
 impl IndexEncoding {
     pub const fn bytes_per_element(self) -> u64 {
         match self {
             Self::U64 => 8,
+            Self::U32 => 4,
         }
     }
 }
@@ -511,7 +525,11 @@ impl OpParams {
     pub fn output_role(&self) -> ValueRole {
         match self {
             OpParams::Route { .. } => ValueRole::Route {
-                index: IndexEncoding::U64,
+                // `u32`, because that is what `RouteTable` stores. Declaring
+                // `U64` here and storing `u32` there made the two disagree by
+                // four bytes an entry in every byte trace M2's exit gate asks
+                // to reconcile against the ledger.
+                index: IndexEncoding::U32,
                 // The coefficients stay FP32 for the same reason the vocabulary
                 // projection's logits do: they are a distribution's tail, and
                 // rounding eight renormalized probabilities to BF16 before they
