@@ -103,6 +103,8 @@ byte-compatible? Which may be deprecated?
 provide an explicit compatibility alias. The earlier isolated answer "No" is not to be interpreted as
 a ruling.
 
+**Roadmap-default constraint (resolves nothing):** [ADR 0016](adr/0016-tunable-contact-surface.md) pins the tunable-surface rule M8 items 2/4 and M11 item 2 are judged against — no silent constants, presets plus explicit override, `auto` reports / `required` errors, unknown semantic fields rejected. Single-user non-parity recorded there. The compatibility ruling itself stays with the owner.
+
 ## O4 — Intrinsic low-bit auxiliary state
 
 **Status:** OPEN
