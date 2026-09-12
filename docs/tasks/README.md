@@ -29,9 +29,13 @@ the routing equation defines. **Nothing executes a checkpoint**, and a routed
 synthetic graph is not MoE model support. The acceptance closes task 0019 only,
 not M2.
 
-**Task 0020 is next**: M2 item 2's residency authority, specified in
+**[Task 0020](0020-m2-weight-residency-authority.md) is active**: M2 item 2's
+residency authority, specified in
 [the task 0019 handover](../handovers/2026-09-12-task0019-routed-expert-semantics.md#next-task).
-Its contract has not been authored.
+Its contract is authored and committed before implementation. It delivers one
+production weight-residency owner connected to bounded storage reads, a host
+cache, upload readiness, leases, eviction and demand/prefetch classes. **It does
+not close M2**, which also needs items 3–5 and a real working set that executes.
 
 Reopen accepted tasks only for a demonstrated defect in accepted scope.
 
