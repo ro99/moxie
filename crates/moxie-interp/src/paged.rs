@@ -196,57 +196,68 @@ impl Interpreter {
         cancel: &Cancel,
     ) -> Result<PagedOutput> {
         cancel.check("forward/start")?;
-        let geometry = sequence.geometry().clone();
-        if geometry.precision != Precision::Bf16
-            || graph.attention_layers().is_empty()
-            || graph.attention_layers().len() != geometry.layers.len()
-        {
-            return Err(invalid(
-                "graph",
-                "paged reference requires exact BF16 attention layer coverage",
-            ));
-        }
-        for node in graph.nodes() {
-            // `kv_heads`, not `heads`: the pages store keys and values, and
-            // under GQA there are fewer of those than there are query heads.
-            // The two coincided while every graph was multi-head, which is how
-            // this read `heads` and still passed.
-            //
-            // Per layer, and including retention: a store that kept fewer rows
-            // than its layer's mask admits would silently drop keys, and one
-            // that kept more would spend the memory the window exists to save.
-            if let OpParams::Attention {
-                kv_heads,
-                head_dim,
-                layer,
-                visibility,
-                ..
-            } = node.params
+        // Borrowed, never cloned. Cloning `KvGeometry` would allocate its
+        // per-layer vector with the infallible allocator, in the middle of an
+        // open transaction: an out-of-memory condition there aborts the process
+        // instead of returning `CapacityExceeded` and rolling the transaction
+        // back, which is exactly the recoverable-failure contract task 0015
+        // established. Only the two scalars this function needs afterwards
+        // outlive the borrow.
+        let (layer_count, max_tokens) = {
+            let geometry = sequence.geometry();
+            if geometry.precision != Precision::Bf16
+                || graph.attention_layers().is_empty()
+                || graph.attention_layers().len() != geometry.layers.len()
             {
-                let Some(l) = geometry.layers.get(layer as usize) else {
-                    return Err(invalid(
-                        "graph",
-                        "attention layer is outside the physical pages",
-                    ));
-                };
-                let retention = match visibility {
-                    Visibility::Causal => Retention::All,
-                    Visibility::SlidingWindow { window } => Retention::Window {
-                        window: window as usize,
-                    },
-                };
-                if kv_heads as usize != l.kv_heads
-                    || head_dim as usize != l.key_dim
-                    || head_dim as usize != l.value_dim
-                    || l.retention != retention
+                return Err(invalid(
+                    "graph",
+                    "paged reference requires exact BF16 attention layer coverage",
+                ));
+            }
+            for node in graph.nodes() {
+                // `kv_heads`, not `heads`: the pages store keys and values, and
+                // under GQA there are fewer of those than there are query
+                // heads. The two coincided while every graph was multi-head,
+                // which is how this read `heads` and still passed.
+                //
+                // Per layer, and including retention: a store that kept fewer
+                // rows than its layer's mask admits would silently drop keys,
+                // and one that kept more would spend the memory the window
+                // exists to save.
+                if let OpParams::Attention {
+                    kv_heads,
+                    head_dim,
+                    layer,
+                    visibility,
+                    ..
+                } = node.params
                 {
-                    return Err(invalid(
-                        "graph",
-                        "attention geometry or visibility differs from physical pages",
-                    ));
+                    let Some(l) = geometry.layers.get(layer as usize) else {
+                        return Err(invalid(
+                            "graph",
+                            "attention layer is outside the physical pages",
+                        ));
+                    };
+                    let retention = match visibility {
+                        Visibility::Causal => Retention::All,
+                        Visibility::SlidingWindow { window } => Retention::Window {
+                            window: window as usize,
+                        },
+                    };
+                    if kv_heads as usize != l.kv_heads
+                        || head_dim as usize != l.key_dim
+                        || head_dim as usize != l.value_dim
+                        || l.retention != retention
+                    {
+                        return Err(invalid(
+                            "graph",
+                            "attention geometry or visibility differs from physical pages",
+                        ));
+                    }
                 }
             }
-        }
+            (geometry.layers.len(), geometry.max_tokens)
+        };
         if bindings.len() != graph.inputs().len() + graph.weights().len() {
             return Err(invalid(
                 "bindings",
@@ -269,7 +280,7 @@ impl Interpreter {
         if rows == 0
             || start
                 .checked_add(rows as u64)
-                .is_none_or(|end| end > geometry.max_tokens as u64)
+                .is_none_or(|end| end > max_tokens as u64)
             || positions
                 .iter()
                 .enumerate()
@@ -310,7 +321,7 @@ impl Interpreter {
             }
         }
         let mut staged = try_vec(
-            rows.checked_mul(geometry.layers.len())
+            rows.checked_mul(layer_count)
                 .ok_or(moxie_types::DimError::Overflow)?,
         )?;
         for node in graph.nodes() {
@@ -337,8 +348,8 @@ impl Interpreter {
             ));
         }
         for position in positions {
-            let mut encoded = try_vec(geometry.layers.len())?;
-            for layer in 0..geometry.layers.len() {
+            let mut encoded = try_vec(layer_count)?;
+            for layer in 0..layer_count {
                 let row = staged
                     .iter()
                     .find(|a| a.layer == layer as u32 && a.position == position)

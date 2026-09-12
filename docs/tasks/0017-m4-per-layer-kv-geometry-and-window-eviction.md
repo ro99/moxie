@@ -1,6 +1,7 @@
 # Task 0017 — M4 per-layer key/value geometry and window eviction
 
-Status: **implemented, awaiting owner review**. Contract and
+Status: **implemented and corrected after independent review, awaiting owner
+re-review**. Contract and
 [ADR 0014](../decisions/adr/0014-bounded-tentative-undo-headroom.md) committed at
 `b748536`, before implementation.
 
@@ -380,8 +381,8 @@ one layer. The pools themselves are unchanged.
 
 | Gate | Exact command / result |
 |---|---|
-| Host workspace | `cargo test --workspace --locked --offline`: **663 unit/integration + 9 doctests passed**, 0 failed, 0 ignored |
-| Retention | `cargo test -p moxie-state --test paged_window --locked --offline`: **9 passed** |
+| Host workspace | `cargo test --workspace --locked --offline`: **666 unit/integration + 9 doctests passed**, 0 failed, 0 ignored (663 + 9 before the review corrections) |
+| Retention | `cargo test -p moxie-state --test paged_window --locked --offline`: **10 passed** |
 | Storage / allocation | `cargo test -p moxie-state --test paged_allocation --test paged_window_allocation --locked --offline -- --nocapture`: **2 passed**, figures above |
 | Gemma integration | `cargo test -p moxie-cli --test gemma --locked --offline`: **16 passed** |
 | Allocation | `cargo test -p moxie-cli --test allocation --locked --offline -- --nocapture`: **1 passed**; six shapes within their admitted envelopes |
@@ -389,7 +390,7 @@ one layer. The pools themselves are unchanged.
 | Format / diff | `cargo fmt --all -- --check`; `git diff --check`: passed |
 | Specification | `cargo xtask spec-check`: passed, 10 documents unchanged |
 | Architecture | `cargo xtask arch-check` on a clean `git archive` of the tree: **73 rejecting + 21 accepted fixtures, 12 rules**, unchanged from task 0016. No new crate edge was introduced, so no new fixture was needed |
-| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`: **679 + 12 doctests passed**, 0 failed |
+| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`: **682 + 12 doctests passed**, 0 failed |
 | Device clippy | the clippy command with the same features: passed |
 | Real GPU | `cargo xtask-cuda test-gpu`: **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 
@@ -430,6 +431,59 @@ Each mutation was applied, observed to fail, and reverted.
 - `a_window_at_or_above_the_context_retains_everything_and_costs_the_same`
   is the control for the envelope claim: windowing wider than the context must
   cost exactly what full retention costs.
+
+### Independent review corrections
+
+The review requested changes and reported three defects plus an acceptance-test
+gap. **All four were reproduced before any change was made, and all four are
+fixed.** The review found no numerical-parity or ring-addressing defect.
+
+**P1 — an allocation failure during forward execution aborted the process.**
+`moxie-interp::paged::evaluate_paged` cloned `KvGeometry`, whose per-layer vector
+is a heap allocation, inside an open transaction. `Vec::clone` uses the
+infallible allocator, so exhaustion there reached `handle_alloc_error` and
+`SIGABRT` instead of `CapacityExceeded` plus rollback — a regression of the
+recoverable-failure contract task 0015 established. The clone is **removed**:
+the validation loop borrows the geometry and only two scalars (`layer_count`,
+`max_tokens`) outlive the borrow. The review also identified an infallible
+`collect::<Result<Vec<_>>>()` newly introduced on the engine's admission path to
+compute the widest layer; it is now a fold, allocating nothing.
+
+**P2 — retained geometry could far exceed its charge.** The sequence takes
+ownership of the caller's layer vector and holds it for life, so what it retains
+is that vector's *capacity*, while the control reserve charged its *length*.
+Reproduced on a one-layer geometry built with `Vec::with_capacity(100_000)`:
+**4,002,039 B retained against a 5,001 B charge**. `construct` now re-seats the
+vector into an exact-length, fallibly allocated one before anything is charged
+or admitted; the same measurement is now **2,079 B retained against 5,001 B
+charged**. `an_oversized_caller_vector_is_not_retained_beyond_its_charge` pins
+it, asserting both the retained capacity and that an oversized vector costs
+exactly what a compact one does.
+
+**P2 — the oracle's absolute-position API could overflow its endpoint.**
+`KvHistory::try_with_base(u64::MAX, 1)` followed by `append(u64::MAX, ..)`
+returned `Ok`, and the next `end()` panicked in debug and wrapped in release —
+reporting an empty history. `append` now refuses, before mutating, a row whose
+exclusive endpoint would be unrepresentable, and
+`an_append_that_would_overflow_the_endpoint_is_refused_before_mutating` checks
+near-maximum bases and that the history is unchanged after the refusal. No
+bounded caller can reach this, but the oracle is a public API.
+
+**Acceptance-test gap.** This contract required abort verification at every
+publication boundary with the ring full; the window test aborted only after
+completed appends, and the boundary-injection tests all used full retention.
+`faults_at_every_boundary_of_a_wrapped_mixed_geometry_restore_all_participants`
+closes it: a mixed All/Window geometry whose ring has wrapped more than twice,
+with a fault injected at every append and sampler-publication boundary, asserting
+every readable row on both layers, both frontiers, the lineage, the committed
+sampler history and the ledger charge — then that the same append succeeds on
+retry. It compares the **readable** range rather than the whole buffer, because
+a wrapped ring's headroom legitimately holds unreachable bytes.
+
+Its deliberately failing control is the sharpest evidence in the task: dropping
+the tentative headroom from the admitted capacity makes it fail by losing
+exactly one readable row (position 12) on the windowed layer, which is the
+defect ADR 0014 exists to prevent. Restored and passing afterwards.
 
 ### Deletion
 

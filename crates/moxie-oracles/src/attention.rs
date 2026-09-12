@@ -66,6 +66,9 @@ impl KvHistory {
     }
 
     /// One past the last absolute position held.
+    ///
+    /// Cannot overflow: [`Self::append`] refuses the row that would make this
+    /// unrepresentable, so `base + len` always fits.
     pub fn end(&self) -> u64 {
         self.base + self.keys.len() as u64
     }
@@ -119,6 +122,21 @@ impl KvHistory {
                     "appending position {position} to a history holding [{}, {}) leaves a gap",
                     self.base,
                     self.end()
+                ),
+            });
+        }
+        // Refused before any mutation, so the exclusive endpoint stays
+        // representable. Without this the append succeeds and the *next*
+        // `end()` overflows -- a panic in debug and a wrapped endpoint, which
+        // silently reports an empty history, in release. No bounded caller can
+        // reach this position today, but this is a public oracle API and it
+        // must not have an input that corrupts it.
+        if position.checked_add(1).is_none() {
+            return Err(Error::InvalidRequest {
+                field: "position",
+                detail: format!(
+                    "appending position {position} would put this history's end \
+                     past the largest representable position"
                 ),
             });
         }
@@ -1088,5 +1106,26 @@ mod tests {
         assert_eq!((h.base(), h.end(), h.len()), (9, 9, 0));
         h.append(9, row(9.0), row(9.0)).unwrap();
         assert_eq!(h.end(), 10);
+    }
+
+    #[test]
+    fn an_append_that_would_overflow_the_endpoint_is_refused_before_mutating() {
+        let mut h = KvHistory::try_with_base(u64::MAX, 1).unwrap();
+        assert_eq!((h.base(), h.end(), h.len()), (u64::MAX, u64::MAX, 0));
+        // The position is the right one -- it is exactly `end()` -- and it is
+        // still refused, because holding it would make the next `end()`
+        // unrepresentable.
+        assert!(h.append(u64::MAX, row(1.0), row(1.0)).is_err());
+        // Unchanged: the refusal happened before the push.
+        assert_eq!((h.base(), h.end(), h.len()), (u64::MAX, u64::MAX, 0));
+        // One below the top is fine, and then the top itself is the gap-free
+        // next position and is refused for the overflow reason instead.
+        let mut h = KvHistory::try_with_base(u64::MAX - 1, 2).unwrap();
+        h.append(u64::MAX - 1, row(1.0), row(1.0)).unwrap();
+        assert_eq!(h.end(), u64::MAX);
+        assert!(h.append(u64::MAX, row(2.0), row(2.0)).is_err());
+        assert_eq!((h.end(), h.len()), (u64::MAX, 1));
+        // And the retained row is still readable and attendable.
+        assert!(attend_mha(&row(1.0), &h, u64::MAX - 1, 1, 2, Visibility::Causal).is_ok());
     }
 }

@@ -23,6 +23,17 @@ The owner selected this task on 2026-09-12 from the three candidates the
 [previous handover](2026-09-12-m1.5-gemma-operation-gap.md) listed. The contract
 was authored and committed **before** implementation, as required.
 
+**Independent review requested changes and found three defects plus an
+acceptance-test gap. All four were reproduced before any change and all four are
+fixed**; the task record carries each one. The review found no numerical-parity
+or ring-addressing defect. The most instructive is the P1: cloning `KvGeometry`
+in the interpreter put an **infallible** heap allocation inside an open
+transaction, so exhaustion there aborted the process instead of returning
+`CapacityExceeded` and rolling back. Per-layer geometry made a previously `Copy`
+type own a vector, and every existing `.clone()` of it silently became an
+allocation. **When a `Copy` type grows a heap field, audit its clones for the
+paths that must not allocate.**
+
 The paged host KV store now admits a per-layer key/value geometry and a
 per-layer retention rule. Pages belong to one layer; each layer has its own ring
 and reclamation *is* the ring overwrite, so a sliding layer costs nothing per
@@ -38,8 +49,8 @@ reclamation actually occurred. No tolerance was added and none was relaxed.
 
 | Lane | Command | Result |
 |---|---|---|
-| Host workspace | `cargo test --workspace --locked --offline` | **663 + 9 doctests passed**, 0 failed, 0 ignored |
-| Retention | `cargo test -p moxie-state --test paged_window --locked --offline` | **9 passed** |
+| Host workspace | `cargo test --workspace --locked --offline` | **666 + 9 doctests passed**, 0 failed, 0 ignored |
+| Retention | `cargo test -p moxie-state --test paged_window --locked --offline` | **10 passed** |
 | Storage | `cargo test -p moxie-state --test paged_allocation --test paged_window_allocation --locked --offline -- --nocapture` | **2 passed** |
 | Gemma integration | `cargo test -p moxie-cli --test gemma --locked --offline` | **16 passed** |
 | Allocation | `cargo test -p moxie-cli --test allocation --locked --offline -- --nocapture` | **1 passed**, six shapes inside their envelopes |
@@ -47,7 +58,7 @@ reclamation actually occurred. No tolerance was added and none was relaxed.
 | Format / diff | `cargo fmt --all -- --check`; `git diff --check` | passed |
 | Specification | `cargo xtask spec-check` | passed, 10 digests unchanged |
 | Architecture | `cargo xtask arch-check` on a clean `git archive` | **73 rejecting + 21 accepted**, 12 rules, unchanged |
-| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **679 + 12 doctests passed**, 0 failed |
+| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **682 + 12 doctests passed**, 0 failed |
 | Device clippy | the clippy command with the same features | passed |
 | Real GPU | `cargo xtask-cuda test-gpu` | **39/39**, 0 failed, 0 skipped; sm_86 and sm_120 qualified |
 
@@ -118,8 +129,13 @@ rows evicted while a transaction is open, which is not known at admission time,
 and a lazily grown buffer would be a second store. ADR 0014 records it as
 option B and the measured argument that would revive it.
 
-Also worth knowing: two counted-allocation tests cannot share one test
-executable, because the counter is a global allocator and they race. Each gets
+Also worth knowing, from the review corrections: the sequence holds the caller's
+layer vector for life, so what it retains is that vector's *capacity*, not its
+length -- charging the length left megabytes outside the ledger when a caller
+passed an over-reserved vector. Any structure the memory authority takes
+ownership of has to be charged for what it retains, or normalized first.
+
+And: two counted-allocation tests cannot share one test executable, because the counter is a global allocator and they race. Each gets
 its own binary, as task 0013 already did. And a counted test must print its
 report **after** its live-heap assertion — captured harness output retains a
 buffer the counter sees as a leak.

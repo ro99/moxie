@@ -387,3 +387,50 @@ fn rows_of_the_wrong_layers_width_are_refused() {
     assert!(s.state().open_transactions().is_empty());
     s.close(&mut owner).unwrap();
 }
+
+/// The sequence owns its geometry vector for life, so what it retains is that
+/// vector's **capacity**. A caller is free to hand over one whose capacity far
+/// exceeds its length, and charging the length for it would leave the
+/// difference outside the memory authority entirely.
+///
+/// Independent review reproduced 4,002,039 B retained against a 5,001 B charge
+/// on a one-layer geometry built with `Vec::with_capacity(100_000)`.
+#[test]
+fn an_oversized_caller_vector_is_not_retained_beyond_its_charge() {
+    let layer = LayerKv {
+        kv_heads: 1,
+        key_dim: 1,
+        value_dim: 1,
+        retention: Retention::All,
+    };
+    let mut layers: Vec<LayerKv> = Vec::with_capacity(100_000);
+    layers.push(layer);
+    let excess = KvGeometry {
+        layers,
+        precision: Precision::Bf16,
+        page_tokens: 4,
+        max_tokens: 8,
+        tentative_rows: 4,
+    };
+    let exact = KvGeometry {
+        layers: vec![layer],
+        ..excess.clone()
+    };
+    assert_eq!(excess.layers.capacity(), 100_000);
+
+    let mut owner = ledger();
+    let a = PagedSequence::new(&mut owner, excess).unwrap();
+    // Re-seated to exactly its length, so the charge below describes the whole
+    // retained allocation rather than a fraction of it.
+    assert_eq!(a.geometry().layers.capacity(), 1);
+    assert_eq!(a.geometry().layers.len(), 1);
+    let with_excess = a.usage();
+
+    let b = PagedSequence::new(&mut owner, exact).unwrap();
+    // And it costs exactly what the same geometry declared compactly costs:
+    // the caller's spare capacity buys nothing and is charged for nothing.
+    assert_eq!(with_excess, b.usage());
+    a.close(&mut owner).unwrap();
+    b.close(&mut owner).unwrap();
+    assert!(owner.outstanding().is_empty());
+}

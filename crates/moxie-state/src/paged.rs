@@ -421,9 +421,22 @@ impl PagedSequence {
 
     fn construct(
         ledger: &mut Ledger,
-        geometry: KvGeometry,
+        mut geometry: KvGeometry,
         sampling: Option<(SamplingLayout, u64)>,
     ) -> Result<Self> {
+        // Normalize the caller's vector to exactly its length, fallibly, before
+        // anything is charged or admitted.
+        //
+        // The sequence takes ownership of this vector and holds it for its
+        // whole life, so what it retains is the vector's *capacity* -- and a
+        // caller is free to hand over one built with `Vec::with_capacity` far
+        // larger than its length. Charging `len` for an allocation of `capacity`
+        // would put megabytes outside the memory authority, which is precisely
+        // the untracked residency this repository has one ledger to prevent.
+        // Re-seating it makes the charge below exact by construction.
+        let mut layers = try_vec(geometry.layers.len())?;
+        layers.extend_from_slice(&geometry.layers);
+        geometry.layers = layers;
         let layout = geometry.layout()?;
         let history_bytes = sampling.map_or(0, |(s, _)| s.state_bytes());
         let workspace_bytes = sampling.map_or(0, |(s, _)| s.workspace_bytes());
@@ -1312,6 +1325,200 @@ mod tests {
                 sequence.commit_prefix(retry, 1).unwrap();
                 sequence.close(&mut ledger).unwrap();
                 assert_eq!(ledger.scope_committed(Scope::Host), 0);
+            }
+        }
+    }
+
+    /// The contract's abort gate, on a ring that has actually wrapped.
+    ///
+    /// The three tests above inject a fault at every publication boundary but
+    /// all use full retention, where no byte is ever overwritten; the window
+    /// tests exercise a wrapped ring but abort only after completed appends.
+    /// Neither on its own covers the case the tentative bound exists for:
+    /// a fault part-way through publishing a row whose slot has already been
+    /// reused, on a sequence whose layers disagree about width and retention,
+    /// with sampler history and lineage to restore alongside the pages.
+    ///
+    /// Whole-buffer equality is deliberately not the assertion here. A wrapped
+    /// ring's headroom legitimately holds bytes from rows nothing can read any
+    /// more, so the claim is over the **readable** range of every layer.
+    #[test]
+    fn faults_at_every_boundary_of_a_wrapped_mixed_geometry_restore_all_participants() {
+        let geometry = KvGeometry {
+            layers: vec![
+                LayerKv {
+                    kv_heads: 2,
+                    key_dim: 2,
+                    value_dim: 1,
+                    retention: Retention::All,
+                },
+                LayerKv {
+                    kv_heads: 1,
+                    key_dim: 3,
+                    value_dim: 2,
+                    retention: Retention::Window { window: 3 },
+                },
+            ],
+            precision: Precision::Bf16,
+            page_tokens: 2,
+            max_tokens: 40,
+            tentative_rows: 2,
+        };
+        let row = |position: usize, layer: usize, key: bool, width: usize| -> Vec<u8> {
+            (0..width * 2)
+                .map(|c| ((position * 31 + layer * 17 + c * 5 + usize::from(key) * 97) % 256) as u8)
+                .collect()
+        };
+        let readable = |s: &PagedSequence| -> Vec<(usize, u64, Vec<u8>, Vec<u8>)> {
+            let mut out = Vec::new();
+            for layer in 0..s.layer_count() {
+                for position in s.retained_range(layer).unwrap() {
+                    let r = s.row(layer, position).unwrap();
+                    out.push((layer, position, r.key.to_vec(), r.value.to_vec()));
+                }
+            }
+            out
+        };
+
+        // Entry, each layer's two copies, the frontier, and the sampler's own
+        // two boundaries.
+        for sample_fault in [false, true] {
+            let boundaries = if sample_fault { 2 } else { 4 };
+            for fail_at in 0..boundaries {
+                let mut ledger =
+                    Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 20, 1 << 14).unwrap()])
+                        .unwrap();
+                let mut s =
+                    PagedSequence::with_sampling(&mut ledger, geometry.clone(), 3, 20, 11).unwrap();
+                let cancel = AtomicBool::new(false);
+                let append = |s: &mut PagedSequence, txn, position: usize| {
+                    let k0 = row(position, 0, true, 4);
+                    let v0 = row(position, 0, false, 2);
+                    let k1 = row(position, 1, true, 3);
+                    let v1 = row(position, 1, false, 2);
+                    s.append(
+                        txn,
+                        position as u64,
+                        &[
+                            KvRow {
+                                key: &k0,
+                                value: &v0,
+                            },
+                            KvRow {
+                                key: &k1,
+                                value: &v1,
+                            },
+                        ],
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                };
+                // One prompt token, then generated tokens two at a time -- the
+                // full admitted headroom -- until the windowed layer's ring of
+                // ceil((3 + 2)/2)*2 = 6 rows has wrapped more than twice.
+                let txn = s.begin().unwrap();
+                s.append_prompt(1).unwrap();
+                append(&mut s, txn, 0);
+                s.commit_prefix(txn, 0).unwrap();
+                let mut position = 1;
+                while position < 15 {
+                    let txn = s.begin().unwrap();
+                    for _ in 0..2 {
+                        s.prepare_sample(txn, position as u64, &[0.25, 0.5, 0.25], None, 1.)
+                            .unwrap()
+                            .stage(&cancel)
+                            .unwrap();
+                        append(&mut s, txn, position);
+                        position += 1;
+                    }
+                    s.commit_prefix(txn, 2).unwrap();
+                }
+                assert!(s.retained_range(1).unwrap().start > 0, "the ring must wrap");
+                assert_eq!(s.retained_range(0).unwrap().start, 0);
+
+                let before_rows = readable(&s);
+                let frontiers = s.state.frontiers(ROOT).unwrap();
+                let lineage = s.state.lineage_at(ROOT, position as u64).unwrap();
+                let history: Vec<_> = s.history(true).unwrap().entries(0).collect();
+                let charge = ledger.scope_committed(Scope::Host);
+
+                let txn = s.begin().unwrap();
+                s.prepare_sample(txn, position as u64, &[0.25, 0.5, 0.25], None, 1.)
+                    .unwrap()
+                    .stage(&cancel)
+                    .unwrap();
+                append(&mut s, txn, position);
+                let mut boundary = 0;
+                let mut checkpoint = || {
+                    let fail = boundary == fail_at;
+                    boundary += 1;
+                    if fail {
+                        Err(Error::Cancelled {
+                            at: "injected wrapped-ring boundary",
+                        })
+                    } else {
+                        Ok(())
+                    }
+                };
+                if sample_fault {
+                    assert!(
+                        s.prepare_sample(txn, position as u64 + 1, &[0.25, 0.5, 0.25], None, 1.)
+                            .unwrap()
+                            .stage_checked(&mut checkpoint)
+                            .is_err()
+                    );
+                } else {
+                    s.prepare_sample(txn, position as u64 + 1, &[0.25, 0.5, 0.25], None, 1.)
+                        .unwrap()
+                        .stage(&cancel)
+                        .unwrap();
+                    let k0 = row(position + 1, 0, true, 4);
+                    let v0 = row(position + 1, 0, false, 2);
+                    let k1 = row(position + 1, 1, true, 3);
+                    let v1 = row(position + 1, 1, false, 2);
+                    assert!(
+                        s.append_checked(
+                            txn,
+                            position as u64 + 1,
+                            &[
+                                KvRow {
+                                    key: &k0,
+                                    value: &v0
+                                },
+                                KvRow {
+                                    key: &k1,
+                                    value: &v1
+                                },
+                            ],
+                            &mut checkpoint,
+                        )
+                        .is_err()
+                    );
+                }
+
+                // Every readable row on both layers, both frontiers, the
+                // lineage, the committed sampler history and the ledger.
+                assert_eq!(
+                    readable(&s),
+                    before_rows,
+                    "sample_fault {sample_fault} at {fail_at}"
+                );
+                assert_eq!(s.state.frontiers(ROOT).unwrap(), frontiers);
+                assert_eq!(s.state.lineage_at(ROOT, position as u64).unwrap(), lineage);
+                assert_eq!(
+                    s.history(true).unwrap().entries(0).collect::<Vec<_>>(),
+                    history
+                );
+                assert!(s.history(false).unwrap().len() == history.len());
+                assert!(s.state.open_transactions().is_empty());
+                assert_eq!(ledger.scope_committed(Scope::Host), charge);
+
+                // And it is still usable: the same append succeeds on retry.
+                let retry = s.begin().unwrap();
+                append(&mut s, retry, position);
+                s.commit_prefix(retry, 0).unwrap();
+                s.close(&mut ledger).unwrap();
+                assert!(ledger.outstanding().is_empty());
             }
         }
     }

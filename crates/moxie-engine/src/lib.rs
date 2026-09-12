@@ -303,13 +303,14 @@ impl Program<'_> {
         }
         // Workspace follows the widest layer: the interpreter holds one layer's
         // dense scratch at a time, and charging the narrowest would under-admit.
-        let width = kv_layers
-            .iter()
-            .map(|l| mul(l.kv_heads, l.key_dim))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .expect("attention layers");
+        //
+        // Folded rather than collected: a `Vec` here would be an infallible
+        // allocation on the admission path, which is the one path that exists
+        // to report `CapacityExceeded` instead of dying.
+        let mut width = 0;
+        for l in &kv_layers {
+            width = width.max(mul(l.kv_heads, l.key_dim)?);
+        }
         let workspace = add(
             add(
                 add(1_048_576, mul(64, elements)?)?,
