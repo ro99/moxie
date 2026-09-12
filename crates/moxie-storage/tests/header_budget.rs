@@ -20,6 +20,14 @@
 //! unbounded one, rank, is answered by a structural limit rather than a larger
 //! multiplier, because no multiplier survives it.
 //!
+//! A fourth round found two more holes, and both are covered here: serde's
+//! derived `Deserialize` accepted a positional array form at less than half the
+//! object form's serialized cost, which invalidated the minimum-size term the
+//! derivation rests on; and the per-construct slopes, measured two points
+//! apart, averaged over the **capacity boundary** where a growing `Vec` holds
+//! its old allocation beside the new one. The cases below therefore sit just
+//! past powers of two, where that transient is worst.
+//!
 //! **Exactly one test lives here.** The counter is global, so a second test in
 //! this binary would run concurrently with this one and both measurements would
 //! be meaningless. The admission rules, which need no allocator, are in
@@ -146,6 +154,18 @@ fn a_header_costs_no_more_peak_heap_than_its_admitted_estimate() {
     cases.push(("worst-metadata".into(), metadata_json(20_000), 1));
     // Tensor-name bytes.
     cases.push(("worst-name-bytes".into(), tensor_json(500, 900), 500));
+    // **Capacity boundaries.** A `Vec` that has just doubled holds its old
+    // allocation alongside the new one, so the peak per entry is worst just
+    // past a power of two. The earlier two-point slopes averaged straight over
+    // this, which is how the previous bound was measured too low; independent
+    // review's counterexamples were at 4,097 and 8,193 entries for exactly
+    // this reason.
+    for k in [6u32, 8, 10, 12, 13] {
+        let n = (1usize << k) + 1;
+        cases.push((format!("boundary-tensors-{n}"), tensor_json(n, 1), n));
+        cases.push((format!("boundary-metadata-{n}"), metadata_json(n), 1));
+    }
+
     // Shape dimensions, at the largest rank the limit admits.
     let dims = format!(
         "[1{}]",

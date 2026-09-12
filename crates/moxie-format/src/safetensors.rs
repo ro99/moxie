@@ -198,12 +198,112 @@ pub struct Header {
 /// header declaring an unsupported dtype and then overwriting it with a
 /// supported one would be accepted. Deserializing straight into this struct
 /// makes serde's own duplicate-field rejection apply.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A tensor entry, accepted **only** in object form.
+///
+/// Hand-written rather than derived, and that is the point: serde's derived
+/// `Deserialize` for a struct accepts a positional array as well as a map, and
+/// `deny_unknown_fields` does not change that. Independent review found
+/// `{"0":["U8",[0],[0,0]]}` accepted at **22.9 serialized bytes per entry**
+/// against the object form's 55 -- which halves the minimum cost the memory
+/// bound in `moxie_storage::HeaderBudget` is derived from, and defeats it.
+///
+/// The safetensors format specifies an object. Accepting a second encoding
+/// bought nothing and cost the bound, so only `visit_map` is implemented and an
+/// array is a typed error.
 struct RawEntry {
     dtype: String,
     shape: Shape,
     data_offsets: [u64; 2],
+}
+
+impl<'de> serde::Deserialize<'de> for RawEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = RawEntry;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a tensor object with dtype, shape and data_offsets")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<RawEntry, A::Error> {
+                let mut dtype: Option<String> = None;
+                let mut shape: Option<Shape> = None;
+                let mut data_offsets: Option<[u64; 2]> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    // Duplicate structural fields stay refused, as the derived
+                    // implementation refused them.
+                    match key.as_str() {
+                        "dtype" if dtype.is_none() => dtype = Some(map.next_value()?),
+                        "shape" if shape.is_none() => shape = Some(map.next_value()?),
+                        "data_offsets" if data_offsets.is_none() => {
+                            data_offsets = Some(map.next_value()?);
+                        }
+                        "dtype" | "shape" | "data_offsets" => {
+                            return Err(serde::de::Error::duplicate_field(match key.as_str() {
+                                "dtype" => "dtype",
+                                "shape" => "shape",
+                                _ => "data_offsets",
+                            }));
+                        }
+                        other => {
+                            return Err(serde::de::Error::unknown_field(
+                                other,
+                                &["dtype", "shape", "data_offsets"],
+                            ));
+                        }
+                    }
+                }
+                Ok(RawEntry {
+                    dtype: dtype.ok_or_else(|| serde::de::Error::missing_field("dtype"))?,
+                    shape: shape.ok_or_else(|| serde::de::Error::missing_field("shape"))?,
+                    data_offsets: data_offsets
+                        .ok_or_else(|| serde::de::Error::missing_field("data_offsets"))?,
+                })
+            }
+        }
+        // `deserialize_map`, not `deserialize_struct`: the latter lets a
+        // self-describing format offer a sequence, which is the hole above.
+        d.deserialize_map(V)
+    }
+}
+
+/// The `__metadata__` map, refused past [`MAX_METADATA_ENTRIES`] **as it is
+/// read**.
+///
+/// The limit used to be checked after `next_value` had built the whole map, so
+/// a hundred-thousand-entry map was allocated in full and then rejected --
+/// stating a limit while paying for its violation. Counting inside the visitor
+/// is what makes the limit mean anything.
+struct Metadata(BTreeMap<String, String>);
+
+impl<'de> serde::Deserialize<'de> for Metadata {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Metadata;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "at most {MAX_METADATA_ENTRIES} string metadata entries")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Metadata, A::Error> {
+                let mut out = BTreeMap::new();
+                while let Some((k, v)) = map.next_entry::<String, String>()? {
+                    if out.len() == MAX_METADATA_ENTRIES {
+                        return Err(serde::de::Error::custom(format!(
+                            "__metadata__ has more than {MAX_METADATA_ENTRIES} entries"
+                        )));
+                    }
+                    out.insert(k, v);
+                }
+                Ok(Metadata(out))
+            }
+        }
+        d.deserialize_map(V)
+    }
 }
 
 /// A shape, refused past [`MAX_RANK`] **as it is read**.
@@ -278,15 +378,10 @@ impl<'de> serde::Deserialize<'de> for RawHeader {
                         )));
                     }
                     let item = if key == "__metadata__" {
-                        let m: BTreeMap<String, String> = map.next_value()?;
-                        if m.len() > MAX_METADATA_ENTRIES {
-                            return Err(serde::de::Error::custom(format!(
-                                "__metadata__ has {} entries, over the \
-                                 {MAX_METADATA_ENTRIES} limit",
-                                m.len()
-                            )));
-                        }
-                        RawItem::Metadata(m)
+                        // The limit lives in `Metadata`'s visitor, so an
+                        // oversized map is refused while it is read rather than
+                        // after it has been built.
+                        RawItem::Metadata(map.next_value::<Metadata>()?.0)
                     } else {
                         tensors += 1;
                         if tensors > MAX_TENSORS {
@@ -638,6 +733,100 @@ mod tests {
             4,
         );
         assert!(parse(&b).is_ok());
+    }
+
+    /// A tensor entry is an object. serde's **derived** `Deserialize` would
+    /// also accept a positional array, and `deny_unknown_fields` does not stop
+    /// it -- independent review found `{"0":["U8",[0],[0,0]]}` accepted at 22.9
+    /// serialized bytes against the object form's 55, which halves the minimum
+    /// cost `moxie_storage::HeaderBudget`'s bound is derived from.
+    #[test]
+    fn a_positional_array_is_not_a_tensor_entry() {
+        let raw = |json: &str, payload: usize| {
+            let mut b = (json.len() as u64).to_le_bytes().to_vec();
+            b.extend_from_slice(json.as_bytes());
+            b.resize(b.len() + payload, 0);
+            b
+        };
+        let parse = |b: &[u8]| {
+            let p = Header::prefix_len(b).unwrap() as usize;
+            Header::parse(&b[..p], b.len() as u64)
+        };
+        // The array form, and the same tensor as an object: refused, accepted.
+        assert!(parse(&raw(r#"{"0":["U8",[0],[0,0]]}"#, 4)).is_err());
+        assert!(
+            parse(&raw(
+                r#"{"0":{"dtype":"U8","shape":[0],"data_offsets":[0,0]}}"#,
+                4
+            ))
+            .is_ok()
+        );
+        // A missing field is still a missing field, not a defaulted one.
+        for json in [
+            r#"{"0":{"shape":[0],"data_offsets":[0,0]}}"#,
+            r#"{"0":{"dtype":"U8","data_offsets":[0,0]}}"#,
+            r#"{"0":{"dtype":"U8","shape":[0]}}"#,
+        ] {
+            assert!(parse(&raw(json, 4)).is_err(), "{json}");
+        }
+    }
+
+    /// The structural limits are refused **while parsing**, so a header that
+    /// exceeds one never costs what it asked for.
+    #[test]
+    fn rank_name_and_metadata_limits_are_refused_while_reading() {
+        let raw = |json: String| {
+            let mut b = (json.len() as u64).to_le_bytes().to_vec();
+            b.extend_from_slice(json.as_bytes());
+            b.resize(b.len() + 8, 0);
+            b
+        };
+        let parse = |b: &[u8]| {
+            let p = Header::prefix_len(b).unwrap() as usize;
+            Header::parse(&b[..p], b.len() as u64)
+        };
+        let with_rank = |n: usize| {
+            let dims = format!("0{}", ",1".repeat(n - 1));
+            format!(r#"{{"t":{{"dtype":"U8","shape":[{dims}],"data_offsets":[0,0]}}}}"#)
+        };
+        assert!(parse(&raw(with_rank(MAX_RANK))).is_ok());
+        assert!(parse(&raw(with_rank(MAX_RANK + 1))).is_err());
+
+        let long = "n".repeat(MAX_NAME_BYTES + 1);
+        assert!(
+            parse(&raw(format!(
+                r#"{{"{long}":{{"dtype":"U8","shape":[0],"data_offsets":[0,0]}}}}"#
+            )))
+            .is_err()
+        );
+
+        // The metadata limit, which used to be checked only after the whole map
+        // had been built -- stating a limit while paying for its violation.
+        let alpha: Vec<char> = ('a'..='z').chain('A'..='Z').chain('0'..='9').collect();
+        let mut over = String::from(r#"{"__metadata__":{"#);
+        let mut c = 0;
+        'outer: for a in &alpha {
+            for b in &alpha {
+                for d in &alpha {
+                    if c > MAX_METADATA_ENTRIES {
+                        break 'outer;
+                    }
+                    if c > 0 {
+                        over.push(',');
+                    }
+                    over.push_str(&format!("\"{a}{b}{d}\":\"\""));
+                    c += 1;
+                }
+            }
+        }
+        // The alphabet gives 238,328 distinct three-character keys, which is
+        // above the limit; if that ever stops being true this assertion says so.
+        assert!(
+            c > MAX_METADATA_ENTRIES,
+            "the fixture must exceed the limit, built {c}"
+        );
+        over.push_str(r#"},"t":{"dtype":"U8","shape":[0],"data_offsets":[0,0]}}"#);
+        assert!(parse(&raw(over)).is_err());
     }
 
     #[test]

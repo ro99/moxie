@@ -308,7 +308,7 @@ artifact is absent, so a fresh clone stays green.
 
 | Gate | Exact command / result |
 |---|---|
-| Host workspace | `cargo test --workspace --locked --offline`: **687 unit/integration + 9 doctests passed**, 0 failed, 0 ignored (681 + 9 as first submitted) |
+| Host workspace | `cargo test --workspace --locked --offline`: **689 unit/integration + 9 doctests passed**, 0 failed, 0 ignored (681 + 9 as first submitted) |
 | Structural limits | `cargo test -p moxie-format --locked --offline safetensors`: rank, name length, tensor and metadata counts each refused while parsing |
 | Header cost | `cargo test -p moxie-storage --test header_budget --locked --offline -- --nocapture`: **1 passed**; measured peaks within their admitted estimates, table above |
 | Importer | `cargo test -p moxie-format --locked --offline`: **102 passed**, including the exhaustive code/lane pairs, tails, granularities, scale dtypes, axis mismatches and header rejections |
@@ -318,7 +318,7 @@ artifact is absent, so a fresh clone stays green.
 | Format / diff | `cargo fmt --all -- --check`; `git diff --check`: passed |
 | Specification | `cargo xtask spec-check`: passed, 10 documents unchanged |
 | Architecture | `cargo xtask arch-check`: **74 rejecting + 21 accepted fixtures**, 12 rules. The undeclared `serde_json` edge was **rejected before it was declared**, which is the allowlist working; the new `shared-takes-serde-json` fixture keeps a second crate from taking it |
-| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`: **703 + 12 doctests passed**, 0 failed |
+| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`: **705 + 12 doctests passed**, 0 failed |
 | Device clippy | the clippy command with the same features: passed |
 | Real GPU | `cargo xtask-cuda test-gpu`: **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 
@@ -354,11 +354,14 @@ contract**, not a canonical capability. A test asserts the refusal is
 
 ### Independent review corrections
 
-Three rounds, all on the same crate. The first found five defects plus a
-documentation contradiction. The second confirmed four fixed and found the fifth
-— the header budget — measuring the wrong quantity. The third found the
-replacement bound still unsound, with two counterexamples. **Every finding was
-reproduced before any change and all are fixed.** All three rounds confirmed the
+Four rounds, and the last three were all the same defect: **a resource bound
+asserted rather than derived.** The first round found five defects plus a
+documentation contradiction. The second found the header budget measuring the
+wrong quantity. The third found the replacement bound fitted to sampled shapes
+and defeated it twice. The fourth found the derivation's minimum-cost term
+invalid, because the parser accepted a cheaper encoding than the derivation
+assumed, and its slopes blind to collection-capacity boundaries. **Every finding
+was reproduced before any change and all are fixed.** Every round confirmed the
 ownership split, the deferral of execution and quality, and the lane-order
 disclosure.
 
@@ -451,6 +454,41 @@ essentially the input slice — against the 1.7 MB accepting it cost before.
 
 Two controls, each restored afterwards: removing `MAX_RANK` makes the test fail,
 and dropping the factor to 9 makes it fail on the metadata case, naming it.
+
+**A fourth round found two more holes in the same derivation, and both are
+fixed.**
+
+*serde accepted a second encoding.* The derived `Deserialize` for a struct
+accepts a **positional array** as well as an object, and `deny_unknown_fields`
+does not change that: `{"0":["U8",[0],[0,0]]}` was accepted at **22.9 serialized
+bytes per entry** against the object form's 55. That halves the minimum-cost
+term the whole derivation rests on, and the review's counterexamples — 4,097 and
+8,193 array-form tensors — beat the bound because of it. `RawEntry` is
+hand-written now with only `visit_map`, and `deserialize_map` rather than
+`deserialize_struct`, so an array is a typed error; duplicate and unknown fields
+stay refused. The safetensors format specifies an object, so accepting a second
+encoding bought nothing and cost the bound.
+
+*The slopes averaged over the capacity boundary.* A `Vec` that has just doubled
+holds its old allocation beside the new one, so the peak per entry is worst just
+past a power of two — which is why the review's counts were 4,097 and 8,193, and
+why two-point slopes measured too low. The regression now includes both
+constructs at `2^k + 1` for k in {6, 8, 10, 12, 13}. Re-measured across every
+such boundary from 64 to 8,192, the worst ratio is **11.69** (metadata at 65),
+and at scale **10.54**; the factor of 16 stands with margin.
+
+*And the metadata limit was enforced too late.* `MAX_METADATA_ENTRIES` was
+checked after `next_value` had built the whole map, so a 100,000-entry map was
+allocated in full and then rejected — stating a limit while paying for its
+violation. It is counted inside a `Metadata` visitor now, like `MAX_RANK`.
+
+| Boundary case | Serialized | Peak | Admitted | Ratio |
+|---|---:|---:|---:|---:|
+| 65 metadata entries | 663 | 7,750 | 18,800 | 11.69 |
+| 4,097 tensors | 246,599 | 2,142,205 | 3,953,776 | 8.69 |
+| 4,097 metadata entries | 36,951 | 389,478 | 599,408 | 10.54 |
+| 8,193 tensors | 496,455 | 4,287,421 | 7,951,472 | 8.64 |
+| 8,193 metadata entries | 73,815 | 777,702 | 1,189,232 | 10.54 |
 
 The real shards' headers are 17–64 KB, so their estimated peaks are under
 800 KB against the 8 MiB default.

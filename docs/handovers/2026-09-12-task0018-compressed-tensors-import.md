@@ -42,7 +42,7 @@ decoder and no runtime decode path.
 
 | Lane | Command | Result |
 |---|---|---|
-| Host workspace | `cargo test --workspace --locked --offline` | **687 + 9 doctests passed**, 0 failed, 0 ignored |
+| Host workspace | `cargo test --workspace --locked --offline` | **689 + 9 doctests passed**, 0 failed, 0 ignored |
 | Importer | `cargo test -p moxie-format --locked --offline` | **102 passed** |
 | Import allocation | `cargo test -p moxie-format --test import_allocation --locked --offline -- --nocapture` | **1 passed**; 3 allocations at 4, 64 and 512 rows, against 7/67/515 for its control |
 | Real artifact | `cargo test -p moxie-storage --test gemma4_import --locked --offline -- --nocapture` | **3 passed** |
@@ -50,7 +50,7 @@ decoder and no runtime decode path.
 | Format / diff | `cargo fmt --all -- --check`; `git diff --check` | passed |
 | Specification | `cargo xtask spec-check` | passed, 10 digests unchanged |
 | Architecture | `cargo xtask arch-check` | **74 rejecting + 21 accepted**, 12 rules |
-| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **703 + 12 doctests passed**, 0 failed |
+| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **705 + 12 doctests passed**, 0 failed |
 | Header cost | `cargo test -p moxie-storage --test header_budget --locked --offline -- --nocapture` | **1 passed**; measured peak heap within the admitted estimate at five header shapes |
 | Device clippy | the clippy command with the same features | passed |
 | Real GPU | `cargo xtask-cuda test-gpu` | **39/39**, 0 failed, 0 skipped; sm_86 and sm_120 qualified |
@@ -143,6 +143,24 @@ brings it to 2.8. The factor is then 16 against a largest remaining ratio of
 9.5. The regression measures **each construct at its own worst shape**, and its
 two controls -- removing the rank limit, and dropping the factor to 9 -- each
 fail.
+
+**A derivation is only as good as the grammar it assumes.** A fourth round broke
+this one twice more, and both are worth carrying forward:
+
+- serde's **derived** `Deserialize` for a struct accepts a positional array as
+  well as an object, and `deny_unknown_fields` does not stop it. A tensor entry
+  written `["U8",[0],[0,0]]` cost 22.9 serialized bytes against the object
+  form's 55, so the minimum-cost term was wrong by half. Hand-write the visitor
+  and use `deserialize_map`, not `deserialize_struct`, when the parse cost is
+  load-bearing.
+- Marginal costs measured two points apart **average over collection-capacity
+  boundaries**. A `Vec` that has just doubled holds its old allocation beside
+  the new one, so the worst per-entry peak is just past a power of two. Measure
+  at `2^k + 1`, which is where the review's counterexamples sat.
+
+And: a limit checked after `next_value` has built the collection is not a limit.
+`MAX_METADATA_ENTRIES` was enforced only after a 100,000-entry map had been
+allocated in full. Count inside the visitor.
 
 And: deserializing untrusted JSON into a map collapses duplicate keys before any
 validation runs, so a header could declare an unsupported dtype and overwrite it
