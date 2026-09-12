@@ -4,11 +4,13 @@
 
 [Task 0018, compressed-tensors pack-quantized import](2026-09-12-task0018-compressed-tensors-import.md)
 is the current continuation. **M1.4 complete; M1.5 active; M3 and M4 open.**
-Task 0017 gave the paged store per-layer geometry and window reclamation;
-task 0018 imports the Gemma 4 artifact's real INT8 weights to canonical affine
-form. Both are implemented and awaiting owner review. **Nothing executes a
-checkpoint**: the W8A16 path, the repacker and the manifest write are M3's, and
-vision is M11.
+The owner **accepted task 0018 on 2026-09-12** within its import-only scope.
+Task 0017, per-layer paged geometry and window reclamation, has had its review
+corrections completed and pushed; the owner directed the next task rather than
+stating a separate acceptance, so it is recorded as awaiting one.
+
+**Nothing executes a checkpoint**: the W8A16 path, the repacker and the manifest
+write are M3's, and vision is M11.
 
 This entry was stale until task 0017: it still named the M1.4 closure handover
 after [the M1.5 Gemma operation gap](2026-09-12-m1.5-gemma-operation-gap.md) had

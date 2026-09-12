@@ -1,7 +1,7 @@
 # Task 0018 — M3 compressed-tensors pack-quantized importer
 
-Status: **implemented and corrected after independent review, awaiting owner
-re-review**. Contract and
+Status: **accepted by the owner, 2026-09-12, within its declared import-only
+scope.** Contract and
 [ADR 0015](../decisions/adr/0015-serde-json-for-safetensors-headers.md)
 committed at `db9529e`, before implementation.
 
@@ -533,6 +533,27 @@ Both now use one row per lane offset and a **two-dimensional** tracker asserting
 "compressed-tensors integer import — **not implemented**" row beside the new
 passing one, and the README still said nothing imports checkpoint data. Both are
 corrected, and both now say plainly that an import is not an execution.
+
+### Owner acceptance, 2026-09-12
+
+The owner accepted task 0018 after five rounds of independent review found no
+remaining blocking correctness or architecture issue. The final round verified
+that a repeated `__metadata__` declaration is refused before the second value is
+read, measuring **454 bytes beyond the input buffer** at 4,097, 8,193 and 16,385
+declarations, and that duplicate tensor-name rejection stays inside the admitted
+bound. All five original findings and every header-budget correction are closed.
+
+Independent validation reproduced 689 host tests + 9 doctests including the
+real-artifact imports, host clippy, formatting, specification and diff checks,
+and clean-archive architecture checks at 74 rejecting + 21 accepted fixtures.
+The reviewer did not rerun the GPU, quality or performance gates; the GPU
+figures in this record are from this agent's runs and are regression evidence
+for already-accepted device behaviour, since this task adds none.
+
+**This acceptance closes task 0018 only.** It states, in the owner's terms:
+**M3 and M1.5 remain open, no checkpoint executes, and source lane-order
+verification remains outstanding.** An import is not an execution, and a
+successful import is not a quality claim.
 
 ### Deletion
 

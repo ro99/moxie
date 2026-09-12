@@ -24,6 +24,12 @@ packing was verified against the artifact before the contract was authored —
 document 03 requires inspecting "pinned config, tensor index and bounded tensor
 headers before an importer claim".
 
+**The owner accepted task 0018 on 2026-09-12**, within its declared import-only
+scope, after five rounds of independent review found no remaining blocking
+correctness or architecture issue, and directed that it be documented and
+pushed. The acceptance states its own limits: **M3 and M1.5 remain open, no
+checkpoint executes, and source lane-order verification remains outstanding.**
+
 **Independent review requested changes and found five defects plus a
 documentation contradiction. All were reproduced before any change and all are
 fixed**; the task record carries each one. The two P1s are worth carrying

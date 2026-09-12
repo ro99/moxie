@@ -59,15 +59,28 @@ still cannot execute. It does clear two of the reduced graph's four reductions:
 sliding and global layers now compose at their own widths and sliding layers
 keep only what they can see. Contract `b748536` precedes implementation.
 
-[Task 0018](docs/tasks/0018-m3-compressed-tensors-int8-importer.md) is
-**implemented and awaiting owner review**: a bounded safetensors reader and a
-compressed-tensors `pack-quantized` importer that turns the Gemma 4 artifact's
-real INT8 weights into the accepted canonical `AffineTensor`, verified on three
-of its modules read-only. `moxie-format` takes `serde_json` for the header parse
+**The owner accepted [task 0018](docs/tasks/0018-m3-compressed-tensors-int8-importer.md)
+on 2026-09-12, within its declared import-only scope**, after five rounds of
+independent review found no remaining blocking correctness or architecture
+issue. It adds a bounded safetensors reader and a compressed-tensors
+`pack-quantized` importer that turns the Gemma 4 artifact's real INT8 weights
+into the accepted canonical `AffineTensor`, verified on three of its modules
+read-only. `moxie-format` takes `serde_json` for the header parse
 ([ADR 0015](docs/decisions/adr/0015-serde-json-for-safetensors-headers.md)).
-Contract `db9529e` precedes implementation.
+Contract `db9529e` precedes implementation `2cab2c0`; corrections `a71ad3e`,
+`0007563`, `ba102cb`, `beced4b` and `c7c6f5b` close the review's findings. Four
+of those five rounds were one defect in different clothes — a resource bound
+asserted rather than established — and the handover says so, because the next
+importer will face the same question.
 
-**It still executes no checkpoint, and an import is not support.** There is no
+[Task 0017](docs/tasks/0017-m4-per-layer-kv-geometry-and-window-eviction.md),
+M4's per-layer key/value geometry and window reclamation, has had its review
+corrections completed and pushed. The owner directed the next task rather than
+stating a separate acceptance, so it is recorded as **awaiting one**.
+
+**It still executes no checkpoint, and an import is not support.** The
+acceptance states its own limits: **M3 and M1.5 remain open, no checkpoint
+executes, and source lane-order verification remains outstanding.** There is no
 W8A16 path, no repacker and no canonical manifest write; all three are M3's. The
 lane order inside a packed word is taken from the pinned reader and **cannot**
 be verified against this artifact, so no quality claim follows from a successful
