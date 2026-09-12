@@ -1,12 +1,11 @@
 # Task 0020 — M2 weight-residency authority
 
-Status: **implemented and corrected after four rounds of independent review;
+Status: **implemented and corrected after five rounds of independent review;
 awaiting owner acceptance.** Contract written and committed at `d6e9170` before
-implementation, per the working rule that produced tasks 0013–0019. The four
-rounds found **twenty-three** issues in total; all twenty-three were reproduced
-and fixed, and none was disputed. Two of the rounds criticised method rather
-than code, and the second of those showed by mutation testing that the sweep
-built to answer the first did not establish its claim. See
+implementation, per the working rule that produced tasks 0013–0019. The five
+rounds found **twenty-five** issues in total; all twenty-five were reproduced
+and fixed, and none was disputed. Three rounds criticised method or a coverage
+claim rather than code, and each was right. See
 [the sweep and what it is worth](#the-sweep-and-what-it-is-worth). Also see
 [Result](#result-filled-after-work),
 [Independent review](#independent-review-and-what-it-changed),
@@ -570,8 +569,8 @@ task does **not** close M2.
 | `cargo fmt --all -- --check` | **passed** |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed** |
 | Device-lane clippy (`moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`) | **passed** |
-| `cargo test --workspace --locked --offline` | **817 passed, 0 failed** (736 before this task) |
-| Device-feature workspace tests | **837 passed, 0 failed** |
+| `cargo test --workspace --locked --offline` | **818 passed, 0 failed** (736 before this task) |
+| Device-feature workspace tests | **838 passed, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | **passed**, 10 documents |
 | `cargo xtask arch-check` | **passes with zero failures**: 78 rejected fixtures, 21 accepted, 13 rules, including the new `a second weight-residency owner` with its three fixtures. The "4 pre-existing failures" every task since 0014 has carried are **gone, and were never real** — see [the arch-check noise floor](#the-arch-check-noise-floor) |
@@ -790,7 +789,9 @@ What changed:
   nothing else, and **fails when a ticket is left in flight that it never
   received an order for**.
 - Every ending must demonstrably apply; a branch that silently did nothing was a
-  duplicate of `Completed` wearing another name.
+  duplicate of `Completed` wearing another name. **This was only half done at
+  round four** — an escape hatch still excused 120 cases, which round five
+  found; it is now required and measured.
 - Two axes were added because mutation testing showed their absence: **cache
   pressure** with a lease held (eviction never ran at all before — a mutation
   making eviction ignore leases survived), and **retirement while a transfer is
@@ -824,6 +825,53 @@ Nine of ten, with the tenth covered by
 last one is worth keeping visible: the sweep is a complement to the named tests,
 not a replacement, and saying so is the honest version of the claim I made in
 round three.
+
+### Fifth independent review
+
+**Two findings; both reproduced, neither disputed.** Both were about things this
+record already claimed.
+
+| # | Finding | Reproduced as | Fix |
+|---|---|---|---|
+| 1 | **Arch-check missed inherited workspace path dependencies.** The crate walk followed only entries with a direct `path`, so `{ workspace = true }` — whose path lives in `[workspace.dependencies]` — resolved to nothing | a forbidden second `ExpertCache` under `results/storage`, reached by `moxie-storage = { workspace = true }`, produced **zero violations** | The walk now resolves inheritance through **the same `effective_spec` the edge checker uses**, extracted so there is one copy. A second implementation of dependency resolution is a second set of its bugs, and this was the proof |
+| 2 | **The sweep counted cases whose ending never happened.** The early prefetch drain completed work before the outcome was injected, and an escape hatch then excused the ending for doing nothing | **120 cases** — 40 `Failed`, 40 `SubmissionUnknown`, 40 `Expire` — while the record claimed every ending applies | Orders are now **received without being performed** until the outcome is injected, the escape hatch is gone, and the sweep **reports its coverage** instead of asserting it |
+
+**Finding 2 is the third time a coverage claim of mine has been wrong**, and the
+pattern in all three is the same: I asserted a property of the tests rather than
+measuring it. The sweep now prints what it exercised —
+
+```text
+800 transition combinations, every step invariant-checked:
+800 applied their ending, 0 were short-circuited
+```
+
+— and the warm preamble that used to turn 100 host cases into cache hits is now
+applied only where it creates the scenario it exists for. The claim and the
+measurement are the same statement.
+
+Re-measured mutation battery, after the round-5 changes:
+
+| Mutation | Caught by the sweep |
+|---|---|
+| Promoted work order discarded | yes |
+| Source pin never released | yes |
+| Source pin released twice | yes |
+| Demand counter never decremented | yes |
+| Cancelled read keeps a held placement | yes |
+| Eviction ignores leases | yes |
+| Retirement never finalises | yes |
+| `unpin` skips retiring finalisation | yes |
+| Failed read spares its source | yes |
+| Quarantine loses its source | yes |
+| `next_prefetch` ignores dependencies | **no** — caught by its named regression |
+
+Ten of eleven, the eleventh covered by
+`the_prefetch_queue_issues_a_dependency_before_the_ticket_waiting_on_it`. One
+further mutation was written and then discarded as an **equivalent mutant**:
+removing the `upload_source` re-assignment on the quarantine path changes
+nothing, because `admit_new` has already set it. Saying so is part of reporting
+a battery honestly — an equivalent mutant surviving is not a coverage gap, and
+counting it as one would inflate the number in the other direction.
 
 ### What was **not** delivered, and why
 

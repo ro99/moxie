@@ -270,6 +270,8 @@ impl Harness {
 #[test]
 fn every_transition_combination_keeps_the_authority_consistent() {
     let mut ran = 0usize;
+    let mut endings_applied = 0usize;
+    let mut short_circuited = 0usize;
     for first in [Dest::Host, Dest::Device] {
         for urgency in [Urgency::Demand, Urgency::Prefetch] {
             for joiner in [
@@ -289,7 +291,7 @@ fn every_transition_combination_keeps_the_authority_consistent() {
                     for hold_lease in [false, true] {
                         for pressure in [false, true] {
                             for retire in [false, true] {
-                                run(Case {
+                                let covered = run(Case {
                                     first,
                                     urgency,
                                     joiner,
@@ -299,6 +301,11 @@ fn every_transition_combination_keeps_the_authority_consistent() {
                                     retire,
                                 });
                                 ran += 1;
+                                if covered.short_circuited {
+                                    short_circuited += 1;
+                                } else if covered.ending_applied {
+                                    endings_applied += 1;
+                                }
                             }
                         }
                     }
@@ -311,10 +318,34 @@ fn every_transition_combination_keeps_the_authority_consistent() {
         2 * 2 * 5 * 5 * 2 * 2 * 2,
         "the sweep must cover the product"
     );
-    println!("{ran} transition combinations, every step invariant-checked");
+    // Coverage is reported, not assumed. A previous version of this sweep let
+    // 120 cases reach their ending and do nothing while the record claimed
+    // every ending applied; the number is printed now so the claim and the
+    // measurement are the same thing.
+    assert_eq!(
+        endings_applied + short_circuited,
+        ran,
+        "a case neither applied its ending nor short-circuited"
+    );
+    println!(
+        "{ran} transition combinations, every step invariant-checked: \
+         {endings_applied} applied their ending, {short_circuited} were \
+         short-circuited by a hit or a refusal before reaching one"
+    );
 }
 
-fn run(case: Case) {
+/// What one case actually exercised, so the sweep can report coverage rather
+/// than only a pass.
+#[derive(Debug, Default, Clone, Copy)]
+struct Covered {
+    ending_applied: bool,
+    /// The case ended before its ending could be reached: the first acquire was
+    /// a hit or a refusal. These are legal and are counted separately rather
+    /// than excused inside the assertion.
+    short_circuited: bool,
+}
+
+fn run(case: Case) -> Covered {
     let mut h = Harness::open(case);
     h.checked("open");
     let id = chunk(0);
@@ -326,7 +357,11 @@ fn run(case: Case) {
     // holds the last thing keeping the placement alive. Retiring only after
     // everything had completed never reached that, and a mutation that stopped
     // retirement finalising on an internal pin release survived because of it.
-    if case.retire {
+    // Only when the first acquire targets a device: that is the shape where an
+    // upload's pin can be the last thing holding the source. Warming before a
+    // *host* acquire would just turn it into a hit and skip the case entirely,
+    // which is 100 combinations that would exercise nothing.
+    if case.retire && case.first == Dest::Device {
         let warm = h
             .authority
             .acquire(h.request(&id, Scope::Host, Urgency::Demand, 0, 1_000));
@@ -370,7 +405,10 @@ fn run(case: Case) {
             h.assert_no_stranded_work();
             h.authority.close(&mut h.ledger).unwrap();
             assert_eq!(h.ledger.scope_committed(Scope::Host), 0);
-            return;
+            return Covered {
+                ending_applied: false,
+                short_circuited: true,
+            };
         }
     };
     leases.push(lease);
@@ -409,13 +447,13 @@ fn run(case: Case) {
         h.checked("retire the device chunk");
     }
 
-    // Give the scheduler a chance to release queued work while both the first
-    // acquire and its joiner are still outstanding. This is where a dependency
-    // ordering error shows: the entry with the earliest deadline may be the one
-    // waiting on another's read.
+    // Release queued work **without performing it**, while the first acquire and
+    // its joiner are both still outstanding. This is where a dependency ordering
+    // error shows: the entry with the earliest deadline may be the one waiting
+    // on another's read. Performing here is what previously let an ending find
+    // nothing to act on.
     while let Some(order) = h.authority.next_prefetch() {
         h.orders.push(order);
-        h.perform_received();
         h.checked("early prefetch release");
     }
 
@@ -484,19 +522,17 @@ fn run(case: Case) {
         }
     }
 
-    // A case whose ending did nothing is a duplicate of `Completed` wearing
-    // another name. The three that can legitimately find nothing to act on are
-    // the ones whose first acquire was a queued prediction with no order yet,
-    // or whose joiner already settled the ticket; every other combination must
-    // actually exercise its ending.
-    if !ending_applied {
-        let excusable = case.urgency == Urgency::Prefetch
-            || matches!(
-                case.joiner,
-                Joiner::HostDemand | Joiner::DeviceDemand | Joiner::HostPrefetch
-            );
-        assert!(excusable, "{:?} claimed an ending it never applied", case);
-    }
+    // **Every ending must actually happen.** Nothing is performed before this
+    // point, so the first acquire's ticket is still outstanding and there is
+    // always something for a failure, a loss or an expiry to act on. A case
+    // whose ending silently did nothing is a duplicate of `Completed` wearing
+    // another name, and an earlier version of this sweep had 120 of them while
+    // the record claimed otherwise.
+    assert!(
+        ending_applied,
+        "{:?} claimed an ending it never applied",
+        case
+    );
 
     // Anything the authority still offers, and then a second acquire of the
     // same chunk -- the operation that panicked in two separate review rounds.
@@ -604,5 +640,10 @@ fn run(case: Case) {
                 "{case:?} refused to close with nothing withheld: {e}"
             );
         }
+    }
+
+    Covered {
+        ending_applied,
+        short_circuited: false,
     }
 }

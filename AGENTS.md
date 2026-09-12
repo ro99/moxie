@@ -5,7 +5,7 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 ## Active assignment
 
 **M1 complete (M1.5 closed 2026-09-12); M2 active, item 1 accepted, item 2
-implemented and corrected after four rounds of independent review.** See the
+implemented and corrected after five rounds of independent review.** See the
 [task 0020 handover](docs/handovers/2026-09-12-task0020-weight-residency-authority.md)
 for the current continuation, and the
 [closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
@@ -18,8 +18,8 @@ shared operations with FP64 oracles, the pinned BF16 boundaries that decide
 which experts a row selects, and two consumers carrying opposite routing
 parameters.
 
-**M2 item 2's residency authority is implemented and corrected after four
-rounds of independent review** — twenty-three findings, all reproduced, all
+**M2 item 2's residency authority is implemented and corrected after five
+rounds of independent review** — twenty-five findings, all reproduced, all
 fixed, none disputed
 ([task 0020](docs/tasks/0020-m2-weight-residency-authority.md), 2026-09-12):
 `moxie_memory::residency` is the **one** production weight-residency owner, with
@@ -52,8 +52,13 @@ operation. Two things are required of such a sweep, both learned the hard way:
 its harness must perform **only** work the scheduler actually handed out — the
 first version completed work it discovered, and a mutation that discarded every
 promoted order passed all 200 combinations — and its strength must be
-**measured by mutation testing** rather than asserted. Apply both to M2 item 3's
-queues rather than rediscovering them. **Task 0021 is next**: M2 item 3's CPU expert fallback and GPU
+**measured by mutation testing** rather than asserted.
+
+**State coverage as a number the test prints, never as a sentence in a record.**
+Three claims about task 0020's test strength were wrong in the same way: the
+property was asserted rather than measured. The sweep now prints what it
+exercised, and an equivalent mutant is reported as such instead of being counted
+as a gap. Apply all of this to M2 item 3's queues rather than rediscovering it. **Task 0021 is next**: M2 item 3's CPU expert fallback and GPU
 grouped candidate plans under one interface, specified in
 [the task 0020 handover](docs/handovers/2026-09-12-task0020-weight-residency-authority.md)
 and not yet authored.

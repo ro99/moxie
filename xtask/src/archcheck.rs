@@ -649,6 +649,49 @@ struct Workspace<'a> {
     doc: &'a toml::Value,
 }
 
+/// Resolve `{ workspace = true }` to the definition it inherits, and say which
+/// directory that definition's `path` is relative to.
+///
+/// **One copy, two callers**, and the second one is why this exists: the crate
+/// walk grew its own "does this dependency have a `path`" test, which read only
+/// direct entries. A review put a forbidden second `ExpertCache` behind
+/// `moxie-storage = { workspace = true }` and the walk never saw the crate at
+/// all. Dependency resolution is subtle enough -- inheritance, renames,
+/// root-relative paths -- that a second implementation of it is a second set of
+/// its bugs.
+///
+/// Returns the effective spec, the base directory for its `path`, and whether
+/// inheritance was requested at all (so a caller can report an inherited
+/// dependency that does not exist, rather than silently ignoring it).
+fn effective_spec<'a>(
+    alias: &str,
+    spec: &'a toml::Value,
+    manifest_dir: &'a Path,
+    workspace: Option<&'a Workspace<'a>>,
+) -> (Option<&'a toml::Value>, &'a Path, bool) {
+    let inherits = spec
+        .get("workspace")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !inherits {
+        return (Some(spec), manifest_dir, false);
+    }
+    match workspace
+        .and_then(|w| w.doc.get("workspace"))
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|d| d.get(alias))
+    {
+        // A `path` in `[workspace.dependencies]` is relative to the workspace
+        // root, not to the member that inherits it.
+        Some(v) => (
+            Some(v),
+            workspace.map(|w| w.root).unwrap_or(manifest_dir),
+            true,
+        ),
+        None => (None, manifest_dir, true),
+    }
+}
+
 fn resolve_edge(
     alias: &str,
     spec: &toml::Value,
@@ -661,27 +704,12 @@ fn resolve_edge(
 
     // `foo.workspace = true` inherits the real definition from the workspace
     // root, which is where a rename or a path actually lives.
-    let inherits = spec
-        .get("workspace")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let (effective, base): (Option<&toml::Value>, &Path) = if inherits {
-        match workspace
-            .and_then(|w| w.doc.get("workspace"))
-            .and_then(|w| w.get("dependencies"))
-            .and_then(|d| d.get(alias))
-        {
-            Some(v) => (Some(v), workspace.map(|w| w.root).unwrap_or(manifest_dir)),
-            None => {
-                unresolved = Some(format!(
-                    "{alias} inherits from [workspace.dependencies], which was not found"
-                ));
-                (None, manifest_dir)
-            }
-        }
-    } else {
-        (Some(spec), manifest_dir)
-    };
+    let (effective, base, inherits) = effective_spec(alias, spec, manifest_dir, workspace);
+    if inherits && effective.is_none() {
+        unresolved = Some(format!(
+            "{alias} inherits from [workspace.dependencies], which was not found"
+        ));
+    }
 
     if let Some(v) = effective {
         if let Some(renamed) = v.get("package").and_then(|p| p.as_str()) {
@@ -2132,6 +2160,11 @@ fn reachable_crate_dirs(root: &Path) -> BTreeSet<PathBuf> {
         }
     }
 
+    // The root manifest resolves `{ workspace = true }`, and its own directory
+    // is what an inherited `path` is relative to.
+    let root_doc = read_manifest(root);
+    let workspace = root_doc.as_ref().map(|doc| Workspace { root, doc });
+
     while let Some(dir) = queue.pop() {
         if !seen.insert(dir.clone()) {
             continue;
@@ -2140,11 +2173,17 @@ fn reachable_crate_dirs(root: &Path) -> BTreeSet<PathBuf> {
             continue;
         };
         // Every production dependency table, target-specific ones included --
-        // the same reason `dependency_edges` reads them all.
+        // the same reason `dependency_edges` reads them all -- and every entry
+        // resolved through the **same** inheritance logic the edge checker
+        // uses, rather than a second reading of it.
         for table in production_dependency_tables(&doc) {
-            for value in table.values() {
-                if let Some(path) = value.get("path").and_then(|p| p.as_str()) {
-                    queue.push(normalize_relative(&dir, path));
+            for (alias, spec) in table {
+                let (effective, base, _) = effective_spec(alias, spec, &dir, workspace.as_ref());
+                if let Some(path) = effective
+                    .and_then(|v| v.get("path"))
+                    .and_then(|p| p.as_str())
+                {
+                    queue.push(normalize_relative(base, path));
                 }
             }
         }
@@ -3384,6 +3423,42 @@ mod tests {
                 if expected { "" } else { "not " }
             );
         }
+    }
+
+    #[test]
+    fn an_inherited_path_dependency_into_scratch_is_still_checked() {
+        // The crate walk grew its own "does this have a `path`" test, which read
+        // only direct entries. A review put a forbidden second `ExpertCache`
+        // behind `moxie-storage = { workspace = true }`, whose path lives in
+        // `[workspace.dependencies]`, and the walk never saw the crate. Both
+        // callers now resolve inheritance through `effective_spec`.
+        let root = tempdir();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/engine\"]\n\
+             [workspace.dependencies]\nstorage = { path = \"results/storage\" }\n",
+        )
+        .unwrap();
+        let engine = root.join("crates/engine");
+        let storage = root.join("results/storage");
+        std::fs::create_dir_all(&engine).unwrap();
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(
+            engine.join("Cargo.toml"),
+            "[package]\nname = \"engine\"\n[dependencies]\nstorage = { workspace = true }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            storage.join("Cargo.toml"),
+            "[package]\nname = \"storage\"\n",
+        )
+        .unwrap();
+
+        let found = find_manifests(&root).unwrap();
+        assert!(
+            found.iter().any(|m| m.starts_with(&storage)),
+            "a crate reached through an inherited path dependency was skipped"
+        );
     }
 
     #[test]

@@ -1,10 +1,12 @@
 # Handover — task 0020 implemented; task 0021 is M2's grouped expert execution
 
-**Task 0020 is implemented, corrected after four rounds of independent review,
-and awaiting owner acceptance.** The four rounds found **twenty-three** issues;
-all twenty-three were reproduced and fixed, and none was disputed. Two rounds
-criticised method rather than code, and the fourth showed by **mutation testing**
-that the sweep built to answer the third did not establish its claim. It delivers M2 item 2 only. M2 items 3–5 are
+**Task 0020 is implemented, corrected after five rounds of independent review,
+and awaiting owner acceptance.** The five rounds found **twenty-five** issues;
+all twenty-five were reproduced and fixed, and none was disputed. Three rounds
+criticised method or a coverage claim rather than code, and each was right: the
+fourth showed by mutation testing that the sweep did not establish its claim, and
+the fifth showed that even after that fix, 120 of its cases never applied the
+ending they were named for. It delivers M2 item 2 only. M2 items 3–5 are
 outstanding and the next of them is specified under [Next task](#next-task).
 
 ## Workspace identity
@@ -36,8 +38,8 @@ the terms it fixed before implementation, and the filled-in result.
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy | passed |
-| `cargo test --workspace --locked --offline` | **817 passed, 0 failed** (736 at task 0019) |
-| Device-feature workspace tests | **837 passed, 0 failed** |
+| `cargo test --workspace --locked --offline` | **818 passed, 0 failed** (736 at task 0019) |
+| Device-feature workspace tests | **838 passed, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | **zero failures** — 78 rejected fixtures, 21 accepted, 13 rules. The "4 pre-existing failures" carried since task 0014 are gone and were never real; see the note below |
@@ -194,6 +196,30 @@ mutations of the authority; the tenth is caught by its named regression. That
 number is in the task record, because "the sweep is strong" is a claim and the
 battery is the evidence. **The sweep complements the named tests; it does not
 replace them** — which is the honest version of what I claimed in round three.
+
+**A fifth round found two more, and both were about claims this handover already
+made.** Arch-check still missed production code: the crate walk followed only
+dependency entries with a direct `path`, so `moxie-storage = { workspace = true }`
+— whose path lives in `[workspace.dependencies]` — resolved to nothing, and a
+forbidden second `ExpertCache` under `results/storage` produced zero violations.
+It now resolves inheritance through the *same* `effective_spec` the edge checker
+uses, extracted so there is one copy; a second implementation of dependency
+resolution is a second set of its bugs, and that is now the second time this
+exact check has been wrong.
+
+**And the sweep still counted cases whose ending never happened** — 120 of them,
+while the record said every ending applies. The early prefetch drain completed
+work before the outcome was injected, and an escape hatch excused the rest.
+Orders are now received without being performed until the outcome is injected,
+the escape hatch is gone, and the sweep **prints its coverage**: 800 combinations,
+800 applying their ending, 0 short-circuited. Re-measured against eleven
+mutations it catches ten; the eleventh is caught by its named regression, and one
+further mutation was identified as an equivalent mutant rather than counted as a
+gap.
+
+**Three coverage claims of mine have now been wrong in the same way**: I asserted
+a property of the tests instead of measuring it. That is the lesson worth
+carrying into task 0021, and it is in AGENTS.md rather than only here.
 
 **Three narrowings, decided during implementation and reported rather than
 quietly dropped.** `Artifact::read_tensor_range` was **not** added: a canonical
