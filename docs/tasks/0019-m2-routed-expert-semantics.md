@@ -1,0 +1,431 @@
+# Task 0019 — M2 shared routed-expert semantics
+
+Status: **proposed.** Contract written before implementation, per the working
+rule that produced tasks 0013–0018.
+
+## Identity and authority
+
+- Task ID / milestone / owner: 0019 / **M2 item 1, mathematics only** /
+  implementation agent; acceptance belongs to the owner. **This task does not
+  close M2 and establishes no residency capability.**
+- Writable root `/home/rodrigo/Developer/moxie`, branch `main`, base `8dc9e77`
+  (task 0017 acceptance record). Working tree clean at authoring; no initial
+  dirty paths.
+- Read-only legacy `/home/rodrigo/Developer/strata` at
+  `2dc566eb8e440fff4837ac75ca1dad1b20c2264e`. Its untracked `.pi/` and
+  `tests/p2p/` are preserved and are not source evidence.
+- Assigned by [the M1 closure handover](../handovers/2026-09-12-m1-closure-to-m2.md),
+  which names task 0019 as "M2's first bounded slice, in roadmap order: shared
+  routing semantics and expert residency against the designated BF16 MoE".
+- Required documents read: AGENTS.md, README, reference documents 01–09, the
+  owner-gate register, `docs/README.md`, the TASK/ADR/HANDOVER/MODEL-BRINGUP
+  templates, [ADR 0009](../decisions/adr/0009-engram-conditional-memory.md),
+  [ADR 0012](../decisions/adr/0012-explicit-family-operation-parameters.md),
+  [ADR 0013](../decisions/adr/0013-one-model-crate-with-family-modules.md), the
+  [gemma4 bring-up record](../models/gemma4.md) and tasks 0016/0017/0018.
+  Normative for this task: document 02's "Semantic operations" (the
+  `Route -> Dispatch -> ExpertMlp -> Combine` row and the `RouteSpec` sketch),
+  document 03's "Shared weight-residency lifecycle" and MoE admission
+  paragraph, document 06 M2 items 1 and 4, and document 09 §§ B and D.
+- Owner gates: **O1–O7 remain open.** None blocks a host-only, synthetic-weight,
+  BF16 slice that reads metadata and copies nothing. Stop before any checkpoint
+  execution, import, conversion, quality claim or device kernel.
+
+### Why this task is narrower than the handover's sentence
+
+The handover names three owners for task 0019 — `moxie-graph` for routing,
+`moxie-engine` for row dispatch and combination, `moxie-memory` for the
+residency authority. That is M2 items 1 **and** 2, and `docs/tasks/README.md`
+requires one bounded assignment to produce one primitive. This contract takes
+**item 1's mathematics** and names **task 0020** for item 2's residency
+authority, for a reason that is an ordering fact rather than a convenience: the
+residency authority is admitted against the union of experts a row batch
+demands, and that union is a *result* of the routing equation. Writing the
+authority first would mean reserving bytes for a demand set defined by code that
+does not exist yet.
+
+Nothing here weakens the handover's stop conditions; they are restated below and
+apply to task 0020 unchanged.
+
+## The designated artifact, inspected
+
+`/fast/models/google/gemma-4-26B-A4B-it`, read-only, **nothing copied,
+converted, deleted or executed**. Verified 2026-09-12:
+
+| Property | Observed |
+|---|---|
+| Revision (HF download metadata) | `4d7ae4984b7db7de8f8457170b3f1a419ee76d52` |
+| `config.json` sha256 | `ed0c1eb3633de771906e9ba004a44cc5635bcc06ee2062077c3d2e88a50707d3` |
+| `model.safetensors.index.json` sha256 | `907826a6e46ff454272bd6db1fee629d5531a2303be22986d825a0871d7dc7a7` |
+| Completeness | **complete.** Both shards: `8 + header + payload_end` equals the file size exactly, and the two payload ends sum to the index's `total_size` of 51,611,872,412 B |
+| Declared license | `apache-2.0`, link `https://ai.google.dev/gemma/docs/gemma_4_license`; base model `google/gemma-4-26B-A4B` |
+| Precision | **BF16 throughout**; there is no `quantization_config` |
+| Reference implementation | `transformers 5.5.0.dev0`, `model_type` `gemma4` / `gemma4_text` |
+
+Text geometry from `config.json.text_config`: hidden 2,816; 30 layers; 16 query
+heads; sliding 8 x 256, global 2 x 512; `attention_k_eq_v` true; `layer_types`
+25 sliding and 5 full at indices 5, 11, 17, 23, 29 — the same
+`(layer + 1) % 6 == 0` predicate task 0016 pinned; `sliding_window` 1,024;
+`rms_norm_eps` 1e-6; `hidden_activation` `gelu_pytorch_tanh`;
+`final_logit_softcapping` 30.0; `tie_word_embeddings` true; vocab 262,144;
+`max_position_embeddings` 262,144 (**not** an admissible context, R19);
+sliding RoPE theta 10,000 `default`, global theta 1,000,000 `proportional` with
+`partial_rotary_factor` 0.25.
+
+New for this task, and absent from the 31B: `enable_moe_block` true,
+`num_experts` 128, `top_k_experts` 8, `moe_intermediate_size` 704, alongside the
+dense `intermediate_size` 2,112.
+
+Per-layer tensors, read from the safetensors headers (BF16, all 30 layers):
+
+| Name | Shape | Role |
+|---|---|---|
+| `router.scale` | `[2816]` | per-channel gain on the router's normalized input |
+| `router.proj.weight` | `[128, 2816]` | router projection, `E x H`, no bias |
+| `router.per_expert_scale` | `[128]` | per-expert coefficient scale |
+| `experts.gate_up_proj` | `[128, 1408, 2816]` | **all 128 experts fused**, `E x 2I x H` |
+| `experts.down_proj` | `[128, 2816, 704]` | **all 128 experts fused**, `E x H x I` |
+| `mlp.{gate,up}_proj.weight` | `[2112, 2816]` | the dense shared expert |
+| `mlp.down_proj.weight` | `[2816, 2112]` | the dense shared expert |
+| `pre_feedforward_layernorm_2.weight` | `[2816]` | norm on the routed branch's input |
+| `post_feedforward_layernorm_1.weight` | `[2816]` | norm on the dense branch's output |
+| `post_feedforward_layernorm_2.weight` | `[2816]` | norm on the routed branch's output |
+
+The census over all 30 layers is exact: 30 of each of the above, 30
+`layer_scalar`, and **25** `self_attn.v_proj.weight` — the five global layers
+carry none, which is the serialized form of `attention_k_eq_v`, exactly as the
+31B's ten global layers do. Two facts the handover named are confirmed here and
+a third is added: experts are fused per layer; every layer carries a dense `mlp`
+beside its routed experts; and **the MoE block adds three norms per layer**, not
+one, so the routed and dense branches each have their own input and output
+normalization.
+
+### The reference the equations come from
+
+The frozen legacy tree has **no Gemma 4 MoE**: its `gemma4` adapter is the dense
+31B path, and `grep` for `per_expert_scale`, `router.scale`, `enable_moe_block`
+and `gate_up_proj` across it returns only unrelated GLM-5.2 routing text and a
+timing counter. So the pinned reference for this task is the released
+`transformers` implementation, read as source and **never executed**:
+
+- `transformers/models/gemma4/modeling_gemma4.py`, class `Gemma4TextRouter`,
+  `Gemma4TextExperts` and `Gemma4TextDecoderLayer.forward`.
+- Three independent copies were compared: `transformers` 5.5.3 under
+  `~/miniconda3`, another 5.5.3 under `~/Developer/heretic/.venv`, and 5.15
+  under the legacy tree's `experiments/tools/`. The router and expert
+  mathematics are identical in all three. **One difference exists and is
+  recorded rather than averaged:** 5.15 computes the router softmax with
+  `dtype=torch.float32` and comments "fp32 for numerical stability"; 5.5.3
+  computes it in the input dtype. The artifact declares 5.5.0.dev0.
+- `transformers/modeling_rope_utils.py:187` `_compute_proportional_rope_parameters`
+  confirms task 0016's global-layer reading — `rope_angles = partial · head_dim // 2`
+  with the exponent denominator the **full** head dimension, and a zero-padded
+  tail that is an identity rotation. No new RoPE gap.
+
+## Bounded deliverable
+
+**One concrete outcome:** the shared operation catalogue gains routed-expert
+mathematics — router score transformation with its tie rule, selection,
+renormalization and per-expert coefficient scale; grouped compute over a fused
+expert tensor; and a combination whose reduction order is a stated parameter —
+each with an independent FP64 transcription and a registered oracle. Two
+unrelated graphs consume them: a reduced Gemma-4-MoE-like text graph whose
+routed branch sits beside a dense shared expert, and a synthetic MoE with a
+different expert count, top-k, activation, shapes and route distribution.
+
+**Sole owning shared component:** `moxie-graph` owns the operation parameters;
+`moxie-oracles` owns every equation and its FP64 transcription; `moxie-interp`
+dispatches to them. `moxie-models::gemma4` gains metadata and graph composition
+**only**.
+
+**Allowed production files:**
+
+- `crates/moxie-graph/src/graph.rs` — `OpParams::Route`, `OpParams::ExpertMlp`,
+  `OpParams::Combine`; the `ValueRole` a route table carries; partition rules
+  and state effects for the three.
+- `crates/moxie-graph/src/lib.rs` — oracle registration for the three.
+- `crates/moxie-oracles/src/route.rs` — the router transform, the fused-expert
+  grouped compute, and the ordered combination. The existing `route_row`,
+  `dispatch`, `required_experts` and `combine` keep their current behaviour and
+  their current callers.
+- `crates/moxie-interp/src/tensor.rs`, `crates/moxie-interp/src/lib.rs` — the
+  route-table value and the three evaluation arms.
+- `crates/moxie-models/src/gemma4.rs` — MoE configuration fields, the
+  artifact's declared MoE geometry as a constant, the routed-branch tensor
+  roles, and the layer composition.
+- `crates/moxie-cli` — the second synthetic consumer and the disclosure surface.
+- Their tests and manifests, the architecture allowlist and negative fixtures,
+  `Cargo.lock`, and tracked task/evidence/model/handover records.
+
+**Explicit non-goals and forbidden shortcuts.** No residency authority, no
+expert cache, no chunk identity, no demand or prefetch class, no eviction, no
+placement, no reservation — **all of that is task 0020**, and a simulated
+placement presented as a reservation is a failed task, not a partial one. No CPU
+expert fallback and no grouped GPU candidate plan (M2 item 3). No CUDA and no
+device kernel; the selected BF16 device chain must **refuse** these operations
+as `UnsupportedKernel` rather than acquire a routed path. No checkpoint import,
+no dequantization, no conversion, no download, no write of any kind under
+`/models` or `/fast/models`. No vision and no audio tower — M11. No expert
+parallelism or partition decision — M5, and the partition rule fails closed
+until then. No second weight-residency owner anywhere. No unbounded queue and no
+demand path at all, because there is no demand path in this task. **No
+synthetic graph may be described as model support**, and a routed synthetic
+graph is not Gemma 4 MoE support: the reduction list stays and the CLI keeps
+printing it first. No quality claim — that is O2's, and it needs paired output
+against the released model.
+
+**Existing consumers and second-shape proof.** Every current consumer of
+`OpParams` must keep passing unchanged: the dense reduced Gemma graph, the task
+0015 synthetic graph, the paged and sampling gates, and the selected device
+chain's refusals. The new operations get two independent consumers with
+deliberately opposite parameters:
+
+| | Gemma-4-MoE-like reduced graph | Second synthetic MoE |
+|---|---|---|
+| Experts / top-k | 128-shaped rule at reduced count, top-k > 1 | a different count, a different top-k, including `top_k == experts` |
+| Activation | GeGLU (`gelu_pytorch_tanh`) | SwiGLU |
+| Shared expert | present, dense, combined outside routing | absent |
+| Per-expert coefficient scale | present | absent (unit) |
+| Combination order | ascending expert id | route order (descending score) |
+| Route distribution | overlapping across rows | disjoint, plus an all-rows-to-one-expert case |
+
+## Contract before implementation
+
+### Equations
+
+Written for one row. `H` is hidden width, `E` expert count, `K` top-k, `I` the
+routed intermediate width. `s` is `router.scale`, `W_r` is
+`router.proj.weight`, `c` is `router.per_expert_scale`, `GU[e]` and `D[e]` are
+expert `e`'s slices of the fused tensors.
+
+**Router** (`Gemma4TextRouter.forward`):
+
+```text
+n  = x · (mean(x²) + ε)^(−1/2)                  scale-free RMS norm, ε = rms_norm_eps
+t  = n ⊙ s · H^(−1/2)
+z  = W_r · t                                     [E], no bias
+p  = softmax(z)                                  over all E experts
+(idx, w) = top_k(p, K)                           descending p; ties → lower expert id
+w  = w / Σ w                                     renormalised over the selected K
+w  = w ⊙ c[idx]                                  per-expert scale, applied last
+```
+
+Two properties are load-bearing and must be tested as such. `H^(−1/2)` is
+`hidden_size**-0.5` in the reference and is **not** a norm epsilon or an
+attention scale; it multiplies the router input only. And the final coefficients
+**do not sum to one** — the per-expert scale is applied *after* renormalization
+and is never renormalized away. A combine that renormalizes again would erase a
+trained parameter.
+
+**Tie rule.** `torch.topk`'s behaviour on equal values is not a contract. The
+shared rule is the one `moxie-oracles::route` already pins for the same reason
+document 05 pins it for sampler ties: **the lower expert id wins**, so two ranks
+cannot route one row to two different experts.
+
+**Expert** (`Gemma4TextExperts.forward`), for each selected `e`:
+
+```text
+gu   = GU[e] · x₂                                [2I], GU[e] is [2I, H]
+gate = gu[0 .. I]                                the first block
+up   = gu[I .. 2I]                               the second block
+h    = act(gate) ⊙ up                            act = gelu_tanh for this family
+y_e  = D[e] · h                                  [H], D[e] is [H, I]
+```
+
+The gate/up split is `chunk(2, dim=-1)` on the projection output, so the fused
+tensor's output axis is the **gate block followed by the up block**, not
+interleaved pairs. That is a logical-order statement read from the pinned
+reference; physical disk layout is the importer's problem (document 03) and this
+task does not read tensor bytes.
+
+**Combine**:
+
+```text
+y = Σ_j  w[j] · y_{idx[j]}                       over the K selected slots
+```
+
+with the summation order an explicit parameter. The pinned reference iterates
+`expert_hit`, which is `nonzero()` over an expert-major mask, so its reduction
+order is **ascending expert id** — not the row's selection order. Floating-point
+addition is not associative, so this is a semantic parameter rather than a
+scheduling detail, and both orders are implemented and tested.
+
+**Layer composition** (`Gemma4TextDecoderLayer.forward` with
+`enable_moe_block`), where `r` is the post-attention residual stream:
+
+```text
+m  = mlp( pre_ffn_norm(r) )                      dense shared expert, width 2112
+h₁ = post_ffn_norm_1(m)
+route = Route(r)                                 ← r, NOT pre_ffn_norm(r)
+h₂ = post_ffn_norm_2( Combine(route, ExpertMlp(pre_ffn_norm_2(r), route)) )
+u  = h₁ + h₂
+r' = ( r + post_ffn_norm(u) ) · layer_scalar
+```
+
+The router consumes the **un-normalized** residual while the experts consume
+`pre_feedforward_layernorm_2` of it. Feeding the router the normalized stream
+would be an ordinary-looking graph that routes every row on the wrong vector.
+The dense branch is a shared expert **outside** routing: its output is added
+after both branches have been normalized, and it takes no routing coefficient.
+`layer_scalar` still applies to the whole layer output, as task 0016 pinned.
+
+### Shapes, precision, accumulation and rounding
+
+- `Route` inputs `[rows, H]` activation, `[H]` weight, `[E, H]` weight, `[E]`
+  weight; output a route table of `[rows, K]`, carrying **integer** expert ids
+  and **activation** coefficients as two role-separated fields. Document 02:
+  indices "are not quantized weights or floating activations", and a route table
+  that typed its ids as floats would be exactly that error.
+- `ExpertMlp` inputs `[rows, H]`, the route table, `[E, 2I, H]`, `[E, H, I]`;
+  output `[rows · K, H]`, slot-major, slot `j` of row `r` at index `r · K + j`.
+  Emitting per-slot outputs rather than a combined row is what keeps `Combine` a
+  separately testable operation, which document 09 §D requires of anything that
+  could have been fused.
+- `Combine` inputs the route table and `[rows · K, H]`; output `[rows, H]`.
+- Arithmetic follows the existing interpreter contract exactly: oracles compute
+  in FP32 with sequential ascending reductions, and the **node output** is the
+  BF16 rounding boundary. The router softmax is computed in FP32, which is the
+  5.15 reference's stated convention; the 5.5.3 delta is recorded above.
+- **One declared deviation from the reference, with its bound.** The reference
+  rounds each expert's weighted contribution to BF16 *before* accumulating
+  (`current_hidden_states.to(dtype)` then `index_add_`). This interpreter
+  accumulates the `K` terms in FP32 and rounds once at the node boundary. The
+  difference is bounded by `metric::bound(K, Σ|w_j · y_j|)` plus one BF16
+  rounding, it is declared here rather than discovered later, and it is not a
+  quality statement either way: closing it needs paired output against the
+  released model, which is **O2**. The *order* of the reduction is pinned
+  regardless, because order changes the result at any precision.
+- No new tolerance is invented. Selection is checked **exactly** — ids and their
+  order are integers and must match the FP64 transcription bit for bit.
+  Coefficients and expert outputs are checked against `moxie-oracles::metric`
+  bounds assembled from the counted rounding steps of each equation, in the same
+  style as the existing attention bound.
+
+### Partition and hardware capabilities
+
+- `Route` is `PartitionRule::Replicated`. Every rank must compute the same route
+  from the same row; a sharded router that reduced across ranks could produce
+  different selections under different reduction orders, and two ranks that
+  disagree about which expert a row needs is a residency bug as well as a
+  numerical one.
+- `ExpertMlp` and `Combine` are `PartitionRule::NotDetermined`, failing closed.
+  Expert partitioning is M5 and this task does not pre-empt it.
+- No device capability is claimed. `moxie-plan`'s selected BF16 chain refuses
+  every operation outside its qualified package, and these three stay outside
+  it; a test asserts the refusal rather than assuming the catch-all covers it.
+
+### Peak memory, transfer dependencies, lease lifetime
+
+None are introduced. This task allocates host tensors inside the existing
+interpreter and its existing counted-allocator envelope; there is no device
+buffer, no upload, no event and no lease. The routed intermediate values
+(`[rows · K, H]`) are the one new peak term and are charged through the existing
+admission path like any other activation.
+
+The arithmetic that **task 0020** will need is recorded now, from the artifact's
+own declared geometry, as a projection and not a measurement:
+
+| Quantity | Bytes |
+|---|---|
+| One expert, one layer (`2·704·2816·2 + 2816·704·2`) | 11,894,784 (11.34 MiB) |
+| All 128 experts, one layer | 1,522,532,352 (1.42 GiB) |
+| All experts, 30 layers | 45,675,970,560 — **88.5%** of the artifact's 51.6 GB |
+| Dense shared expert, 30 layers | 1,070,530,560 |
+| Top-k 8 over 30 layers, one token, no reuse | 2,854,748,160 |
+
+Against 24 GiB (25.77 GB) on the largest single device and 63.9 GiB (68.6 GB)
+aggregate: the artifact fits aggregate VRAM and **no single device**, and M2
+item 4's intentionally restricted budget makes it oversized by construction.
+Document 03's warning applies directly to the last row — the union of experts a
+row batch demands is what must be resident, and multiplying active experts by
+batch rows overstates it whenever routes overlap.
+
+### Cancellation, failure and rollback
+
+The three operations are pure: they touch no sequence state, so
+`Op::touches_state` stays false for all three and a cancelled step has nothing
+to roll back. The interpreter's existing per-operation cancellation boundary
+covers them. Typed failures, never a silent clamp: an empty expert set, a
+`top_k` of zero or greater than `E`, a non-finite router logit or scale, a
+selected mass that is zero or non-finite, an expert id outside `0..E`, a fused
+tensor whose extent does not equal `E · 2I · H` or `E · H · I`, and a slot
+tensor whose row count is not `rows · K` are each an `InvalidRequest`,
+`InvalidArtifact` or `Numerical` error at the point of detection.
+
+### Independent oracle and predeclared metrics
+
+Every new equation gets an FP64 transcription in the test module, written from
+the pinned reference rather than from the implementation, and each operation is
+registered in the `OracleRegistry` so that an unregistered operation still
+cannot be built into a graph. Reported per document 07: max, RMS and p99 error,
+not a maximum alone.
+
+Predeclared, before any code:
+
+1. Selected expert ids and their order: **exact** agreement, including every tie
+   fixture.
+2. Router coefficients: within `metric::bound` for the counted chain
+   (norm over `H`, the two scalings, the `H`-term projection, the softmax, the
+   `K`-term renormalization, the per-expert multiply).
+3. Expert outputs: within `metric::bound` for the `H`-term and `I`-term
+   reductions plus the activation's own declared bound.
+4. Combination: within `metric::bound(K, Σ|terms|)`, with the summation order
+   fixed by the parameter under test.
+5. The load-bearing regression: substituting the conventional value for each new
+   parameter — a unit `router.scale`, a unit `per_expert_scale`, `H^(−1/2)`
+   replaced by 1, the router fed the normalized stream instead of the residual,
+   the shared expert dropped, the gate/up blocks swapped, and the combination
+   order flipped — **must change the graph's logits**. A parameter that can be
+   swapped without changing the result is a failed acceptance.
+
+### Application compatibility and sampler implications
+
+None. No protocol, template, tokenizer, sampler or CLI contract changes; the CLI
+gains a routed fixture and keeps its existing disclosure. Logits still come from
+the same tied vocabulary projection with the same softcap.
+
+## Acceptance
+
+- Per-operation oracle agreement against the FP64 transcriptions at two distinct
+  shapes each, including the boundary cases: `top_k == 1`, `top_k == E`, an
+  exact tie spanning the `k` boundary, an expert that receives no rows, an
+  expert that receives every row, nonuniform row counts, a repeated route within
+  one batch, and a route whose union is strictly smaller than `rows · K`.
+- The load-bearing substitution suite above, all seven cases.
+- Generation through the shared service and the CLI for the routed reduced
+  graph and the second synthetic MoE: one and multiple tokens, whole versus
+  chunked prefill agreeing bit for bit, greedy and temperature, fixed-seed
+  service/CLI agreement, cancellation then a second generation, exactly one
+  terminal event.
+- Allocation: counting-allocator peak below the recomputed admitted envelope
+  with the routed intermediate included, repeated generations retain no growth,
+  every tier charge returns to baseline.
+- The device-path refusal: the selected BF16 chain returns `UnsupportedKernel`
+  for `Route`, `ExpertMlp` and `Combine`, asserted explicitly.
+- Architecture: `xtask arch-check` passes with `moxie-models` still depending on
+  nothing but `moxie-types`, `moxie-graph` and `moxie-model-api`, plus a new
+  negative fixture proving a model crate that reaches for a residency or cache
+  symbol is rejected.
+- All prior gates still pass unchanged: `G-INTERP-BF16`, `G-PAGED-HOST`,
+  `G-PAGED-ALLOCATION`, `G-KV-RETENTION`, `G-WINDOW-ALLOCATION`,
+  `G-SAMPLING-HOST`, `G-SAMPLING-ALLOCATION`, `G-GENERATION-HOST`,
+  `G-GENERATION-ALLOC`, `G-GEMMA-REDUCED`, `G-HOST-ARCH`.
+- Support matrix: one new gate `G-MOE-ROUTING-HOST`, whose limit column says in
+  its own words that it is synthetic, host-only, unrouted to any real weight,
+  and **not Gemma 4 MoE support**.
+- Documentation: this contract's Result section filled in with passed, failed
+  and skipped kept separate; the [gemma4 bring-up record](../models/gemma4.md)
+  extended with the MoE variant's inventory, tensor-role mapping and blockers;
+  a handover naming task 0020.
+
+**Exact condition requiring owner direction or task rejection.** If the routing
+mathematics cannot be expressed through shared operations without either a
+model-owned execution path or a second residency owner, stop and report rather
+than widening `moxie-models`. If the 5.5.3-versus-5.15 softmax-dtype difference
+turns out to change *selection* rather than only coefficient precision on any
+fixture, stop: that is a reference ambiguity about the artifact's own behaviour
+and it belongs to the owner with O2, not to a default chosen here.
+
+## Result, filled after work
+
+Not started.

@@ -2,28 +2,32 @@
 
 ## Current assignment and milestone handoff
 
-**M1.4 complete; M1.5 active.** The owner accepted
-[task 0012](0012-m1-selected-bf16-device-chain.md) on 2026-09-10, including corrections through
-`1138a2a` and their evidence at `ce7548d`.
+**M1 complete (M1.5 closed 2026-09-12); M2 active.** See
+[the closure handover](../handovers/2026-09-12-m1-closure-to-m2.md) for M1's
+exit evidence gate by gate, and
+[the owner-gate register](../decisions/owner-gates.md) for the partial O1 ruling
+that designated `/fast/models/google/gemma-4-26B-A4B-it` as M2's BF16 MoE.
 
-[Task 0013](0013-m1-appendable-paged-state.md) is accepted after independent review
-through `0f39cf5`. Contract `a80ff2c` preceded implementation `c14e32a`; correction
-`c9a4b33` fixes the sole reported error-classification issue.
+Accepted through M1: tasks 0003–0015 (shared tensors and interpreter, sequence
+transactions, manifest and bounded reads, resource ledger and admission,
+event-backed leases, device arena, admitted graph resource plan, selected BF16
+device chain, appendable paged state, transactional sampler history, generation
+service and diagnostic CLI), [0016](0016-m1-gemma-reduced-graph.md) (reduced
+Gemma graph), [0017](0017-m4-per-layer-kv-geometry-and-window-eviction.md)
+(per-layer paged geometry and window reclamation, accepted 2026-09-12) and
+[0018](0018-m3-compressed-tensors-int8-importer.md) (compressed-tensors
+importer, accepted 2026-09-12 within its import-only scope).
 
-The owner accepted the bounded M1.4
-[task 0014](0014-m1-transactional-sampler-history.md) on 2026-09-11 after independent
-review of `23a7a40` / `1e6f253` (contract `4054dd7`): sampler history and deterministic greedy/temperature distribution,
-using task 0004's accepted transaction mechanism for
-history rollback.
+[Task 0019](0019-m2-routed-expert-semantics.md) is **proposed**: M2 item 1's
+routed-expert mathematics — router score transform with its tie rule,
+selection, renormalization and per-expert coefficient scale; grouped compute
+over a fused expert tensor; and an ordered combination — with FP64 oracles and
+two independent consumers. It deliberately excludes M2 item 2's residency
+authority, which is task 0020, because the authority admits against a demand set
+the routing equation defines. **Nothing executes a checkpoint**, and a routed
+synthetic graph is not MoE model support.
 
-The owner accepted [task 0015](0015-m1-generation-service-diagnostic-cli.md),
-shared generation service and minimal diagnostic CLI, implemented at `f7cff56`
-after contract `2fbacec`. Corrections `5990f2a` and `7a08adf` address the independent
-review and re-review findings; final review through `3f13784` found no remaining
-blocker. Acceptance closes M1.4 within its documented synthetic host-reference
-scope. M1.5 is active; its first bounded contract has not yet been authored. M4
-device attention remains a separate gate. Reopen accepted tasks only for a
-demonstrated defect in accepted scope.
+Reopen accepted tasks only for a demonstrated defect in accepted scope.
 
 One file per bounded assignment, `NNNN-slug.md`. Use [TASK.md](../spec/templates/TASK.md).
 
