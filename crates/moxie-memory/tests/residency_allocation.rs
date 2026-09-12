@@ -226,3 +226,128 @@ fn ten_thousand_failed_reads_retain_nothing_and_charge_nothing() {
     std::hint::black_box(&a);
     a.close(&mut l).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Independent review finding 7: the admitted envelope must cover the real heap
+// ---------------------------------------------------------------------------
+
+/// The control envelope is a **bound**, not an estimate.
+///
+/// The defect this pins was measured by an independent review: a flat 512 bytes
+/// per placement against 166,361 bytes of retained heap for a 49,216-byte
+/// envelope, because a chunk identity is two heap strings and both the index and
+/// the placement held a copy. Two things changed. The identity is stored once
+/// behind an `Arc` that both share, and its length is declared by
+/// `max_identity_bytes` and **enforced on every acquire** -- so the per-placement
+/// charge covers a quantity the authority refuses to exceed.
+///
+/// This runs at the declared maximum, which is the only length worth measuring:
+/// anything shorter has slack by construction.
+#[test]
+fn the_control_envelope_covers_the_real_heap_at_the_declared_bound() {
+    let _probe = probe();
+    const N: u32 = 64;
+    const ID: u32 = 768;
+
+    let mut l =
+        Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 30, 1 << 20).unwrap()]).unwrap();
+    // Identities exactly at the bound: 512 bytes of artifact, 256 of role.
+    let ids: Vec<ChunkId> = (0..N)
+        .map(|i| {
+            ChunkId::new(
+                ArtifactId::new("a".repeat(512)).unwrap(),
+                TensorSlot::expert("r".repeat(256), i).unwrap(),
+                LogicalRange::new(0, CHUNK).unwrap(),
+                1,
+            )
+        })
+        .collect();
+    assert_eq!(ids[0].identity_bytes(), u64::from(ID));
+
+    let before = LIVE.load(SeqCst);
+    let mut a = ResidencyAuthority::open(
+        &mut l,
+        &ResidencyRequest::new("envelope", u64::from(N) * CHUNK)
+            .max_placements(N)
+            .max_leases(1)
+            .max_identity_bytes(ID),
+    )
+    .unwrap();
+    for id in &ids {
+        load(&mut a, id, 0);
+    }
+    let heap = (LIVE.load(SeqCst) - before) as u64;
+    let admitted = l.scope_committed(Scope::Host);
+    assert!(
+        heap <= admitted,
+        "retained heap {heap} B exceeds the admitted envelope {admitted} B; the \
+         per-placement control charge is not a bound"
+    );
+    // And the envelope is not absurdly loose either: a charge ten times the
+    // truth would pass the assertion above while starving everything else.
+    assert!(
+        admitted <= heap * 3,
+        "envelope {admitted} B against {heap} B of real heap is not a useful bound"
+    );
+    println!("retained heap {heap} B within admitted envelope {admitted} B");
+    std::hint::black_box(&a);
+    a.close(&mut l).unwrap();
+}
+
+/// Dropping an authority with a transfer in flight **withholds** its host
+/// storage rather than freeing it.
+///
+/// Finding 2. `close` refuses over in-flight work, but a caller can drop
+/// instead, and dropping a `Vec` returns its pages to the allocator while a
+/// host-to-device copy may still be reading them by address. Document 02:
+/// "Rust `Drop` alone must not free in-flight CUDA memory." The pages are
+/// therefore abandoned, which this measures: a settled authority gives its
+/// bytes back, an in-flight one does not.
+#[test]
+fn dropping_an_authority_over_an_in_flight_transfer_withholds_its_host_storage() {
+    let _probe = probe();
+    const CAP: u64 = 1 << 20;
+
+    // Settled: dropping returns every byte.
+    let settled = {
+        let mut l =
+            Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 30, 1 << 20).unwrap()]).unwrap();
+        let before = LIVE.load(SeqCst);
+        {
+            let mut a =
+                ResidencyAuthority::open(&mut l, &ResidencyRequest::new("settled", CAP)).unwrap();
+            load(&mut a, &chunk(0), 0);
+        }
+        (LIVE.load(SeqCst) - before) as u64
+    };
+
+    // In flight: dropping keeps the pages mapped.
+    let withheld = {
+        let mut l =
+            Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 30, 1 << 20).unwrap()]).unwrap();
+        let before = LIVE.load(SeqCst);
+        {
+            let mut a =
+                ResidencyAuthority::open(&mut l, &ResidencyRequest::new("in flight", CAP)).unwrap();
+            let id = chunk(0);
+            let Acquired::Pending { lease, .. } = a.acquire(request(&id, 0)).unwrap() else {
+                panic!("absent")
+            };
+            assert_eq!(a.in_flight_placements(), 1);
+            drop(lease);
+        }
+        (LIVE.load(SeqCst) - before) as u64
+    };
+
+    assert!(
+        settled < CAP,
+        "a settled authority must give its host cache back, retained {settled} B"
+    );
+    assert!(
+        withheld >= CAP,
+        "an authority dropped over a transfer must withhold its host cache; \
+         retained only {withheld} B of a {CAP} B cache, so the pages a copy may \
+         still be reading went back to the allocator"
+    );
+    println!("settled drop retained {settled} B; in-flight drop withheld {withheld} B");
+}

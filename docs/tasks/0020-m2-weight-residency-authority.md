@@ -1,9 +1,11 @@
 # Task 0020 — M2 weight-residency authority
 
-Status: **implemented at the commit this record accompanies; awaiting
-independent review and owner acceptance.** Contract written and committed at
-`d6e9170` before implementation, per the working rule that produced tasks
-0013–0019. See [Result](#result-filled-after-work).
+Status: **implemented and corrected after independent review; awaiting owner
+acceptance.** Contract written and committed at `d6e9170` before implementation,
+per the working rule that produced tasks 0013–0019. The review found **nine**
+issues; all nine were reproduced and fixed, and none was disputed. See
+[Result](#result-filled-after-work) and
+[Independent review](#independent-review-and-what-it-changed).
 
 ## Identity and authority
 
@@ -562,8 +564,8 @@ task does **not** close M2.
 | `cargo fmt --all -- --check` | **passed** |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed** |
 | Device-lane clippy (`moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`) | **passed** |
-| `cargo test --workspace --locked --offline` | **795 passed, 0 failed** (736 before this task) |
-| Device-feature workspace tests | **815 passed, 0 failed** |
+| `cargo test --workspace --locked --offline` | **806 passed, 0 failed** (736 before this task) |
+| Device-feature workspace tests | **826 passed, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | **passed**, 10 documents |
 | `cargo xtask arch-check` | every rule and every fixture passes, including the new `a second weight-residency owner` with its three fixtures. **4 pre-existing failures remain**, all from the untracked review crate under `results/task0014-independent-review-2026-09-11/probes/`; the identical four lines are in `results/task0015/arch-local.log` |
@@ -599,7 +601,7 @@ Raw logs: `results/task0020/` (untracked, per `docs/README.md`).
 | Retained heap after 10,000 cycles | 0 | **0**, for demand/evict and for failed reads |
 | Authority vs. arena vs. ledger | equal | **equal** after every case |
 | Charge after `end_turn` with no next token | baseline | **baseline** |
-| Demand refusal when all entries leased | immediate, typed | **immediate**; there is no waiting path in the API |
+| Demand refusal when all entries leased | immediate, typed | **immediate**; there is no waiting path in the API. **A nonblocking `acquire` is not by itself deadlock freedom** — the review found a cycle between the demand counter and the prefetch gate that `acquire` never touches. That cycle is fixed and tested; the absence of a waiting path remains necessary, not sufficient |
 | Victim sequence for a fixed trace | the predeclared list | **exact** |
 | Prefetch evicted before demand | always | **always**; a prefetch that would displace demand data is refused instead |
 | `ConditionalTable` resident bytes | never below the floor | **never** |
@@ -626,6 +628,43 @@ impact to be *recorded*; there is no baseline on this machine to compare them
 against, and a number without one would be the unsupported performance claim
 AGENTS.md forbids. `ResidencyStats` carries the counters; **no performance claim
 follows from them.**
+
+### Independent review, and what it changed
+
+**Nine findings. All nine reproduced against this tree; none disputed.** Four
+were P1 and one of those was a panic. The review's probes are preserved at
+`results/task0020/independent-review-2026-09-12/` (untracked).
+
+| # | Finding | Reproduced as | Fix |
+|---|---|---|---|
+| 1 | **Device allocations were not bound to their reservation.** `DeviceResidency::create` took a shared borrow and allocated, so two caches could exist against one reservation; `close` then released the charge while both stayed live and readable | **8 MiB live on a real 3090 against a 4 MiB charge**, and readback still worked after `close` | A `DeviceBacking` entitlement, one per scope, claimed before the allocation. `close` refuses while one is out; `return_backing` refuses while placements name ranges inside it, and hands it back so a retry is possible |
+| 2 | **Unknown upload completion did not retain the physical host allocation.** `close` refuses over in-flight work, but a *drop* freed the `Vec` a copy may still be reading by address | code inspection, then measured | `HostBuffer::withhold` plus a `Drop` that abandons the pages when anything is in flight. The charge stays visible — document 02's rule, and the same trade `moxie-executor` makes for a lost context |
+| 3 | **Cancelling a host reader destroyed a device waiter's source**, then panicked | `no entry found for key` | `drop_if_unheld`: a cancellation retires the *intent*, never bytes a surviving consumer still holds |
+| 4 | **Prefetch-to-demand promotion stranded work, and could deadlock.** Promotion de-queued the ticket but returned `Coalesced`, so nobody owned the order; and a device demand waiting on a queued prefetch waited for a read `next_prefetch` refused to release | two probes | Promotion returns the order it de-queued, and priority propagates **through** the dependency: a demand blocking on a queued prediction promotes it and is handed its read |
+| 5 | **A released prefetch upload could be issued twice** — returned by `complete_read` and still in the queue | both orders observed for one ticket | A still-queued ticket keeps its upload in the queue; a prediction's upload does not jump the demand queue, and is issued once from there |
+| 6 | **Expiring blocked demand left a stale demand count**, blocking the queue forever | prefetch never released after the blocked ticket expired | The counter follows ticket **membership**, not issuance, on both sides |
+| 7 | **The control envelope undercounted the real heap** — a flat 512 B per placement | **166,361 B retained against a 49,216 B envelope** | The identity is stored once behind an `Arc` both holders share; its length is declared by `max_identity_bytes` and **enforced on every acquire**; the fixed part is now a measured 1,024 B (measured at 655.7 / 634.1 / 631.3 B for 64 / 256 / 1,024 placements). A gate measures heap against the envelope at the declared bound |
+| 8 | **Device admission bypassed `max_placements`** — one check, two placements created | `max_placements(1)` produced two | The check reserves every placement the acquire will create |
+| 9 | **Conditional tables were accepted with a zero floor**, making every entry an eviction candidate | accepted | Refused, naming ADR 0009's "never zero-resident" |
+
+**One point of the review I resolved differently, and it is worth stating.**
+Finding 5's probe asserts the released upload comes back from `complete_read`.
+It does not: it stays in the prefetch queue and `next_prefetch` issues it. The
+defect — *the same upload issued twice* — is fixed either way, and a test asserts
+the exactly-once invariant directly. Returning it from `complete_read` would let
+a prediction's copy jump ahead of demand, which is the one-way rule document 03
+states. This is a disagreement about one line of the probe, not about the finding.
+
+The review's closing point is the one worth carrying forward: **"A nonblocking
+`acquire` does not establish deadlock freedom."** That was this task's own claim
+about its own mechanism, and finding 4 disproved it — the cycle was not in
+`acquire` at all but between the demand counter and the prefetch gate. The
+claim is corrected below and the property is now tested rather than argued.
+
+Every finding has a regression. Findings 3, 4a, 4b, 5, 6, 8, 9 and the identity
+bound are in `crates/moxie-memory/tests/residency.rs`; findings 2 and 7 are
+measured in `residency_allocation.rs`; finding 1 is checked on the host lane and
+on all three cards in `residency_device.rs`.
 
 ### What was **not** delivered, and why
 

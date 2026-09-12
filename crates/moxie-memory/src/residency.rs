@@ -37,6 +37,7 @@
 //!   R08's leak was invisible, not large.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use moxie_types::{DeviceTier, DeviceUuid, Error, HostTier, Result, Scope, Tier};
@@ -54,16 +55,32 @@ use crate::request::{BufferRequest, PlanRequest, StageSpan};
 /// alignment, so no allocation can ask for more than the arena guarantees.
 pub const CACHE_ALIGNMENT: u64 = 256;
 
-/// Declared control cost of one tracked placement, in bytes.
+/// Declared control cost of one tracked placement, **excluding its identity**.
 ///
-/// Charged up front as `max_placements * PLACEMENT_CONTROL_BYTES` so the
-/// authority's own bookkeeping is admitted rather than assumed free. It covers
-/// the placement record, its map node, the interned identity and the waiter
-/// slot. It is an over-estimate on purpose: an under-estimated control budget
-/// is an unadmitted allocation, which is the thing document 03 calls out when
-/// it says mapped virtual bytes are not committed host RAM and "neither is
-/// free".
-pub const PLACEMENT_CONTROL_BYTES: u64 = 512;
+/// Charged up front as
+/// `max_placements * (PLACEMENT_CONTROL_BYTES + max_identity_bytes)`, so the
+/// authority's own bookkeeping is admitted rather than assumed free. This
+/// constant covers the fixed part: the placement record, the two map nodes that
+/// reach it, the shared identity's own header, and the ticket slot.
+///
+/// The identity is charged **separately and from a declared bound**, because
+/// guessing it was a real defect. A flat 512 bytes per placement was measured
+/// by an independent review at 166,361 bytes of retained heap against a 49,216
+/// byte envelope, because a chunk identity is two heap strings that the index
+/// and the placement each held a copy of. Two things changed: the identity is
+/// now stored **once** behind an `Arc` that both share, and its length is
+/// bounded by [`ResidencyRequest::max_identity_bytes`] and **enforced on every
+/// acquire**. An envelope derived from a bound nobody checks is not an
+/// envelope, and document 03 is blunt about the class of error: mapped virtual
+/// bytes are not committed host RAM, and "neither is free".
+///
+/// The value is **measured, not chosen**. With the identity charged separately,
+/// the fixed part was measured at 655.7, 634.1 and 631.3 bytes per placement for
+/// 64, 256 and 1,024 placements -- converging from above as the map nodes fill.
+/// 1,024 is the next power of two above the worst of those, and
+/// `the_control_envelope_covers_the_real_heap_at_the_declared_bound` fails if a
+/// future change makes it untrue rather than leaving it to be rediscovered.
+pub const PLACEMENT_CONTROL_BYTES: u64 = 1024;
 
 /// Declared control cost of one lease slot, in bytes. Charged like a
 /// placement's: the lease table is real memory and a bounded one is still
@@ -73,6 +90,11 @@ pub const LEASE_CONTROL_BYTES: u64 = 64;
 /// Upper bound on a declared placement or lease count, so the control charge
 /// cannot overflow or quietly become the dominant cost.
 const MAX_DECLARED_PLACEMENTS: u32 = 1 << 22;
+
+/// The longest artifact identity and tensor role the constructors accept. They
+/// are the ceiling [`ResidencyRequest::max_identity_bytes`] is measured against.
+const MAX_ARTIFACT_BYTES: usize = 512;
+const MAX_ROLE_BYTES: usize = 256;
 
 fn invalid(field: &'static str, detail: impl Into<String>) -> Error {
     Error::InvalidRequest {
@@ -148,8 +170,11 @@ impl TensorSlot {
         if role.is_empty() {
             return Err(invalid("role", "a tensor role cannot be empty"));
         }
-        if role.len() > 256 {
-            return Err(invalid("role", "tensor role longer than 256 bytes"));
+        if role.len() > MAX_ROLE_BYTES {
+            return Err(invalid(
+                "role",
+                format!("tensor role longer than {MAX_ROLE_BYTES} bytes"),
+            ));
         }
         Ok(TensorSlot { role, expert })
     }
@@ -247,6 +272,15 @@ impl ChunkId {
 
     pub const fn len_bytes(&self) -> u64 {
         self.range.len_bytes
+    }
+
+    /// What this identity costs on the heap: its two strings.
+    ///
+    /// The rest of a `ChunkId` is inline, so this is the whole of what an
+    /// authority's control envelope has to cover per placement beyond its fixed
+    /// part.
+    pub fn identity_bytes(&self) -> u64 {
+        (self.artifact.0.len() + self.slot.role.len()) as u64
     }
 }
 
@@ -532,6 +566,57 @@ impl ResidencyLease {
     }
 }
 
+/// The right to back **one** scope's cache with **one** real allocation.
+///
+/// Finding 1 of the independent review is why this type exists. Without it,
+/// `DeviceResidency::create` took a shared borrow of the authority and
+/// allocated, so a caller could build two 4 MiB caches against one 4 MiB
+/// reservation -- measured on a real 3090 as 8 MiB of physical allocation
+/// against a 4 MiB charge -- and `close` would then release that charge while
+/// both allocations stayed live and readable. That is R02 with the sign
+/// flipped: the ledger saying zero while the card holds 8 MiB.
+///
+/// **Deliberately not `Clone`.** A second entitlement is a second allocation.
+/// Dropping one does **not** give it back: the authority keeps counting it, so
+/// [`ResidencyAuthority::close`] refuses and the leak is visible rather than
+/// silent -- the same rule [`Reservation`] and [`ResidencyLease`] carry.
+#[derive(Debug)]
+#[must_use = "an unreturned backing keeps its scope claimed; give it back with `return_backing`"]
+pub struct DeviceBacking {
+    authority: AuthorityId,
+    scope: Scope,
+    capacity: u64,
+}
+
+impl DeviceBacking {
+    pub const fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    /// Exactly the admitted capacity. A backing may not be larger than what was
+    /// reserved for it, and may not be smaller either: a short allocation would
+    /// make the authority's ranges address memory that does not exist.
+    pub const fn capacity(&self) -> u64 {
+        self.capacity
+    }
+}
+
+/// A backing the authority refused to take back, carrying it intact.
+#[derive(Debug)]
+#[must_use = "the scope is still backed; correct the cause and return it again"]
+pub struct ReturnBackingRefused {
+    pub backing: DeviceBacking,
+    pub error: Error,
+}
+
+impl core::fmt::Display for ReturnBackingRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for ReturnBackingRefused {}
+
 /// A release the authority refused, carrying the lease back.
 ///
 /// Consuming the lease on a *failed* release would destroy the only handle to a
@@ -780,7 +865,9 @@ pub struct TurnCleanup {
 
 #[derive(Debug)]
 struct Placement {
-    chunk: ChunkId,
+    /// Shared with the index entry that reaches it, so one identity costs one
+    /// allocation rather than two.
+    chunk: Arc<ChunkId>,
     scope: Scope,
     class: UseClass,
     state: ChunkState,
@@ -895,6 +982,13 @@ pub struct ResidencyRequest {
     pub device_caps: Vec<(DeviceUuid, u64)>,
     /// Bound on tracked placements. Its control cost is admitted up front.
     pub max_placements: u32,
+    /// Bound on one chunk identity's heap: `artifact` plus `role`, in bytes.
+    ///
+    /// Charged per placement **and enforced on every acquire**, so the control
+    /// envelope is a bound rather than a hope. An identity longer than this is
+    /// a typed refusal naming both lengths; nothing is truncated and nothing is
+    /// admitted unpriced.
+    pub max_identity_bytes: u32,
     /// Bound on simultaneously live leases. The table is allocated once at
     /// this size, so acquiring a resident chunk allocates nothing.
     pub max_leases: u32,
@@ -912,6 +1006,7 @@ impl ResidencyRequest {
             host_cap_bytes,
             device_caps: Vec::new(),
             max_placements: 4096,
+            max_identity_bytes: 256,
             max_leases: 4096,
             prefetch_queue_capacity: 64,
             conditional_floor_bytes: 0,
@@ -930,6 +1025,11 @@ impl ResidencyRequest {
 
     pub const fn max_leases(mut self, n: u32) -> Self {
         self.max_leases = n;
+        self
+    }
+
+    pub const fn max_identity_bytes(mut self, n: u32) -> Self {
+        self.max_identity_bytes = n;
         self
     }
 
@@ -962,16 +1062,20 @@ pub struct ResidencyAuthority {
     /// would have to *clone* the identity -- two heap allocations -- just to
     /// ask whether it was already resident. The hit path is the one path this
     /// task predeclares as allocation-free, and a gate measures it.
-    index: BTreeMap<Scope, BTreeMap<ChunkId, PlacementKey>>,
+    index: BTreeMap<Scope, BTreeMap<Arc<ChunkId>, PlacementKey>>,
     placements: BTreeMap<PlacementKey, Placement>,
     next_placement: u32,
     max_placements: u32,
+    max_identity_bytes: u32,
     tickets: BTreeMap<TicketId, Ticket>,
     /// Queued prefetch tickets in `(deadline, sequence)` order.
     prefetch_queue: Vec<(u64, u64, TicketId)>,
     prefetch_queue_capacity: u32,
     next_sequence: u64,
     outstanding_demand: u32,
+    /// Scopes whose cache has an outstanding physical backing. One at a time,
+    /// and `close` refuses while any is out.
+    claimed_backings: BTreeMap<Scope, bool>,
     conditional_floor_bytes: u64,
     conditional_resident: u64,
     /// The bounded lease table: one pre-allocated slot per declared lease, so
@@ -1024,8 +1128,19 @@ impl ResidencyAuthority {
                 format!("max_leases must be in 1..={MAX_DECLARED_PLACEMENTS}"),
             ));
         }
+        if request.max_identity_bytes == 0
+            || request.max_identity_bytes > (MAX_ARTIFACT_BYTES + MAX_ROLE_BYTES) as u32
+        {
+            return Err(invalid(
+                "max_identity_bytes",
+                format!(
+                    "max_identity_bytes must be in 1..={}",
+                    MAX_ARTIFACT_BYTES + MAX_ROLE_BYTES
+                ),
+            ));
+        }
         let control_bytes = u64::from(request.max_placements)
-            .checked_mul(PLACEMENT_CONTROL_BYTES)
+            .checked_mul(PLACEMENT_CONTROL_BYTES + u64::from(request.max_identity_bytes))
             .and_then(|p| {
                 u64::from(request.max_leases)
                     .checked_mul(LEASE_CONTROL_BYTES)
@@ -1175,11 +1290,13 @@ impl ResidencyAuthority {
             placements: BTreeMap::new(),
             next_placement: 0,
             max_placements: request.max_placements,
+            max_identity_bytes: request.max_identity_bytes,
             tickets: BTreeMap::new(),
             prefetch_queue: Vec::new(),
             prefetch_queue_capacity: request.prefetch_queue_capacity,
             next_sequence: 0,
             outstanding_demand: 0,
+            claimed_backings: BTreeMap::new(),
             conditional_floor_bytes: request.conditional_floor_bytes,
             conditional_resident: 0,
             lease_slots,
@@ -1187,6 +1304,17 @@ impl ResidencyAuthority {
             live_leases: 0,
             stats: ResidencyStats::default(),
         })
+    }
+
+    /// How many placements are in a state a transfer may still be touching.
+    ///
+    /// Non-zero means [`ResidencyAuthority::close`] will refuse, and means a
+    /// drop will withhold the host storage rather than free it.
+    pub fn in_flight_placements(&self) -> usize {
+        self.placements
+            .values()
+            .filter(|p| p.state.is_in_flight())
+            .count()
     }
 
     /// Release the envelope. Refused while anything is leased or in flight:
@@ -1204,6 +1332,14 @@ impl ResidencyAuthority {
                 format!("chunk {} is {}", p.chunk, p.state.name()),
             ));
         }
+        if let Some((scope, _)) = self.claimed_backings.iter().find(|(_, out)| **out) {
+            // Releasing the reservation now would let the ledger report zero
+            // while the card still holds the allocation it paid for.
+            return Err(invalid(
+                "close",
+                format!("{scope}'s cache is still physically backed; return its backing first"),
+            ));
+        }
         let keys: Vec<PlacementKey> = self.placements.keys().copied().collect();
         for key in keys {
             self.drop_placement(key);
@@ -1212,6 +1348,63 @@ impl ResidencyAuthority {
         if let Some(envelope) = self.device_envelope.take() {
             ledger.release(envelope).map_err(|refused| refused.error)?;
         }
+        Ok(())
+    }
+
+    /// Claim the right to back one scope's cache with one real allocation.
+    ///
+    /// Exactly once per scope per authority: a second claim is refused, because
+    /// a second allocation would be memory the reservation never covered.
+    pub fn claim_backing(&mut self, scope: Scope) -> Result<DeviceBacking> {
+        let capacity = self
+            .caches
+            .get(&scope)
+            .map(|c| c.cap_bytes)
+            .ok_or_else(|| invalid("scope", format!("no residency cache is open for {scope}")))?;
+        if self.claimed_backings.get(&scope).copied().unwrap_or(false) {
+            return Err(invalid(
+                "scope",
+                format!("{scope}'s cache is already backed; one allocation, one reservation"),
+            ));
+        }
+        self.claimed_backings.insert(scope, true);
+        Ok(DeviceBacking {
+            authority: self.id,
+            scope,
+            capacity,
+        })
+    }
+
+    /// Give a backing back, after its physical allocation is gone.
+    ///
+    /// Refused while the scope still holds placements: the ranges they name
+    /// live inside the allocation this entitlement stands for.
+    pub fn return_backing(
+        &mut self,
+        backing: DeviceBacking,
+    ) -> std::result::Result<(), ReturnBackingRefused> {
+        // A refusal hands the entitlement back. Consuming it here would destroy
+        // the only handle to a claim that is still outstanding -- the same
+        // shape of leak as R08, created by the error path instead of the happy
+        // one, and the reason `ReleaseRefused` and `ReleaseLeaseRefused` are
+        // written this way too.
+        let error = if backing.authority != self.id {
+            Some(invalid("backing", "backing belongs to another authority"))
+        } else if self.placements.values().any(|p| p.scope == backing.scope) {
+            Some(invalid(
+                "backing",
+                format!(
+                    "{} still holds placements; their ranges live in this allocation",
+                    backing.scope
+                ),
+            ))
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(ReturnBackingRefused { backing, error });
+        }
+        self.claimed_backings.insert(backing.scope, false);
         Ok(())
     }
 
@@ -1248,7 +1441,7 @@ impl ResidencyAuthority {
         self.placements
             .values()
             .map(|p| OutstandingChunk {
-                chunk: p.chunk.clone(),
+                chunk: (*p.chunk).clone(),
                 scope: p.scope,
                 state: p.state,
                 class: p.class,
@@ -1327,6 +1520,39 @@ impl ResidencyAuthority {
                 error: invalid(
                     "destination",
                     format!("no residency cache is open for {}", request.destination),
+                ),
+                report,
+            });
+        }
+        let identity_bytes = request.chunk.identity_bytes();
+        if identity_bytes > u64::from(self.max_identity_bytes) {
+            // The envelope was admitted from `max_identity_bytes`. Admitting a
+            // longer one would spend control memory nobody reserved, which is
+            // the exact defect this bound replaced.
+            let report = self.report_for(request.destination, request.chunk.len_bytes(), &[]);
+            self.stats.refusals = self.stats.refusals.saturating_add(1);
+            return Err(ResidencyRefused {
+                error: Error::CapacityExceeded {
+                    tier: Some(Tier::Host(HostTier::Pageable)),
+                    requested_bytes: identity_bytes,
+                    available_bytes: u64::from(self.max_identity_bytes),
+                },
+                report,
+            });
+        }
+        if request.class.content == Content::ConditionalTable && self.conditional_floor_bytes == 0 {
+            // ADR 0009 is explicit: a conditional-memory class is NVMe-backed
+            // with an admitted footprint and **never zero-resident**. A class
+            // with no floor is one whose every entry is an eviction candidate,
+            // which is the zero-resident case wearing the class's name. Refused
+            // here rather than left to a caller to remember.
+            let report = self.report_for(request.destination, request.chunk.len_bytes(), &[]);
+            self.stats.refusals = self.stats.refusals.saturating_add(1);
+            return Err(ResidencyRefused {
+                error: invalid(
+                    "conditional_floor_bytes",
+                    "a conditional-memory class needs a nonzero resident floor (ADR 0009: \
+                     never zero-resident); this authority declared none",
                 ),
                 report,
             });
@@ -1410,14 +1636,23 @@ impl ResidencyAuthority {
                 // about punishing a correct one.
                 request.class.urgency == Urgency::Demand && t.urgency == Urgency::Prefetch
             };
-            if promote {
-                self.promote_ticket(ticket, request.deadline);
-            }
+            // Promotion takes the ticket off the prefetch queue, so whoever
+            // promoted it is the only caller that can still be handed its
+            // order. Returning `Coalesced` here would strand the work: the
+            // queue no longer holds it and nobody else will ask.
+            let work = if promote {
+                match self.promote_ticket(ticket, request.deadline) {
+                    Some(order) => PendingWork::Issued(order),
+                    None => PendingWork::Coalesced,
+                }
+            } else {
+                PendingWork::Coalesced
+            };
             self.stats.misses = self.stats.misses.saturating_add(1);
             return Ok(Acquired::Pending {
                 lease,
                 ticket,
-                work: PendingWork::Coalesced,
+                work,
                 report,
             });
         }
@@ -1452,7 +1687,19 @@ impl ResidencyAuthority {
         let incoming = request.chunk.len_bytes();
         let destination = request.destination;
 
-        if self.placements.len() >= self.max_placements as usize {
+        // A device acquire of an absent chunk creates **two** placements: the
+        // device range and the host source it is copied from. Checking room for
+        // one and then making two is how a declared bound stops bounding
+        // anything.
+        let needed = 1 + usize::from(
+            destination.kind() == moxie_types::ScopeKind::Device
+                && self
+                    .index
+                    .get(&Scope::Host)
+                    .and_then(|m| m.get(request.chunk))
+                    .is_none(),
+        );
+        if self.placements.len() + needed > self.max_placements as usize {
             let report = self.report_for(destination, incoming, &[]);
             self.stats.refusals = self.stats.refusals.saturating_add(1);
             return Err(ResidencyRefused {
@@ -1504,32 +1751,35 @@ impl ResidencyAuthority {
 
         let ticket = TicketId::next();
         let queued = request.class.urgency == Urgency::Prefetch;
-        let (stage, source_key, state) = match source {
+        let source_created = source.as_ref().is_some_and(|s| s.created);
+        let source_key_opt = source.as_ref().map(|s| s.key);
+        let promoted = source.as_ref().and_then(|s| s.promoted.clone());
+        let (stage, source_key, state) = match source.as_ref() {
             None => (Stage::Read, key, ChunkState::Reading),
             Some(HostSource {
                 key: src,
                 created: true,
                 ..
-            }) => (Stage::Read, src, ChunkState::Reading),
+            }) => (Stage::Read, *src, ChunkState::Reading),
             Some(HostSource {
                 key: src,
-                created: false,
                 pending: None,
-            }) => (Stage::Upload, src, ChunkState::Uploading),
+                ..
+            }) => (Stage::Upload, *src, ChunkState::Uploading),
             Some(HostSource {
                 key: src,
-                created: false,
                 pending: Some(blocking),
-            }) => (Stage::BlockedOnRead(blocking), src, ChunkState::Reading),
+                ..
+            }) => (Stage::BlockedOnRead(*blocking), *src, ChunkState::Reading),
         };
 
         {
             let p = self.placements.get_mut(&key).expect("just placed");
             p.ticket = Some(ticket);
-            p.upload_source = source.map(|s| s.key);
+            p.upload_source = source_key_opt;
             p.state = state;
         }
-        if let Some(src) = source.filter(|s| s.created) {
+        if let Some(src) = source.as_ref().filter(|s| s.created) {
             let p = self
                 .placements
                 .get_mut(&src.key)
@@ -1550,7 +1800,7 @@ impl ResidencyAuthority {
                 cancelled: false,
                 queued,
                 issued: false,
-                owns_source: source.is_some_and(|s| s.created),
+                owns_source: source_created,
             },
         );
 
@@ -1565,7 +1815,13 @@ impl ResidencyAuthority {
             PendingWork::Queued
         } else if matches!(stage, Stage::BlockedOnRead(_)) {
             self.outstanding_demand = self.outstanding_demand.saturating_add(1);
-            PendingWork::Coalesced
+            // If resolving the source promoted a queued prediction, that
+            // prediction's read is what this acquire is waiting for, and this
+            // caller is the only one still able to perform it.
+            match promoted {
+                Some(order) => PendingWork::Issued(order),
+                None => PendingWork::Coalesced,
+            }
         } else {
             self.outstanding_demand = self.outstanding_demand.saturating_add(1);
             self.tickets.get_mut(&ticket).expect("just inserted").issued = true;
@@ -1608,16 +1864,30 @@ impl ResidencyAuthority {
                         key: existing,
                         created: false,
                         pending: None,
+                        promoted: None,
                     })
                 }
                 ChunkState::Reading => {
                     let blocking = p.ticket.expect("a reading placement owns a ticket");
                     p.leases = p.leases.saturating_add(1);
                     p.last_used = request.now;
+                    // A demand that waits on a *queued prediction* is a
+                    // dependency cycle: this acquire is demand, so
+                    // `next_prefetch` will refuse to release the read it is
+                    // waiting for, and neither ever finishes. Priority has to
+                    // propagate through the dependency, not stop at it.
+                    let promoted = if request.class.urgency == Urgency::Demand
+                        && self.tickets[&blocking].urgency == Urgency::Prefetch
+                    {
+                        self.promote_ticket(blocking, request.deadline)
+                    } else {
+                        None
+                    };
                     Ok(HostSource {
                         key: existing,
                         created: false,
                         pending: Some(blocking),
+                        promoted,
                     })
                 }
                 state => {
@@ -1648,6 +1918,7 @@ impl ResidencyAuthority {
                 key,
                 created: true,
                 pending: None,
+                promoted: None,
             })
         }
     }
@@ -1724,7 +1995,7 @@ impl ResidencyAuthority {
                     victims.push(c);
                 }
                 None => {
-                    let named = victims.iter().map(|c| c.chunk.clone()).collect();
+                    let named = victims.iter().map(|c| (*c.chunk).clone()).collect();
                     let report = self.build_report(
                         scope,
                         incoming,
@@ -1746,7 +2017,7 @@ impl ResidencyAuthority {
             }
         }
 
-        let mut named: Vec<ChunkId> = victims.iter().map(|c| c.chunk.clone()).collect();
+        let mut named: Vec<ChunkId> = victims.iter().map(|c| (*c.chunk).clone()).collect();
         for c in &victims {
             self.evict(c.key);
         }
@@ -1758,7 +2029,7 @@ impl ResidencyAuthority {
                 Ok(a) => break a,
                 Err(refused) => match next_allowed(&mut candidates, &mut conditional, floor) {
                     Some(c) => {
-                        named.push(c.chunk.clone());
+                        named.push((*c.chunk).clone());
                         self.evict(c.key);
                     }
                     None => {
@@ -1785,10 +2056,14 @@ impl ResidencyAuthority {
         if request.class.content == Content::ConditionalTable {
             self.conditional_resident = self.conditional_resident.saturating_add(incoming);
         }
+        // One identity, two holders. The index key and the placement record
+        // share it, so a chunk's name costs one allocation rather than two --
+        // which is what makes a per-placement control bound derivable at all.
+        let identity = Arc::new(request.chunk.clone());
         self.placements.insert(
             key,
             Placement {
-                chunk: request.chunk.clone(),
+                chunk: Arc::clone(&identity),
                 scope,
                 class: request.class,
                 state: ChunkState::Reading,
@@ -1802,10 +2077,7 @@ impl ResidencyAuthority {
                 upload_source: None,
             },
         );
-        self.index
-            .entry(scope)
-            .or_default()
-            .insert(request.chunk.clone(), key);
+        self.index.entry(scope).or_default().insert(identity, key);
         let report = self.build_report(
             scope,
             incoming,
@@ -1861,7 +2133,7 @@ struct Candidate {
     key: PlacementKey,
     bytes: u64,
     content: Content,
-    chunk: ChunkId,
+    chunk: Arc<ChunkId>,
 }
 
 /// The next candidate the conditional-memory floor permits.
@@ -1895,13 +2167,18 @@ fn next_allowed(
 /// transition of the ticket releases that pin. Document 02 is the reason the
 /// pin exists at all: "An upload owns or leases its source bytes through a
 /// completion event."
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct HostSource {
     key: PlacementKey,
     /// This acquire created the host placement, so it owns the read.
     created: bool,
     /// Another ticket is already reading it; this one waits for that.
     pending: Option<TicketId>,
+    /// The order a promotion took off the prefetch queue on this acquire's
+    /// behalf. It belongs to the ticket named by `pending`, not to this
+    /// acquire's own ticket, and the caller must perform it: it is what the
+    /// dependency is waiting for.
+    promoted: Option<WorkOrder>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1914,7 +2191,7 @@ impl ResidencyAuthority {
         let named = victims
             .iter()
             .filter_map(|k| self.placements.get(k))
-            .map(|p| p.chunk.clone())
+            .map(|p| (*p.chunk).clone())
             .collect();
         let freed: u64 = victims
             .iter()
@@ -2052,20 +2329,35 @@ impl ResidencyAuthority {
         Some(held)
     }
 
-    fn promote_ticket(&mut self, ticket: TicketId, deadline: u64) {
-        let (was_queued, stage) = {
+    /// Turn a prediction into demand, and hand back the order that stops being
+    /// the queue's responsibility.
+    ///
+    /// Returns `Some` exactly when this promotion took an **unissued** ticket
+    /// off the prefetch queue: the caller is then the only one who can still be
+    /// given that work. `None` means the ticket was already outstanding as
+    /// demand, or is waiting on another ticket's read and has no order of its
+    /// own.
+    fn promote_ticket(&mut self, ticket: TicketId, deadline: u64) -> Option<WorkOrder> {
+        let (was_queued, issued, stage) = {
             let t = self.tickets.get_mut(&ticket).expect("live ticket");
             t.urgency = Urgency::Demand;
             t.deadline = t.deadline.min(deadline);
-            (t.queued, t.stage)
+            (t.queued, t.issued, t.stage)
         };
-        if was_queued {
-            self.prefetch_queue.retain(|(_, _, id)| *id != ticket);
-            self.tickets.get_mut(&ticket).expect("live ticket").queued = false;
-            if !matches!(stage, Stage::BlockedOnRead(_)) {
-                self.outstanding_demand = self.outstanding_demand.saturating_add(1);
-            }
+        if !was_queued {
+            return None;
         }
+        self.prefetch_queue.retain(|(_, _, id)| *id != ticket);
+        self.tickets.get_mut(&ticket).expect("live ticket").queued = false;
+        // A queued ticket now counts as outstanding demand whatever its stage:
+        // the counter follows membership, and `take_ticket` undoes it the same
+        // way.
+        self.outstanding_demand = self.outstanding_demand.saturating_add(1);
+        if issued || matches!(stage, Stage::BlockedOnRead(_)) {
+            return None;
+        }
+        self.tickets.get_mut(&ticket).expect("live ticket").issued = true;
+        Some(self.work_order_for(ticket))
     }
 
     fn work_order_for(&self, ticket: TicketId) -> WorkOrder {
@@ -2075,7 +2367,7 @@ impl ResidencyAuthority {
                 let src = &self.placements[&t.source];
                 WorkOrder::Read {
                     ticket,
-                    chunk: src.chunk.clone(),
+                    chunk: (*src.chunk).clone(),
                     host_offset: src.offset,
                     len_bytes: src.bytes,
                 }
@@ -2085,7 +2377,7 @@ impl ResidencyAuthority {
                 let p = &self.placements[&t.placement];
                 WorkOrder::Upload {
                     ticket,
-                    chunk: p.chunk.clone(),
+                    chunk: (*p.chunk).clone(),
                     scope: p.scope,
                     host_offset: src.offset,
                     device_offset: p.offset,
@@ -2247,7 +2539,11 @@ impl ResidencyAuthority {
     /// Take a ticket out of flight, correcting the demand counter.
     fn take_ticket(&mut self, ticket: TicketId) -> Option<Ticket> {
         let t = self.tickets.remove(&ticket)?;
-        if t.issued && !t.queued && t.urgency == Urgency::Demand {
+        // The counter follows **membership**, not issuance. A demand ticket
+        // that is blocked on someone else's read has no order of its own yet
+        // and still holds a demand slot; counting it on one side of its life
+        // and not the other is how a settled queue stays blocked forever.
+        if !t.queued && t.urgency == Urgency::Demand {
             self.outstanding_demand = self.outstanding_demand.saturating_sub(1);
         }
         if t.queued {
@@ -2293,14 +2589,16 @@ impl ResidencyAuthority {
                     if cancelled {
                         // The intent was retired while the read ran. The bytes
                         // were charged all along -- R08 -- and only now may
-                        // they be given back.
-                        self.drop_placement(t.placement);
+                        // they be given back, and only if nobody else is
+                        // holding them: a device acquire waiting on this read
+                        // still has its source pin.
+                        self.drop_if_unheld(t.placement);
                     }
                 } else {
                     // A device acquire: the second stage is now legal.
                     if cancelled {
                         let t = self.take_ticket(ticket).expect("live ticket");
-                        self.drop_placement(t.placement);
+                        self.drop_if_unheld(t.placement);
                         self.settle_source(source, placement, owns);
                     } else {
                         // The read's demand slot carries straight into the
@@ -2392,7 +2690,7 @@ impl ResidencyAuthority {
                 }
                 self.settle_source(source, placement, owns);
                 if cancelled {
-                    self.drop_placement(placement);
+                    self.drop_if_unheld(placement);
                 }
                 Ok(())
             }
@@ -2441,8 +2739,15 @@ impl ResidencyAuthority {
                 .state = ChunkState::Uploading;
             if cancelled {
                 self.take_ticket(id);
-                self.drop_placement(placement);
+                self.drop_if_unheld(placement);
                 self.settle_source(source, placement, owns);
+            } else if self.tickets[&id].queued {
+                // Still a prediction. Its read was carried by somebody else's
+                // demand, but its *upload* is new work, and handing it back
+                // here would both jump the demand queue and hand out an order
+                // the queue still owns -- which is how the same upload was
+                // returned twice. It waits its turn in `next_prefetch`.
+                self.tickets.get_mut(&id).expect("waiting ticket").issued = false;
             } else {
                 self.tickets.get_mut(&id).expect("waiting ticket").issued = true;
                 orders.push(self.work_order_for(id));
@@ -2546,6 +2851,29 @@ impl ResidencyAuthority {
         Ok(ChunkState::Retiring)
     }
 
+    /// Retire every settled, unleased placement in one scope.
+    ///
+    /// What a scope's cache is drained with before its physical backing goes
+    /// away, and what document 03's "transition prefill/decode plans at explicit
+    /// barriers" needs: the barrier is explicit, so the drain is too. Placements
+    /// that are leased or in flight are **left alone** and reported, because
+    /// taking bytes from a live consumer is not a transition, it is a fault.
+    pub fn retire_all(&mut self, scope: Scope) -> usize {
+        let drainable: Vec<PlacementKey> = self
+            .placements
+            .iter()
+            .filter(|(_, p)| p.scope == scope && p.is_evictable())
+            .map(|(k, _)| *k)
+            .collect();
+        for key in &drainable {
+            self.drop_placement(*key);
+        }
+        self.placements
+            .values()
+            .filter(|p| p.scope == scope)
+            .count()
+    }
+
     /// Give a quarantined placement back, once its transfer is known to be
     /// over. The only way out of quarantine, and it is explicit on purpose.
     pub fn settle_quarantined(&mut self, scope: Scope, chunk: &ChunkId) -> Result<()> {
@@ -2578,6 +2906,25 @@ impl ResidencyAuthority {
             self.release_source_pin(source, false);
         }
         Ok(())
+    }
+
+    /// Drop a placement **only if nothing holds it**.
+    ///
+    /// Finding 3 of the independent review, in one sentence: a cancellation
+    /// retires the *intent*, and it may not take bytes away from a consumer
+    /// that still wants them. The reproduction was a host read cancelled by its
+    /// own consumer while a device acquire was waiting on it -- the placement
+    /// was destroyed, and building the follow-on upload then panicked on a map
+    /// entry that was gone.
+    ///
+    /// A cancelled read that *completed* produced valid bytes. If someone still
+    /// holds them, they stay; only the cancelling consumer leaves.
+    fn drop_if_unheld(&mut self, key: PlacementKey) -> bool {
+        if self.placements.get(&key).is_none_or(|p| p.leases > 0) {
+            return false;
+        }
+        self.drop_placement(key);
+        true
     }
 
     /// Release the bytes and the index entry. Bookkeeping only: nothing here
@@ -2749,7 +3096,7 @@ impl ResidencyAuthority {
             else {
                 continue;
             };
-            let chunk = self.placements.get(&placement).map(|p| p.chunk.clone());
+            let chunk = self.placements.get(&placement).map(|p| (*p.chunk).clone());
             self.unpin(placement, ticket);
             cleanup.released_leases.push(id);
             if let Some(chunk) = chunk
@@ -2768,5 +3115,26 @@ impl ResidencyAuthority {
             }
         }
         cleanup
+    }
+}
+
+/// Withhold the host storage when anything may still be reading it.
+///
+/// `close` refuses over in-flight work, but a caller can drop the authority
+/// instead, and dropping a `Vec` returns its pages to the allocator. A
+/// host-to-device copy reads those pages by address, so document 02's rule
+/// applies exactly: "Retirement is event-driven; Rust `Drop` alone must not
+/// free in-flight CUDA memory."
+///
+/// The bytes are therefore abandoned rather than freed, and the ledger keeps
+/// showing the charge. That is deliberate: an unrecoverable, *visible* leak is
+/// the safe side of this trade, and it is the same one `moxie-executor` makes
+/// for a lost context. A caller that wants its memory back closes the authority,
+/// which tells it exactly what is still in flight.
+impl Drop for ResidencyAuthority {
+    fn drop(&mut self) {
+        if self.placements.values().any(|p| p.state.is_in_flight()) {
+            self.host.withhold();
+        }
     }
 }

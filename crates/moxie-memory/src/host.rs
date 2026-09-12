@@ -135,6 +135,23 @@ impl HostBuffer {
         })
     }
 
+    /// Abandon the physical bytes **without freeing them**.
+    ///
+    /// For the one case document 02 describes: "Retirement is event-driven;
+    /// Rust `Drop` alone must not free in-flight CUDA memory", and "buffer reuse
+    /// waits for all dependent streams/ranks, including cancelled work". A
+    /// device-to-host copy reads these bytes by address; returning them to the
+    /// allocator while that copy may still be running is a use-after-free the
+    /// allocator will happily hand to somebody else.
+    ///
+    /// So the pages stay mapped and the charge stays visible in the ledger,
+    /// which is the failure mode that can be *found*. `moxie-executor` makes the
+    /// same trade for a lost context: withhold forever rather than advertise
+    /// memory nothing can recover.
+    pub fn withhold(&mut self) {
+        core::mem::forget(core::mem::take(&mut self.data));
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.data
     }

@@ -48,9 +48,9 @@ pub use report::{
 pub use request::{BufferRequest, DerivedReserve, PlanRequest, ReserveRule, Scaling, StageSpan};
 pub use residency::{
     AcquireRequest, Acquired, ArtifactId, AuthorityId, CapabilityKey, ChunkId, ChunkState, Content,
-    LogicalRange, Outcome, OutstandingChunk, PendingWork, PreparedId, ReleaseLeaseRefused,
-    ResidencyAuthority, ResidencyLease, ResidencyLeaseId, ResidencyRefused, ResidencyReport,
-    ResidencyRequest, ResidencyStats, TensorSlot, TicketId, TurnCleanup, TurnId, Urgency, UseClass,
-    WorkOrder,
+    DeviceBacking, LogicalRange, Outcome, OutstandingChunk, PendingWork, PreparedId,
+    ReleaseLeaseRefused, ResidencyAuthority, ResidencyLease, ResidencyLeaseId, ResidencyRefused,
+    ResidencyReport, ResidencyRequest, ResidencyStats, ReturnBackingRefused, TensorSlot, TicketId,
+    TurnCleanup, TurnId, Urgency, UseClass, WorkOrder,
 };
 pub use snapshot::CapacitySnapshot;

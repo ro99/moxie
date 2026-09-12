@@ -1,8 +1,9 @@
 # Handover — task 0020 implemented; task 0021 is M2's grouped expert execution
 
-**Task 0020 is implemented and awaiting independent review and owner
-acceptance.** It delivers M2 item 2 only. M2 items 3–5 are outstanding and the
-next of them is specified under [Next task](#next-task).
+**Task 0020 is implemented, corrected after independent review, and awaiting
+owner acceptance.** The review found **nine** issues; all nine were reproduced
+and fixed, and none was disputed. It delivers M2 item 2 only. M2 items 3–5 are
+outstanding and the next of them is specified under [Next task](#next-task).
 
 ## Workspace identity
 
@@ -33,8 +34,8 @@ the terms it fixed before implementation, and the filled-in result.
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy | passed |
-| `cargo test --workspace --locked --offline` | **795 passed, 0 failed** (736 at task 0019) |
-| Device-feature workspace tests | **815 passed, 0 failed** |
+| `cargo test --workspace --locked --offline` | **806 passed, 0 failed** (736 at task 0019) |
+| Device-feature workspace tests | **826 passed, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | every rule and every fixture, including the new `a second weight-residency owner` and its three fixtures. **4 pre-existing failures remain**, all from the untracked review crate under `results/task0014-independent-review-2026-09-11/probes/`; the identical four lines are in `results/task0015/arch-local.log` |
@@ -85,6 +86,30 @@ its source pin twice**, quietly making a chunk another consumer held evictable.
 The last two have regressions proven load-bearing by substitution: reintroducing
 each defect fails exactly its own test and no other.
 
+**The independent review found nine more, and the most useful of them corrected
+a claim rather than a line of code.** This task had argued that a nonblocking
+`acquire` establishes deadlock freedom. It does not: the review found a cycle
+between the demand counter and the prefetch gate, which `acquire` never touches
+— a device demand waiting on a queued prediction waited for a read that
+`next_prefetch` refused to release while demand was outstanding. Priority now
+propagates *through* the dependency, and the property is tested rather than
+argued.
+
+Four findings were P1. One was a panic (`no entry found for key`) when a host
+reader was cancelled while a device acquire waited on it. One was measured on a
+real 3090 as **8 MiB of allocation live against a 4 MiB reservation**, with the
+charge released by `close` while both allocations stayed readable — R02 with the
+sign flipped. One was a **3.4× control-memory undercount**: 166,361 bytes of
+retained heap against a 49,216-byte envelope, because a chunk identity is two
+heap strings and both the index and the placement held a copy. One was a host
+allocation that `Drop` returned to the allocator while a copy might still be
+reading it by address.
+
+The task record carries the finding-by-finding table, including the single point
+where I resolved a finding differently from the probe's assertion and why. Every
+finding has a regression, and the measured ones are measured rather than
+asserted.
+
 **Three narrowings, decided during implementation and reported rather than
 quietly dropped.** `Artifact::read_tensor_range` was **not** added: a canonical
 manifest carries a whole-tensor checksum a ranged read cannot verify, so a
@@ -122,6 +147,10 @@ made and none follows.
   `ExpertMlp` and `Combine` as `UnsupportedKernel`, asserted by a test. `Route`
   is `Replicated` by requirement; `ExpertMlp` and `Combine` fail closed for
   partitioning, and expert partitioning is **M5**.
+- **Deadlock freedom is a tested property, not an argument.** The absence of a
+  waiting path in `acquire` is necessary and **not sufficient**; the review
+  proved that by finding a cycle elsewhere. Task 0021 adds queues of its own,
+  and the same caution applies to them.
 - **No performance claim.** `ResidencyStats` records reads, uploads, hits,
   misses, evictions, wasted prefetch bytes and evictions of demand data, because
   document 03 requires them to be recorded. There is no baseline on this machine

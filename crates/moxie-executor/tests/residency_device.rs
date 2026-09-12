@@ -114,7 +114,16 @@ fn a_device_chunk_is_readable_only_after_its_copy_is_observed_on_every_device() 
         );
 
         let before = ctx.memory_info().unwrap().0;
-        let mut device = DeviceResidency::create(&ctx, &authority).unwrap();
+        let mut device = DeviceResidency::create(&ctx, &mut authority).unwrap();
+
+        // One allocation, one reservation. A second claim is refused, so two
+        // caches cannot exist against one admitted capacity.
+        let second = DeviceResidency::create(&ctx, &mut authority);
+        assert!(
+            second.is_err(),
+            "a second backing for {} was handed out",
+            ctx.uuid()
+        );
         let during = ctx.memory_info().unwrap().0;
         assert!(
             during < before,
@@ -223,7 +232,31 @@ fn a_device_chunk_is_readable_only_after_its_copy_is_observed_on_every_device() 
 
         let uploaded = authority.stats().bytes_uploaded;
         let evictions = authority.stats().evictions;
-        drop(device);
+
+        // Closing over a live backing is refused: releasing the reservation
+        // while the card still holds the allocation it paid for is the ledger
+        // reporting zero for memory that is spent.
+        let refused = authority.close(&mut ledger).unwrap_err();
+        assert!(
+            format!("{refused}").contains("physically backed"),
+            "{refused}"
+        );
+        assert_eq!(
+            ledger.committed(scope, Tier::Device(DeviceTier::ExpertCache)),
+            DEVICE_CAP,
+            "the charge stays while the allocation lives"
+        );
+
+        // Placements still name ranges inside the allocation, so the backing
+        // cannot be returned yet either.
+        let (device, refused) = device.close(&mut authority).unwrap_err();
+        assert!(
+            format!("{refused}").contains("still holds placements"),
+            "{refused}"
+        );
+
+        assert_eq!(authority.retire_all(scope), 0, "nothing was left pinned");
+        device.close(&mut authority).unwrap();
         authority.close(&mut ledger).unwrap();
         assert_eq!(ledger.scope_committed(scope), 0);
         assert_eq!(ledger.scope_committed(Scope::Host), 0);

@@ -29,8 +29,9 @@ the routing equation defines. **Nothing executes a checkpoint**, and a routed
 synthetic graph is not MoE model support. The acceptance closes task 0019 only,
 not M2.
 
-**[Task 0020](0020-m2-weight-residency-authority.md) is implemented and awaiting
-review**: M2 item 2's residency authority — one production weight-residency
+**[Task 0020](0020-m2-weight-residency-authority.md) is implemented, corrected
+after independent review — nine findings, all reproduced, all fixed, none
+disputed — and awaiting owner acceptance**: M2 item 2's residency authority — one production weight-residency
 owner connected to bounded storage reads, a host cache, real device uploads,
 leases, eviction and demand/prefetch classes, with all nine of M2 item 5's cases
 tested. Its contract was authored and committed at `d6e9170` before

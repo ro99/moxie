@@ -209,7 +209,7 @@ pub use device::{DeviceResidency, UploadRefused};
 #[cfg(feature = "driver")]
 mod device {
     use moxie_cuda::{DeviceBuffer, Event, RankContext, Stream};
-    use moxie_memory::{Outcome, ResidencyAuthority, WorkOrder};
+    use moxie_memory::{DeviceBacking, Outcome, ResidencyAuthority, WorkOrder};
     use moxie_types::{Error, Result, Scope};
 
     /// One device's residency cache: the single real allocation whose ranges
@@ -219,10 +219,13 @@ mod device {
     /// and it owns nothing else. Every offset it copies into was chosen by the
     /// authority; this type never decides where a chunk goes.
     #[derive(Debug)]
+    #[must_use = "a residency backing that is never closed keeps its scope claimed"]
     pub struct DeviceResidency<'ctx> {
         buffer: DeviceBuffer<'ctx>,
         ctx: &'ctx RankContext,
-        capacity: u64,
+        /// The authority's entitlement to exist. One per scope, and the
+        /// authority refuses to close until it is handed back.
+        backing: Option<DeviceBacking>,
     }
 
     /// An upload the device refused, with the copy's identity intact.
@@ -245,29 +248,73 @@ mod device {
     impl<'ctx> DeviceResidency<'ctx> {
         /// Back one scope's cache with one real allocation of exactly the
         /// capacity the authority admitted.
-        pub fn create(ctx: &'ctx RankContext, authority: &ResidencyAuthority) -> Result<Self> {
+        ///
+        /// The entitlement is claimed **before** the allocation, and the
+        /// authority hands out exactly one per scope. Two calls cannot produce
+        /// two allocations against one reservation, which is what they did
+        /// before: 8 MiB live on a real 3090 against a 4 MiB charge.
+        pub fn create(ctx: &'ctx RankContext, authority: &mut ResidencyAuthority) -> Result<Self> {
             let scope = Scope::Device(ctx.uuid());
-            let capacity = authority
-                .cap_bytes(scope)
-                .ok_or_else(|| Error::InvalidRequest {
-                    field: "scope",
-                    detail: format!("the authority opened no cache for {scope}"),
-                })?;
-            let bytes = usize::try_from(capacity).map_err(|_| Error::CapacityExceeded {
-                tier: None,
-                requested_bytes: capacity,
-                available_bytes: 0,
-            })?;
-            let buffer = DeviceBuffer::alloc(ctx, bytes)?;
+            let backing = authority.claim_backing(scope)?;
+            let capacity = backing.capacity();
+            let bytes = match usize::try_from(capacity) {
+                Ok(b) => b,
+                Err(_) => {
+                    let _ = authority.return_backing(backing);
+                    return Err(Error::CapacityExceeded {
+                        tier: None,
+                        requested_bytes: capacity,
+                        available_bytes: 0,
+                    });
+                }
+            };
+            let buffer = match DeviceBuffer::alloc(ctx, bytes) {
+                Ok(b) => b,
+                Err(e) => {
+                    // Nothing was allocated, so the entitlement goes straight
+                    // back: a failed creation must not claim a scope forever.
+                    let _ = authority.return_backing(backing);
+                    return Err(e);
+                }
+            };
             Ok(DeviceResidency {
                 buffer,
                 ctx,
-                capacity,
+                backing: Some(backing),
             })
         }
 
-        pub const fn capacity(&self) -> u64 {
-            self.capacity
+        /// Free the allocation and give the entitlement back.
+        ///
+        /// Refused, with this value intact, while the scope still holds
+        /// placements: their ranges live inside this allocation.
+        pub fn close(
+            mut self,
+            authority: &mut ResidencyAuthority,
+        ) -> std::result::Result<(), (Self, Error)> {
+            let backing = match self.backing.take() {
+                Some(b) => b,
+                None => return Ok(()),
+            };
+            if let Err(refused) = authority.return_backing(backing) {
+                // The refusal handed the entitlement back, so this value is
+                // whole and the caller can fix the cause and retry. Stranding
+                // it here would leave the scope claimed forever with no way to
+                // free the allocation.
+                self.backing = Some(refused.backing);
+                return Err((self, refused.error));
+            }
+            // SAFETY: the authority has confirmed no placement names a range in
+            // this allocation, and no copy is outstanding -- `return_backing`
+            // refuses otherwise.
+            if let Err(error) = unsafe { self.buffer.try_free() } {
+                return Err((self, error));
+            }
+            Ok(())
+        }
+
+        pub fn capacity(&self) -> u64 {
+            self.backing.as_ref().map_or(0, DeviceBacking::capacity)
         }
 
         pub fn scope(&self) -> Scope {
@@ -324,12 +371,12 @@ mod device {
                     false,
                 ));
             }
-            if device_offset.saturating_add(*len_bytes) > self.capacity {
+            if device_offset.saturating_add(*len_bytes) > self.capacity() {
                 return Err(refuse(
                     Error::CapacityExceeded {
                         tier: None,
                         requested_bytes: device_offset.saturating_add(*len_bytes),
-                        available_bytes: self.capacity,
+                        available_bytes: self.capacity(),
                     },
                     false,
                 ));

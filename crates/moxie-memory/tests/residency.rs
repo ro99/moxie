@@ -1663,6 +1663,391 @@ fn a_cancelled_upload_that_completes_gives_its_source_pin_back_exactly_once() {
 }
 
 // ---------------------------------------------------------------------------
+// Independent review, 2026-09-12: nine findings, all reproduced
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_cancelled_host_read_keeps_bytes_a_device_acquire_is_waiting_for() {
+    // Finding 3, and it was a panic. A host reader cancelled by its own
+    // consumer while a device acquire waited on it destroyed the placement;
+    // building the follow-on upload then panicked on a map entry that was gone.
+    // A cancellation retires the *intent*, never bytes a surviving consumer
+    // still wants.
+    let mut l = ledger();
+    let mut a = open_with_device(&mut l, 8 * EXPERT_BYTES, 8 * EXPERT_BYTES);
+    let chunk = expert(0);
+    let device = Scope::Device(gpu());
+
+    let Acquired::Pending {
+        lease: host_lease,
+        ticket,
+        ..
+    } = a.acquire(demand(&chunk, 0)).unwrap()
+    else {
+        panic!("absent")
+    };
+    let Acquired::Pending {
+        lease: device_lease,
+        ..
+    } = a.acquire(device_demand(&chunk, 1)).unwrap()
+    else {
+        panic!("absent")
+    };
+
+    // The host consumer leaves while the read is still running, which cancels
+    // the read's *intent* -- but the device copy still needs those bytes.
+    a.release(host_lease).unwrap();
+    assert_eq!(a.is_cancelled(ticket), Some(true));
+
+    a.read_destination(ticket).unwrap().fill(0x3F);
+    let orders = a.complete_read(ticket, Outcome::Completed).unwrap();
+    assert_eq!(orders.len(), 1, "the waiting upload is still released");
+    assert_eq!(
+        a.state_of(Scope::Host, &chunk),
+        Some(ChunkState::HostReady),
+        "the bytes are valid and somebody wants them"
+    );
+    let WorkOrder::Upload { ticket: up, .. } = &orders[0] else {
+        panic!("an upload")
+    };
+    a.complete_upload(*up, Outcome::Completed).unwrap();
+    assert_eq!(a.state_of(device, &chunk), Some(ChunkState::DeviceReady));
+    assert!(a.device_range(&device_lease).is_ok());
+
+    a.release(device_lease).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn promoting_a_queued_prefetch_hands_its_work_to_the_promoting_caller() {
+    // Finding 4a: promotion took the ticket off the queue and returned
+    // `Coalesced`, so no caller owned an executable order and the read could
+    // never happen.
+    let mut l = ledger();
+    let mut a = open(&mut l, 8 * EXPERT_BYTES);
+    let chunk = expert(0);
+
+    let Acquired::Pending {
+        lease: p,
+        work: queued,
+        ..
+    } = a.acquire(prefetch(&chunk, 0)).unwrap()
+    else {
+        panic!("absent")
+    };
+    assert_eq!(queued, PendingWork::Queued);
+
+    let Acquired::Pending {
+        lease: d,
+        ticket,
+        work,
+        ..
+    } = a.acquire(demand(&chunk, 1)).unwrap()
+    else {
+        panic!("pending")
+    };
+    assert!(
+        matches!(work, PendingWork::Issued(WorkOrder::Read { .. })),
+        "the queue no longer holds this work, so this caller must be given it"
+    );
+    assert_eq!(a.prefetch_queue_len(), 0);
+    assert!(a.next_prefetch().is_none());
+
+    fill_and_complete(&mut a, ticket, 0x4A);
+    assert_eq!(a.chunk_bytes(&d).unwrap()[0], 0x4A);
+    a.release(p).unwrap();
+    a.release(d).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn a_device_demand_waiting_on_a_queued_prefetch_cannot_deadlock() {
+    // Finding 4b, and the sharper half: a nonblocking `acquire` is not by
+    // itself a proof of deadlock freedom. The device demand waited for the
+    // prefetch's read; `next_prefetch` refused to release that read while
+    // demand was outstanding; neither ever finished. Priority has to propagate
+    // through the dependency, not stop at it.
+    let mut l = ledger();
+    let mut a = open_with_device(&mut l, 8 * EXPERT_BYTES, 8 * EXPERT_BYTES);
+    let chunk = expert(0);
+
+    let Acquired::Pending { lease: p, .. } = a.acquire(prefetch(&chunk, 0)).unwrap() else {
+        panic!("absent")
+    };
+    assert_eq!(a.prefetch_queue_len(), 1);
+
+    let Acquired::Pending { lease: d, work, .. } = a.acquire(device_demand(&chunk, 1)).unwrap()
+    else {
+        panic!("absent")
+    };
+    let PendingWork::Issued(order) = work else {
+        panic!("the demand must be handed the read it is waiting for, got {work:?}")
+    };
+    assert_eq!(a.prefetch_queue_len(), 0, "the prediction became demand");
+
+    a.read_destination(order.ticket()).unwrap().fill(0x4B);
+    let orders = a.complete_read(order.ticket(), Outcome::Completed).unwrap();
+    assert_eq!(orders.len(), 1, "the device upload follows");
+    a.complete_upload(orders[0].ticket(), Outcome::Completed)
+        .unwrap();
+    assert_eq!(
+        a.state_of(Scope::Device(gpu()), &chunk),
+        Some(ChunkState::DeviceReady)
+    );
+
+    a.release(p).unwrap();
+    a.release(d).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn a_prefetch_upload_released_by_someone_elses_read_is_issued_exactly_once() {
+    // Finding 5: the released upload was returned by `complete_read` *and*
+    // stayed in the prefetch queue, so `next_prefetch` handed out the same
+    // copy again. It now stays queued -- a prediction's upload is new work and
+    // does not jump the demand queue -- and is issued once, from there.
+    let mut l = ledger();
+    let mut a = open_with_device(&mut l, 8 * EXPERT_BYTES, 8 * EXPERT_BYTES);
+    let chunk = expert(0);
+
+    let Acquired::Pending {
+        lease: host_lease,
+        ticket,
+        ..
+    } = a.acquire(demand(&chunk, 0)).unwrap()
+    else {
+        panic!("absent")
+    };
+    let Acquired::Pending {
+        lease: device_lease,
+        work,
+        ..
+    } = a
+        .acquire(AcquireRequest {
+            class: UseClass::prefetch(Content::Expert),
+            ..device_demand(&chunk, 1)
+        })
+        .unwrap()
+    else {
+        panic!("absent")
+    };
+    assert_eq!(work, PendingWork::Queued);
+
+    a.read_destination(ticket).unwrap().fill(0x5C);
+    let orders = a.complete_read(ticket, Outcome::Completed).unwrap();
+    assert!(
+        orders.is_empty(),
+        "a prediction's upload does not jump the demand queue"
+    );
+
+    let first = a.next_prefetch().expect("the queue still owns it");
+    assert!(matches!(first, WorkOrder::Upload { .. }));
+    assert!(
+        a.next_prefetch().is_none(),
+        "the same upload came back twice"
+    );
+    a.complete_upload(first.ticket(), Outcome::Completed)
+        .unwrap();
+    assert_eq!(a.stats().bytes_uploaded, EXPERT_BYTES, "one copy, not two");
+    assert!(a.next_prefetch().is_none());
+
+    a.release(host_lease).unwrap();
+    a.release(device_lease).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn expiring_blocked_demand_does_not_leave_the_queue_blocked_forever() {
+    // Finding 6: a demand ticket blocked on someone else's read took a demand
+    // slot before it was issued, and cleanup gave it back only if it had been
+    // issued. The counter never returned to zero, so every later prefetch was
+    // refused release for demand that no longer existed.
+    let mut l = ledger();
+    let mut a = open_with_device(&mut l, 8 * EXPERT_BYTES, 8 * EXPERT_BYTES);
+    let chunk = expert(0);
+
+    let Acquired::Pending {
+        lease: host_lease,
+        ticket,
+        ..
+    } = a.acquire(demand(&chunk, 0)).unwrap()
+    else {
+        panic!("absent")
+    };
+    let Acquired::Pending {
+        lease: device_lease,
+        ..
+    } = a
+        .acquire(AcquireRequest {
+            deadline: 1,
+            ..device_demand(&chunk, 1)
+        })
+        .unwrap()
+    else {
+        panic!("absent")
+    };
+    assert_eq!(a.expire(2).len(), 1);
+    fill_and_complete(&mut a, ticket, 0x6D);
+
+    // No demand transfer is outstanding any more, so a prediction may run.
+    let other = expert(1);
+    let Acquired::Pending { lease: p, .. } = a.acquire(prefetch(&other, 3)).unwrap() else {
+        panic!("absent")
+    };
+    let released = a
+        .next_prefetch()
+        .expect("no demand tickets remain, but the demand count still blocks the queue");
+    fill_and_complete(&mut a, released.ticket(), 0x6E);
+    assert_eq!(a.chunk_bytes(&p).unwrap()[0], 0x6E);
+
+    a.release(host_lease).unwrap();
+    a.release(device_lease).unwrap();
+    a.release(p).unwrap();
+    for c in a.outstanding() {
+        assert!(!c.state.is_in_flight(), "{} is {}", c.chunk, c.state.name());
+    }
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn a_device_acquire_reserves_both_the_placements_it_will_create() {
+    // Finding 8: the limit was checked for one placement and then two were
+    // made -- the device range and the host source it is copied from.
+    let mut l = ledger();
+    let mut a = ResidencyAuthority::open(
+        &mut l,
+        &ResidencyRequest::new("one placement", 8 * EXPERT_BYTES)
+            .device(gpu(), 8 * EXPERT_BYTES)
+            .max_placements(1),
+    )
+    .unwrap();
+    let chunk = expert(0);
+
+    let refused = a.acquire(device_demand(&chunk, 0)).unwrap_err();
+    assert!(
+        matches!(refused.error, Error::CapacityExceeded { .. }),
+        "{:?}",
+        refused.error
+    );
+    assert!(
+        a.outstanding().is_empty(),
+        "a refused acquire creates no placement at all"
+    );
+
+    // One is still enough for a host acquire, which creates exactly one.
+    let lease = load(&mut a, &chunk, 1, 0x81);
+    assert_eq!(a.outstanding().len(), 1);
+    a.release(lease).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn a_conditional_memory_class_with_no_floor_is_refused() {
+    // Finding 9: ADR 0009 requires the class to be "never zero-resident". A
+    // floor of zero makes every one of its entries an eviction candidate, which
+    // is the zero-resident case wearing the class's name.
+    let mut l = ledger();
+    let mut a = open(&mut l, 4 * EXPERT_BYTES);
+    let chunk = expert(0);
+    let refused = a
+        .acquire(AcquireRequest {
+            class: UseClass::demand(Content::ConditionalTable),
+            ..demand(&chunk, 0)
+        })
+        .unwrap_err();
+    assert!(
+        format!("{}", refused.error).contains("never zero-resident"),
+        "{refused}"
+    );
+    // The other two classes are unaffected by a zero floor.
+    let lease = load(&mut a, &chunk, 1, 0x90);
+    a.release(lease).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn an_identity_longer_than_the_declared_bound_is_refused() {
+    // Finding 7's enforcement half. The control envelope is admitted from
+    // `max_identity_bytes`; admitting a longer identity would spend control
+    // memory nobody reserved.
+    let mut l = ledger();
+    let mut a = ResidencyAuthority::open(
+        &mut l,
+        &ResidencyRequest::new("bounded ids", 8 * EXPERT_BYTES).max_identity_bytes(32),
+    )
+    .unwrap();
+    let long = ChunkId::new(
+        ArtifactId::new("a".repeat(64)).unwrap(),
+        TensorSlot::expert("role", 0).unwrap(),
+        LogicalRange::new(0, EXPERT_BYTES).unwrap(),
+        1,
+    );
+    let refused = a.acquire(demand(&long, 0)).unwrap_err();
+    match refused.error {
+        Error::CapacityExceeded {
+            requested_bytes,
+            available_bytes,
+            ..
+        } => {
+            assert_eq!(requested_bytes, 68);
+            assert_eq!(available_bytes, 32);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(a.outstanding().is_empty());
+
+    // One inside the bound is fine.
+    let short = ChunkId::new(
+        ArtifactId::new("art").unwrap(),
+        TensorSlot::expert("role", 0).unwrap(),
+        LogicalRange::new(0, EXPERT_BYTES).unwrap(),
+        1,
+    );
+    let lease = load(&mut a, &short, 1, 0x70);
+    a.release(lease).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn a_scope_is_backed_once_and_the_charge_outlives_the_allocation() {
+    // Finding 1, in the half a host lane can hold: the entitlement. The device
+    // lane proves the physical consequence on real cards.
+    let mut l = ledger();
+    let mut a = open_with_device(&mut l, 4 * EXPERT_BYTES, 4 * EXPERT_BYTES);
+    let device = Scope::Device(gpu());
+
+    let backing = a.claim_backing(device).unwrap();
+    assert_eq!(backing.capacity(), 4 * EXPERT_BYTES);
+    assert!(
+        a.claim_backing(device).is_err(),
+        "two allocations against one reservation"
+    );
+    // Closing over a live backing would release the charge while the card still
+    // holds what it paid for.
+    let refused = a.close(&mut l).unwrap_err();
+    assert!(
+        format!("{refused}").contains("physically backed"),
+        "{refused}"
+    );
+
+    // A backing cannot go back while placements name ranges inside it, and the
+    // refusal hands it back so the caller can retry rather than stranding it.
+    let lease = load(&mut a, &expert(0), 0, 0x10);
+    a.release(lease).unwrap();
+    let held = a.claim_backing(Scope::Host).unwrap();
+    let refused = a.return_backing(held).unwrap_err();
+    assert!(
+        format!("{refused}").contains("still holds placements"),
+        "{refused}"
+    );
+    assert_eq!(a.retire_all(Scope::Host), 0);
+    a.return_backing(refused.backing).unwrap();
+
+    a.return_backing(backing).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // The envelope
 // ---------------------------------------------------------------------------
 
@@ -1681,9 +2066,10 @@ fn the_cache_envelope_is_admitted_from_the_ledger_and_returned_on_close() {
     assert_eq!(
         host,
         64 * EXPERT_BYTES
-            + 128 * moxie_memory::residency::PLACEMENT_CONTROL_BYTES
+            + 128 * (moxie_memory::residency::PLACEMENT_CONTROL_BYTES + 256)
             + 256 * moxie_memory::residency::LEASE_CONTROL_BYTES,
-        "the cache, its placement table and its lease table are all admitted"
+        "the cache, its placement table (fixed part plus the declared identity \
+         bound) and its lease table are all admitted"
     );
     let mut a = a;
     a.close(&mut l).unwrap();

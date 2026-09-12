@@ -4,23 +4,37 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 
 ## Active assignment
 
-**M1 complete (M1.5 closed 2026-09-12); M2 active, item 1 accepted.** See the
+**M1 complete (M1.5 closed 2026-09-12); M2 active, item 1 accepted, item 2
+implemented and corrected after independent review.** See the
+[task 0020 handover](docs/handovers/2026-09-12-task0020-weight-residency-authority.md)
+for the current continuation, and the
 [closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
-M1's exit evidence gate by gate and the batched O1/O5 question M2's sequencing
-waits on.
+M1's exit evidence gate by gate.
 
 **M2 item 1's routed-expert mathematics is accepted**
 ([task 0019](docs/tasks/0019-m2-routed-expert-semantics.md), 2026-09-12, after
 three rounds of independent review): `Route`, `ExpertMlp` and `Combine` as
 shared operations with FP64 oracles, the pinned BF16 boundaries that decide
 which experts a row selects, and two consumers carrying opposite routing
-parameters. **It establishes no residency capability and executes no
-checkpoint.** **Task 0020 is next**: M2 item 2's residency authority — one
-production weight-residency owner connected to storage reads, host cache, upload
-readiness, leases, eviction and demand/prefetch classes. Its contract is
-specified in
-[the task 0019 handover](docs/handovers/2026-09-12-task0019-routed-expert-semantics.md)
-and has not been authored.
+parameters.
+
+**M2 item 2's residency authority is implemented and corrected after independent
+review** — nine findings, all reproduced, all fixed, none disputed
+([task 0020](docs/tasks/0020-m2-weight-residency-authority.md), 2026-09-12):
+`moxie_memory::residency` is the **one** production weight-residency owner, with
+document 03's chunk identity, its lifecycle and failure transitions, coalescing,
+event-bound device uploads whose allocation is tied to its reservation,
+deterministic demand LRU with a bounded prefetch class, ADR 0009's
+conditional-memory floor, and an admission report naming the incoming chunk
+before any victim is chosen. An `arch-check` rule rejects a second owner. All
+nine of M2 item 5's cases pass, on the host lane and on all three GPUs, alongside
+a regression for each review finding. One of those findings corrected a claim
+rather than a defect: **a nonblocking acquire is necessary but not sufficient for
+deadlock freedom**, and the cycle it missed was between the demand counter and
+the prefetch gate. **Task 0021 is next**: M2 item 3's CPU expert fallback and GPU
+grouped candidate plans under one interface, specified in
+[the task 0020 handover](docs/handovers/2026-09-12-task0020-weight-residency-authority.md)
+and not yet authored.
 
 M1's accepted work: shared semantic tensors/graph and the bounded host
 interpreter, sequence transactions, canonical manifest and bounded reads, the
@@ -46,8 +60,12 @@ fixture over invented weights and may not be described as model support; the
 importer produces canonical tensors that nothing runs, and its packed-word lane
 order is cited from the pinned reader rather than verified, so **no quality
 claim follows from a successful import** — that needs paired output against the
-released model, which is O2. M4 still owns device paged attention, COW forks and
-page streaming. M11 owns vision.
+released model, which is O2. Task 0020 demand-read 107,053,056 B of the
+designated artifact's real expert weights through the residency authority and
+verified every range against an independent read; **reading is not executing**,
+nothing computed with those bytes, and a demand-loaded expert is not model
+support. M4 still owns device paged attention, COW forks and page streaming. M11
+owns vision.
 
 **M2 is active and proceeds in roadmap order.** The owner designated
 `/fast/models/google/gemma-4-26B-A4B-it` as M2's BF16 MoE on 2026-09-12: BF16,
