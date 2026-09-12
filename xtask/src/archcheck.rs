@@ -2065,7 +2065,35 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
     Ok(out)
 }
 
+/// First path segments the root workspace manifest declares as members.
+///
+/// A declared member is part of the build whatever it is called, so the scratch
+/// skip below must never hide one. Globs are reduced to their leading literal
+/// segment, which is all this needs: it only has to know whether `results` or
+/// `artifacts` could contain a member.
+fn declared_member_roots(root: &Path) -> BTreeSet<String> {
+    let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return BTreeSet::new();
+    };
+    let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
+        return BTreeSet::new();
+    };
+    doc.get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array())
+        .map(|members| {
+            members
+                .iter()
+                .filter_map(|m| m.as_str())
+                .filter_map(|m| m.split('/').next())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn find_manifests(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let members = declared_member_roots(root);
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -2095,10 +2123,21 @@ fn find_manifests(root: &Path) -> Result<Vec<PathBuf>, String> {
                 // as one of the usual ones. Preserving review evidence is
                 // required by document 07; having it fail the architecture
                 // check is not.
-                if matches!(
-                    name.as_ref(),
-                    "target" | ".git" | "fixtures" | "results" | "artifacts"
-                ) {
+                if matches!(name.as_ref(), "target" | ".git" | "fixtures") {
+                    continue;
+                }
+                // The scratch skip is **narrow on purpose**, and a review found
+                // out why: skipping any directory named `results` at any depth
+                // hid `crates/results/model` -- an explicitly declared
+                // workspace member with a forbidden `std::fs::read` -- from
+                // every rule. `docs/README.md` names `/results/` and
+                // `/artifacts/`, with leading slashes: the two directories at
+                // the *root*. So the skip applies there and nowhere else, and
+                // never to a directory the workspace declares a member under.
+                if dir == root
+                    && matches!(name.as_ref(), "results" | "artifacts")
+                    && !members.contains(name.as_ref())
+                {
                     continue;
                 }
                 stack.push(p);
@@ -3233,11 +3272,18 @@ mod tests {
         // The skip must cover exactly the directories `docs/README.md` declares
         // ignored, and nothing else: a crate under `crates/` is still a crate.
         let root = tempdir();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
         for (dir, expected) in [
             ("crates/real", true),
+            // Root scratch, as `docs/README.md` declares it.
             ("results/task0020/probe", false),
             ("artifacts/scratch", false),
             ("target/debug/thing", false),
+            // **Not** root scratch: a crate that merely lives under a directory
+            // with that name is still a crate. A review hid a model crate with
+            // a forbidden `std::fs::read` here.
+            ("crates/results/model", true),
+            ("crates/artifacts/model", true),
         ] {
             let d = root.join(dir);
             std::fs::create_dir_all(&d).unwrap();
@@ -3251,6 +3297,28 @@ mod tests {
                 if expected { "" } else { "not " }
             );
         }
+    }
+
+    #[test]
+    fn a_declared_member_under_a_scratch_name_is_still_checked() {
+        // Membership beats the skip: if the workspace says it builds, it is
+        // checked, wherever it lives.
+        let root = tempdir();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"results/model\"]\n",
+        )
+        .unwrap();
+        let d = root.join("results/model");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        assert!(
+            find_manifests(&root)
+                .unwrap()
+                .iter()
+                .any(|m| m.starts_with(&d)),
+            "a declared workspace member was hidden by its directory name"
+        );
     }
 
     fn tempdir() -> std::path::PathBuf {

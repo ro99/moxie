@@ -1473,6 +1473,177 @@ impl ResidencyAuthority {
         Ok(())
     }
 
+    /// Check every structural invariant this authority maintains, and name the
+    /// first one that does not hold.
+    ///
+    /// **Why this is production code and not a test helper.** Three rounds of
+    /// independent review found defects in the same shape: a transition that
+    /// was individually reasonable left the structure inconsistent in a
+    /// combination nobody had written a test for, and the damage surfaced one
+    /// or two operations later as a panic. Point regressions caught each case
+    /// and missed the next. A checker that states the invariants *once*, and can
+    /// be run after any operation, is the thing those tests were each
+    /// approximating.
+    ///
+    /// It is pure, allocates a message only on failure, and is called by the
+    /// exhaustive transition sweep after **every** step.
+    pub fn check_invariants(&self) -> Result<()> {
+        let fail = |detail: String| Err(invalid("invariant", detail));
+
+        for (key, p) in &self.placements {
+            // The one that panicked twice: an in-flight state is a promise that
+            // a transfer is coming.
+            if p.state.is_in_flight() && p.state != ChunkState::Quarantined {
+                match p.ticket {
+                    None => {
+                        return fail(format!("{} is {} with no ticket", p.chunk, p.state.name()));
+                    }
+                    Some(ticket) if !self.tickets.contains_key(&ticket) => {
+                        return fail(format!(
+                            "{} is {} naming a ticket that is gone",
+                            p.chunk,
+                            p.state.name()
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+            if let Some(source) = p.upload_source
+                && !self.placements.contains_key(&source)
+            {
+                return fail(format!("{} names a source that is gone", p.chunk));
+            }
+            if !self.caches.contains_key(&p.scope) {
+                return fail(format!("{} sits in a scope with no cache", p.chunk));
+            }
+            if self
+                .index
+                .get(&p.scope)
+                .and_then(|m| m.get(p.chunk.as_ref()))
+                != Some(key)
+            {
+                return fail(format!("{} is not indexed at its own key", p.chunk));
+            }
+        }
+
+        for (id, t) in &self.tickets {
+            if !self.placements.contains_key(&t.placement) {
+                return fail(format!(
+                    "ticket {} names a placement that is gone",
+                    id.get()
+                ));
+            }
+            if !self.placements.contains_key(&t.source) {
+                return fail(format!("ticket {} names a source that is gone", id.get()));
+            }
+            if let Stage::BlockedOnRead(dep) = t.stage
+                && !self.tickets.contains_key(&dep)
+            {
+                return fail(format!(
+                    "ticket {} waits on a dependency that is gone",
+                    id.get()
+                ));
+            }
+            // A ticket that is not waiting must be able to say what it wants.
+            if !matches!(t.stage, Stage::BlockedOnRead(_)) && self.work_order_for(*id).is_none() {
+                return fail(format!("ticket {} has a stage but no order", id.get()));
+            }
+            let queued_here = self
+                .prefetch_queue
+                .iter()
+                .filter(|(_, _, q)| q == id)
+                .count();
+            if t.queued != (queued_here == 1) || queued_here > 1 {
+                return fail(format!(
+                    "ticket {} says queued={} but appears {queued_here} time(s) in the queue",
+                    id.get(),
+                    t.queued
+                ));
+            }
+        }
+        for (_, _, id) in &self.prefetch_queue {
+            if !self.tickets.contains_key(id) {
+                return fail(format!("the prefetch queue holds dead ticket {}", id.get()));
+            }
+        }
+
+        // The counter three findings were about.
+        let demand = self
+            .tickets
+            .values()
+            .filter(|t| !t.queued && t.urgency == Urgency::Demand)
+            .count() as u32;
+        if demand != self.outstanding_demand {
+            return fail(format!(
+                "outstanding_demand is {} but {demand} ticket(s) answer that description",
+                self.outstanding_demand
+            ));
+        }
+
+        for (scope, cache) in &self.caches {
+            let bytes: u64 = self
+                .placements
+                .values()
+                .filter(|p| p.scope == *scope)
+                .map(|p| p.bytes)
+                .sum();
+            if bytes != cache.committed {
+                return fail(format!(
+                    "{scope} committed {} B against {bytes} B of placements",
+                    cache.committed
+                ));
+            }
+            let live = cache.arena.occupancy().live_bytes;
+            if bytes != live {
+                return fail(format!("{scope} holds {bytes} B against {live} B of arena"));
+            }
+            if cache.committed > cache.cap_bytes {
+                return fail(format!(
+                    "{scope} committed {} B over a {} B cap",
+                    cache.committed, cache.cap_bytes
+                ));
+            }
+        }
+
+        let conditional: u64 = self
+            .placements
+            .values()
+            .filter(|p| p.class.content == Content::ConditionalTable)
+            .map(|p| p.bytes)
+            .sum();
+        if conditional != self.conditional_resident {
+            return fail(format!(
+                "conditional_resident is {} against {conditional} B resident",
+                self.conditional_resident
+            ));
+        }
+
+        let occupied = self.lease_slots.iter().filter(|s| s.held.is_some()).count() as u32;
+        if occupied != self.live_leases {
+            return fail(format!(
+                "live_leases is {} against {occupied} occupied slot(s)",
+                self.live_leases
+            ));
+        }
+        // A lease **may** outlive its placement, and that is deliberate: a read
+        // that fails discards its bytes whoever holds them, and the holders'
+        // leases resolve to a typed error rather than to a range that never
+        // arrived. So a dangling lease is legal; what is not legal is a lease
+        // whose placement exists but disagrees with it.
+        for slot in &self.lease_slots {
+            if let Some(held) = slot.held
+                && let Some(p) = self.placements.get(&held.placement)
+                && p.leases == 0
+            {
+                return fail(format!(
+                    "{} is held by a live lease but counts none",
+                    p.chunk
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether this authority has been closed. A closed one owns nothing.
     pub const fn is_closed(&self) -> bool {
         self.closed
@@ -1542,6 +1713,18 @@ impl ResidencyAuthority {
 
     pub fn prefetch_queue_len(&self) -> usize {
         self.prefetch_queue.len()
+    }
+
+    /// The ticket outstanding against one placement, if any.
+    ///
+    /// Diagnostic. A driver that lost track of what it was performing can ask;
+    /// the transition sweep uses it to settle whatever it finds in flight.
+    pub fn ticket_of(&self, scope: Scope, chunk: &ChunkId) -> Option<TicketId> {
+        self.index
+            .get(&scope)
+            .and_then(|m| m.get(chunk))
+            .and_then(|k| self.placements.get(k))
+            .and_then(|p| p.ticket)
     }
 
     /// Whether a chunk is ready at a scope right now.
@@ -1939,7 +2122,12 @@ impl ResidencyAuthority {
         } else {
             self.outstanding_demand = self.outstanding_demand.saturating_add(1);
             self.tickets.get_mut(&ticket).expect("just inserted").issued = true;
-            PendingWork::Issued(self.work_order_for(ticket))
+            match self.work_order_for(ticket) {
+                Some(order) => PendingWork::Issued(order),
+                // A ticket with no order of its own is waiting on another's
+                // read; the caller waits with it.
+                None => PendingWork::Coalesced,
+            }
         };
 
         let lease = self.issue_lease(key, request.turn, request.class, Some(ticket));
@@ -2476,18 +2664,25 @@ impl ResidencyAuthority {
         if depth >= MAX_DEPTH {
             return None;
         }
-        let (was_queued, issued, stage) = {
+        let (was_queued, issued, stage, urgency_before) = {
             let t = self.tickets.get_mut(&ticket)?;
+            let before = t.urgency;
             t.urgency = Urgency::Demand;
             t.deadline = t.deadline.min(deadline);
-            (t.queued, t.issued, t.stage)
+            (t.queued, t.issued, t.stage, before)
         };
+        // The counter tracks "non-queued demand tickets", so a promotion adds
+        // to it exactly when the ticket did not already answer that
+        // description. Counting only the *queue* transition missed an
+        // already-issued prediction becoming demand: it went uncounted, and
+        // `take_ticket` -- which decrements every non-queued demand ticket --
+        // then cleared somebody else's slot and let the gate open early.
+        let held_slot_before = !was_queued && urgency_before == Urgency::Demand;
         if was_queued {
             self.prefetch_queue.retain(|(_, _, id)| *id != ticket);
             self.tickets.get_mut(&ticket).expect("live ticket").queued = false;
-            // A queued ticket now counts as outstanding demand whatever its
-            // stage: the counter follows membership, and `take_ticket` undoes
-            // it the same way.
+        }
+        if !held_slot_before {
             self.outstanding_demand = self.outstanding_demand.saturating_add(1);
         }
         if let Stage::BlockedOnRead(dependency) = stage {
@@ -2498,34 +2693,41 @@ impl ResidencyAuthority {
             return None;
         }
         self.tickets.get_mut(&ticket).expect("live ticket").issued = true;
-        Some(self.work_order_for(ticket))
+        self.work_order_for(ticket)
     }
 
-    fn work_order_for(&self, ticket: TicketId) -> WorkOrder {
-        let t = &self.tickets[&ticket];
+    /// The order a ticket's current stage calls for, if it has one.
+    ///
+    /// `None` for a ticket waiting on another ticket's read: it has no work of
+    /// its own. That used to be an `unreachable!`, and a review reached it --
+    /// `next_prefetch` selected a blocked ticket by deadline order. An
+    /// unreachable branch on a path a generation step takes is a crash waiting
+    /// for the right queue order.
+    fn work_order_for(&self, ticket: TicketId) -> Option<WorkOrder> {
+        let t = self.tickets.get(&ticket)?;
         match t.stage {
             Stage::Read => {
-                let src = &self.placements[&t.source];
-                WorkOrder::Read {
+                let src = self.placements.get(&t.source)?;
+                Some(WorkOrder::Read {
                     ticket,
                     chunk: (*src.chunk).clone(),
                     host_offset: src.offset,
                     len_bytes: src.bytes,
-                }
+                })
             }
             Stage::Upload => {
-                let src = &self.placements[&t.source];
-                let p = &self.placements[&t.placement];
-                WorkOrder::Upload {
+                let src = self.placements.get(&t.source)?;
+                let p = self.placements.get(&t.placement)?;
+                Some(WorkOrder::Upload {
                     ticket,
                     chunk: (*p.chunk).clone(),
                     scope: p.scope,
                     host_offset: src.offset,
                     device_offset: p.offset,
                     len_bytes: p.bytes,
-                }
+                })
             }
-            Stage::BlockedOnRead(_) => unreachable!("a blocked ticket has no work of its own"),
+            Stage::BlockedOnRead(_) => None,
         }
     }
 
@@ -2538,11 +2740,57 @@ impl ResidencyAuthority {
         if self.closed || self.outstanding_demand > 0 || self.prefetch_queue.is_empty() {
             return None;
         }
-        let (_, _, ticket) = self.prefetch_queue.remove(0);
-        let t = self.tickets.get_mut(&ticket)?;
+        // Deadline order decides *what to look at first*, not what is
+        // executable. A queued ticket that is waiting on another ticket's read
+        // has no work of its own, and issuing it by position alone panicked
+        // reaching for an order that does not exist -- a device prefetch with
+        // the earlier deadline sorted ahead of the very read it depends on.
+        //
+        // So the queue is scanned in order and each candidate is resolved to
+        // the root of its dependency chain: the ticket that actually holds the
+        // work. A blocked entry stays queued and is released by
+        // `release_blocked_on` when its dependency completes.
+        let mut chosen = None;
+        for index in 0..self.prefetch_queue.len() {
+            let (_, _, ticket) = self.prefetch_queue[index];
+            let Some(root) = self.chain_root(ticket) else {
+                continue;
+            };
+            let Some(t) = self.tickets.get(&root) else {
+                continue;
+            };
+            if t.issued || !t.queued {
+                continue;
+            }
+            chosen = Some((
+                root,
+                self.prefetch_queue.iter().position(|(_, _, q)| *q == root),
+            ));
+            break;
+        }
+        let (root, position) = chosen?;
+        if let Some(position) = position {
+            self.prefetch_queue.remove(position);
+        }
+        let t = self.tickets.get_mut(&root)?;
         t.queued = false;
         t.issued = true;
-        Some(self.work_order_for(ticket))
+        self.work_order_for(root)
+    }
+
+    /// Follow `BlockedOnRead` links to the ticket that actually owns the work.
+    ///
+    /// Depth-bounded for the same reason [`ResidencyAuthority::promote_chain`]
+    /// is: a cycle must cost a `None`, never a stack.
+    fn chain_root(&self, ticket: TicketId) -> Option<TicketId> {
+        let mut current = ticket;
+        for _ in 0..16 {
+            match self.tickets.get(&current)?.stage {
+                Stage::BlockedOnRead(next) => current = next,
+                _ => return Some(current),
+            }
+        }
+        None
     }
 
     /// The host bytes a read must fill. Valid only for a ticket whose current
@@ -2756,7 +3004,9 @@ impl ResidencyAuthority {
                             .get_mut(&placement)
                             .expect("device placement")
                             .state = ChunkState::Uploading;
-                        released.push(self.work_order_for(ticket));
+                        if let Some(order) = self.work_order_for(ticket) {
+                            released.push(order);
+                        }
                     }
                 }
                 released.extend(self.release_blocked_on(ticket, source));
@@ -2770,11 +3020,19 @@ impl ResidencyAuthority {
                 self.stats.read_failures = self.stats.read_failures.saturating_add(1);
                 self.fail_blocked_on(ticket);
                 let t = self.take_ticket(ticket).expect("live ticket");
-                if source == placement {
-                    self.drop_placement(source);
-                } else {
-                    self.drop_placement(t.placement);
+                self.discard(t.placement);
+                if source != placement {
+                    // Release the pin, then discard the source **whoever else
+                    // still holds it**. A host acquire can join a device-owned
+                    // read and take a lease on that placement; leaving it
+                    // because that lease was live left a `Reading` placement
+                    // whose ticket had already gone, and the next acquire of
+                    // the chunk panicked reaching for it. The bytes never
+                    // arrived, so a surviving lease has nothing to read: it
+                    // resolves to a typed error, exactly as every other failed
+                    // read's waiters do.
                     self.settle_source(source, placement, owns);
+                    self.discard(source);
                 }
                 Ok(Vec::new())
             }
@@ -2896,7 +3154,9 @@ impl ResidencyAuthority {
                 self.tickets.get_mut(&id).expect("waiting ticket").issued = false;
             } else {
                 self.tickets.get_mut(&id).expect("waiting ticket").issued = true;
-                orders.push(self.work_order_for(id));
+                if let Some(order) = self.work_order_for(id) {
+                    orders.push(order);
+                }
             }
         }
         orders
@@ -3230,11 +3490,21 @@ impl ResidencyAuthority {
                 self.stats.quarantined = self.stats.quarantined.saturating_add(1);
             } else {
                 // Nothing was ever handed out, so nothing can be touching these
-                // bytes. `settle_source` drops the source only if this ticket
-                // created it -- a ticket that joined someone else's read must
-                // not destroy that read's destination.
-                self.drop_placement(t.placement);
-                self.settle_source(t.source, t.placement, t.owns_source);
+                // bytes, and this ticket's own read will never happen.
+                self.discard(t.placement);
+                if t.source != t.placement {
+                    self.settle_source(t.source, t.placement, t.owns_source);
+                    if t.owns_source {
+                        // This ticket owned the read, so the source is dead
+                        // whoever else joined it -- the same rule a failed read
+                        // follows. Leaving it because a joiner's lease was live
+                        // left a `Reading` placement with a stale ticket, which
+                        // the transition sweep found in a combination no review
+                        // round had reached: a device prefetch, a host prefetch
+                        // joining its read, and a deadline passing.
+                        self.discard(t.source);
+                    }
+                }
             }
         }
         expired

@@ -1,8 +1,10 @@
 # Handover — task 0020 implemented; task 0021 is M2's grouped expert execution
 
-**Task 0020 is implemented, corrected after two rounds of independent review,
-and awaiting owner acceptance.** The two rounds found **sixteen** issues; all
-sixteen were reproduced and fixed, and none was disputed. It delivers M2 item 2 only. M2 items 3–5 are
+**Task 0020 is implemented, corrected after three rounds of independent review,
+and awaiting owner acceptance.** The three rounds found **twenty** issues; all
+twenty were reproduced and fixed, and none was disputed. The third round's
+closing criticism was of method rather than of a defect, and it is answered by an
+exhaustive transition sweep described below. It delivers M2 item 2 only. M2 items 3–5 are
 outstanding and the next of them is specified under [Next task](#next-task).
 
 ## Workspace identity
@@ -34,8 +36,8 @@ the terms it fixed before implementation, and the filled-in result.
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy | passed |
-| `cargo test --workspace --locked --offline` | **812 passed, 0 failed** (736 at task 0019) |
-| Device-feature workspace tests | **832 passed, 0 failed** |
+| `cargo test --workspace --locked --offline` | **817 passed, 0 failed** (736 at task 0019) |
+| Device-feature workspace tests | **837 passed, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | **zero failures** — 78 rejected fixtures, 21 accepted, 13 rules. The "4 pre-existing failures" carried since task 0014 are gone and were never real; see the note below |
@@ -136,6 +138,34 @@ real violation: `docs/README.md` declares `results/` and `artifacts/` ignored
 scratch, and the crate walk read them anyway. It now skips both, with a unit test
 pinning that a crate under `crates/` is still found. **`arch-check` passes with
 zero failures for the first time in six tasks.**
+
+**A third round found four more, two of them panics, and one of them was my own
+round-two fix.** A failed device-owned read left the host acquires that had
+joined it attached to a dead ticket. The prefetch queue could issue a ticket that
+was waiting on another's read, reaching an `unreachable!`. Promotion of an
+already-*issued* prediction undercounted demand and cleared somebody else's slot.
+And the scratch exclusion I had just added skipped any directory named `results`
+or `artifacts` **at any depth**, which hid a declared model crate under
+`crates/results/model` — with a forbidden `std::fs::read` in it — from every
+rule. Narrowing a check to remove noise was right; narrowing it by name at any
+depth made a real rule unenforceable.
+
+**The most useful thing in the third round was not a finding.** It was the
+observation that these cases "continue to expose gaps between individually
+passing regressions". Every one of the twenty defects had the same shape: a
+transition that was individually reasonable left the structure inconsistent in a
+combination nobody had written a test for, and the damage surfaced one or two
+operations later. Point regressions caught each case and missed the next, because
+the space is a product and the tests were points in it.
+
+So there is now `ResidencyAuthority::check_invariants`, which states the
+structural invariants once and can be run after any operation, and
+`residency_transitions.rs`, which enumerates the product — destination × urgency
+× joiner × ending × surviving lease, **200 combinations** — and checks after
+*every* step. **It found a defect none of the three rounds had reached** on its
+first run: a device prefetch whose host read a host prefetch had joined, ending
+in a deadline expiry. Task 0021 adds queues and plans of its own; the same method
+should be applied to them rather than rediscovered.
 
 **Three narrowings, decided during implementation and reported rather than
 quietly dropped.** `Artifact::read_tensor_range` was **not** added: a canonical

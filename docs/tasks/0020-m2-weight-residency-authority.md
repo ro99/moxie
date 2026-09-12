@@ -1,12 +1,16 @@
 # Task 0020 — M2 weight-residency authority
 
-Status: **implemented and corrected after two rounds of independent review;
+Status: **implemented and corrected after three rounds of independent review;
 awaiting owner acceptance.** Contract written and committed at `d6e9170` before
-implementation, per the working rule that produced tasks 0013–0019. The two
-rounds found **sixteen** issues in total; all sixteen were reproduced and fixed,
-and none was disputed. See [Result](#result-filled-after-work),
-[Independent review](#independent-review-and-what-it-changed) and
-[Second independent review](#second-independent-review).
+implementation, per the working rule that produced tasks 0013–0019. The three
+rounds found **twenty** issues in total; all twenty were reproduced and fixed,
+and none was disputed. The third round's closing note was about method rather
+than defects, and it is answered by
+[an exhaustive transition sweep](#the-answer-to-the-pattern). See
+[Result](#result-filled-after-work),
+[Independent review](#independent-review-and-what-it-changed),
+[Second independent review](#second-independent-review) and
+[Third independent review](#third-independent-review).
 
 ## Identity and authority
 
@@ -565,8 +569,8 @@ task does **not** close M2.
 | `cargo fmt --all -- --check` | **passed** |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed** |
 | Device-lane clippy (`moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`) | **passed** |
-| `cargo test --workspace --locked --offline` | **812 passed, 0 failed** (736 before this task) |
-| Device-feature workspace tests | **832 passed, 0 failed** |
+| `cargo test --workspace --locked --offline` | **817 passed, 0 failed** (736 before this task) |
+| Device-feature workspace tests | **837 passed, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | **passed**, 10 documents |
 | `cargo xtask arch-check` | **passes with zero failures**: 78 rejected fixtures, 21 accepted, 13 rules, including the new `a second weight-residency owner` with its three fixtures. The "4 pre-existing failures" every task since 0014 has carried are **gone, and were never real** — see [the arch-check noise floor](#the-arch-check-noise-floor) |
@@ -706,6 +710,57 @@ unit test pinning that a crate under `crates/` is still discovered.
 **`arch-check` passes with zero failures for the first time.** A standing noise
 floor in a pass/fail gate is how a real failure gets read as one of the usual
 ones, and this one stood for six tasks.
+
+### Third independent review
+
+**Four findings, three P1. All four reproduced; none disputed.** Two were
+panics. Probes at `results/task0020/independent-review-2026-09-12-round3/`.
+
+| # | Finding | Reproduced as | Fix |
+|---|---|---|---|
+| 1 | **A failed device-owned read left host joiners on a dead ticket.** A host acquire can join a device-owned read and take a lease on the same placement; the failure path released the pin but kept the placement because that lease was live | **panic at `expect("live ticket")`** | A failed read discards its source **whoever else holds it**: the bytes never arrived, so a surviving lease resolves to a typed error, exactly as every other failed read's waiters do |
+| 2 | **The prefetch queue could issue a blocked dependency.** Deadline order picked a ticket waiting on another's read | **`unreachable!`: "a blocked ticket has no work of its own"** | `next_prefetch` resolves each candidate to its chain root and issues that; `work_order_for` returns `Option` instead of an `unreachable!` — an unreachable branch on a path a generation step takes is a crash waiting for the right queue order |
+| 3 | **The scratch exclusion hid declared production crates.** It skipped any directory named `results` or `artifacts` **at any depth** | a declared model crate with a forbidden `std::fs::read` under `crates/results/model` produced **zero** violations | The skip applies only at the workspace root — `docs/README.md` writes `/results/` and `/artifacts/` with leading slashes — and never to a directory the workspace declares a member under |
+| 4 | **Promoting an already-issued prefetch undercounted demand.** The counter tracked the queue transition, not the urgency transition | an unrelated demand's slot was cleared and the gate opened early | Promotion adds a slot exactly when the ticket did not already answer "non-queued demand" |
+
+Finding 3 is the sharper one, because it was my own fix from round two. Narrowing
+a check to remove noise is right; narrowing it *by directory name at any depth*
+made a real rule unenforceable, and the noise I was removing had itself hidden
+nothing only by luck.
+
+### The answer to the pattern
+
+The third round closed with a criticism of method, not another case: *"These
+cases continue to expose gaps between individually passing regressions."* That is
+exactly right. Every one of the twenty findings had the same shape — a transition
+that was individually reasonable left the structure inconsistent in a combination
+nobody had hand-written a test for, and the damage surfaced one or two operations
+later, usually as a panic. Point regressions caught each case and missed the next,
+because the space is a product and my tests were points in it.
+
+Two things now exist that did not:
+
+- **`ResidencyAuthority::check_invariants`**, which states the structural
+  invariants **once**: no in-flight state without a live ticket, every ticket's
+  placement and source and dependency alive, the prefetch queue and the `queued`
+  flag agreeing, `outstanding_demand` equal to the number of tickets that answer
+  its description, per-scope committed bytes equal to placements equal to arena
+  occupancy, the conditional-memory total, and the lease table's count. It is
+  public because it is a debugging tool, not a test fixture.
+- **`crates/moxie-memory/tests/residency_transitions.rs`**, which enumerates the
+  product — destination × urgency × joiner × ending × surviving lease, **200
+  combinations** — drives each one, and calls `check_invariants` after *every*
+  operation rather than asserting a hand-picked consequence at the end.
+
+**The sweep immediately found a defect none of the three rounds had reached**: a
+device prefetch whose host read a host prefetch had joined, ending in a deadline
+expiry, left a `Reading` placement with a stale ticket. Same class as finding 1,
+different path, and nothing but the product search would have reached it.
+
+What the sweep proves is narrow and worth stating exactly: no reachable sequence
+in that space leaves the authority structurally inconsistent, panics, or fails to
+drain. It does **not** prove the policy is right — the named tests do that, and
+they stay.
 
 ### What was **not** delivered, and why
 

@@ -2239,6 +2239,181 @@ fn a_refused_device_admission_leaves_the_prediction_it_would_have_promoted() {
 }
 
 // ---------------------------------------------------------------------------
+// Third independent review, 2026-09-12: four findings, all reproduced
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_failed_device_owned_read_resolves_the_host_acquires_that_joined_it() {
+    // Finding 1, and it was a panic. A host acquire can join a device-owned
+    // read and take a lease on the same placement; the failure path released
+    // the pin but left the placement because that lease was live, so it stayed
+    // `Reading` with a ticket that was already gone.
+    let mut l = ledger();
+    let mut a = open_with_device(&mut l, 8 * EXPERT_BYTES, 8 * EXPERT_BYTES);
+    let chunk = expert(0);
+    let device = Scope::Device(gpu());
+
+    let Acquired::Pending {
+        lease: dev, ticket, ..
+    } = a.acquire(device_demand(&chunk, 0)).unwrap()
+    else {
+        panic!("absent")
+    };
+    let Acquired::Pending { lease: host, .. } = a.acquire(demand(&chunk, 1)).unwrap() else {
+        panic!("the host joins the device's read")
+    };
+
+    a.complete_read(
+        ticket,
+        Outcome::Failed(Error::InvalidArtifact {
+            detail: "injected read failure".into(),
+        }),
+    )
+    .unwrap();
+
+    // The bytes never arrived, so neither end holds anything and both leases
+    // resolve to an error rather than to a range that was never filled.
+    assert_eq!(a.state_of(Scope::Host, &chunk), None);
+    assert_eq!(a.state_of(device, &chunk), None);
+    assert!(a.chunk_bytes(&host).is_err());
+    assert!(a.device_range(&dev).is_err());
+    assert_eq!(a.committed_bytes(Scope::Host).unwrap(), 0);
+    assert_eq!(a.committed_bytes(device).unwrap(), 0);
+
+    // The acquire that used to panic.
+    let retry = a.acquire(demand(&chunk, 2)).unwrap();
+    let Acquired::Pending { lease, ticket, .. } = retry else {
+        panic!("absent")
+    };
+    fill_and_complete(&mut a, ticket, 0x11);
+    assert_eq!(a.chunk_bytes(&lease).unwrap()[0], 0x11);
+
+    a.release(dev).unwrap();
+    a.release(host).unwrap();
+    a.release(lease).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn the_prefetch_queue_issues_a_dependency_before_the_ticket_waiting_on_it() {
+    // Finding 2, and it was a panic. Deadline order decides what to look at,
+    // not what is executable: a device prefetch with the earlier deadline
+    // sorted ahead of the very read it depends on, and issuing it by position
+    // reached for an order that does not exist.
+    let mut l = ledger();
+    let mut a = ResidencyAuthority::open(
+        &mut l,
+        &ResidencyRequest::new("order", 8 * EXPERT_BYTES).device(gpu(), EXPERT_BYTES),
+    )
+    .unwrap();
+    let chunk = expert(0);
+
+    let Acquired::Pending { lease: host_p, .. } = a
+        .acquire(AcquireRequest {
+            deadline: 100,
+            ..prefetch(&chunk, 0)
+        })
+        .unwrap()
+    else {
+        panic!("absent")
+    };
+    let Acquired::Pending {
+        lease: device_p, ..
+    } = a
+        .acquire(AcquireRequest {
+            destination: Scope::Device(gpu()),
+            deadline: 1,
+            class: UseClass::prefetch(Content::Expert),
+            ..demand(&chunk, 1)
+        })
+        .unwrap()
+    else {
+        panic!("absent")
+    };
+
+    // The earlier deadline belongs to the blocked ticket; the read must come
+    // out first regardless.
+    let first = a.next_prefetch().expect("something must be executable");
+    assert!(
+        matches!(first, WorkOrder::Read { .. }),
+        "a dependency must be read before the upload waiting on it"
+    );
+    a.read_destination(first.ticket()).unwrap().fill(0x22);
+    let released = a.complete_read(first.ticket(), Outcome::Completed).unwrap();
+    assert!(released.is_empty(), "a prediction's upload stays queued");
+    let second = a.next_prefetch().expect("the upload follows");
+    assert!(matches!(second, WorkOrder::Upload { .. }));
+    a.complete_upload(second.ticket(), Outcome::Completed)
+        .unwrap();
+    assert_eq!(
+        a.state_of(Scope::Device(gpu()), &chunk),
+        Some(ChunkState::DeviceReady)
+    );
+
+    a.release(host_p).unwrap();
+    a.release(device_p).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn promoting_an_already_issued_prefetch_does_not_steal_another_demands_slot() {
+    // Finding 4. The counter tracks non-queued demand tickets; promotion
+    // counted only the *queue* transition, so an already-issued prediction
+    // became uncounted demand and `take_ticket` later cleared somebody else's
+    // slot, opening the gate while real demand was still outstanding.
+    let mut l = ledger();
+    let mut a = open(&mut l, 8 * EXPERT_BYTES);
+    let (promoted, other, later) = (expert(0), expert(1), expert(2));
+
+    // A prediction, issued from the queue.
+    let Acquired::Pending {
+        lease: p, ticket, ..
+    } = a.acquire(prefetch(&promoted, 0)).unwrap()
+    else {
+        panic!("absent")
+    };
+    let order = a.next_prefetch().expect("no demand outstanding yet");
+    assert_eq!(order.ticket(), ticket);
+
+    // Demand it -- promoting an *issued* ticket -- and start an unrelated one.
+    let Acquired::Pending { lease: d1, .. } = a.acquire(demand(&promoted, 1)).unwrap() else {
+        panic!("in flight")
+    };
+    let Acquired::Pending { lease: d2, .. } = a.acquire(demand(&other, 2)).unwrap() else {
+        panic!("absent")
+    };
+    let Acquired::Pending { lease: p2, .. } = a.acquire(prefetch(&later, 3)).unwrap() else {
+        panic!("absent")
+    };
+
+    // Completing the promoted ticket must give back its own slot and nobody
+    // else's: the demand on `other` is still in flight.
+    fill_and_complete(&mut a, ticket, 0x33);
+    a.check_invariants()
+        .expect("the counter still describes the tickets");
+    assert!(
+        a.next_prefetch().is_none(),
+        "the unrelated demand is still outstanding, so the gate stays shut"
+    );
+
+    // Settle that one too, and only then does the queue open.
+    let other_ticket = a.ticket_of(Scope::Host, &other).expect("still reading");
+    fill_and_complete(&mut a, other_ticket, 0x44);
+    a.check_invariants().unwrap();
+    let released = a
+        .next_prefetch()
+        .expect("no demand remains, so the queue may run");
+    fill_and_complete(&mut a, released.ticket(), 0x55);
+
+    a.release(p).unwrap();
+    a.release(d1).unwrap();
+    a.release(d2).unwrap();
+    a.release(p2).unwrap();
+    a.check_invariants().unwrap();
+    a.close(&mut l).unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // The envelope
 // ---------------------------------------------------------------------------
 
