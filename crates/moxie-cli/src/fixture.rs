@@ -2,8 +2,8 @@
 //! checkpoint, tokenizer, model family or execution ownership lives here.
 use moxie_engine::{HostTensor, Program, Value};
 use moxie_graph::{
-    Bindings, Graph, GraphBuilder, IndexEncoding, OpParams, OracleRegistry, TensorSpec, ValueId,
-    ValueRole, Visibility,
+    Bindings, Graph, GraphBuilder, IndexEncoding, OpParams, OracleRegistry, RopeLayout, TensorSpec,
+    ValueId, ValueRole, Visibility, reciprocal_sqrt_scale,
 };
 use moxie_types::{Dim, Precision, Result, SymbolId, WeightPrecision};
 
@@ -78,6 +78,7 @@ fn build_with_rows(heads: u64, dim: u64, vocab: u64, layers: u32, rows: Dim) -> 
         OpParams::Embedding {
             vocab,
             hidden: width,
+            scale: 1.0,
         },
         &[tokens, embedding],
     )?;
@@ -88,6 +89,8 @@ fn build_with_rows(heads: u64, dim: u64, vocab: u64, layers: u32, rows: Dim) -> 
                 head_dim: dim,
                 rotary_dim: dim,
                 base: 10_000.0,
+                frequency_dim: dim,
+                layout: RopeLayout::Interleaved,
             },
             &[value, positions],
         )?;
@@ -97,15 +100,18 @@ fn build_with_rows(heads: u64, dim: u64, vocab: u64, layers: u32, rows: Dim) -> 
                 head_dim: dim,
                 visibility: Visibility::Causal,
                 layer,
+                kv_heads: heads,
+                scale: reciprocal_sqrt_scale(dim),
             },
             &[rotated, rotated, value, positions],
         )?;
-        value = graph.node(OpParams::Residual, &[value, attention])?;
+        value = graph.node(OpParams::Residual { scale: 1.0 }, &[value, attention])?;
     }
     let logits = graph.node(
         OpParams::VocabProjection {
             hidden: width,
             vocab,
+            softcap: None,
         },
         &[value, projection],
     )?;

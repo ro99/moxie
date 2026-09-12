@@ -17,6 +17,7 @@ members = [
     "crates/moxie-plan",
     "crates/moxie-executor",
     "crates/moxie-engine",
+    "crates/moxie-models",
     "crates/moxie-cli",
     "xtask",
 ]
@@ -46,6 +47,7 @@ moxie-kernels = { path = "crates/moxie-kernels" }
 moxie-plan = { path = "crates/moxie-plan" }
 moxie-executor = { path = "crates/moxie-executor" }
 moxie-engine = { path = "crates/moxie-engine" }
+moxie-models = { path = "crates/moxie-models" }
 
 [profile.release]
 debug = 1

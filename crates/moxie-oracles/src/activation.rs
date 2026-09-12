@@ -89,6 +89,88 @@ pub fn swiglu_row(gate: &[f32], up: &[f32]) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// The tanh approximation of GELU, FP32 in and out.
+///
+/// ```text
+/// gelu_tanh(v) = 0.5 · v · (1 + tanh(sqrt(2/pi) · (v + 0.044715 · v³)))
+/// ```
+///
+/// `sqrt(2/pi)` is the pinned constant `0.7978845608028654`, transcribed from
+/// `src/platform/numerics.cpp:86` rather than recomputed, so this reference and
+/// the source it stands for cannot drift apart by a rounding of the constant.
+///
+/// Evaluated in FP64 and narrowed once. The inner polynomial is why: `v³`
+/// overflows FP32 at `|v| > 1.1e13` while the true result there is exactly `v`,
+/// and for moderate negative `v` the sum `v + 0.044715·v³` cancels, so an FP32
+/// intermediate loses the bits that decide the tanh argument.
+pub fn gelu_tanh(v: f32) -> f32 {
+    let v = v as f64;
+    (0.5 * v * (1.0 + (0.7978845608028654 * (v + 0.044715 * v * v * v)).tanh())) as f32
+}
+
+/// `y[i] = bf16(gelu_tanh(gate[i])) · up[i]`.
+///
+/// **The BF16 rounding of the gate term is part of the equation, not storage.**
+/// The pinned source rounds there (`src/models/gemma4/gemma4_ops.cpp:70`), and
+/// dropping the boundary would make this reference disagree with the released
+/// model by more than the product's own rounding. The second boundary -- on the
+/// product -- is the ordinary node-output one and belongs to the interpreter,
+/// which is why it is absent here.
+///
+/// Contrast [`swiglu_row`], whose contract declares a single rounding on the
+/// product. The two activations differ in their gate transform *and* in their
+/// declared boundaries, which is precisely why document 02 keeps them separate.
+pub fn geglu_row(gate: &[f32], up: &[f32]) -> Result<Vec<f32>> {
+    if gate.len() != up.len() {
+        return Err(Error::InvalidArtifact {
+            detail: format!("gate has {} elements and up has {}", gate.len(), up.len()),
+        });
+    }
+    if gate.is_empty() {
+        return Err(Error::InvalidRequest {
+            field: "geglu",
+            detail: "an activation over zero features".into(),
+        });
+    }
+    let mut out = crate::try_vec(gate.len())?;
+    out.extend(gate.iter().zip(up).map(|(g, u)| {
+        let gated = crate::bf16_round(gelu_tanh(*g)) as f64;
+        (gated * (*u as f64)) as f32
+    }));
+    Ok(out)
+}
+
+/// Logit soft capping, `bf16(tanh(bf16(bf16(x) / cap))) · cap`.
+///
+/// Three of the four BF16 boundaries in the pinned kernel
+/// (`kernels/cuda/detail/backend_kernels.cuh:905`) are internal to the
+/// operation and appear here; the fourth is on the result and belongs to the
+/// caller. Unlike every other operation in this crate the boundaries are not
+/// optional detail: the cap exists to bend large logits, so it is evaluated
+/// exactly where the source evaluates it.
+///
+/// `cap` must be finite and positive. There is no cap value meaning "uncapped";
+/// absence is modelled by not calling this.
+pub fn softcap(x: f32, cap: f32) -> Result<f32> {
+    if !(cap.is_finite() && cap > 0.0) {
+        return Err(Error::InvalidRequest {
+            field: "softcap",
+            detail: format!("cap must be finite and positive, got {cap}"),
+        });
+    }
+    let scaled = crate::bf16_round(crate::bf16_round(x) / cap);
+    Ok(crate::bf16_round((scaled as f64).tanh() as f32) * cap)
+}
+
+/// [`softcap`] over a row.
+pub fn softcap_row(x: &[f32], cap: f32) -> Result<Vec<f32>> {
+    let mut out = crate::try_vec(x.len())?;
+    for v in x {
+        out.push(softcap(*v, cap)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +247,137 @@ mod tests {
             rel < 1e-6,
             "relative error {rel:e}, got {got:e} want {want:e}"
         );
+    }
+
+    /// The GELU tanh approximation, transcribed separately in FP64 from the
+    /// pinned `src/platform/numerics.cpp:86`.
+    fn gelu_tanh_f64(v: f64) -> f64 {
+        0.5 * v * (1.0 + (0.7978845608028654 * (v + 0.044715 * v.powi(3))).tanh())
+    }
+
+    #[test]
+    fn gelu_tanh_matches_the_equation_within_gamma_four() {
+        let n = 1024usize;
+        let xs: Vec<f32> = (0..n).map(|i| (i as f32 - 512.0) / 48.0).collect();
+        let got: Vec<f32> = xs.iter().map(|v| gelu_tanh(*v)).collect();
+        let want: Vec<f64> = xs.iter().map(|v| gelu_tanh_f64(*v as f64)).collect();
+        let scale: Vec<f64> = want.iter().map(|v| v.abs()).collect();
+        let s = ErrorSummary::normalized(&got, &want, &scale);
+        let bound = gamma(4);
+        assert_eq!(s.count, n);
+        assert!(s.within(bound), "{s} exceeded gamma(4) = {bound:.3e}");
+    }
+
+    #[test]
+    fn gelu_tanh_survives_the_cube_that_overflows_fp32() {
+        // `v³` leaves FP32 above about 1.1e13 while the true GELU there is
+        // exactly `v`. An FP32 intermediate returns NaN; the FP64 one does not.
+        for v in [1e13f32, 1e20, 1e30, f32::MAX] {
+            let got = gelu_tanh(v);
+            assert!(got.is_finite(), "gelu_tanh({v:e}) = {got}");
+            assert_eq!(got, v, "the saturated branch must be the identity");
+            let neg = gelu_tanh(-v);
+            assert!(neg.is_finite() && neg == 0.0, "gelu_tanh({:e}) = {neg}", -v);
+        }
+    }
+
+    #[test]
+    fn gelu_tanh_cancels_where_fp32_would_lose_the_argument() {
+        // Around v = -4.3 the polynomial `v + 0.044715 v³` is a difference of
+        // similar magnitudes. FP64 keeps the bits that decide the tanh.
+        for v in [-4.2f32, -4.3, -4.35, -4.4] {
+            let got = gelu_tanh(v) as f64;
+            let want = gelu_tanh_f64(v as f64);
+            let rel = ((got - want) / want).abs();
+            assert!(rel < 1e-6, "v={v}: relative error {rel:e}");
+        }
+    }
+
+    #[test]
+    fn geglu_rounds_its_gate_term_and_swiglu_does_not() {
+        // The declared difference, asserted rather than described: GeGLU's
+        // gate passes through BF16 before the multiply. Deleting that rounding
+        // changes the result, which is what makes it part of the equation.
+        let gate = [0.31f32, -1.7, 2.9, 0.004];
+        let up = [1.0f32, 1.0, 1.0, 1.0];
+        let got = geglu_row(&gate, &up).unwrap();
+        for (i, g) in gate.iter().enumerate() {
+            assert_eq!(got[i], crate::bf16_round(gelu_tanh(*g)));
+            // And the unrounded value differs, so the boundary is observable.
+            if gelu_tanh(*g) != 0.0 {
+                assert_ne!(
+                    got[i],
+                    gelu_tanh(*g),
+                    "element {i} happens to be BF16-exact; pick another probe"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn geglu_is_not_swiglu() {
+        // R06 in one assertion: substituting one gated activation for another
+        // is a numerical change, not a naming preference.
+        let gate: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 8.0).collect();
+        let up: Vec<f32> = (0..64).map(|i| ((i * 7 % 13) as f32 - 6.0) / 4.0).collect();
+        let g = geglu_row(&gate, &up).unwrap();
+        let s = swiglu_row(&gate, &up).unwrap();
+        assert_ne!(g, s);
+        // They agree at zero, where both gates vanish, so the difference above
+        // is not an artefact of comparing unrelated scales.
+        assert_eq!(geglu_row(&[0.0], &[5.0]).unwrap(), vec![0.0]);
+        assert_eq!(swiglu_row(&[0.0], &[5.0]).unwrap(), vec![0.0]);
+    }
+
+    #[test]
+    fn geglu_shape_disagreements_are_typed_errors() {
+        assert!(geglu_row(&[1.0], &[1.0, 2.0]).is_err());
+        assert!(geglu_row(&[], &[]).is_err());
+    }
+
+    #[test]
+    fn the_softcap_bends_large_logits_and_barely_moves_small_ones() {
+        let cap = 30.0f32;
+        // Far past the cap, tanh saturates and the output approaches it.
+        for x in [300.0f32, 1e4, 1e30] {
+            let got = softcap(x, cap).unwrap();
+            assert!(
+                (got - cap).abs() <= 0.25,
+                "softcap({x:e}) = {got}, expected about {cap}"
+            );
+        }
+        assert_eq!(softcap(-1e30, cap).unwrap(), -cap);
+        // Near zero it is close to the identity: tanh(x/c)*c ~= x.
+        for x in [0.5f32, -0.25, 1.0] {
+            let got = softcap(x, cap).unwrap();
+            assert!((got - x).abs() < 0.05, "softcap({x}) = {got}");
+        }
+        // And it is odd.
+        assert_eq!(softcap(7.0, cap).unwrap(), -softcap(-7.0, cap).unwrap());
+    }
+
+    #[test]
+    fn the_softcap_is_the_pinned_four_step_sequence() {
+        // `kernels/cuda/detail/backend_kernels.cuh:905`, transcribed. The
+        // intermediate roundings are part of the operation: computing
+        // `cap * tanh(x / cap)` in one FP32 expression gives a different
+        // answer, and this fixture is what would catch that substitution.
+        let cap = 30.0f32;
+        for x in [12.5f32, -3.75, 41.0, 0.001] {
+            let scaled = crate::bf16_round(crate::bf16_round(x) / cap);
+            let want = crate::bf16_round((scaled as f64).tanh() as f32) * cap;
+            assert_eq!(softcap(x, cap).unwrap(), want);
+        }
+        let naive = cap * (12.5f32 / cap).tanh();
+        assert_ne!(softcap(12.5, cap).unwrap(), naive);
+    }
+
+    #[test]
+    fn a_softcap_must_be_finite_and_positive() {
+        for cap in [0.0f32, -1.0, f32::INFINITY, f32::NAN] {
+            assert!(softcap(1.0, cap).is_err(), "cap {cap} was accepted");
+        }
+        assert!(softcap_row(&[1.0, 2.0], 4.0).is_ok());
     }
 
     #[test]

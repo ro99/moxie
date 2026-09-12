@@ -197,13 +197,17 @@ impl Interpreter {
             ));
         }
         for node in graph.nodes() {
+            // `kv_heads`, not `heads`: the pages store keys and values, and
+            // under GQA there are fewer of those than there are query heads.
+            // The two coincided while every graph was multi-head, which is how
+            // this read `heads` and still passed.
             if let OpParams::Attention {
-                heads,
+                kv_heads,
                 head_dim,
                 layer,
                 ..
             } = node.params
-                && (heads as usize != geometry.kv_heads
+                && (kv_heads as usize != geometry.kv_heads
                     || head_dim as usize != geometry.key_dim
                     || head_dim as usize != geometry.value_dim
                     || layer as usize >= geometry.layers)

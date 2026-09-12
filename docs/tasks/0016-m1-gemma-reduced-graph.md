@@ -311,8 +311,203 @@ Stop and report, rather than proceeding, if any of these occur:
 
 ## Result, filled after work
 
-- Changed shared owners and consumers; source commit:
-- Commands and result IDs; passed / failed / skipped separately:
-- Measured effect and uncertainty:
-- Deleted/replaced paths:
-- Remaining blockers and next bounded task:
+Status on completion: **implemented; awaiting independent review and owner
+acceptance.** Contract `1199267` precedes the implementation.
+[ADR 0012](../decisions/adr/0012-explicit-family-operation-parameters.md) records
+the parameter-explicitness decision;
+[ADR 0013](../decisions/adr/0013-one-model-crate-with-family-modules.md) records
+the model-crate packaging decision the owner directed during implementation.
+
+### Two deviations from the contract, both widenings
+
+1. **Seven parameters, not six.** The contract listed six, on this record's own
+   inventory of the bring-up document, which marked per-head Q/K normalization
+   "none (composition)". That was wrong: composing a per-head norm needs
+   `Concat`/`Split`, which have no `OpParams` and no registered oracle, so the
+   grouping had to become a seventh parameter — `RmsNorm.group`. The bring-up
+   record's row is corrected in place with the reason, rather than quietly
+   updated. The new parameter carries the same obligations as the other six: an
+   FP64 oracle, boundary cases, a device-path refusal, and a load-bearing test.
+2. **The diagnostic graph-value cap moved from 128 to 384.** A six-layer
+   Gemma-like graph is roughly 210 values, and task 0015's cap would have
+   limited the reduced graph to three layers — too few to place a global layer
+   among sliding ones the way the artifact does. The cap is an explicit
+   host-reference diagnostic bound, not a context, precision or quality gate;
+   raising it grows the reserved control envelope by at most 1 MiB
+   (`4096 * (384 - 128)`), and the envelope formula itself is unchanged. No
+   other task 0015 limit moved: context and chunk stay at 256, tensors at
+   65,536 elements, rank at 4 and attention layers at 8.
+
+3. **One `moxie-models` crate with a `gemma4` module, not `moxie-models-gemma4`.**
+   The contract named a per-family crate because that is what M0's `arch-check`
+   prefix assumed. The owner objected to the ceremony during implementation and
+   was right: the boundary is the dependency list, which a module cannot widen,
+   so one crate enforces the same three rules with a file and a `pub mod` line
+   per family. `arch-check` now recognises both the unprefixed name and the
+   retained `moxie-models-*` prefix, with three new fixtures so the change
+   cannot silently exempt the real crate.
+   [ADR 0013](../decisions/adr/0013-one-model-crate-with-family-modules.md).
+
+Nothing else in the contract was relaxed. No numerical tolerance changed, no
+owner gate was resolved, no checkpoint was read and no support claim is made.
+
+### Changed shared owners and consumers
+
+- **`moxie-graph`** owns the seven parameters, `RopeLayout`, and
+  `reciprocal_sqrt_scale` for callers that want the conventional attention
+  factor. `OpParams::GeGlu` joins the catalogue; `Op::GeGlu` already existed.
+  `check_params` rejects a non-divisible head grouping, a zero frequency
+  denominator, a half-split layout on an odd head, a group that does not divide
+  the width, and any scale, cap or epsilon that is not finite and positive.
+  `check_shapes` now derives the key and value operand widths from `kv_heads`
+  rather than `heads`; the two coincided while every graph was multi-head, which
+  is why the single-width rule went unnoticed.
+- **`moxie-oracles`** owns `gelu_tanh`, `geglu_row`, `softcap`,
+  `rms_norm_row_grouped`, `residual_row_scaled`, `embedding_row_scaled`, and the
+  extended `rope_head`/`attend_multi_head`. Two descriptors —
+  `rope::Rotation` and `attention::Heads` — group the parameters that belong to
+  one decision, which is also what keeps the argument counts honest. `bf16_round`
+  becomes public because GeGLU's gate rounding is part of its equation rather
+  than storage; a new test checks it against `moxie-format` over every BF16
+  pattern and every midpoint, which is what makes the reimplementation
+  defensible rather than merely convenient.
+- **`moxie-interp`** dispatches the new parameters through the same single
+  dispatcher. Its paged path now compares `geometry.kv_heads` against the
+  operation's `kv_heads`.
+- **`moxie-engine`** derives the page geometry and the per-row reserve from
+  `kv_heads * head_dim`. Under grouped-query attention that is narrower than the
+  query width, so a reserve computed the old way would have over-admitted. Its
+  uniformity check covers `(heads, kv_heads, head_dim)` and refuses a graph whose
+  layers disagree.
+- **`moxie-plan::selected`** refuses a scaled residual and a grouped norm with
+  `UnsupportedKernel`, naming the offending value. No qualified device kernel
+  applies either, and dropping the factor silently would be a numerical change
+  wearing a fallback's clothes.
+- **`moxie-models`** is new: `gemma4` holds the config, the tensor roles, the
+  artifact's geometry as a separate non-runnable type, and graph composition.
+  Three workspace dependencies, no allocation, no file read.
+- **`moxie-cli`** gains `gemma`, a composition root that fills the declared roles
+  with a synthetic pattern and a literal unit gain for the value norm, plus
+  `--shape gemma-a|gemma-b`. It prints `event=reduced ... model_support=false`
+  with the reduction list before anything executes.
+- **`xtask`** recognises `moxie-models` as a model crate alongside the retained
+  `moxie-models-*` prefix, and lets `moxie-cli` join `xtask` as a composition
+  root permitted to import it.
+
+### Commands and result IDs
+
+| Gate / exact command | Result |
+|---|---|
+| `cargo test --workspace --locked --offline` | 652 tests, zero failed, zero ignored — 602 before this task plus 50 new |
+| `cargo test -p moxie-cli --locked --offline --test gemma` | 14 tests, zero failed |
+| `cargo test -p moxie-cli --locked --offline --test allocation -- --nocapture` | 1 test, zero failed; the three Gemma cases are in its printed table below |
+| `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | passed |
+| `cargo fmt --all -- --check`; `git diff --check` | passed |
+| `cargo xtask spec-check` | passed, all ten specification digests unchanged |
+| `cargo xtask arch-check` | 73 rejecting + 21 accepted fixtures, 12 rules — three new fixtures for the unprefixed model crate name |
+| Same `cargo test` with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | 659 tests + 12 doctests, zero failed/ignored |
+| Same clippy command with the device feature list | passed |
+| `cargo xtask-cuda test-gpu` | **39/39 real GPU cases, 0 failed, 0 skipped**; sm_86 and sm_120 both qualified |
+
+The GPU result is unchanged from task 0015's, which is the expected outcome: this
+task adds no device kernel, and the two new operations that could reach one are
+explicit `UnsupportedKernel` refusals. A changed GPU result would have been a
+blocker rather than an update.
+
+`arch-check` run against the working tree also reports the four pre-existing
+findings from the retained task 0014 probe crate under `results/`, exactly as
+task 0015 recorded. Product validation uses a clean `git archive`.
+
+### Retained evidence
+
+Raw logs are retained outside git under `results/task0016/` through independent
+review. Their SHA-256 values:
+
+```text
+host.log            e6d3dd9d1ce756153c5321d2d8d2c3dbe9034e0082c41a3cc2c4ec7449f6bb46
+device.log          ab5ec722d3a35142c2d5c3e2860ec0d7596b8d0353dd51ef7ce79fd56b864db5
+clippy.log          4cf86278c1e6d659943a46a3d7e3da429ac15be90f0f17742e24ef85228e7d3e
+device-clippy.log   fb954d94f68bf842a50a2ce65de5bc86bf389e2ab1da68cc970f4086634dd5ba
+gpu.log             debfa6b0a6bd2f53a86b1953c22122ff20c92509c7ee84977c8426c55bbea1ea
+arch-clean.log      9ab0daa781e72184a9d2e1be4f7aa7bc529dc231a7e6d35d688fa14258871984
+spec.log            7ee9b3fc6c1a5e5a612b078e860e08a5d6cb468f3fb849798dbf3c6df79207e9
+gemma.log           b4f9d9aa96a2680a59bbf37a0db907e336b6f6867b8e432d6d1876859df24a6e
+allocation.log      7b5df8c0ef89f00fa9cc7bf1155c66752e4195a5eece26da61fc3ad9431a6ba2
+gemma-shards.sha256 36756b01120982483f08d4dd49912ba2ea74b39b65b1d3e4d1d4df60325ff86e
+```
+
+`gpu.log` and `spec.log` hash identically to task 0015's, which is the intended
+result: neither the real GPU behaviour nor the specification digests changed.
+`gemma-shards.sha256` is the artifact shard verification, retained because the
+checkpoint itself stays outside git.
+
+`arch-clean.log` is `arch-check` run against a copy of the tree without
+`results/`, so the four retained task 0014 probe findings do not appear. It is
+the product architecture result: 73 rejecting, 21 accepted, 12 rules.
+
+### Measured effect and uncertainty
+
+The allocation harness prints, for each shape, the peak requested heap above the
+ledger baseline and the admitted generation bytes:
+
+| Shape | Layers | Query/KV heads | Head dim | Prompt / chunk | Peak above baseline | Admitted |
+|---|---:|---|---:|---|---:|---:|
+| gemma-a | 6 | 4 / 2 | 16 | 37 / 13 | 575,334 | 10,746,366 |
+| gemma-a | 6 | 4 / 2 | 16 | 251 / 65 | 1,700,117 | 42,513,398 |
+| gemma-b | 3 | 6 / 3 | 8 | 255 / 255 | 1,811,602 | 35,587,246 |
+
+These are the conservative reference envelope's numbers, not a measured minimal
+allocation plan and not a performance result. The three task 0015 shapes retain
+their previously recorded figures unchanged.
+
+Sixty-four repeated generations on `gemma-a` retain no growth above the first
+run's settled heap, and every tier charge returns to zero.
+
+**Uncertainty and what is not measured:** no prefill/decode timing, no
+throughput, no quality, no topology, no sanitizer lane, no context above 256 and
+no checkpoint. The reduced graph's agreement with Gemma 4 is agreement with the
+pinned legacy reference's equations at small dimensions over invented weights;
+it is not evidence about the released model's outputs.
+
+### A test that earned its place
+
+The first reduced geometry used `head_dim` 8 with the artifact's quarter rotary
+factor. A quarter of eight is a single rotated pair, whose inverse frequency is
+`base^0` — so the global RoPE base cancelled entirely and the geometry silently
+stopped testing it. `every_gemma_parameter_is_load_bearing` failed on exactly
+that assertion. The geometries now use 16 and 8, the smallest widths at which
+their partial rotary factors leave more than one angle. Had the acceptance
+condition been "the oracle agrees with its transcription" rather than "the
+parameter changes the result", this would have passed review as covered.
+
+### Deleted and replaced paths
+
+Nothing was deleted. No numerical gate, oracle or sampler stage was weakened, and
+no legacy source was removed. `moxie-cli`'s `Options.shape_b: bool` became a
+four-valued `Shape`; the two synthetic fixtures it selected are unchanged in
+behaviour and are now the independent second consumer of every new parameter.
+The unprefixed-model-crate rule replaces nothing: the `moxie-models-*` prefix is
+retained and still tested.
+
+### Remaining blockers and next bounded task
+
+1. **M3 blocks the artifact.** Every language-model linear in
+   `cyankiwi/gemma-4-31B-it-AWQ-8bit` at
+   `34ca187d836de874b2c7e3edf48f439b9f583772` is compressed-tensors INT8
+   `pack-quantized`, group 32, symmetric, four codes per `int32` along the input
+   axis, BF16 scales. The importer, packed-layout reader, canonical repack and
+   W8A16 execution path are all M3, and nothing here substitutes for them.
+2. **M4 blocks the real graph's shape.** The artifact's sliding layers are 16
+   heads of 256 and its global layers 4 of 512; one `KvGeometry` cannot hold
+   both, and sliding layers want ring eviction at the window rather than full
+   retention.
+3. **M11 blocks vision.** The artifact is `image-text-to-text` and its mask rule
+   has a multimodal group exemption. The reduced graph is text-only and refuses
+   nothing about images because it never sees one — a real text-only bring-up
+   must refuse image tokens explicitly.
+4. O1, O2 and O5 remain open. A downloaded artifact is not a catalog decision, no
+   quality statement exists, and nothing may be converted.
+
+The next bounded task is M1.5's remaining half or M4's state schema, at the
+owner's direction. The reduced graph proves the contracts M1.5 asks it to prove;
+it does not prove integration, and this record does not claim it does.

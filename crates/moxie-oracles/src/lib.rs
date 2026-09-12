@@ -69,10 +69,16 @@ use moxie_types::Result;
 /// Round to the nearest BF16 value and back.
 ///
 /// Test fixtures use it so that "a BF16-representable input" is a fact rather
-/// than a hope. The rounding contract itself lives in `moxie-format` and is
-/// tested exhaustively there; duplicating it would be a second contract.
-#[cfg(test)]
-pub(crate) fn bf16_round(v: f32) -> f32 {
+/// than a hope. It is also how an operation whose contract declares an
+/// **internal** BF16 boundary states that boundary: GeGLU rounds its gate term
+/// before multiplying, and that rounding is part of the equation rather than a
+/// storage detail the interpreter applies afterwards.
+///
+/// The rounding contract itself lives in `moxie-format` and is tested
+/// exhaustively there; duplicating it would be a second contract, so
+/// `agrees_with_the_format_crate_over_every_bf16_pattern` below asserts the two
+/// are the same function.
+pub fn bf16_round(v: f32) -> f32 {
     // Reimplemented rather than depending on `moxie-format`, which sits beside
     // this crate rather than below it in the ownership table. Round-to-nearest-
     // even on the top 16 bits: add half an ulp plus the retained low bit.
@@ -105,6 +111,10 @@ pub fn register(registry: &mut OracleRegistry) -> Result<()> {
         ),
         (Op::RmsNorm, "moxie_oracles::norm", "norm::tests"),
         (Op::SwiGlu, "moxie_oracles::activation", "activation::tests"),
+        // Task 0016. Separate from SwiGlu's entry because they are separate
+        // operations with separate declared rounding boundaries, not one
+        // activation with a switch.
+        (Op::GeGlu, "moxie_oracles::activation", "activation::tests"),
         (Op::Rope, "moxie_oracles::rope", "rope::tests"),
         (
             Op::Attention,
@@ -159,6 +169,7 @@ mod tests {
             Op::Rope,
             Op::Attention,
             Op::Residual,
+            Op::GeGlu,
             Op::Route,
             Op::Dispatch,
             Op::Combine,
@@ -175,7 +186,6 @@ mod tests {
             // R06: bounded in both terms, and not SwiGlu. Registering SwiGlu's
             // reference for it would be the substitution R06 warns against.
             Op::SituGlu,
-            Op::GeGlu,
             Op::ResidualMix,
             Op::LayerNorm,
             Op::ExpertLinear,
@@ -187,5 +197,33 @@ mod tests {
                 op.name()
             );
         }
+    }
+
+    #[test]
+    fn agrees_with_the_format_crate_over_every_bf16_pattern() {
+        // `bf16_round` is reimplemented here because `moxie-format` sits beside
+        // this crate rather than below it in the ownership table. That is only
+        // acceptable while the two are demonstrably the same function, so this
+        // checks every BF16 value, every value exactly between two of them, and
+        // the specials.
+        for bits in 0u32..=0xFFFF {
+            let exact = f32::from_bits(bits << 16);
+            for probe in [exact, f32::from_bits((bits << 16) | 0x8000)] {
+                if probe.is_nan() {
+                    continue;
+                }
+                let want = moxie_format::bf16::bf16_bits_to_f32(
+                    moxie_format::bf16::f32_to_bf16_bits(probe),
+                );
+                let got = bf16_round(probe);
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "0x{:08x}: {got} vs {want}",
+                    probe.to_bits()
+                );
+            }
+        }
+        assert!(bf16_round(f32::NAN).is_nan());
     }
 }

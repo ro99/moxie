@@ -1,4 +1,4 @@
-use moxie_cli::{Options, USAGE, fixture, render};
+use moxie_cli::{Options, USAGE, render};
 use moxie_engine::{Cancel, service::GenerationService};
 use moxie_memory::{CapacitySnapshot, Ledger};
 
@@ -10,11 +10,16 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
     }
     let options = Options::parse(&args)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let fixture = if options.shape_b {
-        fixture::build(3, 4, 7, 2)?
-    } else {
-        fixture::build(2, 4, 16, 1)?
-    };
+    let fixture = options.shape.build()?;
+    let reduction = options.shape.reduction();
+    if !reduction.is_empty() {
+        // Printed before admission, so a reader sees what the graph is not
+        // before they see anything it produced.
+        println!(
+            "event=reduced shape={} reduced={reduction} model_support=false",
+            options.shape.name()
+        );
+    }
     let host = moxie_host::read()?;
     let snapshot = CapacitySnapshot::measured_host(&host, 1 << 30)?;
     let mut ledger = Ledger::new([snapshot])?;

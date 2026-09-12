@@ -630,7 +630,11 @@ impl Interpreter {
         };
 
         let out = match node.params {
-            OpParams::Embedding { vocab, hidden } => {
+            OpParams::Embedding {
+                vocab,
+                hidden,
+                scale,
+            } => {
                 let tokens = input(0)?.as_index()?;
                 let table = input(1)?.as_float()?;
                 let mut out = try_vec(tokens.len() * hidden as usize)?;
@@ -639,20 +643,26 @@ impl Interpreter {
                         field: "token",
                         detail: format!("token {t} does not fit a u32"),
                     })?;
-                    out.extend(linear::embedding_row(
+                    out.extend(linear::embedding_row_scaled(
                         id,
                         table.data(),
                         vocab as usize,
                         hidden as usize,
+                        scale,
                     )?);
                 }
-                // A copy: the stored value passes through unchanged, so this is
-                // `bf16` rather than `round_to_bf16`, and it would fail loudly
-                // if the table were not BF16-valued.
-                Value::Float(HostTensor::bf16(
-                    out,
-                    try_shape2(tokens.len(), hidden as usize)?,
-                )?)
+                let shape = try_shape2(tokens.len(), hidden as usize)?;
+                if scale == 1.0 {
+                    // A copy: the stored value passes through unchanged, so
+                    // this is `bf16` rather than `round_to_bf16`, and it would
+                    // fail loudly if the table were not BF16-valued.
+                    Value::Float(HostTensor::bf16(out, shape)?)
+                } else {
+                    // A scaled row is no longer the stored value, so the
+                    // node-output boundary applies. Keeping `bf16` here would
+                    // reject every scaled embedding as a non-BF16 payload.
+                    Value::Float(HostTensor::round_to_bf16(out, shape)?)
+                }
             }
             OpParams::Linear {
                 out_features, bias, ..
@@ -678,21 +688,32 @@ impl Interpreter {
                     try_shape2(x.rows(), out_features as usize)?,
                 )?)
             }
-            OpParams::RmsNorm { eps, .. } => {
+            OpParams::RmsNorm { eps, group, .. } => {
                 let x = input(0)?.as_float()?;
                 let g = input(1)?.as_float()?;
                 let mut out = try_vec(x.data().len())?;
                 for r in 0..x.rows() {
-                    out.extend(norm::rms_norm_row(x.row(r)?, g.data(), eps)?);
+                    out.extend(norm::rms_norm_row_grouped(
+                        x.row(r)?,
+                        g.data(),
+                        group as usize,
+                        eps,
+                    )?);
                 }
                 Value::Float(HostTensor::round_to_bf16(out, try_clone_slice(x.shape())?)?)
             }
-            OpParams::SwiGlu { .. } => {
+            OpParams::SwiGlu { .. } | OpParams::GeGlu { .. } => {
+                let geglu = matches!(node.params, OpParams::GeGlu { .. });
                 let gate = input(0)?.as_float()?;
                 let up = input(1)?.as_float()?;
                 let mut out = try_vec(gate.data().len())?;
                 for r in 0..gate.rows() {
-                    out.extend(activation::swiglu_row(gate.row(r)?, up.row(r)?)?);
+                    let (g, u) = (gate.row(r)?, up.row(r)?);
+                    out.extend(if geglu {
+                        activation::geglu_row(g, u)?
+                    } else {
+                        activation::swiglu_row(g, u)?
+                    });
                 }
                 Value::Float(HostTensor::round_to_bf16(
                     out,
@@ -703,7 +724,9 @@ impl Interpreter {
                 heads,
                 head_dim,
                 rotary_dim,
+                frequency_dim,
                 base,
+                layout,
             } => {
                 let x = input(0)?.as_float()?;
                 let pos = input(1)?.as_index()?;
@@ -717,17 +740,23 @@ impl Interpreter {
                     out.extend(rope::rope_row(
                         x.row(r)?,
                         *p,
-                        base,
                         heads as usize,
                         head_dim as usize,
-                        rotary_dim as usize,
+                        rope::Rotation {
+                            base,
+                            rotary_dim: rotary_dim as usize,
+                            frequency_dim: frequency_dim as usize,
+                            layout,
+                        },
                     )?);
                 }
                 Value::Float(HostTensor::round_to_bf16(out, try_clone_slice(x.shape())?)?)
             }
             OpParams::Attention {
                 heads,
+                kv_heads,
                 head_dim,
+                scale,
                 visibility,
                 layer,
             } => {
@@ -770,33 +799,40 @@ impl Interpreter {
                         q.row(r)?,
                         &history,
                         position,
-                        heads as usize,
-                        head_dim as usize,
+                        attention::Heads {
+                            query: heads as usize,
+                            key_value: kv_heads as usize,
+                            head_dim: head_dim as usize,
+                            scale,
+                        },
                         visibility,
                     )?);
                 }
                 Value::Float(HostTensor::round_to_bf16(out, try_clone_slice(q.shape())?)?)
             }
-            OpParams::Residual => {
+            OpParams::Residual { scale } => {
                 let a = input(0)?.as_float()?;
                 let b = input(1)?.as_float()?;
                 let mut out = try_vec(a.data().len())?;
                 for r in 0..a.rows() {
-                    out.extend(residual::residual_row(a.row(r)?, b.row(r)?)?);
+                    out.extend(residual::residual_row_scaled(a.row(r)?, b.row(r)?, scale)?);
                 }
                 Value::Float(HostTensor::round_to_bf16(out, try_clone_slice(a.shape())?)?)
             }
-            OpParams::VocabProjection { vocab, .. } => {
+            OpParams::VocabProjection { vocab, softcap, .. } => {
                 let h = input(0)?.as_float()?;
                 let w = input(1)?.as_float()?;
                 let mut out = try_vec(h.rows() * vocab as usize)?;
                 for r in 0..h.rows() {
-                    out.extend(linear::linear_row(
-                        h.row(r)?,
-                        w.data(),
-                        vocab as usize,
-                        None,
-                    )?);
+                    let row = linear::linear_row(h.row(r)?, w.data(), vocab as usize, None)?;
+                    // The cap's own BF16 boundaries are internal to it and live
+                    // in the oracle. The logits themselves stay FP32 either
+                    // way: capping bends the distribution the sampler sees, it
+                    // does not change what that distribution is stored as.
+                    out.extend(match softcap {
+                        Some(cap) => activation::softcap_row(&row, cap)?,
+                        None => row,
+                    });
                 }
                 // Not rounded. See `StepOutput::logits`.
                 Value::Float(HostTensor::f32(out, try_shape2(h.rows(), vocab as usize)?)?)

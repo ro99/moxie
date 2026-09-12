@@ -1,0 +1,12 @@
+[package]
+name = "moxie-models"
+version = "0.0.0"
+edition = "2024"
+
+# The shape the real crate has: one crate, one module per family, three allowed
+# workspace dependencies. Adding a family is a file and a `pub mod` line, and
+# the checker must accept that rather than requiring a crate per model.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-graph = { path = "../../../../crates/moxie-graph" }
+moxie-model-api = { path = "../../../../crates/moxie-model-api" }

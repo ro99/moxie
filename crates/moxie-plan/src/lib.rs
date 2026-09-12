@@ -580,7 +580,7 @@ mod tests {
     use super::*;
     use moxie_graph::{
         GraphBuilder, Op, OpParams, OracleEvidence, OracleId, OracleRegistry, TensorSpec,
-        Visibility,
+        Visibility, reciprocal_sqrt_scale,
     };
     use moxie_types::{ActivationPrecision, Dim, Precision, SymbolId, WeightPrecision};
 
@@ -655,7 +655,9 @@ mod tests {
             )
             .unwrap();
         let output = if fan_in {
-            builder.node(OpParams::Residual, &[first, second]).unwrap()
+            builder
+                .node(OpParams::Residual { scale: 1.0 }, &[first, second])
+                .unwrap()
         } else {
             let w3 = builder.weight("w3", weight(width, width)).unwrap();
             builder
@@ -742,6 +744,7 @@ mod tests {
                 OpParams::VocabProjection {
                     vocab: 7,
                     hidden: 5,
+                    softcap: None,
                 },
                 &[input, weight],
             )
@@ -839,6 +842,8 @@ mod tests {
                     head_dim: 4,
                     visibility: Visibility::Causal,
                     layer: 0,
+                    kv_heads: 1,
+                    scale: reciprocal_sqrt_scale(4),
                 },
                 &[q, k, v, positions],
             )
@@ -908,6 +913,7 @@ mod tests {
                 OpParams::Embedding {
                     vocab: 32,
                     hidden: 1,
+                    scale: 1.0,
                 },
                 &[tokens, table],
             )

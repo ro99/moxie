@@ -1,0 +1,15 @@
+[package]
+name = "moxie-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+moxie-types.workspace = true
+moxie-graph.workspace = true
+moxie-model-api.workspace = true
+
+[lints]
+workspace = true

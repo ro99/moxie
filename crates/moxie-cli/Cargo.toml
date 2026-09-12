@@ -17,10 +17,13 @@ moxie-types.workspace = true
 moxie-memory.workspace = true
 moxie-host.workspace = true
 moxie-oracles.workspace = true
+moxie-model-api.workspace = true
+moxie-models.workspace = true
 
 [dev-dependencies]
 moxie-interp.workspace = true
 moxie-state.workspace = true
+moxie-format.workspace = true
 
 [lints]
 workspace = true

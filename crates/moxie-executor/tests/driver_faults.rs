@@ -474,11 +474,14 @@ fn selected_graph() -> (
             OpParams::RmsNorm {
                 hidden: 8,
                 eps: 3.5,
+                group: 1,
             },
             &[linear, gain],
         )
         .unwrap();
-    let output = builder.node(OpParams::Residual, &[x, norm]).unwrap();
+    let output = builder
+        .node(OpParams::Residual { scale: 1.0 }, &[x, norm])
+        .unwrap();
     (builder.finish(output, &registry).unwrap(), x, weight, gain)
 }
 

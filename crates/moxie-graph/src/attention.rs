@@ -18,6 +18,17 @@ pub enum Visibility {
     SlidingWindow { window: u64 },
 }
 
+/// The conventional attention score scale, `1/sqrt(head_dim)`.
+///
+/// A named function rather than a value baked into the operation, because it is
+/// one choice among several: Gemma 4 normalizes queries and keys per head and
+/// then attends with a scale of exactly 1.0. Callers that want the usual factor
+/// ask for it here, so the unusual ones are visible at their construction site
+/// instead of being invisible everywhere.
+pub fn reciprocal_sqrt_scale(head_dim: u64) -> f32 {
+    1.0 / (head_dim as f32).sqrt()
+}
+
 impl Visibility {
     /// Whether query position `q` may attend to key position `k`.
     ///

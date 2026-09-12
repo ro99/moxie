@@ -188,6 +188,11 @@ pub enum OpParams {
     Embedding {
         vocab: u64,
         hidden: u64,
+        /// The factor every looked-up row is multiplied by, at the BF16
+        /// boundary. Gemma scales by `bf16(sqrt(hidden))`; most families use
+        /// 1.0. It is explicit for the same reason `eps` is: a default here is
+        /// a silent numerical difference between two checkpoints.
+        scale: f32,
     },
     Linear {
         in_features: u64,
@@ -198,30 +203,101 @@ pub enum OpParams {
     /// axes, pre/post scaling"; a defaulted epsilon is a silent numerical
     /// difference between two checkpoints that declared different ones.
     RmsNorm {
+        /// The full width of the tensor's last axis.
         hidden: u64,
+        /// How many independent normalizations each row is divided into.
+        ///
+        /// `1` is the ordinary whole-row norm. `heads` is per-head Q/K/V
+        /// normalization: each contiguous `hidden / group` lanes are normalized
+        /// on their own and share one gain of that width, which is what
+        /// `src/models/gemma4/gemma4_runtime.cpp:798` does by looping heads.
+        ///
+        /// This is not the same operation with a different shape. Reducing over
+        /// the whole width instead would mix every head's magnitude into every
+        /// other head's scale factor -- an ordinary-looking graph that is wrong
+        /// at every layer.
+        group: u64,
         eps: f32,
     },
     SwiGlu {
         width: u64,
     },
+    /// Gated GELU with the tanh approximation, `bf16(bf16(gelu_tanh(g)) * u)`.
+    ///
+    /// Distinct from [`OpParams::SwiGlu`] rather than a parameter on it:
+    /// document 02 lists them as separate activations, and the gate transform
+    /// is the whole of the difference.
+    GeGlu {
+        width: u64,
+    },
     Rope {
         heads: u64,
         head_dim: u64,
+        /// How many of a head's elements rotate. May be smaller than
+        /// `head_dim`; the remainder passes through unchanged.
         rotary_dim: u64,
+        /// The denominator of the inverse-frequency exponent,
+        /// `base^(-2j / frequency_dim)`.
+        ///
+        /// Separate from `rotary_dim` because the two conventions disagree when
+        /// rotation is partial: task 0003's fixtures divide by the rotated
+        /// width, and Gemma 4's global layers divide by the **full** head
+        /// dimension while rotating only a quarter of it. Collapsing them
+        /// would silently change every angle on a partial-rotary layer.
+        frequency_dim: u64,
         base: f32,
+        layout: RopeLayout,
     },
     Attention {
         heads: u64,
+        /// Key/value heads. Equal to `heads` for multi-head attention; a
+        /// divisor of it for grouped-query attention, where query head `h`
+        /// reads key/value head `h * kv_heads / heads`.
+        kv_heads: u64,
         head_dim: u64,
+        /// The factor applied to the raw score dot product.
+        ///
+        /// Usually `1/sqrt(head_dim)`, but not always: Gemma 4 normalizes its
+        /// queries and keys per head and then attends with a scale of exactly
+        /// 1.0. Baking the reciprocal square root in would make every such
+        /// layer quietly wrong, so the scale is stated rather than derived.
+        scale: f32,
         visibility: Visibility,
         /// Which KV store this node reads and appends to.
         layer: u32,
     },
-    Residual,
+    Residual {
+        /// The factor applied after the sum, at the BF16 boundary:
+        /// `bf16(bf16(a + b) * scale)`.
+        ///
+        /// Per-residual, not per-layer: Gemma 4 scales its MLP residual by a
+        /// checkpoint scalar and leaves its attention residual alone, so one
+        /// shared value would be wrong on half the residuals in the graph.
+        scale: f32,
+    },
     VocabProjection {
         vocab: u64,
         hidden: u64,
+        /// Logit soft capping, `bf16(bf16(tanh(bf16(bf16(x)/c))) * c)`.
+        ///
+        /// `None` means no cap. It is an option rather than a sentinel value
+        /// because there is no cap magnitude that means "uncapped": a very
+        /// large `c` still rounds and still costs a tanh.
+        softcap: Option<f32>,
     },
+}
+
+/// Which elements of a head RoPE pairs together.
+///
+/// Both conventions appear in released checkpoints and they are not
+/// interchangeable. R06 is the standing instruction against erasing exactly
+/// this kind of difference behind a common default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RopeLayout {
+    /// Adjacent pairs, `(2j, 2j+1)`.
+    Interleaved,
+    /// Halves paired across the head, `(j, j + head_dim/2)`.
+    HalfSplit,
 }
 
 impl OpParams {
@@ -231,9 +307,10 @@ impl OpParams {
             OpParams::Linear { .. } => Op::Linear,
             OpParams::RmsNorm { .. } => Op::RmsNorm,
             OpParams::SwiGlu { .. } => Op::SwiGlu,
+            OpParams::GeGlu { .. } => Op::GeGlu,
             OpParams::Rope { .. } => Op::Rope,
             OpParams::Attention { .. } => Op::Attention,
-            OpParams::Residual => Op::Residual,
+            OpParams::Residual { .. } => Op::Residual,
             OpParams::VocabProjection { .. } => Op::VocabProjection,
         }
     }
@@ -249,10 +326,11 @@ impl OpParams {
             // Elementwise or output-channel sharded.
             OpParams::Linear { .. }
             | OpParams::SwiGlu { .. }
+            | OpParams::GeGlu { .. }
             | OpParams::Rope { .. }
             | OpParams::VocabProjection { .. } => PartitionRule::ColumnShardable,
             // Applied exactly once; the norm reduces over the whole hidden axis.
-            OpParams::Embedding { .. } | OpParams::RmsNorm { .. } | OpParams::Residual => {
+            OpParams::Embedding { .. } | OpParams::RmsNorm { .. } | OpParams::Residual { .. } => {
                 PartitionRule::Replicated
             }
             // Head ownership, GQA KV replication and the output reduction are
@@ -289,9 +367,10 @@ impl OpParams {
             OpParams::Linear { bias, .. } => 2 + usize::from(*bias),
             OpParams::RmsNorm { .. } => 2,   // x, gain
             OpParams::SwiGlu { .. } => 2,    // gate, up
+            OpParams::GeGlu { .. } => 2,     // gate, up
             OpParams::Rope { .. } => 2,      // x, positions
             OpParams::Attention { .. } => 4, // q, k, v, positions
-            OpParams::Residual => 2,
+            OpParams::Residual { .. } => 2,
             OpParams::VocabProjection { .. } => 2, // hidden, table
         }
     }
@@ -309,7 +388,9 @@ impl OpParams {
                 heads,
                 head_dim,
                 rotary_dim,
+                frequency_dim,
                 base,
+                layout,
             } => {
                 if heads == 0 || head_dim == 0 {
                     return Err(Error::InvalidRequest {
@@ -329,6 +410,19 @@ impl OpParams {
                 // Rotation is over pairs, so a shard that split a pair would
                 // rotate half of it. Exact division, not a floor.
                 Dim::constant(rotary_dim).div_exact(2).eval(&empty)?;
+                if frequency_dim == 0 {
+                    return Err(Error::InvalidRequest {
+                        field: "frequency_dim",
+                        detail: "the inverse-frequency denominator cannot be zero".into(),
+                    });
+                }
+                // Half-split pairing reads `x[j + head_dim/2]`, so a head with
+                // an odd dimension has no partner for its middle element. The
+                // interleaved form does not care, which is why this check is
+                // here and not beside the `rotary_dim` one.
+                if layout == RopeLayout::HalfSplit {
+                    Dim::constant(head_dim).div_exact(2).eval(&empty)?;
+                }
                 if !(base.is_finite() && base > 1.0) {
                     return Err(Error::InvalidRequest {
                         field: "rope_base",
@@ -338,7 +432,11 @@ impl OpParams {
                 Ok(())
             }
             OpParams::Attention {
-                heads, head_dim, ..
+                heads,
+                kv_heads,
+                head_dim,
+                scale,
+                ..
             } => {
                 if heads == 0 || head_dim == 0 {
                     return Err(Error::InvalidRequest {
@@ -346,9 +444,58 @@ impl OpParams {
                         detail: format!("{heads} heads of dimension {head_dim}"),
                     });
                 }
+                // Grouped query attention maps query head `h` onto key/value
+                // head `h * kv_heads / heads`. A ratio that does not divide
+                // gives some group one more query head than another, which is
+                // not a layout any released checkpoint uses and not one this
+                // reference will silently invent.
+                if kv_heads == 0 || kv_heads > heads || !heads.is_multiple_of(kv_heads) {
+                    return Err(Error::InvalidRequest {
+                        field: "kv_heads",
+                        detail: format!(
+                            "{kv_heads} key/value heads must be a nonzero divisor of \
+                             {heads} query heads"
+                        ),
+                    });
+                }
+                if !(scale.is_finite() && scale > 0.0) {
+                    return Err(Error::InvalidRequest {
+                        field: "attention_scale",
+                        detail: format!("score scale must be finite and positive, got {scale}"),
+                    });
+                }
                 Ok(())
             }
-            OpParams::RmsNorm { eps, hidden } => {
+            OpParams::Embedding { scale, .. } => {
+                if !(scale.is_finite() && scale > 0.0) {
+                    return Err(Error::InvalidRequest {
+                        field: "embedding_scale",
+                        detail: format!("embedding scale must be finite and positive, got {scale}"),
+                    });
+                }
+                Ok(())
+            }
+            OpParams::Residual { scale } => {
+                if !(scale.is_finite() && scale > 0.0) {
+                    return Err(Error::InvalidRequest {
+                        field: "residual_scale",
+                        detail: format!("residual scale must be finite and positive, got {scale}"),
+                    });
+                }
+                Ok(())
+            }
+            OpParams::VocabProjection {
+                softcap: Some(cap), ..
+            } => {
+                if !(cap.is_finite() && cap > 0.0) {
+                    return Err(Error::InvalidRequest {
+                        field: "logit_softcap",
+                        detail: format!("logit softcap must be finite and positive, got {cap}"),
+                    });
+                }
+                Ok(())
+            }
+            OpParams::RmsNorm { eps, hidden, group } => {
                 if !(eps.is_finite() && eps > 0.0) {
                     return Err(Error::InvalidRequest {
                         field: "eps",
@@ -361,6 +508,15 @@ impl OpParams {
                         detail: "a norm over zero features".into(),
                     });
                 }
+                if group == 0 {
+                    return Err(Error::InvalidRequest {
+                        field: "group",
+                        detail: "a norm over zero groups".into(),
+                    });
+                }
+                // A group count that does not divide the width would leave a
+                // remainder of lanes normalized against nothing.
+                Dim::constant(hidden).div_exact(group).eval(&empty)?;
                 Ok(())
             }
             _ => Ok(()),
@@ -743,7 +899,7 @@ impl GraphBuilder {
         };
 
         Ok(match *params {
-            OpParams::Embedding { vocab, hidden } => {
+            OpParams::Embedding { vocab, hidden, .. } => {
                 want_index(0)?;
                 rank(0, 1)?;
                 want_float(1)?;
@@ -771,16 +927,24 @@ impl GraphBuilder {
                 }
                 vec![s(0).shape[0].clone(), Dim::constant(out_features)]
             }
-            OpParams::RmsNorm { hidden, .. } => {
+            OpParams::RmsNorm { hidden, group, .. } => {
                 want_float(0)?;
                 rank(0, 2)?;
                 dim_is(0, 1, hidden)?;
                 want_float(1)?;
                 rank(1, 1)?;
-                dim_is(1, 0, hidden)?;
+                // One gain per group lane, shared by every group -- not one
+                // gain per element of the row.
+                dim_is(
+                    1,
+                    0,
+                    Dim::constant(hidden)
+                        .div_exact(group)
+                        .eval(&SymbolTable::new())?,
+                )?;
                 s(0).shape.clone()
             }
-            OpParams::SwiGlu { width } => {
+            OpParams::SwiGlu { width } | OpParams::GeGlu { width } => {
                 want_float(0)?;
                 want_float(1)?;
                 rank(0, 2)?;
@@ -806,13 +970,24 @@ impl GraphBuilder {
                 s(0).shape.clone()
             }
             OpParams::Attention {
-                heads, head_dim, ..
+                heads,
+                kv_heads,
+                head_dim,
+                ..
             } => {
-                let width = heads * head_dim;
-                for i in 0..3 {
+                // Queries are as wide as the query heads; keys and values are
+                // as wide as the key/value heads. Under MHA those coincide,
+                // which is why the earlier single-width rule went unnoticed --
+                // and why a GQA graph built against it would have declared
+                // keys `heads * head_dim` wide and stored mostly padding.
+                let query_width =
+                    (Dim::constant(heads) * Dim::constant(head_dim)).eval(&SymbolTable::new())?;
+                let kv_width =
+                    (Dim::constant(kv_heads) * Dim::constant(head_dim)).eval(&SymbolTable::new())?;
+                for (i, want) in [query_width, kv_width, kv_width].into_iter().enumerate() {
                     want_float(i)?;
                     rank(i, 2)?;
-                    dim_is(i, 1, width)?;
+                    dim_is(i, 1, want)?;
                 }
                 if s(0).shape[0] != s(1).shape[0] || s(1).shape[0] != s(2).shape[0] {
                     return Err(bad("q, k and v must have the same row count".into()));
@@ -824,7 +999,7 @@ impl GraphBuilder {
                 }
                 s(0).shape.clone()
             }
-            OpParams::Residual => {
+            OpParams::Residual { .. } => {
                 want_float(0)?;
                 want_float(1)?;
                 if s(0).shape != s(1).shape {
@@ -836,7 +1011,7 @@ impl GraphBuilder {
                 }
                 s(0).shape.clone()
             }
-            OpParams::VocabProjection { vocab, hidden } => {
+            OpParams::VocabProjection { vocab, hidden, .. } => {
                 want_float(0)?;
                 rank(0, 2)?;
                 dim_is(0, 1, hidden)?;
@@ -977,7 +1152,9 @@ mod identity_tests {
         );
         let left = builder.input("left", spec.clone());
         let right = builder.input("right", spec);
-        let output = builder.node(OpParams::Residual, &[left, right]).unwrap();
+        let output = builder
+            .node(OpParams::Residual { scale: 1.0 }, &[left, right])
+            .unwrap();
         (builder, output)
     }
 

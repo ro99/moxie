@@ -1,0 +1,18 @@
+[package]
+name = "moxie-models"
+version = "0.0.0"
+edition = "2024"
+
+# The model crate is one crate with a module per family, so its name carries no
+# family suffix. It is held to exactly the same dependency list as a
+# `moxie-models-*` crate, and this fixture is what proves the unprefixed name is
+# still recognised: without it, renaming the crate would silently exempt every
+# concrete model from the boundary. This fixture must be rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-graph = { path = "../../../../crates/moxie-graph" }
+moxie-model-api = { path = "../../../../crates/moxie-model-api" }
+moxie-state = { path = "../../../../crates/moxie-state" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden dependency"

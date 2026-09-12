@@ -1,0 +1,16 @@
+[package]
+name = "moxie-interp"
+version = "0.0.0"
+edition = "2024"
+
+# Document 02: "Shared production crates cannot import concrete models." That
+# holds for the single `moxie-models` crate exactly as it held for a
+# `moxie-models-*` one -- a shared crate must not be able to reach a family by
+# depending on the crate that contains all of them. This fixture must be
+# rejected.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-models = { path = "../models-crate-reaches-state" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "shared crate imports a concrete model"

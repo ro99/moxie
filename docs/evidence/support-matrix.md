@@ -12,6 +12,18 @@ matrix exists to prevent.
 
 ## Gate IDs
 
+[Task 0016](../tasks/0016-m1-gemma-reduced-graph.md) opens M1.5. It makes seven
+family-mathematics parameters explicit
+([ADR 0012](../decisions/adr/0012-explicit-family-operation-parameters.md)),
+adds `GeGlu` and a grouped RMSNorm with their oracles, decouples the paged row
+width from the query-head count so grouped-query attention stores what it
+actually has, and adds `moxie-models` with a `gemma4` module
+([ADR 0013](../decisions/adr/0013-one-model-crate-with-family-modules.md)).
+**It executes no checkpoint.** Its graph is a reduced synthetic Gemma-like
+fixture over weights the composition root invents; the Gemma 4 artifact is INT8
+`pack-quantized` and its importer is M3. See
+[the bring-up record](../models/gemma4.md).
+
 [Task 0015](../tasks/0015-m1-generation-service-diagnostic-cli.md), implementation
 `f7cff56` after contract `2fbacec` with corrections `5990f2a` and `7a08adf`, adds
 the shared host-reference generation service and diagnostic CLI. The owner accepted
@@ -81,6 +93,7 @@ and isolated no-driver runs retain their previously recorded evidence.
 | `G-SAMPLING-ALLOCATION` | `cargo test -p moxie-state --test sampling_allocation --locked --offline -- --nocapture` | host | passed; 32,768 generated entries + 32,769 physical rows, 1,187,358 B admitted, zero token-path allocations, 10,000 aborts with no growth, exact allocation failures and complete cleanup |
 | `G-GENERATION-HOST` | `cargo test -p moxie-cli --locked --offline --test generation` | host | accepted task 0015; exact dense/paged logits for two shapes, whole/chunk/tail/page and decode parity, fixed-seed CLI/service agreement, immutable paged-program ownership, row-shape admission, output provenance and cancellation/restart |
 | `G-GENERATION-ALLOC` | `cargo test -p moxie-cli --locked --offline --test allocation -- --nocapture` | host | accepted task 0015; admitted peak bound, 1,000 cancellation/restart cycles, typed construction/forward failures, full service cleanup and direct whole-transaction rollback/retry when fallible paged preparation fails |
+| `G-GEMMA-REDUCED` | `cargo test -p moxie-cli --locked --offline --test gemma` | host | task 0016; two reduced geometries generate through the shared service, dense/paged logits agree bit for bit across pages and decode, every one of the seven new parameters is proven load-bearing by substitution, the softcap bounds every logit, the global layers carry no value projection while K still differs from V, mixed per-layer geometry is refused, and the CLI agrees with the service. **Synthetic weights and reduced dimensions; not model support** |
 | `G-TOPOLOGY` | `cargo xtask test-topology` | device | **not implemented** (M5) |
 | `G-QUALITY` | `cargo xtask quality` | device | **not implemented** (M3) |
 | `G-BENCH` | `cargo xtask bench` | device | **not implemented** (M6) |
@@ -141,6 +154,8 @@ integration and closes M1.4. **M1.5 is active.**
 | none | n/a | n/a | Prefix reuse / COW state branches | **not implemented** | `G-HOST-TEST` (`moxie-state`) covers frontier, result-identity and restore-evidence rules only | M4. Counters, retained-result identity and prefix lineage are typed and tested; the new host page pool has no COW/prefix-sharing integration, and document 04's token-content prefix key is a separate identity that is **not** implemented. |
 | none | host | 32,768 history entries; no attention | Base sampler and transactional history | **accepted task 0014, 2026-09-11** | `G-SAMPLING-HOST`, `G-SAMPLING-ALLOCATION`, `G-HOST-ARCH` | One generation with fixed capacity, FP64 greedy/temperature distributions, explicit legality, Philox target draws, generated-token positions and tentative/committed counts. Shared journal restores rows/frontiers/history; replay evidence follows actual count rebuilding. No model-output provenance, GPU sampling, service/CLI, speculation or entropy integration. |
 | none | host-reference synthetic | <=256 requested context; no checkpoint | Shared generation service and diagnostic CLI | **accepted task 0015; M1.4 complete** | `G-GENERATION-HOST`, `G-GENERATION-ALLOC`, `G-HOST-ARCH` | Typed pull events, chunked prefill, one-token decode, accepted sampler and paged state; exact dense-reference parity for two shapes. Every executed prefill/tail/decode row shape is admitted up front, one immutable program owns each paged history, and forward payload allocation failure aborts all work in the open transaction with complete cleanup/retry. No tokenizer, text stop/EOS, HTTP, checkpoint, GPU attention or production CPU fallback. |
+| **none** — synthetic BF16 weights | host-reference synthetic | <=256 requested context; no checkpoint | Reduced Gemma-4-like dense text graph | **task 0016, M1.5** | `G-GEMMA-REDUCED`, `G-GENERATION-HOST`, `G-GENERATION-ALLOC`, `G-HOST-ARCH` | **This is not Gemma support and its output is not model output.** Two reduced geometries compose sliding/global layer types, per-layer-type RoPE, grouped-query attention at score scale 1.0, per-head Q/K norm with unit-gain V norm, global layers whose V comes from the key projection, GeGLU, per-layer MLP residual scalars, an embedding scale, tied embeddings and a logit softcap — all through shared operations with registered oracles. Reduced, each with its owner: uniform per-layer key/value geometry and no window eviction (**M4**), synthetic BF16 weights because the artifact is INT8 `pack-quantized` (**M3**), text only (**M11**). The CLI prints that list before any output. |
+| none | n/a | n/a | Gemma 4 31B-IT checkpoint execution | **not implemented** | — | The artifact is inspected and hashed ([inventory](checkpoint-inventory.md), [bring-up record](../models/gemma4.md)) and nothing more. Every language-model linear is compressed-tensors INT8 `pack-quantized`; the importer, packed-layout reader, canonical repack and W8A16 path are all **M3**. O1, O2 and O5 remain open. |
 | none | n/a | n/a | Complete common sampler pipeline | **partial** | `G-HOST-TEST` (`moxie-oracles::sampler`), `G-SAMPLING-HOST` | Base legality/greedy/temperature/RNG/history are implemented under task 0014. Top-k/top-p/min-p remain oracle-only. Penalties, DRY, n-gram ban, logit bias, typical-p and XTC are **not implemented**. |
 | none | n/a | n/a | Future entropy | **not implemented** | — | M10. Document 05 defines it; nothing here evaluates it. |
 | none | n/a | n/a | Speculation, any proposer | **not implemented** | `G-HOST-TEST` (`moxie-state`) covers acceptance-frontier bookkeeping only | M9. No verifier, no proposer. |

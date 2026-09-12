@@ -52,6 +52,37 @@ pub fn rms_norm_row(x: &[f32], gain: &[f32], eps: f32) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// [`rms_norm_row`] applied to each of `group` contiguous lanes of a row.
+///
+/// The row is `group` blocks of `x.len() / group` elements; each block is
+/// normalized against **its own** mean square and multiplied by the same gain,
+/// which is one block wide. `group == 1` is [`rms_norm_row`] exactly.
+///
+/// This is how per-head query and key normalization works
+/// (`src/models/gemma4/gemma4_runtime.cpp:798`, which loops heads and norms
+/// each one). Normalizing the whole concatenated row instead would let one
+/// head's magnitude set every other head's scale factor, which is a different
+/// function that happens to have the same shape.
+pub fn rms_norm_row_grouped(x: &[f32], gain: &[f32], group: usize, eps: f32) -> Result<Vec<f32>> {
+    if group == 0 {
+        return Err(Error::InvalidRequest {
+            field: "group",
+            detail: "a norm over zero groups".into(),
+        });
+    }
+    if x.is_empty() || !x.len().is_multiple_of(group) {
+        return Err(Error::InvalidArtifact {
+            detail: format!("{} features do not divide into {group} group(s)", x.len()),
+        });
+    }
+    let width = x.len() / group;
+    let mut out = crate::try_vec(x.len())?;
+    for g in 0..group {
+        out.extend(rms_norm_row(&x[g * width..(g + 1) * width], gain, eps)?);
+    }
+    Ok(out)
+}
+
 /// `y[i] = (x[i] − mean(x)) · g[i] / sqrt(var(x) + ε) + b[i]`.
 ///
 /// **Not** an operation in task 0003's slice, and deliberately not registered.
@@ -197,5 +228,47 @@ mod tests {
         assert!(rms_norm_row(&[], &[], 1e-5).is_err());
         assert!(rms_norm_row(&[1.0, 2.0], &[1.0], 1e-5).is_err());
         assert!(layer_norm_row(&[1.0], &[1.0], &[], 1e-5).is_err());
+    }
+
+    #[test]
+    fn a_grouped_norm_is_each_group_normalized_on_its_own() {
+        // Two groups of three with very different magnitudes. A whole-row norm
+        // would let the large group set the small group's scale factor.
+        let x = [1.0f32, 2.0, 3.0, 100.0, 200.0, 300.0];
+        let gain = [1.0f32, 1.0, 1.0];
+        let grouped = rms_norm_row_grouped(&x, &gain, 2, 1e-6).unwrap();
+        let first = rms_norm_row(&x[..3], &gain, 1e-6).unwrap();
+        let second = rms_norm_row(&x[3..], &gain, 1e-6).unwrap();
+        assert_eq!(grouped[..3], first[..]);
+        assert_eq!(grouped[3..], second[..]);
+        // The two groups are scalar multiples of each other in the input and
+        // therefore equal after their own norms -- which a whole-row norm
+        // would not produce.
+        for i in 0..3 {
+            assert!((grouped[i] - grouped[i + 3]).abs() < 1e-5);
+        }
+        let whole = rms_norm_row(&x, &[1.0; 6], 1e-6).unwrap();
+        assert_ne!(&grouped[..], &whole[..]);
+    }
+
+    #[test]
+    fn one_group_is_the_ungrouped_norm_exactly() {
+        let x: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) / 3.0).collect();
+        let gain: Vec<f32> = (0..32).map(|i| 1.0 + (i as f32) / 64.0).collect();
+        assert_eq!(
+            rms_norm_row_grouped(&x, &gain, 1, 1e-5).unwrap(),
+            rms_norm_row(&x, &gain, 1e-5).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_gain_is_one_group_wide_and_shared() {
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        // A gain as wide as the whole row is the wrong length for two groups.
+        assert!(rms_norm_row_grouped(&x, &[1.0; 4], 2, 1e-6).is_err());
+        assert!(rms_norm_row_grouped(&x, &[1.0; 2], 2, 1e-6).is_ok());
+        // Indivisible and zero group counts are typed errors.
+        assert!(rms_norm_row_grouped(&x, &[1.0; 2], 3, 1e-6).is_err());
+        assert!(rms_norm_row_grouped(&x, &[1.0; 2], 0, 1e-6).is_err());
     }
 }

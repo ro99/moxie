@@ -210,7 +210,11 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
             "moxie-cli",
             Allowed {
                 // Composition and presentation only; no direct state, sampler,
-                // interpreter or device executor dependency.
+                // interpreter or device executor dependency. Document 02:
+                // "Only the composition root/registry and integration tests
+                // may" import concrete models, and this is a composition root
+                // -- which is why `moxie-models` is here and in no other
+                // production row.
                 workspace: &[
                     "moxie-engine",
                     "moxie-graph",
@@ -218,6 +222,8 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                     "moxie-memory",
                     "moxie-host",
                     "moxie-oracles",
+                    "moxie-model-api",
+                    "moxie-models",
                 ],
                 third_party: NONE,
             },
@@ -310,8 +316,25 @@ const MODEL_ALLOWED: &[&str] = &["moxie-types", "moxie-graph", "moxie-model-api"
 /// oversight.
 const MODEL_ALLOWED_THIRD_PARTY: &[&str] = &[];
 
-/// Crate-name prefixes that identify a concrete model adapter.
+/// The crate that holds concrete model definitions.
+///
+/// One crate with a module per family, not a crate per family: the boundary
+/// document 02 draws is the **dependency list** ([`MODEL_ALLOWED`]), and a
+/// module cannot import what its crate does not depend on. A crate per family
+/// would add a manifest, a workspace member, an allowlist entry and a build
+/// unit per model while enforcing exactly the same three rules.
+const MODEL_CRATE: &str = "moxie-models";
+
+/// A family that needs a dependency the others must not have -- a narrowly
+/// approved metadata parser, say -- may still take its own crate under this
+/// prefix, and is held to the same list. That stays available without being
+/// the default.
 const MODEL_PREFIX: &str = "moxie-models-";
+
+/// Whether `name` is a concrete model adapter rather than a shared crate.
+fn is_model_crate(name: &str) -> bool {
+    name == MODEL_CRATE || name.starts_with(MODEL_PREFIX)
+}
 
 /// Module paths a model crate may not reach.
 ///
@@ -1703,7 +1726,7 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
         let dir = manifest.parent().expect("manifest has a directory");
 
         let deps = production_deps(&doc, dir, workspace.as_ref());
-        let is_model = name.starts_with(MODEL_PREFIX);
+        let is_model = is_model_crate(&name);
 
         // Rule 1: dependency direction, from the ownership table.
         let (allow_ws, allow_tp): (Vec<&str>, Vec<&str>) = if is_model {
@@ -1757,11 +1780,11 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
         }
 
         // Rule 2: no shared production crate may import a concrete model.
-        // Only the composition root may, and it is named explicitly.
-        if name != "xtask" {
+        // Only the composition roots may, and they are named explicitly.
+        if !matches!(name.as_str(), "xtask" | "moxie-cli") {
             for d in &deps {
                 for id in &d.identities {
-                    if id.starts_with(MODEL_PREFIX) {
+                    if is_model_crate(id) {
                         out.push(Violation {
                             crate_name: name.clone(),
                             rule: rule::SHARED_IMPORTS_MODEL,

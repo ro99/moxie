@@ -1,11 +1,12 @@
 //! Presentation-only diagnostic client for the shared generation service.
 #![forbid(unsafe_code)]
 pub mod fixture;
+pub mod gemma;
 
 use moxie_engine::{Cancel, GenerationEvent, GenerationRequest, service::GenerationService};
 use std::io::Write;
 
-pub const USAGE: &str = "moxie diagnostic [--shape a|b] [--prompt 0,1,2] [--max-new 4] [--chunk 2] [--temperature 0] [--seed 0] [--cancel-after N]\nExplicit host-reference synthetic token-ID diagnostics; context <=256. No checkpoint or GPU attention.";
+pub const USAGE: &str = "moxie diagnostic [--shape a|b|gemma-a|gemma-b] [--prompt 0,1,2] [--max-new 4] [--chunk 2] [--temperature 0] [--seed 0] [--cancel-after N]\nExplicit host-reference synthetic token-ID diagnostics; context <=256. No checkpoint or GPU attention.\nThe gemma shapes are reduced Gemma-4-like graphs over synthetic BF16 weights: contract fixtures, not model support.";
 
 /// Render the same typed events an API client would consume. Broken output is a
 /// disconnect: the owning caller drops the service and releases the generation.
@@ -63,9 +64,56 @@ pub fn render(
     Ok(success)
 }
 
+/// Which diagnostic graph to build.
+///
+/// Named rather than a boolean: there are four now, and a `shape_b: bool` that
+/// grew a second flag beside it is how a composition root starts making
+/// decisions it should not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// Task 0015's synthetic graph: interleaved RoPE, `1/sqrt(head_dim)`
+    /// scores, multi-head attention, SwiGLU, no scales and no cap. It is the
+    /// independent second consumer of every parameter the Gemma shapes set
+    /// differently.
+    SyntheticA,
+    SyntheticB,
+    GemmaA,
+    GemmaB,
+}
+
+impl Shape {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Shape::SyntheticA => "a",
+            Shape::SyntheticB => "b",
+            Shape::GemmaA => gemma::Shape::A.name(),
+            Shape::GemmaB => gemma::Shape::B.name(),
+        }
+    }
+
+    pub fn build(self) -> moxie_types::Result<fixture::Fixture> {
+        match self {
+            Shape::SyntheticA => fixture::build(2, 4, 16, 1),
+            Shape::SyntheticB => fixture::build(3, 4, 7, 2),
+            Shape::GemmaA => gemma::build(gemma::Shape::A),
+            Shape::GemmaB => gemma::build(gemma::Shape::B),
+        }
+    }
+
+    /// The reduction disclosure line, empty for the non-model fixtures.
+    pub fn reduction(self) -> String {
+        match self {
+            Shape::SyntheticA | Shape::SyntheticB => String::new(),
+            Shape::GemmaA | Shape::GemmaB => {
+                gemma::reduction_line(moxie_models::gemma4::Reduction::all())
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Options {
-    pub shape_b: bool,
+    pub shape: Shape,
     pub prompt: Vec<u32>,
     pub maximum: usize,
     pub chunk: usize,
@@ -79,7 +127,7 @@ impl Options {
             return Err(USAGE.into());
         }
         let mut options = Self {
-            shape_b: false,
+            shape: Shape::SyntheticA,
             prompt: vec![0, 1, 2],
             maximum: 4,
             chunk: 2,
@@ -96,9 +144,11 @@ impl Options {
             let malformed = || format!("invalid {}", pair[0]);
             match pair[0].as_str() {
                 "--shape" => {
-                    options.shape_b = match value.as_str() {
-                        "a" => false,
-                        "b" => true,
+                    options.shape = match value.as_str() {
+                        "a" => Shape::SyntheticA,
+                        "b" => Shape::SyntheticB,
+                        "gemma-a" => Shape::GemmaA,
+                        "gemma-b" => Shape::GemmaB,
                         _ => return Err(malformed()),
                     }
                 }

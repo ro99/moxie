@@ -1,5 +1,5 @@
 //! Isolated process-wide allocator instrumentation; one test avoids cross-test noise.
-use moxie_cli::fixture;
+use moxie_cli::{fixture, gemma};
 use moxie_engine::{
     Cancel, GenerationEvent, GenerationRequest,
     service::{GenerationService, StartError},
@@ -93,6 +93,80 @@ fn admitted_peak_cleanup_repeated_generations_and_allocation_failure() {
         println!(
             "shape={heads}x{dim} layers={layers} prompt={prompt_len} chunk={chunk} peak_delta={peak} admitted={charged}"
         );
+    }
+    // The reduced Gemma-like graphs, which are wider per layer than the
+    // synthetic fixtures and reserve less per stored row: under grouped-query
+    // attention the pages hold `kv_heads * head_dim`, not `heads * head_dim`.
+    // A reserve computed from the query width would over-admit here and the
+    // printed numbers are what shows it does not.
+    for (shape, prompt_len, chunk, maximum) in [
+        (gemma::Shape::A, 37usize, 13usize, 1usize),
+        (gemma::Shape::A, 251, 65, 1),
+        (gemma::Shape::B, 255, 255, 1),
+    ] {
+        let config = shape.config();
+        let built = gemma::build(shape).unwrap();
+        let prompt: Vec<u32> = (0..prompt_len)
+            .map(|i| (i as u64 % config.vocab) as u32)
+            .collect();
+        let before_ledger = LIVE.load(SeqCst);
+        let mut owner = ledger(1 << 30);
+        let baseline = LIVE.load(SeqCst);
+        PEAK.store(baseline, SeqCst);
+        let mut service = GenerationService::new(&mut owner, built.program());
+        service.start(req(&prompt, chunk, maximum)).unwrap();
+        let charged = service.charged_bytes();
+        while let Some(event) = service.next_event(&Cancel::never()) {
+            assert!(!matches!(
+                event,
+                GenerationEvent::Failed { .. } | GenerationEvent::Cancelled { .. }
+            ));
+            assert!(
+                PEAK.load(SeqCst) <= baseline + charged as usize,
+                "{shape:?}: peak {} > reserve {}",
+                PEAK.load(SeqCst) - baseline,
+                charged
+            );
+        }
+        assert_eq!(service.charged_bytes(), 0);
+        drop(service);
+        assert!(owner.outstanding().is_empty());
+        let peak = PEAK.load(SeqCst) - baseline;
+        drop(owner);
+        assert!(LIVE.load(SeqCst) <= before_ledger);
+        println!(
+            "shape={} layers={} heads={}/{} head_dim={} prompt={prompt_len} chunk={chunk} \
+             peak_delta={peak} admitted={charged}",
+            shape.name(),
+            config.layers,
+            config.heads,
+            config.kv_heads,
+            config.head_dim
+        );
+    }
+    // Repeated generations on a reduced Gemma graph retain nothing: the third
+    // run's live heap is the first's, which is what "no retained growth" means
+    // when the graph has six layers of paged history rather than one.
+    {
+        let built = gemma::build(gemma::Shape::A).unwrap();
+        let prompt: Vec<u32> = (0..23).map(|i| i % 11).collect();
+        let mut owner = ledger(1 << 30);
+        let mut service = GenerationService::new(&mut owner, built.program());
+        service.start(req(&prompt, 5, 2)).unwrap();
+        while service.next_event(&Cancel::never()).is_some() {}
+        let settled = LIVE.load(SeqCst);
+        for round in 0..64 {
+            service.start(req(&prompt, 5, 2)).unwrap();
+            while service.next_event(&Cancel::never()).is_some() {}
+            assert_eq!(service.charged_bytes(), 0, "round {round}");
+            assert!(
+                LIVE.load(SeqCst) <= settled,
+                "round {round}: {} > {settled}",
+                LIVE.load(SeqCst)
+            );
+        }
+        drop(service);
+        assert!(owner.outstanding().is_empty());
     }
     let fixture = fixture::build(3, 4, 7, 2).unwrap();
     let prompt = [0; 37];

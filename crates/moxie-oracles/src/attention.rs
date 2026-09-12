@@ -121,24 +121,64 @@ impl KvHistory {
     }
 }
 
+/// One layer's head geometry and score scale.
+///
+/// Grouped rather than four more arguments: they are one description of how a
+/// layer attends, and the three counts are all `usize`, so a transposed pair
+/// would be a silent wrong answer rather than a type error.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Heads {
+    pub query: usize,
+    pub key_value: usize,
+    pub head_dim: usize,
+    pub scale: f32,
+}
+
+impl Heads {
+    /// Multi-head attention with the conventional `1/sqrt(head_dim)` scale.
+    pub fn multi(heads: usize, head_dim: usize) -> Self {
+        Self {
+            query: heads,
+            key_value: heads,
+            head_dim,
+            scale: moxie_graph::reciprocal_sqrt_scale(head_dim as u64),
+        }
+    }
+}
+
 /// Attend one query row against the history, for every head.
 ///
-/// `query` is `heads · head_dim` long. `position` is the query's absolute
-/// position, and the history must already contain it -- the caller appends this
-/// row's key and value before attending, because a causal query attends to
-/// itself.
+/// `query` is `heads · head_dim` long. Stored keys and values are
+/// `kv_heads · head_dim` long, and query head `h` reads key/value head
+/// `h · kv_heads / heads` -- grouped-query attention, with multi-head as the
+/// case `kv_heads == heads`. `position` is the query's absolute position, and
+/// the history must already contain it: the caller appends this row's key and
+/// value before attending, because a causal query attends to itself.
 ///
-/// Scores are scaled by `1/sqrt(head_dim)`, the softmax runs in FP32 with the
-/// maximum subtracted, and masked keys are removed from the sum rather than
-/// biased by a large negative number.
+/// Scores are scaled by `scale`, the softmax runs in FP32 with the maximum
+/// subtracted, and masked keys are removed from the sum rather than biased by a
+/// large negative number.
+///
+/// **`scale` is a parameter, not `1/sqrt(head_dim)`.** Gemma 4 normalizes its
+/// queries and keys per head and then attends with a scale of exactly 1.0
+/// (`src/models/gemma4/gemma4_runtime.cpp:857`). Deriving the scale from the
+/// head dimension would make every such layer wrong by a constant factor inside
+/// an exponential, which is not a small error.
+/// `moxie_graph::reciprocal_sqrt_scale` supplies the usual value for callers
+/// that want it.
 pub fn attend_multi_head(
     query: &[f32],
     history: &KvHistory,
     position: u64,
-    heads: usize,
-    head_dim: usize,
+    heads: Heads,
     visibility: Visibility,
 ) -> Result<Vec<f32>> {
+    let Heads {
+        query: heads,
+        key_value: kv_heads,
+        head_dim,
+        scale,
+    } = heads;
     if query.len() != heads * head_dim {
         return Err(Error::InvalidArtifact {
             detail: format!(
@@ -153,6 +193,20 @@ pub fn attend_multi_head(
             detail: "zero head dimension".into(),
         });
     }
+    if kv_heads == 0 || kv_heads > heads || !heads.is_multiple_of(kv_heads) {
+        return Err(Error::InvalidRequest {
+            field: "kv_heads",
+            detail: format!(
+                "{kv_heads} key/value heads must be a nonzero divisor of {heads} query heads"
+            ),
+        });
+    }
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(Error::InvalidRequest {
+            field: "scale",
+            detail: format!("score scale must be finite and positive, got {scale}"),
+        });
+    }
     if (position as usize) >= history.len() {
         return Err(Error::InvalidRequest {
             field: "position",
@@ -163,23 +217,24 @@ pub fn attend_multi_head(
         });
     }
 
-    let scale = 1.0 / (head_dim as f32).sqrt();
+    let group = heads / kv_heads;
     let mut allowed = crate::try_vec(history.len())?;
     allowed.extend((0..history.len()).map(|k| visibility.allows(position, k as u64)));
 
     let mut out = crate::try_vec(query.len())?;
     for h in 0..heads {
         let q = KvHistory::head_slice(query, h, head_dim, heads)?;
+        let kv_head = h / group;
         let mut keys = crate::try_vec(history.keys.len())?;
         for key in &history.keys {
             keys.push(crate::try_clone_slice(KvHistory::head_slice(
-                key, h, head_dim, heads,
+                key, kv_head, head_dim, kv_heads,
             )?)?);
         }
         let mut values = crate::try_vec(history.values.len())?;
         for value in &history.values {
             values.push(crate::try_clone_slice(KvHistory::head_slice(
-                value, h, head_dim, heads,
+                value, kv_head, head_dim, kv_heads,
             )?)?);
         }
         out.extend(attend_row(q, &keys, &values, &allowed, scale)?);
@@ -272,6 +327,26 @@ mod tests {
     use super::*;
     use crate::metric::{ErrorSummary, gamma};
 
+    /// The multi-head case with the conventional scale: exactly the signature
+    /// and behaviour these fixtures pinned before grouped-query attention and
+    /// an explicit scale existed, so each of them still asserts the same fact.
+    fn attend_mha(
+        query: &[f32],
+        history: &KvHistory,
+        position: u64,
+        heads: usize,
+        head_dim: usize,
+        visibility: Visibility,
+    ) -> Result<Vec<f32>> {
+        attend_multi_head(
+            query,
+            history,
+            position,
+            Heads::multi(heads, head_dim),
+            visibility,
+        )
+    }
+
     fn history_of(rows: &[Vec<f32>]) -> KvHistory {
         let mut h = KvHistory::new();
         for (i, r) in rows.iter().enumerate() {
@@ -329,7 +404,7 @@ mod tests {
         vis: Visibility,
         label: &str,
     ) -> f64 {
-        let got = attend_multi_head(q, history, pos, 1, q.len(), vis).unwrap();
+        let got = attend_mha(q, history, pos, 1, q.len(), vis).unwrap();
         let (want, weights, visible) = reference(q, history, pos, vis);
         let keys: Vec<&[f32]> = visible
             .iter()
@@ -389,7 +464,7 @@ mod tests {
             bound < 1e-4,
             "on benign data the bound should be tiny, got {bound:.3e}"
         );
-        let got = attend_multi_head(
+        let got = attend_mha(
             &q,
             &history,
             (n - 1) as u64,
@@ -425,7 +500,7 @@ mod tests {
             .unwrap();
         let q = vec![1.0f32; hd];
 
-        let got = attend_multi_head(&q, &history, 1, 1, hd, Visibility::Causal).unwrap();
+        let got = attend_mha(&q, &history, 1, 1, hd, Visibility::Causal).unwrap();
         let (want, weights, visible) = reference(&q, &history, 1, Visibility::Causal);
 
         // The disagreement is large and real: FP32 genuinely computes a
@@ -482,7 +557,7 @@ mod tests {
         history.append(2, vec![0.0; hd], vec![0.0; hd]).unwrap();
         let q = vec![0.0f32; hd];
 
-        let got = attend_multi_head(&q, &history, 2, 1, hd, Visibility::Causal).unwrap();
+        let got = attend_mha(&q, &history, 2, 1, hd, Visibility::Causal).unwrap();
         let (want, weights, visible) = reference(&q, &history, 2, Visibility::Causal);
         let keys: Vec<&[f32]> = visible
             .iter()
@@ -542,12 +617,12 @@ mod tests {
         let history = history_of(&rows);
         let q = vec![1.0f32, 0.0];
 
-        let at_zero = attend_multi_head(&q, &history, 0, 1, 2, Visibility::Causal).unwrap();
+        let at_zero = attend_mha(&q, &history, 0, 1, 2, Visibility::Causal).unwrap();
         // Position 0's value is its key halved: [0.5, 0.0].
         assert!((at_zero[0] - 0.5).abs() < 1e-6, "{at_zero:?}");
         assert!(at_zero[1].abs() < 1e-6, "the future did not leak in");
 
-        let at_one = attend_multi_head(&q, &history, 1, 1, 2, Visibility::Causal).unwrap();
+        let at_one = attend_mha(&q, &history, 1, 1, 2, Visibility::Causal).unwrap();
         assert!(at_one[1] > 0.0, "position 1 does see position 1");
     }
 
@@ -559,7 +634,7 @@ mod tests {
         let rows = vec![vec![1.0f32, 0.0, 0.0, 1.0]];
         let history = history_of(&rows);
         let q = vec![1.0f32, 0.0, 0.0, 1.0];
-        let out = attend_multi_head(&q, &history, 0, 2, head_dim, Visibility::Causal).unwrap();
+        let out = attend_mha(&q, &history, 0, 2, head_dim, Visibility::Causal).unwrap();
         assert_eq!(out.len(), 4);
         // With one visible position the output is that position's value.
         assert_eq!(out, vec![0.5, 0.0, 0.0, 0.5]);
@@ -570,8 +645,8 @@ mod tests {
         let rows: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32, 1.0]).collect();
         let history = history_of(&rows);
         let q = vec![0.0f32, 1.0];
-        let full = attend_multi_head(&q, &history, 4, 1, 2, Visibility::Causal).unwrap();
-        let windowed = attend_multi_head(
+        let full = attend_mha(&q, &history, 4, 1, 2, Visibility::Causal).unwrap();
+        let windowed = attend_mha(
             &q,
             &history,
             4,
@@ -611,7 +686,7 @@ mod tests {
         // same as agreeing with the geometry they are read under.
         let mut h = KvHistory::new();
         h.append(0, vec![1.0], vec![1.0]).unwrap();
-        let e = attend_multi_head(&[1.0, 2.0], &h, 0, 1, 2, Visibility::Causal).unwrap_err();
+        let e = attend_mha(&[1.0, 2.0], &h, 0, 1, 2, Visibility::Causal).unwrap_err();
         assert_eq!(e.kind(), "invalid_artifact");
         assert!(e.to_string().contains("does not match"), "{e}");
 
@@ -619,16 +694,196 @@ mod tests {
         // single-head row is refused too.
         let mut h = KvHistory::new();
         h.append(0, vec![1.0, 2.0], vec![3.0, 4.0]).unwrap();
-        assert!(attend_multi_head(&[1.0, 2.0], &h, 0, 2, 2, Visibility::Causal).is_err());
-        assert!(attend_multi_head(&[1.0, 2.0], &h, 0, 1, 2, Visibility::Causal).is_ok());
+        assert!(attend_mha(&[1.0, 2.0], &h, 0, 2, 2, Visibility::Causal).is_err());
+        assert!(attend_mha(&[1.0, 2.0], &h, 0, 1, 2, Visibility::Causal).is_ok());
     }
 
     #[test]
     fn attending_to_a_position_with_no_key_is_refused() {
         let history = history_of(&[vec![1.0f32, 2.0]]);
         let q = vec![1.0f32, 2.0];
-        assert!(attend_multi_head(&q, &history, 1, 1, 2, Visibility::Causal).is_err());
-        assert!(attend_multi_head(&q, &KvHistory::new(), 0, 1, 2, Visibility::Causal).is_err());
-        assert!(attend_multi_head(&[1.0], &history, 0, 1, 2, Visibility::Causal).is_err());
+        assert!(attend_mha(&q, &history, 1, 1, 2, Visibility::Causal).is_err());
+        assert!(attend_mha(&q, &KvHistory::new(), 0, 1, 2, Visibility::Causal).is_err());
+        assert!(attend_mha(&[1.0], &history, 0, 1, 2, Visibility::Causal).is_err());
+    }
+
+    #[test]
+    fn grouped_query_heads_read_their_own_key_value_head() {
+        // Four query heads over two key/value heads: heads 0 and 1 read
+        // key/value head 0, heads 2 and 3 read head 1. Distinguishable values
+        // make the mapping visible rather than merely plausible.
+        let (heads, kv_heads, hd) = (4usize, 2usize, 2usize);
+        let mut history = KvHistory::new();
+        history
+            .append(0, vec![1.0, 0.0, 0.0, 1.0], vec![10.0, 11.0, 20.0, 21.0])
+            .unwrap();
+        let q = vec![1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0];
+        let out = attend_multi_head(
+            &q,
+            &history,
+            0,
+            Heads {
+                query: heads,
+                key_value: kv_heads,
+                head_dim: hd,
+                scale: 1.0,
+            },
+            Visibility::Causal,
+        )
+        .unwrap();
+        // One visible key, so every head returns its key/value head's value.
+        assert_eq!(out, vec![10.0, 11.0, 10.0, 11.0, 20.0, 21.0, 20.0, 21.0]);
+    }
+
+    #[test]
+    fn multi_head_is_the_grouped_case_with_one_query_per_group() {
+        let (heads, hd) = (3usize, 4usize);
+        let mut history = KvHistory::new();
+        for p in 0..4u64 {
+            let row: Vec<f32> = (0..heads * hd)
+                .map(|i| ((i as u64 + p) % 7) as f32 - 3.0)
+                .collect();
+            history.append(p, row.clone(), row).unwrap();
+        }
+        let q: Vec<f32> = (0..heads * hd).map(|i| (i as f32) / 5.0 - 1.0).collect();
+        let grouped =
+            attend_multi_head(&q, &history, 3, Heads::multi(heads, hd), Visibility::Causal)
+                .unwrap();
+        assert_eq!(
+            grouped,
+            attend_mha(&q, &history, 3, heads, hd, Visibility::Causal).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_score_scale_is_load_bearing() {
+        // The scale sits inside an exponential, so a substituted value is not
+        // a small error. Gemma 4 uses exactly 1.0 where the conventional
+        // choice would be 1/sqrt(head_dim).
+        let hd = 4usize;
+        let mut history = KvHistory::new();
+        history
+            .append(0, vec![2.0, 0.0, 0.0, 0.0], vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        history
+            .append(1, vec![0.0, 2.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        let q = vec![3.0, 1.0, 0.0, 0.0];
+        let unit = attend_multi_head(
+            &q,
+            &history,
+            1,
+            Heads {
+                query: 1,
+                key_value: 1,
+                head_dim: hd,
+                scale: 1.0,
+            },
+            Visibility::Causal,
+        )
+        .unwrap();
+        let conventional =
+            attend_multi_head(&q, &history, 1, Heads::multi(1, hd), Visibility::Causal).unwrap();
+        assert_ne!(unit, conventional);
+        // A larger scale sharpens the distribution toward the winning key.
+        assert!(unit[0] > conventional[0], "{unit:?} vs {conventional:?}");
+    }
+
+    #[test]
+    fn an_illegal_head_grouping_is_a_typed_error() {
+        let mut history = KvHistory::new();
+        history.append(0, vec![1.0, 1.0], vec![1.0, 1.0]).unwrap();
+        let q = vec![1.0, 1.0, 1.0, 1.0];
+        // 4 query heads over 3 key/value heads does not divide.
+        assert!(
+            attend_multi_head(
+                &q,
+                &history,
+                0,
+                Heads {
+                    query: 4,
+                    key_value: 3,
+                    head_dim: 1,
+                    scale: 1.0
+                },
+                Visibility::Causal
+            )
+            .is_err()
+        );
+        // Zero, and more key/value heads than query heads.
+        assert!(
+            attend_multi_head(
+                &q,
+                &history,
+                0,
+                Heads {
+                    query: 4,
+                    key_value: 0,
+                    head_dim: 1,
+                    scale: 1.0
+                },
+                Visibility::Causal
+            )
+            .is_err()
+        );
+        assert!(
+            attend_multi_head(
+                &q,
+                &history,
+                0,
+                Heads {
+                    query: 2,
+                    key_value: 4,
+                    head_dim: 1,
+                    scale: 1.0
+                },
+                Visibility::Causal
+            )
+            .is_err()
+        );
+        // And a scale that is not finite and positive.
+        for scale in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                attend_multi_head(
+                    &q,
+                    &history,
+                    0,
+                    Heads {
+                        query: 4,
+                        key_value: 2,
+                        head_dim: 1,
+                        scale,
+                    },
+                    Visibility::Causal
+                )
+                .is_err(),
+                "scale {scale} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grouped_history_row_is_narrower_than_the_query_row() {
+        // The stored rows are `kv_heads * head_dim` wide. Passing a query-width
+        // row would be an artifact error, not a silently reinterpreted one.
+        let mut history = KvHistory::new();
+        history.append(0, vec![1.0; 8], vec![1.0; 8]).unwrap();
+        let q = vec![1.0f32; 8];
+        // 4 heads of 2, with 2 key/value heads, wants 4-wide history rows.
+        assert!(
+            attend_multi_head(
+                &q,
+                &history,
+                0,
+                Heads {
+                    query: 4,
+                    key_value: 2,
+                    head_dim: 2,
+                    scale: 1.0
+                },
+                Visibility::Causal
+            )
+            .is_err()
+        );
     }
 }

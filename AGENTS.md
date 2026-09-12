@@ -27,9 +27,25 @@ executed-row-shape and immutable paged-program findings. Re-review found one
 remaining direct-API rollback gap; correction `7a08adf` moves all paged preparation
 under the transaction abort guard. Final independent review through `3f13784` found
 no remaining blocker. This acceptance closes M1.4 within its synthetic
-host-reference bounds. The next bounded M1.5 contract has not yet been authored;
-checkpoint/model integration and M4 device attention remain separate. See the
-[active handover](docs/handovers/2026-09-11-m1.4-closure-to-m1.5.md).
+host-reference bounds.
+
+[Task 0016](docs/tasks/0016-m1-gemma-reduced-graph.md) opens M1.5 and is
+**implemented, awaiting independent review and owner acceptance**. Contract
+`1199267` follows the artifact-inspection evidence `1e1867c` and precedes the
+implementation. It makes seven family-mathematics parameters explicit
+([ADR 0012](docs/decisions/adr/0012-explicit-family-operation-parameters.md)) and
+adds `moxie-models` with a `gemma4` module — one crate with a module per family,
+at the owner's direction during implementation
+([ADR 0013](docs/decisions/adr/0013-one-model-crate-with-family-modules.md)).
+
+**It executes no checkpoint.** The Gemma 4 artifact at
+`/fast/models/cyankiwi/gemma-4-31B-it-AWQ-8bit` is inspected, hashed and
+recorded in [its bring-up record](docs/models/gemma4.md); every language-model
+linear is compressed-tensors INT8 `pack-quantized`, so its importer and execution
+path are M3. The reduced graph is a synthetic contract fixture and may not be
+described as model support. M4 owns per-layer key/value geometry and window
+eviction; M11 owns vision. See the
+[active handover](docs/handovers/2026-09-12-m1.5-gemma-operation-gap.md).
 
 ## Read before editing
 

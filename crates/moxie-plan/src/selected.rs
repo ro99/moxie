@@ -444,8 +444,31 @@ fn node_shape(node: &moxie_graph::Node, rows: u64) -> Result<(u64, u64), Error> 
             }
             Ok((in_features, out_features))
         }
-        moxie_graph::OpParams::RmsNorm { hidden, .. } => Ok((hidden, hidden)),
-        moxie_graph::OpParams::Residual => {
+        moxie_graph::OpParams::RmsNorm { hidden, group, .. } => {
+            // The qualified device norm reduces over the whole row. A grouped
+            // norm is a different reduction, and running it on this kernel
+            // would silently mix every group's magnitude together.
+            if group != 1 {
+                return Err(Error::UnsupportedKernel {
+                    operation: "rms_norm",
+                    detail: format!("no qualified device kernel normalizes {group} groups"),
+                });
+            }
+            Ok((hidden, hidden))
+        }
+        moxie_graph::OpParams::Residual { scale } => {
+            // The qualified device residual adds and rounds; it does not scale.
+            // A scaled residual is a different kernel, and until one is
+            // qualified this must refuse rather than drop the factor -- which
+            // would be a silent numerical change, not a fallback.
+            if scale != 1.0 {
+                return Err(Error::UnsupportedKernel {
+                    operation: "residual",
+                    detail: format!(
+                        "no qualified device kernel applies a residual scale; got {scale}"
+                    ),
+                });
+            }
             if rows == 0 {
                 return Err(invalid("rows", "residual rows must be nonzero"));
             }
@@ -550,11 +573,18 @@ mod tests {
             .weight("gain", weight(vec![Dim::constant(hidden)]))
             .unwrap();
         let n = builder
-            .node(OpParams::RmsNorm { hidden, eps }, &[h, gain])
+            .node(
+                OpParams::RmsNorm {
+                    hidden,
+                    eps,
+                    group: 1,
+                },
+                &[h, gain],
+            )
             .unwrap();
         let residual_left = if exact_residual { x } else { h };
         let y = builder
-            .node(OpParams::Residual, &[residual_left, n])
+            .node(OpParams::Residual { scale: 1.0 }, &[residual_left, n])
             .unwrap();
         builder.finish(y, &registry).unwrap()
     }
@@ -613,9 +643,18 @@ mod tests {
             .weight("gain", weight(vec![Dim::constant(hidden)]))
             .unwrap();
         let n = builder
-            .node(OpParams::RmsNorm { hidden, eps: 1e-5 }, &[h, gain])
+            .node(
+                OpParams::RmsNorm {
+                    hidden,
+                    eps: 1e-5,
+                    group: 1,
+                },
+                &[h, gain],
+            )
             .unwrap();
-        let y = builder.node(OpParams::Residual, &[x, n]).unwrap();
+        let y = builder
+            .node(OpParams::Residual { scale: 1.0 }, &[x, n])
+            .unwrap();
         builder.finish(y, &registry).unwrap()
     }
 

@@ -122,6 +122,39 @@ pub fn embedding_row(
     crate::try_clone_slice(&table[t * hidden..(t + 1) * hidden])
 }
 
+/// One embedding row, multiplied by a checkpoint-defined factor.
+///
+/// Gemma 4 scales every looked-up row by `bf16(sqrt(hidden_size))`
+/// (`src/models/gemma4/gemma4_runtime.cpp:699`); most families use 1.0. The
+/// factor is stated rather than derived from `hidden`, because "the square root
+/// of the hidden size" is a fact about one family's training recipe, not about
+/// what an embedding lookup is.
+///
+/// At `scale == 1.0` this is [`embedding_row`] exactly, including the sign of
+/// zero: the multiply is skipped rather than performed with a one, so a table
+/// holding `-0.0` still yields `-0.0`.
+pub fn embedding_row_scaled(
+    tokens_id: u32,
+    table: &[f32],
+    vocab: usize,
+    hidden: usize,
+    scale: f32,
+) -> Result<Vec<f32>> {
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(Error::InvalidRequest {
+            field: "embedding_scale",
+            detail: format!("embedding scale must be finite and positive, got {scale}"),
+        });
+    }
+    let mut row = embedding_row(tokens_id, table, vocab, hidden)?;
+    if scale != 1.0 {
+        for v in &mut row {
+            *v = ((*v as f64) * (scale as f64)) as f32;
+        }
+    }
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +303,26 @@ mod tests {
         assert!(embedding_row(3, &table, 3, 2).is_err());
         assert!(embedding_row(u32::MAX, &table, 3, 2).is_err());
         assert!(embedding_row(0, &table, 4, 2).is_err(), "table too small");
+    }
+
+    #[test]
+    fn a_unit_embedding_scale_preserves_the_stored_row_exactly() {
+        let signed = [-0.0f32, 1.0, -0.0, 2.0];
+        let r = embedding_row_scaled(0, &signed, 2, 2, 1.0).unwrap();
+        assert_eq!(r, embedding_row(0, &signed, 2, 2).unwrap());
+        // Including the sign of zero: a multiply by one would keep it too, but
+        // the contract is "no multiply", and this is what asserts it.
+        assert!(r[0].is_sign_negative());
+    }
+
+    #[test]
+    fn the_embedding_scale_multiplies_every_lane() {
+        let table = [1.0f32, 2.0, 3.0, 0.5, 1.5, 2.5];
+        let scaled = embedding_row_scaled(1, &table, 2, 3, 4.0).unwrap();
+        assert_eq!(scaled, vec![2.0, 6.0, 10.0]);
+        assert!(embedding_row_scaled(1, &table, 2, 3, 0.0).is_err());
+        assert!(embedding_row_scaled(1, &table, 2, 3, f32::NAN).is_err());
+        // Out-of-vocabulary and shape errors still come from the unscaled path.
+        assert!(embedding_row_scaled(9, &table, 2, 3, 1.0).is_err());
     }
 }

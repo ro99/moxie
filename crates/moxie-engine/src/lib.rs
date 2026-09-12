@@ -123,9 +123,9 @@ impl Program<'_> {
             ));
         }
         let context = add(request.prompt.len(), request.max_new_tokens)?;
-        if context > 256 || request.prefill_chunk > 256 || self.graph.value_count() > 128 {
+        if context > 256 || request.prefill_chunk > 256 || self.graph.value_count() > 384 {
             return Err(unsupported(
-                "context/chunk <=256 and graph values <=128 required",
+                "context/chunk <=256 and graph values <=384 required",
             ));
         }
         if self.tokens == self.positions
@@ -247,22 +247,34 @@ impl Program<'_> {
                     return Err(invalid("graph", "rope must consume absolute positions"));
                 }
                 OpParams::Attention {
-                    heads, head_dim, ..
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    ..
                 } => {
+                    // Uniform across layers, still: this profile stores one
+                    // page geometry for the whole sequence. A graph whose
+                    // layers disagree -- Gemma 4's sliding layers are 16x256
+                    // and its global layers 4x512 -- is refused here rather
+                    // than silently paged at the first layer's width. Per-layer
+                    // geometry is M4's state-schema work.
                     if node.inputs[3] != self.positions
-                        || shape.is_some_and(|s| s != (heads, head_dim))
+                        || shape.is_some_and(|s| s != (heads, kv_heads, head_dim))
                     {
                         return Err(unsupported(
-                            "uniform MHA geometry and absolute positions required",
+                            "uniform attention geometry and absolute positions required",
                         ));
                     }
-                    shape = Some((heads, head_dim));
+                    shape = Some((heads, kv_heads, head_dim));
                 }
                 _ => {}
             }
         }
-        let (heads, dim) = shape.expect("attention layers");
-        let width = mul(heads as usize, dim as usize)?;
+        let (_, kv_heads, dim) = shape.expect("attention layers");
+        // The paged rows hold keys and values, so the per-layer row width
+        // follows the key/value heads, not the query heads. Under GQA the two
+        // differ and charging for the query width would over-reserve.
+        let width = mul(kv_heads as usize, dim as usize)?;
         let workspace = add(
             add(
                 add(1_048_576, mul(64, elements)?)?,
@@ -275,7 +287,7 @@ impl Program<'_> {
             workspace,
             geometry: KvGeometry {
                 layers: layers.len(),
-                kv_heads: heads as usize,
+                kv_heads: kv_heads as usize,
                 key_dim: dim as usize,
                 value_dim: dim as usize,
                 precision: Precision::Bf16,

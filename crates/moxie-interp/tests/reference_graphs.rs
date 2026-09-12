@@ -9,7 +9,7 @@
 
 use moxie_graph::{
     Bindings, Graph, GraphBuilder, IndexEncoding, OpParams, OracleRegistry, PartitionRule,
-    StateEffect, TensorSpec, ValueId, ValueRole, Visibility,
+    RopeLayout, StateEffect, TensorSpec, ValueId, ValueRole, Visibility, reciprocal_sqrt_scale,
 };
 use moxie_interp::{Cancel, HostTensor, Interpreter, KvCache, Value};
 use moxie_oracles::metric::{ErrorSummary, gamma};
@@ -159,6 +159,7 @@ fn build(dims: Dims, seed: u64) -> Fixture {
             OpParams::Embedding {
                 vocab: dims.vocab,
                 hidden: h,
+                scale: 1.0,
             },
             &[tokens_id, table],
         )
@@ -168,6 +169,7 @@ fn build(dims: Dims, seed: u64) -> Fixture {
             OpParams::RmsNorm {
                 hidden: h,
                 eps: 1e-5,
+                group: 1,
             },
             &[h0, g_attn],
         )
@@ -182,6 +184,8 @@ fn build(dims: Dims, seed: u64) -> Fixture {
                 head_dim: dims.head_dim,
                 rotary_dim: dims.head_dim,
                 base: 10_000.0,
+                frequency_dim: dims.head_dim,
+                layout: RopeLayout::Interleaved,
             },
             &[x, positions_id],
         )
@@ -196,6 +200,8 @@ fn build(dims: Dims, seed: u64) -> Fixture {
                 head_dim: dims.head_dim,
                 visibility: Visibility::Causal,
                 layer: 0,
+                kv_heads: dims.heads,
+                scale: reciprocal_sqrt_scale(dims.head_dim),
             },
             &[qr, kr, v, positions_id],
         )
@@ -211,12 +217,15 @@ fn build(dims: Dims, seed: u64) -> Fixture {
             &[a, wo, bo],
         )
         .expect("out proj");
-    let h1 = g.node(OpParams::Residual, &[h0, ao]).expect("residual");
+    let h1 = g
+        .node(OpParams::Residual { scale: 1.0 }, &[h0, ao])
+        .expect("residual");
     let n1 = g
         .node(
             OpParams::RmsNorm {
                 hidden: h,
                 eps: 1e-5,
+                group: 1,
             },
             &[h1, g_ffn],
         )
@@ -227,12 +236,15 @@ fn build(dims: Dims, seed: u64) -> Fixture {
         .node(OpParams::SwiGlu { width: dims.ffn }, &[gate, up])
         .expect("swiglu");
     let down = lin(&mut g, actv, w_down, dims.ffn, h);
-    let h2 = g.node(OpParams::Residual, &[h1, down]).expect("residual");
+    let h2 = g
+        .node(OpParams::Residual { scale: 1.0 }, &[h1, down])
+        .expect("residual");
     let n2 = g
         .node(
             OpParams::RmsNorm {
                 hidden: h,
                 eps: 1e-5,
+                group: 1,
             },
             &[h2, g_out],
         )
@@ -242,6 +254,7 @@ fn build(dims: Dims, seed: u64) -> Fixture {
             OpParams::VocabProjection {
                 vocab: dims.vocab,
                 hidden: h,
+                softcap: None,
             },
             &[n2, w_vocab],
         )
@@ -541,6 +554,7 @@ fn an_operation_with_no_registered_oracle_cannot_be_built_into_a_graph() {
             OpParams::Embedding {
                 vocab: 4,
                 hidden: 2,
+                scale: 1.0,
             },
             &[tokens, table],
         )
@@ -574,6 +588,8 @@ fn shape_and_divisibility_errors_are_refused_at_construction() {
                 head_dim: 4,
                 rotary_dim: 3,
                 base: 10_000.0,
+                frequency_dim: 3,
+                layout: RopeLayout::Interleaved,
             },
             &[x, pos],
         )
@@ -600,6 +616,8 @@ fn shape_and_divisibility_errors_are_refused_at_construction() {
                 head_dim: 4,
                 rotary_dim: 4,
                 base: 10_000.0,
+                frequency_dim: 4,
+                layout: RopeLayout::Interleaved,
             },
             &[narrow, pos],
         )
@@ -621,6 +639,8 @@ fn shape_and_divisibility_errors_are_refused_at_construction() {
         head_dim: 4,
         visibility: Visibility::Causal,
         layer: 0,
+        kv_heads: 2,
+        scale: reciprocal_sqrt_scale(4),
     };
     g.node(params.clone(), &[t, t, t, pos]).unwrap();
     assert!(g.node(params, &[t, t, t, pos]).is_err());
@@ -641,7 +661,8 @@ fn shape_and_divisibility_errors_are_refused_at_construction() {
         g.node(
             OpParams::Embedding {
                 vocab: 4,
-                hidden: 2
+                hidden: 2,
+                scale: 1.0,
             },
             &[f, idx]
         )
@@ -677,6 +698,7 @@ fn the_contract_table_is_what_the_code_says() {
             OpParams::Embedding {
                 vocab: 4,
                 hidden: 2,
+                scale: 1.0,
             },
             PartitionRule::Replicated,
             StateEffect::None,
@@ -696,6 +718,7 @@ fn the_contract_table_is_what_the_code_says() {
             OpParams::RmsNorm {
                 hidden: 2,
                 eps: 1e-5,
+                group: 1,
             },
             PartitionRule::Replicated,
             StateEffect::None,
@@ -713,6 +736,8 @@ fn the_contract_table_is_what_the_code_says() {
                 head_dim: 2,
                 rotary_dim: 2,
                 base: 10_000.0,
+                frequency_dim: 2,
+                layout: RopeLayout::Interleaved,
             },
             PartitionRule::ColumnShardable,
             StateEffect::None,
@@ -724,13 +749,15 @@ fn the_contract_table_is_what_the_code_says() {
                 head_dim: 2,
                 visibility: Visibility::Causal,
                 layer: 0,
+                kv_heads: 1,
+                scale: reciprocal_sqrt_scale(2),
             },
             PartitionRule::NotDetermined,
             StateEffect::Appends,
             Precision::Bf16,
         ),
         (
-            OpParams::Residual,
+            OpParams::Residual { scale: 1.0 },
             PartitionRule::Replicated,
             StateEffect::None,
             Precision::Bf16,
@@ -739,6 +766,7 @@ fn the_contract_table_is_what_the_code_says() {
             OpParams::VocabProjection {
                 vocab: 4,
                 hidden: 2,
+                softcap: None,
             },
             PartitionRule::ColumnShardable,
             StateEffect::None,
@@ -1020,6 +1048,8 @@ fn every_position_operand_is_the_same_binding() {
                 head_dim: 4,
                 rotary_dim: 4,
                 base: 10_000.0,
+                frequency_dim: 4,
+                layout: RopeLayout::Interleaved,
             },
             &[x, p1],
         )
@@ -1031,6 +1061,8 @@ fn every_position_operand_is_the_same_binding() {
                 head_dim: 4,
                 visibility: Visibility::Causal,
                 layer: 0,
+                kv_heads: 2,
+                scale: reciprocal_sqrt_scale(4),
             },
             &[r, r, r, p2],
         )
@@ -1046,6 +1078,8 @@ fn every_position_operand_is_the_same_binding() {
                 head_dim: 4,
                 visibility: Visibility::Causal,
                 layer: 0,
+                kv_heads: 2,
+                scale: reciprocal_sqrt_scale(4),
             },
             &[r, r, r, p1],
         )
@@ -1209,6 +1243,8 @@ fn an_operand_precision_the_node_contract_rejects_is_refused_at_construction() {
                 head_dim: 4,
                 rotary_dim: 4,
                 base: 10_000.0,
+                frequency_dim: 4,
+                layout: RopeLayout::Interleaved,
             },
             &[wide, pos],
         )
@@ -1228,6 +1264,8 @@ fn an_operand_precision_the_node_contract_rejects_is_refused_at_construction() {
                 head_dim: 4,
                 rotary_dim: 4,
                 base: 10_000.0,
+                frequency_dim: 4,
+                layout: RopeLayout::Interleaved,
             },
             &[narrow, pos],
         )
@@ -1302,6 +1340,8 @@ fn a_graph_whose_attention_layers_are_not_dense_is_refused_at_construction() {
                 head_dim: 4,
                 visibility: Visibility::Causal,
                 layer: 1,
+                kv_heads: 2,
+                scale: reciprocal_sqrt_scale(4),
             },
             &[x, x, x, pos],
         )
@@ -1327,6 +1367,8 @@ fn a_graph_whose_attention_layers_are_not_dense_is_refused_at_construction() {
                 head_dim: 4,
                 visibility: Visibility::Causal,
                 layer: 0,
+                kv_heads: 2,
+                scale: reciprocal_sqrt_scale(4),
             },
             &[x, x, x, pos],
         )
@@ -1338,6 +1380,8 @@ fn a_graph_whose_attention_layers_are_not_dense_is_refused_at_construction() {
                 head_dim: 4,
                 visibility: Visibility::Causal,
                 layer: 1,
+                kv_heads: 2,
+                scale: reciprocal_sqrt_scale(4),
             },
             &[a0, a0, a0, pos],
         )
@@ -1371,6 +1415,8 @@ fn stateless_graph() -> (Graph, ValueId, ValueId, ValueId) {
                 head_dim: 4,
                 rotary_dim: 4,
                 base: 10_000.0,
+                frequency_dim: 4,
+                layout: RopeLayout::Interleaved,
             },
             &[x, pos],
         )
@@ -1380,6 +1426,7 @@ fn stateless_graph() -> (Graph, ValueId, ValueId, ValueId) {
             OpParams::VocabProjection {
                 vocab: 4,
                 hidden: 8,
+                softcap: None,
             },
             &[r, w],
         )
@@ -1657,11 +1704,14 @@ fn stateless_trace_reports_each_bf16_semantic_boundary_in_graph_order() {
             OpParams::RmsNorm {
                 hidden: 2,
                 eps: 3.5,
+                group: 1,
             },
             &[linear, gain],
         )
         .unwrap();
-    let residual = graph.node(OpParams::Residual, &[x, norm]).unwrap();
+    let residual = graph
+        .node(OpParams::Residual { scale: 1.0 }, &[x, norm])
+        .unwrap();
     let graph = graph.finish(residual, &oracles()).unwrap();
 
     let mut bindings = Bindings::new();

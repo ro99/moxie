@@ -822,8 +822,15 @@ fn chain_graph(hidden: u64, eps: f32) -> Result<ChainFixture, Error> {
         &[x, weight],
     )?;
     let gain = builder.weight("gain", weight_spec(vec![Dim::constant(hidden)]))?;
-    let norm = builder.node(OpParams::RmsNorm { hidden, eps }, &[linear, gain])?;
-    let output = builder.node(OpParams::Residual, &[x, norm])?;
+    let norm = builder.node(
+        OpParams::RmsNorm {
+            hidden,
+            eps,
+            group: 1,
+        },
+        &[linear, gain],
+    )?;
+    let output = builder.node(OpParams::Residual { scale: 1.0 }, &[x, norm])?;
     Ok(ChainFixture {
         graph: builder.finish(output, &registry)?,
         x,
