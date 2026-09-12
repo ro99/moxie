@@ -2124,7 +2124,90 @@ fn normalize_relative(base: &Path, raw: &str) -> PathBuf {
 ///
 /// So scratch exclusion now means "unreferenced", which is what
 /// `docs/README.md` describes, rather than "named `results`".
-fn reachable_crate_dirs(root: &Path) -> BTreeSet<PathBuf> {
+/// Match one path segment against a Cargo member pattern containing `*` and
+/// `?`, the two wildcards this checker expands exactly.
+///
+/// `*` matches any run of characters within the segment, `?` exactly one.
+/// Neither crosses a `/`, which is why matching is per segment.
+fn segment_matches(pattern: &str, name: &str) -> bool {
+    let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
+    // Iterative backtracking: `star` remembers the last `*` and how much of the
+    // name it had consumed, so a failed match resumes there rather than
+    // recursing.
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut resume) = (None, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            resume = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            resume += 1;
+            ni = resume;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Expand one member pattern to the directories it names.
+///
+/// `None` means **this checker cannot expand it exactly** -- `**`, a character
+/// class, a brace set. Every caller treats that as "reachability is unknown"
+/// and stops excluding anything, because the alternative is what a review found
+/// three times running: a production crate invisible to every rule because the
+/// walk quietly decided it was not there.
+fn expand_member(root: &Path, pattern: &str) -> Option<Vec<PathBuf>> {
+    if pattern.contains("**") || pattern.contains('[') || pattern.contains('{') {
+        return None;
+    }
+    let mut current = vec![root.to_path_buf()];
+    for raw in pattern.split(['/', '\\']) {
+        match raw {
+            "" | "." => continue,
+            ".." => {
+                current = current
+                    .into_iter()
+                    .map(|mut d| {
+                        d.pop();
+                        d
+                    })
+                    .collect();
+            }
+            segment if segment.contains('*') || segment.contains('?') => {
+                let mut next = Vec::new();
+                for dir in &current {
+                    let Ok(rd) = std::fs::read_dir(dir) else {
+                        continue;
+                    };
+                    for entry in rd.filter_map(|e| e.ok()) {
+                        if entry.path().is_dir()
+                            && segment_matches(segment, &entry.file_name().to_string_lossy())
+                        {
+                            next.push(entry.path());
+                        }
+                    }
+                }
+                current = next;
+            }
+            segment => {
+                current = current.into_iter().map(|d| d.join(segment)).collect();
+            }
+        }
+    }
+    Some(current)
+}
+
+/// `None` when membership could not be resolved exactly; see [`expand_member`].
+fn reachable_crate_dirs(root: &Path) -> Option<BTreeSet<PathBuf>> {
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     let mut queue: Vec<PathBuf> = Vec::new();
 
@@ -2143,19 +2226,18 @@ fn reachable_crate_dirs(root: &Path) -> BTreeSet<PathBuf> {
             .and_then(|m| m.as_array())
         {
             for entry in members.iter().filter_map(|m| m.as_str()) {
-                // A trailing `*` is the only glob this needs to understand;
-                // anything else is taken literally, which errs toward checking
-                // more rather than less.
-                if let Some(prefix) = entry.strip_suffix("/*") {
-                    let dir = normalize_relative(root, prefix);
-                    if let Ok(rd) = std::fs::read_dir(&dir) {
-                        for e in rd.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()) {
-                            queue.push(e.path());
-                        }
-                    }
-                } else {
-                    queue.push(normalize_relative(root, entry));
-                }
+                // A pattern this checker cannot expand exactly makes the whole
+                // reachability question unanswerable, and the answer to an
+                // unanswerable question here is "check everything".
+                //
+                // The comment that used to sit here claimed literal treatment
+                // "errs toward checking more rather than less". That was
+                // backwards, and a review proved it: `members = ["results/mo*"]`
+                // resolved to a directory that does not exist, so the real
+                // `results/model` was *unreachable*, so it was excluded, so its
+                // forbidden `std::fs::read` was invisible. Guessing wrong about
+                // membership silently disables every rule for that crate.
+                queue.extend(expand_member(root, entry)?);
             }
         }
     }
@@ -2188,7 +2270,7 @@ fn reachable_crate_dirs(root: &Path) -> BTreeSet<PathBuf> {
             }
         }
     }
-    seen
+    Some(seen)
 }
 
 /// Every `[dependencies]`-shaped table in a manifest, including
@@ -2265,7 +2347,12 @@ fn find_manifests(root: &Path) -> Result<Vec<PathBuf>, String> {
                             "results" | "artifacts"
                         )
                     });
-                if in_root_scratch && !reachable.contains(parent) {
+                // `reachable` is `None` when membership could not be resolved
+                // exactly. Excluding on a guess is how a crate disappears from
+                // every rule, so an unanswerable question means nothing is
+                // excluded and everything is checked.
+                let unreachable = reachable.as_ref().is_some_and(|set| !set.contains(parent));
+                if in_root_scratch && unreachable {
                     continue;
                 }
                 out.push(p);
@@ -3421,6 +3508,82 @@ mod tests {
                 expected,
                 "{dir} should {}be discovered as a workspace crate",
                 if expected { "" } else { "not " }
+            );
+        }
+    }
+
+    #[test]
+    fn member_globs_are_expanded_rather_than_taken_literally() {
+        // `results/mo*` used to resolve to a directory that does not exist, so
+        // the real `results/model` was "unreachable", so it was excluded, so
+        // every rule stopped applying to it. Guessing wrong about membership
+        // silently disables the checker for a crate.
+        let root = tempdir();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"results/mo*\"]\n",
+        )
+        .unwrap();
+        let model = root.join("results/model");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(
+            model.join("Cargo.toml"),
+            "[package]\nname = \"moxie-models\"\n",
+        )
+        .unwrap();
+        assert!(
+            find_manifests(&root)
+                .unwrap()
+                .iter()
+                .any(|m| m.starts_with(&model)),
+            "a glob-declared member was hidden"
+        );
+    }
+
+    #[test]
+    fn an_unexpandable_member_pattern_checks_everything() {
+        // Fail closed. A pattern this checker cannot expand exactly makes
+        // reachability unanswerable, and the answer to an unanswerable question
+        // is "check everything" -- never "exclude it and hope".
+        for pattern in ["crates/**/inner", "crates/[ab]*", "crates/{a,b}"] {
+            let root = tempdir();
+            std::fs::write(
+                root.join("Cargo.toml"),
+                format!("[workspace]\nmembers = [\"{pattern}\"]\n"),
+            )
+            .unwrap();
+            let probe = root.join("results/probe");
+            std::fs::create_dir_all(&probe).unwrap();
+            std::fs::write(probe.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+            assert!(
+                find_manifests(&root)
+                    .unwrap()
+                    .iter()
+                    .any(|m| m.starts_with(&probe)),
+                "{pattern}: scratch was excluded on an unresolvable membership"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_globs_match_the_way_cargo_does() {
+        for (pattern, name, expected) in [
+            ("mo*", "model", true),
+            ("mo*", "moxie", true),
+            ("mo*", "nope", false),
+            ("*", "anything", true),
+            ("m?del", "model", true),
+            ("m?del", "modell", false),
+            ("*el", "model", true),
+            ("a*b*c", "axxbyyc", true),
+            ("a*b*c", "axxbyy", false),
+            ("exact", "exact", true),
+            ("exact", "exacts", false),
+        ] {
+            assert_eq!(
+                segment_matches(pattern, name),
+                expected,
+                "{pattern} vs {name}"
             );
         }
     }

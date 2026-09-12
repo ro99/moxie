@@ -13,12 +13,12 @@ matrix exists to prevent.
 ## Gate IDs
 
 [Task 0020](../tasks/0020-m2-weight-residency-authority.md) is **M2 item 2**,
-implemented, corrected after five rounds of independent review that found
-**twenty-five** issues — all reproduced, all fixed, none disputed — and
+implemented, corrected after six rounds of independent review that found
+**twenty-six** issues — all reproduced, all fixed, none disputed — and
 awaiting owner acceptance: one production weight-residency owner, connected to bounded
 storage reads, a host cache, real device uploads, leases, eviction and
 demand/prefetch classes.
-Gates: 818 host tests + doctests, 838
+Gates: 821 host tests + doctests, 841
 device-feature tests, 39/39 real GPU cases, both clippy lanes, `spec-check`, and
 `arch-check` passing every rule and fixture including the new
 `a second weight-residency owner`. **It does not close M2**, whose exit still
@@ -117,7 +117,7 @@ and isolated no-driver runs retain their previously recorded evidence.
 | `G-HOST-CLIPPY` | `cargo clippy --workspace --all-targets --locked -- -D warnings` | host | passed |
 | `G-DEVICE-CLIPPY` | the same with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | device build | passed; **new at [task 0007](../tasks/0007-m1-rank-context-and-measured-capacity.md)**, which found and fixed two pre-existing `undocumented_unsafe_blocks` findings the lane had never been run against; extended at [task 0009](../tasks/0009-m1-event-backed-leases.md) with `moxie-executor/driver` |
 | `G-HOST-TEST` | `cargo test --workspace --all-targets --locked --offline`; `cargo test --workspace --doc --locked --offline` | host | passed, 593 unit/integration tests + 9 doctests at accepted task 0015 |
-| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed with **zero failures** at task 0020 — 78 negative + 21 accepted fixtures, 13 rules. The four failures every task since 0014 reported as "pre-existing" were review probe crates parked under `results/`, which `docs/README.md` declares ignored scratch; the crate walk now skips `results/` and `artifacts/`, pinned by a unit test that a crate under `crates/` is still found. Previously: 71 negative + 20 accepted fixtures, 12 rules; 343 generated module combinations checked against rustc by the host suite, each against all four crate boundaries |
+| `G-HOST-ARCH` | `cargo xtask arch-check` | host | passed with **zero failures** at task 0020 — 78 negative + 21 accepted fixtures, 13 rules. The four failures every task since 0014 reported as "pre-existing" were review probe crates parked under `results/`, which `docs/README.md` declares ignored scratch. The walk now excludes root scratch **by reachability, computed exactly** — normalized members, globs expanded per segment, `{ workspace = true }` inheritance resolved through the same resolver the edge checker uses — and **fails closed**, checking everything, when reachability cannot be computed. Three review rounds found three different ways a cheaper approximation hid a production crate from every rule. Previously: 71 negative + 20 accepted fixtures, 12 rules; 343 generated module combinations checked against rustc by the host suite, each against all four crate boundaries |
 | `G-HOST-SPEC` | `cargo xtask spec-check` | host | passed, 10 documents |
 | `G-HOST-NODRIVER` | fresh target, `CUDA_HOME=/nonexistent NVCC=/nonexistent`, no CUDA on `PATH`; **`cargo build -p xtask` before `ldd`** | host | passed, 556 unit/integration tests; focused interpreter doctests passed separately. `ldd` shows no `libcuda`. The explicit build is load-bearing: without it `ldd` can read a device-lane artifact left in the shared `target/`, which it did once on 2026-09-08 ([toolchain.md](toolchain.md)) |
 | `G-GPU-CAPACITY` | `cargo xtask-cuda capacity` | device | passed, **the host and** 3 devices measured and admitted against in one ledger; also passed with `CUDA_VISIBLE_DEVICES` reversed, each UUID keeping its own memory total |

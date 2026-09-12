@@ -1,11 +1,14 @@
 # Task 0020 — M2 weight-residency authority
 
-Status: **implemented and corrected after five rounds of independent review;
+Status: **implemented and corrected after six rounds of independent review;
 awaiting owner acceptance.** Contract written and committed at `d6e9170` before
-implementation, per the working rule that produced tasks 0013–0019. The five
-rounds found **twenty-five** issues in total; all twenty-five were reproduced
-and fixed, and none was disputed. Three rounds criticised method or a coverage
-claim rather than code, and each was right. See
+implementation, per the working rule that produced tasks 0013–0019. The six
+rounds found **twenty-six** issues in total; all twenty-six were reproduced and
+fixed, and none was disputed. Three rounds criticised method or a coverage claim
+rather than code, and each was right. The sixth found no residency defect; its
+single finding was in the architecture check, which
+[had now been wrong three times in the same place](#the-check-that-was-wrong-three-times).
+See
 [the sweep and what it is worth](#the-sweep-and-what-it-is-worth). Also see
 [Result](#result-filled-after-work),
 [Independent review](#independent-review-and-what-it-changed),
@@ -569,8 +572,8 @@ task does **not** close M2.
 | `cargo fmt --all -- --check` | **passed** |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed** |
 | Device-lane clippy (`moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`) | **passed** |
-| `cargo test --workspace --locked --offline` | **818 passed, 0 failed** (736 before this task) |
-| Device-feature workspace tests | **838 passed, 0 failed** |
+| `cargo test --workspace --locked --offline` | **821 passed, 0 failed** (736 before this task) |
+| Device-feature workspace tests | **841 passed, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | **passed**, 10 documents |
 | `cargo xtask arch-check` | **passes with zero failures**: 78 rejected fixtures, 21 accepted, 13 rules, including the new `a second weight-residency owner` with its three fixtures. The "4 pre-existing failures" every task since 0014 has carried are **gone, and were never real** — see [the arch-check noise floor](#the-arch-check-noise-floor) |
@@ -872,6 +875,50 @@ removing the `upload_source` re-assignment on the quarantine path changes
 nothing, because `admit_new` has already set it. Saying so is part of reporting
 a battery honestly — an equivalent mutant surviving is not a coverage gap, and
 counting it as one would inflate the number in the other direction.
+
+### Sixth independent review
+
+**One finding, reproduced, not disputed. No residency defect this round.**
+Probe at `results/task0020/independent-review-2026-09-12-round6-arch/`.
+
+**Valid workspace globs could still hide production crates.** The member
+expansion handled only patterns ending in `/*`; everything else was taken
+literally. `members = ["results/mo*"]` therefore resolved to a directory that
+does not exist, so the real `results/model` — holding a `moxie-models` crate with
+a forbidden `std::fs::read` — was *unreachable*, so it was excluded, so every
+rule stopped applying to it. Cargo builds that crate; `arch-check` reported zero
+violations.
+
+The reviewer also noted that the comment I had written there was simply false:
+it claimed literal treatment "errs toward checking more rather than less". It
+errs the other way, which is the whole defect.
+
+#### The check that was wrong three times
+
+This is the same check, wrong a third time, each time by a different route:
+
+| Round | What hid a crate |
+|---|---|
+| 3 | skipping any directory *named* `results`/`artifacts` at any depth |
+| 5 | membership tested against literal `workspace.members` strings, missing `{ workspace = true }` inheritance |
+| 6 | member globs other than a trailing `/*` taken literally |
+
+All three share one root: I kept computing "is this crate part of the build?"
+with a cheaper approximation than the question deserves, and every approximation
+failed *open* — quietly excluding real code rather than including scratch. Three
+attempts at getting the approximation right is enough evidence that the shape was
+wrong.
+
+So the answer is no longer an approximation that must be correct. `expand_member`
+handles `*` and `?` per path segment exactly, and returns `None` for anything it
+cannot — `**`, a character class, a brace set. `None` propagates: reachability is
+**unknown**, and an unknown reachability excludes nothing and checks everything.
+Guessing wrong now costs a probe crate appearing in the report; before, it cost a
+production crate disappearing from every rule.
+
+Four tests pin it: glob expansion, fail-closed behaviour over three unexpandable
+patterns, the segment matcher against eleven cases, and the earlier rounds' two
+scenarios. All four earlier rounds' architecture probes still pass.
 
 ### What was **not** delivered, and why
 
