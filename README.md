@@ -129,7 +129,7 @@ link widths and simultaneous-transfer behavior to be measured rather than assume
 
 ## Current state and the next assignment
 
-**M1.3 complete; M1.4 active.** The owner accepted
+**M1.4 complete; M1.5 active.** The owner accepted
 [task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md) on 2026-09-10 after independent
 verification of the selected BF16 device chain and all five review corrections through `1138a2a`.
 The accepted scope includes explicit refusal of unqualified RMS underflow; it establishes no
@@ -160,10 +160,12 @@ cancellation, failure or disconnect. Its explicit `host-reference` profile is
 limited to 256 requested context tokens, with bounded graph/scratch sizes.
 It has no tokenizer, text stop/EOS, HTTP or checkpoint support. Use `--help` for the
 diagnostic CLI and `--cancel-after N` for deterministic cancellation testing.
-Final independent re-review and owner acceptance remain pending; **M1.4 stays active**.
-M1.5 model integration and M4 device attention are separate work.
-The [active handover](docs/handovers/2026-09-11-task0015-generation-service.md)
-records the review scope and evidence.
+Final independent review through `3f13784` found no remaining blocker, and the owner
+accepted task 0015 on 2026-09-11. This closes M1.4 within the explicit synthetic
+host-reference scope; **M1.5 is active**. Model/checkpoint integration and M4 device
+attention remain separate work. The
+[active handover](docs/handovers/2026-09-11-m1.4-closure-to-m1.5.md) records the
+accepted boundary and next contract.
 
 Assignments use [TASK.md](docs/spec/templates/TASK.md), never "do everything necessary to make model
 X fast." Each task names a shared owner, a bounded deliverable, its consumers, tests, and stop

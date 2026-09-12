@@ -1,4 +1,8 @@
-# Handover — task 0015 final correction ready for re-review
+# Handover — task 0015 generation service accepted
+
+Superseded for continuation by the
+[M1.4 closure to M1.5 handover](2026-09-11-m1.4-closure-to-m1.5.md). The task 0015
+acceptance and evidence below remain historical records.
 
 ## Workspace identity
 
@@ -54,6 +58,13 @@ live logits or journal, and a successful two-row retry. Final gates pass with 59
 host and 609+12 device-feature tests, 39/39 GPU cases, both clippy lanes, formatting,
 specification, and 71 rejecting/20 accepted architecture fixtures.
 
+Final independent review through `3f13784` found no remaining blocking or actionable
+defect. It independently passed the same host, device-feature, GPU, architecture,
+clippy, formatting and specification gates, and additionally verified that foreign
+transaction IDs leave local work untouched. The owner accepted task 0015 and closed
+M1.4 on 2026-09-11. The evidence manifest and exact accepted boundary are recorded
+in the task result.
+
 ## Decisions and limits
 
 The profile is explicitly `host-reference`: requested context <=256, graph values
@@ -76,11 +87,8 @@ was introduced for ignored evidence.
 
 ## Next task
 
-Independently re-review `7a08adf` against the remaining rollback finding and review
-the cumulative corrections from `5990f2a`, contract `2fbacec`, ADR 0011 and the
-task's retained gates. Corrections stay in task 0015. **M1.4 remains active until
-owner acceptance.**
-After acceptance, record M1.4 closure and define the bounded M1.5 model graph/
-integration assignment, inspecting exact local artifact revisions before any model
-claim and stopping at dependent owner gates. Device attention remains M4 scope;
-do not substitute synthetic diagnostic output for actual checkpoint integration.
+Task 0015 is closed. Continue from the
+[M1.4 closure handover](2026-09-11-m1.4-closure-to-m1.5.md): author the first bounded
+M1.5 model graph/integration contract only after exact local artifact inspection.
+Device attention remains M4 scope; do not substitute synthetic diagnostic output
+for actual checkpoint integration.

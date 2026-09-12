@@ -1,8 +1,8 @@
 # Task 0015 — M1.4 shared generation service and diagnostic CLI
 
-Status: **independent re-review finding corrected; final re-review and owner
-acceptance pending**, 2026-09-11. Contract `2fbacec` preceded implementation
-`f7cff56`; corrections `5990f2a` and `7a08adf` follow independent review.
+Status: **accepted by the owner, 2026-09-11; M1.4 complete; M1.5 active**.
+Contract `2fbacec` preceded implementation `f7cff56`; corrections `5990f2a` and
+`7a08adf` follow independent review, with final reviewed record `3f13784`.
 
 ## Identity and authority
 
@@ -134,7 +134,7 @@ Implementation `f7cff56`, with architecture-fixture correction `3c346e6` and
 independent-review corrections `5990f2a` and `7a08adf`.
 [ADR 0011](../decisions/adr/0011-host-reference-generation-service.md) records the
 ownership and reference-profile decisions. No task requirement or numerical gate
-was relaxed. M1.4 remains active pending final re-review and owner acceptance.
+was relaxed. Owner acceptance and M1.4 closure are recorded below.
 
 ### Shared owners and behavior
 
@@ -321,9 +321,31 @@ one immutable configuration to a sequence before it has physical rows. No duplic
 generation/cache path was introduced. The old dense interpreter remains a reference
 consumer, sharing arithmetic with the new path.
 
-This implements the remaining bounded M1.4 service/CLI deliverable. Independent
-review and owner acceptance precede recording milestone closure. M1.5 graph/model
+This implements the remaining bounded M1.4 service/CLI deliverable. M1.5 graph/model
 integration and M4 device attention remain separate; M8 retains production HTTP,
 chat CLI, tokenizer/text stop/EOS and full sampler processors. No new topology,
 sanitizer, checkpoint-quality or paired prefill/decode performance measurement was
 required or claimed. O1–O7 remain open.
+
+### Independent final review and owner acceptance — 2026-09-11
+
+The owner accepted task 0015 and directed “Document and Push” after independent
+final review through `3f13784` found no remaining blocking or actionable defect.
+The reviewer confirmed that the original service allocation crash, incomplete
+row-shape admission and changed-program KV reuse were fixed, and that the final
+rollback correction clears tentative rows, live logits and the open transaction.
+Retry succeeds, while a foreign transaction ID leaves local work untouched.
+
+Independent verification passed 593 host tests + 9 doctests, 609 device-feature
+tests + 12 doctests, 39/39 real GPU cases, 71 rejecting + 20 accepted architecture
+fixtures, both clippy lanes, formatting and specification checks. Reviewer evidence
+and the rollback reproducer are retained at
+`results/task0015-final-review-2026-09-11/`. Every entry in its `SHA256SUMS` matched;
+the manifest SHA-256 is
+`a605e5dbae42d20e2a5c16279b3461806073a58d9cb8a900ee62aabbe57ae11b`.
+
+Acceptance closes M1.4 within its documented bounds: synthetic host-reference
+generation with requested context <=256, shared paged transactions and the base
+sampler. It does not establish checkpoint/model execution, device attention,
+32,768-token inference, quality or performance. M1.5 is active; M4 device attention
+and M8 product surfaces retain their separate gates. O1–O7 remain open.

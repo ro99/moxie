@@ -2,7 +2,7 @@
 
 ## Current assignment and milestone handoff
 
-**M1.3 complete; M1.4 active.** The owner accepted
+**M1.4 complete; M1.5 active.** The owner accepted
 [task 0012](0012-m1-selected-bf16-device-chain.md) on 2026-09-10, including corrections through
 `1138a2a` and their evidence at `ce7548d`.
 
@@ -16,13 +16,14 @@ review of `23a7a40` / `1e6f253` (contract `4054dd7`): sampler history and determ
 using task 0004's accepted transaction mechanism for
 history rollback.
 
-The active assignment is [task 0015](0015-m1-generation-service-diagnostic-cli.md),
+The owner accepted [task 0015](0015-m1-generation-service-diagnostic-cli.md),
 shared generation service and minimal diagnostic CLI, implemented at `f7cff56`
 after contract `2fbacec`. Corrections `5990f2a` and `7a08adf` address the independent
-review and re-review findings; final re-review and owner acceptance remain pending.
-This is the remaining M1.4 deliverable; M1.5 model integration and M4 device
-attention are separate gates. Reopen accepted tasks only for a demonstrated defect
-in accepted scope.
+review and re-review findings; final review through `3f13784` found no remaining
+blocker. Acceptance closes M1.4 within its documented synthetic host-reference
+scope. M1.5 is active; its first bounded contract has not yet been authored. M4
+device attention remains a separate gate. Reopen accepted tasks only for a
+demonstrated defect in accepted scope.
 
 One file per bounded assignment, `NNNN-slug.md`. Use [TASK.md](../spec/templates/TASK.md).
 

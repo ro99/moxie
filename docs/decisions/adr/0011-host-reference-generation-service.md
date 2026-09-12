@@ -1,6 +1,6 @@
 # ADR 0011 — Shared host-reference generation service
 
-Status: independent-review corrections implemented; final re-review and owner acceptance pending.
+Status: accepted with task 0015 on 2026-09-11; M1.4 complete.
 
 ## Context and decision
 
@@ -72,4 +72,6 @@ CUDA attention promise. The token-ID diagnostic CLI refuses unknown options.
 Its deterministic `--cancel-after` exercises cancellation; interactive Ctrl-C
 handling and text/protocol contracts remain M8. M1.5 consumes the common graph
 integration; M4 adds paged device attention; M8 replaces diagnostics as the sole
-CLI mode. O1–O7 remain open. M1.4 closure requires owner acceptance of task 0015.
+CLI mode. O1–O7 remain open. The owner accepted task 0015 after final independent
+review through `3f13784`; this decision closes M1.4 only within the explicit
+synthetic host-reference boundary. M1.5 model integration remains separate.
