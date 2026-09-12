@@ -484,10 +484,10 @@ and it belongs to the owner with O2, not to a default chosen here.
 
 ## Result, filled after work
 
-Status: **implemented and corrected through two rounds of independent review;
+Status: **implemented and corrected through three rounds of independent review;
 awaiting re-review and owner acceptance.** Contract committed at `b63d931`
-before implementation `2608b5e`; the first round's corrections are `136341c`
-and the second round's follow it.
+before implementation `2608b5e`; corrections at `136341c` (round 1), `0ce89a0`
+(round 2) and the commit this record accompanies (round 3).
 
 ### Independent review, and what it changed
 
@@ -520,6 +520,25 @@ reproduced and all three are fixed**; none was disputed.
 | 8 | The revised expert bound **still did not propagate** first-projection error through the activation and the down projection; the record overstated what it proved | `expert_error_bound`, derived in the style of `attention_error_bound`, propagating through both projections, the activation's Lipschitz constant and every BF16 boundary. The review's fixture is now a test, with the disproved bound kept as a negative control |
 | 9 | `IndexEncoding::U32` fixed the route over-count but **opened an under-count**: nothing enforced the "step inputs stay U64" rule, so three `U32` token ids lowered to 12 bytes for 24 bytes of storage | enforced at `GraphBuilder::finish` and again in the planner's external-input validation, with a negative test at each. A route table declared as a step input is refused there too |
 
+### Third independent review
+
+One further issue, reproduced and fixed.
+
+| # | Finding | Fix |
+|---|---|---|
+| 10 | **`BF16_U` was defined at half its true value.** A format with `p` significand bits has `ulp(1) = 2^(1-p)` and unit roundoff `2^-p`; BF16's `p` is 8, so `u = 2^-8`. It was written `2^-9` by halving `2^-8` instead of halving `ulp(1) = 2^-7`. The midpoint `1 + 2^-8` rounds to `1.0` for an error of exactly `2^-8`, twice what the constant allowed — and since `expert_error_bound` charges every BF16 boundary against it, that bound's justification was invalid | the constant is corrected to `2^-8`, and `bf16_midpoints_round_by_exactly_this_much` checks **all 65,536 patterns and their midpoints** exhaustively, asserting both that the bound holds and that it is attained to within the `u/(1+u)` factor, so a smaller constant fails rather than merely looking conservative. A straddling-pair regression pins the `2·u_b·S` term the bound uses. `the_underflow_units_are_half_the_smallest_subnormal` derives all four constants from their formats |
+
+The same cross-check was already available in the repository: `residual.rs`
+pins `1 + 2^-8` as "exactly halfway between two BF16 values" from an earlier
+review. A constant reasoned about once in a doc comment survived where one
+derived from `p` and tested exhaustively would not have — which is the argument
+for the exhaustive test rather than for being more careful.
+
+Correcting the constant only **enlarges** every BF16 term in
+`expert_error_bound`, so no bound assertion loosened and none of the existing
+fixtures changed behaviour. The claim "four hundred times FP32's" is corrected
+to **65,536 times**.
+
 Findings 6 and 7 are the uncomfortable ones: 6 is the *same* defect as finding 1
 in the function beside it, which means the first fix was applied where the
 reviewer pointed rather than swept; and 7 is a regression that passed while
@@ -550,17 +569,17 @@ regressions are.
 
 ### Commands and results
 
-All re-run after **both** rounds of review corrections, on 2026-09-12. The
-counts include the nine regressions the two reviews produced.
+All re-run after **all three** rounds of review corrections, on 2026-09-12.
+The counts include the twelve regressions the three reviews produced.
 
 | Gate | Command | Result |
 |---|---|---|
 | Format | `cargo fmt --all -- --check` | **passed**, empty diff |
 | Clippy, host lane | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed**, no warnings |
-| Host tests | `cargo test --workspace --locked --offline` | **724 passed + 9 doctests, 0 failed** |
-| Device-feature tests | the same with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **740 passed + 12 doctests, 0 failed** |
+| Host tests | `cargo test --workspace --locked --offline` | **727 passed + 9 doctests, 0 failed** |
+| Device-feature tests | the same with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **743 passed + 12 doctests, 0 failed** |
 | Real GPU | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
-| `G-MOE-ROUTING-HOST` | the four commands in the support matrix | **passed**: 168 `moxie-oracles`, 31 `moxie-interp::reference_graphs`, 14 `moxie-models`, 21 `moxie-cli::gemma`, plus 16 `moxie-graph` and 16 `moxie-plan` for the encoding rule |
+| `G-MOE-ROUTING-HOST` | the four commands in the support matrix | **passed**: 171 `moxie-oracles`, 31 `moxie-interp::reference_graphs`, 14 `moxie-models`, 21 `moxie-cli::gemma`, plus 16 `moxie-graph` and 16 `moxie-plan` for the encoding rule |
 | `G-GENERATION-ALLOC` | `cargo test -p moxie-cli --test allocation -- --nocapture` | **passed**, now including the routed shape |
 
 Logs are under `results/task0019/` (untracked, per the placement contract).

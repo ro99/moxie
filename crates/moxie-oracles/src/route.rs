@@ -554,7 +554,8 @@ pub fn expert_row(
 /// `[-0.1, 1.1]` and `gelu_tanh'` in `[-0.13, 1.13]`, so `1.2` covers both. The
 /// `0.17` is the magnitude either activation can add below zero.
 ///
-/// `u_b` is four hundred times FP32's unit roundoff, so on well-conditioned data
+/// `u_b` is [`crate::metric::BF16_U`], **65,536 times** FP32's unit roundoff --
+/// `2^-8` against `2^-24`. So on well-conditioned data
 /// this bound is dominated by the BF16 terms and is correspondingly loose. That
 /// is a true statement about a chain with three BF16 boundaries in it, not a
 /// defect -- and the tests pair it with a **tight** check on their

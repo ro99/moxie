@@ -23,20 +23,20 @@ equations and the filled-in result, and
 [the bring-up record](../models/gemma4.md#the-26b-a4b-moe-variant) for the
 artifact inventory.
 
-Measured after both rounds of independent-review corrections described below:
+Measured after all three rounds of independent-review corrections described below:
 
 | Gate | Result |
 |---|---|
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
-| `cargo test --workspace --locked --offline` | **724 passed + 9 doctests, 0 failed** |
-| Device-feature workspace tests | **740 passed + 12 doctests, 0 failed** |
+| `cargo test --workspace --locked --offline` | **727 passed + 9 doctests, 0 failed** |
+| Device-feature workspace tests | **743 passed + 12 doctests, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask arch-check` | every rule and every fixture passes, including the new `models-crate-reaches-memory`. **4 pre-existing failures remain**, all from the untracked review crate under `results/task0014-independent-review-2026-09-11/probes/`; the identical four lines are already in `results/task0015/arch-local.log` |
 
 ## Decisions
 
-**Two rounds of independent review found eight issues in total; all eight were
+**Three rounds of independent review found nine issues in total; all nine were
 reproduced and fixed, and none was disputed.** Three of them were corrections to claims this work had
 made rather than plain defects: the routing path allocated infallibly and could
 abort a generation step instead of rolling it back; the router and expert chains
@@ -54,8 +54,17 @@ consequence of the first round's own fix — `IndexEncoding::U32` closing a
 four-byte over-count while opening an eight-byte under-count for step inputs —
 was closed at two boundaries with a negative test at each.
 
-The task record carries both finding-by-finding tables. Nine regressions now
-fail if any of it comes back, including a dense control that proves the
+The **third** round found one more, and it invalidated a justification rather
+than a result: `BF16_U` was defined at half its true value — `2^-8` is the unit
+roundoff of an eight-bit significand, not `2^-9` — so every BF16 allowance in
+`expert_error_bound` rested on a wrong constant. It is corrected and now checked
+exhaustively over all 65,536 BF16 patterns and their midpoints, asserting both
+that the bound holds and that it is attained. The fact that would have disproved
+it was already in the repository: `residual.rs` pins `1 + 2^-8` as a BF16
+midpoint.
+
+The task record carries all three finding-by-finding tables. Twelve regressions
+now fail if any of it comes back, including a dense control that proves the
 allocation test injects where it claims to.
 
 **Task 0019 was narrowed to item 1's mathematics, and task 0020 owns item 2.**

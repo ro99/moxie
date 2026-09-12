@@ -27,13 +27,32 @@ pub const FP32_U: f64 = 5.960_464_477_539_063e-8;
 /// Tiny in magnitude, and still a bound that did not hold over its stated inputs.
 pub const FP32_ETA: f64 = 7.006_492_321_624_085e-46;
 
-/// BF16 unit roundoff, `2^-9`.
+/// BF16 unit roundoff, `2^-8`.
 ///
-/// BF16 carries an eight-bit significand (seven stored), so round-to-nearest
-/// has half an ulp of relative error at `2^-9`. Four hundred times FP32's, which
-/// is why a boundary the reference declares is part of an equation rather than a
-/// storage detail: it is the largest rounding in any chain that contains one.
-pub const BF16_U: f64 = 1.953_125e-3;
+/// For a binary format with `p` significand bits, `ulp(1) = 2^(1-p)` and the
+/// round-to-nearest unit roundoff is half of it, `2^-p`. BF16 carries **eight**
+/// significand bits (seven stored plus the implicit leading one), so `u = 2^-8`.
+/// The same arithmetic gives FP32's `p = 24` the [`FP32_U`] above, which is the
+/// cross-check that should have caught this constant: it was first written as
+/// `2^-9`, half its true value, by taking half of `2^-8` instead of half of
+/// `ulp(1) = 2^-7`.
+///
+/// `bf16_midpoints_round_by_exactly_this_much` is the regression, and it is
+/// exhaustive rather than sampled: the counterexample is the midpoint
+/// `1 + 2^-8`, which rounds to `1.0` for an error of exactly `2^-8` — twice
+/// what the wrong constant allowed.
+///
+/// That same value was already named in this crate before this constant
+/// existed: `residual.rs` pins `1 + 2^-8` as "exactly halfway between two BF16
+/// values" from an earlier review. The fact needed to disprove `2^-9` was
+/// therefore sitting in a sibling module, which is the argument for deriving a
+/// constant from `p` and testing it exhaustively rather than reasoning about
+/// it once in a doc comment.
+///
+/// **65,536 times FP32's**, which is why a boundary the reference declares is
+/// part of an equation rather than a storage detail: it is by far the largest
+/// rounding in any chain that contains one.
+pub const BF16_U: f64 = 3.906_25e-3;
 
 /// BF16 underflow unit: half the smallest BF16 subnormal, `2^-134`.
 ///
@@ -153,6 +172,113 @@ impl core::fmt::Display for ErrorSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every BF16 value, and the midpoint just above it.
+    fn bf16_patterns() -> impl Iterator<Item = (f32, f32)> {
+        (0u32..=0xFFFF).filter_map(|bits| {
+            let exact = f32::from_bits(bits << 16);
+            let midpoint = f32::from_bits((bits << 16) | 0x8000);
+            (exact.is_finite() && midpoint.is_finite()).then_some((exact, midpoint))
+        })
+    }
+
+    #[test]
+    fn bf16_midpoints_round_by_exactly_this_much() {
+        // The regression for `BF16_U`, exhaustive over all 65,536 patterns.
+        // The constant was first written as `2^-9`, half its true value, and
+        // an independent review disproved it with one line of arithmetic:
+        // `1 + 2^-8` rounds to `1.0`, an error of `2^-8`, against an allowance
+        // of `2^-9 · 1.0039`.
+        //
+        // A midpoint is the worst case by construction -- it is the furthest an
+        // input can be from the value it rounds to -- so checking every one of
+        // them is checking the constant itself.
+        let mut worst = 0f64;
+        for (exact, midpoint) in bf16_patterns() {
+            for probe in [exact, midpoint] {
+                let rounded = crate::bf16_round(probe);
+                if !rounded.is_finite() {
+                    // Rounding to infinity at the top of the range. The
+                    // relative model says nothing about overflow, exactly as it
+                    // says nothing about underflow without the `η` term, and
+                    // pretending otherwise would be worse than excluding it.
+                    // Recorded rather than skipped silently: this happens only
+                    // above the largest BF16 value.
+                    assert!(
+                        probe.abs() > f32::from_bits(0x7F7F_0000),
+                        "{probe:e} overflowed BF16 but is inside its range"
+                    );
+                    continue;
+                }
+                let error = (rounded as f64 - probe as f64).abs();
+                let allowed = BF16_U * (probe as f64).abs() + BF16_ETA;
+                assert!(
+                    error <= allowed,
+                    "{probe:e} rounded to {rounded:e}: error {error:e} exceeded \
+                     {allowed:e}"
+                );
+                // The *relative* model holds only in the normal range -- below
+                // it, gradual underflow is what `BF16_ETA` is for, and the
+                // ratio there can approach 1. Tracking the worst case over
+                // normals is what makes the tightness claim below meaningful.
+                if probe.abs() >= 2f32.powi(-126) {
+                    worst = worst.max(error / (probe as f64).abs());
+                }
+            }
+        }
+        // And the bound is not loose: some input attains it, so a smaller
+        // constant would be wrong rather than merely conservative.
+        // The bound holds, and is essentially attained: at every midpoint
+        // `2^e · (1 + 2^-8)` the error is exactly `2^e · 2^-8`, so measured
+        // against `x` the ratio is `u / (1 + u)` -- the standard statement
+        // `|fl(x) − x| ≤ u·|x|` is loose by exactly that factor, and no more.
+        // A smaller constant would therefore be wrong rather than conservative.
+        assert!(worst <= BF16_U, "{worst:e} exceeded {BF16_U:e}");
+        let supremum = BF16_U / (1.0 + BF16_U);
+        assert!(
+            (worst - supremum).abs() <= f64::EPSILON * supremum,
+            "the worst relative error {worst:e} is not the expected u/(1+u) \
+             {supremum:e}, so this constant is not the tight one"
+        );
+    }
+
+    #[test]
+    fn two_values_straddling_a_bf16_midpoint_land_a_full_ulp_apart() {
+        // Why `expert_error_bound` charges `2·u_b·S` at every BF16 boundary
+        // rather than absorbing the rounding: the implementation rounds
+        // `bf16(fp32 v)` and the transcription rounds `bf16(fp64 v)`, and when
+        // those two straddle a midpoint they land a whole ulp apart however
+        // close the inputs were.
+        let midpoint = 1.0f32 + 2f32.powi(-8);
+        let a = midpoint - 2f32.powi(-20);
+        let b = midpoint + 2f32.powi(-20);
+        let (ra, rb) = (crate::bf16_round(a), crate::bf16_round(b));
+        let separated = (rb as f64 - ra as f64).abs();
+        assert_eq!(separated, 2f64.powi(-7), "a full BF16 ulp at 1.0");
+        assert!(
+            separated > (b as f64 - a as f64),
+            "the inputs were {:e} apart and the outputs {separated:e}",
+            b as f64 - a as f64
+        );
+        // The allowance the bound actually uses covers it; the halved constant
+        // did not.
+        let allowed = (b as f64 - a as f64)
+            + BF16_U * (a as f64).abs()
+            + BF16_U * (b as f64).abs()
+            + 2.0 * BF16_ETA;
+        assert!(separated <= allowed, "{separated:e} vs {allowed:e}");
+    }
+
+    #[test]
+    fn the_underflow_units_are_half_the_smallest_subnormal() {
+        // FP32's smallest subnormal is `2^-149` and BF16's is `2^-133`, seven
+        // mantissa bits below its `2^-126` smallest normal.
+        assert_eq!(FP32_ETA, 2f64.powi(-150));
+        assert_eq!(BF16_ETA, 2f64.powi(-134));
+        // And the two unit roundoffs are `2^-p` for their own precisions.
+        assert_eq!(FP32_U, 2f64.powi(-24));
+        assert_eq!(BF16_U, 2f64.powi(-8));
+    }
 
     #[test]
     fn gamma_grows_with_the_number_of_roundings_and_is_never_negative() {
