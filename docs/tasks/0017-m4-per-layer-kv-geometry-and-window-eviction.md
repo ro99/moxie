@@ -1,7 +1,6 @@
 # Task 0017 — M4 per-layer key/value geometry and window eviction
 
-Status: **implemented and corrected through two independent review rounds,
-awaiting owner decision**. Contract and
+Status: **accepted by the owner, 2026-09-12.** Contract and
 [ADR 0014](../decisions/adr/0014-bounded-tentative-undo-headroom.md) committed at
 `b748536`, before implementation.
 
@@ -506,6 +505,27 @@ uniform width fields. Nothing was flagged off and no compatibility shim remains.
 The pinned legacy single-row rewind (`gemma4_runtime.cpp:1385`/`:1407`) was
 **not** carried forward; ADR 0014 records why, and the bounded headroom plus two
 explicit refusals replaces it.
+
+### Owner acceptance, 2026-09-12
+
+The owner accepted task 0017 after two rounds of independent review. The first
+found three defects plus an acceptance-test gap; all four were reproduced before
+any change and fixed at `cc00425`. The second confirmed those fixes and found
+the closing test still short of this contract — it reached `append_checked` and
+`stage_checked` but never `commit_checked`, so the one operation that advances
+the accepted frontier and publishes committed sampler history was only ever
+fault-injected against full-retention geometry. That branch was added at
+`22f5733`, and the review found no new implementation defect.
+
+Acceptance was given on 2026-09-12, after M1.5 closed, when the owner confirmed
+it in response to this record being flagged as awaiting one.
+
+**This acceptance closes task 0017 only. It closes neither M4 nor M1.5.**
+M1.5 was closed separately, on the reduced graph, by the
+[M1 closure](../handovers/2026-09-12-m1-closure-to-m2.md). Device paged
+attention, COW forks and prefix sharing, host-backed page streaming with the
+online-softmax merge, recurrent and index state snapshot and replay, and MLA all
+remain M4's: this task delivered the state schema they need, not the paths.
 
 ### Remaining blockers and next task
 

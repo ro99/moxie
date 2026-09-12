@@ -16,8 +16,9 @@ admitted graph resource plan, the selected BF16 device chain, appendable paged
 state, transactional sampler history, the generation service and diagnostic CLI
 (tasks 0003–0015), the reduced Gemma graph
 ([0016](docs/tasks/0016-m1-gemma-reduced-graph.md)), per-layer paged geometry and
-window reclamation ([0017](docs/tasks/0017-m4-per-layer-kv-geometry-and-window-eviction.md),
-awaiting a separate acceptance statement), and the compressed-tensors importer
+window reclamation
+([0017](docs/tasks/0017-m4-per-layer-kv-geometry-and-window-eviction.md),
+accepted 2026-09-12), and the compressed-tensors importer
 ([0018](docs/tasks/0018-m3-compressed-tensors-int8-importer.md), accepted
 2026-09-12 within its import-only scope).
 

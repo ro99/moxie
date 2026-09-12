@@ -19,6 +19,10 @@
 
 ## Completed facts
 
+**The owner accepted task 0017 on 2026-09-12**, after two rounds of independent
+review. It closes neither M4 nor M1.5; M1.5 was closed separately on the reduced
+graph by the [M1 closure](2026-09-12-m1-closure-to-m2.md).
+
 The owner selected this task on 2026-09-12 from the three candidates the
 [previous handover](2026-09-12-m1.5-gemma-operation-gap.md) listed. The contract
 was authored and committed **before** implementation, as required.
