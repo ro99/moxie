@@ -15,7 +15,7 @@ matrix exists to prevent.
 [Task 0020](../tasks/0020-m2-weight-residency-authority.md) is **M2 item 2**,
 implemented and awaiting review: one production weight-residency owner,
 connected to bounded storage reads, a host cache, real device uploads, leases,
-eviction and demand/prefetch classes. Gates: 790 host tests + doctests, 810
+eviction and demand/prefetch classes. Gates: 795 host tests + doctests, 815
 device-feature tests, 39/39 real GPU cases, both clippy lanes, `spec-check`, and
 `arch-check` passing every rule and fixture including the new
 `a second weight-residency owner`. **It does not close M2**, whose exit still

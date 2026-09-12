@@ -562,8 +562,8 @@ task does **not** close M2.
 | `cargo fmt --all -- --check` | **passed** |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed** |
 | Device-lane clippy (`moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`) | **passed** |
-| `cargo test --workspace --locked --offline` | **790 passed, 0 failed** (736 before this task) |
-| Device-feature workspace tests | **810 passed, 0 failed** |
+| `cargo test --workspace --locked --offline` | **795 passed, 0 failed** (736 before this task) |
+| Device-feature workspace tests | **815 passed, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | **passed**, 10 documents |
 | `cargo xtask arch-check` | every rule and every fixture passes, including the new `a second weight-residency owner` with its three fixtures. **4 pre-existing failures remain**, all from the untracked review crate under `results/task0014-independent-review-2026-09-11/probes/`; the identical four lines are in `results/task0015/arch-local.log` |
@@ -665,7 +665,33 @@ property comes back —
 `every_device_cache_is_reserved_in_the_ledger_before_a_byte_of_it_exists` and
 `a_device_cache_the_ledger_cannot_admit_leaves_no_host_charge_either`.
 
-Two smaller findings, both from tests whose first expectation was wrong and
+**A self-review pass before hand-off found three more**, all in the lifecycle's
+least-travelled corner — a device acquire that arrives while another ticket is
+already reading the same chunk to the host. Nothing exercised that path, which is
+why the defects survived the first round of tests, and it now has four of its own.
+
+1. **`Retiring` was a dead state.** Eviction only ever chooses unleased
+   placements, so nothing ever entered it — the same stub problem this record
+   refuses for `Preparing`. It is now reachable through an explicit
+   `retire(scope, chunk)`, which is the `release` half of document 03's pair
+   ("`release` retires only after all consumers complete"): live leases keep
+   reading, new acquires are refused, the placement is not an eviction
+   candidate, and the bytes come back when the last consumer does. Freeing them
+   when the decision was made would be the use-after-free document 02 forbids.
+2. **Expiring a ticket that had *joined* another ticket's read destroyed that
+   read's destination.** Cleanup treated every ticket as the owner of its
+   source, so it freed an arena range a read was still writing into. A ticket
+   now records whether it created its source, and only the owner may drop it.
+3. **A cancelled upload that then completed released its source pin twice**, so
+   a host chunk another consumer was holding silently became evictable
+   underneath them. Pin settlement is now one function called exactly once on
+   every terminal transition, and the invariant it enforces is written where it
+   lives.
+
+Both of the last two have regressions proven load-bearing by substitution:
+reintroducing each defect fails exactly the test written for it and no other.
+
+Two further findings, both from tests whose first expectation was wrong and
 whose second is the real mechanism:
 
 - **Eviction needs two phases.** Byte accounting says whether the cache *holds*

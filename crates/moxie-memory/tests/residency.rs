@@ -569,6 +569,65 @@ fn a_chunk_larger_than_the_whole_cache_is_refused_without_evicting_anything() {
     a.close(&mut l).unwrap();
 }
 
+#[test]
+fn a_retired_chunk_serves_its_existing_leases_and_frees_when_the_last_one_goes() {
+    // Document 03: "`release` retires only after all consumers complete."
+    // Eviction never needs this, because eviction only chooses unleased
+    // placements; what needs it is invalidating bytes somebody is reading.
+    let mut l = ledger();
+    let mut a = open(&mut l, 4 * EXPERT_BYTES);
+    let chunk = expert(0);
+    let first = load(&mut a, &chunk, 0, 0xA1);
+    let Acquired::Ready(second) = a.acquire(demand(&chunk, 1)).unwrap() else {
+        panic!("resident")
+    };
+
+    assert_eq!(a.retire(Scope::Host, &chunk).unwrap(), ChunkState::Retiring);
+    assert_eq!(a.state_of(Scope::Host, &chunk), Some(ChunkState::Retiring));
+    assert_eq!(
+        a.committed_bytes(Scope::Host).unwrap(),
+        EXPERT_BYTES,
+        "freeing the bytes when the decision was made is the use-after-free          document 02 forbids"
+    );
+
+    // Both existing consumers keep reading.
+    assert_eq!(a.chunk_bytes(&first).unwrap()[0], 0xA1);
+    assert_eq!(a.chunk_bytes(&second).unwrap()[0], 0xA1);
+    // A new acquire is refused, not served and not silently re-read.
+    let refused = a.acquire(demand(&chunk, 2)).unwrap_err();
+    assert!(
+        format!("{}", refused.error).contains("retiring"),
+        "{refused}"
+    );
+    // A retiring placement is not an eviction candidate either.
+    assert_eq!(refused.report.evictable_bytes, 0);
+
+    a.release(first).unwrap();
+    assert_eq!(a.state_of(Scope::Host, &chunk), Some(ChunkState::Retiring));
+    a.release(second).unwrap();
+    assert_eq!(
+        a.state_of(Scope::Host, &chunk),
+        None,
+        "the bytes come back when the last consumer does"
+    );
+    assert_eq!(a.committed_bytes(Scope::Host).unwrap(), 0);
+
+    // Retiring an unleased chunk frees it immediately; retiring an in-flight
+    // one is refused, because it has no settled bytes to stop serving.
+    let lease = load(&mut a, &chunk, 3, 0xA2);
+    a.release(lease).unwrap();
+    a.retire(Scope::Host, &chunk).unwrap();
+    assert_eq!(a.state_of(Scope::Host, &chunk), None);
+    let Acquired::Pending { lease, ticket, .. } = a.acquire(demand(&chunk, 4)).unwrap() else {
+        panic!("absent")
+    };
+    assert!(a.retire(Scope::Host, &chunk).is_err());
+    fill_and_complete(&mut a, ticket, 0xA3);
+    a.release(lease).unwrap();
+    assert!(a.retire(Scope::Host, &expert(9)).is_err());
+    a.close(&mut l).unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // M2 item 5: cancellation and the no-next-token turn
 // ---------------------------------------------------------------------------
@@ -1345,6 +1404,261 @@ fn each_device_has_its_own_cap_and_a_chunk_resident_on_one_is_absent_on_the_othe
     );
     assert_eq!(a.committed_bytes(Scope::Device(second)).unwrap(), 0);
     a.release(lease).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn a_device_acquire_joins_a_host_read_already_in_flight_and_uploads_after_it() {
+    let mut l = ledger();
+    let mut a = open_with_device(&mut l, 4 * EXPERT_BYTES, 4 * EXPERT_BYTES);
+    let chunk = expert(0);
+    let device = Scope::Device(gpu());
+
+    // A host acquire starts the read...
+    let Acquired::Pending {
+        lease: host_lease,
+        ticket: read_ticket,
+        work,
+        ..
+    } = a.acquire(demand(&chunk, 0)).unwrap()
+    else {
+        panic!("absent")
+    };
+    assert!(matches!(work, PendingWork::Issued(WorkOrder::Read { .. })));
+
+    // ...and a device acquire arrives while it is still running. It must not
+    // start a second read of the same bytes, and it must not be told the chunk
+    // is unavailable either.
+    let Acquired::Pending {
+        lease: device_lease,
+        work: device_work,
+        ..
+    } = a.acquire(device_demand(&chunk, 1)).unwrap()
+    else {
+        panic!("absent on the device")
+    };
+    assert_eq!(
+        device_work,
+        PendingWork::Coalesced,
+        "a device acquire waits for the host read rather than repeating it"
+    );
+    assert_eq!(a.state_of(device, &chunk), Some(ChunkState::Reading));
+
+    // One completion releases both: the host bytes, and the upload that was
+    // waiting for them.
+    a.read_destination(read_ticket).unwrap().fill(0xB0);
+    let released = a.complete_read(read_ticket, Outcome::Completed).unwrap();
+    assert_eq!(released.len(), 1, "the blocked upload is released");
+    let WorkOrder::Upload { ticket: up, .. } = &released[0] else {
+        panic!("an upload")
+    };
+    assert_eq!(a.stats().bytes_read, EXPERT_BYTES, "one read, not two");
+    assert_eq!(a.state_of(device, &chunk), Some(ChunkState::Uploading));
+    // The host copy is pinned twice now: once by its own consumer, once by the
+    // copy that is reading it.
+    let host = a
+        .outstanding()
+        .into_iter()
+        .find(|c| c.scope == Scope::Host)
+        .unwrap();
+    assert_eq!(host.leases, 2);
+
+    a.complete_upload(*up, Outcome::Completed).unwrap();
+    assert_eq!(a.state_of(device, &chunk), Some(ChunkState::DeviceReady));
+    let host = a
+        .outstanding()
+        .into_iter()
+        .find(|c| c.scope == Scope::Host)
+        .unwrap();
+    assert_eq!(host.leases, 1, "the copy gave its pin back exactly once");
+
+    reconciles(&a, Scope::Host);
+    reconciles(&a, device);
+    a.release(host_lease).unwrap();
+    a.release(device_lease).unwrap();
+    // Both are now unpinned, which a leaked pin would have prevented.
+    for c in a.outstanding() {
+        assert_eq!(c.leases, 0, "{} is still pinned", c.chunk);
+    }
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn a_host_read_that_fails_also_fails_the_device_acquire_waiting_on_it() {
+    let mut l = ledger();
+    let mut a = open_with_device(&mut l, 4 * EXPERT_BYTES, 4 * EXPERT_BYTES);
+    let chunk = expert(0);
+    let device = Scope::Device(gpu());
+
+    let Acquired::Pending {
+        lease: host_lease,
+        ticket: read_ticket,
+        ..
+    } = a.acquire(demand(&chunk, 0)).unwrap()
+    else {
+        panic!("absent")
+    };
+    let Acquired::Pending {
+        lease: device_lease,
+        ..
+    } = a.acquire(device_demand(&chunk, 1)).unwrap()
+    else {
+        panic!("absent")
+    };
+
+    a.complete_read(
+        read_ticket,
+        Outcome::Failed(Error::InvalidArtifact {
+            detail: "short read".into(),
+        }),
+    )
+    .unwrap();
+
+    // Both ends are gone, and neither leaked a byte or a pin. The pin is the
+    // part that would have been invisible: a host chunk that can never be
+    // evicted again is the quiet leak R08 is about.
+    assert_eq!(a.state_of(Scope::Host, &chunk), None);
+    assert_eq!(a.state_of(device, &chunk), None);
+    assert_eq!(a.committed_bytes(Scope::Host).unwrap(), 0);
+    assert_eq!(a.committed_bytes(device).unwrap(), 0);
+    assert_eq!(a.in_flight_count(), 0);
+    assert!(a.chunk_bytes(&host_lease).is_err());
+    assert!(a.device_range(&device_lease).is_err());
+    a.release(host_lease).unwrap();
+    a.release(device_lease).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn expiring_a_blocked_device_acquire_does_not_destroy_the_read_it_was_waiting_on() {
+    // The bug this pins: a ticket that *joined* another ticket's host read was
+    // cleaned up as though it had created that placement, so expiring it freed
+    // an arena range a read was still writing into. A ticket now records
+    // whether it owns its source, and only the owner may drop it.
+    let mut l = ledger();
+    let mut a = open_with_device(&mut l, 4 * EXPERT_BYTES, 4 * EXPERT_BYTES);
+    let chunk = expert(0);
+    let device = Scope::Device(gpu());
+
+    let Acquired::Pending {
+        lease: host_lease,
+        ticket: read_ticket,
+        ..
+    } = a
+        .acquire(AcquireRequest {
+            deadline: 1_000,
+            ..demand(&chunk, 0)
+        })
+        .unwrap()
+    else {
+        panic!("absent")
+    };
+    let Acquired::Pending {
+        lease: device_lease,
+        ticket: blocked,
+        ..
+    } = a
+        .acquire(AcquireRequest {
+            deadline: 5,
+            ..device_demand(&chunk, 1)
+        })
+        .unwrap()
+    else {
+        panic!("absent")
+    };
+
+    // The host consumer lets go first, so the blocked ticket's pin is the only
+    // thing holding that placement. This is the case where ownership is the
+    // *only* protection: a lease count of zero after the pin is released would
+    // otherwise look exactly like a placement nobody wants.
+    a.release(host_lease).unwrap();
+
+    // The blocked ticket's deadline passes; the read it depends on has not.
+    let expired = a.expire(6);
+    assert_eq!(expired, vec![blocked]);
+    assert_eq!(
+        a.state_of(Scope::Host, &chunk),
+        Some(ChunkState::Reading),
+        "the read the expired ticket joined must still be in flight"
+    );
+    assert_eq!(a.state_of(device, &chunk), None);
+    assert_eq!(a.committed_bytes(device).unwrap(), 0);
+
+    // And the read still has its own range to land in, which is the property
+    // the bug destroyed: it had freed that range for reuse while a read was
+    // writing into it.
+    assert_eq!(
+        a.read_destination(read_ticket).unwrap().len() as u64,
+        EXPERT_BYTES
+    );
+    a.read_destination(read_ticket).unwrap().fill(0xE7);
+    let released = a.complete_read(read_ticket, Outcome::Completed).unwrap();
+    assert!(
+        released.is_empty(),
+        "the expired ticket must not be released as though it were waiting"
+    );
+    // The host consumer had already let go and the read was cancelled with it,
+    // so the settled bytes come straight back.
+    assert_eq!(a.committed_bytes(Scope::Host).unwrap(), 0);
+    assert_eq!(a.in_flight_count(), 0);
+
+    a.release(device_lease).unwrap();
+    assert!(a.outstanding().is_empty());
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn a_cancelled_upload_that_completes_gives_its_source_pin_back_exactly_once() {
+    // The bug this pins: the completed-and-cancelled upload path released the
+    // source pin twice, so a host chunk another consumer was holding became
+    // evictable underneath them.
+    let mut l = ledger();
+    let mut a = open_with_device(&mut l, 4 * EXPERT_BYTES, 4 * EXPERT_BYTES);
+    let chunk = expert(0);
+
+    // One consumer holds the host copy for its own sake.
+    let holder = load(&mut a, &chunk, 0, 0xC7);
+
+    let Acquired::Pending {
+        lease,
+        ticket,
+        work,
+        ..
+    } = a.acquire(device_demand(&chunk, 1)).unwrap()
+    else {
+        panic!("absent on the device")
+    };
+    assert!(matches!(
+        work,
+        PendingWork::Issued(WorkOrder::Upload { .. })
+    ));
+    let host = a
+        .outstanding()
+        .into_iter()
+        .find(|c| c.scope == Scope::Host)
+        .unwrap();
+    assert_eq!(host.leases, 2, "the holder plus the copy");
+
+    a.cancel(ticket).unwrap();
+    a.release(lease).unwrap();
+    a.complete_upload(ticket, Outcome::Completed).unwrap();
+
+    let host = a
+        .outstanding()
+        .into_iter()
+        .find(|c| c.scope == Scope::Host)
+        .unwrap();
+    assert_eq!(
+        host.leases, 1,
+        "the holder's pin survives; only the copy's was given back"
+    );
+    assert_eq!(
+        a.committed_bytes(Scope::Device(gpu())).unwrap(),
+        0,
+        "a cancelled upload's device range comes back when the copy is over"
+    );
+    assert_eq!(a.chunk_bytes(&holder).unwrap()[0], 0xC7);
+    a.release(holder).unwrap();
     a.close(&mut l).unwrap();
 }
 

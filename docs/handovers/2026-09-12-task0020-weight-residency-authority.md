@@ -33,8 +33,8 @@ the terms it fixed before implementation, and the filled-in result.
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy | passed |
-| `cargo test --workspace --locked --offline` | **790 passed, 0 failed** (736 at task 0019) |
-| Device-feature workspace tests | **810 passed, 0 failed** |
+| `cargo test --workspace --locked --offline` | **795 passed, 0 failed** (736 at task 0019) |
+| Device-feature workspace tests | **815 passed, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | every rule and every fixture, including the new `a second weight-residency owner` and its three fixtures. **4 pre-existing failures remain**, all from the untracked review crate under `results/task0014-independent-review-2026-09-11/probes/`; the identical four lines are in `results/task0015/arch-local.log` |
@@ -70,6 +70,20 @@ ledger's charge before allocating anything. Every declared device cache is now
 admitted as **one** plan before the host bytes exist, a refusal anywhere in
 `open` leaves the ledger as it found it, and two host-lane regressions fail if
 either property comes back.
+
+**A self-review pass before hand-off found three more defects**, all in the
+least-travelled corner of the lifecycle: a device acquire arriving while another
+ticket is already reading the same chunk to the host. Nothing exercised that
+path, which is why they survived the first round of tests, and it now has four
+of its own. `Retiring` was a **dead state** — eviction only ever chooses
+unleased placements, so nothing entered it — and is now reachable through an
+explicit `retire(scope, chunk)`, document 03's "`release` retires only after all
+consumers complete". Expiring a ticket that had *joined* another's read **freed
+the range that read was writing into**, because cleanup treated every ticket as
+the owner of its source. And a cancelled upload that then completed **released
+its source pin twice**, quietly making a chunk another consumer held evictable.
+The last two have regressions proven load-bearing by substitution: reintroducing
+each defect fails exactly its own test and no other.
 
 **Three narrowings, decided during implementation and reported rather than
 quietly dropped.** `Artifact::read_tensor_range` was **not** added: a canonical

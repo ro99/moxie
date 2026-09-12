@@ -848,6 +848,12 @@ struct Ticket {
     /// True once a work order for the current stage has been given out, so the
     /// same transfer is never issued twice.
     issued: bool,
+    /// This ticket created the host source placement, so it is responsible for
+    /// dropping it if the read never produced usable bytes.
+    ///
+    /// A ticket that merely *joined* someone else's read must never drop that
+    /// placement: it is another ticket's in-flight destination.
+    owns_source: bool,
 }
 
 /// One slot of the bounded lease table.
@@ -1544,6 +1550,7 @@ impl ResidencyAuthority {
                 cancelled: false,
                 queued,
                 issued: false,
+                owns_source: source.is_some_and(|s| s.created),
             },
         );
 
@@ -1645,11 +1652,19 @@ impl ResidencyAuthority {
         }
     }
 
+    /// Undo a source pin taken by an acquire that then failed to be admitted.
+    ///
+    /// Only the rollback path inside `acquire` uses this: nothing has been
+    /// handed out, so a source this acquire created can go immediately.
     fn release_source_pin(&mut self, key: PlacementKey, created: bool) {
-        if let Some(p) = self.placements.get_mut(&key) {
+        let drop_it = {
+            let Some(p) = self.placements.get_mut(&key) else {
+                return;
+            };
             p.leases = p.leases.saturating_sub(1);
-        }
-        if created {
+            created && p.leases == 0
+        };
+        if drop_it {
             self.drop_placement(key);
         }
     }
@@ -1875,6 +1890,11 @@ fn next_allowed(
 }
 
 /// Where a device acquire's source bytes came from.
+///
+/// Every variant leaves the source **pinned**, and exactly one terminal
+/// transition of the ticket releases that pin. Document 02 is the reason the
+/// pin exists at all: "An upload owns or leases its source bytes through a
+/// completion event."
 #[derive(Debug, Clone, Copy)]
 struct HostSource {
     key: PlacementKey,
@@ -2141,7 +2161,9 @@ impl ResidencyAuthority {
                 "device bytes are named by range, not by slice",
             ));
         }
-        if p.state != ChunkState::HostReady {
+        // `Retiring` still serves the leases it already has: retirement stops
+        // new acquires, and frees the bytes when the last consumer is done.
+        if !matches!(p.state, ChunkState::HostReady | ChunkState::Retiring) {
             return Err(invalid(
                 "lease",
                 format!("chunk {} is {}, not readable", p.chunk, p.state.name()),
@@ -2163,7 +2185,7 @@ impl ResidencyAuthority {
         if p.scope == Scope::Host {
             return Err(invalid("lease", "this lease is a host residency"));
         }
-        if p.state != ChunkState::DeviceReady {
+        if !matches!(p.state, ChunkState::DeviceReady | ChunkState::Retiring) {
             return Err(invalid(
                 "lease",
                 format!("chunk {} is {}, not readable", p.chunk, p.state.name()),
@@ -2194,6 +2216,49 @@ impl ResidencyAuthority {
         &mut host.bytes_mut()[start..end]
     }
 
+    /// Release the pin this ticket holds on its host source, exactly once.
+    ///
+    /// The invariant every terminal path below depends on: a ticket whose
+    /// `source` differs from its `placement` holds **one** pin on that source
+    /// from the moment it is resolved until the moment it settles. Releasing it
+    /// twice would unpin bytes another consumer is reading; never releasing it
+    /// would make a host chunk permanently unevictable, which is the quiet leak
+    /// R08 is about.
+    ///
+    /// A ticket that *created* the source also drops it when the read never
+    /// produced usable bytes. A ticket that merely joined someone else's read
+    /// never does: that placement is another ticket's in-flight destination.
+    fn settle_source(&mut self, source: PlacementKey, placement: PlacementKey, owns: bool) {
+        if source == placement {
+            return;
+        }
+        let drop_it = {
+            let Some(p) = self.placements.get_mut(&source) else {
+                return;
+            };
+            p.leases = p.leases.saturating_sub(1);
+            owns && p.state != ChunkState::HostReady && p.leases == 0
+        };
+        if drop_it {
+            self.drop_placement(source);
+        }
+    }
+
+    /// Take a ticket out of flight, correcting the demand counter.
+    fn take_ticket(&mut self, ticket: TicketId) -> Option<Ticket> {
+        let t = self.tickets.remove(&ticket)?;
+        if t.issued && !t.queued && t.urgency == Urgency::Demand {
+            self.outstanding_demand = self.outstanding_demand.saturating_sub(1);
+        }
+        if t.queued {
+            self.prefetch_queue.retain(|(_, _, id)| *id != ticket);
+        }
+        if let Some(p) = self.placements.get_mut(&t.placement) {
+            p.ticket = None;
+        }
+        Some(t)
+    }
+
     /// Report how a read ended. Returns the work orders this outcome released:
     /// the ticket's own upload, and any ticket that was waiting for these host
     /// bytes.
@@ -2205,15 +2270,13 @@ impl ResidencyAuthority {
         if t.stage != Stage::Read {
             return Err(invalid("ticket", "this ticket is not reading"));
         }
-        let (source, placement, cancelled, bytes) = (
+        let (source, placement, cancelled, owns, bytes) = (
             t.source,
             t.placement,
             t.cancelled,
+            t.owns_source,
             self.placements[&t.source].bytes,
         );
-        self.outstanding_demand = self
-            .outstanding_demand
-            .saturating_sub(u32::from(self.tickets[&ticket].urgency == Urgency::Demand));
 
         match outcome {
             Outcome::Completed => {
@@ -2222,53 +2285,73 @@ impl ResidencyAuthority {
                     .get_mut(&source)
                     .expect("source placement")
                     .state = ChunkState::HostReady;
+
                 let mut released = Vec::new();
                 if source == placement {
                     // A host acquire: this ticket is done.
-                    self.retire_ticket(ticket, cancelled);
+                    let t = self.take_ticket(ticket).expect("live ticket");
+                    if cancelled {
+                        // The intent was retired while the read ran. The bytes
+                        // were charged all along -- R08 -- and only now may
+                        // they be given back.
+                        self.drop_placement(t.placement);
+                    }
                 } else {
                     // A device acquire: the second stage is now legal.
-                    let t = self.tickets.get_mut(&ticket).expect("live ticket");
-                    t.stage = Stage::Upload;
-                    t.issued = false;
-                    self.placements
-                        .get_mut(&placement)
-                        .expect("device placement")
-                        .state = ChunkState::Uploading;
                     if cancelled {
-                        self.settle_cancelled(ticket);
+                        let t = self.take_ticket(ticket).expect("live ticket");
+                        self.drop_placement(t.placement);
+                        self.settle_source(source, placement, owns);
                     } else {
-                        self.mark_issued(ticket);
+                        // The read's demand slot carries straight into the
+                        // upload's: one ticket, one outstanding transfer, so
+                        // the counter is not touched here.
+                        let t = self.tickets.get_mut(&ticket).expect("live ticket");
+                        t.stage = Stage::Upload;
+                        t.issued = true;
+                        self.placements
+                            .get_mut(&placement)
+                            .expect("device placement")
+                            .state = ChunkState::Uploading;
                         released.push(self.work_order_for(ticket));
                     }
                 }
                 released.extend(self.release_blocked_on(ticket, source));
                 Ok(released)
             }
-            Outcome::Failed(error) => {
+            Outcome::Failed(_) => {
                 // Everything this read charged is given back, and every waiter
                 // sees the same failure. A retry is a fresh acquire: an
                 // invisible internal retry is how a storage fault becomes a
                 // latency mystery.
                 self.stats.read_failures = self.stats.read_failures.saturating_add(1);
-                self.fail_blocked_on(ticket, &error);
-                self.tickets.remove(&ticket);
-                if source != placement {
-                    self.release_source_pin(source, true);
-                    self.drop_placement(placement);
-                } else {
+                self.fail_blocked_on(ticket);
+                let t = self.take_ticket(ticket).expect("live ticket");
+                if source == placement {
                     self.drop_placement(source);
+                } else {
+                    self.drop_placement(t.placement);
+                    self.settle_source(source, placement, owns);
                 }
                 Ok(Vec::new())
             }
-            Outcome::SubmissionUnknown(error) => {
+            Outcome::SubmissionUnknown(_) => {
+                // The read may still be writing into these bytes. Both ends are
+                // withheld, and the source keeps this ticket's pin until
+                // `settle_quarantined` releases it.
                 self.stats.read_failures = self.stats.read_failures.saturating_add(1);
                 self.stats.quarantined = self.stats.quarantined.saturating_add(1);
-                self.fail_blocked_on(ticket, &error);
-                self.tickets.remove(&ticket);
+                self.fail_blocked_on(ticket);
+                self.take_ticket(ticket);
                 self.quarantine(source);
                 if source != placement {
                     self.quarantine(placement);
+                    // The device placement remembers its source, so settling it
+                    // releases the pin.
+                    self.placements
+                        .get_mut(&placement)
+                        .expect("device placement")
+                        .upload_source = Some(source);
                 }
                 Ok(Vec::new())
             }
@@ -2284,36 +2367,33 @@ impl ResidencyAuthority {
         if t.stage != Stage::Upload {
             return Err(invalid("ticket", "this ticket is not uploading"));
         }
-        let (source, placement, cancelled, urgency, bytes) = (
+        let (source, placement, cancelled, owns, bytes) = (
             t.source,
             t.placement,
             t.cancelled,
-            t.urgency,
+            t.owns_source,
             self.placements[&t.placement].bytes,
         );
-        self.outstanding_demand = self
-            .outstanding_demand
-            .saturating_sub(u32::from(urgency == Urgency::Demand));
 
         match outcome {
             Outcome::Completed => {
                 self.stats.bytes_uploaded = self.stats.bytes_uploaded.saturating_add(bytes);
-                self.placements
-                    .get_mut(&placement)
-                    .expect("device placement")
-                    .state = ChunkState::DeviceReady;
-                // The copy is done, so the source stops being a source. The
-                // host copy becomes an ordinary evictable resident: a cache,
-                // not a mirror that doubles every device byte's cost.
-                self.placements
-                    .get_mut(&placement)
-                    .expect("device placement")
-                    .upload_source = None;
-                if let Some(p) = self.placements.get_mut(&source) {
-                    p.leases = p.leases.saturating_sub(1);
-                    p.ticket = None;
+                self.take_ticket(ticket);
+                {
+                    let p = self
+                        .placements
+                        .get_mut(&placement)
+                        .expect("device placement");
+                    p.state = ChunkState::DeviceReady;
+                    // The copy is done, so the source stops being a source. The
+                    // host copy becomes an ordinary evictable resident: a cache,
+                    // not a mirror that doubles every device byte's cost.
+                    p.upload_source = None;
                 }
-                self.retire_ticket(ticket, cancelled);
+                self.settle_source(source, placement, owns);
+                if cancelled {
+                    self.drop_placement(placement);
+                }
                 Ok(())
             }
             Outcome::Failed(_) => {
@@ -2321,31 +2401,20 @@ impl ResidencyAuthority {
                 // so the device range goes back and the host bytes stay. A
                 // retry uploads again without re-reading.
                 self.stats.upload_failures = self.stats.upload_failures.saturating_add(1);
-                self.tickets.remove(&ticket);
-                if let Some(p) = self.placements.get_mut(&source) {
-                    p.leases = p.leases.saturating_sub(1);
-                    p.ticket = None;
-                }
+                self.take_ticket(ticket);
                 self.drop_placement(placement);
+                self.settle_source(source, placement, owns);
                 Ok(())
             }
             Outcome::SubmissionUnknown(_) => {
-                // R07: the copy may still be running. Both ends are withheld.
+                // R07: the copy may still be running. Both ends are withheld,
+                // and the pin stays until `settle_quarantined` releases it.
                 self.stats.upload_failures = self.stats.upload_failures.saturating_add(1);
                 self.stats.quarantined = self.stats.quarantined.saturating_add(1);
-                self.tickets.remove(&ticket);
+                self.take_ticket(ticket);
                 self.quarantine(placement);
                 self.quarantine(source);
                 Ok(())
-            }
-        }
-    }
-
-    fn mark_issued(&mut self, ticket: TicketId) {
-        if let Some(t) = self.tickets.get_mut(&ticket) {
-            t.issued = true;
-            if t.urgency == Urgency::Demand {
-                self.outstanding_demand = self.outstanding_demand.saturating_add(1);
             }
         }
     }
@@ -2360,29 +2429,30 @@ impl ResidencyAuthority {
             .collect();
         let mut orders = Vec::new();
         for id in waiting {
-            let cancelled = self.tickets[&id].cancelled;
-            {
+            let (cancelled, placement, owns) = {
                 let t = self.tickets.get_mut(&id).expect("waiting ticket");
                 t.stage = Stage::Upload;
                 t.source = source;
-                t.issued = false;
-            }
-            let placement = self.tickets[&id].placement;
+                (t.cancelled, t.placement, t.owns_source)
+            };
             self.placements
                 .get_mut(&placement)
                 .expect("device placement")
                 .state = ChunkState::Uploading;
             if cancelled {
-                self.settle_cancelled(id);
+                self.take_ticket(id);
+                self.drop_placement(placement);
+                self.settle_source(source, placement, owns);
             } else {
-                self.mark_issued(id);
+                self.tickets.get_mut(&id).expect("waiting ticket").issued = true;
                 orders.push(self.work_order_for(id));
             }
         }
         orders
     }
 
-    fn fail_blocked_on(&mut self, ticket: TicketId, _error: &Error) {
+    /// Tickets that were waiting for a read that failed fail with it.
+    fn fail_blocked_on(&mut self, ticket: TicketId) {
         let waiting: Vec<TicketId> = self
             .tickets
             .iter()
@@ -2390,37 +2460,12 @@ impl ResidencyAuthority {
             .map(|(id, _)| *id)
             .collect();
         for id in waiting {
-            let t = self.tickets.remove(&id).expect("waiting ticket");
-            if t.urgency == Urgency::Demand {
-                self.outstanding_demand = self.outstanding_demand.saturating_sub(1);
-            }
+            let t = self.take_ticket(id).expect("waiting ticket");
             self.drop_placement(t.placement);
-        }
-    }
-
-    fn retire_ticket(&mut self, ticket: TicketId, cancelled: bool) {
-        let t = self.tickets.remove(&ticket).expect("live ticket");
-        if let Some(p) = self.placements.get_mut(&t.placement) {
-            p.ticket = None;
-        }
-        if cancelled {
-            // The intent was retired while the transfer ran. The bytes were
-            // charged all along -- R08 -- and only now may they be given back.
-            self.drop_placement(t.placement);
-            if t.source != t.placement {
-                self.release_source_pin(t.source, false);
-            }
-        }
-    }
-
-    fn settle_cancelled(&mut self, ticket: TicketId) {
-        let t = self.tickets.remove(&ticket).expect("live ticket");
-        if let Some(p) = self.placements.get_mut(&t.placement) {
-            p.ticket = None;
-        }
-        self.drop_placement(t.placement);
-        if t.source != t.placement {
-            self.release_source_pin(t.source, false);
+            // A blocked ticket never owns the source it was waiting for, but it
+            // does hold a pin on it. Leaving that pin behind would make the host
+            // chunk permanently unevictable.
+            self.settle_source(t.source, t.placement, t.owns_source);
         }
     }
 }
@@ -2455,6 +2500,50 @@ impl ResidencyAuthority {
             p.state = ChunkState::Quarantined;
             p.ticket = None;
         }
+    }
+
+    /// Retire a resident chunk: stop serving it, and free it when its last
+    /// consumer is done.
+    ///
+    /// This is the `release` half of document 03's pair -- "`release` retires
+    /// only after all consumers complete" -- and the only way `Retiring` is
+    /// entered. Eviction never uses it, because eviction only ever chooses
+    /// unleased placements; what needs it is everything that invalidates bytes
+    /// somebody is still reading: a superseded format version, an artifact
+    /// whose identity changed underneath the cache, or a plan transition at the
+    /// explicit barrier document 03 requires ("transition prefill/decode plans
+    /// at explicit barriers; avoid retaining redundant centralized and sharded
+    /// copies by accident").
+    ///
+    /// Live leases keep reading. New acquires are refused. The bytes come back
+    /// when the last lease does, and not before -- freeing them at the moment
+    /// the decision was made is the use-after-free document 02 forbids.
+    pub fn retire(&mut self, scope: Scope, chunk: &ChunkId) -> Result<ChunkState> {
+        let key = *self
+            .index
+            .get(&scope)
+            .and_then(|m| m.get(chunk))
+            .ok_or_else(|| invalid("chunk", "no such placement"))?;
+        let p = &self.placements[&key];
+        if !p.state.is_ready() {
+            return Err(invalid(
+                "chunk",
+                format!(
+                    "chunk {} is {}; only a settled placement can be retired",
+                    p.chunk,
+                    p.state.name()
+                ),
+            ));
+        }
+        if p.leases == 0 {
+            self.drop_placement(key);
+            return Ok(ChunkState::Retiring);
+        }
+        self.placements
+            .get_mut(&key)
+            .expect("indexed placement")
+            .state = ChunkState::Retiring;
+        Ok(ChunkState::Retiring)
     }
 
     /// Give a quarantined placement back, once its transfer is known to be
@@ -2600,25 +2689,34 @@ impl ResidencyAuthority {
             .map(|(id, _)| *id)
             .collect();
         for id in &expired {
-            let t = self.tickets.remove(id).expect("listed ticket");
+            // Anything that was waiting on this ticket expires with it: a
+            // dependent whose dependency will never arrive is not pending, it
+            // has failed, and leaving it in the table would strand its bytes.
+            self.fail_blocked_on(*id);
+            let Some(t) = self.take_ticket(*id) else {
+                continue;
+            };
             self.stats.expired = self.stats.expired.saturating_add(1);
-            if t.queued {
-                self.prefetch_queue.retain(|(_, _, q)| q != id);
-            } else if t.urgency == Urgency::Demand {
-                self.outstanding_demand = self.outstanding_demand.saturating_sub(1);
-            }
             if t.issued {
-                // A transfer was handed out and may still be running.
+                // A transfer was handed out and may still be running, so both
+                // ends are withheld rather than reused, and the source keeps
+                // this ticket's pin until `settle_quarantined` releases it.
                 self.quarantine(t.placement);
                 if t.source != t.placement {
                     self.quarantine(t.source);
+                    self.placements
+                        .get_mut(&t.placement)
+                        .expect("placement")
+                        .upload_source = Some(t.source);
                 }
                 self.stats.quarantined = self.stats.quarantined.saturating_add(1);
             } else {
+                // Nothing was ever handed out, so nothing can be touching these
+                // bytes. `settle_source` drops the source only if this ticket
+                // created it -- a ticket that joined someone else's read must
+                // not destroy that read's destination.
                 self.drop_placement(t.placement);
-                if t.source != t.placement {
-                    self.release_source_pin(t.source, true);
-                }
+                self.settle_source(t.source, t.placement, t.owns_source);
             }
         }
         expired
