@@ -59,14 +59,22 @@ still cannot execute. It does clear two of the reduced graph's four reductions:
 sliding and global layers now compose at their own widths and sliding layers
 keep only what they can see. Contract `b748536` precedes implementation.
 
-**It executes no checkpoint.** The Gemma 4 artifact at
-`/fast/models/cyankiwi/gemma-4-31B-it-AWQ-8bit` is inspected, hashed and
-recorded in [its bring-up record](docs/models/gemma4.md); every language-model
-linear is compressed-tensors INT8 `pack-quantized`, so its importer and execution
-path are M3. The reduced graph is a synthetic contract fixture and may not be
-described as model support. M11 owns vision. See the
-[active handover](docs/handovers/2026-09-12-task0017-per-layer-kv-retention.md),
-whose next bounded task is M3's compressed-tensors INT8 importer.
+[Task 0018](docs/tasks/0018-m3-compressed-tensors-int8-importer.md) is
+**implemented and awaiting owner review**: a bounded safetensors reader and a
+compressed-tensors `pack-quantized` importer that turns the Gemma 4 artifact's
+real INT8 weights into the accepted canonical `AffineTensor`, verified on three
+of its modules read-only. `moxie-format` takes `serde_json` for the header parse
+([ADR 0015](docs/decisions/adr/0015-serde-json-for-safetensors-headers.md)).
+Contract `db9529e` precedes implementation.
+
+**It still executes no checkpoint, and an import is not support.** There is no
+W8A16 path, no repacker and no canonical manifest write; all three are M3's. The
+lane order inside a packed word is taken from the pinned reader and **cannot**
+be verified against this artifact, so no quality claim follows from a successful
+import — that needs paired output against the released model, which is O2. The
+reduced graph remains a synthetic contract fixture. M11 owns vision. See the
+[active handover](docs/handovers/2026-09-12-task0018-compressed-tensors-import.md),
+whose next bounded task is the shared W8A16 execution path.
 
 ## Read before editing
 

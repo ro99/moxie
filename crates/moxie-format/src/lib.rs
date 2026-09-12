@@ -22,9 +22,28 @@
 
 pub mod affine;
 pub mod bf16;
+pub mod compressed_tensors;
 pub mod manifest;
 pub mod quantize;
+pub mod safetensors;
 pub mod scale;
 pub mod sha256;
 
 pub use sha256::{StreamingSha256, sha256_hex};
+
+/// A vector with exactly `capacity` reserved, or a typed capacity error.
+///
+/// Import sizes come from an artifact's own header, so the allocation that
+/// holds a tensor is the one place a hostile or corrupt file could ask for more
+/// memory than exists. Failing it must be `CapacityExceeded`, never the
+/// infallible allocator's abort.
+pub(crate) fn try_vec<T>(capacity: usize) -> moxie_types::Result<Vec<T>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|_| moxie_types::Error::CapacityExceeded {
+            tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::Pageable)),
+            requested_bytes: capacity.saturating_mul(size_of::<T>()) as u64,
+            available_bytes: 0,
+        })?;
+    Ok(out)
+}

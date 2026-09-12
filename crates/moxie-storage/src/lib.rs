@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use moxie_format::StreamingSha256;
 use moxie_format::bf16::is_finite_bf16_bits;
 use moxie_format::manifest::{self, Manifest, TensorPrecision};
+use moxie_format::safetensors::Header as SafeHeader;
 use moxie_types::{Error, Result};
 
 /// Cap on the reader's own scratch allocation, in bytes.
@@ -245,6 +246,152 @@ impl Artifact {
         })?;
         Ok(need)
     }
+}
+
+/// One safetensors shard, opened for bounded reads.
+///
+/// A *source* container, not a canonical artifact: there is no manifest, no
+/// role mapping and no checksum in a safetensors file, so this deliberately
+/// shares none of [`Artifact`]'s machinery. What it shares is the rule that
+/// this crate is the only one that touches the filesystem --
+/// [`moxie_format::safetensors`] validates the header and never opens a file.
+///
+/// Opening reads the header and stats the file. **No payload byte is read**, so
+/// opening a 5 GB shard costs its header. Nothing is memory-mapped: a file that
+/// changed under a mapping would make a validated header a lie.
+#[derive(Debug)]
+pub struct Shard {
+    path: PathBuf,
+    file: File,
+    header: SafeHeader,
+    len: u64,
+    budget: ByteBudget,
+}
+
+impl Shard {
+    pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_budget(path, ByteBudget::DEFAULT)
+    }
+
+    pub fn open_with_budget(path: &Path, budget: ByteBudget) -> Result<Self> {
+        let file = File::open(path).map_err(|e| Error::InvalidArtifact {
+            detail: format!("cannot open {}: {e}", path.display()),
+        })?;
+        let len = file
+            .metadata()
+            .map_err(|e| Error::InvalidArtifact {
+                detail: format!("cannot stat {}: {e}", path.display()),
+            })?
+            .len();
+        // Read the eight-byte length, learn the bound, then read exactly that
+        // much -- rather than reading a length the file itself chose.
+        let mut prefix = [0u8; 8];
+        let mut source = OpenChunk { file: &file };
+        source
+            .read_at(0, &mut prefix)
+            .map_err(|e| Error::InvalidArtifact {
+                detail: format!("cannot read the length prefix of {}: {e}", path.display()),
+            })?;
+        let prefix_len = SafeHeader::prefix_len(&prefix)?;
+        let mut bytes = crate::try_vec::<u8>(usize::try_from(prefix_len).map_err(|_| {
+            Error::InvalidArtifact {
+                detail: "header length does not fit this platform".into(),
+            }
+        })?)?;
+        bytes.resize(prefix_len as usize, 0);
+        source
+            .read_at(0, &mut bytes)
+            .map_err(|e| Error::InvalidArtifact {
+                detail: format!("cannot read the header of {}: {e}", path.display()),
+            })?;
+        let header = SafeHeader::parse(&bytes, len)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            header,
+            len,
+            budget,
+        })
+    }
+
+    pub fn header(&self) -> &SafeHeader {
+        &self.header
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Read one named tensor's payload into a caller-sized buffer.
+    ///
+    /// The length comes from the validated header, and a buffer that is not
+    /// exactly that size is refused: a partial read must never be reported as
+    /// success. Reads are issued in slices capped by the budget, so the reader
+    /// itself holds nothing beyond it.
+    pub fn read_tensor(&self, name: &str, into: &mut [u8]) -> Result<()> {
+        let entry = self.header.get(name)?;
+        let need = usize::try_from(entry.len()).map_err(|_| Error::InvalidArtifact {
+            detail: format!("tensor {name:?} does not fit this platform"),
+        })?;
+        if into.len() != need {
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "tensor {name:?} is {need} byte(s) but the buffer holds {}",
+                    into.len()
+                ),
+            });
+        }
+        let offset = entry.file_offset(&self.header);
+        let mut source = OpenChunk { file: &self.file };
+        let slice = self.budget.bytes().max(1);
+        let mut done = 0usize;
+        while done < need {
+            let end = (done + slice).min(need);
+            let at = offset
+                .checked_add(done as u64)
+                .ok_or_else(|| Error::InvalidArtifact {
+                    detail: format!("tensor {name:?} offset overflows"),
+                })?;
+            source
+                .read_at(at, &mut into[done..end])
+                .map_err(|e| Error::InvalidArtifact {
+                    detail: format!("reading {name:?} from {}: {e}", self.path.display()),
+                })?;
+            done = end;
+        }
+        Ok(())
+    }
+
+    /// Read a tensor into a freshly allocated, fallibly sized buffer.
+    pub fn tensor_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        let entry = self.header.get(name)?;
+        let need = usize::try_from(entry.len()).map_err(|_| Error::InvalidArtifact {
+            detail: format!("tensor {name:?} does not fit this platform"),
+        })?;
+        let mut out = crate::try_vec::<u8>(need)?;
+        out.resize(need, 0);
+        self.read_tensor(name, &mut out)?;
+        Ok(out)
+    }
+}
+
+fn try_vec<T>(capacity: usize) -> Result<Vec<T>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(capacity)
+        .map_err(|_| Error::CapacityExceeded {
+            tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::Pageable)),
+            requested_bytes: capacity.saturating_mul(size_of::<T>()) as u64,
+            available_bytes: 0,
+        })?;
+    Ok(out)
 }
 
 /// A positioned byte source: one slice read at an absolute offset.

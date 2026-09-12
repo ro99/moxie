@@ -235,11 +235,14 @@ list before it prints anything else.
 ## Blockers
 
 1. **Execution of this artifact is M3-blocked.** Every language-model linear is
-   INT8 `pack-quantized`. Moxie has `moxie-format::affine` host decode for INT8
-   codes, but no compressed-tensors importer, no packed-layout reader, no
-   canonical repack and no W8A16 execution path. M3 owns all four. This record
-   does not authorize a private loader, a dequantization fallback or a
-   model-owned decode path as a way around that.
+   INT8 `pack-quantized`.
+   [Task 0018](../tasks/0018-m3-compressed-tensors-int8-importer.md) closed two
+   of the four gaps: there is now a compressed-tensors importer and a
+   packed-layout reader, and three of this artifact's real modules import to
+   canonical affine form. **No canonical repack and no W8A16 execution path
+   exist**, so nothing runs, and an import is not support. M3 owns both. This
+   record still does not authorize a private loader, a dequantization fallback
+   or a model-owned decode path as a way around that.
 2. **The text graph mathematics are recoverable, and the shared gaps are now
    closed for the text path.** Task 0016 made seven operation parameters
    explicit — the six this inventory first listed, plus the grouped norm the

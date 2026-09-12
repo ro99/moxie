@@ -2,12 +2,13 @@
 
 ## Active handover
 
-[Task 0017, per-layer key/value geometry and window reclamation](2026-09-12-task0017-per-layer-kv-retention.md)
-is the current continuation. **M1.4 complete; M1.5 active; M4 open.** The owner
-accepted task 0016 on 2026-09-12, opening M1.5 with a reduced synthetic Gemma
-graph, and selected M4's state schema as task 0017; that work is implemented and
-awaiting owner review. Checkpoint execution (M3), device attention and the rest
-of M4, and vision (M11) retain their gates.
+[Task 0018, compressed-tensors pack-quantized import](2026-09-12-task0018-compressed-tensors-import.md)
+is the current continuation. **M1.4 complete; M1.5 active; M3 and M4 open.**
+Task 0017 gave the paged store per-layer geometry and window reclamation;
+task 0018 imports the Gemma 4 artifact's real INT8 weights to canonical affine
+form. Both are implemented and awaiting owner review. **Nothing executes a
+checkpoint**: the W8A16 path, the repacker and the manifest write are M3's, and
+vision is M11.
 
 This entry was stale until task 0017: it still named the M1.4 closure handover
 after [the M1.5 Gemma operation gap](2026-09-12-m1.5-gemma-operation-gap.md) had

@@ -1,6 +1,8 @@
 # Task 0018 — M3 compressed-tensors pack-quantized importer
 
-Status: **proposed**.
+Status: **implemented, awaiting owner review**. Contract and
+[ADR 0015](../decisions/adr/0015-serde-json-for-safetensors-headers.md)
+committed at `db9529e`, before implementation.
 
 ## Identity and authority
 
@@ -240,4 +242,128 @@ establishes; or any O2 quality claim.
 
 ## Result, filled after work
 
-Not started.
+Implementation follows contract `db9529e`. No CUDA, kernel, graph, model or
+device execution path changed, and **no byte was written under any checkpoint
+root**. The shared owners are:
+
+- **`moxie-format::safetensors`** owns the container: an eight-byte
+  little-endian length, a bounded JSON header, and per-tensor
+  `{dtype, shape, data_offsets}`. `Header::prefix_len` reads and bounds the
+  declared length **before** the parser sees anything, so a hostile `u64` cannot
+  cause a large allocation ahead of validation. Every entry's declared range
+  must equal `product(shape) * dtype_bytes` exactly — a tensor that merely
+  *fits* is refused, because every later read derives its length here. Overlap
+  is checked in one pass over start-sorted spans; unknown dtypes are a typed
+  error rather than a skipped tensor. It never opens a file.
+- **`moxie-format::compressed_tensors`** owns the `pack-quantized` decode and
+  produces the **existing** canonical `AffineTensor`. The rebias reuses the
+  accepted `affine::rebias_code`; the reconstruction equation, the descriptor
+  and every existing expectation are untouched.
+- **`moxie-storage::Shard`** opens a shard, reads its header, and serves
+  positioned bounded reads under the existing `ByteBudget`. No `mmap`. Opening a
+  5 GB shard costs its header.
+- `moxie-format` gained `serde_json` ([ADR 0015](../decisions/adr/0015-serde-json-for-safetensors-headers.md)),
+  declared in the `arch-check` allowlist. A new negative fixture proves a second
+  crate taking it is rejected: the header contract has one owner.
+
+### What the artifact established, and what it could not
+
+The packing was verified **before** the contract was authored and again by the
+implementation. In `model-00002-of-00007.safetensors`,
+`model.language_model.layers.12.self_attn.q_proj` carries `weight_packed` `I32`
+`[8192, 1344]`, `weight_scale` `BF16` `[8192, 168]` and `weight_shape` `I64[2]`
+holding `(8192, 5376)`: `5376 / 4` and `5376 / 32`, as the equations require. A
+byte histogram of one packed row is dense in `64..191` and sparse at both ends,
+**mean raw byte 127.4** — the codes are biased-unsigned, which `raw - 128`
+decodes, and two's-complement bytes would have been edge-heavy instead.
+
+**The lane order is cited, not verified.** All four lanes of a word fall inside
+one 32-column scale group, so the artifact's own data cannot distinguish it: a
+reversed order reconstructs a different but equally plausible weight. The order
+comes from the pinned reader (`compressed_tensors.cpp:286`). Closing it needs
+paired output against the released model, which is O2 evidence and M3's later
+kernel work. **Nothing here is a quality claim, and a successful import is not
+one.**
+
+### Real-artifact evidence, read-only
+
+Re-derived by this reader rather than restated from the inventory:
+
+| Measure | Value |
+|---|---|
+| Shards parsed | 7, each covering its payload exactly |
+| Tensors | **2008** — 1188 `BF16`, 410 `I32`, 410 `I64` |
+| Total tensor payload | **35,089,877,112 B** |
+| Modules imported | `layers.0.self_attn.q_proj` `(8192, 5376)`, `layers.0.self_attn.o_proj` `(5376, 8192)`, `layers.0.mlp.down_proj` `(5376, 21504)` |
+| Bytes read | **216,416,304** |
+| Codes observed | the full `[-128, 127]`, including `-128`, which document 03 forbids a decoder from rejecting |
+| Scale dtype | BF16, **from the tensor header** — the config declares `scale_dtype: null` |
+
+Every reconstructed value on the sampled rows is finite, and the codes span the
+range rather than being a constant. These tests **skip with a message** when the
+artifact is absent, so a fresh clone stays green.
+
+### Verification
+
+| Gate | Exact command / result |
+|---|---|
+| Host workspace | `cargo test --workspace --locked --offline`: **681 unit/integration + 9 doctests passed**, 0 failed, 0 ignored |
+| Importer | `cargo test -p moxie-format --locked --offline`: **100 passed** (69 unit + 31 integration), including the exhaustive code, tail, granularity, scale-dtype and rejection cases |
+| Real artifact | `cargo test -p moxie-storage --test gemma4_import --locked --offline -- --nocapture`: **3 passed**, figures above |
+| Host clippy | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`: passed |
+| Format / diff | `cargo fmt --all -- --check`; `git diff --check`: passed |
+| Specification | `cargo xtask spec-check`: passed, 10 documents unchanged |
+| Architecture | `cargo xtask arch-check`: **74 rejecting + 21 accepted fixtures**, 12 rules. The undeclared `serde_json` edge was **rejected before it was declared**, which is the allowlist working; the new `shared-takes-serde-json` fixture keeps a second crate from taking it |
+| Device workspace | the host command with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`: **697 + 12 doctests passed**, 0 failed |
+| Device clippy | the clippy command with the same features: passed |
+| Real GPU | `cargo xtask-cuda test-gpu`: **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
+
+| Hardware | UUID |
+|---|---|
+| RTX 5060 Ti / SM120 | `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` |
+| RTX 3090 / SM86 | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` |
+| RTX 3090 / SM86 | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` |
+
+**The GPU result is unchanged, which is expected: this task adds no device
+behaviour.** It is regression evidence for accepted work, not evidence for this
+task's mechanism.
+
+**Unmeasured / not run:** no topology, Compute Sanitizer, **model quality** or
+paired performance gate. No W8A16 or W4A16 kernel, no execution, no repack, no
+manifest write, no prepared layout, no AutoRound/AutoGPTQ adapter, no vision.
+O1–O7 remain open and none was resolved or relied on.
+
+**O5 was respected exactly as the contract stated it.** The work opened files
+under `/fast/models` for positioned reads and wrote nothing anywhere: no
+converted artifact, no manifest, no prepared layout, no download. Nothing under
+either checkpoint root was created, modified or deleted.
+
+### Asymmetric sources
+
+Refused with a typed `Unsupported` naming what evidence would close it. The
+pinned reader rejects asymmetric pack-quantized
+(`compressed_tensors.cpp:204`), no local artifact is one, and document 03
+forbids guessing a zero offset "from a suffix". The canonical descriptor already
+carries `ZeroPoints::PerGroup`, so what is missing is a **verified source
+contract**, not a canonical capability. A test asserts the refusal is
+`Unsupported` and not `InvalidArtifact` — the source is fine; we cannot read it.
+
+### Deletion
+
+Nothing was deleted or superseded. `moxie-storage::Artifact`'s refusal to read
+an affine tensor still stands: that path is the canonical manifest's, and this
+task imports from a **source** container, which is a different thing and
+deliberately shares none of its machinery.
+
+### Remaining blockers and next bounded task
+
+M3 is **not** closed. Importing a tensor is not executing one: the W8A16 and
+W4A16 shared paths, the bounded inspector/repacker with atomic publish, the
+canonical manifest write, and the AutoRound/AutoGPTQ packing adapter are all
+still outstanding, and all four are M3's. M1.5 is **not** closed: the Gemma 4
+artifact still cannot run.
+
+The next bounded task is the shared **W8A16 execution path**, which is what
+turns a canonical INT8 tensor into a result — with the bounded reference
+dequantization as the correctness oracle and explicitly not as the claimed fast
+path, per document 03.

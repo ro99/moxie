@@ -1,0 +1,16 @@
+[package]
+name = "moxie-storage"
+version = "0.0.0"
+edition = "2024"
+
+# Must be rejected: ADR 0015 gives `serde_json` to `moxie-format` alone, for
+# safetensors headers. `moxie-storage` reads the bytes and hands them over; if
+# it could parse JSON itself, the header contract would have two owners and the
+# rule that only one crate interprets an artifact's metadata would be silently
+# gone. The allowlist is per crate, so this fails on the dependency edge.
+
+[dependencies]
+serde_json = "1"
+
+[package.metadata.moxie-arch-check]
+expect-rule = "forbidden dependency"

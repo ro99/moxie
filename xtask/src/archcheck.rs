@@ -112,10 +112,13 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                 workspace: &["moxie-types"],
                 // ADR 0005: TOML manifest v1 is parsed with `toml` and
                 // `serde`, the same two crates `xtask` already builds with.
+                // ADR 0015 adds `serde_json` for safetensors headers, which are
+                // JSON by specification; every structural and arithmetic
+                // validation stays in this crate.
                 // The allowlist stays per crate: every other production
                 // crate keeps an empty list, and a fixture proves a second
                 // crate taking `serde` is rejected.
-                third_party: &["toml", "serde"],
+                third_party: &["toml", "serde", "serde_json"],
             },
         ),
         (
