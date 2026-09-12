@@ -8,9 +8,10 @@ graph plus the accepted importer, with the remaining blockers recorded: the
 Gemma 4 artifact is 32.7 GiB against a 24 GiB largest GPU, so executing it needs
 M3 plus M2 or M5.
 
-**Nothing executes a checkpoint.** M2's sequencing waits on a batched O1/O5
-question about whether a BF16 MoE may be downloaded; no download may be made
-before it is answered.
+**M2 proceeds in roadmap order.** The owner designated
+`/fast/models/google/gemma-4-26B-A4B-it` — BF16, 128 experts at top-k 8, already
+on disk — so no download was needed and none was made. **Nothing executes a
+checkpoint yet.**
 
 One file per bounded continuation, `YYYY-MM-DD-slug.md`. Use
 [HANDOVER.md](../spec/templates/HANDOVER.md).

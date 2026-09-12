@@ -35,12 +35,26 @@ claim follows from a successful import** — that needs paired output against th
 released model, which is O2. M4 still owns device paged attention, COW forks and
 page streaming. M11 owns vision.
 
-**M2 is entered but its sequencing is gated.** Routing, residency and a
-synthetic BF16 MoE consumer can begin; M2's exit needs a real oversized MoE, and
-every MoE on this machine is INT4 or MXFP4 while M2 asks for BF16 initially. A
-BF16 copy of any local MoE family is 541–652 GB of routed experts alone. That is
-an O1 and O5 question, batched to the owner in the closure handover, and no
-download may be made before it is answered.
+**M2 is active and proceeds in roadmap order.** The owner designated
+`/fast/models/google/gemma-4-26B-A4B-it` as M2's BF16 MoE on 2026-09-12: BF16,
+unquantized, **128 experts at top-k 8**, 51.6 GB across 1,013 tensors, already
+on disk — **no download is required, and none was made.** It is the same
+`gemma4` family M1 already gated, with the same `(layer + 1) % 6` global
+predicate, `attention_k_eq_v`, local 8x256 versus global 2x512 key/value
+geometry, softcap 30.0 and 1,024-token window, so the accepted text-tower
+mathematics and task 0017's per-layer paged geometry transfer rather than being
+rebuilt. Its experts are **fused per layer** — one `experts.gate_up_proj` and
+one `experts.down_proj` holding all 128 — and **every layer carries a dense
+`mlp` beside the routed experts**, so routing semantics must model a shared
+expert explicitly. At 51.6 GB it fits aggregate VRAM but no single 24 GiB
+device, and M2 item 4's restricted budget makes it oversized by construction.
+
+`hy3-w4a16-mtp` is in scope. A Laguna checkpoint is being downloaded to
+`/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4`; it was **incomplete** when this
+was written and must be verified complete before it is inspected, and its
+`configuration_laguna.py` is remote code that document 03 forbids executing.
+None of the three is approved for quality, conversion or requantization: O1's
+catalog and O5's storage questions stay open.
 
 ## Read before editing
 

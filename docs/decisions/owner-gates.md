@@ -54,6 +54,16 @@ image-capable and native speculative-head variants.
 **And, for M2 specifically: is a BF16 MoE in the catalog at all, or does M2's
 residency work proceed against the local integer artifacts once M3 lands?**
 
+**Owner ruling, 2026-09-12 — partial.** The BF16 MoE for M2 is
+`/fast/models/google/gemma-4-26B-A4B-it`. `hy3-w4a16-mtp` **is in scope**.
+A Laguna checkpoint, `/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4`, **is being
+downloaded** and was incomplete when this was written.
+
+This answers M2's sequencing and **no download is required**: the artifact is
+already local. It does **not** finalize the release catalog or its order, which
+is what this gate still blocks. Nothing here approves quality, conversion or
+requantization for any of the three.
+
 **Blocks:** final catalog commitment, bulk conversion, and declaring all legacy behavior migrated.
 The provisional bring-up order in M1–M11 is for architectural stress coverage only, not an approved
 catalog.
@@ -149,7 +159,15 @@ The four questions the agent needs answered, and will not decide:
 4. `hy3-w4a16-mtp` is present locally and appears in no tracked record. Is it in
    scope, and what is it?
 
-**Nothing has been downloaded, copied or converted.** The agent stopped here.
+**Answered 2026-09-12, and no download was needed.** Questions 1–3 are resolved
+by `/fast/models/google/gemma-4-26B-A4B-it`, which was already on disk: BF16,
+unquantized, 128 experts at top-k 8, 51.6 GB across 1,013 tensors. Question 4 is
+answered yes.
+
+**Nothing was downloaded, copied or converted by this agent**, before or after
+the ruling. The storage questions this gate governs — disk budget, approved
+revisions, conversion time, retention, and whether a higher-precision original
+exists — remain open for every other artifact.
 
 **Blocks:** writing large converted artifacts, unapproved additional downloads, and any bulk copy or
 requantization. A task must still name the exact artifact, source revision, expected size and

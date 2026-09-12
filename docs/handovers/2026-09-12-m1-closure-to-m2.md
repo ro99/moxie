@@ -105,27 +105,78 @@ the owner below rather than decided here.
 checkpoint exists on this machine**. O1's M0 evidence still stands for that
 family.
 
+## Owner ruling, 2026-09-12 — M2 sequencing answered
+
+**No download was required.** The owner designated
+`/fast/models/google/gemma-4-26B-A4B-it` as M2's BF16 MoE, and it was already on
+disk. `hy3-w4a16-mtp` is in scope. A Laguna checkpoint is downloading to
+`/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4` and was **incomplete** when this
+was written.
+
+The designated artifact, read from its own config and tensor index:
+
+| Property | Value |
+|---|---|
+| Precision | **BF16, unquantized** — no `quantization_config` |
+| Routing | **128 experts, top-k 8**, `moe_intermediate_size` 704 |
+| Size | 51.6 GB declared, 1,013 tensors, two shards |
+| Family | `gemma4` — 30 layers, hidden 2,816, 16 heads |
+| Layer types | 25 sliding, 5 full at indices 5, 11, 17, 23, 29 — the `(layer + 1) % 6` predicate |
+| Key/value geometry | local 8 heads x 256, global 2 x 512; `attention_k_eq_v` true |
+| Other | softcap 30.0, window 1,024, vocab 262,144, vision and audio towers present |
+
+**This changes M2's cost substantially**, in three ways worth stating:
+
+1. **M2 proceeds in roadmap order.** Item 1's "use BF16 initially to isolate
+   residency correctness from quantization" is satisfiable with a real artifact.
+   The M3-first sequencing this handover previously raised is moot.
+2. **The accepted M1 mathematics transfers.** Same family, same global
+   predicate, same layer-type asymmetry task 0017 built per-layer paged geometry
+   for. M2 adds routing and residency to a text tower that is already gated,
+   rather than starting a second one.
+3. **Two structural facts routing must model.** Experts are **fused per layer**
+   — one `experts.gate_up_proj` and one `experts.down_proj` holding all 128, not
+   128 tensors — and **every one of the 30 layers carries a dense `mlp` beside
+   its routed experts**, which is a shared expert, not an alternative to them.
+   The router itself is three tensors: `router.proj.weight`, `router.scale` and
+   `router.per_expert_scale`.
+
+At 51.6 GB it fits the 63.9 GiB aggregate but **no single 24 GiB device**, and
+M2 item 4's "intentionally restricted memory budget smaller than its working
+weights" makes it oversized by construction rather than by hoping.
+
+**Cautions carried into task 0019.** The Laguna artifact was mid-download and
+must be verified complete before inspection; its `configuration_laguna.py` is
+remote code and document 03 forbids executing it — parse metadata safely or not
+at all. Nothing here approves quality, conversion or requantization for any
+artifact, and O1's catalog and O5's storage questions stay open.
+
 ## Next task
 
-Blocked on the owner's answer to the batched O1/O5 question below. Once it is
-answered, task 0019 is one of:
+Task 0019 is **M2's first bounded slice, in roadmap order**: shared routing
+semantics and expert residency against the designated BF16 MoE.
 
-1. **M3's shared W8A16 execution path**, if the answer is to use the local
-   integer artifacts. Owning `moxie-kernels` for the kernel and `moxie-executor`
-   for dispatch, with `AffineTensor::reconstruct` plus the accepted BF16 linear
-   as the **correctness oracle** — document 03: "bounded reference
-   dequantization is not an acceptable final fast path by assertion". Declare
-   the error bound before writing the kernel. Gates: real GPU on both
-   architectures, the declared shape matrix, bounded prepared-layout accounting
-   charging scale metadata as well as weight bits.
-2. **M2's shared routing and residency mechanism on a synthetic BF16 MoE**, if
-   the answer is to proceed in roadmap order and meet the real-artifact exit
-   later. Owning `moxie-engine` for routing and `moxie-memory` for residency,
-   with an intentionally restricted budget smaller than the working weights.
+- Owning components: `moxie-graph` for the routing operation and its oracle,
+  `moxie-engine` for row dispatch and combination, `moxie-memory` for the
+  residency authority. `moxie-models::gemma4` gains metadata and graph
+  composition **only** — no expert cache, no scheduling, no placement.
+- Required reading before the contract: document 03's residency lifecycle,
+  document 02's memory-authority boundary, M2 items 1–5, ADR 0009 for Engram as
+  a residency class, and the artifact's own config and tensor index. Inspect the
+  artifact before claiming anything about it, as task 0016 did for the 31B.
+- The contract must state, before implementation: the routing equation including
+  `router.scale` and `router.per_expert_scale`, the shared-expert combination,
+  the fused-expert tensor layout, and an independent FP64 oracle with a
+  predeclared numerical criterion.
+- **Stop conditions.** A second weight-residency owner; a cache class in a model
+  adapter; simulated placement presented as a reservation; a demand path that
+  can deadlock; an unbounded queue; any bulk write, which remains O5's; and any
+  quality claim, which remains O2's. Executing a checkpoint is still not
+  authorized to be described as model support until quality is measured against
+  the released model.
 
-Stop conditions carried forward: a second resource or transaction owner, a
-model-owned or method-specific execution path, a dequantization fallback
-presented as a fast path, a weakened numerical gate, a speed claim without a
-paired measurement, a quality claim without O2, or any bulk write, which remains
-O5's. **No synthetic graph and no successful import may be described as model
-support.**
+Superseded, and recorded rather than deleted: this handover previously offered
+M3's W8A16 path as a candidate first task on the grounds that M2's exit had no
+BF16 artifact. That was a real constraint but the wrong conclusion to
+*recommend* — the roadmap order is normative and re-ordering milestones is the
+owner's call, not an agent's default. The artifact removes the constraint.
