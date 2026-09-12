@@ -1,8 +1,8 @@
 # Handover — task 0020 implemented; task 0021 is M2's grouped expert execution
 
-**Task 0020 is implemented, corrected after independent review, and awaiting
-owner acceptance.** The review found **nine** issues; all nine were reproduced
-and fixed, and none was disputed. It delivers M2 item 2 only. M2 items 3–5 are
+**Task 0020 is implemented, corrected after two rounds of independent review,
+and awaiting owner acceptance.** The two rounds found **sixteen** issues; all
+sixteen were reproduced and fixed, and none was disputed. It delivers M2 item 2 only. M2 items 3–5 are
 outstanding and the next of them is specified under [Next task](#next-task).
 
 ## Workspace identity
@@ -34,11 +34,11 @@ the terms it fixed before implementation, and the filled-in result.
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy | passed |
-| `cargo test --workspace --locked --offline` | **806 passed, 0 failed** (736 at task 0019) |
-| Device-feature workspace tests | **826 passed, 0 failed** |
+| `cargo test --workspace --locked --offline` | **812 passed, 0 failed** (736 at task 0019) |
+| Device-feature workspace tests | **832 passed, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
-| `cargo xtask arch-check` | every rule and every fixture, including the new `a second weight-residency owner` and its three fixtures. **4 pre-existing failures remain**, all from the untracked review crate under `results/task0014-independent-review-2026-09-11/probes/`; the identical four lines are in `results/task0015/arch-local.log` |
+| `cargo xtask arch-check` | **zero failures** — 78 rejected fixtures, 21 accepted, 13 rules. The "4 pre-existing failures" carried since task 0014 are gone and were never real; see the note below |
 
 Nothing failed. One case is skipped by construction and reports itself: the
 real-artifact read prints `SKIPPED` with its reason when
@@ -109,6 +109,33 @@ The task record carries the finding-by-finding table, including the single point
 where I resolved a finding differently from the probe's assertion and why. Every
 finding has a regression, and the measured ones are measured rather than
 asserted.
+
+**A second review round found seven more, every one P1, and three of them were
+consequences of the first round's own fixes.** A closed authority still issued
+backings — **4,194,304 bytes allocated on a real GPU against a released
+reservation**. A backing accepted another authority's upload and **overwrote
+still-leased bytes**. A cancelled device read left a ticketless `Reading`
+placement and the next acquire panicked. Promotion still deadlocked through a
+dependency that already existed, because it promoted the ticket it was given and
+stopped. A refused device admission stranded the prediction it had already
+promoted. The control envelope still undercounted — **8,274 bytes against 2,368
+admitted** at one pending placement, because the charge had no fixed part and was
+measured only against settled placements. And `close` surrendered the entitlement
+before `try_free`, which leaves the allocation live when it fails.
+
+One of those corrections undid a fix rather than extending it: my first attempt
+at the ticketless-`Reading` bug moved held placements to `Retiring`, which would
+have let a *failed* placement serve its uninitialised range. The distinction is
+whether the bytes are real, not who holds them.
+
+**The review also caught a regression I introduced.** Copying the first round's
+probe crate into `results/` took `arch-check` from four failures to nine — and
+the four it already carried came from a task-0014 review crate parked the same
+way. Every task since 0014 has reported them as "pre-existing". None was ever a
+real violation: `docs/README.md` declares `results/` and `artifacts/` ignored
+scratch, and the crate walk read them anyway. It now skips both, with a unit test
+pinning that a crate under `crates/` is still found. **`arch-check` passes with
+zero failures for the first time in six tasks.**
 
 **Three narrowings, decided during implementation and reported rather than
 quietly dropped.** `Artifact::read_tensor_range` was **not** added: a canonical

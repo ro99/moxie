@@ -294,6 +294,58 @@ fn the_control_envelope_covers_the_real_heap_at_the_declared_bound() {
     a.close(&mut l).unwrap();
 }
 
+/// The envelope covers **small** caches and **pending** placements too.
+///
+/// Finding 6 of the second independent review. The first version of this gate
+/// measured one shape -- 64 settled placements -- and the charge fitted it while
+/// missing two things: the authority's own fixed overhead, which *is* the whole
+/// envelope when a cache holds one chunk, and the live ticket a pending
+/// placement owns. One pending placement retained 8,274 bytes against a 2,368
+/// byte envelope.
+///
+/// So this sweeps capacities from one upward, and leaves every placement
+/// **in flight**, which is the expensive shape.
+#[test]
+fn the_envelope_covers_small_caches_and_pending_placements() {
+    let _probe = probe();
+    for n in [1u32, 2, 4, 16, 64] {
+        let mut l =
+            Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 30, 1 << 20).unwrap()]).unwrap();
+        let ids: Vec<ChunkId> = (0..n).map(chunk).collect();
+        let baseline = LIVE.load(SeqCst);
+        let mut a = ResidencyAuthority::open(
+            &mut l,
+            &ResidencyRequest::new("sweep", u64::from(n) * CHUNK)
+                .max_placements(n)
+                .max_leases(n),
+        )
+        .unwrap();
+        // Acquired and never completed: each placement owns a live ticket.
+        let mut leases = Vec::new();
+        for id in &ids {
+            let Acquired::Pending { lease, .. } = a.acquire(request(id, 0)).unwrap() else {
+                panic!("absent")
+            };
+            leases.push(lease);
+        }
+        let heap = (LIVE.load(SeqCst) - baseline) as u64;
+        let admitted = l.scope_committed(Scope::Host);
+        assert!(
+            heap <= admitted,
+            "{n} pending placement(s): retained heap {heap} B exceeds the admitted \
+             envelope {admitted} B"
+        );
+        println!("{n} pending: heap {heap} B within envelope {admitted} B");
+        for lease in leases {
+            a.release(lease).unwrap();
+        }
+        std::hint::black_box(&a);
+        // The authority is dropped with tickets outstanding, which withholds its
+        // host storage by design; the next iteration takes a fresh baseline.
+        drop(a);
+    }
+}
+
 /// Dropping an authority with a transfer in flight **withholds** its host
 /// storage rather than freeing it.
 ///

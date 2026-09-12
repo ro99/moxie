@@ -249,14 +249,71 @@ fn a_device_chunk_is_readable_only_after_its_copy_is_observed_on_every_device() 
 
         // Placements still name ranges inside the allocation, so the backing
         // cannot be returned yet either.
-        let (device, refused) = device.close(&mut authority).unwrap_err();
+        let (mut device, refused) = device.close(&mut authority).unwrap_err();
         assert!(
             format!("{refused}").contains("still holds placements"),
             "{refused}"
         );
 
         assert_eq!(authority.retire_all(scope), 0, "nothing was left pinned");
+
+        // Second review, finding 2: a backing is a right to allocate against
+        // **one** authority's reservation. Driving another authority's upload
+        // through this one overwrote its still-leased bytes and reported the
+        // other ready. It is refused by identity now.
+        {
+            let mut other_ledger = Ledger::new([
+                CapacitySnapshot::new(Scope::Host, 64 * MIB, 8 * MIB).unwrap(),
+                CapacitySnapshot::new(scope, 64 * MIB, MIB).unwrap(),
+            ])
+            .unwrap();
+            let mut other = ResidencyAuthority::open(
+                &mut other_ledger,
+                &ResidencyRequest::new("other authority", 4 * EXPERT_BYTES)
+                    .device(ctx.uuid(), DEVICE_CAP),
+            )
+            .unwrap();
+            let id = chunk(7);
+            let Acquired::Pending { lease, work, .. } =
+                other.acquire(request(&id, scope, 0)).unwrap()
+            else {
+                panic!("absent")
+            };
+            let uploads = drain_reads(&mut other, &mut src, work).unwrap();
+            assert_eq!(uploads.len(), 1);
+            let refused = device
+                .perform_upload(&mut other, &stream, &uploads[0])
+                .unwrap_err();
+            assert!(
+                format!("{refused}").contains("belongs to authority"),
+                "a foreign authority's upload was accepted: {refused}"
+            );
+            other.release(lease).unwrap();
+            // The foreign ticket is still outstanding, so this authority is
+            // dropped rather than closed; its host storage is withheld by
+            // design and the ledger keeps showing the charge.
+            drop(other);
+        }
+
+        // Second review, finding 7: the entitlement is surrendered only after
+        // the physical free succeeds, so a failed teardown cannot let a second
+        // allocation or an authority close proceed over live memory.
         device.close(&mut authority).unwrap();
+
+        // The entitlement came back only once the allocation was actually gone,
+        // so the scope can be backed again -- and still only once.
+        let reclaimed = authority
+            .claim_backing(scope)
+            .expect("the entitlement returned with the freed allocation");
+        assert!(
+            authority.claim_backing(scope).is_err(),
+            "still one backing at a time"
+        );
+        assert!(
+            authority.close(&mut ledger).is_err(),
+            "a claimed backing blocks close"
+        );
+        authority.return_backing(reclaimed).unwrap();
         authority.close(&mut ledger).unwrap();
         assert_eq!(ledger.scope_committed(scope), 0);
         assert_eq!(ledger.scope_committed(Scope::Host), 0);

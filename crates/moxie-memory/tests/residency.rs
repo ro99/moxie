@@ -2048,6 +2048,197 @@ fn a_scope_is_backed_once_and_the_charge_outlives_the_allocation() {
 }
 
 // ---------------------------------------------------------------------------
+// Second independent review, 2026-09-12: seven findings, all reproduced
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_closed_authority_spends_nothing_more() {
+    // Finding 1. `claim_backing` answered from the retained configuration
+    // without asking whether the reservation still existed, and a review
+    // allocated 4,194,304 bytes of GPU memory with **zero ledger charge**
+    // through a closed authority. A released reservation is not a budget.
+    let mut l = ledger();
+    let mut a = open_with_device(&mut l, 4 * EXPERT_BYTES, 4 * EXPERT_BYTES);
+    let device = Scope::Device(gpu());
+    a.close(&mut l).unwrap();
+    assert!(a.is_closed());
+    assert_eq!(l.scope_committed(device), 0);
+    assert_eq!(l.scope_committed(Scope::Host), 0);
+
+    // Every path that could spend against the released reservation refuses.
+    assert!(a.claim_backing(device).is_err());
+    assert!(a.acquire(demand(&expert(0), 0)).is_err());
+    assert!(a.acquire(device_demand(&expert(0), 0)).is_err());
+    assert!(a.retire(Scope::Host, &expert(0)).is_err());
+    assert!(a.settle_quarantined(Scope::Host, &expert(0)).is_err());
+    assert!(a.next_prefetch().is_none());
+    assert!(
+        a.close(&mut l).is_err(),
+        "a second close is not a second release"
+    );
+    assert_eq!(l.outstanding().len(), 0);
+}
+
+#[test]
+fn a_cancelled_device_read_leaves_no_ticketless_in_flight_placement() {
+    // Finding 3, and it was a panic. `take_ticket` removed the ticket while the
+    // held device placement stayed in `Reading`, so the next acquire of that
+    // chunk reached for a ticket that was not there. An in-flight state is a
+    // promise that a transfer is coming; when the ticket is gone, so is it.
+    let mut l = ledger();
+    let mut a = open_with_device(&mut l, 8 * EXPERT_BYTES, 8 * EXPERT_BYTES);
+    let chunk = expert(0);
+    let device = Scope::Device(gpu());
+
+    let Acquired::Pending { lease, ticket, .. } = a.acquire(device_demand(&chunk, 0)).unwrap()
+    else {
+        panic!("absent")
+    };
+    a.cancel(ticket).unwrap();
+    a.read_destination(ticket).unwrap().fill(0x31);
+    a.complete_read(ticket, Outcome::Completed).unwrap();
+
+    // No upload ever ran, so the device placement holds nothing and is gone.
+    assert_eq!(a.state_of(device, &chunk), None);
+    assert_eq!(a.committed_bytes(device).unwrap(), 0);
+    // The host bytes are valid and stay cached.
+    assert_eq!(a.state_of(Scope::Host, &chunk), Some(ChunkState::HostReady));
+
+    // The acquire that used to panic.
+    let retry = a.acquire(device_demand(&chunk, 1)).unwrap();
+    let Acquired::Pending {
+        lease: second,
+        ticket: up,
+        work,
+        ..
+    } = retry
+    else {
+        panic!("absent on the device")
+    };
+    assert!(matches!(
+        work,
+        PendingWork::Issued(WorkOrder::Upload { .. })
+    ));
+    a.complete_upload(up, Outcome::Completed).unwrap();
+    assert_eq!(a.state_of(device, &chunk), Some(ChunkState::DeviceReady));
+
+    a.release(lease).unwrap();
+    a.release(second).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn promotion_follows_a_dependency_chain_that_already_existed() {
+    // Finding 4. Promoting only the ticket the caller named left the chain's
+    // *root* queued: the demand blocked the prefetch gate that had to release
+    // the read the demand was waiting for. Priority travels the whole chain.
+    let mut l = ledger();
+    let mut a = ResidencyAuthority::open(
+        &mut l,
+        &ResidencyRequest::new("chain", 8 * EXPERT_BYTES).device(gpu(), EXPERT_BYTES),
+    )
+    .unwrap();
+    let chunk = expert(0);
+
+    // A queued host prefetch, and a queued device prefetch waiting on its read.
+    let Acquired::Pending { lease: host_p, .. } = a.acquire(prefetch(&chunk, 0)).unwrap() else {
+        panic!("absent")
+    };
+    let Acquired::Pending {
+        lease: device_p, ..
+    } = a
+        .acquire(AcquireRequest {
+            class: UseClass::prefetch(Content::Expert),
+            ..device_demand(&chunk, 1)
+        })
+        .unwrap()
+    else {
+        panic!("absent")
+    };
+    assert_eq!(a.prefetch_queue_len(), 2);
+
+    // Now demand it. The chain is device -> host, and both must be promoted.
+    let Acquired::Pending { lease: d, work, .. } = a.acquire(device_demand(&chunk, 2)).unwrap()
+    else {
+        panic!("pending")
+    };
+    let PendingWork::Issued(order) = work else {
+        panic!("demand was left waiting on a gated prefetch: {work:?}")
+    };
+    assert!(matches!(order, WorkOrder::Read { .. }), "the chain's root");
+
+    a.read_destination(order.ticket()).unwrap().fill(0x4C);
+    let released = a.complete_read(order.ticket(), Outcome::Completed).unwrap();
+    assert!(!released.is_empty(), "the dependent upload follows");
+    for o in &released {
+        a.complete_upload(o.ticket(), Outcome::Completed).unwrap();
+    }
+    assert_eq!(
+        a.state_of(Scope::Device(gpu()), &chunk),
+        Some(ChunkState::DeviceReady)
+    );
+
+    a.release(host_p).unwrap();
+    a.release(device_p).unwrap();
+    a.release(d).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+#[test]
+fn a_refused_device_admission_leaves_the_prediction_it_would_have_promoted() {
+    // Finding 5. Promotion ran while resolving the source, before the device
+    // placement was known to be admissible; when admission failed, the original
+    // prediction was left off the queue, counted as demand and owned by nobody.
+    // Promotion now commits only after admission succeeds.
+    let mut l = ledger();
+    let mut a = ResidencyAuthority::open(
+        &mut l,
+        &ResidencyRequest::new("one device slot", 8 * EXPERT_BYTES).device(gpu(), EXPERT_BYTES),
+    )
+    .unwrap();
+
+    // Fill the single-expert device cache and keep its lease, so the next
+    // device admission cannot be satisfied.
+    let resident = expert(1);
+    let Acquired::Pending {
+        lease: held,
+        ticket,
+        ..
+    } = a.acquire(device_demand(&resident, 0)).unwrap()
+    else {
+        panic!("absent")
+    };
+    a.read_destination(ticket).unwrap().fill(0x01);
+    a.complete_read(ticket, Outcome::Completed).unwrap();
+    a.complete_upload(ticket, Outcome::Completed).unwrap();
+
+    let chunk = expert(0);
+    let Acquired::Pending { lease: p, .. } = a.acquire(prefetch(&chunk, 1)).unwrap() else {
+        panic!("absent")
+    };
+    assert_eq!(a.prefetch_queue_len(), 1);
+
+    let refused = a.acquire(device_demand(&chunk, 2)).unwrap_err();
+    assert!(matches!(refused.error, Error::CapacityExceeded { .. }));
+    assert_eq!(
+        a.prefetch_queue_len(),
+        1,
+        "a refused admission must leave the prediction exactly where it was"
+    );
+
+    let order = a
+        .next_prefetch()
+        .expect("the refused admission consumed the only read order");
+    a.read_destination(order.ticket()).unwrap().fill(0x05);
+    a.complete_read(order.ticket(), Outcome::Completed).unwrap();
+    assert_eq!(a.chunk_bytes(&p).unwrap()[0], 0x05);
+
+    a.release(held).unwrap();
+    a.release(p).unwrap();
+    a.close(&mut l).unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // The envelope
 // ---------------------------------------------------------------------------
 
@@ -2067,9 +2258,11 @@ fn the_cache_envelope_is_admitted_from_the_ledger_and_returned_on_close() {
         host,
         64 * EXPERT_BYTES
             + 128 * (moxie_memory::residency::PLACEMENT_CONTROL_BYTES + 256)
-            + 256 * moxie_memory::residency::LEASE_CONTROL_BYTES,
+            + 256 * moxie_memory::residency::LEASE_CONTROL_BYTES
+            + moxie_memory::residency::AUTHORITY_CONTROL_BYTES,
         "the cache, its placement table (fixed part plus the declared identity \
-         bound) and its lease table are all admitted"
+         bound), its lease table and the authority's own fixed overhead are all \
+         admitted"
     );
     let mut a = a;
     a.close(&mut l).unwrap();

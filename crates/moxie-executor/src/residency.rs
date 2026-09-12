@@ -296,19 +296,26 @@ mod device {
                 Some(b) => b,
                 None => return Ok(()),
             };
-            if let Err(refused) = authority.return_backing(backing) {
-                // The refusal handed the entitlement back, so this value is
-                // whole and the caller can fix the cause and retry. Stranding
-                // it here would leave the scope claimed forever with no way to
-                // free the allocation.
-                self.backing = Some(refused.backing);
-                return Err((self, refused.error));
+            // Ask the authority whether release is legal, but do **not** take
+            // the entitlement yet: `try_free` explicitly leaves the allocation
+            // live on failure, and an entitlement returned before the memory is
+            // actually gone would let another allocation -- or the authority's
+            // own close -- proceed over memory that still exists.
+            if let Err(refused) = authority.check_returnable(&backing) {
+                self.backing = Some(backing);
+                return Err((self, refused));
             }
             // SAFETY: the authority has confirmed no placement names a range in
-            // this allocation, and no copy is outstanding -- `return_backing`
+            // this allocation and no copy is outstanding; `check_returnable`
             // refuses otherwise.
             if let Err(error) = unsafe { self.buffer.try_free() } {
+                // The allocation is still live, so the scope stays claimed.
+                self.backing = Some(backing);
                 return Err((self, error));
+            }
+            if let Err(refused) = authority.return_backing(backing) {
+                self.backing = Some(refused.backing);
+                return Err((self, refused.error));
             }
             Ok(())
         }
@@ -324,6 +331,12 @@ mod device {
         /// Read a device range back, for an oracle that has to compare what
         /// arrived against what was asked for.
         pub fn read_back(&self, offset: u64, into: &mut [u8]) -> Result<()> {
+            if self.backing.is_none() {
+                return Err(Error::InvalidRequest {
+                    field: "backing",
+                    detail: "this residency has already been closed".into(),
+                });
+            }
             self.buffer.copy_to_host_at(offset as usize, into)
         }
 
@@ -362,6 +375,31 @@ mod device {
                 error,
                 submission_unknown: unknown,
             };
+            // A backing is a right to allocate against **one** authority's
+            // reservation, and this is the only place the two meet. Without
+            // this check, authority B's upload driven through authority A's
+            // backing overwrote A's still-leased bytes and reported B ready --
+            // measured on a real GPU, and silent.
+            let backing = self.backing.as_ref().ok_or_else(|| UploadRefused {
+                error: Error::InvalidRequest {
+                    field: "backing",
+                    detail: "this residency has already been closed".into(),
+                },
+                submission_unknown: false,
+            })?;
+            if backing.authority() != authority.id() {
+                return Err(UploadRefused {
+                    error: Error::InvalidRequest {
+                        field: "authority",
+                        detail: format!(
+                            "this backing belongs to authority {}; the upload came from {}",
+                            backing.authority().get(),
+                            authority.id().get()
+                        ),
+                    },
+                    submission_unknown: false,
+                });
+            }
             if *scope != self.scope() {
                 return Err(refuse(
                     Error::InvalidRequest {

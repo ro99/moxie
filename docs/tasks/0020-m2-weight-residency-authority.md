@@ -1,11 +1,12 @@
 # Task 0020 — M2 weight-residency authority
 
-Status: **implemented and corrected after independent review; awaiting owner
-acceptance.** Contract written and committed at `d6e9170` before implementation,
-per the working rule that produced tasks 0013–0019. The review found **nine**
-issues; all nine were reproduced and fixed, and none was disputed. See
-[Result](#result-filled-after-work) and
-[Independent review](#independent-review-and-what-it-changed).
+Status: **implemented and corrected after two rounds of independent review;
+awaiting owner acceptance.** Contract written and committed at `d6e9170` before
+implementation, per the working rule that produced tasks 0013–0019. The two
+rounds found **sixteen** issues in total; all sixteen were reproduced and fixed,
+and none was disputed. See [Result](#result-filled-after-work),
+[Independent review](#independent-review-and-what-it-changed) and
+[Second independent review](#second-independent-review).
 
 ## Identity and authority
 
@@ -564,11 +565,11 @@ task does **not** close M2.
 | `cargo fmt --all -- --check` | **passed** |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed** |
 | Device-lane clippy (`moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda`) | **passed** |
-| `cargo test --workspace --locked --offline` | **806 passed, 0 failed** (736 before this task) |
-| Device-feature workspace tests | **826 passed, 0 failed** |
+| `cargo test --workspace --locked --offline` | **812 passed, 0 failed** (736 before this task) |
+| Device-feature workspace tests | **832 passed, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | **passed**, 10 documents |
-| `cargo xtask arch-check` | every rule and every fixture passes, including the new `a second weight-residency owner` with its three fixtures. **4 pre-existing failures remain**, all from the untracked review crate under `results/task0014-independent-review-2026-09-11/probes/`; the identical four lines are in `results/task0015/arch-local.log` |
+| `cargo xtask arch-check` | **passes with zero failures**: 78 rejected fixtures, 21 accepted, 13 rules, including the new `a second weight-residency owner` with its three fixtures. The "4 pre-existing failures" every task since 0014 has carried are **gone, and were never real** — see [the arch-check noise floor](#the-arch-check-noise-floor) |
 
 Raw logs: `results/task0020/` (untracked, per `docs/README.md`).
 
@@ -665,6 +666,46 @@ Every finding has a regression. Findings 3, 4a, 4b, 5, 6, 8, 9 and the identity
 bound are in `crates/moxie-memory/tests/residency.rs`; findings 2 and 7 are
 measured in `residency_allocation.rs`; finding 1 is checked on the host lane and
 on all three cards in `residency_device.rs`.
+
+### Second independent review
+
+**Seven findings, all P1. All seven reproduced against `5be984f`; none
+disputed.** Probes preserved at
+`results/task0020/independent-review-2026-09-12-round2/` (untracked).
+
+| # | Finding | Reproduced as | Fix |
+|---|---|---|---|
+| 1 | **A closed authority still allocated.** `claim_backing` answered from the retained configuration without asking whether the reservation still existed | **4,194,304 B allocated on a real GPU with zero ledger charge** | A `closed` flag set by `close`; `acquire`, `claim_backing`, `retire`, `settle_quarantined`, `complete_read`, `complete_upload`, `next_prefetch` and a second `close` all refuse. A released reservation is not a budget |
+| 2 | **A backing accepted another authority's upload.** `perform_upload` checked scope and capacity but never bound the authority to the entitlement | authority B's upload through A's backing **overwrote A's still-leased bytes and marked B ready** | `DeviceBacking::authority()`, checked before either endpoint is touched; `read_back` refuses a closed residency too |
+| 3 | **A cancelled device read left a ticketless `Reading` placement**, and the next acquire panicked | **`an in-flight placement owns a ticket`** | The placement is discarded: no upload ran, so it holds nothing. Plus a typed refusal instead of that `expect`, because an invariant breach inside a generation step must be reportable, not fatal |
+| 4 | **Promotion still deadlocked through an existing dependency.** It promoted the ticket named and returned early for `BlockedOnRead`, leaving the chain's root queued | demand blocked the gate that had to release the read it waited for | `promote_chain` walks the whole dependency, depth-bounded against a cycle |
+| 5 | **Failed device admission lost a promoted read order.** Promotion ran while resolving the source, before the placement was known admissible | the original prediction stranded: off the queue, counted as demand, owned by nobody | Promotion is recorded during resolution and **committed only after admission succeeds** |
+| 6 | **The envelope still undercounted small and pending configurations.** The charge was per placement only, and measured against settled placements | **8,274 B retained against 2,368 B admitted** at one pending placement | `AUTHORITY_CONTROL_BYTES` for the fixed part (measured ≈ 7,061 B) and `PLACEMENT_CONTROL_BYTES` raised to 2,048 (a pending placement also owns a live ticket; measured ≈ 1,478 B beyond the identity). The gate now sweeps 1, 2, 4, 16 and 64 **pending** placements |
+| 7 | **Failed physical teardown returned the entitlement too early.** `try_free` leaves the allocation live on failure | code inspection | `check_returnable` asks, `try_free` frees, and only then is the entitlement surrendered. A failure at any step keeps it |
+
+**Finding 3 changed a fix from the first round rather than adding to it.** My
+first attempt moved held placements to `Retiring`, which would have let a
+*failed* placement serve its uninitialised range to the leases still holding it.
+The distinction is not who holds a placement but whether its bytes are real: a
+read that completed leaves valid bytes others may want and stays; a read that
+failed or was cancelled before its data arrived leaves nothing, and is discarded
+even under live leases so its holders get a typed error. That is what every
+failure test already asserted, and the wrong fix would have broken two of them.
+
+#### The arch-check noise floor
+
+The review also caught something I caused. Copying the first round's probe crate
+into `results/` took `arch-check` from four failures to **nine**, and the four it
+already had came from a task-0014 review crate parked the same way. Every task
+since 0014 has reported "4 pre-existing failures" in its acceptance evidence.
+
+None of them was ever a real violation. `docs/README.md` declares `/results/` and
+`/artifacts/` ignored scratch — nothing there is in the workspace or built by
+anything — and `find_manifests` walked them anyway. It now skips both, with a
+unit test pinning that a crate under `crates/` is still discovered.
+**`arch-check` passes with zero failures for the first time.** A standing noise
+floor in a pass/fail gate is how a real failure gets read as one of the usual
+ones, and this one stood for six tasks.
 
 ### What was **not** delivered, and why
 

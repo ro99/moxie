@@ -2080,7 +2080,25 @@ fn find_manifests(root: &Path) -> Result<Vec<PathBuf>, String> {
             if p.is_dir() {
                 // `target` is build output; `fixtures` is walked explicitly by
                 // the caller, never as part of the real workspace.
-                if name == "target" || name == ".git" || name == "fixtures" {
+                //
+                // `results` and `artifacts` are the two directories
+                // `docs/README.md` declares ignored scratch -- "`/results/` and
+                // `/artifacts/` are ignored for exactly this". Nothing there is
+                // in the workspace, nothing there is built, and nothing there
+                // can violate an ownership rule that only governs what ships.
+                //
+                // They were not skipped before, and it cost something real:
+                // every task since 0014 has reported "4 pre-existing failures"
+                // from a review probe crate parked under `results/`, and task
+                // 0020's own review probes took that to nine. A standing noise
+                // floor in a pass/fail gate is how a genuine failure gets read
+                // as one of the usual ones. Preserving review evidence is
+                // required by document 07; having it fail the architecture
+                // check is not.
+                if matches!(
+                    name.as_ref(),
+                    "target" | ".git" | "fixtures" | "results" | "artifacts"
+                ) {
                     continue;
                 }
                 stack.push(p);
@@ -3208,6 +3226,44 @@ mod tests {
         assert_eq!(telemetry_hit("artifacts/manifest.toml"), None);
         assert_eq!(telemetry_hit("/procfoo/bar"), None);
         assert_eq!(telemetry_hit("models/proc_weights"), None);
+    }
+
+    #[test]
+    fn ignored_scratch_directories_are_not_workspace_crates() {
+        // The skip must cover exactly the directories `docs/README.md` declares
+        // ignored, and nothing else: a crate under `crates/` is still a crate.
+        let root = tempdir();
+        for (dir, expected) in [
+            ("crates/real", true),
+            ("results/task0020/probe", false),
+            ("artifacts/scratch", false),
+            ("target/debug/thing", false),
+        ] {
+            let d = root.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+            let found = find_manifests(&root).unwrap();
+            let hit = found.iter().any(|m| m.starts_with(&d));
+            assert_eq!(
+                hit,
+                expected,
+                "{dir} should {}be discovered as a workspace crate",
+                if expected { "" } else { "not " }
+            );
+        }
+    }
+
+    fn tempdir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "moxie-archcheck-walk-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
     #[test]

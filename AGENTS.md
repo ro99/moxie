@@ -5,7 +5,7 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 ## Active assignment
 
 **M1 complete (M1.5 closed 2026-09-12); M2 active, item 1 accepted, item 2
-implemented and corrected after independent review.** See the
+implemented and corrected after two rounds of independent review.** See the
 [task 0020 handover](docs/handovers/2026-09-12-task0020-weight-residency-authority.md)
 for the current continuation, and the
 [closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
@@ -18,8 +18,9 @@ shared operations with FP64 oracles, the pinned BF16 boundaries that decide
 which experts a row selects, and two consumers carrying opposite routing
 parameters.
 
-**M2 item 2's residency authority is implemented and corrected after independent
-review** — nine findings, all reproduced, all fixed, none disputed
+**M2 item 2's residency authority is implemented and corrected after two rounds
+of independent review** — sixteen findings, all reproduced, all fixed, none
+disputed
 ([task 0020](docs/tasks/0020-m2-weight-residency-authority.md), 2026-09-12):
 `moxie_memory::residency` is the **one** production weight-residency owner, with
 document 03's chunk identity, its lifecycle and failure transitions, coalescing,
@@ -30,8 +31,14 @@ before any victim is chosen. An `arch-check` rule rejects a second owner. All
 nine of M2 item 5's cases pass, on the host lane and on all three GPUs, alongside
 a regression for each review finding. One of those findings corrected a claim
 rather than a defect: **a nonblocking acquire is necessary but not sufficient for
-deadlock freedom**, and the cycle it missed was between the demand counter and
-the prefetch gate. **Task 0021 is next**: M2 item 3's CPU expert fallback and GPU
+deadlock freedom**, and the cycles it missed were between the demand counter and
+the prefetch gate, and along promotion's dependency chain.
+
+**`arch-check` now passes with zero failures.** The four it reported as
+"pre-existing" from task 0014 onward were review probe crates parked under
+`results/`, which [docs/README.md](docs/README.md) declares ignored scratch; the
+crate walk now skips `results/` and `artifacts/`. Do not carry a standing
+failure count forward as background noise — that is how a real one gets missed. **Task 0021 is next**: M2 item 3's CPU expert fallback and GPU
 grouped candidate plans under one interface, specified in
 [the task 0020 handover](docs/handovers/2026-09-12-task0020-weight-residency-authority.md)
 and not yet authored.
