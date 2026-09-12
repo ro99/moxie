@@ -20,7 +20,7 @@ families, **two are present on disk and five are absent**:
 
 | Family | Checkpoint on disk | Note |
 |---|---|---|
-| Gemma | **absent** | M1's proposed dense vertical slice has no artifact |
+| Gemma | **absent on 2026-09-07; present since** | see the [2026-09-12 update](#update-2026-09-12--gemma-4-31b-it-int8-is-now-on-disk) |
 | Laguna | **absent** | M2's proposed first MoE workload has no artifact |
 | Inkling | **absent** | |
 | GLM-5.2 | **absent** | M4's proposed MLA case has no artifact |
@@ -180,3 +180,97 @@ until the source can be released. Converting GLM-5.3-NVFP4 (433 G) fits on
 - Full license terms. Only the first lines were read; redistribution and
   derivative terms matter before any fixture is exported from these weights
   (document 06 M0.6 requires permission to be verified first).
+
+## Update 2026-09-12 — Gemma 4 31B-IT INT8 is now on disk
+
+Read-only inspection on 2026-09-12 while preparing the M1.5 contract. No file was
+copied, converted, modified or executed; no checkpoint-provided code was run.
+This changes the artifact facts below and changes **no** owner gate.
+
+### Roots as they stand today
+
+`/models` is empty. `/fast/models` holds three directories: `canada-quant`,
+`cyankiwi` and `Intel`. Under `cyankiwi` there are four artifacts —
+`gemma-4-31B-it-AWQ-8bit`, `Inkling-Small-AWQ-INT4`, `Muse-Glimmer-30B-AWQ-INT4`
+and `Qwen3.8-27B-AWQ-BF16-INT4`. Only the Gemma directory was inspected in
+detail; the other three are recorded here as present, nothing more.
+
+Two of the three M0 checkpoints above are **no longer at the paths this document
+records**. `/fast/models/incoai/GLM-5.3-NVFP4` and
+`strata/models/glm53f-nvfp4` do not exist today; `/data/kimi-k3` still does and
+was not re-verified. This agent did not delete anything and does not know where
+those two went, so the M0 sections are left standing as the record of what was
+measured on 2026-09-07 rather than edited to match today. `/fast` now reports
+742 G used of 1.8 T.
+
+### `/fast/models/cyankiwi/gemma-4-31B-it-AWQ-8bit`
+
+| Property | Value |
+|---|---|
+| Source repository | `cyankiwi/gemma-4-31B-it-AWQ-8bit` |
+| Immutable revision | `34ca187d836de874b2c7e3edf48f439b9f583772` |
+| Base model declared | `google/gemma-4-31B-it` |
+| License in README front matter | `apache-2.0`, Gemma 4 license link |
+| Size | 35,089,877,112 B of tensor payload across seven shards |
+| Tensors | 2008 — 1188 `BF16`, 410 `I32`, 410 `I64` |
+| Text precision | compressed-tensors `pack-quantized`, INT8, symmetric, **group 32** |
+| Vision tower | BF16, excluded from quantization by the 192-entry `ignore` list |
+
+**Revision identity is confirmed, not assumed.** The local `config.json` hashes
+to `f9f7b7c592c98a99018843aa242b05cbd19f98a423ce43241d3ef208ec444b76`, which is
+byte-identical to the hash recorded for this candidate in
+[quantization-candidates.md](quantization-candidates.md) on 2026-09-07 from the
+public API. The directory's `.cache/huggingface/` download metadata names the
+same commit for every file.
+
+**Shard completeness is verified three ways.** The index's `weight_map`
+references exactly the seven shard files present, with no missing and no
+unreferenced file; each shard's safetensors header accounts for its file size
+exactly (`8 + header + payload == size`) and its tensor set equals the index's
+entries for that shard; and the sum of tensor payloads equals the index's
+declared `total_size` of 35,089,877,112 B.
+
+**Content hashes, computed locally and compared with the publisher's declared
+LFS hashes in the artifact's own download metadata. All eight match.**
+
+```text
+852af1be0e6c2f40f5f5fbce5f4b0a05b596004086e40fa4cba3bf15cf00b311  model-00001-of-00007.safetensors
+ed73e91ffe05617f737f07b002c8144638cf8cee961c84532e98f95657e04b83  model-00002-of-00007.safetensors
+69f5c0848ab9f4696120eef02f271998b4a0a152f5e5532e149768efb724527e  model-00003-of-00007.safetensors
+c0aaf5ca502a9cdfe1ed6778d126c3de2ce3ec22cb53fd3376810eab5fc0ba99  model-00004-of-00007.safetensors
+d5c771d8b9ae4a6752b2b54e654650a873abc4e58472c1d234a65ca90a9ad0ec  model-00005-of-00007.safetensors
+c8e09c17d307a8bdff98072f3fb7011815846b782be8b2653fd7499fc52452b1  model-00006-of-00007.safetensors
+dc209d902322575b8c7091ae425e6e35c5eadce8af9265ce530259a7cd77cbd3  model-00007-of-00007.safetensors
+cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f  tokenizer.json
+```
+
+Small metadata files, hashed locally; the publisher declares no LFS hash for
+these, so they are recorded as observed rather than as verified against a source:
+
+```text
+f9f7b7c592c98a99018843aa242b05cbd19f98a423ce43241d3ef208ec444b76  config.json
+d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de  generation_config.json
+90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df  tokenizer_config.json
+85a08664d16d8f3be4416c92427b3ac10df1024ac566cc0b4bc3bab409393f98  chat_template.jinja
+32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c  processor_config.json
+d6d47cb0547c6090c4b81aa5fe90d72026c2124b06c53c2d9efeec0e693fd421  model.safetensors.index.json
+```
+
+Retention: the artifact stays where it is, read-only. Nothing is copied out.
+The full geometry, tensor-role mapping, packing parameters and equation
+inventory are in [the Gemma 4 bring-up record](../models/gemma4.md).
+
+### What this does and does not change
+
+It changes the M0 headline above in one respect only: the roadmap's proposed
+dense M1 slice now has an artifact on disk. It does **not** make that artifact
+executable here. Every language-model linear is INT8 `pack-quantized`, and Moxie
+has no compressed-tensors importer, no packed-layout reader and no W8A16
+execution path — all four are M3. M1.5 therefore proceeds against a reduced
+synthetic graph, which document 06 explicitly provides for, under
+[task 0016](../tasks/0016-m1-gemma-reduced-graph.md).
+
+O1 is still open and still blocks the bring-up order and the catalog; a
+downloaded artifact is not a catalog decision. O2 is still open and no quality
+statement exists. O5 is still open and nothing may be converted or requantized.
+Laguna, GLM-5.2 and DeepSeek remain absent under these roots.
