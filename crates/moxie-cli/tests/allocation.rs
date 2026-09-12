@@ -233,20 +233,58 @@ fn admitted_peak_cleanup_repeated_generations_and_allocation_failure() {
     assert!(wide_owner.outstanding().is_empty());
 
     // The routing path must fail the way every other step does. Before an
-    // independent review, `moxie_oracles::route::softmax` and the selection's
-    // scratch used infallible `collect()` and a stable sort: an allocation
+    // independent review, `moxie_oracles::route::softmax`, the selection's
+    // scratch and `combine_order`'s sort allocated infallibly: an allocation
     // failure inside a routed step aborted the process with
     // `memory allocation of N bytes failed`, taking the transaction rollback,
     // the lease release and the next generation with it. Routing was an
     // unreached M0 fixture when that code was written and became an execution
     // path when task 0019 gave it an interpreter.
     //
-    // The injected extent is the router's own input row, `hidden * 4` bytes,
-    // which only the routed shape allocates at this point in a step.
+    // **The injected extent has to be one only routing allocates**, or the test
+    // proves nothing about routing. The review found the first version of this
+    // block injecting `hidden * 4`, which a `[hidden]` norm gain's `try_clone`
+    // consumed during weight preparation, before the router ran. This one uses
+    // the routed slot tensor, `rows * top_k * hidden * 4`, whose extent depends
+    // on the **prompt length** as no weight's does -- and then proves the choice
+    // rather than asserting it: the same fault armed over a dense generation of
+    // the same prompt must come back **unconsumed**.
     {
-        let routed = gemma::build(gemma::Shape::C).unwrap();
-        let hidden = gemma::Shape::C.config().hidden as usize;
+        let routed_config = gemma::Shape::C.config();
+        let moe = routed_config.moe.expect("shape C is routed");
         let prompt: Vec<u32> = (0..11).collect();
+        let slot_bytes = prompt.len() * moe.top_k as usize * routed_config.hidden as usize * 4;
+
+        // The control. Shape A is dense and shares this shape's hidden width,
+        // layer count and vocabulary, so if it never allocates `slot_bytes`
+        // over a whole generation, neither does anything the two have in
+        // common -- weight preparation included.
+        let dense = gemma::build(gemma::Shape::A).unwrap();
+        let mut dense_owner = ledger(1 << 30);
+        let mut dense_service = GenerationService::new(&mut dense_owner, dense.program());
+        dense_service.start(req(&prompt, 11, 2)).unwrap();
+        FAIL.store(slot_bytes, SeqCst);
+        while let Some(event) = dense_service.next_event(&Cancel::never()) {
+            assert!(
+                !matches!(
+                    event,
+                    GenerationEvent::Failed { .. } | GenerationEvent::Cancelled { .. }
+                ),
+                "the dense control consumed the fault, so the extent is not \
+                 routing-only and this test would prove nothing"
+            );
+        }
+        assert_eq!(
+            FAIL.swap(0, SeqCst),
+            slot_bytes,
+            "a dense generation allocated {slot_bytes} bytes, so the extent is not \
+             routing-only"
+        );
+        drop(dense_service);
+        assert!(dense_owner.outstanding().is_empty());
+
+        // The routed run, with the same fault.
+        let routed = gemma::build(gemma::Shape::C).unwrap();
         let mut routed_owner = ledger(1 << 30);
         let mut service = GenerationService::new(&mut routed_owner, routed.program());
         service.start(req(&prompt, 11, 1)).unwrap();
@@ -254,12 +292,12 @@ fn admitted_peak_cleanup_repeated_generations_and_allocation_failure() {
             service.next_event(&Cancel::never()),
             Some(GenerationEvent::Admitted { .. })
         ));
-        FAIL.store(hidden * 4, SeqCst);
+        FAIL.store(slot_bytes, SeqCst);
         let event = service.next_event(&Cancel::never());
         assert_eq!(
             FAIL.swap(0, SeqCst),
             0,
-            "routed forward fault was not injected"
+            "the routed step did not allocate {slot_bytes} bytes"
         );
         // A typed terminal event, not a panic and not a silent success.
         assert!(
@@ -275,8 +313,8 @@ fn admitted_peak_cleanup_repeated_generations_and_allocation_failure() {
             ),
             "{event:?}"
         );
-        // Rollback: the service is idle, every charge is released, and a second
-        // generation succeeds. R08's rule, on the routed path.
+        // Rollback: idle, every charge released, and a second generation
+        // succeeds. R08's rule, on the routed path.
         assert!(service.is_idle());
         assert_eq!(service.charged_bytes(), 0);
         service.start(req(&prompt, 11, 2)).unwrap();

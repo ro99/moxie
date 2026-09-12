@@ -332,12 +332,17 @@ after both branches have been normalized, and it takes no routing coefficient.
   order are integers and must match the FP64 transcription bit for bit.
   Coefficients and expert outputs are checked against `moxie-oracles::metric`
   bounds assembled from the counted rounding steps of each equation, in the same
-  style as the existing attention bound. Every such bound is stated against
-  **`Σ|terms|`**, never against `|y|`: `linear::linear_row_scale` gives the
-  reason in its own words, and the review found this task's expert-output test
-  scaling by `max(|y|, 1)` — which would have accepted a cancelling fixture that
-  is wrong by its whole magnitude.
-  `an_experts_down_projection_is_bounded_when_its_terms_cancel` is that case.
+  style as the existing attention bound. The expert path gets a **derived,
+  data-dependent** bound, `expert_error_bound`, for the reason
+  `attention_error_bound` has one: counting steps and scaling by the final
+  reduction's term magnitudes is not a bound on a chain whose *first* stage can
+  cancel. The error is propagated through both projections, the activation's
+  Lipschitz constant and every BF16 boundary — a boundary **amplifies** rather
+  than absorbs, because this reference rounds `bf16(fp32 v)` and the
+  transcription rounds `bf16(fp64 v)`, and the two can land a full ulp apart.
+  Tests assert the sound bound on every fixture and additionally a tight
+  FP32-only bound on the well-conditioned ones, so the sound bound's BF16 slack
+  cannot hide an ordinary mistake.
 
 ### Partition and hardware capabilities
 
@@ -385,15 +390,18 @@ The three operations are pure: they touch no sequence state, so
 to roll back. The interpreter's existing per-operation cancellation boundary
 covers them.
 
-**Every allocation on the routing path is fallible.** That is a requirement, not
+**Every allocation on the routing path is fallible, sorts included.** That is a requirement, not
 a style note: an allocation failure inside a generation step must become a typed
 error the transaction can roll back. The contract's first implementation missed
 it — `softmax` used plain `collect()` and the selection used a stable sort,
 whose scratch buffer allocates infallibly — because routing was an unreached M0
-fixture when that code was written and became an execution path here. Both are
-fixed, the sort is now `sort_unstable_by` with the tie rule written into the
-comparator, and the routed step has failure-injection coverage asserting a typed
-terminal event, a released charge and a successful retry. Typed failures, never a silent clamp: an empty expert set, a
+fixture when that code was written and became an execution path here. Both
+sorts on the path — the selection's and the combination's — are now
+`sort_unstable_by` with a total comparator, which allocates nothing and states
+the tie rule instead of resting on stability. The routed step has
+failure-injection coverage asserting a typed terminal event, a released charge
+and a successful retry, and the injected extent is **proved** routing-only by a
+dense control that must return the same fault unconsumed. Typed failures, never a silent clamp: an empty expert set, a
 `top_k` of zero or greater than `E`, a non-finite router logit or scale, a
 selected mass that is zero or non-finite, an expert id outside `0..E`, a fused
 tensor whose extent does not equal `E · 2I · H` or `E · H · I`, and a slot
@@ -476,9 +484,10 @@ and it belongs to the owner with O2, not to a default chosen here.
 
 ## Result, filled after work
 
-Status: **implemented and corrected after independent review; awaiting
-re-review and owner acceptance.** Contract committed at `b63d931` before
-implementation `2608b5e`; the review corrections follow it.
+Status: **implemented and corrected through two rounds of independent review;
+awaiting re-review and owner acceptance.** Contract committed at `b63d931`
+before implementation `2608b5e`; the first round's corrections are `136341c`
+and the second round's follow it.
 
 ### Independent review, and what it changed
 
@@ -499,7 +508,27 @@ The review also corrected this task's **milestone attribution**: grouped GPU
 expert execution is **M2 item 3**, not M5/M6. Fixed here, in the handover and in
 the support matrix.
 
-Findings 2 and 3 are the substantive ones. Both were places where this record
+### Second independent review, and what it changed
+
+A re-review of `136341c` reported three further issues. **All three were
+reproduced and all three are fixed**; none was disputed.
+
+| # | Finding | Fix |
+|---|---|---|
+| 6 | **`combine_order` still used `sort_by_key`**, the *stable* sort, which allocates scratch — the same defect as finding 1, in the function next to it | `sort_unstable_by` with a total comparator. Both sorts on the path now carry the reason in a comment |
+| 7 | The finding-1 regression **did not hit routing**: it injected `hidden * 4`, which a `[hidden]` norm gain's `try_clone` consumed during weight preparation, before the router ran | the injection is now the routed slot tensor, `rows · top_k · hidden · 4`, whose extent depends on the prompt length as no weight's does — and a **dense control** on the same prompt must return the same fault *unconsumed*, so the extent is proved routing-only instead of assumed |
+| 8 | The revised expert bound **still did not propagate** first-projection error through the activation and the down projection; the record overstated what it proved | `expert_error_bound`, derived in the style of `attention_error_bound`, propagating through both projections, the activation's Lipschitz constant and every BF16 boundary. The review's fixture is now a test, with the disproved bound kept as a negative control |
+| 9 | `IndexEncoding::U32` fixed the route over-count but **opened an under-count**: nothing enforced the "step inputs stay U64" rule, so three `U32` token ids lowered to 12 bytes for 24 bytes of storage | enforced at `GraphBuilder::finish` and again in the planner's external-input validation, with a negative test at each. A route table declared as a step input is refused there too |
+
+Findings 6 and 7 are the uncomfortable ones: 6 is the *same* defect as finding 1
+in the function beside it, which means the first fix was applied where the
+reviewer pointed rather than swept; and 7 is a regression that passed while
+testing something other than what it claimed. Both are the same failure of
+verification — asserting that a fix works rather than proving it does — which is
+why the allocation test now proves its own targeting with a control, and why
+every sort on the path is named in a comment.
+
+Findings 2, 3 and 8 are the substantive numerical ones. Both were places where this record
 **claimed more than it had**: "one declared deviation" was three, and the one
 that was declared was declared with a bound that does not hold. The lesson is
 narrower than "add boundaries" — a transcription that omits the same boundary as
@@ -521,17 +550,17 @@ regressions are.
 
 ### Commands and results
 
-All re-run after the review corrections, on 2026-09-12. The counts include the
-five regressions the review produced.
+All re-run after **both** rounds of review corrections, on 2026-09-12. The
+counts include the nine regressions the two reviews produced.
 
 | Gate | Command | Result |
 |---|---|---|
 | Format | `cargo fmt --all -- --check` | **passed**, empty diff |
 | Clippy, host lane | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed**, no warnings |
-| Host tests | `cargo test --workspace --locked --offline` | **720 passed + 9 doctests, 0 failed** |
-| Device-feature tests | the same with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **736 passed + 12 doctests, 0 failed** |
+| Host tests | `cargo test --workspace --locked --offline` | **724 passed + 9 doctests, 0 failed** |
+| Device-feature tests | the same with `--features moxie-cuda/driver,moxie-kernels/fatbin,moxie-executor/driver,xtask/cuda` | **740 passed + 12 doctests, 0 failed** |
 | Real GPU | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
-| `G-MOE-ROUTING-HOST` | the four commands in the support matrix | **passed**: 167 `moxie-oracles`, 31 `moxie-interp::reference_graphs`, 14 `moxie-models`, 21 `moxie-cli::gemma` |
+| `G-MOE-ROUTING-HOST` | the four commands in the support matrix | **passed**: 168 `moxie-oracles`, 31 `moxie-interp::reference_graphs`, 14 `moxie-models`, 21 `moxie-cli::gemma`, plus 16 `moxie-graph` and 16 `moxie-plan` for the encoding rule |
 | `G-GENERATION-ALLOC` | `cargo test -p moxie-cli --test allocation -- --nocapture` | **passed**, now including the routed shape |
 
 Logs are under `results/task0019/` (untracked, per the placement contract).

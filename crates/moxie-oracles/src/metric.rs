@@ -27,6 +27,20 @@ pub const FP32_U: f64 = 5.960_464_477_539_063e-8;
 /// Tiny in magnitude, and still a bound that did not hold over its stated inputs.
 pub const FP32_ETA: f64 = 7.006_492_321_624_085e-46;
 
+/// BF16 unit roundoff, `2^-9`.
+///
+/// BF16 carries an eight-bit significand (seven stored), so round-to-nearest
+/// has half an ulp of relative error at `2^-9`. Four hundred times FP32's, which
+/// is why a boundary the reference declares is part of an equation rather than a
+/// storage detail: it is the largest rounding in any chain that contains one.
+pub const BF16_U: f64 = 1.953_125e-3;
+
+/// BF16 underflow unit: half the smallest BF16 subnormal, `2^-134`.
+///
+/// The same role `FP32_ETA` plays for FP32, at BF16's much earlier onset of
+/// gradual underflow -- `2^-133` rather than `2^-149`.
+pub const BF16_ETA: f64 = 4.591_774_807_899_561e-41;
+
 /// The standard bound for `n` chained FP32 roundings: `γ(n) = n·u / (1 − n·u)`.
 ///
 /// Higham, *Accuracy and Stability of Numerical Algorithms*, §3.1. A sequential

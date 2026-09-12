@@ -23,30 +23,40 @@ equations and the filled-in result, and
 [the bring-up record](../models/gemma4.md#the-26b-a4b-moe-variant) for the
 artifact inventory.
 
-Measured after the independent-review corrections described below:
+Measured after both rounds of independent-review corrections described below:
 
 | Gate | Result |
 |---|---|
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
-| `cargo test --workspace --locked --offline` | **720 passed + 9 doctests, 0 failed** |
-| Device-feature workspace tests | **736 passed + 12 doctests, 0 failed** |
+| `cargo test --workspace --locked --offline` | **724 passed + 9 doctests, 0 failed** |
+| Device-feature workspace tests | **740 passed + 12 doctests, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask arch-check` | every rule and every fixture passes, including the new `models-crate-reaches-memory`. **4 pre-existing failures remain**, all from the untracked review crate under `results/task0014-independent-review-2026-09-11/probes/`; the identical four lines are already in `results/task0015/arch-local.log` |
 
 ## Decisions
 
-**An independent review found five issues; all five were reproduced and fixed,
-and none was disputed.** Three of them were corrections to claims this work had
+**Two rounds of independent review found eight issues in total; all eight were
+reproduced and fixed, and none was disputed.** Three of them were corrections to claims this work had
 made rather than plain defects: the routing path allocated infallibly and could
 abort a generation step instead of rolling it back; the router and expert chains
 dropped BF16 boundaries the reference has, and the FP64 transcription dropped
 the same ones, so their agreement proved nothing; and the stated bound on the
 remaining deviation was false. A probe over 200,000 random rows confirmed the
 second is not cosmetic — omitting those boundaries changes **which experts a row
-selects** on about one row in 270, which is a residency difference. The task
-record carries the finding-by-finding table. Two regressions now fail if the
-boundaries are dropped or the false bound returns.
+selects** on about one row in 270, which is a residency difference.
+
+The **second** round found three more: a second allocating sort in
+`combine_order` that the first fix had not swept, an allocation regression whose
+injected extent was consumed by weight preparation before routing ran, and an
+expert bound that still did not propagate first-projection error. A fourth
+consequence of the first round's own fix — `IndexEncoding::U32` closing a
+four-byte over-count while opening an eight-byte under-count for step inputs —
+was closed at two boundaries with a negative test at each.
+
+The task record carries both finding-by-finding tables. Nine regressions now
+fail if any of it comes back, including a dense control that proves the
+allocation test injects where it claims to.
 
 **Task 0019 was narrowed to item 1's mathematics, and task 0020 owns item 2.**
 The M1 closure handover named routing *and* residency for 0019. The contract

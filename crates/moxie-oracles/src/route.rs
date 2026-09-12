@@ -515,6 +515,99 @@ pub fn expert_row(
     )
 }
 
+/// The error bound for one component of one expert's output.
+///
+/// Written in the style of [`crate::attention::attention_error_bound`], and for
+/// the same reason it exists: counting rounding steps and multiplying by the
+/// **final** reduction's term magnitudes is not a bound on this operation. An
+/// independent review disproved the first attempt with a fixture whose *first*
+/// projection cancels catastrophically -- hidden width 3, input `[1,1,1]`, gate
+/// weights `[2^26, 1, -2^26]` -- where the FP32 chain produces a gate of 0 and
+/// the FP64 one produces 1, the outputs differ by `0.73`, and the bound stated
+/// against the down projection's terms was `3.5e-7`.
+///
+/// The error has to be propagated through three stages, because the first
+/// stage's error is multiplied by everything after it:
+///
+/// ```text
+/// S_g,i = Σ_k |x_k · GU[i,k]|            the gate lane's term magnitudes
+/// S_u,i = Σ_k |x_k · GU[I+i,k]|          the up lane's
+///
+/// Δg_i  = γ(H)·S_g,i + H·η               FP32 sequential sum
+///       + 2·u_b·S_g,i + 2·η_b            the two BF16 roundings may differ
+/// ΔA_i  = L·Δg_i + 2·u_b·(S_g,i + 0.17) + 2·η_b       through the activation
+/// Δh_i  = ΔA_i·(S_u,i + Δu_i) + (S_g,i + 0.17)·Δu_i   the product
+///       + 2·u_b·(S_g,i + 0.17)·S_u,i + 2·η_b          and its BF16 boundary
+/// Δy_o  ≤ Σ_i Δh_i·|D[o,i]| + γ(I)·Σ_i (S_g,i + 0.17)·S_u,i·|D[o,i]| + I·η
+/// ```
+///
+/// Three terms deserve their reasons stated.
+///
+/// `2·u_b·S` appears at every BF16 boundary because the boundary **amplifies**
+/// rather than absorbs: this reference rounds `bf16(fp32 value)` and the
+/// transcription rounds `bf16(fp64 value)`, and when the two straddle a BF16
+/// tie point they land a full ulp apart. That is precisely the review's
+/// counterexample, where an FP32 difference of 1 in the gate became a BF16
+/// difference of 1 that the rest of the chain multiplied.
+///
+/// `L` is a Lipschitz constant for the gate transform: `silu'` lies in
+/// `[-0.1, 1.1]` and `gelu_tanh'` in `[-0.13, 1.13]`, so `1.2` covers both. The
+/// `0.17` is the magnitude either activation can add below zero.
+///
+/// `u_b` is four hundred times FP32's unit roundoff, so on well-conditioned data
+/// this bound is dominated by the BF16 terms and is correspondingly loose. That
+/// is a true statement about a chain with three BF16 boundaries in it, not a
+/// defect -- and the tests pair it with a **tight** check on their
+/// well-conditioned fixtures, asserting the error also fits the FP32-only term,
+/// so an ordinary implementation mistake cannot hide inside the slack.
+pub fn expert_error_bound(
+    x: &[f32],
+    gate_up: &[f32],
+    down: &[f32],
+    expert: u32,
+    spec: ExpertSpec,
+    component: usize,
+) -> f64 {
+    use crate::metric::{BF16_ETA, BF16_U, FP32_ETA, gamma};
+    const LIPSCHITZ: f64 = 1.2;
+    const ACTIVATION_FLOOR: f64 = 0.17;
+
+    let ExpertSpec {
+        hidden,
+        intermediate,
+        ..
+    } = spec;
+    let e = expert as usize;
+    let gu = &gate_up[e * 2 * intermediate * hidden..(e + 1) * 2 * intermediate * hidden];
+    let d = &down[e * hidden * intermediate..(e + 1) * hidden * intermediate];
+
+    let lane_scale = |row: usize| -> f64 {
+        (0..hidden)
+            .map(|k| (x[k] as f64 * gu[row * hidden + k] as f64).abs())
+            .sum()
+    };
+
+    let mut through_h = 0f64;
+    let mut weighted = 0f64;
+    for i in 0..intermediate {
+        let s_g = lane_scale(i);
+        let s_u = lane_scale(intermediate + i);
+        let fp32 = |s: f64| gamma(hidden as u64) * s + hidden as f64 * FP32_ETA;
+        let rounded = |s: f64| 2.0 * BF16_U * s + 2.0 * BF16_ETA;
+
+        let delta_g = fp32(s_g) + rounded(s_g);
+        let delta_u = fp32(s_u) + rounded(s_u);
+        let a_mag = s_g + ACTIVATION_FLOOR;
+        let delta_a = LIPSCHITZ * delta_g + rounded(a_mag);
+        let delta_h = delta_a * (s_u + delta_u) + a_mag * delta_u + rounded(a_mag * s_u);
+
+        let w = (d[component * intermediate + i] as f64).abs();
+        through_h += delta_h * w;
+        weighted += a_mag * s_u * w;
+    }
+    through_h + gamma(intermediate as u64) * weighted + intermediate as f64 * FP32_ETA
+}
+
 /// The slot order a row's expert contributions are summed in.
 ///
 /// Returns indices into the route's own selection order. Floating-point
@@ -525,9 +618,13 @@ pub fn combine_order(experts: &[u32], order: moxie_graph::CombineOrder) -> Resul
     let mut slots: Vec<usize> = crate::try_vec(experts.len())?;
     slots.extend(0..experts.len());
     if order == moxie_graph::CombineOrder::AscendingExpertId {
-        // Expert ids within one row are distinct, so this total order has no
-        // ties to break.
-        slots.sort_by_key(|j| experts[*j]);
+        // `sort_unstable_by`, and a comparator that is total whether or not the
+        // caller's expert ids happen to be distinct. `sort_by_key` is the
+        // *stable* sort and allocates scratch, which is an infallible
+        // allocation inside a generation step -- the same defect that was fixed
+        // in `select_top_k` and missed here, which is why both sorts on this
+        // path now carry the reason in a comment rather than in a memory.
+        slots.sort_unstable_by(|a, b| experts[*a].cmp(&experts[*b]).then(a.cmp(b)));
     }
     Ok(slots)
 }
@@ -1026,21 +1123,31 @@ mod tests {
             for e in 0..experts {
                 let got = expert_row(&x, &gate_up, &down, e as u32, spec).unwrap();
                 let want = fp64_expert(&x, &gate_up, &down, e, spec);
-                let scales = fp64_expert_scale(&x, &gate_up, &down, e, spec);
+                let tight = fp64_expert_scale(&x, &gate_up, &down, e, spec);
                 for (d, (g, w)) in got.iter().zip(&want).enumerate() {
-                    // The scale is the **sum of the magnitudes of the terms**
-                    // entering this component's reduction, not `|y|`.
-                    // `linear::linear_row_scale` says why in its own words: a
-                    // dot product whose terms cancel has a small result and no
-                    // relative accuracy in it, so a bound stated against the
-                    // result is not a bound at all. An earlier version of this
-                    // test used `max(|want|, 1)` and would have accepted a
-                    // cancelling fixture that is wrong by its whole magnitude.
-                    let bound = crate::metric::bound((hidden + intermediate + 4) as u64, scales[d]);
+                    let err = (*g as f64 - w).abs();
+                    // The sound bound: error propagated through **both**
+                    // projections, the activation and every BF16 boundary. An
+                    // earlier version scaled by the final reduction's terms
+                    // alone, which a review disproved with a fixture whose
+                    // *first* projection cancels.
+                    let sound = expert_error_bound(&x, &gate_up, &down, e as u32, spec, d);
                     assert!(
-                        (*g as f64 - w).abs() <= bound,
-                        "expert {e} component {d}: {:.3e} vs bound {bound:.3e}",
-                        (*g as f64 - w).abs()
+                        err <= sound,
+                        "expert {e} component {d}: {err:.3e} vs sound bound {sound:.3e}"
+                    );
+                    // And the tight one, which holds here because this fixture's
+                    // intermediates are well conditioned and do not straddle a
+                    // BF16 tie point. Keeping it stops the sound bound's BF16
+                    // slack from hiding an ordinary mistake; a future fixture
+                    // that does straddle one fails here and says so.
+                    let tight_bound =
+                        crate::metric::bound((hidden + intermediate + 4) as u64, tight[d]);
+                    assert!(
+                        err <= tight_bound,
+                        "expert {e} component {d}: {err:.3e} exceeded the FP32-only \
+                         bound {tight_bound:.3e}; an intermediate straddled a BF16 \
+                         boundary, so only the sound bound applies"
                     );
                 }
             }
@@ -1055,6 +1162,57 @@ mod tests {
             let before = expert_row(&x, &gate_up, &down, 0, spec).unwrap();
             let after = expert_row(&x, &perturbed, &down, 0, spec).unwrap();
             assert_eq!(before, after, "expert 0 read expert 1's slice");
+        }
+    }
+
+    #[test]
+    fn an_experts_first_projection_cancelling_is_bounded_too() {
+        // The review's counterexample, and the reason `expert_error_bound`
+        // exists. The **gate** projection cancels: in FP32 `2^26 + 1 - 2^26` is
+        // 0, in FP64 it is 1, and the BF16 boundary preserves that difference
+        // rather than absorbing it. The outputs differ by about 0.73, while the
+        // bound stated against the down projection's own terms was about
+        // 3.5e-7.
+        let hidden = 3usize;
+        let intermediate = 1usize;
+        let spec = ExpertSpec {
+            experts: 1,
+            hidden,
+            intermediate,
+            activation: ExpertActivation::SwiGlu,
+        };
+        let big = 2f32.powi(26);
+        // Row 0 is the gate lane, row 1 the up lane.
+        let gate_up = vec![big, 1.0, -big, 1.0, 0.0, 0.0];
+        let down = vec![1.0f32; hidden * intermediate];
+        let x = vec![1.0f32; hidden];
+
+        let got = expert_row(&x, &gate_up, &down, 0, spec).unwrap();
+        let want = fp64_expert(&x, &gate_up, &down, 0, spec);
+
+        assert_eq!(got[0], 0.0, "the FP32 gate projection did not cancel");
+        assert!(
+            (want[0] - 0.730_468_75).abs() < 1e-6,
+            "reference {}",
+            want[0]
+        );
+        let err = (got[0] as f64 - want[0]).abs();
+        assert!(err > 0.7, "error {err}");
+
+        // The disproved bound, kept as a negative control: the down
+        // projection's own terms cannot see the first projection's error.
+        let down_terms = fp64_expert_scale(&x, &gate_up, &down, 0, spec);
+        let disproved = crate::metric::bound((hidden + intermediate + 4) as u64, down_terms[0]);
+        assert!(
+            err > disproved * 1e6,
+            "error {err:.3e} against the disproved bound {disproved:.3e}"
+        );
+
+        // The propagated bound holds, on every component.
+        for d in 0..got.len() {
+            let sound = expert_error_bound(&x, &gate_up, &down, 0, spec, d);
+            let e = (got[d] as f64 - want[d]).abs();
+            assert!(e <= sound, "component {d}: {e:.3e} vs {sound:.3e}");
         }
     }
 
@@ -1101,6 +1259,10 @@ mod tests {
 
         let err = (got[0] as f64 - want[0]).abs();
         assert!(err <= term_scaled, "{err:.3e} vs {term_scaled:.3e}");
+        // And the propagated bound, which covers this case as well as the one
+        // where the *first* projection is what cancels.
+        let sound = expert_error_bound(&x, &gate_up, &down, 0, spec, 0);
+        assert!(err <= sound, "{err:.3e} vs sound {sound:.3e}");
     }
 
     #[test]

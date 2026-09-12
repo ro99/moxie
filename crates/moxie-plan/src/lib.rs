@@ -573,6 +573,14 @@ fn validate_external_input(role: ValueRole, shape: &[u64]) -> Result<u64> {
             "role",
             "a weight-role value must be declared as a graph weight and charged",
         )),
+        // Both halves of the rule, at the boundary that sizes the buffer.
+        // `GraphBuilder::input` refuses this too; a plan that trusted the graph
+        // to have been built by that constructor would be trusting the thing it
+        // is validating.
+        ValueRole::Index(encoding) if !encoding.is_legal_external_input() => Err(invalid(
+            "role",
+            "a step input declaring an index encoding narrower than u64 would be              charged fewer bytes than it occupies",
+        )),
         ValueRole::Activation(_) | ValueRole::Index(_) => tensor_bytes(role, shape),
         // A route is computed, never supplied: it is the output of a `Route`
         // node over this step's own rows. Accepting one from outside would let
@@ -615,6 +623,27 @@ mod tests {
 
     fn uuid() -> DeviceUuid {
         DeviceUuid::parse("GPU-00000000-0000-0000-0000-000000000011").unwrap()
+    }
+
+    #[test]
+    fn the_planner_refuses_a_step_input_narrower_than_its_storage() {
+        // `GraphBuilder::finish` refuses this too. Both checks exist because a
+        // plan that trusted the graph to have been built by that constructor
+        // would be trusting the thing it is validating -- and this is the
+        // boundary that turns a declaration into a byte count.
+        let shape = [3u64];
+        let wide = validate_external_input(ValueRole::Index(IndexEncoding::U64), &shape).unwrap();
+        assert_eq!(wide, 24, "three u64 token ids occupy 24 bytes");
+        let narrow = validate_external_input(ValueRole::Index(IndexEncoding::U32), &shape);
+        let error = narrow.unwrap_err();
+        assert_eq!(error.kind(), "invalid_request", "{error}");
+        // The defect this prevents: a 12-byte requirement for 24 bytes of
+        // storage, which under-counts rather than over-counts.
+        assert_eq!(
+            IndexEncoding::U32.bytes_per_element() * 3,
+            12,
+            "the narrow encoding would have been charged 12"
+        );
     }
 
     fn registry() -> OracleRegistry {

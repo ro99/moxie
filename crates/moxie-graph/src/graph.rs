@@ -129,6 +129,20 @@ impl IndexEncoding {
             Self::U32 => 4,
         }
     }
+
+    /// Whether a value a caller supplies per step may declare this encoding.
+    ///
+    /// Only `U64`, because `moxie_interp::Value::Index` stores `u64` and a
+    /// declaration narrower than the storage makes every byte count downstream
+    /// too small. This is a rule, not a note: the first version of `U32` said
+    /// "only `U64` for step inputs" in a comment and enforced nothing, so a
+    /// graph declaring three `U32` token ids lowered to a 12-byte requirement
+    /// for 24 bytes of storage -- trading the route table's four-byte
+    /// *over*-count for an eight-byte *under*-count, which is the direction
+    /// that actually corrupts.
+    pub const fn is_legal_external_input(self) -> bool {
+        matches!(self, Self::U64)
+    }
 }
 
 /// What kind of thing a value is.
@@ -991,6 +1005,11 @@ impl GraphBuilder {
     }
 
     /// A value supplied per step.
+    ///
+    /// Infallible, because the role it is handed is checked where a graph
+    /// becomes valid rather than where a value is named: `finish` refuses a step
+    /// input whose declared index encoding is narrower than the `u64` the host
+    /// reference stores, and refuses a route table supplied from outside.
     pub fn input(&mut self, name: &str, spec: TensorSpec) -> ValueId {
         let id = self.add_value(name, spec);
         self.inputs.push(id);
@@ -1438,6 +1457,32 @@ impl GraphBuilder {
                 detail: "a graph with no operations computes nothing".into(),
             });
         }
+        // Step inputs, before anything else: a declaration narrower than the
+        // storage makes every byte count derived from it too small, and the
+        // first `U32` encoding shipped with that rule in a comment and nothing
+        // enforcing it. A graph declaring three `U32` token ids lowered to a
+        // 12-byte requirement for 24 bytes of storage.
+        for id in &self.inputs {
+            let spec = &self.values[id.0 as usize];
+            let name = self.names.get(id).map(String::as_str).unwrap_or("?");
+            match spec.role {
+                ValueRole::Index(encoding) if !encoding.is_legal_external_input() => {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!(
+                            "step input {name} is declared {encoding:?}, which is                              narrower than the u64 it is stored as"
+                        ),
+                    });
+                }
+                ValueRole::Route { .. } => {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!(
+                            "step input {name} is declared a route table; a route is                              produced by a Route operation over this step's own rows,                              never supplied"
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
         for n in &self.nodes {
             n.contract.check_lowerable(oracles)?;
         }
@@ -1514,6 +1559,114 @@ mod identity_tests {
     use super::*;
     use crate::OracleEvidence;
     use moxie_types::{ActivationPrecision, Precision};
+
+    fn embedding_registry() -> OracleRegistry {
+        let mut registry = OracleRegistry::new();
+        registry
+            .register(
+                Op::Embedding,
+                OracleId("test"),
+                OracleEvidence {
+                    implementation: "test",
+                    test_module: "test",
+                },
+            )
+            .unwrap();
+        registry
+    }
+
+    #[test]
+    fn a_step_input_narrower_than_its_storage_is_refused() {
+        // `IndexEncoding::U32` exists for route tables, whose ids really are
+        // `u32`. It must not become a way to declare token ids or positions
+        // narrower than the `u64` they are stored as: the route table's defect
+        // was a four-byte over-count, and this would be an eight-byte
+        // *under*-count, which is the direction that corrupts. The first
+        // version of `U32` stated this rule in a comment and enforced nothing,
+        // and an independent review lowered a three-token graph to a 12-byte
+        // requirement for 24 bytes of storage.
+        let registry = embedding_registry();
+        let rows = SymbolId(0);
+        let build = |encoding: IndexEncoding| {
+            let mut g = GraphBuilder::new(OracleId("test"), rows);
+            let tokens = g.input(
+                "tokens",
+                TensorSpec::new(ValueRole::Index(encoding), vec![Dim::symbol(rows)]),
+            );
+            let table = g
+                .weight(
+                    "embedding",
+                    TensorSpec::new(
+                        ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
+                        vec![Dim::constant(4), Dim::constant(2)],
+                    ),
+                )
+                .unwrap();
+            let out = g
+                .node(
+                    OpParams::Embedding {
+                        vocab: 4,
+                        hidden: 2,
+                        scale: 1.0,
+                    },
+                    &[tokens, table],
+                )
+                .unwrap();
+            g.finish(out, &registry)
+        };
+        assert!(build(IndexEncoding::U64).is_ok());
+        let error = build(IndexEncoding::U32).unwrap_err();
+        assert_eq!(error.kind(), "invalid_artifact", "{error}");
+        assert!(format!("{error}").contains("narrower"), "{error}");
+    }
+
+    #[test]
+    fn a_route_table_cannot_be_declared_as_a_step_input() {
+        // A supplied route would let a caller choose which experts a step
+        // demands without the router ever running -- a residency decision made
+        // by the wrong owner.
+        let registry = embedding_registry();
+        let rows = SymbolId(0);
+        let mut g = GraphBuilder::new(OracleId("test"), rows);
+        let tokens = g.input(
+            "tokens",
+            TensorSpec::new(
+                ValueRole::Index(IndexEncoding::U64),
+                vec![Dim::symbol(rows)],
+            ),
+        );
+        let _smuggled = g.input(
+            "smuggled route",
+            TensorSpec::new(
+                ValueRole::Route {
+                    index: IndexEncoding::U32,
+                    coefficient: ActivationPrecision::expect(Precision::F32),
+                },
+                vec![Dim::symbol(rows), Dim::constant(2)],
+            ),
+        );
+        let table = g
+            .weight(
+                "embedding",
+                TensorSpec::new(
+                    ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
+                    vec![Dim::constant(4), Dim::constant(2)],
+                ),
+            )
+            .unwrap();
+        let out = g
+            .node(
+                OpParams::Embedding {
+                    vocab: 4,
+                    hidden: 2,
+                    scale: 1.0,
+                },
+                &[tokens, table],
+            )
+            .unwrap();
+        let error = g.finish(out, &registry).unwrap_err();
+        assert_eq!(error.kind(), "invalid_artifact", "{error}");
+    }
 
     const ORACLE: OracleId = OracleId("graph-id-test");
     const ROWS: SymbolId = SymbolId(91);
