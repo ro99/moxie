@@ -2065,35 +2065,114 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
     Ok(out)
 }
 
-/// First path segments the root workspace manifest declares as members.
+/// Normalize a manifest-relative path to a plain sequence of segments.
 ///
-/// A declared member is part of the build whatever it is called, so the scratch
-/// skip below must never hide one. Globs are reduced to their leading literal
-/// segment, which is all this needs: it only has to know whether `results` or
-/// `artifacts` could contain a member.
-fn declared_member_roots(root: &Path) -> BTreeSet<String> {
-    let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml")) else {
-        return BTreeSet::new();
+/// `./results/model`, `results/model` and `results//model` are the same
+/// directory, and a rule that compares strings treats them as three. A review
+/// hid a declared member behind a leading `./`.
+fn normalize_relative(base: &Path, raw: &str) -> PathBuf {
+    let mut out = base.to_path_buf();
+    for segment in raw.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Every directory the workspace actually builds: declared members, plus
+/// everything reachable from them through **production path dependencies**.
+///
+/// Reachability is the question, and a literal-string membership test was not
+/// it. A review put a second `ExpertCache` in a crate under `results/storage`,
+/// reached it through an allowed `moxie-executor -> moxie-storage` path
+/// dependency, and `arch-check` reported nothing: the crate was built, was
+/// production code, and was invisible to every rule because of the directory it
+/// sat in.
+///
+/// So scratch exclusion now means "unreferenced", which is what
+/// `docs/README.md` describes, rather than "named `results`".
+fn reachable_crate_dirs(root: &Path) -> BTreeSet<PathBuf> {
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut queue: Vec<PathBuf> = Vec::new();
+
+    let read_manifest = |dir: &Path| -> Option<toml::Value> {
+        let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+        toml::from_str::<toml::Value>(&text).ok()
     };
-    let Ok(doc) = toml::from_str::<toml::Value>(&text) else {
-        return BTreeSet::new();
-    };
-    doc.get("workspace")
-        .and_then(|w| w.get("members"))
-        .and_then(|m| m.as_array())
-        .map(|members| {
-            members
-                .iter()
-                .filter_map(|m| m.as_str())
-                .filter_map(|m| m.split('/').next())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+
+    if let Some(doc) = read_manifest(root) {
+        if doc.get("package").is_some() {
+            queue.push(root.to_path_buf());
+        }
+        if let Some(members) = doc
+            .get("workspace")
+            .and_then(|w| w.get("members"))
+            .and_then(|m| m.as_array())
+        {
+            for entry in members.iter().filter_map(|m| m.as_str()) {
+                // A trailing `*` is the only glob this needs to understand;
+                // anything else is taken literally, which errs toward checking
+                // more rather than less.
+                if let Some(prefix) = entry.strip_suffix("/*") {
+                    let dir = normalize_relative(root, prefix);
+                    if let Ok(rd) = std::fs::read_dir(&dir) {
+                        for e in rd.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()) {
+                            queue.push(e.path());
+                        }
+                    }
+                } else {
+                    queue.push(normalize_relative(root, entry));
+                }
+            }
+        }
+    }
+
+    while let Some(dir) = queue.pop() {
+        if !seen.insert(dir.clone()) {
+            continue;
+        }
+        let Some(doc) = read_manifest(&dir) else {
+            continue;
+        };
+        // Every production dependency table, target-specific ones included --
+        // the same reason `dependency_edges` reads them all.
+        for table in production_dependency_tables(&doc) {
+            for value in table.values() {
+                if let Some(path) = value.get("path").and_then(|p| p.as_str()) {
+                    queue.push(normalize_relative(&dir, path));
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Every `[dependencies]`-shaped table in a manifest, including
+/// `[target.'cfg(..)'.dependencies]`. Dev and build tables are excluded: a dev
+/// dependency is not production code, which is the same line
+/// `dependency_edges` draws.
+fn production_dependency_tables(doc: &toml::Value) -> Vec<&toml::map::Map<String, toml::Value>> {
+    let mut out = Vec::new();
+    if let Some(t) = doc.get("dependencies").and_then(|d| d.as_table()) {
+        out.push(t);
+    }
+    if let Some(targets) = doc.get("target").and_then(|t| t.as_table()) {
+        for cfg in targets.values() {
+            if let Some(t) = cfg.get("dependencies").and_then(|d| d.as_table()) {
+                out.push(t);
+            }
+        }
+    }
+    out
 }
 
 fn find_manifests(root: &Path) -> Result<Vec<PathBuf>, String> {
-    let members = declared_member_roots(root);
+    let reachable = reachable_crate_dirs(root);
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -2126,22 +2205,30 @@ fn find_manifests(root: &Path) -> Result<Vec<PathBuf>, String> {
                 if matches!(name.as_ref(), "target" | ".git" | "fixtures") {
                     continue;
                 }
-                // The scratch skip is **narrow on purpose**, and a review found
-                // out why: skipping any directory named `results` at any depth
-                // hid `crates/results/model` -- an explicitly declared
-                // workspace member with a forbidden `std::fs::read` -- from
-                // every rule. `docs/README.md` names `/results/` and
-                // `/artifacts/`, with leading slashes: the two directories at
-                // the *root*. So the skip applies there and nowhere else, and
-                // never to a directory the workspace declares a member under.
-                if dir == root
-                    && matches!(name.as_ref(), "results" | "artifacts")
-                    && !members.contains(name.as_ref())
-                {
-                    continue;
-                }
                 stack.push(p);
             } else if name == "Cargo.toml" {
+                // Scratch exclusion is by **reachability**, not by name. A
+                // manifest under the two directories `docs/README.md` declares
+                // ignored -- `/results/` and `/artifacts/`, at the root -- is
+                // skipped only when nothing the workspace builds refers to it.
+                // Two reviews found the two ways a name test gets this wrong:
+                // it hides a declared member (`./results/model`, or
+                // `crates/results/model`), and it hides production code reached
+                // through a path dependency.
+                let parent = p.parent().unwrap_or(&dir);
+                let in_root_scratch = parent
+                    .strip_prefix(root)
+                    .ok()
+                    .and_then(|rel| rel.components().next())
+                    .is_some_and(|first| {
+                        matches!(
+                            first.as_os_str().to_string_lossy().as_ref(),
+                            "results" | "artifacts"
+                        )
+                    });
+                if in_root_scratch && !reachable.contains(parent) {
+                    continue;
+                }
                 out.push(p);
             }
         }

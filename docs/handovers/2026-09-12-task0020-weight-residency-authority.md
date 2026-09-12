@@ -1,10 +1,10 @@
 # Handover — task 0020 implemented; task 0021 is M2's grouped expert execution
 
-**Task 0020 is implemented, corrected after three rounds of independent review,
-and awaiting owner acceptance.** The three rounds found **twenty** issues; all
-twenty were reproduced and fixed, and none was disputed. The third round's
-closing criticism was of method rather than of a defect, and it is answered by an
-exhaustive transition sweep described below. It delivers M2 item 2 only. M2 items 3–5 are
+**Task 0020 is implemented, corrected after four rounds of independent review,
+and awaiting owner acceptance.** The four rounds found **twenty-three** issues;
+all twenty-three were reproduced and fixed, and none was disputed. Two rounds
+criticised method rather than code, and the fourth showed by **mutation testing**
+that the sweep built to answer the third did not establish its claim. It delivers M2 item 2 only. M2 items 3–5 are
 outstanding and the next of them is specified under [Next task](#next-task).
 
 ## Workspace identity
@@ -166,6 +166,34 @@ structural invariants once and can be run after any operation, and
 first run: a device prefetch whose host read a host prefetch had joined, ending
 in a deadline expiry. Task 0021 adds queues and plans of its own; the same method
 should be applied to them rather than rediscovered.
+
+**A fourth round found three more, and the third of them was aimed at my own
+answer to the third round.** Releasing an upload's last source pin did not
+finish retirement, leaving a placement `Retiring` with zero leases — charged,
+unservable and unevictable, holding a one-chunk cache shut, **with
+`check_invariants` passing throughout**. Arch-check still skipped production
+code: membership was a literal string test, so a forbidden second `ExpertCache`
+under `results/storage`, reached through an allowed path dependency, produced
+zero violations, and `./results/model` was invisible because its first segment is
+`"."`. Exclusion is now by reachability — normalized members, globs expanded, and
+a transitive walk of production path dependencies.
+
+**And the transition sweep did not prove what I said it proved.** The
+demonstration was a mutation: discard every promoted work order, and all 200
+combinations still passed, while a named regression caught it in one. The harness
+discovered work through `ticket_of` and completed it directly, so it was testing
+whether the authority can be *poked* into consistency, not whether the scheduler
+hands the work out. It is now a faithful executor — it performs only orders it
+was given and fails when a ticket is left in flight that nobody was told to
+perform — with two axes added because mutation testing showed their absence
+(cache pressure with a lease held; retirement while a transfer is outstanding),
+and an exact pin-balance invariant.
+
+It is now **800 combinations**, and it catches **nine of ten** deliberate
+mutations of the authority; the tenth is caught by its named regression. That
+number is in the task record, because "the sweep is strong" is a claim and the
+battery is the evidence. **The sweep complements the named tests; it does not
+replace them** — which is the honest version of what I claimed in round three.
 
 **Three narrowings, decided during implementation and reported rather than
 quietly dropped.** `Artifact::read_tensor_range` was **not** added: a canonical

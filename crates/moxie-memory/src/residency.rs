@@ -1513,6 +1513,13 @@ impl ResidencyAuthority {
             {
                 return fail(format!("{} names a source that is gone", p.chunk));
             }
+            // `Retiring` means "freed when the last holder lets go". With no
+            // holder left it is not retiring, it is stranded -- charged,
+            // unservable and unevictable. The checker accepted exactly this
+            // state while a review found a one-chunk cache held shut by it.
+            if p.state == ChunkState::Retiring && p.leases == 0 {
+                return fail(format!("{} is retiring with nothing holding it", p.chunk));
+            }
             if !self.caches.contains_key(&p.scope) {
                 return fail(format!("{} sits in a scope with no cache", p.chunk));
             }
@@ -1628,16 +1635,40 @@ impl ResidencyAuthority {
         // A lease **may** outlive its placement, and that is deliberate: a read
         // that fails discards its bytes whoever holds them, and the holders'
         // leases resolve to a typed error rather than to a range that never
-        // arrived. So a dangling lease is legal; what is not legal is a lease
-        // whose placement exists but disagrees with it.
-        for slot in &self.lease_slots {
-            if let Some(held) = slot.held
-                && let Some(p) = self.placements.get(&held.placement)
-                && p.leases == 0
-            {
+        // arrived. So a dangling lease is legal.
+        //
+        // What must balance exactly is the count. A placement's `leases` is the
+        // number of consumer leases naming it **plus** one internal pin for
+        // every ticket copying out of it -- document 02's "an upload owns or
+        // leases its source bytes through a completion event". Stating it as an
+        // identity rather than a bound is what catches a pin released twice or
+        // never released at all: a leaked pin makes a chunk permanently
+        // unevictable, which is invisible until a cache stops admitting.
+        for (key, p) in &self.placements {
+            let consumers = self
+                .lease_slots
+                .iter()
+                .filter_map(|s| s.held)
+                .filter(|h| h.placement == *key)
+                .count() as u32;
+            let ticket_pins = self
+                .tickets
+                .values()
+                .filter(|t| t.source == *key && t.source != t.placement)
+                .count() as u32;
+            // A withheld copy holds its source too. `SubmissionUnknown` takes
+            // the ticket away but the copy may still be reading, so the pin
+            // outlives it and `settle_quarantined` is what releases it (R07).
+            let quarantine_pins = self
+                .placements
+                .values()
+                .filter(|q| q.state == ChunkState::Quarantined && q.upload_source == Some(*key))
+                .count() as u32;
+            let pins = ticket_pins + quarantine_pins;
+            if p.leases != consumers + pins {
                 return fail(format!(
-                    "{} is held by a live lease but counts none",
-                    p.chunk
+                    "{} counts {} lease(s) against {consumers} consumer(s) and {pins} pin(s)",
+                    p.chunk, p.leases
                 ));
             }
         }
@@ -2918,7 +2949,16 @@ impl ResidencyAuthority {
                 return;
             };
             p.leases = p.leases.saturating_sub(1);
-            owns && p.state != ChunkState::HostReady && p.leases == 0
+            // Two reasons to free it now, and the second was missing. The
+            // source is dead because this ticket owned a read that never
+            // delivered -- or it was **retired** while this pin was the last
+            // thing holding it, in which case releasing the pin is what
+            // finishes the retirement. `unpin` already does that for a
+            // consumer's lease; an internal pin is no different, and leaving it
+            // out stranded a `Retiring` placement with zero leases: charged,
+            // unevictable and holding a one-chunk cache shut forever.
+            p.leases == 0
+                && (p.state == ChunkState::Retiring || (owns && p.state != ChunkState::HostReady))
         };
         if drop_it {
             self.drop_placement(source);

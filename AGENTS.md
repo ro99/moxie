@@ -5,7 +5,7 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 ## Active assignment
 
 **M1 complete (M1.5 closed 2026-09-12); M2 active, item 1 accepted, item 2
-implemented and corrected after three rounds of independent review.** See the
+implemented and corrected after four rounds of independent review.** See the
 [task 0020 handover](docs/handovers/2026-09-12-task0020-weight-residency-authority.md)
 for the current continuation, and the
 [closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
@@ -18,9 +18,9 @@ shared operations with FP64 oracles, the pinned BF16 boundaries that decide
 which experts a row selects, and two consumers carrying opposite routing
 parameters.
 
-**M2 item 2's residency authority is implemented and corrected after three
-rounds of independent review** — twenty findings, all reproduced, all fixed,
-none disputed
+**M2 item 2's residency authority is implemented and corrected after four
+rounds of independent review** — twenty-three findings, all reproduced, all
+fixed, none disputed
 ([task 0020](docs/tasks/0020-m2-weight-residency-authority.md), 2026-09-12):
 `moxie_memory::residency` is the **one** production weight-residency owner, with
 document 03's chunk identity, its lifecycle and failure transitions, coalescing,
@@ -42,13 +42,18 @@ never a declared member. Do not carry a standing failure count forward as
 background noise — that is how a real one gets missed — and do not widen that
 skip: a review hid a model crate under `crates/results/` from every rule.
 
-**A state machine's tests should enumerate its product, not sample it.** Twenty
-review findings against task 0020 shared one shape: a transition that was
-individually reasonable left the structure inconsistent in a combination nobody
-had written a test for. `ResidencyAuthority::check_invariants` states the
-invariants once and `residency_transitions.rs` sweeps 200 combinations calling it
-after every operation; the sweep found a defect three review rounds had missed.
-Apply the same method to M2 item 3's queues rather than rediscovering it. **Task 0021 is next**: M2 item 3's CPU expert fallback and GPU
+**A state machine's tests should enumerate its product, not sample it — and the
+sweep itself needs evidence.** Twenty-three review findings against task 0020
+shared one shape: a transition that was individually reasonable left the
+structure inconsistent in a combination nobody had written a test for.
+`ResidencyAuthority::check_invariants` states the invariants once and
+`residency_transitions.rs` sweeps 800 combinations calling it after every
+operation. Two things are required of such a sweep, both learned the hard way:
+its harness must perform **only** work the scheduler actually handed out — the
+first version completed work it discovered, and a mutation that discarded every
+promoted order passed all 200 combinations — and its strength must be
+**measured by mutation testing** rather than asserted. Apply both to M2 item 3's
+queues rather than rediscovering them. **Task 0021 is next**: M2 item 3's CPU expert fallback and GPU
 grouped candidate plans under one interface, specified in
 [the task 0020 handover](docs/handovers/2026-09-12-task0020-weight-residency-authority.md)
 and not yet authored.

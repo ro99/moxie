@@ -15,15 +15,29 @@
 //! [`ResidencyAuthority::check_invariants`] after **every** operation rather
 //! than asserting a hand-picked consequence at the end.
 //!
-//! What it proves is narrow and worth stating exactly: that no reachable
-//! sequence in this space leaves the authority structurally inconsistent, panics,
-//! or fails to drain. It does not prove the *policy* is right — the named tests
-//! in `residency.rs` do that, and they stay.
+//! **The harness is a faithful executor, and the first version was not.** A
+//! fourth review mutated `promote_ticket` to discard every order it produced and
+//! all 200 combinations still passed, while a named regression caught it in one.
+//! The reason: the harness discovered work through `ticket_of` and completed it
+//! directly, so it was testing whether the authority *can be poked* into a
+//! consistent state, not whether the scheduler ever hands out the work. A sweep
+//! that completes work the scheduler lost cannot make a claim about progress.
+//!
+//! So the harness now tracks only the orders it was actually given — from an
+//! acquire, from a completion's follow-ons, from `next_prefetch` — completes
+//! nothing else, and **fails when a ticket is left in flight that it never
+//! received an order for**. That is the property worth having: every outstanding
+//! transfer is one somebody was told to perform.
+//!
+//! What it proves is narrow and worth stating exactly: that across this space no
+//! sequence leaves the authority structurally inconsistent, panics, strands work
+//! the executor was never given, or fails to drain. It does not prove the
+//! *policy* is right — the named tests in `residency.rs` do that, and they stay.
 
 use moxie_memory::{
     AcquireRequest, Acquired, ArtifactId, CapacitySnapshot, ChunkId, Content, Ledger, LogicalRange,
-    Outcome, PendingWork, ResidencyAuthority, ResidencyLease, ResidencyRequest, TensorSlot,
-    TicketId, TurnId, Urgency, UseClass, WorkOrder,
+    Outcome, PendingWork, ResidencyAuthority, ResidencyLease, ResidencyRequest, TensorSlot, TurnId,
+    Urgency, UseClass, WorkOrder,
 };
 use moxie_types::{DeviceUuid, Error, Scope};
 
@@ -84,6 +98,16 @@ struct Case {
     joiner: Joiner,
     ending: Ending,
     hold_lease: bool,
+    /// A cache too small to hold a second chunk, so admitting one has to
+    /// displace something -- with a lease held over the first.
+    ///
+    /// Without this axis the sweep never ran eviction at all: a mutation that
+    /// made eviction ignore leases entirely survived all 200 combinations.
+    pressure: bool,
+    /// Retire the chunk once it is ready, so `Retiring` is entered and has to
+    /// finalise. A mutation that stopped retirement finalising on an internal
+    /// pin release survived until this axis existed.
+    retire: bool,
 }
 
 impl Case {
@@ -100,14 +124,19 @@ struct Harness {
     ledger: Ledger,
     case: Case,
     step: usize,
+    /// Exactly the orders the authority handed out, and the only work this
+    /// harness may perform.
+    orders: Vec<WorkOrder>,
 }
 
 impl Harness {
     fn open(case: Case) -> Self {
         let mut ledger = ledger();
+        // Under pressure the cache holds exactly one chunk.
+        let cap = if case.pressure { CHUNK } else { 8 * CHUNK };
         let authority = ResidencyAuthority::open(
             &mut ledger,
-            &ResidencyRequest::new("sweep", 8 * CHUNK).device(gpu(), 8 * CHUNK),
+            &ResidencyRequest::new("sweep", cap).device(gpu(), cap),
         )
         .unwrap();
         Harness {
@@ -115,6 +144,7 @@ impl Harness {
             ledger,
             case,
             step: 0,
+            orders: Vec::new(),
         }
     }
 
@@ -150,25 +180,31 @@ impl Harness {
         }
     }
 
-    /// Perform whatever the authority offered, filling reads, and return the
-    /// orders that came back. Never assumes a shape.
-    fn perform(&mut self, work: PendingWork) -> Vec<WorkOrder> {
-        let mut pending = match work {
-            PendingWork::Issued(order) => vec![order],
-            PendingWork::Coalesced | PendingWork::Queued => Vec::new(),
-        };
-        let mut done = Vec::new();
-        while let Some(order) = pending.pop() {
+    /// Record an order the authority handed out. **Only** these may be
+    /// performed; nothing is discovered.
+    fn receive(&mut self, work: PendingWork) {
+        if let PendingWork::Issued(order) = work {
+            self.orders.push(order);
+        }
+    }
+
+    /// Perform every order this harness has been given, and every follow-on
+    /// those completions release. Nothing else is touched.
+    fn perform_received(&mut self) {
+        while let Some(order) = self.orders.pop() {
             match &order {
                 WorkOrder::Read { ticket, .. } => {
+                    // An order whose ticket has since settled is not an error:
+                    // a cancellation can retire it before the executor gets to
+                    // it. It is simply no longer performable.
                     if self.authority.read_destination(*ticket).is_ok() {
                         self.authority.read_destination(*ticket).unwrap().fill(0xAB);
                         let released = self
                             .authority
                             .complete_read(*ticket, Outcome::Completed)
                             .unwrap();
-                        self.checked("complete a released read");
-                        pending.extend(released);
+                        self.checked("complete a received read");
+                        self.orders.extend(released);
                     }
                 }
                 WorkOrder::Upload { ticket, .. } => {
@@ -176,46 +212,26 @@ impl Harness {
                         self.authority
                             .complete_upload(*ticket, Outcome::Completed)
                             .unwrap();
-                        self.checked("complete a released upload");
+                        self.checked("complete a received upload");
                     }
                 }
             }
-            done.push(order);
         }
-        done
     }
 
-    /// Drain everything: prefetch queue, outstanding tickets, leases. The
-    /// authority must reach zero from any reachable state.
+    /// Release leases, then run the scheduler to exhaustion: everything it
+    /// offers is performed, and nothing it did not offer is.
     fn drain(&mut self, leases: Vec<ResidencyLease>) {
         for lease in leases {
             // A lease whose placement is gone is still a live lease.
             let _ = self.authority.release(lease);
             self.checked("release a lease");
         }
-
-        // Settle anything still in flight, whatever stage it is in.
-        for _ in 0..64 {
-            let tickets: Vec<TicketId> = self
-                .authority
-                .outstanding()
-                .iter()
-                .filter(|c| c.state.is_in_flight())
-                .filter_map(|c| self.authority.ticket_of(c.scope, &c.chunk))
-                .collect();
-            if tickets.is_empty() {
-                break;
-            }
-            for ticket in tickets {
-                if self.authority.read_destination(ticket).is_ok() {
-                    let _ = self.authority.complete_read(ticket, Outcome::Completed);
-                } else if self.authority.upload_source(ticket).is_ok() {
-                    let _ = self.authority.complete_upload(ticket, Outcome::Completed);
-                } else {
-                    break;
-                }
-                self.checked("drain a ticket");
-            }
+        self.perform_received();
+        while let Some(order) = self.authority.next_prefetch() {
+            self.orders.push(order);
+            self.perform_received();
+            self.checked("drain the prefetch queue");
         }
         // Anything withheld is settled explicitly, which is the only way out.
         for c in self.authority.outstanding() {
@@ -224,10 +240,29 @@ impl Harness {
                 self.checked("settle a quarantined placement");
             }
         }
-        while let Some(order) = self.authority.next_prefetch() {
-            self.perform(PendingWork::Issued(order));
-        }
-        self.checked("drain the prefetch queue");
+    }
+
+    /// The progress property the first harness could not state: after the
+    /// scheduler has been run to exhaustion, nothing may still be in flight.
+    ///
+    /// A placement left `Reading` or `Uploading` here is work the authority is
+    /// waiting on and never handed to anybody -- which is exactly what the
+    /// mutated `promote_ticket` produced, and what the old harness hid by
+    /// completing it anyway.
+    fn assert_no_stranded_work(&self) {
+        let stranded: Vec<String> = self
+            .authority
+            .outstanding()
+            .iter()
+            .filter(|c| c.state.is_in_flight() && c.state != moxie_memory::ChunkState::Quarantined)
+            .map(|c| format!("{} is {}", c.chunk, c.state.name()))
+            .collect();
+        assert!(
+            stranded.is_empty(),
+            "{:?} left work nobody was told to perform: {}",
+            self.case,
+            stranded.join(", ")
+        );
     }
 }
 
@@ -252,20 +287,30 @@ fn every_transition_combination_keeps_the_authority_consistent() {
                     Ending::Expire,
                 ] {
                     for hold_lease in [false, true] {
-                        run(Case {
-                            first,
-                            urgency,
-                            joiner,
-                            ending,
-                            hold_lease,
-                        });
-                        ran += 1;
+                        for pressure in [false, true] {
+                            for retire in [false, true] {
+                                run(Case {
+                                    first,
+                                    urgency,
+                                    joiner,
+                                    ending,
+                                    hold_lease,
+                                    pressure,
+                                    retire,
+                                });
+                                ran += 1;
+                            }
+                        }
                     }
                 }
             }
         }
     }
-    assert_eq!(ran, 2 * 2 * 5 * 5 * 2, "the sweep must cover the product");
+    assert_eq!(
+        ran,
+        2 * 2 * 5 * 5 * 2 * 2 * 2,
+        "the sweep must cover the product"
+    );
     println!("{ran} transition combinations, every step invariant-checked");
 }
 
@@ -275,26 +320,62 @@ fn run(case: Case) {
     let id = chunk(0);
     let mut leases = Vec::new();
 
+    // When this case retires, the chunk is warmed to `HostReady` first and its
+    // lease released. That is what lets a later device acquire pin a *settled*
+    // source, so retirement can happen while an upload -- not a consumer --
+    // holds the last thing keeping the placement alive. Retiring only after
+    // everything had completed never reached that, and a mutation that stopped
+    // retirement finalising on an internal pin release survived because of it.
+    if case.retire {
+        let warm = h
+            .authority
+            .acquire(h.request(&id, Scope::Host, Urgency::Demand, 0, 1_000));
+        h.checked("warm acquire");
+        match warm {
+            Ok(Acquired::Pending { lease, work, .. }) => {
+                h.receive(work);
+                h.perform_received();
+                h.checked("warm read");
+                h.authority.release(lease).unwrap();
+                h.checked("release the warm lease");
+            }
+            Ok(Acquired::Ready(lease)) => {
+                h.authority.release(lease).unwrap();
+                h.checked("release the warm lease");
+            }
+            Err(_) => {}
+        }
+    }
+
     // The first acquire.
     let first = h
         .authority
         .acquire(h.request(&id, Case::scope(case.first), case.urgency, 0, 100));
     h.checked("first acquire");
-    let Ok(Acquired::Pending {
-        lease,
-        ticket,
-        work,
-        ..
-    }) = first
-    else {
-        // A refusal is a legal outcome; nothing is outstanding, so the case is
-        // finished and must still drain to nothing.
-        h.drain(leases);
-        h.authority.close(&mut h.ledger).unwrap();
-        assert_eq!(h.ledger.scope_committed(Scope::Host), 0);
-        return;
+    let (lease, ticket, work) = match first {
+        Ok(Acquired::Pending {
+            lease,
+            ticket,
+            work,
+            ..
+        }) => (lease, ticket, work),
+        // A hit -- the warm preamble already made it resident -- and a refusal
+        // are both legal outcomes with nothing outstanding. The case is over,
+        // and it must still drain to nothing.
+        other => {
+            if let Ok(Acquired::Ready(lease)) = other {
+                leases.push(lease);
+            }
+            h.drain(leases);
+            h.assert_no_stranded_work();
+            h.authority.close(&mut h.ledger).unwrap();
+            assert_eq!(h.ledger.scope_committed(Scope::Host), 0);
+            return;
+        }
     };
     leases.push(lease);
+
+    h.receive(work);
 
     // The joiner, if this case has one.
     if case.joiner != Joiner::None {
@@ -309,34 +390,61 @@ fn run(case: Case) {
         h.checked("joining acquire");
         if let Ok(Acquired::Pending { lease, work, .. }) = joined {
             leases.push(lease);
-            h.perform(work);
-            h.checked("perform the joiner's work");
+            h.receive(work);
         } else if let Ok(Acquired::Ready(lease)) = joined {
             leases.push(lease);
         }
     }
 
     // The first acquire's ending.
+    // Retirement, if this case has it, happens **while a transfer is still
+    // outstanding**: stop serving the chunk and let its last holder free it.
+    // Whatever that holder is -- a consumer's lease or an upload's internal pin
+    // -- releasing it must finish the job, or the placement is stranded:
+    // charged, unservable and unevictable.
+    if case.retire {
+        let _ = h.authority.retire(Scope::Host, &id);
+        h.checked("retire the host chunk");
+        let _ = h.authority.retire(Scope::Device(gpu()), &id);
+        h.checked("retire the device chunk");
+    }
+
+    // Give the scheduler a chance to release queued work while both the first
+    // acquire and its joiner are still outstanding. This is where a dependency
+    // ordering error shows: the entry with the earliest deadline may be the one
+    // waiting on another's read.
+    while let Some(order) = h.authority.next_prefetch() {
+        h.orders.push(order);
+        h.perform_received();
+        h.checked("early prefetch release");
+    }
+
+    // Every ending must actually happen. A branch that silently did nothing --
+    // because an earlier step had already settled the ticket -- would make the
+    // case a duplicate of `Completed` while claiming to test a failure path.
+    let ending_applied;
     match case.ending {
         Ending::Completed => {
-            h.perform(work);
+            h.perform_received();
             h.checked("complete");
+            ending_applied = true;
         }
         Ending::Failed => {
+            let injected = Error::InvalidArtifact {
+                detail: "injected".into(),
+            };
             if h.authority.read_destination(ticket).is_ok() {
-                let _ = h.authority.complete_read(
-                    ticket,
-                    Outcome::Failed(Error::InvalidArtifact {
-                        detail: "injected".into(),
-                    }),
-                );
+                h.authority
+                    .complete_read(ticket, Outcome::Failed(injected))
+                    .unwrap();
+                ending_applied = true;
             } else if h.authority.upload_source(ticket).is_ok() {
-                let _ = h.authority.complete_upload(
-                    ticket,
-                    Outcome::Failed(Error::InvalidArtifact {
-                        detail: "injected".into(),
-                    }),
-                );
+                h.authority
+                    .complete_upload(ticket, Outcome::Failed(injected))
+                    .unwrap();
+                ending_applied = true;
+            } else {
+                ending_applied = false;
             }
             h.checked("fail");
         }
@@ -346,13 +454,17 @@ fn run(case: Case) {
                 detail: "unknown".into(),
             };
             if h.authority.read_destination(ticket).is_ok() {
-                let _ = h
-                    .authority
-                    .complete_read(ticket, Outcome::SubmissionUnknown(lost));
+                h.authority
+                    .complete_read(ticket, Outcome::SubmissionUnknown(lost))
+                    .unwrap();
+                ending_applied = true;
             } else if h.authority.upload_source(ticket).is_ok() {
-                let _ = h
-                    .authority
-                    .complete_upload(ticket, Outcome::SubmissionUnknown(lost));
+                h.authority
+                    .complete_upload(ticket, Outcome::SubmissionUnknown(lost))
+                    .unwrap();
+                ending_applied = true;
+            } else {
+                ending_applied = false;
             }
             h.checked("submission unknown");
         }
@@ -361,19 +473,36 @@ fn run(case: Case) {
             h.checked("cancel");
             h.authority.cancel(ticket).unwrap();
             h.checked("cancel again");
-            h.perform(work);
+            h.perform_received();
             h.checked("complete after cancellation");
+            ending_applied = true;
         }
         Ending::Expire => {
-            h.authority.expire(1_000);
+            let expired = h.authority.expire(1_000);
             h.checked("expire");
+            ending_applied = !expired.is_empty();
         }
+    }
+
+    // A case whose ending did nothing is a duplicate of `Completed` wearing
+    // another name. The three that can legitimately find nothing to act on are
+    // the ones whose first acquire was a queued prediction with no order yet,
+    // or whose joiner already settled the ticket; every other combination must
+    // actually exercise its ending.
+    if !ending_applied {
+        let excusable = case.urgency == Urgency::Prefetch
+            || matches!(
+                case.joiner,
+                Joiner::HostDemand | Joiner::DeviceDemand | Joiner::HostPrefetch
+            );
+        assert!(excusable, "{:?} claimed an ending it never applied", case);
     }
 
     // Anything the authority still offers, and then a second acquire of the
     // same chunk -- the operation that panicked in two separate review rounds.
     while let Some(order) = h.authority.next_prefetch() {
-        h.perform(PendingWork::Issued(order));
+        h.orders.push(order);
+        h.perform_received();
         h.checked("released prefetch");
     }
     let again =
@@ -384,10 +513,50 @@ fn run(case: Case) {
         Ok(Acquired::Ready(lease)) => leases.push(lease),
         Ok(Acquired::Pending { lease, work, .. }) => {
             leases.push(lease);
-            h.perform(work);
+            h.receive(work);
+            h.perform_received();
             h.checked("perform the re-acquire's work");
         }
         Err(_) => {}
+    }
+
+    // Cache pressure, with a lease still held. Admitting a second chunk into a
+    // one-chunk cache must displace something -- and it may not displace what a
+    // consumer is holding. That is a *functional* property no structural
+    // invariant can see, so it is asserted directly: whatever a live lease
+    // could read before the pressure, it can still read after.
+    if case.pressure {
+        let readable: Vec<(usize, Vec<u8>)> = leases
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| h.authority.chunk_bytes(l).ok().map(|b| (i, b.to_vec())))
+            .collect();
+        let other = chunk(1);
+        let squeeze =
+            h.authority
+                .acquire(h.request(&other, Scope::Host, Urgency::Demand, 3, 1_000));
+        h.checked("acquire under pressure");
+        if let Ok(Acquired::Pending { lease, work, .. }) = squeeze {
+            leases.push(lease);
+            h.receive(work);
+            h.perform_received();
+            h.checked("perform under pressure");
+        } else if let Ok(Acquired::Ready(lease)) = squeeze {
+            leases.push(lease);
+        }
+        for (i, before) in readable {
+            let after = h.authority.chunk_bytes(&leases[i]).unwrap_or_else(|e| {
+                panic!("{:?} lost a held chunk to eviction: {e}", case);
+            });
+            // A retired chunk still serves the leases it already had, which is
+            // the whole point of `Retiring`; eviction must not take it either.
+            assert_eq!(
+                after,
+                &before[..],
+                "{:?} served a held chunk different bytes after eviction",
+                case
+            );
+        }
     }
 
     if !case.hold_lease {
@@ -402,16 +571,9 @@ fn run(case: Case) {
     let held = std::mem::take(&mut leases);
     h.drain(held);
 
-    // Everything must come back.
-    for c in h.authority.outstanding() {
-        assert!(
-            !c.state.is_in_flight() || c.state == moxie_memory::ChunkState::Quarantined,
-            "{:?} left {} {}",
-            case,
-            c.chunk,
-            c.state.name()
-        );
-    }
+    // Everything must come back, and nothing may be left waiting on a transfer
+    // that was never handed out.
+    h.assert_no_stranded_work();
     assert_eq!(
         h.authority.live_lease_count(),
         0,

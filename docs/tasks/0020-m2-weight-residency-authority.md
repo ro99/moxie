@@ -1,12 +1,13 @@
 # Task 0020 — M2 weight-residency authority
 
-Status: **implemented and corrected after three rounds of independent review;
+Status: **implemented and corrected after four rounds of independent review;
 awaiting owner acceptance.** Contract written and committed at `d6e9170` before
-implementation, per the working rule that produced tasks 0013–0019. The three
-rounds found **twenty** issues in total; all twenty were reproduced and fixed,
-and none was disputed. The third round's closing note was about method rather
-than defects, and it is answered by
-[an exhaustive transition sweep](#the-answer-to-the-pattern). See
+implementation, per the working rule that produced tasks 0013–0019. The four
+rounds found **twenty-three** issues in total; all twenty-three were reproduced
+and fixed, and none was disputed. Two of the rounds criticised method rather
+than code, and the second of those showed by mutation testing that the sweep
+built to answer the first did not establish its claim. See
+[the sweep and what it is worth](#the-sweep-and-what-it-is-worth). Also see
 [Result](#result-filled-after-work),
 [Independent review](#independent-review-and-what-it-changed),
 [Second independent review](#second-independent-review) and
@@ -761,6 +762,68 @@ What the sweep proves is narrow and worth stating exactly: no reachable sequence
 in that space leaves the authority structurally inconsistent, panics, or fails to
 drain. It does **not** prove the policy is right — the named tests do that, and
 they stay.
+
+### Fourth independent review
+
+**Three findings; all reproduced, none disputed.** Probes at
+`results/task0020/independent-review-2026-09-12-round4/`.
+
+| # | Finding | Reproduced as | Fix |
+|---|---|---|---|
+| 1 | **Releasing an upload's last source pin did not finish retirement.** Retire a host chunk while an upload holds the last pin, then complete the upload | the placement stayed `Retiring` with **zero leases** — charged, unservable, unevictable, holding a one-chunk cache shut. **`check_invariants` passed throughout** | `settle_source` finalises retirement exactly as `unpin` does; an internal pin is no different from a consumer's. And the checker now rejects `Retiring` with no holder, because that state is not retiring, it is stranded |
+| 2 | **Arch-check still skipped production code.** Membership was tested against literal `workspace.members` strings | a forbidden second `ExpertCache` in `results/storage`, reached through an allowed `moxie-executor → moxie-storage` **path dependency**, produced **zero violations**; `./results/model` was skipped because its first segment is `"."` | Exclusion is now by **reachability**: normalized member paths, globs expanded, and a transitive walk of production path dependencies. A manifest in root scratch is skipped only when nothing the workspace builds refers to it |
+| 3 | **The sweep could conceal stranded work**, so it did not establish its drain claim | mutating `promote_ticket` to discard every order it produced: **all 200 combinations passed**, while a named regression caught it | The harness is now a faithful executor — see below |
+
+### The sweep and what it is worth
+
+Finding 3 is the one that matters, and it was aimed at the thing I built in
+round three and described as the answer to the pattern. It was not, and the
+demonstration was a mutation test: discard every promoted work order and the
+sweep still passed, because the harness discovered work through `ticket_of` and
+completed it directly. It was testing whether the authority *can be poked* into
+a consistent state, not whether the scheduler ever hands the work out.
+
+What changed:
+
+- The harness now tracks **only the orders it was actually given** — from an
+  acquire, from a completion's follow-ons, from `next_prefetch` — performs
+  nothing else, and **fails when a ticket is left in flight that it never
+  received an order for**.
+- Every ending must demonstrably apply; a branch that silently did nothing was a
+  duplicate of `Completed` wearing another name.
+- Two axes were added because mutation testing showed their absence: **cache
+  pressure** with a lease held (eviction never ran at all before — a mutation
+  making eviction ignore leases survived), and **retirement while a transfer is
+  outstanding**, with the chunk warmed to `HostReady` first so an upload's pin
+  can be the last holder.
+- `check_invariants` gained an **exact pin balance**: a placement's lease count
+  equals its consumer leases plus one pin per ticket copying out of it plus one
+  per quarantined placement withholding it. Stated as an identity rather than a
+  bound, it catches a pin released twice or never released — a leaked pin makes
+  a chunk permanently unevictable and is invisible until a cache stops admitting.
+
+**800 combinations**, every step checked. And rather than assert that it is
+strong, here is what it measures against a battery of ten deliberate mutations
+of the authority:
+
+| Mutation | Caught by the sweep |
+|---|---|
+| Promoted work order discarded | yes |
+| Source pin never released | yes |
+| Source pin released twice | yes |
+| Demand counter never decremented | yes |
+| Cancelled read keeps a held placement | yes |
+| Eviction ignores leases | yes |
+| Retirement never finalises | yes |
+| `unpin` skips retiring finalisation | yes |
+| Failed read spares its source | yes |
+| `next_prefetch` ignores dependencies | **no** — caught by its named regression instead |
+
+Nine of ten, with the tenth covered by
+`the_prefetch_queue_issues_a_dependency_before_the_ticket_waiting_on_it`. That
+last one is worth keeping visible: the sweep is a complement to the named tests,
+not a replacement, and saying so is the honest version of the claim I made in
+round three.
 
 ### What was **not** delivered, and why
 
