@@ -1,7 +1,10 @@
 # Task 0021 — M2 expert execution plans: one interface over a CPU and a GPU candidate
 
-Status: **implemented and corrected after four rounds of independent review;
-awaiting a further review and owner acceptance.** The contract above was written
+Status: **accepted by the owner on 2026-09-13**, after four rounds of
+independent review. **The acceptance closes this task only. It does not close
+M2**, which is the owner's separate decision, and it establishes **no
+model-quality claim**: the activations are synthetic and the route is written by
+the test. The contract above was written
 and committed at `cdda4f4` before any implementation, per the working rule that
 produced tasks 0013–0020. The four rounds found **twenty-one** issues — fourteen
 P1 and seven P2 — and **all twenty-one were reproduced and fixed; none was

@@ -4,12 +4,25 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 
 ## Active assignment
 
-**M1 complete (M1.5 closed 2026-09-12); M2 active, items 1, 2 and 5 accepted and
-items 3 and 4 awaiting acceptance.** See the
+**M1 complete (M1.5 closed 2026-09-12); M2's five items are all accepted — items
+1 and 2 on 2026-09-12, items 3, 4 and 5 on 2026-09-13 — and the owner authorized
+M3 on 2026-09-13. M3 is the milestone the next task comes from.** M2's formal
+closure statement is still the owner's to make and is not claimed here. See the
 [task 0023 handover](docs/handovers/2026-09-13-task0023-whole-working-set-trace.md)
 for the current continuation, and the
 [closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
 M1's exit evidence gate by gate.
+
+**M3 — canonical INT4/INT8/BF16 with quality separation — is authorized (owner,
+2026-09-13)**, and both of its owner gates are already answered, which bounds the
+work rather than opening it. **O2** is repack-only for v1 (ADR 0018): a lossless
+claim needs source-oracle evidence and **Moxie never quantizes**. **O5** is
+user-managed storage and conversion (ADR 0020): Moxie reads the canonical file,
+repacking is an external script the user runs, and **no agent-initiated bulk
+download, copy or conversion may start** without a task naming artifact,
+revision, expected size and retention. `/models` and `/fast/models` remain
+read-only inputs to an agent. The roadmap's M3 items are in
+[06-implementation-roadmap.md](docs/spec/06-implementation-roadmap.md).
 
 **M2 item 1's routed-expert mathematics is accepted**
 ([task 0019](docs/tasks/0019-m2-routed-expert-semantics.md), 2026-09-12, after
@@ -67,9 +80,10 @@ Three claims about task 0020's test strength were wrong in the same way: the
 property was asserted rather than measured. The sweep prints what it exercised,
 and an equivalent mutant is reported as such instead of being counted as a gap.
 
-**M2 item 3 is implemented, corrected after four rounds of independent review,
-and awaits acceptance**
-([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), 2026-09-12; the four
+**M2 item 3 is accepted by the owner on 2026-09-13**, after four rounds of
+independent review
+([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), implemented
+2026-09-12; the four
 rounds found **twenty-one** issues, fourteen P1, all reproduced and fixed, none
 disputed): CPU
 expert fallback and GPU grouped candidate plans under one interface, with an
@@ -178,11 +192,12 @@ this sweep's advertised axes unreachable. **Three separate coverage claims in on
 task were softer than they looked, and every one was found by asking what a
 mutation would survive rather than by reading the test.**
 
-**M2 item 4 is implemented, corrected after two rounds of independent review,
-and awaits acceptance**
+**M2 item 4 is accepted by the owner on 2026-09-13**, after three rounds of
+independent review
 ([task 0022](docs/tasks/0022-m2-laguna-metadata-and-second-consumer.md),
-2026-09-13; three rounds found **eight** issues, two P1, all reproduced and
-fixed, none disputed, and the third recommended acceptance with no new blocking
+implemented 2026-09-13; three rounds found **eight** issues, two P1, all
+reproduced and fixed, none disputed, and the third recommended acceptance with
+no new blocking
 findings): Laguna's metadata and its **routed block**, a second routed
 consumer driven through task 0021's interface, and a restricted budget expressed
 as a **ratio** of what the route demands rather than a constant. A routed layer

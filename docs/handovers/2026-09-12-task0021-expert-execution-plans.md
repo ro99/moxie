@@ -1,6 +1,7 @@
 # Handover — task 0021 implemented; task 0022 is M2 item 4
 
-**Task 0021 is implemented and awaits independent review and owner acceptance.**
+**Task 0021 was accepted by the owner on 2026-09-13**, after four rounds of
+independent review. The acceptance closes task 0021 only, not M2.
 It delivers roadmap **M2 item 3** — "CPU expert fallback and GPU grouped
 candidate plans under one interface, with bounded queues and NUMA-aware host
 placement" — and nothing beyond it. **It does not close M2.**

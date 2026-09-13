@@ -2,7 +2,14 @@
 
 ## Current assignment and milestone handoff
 
-**M1 complete (M1.5 closed 2026-09-12); M2 active.** See
+**M1 complete (M1.5 closed 2026-09-12); M2's five items are all accepted — items
+1 and 2 on 2026-09-12, items 3, 4 and 5 on 2026-09-13 — and the owner authorized
+M3 on 2026-09-13, so the next contract is an M3 contract.** M2's formal closure
+statement is still the owner's to make and is not claimed here. M3's own gates
+are already ruled on: O2 repack-only (ADR 0018) and O5 user-managed storage and
+conversion (ADR 0020), so no bulk download, copy or conversion may be started by
+an agent without a task naming artifact, revision, expected size and retention.
+See
 [the closure handover](../handovers/2026-09-12-m1-closure-to-m2.md) for M1's
 exit evidence gate by gate, and
 [the owner-gate register](../decisions/owner-gates.md) for the partial O1 ruling
@@ -43,8 +50,10 @@ against an independent read. **Reading is not executing**: nothing computes with
 those bytes and no checkpoint runs. **It does not close M2**, which also needs
 items 3–5 and a real working set that executes.
 
-**[Task 0021](0021-m2-expert-execution-plans.md) is implemented and awaiting
-independent review and owner acceptance**, 2026-09-12. It is M2 item 3: CPU
+**[Task 0021](0021-m2-expert-execution-plans.md) is accepted by the owner on
+2026-09-13**, after four rounds of independent review — twenty-one findings,
+fourteen P1, all reproduced and fixed, none disputed. It was implemented on
+2026-09-12. **The acceptance closes task 0021 only, not M2.** It is M2 item 3: CPU
 expert fallback and GPU grouped candidate plans under one interface, with an
 admitted envelope, a bounded queue that refuses rather than waits, NUMA-placed
 host buffers whose pages are **read back** rather than asserted, and a reduction
@@ -58,9 +67,9 @@ writes**. **That is not model support and no quality claim follows.** **It does
 not close M2**, which also needs item 4 and byte/cost traces reconciled with the
 ledger across a whole working set.
 
-**[Task 0022](0022-m2-laguna-metadata-and-second-consumer.md) is implemented,
-corrected after three rounds of independent review, and awaiting owner
-acceptance**, 2026-09-13. The third round recommended acceptance with no new
+**[Task 0022](0022-m2-laguna-metadata-and-second-consumer.md) is accepted by the
+owner on 2026-09-13**, after three rounds of independent review; it was
+implemented the same day. **The acceptance closes task 0022 only, not M2.** The third round recommended acceptance with no new
 blocking findings, within this task's documented routed-block scope. The rounds found **eight** issues, two
 P1, all reproduced and fixed, none disputed — the second round's P1 was
 introduced by the first round's own fix, asking its question of the rest of the
@@ -93,6 +102,23 @@ the artifact does not ship, and the locally installed copy is 5.5.3 against the
 artifact's declared 5.14.1. Both are named gap tasks. The deliverable is the
 **routed block**, which is composable in full from pinned sources, and which is
 what M2's exit gate needs.
+
+**[Task 0023](0023-m2-whole-working-set-trace.md) is accepted by the owner on
+2026-09-13**, at `ad69a0a`, after three rounds of independent review — ten
+findings, four P1, all reproduced and fixed, none disputed; the third reported no
+new blocking findings and recommended acceptance "within its declared M2
+engineering scope". Its contract was authored and committed at `840b0e3` before
+implementation. It is M2 item 5's remainder and M2's exit clause on traces:
+**byte and cost traces reconciled with the resource ledger across a whole
+working set**, not one layer — a step trace whose layers are reconciled as
+**seventeen named equalities** across the planner's prediction, the residency
+authority's accounting and the ledger's charges, each with a violating fixture,
+and every discrepancy constructible without allocating. All 30 routed layers of
+`/fast/models/google/gemma-4-26B-A4B-it` ran on each of the three GPUs over
+**synthetic activations and routes the test writes**, one route constructed so
+its union is the whole expert set. **The acceptance closes task 0023 only, not
+M2**, which is the owner's separate decision, and **no model-quality claim
+follows** (**O2**).
 
 Reopen accepted tasks only for a demonstrated defect in accepted scope.
 

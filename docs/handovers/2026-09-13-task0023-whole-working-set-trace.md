@@ -304,11 +304,22 @@ find. The sweep found it; reading the rule did not.
 
 ## Next task
 
-**Not yet authored.** M2 items 3 and 4 (tasks 0021 and 0022) are implemented,
-reviewed and still awaiting owner acceptance; M2's closure is the owner's
-separate decision and nothing here claims it. The obvious candidates, in the roadmap's own
-order, are M3's importer for Laguna's asymmetric INT4 at group 32 with zero
-points packed along the output axis — Laguna is number 8 of the v1 catalogue the
-owner pinned on 2026-09-13 — and the two named gap tasks its attention tower
-needs, `softplus` output gating and the yarn rotary ramp, neither of which may be
-guessed.
+**Not yet authored, and it comes from M3.** All five M2 items are accepted —
+items 1 and 2 on 2026-09-12, items 3, 4 and 5 (tasks 0021, 0022 and this one) on
+2026-09-13 — and **the owner authorized M3 on 2026-09-13**. M2's formal closure
+statement remains the owner's to make; nothing here claims it, and the
+authorization to proceed is recorded as what it is.
+
+The candidates, in the roadmap's own order, are M3 item 2's importer for
+Laguna's asymmetric INT4 at group 32 with zero points packed along the output
+axis — Laguna is number 8 of the v1 catalogue the owner pinned on 2026-09-13 —
+and the two named gap tasks its attention tower needs, `softplus` output gating
+and the yarn rotary ramp, neither of which may be guessed.
+
+**M3's two owner gates are already answered, and they bound the work rather than
+open it.** O2 is repack-only for v1 (ADR 0018): a lossless-repack claim needs
+source-oracle evidence and Moxie never quantizes. O5 is user-managed storage and
+conversion (ADR 0020): Moxie reads the canonical file, repacking is an external
+script the user runs, and **no agent-initiated bulk download, copy or conversion
+may start** without a task naming artifact, revision, expected size and
+retention. `/models` and `/fast/models` stay read-only inputs to an agent.

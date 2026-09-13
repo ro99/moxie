@@ -1,6 +1,9 @@
 # Task 0022 — M2 item 4: Laguna metadata, a second routed consumer, and a budget smaller than its weights
 
-Status: proposed.
+Status: **accepted by the owner on 2026-09-13** — see
+[Result](#result-filled-after-work). The contract sections that follow are as
+authored: they were written and committed at `78c493d` before any
+implementation, and are left unedited.
 
 Roadmap **M2 item 4**, in full: "Add Laguna model metadata/graph only. Add a
 second synthetic MoE consumer with different expert count, activation, top-k,
@@ -470,9 +473,12 @@ Any of 3, 4, 5 is a failed task rather than a smaller one.
 
 ## Result, filled after work
 
-Status: **implemented, 2026-09-13; corrected after three rounds of independent
-review, the third of which recommended acceptance with no new blocking
-findings; awaiting owner acceptance.** It does not close M2.
+Status: **accepted by the owner on 2026-09-13**, after three rounds of
+independent review, the third of which recommended acceptance with no new
+blocking findings. **The acceptance closes this task only. It does not close
+M2**, which is the owner's separate decision, and it is **no Laguna support
+claim**: these are weight-shaped bytes at a declared shape, not Laguna's
+weights.
 
 ### Changed shared owners and consumers
 

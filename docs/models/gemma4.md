@@ -484,9 +484,9 @@ about its output.
   `Route`, `ExpertMlp` and `Combine`. What made it possible is
   `Shard::read_tensor_range`: the experts are fused, so serving one through the
   whole-tensor reader would have read 1,522,532,352 B to use 11,894,784.
-- **CPU expert fallback and grouped GPU candidate plans: implemented**
-  ([task 0021](../tasks/0021-m2-expert-execution-plans.md), 2026-09-12, awaiting
-  review and acceptance). **One layer's routed expert block of this artifact has
+- **CPU expert fallback and grouped GPU candidate plans: accepted**
+  ([task 0021](../tasks/0021-m2-expert-execution-plans.md), implemented
+  2026-09-12, accepted by the owner 2026-09-13). **One layer's routed expert block of this artifact has
   now been executed.** Layer 0, two rows of top-k 8 selecting ten distinct
   experts, **118,947,840 B** demand-loaded through the residency authority into
   a device cache holding **two** of them — 28 evictions, 8 backpressure drains —
