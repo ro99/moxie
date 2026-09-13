@@ -315,7 +315,7 @@ fn every_device_reproduces_the_oracle_bit_for_bit_for_both_gate_transforms() {
                 .unwrap_or_else(|e| panic!("device {ordinal}: {e}"));
             let reservation = run.detach_reservation().unwrap();
             let mut experts = DeviceExperts::attach(
-                &ledger,
+                &mut ledger,
                 reservation,
                 &ctx,
                 run.plan(),
@@ -454,7 +454,7 @@ fn a_mixed_plan_reduces_cpu_and_gpu_slots_in_one_declared_order() {
     let mut run = GroupedRun::admit(&mut ledger, plan, roles(), None).unwrap();
     let reservation = run.detach_reservation().unwrap();
     let mut experts = DeviceExperts::attach(
-        &ledger,
+        &mut ledger,
         reservation,
         &ctx,
         run.plan(),
@@ -568,7 +568,7 @@ fn a_device_cache_smaller_than_the_working_set_executes_under_backpressure() {
     let mut run = GroupedRun::admit(&mut ledger, plan, roles(), None).unwrap();
     let reservation = run.detach_reservation().unwrap();
     let mut experts = DeviceExperts::attach(
-        &ledger,
+        &mut ledger,
         reservation,
         &ctx,
         run.plan(),
@@ -616,4 +616,116 @@ fn a_device_cache_smaller_than_the_working_set_executes_under_backpressure() {
     residency.close(&mut authority).unwrap();
     authority.close(&mut ledger).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The attachment's failure paths give the envelope back.
+///
+/// Two of them, because they are different: a plan with no selected kernel
+/// fails **before** an arena takes the reservation and hands it straight back,
+/// while a bad image fails **after**, with ranges already allocated — the arena
+/// must then release every one of them and close, or the charge and the device
+/// memory are both stranded behind a tidy-looking error return.
+#[test]
+fn a_refused_attachment_leaves_nothing_charged() {
+    let _serial = one_at_a_time();
+    let count = moxie_cuda::device_count().unwrap();
+    assert!(count > 0, "the device lane requires real hardware");
+    let ordinal = 0;
+    let ctx = RankContext::acquire(RankId(ordinal), ordinal).unwrap();
+    let scope = Scope::Device(ctx.uuid());
+    let catalogue = moxie_kernels::expert_mlp_catalogue();
+
+    let budget = ExpertBudget {
+        device: ctx.uuid(),
+        device_pci_bus_id: ctx.capability().pci_bus_id.clone(),
+        device_cache_cap_bytes: 8 * CHUNK,
+        device_cache_leased_bytes: 0,
+        device_arena_free_bytes: 16 * MIB,
+        host_workspace_bytes: MIB,
+        host_buffer_bytes: MIB,
+        resident_experts: Vec::new(),
+    };
+    let device_policy = ExpertPolicy {
+        device: StrategyControl::Required,
+        host: StrategyControl::Auto,
+        host_placement: StrategyControl::Off,
+        ..ExpertPolicy::default()
+    };
+
+    // After the arena: the ranges are allocated and the image is refused.
+    {
+        let mut ledger = Ledger::new([
+            CapacitySnapshot::new(Scope::Host, 64 * MIB, MIB).unwrap(),
+            CapacitySnapshot::new(scope, 64 * MIB, MIB).unwrap(),
+        ])
+        .unwrap();
+        let plan = compile_experts(
+            &mlp(ExpertActivation::GeGlu),
+            &combine(),
+            &route(),
+            &budget,
+            &device_policy,
+            None,
+            Some(ExpertKernels {
+                capability: ctx.capability(),
+                catalogue: &catalogue,
+            }),
+        )
+        .unwrap();
+        let mut run = GroupedRun::admit(&mut ledger, plan, roles(), None).unwrap();
+        let reservation = run.detach_reservation().unwrap();
+        assert!(ledger.scope_committed(scope) > 0);
+        const NOT_AN_IMAGE: &[u8] = &[0u8; 64];
+        let refused =
+            DeviceExperts::attach(&mut ledger, reservation, &ctx, run.plan(), NOT_AN_IMAGE)
+                .expect_err("64 zero bytes are not a fatbin");
+        assert!(refused.reservation.is_none(), "the arena owned it");
+        run.close(&mut ledger).unwrap();
+        assert!(
+            ledger.outstanding().is_empty(),
+            "a refused attachment left {:?} charged",
+            ledger.outstanding()
+        );
+    }
+
+    // Before the arena: a host-only plan selects no device kernel.
+    {
+        let mut ledger = Ledger::new([
+            CapacitySnapshot::new(Scope::Host, 64 * MIB, MIB).unwrap(),
+            CapacitySnapshot::new(scope, 64 * MIB, MIB).unwrap(),
+        ])
+        .unwrap();
+        let plan = compile_experts(
+            &mlp(ExpertActivation::GeGlu),
+            &combine(),
+            &route(),
+            &budget,
+            &ExpertPolicy {
+                device: StrategyControl::Off,
+                host: StrategyControl::Auto,
+                host_placement: StrategyControl::Off,
+                ..ExpertPolicy::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(plan.kernel().is_none());
+        let mut run = GroupedRun::admit(&mut ledger, plan, roles(), None).unwrap();
+        let reservation = run.detach_reservation().unwrap();
+        let refused = DeviceExperts::attach(
+            &mut ledger,
+            reservation,
+            &ctx,
+            run.plan(),
+            moxie_kernels::EXPERT_MLP_FATBIN,
+        )
+        .expect_err("a host-only plan has no device kernel");
+        let reservation = refused
+            .reservation
+            .expect("the reservation comes back when no arena took it");
+        ledger.release(reservation).unwrap();
+        run.close(&mut ledger).unwrap();
+        assert!(ledger.outstanding().is_empty());
+    }
 }

@@ -293,7 +293,7 @@ fn a_real_layers_experts_execute_on_the_gpu_and_agree_with_the_cpu_candidate() {
     let mut run = GroupedRun::admit(&mut ledger, plan, roles(), None).unwrap();
     let reservation = run.detach_reservation().unwrap();
     let mut experts = DeviceExperts::attach(
-        &ledger,
+        &mut ledger,
         reservation,
         &ctx,
         run.plan(),

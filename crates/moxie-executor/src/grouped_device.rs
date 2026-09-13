@@ -110,7 +110,7 @@ impl<'ctx> DeviceExperts<'ctx> {
     /// as a reservation" impossible to write, and splitting the ownership would
     /// undo it.
     pub fn attach(
-        ledger: &Ledger,
+        ledger: &mut Ledger,
         reservation: Reservation,
         ctx: &'ctx RankContext,
         plan: &ExpertPlan,
@@ -172,24 +172,38 @@ impl<'ctx> DeviceExperts<'ctx> {
             Err(refused) => return Err(fail(refused.reservation, refused.error)),
         };
 
-        // Allocate in region order, which is the order the arena partitioned.
-        let take = |arena: &mut DeviceArena<'ctx>, bytes: u64, owner: &str| {
-            arena
-                .allocate(align_up(bytes)?, ALIGNMENT, owner.to_string())
-                .map_err(|refused| refused.error)
-        };
-        let ranges = (|| -> Result<_> {
-            let activations = take(&mut arena, extents.activations, "expert activations")?;
-            let slots = take(&mut arena, extents.slots, "expert slots")?;
-            let workspace = take(&mut arena, extents.workspace, "expert workspace")?;
-            let row_index = take(&mut arena, extents.indices, "expert row index")?;
-            let slot_index = take(&mut arena, extents.indices, "expert slot index")?;
-            Ok((activations, slots, workspace, row_index, slot_index))
-        })();
-        let (activations, slots, workspace, row_index, slot_index) = match ranges {
-            Ok(ranges) => ranges,
-            Err(error) => return Err(close_and_fail(arena, ledger, error)),
-        };
+        // Everything below can fail, and every failure has to give the arena --
+        // and with it the reservation -- back. `unwind` collects whatever was
+        // allocated so far and releases it in order before closing, because a
+        // dropped `DeviceRange` leaves its allocation live and `close` then
+        // refuses. That refusal would strand the charge *and* the device memory
+        // behind a tidy-looking error return.
+        let mut taken: Vec<DeviceRange<'ctx>> = Vec::with_capacity(5);
+        macro_rules! unwind {
+            ($error:expr) => {{
+                let error = $error;
+                for range in taken.drain(..) {
+                    let _ = arena.release(range);
+                }
+                return Err(close_and_fail(arena, ledger, error));
+            }};
+        }
+        for (bytes, owner) in [
+            (extents.activations, "expert activations"),
+            (extents.slots, "expert slots"),
+            (extents.workspace, "expert workspace"),
+            (extents.indices, "expert row index"),
+            (extents.indices, "expert slot index"),
+        ] {
+            let aligned = match align_up(bytes) {
+                Ok(aligned) => aligned,
+                Err(error) => unwind!(error),
+            };
+            match arena.allocate(aligned, ALIGNMENT, owner.to_string()) {
+                Ok(range) => taken.push(range),
+                Err(refused) => unwind!(refused.error),
+            }
+        }
 
         let module = (|| -> Result<ResolvedModule<'ctx>> {
             // SAFETY: the image is this build's own fatbin, embedded by
@@ -205,32 +219,25 @@ impl<'ctx> DeviceExperts<'ctx> {
         })();
         let module = match module {
             Ok(module) => module,
-            Err(error) => {
-                // Give the ranges back before the arena, or `close` refuses and
-                // the reservation is stranded behind a tidy-looking error path.
-                let _ = arena.release(activations);
-                let _ = arena.release(slots);
-                let _ = arena.release(workspace);
-                let _ = arena.release(row_index);
-                let _ = arena.release(slot_index);
-                return Err(close_and_fail(arena, ledger, error));
-            }
+            Err(error) => unwind!(error),
+        };
+        let stream = match Stream::new(ctx) {
+            Ok(stream) => stream,
+            Err(error) => unwind!(error),
         };
 
+        let mut taken = taken.into_iter();
         Ok(DeviceExperts {
             ctx,
-            stream: match Stream::new(ctx) {
-                Ok(stream) => stream,
-                Err(error) => return Err(close_and_fail(arena, ledger, error)),
-            },
+            stream,
             module,
             descriptor,
             arena,
-            activations: Some(activations),
-            slots: Some(slots),
-            workspace: Some(workspace),
-            row_index: Some(row_index),
-            slot_index: Some(slot_index),
+            activations: taken.next(),
+            slots: taken.next(),
+            workspace: taken.next(),
+            row_index: taken.next(),
+            slot_index: taken.next(),
             hidden: plan.shape().hidden,
             intermediate: plan.shape().intermediate,
             activations_loaded: false,
@@ -436,22 +443,37 @@ fn grid(elements: u64) -> Result<u32> {
     u32::try_from(blocks).map_err(|_| invalid("launch", "grid exceeds one dimension".into()))
 }
 
-fn close_and_fail(arena: DeviceArena<'_>, ledger: &Ledger, error: Error) -> AttachRefused {
-    // The arena still owns the reservation and `close` needs a mutable ledger,
-    // which this path does not have. Rather than pretend, the arena is dropped
-    // and the charge stays outstanding and visible -- which is what a dropped
-    // `Reservation` already does everywhere else in this crate.
-    let _ = ledger;
-    drop(arena);
-    AttachRefused {
-        reservation: None,
-        error,
+/// Close the arena and report the original failure, not the cleanup's.
+///
+/// If `close` itself refuses -- a quarantined arena, a range still live -- the
+/// arena is dropped, which keeps its physical allocation alive and leaves the
+/// charge outstanding and visible in `Ledger::outstanding`. That is the same
+/// rule a dropped `Reservation` follows everywhere else in this crate:
+/// withholding wins, and a leak that is visible beats memory the ledger says is
+/// free.
+fn close_and_fail(arena: DeviceArena<'_>, ledger: &mut Ledger, error: Error) -> AttachRefused {
+    match arena.close(ledger) {
+        Ok(()) => AttachRefused {
+            reservation: None,
+            error,
+        },
+        Err(refused) => {
+            drop(refused);
+            AttachRefused {
+                reservation: None,
+                error,
+            }
+        }
     }
 }
 
-/// A refused attachment. The reservation comes back when it was never handed to
-/// an arena; once an arena owns it, a failure leaves the charge outstanding and
-/// visible rather than silently released.
+/// A refused attachment.
+///
+/// `reservation` comes back whenever the failure happened before an arena took
+/// it, so the caller can retry or release it. Once an arena owns it, the arena
+/// is closed on the way out and the reservation is released with it; if even
+/// that refuses, the charge stays outstanding and visible rather than being
+/// silently dropped.
 #[derive(Debug)]
 #[must_use = "the reservation or the charge is still live"]
 pub struct AttachRefused {

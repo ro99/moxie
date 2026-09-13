@@ -456,7 +456,7 @@ contract required. No new crate, and one new workspace edge (`xtask` ->
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy (`--features moxie-executor/driver`) | passed |
 | `cargo test --workspace --locked --offline` | **871 passed, 0 failed** (823 at task 0020) |
-| Device-feature workspace tests | **894 passed, 0 failed** (843 at task 0020) |
+| Device-feature workspace tests | **895 passed, 0 failed** (843 at task 0020) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified (39 at task 0020) |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | **zero failures**, 78 rejected fixtures, 21 accepted, 13 rules |

@@ -1276,10 +1276,15 @@ impl GroupedRun {
                     match self.queue.push(queued) {
                         Ok(()) => self.next_group += 1,
                         Err(full) => {
-                            // The loop checks `is_full` before acquiring, so a
-                            // refusal here would mean the queue changed
-                            // underneath this call. Give the leases back rather
-                            // than leak them, and report the contradiction.
+                            // Unreachable by construction: the loop condition
+                            // already checked `is_full`. It is written out
+                            // rather than asserted because the failure mode of
+                            // getting it wrong is a stranded residency lease,
+                            // and an error return that gives the leases back
+                            // costs nothing while a panic here would strand
+                            // them. The queue's refusal itself is a real,
+                            // separately tested behaviour of `OrderQueue`; what
+                            // is unreachable is this call site reaching it.
                             let error = full.error();
                             let (gate_up, down) = (full.group.gate_up, full.group.down);
                             self.release_pair(authority, gate_up, down);

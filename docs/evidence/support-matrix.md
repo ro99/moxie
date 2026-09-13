@@ -35,7 +35,7 @@ executes a routed layer, and the selected BF16 chain still refuses `Route`,
 acceptance**: CPU expert fallback and GPU grouped candidate plans under one
 interface, with an admitted envelope, a bounded queue that refuses rather than
 waits, NUMA-placed host buffers and a reduction whose order is data.
-Gates: 871 host tests, 894 device-feature tests, 42/42 real GPU cases, both
+Gates: 871 host tests, 895 device-feature tests, 42/42 real GPU cases, both
 clippy lanes, `spec-check`, and `arch-check` with zero failures. **It does not
 close M2**, whose item 4 is outstanding and whose exit asks for byte/cost traces
 reconciled with the ledger across a whole working set rather than one layer.
