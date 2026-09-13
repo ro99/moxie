@@ -44,14 +44,28 @@ use std::collections::BTreeMap;
 
 use moxie_graph::{CombineOrder, ExpertActivation, OpParams};
 use moxie_types::{
-    DeviceTier, DeviceUuid, Error, GateTransform, HostPlacement, HostTier, NumaTopology, Result,
-    StrategyControl, Tier,
+    DeviceCapability, DeviceTier, DeviceUuid, Error, GateTransform, HostPlacement, HostTier,
+    KernelCatalogue, NumaTopology, Result, SemanticKernelDescriptor, SemanticKernelOp,
+    StrategyControl, Tier, WorkspaceExpression,
 };
 
 /// Bytes of one BF16 element.
 const BF16: u64 = 2;
 /// Bytes of one FP32 workspace element.
 const F32: u64 = 4;
+/// Device range alignment, as every admitted range in this workspace uses.
+const DEVICE_ALIGNMENT: u64 = 256;
+
+/// Round up to a whole device range.
+///
+/// The envelope is charged in aligned units because that is what the executor
+/// will actually allocate: charging the logical extent and allocating the
+/// aligned one is how a plan comes to need more memory than it reserved.
+fn align_device(bytes: u64) -> Option<u64> {
+    bytes
+        .checked_add(DEVICE_ALIGNMENT - 1)
+        .map(|v| v / DEVICE_ALIGNMENT * DEVICE_ALIGNMENT)
+}
 
 fn invalid(field: &'static str, detail: String) -> Error {
     Error::InvalidRequest { field, detail }
@@ -125,6 +139,10 @@ pub enum RejectionReason {
     HostBuffersTooSmall { needed: u64, free: u64 },
     /// The other candidate is `required`, so this one may not be considered.
     OtherCandidateRequired,
+    /// No kernel in the injected catalogue matches this operation on this
+    /// device. Distinct from every capacity reason: the bytes are there and the
+    /// code is not.
+    NoQualifiedKernel,
     /// Chosen on merit; the other candidate was admissible and not preferred.
     NotPreferred,
 }
@@ -173,6 +191,9 @@ impl core::fmt::Display for RejectionReason {
             }
             Self::OtherCandidateRequired => {
                 f.write_str("the other candidate is required, so this one is not considered")
+            }
+            Self::NoQualifiedKernel => {
+                f.write_str("no catalogue kernel matches this operation on this device")
             }
             Self::NotPreferred => f.write_str("admissible but not preferred"),
         }
@@ -356,9 +377,21 @@ impl ExpertShape {
     }
 }
 
+/// The device half of a compilation: what the hardware is and what kernels
+/// exist for it.
+///
+/// Optional, because a host-only plan needs neither and must still compile on a
+/// machine with no catalogue at all.
+#[derive(Debug, Clone, Copy)]
+pub struct ExpertKernels<'a> {
+    pub capability: &'a DeviceCapability,
+    pub catalogue: &'a KernelCatalogue,
+}
+
 /// A routed layer's expert work, decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpertPlan {
+    kernel: Option<SemanticKernelDescriptor>,
     shape: ExpertShape,
     rows: u64,
     device: DeviceUuid,
@@ -403,6 +436,14 @@ impl ExpertPlan {
     }
     pub const fn policy(&self) -> &ExpertPolicy {
         &self.policy
+    }
+    /// The descriptor selected for the device candidate, when there is one.
+    ///
+    /// Document 02 puts "chosen kernels" in the plan, so selection happens here
+    /// -- pure, from an injected immutable catalogue -- rather than at launch
+    /// time where a fallback would be easy to write.
+    pub const fn kernel(&self) -> Option<&SemanticKernelDescriptor> {
+        self.kernel.as_ref()
     }
 
     pub fn groups_on(&self, candidate: Candidate) -> impl Iterator<Item = &ExpertGroup> {
@@ -637,6 +678,7 @@ pub fn compile_experts(
     budget: &ExpertBudget,
     policy: &ExpertPolicy,
     topology: Option<&NumaTopology>,
+    kernels: Option<ExpertKernels<'_>>,
 ) -> std::result::Result<ExpertPlan, ExpertPlanRefused> {
     let refuse = |error: Error| ExpertPlanRefused {
         error,
@@ -740,6 +782,10 @@ pub fn compile_experts(
         .and_then(|v| v.checked_mul(F32))
         .and_then(|v| v.checked_mul(u64::from(queue_capacity)))
         .ok_or_else(|| refuse(overflow("the host workspace")))?;
+    let index_staging_bytes = rows
+        .checked_mul(shape.top_k)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or_else(|| refuse(overflow("the index staging")))?;
     let host_buffer_bytes = activation_bytes
         .checked_add(slot_bytes)
         .and_then(|v| v.checked_add(rows * shape.hidden * BF16))
@@ -758,6 +804,14 @@ pub fn compile_experts(
             host: Some(RejectionReason::OtherCandidateRequired),
         });
     }
+    // Kernel selection is part of compilation, not of launching. A device
+    // candidate with no qualified kernel is inadmissible for that reason and
+    // says so, rather than being discovered at the launch site where writing a
+    // fallback would be the easy thing to do.
+    let selected = match kernels {
+        Some(kernels) => select_expert_kernel(shape, rows, kernels).ok(),
+        None => None,
+    };
     let device_unavailable = if policy.host == StrategyControl::Required {
         // `required` on one candidate removes the other from consideration.
         // Erroring instead -- on the ground that a device group would silently
@@ -767,6 +821,8 @@ pub fn compile_experts(
         Some(RejectionReason::OtherCandidateRequired)
     } else if !policy.device.may_select() {
         Some(RejectionReason::CandidateOff)
+    } else if selected.is_none() {
+        Some(RejectionReason::NoQualifiedKernel)
     } else if device_needed > budget.device_arena_free_bytes {
         Some(RejectionReason::DeviceArenaTooSmall {
             needed: device_needed,
@@ -943,13 +999,25 @@ pub fn compile_experts(
         .any(|g| g.placement.candidate() == Candidate::Host);
     let mut device = Vec::new();
     if any_device {
-        device.push((DeviceTier::Activations, activation_bytes + slot_bytes));
-        device.push((DeviceTier::KernelWorkspace, device_workspace_bytes));
-        // Stated rather than omitted. The readback's destination is a host
-        // buffer that is already charged below, and no device-side bounce
-        // buffer exists on this path; a nonzero figure here would be describing
-        // a copy that does not happen.
-        device.push((DeviceTier::TransferStaging, 0));
+        let aligned = |bytes: u64| {
+            align_device(bytes).ok_or_else(|| refuse(overflow("an aligned device region")))
+        };
+        device.push((
+            DeviceTier::Activations,
+            aligned(activation_bytes)? + aligned(slot_bytes)?,
+        ));
+        device.push((
+            DeviceTier::KernelWorkspace,
+            aligned(device_workspace_bytes)?,
+        ));
+        // The two `RouteIndex` operands: which rows a launch serves and where
+        // each result goes. Sized for the largest group a plan of this shape can
+        // produce, which is every slot, so a group's staging is admitted before
+        // the group is known.
+        device.push((
+            DeviceTier::TransferStaging,
+            aligned(index_staging_bytes)? * 2,
+        ));
     }
     let mut host = vec![(HostTier::Pageable, host_buffer_bytes)];
     if any_host {
@@ -957,6 +1025,7 @@ pub fn compile_experts(
     }
 
     let plan = ExpertPlan {
+        kernel: if any_device { selected } else { None },
         shape,
         rows,
         device: budget.device,
@@ -1005,6 +1074,62 @@ fn reduction_permutation(route_experts: &[u32], top_k: usize, order: CombineOrde
         out.extend(positions);
     }
     out
+}
+
+/// Select the one catalogue descriptor that serves this operation on this
+/// device, or fail.
+///
+/// Exactly one, or none: an ambiguous catalogue is a defect, not a choice to be
+/// made by ordering. The match is on semantic operation (gate transform
+/// included), operand roles, precisions, accumulation, rounding, layout, SM and
+/// shape bounds -- never on a model name, which is document 02's rule and
+/// task 0012's mechanism.
+pub fn select_expert_kernel(
+    shape: ExpertShape,
+    rows: u64,
+    kernels: ExpertKernels<'_>,
+) -> Result<SemanticKernelDescriptor> {
+    let operation = SemanticKernelOp::ExpertMlp(shape.gate_transform());
+    let assignments = rows
+        .checked_mul(shape.top_k)
+        .ok_or_else(|| invalid("rows", "assignment count overflows".into()))?;
+    let matches: Vec<_> = kernels
+        .catalogue
+        .descriptors()
+        .iter()
+        .filter(|d| {
+            d.operation == operation
+                && d.sm.major == kernels.capability.compute_major
+                && d.sm.minor == kernels.capability.compute_minor
+                && d.layout == moxie_types::TensorLayout::ContiguousRowMajorV1
+                && d.workspace == WorkspaceExpression::RowsTimesIntermediateF32
+                && assignments <= d.shape.max_rows
+                && shape.hidden <= d.shape.max_input
+                && shape.hidden <= d.shape.max_output
+        })
+        .collect();
+    if matches.len() != 1 {
+        return Err(Error::UnsupportedKernel {
+            operation: "expert_mlp",
+            detail: format!(
+                "expected exactly one descriptor for {} on sm_{}{} at {assignments} assignment(s) \
+                 of width {}; found {}",
+                operation.name(),
+                kernels.capability.compute_major,
+                kernels.capability.compute_minor,
+                shape.hidden,
+                matches.len()
+            ),
+        });
+    }
+    let descriptor = matches[0];
+    if descriptor.symbols.len() != 2 {
+        return Err(Error::UnsupportedKernel {
+            operation: "expert_mlp",
+            detail: "a grouped expert descriptor names a projection and a down symbol".into(),
+        });
+    }
+    Ok(descriptor.clone())
 }
 
 #[cfg(test)]

@@ -353,6 +353,7 @@ dependencies = [
  "moxie-interp",
  "moxie-kernels",
  "moxie-memory",
+ "moxie-oracles",
  "moxie-plan",
  "moxie-types",
  "proc-macro2",

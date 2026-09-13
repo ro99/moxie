@@ -36,6 +36,7 @@ const PINNED_NVCC_RELEASE: &str = "release 13.0, V13.0.88";
 fn main() {
     println!("cargo:rerun-if-changed=cuda/smoke.cu");
     println!("cargo:rerun-if-changed=cuda/bf16_chain.cu");
+    println!("cargo:rerun-if-changed=cuda/expert_mlp.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=archs.rs");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -107,6 +108,15 @@ fn main() {
         ARCHS,
     );
 
+    let experts = build_source_fatbin(
+        &nvcc,
+        &host_cc,
+        &out,
+        "expert_mlp.fatbin",
+        "cuda/expert_mlp.cu",
+        ARCHS,
+    );
+
     println!(
         "cargo:rustc-env=MOXIE_SMOKE_FATBIN={}",
         out.join("smoke.fatbin").display()
@@ -123,6 +133,11 @@ fn main() {
         out.join("bf16_chain.fatbin").display()
     );
     println!("cargo:rustc-env=MOXIE_BF16_CHAIN_FATBIN_SHA256={semantic}");
+    println!(
+        "cargo:rustc-env=MOXIE_EXPERT_MLP_FATBIN={}",
+        out.join("expert_mlp.fatbin").display()
+    );
+    println!("cargo:rustc-env=MOXIE_EXPERT_MLP_FATBIN_SHA256={experts}");
     println!(
         "cargo:rustc-env=MOXIE_NVCC_VERSION={}",
         one_line(&nvcc_version)

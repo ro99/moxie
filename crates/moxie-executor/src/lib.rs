@@ -76,6 +76,11 @@ pub use arena::{
 pub use turn::{HeldLease, RetiredLease, Turn, TurnReport};
 
 #[cfg(feature = "driver")]
+pub mod grouped_device;
+#[cfg(feature = "driver")]
+pub use grouped_device::{AttachRefused, DeviceExperts, DeviceExtents, ExpertLane};
+
+#[cfg(feature = "driver")]
 mod chain;
 #[cfg(feature = "driver")]
 pub use chain::{

@@ -84,6 +84,7 @@ const CASES: &[&str] = &[
     "rank_context_is_exclusive",
     "concurrent_handoff_is_exclusive",
     "measurement_is_live",
+    "grouped_expert_mlp",
 ];
 
 /// Run every GPU case on every visible device.
@@ -214,6 +215,7 @@ pub fn run(profile: Option<&str>) -> i32 {
             concurrent_handoff(&cap),
         ));
         results.push(case(&cap, "measurement_is_live", measurement_is_live(&cap)));
+        results.push(case(&cap, "grouped_expert_mlp", grouped_expert_mlp(&cap)));
     }
 
     println!("\n--- results ---");
@@ -2198,4 +2200,196 @@ mod task_0012_negative_fixtures {
             None,
         ));
     }
+}
+
+/// Task 0021's grouped expert kernel against task 0019's oracle, on real
+/// hardware, for both gate transforms.
+///
+/// The declared gate is **bitwise** equality of the BF16 slot outputs. Nothing
+/// here is a checkpoint and nothing here is a model: the weights are bytes this
+/// function invents, and a synthetic routed block is not MoE support.
+fn grouped_expert_mlp(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    use moxie_graph::ExpertActivation;
+    use moxie_kernels::cpu_expert::{bf16_round, to_bf16_bits};
+    use moxie_oracles::route;
+
+    const HIDDEN: u64 = 96;
+    const INTERMEDIATE: u64 = 24;
+    const EXPERTS: u64 = 3;
+    const ASSIGNMENTS: u64 = 5;
+
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let stream = Stream::new(&ctx)?;
+    let module = Module::load(
+        &ctx,
+        ModuleImage::Binary(smoke_image(moxie_kernels::EXPERT_MLP_FATBIN)?),
+    )?;
+
+    // Deterministic BF16-representable values, so "the fixture" is a fact.
+    let mut state = 0x9e37_79b9_u64;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        bf16_round(((state >> 40) as f32) / ((1u32 << 24) as f32) - 0.5)
+    };
+    let x: Vec<f32> = (0..(ASSIGNMENTS * HIDDEN) as usize)
+        .map(|_| next())
+        .collect();
+    let gate_up: Vec<f32> = (0..(EXPERTS * 2 * INTERMEDIATE * HIDDEN) as usize)
+        .map(|_| next())
+        .collect();
+    let down: Vec<f32> = (0..(EXPERTS * HIDDEN * INTERMEDIATE) as usize)
+        .map(|_| next())
+        .collect();
+
+    let encode = |values: &[f32]| -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|v| to_bf16_bits(*v).to_le_bytes())
+            .collect()
+    };
+
+    let mut compared = 0usize;
+    for (activation, symbol) in [
+        (
+            ExpertActivation::GeGlu,
+            moxie_kernels::BF16_EXPERT_PROJECT_GELU,
+        ),
+        (
+            ExpertActivation::SwiGlu,
+            moxie_kernels::BF16_EXPERT_PROJECT_SILU,
+        ),
+    ] {
+        // One expert per assignment, cycling, so the row index and the expert
+        // slice are exercised independently of each other.
+        let expert = 1u32;
+        let rows: Vec<u32> = (0..ASSIGNMENTS as u32).collect();
+        let slots: Vec<u32> = (0..ASSIGNMENTS as u32).rev().collect();
+
+        let mut d_x = DeviceBuffer::alloc(&ctx, (ASSIGNMENTS * HIDDEN * 2) as usize)?;
+        d_x.copy_from_host(&encode(&x))?;
+        let gu_stride = (2 * INTERMEDIATE * HIDDEN) as usize;
+        let d_stride = (HIDDEN * INTERMEDIATE) as usize;
+        let mut d_gate_up = DeviceBuffer::alloc(&ctx, gu_stride * 2)?;
+        d_gate_up.copy_from_host(&encode(
+            &gate_up[expert as usize * gu_stride..(expert as usize + 1) * gu_stride],
+        ))?;
+        let mut d_down = DeviceBuffer::alloc(&ctx, d_stride * 2)?;
+        d_down.copy_from_host(&encode(
+            &down[expert as usize * d_stride..(expert as usize + 1) * d_stride],
+        ))?;
+        let mut d_rows = DeviceBuffer::alloc(&ctx, rows.len() * 4)?;
+        d_rows.copy_from_host(
+            &rows
+                .iter()
+                .flat_map(|r| r.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )?;
+        let mut d_slots = DeviceBuffer::alloc(&ctx, slots.len() * 4)?;
+        d_slots.copy_from_host(
+            &slots
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )?;
+        let d_workspace = DeviceBuffer::alloc(&ctx, (ASSIGNMENTS * INTERMEDIATE * 4) as usize)?;
+        let d_out = DeviceBuffer::alloc(&ctx, (ASSIGNMENTS * HIDDEN * 2) as usize)?;
+
+        let project = module.function(symbol)?;
+        let reduce = module.function(moxie_kernels::BF16_EXPERT_DOWN)?;
+        let (mut x_ptr, mut row_ptr, mut gu_ptr, mut ws_ptr) = (
+            d_x.device_ptr(),
+            d_rows.device_ptr(),
+            d_gate_up.device_ptr(),
+            d_workspace.device_ptr(),
+        );
+        let (mut down_ptr, mut slot_ptr, mut out_ptr) = (
+            d_down.device_ptr(),
+            d_slots.device_ptr(),
+            d_out.device_ptr(),
+        );
+        let (mut count, mut hidden, mut intermediate) = (ASSIGNMENTS, HIDDEN, INTERMEDIATE);
+        let block = 64u32;
+        let lanes = ASSIGNMENTS * INTERMEDIATE;
+        let mut params: [*mut c_void; 7] = [
+            (&raw mut x_ptr).cast(),
+            (&raw mut row_ptr).cast(),
+            (&raw mut gu_ptr).cast(),
+            (&raw mut ws_ptr).cast(),
+            (&raw mut count).cast(),
+            (&raw mut hidden).cast(),
+            (&raw mut intermediate).cast(),
+        ];
+        // SAFETY: the symbol's ABI is the one declared in `expert_mlp.cu`; every
+        // pointer is a live buffer of the size the kernel indexes, and the grid
+        // covers exactly the element count.
+        unsafe {
+            project.launch_blocking(
+                (lanes.div_ceil(u64::from(block)) as u32, 1, 1),
+                (block, 1, 1),
+                0,
+                &mut params,
+            )?;
+        }
+        let components = ASSIGNMENTS * HIDDEN;
+        let mut down_params: [*mut c_void; 7] = [
+            (&raw mut ws_ptr).cast(),
+            (&raw mut down_ptr).cast(),
+            (&raw mut slot_ptr).cast(),
+            (&raw mut out_ptr).cast(),
+            (&raw mut count).cast(),
+            (&raw mut hidden).cast(),
+            (&raw mut intermediate).cast(),
+        ];
+        // SAFETY: as above, for the second symbol.
+        unsafe {
+            reduce.launch_blocking(
+                (components.div_ceil(u64::from(block)) as u32, 1, 1),
+                (block, 1, 1),
+                0,
+                &mut down_params,
+            )?;
+        }
+        stream.synchronize()?;
+
+        let mut got = vec![0u8; (ASSIGNMENTS * HIDDEN * 2) as usize];
+        d_out.copy_to_host(&mut got)?;
+        let got = decode_u16(&got);
+
+        let spec = route::ExpertSpec {
+            experts: EXPERTS as usize,
+            hidden: HIDDEN as usize,
+            intermediate: INTERMEDIATE as usize,
+            activation,
+        };
+        for (assignment, (row, slot)) in rows.iter().zip(&slots).enumerate() {
+            let want = route::expert_row(
+                &x[*row as usize * HIDDEN as usize..(*row as usize + 1) * HIDDEN as usize],
+                &gate_up,
+                &down,
+                expert,
+                spec,
+            )
+            .map_err(|e| Error::Numerical {
+                detail: format!("oracle: {e}"),
+            })?;
+            let want: Vec<u16> = want.iter().map(|v| to_bf16_bits(*v)).collect();
+            let start = *slot as usize * HIDDEN as usize;
+            if got[start..start + HIDDEN as usize] != want[..] {
+                return Ok(Outcome::Failed(format!(
+                    "{activation:?} assignment {assignment} (row {row} -> slot {slot}) differs \
+                     from the oracle"
+                )));
+            }
+            compared += HIDDEN as usize;
+        }
+    }
+
+    Ok(Outcome::Passed).map(|outcome| {
+        // The count is part of the claim: "matches the oracle" over five
+        // components would be a different statement.
+        println!("      grouped expert: {compared} BF16 components bit-identical");
+        outcome
+    })
 }

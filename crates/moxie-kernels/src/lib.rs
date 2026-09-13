@@ -52,11 +52,18 @@ pub const BF16_RMS_APPLY: &str = "moxie_bf16_rms_apply_v1";
 pub const BF16_RESIDUAL: &str = "moxie_bf16_residual_v1";
 pub const BF16_CHAIN_ABI: u32 = 1;
 
+/// Task 0021's grouped expert package. Two projection symbols, one per gate
+/// transform, because they are two operations rather than one with a flag.
+pub const BF16_EXPERT_PROJECT_GELU: &str = "moxie_bf16_expert_project_gelu_v1";
+pub const BF16_EXPERT_PROJECT_SILU: &str = "moxie_bf16_expert_project_silu_v1";
+pub const BF16_EXPERT_DOWN: &str = "moxie_bf16_expert_down_v1";
+pub const BF16_EXPERT_ABI: u32 = 1;
+
 #[cfg(feature = "fatbin")]
 mod images {
     use moxie_types::{
-        AccumulationPolicy, ActivationPrecision, KernelCapability, KernelCatalogue, KernelId,
-        KernelOperand, KernelShapeBounds, KernelSymbol, Precision, RoundingProfile,
+        AccumulationPolicy, ActivationPrecision, GateTransform, KernelCapability, KernelCatalogue,
+        KernelId, KernelOperand, KernelShapeBounds, KernelSymbol, Precision, RoundingProfile,
         SemanticKernelDescriptor, SemanticKernelOp, SmVersion, TensorLayout, WeightPrecision,
         WorkspaceExpression,
     };
@@ -76,6 +83,7 @@ mod images {
     /// for the same reason: embedded PTX would let the driver JIT it anywhere.
     pub const SMOKE_FATBIN_SM86_ONLY: &[u8] = include_bytes!(env!("MOXIE_SMOKE_FATBIN_SM86"));
     pub const BF16_CHAIN_FATBIN: &[u8] = include_bytes!(env!("MOXIE_BF16_CHAIN_FATBIN"));
+    pub const EXPERT_MLP_FATBIN: &[u8] = include_bytes!(env!("MOXIE_EXPERT_MLP_FATBIN"));
 
     /// Compute capabilities actually compiled into [`SMOKE_FATBIN`].
     pub const KERNEL_ARCHS: &str = env!("MOXIE_KERNEL_ARCHS");
@@ -84,6 +92,7 @@ mod images {
     pub const SMOKE_FATBIN_SHA256: &str = env!("MOXIE_SMOKE_FATBIN_SHA256");
     pub const SMOKE_FATBIN_SM86_SHA256: &str = env!("MOXIE_SMOKE_FATBIN_SM86_SHA256");
     pub const BF16_CHAIN_FATBIN_SHA256: &str = env!("MOXIE_BF16_CHAIN_FATBIN_SHA256");
+    pub const EXPERT_MLP_FATBIN_SHA256: &str = env!("MOXIE_EXPERT_MLP_FATBIN_SHA256");
     /// What `nvcc --version` reported, verified against the pin in `build.rs`.
     pub const NVCC_VERSION: &str = env!("MOXIE_NVCC_VERSION");
     /// The host compiler nvcc drove. Recorded, not pinned.
@@ -160,6 +169,53 @@ mod images {
         KernelCatalogue::new(descriptors).expect("built-in descriptors are unique")
     }
 
+    /// Task 0021's grouped expert package, one descriptor per (gate transform,
+    /// SM). Separate identities per SM so qualification cannot leak from Ampere
+    /// to Blackwell, exactly as the chain package does.
+    ///
+    /// The shape bounds are the operation's, not the chain's: an expert's
+    /// reduction runs over `hidden` and its output is `hidden` wide, and the
+    /// designated artifact's layer is 2,816 by 704.
+    pub fn expert_mlp_catalogue() -> KernelCatalogue {
+        let hash = parse_sha256(EXPERT_MLP_FATBIN_SHA256);
+        let mut descriptors = Vec::new();
+        for sm in [SmVersion::SM86, SmVersion::SM120] {
+            for (gate, project) in [
+                (GateTransform::GeluTanh, super::BF16_EXPERT_PROJECT_GELU),
+                (GateTransform::Silu, super::BF16_EXPERT_PROJECT_SILU),
+            ] {
+                descriptors.push(SemanticKernelDescriptor {
+                    id: KernelId(format!("bf16-expert-mlp-v1-{}-{}", gate.name(), sm.name())),
+                    abi_version: super::BF16_EXPERT_ABI,
+                    operation: SemanticKernelOp::ExpertMlp(gate),
+                    inputs: vec![
+                        KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                        KernelOperand::RouteIndex,
+                        KernelOperand::Weight(WeightPrecision::expect(Precision::Bf16)),
+                        KernelOperand::Weight(WeightPrecision::expect(Precision::Bf16)),
+                    ],
+                    output: ActivationPrecision::expect(Precision::Bf16),
+                    accumulation: AccumulationPolicy::Bf16InF32Acc,
+                    rounding: RoundingProfile::FinalBf16Rne,
+                    layout: TensorLayout::ContiguousRowMajorV1,
+                    shape: KernelShapeBounds {
+                        max_rows: 65_536,
+                        max_input: 16_384,
+                        max_output: 16_384,
+                    },
+                    sm,
+                    workspace: WorkspaceExpression::RowsTimesIntermediateF32,
+                    image_sha256: hash,
+                    symbols: vec![
+                        KernelSymbol(project.to_string()),
+                        KernelSymbol(super::BF16_EXPERT_DOWN.to_string()),
+                    ],
+                });
+            }
+        }
+        KernelCatalogue::new(descriptors).expect("built-in descriptors are unique")
+    }
+
     fn descriptor(
         id: String,
         operation: SemanticKernelOp,
@@ -206,9 +262,10 @@ mod images {
 
 #[cfg(feature = "fatbin")]
 pub use images::{
-    BF16_CHAIN_FATBIN, BF16_CHAIN_FATBIN_SHA256, HOST_COMPILER_VERSION, KERNEL_ARCHS, NVCC_VERSION,
-    SMOKE_FATBIN, SMOKE_FATBIN_SHA256, SMOKE_FATBIN_SM86_ONLY, SMOKE_FATBIN_SM86_SHA256,
-    axpy_capability, bf16_chain_catalogue, compiled_sm,
+    BF16_CHAIN_FATBIN, BF16_CHAIN_FATBIN_SHA256, EXPERT_MLP_FATBIN, EXPERT_MLP_FATBIN_SHA256,
+    HOST_COMPILER_VERSION, KERNEL_ARCHS, NVCC_VERSION, SMOKE_FATBIN, SMOKE_FATBIN_SHA256,
+    SMOKE_FATBIN_SM86_ONLY, SMOKE_FATBIN_SM86_SHA256, axpy_capability, bf16_chain_catalogue,
+    compiled_sm, expert_mlp_catalogue,
 };
 
 #[cfg(test)]

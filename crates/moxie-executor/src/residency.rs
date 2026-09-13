@@ -328,6 +328,35 @@ mod device {
             Scope::Device(self.ctx.uuid())
         }
 
+        /// The device address of one offset inside this cache's allocation.
+        ///
+        /// Crate-internal: a raw device address is not something a caller
+        /// outside this crate has any business holding, and document 02 keeps
+        /// `TensorHandle` rather than a pointer at every public boundary. The
+        /// grouped expert launch is inside this crate for exactly that reason.
+        pub(crate) fn device_address(&self, offset: u64, len: u64) -> Result<u64> {
+            if self.backing.is_none() {
+                return Err(Error::InvalidRequest {
+                    field: "backing",
+                    detail: "this residency has already been closed".into(),
+                });
+            }
+            if offset.saturating_add(len) > self.capacity() {
+                return Err(Error::CapacityExceeded {
+                    tier: None,
+                    requested_bytes: offset.saturating_add(len),
+                    available_bytes: self.capacity(),
+                });
+            }
+            self.buffer
+                .device_ptr()
+                .checked_add(offset)
+                .ok_or_else(|| Error::InvalidRequest {
+                    field: "address",
+                    detail: "device address overflowed".into(),
+                })
+        }
+
         /// Read a device range back, for an oracle that has to compare what
         /// arrived against what was asked for.
         pub fn read_back(&self, offset: u64, into: &mut [u8]) -> Result<()> {

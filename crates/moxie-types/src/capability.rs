@@ -121,22 +121,39 @@ pub struct KernelShapeBounds {
 pub enum WorkspaceExpression {
     Zero,
     RowsTimesF32,
-    /// `rows * width * 4`: one FP32 intermediate vector per row.
+    /// `rows * intermediate * 4`: one FP32 gated-intermediate vector per row.
     ///
-    /// The expert feed-forward's gated intermediate is `intermediate` wide and
-    /// does not fit in registers at the designated artifact's 704, so it is a
-    /// declared workspace rather than a hidden allocation inside a launch.
-    RowsTimesWidthF32(u64),
+    /// The expert feed-forward's intermediate is `intermediate` wide and does
+    /// not fit in registers at the designated artifact's 704, so it is a
+    /// declared workspace rather than a hidden allocation inside a launch. The
+    /// width is not baked into the descriptor: it is the *operation's*
+    /// parameter, and a catalogue entry per intermediate width would make
+    /// kernel selection depend on a shape the kernel does not care about.
+    RowsTimesIntermediateF32,
 }
 
 impl WorkspaceExpression {
+    /// Bytes, for an expression that needs only the row count.
+    ///
+    /// `None` for [`WorkspaceExpression::RowsTimesIntermediateF32`], which
+    /// cannot be evaluated without the operation's width. Returning `None`
+    /// rather than a plausible number is the point: a caller that ignores it
+    /// gets no workspace figure instead of a wrong one.
     pub fn evaluate(self, rows: u64) -> Option<u64> {
         match self {
             Self::Zero => Some(0),
             Self::RowsTimesF32 => rows.checked_mul(4),
-            Self::RowsTimesWidthF32(width) => {
-                rows.checked_mul(width).and_then(|v| v.checked_mul(4))
-            }
+            Self::RowsTimesIntermediateF32 => None,
+        }
+    }
+
+    /// Bytes, given the operation's intermediate width where one is needed.
+    pub fn evaluate_with(self, rows: u64, intermediate: u64) -> Option<u64> {
+        match self {
+            Self::RowsTimesIntermediateF32 => rows
+                .checked_mul(intermediate)
+                .and_then(|v| v.checked_mul(4)),
+            other => other.evaluate(rows),
         }
     }
 }

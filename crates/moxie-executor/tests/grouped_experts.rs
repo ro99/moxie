@@ -250,6 +250,7 @@ fn a_host_plan_reproduces_the_oracle_bit_for_bit() {
         &host_only_budget(),
         &host_only_policy(),
         None,
+        None,
     )
     .unwrap();
     assert!(
@@ -290,6 +291,7 @@ fn the_ledger_is_charged_before_a_single_byte_exists() {
         &host_only_budget(),
         &host_only_policy(),
         None,
+        None,
     )
     .unwrap();
     let envelope_bytes = plan.envelope().total_host_bytes();
@@ -320,6 +322,7 @@ fn an_envelope_the_ledger_cannot_hold_is_refused_with_its_report() {
         &ROUTE,
         &host_only_budget(),
         &host_only_policy(),
+        None,
         None,
     )
     .unwrap();
@@ -371,6 +374,7 @@ fn a_budget_smaller_than_the_working_set_still_executes() {
         &host_only_budget(),
         &policy,
         None,
+        None,
     )
     .unwrap();
     assert_eq!(plan.queue_capacity(), 4);
@@ -416,6 +420,7 @@ fn a_cancelled_run_releases_every_lease_exactly_once() {
         &ROUTE,
         &host_only_budget(),
         &host_only_policy(),
+        None,
         None,
     )
     .unwrap();
@@ -622,6 +627,7 @@ fn two_groups_of_one_run_reduce_in_the_planned_order_and_not_in_completion_order
             &host_only_budget(),
             &host_only_policy(),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(plan.groups().len(), 3, "three groups, one per expert");
@@ -720,7 +726,16 @@ fn host_buffers_are_bound_to_the_planned_node_and_the_pages_are_read_back() {
     budget.host_workspace_bytes = 1 << 30;
     let mut policy = host_only_policy();
     policy.host_placement = StrategyControl::Required;
-    let plan = compile_experts(&mlp, &combine, &route, &budget, &policy, Some(&topology)).unwrap();
+    let plan = compile_experts(
+        &mlp,
+        &combine,
+        &route,
+        &budget,
+        &policy,
+        Some(&topology),
+        None,
+    )
+    .unwrap();
     assert_eq!(plan.host_placement(), HostPlacement::Node(node));
 
     let mut l = ledger(1 << 30);
@@ -790,6 +805,7 @@ fn an_auto_placement_reports_what_it_got_rather_than_claiming_what_it_asked_for(
         &host_only_budget(),
         &host_only_policy(),
         Some(&topology),
+        None,
     )
     .unwrap();
     let run = GroupedRun::admit(&mut l, plan, roles(), Some(&topology)).unwrap();

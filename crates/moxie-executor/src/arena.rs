@@ -363,6 +363,34 @@ mod driver_binding {
             }
         }
 
+        /// Read one slice of this range back, at an offset inside it.
+        ///
+        /// Task 0021 reads a grouped launch's slots back one at a time: the
+        /// device slot buffer never held the host groups' results, so copying it
+        /// whole would overwrite them with whatever the device side happens to
+        /// contain.
+        pub(crate) fn copy_to_host_at(
+            &self,
+            offset: u64,
+            destination: &mut [u8],
+        ) -> moxie_types::Result<()> {
+            let end = offset
+                .checked_add(destination.len() as u64)
+                .ok_or_else(|| invalid("destination", "readback extent overflowed"))?;
+            if end > self.bytes() {
+                return Err(invalid(
+                    "destination",
+                    "readback exceeds its admitted range",
+                ));
+            }
+            let start = self
+                .offset()
+                .checked_add(offset)
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| invalid("range", "range offset is not addressable"))?;
+            self.core.buffer.copy_to_host_at(start, destination)
+        }
+
         pub(crate) fn copy_to_host(&self, destination: &mut [u8]) -> moxie_types::Result<()> {
             if destination.len() as u64 > self.bytes() {
                 return Err(invalid(

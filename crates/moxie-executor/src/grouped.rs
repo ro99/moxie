@@ -35,14 +35,42 @@ use std::collections::VecDeque;
 use moxie_memory::{
     AcquireRequest, Acquired, AdmitError, ArtifactId, BufferRequest, ChunkId, Content, Ledger,
     LedgerId, LogicalRange, PlanRequest, Reservation, ResidencyAuthority, ResidencyLease,
-    StageSpan, TensorSlot, TurnId, UseClass,
+    StageSpan, TensorSlot, TurnId, UseClass, WorkOrder,
 };
-use moxie_plan::expert::{Candidate, ExpertPlan, ExpertShape, Placement};
+use moxie_plan::expert::{Candidate, ExpertGroup, ExpertPlan, ExpertShape, Placement};
 use moxie_types::{
     DeviceTier, Error, HostPlacement, HostTier, NumaTopology, Result, Scope, StrategyControl, Tier,
 };
 
 use crate::residency::{ChunkSource, drain_reads};
+
+/// What a run needs from a device, stated as a trait so this file names no CUDA
+/// type and compiles identically with and without the driver.
+///
+/// The implementation lives in `crate::grouped_device`, which is the only place
+/// in this crate that may hold a device address. A host-lane double can also
+/// implement it, which is how the device *sequencing* is exercised without
+/// hardware while the device *arithmetic* is exercised only on hardware.
+pub trait ExpertDeviceLane {
+    /// Put the activation block on the device, once per run.
+    fn load_activations(&mut self, x: &[u8]) -> Result<()>;
+    /// Perform one upload order the residency authority issued, and report its
+    /// outcome to the authority.
+    fn perform_upload(
+        &mut self,
+        authority: &mut ResidencyAuthority,
+        order: &WorkOrder,
+    ) -> Result<()>;
+    /// Run one group and read its slots back into `host_slots`.
+    fn run_group(
+        &mut self,
+        authority: &ResidencyAuthority,
+        group: &ExpertGroup,
+        gate_up: &ResidencyLease,
+        down: &ResidencyLease,
+        host_slots: &mut [u8],
+    ) -> Result<()>;
+}
 
 /// BF16 bytes per element.
 const BF16: u64 = 2;
@@ -873,6 +901,10 @@ pub struct GroupedRun {
     next_group: usize,
     stats: GroupedStats,
     cancelled: bool,
+    /// True once a device attachment took the reservation. The charge is then
+    /// that attachment's to release, and this run's `close` must not release it
+    /// a second time.
+    detached: bool,
 }
 
 impl GroupedRun {
@@ -956,6 +988,7 @@ impl GroupedRun {
             next_group: 0,
             stats: GroupedStats::default(),
             cancelled: false,
+            detached: false,
         })
     }
 
@@ -1054,6 +1087,16 @@ impl GroupedRun {
         self.buffers.x.as_mut_slice().copy_from_slice(x);
         Ok(())
     }
+
+    /// Load the activation block and put it on the device too.
+    pub fn load_activations_with(
+        &mut self,
+        x: &[u8],
+        lane: &mut dyn ExpertDeviceLane,
+    ) -> Result<()> {
+        self.load_activations(x)?;
+        lane.load_activations(self.buffers.x.as_slice())
+    }
 }
 
 fn too_large(what: &'static str) -> Error {
@@ -1092,6 +1135,7 @@ fn acquire_pair<S: ChunkSource>(
     source: &mut S,
     roles: &ExpertRoles,
     what: GroupAcquire,
+    mut lane: Option<&mut (dyn ExpertDeviceLane + '_)>,
 ) -> std::result::Result<(ResidencyLease, ResidencyLease), AcquireFailed> {
     let GroupAcquire {
         shape,
@@ -1134,18 +1178,28 @@ fn acquire_pair<S: ChunkSource>(
             Acquired::Ready(lease) => held.push(lease),
             Acquired::Pending { lease, work, .. } => {
                 held.push(lease);
-                match drain_reads(authority, source, work) {
-                    Ok(uploads) if uploads.is_empty() => {}
-                    Ok(_) => {
+                let uploads = match drain_reads(authority, source, work) {
+                    Ok(uploads) => uploads,
+                    Err(error) => return Err(AcquireFailed { error, held }),
+                };
+                for order in &uploads {
+                    let Some(lane) = lane.as_deref_mut() else {
+                        // A host destination produces no upload order. Reaching
+                        // one with no device lane is a wiring mistake rather
+                        // than a capacity one, and saying so beats a copy that
+                        // silently never happens.
                         return Err(AcquireFailed {
                             error: invalid(
                                 "scope",
-                                "a host acquire produced an upload order".into(),
+                                "an upload order was issued with no device lane to perform it"
+                                    .into(),
                             ),
                             held,
                         });
+                    };
+                    if let Err(error) = lane.perform_upload(authority, order) {
+                        return Err(AcquireFailed { error, held });
                     }
-                    Err(error) => return Err(AcquireFailed { error, held }),
                 }
             }
         }
@@ -1168,6 +1222,19 @@ impl GroupedRun {
         &mut self,
         authority: &mut ResidencyAuthority,
         source: &mut S,
+        turn: TurnId,
+        now: u64,
+        deadline: u64,
+    ) -> Result<Progress> {
+        self.step_with(authority, source, None, turn, now, deadline)
+    }
+
+    /// The same step, with a device lane for the groups the plan put there.
+    pub fn step_with<S: ChunkSource>(
+        &mut self,
+        authority: &mut ResidencyAuthority,
+        source: &mut S,
+        mut lane: Option<&mut (dyn ExpertDeviceLane + '_)>,
         turn: TurnId,
         now: u64,
         deadline: u64,
@@ -1196,6 +1263,7 @@ impl GroupedRun {
                     now,
                     deadline,
                 },
+                lane.as_deref_mut(),
             ) {
                 Ok((gate_up, down)) => {
                     let queued = QueuedGroup {
@@ -1238,7 +1306,7 @@ impl GroupedRun {
         };
         let expert = queued.expert;
         let candidate = queued.candidate;
-        let result = self.perform(authority, &queued);
+        let result = self.perform(authority, &queued, lane);
         self.release_pair(authority, queued.gate_up, queued.down);
         result?;
         self.stats.groups_run += 1;
@@ -1259,15 +1327,33 @@ impl GroupedRun {
         now: u64,
         deadline: u64,
     ) -> Result<()> {
+        self.run_to_completion_with(authority, source, None, turn, now, deadline)
+    }
+
+    /// Run every group, with a device lane for the groups the plan put there.
+    pub fn run_to_completion_with<S: ChunkSource>(
+        &mut self,
+        authority: &mut ResidencyAuthority,
+        source: &mut S,
+        mut lane: Option<&mut (dyn ExpertDeviceLane + '_)>,
+        turn: TurnId,
+        now: u64,
+        deadline: u64,
+    ) -> Result<()> {
         loop {
-            match self.step(authority, source, turn, now, deadline)? {
+            match self.step_with(authority, source, lane.as_deref_mut(), turn, now, deadline)? {
                 Progress::Done => return Ok(()),
                 Progress::Ran { .. } => {}
             }
         }
     }
 
-    fn perform(&mut self, authority: &ResidencyAuthority, queued: &QueuedGroup) -> Result<()> {
+    fn perform(
+        &mut self,
+        authority: &ResidencyAuthority,
+        queued: &QueuedGroup,
+        lane: Option<&mut (dyn ExpertDeviceLane + '_)>,
+    ) -> Result<()> {
         let group = &self.plan.groups()[queued.index];
         match queued.candidate {
             Candidate::Host => {
@@ -1297,10 +1383,23 @@ impl GroupedRun {
                 self.stats.slots_written += group.slots.len() as u64;
                 Ok(())
             }
-            Candidate::Device => Err(Error::UnsupportedKernel {
-                operation: "expert_mlp",
-                detail: "this build has no device grouped expert path".into(),
-            }),
+            Candidate::Device => {
+                let Some(lane) = lane else {
+                    return Err(Error::UnsupportedKernel {
+                        operation: "expert_mlp",
+                        detail: "this plan has device groups and no device lane to run them".into(),
+                    });
+                };
+                lane.run_group(
+                    authority,
+                    group,
+                    &queued.gate_up,
+                    &queued.down,
+                    self.buffers.slots.as_mut_slice(),
+                )?;
+                self.stats.slots_written += group.slots.len() as u64;
+                Ok(())
+            }
         }
     }
 
@@ -1325,6 +1424,24 @@ impl GroupedRun {
     ) {
         self.release_one(authority, gate_up);
         self.release_one(authority, down);
+    }
+
+    /// Hand the envelope's reservation to a device attachment.
+    ///
+    /// A `DeviceArena` owns the charge it materialises -- that is how task 0010
+    /// made "simulated placement presented as a reservation" impossible to
+    /// write -- so the reservation has to move rather than be borrowed. After
+    /// this, [`GroupedRun::close`] releases nothing and the attachment's own
+    /// `close` is what gives the envelope back.
+    pub fn detach_reservation(&mut self) -> Result<Reservation> {
+        let reservation = self.reservation.take().ok_or_else(|| {
+            invalid(
+                "reservation",
+                "this run has no reservation to hand over".into(),
+            )
+        })?;
+        self.detached = true;
+        Ok(reservation)
     }
 
     /// Reduce every row's slots in the plan's declared order.
@@ -1402,6 +1519,14 @@ impl GroupedRun {
                 ),
                 run: self,
             });
+        }
+        if self.detached {
+            // The device attachment owns the charge. Releasing here as well
+            // would double-release, which the ledger refuses -- but relying on
+            // that refusal instead of knowing whose charge it is is exactly the
+            // kind of accounting that made R02 possible.
+            self.guard = None;
+            return Ok(());
         }
         let Some(reservation) = self.reservation.take() else {
             return Err(GroupedCloseRefused {
