@@ -937,14 +937,26 @@ pub fn compile_experts(
             (None, _) => (Candidate::Device, RejectionReason::NotPreferred),
             (Some(reason), None) => (Candidate::Host, reason),
             (Some(device), Some(host)) => {
-                // Both refused this expert. `required` was already handled
-                // plan-wide; what is left is a genuine dead end.
-                return Err(ExpertPlanRefused {
-                    error: Error::CapacityExceeded {
+                // Both refused this expert. When one of them is `required`, the
+                // actionable error is *that* candidate's reason: reporting
+                // `CapacityExceeded` with a cache that has room, because the
+                // other candidate was excluded by the control, tells the caller
+                // the wrong thing. The real-artifact case found exactly that --
+                // 11,894,784 B "exceeding" 47,579,136 B available, when the
+                // actual reason was the declared amortisation threshold.
+                let error = if policy.device == StrategyControl::Required {
+                    required_error("gpu-grouped", device)
+                } else if policy.host == StrategyControl::Required {
+                    required_error("cpu-tiled", host)
+                } else {
+                    Error::CapacityExceeded {
                         tier: Some(Tier::Device(DeviceTier::ExpertCache)),
                         requested_bytes: transfer_bytes,
                         available_bytes: displaceable,
-                    },
+                    }
+                };
+                return Err(ExpertPlanRefused {
+                    error,
                     device: Some(device),
                     host: Some(host),
                 });
