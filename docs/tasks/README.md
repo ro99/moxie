@@ -43,10 +43,16 @@ against an independent read. **Reading is not executing**: nothing computes with
 those bytes and no checkpoint runs. **It does not close M2**, which also needs
 items 3–5 and a real working set that executes.
 
-**Task 0021 is next**: M2 item 3's CPU expert fallback and GPU grouped candidate
-plans under one interface, specified in
+**[Task 0021](0021-m2-expert-execution-plans.md) is active**: M2 item 3's CPU
+expert fallback and GPU grouped candidate plans under one interface, assigned by
 [the task 0020 handover](../handovers/2026-09-12-task0020-weight-residency-authority.md#next-task).
-Its contract has not been authored.
+Its contract was authored and committed before implementation, and states the
+five terms the handover required: the grouped operand layout and how a residency
+lease becomes it, the deterministic choice between the candidates and what it
+reports about the rejected one, the bounded queue's admitted capacity and its
+refusal, measured NUMA placement on this machine, and the reduction of partial
+outputs. **It does not close M2**, which also needs item 4 and a real working set
+that executes.
 
 Reopen accepted tasks only for a demonstrated defect in accepted scope.
 
