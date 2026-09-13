@@ -4,8 +4,8 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 
 ## Active assignment
 
-**M1 complete (M1.5 closed 2026-09-12); M2 active, item 1 accepted, item 2
-implemented and corrected after seven rounds of independent review.** See the
+**M1 complete (M1.5 closed 2026-09-12); M2 active, items 1 and 2 accepted.** See
+the
 [task 0020 handover](docs/handovers/2026-09-12-task0020-weight-residency-authority.md)
 for the current continuation, and the
 [closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
@@ -18,10 +18,10 @@ shared operations with FP64 oracles, the pinned BF16 boundaries that decide
 which experts a row selects, and two consumers carrying opposite routing
 parameters.
 
-**M2 item 2's residency authority is implemented and corrected after seven
-rounds of independent review** — twenty-seven findings, all reproduced, all
-fixed, none disputed
-([task 0020](docs/tasks/0020-m2-weight-residency-authority.md), 2026-09-12):
+**M2 item 2's residency authority is accepted** (2026-09-12, after seven rounds
+of independent review — twenty-seven findings, all reproduced, all fixed, none
+disputed; the seventh recommended acceptance with no new blocking findings)
+([task 0020](docs/tasks/0020-m2-weight-residency-authority.md)):
 `moxie_memory::residency` is the **one** production weight-residency owner, with
 document 03's chunk identity, its lifecycle and failure transitions, coalescing,
 event-bound device uploads whose allocation is tied to its reservation,
@@ -32,7 +32,9 @@ nine of M2 item 5's cases pass, on the host lane and on all three GPUs, alongsid
 a regression for each review finding. One of those findings corrected a claim
 rather than a defect: **a nonblocking acquire is necessary but not sufficient for
 deadlock freedom**, and the cycles it missed were between the demand counter and
-the prefetch gate, and along promotion's dependency chain.
+the prefetch gate, and along promotion's dependency chain. **The acceptance
+closes task 0020 only, not M2**: nothing executes a routed layer, which is item
+3.
 
 **`arch-check` now passes with zero failures.** The four it reported as
 "pre-existing" from task 0014 onward were review probe crates parked under

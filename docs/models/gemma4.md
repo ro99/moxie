@@ -275,7 +275,7 @@ Status: **inventory 2026-09-12; routed graph composed by
 [task 0019](../tasks/0019-m2-routed-expert-semantics.md) over synthetic weights,
 accepted 2026-09-12; its expert bytes demand-read through the residency
 authority by [task 0020](../tasks/0020-m2-weight-residency-authority.md),
-2026-09-12.** The checkpoint is **not imported and not executed** — task 0020
+accepted 2026-09-12.** The checkpoint is **not imported and not executed** — task 0020
 reads bounded ranges and computes nothing with them. This record
 exists because roadmap M2 needs a real BF16 MoE and document 09 §B requires the
 mathematical inventory before implementation. It resolves no owner gate and
@@ -466,9 +466,9 @@ weights the composition root invents.
 - **No private runtime, cache, transfer, sampler or branch evaluator: yes.** The
   routed graph runs through the accepted task 0015 service, task 0013 paged
   transactions and the task 0014 sampler.
-- **Residency, expert chunk identity, demand cache and eviction: implemented**
-  by [task 0020](../tasks/0020-m2-weight-residency-authority.md), awaiting
-  review. `moxie_memory::residency` is the one production weight-residency
+- **Residency, expert chunk identity, demand cache and eviction: accepted**
+  ([task 0020](../tasks/0020-m2-weight-residency-authority.md), 2026-09-12, after
+  seven rounds of independent review). `moxie_memory::residency` is the one production weight-residency
   owner. **This artifact's own expert bytes have been read through it**: nine
   distinct experts of layer 0, demanded from routes shaped like a top-k-8 batch,
   **107,053,056 B** read once each against a cache holding four, every range

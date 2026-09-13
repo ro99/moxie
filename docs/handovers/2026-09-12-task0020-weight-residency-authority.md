@@ -1,10 +1,14 @@
 # Handover — task 0020 implemented; task 0021 is M2's grouped expert execution
 
-**Task 0020 is implemented, corrected after seven rounds of independent review,
-and awaiting owner acceptance.** The seven rounds found **twenty-seven** issues;
-all twenty-seven were reproduced and fixed, and none was disputed. **The last two
-rounds found no residency defect at all** — both findings were in the
-architecture check. Three rounds
+**Task 0020 was accepted by the owner on 2026-09-12**, after seven rounds of
+independent review; the seventh reported no new blocking findings and recommended
+acceptance within the declared M2 item 2 scope. The seven rounds found
+**twenty-seven** issues; all twenty-seven were reproduced and fixed, and none was
+disputed. **The last two rounds found no residency defect at all** — both
+findings were in the architecture check.
+
+**The acceptance closes task 0020 only.** M2 items 3–5 are outstanding and the
+next of them is specified under [Next task](#next-task). Three rounds
 criticised method or a coverage claim rather than code, and each was right: the
 fourth showed by mutation testing that the sweep did not establish its claim, and
 the fifth showed that even after that fix, 120 of its cases never applied the

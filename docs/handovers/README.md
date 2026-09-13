@@ -2,10 +2,11 @@
 
 ## Active handover
 
-[Task 0020 implemented; task 0021 is M2 item 3](2026-09-12-task0020-weight-residency-authority.md)
-is the current continuation. M2 item 2's residency authority exists and this
-artifact's own expert bytes have been read through it; **nothing executes a
-routed layer**, which is item 3.
+[Task 0020 accepted; task 0021 is M2 item 3](2026-09-12-task0020-weight-residency-authority.md)
+is the current continuation. M2 item 2's residency authority was accepted on
+2026-09-12 after seven rounds of independent review, and this artifact's own
+expert bytes have been read through it; **nothing executes a routed layer**,
+which is item 3.
 
 The milestone context below remains in force.
 

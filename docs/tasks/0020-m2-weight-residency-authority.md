@@ -1,7 +1,14 @@
 # Task 0020 — M2 weight-residency authority
 
-Status: **implemented and corrected after seven rounds of independent review;
-awaiting owner acceptance.** Contract written and committed at `d6e9170` before
+Status: **accepted by the owner on 2026-09-12**, after seven rounds of
+independent review, the seventh reporting no new blocking findings and
+recommending acceptance "within its declared M2 item 2 scope".
+
+**The acceptance closes this residency assignment only. It does not close M2**,
+whose exit still needs grouped expert execution, CPU fallback and a real working
+set that executes — none of which exists. Nothing here executes a checkpoint.
+
+Contract written and committed at `d6e9170` before
 implementation, per the working rule that produced tasks 0013–0019. The seven
 rounds found **twenty-seven** issues in total; all twenty-seven were reproduced
 and fixed, and none was disputed. Three rounds criticised method or a coverage
@@ -948,6 +955,25 @@ actually use — enumerates those *and* `[build-dependencies]` and
 `cargo check` and produced zero violations.
 
 It is folded into the table above, because it is the same failure a fourth time.
+
+### Acceptance
+
+**Accepted 2026-09-12.** The seventh review closed with "no new blocking
+findings in `db6b613`. I recommend accepting task 0020 within its declared M2
+item 2 scope", verifying all three architecture probes, 53 xtask tests,
+arch-check and spec-check, and noting that no runtime code had changed since the
+GPU verification of earlier rounds. The owner directed the acceptance be
+recorded.
+
+What the acceptance covers, in the review's own framing: **this residency
+assignment, not M2.** Grouped expert execution, CPU fallback and checkpoint
+execution remain outstanding, and the next bounded task is 0021.
+
+Seven rounds found **twenty-seven** issues. All twenty-seven were reproduced and
+fixed; **none was disputed**. Four of them were in this task's own enforcement
+tooling rather than in the authority, and three were criticisms of method or of a
+coverage claim rather than of code — each correct. The last two rounds found no
+residency defect at all.
 
 ### What was **not** delivered, and why
 

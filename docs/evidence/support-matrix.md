@@ -13,9 +13,9 @@ matrix exists to prevent.
 ## Gate IDs
 
 [Task 0020](../tasks/0020-m2-weight-residency-authority.md) is **M2 item 2**,
-implemented, corrected after seven rounds of independent review that found
-**twenty-seven** issues — all reproduced, all fixed, none disputed — and
-awaiting owner acceptance: one production weight-residency owner, connected to bounded
+**accepted on 2026-09-12** after seven rounds of independent review that found
+**twenty-seven** issues — all reproduced, all fixed, none disputed; the seventh
+recommended acceptance with no new blocking findings: one production weight-residency owner, connected to bounded
 storage reads, a host cache, real device uploads, leases, eviction and
 demand/prefetch classes.
 Gates: 823 host tests + doctests, 843
@@ -193,7 +193,7 @@ residency. See [the closure handover](../handovers/2026-09-12-m1-closure-to-m2.m
 | none | n/a | n/a | INT8 affine host decode | passed | `G-HOST-TEST` (`moxie-format::affine`, all 256 codes including -128) | As above. |
 | none | n/a | n/a | W4A16 / W8A16 execution | **not implemented** | — | M3. `ExecutionProfile` names the operand widths and declares that the weights must be dequantized; no kernel exists. Task 0018 imports the weights; nothing executes them. |
 | **inspected, not executed** — `/fast/models/cyankiwi/gemma-4-31B-it-AWQ-8bit` rev `34ca187d` | n/a — host import | n/a | compressed-tensors `pack-quantized` INT8/INT4 **import** to canonical affine form | **accepted task 0018, 2026-09-12** | `G-CT-IMPORT` | **Import only. This is not model support and nothing executes.** Symmetric sources; asymmetric is an explicit typed refusal because no pinned exporter or local artifact establishes its zero-point serialization. The lane order within a packed word is taken from the pinned reader and **cannot** be verified against this artifact, because all four lanes fall inside one scale group — closing it needs paired output against the released model (**O2**). No quality claim follows. Nothing was written under any checkpoint root (**O5**). |
-| **inspected and read, not executed** — `/fast/models/google/gemma-4-26B-A4B-it` rev `4d7ae498` | host cache + sm_86 / sm_120 device caches | n/a | Weight **residency**: bounded ranged reads, host cache, device upload readiness, leases, eviction, demand/prefetch classes | **implemented task 0020, awaiting review** | `G-RESIDENCY-HOST`, `G-RESIDENCY-DEVICE` | **Residency is not execution.** Nine experts' bytes were demand-loaded and verified; **nothing computed with them**, no routed layer ran, and the selected BF16 chain still refuses `Route`/`ExpertMlp`/`Combine`. M2's exit needs a working set that executes (item 3). Device evidence is on synthetic weight-shaped bytes, not on this artifact. No quality claim (**O2**); nothing written under any checkpoint root (**O5**). |
+| **inspected and read, not executed** — `/fast/models/google/gemma-4-26B-A4B-it` rev `4d7ae498` | host cache + sm_86 / sm_120 device caches | n/a | Weight **residency**: bounded ranged reads, host cache, device upload readiness, leases, eviction, demand/prefetch classes | **accepted task 0020, 2026-09-12** | `G-RESIDENCY-HOST`, `G-RESIDENCY-DEVICE` | **Residency is not execution.** Nine experts' bytes were demand-loaded and verified; **nothing computed with them**, no routed layer ran, and the selected BF16 chain still refuses `Route`/`ExpertMlp`/`Combine`. M2's exit needs a working set that executes (item 3). Device evidence is on synthetic weight-shaped bytes, not on this artifact. No quality claim (**O2**); nothing written under any checkpoint root (**O5**). |
 | none | n/a | n/a | Grouped expert execution (CPU fallback, GPU candidate plans) | **not implemented** | — | M2 item 3. The residency authority exists; nothing consumes its chunks as operands. |
 | none | n/a | n/a | AutoRound / AutoGPTQ packing import | **not implemented** | — | M3, second importer. |
 | none | n/a | n/a | NVFP4 / FP8 / W4A4 / W8A8 | **unsupported** | — | Deferred by [ADR 0003](../decisions/adr/0003-int4-int8-bf16-weight-family.md). Not a gap to close; a decision. |
