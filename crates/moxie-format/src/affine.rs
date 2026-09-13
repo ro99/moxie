@@ -34,6 +34,20 @@ use moxie_types::{Error, Precision, Result};
 
 use crate::scale::{ScaleDtype, ScaleValues};
 
+/// This module's refusals, composed **fallibly** -- see [`crate::invalid_fmt`].
+fn invalid(detail: core::fmt::Arguments<'_>) -> Error {
+    crate::invalid_fmt(
+        "a malformed affine-integer tensor (detail unavailable: out of memory)",
+        detail,
+    )
+}
+
+/// A refusal whose whole message is static: allocation-free, always available.
+#[allow(dead_code)]
+fn invalid_static(detail: &'static str) -> Error {
+    crate::invalid_static(detail)
+}
+
 /// Integer code width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntWidth {
@@ -184,9 +198,7 @@ impl AffineDescriptor {
             Grouping::PerOutputChannel => Ok(1),
             Grouping::Contiguous { size } => {
                 if size == 0 {
-                    return Err(Error::InvalidArtifact {
-                        detail: "group size 0".into(),
-                    });
+                    return Err(invalid_static("group size 0"));
                 }
                 Ok(self.in_features.div_ceil(size as usize))
             }
@@ -196,14 +208,12 @@ impl AffineDescriptor {
     /// Total scale/zero-point entries: one per `(output channel, group)`.
     pub fn group_entries(&self) -> Result<usize> {
         let per_row = self.groups_per_row()?;
-        self.out_features
-            .checked_mul(per_row)
-            .ok_or_else(|| Error::InvalidArtifact {
-                detail: format!(
-                    "group table size overflows: {} rows x {per_row} groups",
-                    self.out_features
-                ),
-            })
+        self.out_features.checked_mul(per_row).ok_or_else(|| {
+            invalid(format_args!(
+                "group table size overflows: {} rows x {per_row} groups",
+                self.out_features
+            ))
+        })
     }
 
     /// Bytes of packed codes the whole tensor needs.
@@ -211,17 +221,16 @@ impl AffineDescriptor {
         self.width
             .row_stride(self.in_features)
             .checked_mul(self.out_features)
-            .ok_or_else(|| Error::InvalidArtifact {
-                detail: "packed code length overflows usize".into(),
-            })
+            .ok_or_else(|| invalid_static("packed code length overflows usize"))
     }
 
     /// The group a logical input column belongs to.
     pub fn group_of(&self, k: usize) -> Result<usize> {
         if k >= self.in_features {
-            return Err(Error::InvalidArtifact {
-                detail: format!("column {k} is outside {} input features", self.in_features),
-            });
+            return Err(invalid(format_args!(
+                "column {k} is outside {} input features",
+                self.in_features
+            )));
         }
         match &self.group_index {
             Some(map) => Ok(map[k] as usize),
@@ -235,22 +244,18 @@ impl AffineDescriptor {
     /// Validate everything that does not need the payload.
     pub fn validate(&self) -> Result<()> {
         if self.out_features == 0 || self.in_features == 0 {
-            return Err(Error::InvalidArtifact {
-                detail: format!(
-                    "empty logical shape {}x{}",
-                    self.out_features, self.in_features
-                ),
-            });
+            return Err(invalid(format_args!(
+                "empty logical shape {}x{}",
+                self.out_features, self.in_features
+            )));
         }
         if let Grouping::Contiguous { size } = self.grouping
             && !ALLOWED_GROUP_SIZES.contains(&size)
         {
-            return Err(Error::InvalidArtifact {
-                detail: format!(
-                    "group size {size} is outside the closed set {ALLOWED_GROUP_SIZES:?}; \
+            return Err(invalid(format_args!(
+                "group size {size} is outside the closed set {ALLOWED_GROUP_SIZES:?}; \
                      widening it is an ADR, not an import decision"
-                ),
-            });
+            )));
         }
         // Overflow checks before anything indexes with these.
         let groups = self.groups_per_row()?;
@@ -259,24 +264,20 @@ impl AffineDescriptor {
 
         if let Some(map) = &self.group_index {
             if map.len() != self.in_features {
-                return Err(Error::InvalidArtifact {
-                    detail: format!(
-                        "group index map has {} entries for {} input features",
-                        map.len(),
-                        self.in_features
-                    ),
-                });
+                return Err(invalid(format_args!(
+                    "group index map has {} entries for {} input features",
+                    map.len(),
+                    self.in_features
+                )));
             }
             let mut used = vec![0usize; groups];
             for (k, g) in map.iter().enumerate() {
                 let g = *g as usize;
                 if g >= groups {
-                    return Err(Error::InvalidArtifact {
-                        detail: format!(
-                            "group index map sends column {k} to group {g}, but there are \
+                    return Err(invalid(format_args!(
+                        "group index map sends column {k} to group {g}, but there are \
                              only {groups} groups"
-                        ),
-                    });
+                    )));
                 }
                 used[g] += 1;
             }
@@ -284,12 +285,10 @@ impl AffineDescriptor {
             // consistent." An unused group means a scale nothing reads, which is
             // how a misread permutation hides.
             if let Some(g) = used.iter().position(|n| *n == 0) {
-                return Err(Error::InvalidArtifact {
-                    detail: format!(
-                        "group {g} has a scale but no input column maps to it; \
+                return Err(invalid(format_args!(
+                    "group {g} has a scale but no input column maps to it; \
                          the activation-order map and the group table disagree"
-                    ),
-                });
+                )));
             }
         }
         Ok(())
@@ -366,40 +365,38 @@ impl AffineTensor {
 
         let need_bytes = desc.code_bytes()?;
         if codes.len() != need_bytes {
-            return Err(Error::InvalidArtifact {
-                detail: format!(
-                    "{} needs {need_bytes} packed byte(s) for {}x{}, got {}",
-                    desc.width.profile(),
-                    desc.out_features,
-                    desc.in_features,
-                    codes.len()
-                ),
-            });
+            return Err(invalid(format_args!(
+                "{} needs {need_bytes} packed byte(s) for {}x{}, got {}",
+                desc.width.profile(),
+                desc.out_features,
+                desc.in_features,
+                codes.len()
+            )));
         }
 
         let entries = desc.group_entries()?;
         if scales.len() != entries {
-            return Err(Error::InvalidArtifact {
-                detail: format!("expected {entries} scale(s), got {}", scales.len()),
-            });
+            return Err(invalid(format_args!(
+                "expected {entries} scale(s), got {}",
+                scales.len()
+            )));
         }
         if scales.dtype() != desc.scale_dtype {
-            return Err(Error::InvalidArtifact {
-                detail: format!(
-                    "descriptor declares {} scales but the payload is {}",
-                    desc.scale_dtype.name(),
-                    scales.dtype().name()
-                ),
-            });
+            return Err(invalid(format_args!(
+                "descriptor declares {} scales but the payload is {}",
+                desc.scale_dtype.name(),
+                scales.dtype().name()
+            )));
         }
         scales.validate()?;
 
         if let ZeroPoints::PerGroup(z) = &zero_points
             && z.len() != entries
         {
-            return Err(Error::InvalidArtifact {
-                detail: format!("expected {entries} zero point(s), got {}", z.len()),
-            });
+            return Err(invalid(format_args!(
+                "expected {entries} zero point(s), got {}",
+                z.len()
+            )));
         }
 
         Ok(Self {
@@ -433,12 +430,10 @@ impl AffineTensor {
     /// in the tensor, which no accuracy tolerance would catch.
     pub fn code(&self, o: usize, k: usize) -> Result<i32> {
         if o >= self.desc.out_features || k >= self.desc.in_features {
-            return Err(Error::InvalidArtifact {
-                detail: format!(
-                    "({o},{k}) is outside {}x{}",
-                    self.desc.out_features, self.desc.in_features
-                ),
-            });
+            return Err(invalid(format_args!(
+                "({o},{k}) is outside {}x{}",
+                self.desc.out_features, self.desc.in_features
+            )));
         }
         let stride = self.desc.width.row_stride(self.desc.in_features);
         Ok(match self.desc.width {
@@ -470,18 +465,17 @@ impl AffineTensor {
     /// The bounded form: no allocation, and the working set is one row.
     pub fn reconstruct_row_into(&self, o: usize, out: &mut [f32]) -> Result<()> {
         if o >= self.desc.out_features {
-            return Err(Error::InvalidArtifact {
-                detail: format!("row {o} is outside {} rows", self.desc.out_features),
-            });
+            return Err(invalid(format_args!(
+                "row {o} is outside {} rows",
+                self.desc.out_features
+            )));
         }
         if out.len() != self.desc.in_features {
-            return Err(Error::InvalidArtifact {
-                detail: format!(
-                    "destination holds {} values for a {}-wide row",
-                    out.len(),
-                    self.desc.in_features
-                ),
-            });
+            return Err(invalid(format_args!(
+                "destination holds {} values for a {}-wide row",
+                out.len(),
+                self.desc.in_features
+            )));
         }
         let per_row = self.desc.groups_per_row()?;
         for (k, slot) in out.iter_mut().enumerate() {
@@ -490,9 +484,7 @@ impl AffineTensor {
             let scale = self
                 .scales
                 .get(entry)
-                .ok_or_else(|| Error::InvalidArtifact {
-                    detail: format!("no scale for row {o} group {g}"),
-                })?;
+                .ok_or_else(|| invalid(format_args!("no scale for row {o} group {g}")))?;
             let z = self.zero_points.get(entry);
             let q = self.code(o, k)?;
             // Subtraction in i32: wide enough that no (code, zero point) pair in
@@ -507,11 +499,9 @@ impl AffineTensor {
             // infinite reconstructed weight belongs in the same list -- it would
             // reach a kernel and poison a whole row's accumulation.
             if !w.is_finite() {
-                return Err(Error::InvalidArtifact {
-                    detail: format!(
-                        "reconstruction overflows at ({o},{k}): ({q} - {z}) * {scale} = {w}"
-                    ),
-                });
+                return Err(invalid(format_args!(
+                    "reconstruction overflows at ({o},{k}): ({q} - {z}) * {scale} = {w}"
+                )));
             }
             *slot = w;
         }
@@ -555,9 +545,9 @@ pub fn pack_row(width: IntWidth, codes: &[i32]) -> Result<Vec<u8>> {
     let (lo, hi) = width.code_range();
     for (k, c) in codes.iter().enumerate() {
         if *c < lo || *c > hi {
-            return Err(Error::InvalidArtifact {
-                detail: format!("code {c} at column {k} is outside [{lo}, {hi}]"),
-            });
+            return Err(invalid(format_args!(
+                "code {c} at column {k} is outside [{lo}, {hi}]"
+            )));
         }
     }
     // Fallible, because an importer sizes this from an artifact's own header:
@@ -595,21 +585,19 @@ pub fn pack_row(width: IntWidth, codes: &[i32]) -> Result<Vec<u8>> {
 pub fn pack_row_into(width: IntWidth, codes: &[i32], out: &mut [u8]) -> Result<()> {
     let need = width.row_stride(codes.len());
     if out.len() != need {
-        return Err(Error::InvalidArtifact {
-            detail: format!(
-                "a {} row of {} code(s) needs {need} byte(s), got {}",
-                width.profile(),
-                codes.len(),
-                out.len()
-            ),
-        });
+        return Err(invalid(format_args!(
+            "a {} row of {} code(s) needs {need} byte(s), got {}",
+            width.profile(),
+            codes.len(),
+            out.len()
+        )));
     }
     let (lo, hi) = width.code_range();
     for (k, c) in codes.iter().enumerate() {
         if *c < lo || *c > hi {
-            return Err(Error::InvalidArtifact {
-                detail: format!("code {c} at column {k} is outside [{lo}, {hi}]"),
-            });
+            return Err(invalid(format_args!(
+                "code {c} at column {k} is outside [{lo}, {hi}]"
+            )));
         }
     }
     out.fill(0);
@@ -641,13 +629,11 @@ pub fn pack_row_into(width: IntWidth, codes: &[i32], out: &mut [u8]) -> Result<(
 /// requantization."
 pub fn rebias_code(width: IntWidth, unsigned: u32) -> Result<i32> {
     if unsigned > width.max_unsigned() {
-        return Err(Error::InvalidArtifact {
-            detail: format!(
-                "unsigned code {unsigned} exceeds {} for {}",
-                width.max_unsigned(),
-                width.profile()
-            ),
-        });
+        return Err(invalid(format_args!(
+            "unsigned code {unsigned} exceeds {} for {}",
+            width.max_unsigned(),
+            width.profile()
+        )));
     }
     Ok(unsigned as i32 - width.bias())
 }
@@ -659,9 +645,8 @@ pub fn rebias_code(width: IntWidth, unsigned: u32) -> Result<i32> {
 /// would change every reconstructed value in the group.
 pub fn rebias_zero_point(width: IntWidth, unsigned: u32) -> Result<i16> {
     let z = rebias_code(width, unsigned)?;
-    i16::try_from(z).map_err(|_| Error::InvalidArtifact {
-        detail: format!("rebiased zero point {z} does not fit in i16"),
-    })
+    i16::try_from(z)
+        .map_err(|_| invalid(format_args!("rebiased zero point {z} does not fit in i16")))
 }
 
 #[cfg(test)]

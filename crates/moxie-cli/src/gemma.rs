@@ -172,7 +172,7 @@ pub fn build_with_config(config: TextConfig) -> Result<Fixture> {
             .graph
             .spec(bound.value)
             .ok_or_else(|| Error::InvalidArtifact {
-                detail: format!("role {} has no graph value", bound.role.name),
+                detail: format!("role {} has no graph value", bound.role.name).into(),
             })?;
         let extent: Vec<usize> = spec
             .shape
@@ -183,7 +183,8 @@ pub fn build_with_config(config: TextConfig) -> Result<Fixture> {
                     detail: format!(
                         "weight {} has a non-constant extent {other:?}",
                         bound.role.name
-                    ),
+                    )
+                    .into(),
                 }),
             })
             .collect::<Result<_>>()?;

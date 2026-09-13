@@ -360,7 +360,8 @@ impl<'ctx> DeviceExperts<'ctx> {
                     x.len(),
                     self.rows,
                     self.hidden
-                ),
+                )
+                .into(),
             }));
         }
         let range = self.activations.as_ref().expect("live range");
@@ -560,7 +561,8 @@ impl<'ctx> DeviceExperts<'ctx> {
                     "the host slot buffer is {} B, expected {}",
                     host_slots.len(),
                     self.slot_count * width
-                ),
+                )
+                .into(),
             }));
         }
         let index_bytes = (assignments * 4) as usize;
@@ -582,7 +584,8 @@ impl<'ctx> DeviceExperts<'ctx> {
                     "expert {} is {gate_up_len} + {down_len} B resident, expected \
                      {expected_gate_up} + {expected_down}",
                     group.expert()
-                ),
+                )
+                .into(),
             }));
         }
         let mut gate_up_ptr = residency
@@ -850,7 +853,7 @@ fn expert_package_sha256() -> Result<[u8; 32]> {
     let text = moxie_kernels::EXPERT_MLP_FATBIN_SHA256;
     if text.len() != 64 {
         return Err(Error::InvalidArtifact {
-            detail: format!("the kernel package digest is {} characters", text.len()),
+            detail: format!("the kernel package digest is {} characters", text.len()).into(),
         });
     }
     let mut out = [0u8; 32];

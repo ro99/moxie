@@ -79,12 +79,13 @@ pub fn rope_head(x: &[f32], pos: u64, rotation: Rotation) -> Result<Vec<f32>> {
             detail: format!(
                 "rotary_dim {rotary_dim} exceeds the head dimension {}",
                 x.len()
-            ),
+            )
+            .into(),
         });
     }
     if !rotary_dim.is_multiple_of(2) {
         return Err(Error::InvalidArtifact {
-            detail: format!("rotary_dim {rotary_dim} is odd; rotation is over pairs"),
+            detail: format!("rotary_dim {rotary_dim} is odd; rotation is over pairs").into(),
         });
     }
     if frequency_dim == 0 {
@@ -101,7 +102,8 @@ pub fn rope_head(x: &[f32], pos: u64, rotation: Rotation) -> Result<Vec<f32>> {
             detail: format!(
                 "half-split rotation needs an even head dimension, got {}",
                 x.len()
-            ),
+            )
+            .into(),
         });
     }
     if !(base.is_finite() && base > 1.0) {
@@ -137,7 +139,7 @@ pub fn rope_row(
 ) -> Result<Vec<f32>> {
     if x.len() != heads * head_dim {
         return Err(Error::InvalidArtifact {
-            detail: format!("row has {} elements, expected {heads}x{head_dim}", x.len()),
+            detail: format!("row has {} elements, expected {heads}x{head_dim}", x.len()).into(),
         });
     }
     let mut out = crate::try_vec(x.len())?;

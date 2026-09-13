@@ -78,7 +78,7 @@ impl ShardSource {
         }
         if self.shards[shard].header().get(&tensor).is_err() {
             return Err(Error::InvalidArtifact {
-                detail: format!("shard {shard} has no tensor {tensor:?}"),
+                detail: format!("shard {shard} has no tensor {tensor:?}").into(),
             });
         }
         self.roles.insert(role, (shard, tensor));
@@ -142,7 +142,8 @@ pub fn perform_read<S: ChunkSource>(
                 detail: format!(
                     "the authority offered {} byte(s) for a {len_bytes}-byte order",
                     destination.len()
-                ),
+                )
+                .into(),
             });
         }
         match source.read_chunk(chunk, destination) {
@@ -474,7 +475,8 @@ mod device {
                                 "the authority offered {} source byte(s) for a {len_bytes}-byte \
                                  copy",
                                 source.len()
-                            ),
+                            )
+                            .into(),
                         },
                         false,
                     ));

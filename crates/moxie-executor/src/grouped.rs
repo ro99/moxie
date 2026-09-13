@@ -1533,7 +1533,8 @@ impl<'lane> GroupedRun<'lane> {
                     self.plan.activation_bytes(),
                     self.plan.rows(),
                     self.plan.shape().hidden
-                ),
+                )
+                .into(),
             });
         }
         // The host buffer is the upload's source, so it is written first and

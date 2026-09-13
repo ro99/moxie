@@ -107,17 +107,47 @@ impl Source {
 }
 
 /// Where each of an artifact's `pack-quantized` tensors actually lives.
+///
+/// **Every discovered packed module is kept.** An earlier version filtered the
+/// incomplete ones out of `modules` *before* the audit that is supposed to find
+/// them, so the audit could not fail: an independent review built a shard with
+/// four packed modules, one missing its `weight_zero_point`, and the inventory
+/// test passed while reporting three. A filter applied to the population being
+/// audited removes exactly the rows the audit exists to see -- which is task
+/// 0023's omitted layer, in a different file.
 struct Inventory<'a> {
     source: &'a Source,
     /// Tensor name -> (shard number, dtype, declared shape).
     located: BTreeMap<String, (u32, Dtype, Vec<u64>)>,
-    /// Modules with all four tensors somewhere, smallest packed payload first.
+    /// **Every** module carrying `weight_packed`, smallest payload first,
+    /// complete or not.
     modules: Vec<(String, u64)>,
     /// Modules whose four tensors are all in one shard, by shard number.
     whole: BTreeMap<u32, Vec<String>>,
     /// One opened shard, kept so a run of reads from the same shard parses its
     /// header once.
     open: RefCell<Option<(u32, Shard)>>,
+}
+
+/// A module missing one or more of the four tensors a `pack-quantized` weight
+/// is serialized as, anywhere in the artifact.
+#[derive(Debug, PartialEq, Eq)]
+struct Incomplete {
+    module: String,
+    missing: Vec<&'static str>,
+}
+
+/// Which of the four companions a module lacks, across the whole artifact.
+///
+/// A pure function of the located names, so the audit it feeds can be tested
+/// against a table that **contains** a missing companion -- the case no real
+/// artifact here supplies, and the case the check exists for.
+fn missing_companions<'n>(module: &str, located: impl Fn(&str) -> bool + 'n) -> Vec<&'static str> {
+    SUFFIXES
+        .iter()
+        .copied()
+        .filter(|s| !located(&format!("{module}.{s}")))
+        .collect()
 }
 
 impl<'a> Inventory<'a> {
@@ -151,14 +181,10 @@ impl<'a> Inventory<'a> {
                 located.insert(name.clone(), (n, entry.dtype, entry.shape.clone()));
             }
         }
-        let mut modules: Vec<(String, u64)> = sizes
-            .into_iter()
-            .filter(|(module, _)| {
-                SUFFIXES
-                    .iter()
-                    .all(|s| located.contains_key(&format!("{module}.{s}")))
-            })
-            .collect();
+        // Every packed module, complete or not. The audit below is what
+        // decides whether an incomplete one is acceptable; this list is its
+        // population and may not pre-empt it.
+        let mut modules: Vec<(String, u64)> = sizes.into_iter().collect();
         // By size, then by name: a deterministic choice, not whatever the map
         // happened to yield.
         modules.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
@@ -169,6 +195,30 @@ impl<'a> Inventory<'a> {
             whole: per_shard,
             open: RefCell::new(None),
         }
+    }
+
+    /// Every module lacking one of the four tensors, anywhere in the artifact.
+    fn incomplete(&self) -> Vec<Incomplete> {
+        self.modules
+            .iter()
+            .filter_map(|(module, _)| {
+                let missing = missing_companions(module, |n| self.located.contains_key(n));
+                (!missing.is_empty()).then(|| Incomplete {
+                    module: module.clone(),
+                    missing,
+                })
+            })
+            .collect()
+    }
+
+    /// The modules that can actually be imported: all four tensors located.
+    fn importable(&self) -> Vec<&(String, u64)> {
+        self.modules
+            .iter()
+            .filter(|(module, _)| {
+                missing_companions(module, |n| self.located.contains_key(n)).is_empty()
+            })
+            .collect()
     }
 
     fn entry(&self, name: &str) -> &(u32, Dtype, Vec<u64>) {
@@ -298,6 +348,37 @@ impl Payloads {
         }
     }
 
+    /// The source's reconstruction of `(o, k)`, **with the rounding boundary its
+    /// own reference applies**, as a BF16 bit pattern.
+    ///
+    /// The pinned `_dequantize` is
+    /// `(x_q.to(scale.dtype) - zero_point.to(scale.dtype)) * scale`, and
+    /// `scale.dtype` is BF16 for both artifacts, so the source's value is a
+    /// **BF16** number. The canonical reconstruction is FP32 by document 03's
+    /// contract ("scale multiplication is evaluated in FP32 in the host
+    /// reconstruction oracle"), and the two are not the same quantity.
+    ///
+    /// Task 0024's independent review found the first version of this file
+    /// claiming an FP32 comparison as agreement with "the source's own declared
+    /// arithmetic" and measured **27,501 of 112,640** values where the two
+    /// differ. Both are right; only one of them is what the source computes.
+    ///
+    /// **Why one rounding and not two.** `q - z` is an integer in `[-15, 15]`
+    /// and the scale is a BF16 value; both are exact in FP32 and their product
+    /// needs at most twelve significant bits, so the FP32 multiply is exact and
+    /// the only rounding is the single round-to-nearest-even into BF16. That is
+    /// what makes `bf16(canonical)` the source's value rather than an
+    /// approximation of it.
+    ///
+    /// Takes the already-unpacked zero points rather than unpacking them per
+    /// value: the first version called `unpack_zero_points` inside the loop and
+    /// turned a per-value check into a quadratic one.
+    fn source_bf16(&self, zeros: &[Vec<i32>], o: usize, k: usize) -> u16 {
+        let q = self.source_code(o, k);
+        let z = zeros[o][k / 32];
+        moxie_format::bf16::f32_to_bf16_bits((q - z) as f32 * self.scale_at(o, k / 32))
+    }
+
     /// The source's own code at `(o, k)`, read straight from `weight_packed`.
     fn source_code(&self, o: usize, k: usize) -> i32 {
         let packed_columns = self.logical.1.div_ceil(8);
@@ -379,6 +460,10 @@ fn real_asymmetric_tensors_import_and_match_the_sources_own_arithmetic() {
     let mut imported = 0usize;
     let mut bytes_read = 0u64;
     let mut values_checked = 0u64;
+    // How many sampled values the source's BF16 boundary actually moves. A
+    // boundary check on a sample where the boundary never fires would be
+    // vacuous, so this is counted and required to be nonzero.
+    let mut narrowed = 0u64;
     for source in &SOURCES {
         if !source.present() {
             source.skip("asymmetric import");
@@ -386,12 +471,12 @@ fn real_asymmetric_tensors_import_and_match_the_sources_own_arithmetic() {
         }
         let inventory = Inventory::build(source);
         assert!(
-            inventory.modules.len() >= 3,
-            "{} holds {} complete asymmetric module(s)",
+            inventory.importable().len() >= 3,
+            "{} holds {} importable asymmetric module(s)",
             source.name,
-            inventory.modules.len()
+            inventory.importable().len()
         );
-        for (module, _) in inventory.modules.iter().take(3) {
+        for (module, _) in inventory.importable().into_iter().take(3) {
             let p = Payloads::read(&inventory, module);
             let (out_features, in_features) = p.logical;
             let groups = p.groups();
@@ -435,7 +520,8 @@ fn real_asymmetric_tensors_import_and_match_the_sources_own_arithmetic() {
                     );
                 }
             }
-            // Bitwise equality on a deterministic sample of rows spanning the
+            // Two comparisons, because there are two quantities and they are
+            // not the same one. A deterministic sample of rows spanning the
             // whole output axis, including the last -- which is the row a
             // padded zero-point word would get wrong.
             let rows: Vec<usize> = [0, 1, out_features / 3, out_features / 2, out_features - 1]
@@ -450,12 +536,30 @@ fn real_asymmetric_tensors_import_and_match_the_sources_own_arithmetic() {
                 for (k, value) in row.iter().enumerate() {
                     let q = p.source_code(o, k);
                     let z = unpacked[o][k / 32];
-                    let want = (q - z) as f32 * p.scale_at(o, k / 32);
+                    // (a) The **canonical** equation of document 03, in FP32,
+                    // over the source's own bytes. This is what `moxie-format`
+                    // is contracted to reconstruct.
+                    let canonical = (q - z) as f32 * p.scale_at(o, k / 32);
                     assert_eq!(
                         value.to_bits(),
-                        want.to_bits(),
-                        "{module} at ({o},{k}): {value} against the source's {want}"
+                        canonical.to_bits(),
+                        "{module} at ({o},{k}): {value} against the canonical {canonical}"
                     );
+                    // (b) The **source's own** arithmetic, with the BF16
+                    // boundary its reference applies. The canonical FP32 value
+                    // must round to it exactly -- a repack that changed a code,
+                    // a zero point or a scale byte could not.
+                    let source = p.source_bf16(&unpacked, o, k);
+                    assert_eq!(
+                        moxie_format::bf16::f32_to_bf16_bits(*value),
+                        source,
+                        "{module} at ({o},{k}): the canonical value does not round to the \
+                         source's own BF16 result"
+                    );
+                    if canonical.to_bits() != moxie_format::bf16::bf16_bits_to_f32(source).to_bits()
+                    {
+                        narrowed += 1;
+                    }
                     low = low.min(q);
                     high = high.max(q);
                     values_checked += 1;
@@ -482,7 +586,14 @@ fn real_asymmetric_tensors_import_and_match_the_sources_own_arithmetic() {
     }
     eprintln!(
         "task0024 imported {imported} module(s), read {bytes_read} artifact byte(s), \
-         checked {values_checked} reconstructed value(s) bitwise"
+         checked {values_checked} reconstructed value(s) against the canonical FP32 \
+         equation and against the source's own BF16 arithmetic; the source's rounding \
+         boundary moves {narrowed} of them"
+    );
+    assert!(
+        narrowed > 0,
+        "the source's BF16 boundary never fired on {values_checked} sampled value(s), so \
+         checking it proved nothing"
     );
 }
 
@@ -512,7 +623,7 @@ fn the_pinned_zero_point_lane_assignment_is_the_one_the_artifacts_bytes_support(
             continue;
         }
         let inventory = Inventory::build(source);
-        for (module, _) in inventory.modules.iter().take(2) {
+        for (module, _) in inventory.importable().into_iter().take(2) {
             let p = Payloads::read(&inventory, module);
             let (out_features, in_features) = p.logical;
             let groups = p.groups();
@@ -541,7 +652,7 @@ fn the_pinned_zero_point_lane_assignment_is_the_one_the_artifacts_bytes_support(
             /// One reading of the packed zero points: output channel and
             /// group in, the zero point it assigns out.
             type Assignment<'a> = (&'a str, Box<dyn Fn(usize, usize) -> i32 + 'a>);
-            let candidates: [Assignment<'_>; 4] = [
+            let candidates: [Assignment<'_>; 5] = [
                 (
                     "pinned o = 8j + l",
                     Box::new(|o: usize, g: usize| {
@@ -565,6 +676,23 @@ fn the_pinned_zero_point_lane_assignment_is_the_one_the_artifacts_bytes_support(
                     Box::new(|o: usize, g: usize| {
                         ((word(o % word_rows, g) >> (4 * (7 - o / word_rows) as u32)) & 0xF) as i32
                             - 8
+                    }),
+                ),
+                // The sign. `mean_code - (-z)` is `mean_code + z`, so the
+                // pinned assignment negated measures whether the source adds
+                // its zero point instead of subtracting it.
+                //
+                // The first version of this record claimed the statistic could
+                // not separate the two, on the grounds that a distribution
+                // centred near zero is symmetric. That reasoning ignores the
+                // correlation between a group's code mean and its own zero
+                // point -- which is the entire premise of this measurement, two
+                // paragraphs earlier. An independent review measured the
+                // difference and it is large.
+                (
+                    "sign-flipped z -> -z",
+                    Box::new(|o: usize, g: usize| {
+                        -(((word(o / 8, g) >> (4 * (o % 8) as u32)) & 0xF) as i32 - 8)
                     }),
                 ),
             ];
@@ -632,6 +760,22 @@ fn every_asymmetric_module_declares_a_packed_zero_point() {
             continue;
         }
         let inventory = Inventory::build(source);
+        // The audit's own population: every packed module, before any filter.
+        // A module missing a companion is a finding, not a row to drop.
+        let incomplete = inventory.incomplete();
+        assert!(
+            incomplete.is_empty(),
+            "{}: {} packed module(s) lack a companion tensor: {:?}",
+            source.name,
+            incomplete.len(),
+            &incomplete[..incomplete.len().min(5)]
+        );
+        assert_eq!(
+            inventory.importable().len(),
+            inventory.modules.len(),
+            "{}: the audited population and the importable one must be the same              set once no module is incomplete",
+            source.name
+        );
         for (module, _) in &inventory.modules {
             let shape = |suffix: &str| &inventory.entry(&format!("{module}.{suffix}")).2;
             let packed = shape("weight_packed");
@@ -688,4 +832,51 @@ fn every_asymmetric_module_declares_a_packed_zero_point() {
     if inspected == 0 {
         eprintln!("SKIPPED: no asymmetric artifact is present on this machine");
     }
+}
+
+/// The inventory audit can actually fail.
+///
+/// The real artifacts have no incomplete module, so on them the assertion above
+/// is satisfied by a population that never violates it — and a check nothing
+/// violates is a check nobody has watched fail. An independent review proved the
+/// point the hard way: the earlier version filtered incomplete modules out
+/// before auditing, and a shard with four packed modules, one missing its
+/// `weight_zero_point`, passed while reporting three.
+///
+/// `missing_companions` is the audit's decision, so it is tested here against a
+/// table that **contains** the case, without needing a synthetic checkpoint.
+#[test]
+fn a_module_missing_a_companion_tensor_is_reported_not_dropped() {
+    let present: std::collections::BTreeSet<&str> = [
+        "m0.weight_packed",
+        "m0.weight_scale",
+        "m0.weight_shape",
+        "m0.weight_zero_point",
+        "m1.weight_packed",
+        "m1.weight_scale",
+        "m1.weight_shape",
+        // m1 has no zero point: the review's fixture.
+        "m2.weight_packed",
+        "m2.weight_zero_point",
+        // m2 has neither scale nor shape.
+    ]
+    .into_iter()
+    .collect();
+    let located = |n: &str| present.contains(n);
+
+    assert!(
+        missing_companions("m0", located).is_empty(),
+        "a complete module has nothing missing"
+    );
+    assert_eq!(missing_companions("m1", located), vec!["weight_zero_point"]);
+    assert_eq!(
+        missing_companions("m2", located),
+        vec!["weight_scale", "weight_shape"]
+    );
+    // And the ordering is the declared suffix order, so a report is stable.
+    assert_eq!(
+        missing_companions("absent", located),
+        SUFFIXES.to_vec(),
+        "a module with nothing at all names every companion"
+    );
 }

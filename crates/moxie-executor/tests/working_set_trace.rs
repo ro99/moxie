@@ -186,7 +186,7 @@ impl ChunkSource for FailingSource {
         self.seen += 1;
         if self.fail_at == Some(seen) {
             return Err(Error::InvalidArtifact {
-                detail: format!("injected read failure on {chunk}"),
+                detail: format!("injected read failure on {chunk}").into(),
             });
         }
         self.inner.read_chunk(chunk, into)

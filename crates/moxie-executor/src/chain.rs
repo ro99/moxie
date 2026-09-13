@@ -975,7 +975,7 @@ fn attribute_error(error: Error, device: u32, attribution: String) -> Error {
             detail: format!("{attribution}: {detail}"),
         },
         Error::InvalidArtifact { detail } => Error::InvalidArtifact {
-            detail: format!("{attribution}: {detail}"),
+            detail: format!("{attribution}: {detail}").into(),
         },
         Error::Numerical { detail } => Error::Numerical {
             detail: format!("{attribution}: {detail}"),

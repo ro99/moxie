@@ -31,6 +31,58 @@ pub mod sha256;
 
 pub use sha256::{StreamingSha256, sha256_hex};
 
+/// An [`Error::InvalidArtifact`] whose prose is a borrowed `&'static str`.
+///
+/// Allocation-free, so it is the refusal a path under memory pressure can
+/// always return.
+pub(crate) fn invalid_static(detail: &'static str) -> moxie_types::Error {
+    moxie_types::Error::InvalidArtifact {
+        detail: std::borrow::Cow::Borrowed(detail),
+    }
+}
+
+/// An [`Error::InvalidArtifact`] whose prose is composed **fallibly**.
+///
+/// Task 0024's independent review injected one allocation failure into an
+/// importer refusing a malformed artifact and got `SIGABRT`: every refusal in
+/// this crate built its detail with `format!`, which aborts rather than
+/// returning. The context that produces a refusal -- a corrupt or hostile file
+/// being read -- is exactly the context most likely to coincide with memory
+/// pressure, so this is the one path that may not depend on an allocation
+/// succeeding.
+///
+/// The message is built into a `String` grown only through `try_reserve`. When
+/// that fails, `fallback` is returned **borrowed**: a shorter true statement
+/// rather than an abort, which is task 0023's conclusion -- "a diagnostic that
+/// cannot be built is a process that cannot report anything". The variant is
+/// what a caller branches on either way (document 02).
+pub(crate) fn invalid_fmt(
+    fallback: &'static str,
+    args: core::fmt::Arguments<'_>,
+) -> moxie_types::Error {
+    use core::fmt::Write;
+    let mut sink = FallibleString(String::new());
+    match sink.write_fmt(args) {
+        Ok(()) => moxie_types::Error::InvalidArtifact {
+            detail: std::borrow::Cow::Owned(sink.0),
+        },
+        Err(_) => invalid_static(fallback),
+    }
+}
+
+/// A `String` that grows only through `try_reserve`.
+struct FallibleString(String);
+
+impl core::fmt::Write for FallibleString {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        // Reserve first, then push: `push_str` cannot reallocate once the
+        // capacity is there, so no infallible growth happens on this path.
+        self.0.try_reserve(s.len()).map_err(|_| core::fmt::Error)?;
+        self.0.push_str(s);
+        Ok(())
+    }
+}
+
 /// A vector with exactly `capacity` reserved, or a typed capacity error.
 ///
 /// Import sizes come from an artifact's own header, so the allocation that

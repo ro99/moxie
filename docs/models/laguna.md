@@ -4,8 +4,9 @@ Status: **metadata, the routed block, and an importer that reads its weights.**
 Nothing executes this checkpoint and no quality claim follows from anything in
 this record. Since [task 0024](../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md)
 (2026-09-13) its tensors **are** read — three of them import to canonical affine
-form, bitwise equal to the source's own arithmetic — and that is a statement
-about a reader agreeing with a file, not about a model. Its attention tower is **not composable** from today's
+form, matching document 03's canonical equation over the source's bytes bitwise
+and rounding exactly to the source's own BF16 arithmetic — and that is a
+statement about a reader agreeing with a file, not about a model. Its attention tower is **not composable** from today's
 operation catalogue; the two gaps that block it are named below with the
 evidence that they may not be guessed.
 
@@ -34,7 +35,7 @@ roadmap M2 item 4.
 | Declared draft model | `poolside/Laguna-S-2.1-DFlash`, method `dflash`, 15 speculative tokens. **Not present on this machine and not inspected.** M9's |
 | O1 catalog decision | **RESOLVED 2026-09-13** ([ADR 0017](../decisions/adr/0017-v1-catalog-and-no-quantizer.md)) — Laguna is **number 8** of the ten pinned v1 revisions, at the revision above. Task 0022 recorded this row as OPEN because it was, until the owner ruled mid-task |
 | O2 quality decision | **RESOLVED 2026-09-13** ([ADR 0018](../decisions/adr/0018-v1-quality-is-bit-identical-repack.md)) — v1's acceptable loss is a **bit-identical repack** `W=(Q-Z)*S`, publisher quality accepted as-is. Task 0024 shows this artifact's tensors repack bit-identically; **no paired output evidence exists and none is claimed** |
-| O5 storage/conversion authorization | **RESOLVED 2026-09-13** ([ADR 0020](../decisions/adr/0020-user-managed-storage-and-canonical-materialization.md)) — user-managed: Moxie reads the canonical file, repacking is an external script the user runs, and **no agent-initiated bulk download, copy or conversion** may start without a task naming artifact, revision, expected size and retention. Nothing here has written a byte |
+| O5 storage/conversion authorization | **RESOLVED 2026-09-13** ([ADR 0020](../decisions/adr/0020-user-managed-storage-and-canonical-materialization.md), wording corrected by [ADR 0021](../decisions/adr/0021-repack-is-a-moxie-program.md)) — user-managed: Moxie reads the canonical file, repacking is a Moxie program the user runs offline (not an external script), and **no agent-initiated bulk download, copy or conversion** may start without a task naming artifact, revision, expected size and retention. Nothing here has written a byte |
 
 **No download was made.** The artifact finished downloading on 2026-09-12,
 before this task, and was verified complete then and again now.
@@ -253,8 +254,12 @@ group 32 and eight INT4 codes per word.
   ([experiment 0005](../evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md)).
 
 **Reading a tensor is not executing one.** `model.layers.1.mlp.experts.0`'s
-three projections import to canonical affine form and every reconstructed value
-is bitwise equal to the source's own `(q - z) * s`. Nothing computes with them:
+three projections import to canonical affine form; every reconstructed value is
+bitwise equal to document 03's canonical FP32 `(q - z) * s` over the source's
+own bytes, and rounds exactly to the value the source's own reference computes,
+which applies a **BF16** boundary because these artifacts' scales are BF16. The
+two are different quantities and an independent review found the first version
+of this record calling the first one the second. Nothing computes with them:
 W4A16 is M3 item 3 and no kernel exists. **No quality claim follows** (**O2**),
 and nothing was written under any checkpoint root (**O5**).
 

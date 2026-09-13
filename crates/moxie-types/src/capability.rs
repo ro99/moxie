@@ -198,7 +198,8 @@ impl KernelCatalogue {
                         detail: format!(
                             "duplicate or indistinguishable kernel descriptors {} and {}",
                             first.id.0, second.id.0
-                        ),
+                        )
+                        .into(),
                     });
                 }
             }

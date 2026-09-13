@@ -243,7 +243,7 @@ impl ChunkSource for FailingSource {
             let half = into.len() / 2;
             into[..half].fill(0xFF);
             return Err(Error::InvalidArtifact {
-                detail: format!("short read of chunk '{}': truncation", chunk.slot().role()),
+                detail: format!("short read of chunk '{}': truncation", chunk.slot().role()).into(),
             });
         }
         self.served += 1;

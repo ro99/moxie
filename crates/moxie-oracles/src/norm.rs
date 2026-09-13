@@ -27,7 +27,7 @@ pub fn rms_norm_row(x: &[f32], gain: &[f32], eps: f32) -> Result<Vec<f32>> {
     }
     if gain.len() != x.len() {
         return Err(Error::InvalidArtifact {
-            detail: format!("gain has {} elements for {} features", gain.len(), x.len()),
+            detail: format!("gain has {} elements for {} features", gain.len(), x.len()).into(),
         });
     }
     if !(eps.is_finite() && eps > 0.0) {
@@ -72,7 +72,7 @@ pub fn rms_norm_row_grouped(x: &[f32], gain: &[f32], group: usize, eps: f32) -> 
     }
     if x.is_empty() || !x.len().is_multiple_of(group) {
         return Err(Error::InvalidArtifact {
-            detail: format!("{} features do not divide into {group} group(s)", x.len()),
+            detail: format!("{} features do not divide into {group} group(s)", x.len()).into(),
         });
     }
     let width = x.len() / group;

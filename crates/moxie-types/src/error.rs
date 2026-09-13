@@ -6,6 +6,7 @@
 //! it rather than silently falling back, and a test may assert it.
 
 use core::fmt;
+use std::borrow::Cow;
 
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -39,7 +40,19 @@ pub enum Error {
     },
     /// An artifact failed validation: checksum, overlap, truncation, NaN scale,
     /// incompatible dimensions or an unknown required feature (document 03).
-    InvalidArtifact { detail: String },
+    ///
+    /// `detail` is a [`Cow`] so that this variant can be constructed **without
+    /// allocating**. Task 0024's independent review injected one allocation
+    /// failure into an importer refusing a malformed artifact and got
+    /// `SIGABRT`: every refusal built its prose with `format!`, so the one
+    /// context most likely to coincide with memory pressure -- a corrupt or
+    /// hostile file being read under load -- was the one that could not report.
+    /// That is task 0023's own conclusion at the level of the shared type:
+    /// "a diagnostic that cannot be built is a process that cannot report
+    /// anything", and "whether rendering allocates is the caller's decision".
+    /// A borrowed `&'static str` costs nothing; an owned detail still works and
+    /// every existing caller keeps one.
+    InvalidArtifact { detail: Cow<'static, str> },
     /// The device was lost or its context is unusable. Not recoverable in place.
     DeviceLost { device: u32, detail: String },
     /// Work was cancelled. Resources must still be released at a safe boundary
@@ -173,7 +186,7 @@ mod tests {
                 reason: String::new(),
             },
             Error::InvalidArtifact {
-                detail: String::new(),
+                detail: String::new().into(),
             },
             Error::DeviceLost {
                 device: 0,

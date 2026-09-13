@@ -103,7 +103,7 @@ impl ByteTokenizer {
             bytes.push(b as u8);
         }
         String::from_utf8(bytes).map_err(|e| Error::InvalidArtifact {
-            detail: format!("token sequence is not valid UTF-8: {e}"),
+            detail: format!("token sequence is not valid UTF-8: {e}").into(),
         })
     }
 

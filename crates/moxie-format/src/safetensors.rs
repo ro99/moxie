@@ -59,10 +59,24 @@ pub const MAX_TENSORS: usize = 1 << 20;
 /// Most `__metadata__` entries one header may declare.
 pub const MAX_METADATA_ENTRIES: usize = 1 << 16;
 
-fn invalid(detail: impl Into<String>) -> Error {
-    Error::InvalidArtifact {
-        detail: detail.into(),
-    }
+/// This module's refusals, composed **fallibly**.
+///
+/// Takes `fmt::Arguments` rather than a `String`, so the message is never
+/// built by an allocation that can abort: [`crate::invalid_fmt`] grows its
+/// buffer through `try_reserve` and falls back to a borrowed static detail.
+/// Task 0024's review reached `SIGABRT` here by refusing one allocation while
+/// this module refused a malformed artifact.
+fn invalid(detail: core::fmt::Arguments<'_>) -> Error {
+    crate::invalid_fmt(
+        "a malformed safetensors header (detail unavailable: out of memory)",
+        detail,
+    )
+}
+
+/// A refusal whose whole message is static: allocation-free, always available.
+#[allow(dead_code)]
+fn invalid_static(detail: &'static str) -> Error {
+    crate::invalid_static(detail)
 }
 
 fn capacity(requested: u64) -> Error {
@@ -138,7 +152,7 @@ impl Dtype {
             "U64" => Dtype::U64,
             "I64" => Dtype::I64,
             "F64" => Dtype::F64,
-            other => return Err(invalid(format!("unknown safetensors dtype {other:?}"))),
+            other => return Err(invalid(format_args!("unknown safetensors dtype {other:?}"))),
         })
     }
 }
@@ -168,7 +182,7 @@ impl TensorEntry {
         for d in &self.shape {
             n = n
                 .checked_mul(*d)
-                .ok_or_else(|| invalid("tensor shape product overflows u64"))?;
+                .ok_or_else(|| invalid_static("tensor shape product overflows u64"))?;
         }
         Ok(n)
     }
@@ -424,7 +438,9 @@ impl Header {
     pub fn prefix_len(first_eight: &[u8]) -> Result<u64> {
         let bytes: [u8; 8] = first_eight
             .get(..8)
-            .ok_or_else(|| invalid("a safetensors file needs at least an eight-byte length"))?
+            .ok_or_else(|| {
+                invalid_static("a safetensors file needs at least an eight-byte length")
+            })?
             .try_into()
             .expect("eight bytes");
         let header_len = u64::from_le_bytes(bytes);
@@ -433,7 +449,7 @@ impl Header {
         }
         header_len
             .checked_add(8)
-            .ok_or_else(|| invalid("header length overflows the file offset space"))
+            .ok_or_else(|| invalid_static("header length overflows the file offset space"))
     }
 
     /// Parse and validate a header.
@@ -444,20 +460,20 @@ impl Header {
     pub fn parse(prefix: &[u8], file_len: u64) -> Result<Self> {
         let payload_start = Self::prefix_len(prefix)?;
         if prefix.len() as u64 != payload_start {
-            return Err(invalid(format!(
+            return Err(invalid(format_args!(
                 "header prefix is {} byte(s); the declared length needs {payload_start}",
                 prefix.len()
             )));
         }
         if payload_start > file_len {
-            return Err(invalid(format!(
+            return Err(invalid(format_args!(
                 "header claims {payload_start} byte(s) of a {file_len}-byte file"
             )));
         }
         let payload_len = file_len - payload_start;
 
         let RawHeader(raw) = serde_json::from_slice(&prefix[8..]).map_err(|e| {
-            invalid(format!(
+            invalid(format_args!(
                 "safetensors header is not a valid tensor object: {e}"
             ))
         })?;
@@ -488,19 +504,19 @@ impl Header {
             // would raise the name-byte ratio to pay for a case that is already
             // covered.
             if tensors.contains_key(&name) {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "the header declares tensor {name:?} twice"
                 )));
             }
             let dtype = Dtype::parse(&entry.dtype)?;
             let [begin, end] = entry.data_offsets;
             if begin > end {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "tensor {name:?} has a reversed range [{begin}, {end})"
                 )));
             }
             if end > payload_len {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "tensor {name:?} ends at {end}, past the {payload_len}-byte payload"
                 )));
             }
@@ -516,9 +532,11 @@ impl Header {
             let need = tensor
                 .elements()?
                 .checked_mul(dtype.bytes() as u64)
-                .ok_or_else(|| invalid(format!("tensor {name:?} byte length overflows u64")))?;
+                .ok_or_else(|| {
+                    invalid(format_args!("tensor {name:?} byte length overflows u64"))
+                })?;
             if tensor.len() != need {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "tensor {name:?} is {} shape-{:?} {} element(s) needing {need} byte(s), \
                      but its range spans {}",
                     dtype.name(),
@@ -538,7 +556,7 @@ impl Header {
             // Zero-length tensors can share a boundary; a nonempty overlap
             // means two tensors claim the same bytes.
             if b_begin < a_end {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "tensors {a_name:?} and {b_name:?} overlap at byte {b_begin}"
                 )));
             }
@@ -562,7 +580,7 @@ impl Header {
     pub fn get(&self, name: &str) -> Result<&TensorEntry> {
         self.tensors
             .get(name)
-            .ok_or_else(|| invalid(format!("this shard has no tensor {name:?}")))
+            .ok_or_else(|| invalid(format_args!("this shard has no tensor {name:?}")))
     }
 
     /// Payload bytes every tensor accounts for, and whether they cover it.

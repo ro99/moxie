@@ -37,14 +37,15 @@ pub fn linear_row(
             detail: format!(
                 "weight has {} elements, expected {out_features}x{k}",
                 w.len()
-            ),
+            )
+            .into(),
         });
     }
     if let Some(b) = bias
         && b.len() != out_features
     {
         return Err(Error::InvalidArtifact {
-            detail: format!("bias has {} elements, expected {out_features}", b.len()),
+            detail: format!("bias has {} elements, expected {out_features}", b.len()).into(),
         });
     }
 
@@ -109,7 +110,8 @@ pub fn embedding_row(
             detail: format!(
                 "embedding table has {} elements, expected {vocab}x{hidden}",
                 table.len()
-            ),
+            )
+            .into(),
         });
     }
     let t = tokens_id as usize;

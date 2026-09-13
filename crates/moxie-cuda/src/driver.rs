@@ -861,7 +861,8 @@ impl<'a> TrustedImage<'a> {
     pub unsafe fn from_build_output(bytes: &'a [u8]) -> Result<Self> {
         if bytes.len() < 4 {
             return Err(Error::InvalidArtifact {
-                detail: format!("device image is {} bytes; too short to be one", bytes.len()),
+                detail: format!("device image is {} bytes; too short to be one", bytes.len())
+                    .into(),
             });
         }
         let head = [bytes[0], bytes[1], bytes[2], bytes[3]];
@@ -869,7 +870,8 @@ impl<'a> TrustedImage<'a> {
             return Err(Error::InvalidArtifact {
                 detail: format!(
                     "device image does not begin with a fatbin or ELF magic: {head:02x?}"
-                ),
+                )
+                .into(),
             });
         }
         Ok(Self { bytes })

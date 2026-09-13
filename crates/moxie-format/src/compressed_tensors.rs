@@ -103,10 +103,24 @@ use crate::safetensors::{Dtype, Header, TensorEntry};
 use crate::scale::{ScaleDtype, ScaleValues};
 use moxie_types::{Error, Result};
 
-fn invalid(detail: impl Into<String>) -> Error {
-    Error::InvalidArtifact {
-        detail: detail.into(),
-    }
+/// This module's refusals, composed **fallibly**.
+///
+/// Takes `fmt::Arguments` rather than a `String`, so the message is never
+/// built by an allocation that can abort: [`crate::invalid_fmt`] grows its
+/// buffer through `try_reserve` and falls back to a borrowed static detail.
+/// Task 0024's review reached `SIGABRT` here by refusing one allocation while
+/// this module refused a malformed artifact.
+fn invalid(detail: core::fmt::Arguments<'_>) -> Error {
+    crate::invalid_fmt(
+        "a malformed compressed-tensors pack-quantized source (detail unavailable: out of memory)",
+        detail,
+    )
+}
+
+/// A refusal whose whole message is static: allocation-free, always available.
+#[allow(dead_code)]
+fn invalid_static(detail: &'static str) -> Error {
+    crate::invalid_static(detail)
 }
 
 /// How a source divides the input axis for scaling.
@@ -197,7 +211,7 @@ pub struct SourceTensors<'a> {
 /// Decode a `weight_shape` payload: exactly two little-endian `I64` values.
 pub fn decode_weight_shape(payload: &[u8]) -> Result<(usize, usize)> {
     if payload.len() != 16 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "weight_shape must hold exactly two I64 values, got {} byte(s)",
             payload.len()
         )));
@@ -205,12 +219,13 @@ pub fn decode_weight_shape(payload: &[u8]) -> Result<(usize, usize)> {
     let read = |at: usize| i64::from_le_bytes(payload[at..at + 8].try_into().expect("eight bytes"));
     let (rows, columns) = (read(0), read(8));
     if rows <= 0 || columns <= 0 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "weight_shape dimensions must be positive, got [{rows}, {columns}]"
         )));
     }
     let to_usize = |v: i64| {
-        usize::try_from(v).map_err(|_| invalid("weight_shape dimension does not fit this platform"))
+        usize::try_from(v)
+            .map_err(|_| invalid_static("weight_shape dimension does not fit this platform"))
     };
     Ok((to_usize(rows)?, to_usize(columns)?))
 }
@@ -226,7 +241,7 @@ pub fn scale_dtype_of(dtype: Dtype) -> Result<ScaleDtype> {
         Dtype::F16 => ScaleDtype::F16,
         Dtype::F32 => ScaleDtype::F32,
         other => {
-            return Err(invalid(format!(
+            return Err(invalid(format_args!(
                 "weight_scale is {}; canonical scales are BF16, F16 or F32",
                 other.name()
             )));
@@ -263,13 +278,13 @@ pub fn source_entries<'a>(
     let scale = header.get(&format!("{module}.weight_scale"))?;
     let shape = header.get(&format!("{module}.weight_shape"))?;
     if packed.dtype != Dtype::I32 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "{module}.weight_packed is {}; pack-quantized requires I32",
             packed.dtype.name()
         )));
     }
     if shape.dtype != Dtype::I64 || shape.shape != vec![2] {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "{module}.weight_shape must be I64[2], got {} {:?}",
             shape.dtype.name(),
             shape.shape
@@ -281,7 +296,7 @@ pub fn source_entries<'a>(
         (ZeroPointSource::Symmetric, None) => None,
         (ZeroPointSource::PackedAlongOutput, Some(e)) => {
             if e.dtype != Dtype::I32 {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "{name} is {}; a packed zero point is I32",
                     e.dtype.name()
                 )));
@@ -289,13 +304,13 @@ pub fn source_entries<'a>(
             Some(e)
         }
         (ZeroPointSource::Symmetric, Some(_)) => {
-            return Err(invalid(format!(
+            return Err(invalid(format_args!(
                 "{module} is declared symmetric but serializes {name}; the config and the \
                  tensor index disagree about this module's zero points"
             )));
         }
         (ZeroPointSource::PackedAlongOutput, None) => {
-            return Err(invalid(format!(
+            return Err(invalid(format_args!(
                 "{module} is declared asymmetric but has no {name}"
             )));
         }
@@ -319,13 +334,13 @@ pub fn import(spec: &PackQuantizedSpec, src: SourceTensors<'_>) -> Result<Affine
     match (spec.zero_points, src.zero_point.is_some()) {
         (ZeroPointSource::Symmetric, false) | (ZeroPointSource::PackedAlongOutput, true) => {}
         (ZeroPointSource::Symmetric, true) => {
-            return Err(invalid(
+            return Err(invalid_static(
                 "a symmetric pack-quantized source carries no weight_zero_point, but one was \
                  supplied",
             ));
         }
         (ZeroPointSource::PackedAlongOutput, false) => {
-            return Err(invalid(
+            return Err(invalid_static(
                 "an asymmetric pack-quantized source requires its weight_zero_point payload",
             ));
         }
@@ -333,7 +348,7 @@ pub fn import(spec: &PackQuantizedSpec, src: SourceTensors<'_>) -> Result<Affine
 
     let (out_features, in_features) = src.logical;
     if out_features == 0 || in_features == 0 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "empty logical shape {out_features}x{in_features}"
         )));
     }
@@ -343,7 +358,7 @@ pub fn import(spec: &PackQuantizedSpec, src: SourceTensors<'_>) -> Result<Affine
     // incompatible shape can have exactly the right number of bytes.
     let want_packed = [out_features as u64, packed_columns as u64];
     if src.packed_shape != want_packed {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "weight_packed is declared {:?}; {out_features}x{in_features} at {} bit(s) \
              requires {want_packed:?}",
             src.packed_shape,
@@ -352,12 +367,12 @@ pub fn import(spec: &PackQuantizedSpec, src: SourceTensors<'_>) -> Result<Affine
     }
     let need_words = packed_columns
         .checked_mul(out_features)
-        .ok_or_else(|| invalid("packed word count overflows usize"))?;
+        .ok_or_else(|| invalid_static("packed word count overflows usize"))?;
     let need_packed = need_words
         .checked_mul(4)
-        .ok_or_else(|| invalid("packed byte count overflows usize"))?;
+        .ok_or_else(|| invalid_static("packed byte count overflows usize"))?;
     if src.packed.len() != need_packed {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "weight_packed is {} byte(s); {out_features}x{in_features} at {} bit(s) needs \
              {need_packed} ({out_features}x{packed_columns} I32 words)",
             src.packed.len(),
@@ -390,7 +405,7 @@ pub fn import(spec: &PackQuantizedSpec, src: SourceTensors<'_>) -> Result<Affine
     let scale_ok = src.scale_shape == [out_features as u64, groups_per_row as u64]
         || (groups_per_row == 1 && src.scale_shape == [out_features as u64]);
     if !scale_ok {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "weight_scale is declared {:?}; {out_features} output channel(s) with \
              {groups_per_row} group(s) each requires [{out_features}, {groups_per_row}]",
             src.scale_shape
@@ -398,9 +413,9 @@ pub fn import(spec: &PackQuantizedSpec, src: SourceTensors<'_>) -> Result<Affine
     }
     let need_scale = entries
         .checked_mul(src.scale_dtype.bytes())
-        .ok_or_else(|| invalid("scale byte count overflows usize"))?;
+        .ok_or_else(|| invalid_static("scale byte count overflows usize"))?;
     if src.scale.len() != need_scale {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "weight_scale is {} byte(s); {entries} {} scale(s) need {need_scale}",
             src.scale.len(),
             src.scale_dtype.name()
@@ -468,7 +483,7 @@ fn decode_zero_points(
     // emit a one-dimensional zero point, and accepting a shape nothing produces
     // is a branch no fixture can justify.
     if zp.shape != want {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "weight_zero_point is declared {:?}; {out_features} output channel(s) at {} bit(s) \
              with {groups_per_row} group(s) each requires {want:?} -- zero points are packed \
              along the output axis, unlike the codes",
@@ -479,9 +494,9 @@ fn decode_zero_points(
     let need = zp_rows
         .checked_mul(groups_per_row)
         .and_then(|w| w.checked_mul(4))
-        .ok_or_else(|| invalid("zero-point byte count overflows usize"))?;
+        .ok_or_else(|| invalid_static("zero-point byte count overflows usize"))?;
     if zp.payload.len() != need {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "weight_zero_point is {} byte(s); {zp_rows}x{groups_per_row} I32 words need {need}",
             zp.payload.len()
         )));

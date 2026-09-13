@@ -90,7 +90,7 @@ pub fn admit(model: &dyn ModelDefinition, oracles: &OracleRegistry) -> Result<()
     }
     if meta.vocab_size == 0 {
         return Err(Error::InvalidArtifact {
-            detail: format!("{} declares an empty vocabulary", meta.family),
+            detail: format!("{} declares an empty vocabulary", meta.family).into(),
         });
     }
 
@@ -101,12 +101,13 @@ pub fn admit(model: &dyn ModelDefinition, oracles: &OracleRegistry) -> Result<()
                 detail: format!(
                     "{}: tensor role {:?} allows no storage precision",
                     meta.family, t.role.name
-                ),
+                )
+                .into(),
             });
         }
         if seen.contains(&&t.role) {
             return Err(Error::InvalidArtifact {
-                detail: format!("{}: duplicate tensor role {:?}", meta.family, t.role.name),
+                detail: format!("{}: duplicate tensor role {:?}", meta.family, t.role.name).into(),
             });
         }
         seen.push(&t.role);
@@ -115,7 +116,7 @@ pub fn admit(model: &dyn ModelDefinition, oracles: &OracleRegistry) -> Result<()
     let req = model.graph_requirements();
     if req.ops.is_empty() {
         return Err(Error::InvalidArtifact {
-            detail: format!("{} declares no operations", meta.family),
+            detail: format!("{} declares no operations", meta.family).into(),
         });
     }
     // Every operation the model needs must have an independent host reference

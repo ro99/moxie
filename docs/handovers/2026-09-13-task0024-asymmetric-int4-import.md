@@ -1,7 +1,13 @@
-# Handover — task 0024 implemented: asymmetric INT4 import, and a convention that could be measured
+# Handover — task 0024 implemented and corrected: asymmetric INT4 import, and a convention that could be measured
 
-**Task 0024 is implemented on 2026-09-13 and is not accepted.** It has had no
-independent review. Everything below is a claim awaiting one.
+**Task 0024 is implemented on 2026-09-13, corrected after one independent
+review, and is not accepted.** The review made **five findings, one P1**; all
+five were reproduced, all five are fixed, **none is disputed**. Two of them
+reproduce to the digit in this workspace's own tests: the review's 27,501
+divergent values and its `2.1797049840291343`.
+
+The corrections are summarised below and written up in full in
+[the task record](../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md#corrections-after-the-first-independent-review).
 
 It is **M3 item 2's asymmetric half**: the compressed-tensors `pack-quantized`
 importer now reads **asymmetric INT4 at group 32**, whose `weight_zero_point` is
@@ -39,8 +45,8 @@ quality.
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy (`--features moxie-executor/driver`) | passed |
 | CUDA-lane clippy (`--features cuda`) | passed |
-| `cargo test --workspace --locked --offline` | **943 passed, 0 failed** (baseline **930**, re-measured at `e122de3` before implementation) |
-| Device-feature workspace tests | **978 passed, 0 failed** (task 0023 recorded 965; +13 is exactly this task's new tests) |
+| `cargo test --workspace --locked --offline` | **945 passed, 0 failed** (baseline **930**, re-measured at `e122de3` before implementation) |
+| Device-feature workspace tests | **980 passed, 0 failed** (task 0023 recorded 965; +15 is exactly this task's new tests) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | zero failures, 79 rejected fixtures, 21 accepted, 13 rules |
@@ -50,24 +56,84 @@ this machine, so every artifact lane ran. Each of them prints `SKIP` with a
 reason when its checkpoint is absent; that path was exercised while writing them
 and is not what ran here.
 
-**Mutation measurement: 16 of 16 caught, 0 survivors**, first measurement, no
-corrections forced
-([experiment 0005](../evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md)).
+**Mutation measurement: 21 of 21 caught, 0 survivors**, every verdict repeated
+three times in both directions, **driver committed**
+([experiment 0005](../evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md),
+[its driver](../evidence/experiments/drivers/0005-mutations.py)). The first
+measurement was 16 of 16 — a complete battery against a suite with three holes
+in it. The five mutations added after the review are each caught by exactly the
+lane a finding created, four of them by that lane alone.
 
 ### What was read, and what it is not
 
 Six modules across two artifacts — three of
 `/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4` revision `bc59f497…` and three of
 `/fast/models/cyankiwi/Qwen3.8-27B-AWQ-BF16-INT4` — import to canonical affine
-form, and **112,640 reconstructed values are bitwise equal** to the source's own
-`(q − z) · s` computed independently from the raw bytes. All **34,996** of the
-two artifacts' asymmetric modules had their declared zero-point shapes checked.
+form, and **112,640 reconstructed values are checked against two quantities that
+are not the same one**: bitwise against document 03's canonical FP32
+`(q − z) · s` over the source's own bytes, and against the source's own
+arithmetic **with the BF16 boundary its reference applies**, which the canonical
+value rounds to exactly. The boundary moves **27,501** of them, a count the test
+prints and requires to be nonzero. All **34,996** of the two artifacts'
+asymmetric modules had their declared zero-point shapes checked, and a module
+missing any of its four tensors is now reported rather than dropped from the
+audit's own population.
 
 **Nothing executes a canonical INT4 tensor.** W4A16 is M3 item 3 and no kernel
 exists; Laguna's graph still declares BF16 tensor requirements, because listing
 INT4 would advertise a path that is not there. A bit-identical repack is
 **ADR 0018's v1 quality definition** — it is not evidence about what any model
 produces, and no paired output against a released model exists (**O2**).
+
+## What the first review found, and what changed
+
+**Five findings, one P1, none disputed.** The short version; the task record has
+the full account.
+
+1. **P1 — a refusal under memory pressure aborted the process.** Every refusal
+   in `moxie-format` built its prose with `format!`, so refusing one allocation
+   while the importer rejected a malformed artifact gave `SIGABRT`. My
+   allocation sweep swept every position of an import that **succeeds**, and a
+   refusal has no positions in it at all — **task 0023's third-round lesson word
+   for word, in a file written by someone who had just read it.**
+   `Error::InvalidArtifact` carries a `Cow<'static, str>` now, this crate's
+   refusals compose their prose into a `try_reserve`d buffer and fall back to a
+   borrowed static detail, and eight refusals are constructed with every
+   allocation position refused in turn.
+2. **The comparison was not the comparison it was advertised as.** The pinned
+   `_dequantize` casts to `scale.dtype` before subtracting and multiplying, and
+   that is **BF16** for both artifacts; the test computed FP32 and the records
+   called it "the source's own declared arithmetic". Neither quantity is wrong —
+   document 03 fixes the canonical reconstruction at FP32 — but one was called
+   by the other's name, which is **task 0022's BF16-boundary lesson one task
+   later.** There are two comparisons now, and the count of values the boundary
+   moves is asserted nonzero so the new check cannot be vacuous.
+3. **The inventory audit could not fail**, because it filtered incomplete
+   modules out of its own population first. A filter applied to the population
+   being audited removes exactly the rows the audit exists to see — task 0023's
+   omitted layer, in a different file. Every packed module is kept now,
+   `importable()` is the separately named subset the import tests use, and the
+   audit's decision is a pure function tested against a table containing the
+   case the real artifacts do not supply.
+4. **The mutation driver was described and not committed**, and the contract's
+   promise of repeated substitutions was not kept and not reported. Both fixed:
+   the driver is tracked, every verdict is repeated three times in both
+   directions, and a lane that disagrees with itself is reported rather than
+   counted.
+5. **The recorded reason for not measuring the zero-point sign was false.** It
+   assumed independence between a group's code mean and its own zero point —
+   the correlation that is the measurement's entire premise, two paragraphs
+   earlier. The sign is a fifth candidate now and separates further than any
+   misassignment: 2.18–2.57 against the pinned 0.52.
+
+**A scope extension, stated because it exceeded the contract.** Fixing finding 1
+properly meant widening a field of `moxie_types::Error`, which touches 41 files
+and 150 construction sites rather than the two files the contract named. The
+reason is that the defect is not reachable from the importer alone —
+`desc.validate()`, `AffineTensor::new` and `scales.validate()` are all on the
+import path and all aborted the same way — and "pre-existing" is how a standing
+failure becomes background noise. Every one of the 150 edits is mechanical, and
+each was located by rustc's own spans rather than by a regex over source.
 
 ## Decisions
 

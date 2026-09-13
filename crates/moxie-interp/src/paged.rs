@@ -314,7 +314,8 @@ impl Interpreter {
                             "value {} was bound a route table; a route is produced by a \
                              Route operation over this step's own rows, never supplied",
                             id.0
-                        ),
+                        )
+                        .into(),
                     });
                 }
             };

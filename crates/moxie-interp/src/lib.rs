@@ -259,7 +259,8 @@ impl Interpreter {
                             "value {} was bound a route table; a route is produced by a \
                              Route operation over this step's own rows, never supplied",
                             value.0
-                        ),
+                        )
+                        .into(),
                     });
                 }
             };
@@ -268,14 +269,15 @@ impl Interpreter {
                     detail: format!(
                         "binding {} shape or precision differs from the graph",
                         value.0
-                    ),
+                    )
+                    .into(),
                 });
             }
             if let Value::Float(tensor) = bound
                 && tensor.data().iter().any(|element| !element.is_finite())
             {
                 return Err(Error::InvalidArtifact {
-                    detail: format!("binding {} contains a nonfinite value", value.0),
+                    detail: format!("binding {} contains a nonfinite value", value.0).into(),
                 });
             }
             values[value.0 as usize] = Some(bound.clone());
@@ -370,7 +372,8 @@ impl Interpreter {
                     "the cache has {} layer(s) but the graph writes {graph_layers}; every \
                      layer must advance together or the cache cannot track the frontier",
                     kv.layers()
-                ),
+                )
+                .into(),
             });
         }
         let mut values: Vec<Option<Value>> = vec![None; graph.value_count()];
@@ -434,7 +437,8 @@ impl Interpreter {
             };
             if got != want {
                 return Err(Error::InvalidArtifact {
-                    detail: format!("{name} has shape {got:?} but the graph declares {want:?}"),
+                    detail: format!("{name} has shape {got:?} but the graph declares {want:?}")
+                        .into(),
                 });
             }
             // Shape agreement is not dtype agreement. The fourth review bound an
@@ -445,17 +449,19 @@ impl Interpreter {
             match (bound, spec.role.precision()) {
                 (Value::Float(t), Some(p)) if t.precision() != p => {
                     return Err(Error::InvalidArtifact {
-                        detail: format!("{name} is {} but the graph declares {p}", t.precision()),
+                        detail: format!("{name} is {} but the graph declares {p}", t.precision())
+                            .into(),
                     });
                 }
                 (Value::Float(_), None) => {
                     return Err(Error::InvalidArtifact {
-                        detail: format!("{name} is declared an index but a tensor was bound"),
+                        detail: format!("{name} is declared an index but a tensor was bound")
+                            .into(),
                     });
                 }
                 (Value::Index(_), Some(p)) => {
                     return Err(Error::InvalidArtifact {
-                        detail: format!("{name} is declared {p} but an index was bound"),
+                        detail: format!("{name} is declared {p} but an index was bound").into(),
                     });
                 }
                 (Value::Route(_), _) => {
@@ -463,7 +469,8 @@ impl Interpreter {
                         detail: format!(
                             "{name} was bound a route table; a route is produced by a \
                              Route operation over this step's own rows, never supplied"
-                        ),
+                        )
+                        .into(),
                     });
                 }
                 _ => {}
@@ -476,7 +483,7 @@ impl Interpreter {
                 && let Some(i) = t.data().iter().position(|x| !x.is_finite())
             {
                 return Err(Error::InvalidArtifact {
-                    detail: format!("{name} element {i} is {}", t.data()[i]),
+                    detail: format!("{name} element {i} is {}", t.data()[i]).into(),
                 });
             }
         }
@@ -513,7 +520,7 @@ impl Interpreter {
             .clone();
         if logits.rows() != rows {
             return Err(Error::InvalidArtifact {
-                detail: format!("{} logit rows for {rows} input row(s)", logits.rows()),
+                detail: format!("{} logit rows for {rows} input row(s)", logits.rows()).into(),
             });
         }
 
@@ -647,7 +654,8 @@ impl Interpreter {
                     detail: format!(
                         "{} input {i} was used before it was produced",
                         node.params.op().name()
-                    ),
+                    )
+                    .into(),
                 })
         };
 
@@ -754,7 +762,7 @@ impl Interpreter {
                 let pos = input(1)?.as_index()?;
                 if pos.len() != x.rows() {
                     return Err(Error::InvalidArtifact {
-                        detail: format!("{} positions for {} rows", pos.len(), x.rows()),
+                        detail: format!("{} positions for {} rows", pos.len(), x.rows()).into(),
                     });
                 }
                 let mut out = try_vec(x.data().len())?;
@@ -946,7 +954,8 @@ impl Interpreter {
                             "the route table covers {} rows but {} were supplied",
                             table.rows(),
                             x.rows()
-                        ),
+                        )
+                        .into(),
                     });
                 }
                 let spec = route::ExpertSpec {
@@ -989,7 +998,8 @@ impl Interpreter {
                             "the slot tensor has {} rows but this route needs {}",
                             slots.rows(),
                             table.rows() * top_k as usize
-                        ),
+                        )
+                        .into(),
                     });
                 }
                 let width = hidden as usize;

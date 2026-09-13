@@ -2,9 +2,11 @@
 
 Date: 2026-09-13. Milestone: M3 item 2,
 [task 0024](../../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md).
-Status: **accepted**. The pinned assignment is separated from every alternative
-the same bytes permit, on four tensors across two artifacts; and the tests
-written for it caught **16 of 16** mutations, 0 survivors.
+Status: **corrected after one independent review, awaiting a second.** The
+pinned assignment is separated from every alternative the same bytes permit —
+including the **sign**, which the first version of this record wrongly claimed
+was not separable — on four tensors across two artifacts. The mutation battery
+is measured again, with the driver committed and every verdict repeated.
 
 ## Why this exists
 
@@ -62,7 +64,8 @@ quantities subtracted, and its spread is the quadrature sum of both.
 The statistic is `mean |mean_code(o,g) - z(o,g)|`, in codes. The thresholds were
 written into [the task contract](../../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md)
 **before** the measurement: the pinned assignment below **1.0**, every
-alternative above **1.2**. The test also requires every alternative to be at
+alternative above **1.2**. The sign candidate was added after a review and is
+held to the same thresholds; it was not chosen to fit the number it produced. The test also requires every alternative to be at
 least twice the pinned value, so a shrinking margin fails rather than degrading
 quietly.
 
@@ -75,38 +78,66 @@ Measured by
 `crates/moxie-storage/tests/asymmetric_int4_import.rs::the_pinned_zero_point_lane_assignment_is_the_one_the_artifacts_bytes_support`,
 on the two smallest complete modules of each artifact.
 
-| Artifact | Module | pinned | lane-reversed | block-major | block reversed |
-|---|---|---:|---:|---:|---:|
-| Laguna-S-2.1-AWQ-INT4 | `layers.1.mlp.experts.0.down_proj` `[3072, 1024]` | **0.5236** | 1.4900 | 1.4853 | 1.4817 |
-| Laguna-S-2.1-AWQ-INT4 | `layers.1.mlp.experts.0.gate_proj` `[1024, 3072]` | **0.5183** | 1.5661 | 1.5652 | 1.5670 |
-| Qwen3.8-27B-AWQ-BF16-INT4 | `layers.11.self_attn.k_proj` `[1024, 5120]` | **0.5163** | 1.7629 | 1.7809 | 1.7839 |
-| Qwen3.8-27B-AWQ-BF16-INT4 | `layers.11.self_attn.v_proj` `[1024, 5120]` | **0.5300** | 1.5751 | 1.5741 | 1.5776 |
+| Artifact | Module | pinned | lane-reversed | block-major | block reversed | sign-flipped |
+|---|---|---:|---:|---:|---:|---:|
+| Laguna-S-2.1-AWQ-INT4 | `layers.1.mlp.experts.0.down_proj` `[3072, 1024]` | **0.5236** | 1.4900 | 1.4853 | 1.4817 | 2.1797 |
+| Laguna-S-2.1-AWQ-INT4 | `layers.1.mlp.experts.0.gate_proj` `[1024, 3072]` | **0.5183** | 1.5661 | 1.5652 | 1.5670 | 2.2912 |
+| Qwen3.8-27B-AWQ-BF16-INT4 | `layers.11.self_attn.k_proj` `[1024, 5120]` | **0.5163** | 1.7629 | 1.7809 | 1.7839 | 2.5735 |
+| Qwen3.8-27B-AWQ-BF16-INT4 | `layers.11.self_attn.v_proj` `[1024, 5120]` | **0.5300** | 1.5751 | 1.5741 | 1.5776 | 2.2888 |
 
-The pinned reading is **2.8 to 3.5 times** tighter than every alternative, on
+The pinned reading is **2.8 to 4.9 times** tighter than every alternative, on
 every tensor, on two artifacts from two different compressor builds. The three
-alternatives land on each other, which is what "independent" looks like and is
+misassignments land on each other, which is what "independent" looks like and is
 itself a check that the statistic is measuring the pairing rather than something
-about the codes.
+about the codes; the sign lands further out still, for the reason below.
 
 **A margin of 0.52 against 1.48 is corroboration, not proof.** What it rules out
 is the three specific alternatives the same bytes permit. It does not establish
 the *code* lane order, which remains exactly where task 0018 left it, and it is
 not evidence about model output.
 
-### What was not measured
+### The sign, and a claim this record got wrong
 
-The zero-point **sign** is taken from the pinned library's `_dequantize`
-(`(x_q - zero_point) * scale`) and is not separable by this statistic: negating
-`z` changes `mean(q) - z` into `mean(q) + z`, which for a distribution centred
-near zero is indistinguishable in mean absolute deviation. It is the same
-equation document 03 already declares, from two independent sources, which is
-why it is stated rather than measured.
+The first version of this record said the zero-point **sign** was not separable
+by this statistic, because "negating `z` changes `mean(q) - z` into
+`mean(q) + z`, which for a distribution centred near zero is indistinguishable
+in mean absolute deviation."
 
-## The mutation battery: 16 of 16 caught, 0 survivors
+**That is false, and it is false for a reason stated two paragraphs earlier in
+this same document.** The argument holds only for quantities that are
+independent. `mean(q)` and `z` are *correlated* — that correlation is the entire
+premise of the measurement above. An independent review measured the difference
+on the Laguna down-projection and it is larger than any misassignment's:
+**0.523622194925944** for subtraction against **2.1797049840291343** for
+addition. This workspace's own test now prints the same figures.
+
+A record contradicting a fact it already contains is the third instance of that
+class here; the previous two were arithmetic and this one is an argument, which
+is if anything easier to wave through. The sign is a fifth candidate in the
+table above now, measured like the rest.
+
+### What is still not measured
+
+The **code** word's lane order, exactly as task 0018 left it: all eight lanes of
+a packed code word fall inside one scale group, so no statistic over this
+artifact separates them. Closing that needs paired output against the released
+model, which is O2's.
+
+## The mutation battery: 21 of 21 caught, 0 survivors
 
 The method is experiments 0002–0004's: one edit that changes behaviour and
-still compiles; apply, run every lane, record which caught it, revert. The
-driver is at the bottom.
+still compiles; apply, run every lane, record which caught it, revert. Two
+things are different here, and both came from the review.
+
+**The driver is committed** — [`drivers/0005-mutations.py`](drivers/0005-mutations.py)
+— with every substitution verbatim, because the names below are not the
+measurement.
+
+**Every verdict is repeated three times in both directions**: the mutant against
+the mutated tree and the control against the restored one, on the first lane
+that catches. The task contract promised this and the first run did not do it.
+No lane disagreed with itself, so nothing here is a coin flip recorded as a
+measurement.
 
 | Mutation | Caught by |
 |---|---|
@@ -115,17 +146,22 @@ driver is at the bottom.
 | `zp-lane-reversed` | unit, artifact |
 | `zp-word-row-is-block-major` | unit, artifact |
 | `zp-rebias-dropped` | unit, artifact |
-| `zp-shape-check-deleted` | unit |
-| `zp-length-check-deleted` | unit |
-| `zp-vec-allocated-infallibly` | **allocfail only** |
+| `zero-points-dropped-entirely` | unit, alloccount, artifact |
 | `zp-reads-the-padding-lanes` | unit, allocfail |
-| `spec-payload-disagreement-ignored` | unit |
-| `spec-payload-missing-ignored` | unit |
+| `zp-shape-check-deleted` | unit, allocfail |
+| `zp-length-check-deleted` | unit, allocfail |
+| `spec-payload-disagreement-ignored` | unit, allocfail |
+| `spec-payload-missing-ignored` | unit, allocfail |
 | `index-disagreement-symmetric-ignored` | unit, artifact |
 | `index-missing-zero-point-ignored` | unit |
 | `zero-point-dtype-unchecked` | unit |
-| `zero-points-dropped-entirely` | unit, alloccount, artifact |
+| `zp-vec-allocated-infallibly` | **allocfail only** |
+| `refusal-prose-allocates-infallibly` | **allocfail only** |
+| `bf16-rounding-truncates` | unit |
+| `boundary-count-never-increments` | **artifact only** |
+| `missing-companions-always-empty` | **artifact only** |
 | `measurement-pinned-becomes-lane-reversed` | **artifact only** |
+| `measurement-sign-candidate-equals-pinned` | **artifact only** |
 
 Lanes: `unit` is `cargo test -p moxie-format --lib`; `allocfail` is
 `--test import_allocation_failure`; `alloccount` is
@@ -134,15 +170,40 @@ Lanes: `unit` is `cargo test -p moxie-format --lib`; `allocfail` is
 `--test gemma4_import`, which caught none — correctly, since it is the
 regression lane for the path this task did not change.
 
-**Two mutations are caught by exactly one lane each, and both are the point of
-that lane.** `zp-vec-allocated-infallibly` swaps the fallible reservation for
-`Vec::with_capacity`: every other lane passes, because the allocation succeeds
-whenever memory is available. Only the injected-failure sweep sees it, and what
-it sees is an abort — task 0019's rule for the sixth time in this workspace, on
-a path added after the previous five. And
-`measurement-pinned-becomes-lane-reversed` mutates the **measurement**, not the
-product: it asks whether the declared thresholds would have accepted the wrong
-reading. They would not.
+### The five the review forced, and what each one is for
+
+The first battery was 16 of 16 and it was measuring a suite with three holes in
+it. Every mutation added below exists because something was found, and each is
+caught by exactly the lane that was missing.
+
+`refusal-prose-allocates-infallibly` puts the old `format!` back into the
+importer's refusal constructor. Sixteen mutations and five lanes passed it
+before, because every one of them imported something **valid**. Only the
+malformed-input sweep added after the review sees it, and what it sees is an
+abort.
+
+`boundary-count-never-increments` stops the counter that proves the source's
+BF16 rounding actually fires on the sampled values. Without that count the new
+boundary check could be satisfied by a sample where the boundary never moves
+anything, which is a check of nothing.
+
+`missing-companions-always-empty` makes the inventory audit's decision return
+"nothing missing" for every module. The real artifacts have no incomplete
+module, so this is caught only by the table-driven test written for the case the
+artifacts do not supply — which is the whole reason that test exists.
+
+`bf16-rounding-truncates` swaps round-to-nearest-even for truncation in
+`f32_to_bf16_bits`, the function the new source-arithmetic comparison depends
+on.
+
+`measurement-sign-candidate-equals-pinned` makes the sign candidate agree with
+the pinned reading. The declared thresholds reject it, which is what makes the
+sign a measurement rather than a number in a table.
+
+**Three mutations are caught by exactly one lane each and one is caught by two,
+and in every case that lane is the one the review's findings added.** A battery
+that is complete against the suite it was written for says nothing about the
+suite's holes; only a finding from outside does.
 
 ## Two facts this measurement's plumbing turned up
 
@@ -171,10 +232,18 @@ cargo test -p moxie-format  --locked --offline --test import_allocation_failure 
 cargo test -p moxie-format  --locked --offline --test import_allocation_asymmetric -- --nocapture
 ```
 
-The mutation driver is a Python script that applies each edit, runs the five
-lanes, and reverts; it is reproduced in the task record's result section rather
-than committed, because it is a one-shot measurement tool and the mutations are
-the evidence.
+The mutation driver is committed, with every substitution verbatim:
+
+```text
+python3 docs/evidence/experiments/drivers/0005-mutations.py
+```
+
+The first version of this record said it was "reproduced in the task record's
+result section". It was not, in either commit, and an independent review called
+that what it is — a reproducibility gap. **The mutation names are not the
+measurement; the exact substitutions are.** It edits tracked source in place and
+restores it in a `finally`, so a clean `git status` afterwards is part of the
+evidence.
 
 Artifacts read, read-only, nothing written (**O5**):
 `/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4` revision

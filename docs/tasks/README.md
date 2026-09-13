@@ -2,6 +2,8 @@
 
 ## Current assignment and milestone handoff
 
+[Task 0025](0025-m3-offline-repack-publication.md) is **proposed, contract only**: M3 item 1's bounded offline repacker and canonical publication, placed by [ADR 0022](../decisions/adr/0022-user-programs-and-canonical-write-authority.md) under [ADR 0021](../decisions/adr/0021-repack-is-a-moxie-program.md). It authorizes no bulk materialization and does not accept task 0024.
+
 **M1 complete (M1.5 closed 2026-09-12); M2's five items are all accepted — items
 1 and 2 on 2026-09-12, items 3, 4 and 5 on 2026-09-13 — and the owner authorized
 M3 on 2026-09-13. [Task 0024](0024-m3-asymmetric-int4-pack-quantized-import.md)
@@ -123,24 +125,32 @@ M2**, which is the owner's separate decision, and **no model-quality claim
 follows** (**O2**).
 
 **[Task 0024](0024-m3-asymmetric-int4-pack-quantized-import.md) is implemented
-on 2026-09-13 and is not accepted**; its contract was authored and committed at
-`e122de3` before implementation. It is M3 item 2's asymmetric half: the importer
+on 2026-09-13, corrected after one independent review — five findings, one P1,
+all reproduced, all fixed, none disputed — and is not accepted**; its contract
+was authored and committed at `e122de3` before implementation. It is M3 item 2's asymmetric half: the importer
 reads compressed-tensors `pack-quantized` **asymmetric INT4 at group 32**, whose
 `weight_zero_point` is packed along the **output** axis while the codes are
 packed along the input axis — two conventions inside one tensor group,
 distinguished by nothing in either name, which is R16 in its exact form. Six
 modules of `/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4` and
 `/fast/models/cyankiwi/Qwen3.8-27B-AWQ-BF16-INT4` import, with **112,640
-reconstructed values bitwise equal** to the source's own `(q-z)*s` computed
-independently from the raw bytes. The lane assignment inside a zero-point word
+reconstructed values** checked bitwise against document 03's canonical FP32
+equation over the source's own bytes **and** against the source's own
+arithmetic including the BF16 rounding its reference applies — two quantities
+that differ on **27,501** of those values, which the first version of this task
+conflated. The lane assignment inside a zero-point word
 is **measured** against the artifacts' own codes rather than taken from the
 pinned library, because a zero-point word's lanes are different output channels
 — the check a *code* word can never support, and a check that mattered because
 both artifacts declare untagged development compressor versions. **Import is not
 execution**: nothing consumes a canonical INT4 tensor, W4A16 is M3 item 3, and
 Laguna's graph still declares BF16. A bit-identical repack is ADR 0018's v1
-quality definition, **not** evidence about model output. Mutation-measured 16 of
-16, 0 survivors.
+quality definition, **not** evidence about model output. Mutation-measured **21
+of 21**, 0 survivors, with the driver committed and every verdict repeated. The
+review's P1 was the workspace's most repeated defect for the **sixth** time — a
+refusal that aborted under an allocation failure, on a sweep that only ever
+imported valid inputs — and it is fixed at the shared error type rather than in
+the six lines this task added.
 
 Reopen accepted tasks only for a demonstrated defect in accepted scope.
 

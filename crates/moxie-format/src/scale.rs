@@ -16,6 +16,20 @@ use moxie_types::{Error, Result};
 
 use crate::bf16::bf16_bits_to_f32;
 
+/// This module's refusals, composed **fallibly** -- see [`crate::invalid_fmt`].
+fn invalid(detail: core::fmt::Arguments<'_>) -> Error {
+    crate::invalid_fmt(
+        "a malformed scale payload (detail unavailable: out of memory)",
+        detail,
+    )
+}
+
+/// A refusal whose whole message is static: allocation-free, always available.
+#[allow(dead_code)]
+fn invalid_static(detail: &'static str) -> Error {
+    crate::invalid_static(detail)
+}
+
 /// The closed set of scale scalar encodings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScaleDtype {
@@ -135,12 +149,10 @@ impl ScaleValues {
         for i in 0..self.len() {
             let v = self.get(i).expect("index below len");
             if !v.is_finite() || v <= 0.0 {
-                return Err(Error::InvalidArtifact {
-                    detail: format!(
-                        "scale[{i}] is {v} ({}); scales must be positive and finite",
-                        self.dtype().name()
-                    ),
-                });
+                return Err(invalid(format_args!(
+                    "scale[{i}] is {v} ({}); scales must be positive and finite",
+                    self.dtype().name()
+                )));
             }
         }
         Ok(())

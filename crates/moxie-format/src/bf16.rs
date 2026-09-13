@@ -7,6 +7,22 @@
 //! toward zero. The GPU lane compares this host implementation against the
 //! device's `__float2bfloat16` bit for bit.
 
+use moxie_types::Error;
+
+/// This module's refusals, composed **fallibly** -- see [`crate::invalid_fmt`].
+fn invalid(detail: core::fmt::Arguments<'_>) -> Error {
+    crate::invalid_fmt(
+        "a malformed BF16 payload (detail unavailable: out of memory)",
+        detail,
+    )
+}
+
+/// A refusal whose whole message is static: allocation-free, always available.
+#[allow(dead_code)]
+fn invalid_static(detail: &'static str) -> Error {
+    crate::invalid_static(detail)
+}
+
 /// Round-to-nearest-even f32 -> bf16, returning the raw 16-bit pattern.
 pub fn f32_to_bf16_bits(v: f32) -> u16 {
     let bits = v.to_bits();
@@ -41,18 +57,17 @@ pub fn is_finite_bf16_bits(bits: u16) -> bool {
 /// Validate a little-endian BF16 payload: even length, every element finite.
 pub fn validate_bf16_payload(bytes: &[u8]) -> moxie_types::Result<()> {
     if !bytes.len().is_multiple_of(2) {
-        return Err(moxie_types::Error::InvalidArtifact {
-            detail: format!("BF16 payload has odd length {}", bytes.len()),
-        });
+        return Err(invalid(format_args!(
+            "BF16 payload has odd length {}",
+            bytes.len()
+        )));
     }
     for (i, pair) in bytes.chunks_exact(2).enumerate() {
         let bits = u16::from_le_bytes([pair[0], pair[1]]);
         if !is_finite_bf16_bits(bits) {
-            return Err(moxie_types::Error::InvalidArtifact {
-                detail: format!(
-                    "BF16 element {i} is 0x{bits:04x}, a non-finite weight: caught at load, not at the first matmul"
-                ),
-            });
+            return Err(invalid(format_args!(
+                "BF16 element {i} is 0x{bits:04x}, a non-finite weight: caught at load, not at the first matmul"
+            )));
         }
     }
     Ok(())

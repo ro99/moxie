@@ -1227,7 +1227,7 @@ fn interpreter_chain(
         Ok(trace
             .node_output(value)
             .ok_or_else(|| Error::InvalidArtifact {
-                detail: format!("interpreter trace omitted value {}", value.0),
+                detail: format!("interpreter trace omitted value {}", value.0).into(),
             })?
             .as_float()?
             .data()

@@ -339,10 +339,24 @@ pub enum Completeness {
     Partial { missing: Vec<String> },
 }
 
-fn invalid(detail: impl Into<String>) -> Error {
-    Error::InvalidArtifact {
-        detail: detail.into(),
-    }
+/// This module's refusals, composed **fallibly**.
+///
+/// Takes `fmt::Arguments` rather than a `String`, so the message is never
+/// built by an allocation that can abort: [`crate::invalid_fmt`] grows its
+/// buffer through `try_reserve` and falls back to a borrowed static detail.
+/// Task 0024's review reached `SIGABRT` here by refusing one allocation while
+/// this module refused a malformed artifact.
+fn invalid(detail: core::fmt::Arguments<'_>) -> Error {
+    crate::invalid_fmt(
+        "a malformed canonical manifest (detail unavailable: out of memory)",
+        detail,
+    )
+}
+
+/// A refusal whose whole message is static: allocation-free, always available.
+#[allow(dead_code)]
+fn invalid_static(detail: &'static str) -> Error {
+    crate::invalid_static(detail)
 }
 
 /// Parse and fully validate a manifest from its TOML text.
@@ -358,7 +372,7 @@ pub fn parse(text: &str) -> Result<Manifest> {
     // field is looked at, even when v1's fields are missing or changed.
     check_version(text)?;
     let raw: RawManifest = toml::from_str(text)
-        .map_err(|e| invalid(format!("manifest does not parse as TOML v1: {e}")))?;
+        .map_err(|e| invalid(format_args!("manifest does not parse as TOML v1: {e}")))?;
     validate_raw(raw)
 }
 
@@ -367,19 +381,19 @@ pub fn parse(text: &str) -> Result<Manifest> {
 pub fn validate_chunks(manifest: &Manifest, chunks: &BTreeMap<String, u64>) -> Result<()> {
     for t in &manifest.tensors {
         let len = chunks.get(&t.chunk).ok_or_else(|| {
-            invalid(format!(
+            invalid(format_args!(
                 "tensor '{}' names chunk '{}', which does not exist",
                 t.role, t.chunk
             ))
         })?;
         let end = t.offset.checked_add(t.length).ok_or_else(|| {
-            invalid(format!(
+            invalid(format_args!(
                 "tensor '{}' offset {} + length {} overflows",
                 t.role, t.offset, t.length
             ))
         })?;
         if end > *len {
-            return Err(invalid(format!(
+            return Err(invalid(format_args!(
                 "tensor '{}' describes bytes {}..{end} but chunk '{}' holds {len} bytes: truncation",
                 t.role, t.offset, t.chunk
             )));
@@ -403,13 +417,13 @@ fn check_version(text: &str) -> Result<()> {
         // message says which.
         let msg = e.to_string();
         if msg.contains("schema_version") {
-            invalid(format!("manifest carries no schema_version: {e}"))
+            invalid(format_args!("manifest carries no schema_version: {e}"))
         } else {
-            invalid(format!("manifest does not parse as TOML v1: {e}"))
+            invalid(format_args!("manifest does not parse as TOML v1: {e}"))
         }
     })?;
     if v.schema_version != SCHEMA_VERSION {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "schema_version is {}, this reader accepts only version {}: refused by version before any other field",
             v.schema_version, SCHEMA_VERSION
         )));
@@ -422,7 +436,7 @@ fn validate_raw(raw: RawManifest) -> Result<Manifest> {
     // this schema; re-checking here would only repeat it.
     for f in &raw.required_features {
         if !KNOWN_REQUIRED_FEATURES.contains(&f.as_str()) {
-            return Err(invalid(format!(
+            return Err(invalid(format_args!(
                 "unknown required feature '{f}': refused by name; a future writer's artifact needs a future reader"
             )));
         }
@@ -430,13 +444,13 @@ fn validate_raw(raw: RawManifest) -> Result<Manifest> {
     let endianness = match raw.endianness.as_str() {
         "little" => Endianness::Little,
         other => {
-            return Err(invalid(format!(
+            return Err(invalid(format_args!(
                 "endianness '{other}' is refused rather than byte-swapped: nothing here has ever been tested on one"
             )));
         }
     };
     if raw.tensors.len() > MAX_TENSORS {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "manifest lists {} tensors, above the {} cap checked before validation",
             raw.tensors.len(),
             MAX_TENSORS
@@ -469,7 +483,7 @@ fn validate_raw(raw: RawManifest) -> Result<Manifest> {
     let mut roles = BTreeSet::new();
     for t in &tensors {
         if !roles.insert(t.role.clone()) {
-            return Err(invalid(format!(
+            return Err(invalid(format_args!(
                 "duplicate tensor role '{}': the second entry would silently win",
                 t.role
             )));
@@ -479,7 +493,7 @@ fn validate_raw(raw: RawManifest) -> Result<Manifest> {
     let mut orders = BTreeSet::new();
     for t in &tensors {
         if !orders.insert(t.logical_order) {
-            return Err(invalid(format!(
+            return Err(invalid(format_args!(
                 "duplicate logical_order {} (tensor '{}'): ordering must be unique",
                 t.logical_order, t.role
             )));
@@ -498,7 +512,7 @@ fn validate_raw(raw: RawManifest) -> Result<Manifest> {
     let completeness = match raw.completeness.status.as_str() {
         "complete" => {
             if !raw.completeness.missing.is_empty() {
-                return Err(invalid(
+                return Err(invalid_static(
                     "completeness is 'complete' but lists missing tensors",
                 ));
             }
@@ -506,13 +520,13 @@ fn validate_raw(raw: RawManifest) -> Result<Manifest> {
         }
         "partial" => {
             if raw.completeness.missing.is_empty() {
-                return Err(invalid(
+                return Err(invalid_static(
                     "completeness is 'partial' but names no missing tensor",
                 ));
             }
             for m in &raw.completeness.missing {
                 if m.is_empty() {
-                    return Err(invalid("completeness lists an empty missing role"));
+                    return Err(invalid_static("completeness lists an empty missing role"));
                 }
             }
             Completeness::Partial {
@@ -520,7 +534,7 @@ fn validate_raw(raw: RawManifest) -> Result<Manifest> {
             }
         }
         other => {
-            return Err(invalid(format!(
+            return Err(invalid(format_args!(
                 "completeness status '{other}': expected 'complete' or 'partial'"
             )));
         }
@@ -542,7 +556,7 @@ fn validate_raw(raw: RawManifest) -> Result<Manifest> {
 
 fn nonempty(s: String, field: &str) -> Result<String> {
     if s.is_empty() {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "{field} must be present and non-empty: absence is a rejection, not a default"
         )));
     }
@@ -552,7 +566,7 @@ fn nonempty(s: String, field: &str) -> Result<String> {
 fn validate_source(s: RawSource) -> Result<Source> {
     let mut files = Vec::with_capacity(s.files.len());
     if s.files.is_empty() {
-        return Err(invalid(
+        return Err(invalid_static(
             "source.files must list at least one source file checksum: recorded, never fetched",
         ));
     }
@@ -580,7 +594,7 @@ fn validate_identity(id: RawIdentity, what: &str) -> Result<Identity> {
 
 fn validate_sha256(s: String, field: &str) -> Result<String> {
     if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "{field} must be 64 lowercase hex digits, got {s:?}"
         )));
     }
@@ -589,7 +603,7 @@ fn validate_sha256(s: String, field: &str) -> Result<String> {
 
 fn to_u64(v: i64, field: &str) -> Result<u64> {
     u64::try_from(v).map_err(|_| {
-        invalid(format!(
+        invalid(format_args!(
             "{field} is {v}: negative values are never valid here"
         ))
     })
@@ -597,15 +611,17 @@ fn to_u64(v: i64, field: &str) -> Result<u64> {
 
 fn validate_tensor(t: RawTensor) -> Result<Tensor> {
     let role = nonempty(t.role, "tensors.role")?;
-    validate_chunk_name(&t.chunk).map_err(|d| invalid(format!("tensor '{role}': {d}")))?;
+    validate_chunk_name(&t.chunk).map_err(|d| invalid(format_args!("tensor '{role}': {d}")))?;
     if t.shape.is_empty() {
-        return Err(invalid(format!("tensor '{role}': shape must be non-empty")));
+        return Err(invalid(format_args!(
+            "tensor '{role}': shape must be non-empty"
+        )));
     }
     let mut shape = Vec::with_capacity(t.shape.len());
     for (i, d) in t.shape.iter().enumerate() {
         let d = to_u64(*d, &format!("tensor '{role}' shape[{i}]"))?;
         if d == 0 {
-            return Err(invalid(format!(
+            return Err(invalid(format_args!(
                 "tensor '{role}': shape[{i}] is 0; dimensions must be positive"
             )));
         }
@@ -616,7 +632,7 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
         PRECISION_AFFINE_INT4_V1 => TensorPrecision::AffineInt4V1,
         PRECISION_AFFINE_INT8_V1 => TensorPrecision::AffineInt8V1,
         other => {
-            return Err(invalid(format!(
+            return Err(invalid(format_args!(
                 "tensor '{role}': precision '{other}' is not one of {KNOWN_PRECISIONS:?}"
             )));
         }
@@ -624,19 +640,19 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
     let offset = to_u64(t.offset, &format!("tensor '{role}' offset"))?;
     let length = to_u64(t.length, &format!("tensor '{role}' length"))?;
     if length == 0 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "tensor '{role}': length 0 describes no bytes"
         )));
     }
     let sha256 = validate_sha256(t.sha256, &format!("tensor '{role}' sha256"))?;
     let alignment = to_u64(t.alignment, &format!("tensor '{role}' alignment"))?;
     if !alignment.is_power_of_two() {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "tensor '{role}': alignment {alignment} is not a power of two"
         )));
     }
     if offset % alignment != 0 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "tensor '{role}': offset {offset} is not a multiple of alignment {alignment}"
         )));
     }
@@ -647,7 +663,7 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
     for d in &shape {
         elements = elements
             .checked_mul(*d)
-            .ok_or_else(|| invalid(format!("tensor '{role}': shape product overflows u64")))?;
+            .ok_or_else(|| invalid(format_args!("tensor '{role}': shape product overflows u64")))?;
     }
 
     let affine = match precision {
@@ -657,15 +673,15 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
                 || t.zero_point.is_some()
                 || t.group_index.is_some()
             {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "tensor '{role}': a bf16-v1 tensor must not carry affine fields (group_rule/scale_dtype/zero_point/group_index)"
                 )));
             }
-            let need = elements
-                .checked_mul(2)
-                .ok_or_else(|| invalid(format!("tensor '{role}': BF16 byte count overflows")))?;
+            let need = elements.checked_mul(2).ok_or_else(|| {
+                invalid(format_args!("tensor '{role}': BF16 byte count overflows"))
+            })?;
             if need != length {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "tensor '{role}': shape product {elements} * 2 BF16 bytes = {need}, but length is {length}: shape and byte count disagree"
                 )));
             }
@@ -673,7 +689,7 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
         }
         TensorPrecision::AffineInt4V1 | TensorPrecision::AffineInt8V1 => {
             let group_rule = t.group_rule.ok_or_else(|| {
-                invalid(format!(
+                invalid(format_args!(
                     "tensor '{role}': affine tensors must carry group_rule"
                 ))
             })?;
@@ -682,13 +698,13 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
                 "contiguous-128" => GroupRule::Contiguous128,
                 "per-channel" => GroupRule::PerChannel,
                 other => {
-                    return Err(invalid(format!(
+                    return Err(invalid(format_args!(
                         "tensor '{role}': group_rule '{other}' is outside the closed set {{contiguous-32, contiguous-128, per-channel}}; widening it is an ADR"
                     )));
                 }
             };
             let scale_dtype = t.scale_dtype.ok_or_else(|| {
-                invalid(format!(
+                invalid(format_args!(
                     "tensor '{role}': affine tensors must carry scale_dtype"
                 ))
             })?;
@@ -697,13 +713,13 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
                 "bf16" => ScaleDtype::Bf16,
                 "f32" => ScaleDtype::F32,
                 other => {
-                    return Err(invalid(format!(
+                    return Err(invalid(format_args!(
                         "tensor '{role}': scale_dtype '{other}' is outside {{f16, bf16, f32}}"
                     )));
                 }
             };
             let zero_point = t.zero_point.ok_or_else(|| {
-                invalid(format!(
+                invalid(format_args!(
                     "tensor '{role}': affine tensors must carry zero_point"
                 ))
             })?;
@@ -711,7 +727,7 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
                 "symmetric" => ZeroPointMode::Symmetric,
                 "per-group" => ZeroPointMode::PerGroup,
                 other => {
-                    return Err(invalid(format!(
+                    return Err(invalid(format_args!(
                         "tensor '{role}': zero_point '{other}' is outside {{symmetric, per-group}}"
                     )));
                 }
@@ -720,13 +736,13 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
                 None => None,
                 Some(idx) => {
                     if shape.len() < 2 {
-                        return Err(invalid(format!(
+                        return Err(invalid(format_args!(
                             "tensor '{role}': group_index needs at least a 2-D shape to index input channels"
                         )));
                     }
                     let in_features = shape[shape.len() - 1];
                     if idx.len() as u64 != in_features {
-                        return Err(invalid(format!(
+                        return Err(invalid(format_args!(
                             "tensor '{role}': group_index has {} entries for {in_features} input channels",
                             idx.len()
                         )));
@@ -740,12 +756,12 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
                     for (k, g) in idx.iter().enumerate() {
                         let g = to_u64(*g, &format!("tensor '{role}' group_index[{k}]"))?;
                         if g >= groups {
-                            return Err(invalid(format!(
+                            return Err(invalid(format_args!(
                                 "tensor '{role}': group_index[{k}] is group {g}, but there are only {groups} groups"
                             )));
                         }
                         let g = u32::try_from(g).map_err(|_| {
-                            invalid(format!(
+                            invalid(format_args!(
                                 "tensor '{role}': group_index[{k}] is group {g}, above u32"
                             ))
                         })?;
@@ -777,15 +793,20 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
             // channels. Both come from the already-validated positive shape.
             // `try_from`, never `as`: truncating conversions have no place in
             // the validator.
-            let in_features = usize::try_from(shape[shape.len() - 1])
-                .map_err(|_| invalid(format!("tensor '{role}': input dimension does not fit")))?;
+            let in_features = usize::try_from(shape[shape.len() - 1]).map_err(|_| {
+                invalid(format_args!(
+                    "tensor '{role}': input dimension does not fit"
+                ))
+            })?;
             let mut out_features: usize = 1;
             for d in &shape[..shape.len() - 1] {
                 let d = usize::try_from(*d).map_err(|_| {
-                    invalid(format!("tensor '{role}': a leading dimension does not fit"))
+                    invalid(format_args!(
+                        "tensor '{role}': a leading dimension does not fit"
+                    ))
                 })?;
                 out_features = out_features.checked_mul(d).ok_or_else(|| {
-                    invalid(format!(
+                    invalid(format_args!(
                         "tensor '{role}': leading-dimension product overflows"
                     ))
                 })?;
@@ -807,7 +828,7 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
                 },
             };
             desc.validate().map_err(|e| {
-                invalid(format!(
+                invalid(format_args!(
                     "tensor '{role}': shared affine descriptor rejects it: {e}"
                 ))
             })?;
@@ -845,14 +866,16 @@ fn check_overlap(tensors: &[Tensor]) -> Result<()> {
         list.sort_by_key(|t| (t.offset, t.length));
         for w in list.windows(2) {
             let (a, b) = (w[0], w[1]);
-            let a_end = a
-                .offset
-                .checked_add(a.length)
-                .ok_or_else(|| invalid(format!("tensor '{}' offset + length overflows", a.role)))?;
+            let a_end = a.offset.checked_add(a.length).ok_or_else(|| {
+                invalid(format_args!(
+                    "tensor '{}' offset + length overflows",
+                    a.role
+                ))
+            })?;
             // Sorted by offset, so any intersection means b starts inside
             // a -- including b wholly contained in a.
             if b.offset < a_end {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "tensors '{}' ({}..{a_end}) and '{}' ({}..) overlap in chunk '{chunk}', including containment",
                     a.role, a.offset, b.role, b.offset
                 )));
@@ -907,14 +930,14 @@ pub fn check_arch_limits(value: &toml::Value) -> Result<()> {
 fn check_arch_walk(value: &toml::Value, depth: usize, nodes: &mut usize) -> Result<()> {
     *nodes = nodes
         .checked_add(1)
-        .ok_or_else(|| invalid("architecture metadata node count overflows"))?;
+        .ok_or_else(|| invalid_static("architecture metadata node count overflows"))?;
     if *nodes > MAX_ARCH_NODES {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "architecture metadata has more than {MAX_ARCH_NODES} nodes: the walk stops at the limit"
         )));
     }
     if depth > MAX_ARCH_DEPTH {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "architecture metadata is deeper than {MAX_ARCH_DEPTH}: the walk stops at the limit"
         )));
     }

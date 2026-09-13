@@ -1,6 +1,6 @@
 # Task 0024 — M3 item 2: asymmetric INT4 `pack-quantized` import, zero points along the output axis
 
-Status: **implemented 2026-09-13, awaiting independent review and owner acceptance**.
+Status: **implemented 2026-09-13; corrected after one independent review (five findings, one P1, all reproduced, all fixed, none disputed); awaiting a second review and owner acceptance**.
 
 ## Identity and authority
 
@@ -289,6 +289,119 @@ else. **The "not implemented" verdict for W4A16 execution does not move.**
 
 ## Result, filled after work
 
+### Corrections after the first independent review
+
+Five findings, one P1. **All five reproduced, all five fixed, none disputed.**
+Two of them reproduce to the digit: the review's 27,501 divergent values and its
+`2.1797049840291343` are what this workspace's own tests now print.
+
+#### 1 (P1). A refusal under memory pressure aborted the process
+
+Every refusal in this crate built its prose with `format!`, so refusing one
+allocation while the importer rejected a malformed artifact gave **SIGABRT**. I
+reproduced it on the first try, and on a path task 0018 wrote rather than one of
+mine — the defect is the crate's, not the six lines this task added.
+
+**That is task 0023's third-round lesson, word for word, in a file written by
+someone who had just read it**: "the sweep written for the previous P1
+reconciled only a *valid* trace, so it never constructed a diagnostic and could
+not have caught this." My allocation sweep sweeps every allocation position of
+an import that *succeeds*. A refusal has no positions in it at all.
+
+The fix is the one task 0023 arrived at, moved to where it belongs — the shared
+error type. `Error::InvalidArtifact` carries a `Cow<'static, str>`, so the
+variant can be built **without allocating**; `moxie-format`'s refusals compose
+their prose into a buffer grown only through `try_reserve` and fall back to a
+borrowed static detail when that fails. The variant is what a caller branches
+on (document 02), so the refusal survives and only its prose degrades.
+
+**This exceeded the contract's declared file list**, which named
+`compressed_tensors.rs` and `affine.rs`. Widening a field of `moxie_types::Error`
+touches 41 files and 150 construction sites. I did it anyway, and the reason is
+the repository's own rule rather than convenience: the defect is not reachable
+from the importer alone — `desc.validate()`, `AffineTensor::new` and
+`scales.validate()` are all on the import path and all aborted the same way — and
+"pre-existing" is how a standing failure becomes background noise. Every one of
+the 150 edits is mechanical (`.into()`), driven by rustc's own spans rather than
+by a regex over source, so no site was guessed and none was missed.
+
+The gate that was missing now exists:
+`every_refusal_is_a_typed_error_with_every_allocation_refused` constructs **eight**
+refusals with **every** allocation position refused in turn, and a mutation
+(`refusal-prose-allocates-infallibly`) puts the old `format!` back to prove the
+gate fails on it.
+
+#### 2 (P2). The comparison was not the comparison it was advertised as
+
+The test computed `(q - z) * s` in FP32 and the record called it agreement with
+"the source's own declared arithmetic". The pinned `_dequantize` casts to
+`scale.dtype` first, and for both artifacts that is **BF16**, so the source's
+value is a BF16 number. The review ran the pinned helpers and measured **27,501
+of 112,640** sampled values where the two differ; this workspace's own test now
+prints the same number.
+
+**Neither quantity is wrong and that is the point.** Document 03 fixes the
+canonical host reconstruction at FP32, and the repack is faithful: codes, zero
+points and scale bytes are preserved exactly. What was wrong was calling one
+quantity by the other's name — **task 0022's lesson about a BF16 boundary,
+one task later.**
+
+There are two comparisons now. The canonical FP32 equation over the source's own
+bytes, bitwise; and the source's own arithmetic *with its rounding boundary*,
+which the canonical value must round to exactly. The second is sound because it
+rounds once and not twice: `q - z` is an integer in `[-15, 15]` and the scale is
+a BF16 value, so the FP32 product is **exact** and the only rounding is the
+single round-to-nearest-even into BF16. And the boundary is shown to fire —
+`narrowed` counts the values it moves and the test **requires that count to be
+nonzero**, because a boundary check on a sample where the boundary never fires
+proves nothing.
+
+#### 3 (P2). The audit could not fail, because its population was filtered first
+
+`Inventory::build` dropped every module missing one of its four tensors, and
+then `every_asymmetric_module_declares_a_packed_zero_point` iterated what was
+left. The review built a shard with four packed modules, one without its
+`weight_zero_point`; the test passed and reported three.
+
+**A filter applied to the population being audited removes exactly the rows the
+audit exists to see.** That is task 0023's omitted layer — "totals were derived
+from the records supplied and then re-summed from the same records" — in a
+different file.
+
+The inventory keeps **every** discovered packed module now, `incomplete()` is the
+finding rather than a silent drop, and `importable()` is the separate, explicitly
+named subset the import tests use. `missing_companions` is a pure function so the
+audit's decision can be tested against a table that **contains** the case the
+real artifacts do not supply, and a mutation
+(`missing-companions-always-empty`) proves that test load-bearing.
+
+#### 4 (P2). The driver was described and not committed
+
+Experiment 0005 said the driver was "reproduced in the task record's result
+section". It was not, in either commit. **The mutation names are not the
+measurement; the exact substitutions are.** And the contract promised
+substitutions "repeated in both directions" — the first run did each once, and
+neither the record nor I said so.
+
+The driver is tracked now, at
+[`docs/evidence/experiments/drivers/0005-mutations.py`](../evidence/experiments/drivers/0005-mutations.py),
+with every substitution verbatim. Each verdict is repeated **three times in both
+directions** — mutant against the mutated tree, control against the restored one
+— and a lane that disagrees with itself is reported as nondeterministic rather
+than counted.
+
+#### 5 (P2). The stated reason for not measuring the sign was false
+
+The record said a distribution centred near zero makes `mean|mean(q) - z|` and
+`mean|mean(q) + z|` indistinguishable. That ignores the correlation between a
+group's code mean and its own zero point — **which is the premise of the
+measurement two paragraphs earlier.** A record contradicting a fact it already
+contains is the third instance of that class in this workspace.
+
+The sign is a fifth candidate in the measurement now, and it separates further
+than any misassignment does: **2.18 to 2.57** against the pinned **0.52**,
+measured on all four tensors.
+
 ### Changed shared owners and consumers
 
 `moxie_format::compressed_tensors` is the sole owner and the only production
@@ -323,9 +436,9 @@ Base `e122de3` (this contract). Implementation is the commits after it.
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed** |
 | Device-lane clippy (`--features moxie-executor/driver`) | **passed** |
 | CUDA-lane clippy (`--features cuda`) | **passed** |
-| `cargo test --workspace --locked --offline` | **943 passed, 0 failed**, against a baseline of **930** re-measured at `e122de3` before implementation |
-| `cargo test --workspace --locked --offline --features moxie-executor/driver` | **978 passed, 0 failed** (task 0023 recorded 965; +13 is exactly this task's new tests) |
-| `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified. Nothing here touches the device; run to show nothing broke |
+| `cargo test --workspace --locked --offline` | **945 passed, 0 failed**, against a baseline of **930** re-measured at `e122de3` before implementation (943 before the review's corrections) |
+| `cargo test --workspace --locked --offline --features moxie-executor/driver` | **980 passed, 0 failed** (task 0023 recorded 965; +15 is exactly this task's new tests) |
+| `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified. Re-run after the corrections, because widening `Error::InvalidArtifact` touches every crate including the device lane |
 | `cargo xtask spec-check` | **passed**, 10 documents |
 | `cargo xtask arch-check` | **zero failures**, 79 rejected fixtures, 21 accepted, 13 rules |
 
@@ -335,49 +448,60 @@ this machine and every artifact lane ran. The four artifact tests each print
 green — that path was exercised while the tests were being written and is not
 what ran here.
 
-Thirteen new tests: seven in `moxie-format`'s own module, one
-`import_allocation_asymmetric`, one `import_allocation_failure`, four in
+Fifteen new tests: seven in `moxie-format`'s own module, one
+`import_allocation_asymmetric`, **two** `import_allocation_failure`, **five** in
 `moxie-storage/tests/asymmetric_int4_import.rs`.
 
-**Mutation measurement: 16 of 16 caught, 0 survivors**, first measurement, no
-corrections needed
-([experiment 0005](../evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md)).
-Two mutations are caught by exactly one lane each and both are that lane's
-reason for existing: `zp-vec-allocated-infallibly` only by the injected
-allocation-failure sweep, and `measurement-pinned-becomes-lane-reversed` — a
-mutation of the *measurement* rather than the product — only by the artifact
-lane.
+**Mutation measurement: 21 of 21 caught, 0 survivors**, each verdict repeated
+**three times in both directions**, driver committed
+([experiment 0005](../evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md),
+[its driver](../evidence/experiments/drivers/0005-mutations.py)). The first
+measurement was 16 of 16 and it was a complete battery against a suite with
+three holes in it: **the five mutations added after the review are each caught
+by exactly the lane a finding created**, and four of them by that lane alone. A
+battery that is complete against the suite it was written for says nothing about
+the suite's holes.
 
 ### Measured effect and uncertainty
 
 **The zero-point lane assignment is measured, not assumed.** `mean |mean_code −
 z|` in codes, on four tensors across the two artifacts:
 
-| Artifact | Module | pinned | lane-reversed | block-major | block reversed |
-|---|---|---:|---:|---:|---:|
-| Laguna | `layers.1.mlp.experts.0.down_proj` | **0.5236** | 1.4900 | 1.4853 | 1.4817 |
-| Laguna | `layers.1.mlp.experts.0.gate_proj` | **0.5183** | 1.5661 | 1.5652 | 1.5670 |
-| Qwen3.8-27B | `layers.11.self_attn.k_proj` | **0.5163** | 1.7629 | 1.7809 | 1.7839 |
-| Qwen3.8-27B | `layers.11.self_attn.v_proj` | **0.5300** | 1.5751 | 1.5741 | 1.5776 |
+| Artifact | Module | pinned | lane-reversed | block-major | block reversed | sign-flipped |
+|---|---|---:|---:|---:|---:|---:|
+| Laguna | `layers.1.mlp.experts.0.down_proj` | **0.5236** | 1.4900 | 1.4853 | 1.4817 | 2.1797 |
+| Laguna | `layers.1.mlp.experts.0.gate_proj` | **0.5183** | 1.5661 | 1.5652 | 1.5670 | 2.2912 |
+| Qwen3.8-27B | `layers.11.self_attn.k_proj` | **0.5163** | 1.7629 | 1.7809 | 1.7839 | 2.5735 |
+| Qwen3.8-27B | `layers.11.self_attn.v_proj` | **0.5300** | 1.5751 | 1.5741 | 1.5776 | 2.2888 |
 
 Declared thresholds were 1.0 and 1.2, written into this contract before the
-measurement; the margin is 2.8–3.5×. **Uncertainty, stated:** this rules out the
-three specific alternatives the same bytes permit. It does not establish the
-**code** word's lane order, which stays exactly where task 0018 left it, and the
-zero-point **sign** is taken from two independent statements of `(q − z) · s`
-(document 03 and the pinned library) rather than measured — a mean absolute
-deviation cannot separate `+z` from `−z` on a distribution centred near zero.
+measurement; the margin is 2.8–4.9×. The **sign** column was added after the
+review and is held to the same thresholds — this contract's original claim that
+the statistic could not separate a sign was wrong, and wrong for a reason the
+measurement's own premise contradicts.
 
-**112,640 reconstructed values are bitwise equal** to the source's own
-arithmetic, computed from the raw bytes by a transcription that follows the
-library's *unpack procedure* rather than this importer's closed-form index. That
-is ADR 0018's bit-identical repack at tensor scale. **It is not a quality
-claim** and no paired output against any released model exists.
+**Uncertainty, stated:** this rules out the four alternatives the same bytes
+permit. It does not establish the **code** word's lane order, which stays exactly
+where task 0018 left it, because all eight lanes of a code word fall inside one
+scale group.
+
+**112,640 reconstructed values are checked against two quantities**, because
+there are two and they are not the same one. Bitwise against document 03's
+canonical FP32 `(q - z) * s` over the source's own bytes; and against the
+source's own arithmetic **with the BF16 boundary its reference applies**, which
+the canonical value rounds to exactly. The boundary moves **27,501** of the
+112,640, a count the test prints and requires to be nonzero. The zero points
+themselves are checked against a transcription that follows the library's
+*unpack procedure* rather than this importer's closed-form index.
+
+That is ADR 0018's bit-identical repack at tensor scale: codes, zero points and
+scale bytes preserved exactly. **It is not a quality claim** and no paired output
+against any released model exists.
 
 **No performance claim.** Nothing was timed and the import path has no
 duration field.
 
-### Three things the work turned up that were not in the contract
+### Four things the work turned up that were not in the contract
 
 1. **A module's four tensors need not share a shard.** Laguna keeps them
    together for 34,739 of 34,740 modules; Qwen3.8-27B for **none** of its 256.
@@ -396,6 +520,11 @@ duration field.
    two tests interleaved on the global counter — which that file's first
    paragraph says will happen. It is its own executable now. A measurement taken
    while something else allocates is not a measurement.
+4. **A refusal is not reachable from a sweep of successful imports**, and the
+   whole crate's refusal paths aborted under memory pressure. Found by the
+   review, fixed at the shared error type. The full account is in the
+   corrections above; it is listed here because it is the single largest thing
+   this task learned and it was not in the contract.
 
 ### Deleted and replaced paths
 
@@ -427,3 +556,11 @@ duration field.
   v1's quality definition, not evidence about output, and nothing may be written
   under a checkpoint root without a task naming artifact, revision, expected
   size and retention. **This task wrote nothing.**
+- **The rest of the workspace's refusal paths still allocate their prose.**
+  `Error::InvalidArtifact` can now be built without allocating and
+  `moxie-format`'s import path does; the other 40 files still call `format!`,
+  which is correct wherever an allocation failure is not the context — and is
+  an open question wherever it is. The three sibling variants
+  (`Unsupported`, `Numerical`, `InvalidRequest`) still carry `String`. Deciding
+  how far that goes is a bounded task of its own, not something to widen into
+  this one after the fact.

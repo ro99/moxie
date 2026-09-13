@@ -181,7 +181,8 @@ pub fn expert_group_bf16(
                 gate_up.len(),
                 2 * intermediate * hidden * 2,
                 2 * intermediate
-            ),
+            )
+            .into(),
         });
     }
     if down.len() != hidden * intermediate * 2 {
@@ -190,7 +191,8 @@ pub fn expert_group_bf16(
                 "down slice is {} B, expected {} for [{hidden}, {intermediate}] BF16",
                 down.len(),
                 hidden * intermediate * 2
-            ),
+            )
+            .into(),
         });
     }
     if assignment.rows.len() != assignment.slots.len() {
@@ -334,7 +336,8 @@ pub fn combine_rows_bf16(
                 "slot buffer is {} B, expected {} for [{expected_slots}, {hidden}] BF16",
                 slots.len(),
                 expected_slots * hidden * 2
-            ),
+            )
+            .into(),
         });
     }
     if weights.len() != expected_slots || order.len() != expected_slots {
@@ -343,7 +346,8 @@ pub fn combine_rows_bf16(
                 "{} coefficient(s) and {} order entries for {expected_slots} slot(s)",
                 weights.len(),
                 order.len()
-            ),
+            )
+            .into(),
         });
     }
     if out.len() != rows * hidden * 2 {
@@ -352,7 +356,8 @@ pub fn combine_rows_bf16(
                 "output is {} B, expected {} for [{rows}, {hidden}] BF16",
                 out.len(),
                 rows * hidden * 2
-            ),
+            )
+            .into(),
         });
     }
     if accumulator.len() < hidden {

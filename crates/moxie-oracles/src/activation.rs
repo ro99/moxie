@@ -72,7 +72,7 @@ fn sigmoid_f64(v: f64) -> f64 {
 pub fn swiglu_row(gate: &[f32], up: &[f32]) -> Result<Vec<f32>> {
     if gate.len() != up.len() {
         return Err(Error::InvalidArtifact {
-            detail: format!("gate has {} elements and up has {}", gate.len(), up.len()),
+            detail: format!("gate has {} elements and up has {}", gate.len(), up.len()).into(),
         });
     }
     if gate.is_empty() {
@@ -123,7 +123,7 @@ pub fn gelu_tanh(v: f32) -> f32 {
 pub fn geglu_row(gate: &[f32], up: &[f32]) -> Result<Vec<f32>> {
     if gate.len() != up.len() {
         return Err(Error::InvalidArtifact {
-            detail: format!("gate has {} elements and up has {}", gate.len(), up.len()),
+            detail: format!("gate has {} elements and up has {}", gate.len(), up.len()).into(),
         });
     }
     if gate.is_empty() {

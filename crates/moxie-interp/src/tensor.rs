@@ -46,7 +46,7 @@ impl HostTensor {
         let want: usize = shape.iter().product();
         if data.len() != want {
             return Err(Error::InvalidArtifact {
-                detail: format!("{} values for shape {shape:?}", data.len()),
+                detail: format!("{} values for shape {shape:?}", data.len()).into(),
             });
         }
         if shape.is_empty() {
@@ -69,7 +69,8 @@ impl HostTensor {
                     "element {i} is {} which is not representable in BF16; \
                      round it explicitly rather than storing it in a BF16 tensor",
                     data[i]
-                ),
+                )
+                .into(),
             });
         }
         Self::checked(data, shape, Precision::Bf16)
@@ -113,7 +114,7 @@ impl HostTensor {
     pub fn row(&self, r: usize) -> Result<&[f32]> {
         if self.shape.len() != 2 {
             return Err(Error::InvalidArtifact {
-                detail: format!("row() on a rank-{} tensor", self.shape.len()),
+                detail: format!("row() on a rank-{} tensor", self.shape.len()).into(),
             });
         }
         if r >= self.rows() {
@@ -175,7 +176,8 @@ impl RouteTable {
                      number of {top_k}-wide rows",
                     experts.len(),
                     weights.len()
-                ),
+                )
+                .into(),
             });
         }
         Ok(Self {

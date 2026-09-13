@@ -543,7 +543,7 @@ impl RoutedBlocks {
             revision: revision.into(),
             max_trained_position: config.max_trained_position,
             vocab_size: u32::try_from(config.vocab).map_err(|_| Error::InvalidArtifact {
-                detail: format!("vocabulary {} does not fit a u32", config.vocab),
+                detail: format!("vocabulary {} does not fit a u32", config.vocab).into(),
             })?,
         };
         let mut tensors = vec![

@@ -1252,7 +1252,8 @@ impl GraphBuilder {
                 detail: format!(
                     "{name} is declared as a weight but its role is {:?}",
                     spec.role
-                ),
+                )
+                .into(),
             });
         }
         let id = self.add_value(name, spec);
@@ -1298,7 +1299,8 @@ impl GraphBuilder {
                     "attention layer {layer} is already used by node {}; two nodes sharing \
                      a KV layer would append the same positions twice",
                     clash.id.0
-                ),
+                )
+                .into(),
             });
         }
         // Every operation that consumes positions must consume the *same* ones.
@@ -1317,7 +1319,8 @@ impl GraphBuilder {
                             params.op().name(),
                             v.0,
                             existing.0
-                        ),
+                        )
+                        .into(),
                     });
                 }
                 Some(_) => {}
@@ -1371,7 +1374,8 @@ impl GraphBuilder {
                             .iter()
                             .map(|a| a.get().name())
                             .collect::<Vec<_>>(),
-                    ),
+                    )
+                    .into(),
                 });
             }
         }
@@ -1393,7 +1397,7 @@ impl GraphBuilder {
         let s = |i: usize| self.spec(inputs[i]).expect("checked above");
         let bad = |detail: String| -> Error {
             Error::InvalidArtifact {
-                detail: format!("{}: {detail}", params.op().name()),
+                detail: format!("{}: {detail}", params.op().name()).into(),
             }
         };
         let want_index = |i: usize| -> Result<()> {
@@ -1710,14 +1714,14 @@ impl GraphBuilder {
                     return Err(Error::InvalidArtifact {
                         detail: format!(
                             "step input {name} is declared {encoding:?}, which is                              narrower than the u64 it is stored as"
-                        ),
+                        ).into(),
                     });
                 }
                 ValueRole::Route { .. } => {
                     return Err(Error::InvalidArtifact {
                         detail: format!(
                             "step input {name} is declared a route table; a route is                              produced by a Route operation over this step's own rows,                              never supplied"
-                        ),
+                        ).into(),
                     });
                 }
                 _ => {}
@@ -1745,7 +1749,8 @@ impl GraphBuilder {
                 return Err(Error::InvalidArtifact {
                     detail: format!(
                         "attention layers must be numbered from zero without gaps; got {layers:?}"
-                    ),
+                    )
+                    .into(),
                 });
             }
         }

@@ -23,6 +23,20 @@ use moxie_types::{Error, Result};
 
 use crate::affine::IntWidth;
 
+/// This module's refusals, composed **fallibly** -- see [`crate::invalid_fmt`].
+fn invalid(detail: core::fmt::Arguments<'_>) -> Error {
+    crate::invalid_fmt(
+        "a value a quantizer cannot accept (detail unavailable: out of memory)",
+        detail,
+    )
+}
+
+/// A refusal whose whole message is static: allocation-free, always available.
+#[allow(dead_code)]
+fn invalid_static(detail: &'static str) -> Error {
+    crate::invalid_static(detail)
+}
+
 /// Round half to even. The pinned rounding rule (document 03).
 ///
 /// `f32::round` rounds half *away from zero*, which biases a tensor's magnitude
@@ -84,14 +98,14 @@ impl Quantizer {
     /// `q = clip(round_ties_even(value / scale) + zero_point)`.
     pub fn quantize(self, value: f32, scale: f32, zero_point: i32) -> Result<i32> {
         if !scale.is_finite() || scale <= 0.0 {
-            return Err(Error::InvalidArtifact {
-                detail: format!("scale must be positive and finite, got {scale}"),
-            });
+            return Err(invalid(format_args!(
+                "scale must be positive and finite, got {scale}"
+            )));
         }
         if !value.is_finite() {
-            return Err(Error::InvalidArtifact {
-                detail: format!("cannot quantize non-finite value {value}"),
-            });
+            return Err(invalid(format_args!(
+                "cannot quantize non-finite value {value}"
+            )));
         }
         let q = round_ties_even(value / scale);
         // Bound the quotient in f32 before casting: a tiny scale makes it exceed

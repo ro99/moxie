@@ -314,13 +314,13 @@ impl KvCache {
             return Err(Error::InvalidArtifact {
                 detail: format!(
                     "the cache layers hold {lens:?} position(s), not {executed} each,                      which is what the branch has executed"
-                ),
+                ).into(),
             });
         }
         while (self.owner.stamps.len() as u64) <= executed {
             let p = self.owner.stamps.len() as u64;
             let l = state.lineage_at(branch, p)?.ok_or(Error::InvalidArtifact {
-                detail: format!("prefix {p} is not occupied on {branch}"),
+                detail: format!("prefix {p} is not occupied on {branch}").into(),
             })?;
             self.owner.stamps.push(l);
         }

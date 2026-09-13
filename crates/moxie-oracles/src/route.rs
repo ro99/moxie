@@ -144,7 +144,8 @@ pub fn select_top_k_biased(probs: &[f32], bias: Option<&[f32]>, k: usize) -> Res
                         "selection bias has {} elements for {} experts",
                         b.len(),
                         probs.len()
-                    ),
+                    )
+                    .into(),
                 });
             }
             if let Some(bad) = b.iter().position(|v| !v.is_finite()) {
@@ -319,7 +320,8 @@ pub fn router_input_row(x: &[f32], gain: &[f32], input_scale: f32, eps: f32) -> 
                 "router gain has {} elements for {} features",
                 gain.len(),
                 x.len()
-            ),
+            )
+            .into(),
         });
     }
     if !(eps.is_finite() && eps > 0.0) {
@@ -453,7 +455,8 @@ pub fn apply_per_expert_scale(route: &Route, per_expert: &[f32]) -> Result<Route
                 detail: format!(
                     "expert {e} has no per-expert scale among {}",
                     per_expert.len()
-                ),
+                )
+                .into(),
             })?;
         if !s.is_finite() {
             return Err(Error::Numerical {
@@ -620,7 +623,7 @@ pub fn expert_row(
     }
     if x.len() != hidden {
         return Err(Error::InvalidArtifact {
-            detail: format!("expert input has {} elements, expected {hidden}", x.len()),
+            detail: format!("expert input has {} elements, expected {hidden}", x.len()).into(),
         });
     }
     let e = expert as usize;
@@ -638,7 +641,8 @@ pub fn expert_row(
                 "fused gate/up has {} elements, expected {experts}x{}x{hidden}",
                 gate_up.len(),
                 2 * intermediate
-            ),
+            )
+            .into(),
         });
     }
     if down.len() != experts * down_stride {
@@ -646,7 +650,8 @@ pub fn expert_row(
             detail: format!(
                 "fused down has {} elements, expected {experts}x{hidden}x{intermediate}",
                 down.len()
-            ),
+            )
+            .into(),
         });
     }
     let gu = &gate_up[e * gate_up_stride..(e + 1) * gate_up_stride];
@@ -874,7 +879,8 @@ pub fn combine_row(
                 "route has {} experts and {} coefficients",
                 experts.len(),
                 weights.len()
-            ),
+            )
+            .into(),
         });
     }
     if slots.len() != experts.len() * width {
@@ -883,7 +889,8 @@ pub fn combine_row(
                 "slot tensor has {} elements, expected {}x{width}",
                 slots.len(),
                 experts.len()
-            ),
+            )
+            .into(),
         });
     }
     let mut acc = crate::try_vec(width)?;

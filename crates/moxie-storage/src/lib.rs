@@ -112,7 +112,8 @@ impl Artifact {
             detail: format!(
                 "artifact directory {} does not canonicalize: {e}",
                 dir.display()
-            ),
+            )
+            .into(),
         })?;
         let mut lengths = BTreeMap::new();
         let mut chunks = BTreeMap::new();
@@ -124,12 +125,12 @@ impl Artifact {
         for name in names {
             let resolved = resolve_chunk(&canonical_dir, dir, name)?;
             let file = File::open(&resolved).map_err(|e| Error::InvalidArtifact {
-                detail: format!("cannot open chunk '{}': {e}", resolved.display()),
+                detail: format!("cannot open chunk '{}': {e}", resolved.display()).into(),
             })?;
             let len = file
                 .metadata()
                 .map_err(|e| Error::InvalidArtifact {
-                    detail: format!("cannot stat chunk '{}': {e}", resolved.display()),
+                    detail: format!("cannot stat chunk '{}': {e}", resolved.display()).into(),
                 })?
                 .len();
             lengths.insert(name.clone(), len);
@@ -192,7 +193,7 @@ impl Artifact {
             .iter()
             .find(|t| t.role == role)
             .ok_or_else(|| Error::InvalidArtifact {
-                detail: format!("no tensor named '{role}'"),
+                detail: format!("no tensor named '{role}'").into(),
             })?;
         if matches!(
             self.manifest.completeness,
@@ -207,25 +208,25 @@ impl Artifact {
                 detail: format!(
                     "tensor '{role}' is {}: manifest v1 describes affine tensors and refuses to read them; decoding arrives in M3",
                     t.precision.name()
-                ),
+                ).into(),
             });
         }
         let need: usize = t.length.try_into().map_err(|_| Error::InvalidArtifact {
-            detail: format!("tensor '{role}' length {} does not fit in usize", t.length),
+            detail: format!("tensor '{role}' length {} does not fit in usize", t.length).into(),
         })?;
         if into.len() < need {
             return Err(Error::InvalidArtifact {
                 detail: format!(
                     "tensor '{role}' needs {need} bytes but the buffer holds {}: never a partial read reported as success",
                     into.len()
-                ),
+                ).into(),
             });
         }
         let chunk = self
             .chunks
             .get(&t.chunk)
             .ok_or_else(|| Error::InvalidArtifact {
-                detail: format!("chunk '{}' was validated but is not open", t.chunk),
+                detail: format!("chunk '{}' was validated but is not open", t.chunk).into(),
             })?;
         let dest = &mut into[..need];
         let mut source = OpenChunk { file: &chunk.file };
@@ -240,7 +241,7 @@ impl Artifact {
         )
         .map_err(|e| match e {
             Error::InvalidArtifact { detail } => Error::InvalidArtifact {
-                detail: format!("tensor '{role}': {detail}"),
+                detail: format!("tensor '{role}': {detail}").into(),
             },
             other => other,
         })?;
@@ -408,12 +409,12 @@ impl Shard {
         header_budget: HeaderBudget,
     ) -> Result<Self> {
         let file = File::open(path).map_err(|e| Error::InvalidArtifact {
-            detail: format!("cannot open {}: {e}", path.display()),
+            detail: format!("cannot open {}: {e}", path.display()).into(),
         })?;
         let len = file
             .metadata()
             .map_err(|e| Error::InvalidArtifact {
-                detail: format!("cannot stat {}: {e}", path.display()),
+                detail: format!("cannot stat {}: {e}", path.display()).into(),
             })?
             .len();
         // Read the eight-byte length, learn the bound, then read exactly that
@@ -423,7 +424,7 @@ impl Shard {
         source
             .read_at(0, &mut prefix)
             .map_err(|e| Error::InvalidArtifact {
-                detail: format!("cannot read the length prefix of {}: {e}", path.display()),
+                detail: format!("cannot read the length prefix of {}: {e}", path.display()).into(),
             })?;
         let prefix_len = SafeHeader::prefix_len(&prefix)?;
         // Both bounds before the allocation, not after. A header longer than
@@ -434,7 +435,8 @@ impl Shard {
                 detail: format!(
                     "{} declares a {prefix_len}-byte header in a {len}-byte file",
                     path.display()
-                ),
+                )
+                .into(),
             });
         }
         // Against the estimated **peak heap**, not the serialized length: the
@@ -460,7 +462,7 @@ impl Shard {
         source
             .read_at(0, &mut bytes)
             .map_err(|e| Error::InvalidArtifact {
-                detail: format!("cannot read the header of {}: {e}", path.display()),
+                detail: format!("cannot read the header of {}: {e}", path.display()).into(),
             })?;
         let header = SafeHeader::parse(&bytes, len)?;
         Ok(Self {
@@ -503,14 +505,15 @@ impl Shard {
     pub fn read_tensor(&self, name: &str, into: &mut [u8]) -> Result<()> {
         let entry = self.header.get(name)?;
         let need = usize::try_from(entry.len()).map_err(|_| Error::InvalidArtifact {
-            detail: format!("tensor {name:?} does not fit this platform"),
+            detail: format!("tensor {name:?} does not fit this platform").into(),
         })?;
         if into.len() != need {
             return Err(Error::InvalidArtifact {
                 detail: format!(
                     "tensor {name:?} is {need} byte(s) but the buffer holds {}",
                     into.len()
-                ),
+                )
+                .into(),
             });
         }
         let offset = entry.file_offset(&self.header);
@@ -522,12 +525,12 @@ impl Shard {
             let at = offset
                 .checked_add(done as u64)
                 .ok_or_else(|| Error::InvalidArtifact {
-                    detail: format!("tensor {name:?} offset overflows"),
+                    detail: format!("tensor {name:?} offset overflows").into(),
                 })?;
             source
                 .read_at(at, &mut into[done..end])
                 .map_err(|e| Error::InvalidArtifact {
-                    detail: format!("reading {name:?} from {}: {e}", self.path.display()),
+                    detail: format!("reading {name:?} from {}: {e}", self.path.display()).into(),
                 })?;
             done = end;
         }
@@ -555,25 +558,26 @@ impl Shard {
         let end = offset_bytes
             .checked_add(want)
             .ok_or_else(|| Error::InvalidArtifact {
-                detail: format!("range of tensor {name:?} overflows"),
+                detail: format!("range of tensor {name:?} overflows").into(),
             })?;
         if want == 0 {
             return Err(Error::InvalidArtifact {
-                detail: format!("an empty range of tensor {name:?} is not a read"),
+                detail: format!("an empty range of tensor {name:?} is not a read").into(),
             });
         }
         if end > len {
             return Err(Error::InvalidArtifact {
                 detail: format!(
                     "range {offset_bytes}..{end} of tensor {name:?} exceeds its {len} byte(s)"
-                ),
+                )
+                .into(),
             });
         }
         let base = entry
             .file_offset(&self.header)
             .checked_add(offset_bytes)
             .ok_or_else(|| Error::InvalidArtifact {
-                detail: format!("tensor {name:?} offset overflows"),
+                detail: format!("tensor {name:?} offset overflows").into(),
             })?;
         let mut source = OpenChunk { file: &self.file };
         let slice = self.budget.bytes().max(1);
@@ -584,12 +588,12 @@ impl Shard {
             let at = base
                 .checked_add(done as u64)
                 .ok_or_else(|| Error::InvalidArtifact {
-                    detail: format!("tensor {name:?} offset overflows"),
+                    detail: format!("tensor {name:?} offset overflows").into(),
                 })?;
             source
                 .read_at(at, &mut into[done..stop])
                 .map_err(|e| Error::InvalidArtifact {
-                    detail: format!("reading {name:?} from {}: {e}", self.path.display()),
+                    detail: format!("reading {name:?} from {}: {e}", self.path.display()).into(),
                 })?;
             done = stop;
         }
@@ -600,7 +604,7 @@ impl Shard {
     pub fn tensor_bytes(&self, name: &str) -> Result<Vec<u8>> {
         let entry = self.header.get(name)?;
         let need = usize::try_from(entry.len()).map_err(|_| Error::InvalidArtifact {
-            detail: format!("tensor {name:?} does not fit this platform"),
+            detail: format!("tensor {name:?} does not fit this platform").into(),
         })?;
         let mut out = crate::try_vec::<u8>(need)?;
         out.resize(need, 0);
@@ -668,13 +672,13 @@ impl RangeSource for OpenChunk<'_> {
 fn read_manifest_capped(dir: &Path) -> Result<String> {
     let path = dir.join("manifest.toml");
     let mut f = File::open(&path).map_err(|e| Error::InvalidArtifact {
-        detail: format!("cannot open {}: {e}", path.display()),
+        detail: format!("cannot open {}: {e}", path.display()).into(),
     })?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
         let n = f.read(&mut chunk).map_err(|e| Error::InvalidArtifact {
-            detail: format!("cannot read {}: {e}", path.display()),
+            detail: format!("cannot read {}: {e}", path.display()).into(),
         })?;
         if n == 0 {
             break;
@@ -685,12 +689,12 @@ fn read_manifest_capped(dir: &Path) -> Result<String> {
                 detail: format!(
                     "manifest.toml exceeds the {} byte cap before parsing: it bounds the parse itself",
                     moxie_format::manifest::MAX_MANIFEST_BYTES
-                ),
+                ).into(),
             });
         }
     }
     String::from_utf8(buf).map_err(|e| Error::InvalidArtifact {
-        detail: format!("manifest.toml is not UTF-8: {e}"),
+        detail: format!("manifest.toml is not UTF-8: {e}").into(),
     })
 }
 
@@ -702,27 +706,27 @@ fn read_manifest_capped(dir: &Path) -> Result<String> {
 /// alone is insufficient.
 fn resolve_chunk(canonical_dir: &Path, dir: &Path, name: &str) -> Result<PathBuf> {
     manifest::validate_chunk_name(name).map_err(|d| Error::InvalidArtifact {
-        detail: format!("chunk reference rejected on the string, before joining: {d}"),
+        detail: format!("chunk reference rejected on the string, before joining: {d}").into(),
     })?;
     let joined = dir.join(name);
     let canonical = joined.canonicalize().map_err(|e| Error::InvalidArtifact {
-        detail: format!("chunk '{name}' does not canonicalize: {e}"),
+        detail: format!("chunk '{name}' does not canonicalize: {e}").into(),
     })?;
     if !canonical.starts_with(canonical_dir) {
         return Err(Error::InvalidArtifact {
             detail: format!(
                 "chunk '{name}' resolves outside the artifact directory: a symlink pointing outside, which no string check can catch"
-            ),
+            ).into(),
         });
     }
     // A regular file: not a directory, not a device, not a dangling link that
     // somehow canonicalized.
     let meta = std::fs::metadata(&canonical).map_err(|e| Error::InvalidArtifact {
-        detail: format!("cannot metadata chunk '{name}': {e}"),
+        detail: format!("cannot metadata chunk '{name}': {e}").into(),
     })?;
     if !meta.is_file() {
         return Err(Error::InvalidArtifact {
-            detail: format!("chunk '{name}' is not a regular file"),
+            detail: format!("chunk '{name}' is not a regular file").into(),
         });
     }
     Ok(canonical)
@@ -761,7 +765,7 @@ fn pump_range<S: RangeSource>(
         let pos = offset
             .checked_add(done as u64)
             .ok_or_else(|| Error::InvalidArtifact {
-                detail: format!("tensor offset {offset} + {done} overflows"),
+                detail: format!("tensor offset {offset} + {done} overflows").into(),
             })?;
         // An interrupted syscall is retried without advancing: the tensor
         // offset has not moved, so no byte is skipped or duplicated.
@@ -775,7 +779,8 @@ fn pump_range<S: RangeSource>(
                     detail: format!(
                         "short read of chunk '{chunk}' at {pos} for {} bytes: truncation: {e}",
                         buf.len()
-                    ),
+                    )
+                    .into(),
                 });
             }
         }
@@ -797,7 +802,7 @@ fn pump_range<S: RangeSource>(
             detail: format!(
                 "checksum mismatch: expected {want_sha256}, computed {}; the destination buffer's contents are explicitly not to be trusted",
                 str::from_utf8(&hex_of(&got)).unwrap_or("?")
-            ),
+            ).into(),
         });
     }
     Ok(())
@@ -880,7 +885,7 @@ impl Bf16StreamValidator {
                 detail: format!(
                     "BF16 element {} is 0x{bits:04x}, a non-finite weight: caught at load, not at the first matmul",
                     self.elements
-                ),
+                ).into(),
             });
         }
         self.elements += 1;

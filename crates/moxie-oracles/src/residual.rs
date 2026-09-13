@@ -37,7 +37,7 @@ pub fn residual_row(a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
 pub fn residual_row_scaled(a: &[f32], b: &[f32], scale: f32) -> Result<Vec<f32>> {
     if a.len() != b.len() {
         return Err(Error::InvalidArtifact {
-            detail: format!("operands have {} and {} elements", a.len(), b.len()),
+            detail: format!("operands have {} and {} elements", a.len(), b.len()).into(),
         });
     }
     if a.is_empty() {

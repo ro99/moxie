@@ -142,7 +142,7 @@ impl KvHistory {
         }
         if key.len() != value.len() {
             return Err(Error::InvalidArtifact {
-                detail: format!("key has {} elements, value {}", key.len(), value.len()),
+                detail: format!("key has {} elements, value {}", key.len(), value.len()).into(),
             });
         }
         self.keys
@@ -192,7 +192,8 @@ impl KvHistory {
                     "a stored row of {} element(s) does not match {heads} head(s) of \
                      dimension {head_dim}",
                     row.len()
-                ),
+                )
+                .into(),
             });
         }
         Ok(&row[head * head_dim..(head + 1) * head_dim])
@@ -262,7 +263,8 @@ pub fn attend_multi_head(
             detail: format!(
                 "query has {} elements, expected {heads}x{head_dim}",
                 query.len()
-            ),
+            )
+            .into(),
         });
     }
     if head_dim == 0 {
