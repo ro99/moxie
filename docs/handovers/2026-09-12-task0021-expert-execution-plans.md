@@ -28,8 +28,8 @@ placement" — and nothing beyond it. **It does not close M2.**
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy | passed |
-| `cargo test --workspace --locked --offline` | **882 passed, 0 failed** (823 at task 0020) |
-| Device-feature workspace tests | **910 passed, 0 failed** (843 at task 0020) |
+| `cargo test --workspace --locked --offline` | **883 passed, 0 failed** (823 at task 0020) |
+| Device-feature workspace tests | **912 passed, 0 failed** (843 at task 0020) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | **zero failures** |
@@ -207,15 +207,13 @@ smaller than its working weights."
   and any quality claim (**O2**).
 - M2 item 5's nine residency cases, task 0021's sweep and its device cases must
   keep passing unchanged.
-- **Add the run-lifecycle sweep task 0021 does not have.** Both review rounds
-  found defects in the executor's own transitions, and its only enumerated
-  product is the planner's. The axes are known: candidate × failure point
-  (acquire, readiness, launch, launch-with-unknown-submission) × cancellation ×
-  close ordering, with a structural invariant checked after **every** call, and
-  its strength measured by mutation the way task 0020's was. Two of the second
-  round's five findings were `close` and the next `step` disagreeing with a state
-  the failure had set correctly, which is exactly the shape such a sweep
-  enumerates.
+- **Task 0021's two sweeps must keep passing**, and item 4's second MoE consumer
+  should go through both rather than beside them. The run sweep's axes are the
+  ones a second consumer changes -- a different top-k changes the slot
+  arithmetic, a different expert count changes the queue's behaviour under a
+  restricted cache -- so extending its product is cheaper than writing new point
+  tests, and the measurement is already there to say whether the extension
+  helped.
 
 **Three habits from this task should be applied there rather than rediscovered.**
 
@@ -240,9 +238,9 @@ were not parallel paths but the same path one step later — quarantine set
 correctly at the moment of failure and ignored by `close`; a failure made
 terminal for a group and not for a load. The reviewer put it best: "checking
 quarantine immediately after failure missed what `cancel → close` did next."
-Task 0021 has a sweep over the *planner's* product and no sweep over the
-**run's**: destination × failure point × cancellation × close, with an
-invariant checked after every step, the way `residency_transitions.rs` does for
-task 0020's authority. **Task 0022 should build that** rather than rely on the
-next reviewer to enumerate it by hand — it is named in the next task's
-acceptance below.
+Task 0021 had a sweep over the *planner's* product and none over the **run's**,
+and the third review was right that deferring it to task 0022 did not satisfy
+this task's own coverage rule. It is **built**: `tests/grouped_transitions.rs`,
+144 combinations, `GroupedRun::check_invariants` after every operation, the
+authority's lease count reconciled against the run's after every one of them,
+coverage printed, and 14 of 14 mutations caught.

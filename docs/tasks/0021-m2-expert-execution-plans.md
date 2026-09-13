@@ -1,15 +1,19 @@
 # Task 0021 — M2 expert execution plans: one interface over a CPU and a GPU candidate
 
-Status: **implemented and corrected after two rounds of independent review;
+Status: **implemented and corrected after three rounds of independent review;
 awaiting a further review and owner acceptance.** The contract above was written
 and committed at `cdda4f4` before any implementation, per the working rule that
-produced tasks 0013–0020. The two rounds found **fifteen** issues — twelve P1
-and three P2 — and **all fifteen were reproduced and fixed; none was disputed.**
-**Two of the second round's five were the other half of the first round's own
-findings**, so the first round's record that "all ten are closed" was premature
-and is corrected below. See [Result](#result-filled-after-work),
-[Independent review](#independent-review-and-what-it-changed) and
-[Second independent review](#second-independent-review).
+produced tasks 0013–0020. The three rounds found **nineteen** issues — thirteen
+P1 and six P2 — and **all nineteen were reproduced and fixed; none was
+disputed.** **Two of the second round's five were the other half of the first
+round's own findings**, so that round's record that "all ten are closed" was
+premature and is corrected below. The third round's most useful finding was not
+a defect at all: it was that the runtime sweep this task kept deferring was
+**required evidence, not future work**, and it is now built. See
+[Result](#result-filled-after-work),
+[Independent review](#independent-review-and-what-it-changed),
+[Second independent review](#second-independent-review) and
+[Third independent review](#third-independent-review).
 
 **This task does not close M2.** It delivers roadmap M2 **item 3** only. Item 4's
 Laguna metadata, its second synthetic MoE consumer and M2's exit gate — "a real
@@ -461,8 +465,8 @@ contract required. No new crate, and one new workspace edge (`xtask` ->
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy (`--features moxie-executor/driver`) | passed |
-| `cargo test --workspace --locked --offline` | **882 passed, 0 failed** (823 at task 0020; 871 before the reviews' corrections) |
-| Device-feature workspace tests | **910 passed, 0 failed** (843 at task 0020; 895 before the corrections) |
+| `cargo test --workspace --locked --offline` | **883 passed, 0 failed** (823 at task 0020; 871 before the reviews' corrections) |
+| Device-feature workspace tests | **912 passed, 0 failed** (843 at task 0020; 895 before the corrections) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified (39 at task 0020) |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | **zero failures**, 78 rejected fixtures, 21 accepted, 13 rules |
@@ -711,6 +715,63 @@ enqueue, which this task does not inject. It is defence in depth, reported as
 untested rather than counted.
 
 Gates after this round: **882 host tests**, **910 device-feature tests**,
+**42/42 real GPU cases**, both clippy lanes, `spec-check`, `arch-check` with zero
+failures, and the real-artifact execution still agreeing with the host candidate
+on all 45,056 components.
+
+## Third independent review
+
+The third round reported **four** findings — two P1, two P2 — against the second
+round's corrections. Two reproduced with its probe, two were established by
+source inspection and confirmed. None was disputed.
+
+| # | Severity | Finding | Fix |
+|---|---|---|---|
+| 1 | P1 | `DeviceExperts::run_group` and `load_activations` were public and took borrowed operands, so a direct caller could free a buffer or release a lease after an unknown submission. The run retained correctly; the API let a caller bypass it | Both are crate-internal. The operands belong to the run, and the run is what withholds them. The three checks only a direct caller could reach moved into crate tests beside the code |
+| 2 | P1 | `attach` took any `&'static [u8]` and passed it to unsafe `TrustedImage::from_build_output`, whose contract is that the bytes are this build's own fatbin. The selected descriptor's hash was unchecked. **Reproduced**: a plan naming an all-zero image hash loaded the real fatbin | The image is named at the call site from `moxie-kernels`, as `crate::chain` does, and the descriptor must identify that package before it is loaded |
+| 3 | P2 | Activation loading rejected only inputs **larger** than the padded range. **Reproduced**: an empty reload was accepted for a 4,096-byte block, leaving the previous contents on the device | The exact logical extent, independent of the allocation's padding |
+| 4 | P2 | The runtime sweep was deferred to task 0022 rather than completed | Built. See below |
+
+### The sweep, and why deferring it was wrong
+
+The contract's own coverage rule — "a state machine's tests should enumerate its
+product" — was applied to the **planner** and not to the **run**, while both
+earlier rounds found defects in the run. Naming the work for a later task is not
+evidence that this one is finished, and the reviewer was right to say so.
+
+`GroupedRun::check_invariants` states the run's structural properties once:
+the queue within its capacity, groups run plus queued within groups enqueued,
+slots written within the plan's slots, an **exact** lease balance — acquired
+equals released plus withheld plus queued — and withholding or quarantine only
+ever as a consequence of failure. `tests/grouped_transitions.rs` enumerates
+**144 combinations** of candidate × failure point × cancellation × close ordering
+× queue depth, calling it after *every* operation and, after every one of them,
+reconciling the authority's own live-lease count against the run's account. That
+second check is external to the run and is the one that catches a lease the run
+believes it gave back.
+
+It prints what it covered: 144 combinations, 12 completed, 68 failed, 64
+cancelled, 128 closed and **16 closes refused**, 16 withholding, 8 with
+backpressure, with every failure point and both capacity outcomes reached.
+
+Its strength is **measured**: **14 of 14** deliberate mutations of the run
+machinery, including two that are the second review's own P1s — a `close` that
+releases a withholding run's charge, and an unknown submission that releases its
+leases. Getting there took four rounds of strengthening, and each one was the
+measurement doing its job: an equivalent mutant that had to be replaced, and
+three axes that *recorded* being reached without checking they did what they are
+for. Counting that a failure happened is not the same as checking what it caused.
+
+Four mutations are caught by the sweep and by nothing else; one was caught only
+by a named regression until the sweep was taught to check the host buffers
+specifically. **The sweep complements the named tests and does not replace
+them** — the same honest statement task 0020's record makes.
+
+### Evidence
+
+The substitution battery is now **twenty checks, all twenty load-bearing**.
+
+Gates after this round: **883 host tests**, **912 device-feature tests**,
 **42/42 real GPU cases**, both clippy lanes, `spec-check`, `arch-check` with zero
 failures, and the real-artifact execution still agreeing with the host candidate
 on all 45,056 components.

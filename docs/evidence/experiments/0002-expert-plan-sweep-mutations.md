@@ -1,4 +1,4 @@
-# 0002 — Measuring the expert-plan sweep, by mutation
+# 0002 — Measuring task 0021's sweeps, by mutation
 
 Date: 2026-09-12. Milestone: M2, [task 0021](../../tasks/0021-m2-expert-execution-plans.md).
 Status: **accepted**; the sweep catches every mutation in the battery, after two rounds of
@@ -124,16 +124,44 @@ claimed as covered: the attachment-level quarantine in `DeviceExperts::close` si
 run-level check that is covered, and reaching it directly needs a CUDA fault injected after an
 enqueue, which this task does not do.
 
-## What still has no battery, and should
+## The battery that was missing, and now exists
 
-Both review rounds found defects in the **executor's** transitions, and the only enumerated product
-in task 0021 is the **planner's**. The second round's shape says why that matters: its findings were
-the same path one step later, which is precisely what a sweep over run states would enumerate and
-what reading each function in isolation does not. The reviewer's own sentence is the clearest
-statement of it — "checking quarantine immediately after failure missed what `cancel → close` did
-next." The axes are known: candidate × failure point × cancellation × close ordering, with a
-structural invariant after every call and its strength measured by mutation, the way
-`residency_transitions.rs` does for task 0020's authority. Task 0022 carries it.
+The first two review rounds found their defects in the **executor's** transitions while the only
+enumerated product in task 0021 was the **planner's**. The third round said plainly that naming that
+gap for a later task is not evidence this one is finished. It was right, and the sweep is built.
+
+`tests/grouped_transitions.rs` enumerates **144 combinations** — candidate × failure point ×
+cancellation × close ordering × queue depth — calling `GroupedRun::check_invariants` after every
+operation and reconciling the residency authority's own live-lease count against the run's account
+after every one of them. That second check is **external** to the run, and it is the one that
+catches a lease the run believes it returned.
+
+Coverage, printed by the test: 144 combinations, 12 completed, 68 failed, 64 cancelled, 128 closed
+and **16 closes refused**, 16 withholding, 8 with backpressure, every failure point reached and both
+capacity outcomes — the recoverable drain and the fatal refusal — separately.
+
+Strength, measured: **14 of 14** deliberate mutations of the run machinery, two of which are the
+second review's own P1s. Four of them are caught by this sweep and by nothing else.
+
+### It took four rounds of strengthening, and every one was the measurement working
+
+The first measurement was 8 of 14 by the sweep, 4 by named tests and **2 survivors**, and the
+reasons were all instructive rather than mechanical:
+
+- One survivor was an **equivalent mutant** I had written — a change that could not alter behaviour.
+  Replaced, not counted as a gap, which is the rule task 0020 established.
+- One survivor was a check the sweep could not reach because an earlier check always fired first:
+  `reduce` refusing a non-empty queue is unreachable while `usable()` rejects every failed or
+  cancelled run. The sweep now attempts a reduction and a reload **mid-run**, where neither has
+  happened, which is a real transition it was not enumerating at all.
+- Three mutants survived on a subtler point: the sweep **recorded that an axis was reached** without
+  checking what it caused. A corrupt read reached "acquire-read" whether or not it failed the run;
+  an unknown submission reached "load-unknown" whether or not it withheld anything. Each axis now
+  asserts its own outcome, including that the **host buffers** specifically are quarantined when the
+  copy's source is one of them.
+
+Counting that a failure happened is not the same as checking what it did, and a sweep that only
+counts is a sweep that measures its own itinerary.
 
 ## Reproducing it
 

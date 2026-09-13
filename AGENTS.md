@@ -69,8 +69,8 @@ and an equivalent mutant is reported as such instead of being counted as a gap.
 
 **M2 item 3 is implemented, corrected after two rounds of independent review,
 and awaits a further one**
-([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), 2026-09-12; the two
-rounds found **fifteen** issues, twelve P1, all reproduced and fixed, none
+([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), 2026-09-12; three
+rounds found **nineteen** issues, thirteen P1, all reproduced and fixed, none
 disputed): CPU
 expert fallback and GPU grouped candidate plans under one interface, with an
 admitted envelope, a bounded queue that refuses rather than waits, NUMA-placed
@@ -120,9 +120,23 @@ not for a *load*; a backing checked and the lease inside it not. Two of its five
 were the other half of the first round's own, so **"all ten are closed" was a
 claim about fixes rather than a measurement of them** — the same error AGENTS.md
 already records three times over test coverage. The answer is the method task
-0020 established and task 0021 applied only to its planner: **enumerate the
-run's product too** — candidate × failure point × cancellation × close ordering,
-with an invariant after every call. Task 0022 is to build it.
+0020 established and task 0021 had applied only to its planner. The third round said plainly that
+deferring that to a later task is not evidence this one is finished, and it was
+right: **enumerate the run's product too**. It is built — 144 combinations of
+candidate × failure point × cancellation × close ordering × queue depth, an
+invariant after every operation, the residency authority's lease count
+reconciled against the run's after every one of them, coverage printed, and
+14 of 14 mutations caught, two of which are round two's own P1s.
+
+**A public function may not assert a safety contract on its caller's behalf, and
+may not hand out what it is responsible for retaining.** Round three: the device
+attachment took any `&'static [u8]` and passed it to
+`TrustedImage::from_build_output`, whose contract is that the bytes are this
+build's own fatbin; and its launch and upload entry points took borrowed operands
+that only the **run** withholds after an unknown submission. Both are now the
+crate's own — the image named at the call site as `chain` already did, the
+operands reachable only through their owner. When a check is "the caller must
+guarantee", ask who the caller can be.
 
 **Measure the tests, then fix what the measurement finds.** Task 0021's sweep
 started at 13 of 16 mutations with two survivors. One survivor was a **product
@@ -137,7 +151,10 @@ with the check removed; the second round's six added four more, three of them
 aimed at the wrong one of two identical lines. It is eighteen of eighteen now. A
 regression is not load-bearing until a substitution says so — and when a
 substitution says a check is redundant, **delete the check**: one line went that
-way, a state reset the failure path already performed.
+way, a state reset the failure path already performed. The run sweep took four
+rounds of strengthening for the same reason: one equivalent mutant, and three
+axes that **recorded being reached without checking what they caused**. Counting
+that a failure happened is not the same as checking what it did.
 
 **Task 0022 is next**: M2 item 4's Laguna metadata and graph, a second synthetic
 MoE consumer through task 0021's interface, and the restricted budget at its
