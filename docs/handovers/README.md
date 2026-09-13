@@ -2,14 +2,18 @@
 
 ## Active handover
 
-[Task 0024 implemented: asymmetric INT4 import](2026-09-13-task0024-asymmetric-int4-import.md)
+[Task 0024 implemented and corrected: asymmetric INT4 import](2026-09-13-task0024-asymmetric-int4-import.md)
 is the current continuation. M3 item 2's asymmetric half — compressed-tensors
 `pack-quantized` **asymmetric INT4 at group 32**, whose zero points are packed
 along the **output** axis while its codes are packed along the input axis — is
-implemented on 2026-09-13 and **has had no independent review and is not
-accepted**. Six modules of two real artifacts import with 112,640 reconstructed
-values bitwise equal to the source's own arithmetic, and the zero-point lane
-assignment is **measured** against the artifacts' own codes rather than taken
+implemented on 2026-09-13, **corrected after one independent review** (five
+findings, one P1, all reproduced, all fixed, none disputed) and **is not
+accepted**. Six modules of two real artifacts import, and 112,640 reconstructed
+values are checked against document 03's canonical FP32 equation over the
+source's own bytes **and** against the source's own arithmetic including the
+BF16 rounding its reference applies — two quantities that differ on 27,501 of
+them, which the first version conflated. The zero-point lane assignment **and
+its sign** are **measured** against the artifacts' own codes rather than taken
 from the pinned library. **Import is not execution**: nothing consumes a
 canonical INT4 tensor, and W4A16 is M3 item 3.
 
