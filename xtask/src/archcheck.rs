@@ -599,20 +599,39 @@ fn production_deps(
     workspace: Option<&Workspace<'_>>,
 ) -> Vec<DepEdge> {
     let mut out = Vec::new();
+    for (parent, key, label) in production_dependency_sections(doc) {
+        collect_section(parent, key, &label, manifest_dir, workspace, &mut out);
+    }
+    out
+}
+
+/// Every production dependency table in one manifest, as
+/// `(parent table, key, label)`.
+///
+/// **One enumeration, two consumers**, and the second one is why this exists.
+/// The crate walk grew its own copy that read `[dependencies]` and
+/// `[target.<cfg>.dependencies]` only; a review reached a forbidden second
+/// `ExpertCache` through a **build** dependency -- which this file already calls
+/// production, because "it is how generated code and kernel compilation get in"
+/// -- and the walk never saw the crate.
+///
+/// That is the mistake round five fixed for dependency *resolution* and left
+/// standing for table *enumeration*, one function away. A second reading of what
+/// counts as a production dependency is a second set of its omissions. There is
+/// now one reading.
+///
+/// `dev-dependencies` stay out, in every table: document 02 permits a test
+/// harness there, and integration tests are one of the two places allowed to
+/// import a concrete model.
+fn production_dependency_sections(doc: &toml::Value) -> Vec<(&toml::Value, &'static str, String)> {
+    let mut out: Vec<(&toml::Value, &'static str, String)> = Vec::new();
     for section in ["dependencies", "build-dependencies"] {
-        collect_section(doc, section, section, manifest_dir, workspace, &mut out);
+        out.push((doc, section, section.to_string()));
     }
     if let Some(targets) = doc.get("target").and_then(|v| v.as_table()) {
         for (cfg, table) in targets {
             for section in ["dependencies", "build-dependencies"] {
-                collect_section(
-                    table,
-                    section,
-                    &format!("target.{cfg}.{section}"),
-                    manifest_dir,
-                    workspace,
-                    &mut out,
-                );
+                out.push((table, section, format!("target.{cfg}.{section}")));
             }
         }
     }
@@ -2254,11 +2273,14 @@ fn reachable_crate_dirs(root: &Path) -> Option<BTreeSet<PathBuf>> {
         let Some(doc) = read_manifest(&dir) else {
             continue;
         };
-        // Every production dependency table, target-specific ones included --
-        // the same reason `dependency_edges` reads them all -- and every entry
-        // resolved through the **same** inheritance logic the edge checker
-        // uses, rather than a second reading of it.
-        for table in production_dependency_tables(&doc) {
+        // The **same** table enumeration and the **same** inheritance resolution
+        // the edge checker uses. Build dependencies included: they are how
+        // generated code and kernel compilation get in, and a crate reached only
+        // through one is production code like any other.
+        for (parent, key, _) in production_dependency_sections(&doc) {
+            let Some(table) = parent.get(key).and_then(|v| v.as_table()) else {
+                continue;
+            };
             for (alias, spec) in table {
                 let (effective, base, _) = effective_spec(alias, spec, &dir, workspace.as_ref());
                 if let Some(path) = effective
@@ -2271,25 +2293,6 @@ fn reachable_crate_dirs(root: &Path) -> Option<BTreeSet<PathBuf>> {
         }
     }
     Some(seen)
-}
-
-/// Every `[dependencies]`-shaped table in a manifest, including
-/// `[target.'cfg(..)'.dependencies]`. Dev and build tables are excluded: a dev
-/// dependency is not production code, which is the same line
-/// `dependency_edges` draws.
-fn production_dependency_tables(doc: &toml::Value) -> Vec<&toml::map::Map<String, toml::Value>> {
-    let mut out = Vec::new();
-    if let Some(t) = doc.get("dependencies").and_then(|d| d.as_table()) {
-        out.push(t);
-    }
-    if let Some(targets) = doc.get("target").and_then(|t| t.as_table()) {
-        for cfg in targets.values() {
-            if let Some(t) = cfg.get("dependencies").and_then(|d| d.as_table()) {
-                out.push(t);
-            }
-        }
-    }
-    out
 }
 
 fn find_manifests(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -3510,6 +3513,69 @@ mod tests {
                 if expected { "" } else { "not " }
             );
         }
+    }
+
+    #[test]
+    fn reachability_and_edge_checking_read_the_same_tables() {
+        // The property, rather than one instance of it: whatever
+        // `production_deps` treats as a production dependency, the crate walk
+        // must follow. They took different views four review rounds in a row;
+        // now there is one enumeration and this asserts they agree on it.
+        let doc: toml::Value = toml::from_str(
+            "[dependencies]\na = { path = \"a\" }\n             [build-dependencies]\nb = { path = \"b\" }\n             [dev-dependencies]\nd = { path = \"d\" }\n             [target.'cfg(unix)'.dependencies]\nc = { path = \"c\" }\n             [target.'cfg(unix)'.build-dependencies]\ne = { path = \"e\" }\n             [target.'cfg(unix)'.dev-dependencies]\nf = { path = \"f\" }\n",
+        )
+        .unwrap();
+
+        let mut walked: Vec<String> = Vec::new();
+        for (parent, key, _) in production_dependency_sections(&doc) {
+            if let Some(table) = parent.get(key).and_then(|v| v.as_table()) {
+                walked.extend(table.keys().cloned());
+            }
+        }
+        walked.sort();
+        let mut edges: Vec<String> = production_deps(&doc, Path::new("/x"), None)
+            .into_iter()
+            .map(|e| e.alias)
+            .collect();
+        edges.sort();
+
+        assert_eq!(walked, edges, "the two consumers disagree about the tables");
+        assert_eq!(walked, ["a", "b", "c", "e"], "build deps in, dev deps out");
+    }
+
+    #[test]
+    fn a_build_dependency_into_scratch_is_still_checked() {
+        // A build dependency is production -- it is how generated code and
+        // kernel compilation get in -- and the crate walk read only ordinary
+        // dependency tables, so a crate reachable solely through one was
+        // invisible to every rule.
+        let root = tempdir();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/engine\"]\n",
+        )
+        .unwrap();
+        let engine = root.join("crates/engine");
+        let storage = root.join("results/storage");
+        std::fs::create_dir_all(&engine).unwrap();
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(
+            engine.join("Cargo.toml"),
+            "[package]\nname = \"engine\"\n             [build-dependencies]\nstorage = { path = \"../../results/storage\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            storage.join("Cargo.toml"),
+            "[package]\nname = \"storage\"\n",
+        )
+        .unwrap();
+        assert!(
+            find_manifests(&root)
+                .unwrap()
+                .iter()
+                .any(|m| m.starts_with(&storage)),
+            "a crate reached only through a build dependency was skipped"
+        );
     }
 
     #[test]

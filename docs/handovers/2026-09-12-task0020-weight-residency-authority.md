@@ -1,9 +1,10 @@
 # Handover — task 0020 implemented; task 0021 is M2's grouped expert execution
 
-**Task 0020 is implemented, corrected after six rounds of independent review,
-and awaiting owner acceptance.** The six rounds found **twenty-six** issues; all
-twenty-six were reproduced and fixed, and none was disputed. The sixth round
-found **no residency defect**; its single finding was in the architecture check. Three rounds
+**Task 0020 is implemented, corrected after seven rounds of independent review,
+and awaiting owner acceptance.** The seven rounds found **twenty-seven** issues;
+all twenty-seven were reproduced and fixed, and none was disputed. **The last two
+rounds found no residency defect at all** — both findings were in the
+architecture check. Three rounds
 criticised method or a coverage claim rather than code, and each was right: the
 fourth showed by mutation testing that the sweep did not establish its claim, and
 the fifth showed that even after that fix, 120 of its cases never applied the
@@ -39,8 +40,8 @@ the terms it fixed before implementation, and the filled-in result.
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy | passed |
-| `cargo test --workspace --locked --offline` | **821 passed, 0 failed** (736 at task 0019) |
-| Device-feature workspace tests | **841 passed, 0 failed** |
+| `cargo test --workspace --locked --offline` | **823 passed, 0 failed** (736 at task 0019) |
+| Device-feature workspace tests | **843 passed, 0 failed** |
 | `cargo xtask-cuda test-gpu` | **39 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | **zero failures** — 78 rejected fixtures, 21 accepted, 13 rules. The "4 pre-existing failures" carried since task 0014 are gone and were never real; see the note below |
@@ -222,24 +223,39 @@ gap.
 a property of the tests instead of measuring it. That is the lesson worth
 carrying into task 0021, and it is in AGENTS.md rather than only here.
 
-**A sixth round found one more, and it was the same check wrong a third time.**
+**A seventh round found one more, and it was the same check wrong a fourth
+time** — this one the round-five lesson applied incompletely. Round five said "a
+second implementation of dependency resolution is a second set of its bugs", and
+I extracted `effective_spec` so *inheritance* had one reading, while leaving my
+own duplicate of the **table enumeration** one function away. It read
+`[dependencies]`; the real one reads `[dependencies]`, `[build-dependencies]` and
+both target variants. A crate reachable only through a build dependency — which
+this file already calls production, "how generated code and kernel compilation
+get in" — was invisible to every rule. There is now one enumeration,
+`production_dependency_sections`, the duplicate is deleted, and a test asserts
+the two consumers agree on which tables count.
+
+**A sixth round found one before it, the same check wrong a third time.**
 Member globs other than a trailing `/*` were taken literally, so
 `members = ["results/mo*"]` resolved to a directory that does not exist, the real
 `results/model` was "unreachable", and a `moxie-models` crate with a forbidden
 `std::fs::read` was invisible to every rule.
 
-Three rounds, three routes into the same hole: a directory *name* test (round 3),
-a literal membership string test missing `{ workspace = true }` (round 5), and
-now a partial glob expansion. Each was a cheaper approximation of "is this crate
-part of the build?" than the question deserves, and each failed **open** --
-quietly excluding real code rather than including scratch.
+Four rounds, four routes into the same hole: a directory *name* test (round 3),
+a literal membership string test missing `{ workspace = true }` (round 5), a
+partial glob expansion (round 6), and a second dependency-table enumeration
+(round 7). Each was a cheaper approximation of "is this crate part of the build?"
+than the question deserves, and each failed **open** — quietly excluding real
+code rather than including scratch.
 
 It is no longer an approximation that has to be right. `expand_member` handles
 `*` and `?` per segment exactly and returns `None` for anything it cannot; `None`
 means reachability is unknown, and unknown reachability excludes nothing and
 checks everything. A wrong guess now costs a probe crate in the report instead of
 a production crate vanishing from the rules. **If task 0021 needs to narrow a
-check, narrow it so that being wrong is loud.**
+check, narrow it so that being wrong is loud — and ask one question once.** Those
+four rounds were four places answering one question separately; deduplicating
+three of them while leaving the fourth is exactly how the fourth was found.
 
 **Three narrowings, decided during implementation and reported rather than
 quietly dropped.** `Artifact::read_tensor_range` was **not** added: a canonical

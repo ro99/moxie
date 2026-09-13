@@ -5,7 +5,7 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 ## Active assignment
 
 **M1 complete (M1.5 closed 2026-09-12); M2 active, item 1 accepted, item 2
-implemented and corrected after six rounds of independent review.** See the
+implemented and corrected after seven rounds of independent review.** See the
 [task 0020 handover](docs/handovers/2026-09-12-task0020-weight-residency-authority.md)
 for the current continuation, and the
 [closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
@@ -18,9 +18,9 @@ shared operations with FP64 oracles, the pinned BF16 boundaries that decide
 which experts a row selects, and two consumers carrying opposite routing
 parameters.
 
-**M2 item 2's residency authority is implemented and corrected after six
-rounds of independent review** — twenty-six findings, all reproduced, all fixed,
-none disputed
+**M2 item 2's residency authority is implemented and corrected after seven
+rounds of independent review** — twenty-seven findings, all reproduced, all
+fixed, none disputed
 ([task 0020](docs/tasks/0020-m2-weight-residency-authority.md), 2026-09-12):
 `moxie_memory::residency` is the **one** production weight-residency owner, with
 document 03's chunk identity, its lifecycle and failure transitions, coalescing,
@@ -41,9 +41,12 @@ crate walk now excludes root scratch **by reachability, computed exactly**, and
 **fails closed** — checking everything — when reachability cannot be computed. Do
 not carry a standing failure count forward as background noise; that is how a
 real one gets missed. And when you narrow a check, **narrow it so that being
-wrong is loud**: three review rounds found three different ways a cheaper
+wrong is loud**: four review rounds found four different ways a cheaper
 approximation of "is this crate part of the build?" silently hid production code
-from every rule.
+from every rule. **Ask one question once.** Those four were four places
+answering it separately — a directory-name test, a membership-string test, a
+partial glob expander, a second dependency-table enumeration — and deduplicating
+three of them while leaving the fourth is how the fourth was found.
 
 **A state machine's tests should enumerate its product, not sample it — and the
 sweep itself needs evidence.** Twenty-three review findings against task 0020
