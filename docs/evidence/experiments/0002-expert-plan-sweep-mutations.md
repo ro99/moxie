@@ -163,6 +163,29 @@ reasons were all instructive rather than mechanical:
 Counting that a failure happened is not the same as checking what it did, and a sweep that only
 counts is a sweep that measures its own itinerary.
 
+### And a fourth round found an axis that was not there at all
+
+The sweep advertised "close ordering" as an axis. It was not one: the flag toggled only whether a
+reduction was attempted, and **both** branches drained the queue before closing, so `close`'s
+queued-work refusal was unreachable. A fourth review demonstrated it in the only way that settles
+such a question — delete the guard, run the sweep, watch all 144 combinations pass.
+
+Sixteen combinations now close **with work still queued** and require the refusal to leave the
+queue, the authority's live-lease count and the ledger charge exactly where they were, then recover
+the returned run and close it properly. The guard is in the battery: **15 of 15**.
+
+## The number that matters most in this record
+
+**Three separate coverage claims in one task were softer than they looked.** Regressions that
+asserted the symptom rather than the check. Sweep axes that recorded being reached without checking
+what they caused. And an advertised axis that was unreachable. Every one was found by asking what a
+mutation would survive; **none** by reading the test, and none by the three independent review
+rounds that read the same code.
+
+That is the argument for keeping these batteries, and it is stronger than "the sweep is thorough."
+An axis that is exercised is not an axis that is checked, and only a mutation can tell the two
+apart.
+
 ## Reproducing it
 
 The driver is a short script; it is reproduced here rather than committed as a tool, because it

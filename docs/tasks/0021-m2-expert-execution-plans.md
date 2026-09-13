@@ -1,19 +1,21 @@
 # Task 0021 — M2 expert execution plans: one interface over a CPU and a GPU candidate
 
-Status: **implemented and corrected after three rounds of independent review;
+Status: **implemented and corrected after four rounds of independent review;
 awaiting a further review and owner acceptance.** The contract above was written
 and committed at `cdda4f4` before any implementation, per the working rule that
-produced tasks 0013–0020. The three rounds found **nineteen** issues — thirteen
-P1 and six P2 — and **all nineteen were reproduced and fixed; none was
+produced tasks 0013–0020. The four rounds found **twenty-one** issues — fourteen
+P1 and seven P2 — and **all twenty-one were reproduced and fixed; none was
 disputed.** **Two of the second round's five were the other half of the first
 round's own findings**, so that round's record that "all ten are closed" was
 premature and is corrected below. The third round's most useful finding was not
 a defect at all: it was that the runtime sweep this task kept deferring was
-**required evidence, not future work**, and it is now built. See
+**required evidence, not future work**. The fourth then showed that the sweep, as
+first built, did not cover the axis it advertised. See
 [Result](#result-filled-after-work),
 [Independent review](#independent-review-and-what-it-changed),
-[Second independent review](#second-independent-review) and
-[Third independent review](#third-independent-review).
+[Second independent review](#second-independent-review),
+[Third independent review](#third-independent-review) and
+[Fourth independent review](#fourth-independent-review).
 
 **This task does not close M2.** It delivers roadmap M2 **item 3** only. Item 4's
 Laguna metadata, its second synthetic MoE consumer and M2's exit gate — "a real
@@ -466,7 +468,7 @@ contract required. No new crate, and one new workspace edge (`xtask` ->
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy (`--features moxie-executor/driver`) | passed |
 | `cargo test --workspace --locked --offline` | **883 passed, 0 failed** (823 at task 0020; 871 before the reviews' corrections) |
-| Device-feature workspace tests | **912 passed, 0 failed** (843 at task 0020; 895 before the corrections) |
+| Device-feature workspace tests | **913 passed, 0 failed** (843 at task 0020; 895 before the corrections) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified (39 at task 0020) |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | **zero failures**, 78 rejected fixtures, 21 accepted, 13 rules |
@@ -775,3 +777,61 @@ Gates after this round: **883 host tests**, **912 device-feature tests**,
 **42/42 real GPU cases**, both clippy lanes, `spec-check`, `arch-check` with zero
 failures, and the real-artifact execution still agreeing with the host candidate
 on all 45,056 components.
+
+## Fourth independent review
+
+Two findings, one P1 and one P2, both reproduced before anything was changed and
+neither disputed.
+
+### A hash is not an identity
+
+The package check asked whether the descriptor named this build's fatbin and then
+resolved whatever symbols it carried. The review kept the built-in GeGLU
+descriptor's **operation, ABI and hash** and replaced its projection symbol with
+the SiLU one. Planning, attachment and execution all succeeded, and every GPU
+returned **exactly SwiGLU**: 3,959, 3,962 and 3,962 of 4,096 components differed
+from GeGLU.
+
+That is the worst shape a numerical defect can take. The declared gate for this
+kernel is bitwise equality with task 0019's oracle, and it would not have fired
+for a moment — the result is a **correct evaluation of the wrong function**, and
+the oracle it is compared against is chosen by the same descriptor that chose the
+wrong symbol.
+
+The fix is the only form of the check that cannot be half-satisfied: the
+descriptor must **be** one of the built-in package's own, comparing operation,
+ABI, operand roles, precisions, rounding, layout, shape bounds, SM, workspace and
+symbols together. The planner still selects from an injected catalogue — that is
+task 0012's design — and the attachment is where a selection becomes a launch.
+Five axes are regressed separately, including the unmodified descriptor, so the
+refusals are the check biting rather than the fixture failing.
+
+### The sweep was measuring its own itinerary, again
+
+The run sweep's "close ordering" axis toggled only whether a reduction was
+attempted. Both branches cancelled any queued work before closing, so `close`'s
+queued-work refusal was **unreachable**, and the review demonstrated it the right
+way: remove the guard entirely and all 144 combinations still pass.
+
+The sweep now closes **with work still queued** in 16 of its combinations, and
+requires the refusal to leave the queue, the authority's live-lease count and the
+ledger charge exactly where they were, then recovers the returned run, drains it
+and closes properly. The guard is in the mutation battery, which is **15 of 15**.
+
+### The pattern this makes, and it is the task's own
+
+This is the **third** coverage claim in task 0021 that was softer than it looked,
+after three of the first round's regressions asserting symptoms and three of the
+sweep's axes recording that they were reached without checking what they caused.
+All three were found the same way — by asking what a mutation would survive — and
+none by reading the test. The record of that is in
+[experiment 0002](../evidence/experiments/0002-expert-plan-sweep-mutations.md),
+and the general form is in AGENTS.md: **an axis that is exercised is not an axis
+that is checked.**
+
+### Evidence
+
+Substitution battery: **21 checks, all 21 load-bearing**. Run sweep: **15 of 15**
+mutations. Gates: **883 host tests**, **913 device-feature tests**, **42/42 real
+GPU cases**, both clippy lanes, `spec-check`, `arch-check` with zero failures,
+and the real-artifact execution still agreeing on all 45,056 components.

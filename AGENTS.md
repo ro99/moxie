@@ -69,8 +69,8 @@ and an equivalent mutant is reported as such instead of being counted as a gap.
 
 **M2 item 3 is implemented, corrected after two rounds of independent review,
 and awaits a further one**
-([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), 2026-09-12; three
-rounds found **nineteen** issues, thirteen P1, all reproduced and fixed, none
+([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), 2026-09-12; four
+rounds found **twenty-one** issues, fourteen P1, all reproduced and fixed, none
 disputed): CPU
 expert fallback and GPU grouped candidate plans under one interface, with an
 admitted envelope, a bounded queue that refuses rather than waits, NUMA-placed
@@ -126,7 +126,21 @@ right: **enumerate the run's product too**. It is built — 144 combinations of
 candidate × failure point × cancellation × close ordering × queue depth, an
 invariant after every operation, the residency authority's lease count
 reconciled against the run's after every one of them, coverage printed, and
-14 of 14 mutations caught, two of which are round two's own P1s.
+**15 of 15** mutations caught, two of which are round two's own P1s. The
+fifteenth is round four's: one of the sweep's advertised axes was **unreachable**
+— both branches drained the queue before closing, so `close`'s queued-work
+refusal could be deleted with all 144 combinations still passing.
+
+**A numerical gate cannot check an identity.** Task 0021's declared gate is
+bitwise equality with an FP64 oracle, and a descriptor carrying this build's own
+package hash with the **other activation's** projection symbol passed it
+trivially: every GPU returned exactly SwiGLU for a GeGLU plan, 3,959 of 4,096
+components wrong, because the result is a correct evaluation of the wrong
+function and the oracle is chosen by the same descriptor that chose the symbol.
+A selected descriptor must **be** one the built-in package declares — operation,
+ABI, operand roles, precisions, rounding, layout, shape bounds, SM, workspace and
+symbols together. Half an identity check is not a weaker check; it is a check of
+something else.
 
 **A public function may not assert a safety contract on its caller's behalf, and
 may not hand out what it is responsible for retaining.** Round three: the device
@@ -154,7 +168,11 @@ substitution says a check is redundant, **delete the check**: one line went that
 way, a state reset the failure path already performed. The run sweep took four
 rounds of strengthening for the same reason: one equivalent mutant, and three
 axes that **recorded being reached without checking what they caused**. Counting
-that a failure happened is not the same as checking what it did.
+that a failure happened is not the same as checking what it did — and an axis
+that is *exercised* is not an axis that is *checked*: a fourth round found one of
+this sweep's advertised axes unreachable. **Three separate coverage claims in one
+task were softer than they looked, and every one was found by asking what a
+mutation would survive rather than by reading the test.**
 
 **Task 0022 is next**: M2 item 4's Laguna metadata and graph, a second synthetic
 MoE consumer through task 0021's interface, and the restricted budget at its

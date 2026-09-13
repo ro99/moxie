@@ -29,7 +29,7 @@ placement" — and nothing beyond it. **It does not close M2.**
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy | passed |
 | `cargo test --workspace --locked --offline` | **883 passed, 0 failed** (823 at task 0020) |
-| Device-feature workspace tests | **912 passed, 0 failed** (843 at task 0020) |
+| Device-feature workspace tests | **913 passed, 0 failed** (843 at task 0020) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | **zero failures** |
@@ -220,11 +220,18 @@ smaller than its working weights."
 First, **a property of the machine is measured or it is not known**: three
 plausible NUMA mechanisms in a row were wrong, and only the read-back showed it.
 
-Second, **measure the tests, then fix what the measurement finds**: the mutation
-battery found a product defect and a fixture that could not distinguish two
-answers, and both were invisible to every other check. Three of the review's
-twelve regressions also failed their own substitution on the first attempt,
-because they asserted the symptom rather than the check.
+Second, **measure the tests, then fix what the measurement finds**, and keep
+doing it: **three separate coverage claims in this task were softer than they
+looked** -- regressions asserting symptoms, sweep axes recording that they were
+reached without checking what they caused, and a sweep axis that was unreachable
+altogether. Every one was found by asking what a mutation would survive; none by
+reading the test.
+
+Also from round four: **the strongest numerical gate cannot check a binding.**
+The declared gate here is bitwise equality with an FP64 oracle, and a descriptor
+that named the wrong kernel symbol passed it trivially, because the oracle is
+chosen by the same descriptor. Identity has to be established separately from
+arithmetic.
 
 Third — and this is the first review's lesson rather than mine — **ask of every
 check what else reaches the resource it guards.** Nine of its ten findings were a
@@ -243,4 +250,5 @@ and the third review was right that deferring it to task 0022 did not satisfy
 this task's own coverage rule. It is **built**: `tests/grouped_transitions.rs`,
 144 combinations, `GroupedRun::check_invariants` after every operation, the
 authority's lease count reconciled against the run's after every one of them,
-coverage printed, and 14 of 14 mutations caught.
+coverage printed, and **15 of 15** mutations caught -- after the fourth review
+showed that one of its advertised axes was unreachable.
