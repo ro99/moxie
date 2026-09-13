@@ -524,14 +524,18 @@ about its output.
   equal to each other, which is also sm_86 against sm_120.
 
   Each layer's byte and cost trace **reconciles** against the residency
-  authority's own per-scope accounting and the ledger's own charges, as thirteen
+  authority's own per-scope accounting and the ledger's own charges, as **fourteen**
   named equalities rather than as a printed report.
 
   **This is still not model support and no quality claim follows.** The
   activations are synthetic and the routes are written by the test — the
   full-payload route is *constructed* so that its union is the whole expert set,
   which no prompt produced — so nothing about the released model's output is
-  established (**O2**), and no route-distribution claim follows either. What ran
+  established, and no route-distribution claim follows either. The owner's
+  2026-09-13 ruling puts this artifact **outside the v1 catalog** (O1,
+  [ADR 0017](../decisions/adr/0017-v1-catalog-and-no-quantizer.md)) — it "remains
+  M2's BF16 workhorse" — so everything here is engineering evidence at real
+  scale rather than anything about a release. What ran
   is the routed expert block of each layer, not the layer: attention, the norms
   and the shared expert are not in this path, and nothing generates a token.
 - Reference quality, actual-context prefill/decode: **not started**, and O2.
@@ -576,9 +580,18 @@ about its output.
    showed that omitting them changes which experts a row selects.
 4. **Vision and audio are out of scope** — **M11**. The artifact is
    `image-text-to-text` and declares both towers.
-5. **O1, O2 and O5 remain open.** The owner designated this artifact for M2's
-   residency work; that is not catalog membership, a quality statement or a
-   conversion authorization.
+5. **O1, O2 and O5 were resolved on 2026-09-13, and this artifact is
+   explicitly outside the v1 catalog.** The owner's ruling names ten revisions
+   and says of this one that it "remains M2's BF16 workhorse"
+   ([ADR 0017](../decisions/adr/0017-v1-catalog-and-no-quantizer.md)). So the
+   designation that brought it here is confirmed as what it always was —
+   engineering scale, not release membership — and v1's quality rule
+   ([ADR 0018](../decisions/adr/0018-v1-quality-is-bit-identical-repack.md)) is
+   about repacking catalogue artifacts bit-identically, which is not a statement
+   about anything computed here over synthetic activations. **O6 and O7 remain
+   open**, which is why nothing here is a performance claim. *(Recorded by task
+   0023, which met the ruling mid-task; the paragraphs above were written while
+   the gates were open and are left as they were.)*
 
 ### Bring-up cost
 

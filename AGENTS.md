@@ -286,11 +286,26 @@ was demanded, admitted and computed with** through a device cache holding one
 240th of it, 15,286 evictions per card, no OOM, the three cards bitwise equal to
 each other. **The activations are synthetic and the routes are written by the
 test**, the full-payload route *constructed* so its union is the whole expert
-set, so this is not model support, no quality claim follows (**O2**) and **no
+set, so this is not model support, no quality claim follows and **no
 route-distribution claim follows either**. **It does not close M2**, which is the
 owner's.
 
-**Reconciled means a named equality, not a printed report.** Thirteen of them
+**The owner resolved O1–O5 on 2026-09-13** (`1e927ef`, ADRs 0017–0020), while
+task 0023 was being implemented. Three of them touch the active work and are
+worth reading before the next task rather than rediscovering: the **v1 catalog is
+ten pinned revisions**, Laguna is number 8 of them, and `gemma-4-26B-A4B-it` is
+**explicitly not in it** — it "remains M2's BF16 workhorse", so every
+whole-working-set result above is an engineering fixture at real scale. **v1's
+acceptable quality loss is a bit-identical repack**, with the publisher's own
+quality accepted as-is, and **Moxie never quantizes**. Storage and conversion are
+**user-managed**: no agent-initiated bulk write without a task naming the
+artifact, revision, size and retention. **O6 and O7 stay open**, which is what
+keeps every timing in these records a diagnostic. The paragraphs below, and tasks
+0018–0022, were written while those gates were open and still describe them so;
+they are left as they were, because rewriting a record to match a later ruling
+erases what was true when it was written.
+
+**Reconciled means a named equality, not a printed report.** Fourteen of them
 tie the ledger's charges, the run's own record and the planner's prediction to
 the residency authority's per-scope byte flow, and **each has a fixture that
 violates it** — a `reconcile()` that can only succeed is a stub. **The trace

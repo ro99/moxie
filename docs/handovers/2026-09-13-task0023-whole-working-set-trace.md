@@ -74,8 +74,8 @@ sm_120.
 **Those are the artifact's own bytes at their real offsets. The activations are
 synthetic and the routes are written by the test** — `whole-set-full`'s is
 *constructed* so that its union is the whole expert set, which no prompt
-produced. Nothing here is model support, **no quality claim follows (O2)**, and
-**no route-distribution claim follows either**.
+produced. Nothing here is model support, **no quality claim follows**, and **no
+route-distribution claim follows either**.
 
 **No performance claim.** Both lanes are debug builds, there is no baseline on
 this machine, and the trace schema has **no duration field at any point**.
@@ -92,13 +92,15 @@ is capped — true, and weaker. A batch whose union is the whole expert set is
 42.5 GiB against a 24 GiB card and needs no ratio argument to be oversized. Both
 run so that neither carries the other's claim.
 
-**"Reconciled" is thirteen named equalities, and every one of them can fail.**
-Four tie the ledger to what is held, four tie the run's own record to the
-authority's bytes, four are the planner's prediction, and one pins the schema.
+**"Reconciled" is fourteen named equalities, and every one of them can fail.**
+Three tie the ledger to what is held, five tie the run's own record to the
+authority's bytes, four are the planner's prediction, one pins the schema and one
+requires the step's totals to be its layers'.
 The name is what a failure reports. A violation battery mutates one number of a
 trace that reconciles and requires the equality that number belongs to be the one
-reported: 21 mutations over all 13, including three against the lower-bound
-branch, which fails on being *below* a bound rather than on differing from it.
+reported: **19 mutations over all fourteen**, plus three against the lower-bound
+branch — which fails on being *below* a bound rather than on differing from it —
+and three against a layer that did not finish.
 
 **A prediction is an equality or a declared lower bound, and the planner says
 which.** A layer whose whole live set fits the displaceable cache admits every
@@ -179,7 +181,22 @@ find. The sweep found it; reading the rule did not.
   still a declared policy parameter; at this artifact's expert size the default
   sends every expert to the CPU, and both device cases declare their own
   threshold and say so. M6 owns measuring one.
-- **Quality is O2** for both families. O1 and O5 remain open.
+- **The owner resolved O1–O5 on 2026-09-13, mid-task** (`1e927ef`, ADRs
+  0017–0020), and it is worth reading before the next task rather than
+  rediscovering. The three that touch this work: the designated artifact here,
+  `gemma-4-26B-A4B-it`, is **explicitly not in the v1 catalog** and "remains M2's
+  BF16 workhorse", so this whole working set is an engineering fixture at real
+  scale; v1's acceptable quality loss is a **bit-identical repack** with the
+  publisher's own quality accepted as-is; and storage/conversion is
+  user-managed, with no agent bulk write without a task naming artifact,
+  revision, size and retention — which this task did not need, having written
+  nothing. **Laguna is number 8 of the ten**, at the revision task 0022
+  recorded. **O6 and O7 stay open**, which is why every timing here is a
+  diagnostic.
+- Older records — AGENTS.md's earlier paragraphs and tasks 0018–0022 — still
+  describe O1, O2 and O5 as open. Reconciling them is the owner's: rewriting
+  another task's record to match a later ruling would erase what was true when it
+  was written.
 - The README's "current state" section still describes M1.4/M1.5. It is stale and
   was stale before this task; AGENTS.md is the entry point and is current.
 

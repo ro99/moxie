@@ -92,8 +92,10 @@ numbers would require, which is what this task builds.
   reconcile *against*; and
   [the gemma4 bring-up record](../models/gemma4.md#the-26b-a4b-moe-variant) for
   the designated artifact's geometry.
-- Owner gates: **O1 (catalog), O2 (quality), O5 (storage/conversion) and O6
-  (performance defaults) remain open and this task resolves none of them.**
+- Owner gates **at authoring time**: O1, O2, O5 and O6 were open and this task
+  resolves none of them. **The owner resolved O1–O5 on 2026-09-13 while this task
+  was being implemented** (`1e927ef`, ADRs 0017–0020); what that changes for this
+  task is recorded in the Result section, and it changes nothing this task did.
 
 ## What a "whole working set" is, and why this one
 
@@ -192,8 +194,10 @@ individually tested.
   increments no counter of its own. An `arch-check` rule is extended to say so.
 - Not an importer, not a graph, not a model. No attention, no tokens, no
   generation loop: a routed block per layer is what exists and what runs.
-- **No performance claim, no quality claim (O2), no bulk write (O5), no
-  execution of remote model code.**
+- **No performance claim, no quality claim, no bulk write, no execution of
+  remote model code.** (Written against O2 and O5 as open gates; both were
+  resolved during implementation and neither ruling makes any of these
+  permissible — see the Result section.)
 
 **Existing consumers that must keep passing unchanged:** every test task 0022
 left green, including both sweeps at their extended products (10,368 and 288
@@ -559,9 +563,9 @@ each, no baseline, and no duration appears anywhere in the trace.
   — each of those traced as incomplete, with its prediction skipped and counted
   as skipped. The product and the census are **printed** by the test.
 - The **violation battery** mutates one number of a trace that reconciles and
-  requires the equality that number belongs to to be the one reported: 21
-  mutations over all **14** equalities, plus 3 against the lower-bound branch and
-  3 against a layer that did not finish.
+  requires the equality that number belongs to to be the one reported: **19
+  mutations over all fourteen equalities**, plus 3 against the lower-bound branch
+  and 3 against a layer that did not finish -- **25** in all.
 - The **planner sweep** gained a host-residency axis: 10,368 combinations became
   **31,104**, and every plan's prediction is checked against a statement of the
   rule written independently of the planner's.
@@ -643,11 +647,53 @@ are not what was built, and each is recorded rather than quietly reconciled.
    than produced; `ResidencyAuthority::outstanding` still names every live
    placement for diagnosis.
 
+**The count of equalities is fourteen, not the nine this contract's acceptance
+section names.** That line is an inconsistency in the contract itself: section 5
+above already lists thirteen in three groups, and the acceptance section's "nine
+in total" is left over from an earlier draft of it. What the requirement meant is
+unchanged and is met — **one violating fixture per equality, whatever the count
+turns out to be** — and the count is printed by the test rather than asserted in
+prose, which is the only reason the discrepancy is visible at all.
+
 Two additions arrived from the mutation measurement rather than from the
 contract: a fourteenth equality (`launches-match-device-groups`), and the
 incomplete-layer branch — a layer that did not finish is traced, reconciled and
 counted as incomplete, which the contract asked for and the first implementation
 dropped.
+
+### The owner resolved O1–O5 during this task
+
+`1e927ef`, `71bd099` and `7a1f655` landed between this contract and this
+implementation. Read after the fact, and reconciled here rather than left to
+contradict the paragraphs above:
+
+- **O1 is resolved**, and the designated artifact of this task,
+  `/fast/models/google/gemma-4-26B-A4B-it`, is **explicitly not in the v1
+  catalog** — it "remains M2's BF16 workhorse". So the whole working set this
+  task ran is an engineering fixture at real scale, and was never going to be a
+  release claim. The other family this workspace has inspected,
+  `cyankiwi/Laguna-S-2.1-AWQ-INT4` at the revision task 0022 recorded, **is**
+  number 8 of the ten.
+- **O2 is resolved**: for v1, acceptable loss is a **bit-identical repack**, and
+  the publisher's own quality is accepted as-is. Nothing here claims otherwise.
+  What this task's caveat means under the new ruling is unchanged and its
+  citation is not: computing a routed block over **synthetic activations and a
+  written route** says nothing about any model's output, catalogued or not. It
+  is not a quality claim, and it is not evidence for one.
+- **O5 is resolved**: storage and conversion are user-managed, repack is an
+  external script, and no agent-initiated bulk write may happen without a task
+  naming the artifact, revision, size and retention. **This task wrote nothing**
+  under either checkpoint root, so it complies with the ruling as it complied
+  with the gate.
+- **O3 and O4** are resolved and touch nothing here. **O6 and O7 remain open**,
+  which is what keeps every timing in this record a diagnostic.
+- M2's deliverables and exit text in document 06 are **unchanged** by
+  `7a1f655`; this task's target is intact.
+
+Older records — AGENTS.md's earlier paragraphs and tasks 0018–0022 — still
+describe O1, O2 and O5 as open. Reconciling those is the owner's, not this
+task's: rewriting another task's record to match a later ruling would erase what
+was true when it was written.
 
 ### Deleted or replaced paths
 
@@ -661,4 +707,5 @@ In [the handover](../handovers/2026-09-13-task0023-whole-working-set-trace.md).
 The short form: **M2 is not closed and closing it is the owner's**; nothing
 generates a token from either designated artifact; `whole-set-full` is not
 compared against the CPU candidate, by declared exclusion with the arithmetic
-attached; quality is **O2**; and O1 and O5 remain open.
+attached; and the owner's O1–O5 rulings of 2026-09-13 arrived mid-task and are
+reconciled in the Result section and the handover.
