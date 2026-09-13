@@ -67,8 +67,11 @@ Three claims about task 0020's test strength were wrong in the same way: the
 property was asserted rather than measured. The sweep prints what it exercised,
 and an equivalent mutant is reported as such instead of being counted as a gap.
 
-**M2 item 3 is implemented and awaits review**
-([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), 2026-09-12): CPU
+**M2 item 3 is implemented, corrected after one round of independent review,
+and awaits a further one**
+([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), 2026-09-12; the
+review found **ten** issues, seven P1, all reproduced and fixed, none disputed):
+CPU
 expert fallback and GPU grouped candidate plans under one interface, with an
 admitted envelope, a bounded queue that refuses rather than waits, NUMA-placed
 host buffers, and a reduction over a permutation the plan computes so partial
@@ -93,6 +96,20 @@ node 0's **5.1 GB** (**4,471 of 6,144** on the wrong node). `required` now means
 `mbind` and the gate is every page. Do not carry an unverified placement,
 affinity or bandwidth claim forward.
 
+**Ask of every check what else reaches the resource it guards.** Nine of the ten
+findings against task 0021 were one sentence: **a check that existed on one path
+and was missing on the neighbouring one.** The upload path validated the backing
+a lease is resolved through and the launch path did not — authority A's leases
+driven through authority B's backing returned a confident, different answer on a
+real GPU. The planner computed one envelope for admission and checked
+feasibility against a smaller one. A run could be cancelled but not fail, so a
+failed group was followed by a successful reduction over an unwritten buffer.
+This is **not** the failure mode task 0020's transition sweep exists for: a
+sweep enumerates one state machine's product, and these were parallel paths
+never compared to each other. The tenth finding is why it matters that the
+question be asked at all — `ExpertGroup`'s launch indices were public `Vec`
+fields, so the answer was "anything".
+
 **Measure the tests, then fix what the measurement finds.** Task 0021's sweep
 started at 13 of 16 mutations with two survivors. One survivor was a **product
 defect** — a refusal reporting `CapacityExceeded` where a `required` candidate's
@@ -100,7 +117,10 @@ own reason belonged — and the other was a fixture whose every row was already
 ascending, so the two reduction orders agreed and a planner ignoring the
 parameter passed. It is 16 of 16 now. A fixture on which two behaviours agree
 tests neither, and an unreachable branch is a stub: one was found and deleted
-the same way.
+the same way. The same battery applied to the review's twelve regressions found
+**three that asserted the symptom rather than the check** and would have passed
+with the check removed. A regression is not load-bearing until a substitution
+says so.
 
 **Task 0022 is next**: M2 item 4's Laguna metadata and graph, a second synthetic
 MoE consumer through task 0021's interface, and the restricted budget at its

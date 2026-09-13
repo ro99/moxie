@@ -1,9 +1,12 @@
 # Task 0021 — M2 expert execution plans: one interface over a CPU and a GPU candidate
 
-Status: **implemented at the commit this record accompanies; awaiting
-independent review and owner acceptance.** The contract above was written and
-committed at `cdda4f4` before any implementation, per the working rule that
-produced tasks 0013–0020. See [Result](#result-filled-after-work).
+Status: **implemented and corrected after one round of independent review;
+awaiting a further review and owner acceptance.** The contract above was written
+and committed at `cdda4f4` before any implementation, per the working rule that
+produced tasks 0013–0020. The review found **ten** issues — seven P1 and three
+P2 — and **all ten were reproduced and fixed; none was disputed.** See
+[Result](#result-filled-after-work) and
+[Independent review](#independent-review-and-what-it-changed).
 
 **This task does not close M2.** It delivers roadmap M2 **item 3** only. Item 4's
 Laguna metadata, its second synthetic MoE consumer and M2's exit gate — "a real
@@ -455,8 +458,8 @@ contract required. No new crate, and one new workspace edge (`xtask` ->
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy (`--features moxie-executor/driver`) | passed |
-| `cargo test --workspace --locked --offline` | **871 passed, 0 failed** (823 at task 0020) |
-| Device-feature workspace tests | **895 passed, 0 failed** (843 at task 0020) |
+| `cargo test --workspace --locked --offline` | **880 passed, 0 failed** (823 at task 0020; 871 before the review's corrections) |
+| Device-feature workspace tests | **906 passed, 0 failed** (843 at task 0020; 895 before the corrections) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified (39 at task 0020) |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | **zero failures**, 78 rejected fixtures, 21 accepted, 13 rules |
@@ -592,3 +595,65 @@ compatibility surface changed. No quality claim is made and none follows.
   closed.
 - The next bounded task is named in
   [the handover](../handovers/2026-09-12-task0021-expert-execution-plans.md).
+
+
+## Independent review, and what it changed
+
+The review ran against the eleven commits through `758dc66` and reported **ten**
+findings with seven reproducers. Every reproducer was run before anything was
+changed and every one reproduced; the two findings established by source
+inspection were confirmed in the source. **None was disputed.** The repository
+was left unchanged by the reviewer.
+
+### The shape they shared
+
+Nine of the ten are one sentence: **a check that exists on one path was missing
+on the neighbouring one.** The upload path validated the backing a lease is
+resolved through; the launch path did not. The planner computed an envelope for
+admission; it checked feasibility against a different, smaller one. The run
+could be cancelled; it could not fail. The host candidate's workspace was
+charged; the reduction's accumulator, which every plan needs, was not.
+
+That is worth stating plainly because it is not the same failure mode as task
+0020's, and the method that caught task 0020's would not have caught these. A
+transition sweep enumerates a state machine's product; these were **parallel
+paths that were never compared to each other**. What finds them is asking, of
+every check, "what else reaches this resource?" — and the tenth finding is the
+one that shows why: `ExpertGroup`'s indices were public `Vec` fields, so the
+answer was "anything at all".
+
+### Finding by finding
+
+| # | Severity | Finding | Fix |
+|---|---|---|---|
+| 1 | P1 | A CUDA failure after an enqueue released the weight leases and dropped the index vectors, though a copy or launch might still be reading them | A launch reports `submission_unknown`; the run **withholds** that group's leases and **quarantines** its host buffers, which are then never unmapped. The index staging comes from admitted storage that outlives the copy |
+| 2 | P1 | A lease's offset was resolved inside whatever `DeviceResidency` the caller passed. **Reproduced on a real GPU**: authority A's leases through authority B's backing returned success and a different answer | The launch path checks the backing's authority and device before resolving any address, exactly as `perform_upload` has since task 0020 |
+| 3 | P1 | `ExpertGroup`'s row and slot vectors were public and mutable, and `run_group` checked neither their lengths nor their bounds before launching | The fields are private with slice accessors, and the attachment checks assignment count, every row and every slot against **its own** extents before anything is enqueued |
+| 4 | P1 | A failed group left the run usable. **Reproduced**: the group failed, `reduce()` then succeeded over an unwritten slot buffer, and the next `step()` returned `Done` with zero groups run | `RunState::Failed` ends the run: no reduction, no progress, no reload. Readiness is also checked at the acquire, where its cause is |
+| 5 | P1 | Three buffers were allocated outside the envelope: the reduction's accumulator, the per-launch index staging, and a host tile on a GPU-only plan that charged none | All three are charged and allocated once. `HostBuffers::allocated_bytes` exists so a test asserts **allocation equals charge** |
+| 6 | P1 | `detach_reservation` separated the charge from the live host buffers. **Reproduced**: release the detached reservation, then write the still-live activation buffer | The reservation never leaves the run. The device attachment is created inside it and owned by it; one `close` gives everything back |
+| 7 | P1 | Selection ignored operand roles, output precision, accumulation, rounding and ABI. **Reproduced**: a descriptor with ABI 999, no inputs and an FP32 output was selected for this BF16 executor | Every axis is matched, and each is proven load-bearing by substitution |
+| 8 | P2 | `required` placement returned an ordinary unbound report. **Reproduced**: admitted with `page_policy: "heap"` | It refuses admission and releases the reservation |
+| 9 | P2 | Feasibility used a smaller envelope than admission reserved. **Reproduced**: a 640-byte device budget admitted a plan needing 1,280; a zero host-buffer budget still produced a 256-byte host envelope | Feasibility is computed from the admitted envelope — aligned, staging included — and the host buffers and reduction accumulator are plan-level preconditions |
+| 10 | P2 | No activation-ready state. **Reproduced**: an unloaded run produced a confident all-zero answer, and activations could be replaced between steps | Execution requires a successful load, and activations freeze once a group has run |
+
+Two of the fixes found further defects of their own, both in the same place and
+neither reported: a device attachment that failed **after** an arena had taken
+and released the reservation left the run holding host buffers against a charge
+of zero — so the buffers are now given back at that moment — and a refused
+upload never reached the ticket's own authority, which left a placement
+`Uploading` forever and a cache that could not close.
+
+### Evidence
+
+Twelve regressions, one per finding plus the two follow-ons, **each proven
+load-bearing by substitution**: remove the check and exactly its own test fails.
+Three of them did not bite on the first attempt and the substitution battery is
+what said so — they asserted the symptom rather than the check — so one now
+asserts the failure comes from the acquire, one uses a fixture where only the
+row bound can fire, and one pins the device budget at the exact byte.
+
+The gates after the corrections: **880 host tests**, **906 device-feature
+tests**, **42/42 real GPU cases** on both architectures, both clippy lanes,
+`spec-check`, and `arch-check` with zero failures. The planner mutation battery
+is **16 of 16** after one stale mutation site was re-pointed.

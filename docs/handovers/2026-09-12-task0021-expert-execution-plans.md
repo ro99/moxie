@@ -28,8 +28,8 @@ placement" — and nothing beyond it. **It does not close M2.**
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy | passed |
-| `cargo test --workspace --locked --offline` | **871 passed, 0 failed** (823 at task 0020) |
-| Device-feature workspace tests | **895 passed, 0 failed** (843 at task 0020) |
+| `cargo test --workspace --locked --offline` | **880 passed, 0 failed** (823 at task 0020) |
+| Device-feature workspace tests | **906 passed, 0 failed** (843 at task 0020) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | **zero failures** |
@@ -208,9 +208,20 @@ smaller than its working weights."
 - M2 item 5's nine residency cases, task 0021's sweep and its device cases must
   keep passing unchanged.
 
-**Two habits from this task should be applied there rather than rediscovered.**
+**Three habits from this task should be applied there rather than rediscovered.**
+
 First, **a property of the machine is measured or it is not known**: three
 plausible NUMA mechanisms in a row were wrong, and only the read-back showed it.
+
 Second, **measure the tests, then fix what the measurement finds**: the mutation
 battery found a product defect and a fixture that could not distinguish two
-answers, and both were invisible to every other check.
+answers, and both were invisible to every other check. Three of the review's
+twelve regressions also failed their own substitution on the first attempt,
+because they asserted the symptom rather than the check.
+
+Third — and this is the review's lesson rather than mine — **ask of every check
+what else reaches the resource it guards.** Nine of the ten findings were a check
+present on one path and absent on the neighbour. A sweep over a state machine's
+product does not find those; comparing parallel paths does. The tenth is why:
+`ExpertGroup`'s launch indices were public `Vec` fields, so the answer to "what
+else reaches this?" was "anything at all".

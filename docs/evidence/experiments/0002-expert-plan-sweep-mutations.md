@@ -81,13 +81,34 @@ whole plan, so a group can never fall back. AGENTS.md counts an unreachable path
 branch was deleted rather than given a test. The both-refused arm above it already reports the
 required candidate's reason.
 
-## What this does not establish
+## What this does not establish, demonstrated the hard way
 
-A mutation battery measures a sweep against the mutations someone thought of. Sixteen is not a
-proof of adequacy, and the two gaps above are evidence for exactly that: both were invisible until a
+A mutation battery measures a sweep against the mutations someone thought of. Sixteen is not a proof
+of adequacy, and the two gaps above are evidence for exactly that: both were invisible until a
 mutation aimed at them. The number belongs beside the sweep's own printed coverage — 5,184
 combinations, 1,348 planned, every rejection reason exercised — and neither replaces a named
 regression for a specific defect.
+
+**An independent review then found ten defects this battery could not have reached**, seven of them
+P1. Nine were a check present on one path and missing on the neighbouring one — the upload path
+validated a backing and the launch path did not; feasibility used a smaller envelope than admission
+reserved; a run could be cancelled but not fail. Mutating the chooser cannot find a defect in the
+executor, and enumerating one state machine's product cannot find two paths that were never compared
+to each other. The battery measures what it measures.
+
+## The same method, applied to the review's own regressions
+
+The twelve regressions written for those findings were put through a **substitution** battery of the
+same shape: remove the check, run only that regression, and require it to fail.
+
+**Three of the twelve did not fail.** Each asserted the *symptom* rather than the check — a run that
+fails either way, a fixture tripping three bounds at once so none of them is pinned, a budget that
+happens to be generous enough that alignment does not matter. They were rewritten: one now asserts
+the failure comes from the acquire by its own message, one uses a fixture where only the row bound
+can fire, and one pins the device budget at the exact byte from both sides. It is **12 of 12** now.
+
+A regression is not load-bearing because it was written for a defect. It is load-bearing when a
+substitution says so, and a quarter of these were not.
 
 ## Reproducing it
 
