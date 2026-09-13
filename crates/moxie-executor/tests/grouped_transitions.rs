@@ -706,9 +706,48 @@ fn the_run_lifecycle_product_holds_its_invariants_after_every_operation() {
                                 .or_insert(1);
                         }
 
-                        // Anything still queued is released before closing, as
-                        // any caller must.
+                        // Closing **with work still queued** is its own
+                        // transition and it used to be unreachable here: both
+                        // branches drained first, so removing the guard changed
+                        // nothing and all 144 combinations still passed. It is
+                        // exercised now, and the refusal has to leave everything
+                        // exactly where it was.
+                        let mut run = run;
                         if !run.queue().is_empty() {
+                            let queued = run.queue().len();
+                            let held = authority.live_lease_count();
+                            let charged = ledger.scope_committed(Scope::Host);
+                            let refused = run
+                                .close(&mut ledger)
+                                .expect_err("a run still holding leases may not close");
+                            assert!(
+                                format!("{refused}").contains("still hold residency leases"),
+                                "{case:?}: {refused}"
+                            );
+                            run = refused.run;
+                            assert_eq!(
+                                run.queue().len(),
+                                queued,
+                                "{case:?}: a refused close changed the queue"
+                            );
+                            assert_eq!(
+                                authority.live_lease_count(),
+                                held,
+                                "{case:?}: a refused close moved a lease"
+                            );
+                            assert_eq!(
+                                ledger.scope_committed(Scope::Host),
+                                charged,
+                                "{case:?}: a refused close moved the charge"
+                            );
+                            agree(&run, &authority, baseline, "close-with-queued-work", case);
+                            reached
+                                .entry("close-with-queued-work")
+                                .and_modify(|n| *n += 1)
+                                .or_insert(1);
+
+                            // Then drain and let the real close proceed, which
+                            // is what a caller must do.
                             run.cancel(&mut authority);
                             agree(&run, &authority, baseline, "cancel-drain", case);
                         }
@@ -786,6 +825,7 @@ fn the_run_lifecycle_product_holds_its_invariants_after_every_operation() {
         "withheld-leases",
         "quarantined-buffers",
         "mid-run-refusals",
+        "close-with-queued-work",
     ] {
         assert!(
             reached.get(required).copied().unwrap_or(0) > 0,

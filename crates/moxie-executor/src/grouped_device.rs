@@ -230,15 +230,43 @@ impl<'ctx> DeviceExperts<'ctx> {
         }
 
         let module = (|| -> Result<ResolvedModule<'ctx>> {
-            // Identity before loading: the descriptor the plan selected must
-            // name the package about to be loaded, or the plan and the code are
-            // two different things.
+            // Identity before loading, and **whole** identity. The hash says
+            // the plan named this package; it says nothing about whether the
+            // rest of the descriptor is one this package actually declares. A
+            // review kept the built-in GeGLU descriptor's operation, ABI and
+            // hash and swapped its projection symbol for the SiLU one: planning,
+            // attachment and execution all succeeded, and the answer was SwiGLU
+            // on all three GPUs -- 3,959 of 4,096 components wrong, and wrong in
+            // a way no gate would have noticed, because it was exactly the other
+            // activation.
+            //
+            // So the descriptor must **be** one of the built-in package's own.
+            // That binds operation, ABI, operand roles, precisions, rounding,
+            // layout, shape bounds, SM, workspace and symbols together, which is
+            // the only form of this check that cannot be half-satisfied. The
+            // planner still selects from an injected catalogue -- that is task
+            // 0012's design -- and this is the boundary where selection becomes
+            // a launch.
             if descriptor.image_sha256 != expert_package_sha256()? {
                 return Err(Error::UnsupportedKernel {
                     operation: "expert_mlp",
                     detail: "the selected descriptor does not identify this build's grouped \
                              expert package"
                         .into(),
+                });
+            }
+            if !moxie_kernels::expert_mlp_catalogue()
+                .descriptors()
+                .contains(&descriptor)
+            {
+                return Err(Error::UnsupportedKernel {
+                    operation: "expert_mlp",
+                    detail: format!(
+                        "descriptor {} names this build's package but is not one of the {} it \
+                         declares; its operation and its symbols are not bound",
+                        descriptor.id.0,
+                        moxie_kernels::expert_mlp_catalogue().descriptors().len()
+                    ),
                 });
             }
             // SAFETY: the image is this build's own fatbin, embedded by
@@ -1501,6 +1529,119 @@ mod tests {
         residency.close(&mut authority).unwrap();
         authority.close(&mut ledger).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A descriptor that names this build's package but is not one of its own
+    /// is refused, on every axis separately.
+    ///
+    /// The review's counterexample is the third case: the built-in GeGLU
+    /// descriptor with its projection symbol swapped for the SiLU one. Operation,
+    /// ABI and hash all matched, execution succeeded, and the answer was
+    /// **exactly SwiGLU** -- 3,959 of 4,096 components wrong on device 0. A
+    /// numerical gate cannot catch that, because the result is a correct
+    /// evaluation of the wrong function.
+    #[test]
+    fn a_descriptor_the_package_does_not_declare_is_refused() {
+        let _guard = crate::DRIVER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if moxie_cuda::device_count().unwrap() == 0 {
+            eprintln!("SKIPPED: no CUDA device");
+            return;
+        }
+        let ctx = RankContext::acquire(RankId(0), 0).unwrap();
+        let scope = Scope::Device(ctx.uuid());
+        let builtin = moxie_kernels::expert_mlp_catalogue();
+        let gelu = builtin
+            .descriptors()
+            .iter()
+            .find(|d| {
+                d.operation
+                    == moxie_types::SemanticKernelOp::ExpertMlp(
+                        moxie_types::GateTransform::GeluTanh,
+                    )
+                    && d.sm.major == ctx.capability().compute_major
+                    && d.sm.minor == ctx.capability().compute_minor
+            })
+            .expect("this build declares a GeGLU descriptor for this device")
+            .clone();
+
+        // The unmodified descriptor attaches, so the refusals below are the
+        // check biting and not the fixture failing.
+        /// One named change to a descriptor, applied alone.
+        type Change = Box<dyn Fn(&mut moxie_types::SemanticKernelDescriptor)>;
+        let mutate: Vec<(&str, Change)> = vec![
+            (
+                "none",
+                Box::new(|_: &mut moxie_types::SemanticKernelDescriptor| {}),
+            ),
+            (
+                "the other activation's projection symbol",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                    d.symbols[0] = moxie_types::KernelSymbol(
+                        moxie_kernels::BF16_EXPERT_PROJECT_SILU.to_string(),
+                    );
+                }),
+            ),
+            (
+                "a symbol this package does not export",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                    d.symbols[1] = moxie_types::KernelSymbol("moxie_smoke_axpy_f32".into());
+                }),
+            ),
+            (
+                "widened shape bounds",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                    d.shape.max_rows = u64::MAX;
+                }),
+            ),
+            (
+                "a zeroed image hash",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                    d.image_sha256 = [0; 32];
+                }),
+            ),
+        ];
+        for (what, change) in mutate {
+            let mut descriptor = gelu.clone();
+            change(&mut descriptor);
+            let catalogue = moxie_types::KernelCatalogue::new(vec![descriptor]).unwrap();
+            let mut ledger = Ledger::new([
+                CapacitySnapshot::new(Scope::Host, 64 * MIB, MIB).unwrap(),
+                CapacitySnapshot::new(scope, 64 * MIB, MIB).unwrap(),
+            ])
+            .unwrap();
+            let plan = compile_experts(
+                &mlp(EXPERTS, TOP_K),
+                &combine(TOP_K),
+                &ROUTE,
+                &budget(&ctx),
+                &policy(),
+                None,
+                Some(ExpertKernels {
+                    capability: ctx.capability(),
+                    catalogue: &catalogue,
+                }),
+            )
+            .expect("the planner selects from whatever catalogue it is given");
+            let request = GroupedRun::request_for(&plan).unwrap();
+            let reservation = ledger.admit(&request).unwrap();
+            let attached = DeviceExperts::attach(&mut ledger, reservation, &ctx, &plan);
+            if what == "none" {
+                let experts = attached.expect("the package's own descriptor attaches");
+                experts.close(&mut ledger).unwrap();
+                assert!(ledger.outstanding().is_empty());
+                continue;
+            }
+            let refused = attached
+                .err()
+                .unwrap_or_else(|| panic!("a descriptor with {what} was accepted for a launch"));
+            assert!(
+                format!("{}", refused.error).contains("expert_mlp"),
+                "{}",
+                refused.error
+            );
+        }
     }
 
     /// An activation block of the wrong logical size is refused, whatever the
