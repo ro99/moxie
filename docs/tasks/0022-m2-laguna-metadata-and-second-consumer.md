@@ -876,3 +876,73 @@ narrowing test and the whole-router test, and a single spurious `Vec` inside
 Both mutation batteries were re-run again, with a mutation added for each new
 check: **39 mutations, 0 survivors** — 17 of 18 by the planner sweep, 7 of 21 by the run
 sweep, the rest by named tests.
+
+## Third independent review
+
+The third round confirmed both production allocation fixes and found **one P2 in
+the regressions themselves**. Reproduced, fixed, not disputed.
+
+### The allocation regressions raced on a process-wide counter
+
+`libtest` runs each test on its own thread in parallel, and all three tests read
+the same `AtomicUsize`. Another test's allocations fall between a test's two
+snapshots and implicate allocation-free code. Reproduced on unchanged `a14f8e5`:
+
+```text
+default execution   14 failures in 100 runs
+serial execution     0 failures in  50 runs
+```
+
+The counter is thread-local now, so the isolation is a property of the harness
+rather than of how it is invoked. `--test-threads=1` was **not** the fix and the
+reviewer was right to rule it out: it would have removed the flake and left the
+workspace gate everyone actually runs unreliable, which is strictly worse than a
+flake that announces itself. Two details are load-bearing: the cell is
+`const`-initialised, because a lazily initialised thread-local would allocate
+*inside the allocator*; and it is read with `try_with`, so an allocation during
+thread-local destruction counts as nothing instead of panicking.
+
+After the fix: **0 failures in 200 default runs.**
+
+### And the substitutions were repeated, because a single run could not tell the
+### difference
+
+The reviewer's second point is the sharper one: with a racy counter, a
+substitution that "failed" might have failed from unrelated allocation noise
+rather than from the mutation, so the *previous* round's 3-of-3 was not
+trustworthy evidence even though it was the right answer.
+
+The battery now builds each mutant once and runs its test **25 times**, and runs
+the clean tree 25 times as well, requiring all 25 to fail and all 25 to pass
+respectively:
+
+```text
+clean   narrowing-allocates-again                25/25 pass
+clean   narrowing-allocates-again-whole-router   25/25 pass
+clean   operand-list-allocates-again             25/25 pass
+mutant  narrowing-allocates-again                25/25 fail
+mutant  narrowing-allocates-again-whole-router   25/25 fail
+mutant  operand-list-allocates-again             25/25 fail
+```
+
+**A substitution result from a nondeterministic test is not evidence, whichever
+way it came out.** That belongs beside the rule this repository already has — a
+regression is load-bearing when a substitution says so — because it is the
+precondition that rule quietly assumes.
+
+### Evidence
+
+| Gate, after the third round | Result |
+|---|---|
+| `cargo fmt --all -- --check` | passed |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
+| Device-lane clippy | passed |
+| `cargo test --workspace --locked --offline` | **918 passed, 0 failed** (unchanged; the fix is to a test's harness, not its count) |
+| Device-feature workspace tests | **951 passed, 0 failed** (unchanged) |
+| `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped** |
+| `cargo xtask spec-check` | passed, 10 documents |
+| `cargo xtask arch-check` | **zero failures** |
+| `route_allocation` under default parallelism | **200 runs, 0 failures** |
+
+Both mutation batteries re-run: **39 mutations, 0 survivors** — 17 of 18 by the
+planner sweep, 7 of 21 by the run sweep, the rest by named tests.

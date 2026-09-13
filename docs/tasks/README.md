@@ -59,11 +59,13 @@ not close M2**, which also needs item 4 and byte/cost traces reconciled with the
 ledger across a whole working set.
 
 **[Task 0022](0022-m2-laguna-metadata-and-second-consumer.md) is implemented,
-corrected after two rounds of independent review, and awaiting a further review
-and owner acceptance**, 2026-09-13. The rounds found **seven** issues, two P1,
-all reproduced and fixed, none disputed — the second round's P1 was introduced by
-the first round's own fix, and asking its question of the rest of the change
-found a second instance of the same defect class. It is M2
+corrected after three rounds of independent review, and awaiting a further
+review and owner acceptance**, 2026-09-13. The rounds found **eight** issues, two
+P1, all reproduced and fixed, none disputed — the second round's P1 was
+introduced by the first round's own fix, asking its question of the rest of the
+change found a second instance of the same class, and the third round found the
+regressions written for it **flaky**, which made the previous round's
+substitution evidence untrustworthy whichever way it had come out. It is M2
 item 4: Laguna's metadata and its **routed block**, a second routed consumer
 through task 0021's interface, and a restricted budget expressed as a ratio of
 working weights. Its contract was authored and committed at `78c493d` before

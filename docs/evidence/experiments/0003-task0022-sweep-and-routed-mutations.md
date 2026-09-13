@@ -219,6 +219,30 @@ both were written after the fact. The structural answers are elsewhere: make the
 executable, and check a transcription against a quantity computed from the source's stated equation
 rather than against the implementation it is supposed to be independent of.
 
+## A substitution result from a nondeterministic test is not evidence
+
+The third review round found the two allocation regressions **flaky**: they read a process-wide
+`AtomicUsize` while `libtest` ran them on parallel threads, so another test's allocations fell
+between a test's snapshots. Measured on the unchanged tree: **14 failures in 100 default runs, 0 in
+50 serial ones.**
+
+The counter is thread-local now — `const`-initialised, because a lazily initialised thread-local
+would allocate inside the allocator, and read with `try_with`, so an allocation during thread-local
+destruction counts as nothing instead of panicking. **0 failures in 200 default runs** afterwards.
+`--test-threads=1` was available and was not used: it removes the flake and leaves the gate everyone
+actually runs unreliable.
+
+The consequence for this record is the part worth keeping. A substitution says a check is
+load-bearing when removing it makes the test fail. With a flaky test, a failure might be the
+mutation or might be noise — so the previous round's "3 of 3 load-bearing" was **not evidence**,
+even though it happened to be the right answer. The battery now builds each mutant once and runs its
+test 25 times, and runs the clean tree 25 times, requiring 25/25 in both directions. All three are
+load-bearing on that stronger reading.
+
+This is the precondition the repository's existing rule quietly assumes. "A regression is not
+load-bearing until a substitution says so" is only true if the substitution is repeatable; otherwise
+it is a coin flip that gets recorded as a measurement.
+
 ## Reproducing it
 
 Two drivers, reproduced rather than committed as tools, because they edit source in place and a tool

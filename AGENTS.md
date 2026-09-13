@@ -181,8 +181,8 @@ mutation would survive rather than by reading the test.**
 **M2 item 4 is implemented, corrected after two rounds of independent review,
 and awaits acceptance**
 ([task 0022](docs/tasks/0022-m2-laguna-metadata-and-second-consumer.md),
-2026-09-13; the rounds found **seven** issues, two P1, all reproduced and fixed,
-none disputed): Laguna's metadata and its **routed block**, a second routed
+2026-09-13; three rounds found **eight** issues, two P1, all reproduced and
+fixed, none disputed): Laguna's metadata and its **routed block**, a second routed
 consumer driven through task 0021's interface, and a restricted budget expressed
 as a **ratio** of what the route demands rather than a constant. A routed layer
 at Laguna's declared expert width — 18,874,368 B per expert in BF16 — ran on all
@@ -205,6 +205,17 @@ packed along the **output** axis — a second convention the accepted importer h
 never seen — so **no Laguna tensor was read** and M3 owns the importer.
 [The bring-up record](docs/models/laguna.md) carries the inventory and every
 open mapping question.
+
+**A substitution result from a nondeterministic test is not evidence, whichever
+way it came out.** Task 0022's two allocation regressions read a process-wide
+counter while the harness ran them on parallel threads: **14 failures in 100
+runs**, and another test's allocations falling between a measurement's two
+snapshots. The rule this repository already has — a regression is load-bearing
+when a substitution says so — quietly assumes the substitution is repeatable,
+and a flaky test turns it into a coin flip recorded as a measurement. The
+battery repeats each substitution **25 times in both directions** now. Fixing
+such a test by requiring `--test-threads=1` is not fixing it: it removes the
+flake and leaves the gate everyone actually runs unreliable.
 
 **A fix is a new caller, and a new caller on a path with a discipline has to
 satisfy it.** The second review's only finding was a defect the **first round's

@@ -13,21 +13,50 @@
 //! This test is what keeps that true, and it counts allocator *calls* rather
 //! than injecting a failure, because "requires no allocation" is the property
 //! and a call count states it directly.
+//!
+//! ## Why the counter is thread-local
+//!
+//! The first version used a process-wide `AtomicUsize`, and a review showed it
+//! **flaky**: `libtest` runs each test on its own thread in parallel, so
+//! another test's allocations fall between this one's two snapshots and
+//! implicate allocation-free code. Measured on the unchanged binary: **14
+//! failures in 100 default runs, 0 in 50 serial ones.**
+//!
+//! Requiring `--test-threads=1` would have fixed the flake and left the
+//! standard workspace gate unreliable, which is worse than the flake: the gate
+//! everyone actually runs would be the one that lies. A thread-local counter
+//! measures the thread doing the measuring, so the isolation is a property of
+//! the harness rather than of how it is invoked.
+//!
+//! The counter is `const`-initialised so that first access allocates nothing --
+//! a lazily initialised thread-local would allocate *inside the allocator* --
+//! and read with `try_with`, so an allocation during thread-local destruction
+//! is counted as nothing rather than panicking.
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::cell::Cell;
 
 use moxie_graph::{RouteCoefficient, RouteScore, RouterInput};
 use moxie_oracles::route::{self, Route, RouterSpec};
 
+thread_local! {
+    static CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// This thread's allocation count.
+fn calls() -> usize {
+    CALLS.try_with(Cell::get).unwrap_or(0)
+}
+
 struct Counter;
-static CALLS: AtomicUsize = AtomicUsize::new(0);
 // SAFETY: allocation operations are forwarded unchanged to the system allocator.
 unsafe impl GlobalAlloc for Counter {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: the allocator caller supplies a valid layout.
         let pointer = unsafe { System.alloc(layout) };
         if !pointer.is_null() {
-            CALLS.fetch_add(1, SeqCst);
+            // `try_with` and no allocation of its own: this runs inside the
+            // allocator, and a counter that allocated would recurse.
+            let _ = CALLS.try_with(|c| c.set(c.get() + 1));
         }
         pointer
     }
@@ -47,9 +76,9 @@ fn narrowing_a_routes_coefficients_requests_no_heap() {
     };
     // The vectors above are already allocated; what is counted is what
     // narrowing adds.
-    let before = CALLS.load(SeqCst);
+    let before = calls();
     let narrowed = route::narrow_coefficients(route, RouteCoefficient::Bf16);
-    let after = CALLS.load(SeqCst);
+    let after = calls();
     assert_eq!(
         after - before,
         0,
@@ -66,9 +95,9 @@ fn narrowing_a_routes_coefficients_requests_no_heap() {
         experts: vec![3, 1],
         weights: vec![0.25, 0.75],
     };
-    let before = CALLS.load(SeqCst);
+    let before = calls();
     let same = route::narrow_coefficients(route, RouteCoefficient::Fp32);
-    assert_eq!(CALLS.load(SeqCst) - before, 0);
+    assert_eq!(calls() - before, 0);
     assert_eq!(same.weights, vec![0.25, 0.75]);
 }
 
@@ -103,7 +132,7 @@ fn the_whole_router_allocates_only_what_it_must() {
         spec(RouteCoefficient::Fp32),
     );
 
-    let before = CALLS.load(SeqCst);
+    let before = calls();
     let plain = route::router_route_row(
         &x,
         None,
@@ -113,9 +142,9 @@ fn the_whole_router_allocates_only_what_it_must() {
         spec(RouteCoefficient::Fp32),
     )
     .unwrap();
-    let plain_calls = CALLS.load(SeqCst) - before;
+    let plain_calls = calls() - before;
 
-    let before = CALLS.load(SeqCst);
+    let before = calls();
     let narrowed = route::router_route_row(
         &x,
         None,
@@ -125,7 +154,7 @@ fn the_whole_router_allocates_only_what_it_must() {
         spec(RouteCoefficient::Bf16),
     )
     .unwrap();
-    let narrowed_calls = CALLS.load(SeqCst) - before;
+    let narrowed_calls = calls() - before;
 
     assert_eq!(
         narrowed_calls, plain_calls,
@@ -164,11 +193,11 @@ fn a_routers_operand_list_requests_no_heap() {
     // Warm anything the first call touches.
     let _ = params.route_operands();
 
-    let before = CALLS.load(SeqCst);
+    let before = calls();
     let operands = params.route_operands();
     let arity = params.arity();
     assert_eq!(
-        CALLS.load(SeqCst) - before,
+        calls() - before,
         0,
         "reading a router's operand list allocated"
     );

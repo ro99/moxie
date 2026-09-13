@@ -1,14 +1,16 @@
 # Handover — task 0022 implemented; M2 item 5's remainder is next
 
-**Task 0022 is implemented, corrected after two rounds of independent review,
+**Task 0022 is implemented, corrected after three rounds of independent review,
 and awaits a further review and owner acceptance.** It delivers roadmap **M2
 item 4** in the only shape the evidence allows, and it says so in its own
 contract rather than afterwards. **It does not close M2.**
 
-The first review found **six** issues — one P1, five P2 — all reproduced, all
-fixed, none disputed. The second found **one more P1, introduced by the first
-round's own fix**, and a sweep for the same defect class in the same change
-found a second instance the review had not reached. Four were the shape task 0021's four rounds kept finding: **a
+The three rounds found **eight** issues — two P1 — all reproduced, all fixed,
+none disputed. The second round's P1 was **introduced by the first round's own
+fix**, and a sweep for the same defect class in the same change found a second
+instance the review had not reached. The third round found the regressions
+written for *that* **flaky**, which is worth its own line: it meant the second
+round's substitution evidence was not evidence, whichever way it had come out. Four were the shape task 0021's four rounds kept finding: **a
 check on one path and not on the neighbouring one.** The other two are a shape
 worth naming separately, because no mutation battery can reach it: **a record
 and a transcription that each contradicted a fact their own document already
@@ -198,6 +200,28 @@ is a new caller, and a new caller on a path with a discipline has to satisfy it
 — which is not something a diff review of the fix will tell you, because the fix
 looks like the thing it replaced.**
 
+### The third round: the evidence itself was nondeterministic
+
+The two allocation regressions read a process-wide `AtomicUsize` while `libtest`
+ran them on parallel threads, so another test's allocations fell between a
+measurement's two snapshots — **14 failures in 100 default runs, 0 in 50 serial
+ones**. The counter is thread-local now (`const`-initialised, because a lazily
+initialised one would allocate inside the allocator; read with `try_with`, so
+allocation during thread-local destruction counts as nothing): **0 failures in
+200 default runs**.
+
+`--test-threads=1` would have removed the flake and left the workspace gate
+everyone actually runs unreliable, which is worse than a flake that announces
+itself.
+
+The consequence is the part to carry: **a substitution result from a
+nondeterministic test is not evidence.** This repository's rule is that a
+regression is load-bearing when a substitution says so, and that quietly assumes
+the substitution is repeatable. It was not, so the previous round's "3 of 3"
+was a coin flip recorded as a measurement — even though it had landed on the
+right answer. The battery repeats each substitution **25 times in both
+directions** now, and all three hold at 25/25.
+
 ## Remaining hypotheses and blockers
 
 - **M2 is not closed.** Its exit still asks that a real out-of-device-memory
@@ -254,7 +278,7 @@ layer.
   sweeps at their extended products and the restricted-budget device case on all
   three cards.
 
-**Four habits from this task should be applied there rather than rediscovered.**
+**Five habits from this task should be applied there rather than rediscovered.**
 
 First, **ask what the input space is, not only what the assertion says.** The
 `output_scale` gap was not a weak test. It was a strong test over fixtures that
@@ -272,7 +296,11 @@ reader's omissions. When a reference exists, the transcription's agreement with
 the implementation is worth nothing on its own; what is worth something is
 agreement with a number computed from the source's own stated equation.
 
-Fourth — and this is the contract's own doing rather than the measurement's —
+Fourth, **check that a measurement is repeatable before recording it as one.**
+A flaky test makes every substitution over it a coin flip, and the coin landing
+correctly does not make the record true.
+
+Fifth — and this is the contract's own doing rather than the measurement's —
 **write the narrowing into the contract, before implementing.** Laguna's tower
 was going to be impossible whichever order the work was done in. Discovering it
 halfway would have produced either a guessed yarn ramp or a task that quietly
