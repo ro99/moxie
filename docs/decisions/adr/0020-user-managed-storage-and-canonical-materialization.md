@@ -1,9 +1,9 @@
 # ADR 0020 — User-managed storage and canonical materialization
 
-- ID / date / author / status: 0020 / 2026-09-13 / owner-directed, recorded by implementation agent / adopted.
+- ID / date / author / status: 0020 / 2026-09-13 / owner-directed, recorded by implementation agent / adopted; **wording corrected in part by [ADR 0021](0021-repack-is-a-moxie-program.md) (2026-09-13): repack is a Moxie program, not an external script. The 0020 text below is preserved; where it says "external script/process" for repack, read ADR 0021.**
 - Classification: owner requirement (storage authorization). It does not change precision, cache, or catalog membership.
 - Scope and owning shared component: `moxie-format` / `moxie-storage` (manifest, canonical chunk reading), docs `artifact-roots.md`, `checkpoint-inventory.md`. No engine crate gains bulk-write authority.
-- Supersedes / superseded by: refines O5 portion of [ADR 0017](0017-v1-catalog-and-no-quantizer.md). Document 03 converter prose remains repack-only; this ADR records *who* runs it. See [O5](../owner-gates.md#o5--storage-and-conversion-authorization).
+- Supersedes / superseded by: refines O5 portion of [ADR 0017](0017-v1-catalog-and-no-quantizer.md). Corrected in part by ADR 0021 on the repack-"external" wording only; substance (user-run, per-task naming, roots, ten revisions) unchanged. Document 03 converter prose remains repack-only; this ADR records *who* runs it. See [O5](../owner-gates.md#o5--storage-and-conversion-authorization).
 
 ## Problem and mechanism
 

@@ -162,6 +162,7 @@ taking a silent exception.
 **Status:** RESOLVED 2026-09-13
 
 **Owner ruling, 2026-09-13 — verbatim, recorded here; ADR 0020 implements it.** The owner ruled: storage and conversion is user-managed. Repack is done via an external script pointing to the chosen directory; Moxie only points to the repacked (canonical) file. No agent-initiated bulk download, copy, or conversion without a task naming exact artifact, revision, expected size and retention. Designated roots remain `/models` and `/fast/models`; canonicals for the ten v1 revisions (O1) are authorized to be materialized there.
+**Correction, 2026-09-13 ([ADR 0021](adr/0021-repack-is-a-moxie-program.md)).** The "external script" phrasing above is wrong for repack and is preserved here only for provenance. Repack is a Moxie program the user runs offline — not an external script. Unchanged: user-run, one authorized entry at a time, no agent bulk write without artifact + revision + size + retention named, roots `/models` and `/fast/models`, ten authorized revisions. "External" stays correct only for quantization (O1/ADR 0017: never in Moxie).
 
 **Historical evidence and M2 sequencing questions remain below for provenance; they are not the ruling.**
 

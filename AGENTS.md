@@ -4,6 +4,8 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 
 ## Active assignment
 
+**Repack user-surface ruling (2026-09-13):** [ADR 0022](docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md) resolves the engineer-lead placement gap: `moxie-repack` is the offline program; canonical write I/O is isolated in `moxie-storage-write`. M3 retains manifest-v1 directories; final single-file `.mox` packaging is assigned to M11 item 4. [Task 0025](docs/tasks/0025-m3-offline-repack-publication.md) is the proposed first publication contract, not an implementation or acceptance. Its write-authority architecture rule is pending implementation. Task 0024 remains unaccepted.
+
 **M1 complete (M1.5 closed 2026-09-12); M2's five items are all accepted — items
 1 and 2 on 2026-09-12, items 3, 4 and 5 on 2026-09-13 — and the owner authorized
 M3 on 2026-09-13. M3 is the milestone the next task comes from.** M2's formal
@@ -19,8 +21,8 @@ M1's exit evidence gate by gate.
 2026-09-13)**, and both of its owner gates are already answered, which bounds the
 work rather than opening it. **O2** is repack-only for v1 (ADR 0018): a lossless
 claim needs source-oracle evidence and **Moxie never quantizes**. **O5** is
-user-managed storage and conversion (ADR 0020): Moxie reads the canonical file,
-repacking is an external script the user runs, and **no agent-initiated bulk
+user-managed storage and conversion (ADRs 0020–0021): Moxie reads the canonical file,
+repacking is a Moxie program the user runs offline — not an external script — and **no agent-initiated bulk
 download, copy or conversion may start** without a task naming artifact,
 revision, expected size and retention. `/models` and `/fast/models` remain
 read-only inputs to an agent. The roadmap's M3 items are in
@@ -35,10 +37,12 @@ packed along the input axis: **two packing conventions inside one tensor group,
 distinguished by nothing in either name.** That is R16 in its exact form, and it
 is why the shapes are validated rather than derived from byte counts. Six
 modules of `/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4` and
-`/fast/models/cyankiwi/Qwen3.8-27B-AWQ-BF16-INT4` import with **112,640
-reconstructed values bitwise equal** to the source's own `(q-z)*s`, computed
-from the raw bytes by a transcription that follows the pinned library's *unpack
-procedure* rather than this importer's closed-form index. **Import is not
+`/fast/models/cyankiwi/Qwen3.8-27B-AWQ-BF16-INT4` import, and **112,640
+reconstructed values are checked against two quantities that are not the same
+one**: document 03's canonical FP32 equation over the source's own bytes,
+bitwise; and the source's own arithmetic **including the BF16 rounding its
+reference applies**, which the canonical value rounds to exactly. The second
+comparison is the review's, not this task's first instinct — see below. **Import is not
 execution**: nothing consumes a canonical INT4 tensor, W4A16 is M3 item 3, and
 Laguna's graph still declares BF16 tensor requirements — listing INT4 would
 advertise a path that is not there. A bit-identical repack is **ADR 0018's v1
@@ -60,6 +64,62 @@ development builds and pin nothing, and this repository already refused one
 mismatched `transformers` copy as a pinned exporter for yarn. **When a
 convention cannot be checked, say so and pin it; when it can, measure it.** The
 code word's lane order is still unchecked and stays where task 0018 left it.
+
+**One independent review, five findings, one P1, none disputed — and the P1 is
+this workspace's most repeated defect for the sixth time.** Every refusal in
+`moxie-format` built its prose with `format!`, so refusing one allocation while
+the importer rejected a malformed artifact was `SIGABRT`. **The sweep written to
+prevent exactly this swept only imports that succeed, and a refusal has no
+allocation positions in it at all.** That is task 0023's own third-round
+sentence — "a gate that exercises the happy path under the adverse condition has
+tested the adverse condition on the happy path" — reproduced by someone who had
+read it that morning. Reading a lesson is not the same as applying it to the
+gate you are writing; **ask of every new gate which of its axes the adverse
+condition is actually on.** `Error::InvalidArtifact` carries a
+`Cow<'static, str>` now so the variant can be built without allocating, and
+`moxie-format`'s refusals compose their prose into a `try_reserve`d buffer with a
+borrowed fallback. The other three string-carrying variants still allocate, and
+that is named as an open question rather than quietly widened into this task.
+
+**Two quantities, one name: the BF16 boundary again, one task after the task
+that recorded it.** The pinned compressor's `_dequantize` casts to `scale.dtype`
+before subtracting and multiplying, and that dtype is BF16 for these artifacts;
+the test computed FP32 and every record called it "the source's own declared
+arithmetic". **27,501 of 112,640 sampled values differ**, and neither number is
+wrong — document 03 fixes the canonical reconstruction at FP32. What was wrong
+was the name. There are two comparisons now, and the count of values the
+boundary moves is **asserted nonzero**, because a boundary check on a sample
+where the boundary never fires is a check of nothing.
+
+**A filter applied to the population being audited removes exactly the rows the
+audit exists to see.** The inventory dropped every module missing one of its four
+tensors and then checked that every module had all four; a review built a shard
+with a module missing its zero point and the test passed while reporting one
+fewer module. Task 0023's omitted layer, in a different file and a different
+year's worth of confidence. **Audit the population before you filter it, and
+make the filtered subset a separately named thing.**
+
+**The mutation names are not the measurement; the exact substitutions are.**
+Experiment 0005 said its driver was "reproduced in the task record" and it was
+not, in either commit. The driver is tracked now, at
+[`docs/evidence/experiments/drivers/0005-mutations.py`](docs/evidence/experiments/drivers/0005-mutations.py),
+and every verdict is repeated three times in both directions because the
+contract promised that and the first run did not do it. **21 of 21 caught, 0
+survivors** — where the first battery was 16 of 16 and complete against a suite
+with three holes in it. **The five mutations added after the review are each
+caught by exactly the lane a finding created**, four of them by that lane alone:
+a battery that is complete against the suite it was written for says nothing
+about the suite's holes, and only a finding from outside can.
+
+**An impossibility claim is a claim, and this one contradicted its own
+document.** The record said the statistic could not separate a zero point that is
+subtracted from one that is added, because a distribution centred near zero is
+symmetric. That holds only for independent quantities, and the correlation
+between a group's code mean and its own zero point is the premise of the
+measurement **two paragraphs earlier**. Measured: **0.52 against 2.18**. Third
+instance of a record contradicting a fact it already contains, and the first of
+the three that was an argument rather than arithmetic — which is easier to wave
+through, not harder.
 
 **The paragraph on task 0022 below says "no Laguna tensor was read". That was
 true when it was written.** Three of its tensors have now been read and
