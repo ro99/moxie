@@ -10,8 +10,13 @@ publish = false
 # Off by default so the host lane never links libcuda. `driver` binds leases
 # to real completion events; without it only the pure retirement machine and
 # the manual test double compile.
-default = []
+default = ["numa"]
 driver = ["moxie-cuda/driver", "moxie-kernels/fatbin"]
+# NUMA-aware host placement (task 0021, roadmap M2 item 3). One audited glibc
+# FFI block for thread affinity; on by default because the benchmark machine has
+# two nodes and the GPUs are split across them, and `HostPlacementControl`'s
+# `required` is what errors when this is absent.
+numa = []
 
 [dependencies]
 moxie-types.workspace = true
@@ -32,6 +37,11 @@ moxie-graph.workspace = true
 # the executor's production code names no engine type, and a fixture proves the
 # production edge is refused.
 moxie-engine.workspace = true
+# Task 0021: the grouped run's answer is checked against task 0019's accepted
+# oracle, and its NUMA placement is *measured* through the one crate ADR 0006
+# lets read `/proc`. Both are test-only; production code here names neither.
+moxie-oracles.workspace = true
+moxie-host.workspace = true
 
 [lints]
 workspace = true

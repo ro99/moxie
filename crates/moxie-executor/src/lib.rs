@@ -33,7 +33,9 @@
 //! [`Ledger::outstanding`]: moxie_memory::Ledger::outstanding
 //! [`Reservation`]: moxie_memory::Reservation
 
-#![cfg_attr(not(feature = "driver"), forbid(unsafe_code))]
+// The `numa` feature adds one audited glibc FFI block (thread affinity) and
+// `driver` adds the CUDA one; every other build of this crate forbids unsafe.
+#![cfg_attr(not(any(feature = "driver", feature = "numa")), forbid(unsafe_code))]
 
 #[cfg(all(test, feature = "driver"))]
 pub(crate) static DRIVER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -49,6 +51,12 @@ pub use plan::{resource_request, validate_plan_binding};
 
 pub mod residency;
 pub use residency::{ChunkSource, ShardSource, drain_reads, perform_read};
+
+pub mod grouped;
+pub use grouped::{
+    BufferAddresses, ExpertRoles, GroupedAdmitRefused, GroupedCloseRefused, GroupedRun,
+    GroupedStats, HostBuffers, OrderQueue, PlacementReport, Progress, QueueFull, QueuedGroup,
+};
 
 pub mod arena;
 pub use arena::{
