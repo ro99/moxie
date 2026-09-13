@@ -22,6 +22,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cpu_expert;
+
 /// Compute capabilities this build *targets*, as `["86", "120"]`.
 ///
 /// Declared, not measured. Targeting an architecture is not compiling for it

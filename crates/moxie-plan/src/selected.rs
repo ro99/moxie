@@ -672,6 +672,15 @@ mod tests {
                 KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
                 KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
             ],
+            // Not selectable by `lower_selected`, which is task 0012's exact
+            // three-node chain. The grouped expert operand list is task 0021's
+            // and is built where that plan is built.
+            SemanticKernelOp::ExpertMlp(_) => vec![
+                KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                KernelOperand::RouteIndex,
+                KernelOperand::Weight(WeightPrecision::expect(Precision::Bf16)),
+                KernelOperand::Weight(WeightPrecision::expect(Precision::Bf16)),
+            ],
         };
         SemanticKernelDescriptor {
             id: KernelId(format!("{}-{}", op.name(), sm.name())),

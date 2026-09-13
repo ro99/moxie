@@ -16,5 +16,17 @@ fatbin = []
 [dependencies]
 moxie-types.workspace = true
 
+[dev-dependencies]
+# The BF16 rounding contract lives in `moxie-format`, which sits beside this
+# crate rather than below it, so `cpu_expert::bf16_round` is a reimplementation.
+# A dev dependency is what makes "demonstrably the same function" a test rather
+# than a comment; production code here still names `moxie-types` alone.
+moxie-format.workspace = true
+# Task 0019's accepted FP64 reference. The host expert kernel's declared gate is
+# **bitwise** equality with it, so the oracle has to be in the test binary; it is
+# not reachable from production code here.
+moxie-oracles.workspace = true
+moxie-graph.workspace = true
+
 [lints]
 workspace = true

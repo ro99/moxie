@@ -11,12 +11,13 @@ pub mod dim;
 pub mod error;
 pub mod ids;
 pub mod layout;
+pub mod numa;
 pub mod precision;
 pub mod tier;
 
 pub use capability::{
-    DeviceCapability, HostLimit, KernelCapability, KernelCatalogue, KernelId, KernelOperand,
-    KernelShapeBounds, KernelSymbol, MeasuredDevice, MeasuredHost, RoundingProfile,
+    DeviceCapability, GateTransform, HostLimit, KernelCapability, KernelCatalogue, KernelId,
+    KernelOperand, KernelShapeBounds, KernelSymbol, MeasuredDevice, MeasuredHost, RoundingProfile,
     SemanticKernelDescriptor, SemanticKernelOp, SmVersion, StrategyControl, WorkspaceExpression,
 };
 pub use dim::{Dim, DimError, SymbolId, SymbolTable};
@@ -26,6 +27,7 @@ pub use ids::{
     TensorId,
 };
 pub use layout::TensorLayout;
+pub use numa::{HostPlacement, NumaNode, NumaNodeId, NumaTopology};
 pub use precision::{
     AccumulationPolicy, ActivationPrecision, CachePrecision, ExecutionProfile, Precision,
     WeightPrecision,

@@ -17,12 +17,41 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KernelId(pub String);
 
+/// Which gate transform a gated feed-forward kernel implements.
+///
+/// A dispatch key, and a **closed** one: document 02 keeps SwiGLU and GeGLU as
+/// distinct operations because they are distinct functions with distinct
+/// declared rounding boundaries, and task 0019 carried that into
+/// `ExpertActivation`. This is that distinction at the kernel boundary, so a
+/// GeGLU kernel can never be selected for a SiLU-gated node. It is spelled here
+/// rather than reached for from the graph crate because kernel dispatch keys
+/// live at the bottom of the dependency graph (document 02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GateTransform {
+    /// `bf16(gelu_tanh(gate)) * up`.
+    GeluTanh,
+    /// `silu(gate) * up`, evaluated in FP64 and rounded once.
+    Silu,
+}
+
+impl GateTransform {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::GeluTanh => "gelu_tanh",
+            Self::Silu => "silu",
+        }
+    }
+}
+
 /// Closed semantic operations that may cross the planning/execution boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SemanticKernelOp {
     Linear,
     RmsNorm,
     Residual,
+    /// The gated expert feed-forward, evaluated per selected slot. The gate
+    /// transform is part of the operation's identity, not a parameter of it.
+    ExpertMlp(GateTransform),
 }
 
 impl SemanticKernelOp {
@@ -31,6 +60,8 @@ impl SemanticKernelOp {
             Self::Linear => "linear",
             Self::RmsNorm => "rms_norm",
             Self::Residual => "residual",
+            Self::ExpertMlp(GateTransform::GeluTanh) => "expert_mlp_gelu_tanh",
+            Self::ExpertMlp(GateTransform::Silu) => "expert_mlp_silu",
         }
     }
 }
@@ -40,6 +71,16 @@ impl SemanticKernelOp {
 pub enum KernelOperand {
     Activation(ActivationPrecision),
     Weight(WeightPrecision),
+    /// A `u32` selection index per routed slot.
+    ///
+    /// Document 02 requires integer roles to be described as integer roles:
+    /// "Token IDs, positions, page/group/sparse indices and masks also need
+    /// integer/boolean descriptor roles; they are not quantized weights or
+    /// floating activations." A grouped expert kernel takes exactly one such
+    /// operand -- which rows this launch serves -- and a descriptor that spelled
+    /// it as an activation precision would invite a precision predicate to be
+    /// applied to a row number.
+    RouteIndex,
 }
 
 /// The one output-rounding boundary qualified by task 0012.
@@ -80,6 +121,12 @@ pub struct KernelShapeBounds {
 pub enum WorkspaceExpression {
     Zero,
     RowsTimesF32,
+    /// `rows * width * 4`: one FP32 intermediate vector per row.
+    ///
+    /// The expert feed-forward's gated intermediate is `intermediate` wide and
+    /// does not fit in registers at the designated artifact's 704, so it is a
+    /// declared workspace rather than a hidden allocation inside a launch.
+    RowsTimesWidthF32(u64),
 }
 
 impl WorkspaceExpression {
@@ -87,6 +134,9 @@ impl WorkspaceExpression {
         match self {
             Self::Zero => Some(0),
             Self::RowsTimesF32 => rows.checked_mul(4),
+            Self::RowsTimesWidthF32(width) => {
+                rows.checked_mul(width).and_then(|v| v.checked_mul(4))
+            }
         }
     }
 }

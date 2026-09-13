@@ -17,6 +17,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod numa;
+
 use std::path::{Path, PathBuf};
 
 use moxie_types::{Error, HostLimit, MeasuredHost, Result};
