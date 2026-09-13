@@ -4,11 +4,23 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 
 ## Active assignment
 
-**Repack user-surface ruling (2026-09-13):** [ADR 0022](docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md) resolves the engineer-lead placement gap: `moxie-repack` is the offline program; canonical write I/O is isolated in `moxie-storage-write`. M3 retains manifest-v1 directories; final single-file `.mox` packaging is assigned to M11 item 4. [Task 0025](docs/tasks/0025-m3-offline-repack-publication.md) is the proposed first publication contract, not an implementation or acceptance. Its write-authority architecture rule is pending implementation. Task 0024 remains unaccepted.
+**Repack user-surface ruling (2026-09-13):** [ADR 0022](docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md) resolves the engineer-lead placement gap: `moxie-repack` is the offline program; canonical write I/O is isolated in `moxie-storage-write`. M3 retains manifest-v1 directories; final single-file `.mox` packaging is assigned to M11 item 4. [Task 0025](docs/tasks/0025-m3-offline-repack-publication.md) is the proposed first publication contract, not an implementation or acceptance. Its write-authority architecture rule is pending implementation.
+
+**Task 0025 is the next task**, and it comes before M3 item 3 for three reasons
+rather than one: repack is roadmap item **1** while the importers tasks 0018 and
+0024 delivered are item 2; ADR 0021 assigns repack to item 1 explicitly and
+states that M3's exit clause — "lossless (repack) claims have source-oracle
+evidence" — **cannot close without the program that publishes what the evidence
+is about**; and nothing persists what the importers produce, so a kernel built
+first would have nothing to execute from but a test fixture. **M3 item 3, the
+W4A16/W8A16 paths, is what follows** and is still the largest gap in the
+milestone. The task 0024 handover's own "next task" section named item 3 when it
+was written, before this ruling existed; it is corrected in place.
 
 **M1 complete (M1.5 closed 2026-09-12); M2's five items are all accepted — items
 1 and 2 on 2026-09-12, items 3, 4 and 5 on 2026-09-13 — and the owner authorized
-M3 on 2026-09-13. M3 is the milestone the next task comes from.** M2's formal
+M3 on 2026-09-13; **M3's first contract, task 0024, is accepted by the owner the
+same day** after three rounds of independent review.** M2's formal
 closure statement is still the owner's to make and is not claimed here. See the
 [task 0024 handover](docs/handovers/2026-09-13-task0024-asymmetric-int4-import.md)
 for the current continuation, the

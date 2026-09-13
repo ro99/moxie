@@ -2,16 +2,31 @@
 
 ## Current assignment and milestone handoff
 
-[Task 0025](0025-m3-offline-repack-publication.md) is **proposed, contract only**: M3 item 1's bounded offline repacker and canonical publication, placed by [ADR 0022](../decisions/adr/0022-user-programs-and-canonical-write-authority.md) under [ADR 0021](../decisions/adr/0021-repack-is-a-moxie-program.md). It authorizes no bulk materialization and does not accept task 0024.
+**[Task 0025](0025-m3-offline-repack-publication.md) is the next contract:
+M3 item 1's bounded offline repacker and canonical publication**, placed by
+[ADR 0022](../decisions/adr/0022-user-programs-and-canonical-write-authority.md)
+under [ADR 0021](../decisions/adr/0021-repack-is-a-moxie-program.md). It is
+**proposed, contract only — no implementation and no acceptance** — and it
+authorizes no bulk materialization.
+
+**It comes before M3 item 3, and the reason is not only roadmap order.** Repack
+is item 1 and the importers are item 2, which tasks 0018 and 0024 delivered
+ahead of it; ADR 0021 assigns repack to item 1 explicitly and states that M3's
+exit clause — "lossless (repack) claims have source-oracle evidence" — cannot
+close without the program that publishes what the evidence is about. And nothing
+persists what the importers produce: they build canonical tensors in memory that
+no manifest holds and no reader round-trips, so a kernel built first would have
+nothing to execute from but a test fixture. **M3 item 3 — the W4A16/W8A16 paths
+— is what follows**, and remains the largest gap in the milestone.
 
 **M1 complete (M1.5 closed 2026-09-12); M2's five items are all accepted — items
-1 and 2 on 2026-09-12, items 3, 4 and 5 on 2026-09-13 — and the owner authorized
-M3 on 2026-09-13. [Task 0024](0024-m3-asymmetric-int4-pack-quantized-import.md)
-is M3's first contract: implemented 2026-09-13, awaiting independent review and
-owner acceptance.** M2's formal closure
+1 and 2 on 2026-09-12, items 3, 4 and 5 on 2026-09-13 — the owner authorized
+M3 on 2026-09-13, and M3's first contract
+([task 0024](0024-m3-asymmetric-int4-pack-quantized-import.md)) is **accepted**
+by the owner the same day after three rounds of independent review.** M2's formal closure
 statement is still the owner's to make and is not claimed here. M3's own gates
 are already ruled on: O2 repack-only (ADR 0018) and O5 user-managed storage and
-conversion (ADR 0020), so no bulk download, copy or conversion may be started by
+conversion (ADRs 0020-0021), so no bulk download, copy or conversion may be started by
 an agent without a task naming artifact, revision, expected size and retention.
 See
 [the closure handover](../handovers/2026-09-12-m1-closure-to-m2.md) for M1's

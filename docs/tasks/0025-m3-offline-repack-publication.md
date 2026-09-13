@@ -6,11 +6,12 @@ Status: **proposed, contract only; no implementation or acceptance claimed**.
 
 - Task ID 0025; M3 item 1. Engineering assignment: shared offline publication
   slice. Reviewer/acceptance: repository owner under the existing review process.
-- Writable root `/home/rodrigo/Developer/moxie`, branch `main`, base
-  `645e75902ea6bd201f60ac78628178ddc734d985`. Initial dirty work belongs to task
-  0024's importer/review corrections, workspace-wide corrections and the repack
-  wording handover. This contract and ADR 0022 are new; preserve all prior edits.
-  Re-record exact dirty paths and implementation base before activating.
+- Writable root `/home/rodrigo/Developer/moxie`, branch `main`. **Base
+  re-recorded on 2026-09-13 as `adf47cb` with a clean tree**, as this contract
+  asked: it was authored at `645e75902ea6bd201f60ac78628178ddc734d985` while
+  task 0024's corrections were still in flight. Those are committed and pushed;
+  ADRs 0021/0022 and this contract are committed at `74e0709`. Re-record again
+  if the tree has moved before implementation starts.
 - Legacy root `/home/rodrigo/Developer/strata`, read-only at
   `2dc566eb8e440fff4837ac75ca1dad1b20c2264e`; checkpoint roots `/models` and
   `/fast/models` remain read-only to the implementing agent.
@@ -28,9 +29,12 @@ Status: **proposed, contract only; no implementation or acceptance claimed**.
 - O1–O5 already resolved. No full artifact materialization, source copy or download
   is authorized. O6/O7 remain open; timings here cannot establish speed targets.
 - Commit this contract before implementation or acceptance tests. Placement is
-  settled by ADR 0022. Task 0024 remains unaccepted: acceptance of this task's
-  asymmetric lane depends on its accepted importer contract/corrections; do not
-  implicitly accept it by using it.
+  settled by ADR 0022. **Task 0024 is accepted by the owner on 2026-09-13**,
+  after three rounds of independent review, so the dependency this contract
+  recorded as unmet is met: its importer contract and corrections are the
+  accepted asymmetric lane. Its acceptance is **importer-only** — no W4A16
+  execution, no model-output quality, no cross-shard resolution — so consuming
+  it here inherits that boundary rather than widening it.
 
 ## Bounded deliverable
 

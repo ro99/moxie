@@ -18,6 +18,14 @@ its sign** are **measured** against the artifacts' own codes rather than taken
 from the pinned library. **Import is not execution**: nothing consumes a
 canonical INT4 tensor, and W4A16 is M3 item 3.
 
+**The next task is [task 0025](../tasks/0025-m3-offline-repack-publication.md),
+M3 item 1's bounded offline repack and canonical publication** — proposed,
+contract only. That handover's own "next task" section named M3 item 3 when it
+was written, before ADRs 0021/0022 and task 0025 existed; it is corrected in
+place and the reasoning is recorded there. Repack is item 1, the importers are
+item 2, and ADR 0021 ties M3's exit clause to the program that publishes what
+the evidence is about.
+
 [Task 0023 accepted; M3 is authorized](2026-09-13-task0023-whole-working-set-trace.md)
 precedes it, and is M2's last task. M2 item 5's remainder — byte and cost traces
 reconciled with the resource ledger across a **whole working set** rather than

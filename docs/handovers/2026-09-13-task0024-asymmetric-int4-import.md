@@ -278,22 +278,48 @@ has measured.
 
 ## Next task
 
-**M3 item 3 — shared W4A16/W8A16 dense and expert paths — is the one that turns
-every imported tensor into something.** It is the largest remaining gap in the
-milestone and the reason nothing in this repository executes a quantized weight.
-Document 03 bounds it before it starts: weight-only paths with BF16 preferred
-and FP32 accumulation, **not** INT4×INT4 or INT8×INT8 MMA; SM86 first with SM120
-qualified **separately**; and "bounded reference dequantization is not an
-acceptable final fast path by assertion" — shared bounded dequantization plus a
-BF16 GEMM is the correctness fallback, not a claimed result. Dense GEMM
-qualification does not qualify routed or grouped MoE.
+**Task 0025 — M3 item 1's bounded offline repack and canonical publication.**
+Its contract is authored and committed at `74e0709` by a concurrent agent and
+its status is *proposed*.
 
-The alternative, if a smaller step is wanted first, is **item 2's remainder**:
-the group-128 symmetric INT4 import, whose real content is the `actorder:
-"static"` question above rather than the packing, which this importer already
-handles.
+**This section originally named M3 item 3 and that was wrong.** It was written
+before [ADR 0021](../decisions/adr/0021-repack-is-a-moxie-program.md),
+[ADR 0022](../decisions/adr/0022-user-programs-and-canonical-write-authority.md)
+and [task 0025](../tasks/0025-m3-offline-repack-publication.md) existed. Three
+things decide it the other way:
+
+1. **Roadmap order.** Repack is item **1**; the importers this task extended are
+   item 2, delivered ahead of it. Item 3 is later still.
+2. **ADR 0021 assigns it explicitly** — repack "is built under M3 item 1" — and
+   says M3's exit clause, *"lossless (repack) claims have source-oracle
+   evidence"*, **cannot close without the program that publishes what the
+   evidence is about.**
+3. **Nothing persists what this task imports.** The importer produces canonical
+   `AffineTensor`s in memory that no manifest holds and no reader round-trips.
+   A kernel built before that has nothing to execute from but a test fixture.
+
+**Two of task 0025's stated preconditions have since moved**, and its own
+contract asks that they be re-recorded before it is activated: its base is
+`645e759` with a dirty tree, and it says "task 0024 remains unaccepted ... do
+not implicitly accept it by using it." Task 0024 **is** accepted, at
+`adf47cb`, on a clean tree. That note has been updated in place; nothing else
+of that contract was touched, because it is another agent's and its design
+decisions are not this task's to revise.
+
+**M3 item 3 — shared W4A16/W8A16 dense and expert paths — is what follows**, and
+it is still the largest gap in the milestone: nothing in this repository
+executes a quantized weight. Document 03 bounds it before it starts: weight-only
+paths with BF16 preferred and FP32 accumulation, **not** INT4×INT4 or INT8×INT8
+MMA; SM86 first with SM120 qualified **separately**; and "bounded reference
+dequantization is not an acceptable final fast path by assertion" — shared
+bounded dequantization plus a BF16 GEMM is the correctness fallback, not a
+claimed result. Dense GEMM qualification does not qualify routed or grouped MoE.
+
+**Item 2's own remainder is also open** and is smaller than either: the
+group-128 symmetric INT4 import, whose real content is the `actorder: "static"`
+question above rather than the packing, which this importer already handles.
 
 Either way the standing bound is unchanged: **Moxie never quantizes** (ADR
 0017), v1 quality is a bit-identical repack (ADR 0018), and **no
 agent-initiated bulk download, copy or conversion** may start without a task
-naming artifact, revision, expected size and retention (ADR 0020).
+naming artifact, revision, expected size and retention (ADRs 0020–0021).
