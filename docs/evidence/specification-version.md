@@ -16,9 +16,9 @@ SHA-256 of the raw file bytes:
 
 | Document | SHA-256 |
 |---|---|
-| `docs/spec/01-product-and-decisions.md` | `ac14455eea4aead0ce3e6f038b818609741194cbdfeba9d32fcdba540242ab3b` |
+| `docs/spec/01-product-and-decisions.md` | `ef092bf47eaaaaabbee8c91df79e6d70255b6500d827bd4890c4d912eb6f5c97` |
 | `docs/spec/02-architecture-and-common-api.md` | `7a458c89c4e12ad87eaa67cbf4aea2ec8381e0575e380beb046728355b460cfe` |
-| `docs/spec/03-memory-formats-and-cuda.md` | `1432619b97750185cd2679902df14ab902470601a3a66d87425a95f4529e4c5b` |
+| `docs/spec/03-memory-formats-and-cuda.md` | `7a3798b99b402ec4884029f8c836484bad31d7675dd08851c8fdf5eded7aa35f` |
 | `docs/spec/04-attention-parallelism-and-speculation.md` | `f13963ae01f14ae18ae9e8eedb0f3d1807ca560e4182ee887c79c5c38322c612` |
 | `docs/spec/05-sampling-api-and-cli.md` | `a5eb36d86efaf6532d40a18791e96a2dca4dc288f0ecfb77e63637b6c6c5f61a` |
 | `docs/spec/06-implementation-roadmap.md` | `a5d8ec79291578d3b4087de306e33777f1a17ac3448d515e80f23ff4813cb266` |
