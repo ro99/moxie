@@ -505,9 +505,9 @@ about its output.
   **every expert goes to the CPU candidate**, and a test asserts that. And the
   declared threshold is a **policy parameter, not a measured crossover** —
   measuring one is M6's.
-- **A whole working set, traced and reconciled: implemented**
-  ([task 0023](../tasks/0023-m2-whole-working-set-trace.md), 2026-09-13, awaiting
-  review and acceptance). **Every routed layer of this artifact has now been
+- **A whole working set, traced and reconciled: accepted**
+  ([task 0023](../tasks/0023-m2-whole-working-set-trace.md), 2026-09-13, after
+  three rounds of independent review). **Every routed layer of this artifact has now been
   executed, twice over, at two row shapes.**
 
   At a decode-shaped batch — two rows of top-k 8, a distinct route per layer,

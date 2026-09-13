@@ -4,8 +4,8 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 
 ## Active assignment
 
-**M1 complete (M1.5 closed 2026-09-12); M2 active, items 1 and 2 accepted and
-items 3, 4 and 5 awaiting review.** See the
+**M1 complete (M1.5 closed 2026-09-12); M2 active, items 1, 2 and 5 accepted and
+items 3 and 4 awaiting acceptance.** See the
 [task 0023 handover](docs/handovers/2026-09-13-task0023-whole-working-set-trace.md)
 for the current continuation, and the
 [closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
@@ -274,8 +274,11 @@ relabels the validation and the interpretation consistently. The two runs were
 still different; they were each other's. It is now checked against an oracle
 composed with each operand in the role its name says.
 
-**M2 item 5's remainder is implemented and awaits acceptance**
-([task 0023](docs/tasks/0023-m2-whole-working-set-trace.md), 2026-09-13): byte
+**M2 item 5's remainder is accepted** (2026-09-13, at `ad69a0a`, after three
+rounds of independent review — ten findings, four P1, all reproduced, all fixed,
+none disputed; the third recommended acceptance "within its declared M2
+engineering scope")
+([task 0023](docs/tasks/0023-m2-whole-working-set-trace.md)): byte
 and cost traces reconciled with the resource ledger across a **whole working
 set**. **Every routed layer of the designated artifact has executed, on all three
 GPUs, at two row shapes.** At a decode-shaped batch all 30 layers agree
@@ -287,8 +290,8 @@ was demanded, admitted and computed with** through a device cache holding one
 each other. **The activations are synthetic and the routes are written by the
 test**, the full-payload route *constructed* so its union is the whole expert
 set, so this is not model support, no quality claim follows and **no
-route-distribution claim follows either**. **It does not close M2**, which is the
-owner's.
+route-distribution claim follows either**. **The acceptance closes task 0023
+only, not M2**, which is the owner's separate decision.
 
 **The owner resolved O1–O5 on 2026-09-13** (`1e927ef`, ADRs 0017–0020), while
 task 0023 was being implemented. Three of them touch the active work and are

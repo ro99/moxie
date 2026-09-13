@@ -1,8 +1,12 @@
 # Handover — task 0023 implemented and corrected; M2's exit is one clause from complete
 
-**Task 0023 is implemented and corrected after three rounds of independent
-review — ten findings, four P1, all reproduced, all fixed, none disputed — and
-awaits owner acceptance.**
+**Task 0023 is accepted by the owner on 2026-09-13, at `ad69a0a`**, after three
+rounds of independent review — ten findings, four P1, all reproduced, all fixed,
+none disputed; the third reported no new blocking findings and recommended
+acceptance "within its declared M2 engineering scope".
+
+**The acceptance closes this trace assignment only.** It does not close M2, which
+is the owner's separate decision, and it establishes no model-quality claim.
 It delivers M2's exit clause on traces in the shape its contract declared before
 implementation: **a whole working set, out of device memory, with byte and cost
 traces reconciled against the resource ledger as named equalities.**
@@ -300,8 +304,11 @@ find. The sweep found it; reading the rule did not.
 
 ## Next task
 
-To be written after this task's review. The obvious candidates, in the roadmap's
-own order, are M3's importer for Laguna's asymmetric INT4 at group 32 with zero
-points packed along the output axis, and the two named gap tasks Laguna's
-attention tower needs — `softplus` output gating and the yarn rotary ramp —
-neither of which may be guessed.
+**Not yet authored.** M2 items 3 and 4 (tasks 0021 and 0022) are implemented,
+reviewed and still awaiting owner acceptance; M2's closure is the owner's
+separate decision and nothing here claims it. The obvious candidates, in the roadmap's own
+order, are M3's importer for Laguna's asymmetric INT4 at group 32 with zero
+points packed along the output axis — Laguna is number 8 of the v1 catalogue the
+owner pinned on 2026-09-13 — and the two named gap tasks its attention tower
+needs, `softplus` output gating and the yarn rotary ramp, neither of which may be
+guessed.

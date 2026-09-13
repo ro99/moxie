@@ -1,6 +1,13 @@
 # Task 0023 — M2 item 5's remainder and M2's exit: a whole working set's byte and cost trace, reconciled with the ledger
 
-Status: implemented; awaiting independent review and owner acceptance.
+Status: **accepted by the owner on 2026-09-13**, at `ad69a0a`, after three rounds
+of independent review — the third reporting no new blocking findings and
+recommending acceptance "within its declared M2 engineering scope".
+
+**The acceptance closes this trace assignment only. It does not close M2**, which
+is the owner's separate decision. And it establishes **no model-quality claim**:
+the activations are synthetic and the routes are written by the tests, one of
+them constructed so that its union is the whole expert set.
 
 Roadmap **M2's exit**, in full: "real out-of-device-memory working set executes
 without OOM or hidden allocations, matches the reference, and produces byte/cost
@@ -512,8 +519,9 @@ experts of a single layer and **one 240th** of the set it serves.
 
 ## Result, filled after work
 
-Status: **implemented 2026-09-13; awaiting independent review and owner
-acceptance.**
+Status: **accepted by the owner on 2026-09-13**, at `ad69a0a`, within its
+declared M2 engineering scope. The three review rounds found **ten** issues, four
+P1; all ten were reproduced and fixed and none was disputed.
 
 ### Changed shared owners and consumers
 
