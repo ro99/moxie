@@ -221,11 +221,13 @@ fn host_only_budget() -> ExpertBudget {
         device_pci_bus_id: BUS.into(),
         device_cache_cap_bytes: 0,
         device_cache_leased_bytes: 0,
+        device_cache_resident_bytes: 0,
         device_arena_free_bytes: 0,
         host_workspace_bytes: 1 << 20,
         host_buffer_bytes: 1 << 20,
         host_cache_cap_bytes: 1 << 30,
         host_cache_leased_bytes: 0,
+        host_cache_resident_bytes: 0,
         resident: ResidentChunks::none(),
     }
 }
@@ -1224,7 +1226,7 @@ fn an_unknown_submission_state_withholds_the_weight_leases() {
             _down: &moxie_memory::ResidencyLease,
             _staging: moxie_executor::grouped::ExpertStaging<'_>,
             _host_slots: &mut [u8],
-        ) -> Result<(), moxie_executor::grouped::LaunchRefused> {
+        ) -> Result<u32, moxie_executor::grouped::LaunchRefused> {
             // A faithful double quarantines itself, as the real attachment does:
             // one place decides that its ranges can never be released.
             self.quarantined = true;
@@ -1234,6 +1236,9 @@ fn an_unknown_submission_state_withholds_the_weight_leases() {
                     detail: "the event could not be recorded".into(),
                 },
                 submission_unknown: true,
+                // Both symbols went out; it is the event that could not be
+                // recorded, which is why the submission state is unknown.
+                submitted: 2,
             })
         }
         fn close(&mut self, _ledger: &mut Ledger) -> moxie_types::Result<()> {
@@ -1424,6 +1429,8 @@ fn a_failed_activation_load_ends_the_run() {
                     detail: "the activation copy could not be confirmed".into(),
                 },
                 submission_unknown: true,
+                // An activation copy is not a kernel launch.
+                submitted: 0,
             })
         }
         fn perform_upload(
@@ -1441,8 +1448,10 @@ fn a_failed_activation_load_ends_the_run() {
             _down: &moxie_memory::ResidencyLease,
             _staging: moxie_executor::grouped::ExpertStaging<'_>,
             _host_slots: &mut [u8],
-        ) -> Result<(), moxie_executor::grouped::LaunchRefused> {
-            Ok(())
+        ) -> Result<u32, moxie_executor::grouped::LaunchRefused> {
+            // One launch per symbol of the selected descriptor, as the
+            // production lane submits.
+            Ok(2)
         }
         fn close(&mut self, _ledger: &mut Ledger) -> moxie_types::Result<()> {
             Ok(())

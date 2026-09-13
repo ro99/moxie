@@ -98,6 +98,9 @@ through the device build would leave that independence untested.
 | `cargo xtask spec-check [--update]` | nothing | The normative specification is present and unmodified |
 | `cargo xtask index` | nothing | The command contracts and their required lanes |
 | `cargo test --workspace` | nothing | Host semantics, formats, state, sampling, protocol |
+| `cargo clippy --workspace --all-targets -- -D warnings` | nothing | The host lane's lints |
+| `cargo clippy --workspace --all-targets --features moxie-executor/driver -- -D warnings` | CUDA 13.0 | The executor's device code |
+| `cargo clippy --workspace --all-targets --features cuda -- -D warnings` | CUDA 13.0 | **`xtask`'s own device code.** A third lane, declared by task 0023: the first two do not compile it, and two lints stood in it unnoticed from task 0021 until an independent review ran this |
 | `cargo run -p moxie-cli -- diagnostic --shape b --prompt 0,1,2,3 --max-new 4 --chunk 3 --temperature 1 --seed 42` | host telemetry | Synthetic token-ID generation through the shared host-reference service; no checkpoint or GPU attention |
 | `cargo xtask-cuda test-gpu [--profile sm_NN]` | CUDA 13.0 + the cards | Real launches on every visible device; **fails** when a required architecture has no passing device |
 | `cargo xtask-cuda test-bf16-chain` | CUDA 13.0 + one card | Reduced H8/H17 selected semantic chain used by Compute Sanitizer |

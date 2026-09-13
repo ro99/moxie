@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use moxie_executor::grouped::{ExpertRoles, GroupedRun};
 use moxie_executor::residency::ShardSource;
-use moxie_executor::trace::{LayerSnapshot, LayerTrace, StepTrace};
+use moxie_executor::trace::{LayerSnapshot, LayerTrace, StepSnapshot, StepTrace};
 use moxie_graph::{CombineOrder, ExpertActivation, OpParams};
 use moxie_kernels::cpu_expert::to_bf16_bits;
 use moxie_memory::{
@@ -35,10 +35,21 @@ use moxie_types::{DeviceUuid, Scope, StrategyControl};
 
 thread_local! {
     static CALLS: Cell<usize> = const { Cell::new(0) };
+    /// Bytes allocated minus bytes freed, on this thread.
+    ///
+    /// A review inserted a deliberate 1 MiB leak per layer and the gate still
+    /// passed at 236 allocations per layer: a count of *calls* cannot see a
+    /// leak, because a leak is one call whose bytes never come back. Live bytes
+    /// can, and this file now measures both.
+    static LIVE: Cell<isize> = const { Cell::new(0) };
 }
 
 fn calls() -> usize {
     CALLS.try_with(Cell::get).unwrap_or(0)
+}
+
+fn live() -> isize {
+    LIVE.try_with(Cell::get).unwrap_or(0)
 }
 
 struct Counter;
@@ -51,10 +62,12 @@ unsafe impl GlobalAlloc for Counter {
             // `try_with` and no allocation of its own: this runs inside the
             // allocator, and a counter that allocated would recurse.
             let _ = CALLS.try_with(|c| c.set(c.get() + 1));
+            let _ = LIVE.try_with(|c| c.set(c.get() + layout.size() as isize));
         }
         pointer
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        let _ = LIVE.try_with(|c| c.set(c.get() - layout.size() as isize));
         // SAFETY: pointer and layout describe the original live allocation.
         unsafe { System.dealloc(pointer, layout) };
     }
@@ -149,10 +162,21 @@ fn source(path: &Path) -> ShardSource {
     src
 }
 
-/// A whole working set of `LAYERS` identical layers, measuring each one.
-#[test]
-fn a_traced_layer_costs_the_same_however_many_came_before_it() {
-    let dir = std::env::temp_dir().join(format!("moxie-step-alloc-{}", std::process::id()));
+/// What one run of the whole working set cost the heap, layer by layer.
+struct Measurement {
+    /// Allocator calls per layer.
+    calls: Vec<usize>,
+    /// Bytes still live after each layer: what the step **retained**.
+    retained: Vec<isize>,
+    /// Allocator calls to assemble the step's trace.
+    assembly: usize,
+    equalities: u32,
+}
+
+/// Run `LAYERS` identical layers, measuring each, and leak `leak_bytes` per
+/// layer on purpose when asked.
+fn measure(name: &str, leak_bytes: usize) -> Measurement {
+    let dir = std::env::temp_dir().join(format!("moxie-step-alloc-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let (path, x) = write_shard(&dir);
@@ -168,6 +192,7 @@ fn a_traced_layer_costs_the_same_however_many_came_before_it() {
         Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 26, 1 << 20).unwrap()]).unwrap();
     let mut authority =
         ResidencyAuthority::open(&mut ledger, &ResidencyRequest::new("step", union)).unwrap();
+    let start = StepSnapshot::take(&authority).unwrap();
 
     let mlp = OpParams::ExpertMlp {
         hidden: HIDDEN,
@@ -190,6 +215,7 @@ fn a_traced_layer_costs_the_same_however_many_came_before_it() {
     };
 
     let mut per_layer = Vec::new();
+    let mut retained: Vec<isize> = Vec::new();
     let mut traces: Vec<LayerTrace> = Vec::new();
     for layer in 0..LAYERS {
         let budget = ExpertBudget {
@@ -197,11 +223,13 @@ fn a_traced_layer_costs_the_same_however_many_came_before_it() {
             device_pci_bus_id: BUS.into(),
             device_cache_cap_bytes: 0,
             device_cache_leased_bytes: 0,
+            device_cache_resident_bytes: 0,
             device_arena_free_bytes: 0,
             host_workspace_bytes: 1 << 20,
             host_buffer_bytes: 1 << 20,
             host_cache_cap_bytes: union,
             host_cache_leased_bytes: 0,
+            host_cache_resident_bytes: 0,
             resident: ResidentChunks::none(),
         };
         let roles = ExpertRoles {
@@ -212,8 +240,9 @@ fn a_traced_layer_costs_the_same_however_many_came_before_it() {
         };
 
         let before = calls();
+        let live_before = live();
         let plan = compile_experts(&mlp, &combine, &ROUTE, &budget, &policy, None, None).unwrap();
-        let snapshot = LayerSnapshot::take(layer, &authority);
+        let snapshot = LayerSnapshot::take(layer, &authority).unwrap();
         let mut run = GroupedRun::admit(&mut ledger, plan, roles, None).unwrap();
         run.load_activations(&x).unwrap();
         run.run_to_completion(
@@ -224,52 +253,117 @@ fn a_traced_layer_costs_the_same_however_many_came_before_it() {
             u64::MAX,
         )
         .unwrap();
-        let trace = snapshot.close(&run, &authority, &ledger);
+        let trace = snapshot.close(&run, &authority, &ledger).unwrap();
         run.close(&mut ledger).unwrap();
         authority.end_turn(TurnId::new(u64::from(layer) + 1));
         let after = calls();
         per_layer.push(after - before);
+        // A deliberate leak, when this run asks for one, **inside** the layer's
+        // measurement window: a leak between two windows is not this layer's,
+        // and a gate nobody has seen fail is a gate nobody has measured.
+        if leak_bytes > 0 {
+            let leak: Vec<u8> = Vec::with_capacity(leak_bytes);
+            core::mem::forget(leak);
+        }
+        retained.push(live() - live_before);
         traces.push(trace);
     }
 
-    println!("traced layer heap requests, layer by layer: {per_layer:?}");
-
-    // The first two layers are the warm-up: layer 0 admits into an empty cache
-    // and layer 1 is the first to evict. From layer 2 the work is identical, so
-    // the cost must be too.
-    let steady = &per_layer[2..];
-    let first = steady[0];
-    assert!(
-        steady.iter().all(|n| *n == first),
-        "a traced layer's heap cost changes with the layers before it: {per_layer:?}"
-    );
-    println!(
-        "steady state: {first} heap request(s) per traced layer, identical across layers 2..{}",
-        LAYERS
-    );
-
-    // And the step's own assembly, measured separately, because a trace that was
-    // cheap per layer and expensive to close would still be an unbounded step.
     authority.retire_all(Scope::Host);
     authority.close(&mut ledger).unwrap();
     let before = calls();
     let step = StepTrace::new(
-        artifact().as_str(),
-        "allocation probe",
+        artifact().as_str().to_string(),
+        "allocation probe".to_string(),
         traces,
+        &start,
         &authority,
         &ledger,
-    );
+    )
+    .unwrap();
     let assembled = calls() - before;
     let report = step.reconcile().expect("the probe's trace reconciles");
+    Measurement {
+        calls: per_layer,
+        retained,
+        assembly: assembled,
+        equalities: report.equalities_checked,
+    }
+}
+
+/// The gate: a layer costs the same however many came before it, and the step
+/// retains a bounded, declared amount per layer.
+///
+/// **Both halves are required, and the second was missing.** A review inserted a
+/// deliberate 1 MiB leak per layer and this file still passed at 236 allocator
+/// calls per layer, because a count of calls cannot see a leak: a leak is one
+/// call whose bytes never come back. The second case below makes the same
+/// injection and requires the criterion to reject it, so the gate is one
+/// somebody has watched fail.
+#[test]
+fn a_traced_layer_costs_the_same_and_retains_a_bounded_amount() {
+    let clean = measure("clean", 0);
     println!(
-        "step assembly: {assembled} heap request(s) for {} layer(s); reconcile checked {} \
-         equalities",
-        step.layers.len(),
-        report.equalities_checked
+        "traced layer heap requests, layer by layer: {:?}",
+        clean.calls
+    );
+    println!("bytes retained per layer: {:?}", clean.retained);
+
+    // The first two layers are the warm-up: layer 0 admits into an empty cache
+    // and layer 1 is the first to evict. From layer 2 the work is identical, so
+    // the cost must be too.
+    let steady = &clean.calls[2..];
+    let first = steady[0];
+    assert!(
+        steady.iter().all(|n| *n == first),
+        "a traced layer's heap cost changes with the layers before it: {:?}",
+        clean.calls
+    );
+
+    // What a layer legitimately retains is its own trace record, and nothing
+    // else: the plan, the run and its buffers are all released before the
+    // measurement. The bound is declared here rather than derived, and it is the
+    // number the leak case has to break.
+    const RETAINED_PER_LAYER: isize = 4 * 1024;
+    let worst = clean.retained[2..].iter().copied().max().unwrap_or(0);
+    assert!(
+        worst <= RETAINED_PER_LAYER,
+        "a traced layer retained {worst} B, above the declared {RETAINED_PER_LAYER} B: {:?}",
+        clean.retained
+    );
+    println!(
+        "steady state: {first} heap request(s) and at most {worst} B retained per traced layer, \
+         against a declared bound of {RETAINED_PER_LAYER} B"
+    );
+    println!(
+        "step assembly: {} heap request(s) for {LAYERS} layer(s); reconcile checked {} equalities",
+        clean.assembly, clean.equalities
     );
     assert!(
-        assembled < 8 * LAYERS as usize,
-        "assembling a step trace cost {assembled} allocation(s) for {LAYERS} layer(s)"
+        clean.assembly < 8 * LAYERS as usize,
+        "assembling a step trace cost {} allocation(s) for {LAYERS} layer(s)",
+        clean.assembly
+    );
+
+    // The substitution: one megabyte per layer that never comes back.
+    const LEAK: usize = 1 << 20;
+    let leaky = measure("leaky", LEAK);
+    let leaked = leaky.retained[2..].iter().copied().max().unwrap_or(0);
+    assert!(
+        leaked > RETAINED_PER_LAYER,
+        "a {LEAK} B per-layer leak was not visible to this gate: {:?}",
+        leaky.retained
+    );
+    // And the call count, which is what the gate used to be, does **not** see it.
+    let leaky_steady = &leaky.calls[2..];
+    assert!(
+        leaky_steady.iter().all(|n| *n == leaky_steady[0]),
+        "the leak changed the call count, so this substitution proves less than it should: {:?}",
+        leaky.calls
+    );
+    println!(
+        "substitution: a {LEAK} B per-layer leak retains {leaked} B per layer and is rejected, \
+         while its call count stays flat at {} -- which is why the byte measurement exists",
+        leaky_steady[0]
     );
 }

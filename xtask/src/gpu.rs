@@ -2084,124 +2084,6 @@ fn concurrent_handoff(cap: &DeviceCapability) -> Result<Outcome, Error> {
     Ok(Outcome::Passed)
 }
 
-#[cfg(test)]
-mod task_0012_negative_fixtures {
-    use super::*;
-
-    #[test]
-    fn nonfinite_metrics_fail_closed() {
-        let summary = bound_summary(&[f32::NAN], &[0.0], &[1.0]);
-        assert!(summary.max_normalized.is_infinite());
-        let summary = bound_summary(&[0.0], &[f64::INFINITY], &[1.0]);
-        assert!(summary.max_normalized.is_infinite());
-    }
-
-    #[test]
-    fn forbidden_semantic_substitutions_fail_the_real_acceptance_gate() {
-        // This BF16 vector lands exactly on a BF16 tie in ascending FP32
-        // accumulation. Reversing the adds nudges it above the tie, changing
-        // the stored BF16 bit pattern even though both results satisfy the
-        // ordinary analytical rounding bound.
-        let terms = [
-            6.1875f32,
-            f32::from_bits(0x3580_0000), // 2^-20
-            7.375,
-            4.875,
-            f32::from_bits(0x3600_0000), // 2^-19
-            7.0625,
-            1.375,
-            7.75,
-        ];
-        let mut ascending = 0.0f32;
-        for value in &terms {
-            ascending += *value;
-        }
-        let mut reversed = 0.0f32;
-        for value in terms.iter().rev() {
-            reversed += *value;
-        }
-        let mut ascending_bits = vec![0; 8];
-        ascending_bits[0] = host_f32_to_bf16_bits(ascending);
-        let mut reversed_bits = vec![0; 8];
-        reversed_bits[0] = host_f32_to_bf16_bits(reversed);
-        let mut identity_row = vec![0.0; 64];
-        identity_row[..8].fill(1.0);
-        let (linear_want, linear_bounds) = linear_equation(1, 8, &terms, &identity_row);
-        assert!(primitive_accepted(
-            &ascending_bits,
-            &linear_want,
-            &linear_bounds,
-            Some(&ascending_bits),
-        ));
-        assert!(!primitive_accepted(
-            &reversed_bits,
-            &linear_want,
-            &linear_bounds,
-            Some(&ascending_bits),
-        ));
-
-        // Feed a deliberately unrounded Linear result into RMSNorm. The same
-        // per-node fixed-bound gate used above rejects the substituted output.
-        let unrounded = [-2.312_744_1f32, 1.878_906_2];
-        let rounded: Vec<_> = unrounded
-            .iter()
-            .map(|value| bf16_value(host_f32_to_bf16_bits(*value)))
-            .collect();
-        let mut sum = 0.0f32;
-        for value in unrounded {
-            sum += value * value;
-        }
-        let denom = (sum / 2.0 + 1e-5).sqrt();
-        let omitted_boundary_bits: Vec<_> = unrounded
-            .iter()
-            .map(|value| host_f32_to_bf16_bits(*value / denom))
-            .collect();
-        let (rms_want, rms_bounds) = rms_equation(1, 2, 1e-5, &rounded, &[1.0, 1.0]);
-        assert!(!primitive_accepted(
-            &omitted_boundary_bits,
-            &rms_want,
-            &rms_bounds,
-            None,
-        ));
-
-        let norm_input = [10.0f32, 11.0, 12.0, 13.0];
-        let (rms_want, rms_bounds) = rms_equation(1, 4, 1e-5, &norm_input, &[1.0; 4]);
-        let mean = norm_input.iter().sum::<f32>() / 4.0;
-        let variance = norm_input
-            .iter()
-            .map(|value| (*value - mean) * (*value - mean))
-            .sum::<f32>()
-            / 4.0;
-        let layer_denom = (variance + 1e-5).sqrt();
-        let layer_bits: Vec<_> = norm_input
-            .iter()
-            .map(|value| host_f32_to_bf16_bits((*value - mean) / layer_denom))
-            .collect();
-        assert!(!primitive_accepted(
-            &layer_bits,
-            &rms_want,
-            &rms_bounds,
-            None,
-        ));
-
-        let input = [1.0f32, -2.0];
-        let residual = [10.0f32, 20.0];
-        let once: Vec<_> = input.iter().zip(residual).map(|(a, b)| *a + b).collect();
-        let twice: Vec<_> = once.iter().zip(residual).map(|(a, b)| *a + b).collect();
-        let twice_bits: Vec<_> = twice
-            .iter()
-            .map(|value| host_f32_to_bf16_bits(*value))
-            .collect();
-        let (residual_want, residual_bounds) = residual_equation(&input, &residual);
-        assert!(!primitive_accepted(
-            &twice_bits,
-            &residual_want,
-            &residual_bounds,
-            None,
-        ));
-    }
-}
-
 /// Task 0021's grouped expert kernel against task 0019's oracle, on real
 /// hardware, for both gate transforms.
 ///
@@ -2386,10 +2268,126 @@ fn grouped_expert_mlp(cap: &DeviceCapability) -> Result<Outcome, Error> {
         }
     }
 
-    Ok(Outcome::Passed).map(|outcome| {
-        // The count is part of the claim: "matches the oracle" over five
-        // components would be a different statement.
-        println!("      grouped expert: {compared} BF16 components bit-identical");
-        outcome
-    })
+    // The count is part of the claim: "matches the oracle" over five components
+    // would be a different statement.
+    println!("      grouped expert: {compared} BF16 components bit-identical");
+    Ok(Outcome::Passed)
+}
+
+#[cfg(test)]
+mod task_0012_negative_fixtures {
+    use super::*;
+
+    #[test]
+    fn nonfinite_metrics_fail_closed() {
+        let summary = bound_summary(&[f32::NAN], &[0.0], &[1.0]);
+        assert!(summary.max_normalized.is_infinite());
+        let summary = bound_summary(&[0.0], &[f64::INFINITY], &[1.0]);
+        assert!(summary.max_normalized.is_infinite());
+    }
+
+    #[test]
+    fn forbidden_semantic_substitutions_fail_the_real_acceptance_gate() {
+        // This BF16 vector lands exactly on a BF16 tie in ascending FP32
+        // accumulation. Reversing the adds nudges it above the tie, changing
+        // the stored BF16 bit pattern even though both results satisfy the
+        // ordinary analytical rounding bound.
+        let terms = [
+            6.1875f32,
+            f32::from_bits(0x3580_0000), // 2^-20
+            7.375,
+            4.875,
+            f32::from_bits(0x3600_0000), // 2^-19
+            7.0625,
+            1.375,
+            7.75,
+        ];
+        let mut ascending = 0.0f32;
+        for value in &terms {
+            ascending += *value;
+        }
+        let mut reversed = 0.0f32;
+        for value in terms.iter().rev() {
+            reversed += *value;
+        }
+        let mut ascending_bits = vec![0; 8];
+        ascending_bits[0] = host_f32_to_bf16_bits(ascending);
+        let mut reversed_bits = vec![0; 8];
+        reversed_bits[0] = host_f32_to_bf16_bits(reversed);
+        let mut identity_row = vec![0.0; 64];
+        identity_row[..8].fill(1.0);
+        let (linear_want, linear_bounds) = linear_equation(1, 8, &terms, &identity_row);
+        assert!(primitive_accepted(
+            &ascending_bits,
+            &linear_want,
+            &linear_bounds,
+            Some(&ascending_bits),
+        ));
+        assert!(!primitive_accepted(
+            &reversed_bits,
+            &linear_want,
+            &linear_bounds,
+            Some(&ascending_bits),
+        ));
+
+        // Feed a deliberately unrounded Linear result into RMSNorm. The same
+        // per-node fixed-bound gate used above rejects the substituted output.
+        let unrounded = [-2.312_744_1f32, 1.878_906_2];
+        let rounded: Vec<_> = unrounded
+            .iter()
+            .map(|value| bf16_value(host_f32_to_bf16_bits(*value)))
+            .collect();
+        let mut sum = 0.0f32;
+        for value in unrounded {
+            sum += value * value;
+        }
+        let denom = (sum / 2.0 + 1e-5).sqrt();
+        let omitted_boundary_bits: Vec<_> = unrounded
+            .iter()
+            .map(|value| host_f32_to_bf16_bits(*value / denom))
+            .collect();
+        let (rms_want, rms_bounds) = rms_equation(1, 2, 1e-5, &rounded, &[1.0, 1.0]);
+        assert!(!primitive_accepted(
+            &omitted_boundary_bits,
+            &rms_want,
+            &rms_bounds,
+            None,
+        ));
+
+        let norm_input = [10.0f32, 11.0, 12.0, 13.0];
+        let (rms_want, rms_bounds) = rms_equation(1, 4, 1e-5, &norm_input, &[1.0; 4]);
+        let mean = norm_input.iter().sum::<f32>() / 4.0;
+        let variance = norm_input
+            .iter()
+            .map(|value| (*value - mean) * (*value - mean))
+            .sum::<f32>()
+            / 4.0;
+        let layer_denom = (variance + 1e-5).sqrt();
+        let layer_bits: Vec<_> = norm_input
+            .iter()
+            .map(|value| host_f32_to_bf16_bits((*value - mean) / layer_denom))
+            .collect();
+        assert!(!primitive_accepted(
+            &layer_bits,
+            &rms_want,
+            &rms_bounds,
+            None,
+        ));
+
+        let input = [1.0f32, -2.0];
+        let residual = [10.0f32, 20.0];
+        let once: Vec<_> = input.iter().zip(residual).map(|(a, b)| *a + b).collect();
+        let twice: Vec<_> = once.iter().zip(residual).map(|(a, b)| *a + b).collect();
+        let twice_bits: Vec<_> = twice
+            .iter()
+            .map(|value| host_f32_to_bf16_bits(*value))
+            .collect();
+        let (residual_want, residual_bounds) = residual_equation(&input, &residual);
+        assert!(!primitive_accepted(
+            &twice_bits,
+            &residual_want,
+            &residual_bounds,
+            None,
+        ));
+    }
 }

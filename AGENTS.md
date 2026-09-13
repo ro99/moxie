@@ -305,13 +305,50 @@ keeps every timing in these records a diagnostic. The paragraphs below, and task
 they are left as they were, because rewriting a record to match a later ruling
 erases what was true when it was written.
 
-**Reconciled means a named equality, not a printed report.** Fourteen of them
+**Reconciled means a named equality, not a printed report.** Seventeen of them
 tie the ledger's charges, the run's own record and the planner's prediction to
 the residency authority's per-scope byte flow, and **each has a fixture that
 violates it** — a `reconcile()` that can only succeed is a stub. **The trace
 counts nothing**: every number is read from an owner and a layer's record is the
 difference of two snapshots. The `arch-check` rule against a second residency
 owner now rejects a second *byte* owner too.
+
+**A comparison is worth nothing when both its sides can come from the wrong
+place, or when neither is the quantity it names.** That is four of the six
+findings an independent review made against this task, and it is the sentence to
+carry. A trace read from a **different, empty ledger** reconciled a completed run
+with no charges at all, because empty equals empty. A step that **omitted an
+executed layer** reconciled 35 checks, because its totals were derived from the
+records it was handed and then re-summed from the same records — a step needs its
+own boundary, taken before its first layer, and now has one. The **launch
+equality compared groups** where the device submits one kernel per *symbol*: a
+check added *because* mutation testing found the counter unchecked, then written
+against the wrong quantity. And the **"exact" prediction was unsound for the
+third time**, each time for the same reason — it reasoned about *this plan's
+share* of a cache, and eviction does not. A warm chunk a layer needed was older
+in LRU than an unrelated cached chunk, so the layer's own admissions evicted the
+chunk it had predicted a hit on: **3,840 B read against 3,072 B predicted
+exactly**. Exactness now means **nothing has to be evicted**.
+
+**A trace runs inside a generation step, so it may not abort.** The review's P1:
+one injected allocation failure before a snapshot gave **SIGABRT**. Task 0019's
+rule, for the **fifth** time in this workspace, on a path added after the
+previous four. Every collection the trace builds is reserved fallibly, **none is
+a `BTreeMap`** — it has no fallible insert, so a map there would abort however
+carefully the rest reserved — the owners hand their numbers out through visitors
+that allocate nothing, and the snapshots are deliberately **not `Clone`**.
+
+**A gate that counts calls cannot see a leak.** The allocation gate compared
+allocator *call counts* between layers and a deliberate **1 MiB per layer** leak
+passed it. It measures live bytes now, declares what a layer may retain, and
+performs the leak substitution itself — the gate is one somebody has watched
+fail.
+
+**A lane nobody runs is a lane that holds failures.** The same review found two
+clippy lints standing in `xtask/src/gpu.rs` since task 0021. The declared gates
+named a host clippy lane and a `--features moxie-executor/driver` one, and
+**neither compiles `xtask`'s CUDA code**. `cargo clippy --workspace
+--all-targets --features cuda` is a third lane and is now declared.
 
 **Three quantities the accounting did not have, and could not be reconciled
 without.** A device upload whose host source was already resident was counted as

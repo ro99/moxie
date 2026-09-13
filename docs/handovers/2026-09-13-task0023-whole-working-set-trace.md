@@ -1,6 +1,8 @@
-# Handover — task 0023 implemented; M2's exit is one clause from complete
+# Handover — task 0023 implemented and corrected; M2's exit is one clause from complete
 
-**Task 0023 is implemented and awaits independent review and owner acceptance.**
+**Task 0023 is implemented, corrected after one round of independent review —
+six findings, one P1, all reproduced, all fixed, none disputed — and awaits
+owner acceptance.**
 It delivers M2's exit clause on traces in the shape its contract declared before
 implementation: **a whole working set, out of device memory, with byte and cost
 traces reconciled against the resource ledger as named equalities.**
@@ -32,8 +34,9 @@ had done.
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy (`--features moxie-executor/driver`) | passed |
-| `cargo test --workspace --locked --offline` | **923 passed, 0 failed** (918 at `aeac114`) |
-| Device-feature workspace tests | **958 passed, 0 failed** (951 at `aeac114`) |
+| CUDA-lane clippy (`--features cuda`) | passed — **a third lane, declared by this task**; it was failing on two lints standing since task 0021 |
+| `cargo test --workspace --locked --offline` | **927 passed, 0 failed** (918 at `aeac114`) |
+| Device-feature workspace tests | **962 passed, 0 failed** (951 at `aeac114`) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | zero failures, 79 rejected fixtures, 21 accepted, 13 rules |
@@ -43,11 +46,13 @@ tests and **951** device-feature tests. Task 0022's own record says why: its
 first attempt at the same comparison was taken on a half-built tree and read a
 number that was wrong.
 
-**Mutation measurement: 30 of 30 caught, 0 survivors**
+**Mutation measurement: 36 of 36 caught, 0 survivors**, over four rounds
 ([experiment 0004](../evidence/experiments/0004-task0023-whole-working-set-trace.md)).
-The first measurement was **27 of 30**, and every one of the three survivors was
-a defect rather than an opinion about test strength: a missing equality, an
-unchecked counter, and a property with no fixture at all.
+The first was 27 of 30; the third, after the review's six fixes, was 34 of 36.
+**Every survivor in every round was a defect or a missing fixture**, and two of
+them were checks added in response to an earlier finding that nothing had yet
+violated — a check added because something was found is not itself checked until
+something violates it.
 
 ### What executed
 
@@ -58,9 +63,13 @@ on all three GPUs.**
 unions of twelve or thirteen experts, **4,543,807,488 B** demanded. Run in a
 roomy cache and a tight one on each card. **Every layer's device slot buffer is
 bitwise equal to the CPU candidate's over the same bytes, on every card.** The
-roomy configuration produced an exact prediction on all 30 layers and the tight
-one on none — 292 backpressure drains and 1,517 evictions per card — and the test
-asserts both, so neither branch can quietly stop being reached.
+roomy configuration produced an exact prediction on all 30 layers with **zero
+evictions**, and the tight one an exact prediction on none with 1,517 evictions
+and 292 backpressure drains; the test asserts both, so neither branch can quietly
+stop being reached. Roomy is sized for the **whole step** rather than one layer,
+which is the review's second finding: a prediction is an equality only when
+nothing has to be evicted, and a one-layer cache evicts the previous layer to
+admit this one.
 
 `whole-set-full` — 30 layers, sixteen rows whose routes partition the expert set,
 so each layer's union is all 128 experts: **45,675,970,560 B demanded and
@@ -92,23 +101,67 @@ is capped — true, and weaker. A batch whose union is the whole expert set is
 42.5 GiB against a 24 GiB card and needs no ratio argument to be oversized. Both
 run so that neither carries the other's claim.
 
-**"Reconciled" is fourteen named equalities, and every one of them can fail.**
-Three tie the ledger to what is held, five tie the run's own record to the
-authority's bytes, four are the planner's prediction, one pins the schema and one
-requires the step's totals to be its layers'.
+### The review, and what its six findings have in common
+
+**Four of the six are one sentence: a comparison is worth nothing when both its
+sides can come from the wrong place, or when neither is the quantity it names.**
+
+1. **P1.** One injected allocation failure before a snapshot gave **SIGABRT**.
+   That is task 0019's rule for the **fifth** time in this workspace, on a path
+   added after the previous four. Every collection the trace builds is reserved
+   fallibly now, none is a `BTreeMap` — which has no fallible insert and would
+   abort however carefully the rest reserved — and the owners hand their numbers
+   out through visitors that allocate nothing.
+2. **The exact prediction was unsound**, for the third time and each time for the
+   same reason: it reasoned about *this plan's share* of a cache, and eviction
+   does not. A warm chunk this layer needed was older in LRU than an unrelated
+   cached chunk, so the layer's own admissions evicted exactly the chunk it
+   predicted a hit on: **3,840 B read against 3,072 B predicted exactly**.
+   Exactness now means **nothing has to be evicted**, which is about the whole
+   cache.
+3. **An omitted layer reconciled.** Totals were derived from the records supplied
+   and then re-summed from the same records; three layers ran, the middle one was
+   dropped, and **35 checks passed** while 11,520 B of reads went unmentioned. A
+   step needs its own boundary, and it has one.
+4. **A different, empty ledger reconciled** a completed run with no charges at
+   all. Which ledger is checked before what it says.
+5. **The launch counter counted groups, not launches** — the device path submits
+   one kernel per symbol — so an equality added *because* mutation testing found
+   the counter unchecked was then written against the wrong quantity. Adding a
+   check is not the same as checking the right thing.
+6. **The allocation gate could not see a leak**, because it counted calls and a
+   leak is one call whose bytes never come back. It measures live bytes now and
+   **performs the leak substitution itself**.
+
+**And a lane nobody had run.** Two clippy lints in `xtask/src/gpu.rs`, untouched
+by this task and standing since task 0021, are fixed here rather than recorded as
+pre-existing. They stood because the declared gates name a host clippy lane and a
+`--features moxie-executor/driver` one, and **neither compiles `xtask`'s CUDA
+code**. `cargo clippy --workspace --all-targets --features cuda` is a third lane
+and is now one of this task's gates.
+
+**"Reconciled" is seventeen named equalities, and every one of them can fail.**
+Five tie the ledger to what is held — including **which** ledger, and whether
+every reservation this step can name is in it. Five tie the run's own record to
+the authority's bytes. Four are the planner's prediction, one pins the schema,
+and two are the step's own boundary: its totals must be its layers', and its
+layers must account for every byte that entered a cache inside it.
 The name is what a failure reports. A violation battery mutates one number of a
 trace that reconciles and requires the equality that number belongs to be the one
-reported: **19 mutations over all fourteen**, plus three against the lower-bound
+reported: **22 mutations over all seventeen**, plus three against the lower-bound
 branch — which fails on being *below* a bound rather than on differing from it —
 and three against a layer that did not finish.
 
 **A prediction is an equality or a declared lower bound, and the planner says
-which.** A layer whose whole live set fits the displaceable cache admits every
-chunk once, so its prediction is an equality and one extra admitted byte is a
-defect. A layer that does not can lose a chunk to eviction between a backpressure
-refusal and the retry that follows, and admit it twice; what it can state exactly
-is a lower bound. Both branches have an acceptance case, because an unreachable
-branch is a stub.
+which.** A layer that can be run **without evicting anything** admits every chunk
+once and keeps every chunk it predicted a hit on, so its prediction is an
+equality and one extra admitted byte is a defect. A layer that cannot can lose a
+chunk between a backpressure refusal and the retry that follows, or lose a warm
+chunk to its own admissions, and read it again; what it can state exactly is a
+lower bound. The condition is about the **whole cache**, not this plan's share of
+it — that was the review's second finding, and it was the third time this rule
+had been written too narrowly. Both branches have an acceptance case, because an
+unreachable branch is a stub.
 
 **The trace counts nothing.** Every number is read from the residency authority,
 the ledger, the plan or the run's own record of its own actions; a `LayerTrace`

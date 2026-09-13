@@ -294,6 +294,33 @@ impl Ledger {
             .collect()
     }
 
+    /// Visit every outstanding reservation's charges, allocating **nothing**.
+    ///
+    /// [`Ledger::outstanding`] clones a label and two vectors per reservation,
+    /// which is right for a diagnostic and wrong for a caller that must not
+    /// abort. A trace is such a caller: it runs inside a generation step, and an
+    /// allocation failure there has to be a typed error the transaction can roll
+    /// back rather than a panic that takes the rollback with it. So the charges
+    /// are handed out by reference and the caller keeps what it needs in storage
+    /// it reserved.
+    pub fn for_each_charge(&self, mut visit: impl FnMut(ReservationId, Scope, Tier, u64)) {
+        for (id, record) in &self.outstanding {
+            for (scope, tier, bytes) in &record.charges {
+                visit(*id, *scope, *tier, *bytes);
+            }
+        }
+    }
+
+    /// How many reservations are outstanding, without building them.
+    pub fn outstanding_count(&self) -> usize {
+        self.outstanding.len()
+    }
+
+    /// How many scopes this ledger knows, for a caller reserving storage.
+    pub fn scope_count(&self) -> usize {
+        self.scopes.len()
+    }
+
     /// The full breakdown for a request, whether or not it would be admitted.
     /// Pure with respect to live resources: it commits nothing (document 02).
     pub fn preview(&self, request: &PlanRequest) -> Result<AdmissionReport> {

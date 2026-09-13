@@ -514,7 +514,9 @@ about its output.
   unions of twelve or thirteen experts — all **30** layers ran on all three GPUs
   in two cache configurations, demanding **4,543,807,488 B**, and every layer's
   device answer was **bitwise equal to the CPU candidate over the same bytes** on
-  every card.
+  every card. One configuration holds the whole step and evicts nothing; the
+  other holds a quarter of a layer and evicts 1,517 times with 292 backpressure
+  drains per card.
 
   At a batch whose route partitions the expert set, all 30 layers demanded and
   admitted **45,675,970,560 B** — this artifact's **entire routed expert
@@ -524,8 +526,8 @@ about its output.
   equal to each other, which is also sm_86 against sm_120.
 
   Each layer's byte and cost trace **reconciles** against the residency
-  authority's own per-scope accounting and the ledger's own charges, as **fourteen**
-  named equalities rather than as a printed report.
+  authority's own per-scope accounting and the ledger's own charges, as
+  **seventeen** named equalities rather than as a printed report.
 
   **This is still not model support and no quality claim follows.** The
   activations are synthetic and the routes are written by the test — the

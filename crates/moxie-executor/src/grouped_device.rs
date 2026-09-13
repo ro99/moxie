@@ -340,6 +340,7 @@ impl<'ctx> DeviceExperts<'ctx> {
         let plain = |error: Error| LaunchRefused {
             error,
             submission_unknown: false,
+            submitted: 0,
         };
         if self.quarantined {
             return Err(plain(invalid(
@@ -383,6 +384,7 @@ impl<'ctx> DeviceExperts<'ctx> {
             LaunchRefused {
                 error,
                 submission_unknown: true,
+                submitted: 0,
             }
         };
         let event = match Event::new(self.ctx) {
@@ -427,7 +429,7 @@ impl<'ctx> DeviceExperts<'ctx> {
         residency: &DeviceResidency<'ctx>,
         staging: ExpertStaging<'_>,
         host_slots: &mut [u8],
-    ) -> std::result::Result<(), LaunchRefused> {
+    ) -> std::result::Result<u32, LaunchRefused> {
         let result = self.run_group_inner(
             authority, group, gate_up, down, residency, staging, host_slots,
         );
@@ -451,10 +453,11 @@ impl<'ctx> DeviceExperts<'ctx> {
         residency: &DeviceResidency<'ctx>,
         staging: ExpertStaging<'_>,
         host_slots: &mut [u8],
-    ) -> std::result::Result<(), LaunchRefused> {
+    ) -> std::result::Result<u32, LaunchRefused> {
         let plain = |error: Error| LaunchRefused {
             error,
             submission_unknown: false,
+            submitted: 0,
         };
         if self.quarantined {
             return Err(plain(invalid(
@@ -603,9 +606,21 @@ impl<'ctx> DeviceExperts<'ctx> {
         // From here on an enqueue may have happened, so every failure is
         // reported with the submission state unknown, the caller withholds, and
         // this attachment quarantines its own ranges.
-        let unknown = |error: Error| LaunchRefused {
+        // `submitted` is threaded through by hand rather than captured, because
+        // it changes as the two symbols go out and a closure over a copy would
+        // report the count as it was when the closure was made. A review found
+        // this function reporting zero launches for a group that had already run
+        // one kernel on the device.
+        let mut submitted = 0u32;
+        let unknown = move |error: Error| LaunchRefused {
             error,
             submission_unknown: true,
+            submitted: 0,
+        };
+        let unknown_after = |error: Error, submitted: u32| LaunchRefused {
+            error,
+            submission_unknown: true,
+            submitted,
         };
         // SAFETY: both copies are enqueued on this stream and the launches that
         // read them are enqueued after, on the same stream, so ordering is the
@@ -673,10 +688,13 @@ impl<'ctx> DeviceExperts<'ctx> {
                 )
                 .map_err(unknown)?;
         }
+        // One symbol of the descriptor is on the device now, whatever happens
+        // next.
+        submitted += 1;
 
-        let components = assignments
-            .checked_mul(self.hidden)
-            .ok_or_else(|| unknown(invalid("launch", "down grid overflowed".into())))?;
+        let components = assignments.checked_mul(self.hidden).ok_or_else(|| {
+            unknown_after(invalid("launch", "down grid overflowed".into()), submitted)
+        })?;
         let mut down_params: [*mut c_void; 7] = [
             (&raw mut workspace_ptr).cast(),
             (&raw mut down_ptr).cast(),
@@ -692,35 +710,47 @@ impl<'ctx> DeviceExperts<'ctx> {
                 .launch_async(
                     1,
                     &self.stream,
-                    (grid(components).map_err(unknown)?, 1, 1),
+                    (
+                        grid(components).map_err(|e| unknown_after(e, submitted))?,
+                        1,
+                        1,
+                    ),
                     (BLOCK, 1, 1),
                     0,
                     &mut down_params,
                 )
-                .map_err(unknown)?;
+                .map_err(|e| unknown_after(e, submitted))?;
         }
+        submitted += 1;
 
-        let event = Event::new(self.ctx).map_err(unknown)?;
-        event.record(&self.stream).map_err(unknown)?;
-        event.synchronize().map_err(unknown)?;
+        let event = Event::new(self.ctx).map_err(|e| unknown_after(e, submitted))?;
+        event
+            .record(&self.stream)
+            .map_err(|e| unknown_after(e, submitted))?;
+        event
+            .synchronize()
+            .map_err(|e| unknown_after(e, submitted))?;
 
         // Read back only this group's slots. The device slot buffer never held
         // the host groups' results, so copying it whole would overwrite them.
         // Past the event, nothing is in flight: a readback failure is ordinary.
-        let width = usize::try_from(width).map_err(|_| {
-            plain(invalid(
-                "hidden",
-                "a row wider than this address space".into(),
-            ))
+        let width = usize::try_from(width).map_err(|_| LaunchRefused {
+            error: invalid("hidden", "a row wider than this address space".into()),
+            submission_unknown: false,
+            submitted,
         })?;
         let base = self.slots.as_ref().expect("live range");
         for slot in group.slots() {
             let offset = u64::from(*slot) * self.hidden * 2;
             let start = (*slot as usize) * width;
             base.copy_to_host_at(offset, &mut host_slots[start..start + width])
-                .map_err(plain)?;
+                .map_err(|e| LaunchRefused {
+                    error: e,
+                    submission_unknown: false,
+                    submitted,
+                })?;
         }
-        Ok(())
+        Ok(submitted)
     }
 
     /// Mark this attachment's ranges as unreleasable. Irreversible.
@@ -906,6 +936,7 @@ impl ExpertDeviceLane for ExpertLane<'_, '_> {
             None => Err(LaunchRefused {
                 error: invalid("attachment", "this lane has already been closed".into()),
                 submission_unknown: false,
+                submitted: 0,
             }),
         }
     }
@@ -952,12 +983,13 @@ impl ExpertDeviceLane for ExpertLane<'_, '_> {
         down: &ResidencyLease,
         staging: ExpertStaging<'_>,
         host_slots: &mut [u8],
-    ) -> std::result::Result<(), LaunchRefused> {
+    ) -> std::result::Result<u32, LaunchRefused> {
         let ExpertLane { experts, residency } = self;
         let Some(experts) = experts.as_mut() else {
             return Err(LaunchRefused {
                 error: invalid("attachment", "this lane has already been closed".into()),
                 submission_unknown: false,
+                submitted: 0,
             });
         };
         experts.run_group(
@@ -1167,11 +1199,13 @@ mod tests {
             device_pci_bus_id: ctx.capability().pci_bus_id.clone(),
             device_cache_cap_bytes: 8 * CHUNK,
             device_cache_leased_bytes: 0,
+            device_cache_resident_bytes: 0,
             device_arena_free_bytes: 16 * MIB,
             host_workspace_bytes: MIB,
             host_buffer_bytes: MIB,
             host_cache_cap_bytes: 1 << 30,
             host_cache_leased_bytes: 0,
+            host_cache_resident_bytes: 0,
             resident: moxie_plan::expert::ResidentChunks::none(),
         }
     }

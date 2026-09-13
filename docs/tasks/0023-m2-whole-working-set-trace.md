@@ -532,8 +532,9 @@ acceptance.**
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy (`--features moxie-executor/driver`) | passed |
-| `cargo test --workspace --locked --offline` | **923 passed, 0 failed**, against a re-measured baseline of **918** at `aeac114` |
-| Device-feature workspace tests | **958 passed, 0 failed**, against a re-measured baseline of **951** at `aeac114` |
+| CUDA-lane clippy (`--features cuda`, which compiles `xtask`'s device code) | passed — **a third lane, declared by this task**, and it was failing on two lints standing since task 0021 |
+| `cargo test --workspace --locked --offline` | **927 passed, 0 failed**, against a re-measured baseline of **918** at `aeac114` |
+| Device-feature workspace tests | **962 passed, 0 failed**, against a re-measured baseline of **951** at `aeac114` |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | **zero failures**, 79 rejected fixtures, 21 accepted, 13 rules |
@@ -557,34 +558,45 @@ each, no baseline, and no duration appears anywhere in the trace.
 
 ### Host-lane coverage
 
-- The **trace sweep** enumerates 64 combinations and traces **128** layers,
-  checking **2,702** equalities of which **473** are the declared lower-bound
-  form. 56 layers produced an exact prediction, 72 a bound, and 16 did not finish
+- The **trace sweep** enumerates 64 combinations and traces **192** layers,
+  checking **4,900** equalities of which **862** are the declared lower-bound
+  form -- 192 layers rather than 128, because a warm pass is a layer execution
+  and the step's boundary counts its bytes whether the test does or not. 66
+  layers produced an exact prediction, 126 a bound, and 16 did not finish
   — each of those traced as incomplete, with its prediction skipped and counted
   as skipped. The product and the census are **printed** by the test.
 - The **violation battery** mutates one number of a trace that reconciles and
-  requires the equality that number belongs to to be the one reported: **19
-  mutations over all fourteen equalities**, plus 3 against the lower-bound branch
-  and 3 against a layer that did not finish -- **25** in all.
-- The **planner sweep** gained a host-residency axis: 10,368 combinations became
-  **31,104**, and every plan's prediction is checked against a statement of the
-  rule written independently of the planner's.
+  requires the equality that number belongs to to be the one reported: **22
+  mutations over all seventeen equalities**, plus 3 against the lower-bound branch
+  and 3 against a layer that did not finish -- **28** in all. Four equalities also
+  have a dedicated end-to-end regression built from the review's own
+  reproducers: a foreign ledger, an omitted layer, a warm chunk evicted by its
+  own layer, and a charge nobody can name.
+- The **planner sweep** gained a host-residency axis and then, after the review,
+  a `crowded` axis -- whether the caches already hold bytes this route does not
+  name, which is the condition its second finding turned on. 10,368 combinations
+  became **62,208**, and every plan's prediction is checked against a statement
+  of the rule written independently of the planner's.
 - The **transition sweep** exercises the new conservation identities over its
   whole 800-combination product without a new harness, because they live in
   `check_invariants`.
 - The **allocation gate** is a number: **235** heap requests per traced layer,
   identical from layer 2 to layer 8, so a step's heap is bounded by one layer's
   record however long the step runs. Assembling an 8-layer `StepTrace` costs 6.
+  **And live bytes**, after the review: at most **348 B** retained per layer
+  against a declared 4 KiB bound, with the gate performing its own substitution —
+  a deliberate 1 MiB per-layer leak retains 1,048,924 B and is rejected while the
+  call count stays flat at 225, which is why the byte measurement exists.
 
 ### Measured effect and uncertainty
 
-- **Mutation measurement: 30 of 30 caught, 0 survivors**
+- **Mutation measurement: 36 of 36 caught, 0 survivors**, over four rounds
   ([experiment 0004](../evidence/experiments/0004-task0023-whole-working-set-trace.md)).
-  The first measurement was 27 of 30, and each of the three survivors was a
-  defect: a missing equality (`launches-match-device-groups`), an unchecked
-  counter (the residency high-water mark) and a property with no fixture at all
-  ("no third charger"). All three are fixed and the fixes are what the second
-  measurement measures.
+  The first was 27 of 30 and the third — after the review's six fixes — was 34 of
+  36. **Every survivor in every round was a defect or a missing fixture**, never
+  an opinion about test strength, and two of them were checks added in response
+  to an earlier finding that nothing had yet violated: a check added because
+  something was found is not itself checked until something violates it.
 - **A null result:** the sweep's failing-read axis caught no mutation the other
   axes did not. What it produced is the incomplete-layer branch of the
   reconciliation and the three fixtures that branch needed.
@@ -660,6 +672,42 @@ contract: a fourteenth equality (`launches-match-device-groups`), and the
 incomplete-layer branch — a layer that did not finish is traced, reconciled and
 counted as incomplete, which the contract asked for and the first implementation
 dropped.
+
+### The independent review, and the six findings it reproduced
+
+**Six findings, one P1, all reproduced, all fixed, none disputed.** Four of them
+are one sentence: **a check that compares two numbers is worth nothing when both
+can be read from the wrong place, or when neither is the number it names.** The
+review's own reproducers ran here before anything was changed, and every one of
+them is a regression now.
+
+| # | Finding | What it measured | Fix |
+|---|---|---|---|
+| 1 | **P1 — a trace that cannot allocate aborts the process.** One injected failure before `LayerSnapshot::take` | **SIGABRT**, `memory allocation of 864 bytes failed` | Every collection the trace builds is `try_reserve`d; none is a `BTreeMap`, which has no fallible insert; the owners hand their numbers out through visitors that allocate nothing; `new` takes owned strings, because converting a `&str` inside it would allocate infallibly. `LayerSnapshot` and `StepSnapshot` are **no longer `Clone`** |
+| 2 | **The "exact" prediction was unsound.** A warm chunk this layer needs, older in LRU than an unrelated cached chunk | **3,840 B read against 3,072 B predicted exactly** | A prediction is exact only when **nothing has to be evicted**: what the cache already holds plus what this layer admits fits the cap. `ExpertBudget` carries the whole cache's resident bytes, not this plan's share of it |
+| 3 | **Reconciliation accepted an omitted layer.** Totals derived from the records supplied, then re-summed from the same records | 3 layers ran and read **11,520 B**; dropping the middle one **passed 35 checks** | `StepSnapshot` taken before the first layer gives the step its own boundary, and `step-covers-every-byte` requires the layers to account for every byte that **entered** a cache inside it |
+| 4 | **An unrelated empty ledger passed.** Reservations looked up in the supplied ledger, with no identity check | A completed run **reconciled with no recorded charges at all** | `ledger-is-the-runs-own` compares the ledger the trace read against the one the run was admitted to, and `every-reservation-is-charged` requires every reservation this step can name to be present before any charge is compared |
+| 5 | **The launch counter counted groups, not launches.** The device path submits one kernel per **symbol** — a projection and a reduction | The equality validated a quantity wrong by a factor of two, and a group that failed between the two symbols reported zero | The lane reports what it submitted, `LaunchRefused` carries the count of a group that failed part way, and the equality is against the descriptor's own symbol count |
+| 6 | **The allocation gate could not see a leak.** It counted allocator calls, not bytes | A deliberate **1 MiB per layer** leak passed at 236 calls per layer | The gate measures live bytes too, declares what a layer may retain (its own trace record), and **performs the leak substitution itself**: 1,048,924 B retained per layer is rejected while the call count stays flat at 225 |
+
+**What the six have in common is worth more than any one of them.** Findings 3
+and 4 are the same defect in two places: a comparison whose two sides come from
+the same place cannot fail. Finding 2 is the third time this task's exactness
+rule was wrong, and each time for the same reason — it reasoned about *this
+plan's share* of a cache, and eviction does not. Finding 5 is a check that was
+added **because** mutation testing found the counter unchecked, and was then
+written against the wrong quantity: adding a check is not the same as checking
+the right thing. Finding 1 is the allocation-failure discipline for the **fifth**
+time in this workspace, on a path added after the previous four.
+
+**A lane nobody had run.** The review also found two clippy lints in
+`xtask/src/gpu.rs`, untouched by this task and last changed at `94d6cfb` (task
+0021). They are real and they are **fixed here** rather than recorded as
+pre-existing: AGENTS.md says a standing failure is how a real one gets missed.
+The reason they stood is that the declared gates name two clippy lanes, host and
+`--features moxie-executor/driver`, and **neither compiles `xtask`'s CUDA code**.
+`cargo clippy --workspace --all-targets --features cuda` is a third lane and is
+now one of this task's gates.
 
 ### The owner resolved O1–O5 during this task
 

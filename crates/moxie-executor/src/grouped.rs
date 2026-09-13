@@ -75,6 +75,11 @@ pub trait ExpertDeviceLane: core::fmt::Debug {
     /// array allocated per group is an allocation outside the envelope, and one
     /// that a submitted copy may still be reading when it drops is worse than
     /// that.
+    /// Run one group, returning **how many kernel launches it submitted**.
+    ///
+    /// One per symbol of the selected descriptor, on the production lane. The
+    /// count is the lane's own report of what it did rather than a number the
+    /// run infers, because only the lane knows how far it got.
     fn run_group(
         &mut self,
         authority: &ResidencyAuthority,
@@ -83,7 +88,7 @@ pub trait ExpertDeviceLane: core::fmt::Debug {
         down: &ResidencyLease,
         staging: ExpertStaging<'_>,
         host_slots: &mut [u8],
-    ) -> std::result::Result<(), LaunchRefused>;
+    ) -> std::result::Result<u32, LaunchRefused>;
     /// Give the device envelope back. Called by [`GroupedRun::close`].
     ///
     /// It takes `&mut self` rather than `Box<Self>` so that a refusal leaves the
@@ -120,6 +125,14 @@ pub struct ExpertStaging<'a> {
 pub struct LaunchRefused {
     pub error: Error,
     pub submission_unknown: bool,
+    /// Kernel launches this group **had already submitted** when it failed.
+    ///
+    /// A review found `launches` counting one per completed group while the
+    /// device path submits one per symbol of the descriptor it selected, and
+    /// losing every submission of a group that failed between them. A count that
+    /// forgets what was submitted is worse than no count: the work happened, the
+    /// device did it, and the record says otherwise.
+    pub submitted: u32,
 }
 
 impl core::fmt::Display for LaunchRefused {
@@ -1038,8 +1051,13 @@ pub struct GroupedStats {
     /// A backpressure retry issues them again, and that is deliberate: the
     /// authority counts the retried request too.
     pub acquires_issued: [u64; 2],
-    /// Device kernel launches this run submitted. Document 07 lists launch count
-    /// among the per-phase counters; it is a count, and it is not a timing.
+    /// Device kernel launches this run submitted, as the **lane reports them**.
+    ///
+    /// One per symbol of the selected descriptor -- the production lane submits a
+    /// projection and a reduction per group -- and a group that failed between
+    /// two symbols still contributes what it had already submitted. Document 07
+    /// lists launch count among the per-phase counters; it is a count, and it is
+    /// not a timing.
     pub launches: u64,
     /// Acquires refused while the queue held work, which drained and retried.
     pub backpressure_drains: u64,
@@ -1856,6 +1874,7 @@ impl<'lane> GroupedRun<'lane> {
         let plain = |error: Error| LaunchRefused {
             error,
             submission_unknown: false,
+            submitted: 0,
         };
         match queued.candidate {
             Candidate::Host => {
@@ -1910,7 +1929,7 @@ impl<'lane> GroupedRun<'lane> {
                     slot_index,
                     ..
                 } = &mut self.buffers;
-                lane.run_group(
+                let submitted = match lane.run_group(
                     authority,
                     group,
                     &queued.gate_up,
@@ -1920,11 +1939,17 @@ impl<'lane> GroupedRun<'lane> {
                         slots: slot_index.as_mut_slice(),
                     },
                     slots.as_mut_slice(),
-                )?;
-                // One launch per device group, counted where the launch is
-                // submitted rather than inferred from the group count -- a group
-                // that failed before submitting must not be counted as one.
-                self.stats.launches += 1;
+                ) {
+                    Ok(submitted) => submitted,
+                    Err(refused) => {
+                        // A group that failed part way through its symbols still
+                        // submitted what it submitted, and the device still ran
+                        // it. Counting zero there is the defect a review found.
+                        self.stats.launches += u64::from(refused.submitted);
+                        return Err(refused);
+                    }
+                };
+                self.stats.launches += u64::from(submitted);
                 self.stats.slots_written += group.slots().len() as u64;
                 Ok(())
             }

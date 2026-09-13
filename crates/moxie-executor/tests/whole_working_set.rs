@@ -40,7 +40,7 @@ use std::time::Instant;
 use moxie_cuda::RankContext;
 use moxie_executor::grouped::{ExpertRoles, GroupedRun};
 use moxie_executor::residency::{DeviceResidency, ShardSource};
-use moxie_executor::trace::{LayerSnapshot, LayerTrace, StepTrace};
+use moxie_executor::trace::{LayerSnapshot, LayerTrace, StepSnapshot, StepTrace};
 use moxie_graph::{CombineOrder, ExpertActivation, OpParams};
 use moxie_memory::{
     ArtifactId, CapacitySnapshot, Ledger, ResidencyAuthority, ResidencyRequest, TurnId,
@@ -242,11 +242,19 @@ enum Room {
 }
 
 impl Room {
-    fn of(self, union_bytes: u64) -> u64 {
+    /// `layer` is one layer's union; `step` is every layer's, summed.
+    ///
+    /// **Roomy is sized for the whole step, not one layer**, and a review is why.
+    /// A prediction is an equality only when nothing has to be evicted, and what
+    /// decides that is the whole cache: a cache holding one layer evicts the
+    /// previous layer's chunks to admit this one's, so from the second layer on
+    /// nothing could promise an equality. A cache that holds the step evicts
+    /// nothing, which is what the exact branch is for.
+    fn of(self, layer: u64, step: u64) -> u64 {
         let align = |bytes: u64| bytes.div_ceil(256) * 256;
         match self {
-            Room::Roomy => align(union_bytes),
-            Room::Tight => align(union_bytes.div_ceil(4).max(EXPERT_TOTAL)),
+            Room::Roomy => align(step),
+            Room::Tight => align(layer.div_ceil(4).max(EXPERT_TOTAL)),
             Room::Eighth => align(LAYER_EXPERTS / 8),
         }
     }
@@ -282,13 +290,18 @@ fn run_whole_set(dir: &Path, config: &Config<'_>) -> StepResult {
     // named "roomy" means the same thing at every layer of a route whose union
     // varies.
     let first_union = union_of(&config.routes[0]).len() as u64 * EXPERT_TOTAL;
-    let device_cache = config.device_room.of(first_union);
-    let host_cache = config.host_room.of(first_union);
+    let whole: u64 = config
+        .routes
+        .iter()
+        .map(|r| union_of(r).len() as u64 * EXPERT_TOTAL)
+        .sum();
+    let device_cache = config.device_room.of(first_union, whole);
+    let host_cache = config.host_room.of(first_union, whole);
 
-    let mut snapshots = vec![CapacitySnapshot::new(Scope::Host, 8 << 30, 256 * MIB).unwrap()];
+    let mut snapshots = vec![CapacitySnapshot::new(Scope::Host, 16 << 30, 256 * MIB).unwrap()];
     if let Some(ctx) = device {
         snapshots
-            .push(CapacitySnapshot::new(Scope::Device(ctx.uuid()), 8 << 30, 256 * MIB).unwrap());
+            .push(CapacitySnapshot::new(Scope::Device(ctx.uuid()), 16 << 30, 256 * MIB).unwrap());
     }
     let mut ledger = Ledger::new(snapshots).unwrap();
     let mut request = ResidencyRequest::new(config.case, host_cache);
@@ -318,6 +331,7 @@ fn run_whole_set(dir: &Path, config: &Config<'_>) -> StepResult {
         ..ExpertPolicy::default()
     };
 
+    let start = StepSnapshot::take(&authority).unwrap();
     let started = Instant::now();
     let mut layers: Vec<LayerTrace> = Vec::new();
     let mut slots: Vec<Vec<u8>> = Vec::new();
@@ -339,11 +353,17 @@ fn run_whole_set(dir: &Path, config: &Config<'_>) -> StepResult {
                 .map_or_else(String::new, |c| c.capability().pci_bus_id.clone()),
             device_cache_cap_bytes: if device.is_some() { device_cache } else { 0 },
             device_cache_leased_bytes: 0,
+            device_cache_resident_bytes: if device.is_some() {
+                resident_bytes_of(&authority, scope)
+            } else {
+                0
+            },
             device_arena_free_bytes: if device.is_some() { 64 * MIB } else { 0 },
             host_workspace_bytes: 16 * MIB,
             host_buffer_bytes: 16 * MIB,
             host_cache_cap_bytes: host_cache,
             host_cache_leased_bytes: 0,
+            host_cache_resident_bytes: resident_bytes_of(&authority, Scope::Host),
             resident,
         };
         let plan = compile_experts(
@@ -361,7 +381,7 @@ fn run_whole_set(dir: &Path, config: &Config<'_>) -> StepResult {
         .unwrap();
         assert_eq!(plan.groups().len(), union.len(), "layer {layer}");
 
-        let snapshot = LayerSnapshot::take(layer, &authority);
+        let snapshot = LayerSnapshot::take(layer, &authority).unwrap();
         let mut run = GroupedRun::admit(&mut ledger, plan, roles(layer), None).unwrap();
         if let (Some(ctx), Some(residency)) = (device, residency.as_mut()) {
             run.attach_device(&mut ledger, ctx, residency).unwrap();
@@ -375,7 +395,7 @@ fn run_whole_set(dir: &Path, config: &Config<'_>) -> StepResult {
             u64::MAX,
         )
         .unwrap();
-        layers.push(snapshot.close(&run, &authority, &ledger));
+        layers.push(snapshot.close(&run, &authority, &ledger).unwrap());
         slots.push(run.buffers().slots().to_vec());
         run.close(&mut ledger).unwrap();
         authority.end_turn(TurnId::new(u64::from(layer) + 1));
@@ -393,12 +413,14 @@ fn run_whole_set(dir: &Path, config: &Config<'_>) -> StepResult {
     }
     authority.close(&mut ledger).unwrap();
     let trace = StepTrace::new(
-        artifact_id().as_str(),
-        config.case,
+        artifact_id().as_str().to_string(),
+        config.case.to_string(),
         layers,
+        &start,
         &authority,
         &ledger,
-    );
+    )
+    .unwrap();
     assert!(ledger.outstanding().is_empty());
 
     StepResult {
@@ -409,6 +431,11 @@ fn run_whole_set(dir: &Path, config: &Config<'_>) -> StepResult {
         drains,
         elapsed,
     }
+}
+
+/// Everything a scope's cache holds right now, this route's chunks or not.
+fn resident_bytes_of(authority: &ResidencyAuthority, scope: Scope) -> u64 {
+    authority.account(scope).map_or(0, |a| a.resident_bytes)
 }
 
 /// Where this layer's expert chunks are, read from the authority per chunk.
@@ -603,7 +630,7 @@ fn the_artifacts_whole_expert_payload_streams_through_a_restricted_cache() {
     assert_eq!(union_of(&route).len(), EXPERTS as usize);
     let routes: Vec<Vec<u32>> = (0..LAYERS).map(|_| route.clone()).collect();
 
-    let device_cache = Room::Eighth.of(LAYER_EXPERTS);
+    let device_cache = Room::Eighth.of(LAYER_EXPERTS, WHOLE_SET);
     println!(
         "whole-set-full: {WHOLE_SET} B of expert weights over {LAYERS} layer(s) -- 88.5% of the \
          artifact -- through a {device_cache} B device cache holding {} of 128 experts",

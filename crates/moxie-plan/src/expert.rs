@@ -409,6 +409,18 @@ pub struct ExpertBudget {
     pub device_cache_cap_bytes: u64,
     /// Of that cap, what a live lease pins and eviction therefore cannot reach.
     pub device_cache_leased_bytes: u64,
+    /// Everything charged in that cache right now, **including chunks this plan
+    /// does not name**.
+    ///
+    /// A prediction is an equality only when nothing has to be evicted, and what
+    /// decides that is the whole cache, not this plan's share of it. A review
+    /// found the first version of that rule unsound in one line: it asked only
+    /// whether this layer's own live set fit, so a layer that predicted a hit on
+    /// a warm chunk could evict exactly that chunk to make room for its own
+    /// admissions -- the warm chunk being the least recently used of them all --
+    /// and then read it again. Measured: 3,840 B read against 3,072 B predicted
+    /// exactly.
+    pub device_cache_resident_bytes: u64,
     /// Free bytes in the device activation arena available to this plan.
     pub device_arena_free_bytes: u64,
     /// Host FP32 workspace bytes this plan may use.
@@ -425,6 +437,9 @@ pub struct ExpertBudget {
     pub host_cache_cap_bytes: u64,
     /// Of that cap, what a live lease pins and eviction cannot reach.
     pub host_cache_leased_bytes: u64,
+    /// Everything charged in the host cache right now, including chunks this
+    /// plan does not name. See `device_cache_resident_bytes`.
+    pub host_cache_resident_bytes: u64,
     /// Where the caches were holding this route's expert chunks.
     ///
     /// One snapshot covering both caches, because the question a plan asks of it
@@ -553,11 +568,6 @@ impl ExpertBudget {
     fn displaceable(&self) -> u64 {
         self.device_cache_cap_bytes
             .saturating_sub(self.device_cache_leased_bytes)
-    }
-
-    fn host_displaceable(&self) -> u64 {
-        self.host_cache_cap_bytes
-            .saturating_sub(self.host_cache_leased_bytes)
     }
 }
 
@@ -1499,40 +1509,59 @@ pub fn compile_experts(
 
     // Whether the predictions above are equalities.
     //
-    // The condition is that everything this plan needs **at once** fits: what it
-    // admits *and* what it is counting on already being there. A cache that can
-    // hold all of it never evicts any of it before the plan is finished --
-    // deterministic demand LRU takes the least recently used, which is always an
-    // earlier plan's -- so every chunk is admitted once and every predicted hit
-    // is still there when it is asked for.
+    // The condition is that **nothing has to be evicted**: what the cache already
+    // holds, plus what this plan will admit, fits under the cap. Then `place`
+    // never displaces anything, so no chunk is admitted twice and no predicted
+    // hit disappears before it is asked for, and every prediction above is an
+    // equality.
     //
-    // Leaving the resident half out of this sum is a mistake this task made
-    // once: a plan that predicted a hit on bytes its own admissions then evicted
-    // reported an exact prediction and read them again.
-    let device_live = predicted
-        .device_upload_bytes
-        .saturating_add(predicted.device_hit_bytes);
-    let host_live = host_admitted
-        .saturating_add(predicted.host_hit_bytes)
-        .saturating_add(predicted.host_source_reuse_bytes);
-    let device_fits = device_live <= displaceable;
-    let host_fits = host_live <= budget.host_displaceable();
+    // Two weaker conditions were tried and both were unsound, in the same way
+    // and for the same reason -- they reasoned about this plan's share of the
+    // cache and eviction does not:
+    //
+    // * "this plan's admissions fit" ignores the hits it is counting on, which
+    //   its own admissions can evict;
+    // * "this plan's admissions **and** its hits fit" ignores everything *else*
+    //   resident, which is newer than a warm chunk this plan needs and is
+    //   therefore not the victim -- the warm chunk is. A review demonstrated it:
+    //   warm experts 4 and 5, then demand 0-4 through a five-expert cache, and
+    //   expert 4 is evicted by this plan's own admissions and read again.
+    //
+    // This condition is sufficient rather than necessary: eviction might in
+    // principle take only chunks nobody here needs. Over-declaring `LowerBound`
+    // costs a weaker claim; under-declaring it costs a wrong one.
+    let device_fits = budget
+        .device_cache_resident_bytes
+        .saturating_add(predicted.device_upload_bytes)
+        <= budget.device_cache_cap_bytes;
+    let host_fits = budget
+        .host_cache_resident_bytes
+        .saturating_add(host_admitted)
+        <= budget.host_cache_cap_bytes;
+    let device_live = budget
+        .device_cache_resident_bytes
+        .saturating_add(predicted.device_upload_bytes);
+    let host_live = budget
+        .host_cache_resident_bytes
+        .saturating_add(host_admitted);
     predicted.exactness = match (device_fits, host_fits) {
         (true, true) => Exactness::Exact,
         (false, true) => Exactness::LowerBound {
             where_: BoundOn::DeviceCache,
             admitted_bytes: device_live,
-            displaceable_bytes: displaceable,
+            displaceable_bytes: budget.device_cache_cap_bytes,
         },
         (true, false) => Exactness::LowerBound {
             where_: BoundOn::HostCache,
             admitted_bytes: host_live,
-            displaceable_bytes: budget.host_displaceable(),
+            displaceable_bytes: budget.host_cache_cap_bytes,
         },
         (false, false) => Exactness::LowerBound {
             where_: BoundOn::Both,
             admitted_bytes: device_live.saturating_add(host_live),
-            displaceable_bytes: displaceable.saturating_add(budget.host_displaceable()),
+            displaceable_bytes: budget
+                .device_cache_cap_bytes
+                .saturating_add(budget.host_cache_cap_bytes),
         },
     };
 

@@ -61,7 +61,8 @@ pub use grouped::{
 
 pub mod trace;
 pub use trace::{
-    Discrepancy, LayerSnapshot, LayerTrace, Reconciled, ScopeDelta, StepTrace, TRACE_SCHEMA_VERSION,
+    Discrepancy, LayerSnapshot, LayerTrace, Reconciled, ScopeDelta, StepSnapshot, StepTrace,
+    TRACE_SCHEMA_VERSION,
 };
 
 pub mod arena;

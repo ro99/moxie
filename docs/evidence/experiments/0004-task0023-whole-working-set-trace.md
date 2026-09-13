@@ -1,10 +1,11 @@
 # 0004 — Measuring task 0023's byte accounting and its reconciliation, by mutation
 
 Date: 2026-09-13. Milestone: M2's exit, [task 0023](../../tasks/0023-m2-whole-working-set-trace.md).
-Status: **accepted**; **30 of 30** mutations caught, 0 survivors. The first
-measurement was 27 of 30, and all three survivors were **defects** -- one missing
-equality, one unchecked counter and one property with no fixture -- rather than
-opinions about test strength.
+Status: **accepted**; three measurements, the last of them after an independent
+review's six findings were fixed. Every survivor in every round was a **defect or
+a missing fixture**, never an opinion about test strength: two of them were
+checks that had been added in response to an earlier finding and never violated
+by anything.
 
 Companion to [experiment 0003](0003-task0022-sweep-and-routed-mutations.md), which measured the
 sweeps this task extends rather than replaces.
@@ -40,20 +41,36 @@ not tracked; what is tracked is this record and the tests the measurement produc
 
 ## Results
 
-**30 mutations, 30 caught, 0 survivors** — after the three fixes the first
-measurement forced. The first measurement was **27 of 30 with three survivors**,
-and all three were defects rather than opinions about test strength:
+**Three measurements, and each one found something the previous had not.**
+
+| Round | Mutations | Caught | Survivors |
+|---|---|---|---|
+| First | 30 | 27 | 3 |
+| Second, after the three fixes | 30 | **30** | 0 |
+| Third, after an independent review's six findings and their fixes | 36 | 34 | 2 |
+| Fourth, after those two | **36** | **36** | **0** |
+
+The **first** measurement's three survivors were defects rather than opinions
+about test strength:
 
 | Survivor | What it was | What it produced |
 |---|---|---|
 | Setting the residency high-water mark to the current level at every admission | Nothing ever compared **two readings** of `peak_resident_bytes`. `check_invariants` asks whether the level is below the mark, which stays true when the mark follows the level down | The sweep now requires a scope's peak to be non-decreasing from layer to layer |
-| Deleting the device launch counter's increment | Nothing compared `launches` to anything at all. Document 07 lists launch count among the per-phase counters, and a count nobody checks is a count nobody can trust | A **fourteenth equality**, `launches-match-device-groups`, with its own violating fixture |
+| Deleting the device launch counter's increment | Nothing compared `launches` to anything at all | A **new equality**, `launches-match-device-groups`, with its own violating fixture |
 | Deleting the filter that keeps only **this step's** reservations | In every fixture the only reservations the ledger held *were* this step's, so filtering and not filtering gave the same answer. "No third charger" was the property with no fixture at all | `a_charge_nobody_can_name_is_reported`: an unrelated consumer's reservation, live across a layer, in a tier this step also uses |
 
-The third is the shape AGENTS.md already records: **a fixture on which two
-behaviours agree tests neither.** It is worth noticing that the property it left
-untested is the one the equality exists for — the others check that the numbers
-agree, and this one checks that nobody else is spending.
+The **third** round's two survivors were both exposed by the independent review's
+own corrections, which is the point of re-measuring after a fix:
+
+| Survivor | What it was | What it produced |
+|---|---|---|
+| Deleting `every-reservation-is-charged` | The equality the review's fourth finding produced had no violating fixture of its own | Three more battery entries, one per equality the review added |
+| Discarding what a failed group had already submitted | The launch count the review's fifth finding corrected was compared for a *completed* run and nowhere for a failed one | The run sweep asserts, on both launch-failure axes, that a group failing between its two symbols still counts the one it submitted |
+
+**The second survivor is the same shape as the first round's third one**, and
+that is worth stating rather than filing: a check added in response to a finding
+is not itself checked until something violates it. Both rounds produced exactly
+one of those.
 
 ### The mutations
 
@@ -89,8 +106,15 @@ agree, and this one checks that nobody else is spending.
 | `M28` always complete | a layer that did not finish is traced as one that did | the trace sweep |
 | `M29` withheld ignored | a withheld lease is counted as lost | the trace sweep |
 | `M30` failed bound reversed | a failed layer's group bound is checked backwards | the battery's interrupted-layer arm |
+| `M31` exactness ignores others | exactness ignores what else the cache already holds | the planner sweep's `crowded` axis |
+| `M32` step coverage deleted | a byte that entered a cache outside every layer is accepted | the omitted-layer regression |
+| `M33` ledger identity deleted | a trace read from another ledger is accepted | the foreign-ledger regression |
+| `M34` reservations found deleted | a named reservation the ledger has never heard of is accepted | the battery (**after** the third measurement) |
+| `M35` launches per group | the launch equality counts groups instead of kernels | the trace sweep |
+| `M36` submitted forgotten | a group that failed part way forgets what it submitted | the run sweep's launch-failure axes (**after** the third measurement) |
+| `M37` reserve is infallible | trace storage is reserved infallibly again | the allocation-failure regression |
 
-## What the measurement found, beyond the three survivors
+## What the measurements found, beyond the survivors
 
 **Every mutation of the accounting was caught by a sweep that already existed.**
 `M02`, `M04`, `M06`–`M11` are all caught by task 0020's transition sweep, without
@@ -101,8 +125,13 @@ operation over 800 combinations, and an identity that holds there holds under
 interleavings no test would have thought to write.
 
 **A null result, reported as one.** The trace sweep's `fail_read_at` axis caught
-no mutation that the other axes did not already catch. What it produced instead
-is the incomplete-layer branch of the reconciliation — a layer that did not
-finish still has to account for its bytes — and the three violating fixtures that
-branch needed. The axis earns its place through the code it forced, not through a
-mutation it was the only one to catch.
+no mutation the other axes did not already catch. What it produced instead is the
+incomplete-layer branch of the reconciliation — a layer that did not finish still
+has to account for its bytes — and the three violating fixtures that branch
+needed. The axis earns its place through the code it forced, not through a
+mutation it was alone in catching.
+
+**The reverse is true of the `crowded` axis**, added after the review's second
+finding: it exists because a counterexample already existed, and `M31` is the
+mutation that would otherwise have survived. An axis added *because* something
+was found is the cheapest kind there is.

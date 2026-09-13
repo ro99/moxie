@@ -220,6 +220,10 @@ impl ChunkSource for Fallible {
     }
 }
 
+/// Kernel launches one device group submits: one per symbol of the selected
+/// descriptor, which for the expert kernel is a projection and a reduction.
+const KERNELS_PER_GROUP: u32 = 2;
+
 /// A lane that fails on demand, at a chosen point, with a chosen submission
 /// state.
 #[derive(Debug)]
@@ -244,6 +248,8 @@ impl moxie_executor::grouped::ExpertDeviceLane for Lane {
                         detail: "injected activation copy failure".into(),
                     },
                     submission_unknown: unknown,
+                    // An activation copy is not a kernel launch.
+                    submitted: 0,
                 })
             }
         }
@@ -265,9 +271,13 @@ impl moxie_executor::grouped::ExpertDeviceLane for Lane {
         _down: &moxie_memory::ResidencyLease,
         _staging: moxie_executor::grouped::ExpertStaging<'_>,
         _host_slots: &mut [u8],
-    ) -> std::result::Result<(), moxie_executor::grouped::LaunchRefused> {
+    ) -> std::result::Result<u32, moxie_executor::grouped::LaunchRefused> {
         match self.fail_launch.take() {
-            None => Ok(()),
+            // What the production lane submits: one launch per symbol of the
+            // descriptor it selected. A double that reported a different number
+            // would make the launch equality mean something else here than it
+            // means on a card.
+            None => Ok(KERNELS_PER_GROUP),
             Some(unknown) => {
                 self.quarantined |= unknown;
                 Err(moxie_executor::grouped::LaunchRefused {
@@ -276,6 +286,9 @@ impl moxie_executor::grouped::ExpertDeviceLane for Lane {
                         detail: "injected launch failure".into(),
                     },
                     submission_unknown: unknown,
+                    // Failed between the two symbols: the first is on the
+                    // device and the count has to say so.
+                    submitted: 1,
                 })
             }
         }
@@ -422,11 +435,13 @@ fn plan_for(case: Case) -> ExpertPlan {
         device_pci_bus_id: BUS.into(),
         device_cache_cap_bytes: if on_device { 64 * g.chunk() } else { 0 },
         device_cache_leased_bytes: 0,
+        device_cache_resident_bytes: 0,
         device_arena_free_bytes: if on_device { 1 << 20 } else { 0 },
         host_workspace_bytes: 1 << 20,
         host_buffer_bytes: 1 << 20,
         host_cache_cap_bytes: 1 << 30,
         host_cache_leased_bytes: 0,
+        host_cache_resident_bytes: 0,
         resident: ResidentChunks::none(),
     };
     let policy = ExpertPolicy {
@@ -789,6 +804,26 @@ fn the_run_lifecycle_product_holds_its_invariants_after_every_operation() {
                                         assert!(run.failure().is_some());
                                     }
                                     Failure::None | Failure::AcquireCapacity => {}
+                                }
+                                // What a failed group **submitted** before it
+                                // failed. A review found the run counting zero
+                                // launches for a group that had already put one
+                                // kernel on the device, and a mutation that
+                                // discarded the lane's report then survived the
+                                // whole battery, because nothing compared this
+                                // number to anything.
+                                match case.failure {
+                                    Failure::LaunchPlain | Failure::LaunchUnknown => {
+                                        let completed_groups = run.stats().device_groups
+                                            * u64::from(KERNELS_PER_GROUP);
+                                        assert_eq!(
+                                            run.stats().launches,
+                                            completed_groups + 1,
+                                            "{case:?}: a group that failed between its two \
+                                             symbols must still count the one it submitted"
+                                        );
+                                    }
+                                    _ => {}
                                 }
                             }
                             match run.state_name() {

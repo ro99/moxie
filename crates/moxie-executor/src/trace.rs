@@ -29,13 +29,47 @@
 //! there is no field for one. Document 07 keeps profiling mode and benchmark
 //! mode apart; a trace is neither, and a debug build's wall clock is not a cost.
 
-use std::collections::BTreeMap;
-
 use moxie_memory::{ByteFlow, Ledger, ResidencyAuthority, ScopeAccount};
 use moxie_plan::expert::{EnvelopePrediction, Exactness, ExpertPlan};
-use moxie_types::{Scope, Tier};
+use moxie_types::{Error, HostTier, Scope, Tier};
 
 use crate::grouped::{GroupedRun, GroupedStats};
+
+fn invalid(field: &'static str, detail: String) -> Error {
+    Error::InvalidRequest { field, detail }
+}
+
+/// Reserve exactly `len` more, or fail.
+///
+/// Every collection this module builds goes through here. Task 0019's rule, for
+/// the fourth time in this workspace: an allocation failure inside a generation
+/// step must be a typed error the transaction can roll back, not a panic that
+/// takes the rollback, the lease release and the next generation with it. A
+/// review injected one failure immediately before a snapshot and got **SIGABRT**.
+fn reserve<T>(out: &mut Vec<T>, len: usize) -> Result<(), Error> {
+    out.try_reserve_exact(len)
+        .map_err(|_| Error::CapacityExceeded {
+            tier: Some(Tier::Host(HostTier::Pageable)),
+            requested_bytes: (len * core::mem::size_of::<T>()) as u64,
+            available_bytes: 0,
+        })
+}
+
+/// Find or append a scope's entry in a sorted-by-insertion association list.
+///
+/// A `Vec`, not a `BTreeMap`: `BTreeMap` has no fallible insert, so a map here
+/// would abort on an allocation failure however carefully the rest of this
+/// module reserved. The lists are one entry per scope -- four on this machine --
+/// so the linear search is not the interesting cost.
+fn entry_for<V: Default>(list: &mut Vec<(Scope, V)>, scope: Scope) -> Result<&mut V, Error> {
+    if let Some(index) = list.iter().position(|(s, _)| *s == scope) {
+        return Ok(&mut list[index].1);
+    }
+    reserve(list, 1)?;
+    list.push((scope, V::default()));
+    let last = list.len() - 1;
+    Ok(&mut list[last].1)
+}
 
 /// The trace schema's version.
 ///
@@ -96,6 +130,14 @@ pub struct LayerTrace {
     pub groups: u64,
     pub rows: u64,
     pub top_k: u64,
+    /// Kernel launches one device group submits: the number of symbols in the
+    /// descriptor this plan selected. Zero when the plan selected none.
+    ///
+    /// A review found the launch count being one per completed group while the
+    /// device path submits one per symbol -- a projection and a reduction. The
+    /// count of symbols is the plan's own, so the equality compares what the
+    /// lane reported against what the descriptor says it takes.
+    pub kernels_per_group: u64,
     pub scopes: Vec<ScopeDelta>,
     pub cost: GroupedStats,
     /// Whether this layer ran every group. A layer that failed or was cancelled
@@ -108,6 +150,19 @@ pub struct LayerTrace {
     pub withheld_leases: u64,
     /// What the ledger held while this layer's run was live, per scope and tier.
     pub ledger: Vec<(Scope, Tier, u64)>,
+    /// The ledger this trace read, and the one the run was admitted against.
+    ///
+    /// A review handed `close` a **different, empty** ledger: observed and
+    /// accounted charges both came back empty and the layer reconciled with no
+    /// recorded charges at all. Comparing two numbers is worth nothing if they
+    /// can both be read from the wrong place.
+    pub ledger_id: u64,
+    pub run_ledger_id: u64,
+    /// Reservations this trace could name, and how many of them the ledger
+    /// actually holds. A named reservation the ledger has never heard of is the
+    /// other half of the same finding.
+    pub reservations_named: u64,
+    pub reservations_found: u64,
     /// What the authority's caps and this plan's envelope together account for,
     /// in the same shape. The `ledger-charges-what-is-held` equality compares
     /// these two lists and nothing else.
@@ -131,6 +186,11 @@ pub struct StepTrace {
     pub outstanding_reservations: usize,
     /// Each scope's account after everything was retired.
     pub final_accounts: Vec<ScopeAccount>,
+    /// What the **authority** moved over the whole step, from the snapshot taken
+    /// before the first layer to the end. The outer boundary the layers are
+    /// checked against: a byte that entered a cache and belongs to no layer
+    /// shows up here and nowhere else.
+    pub whole: Vec<(Scope, ByteFlow)>,
     pub unmeasured: &'static [&'static str],
 }
 
@@ -185,26 +245,85 @@ pub struct Reconciled {
 // Taking the snapshots
 // ---------------------------------------------------------------------------
 
+/// The authority's position before a **step** runs.
+///
+/// The trace's outer boundary. Without one, a step's totals are a sum of the
+/// records it was handed and reconciliation re-sums the same records: a review
+/// executed three layers, dropped the middle one, and the trace reconciled 35
+/// checks while 3,840 B of reads went unmentioned. The step's own delta is the
+/// only thing that can say a layer is missing.
+/// **Not `Clone`**, deliberately: cloning it would allocate infallibly, and the
+/// one thing this type exists to be is safe to take inside a generation step.
+#[derive(Debug, PartialEq)]
+pub struct StepSnapshot {
+    flows: Vec<(Scope, ByteFlow)>,
+}
+
+impl StepSnapshot {
+    /// Read every scope's flow. Call this before the step's first layer.
+    ///
+    /// Fallible, and the storage is reserved before a byte of it is written: an
+    /// allocation failure here is a typed error, not a process abort.
+    pub fn take(authority: &ResidencyAuthority) -> Result<Self, Error> {
+        let mut flows = Vec::new();
+        reserve(&mut flows, authority.scope_count())?;
+        let mut overflow = None;
+        authority.for_each_account(|a| {
+            if flows.len() == flows.capacity() {
+                // Reserved from `scope_count`, so this cannot happen unless the
+                // authority gained a scope between the two calls. Recorded
+                // rather than pushed: a push here would allocate.
+                overflow = Some(a.scope);
+                return;
+            }
+            flows.push((a.scope, a.flow));
+        });
+        if let Some(scope) = overflow {
+            return Err(invalid(
+                "scopes",
+                format!("{scope} appeared while its snapshot was being taken"),
+            ));
+        }
+        Ok(StepSnapshot { flows })
+    }
+
+    fn flow_of(&self, scope: Scope) -> ByteFlow {
+        self.flows
+            .iter()
+            .find(|(s, _)| *s == scope)
+            .map_or_else(ByteFlow::default, |(_, f)| *f)
+    }
+}
+
 /// The authority's and the ledger's position before a layer runs.
 ///
 /// Held by value, so nothing here borrows the owners while the layer executes.
-#[derive(Debug, Clone, PartialEq)]
+/// **Not `Clone`**, for the same reason [`StepSnapshot`] is not.
+#[derive(Debug, PartialEq)]
 pub struct LayerSnapshot {
     layer: u32,
-    flows: BTreeMap<Scope, ByteFlow>,
+    flows: Vec<(Scope, ByteFlow)>,
 }
 
 impl LayerSnapshot {
     /// Read every scope's flow. Call this immediately before the layer runs.
-    pub fn take(layer: u32, authority: &ResidencyAuthority) -> Self {
-        LayerSnapshot {
+    ///
+    /// Fallible, for the reason every allocation on this path is: a review
+    /// injected one failure here and got `SIGABRT` where a generation step needs
+    /// a typed error it can roll back.
+    pub fn take(layer: u32, authority: &ResidencyAuthority) -> Result<Self, Error> {
+        let step = StepSnapshot::take(authority)?;
+        Ok(LayerSnapshot {
             layer,
-            flows: authority
-                .accounts()
-                .into_iter()
-                .map(|a| (a.scope, a.flow))
-                .collect(),
-        }
+            flows: step.flows,
+        })
+    }
+
+    fn flow_of(&self, scope: Scope) -> ByteFlow {
+        self.flows
+            .iter()
+            .find(|(s, _)| *s == scope)
+            .map_or_else(ByteFlow::default, |(_, f)| *f)
     }
 
     /// Close the layer: difference the flows, read the levels, and record what
@@ -218,12 +337,18 @@ impl LayerSnapshot {
         run: &GroupedRun<'_>,
         authority: &ResidencyAuthority,
         ledger: &Ledger,
-    ) -> LayerTrace {
+    ) -> Result<LayerTrace, Error> {
         let plan = run.plan();
         let cost = run.stats();
         let mut scopes = Vec::new();
-        for account in authority.accounts() {
-            let before = self.flows.get(&account.scope).copied().unwrap_or_default();
+        reserve(&mut scopes, authority.scope_count())?;
+        let mut overflow = None;
+        authority.for_each_account(|account| {
+            if scopes.len() == scopes.capacity() {
+                overflow = Some(account.scope);
+                return;
+            }
+            let before = self.flow_of(account.scope);
             scopes.push(ScopeDelta {
                 scope: account.scope,
                 tier: account.tier,
@@ -234,41 +359,55 @@ impl LayerSnapshot {
                 unreported_bytes: account.unreported_bytes,
                 peak_resident_bytes: account.peak_resident_bytes,
             });
+        });
+        if let Some(scope) = overflow {
+            return Err(invalid(
+                "scopes",
+                format!("{scope} appeared while this layer was being closed"),
+            ));
         }
         let shape = plan.shape();
-        // Collected through the same ordered map the accounted side uses, so the
-        // two lists are comparable row by row. Two orderings of the same numbers
-        // would make the comparison report the wrong pair on a mismatch, which
-        // is a diagnosis problem rather than a correctness one -- and this
-        // repository has spent two review rounds on findings that were exactly
-        // that.
-        let mut observed_map: BTreeMap<(Scope, Tier), u64> = BTreeMap::new();
-        for scope in ledger.scopes() {
-            for tier in tiers_of(scope) {
-                let committed = ledger.committed(scope, tier);
+        // Both charge lists are built in the same order -- scope order, then the
+        // tier order `Tier::ALL` fixes -- so they are comparable row by row. Two
+        // orderings of the same numbers would make a mismatch report the wrong
+        // pair, which is a diagnosis problem rather than a correctness one, and
+        // this repository has spent two review rounds on findings of exactly
+        // that shape.
+        let mut observed: Vec<(Scope, Tier, u64)> = Vec::new();
+        let mut scope_list = Vec::new();
+        reserve(&mut scope_list, ledger.scope_count())?;
+        scope_list.extend(ledger.scopes());
+        for scope in &scope_list {
+            for tier in Tier::valid_in(scope.kind()) {
+                let committed = ledger.committed(*scope, tier);
                 if committed != 0 {
-                    observed_map.insert((scope, tier), committed);
+                    reserve(&mut observed, 1)?;
+                    observed.push((*scope, tier, committed));
                 }
             }
         }
-        let observed: Vec<(Scope, Tier, u64)> = observed_map
-            .into_iter()
-            .map(|((scope, tier), bytes)| (scope, tier, bytes))
-            .collect();
-        LayerTrace {
+        let (accounted, named, found) = accounted_charges(authority, run, ledger)?;
+        Ok(LayerTrace {
             layer: self.layer,
             predicted: plan.envelope().predicted,
             chunk_bytes: role_chunk_bytes(plan),
             groups: plan.groups().len() as u64,
+            kernels_per_group: plan
+                .kernel()
+                .map_or(0, |descriptor| descriptor.symbols.len() as u64),
             rows: plan.rows(),
             top_k: shape.top_k,
-            accounted: accounted_charges(authority, run, ledger),
+            accounted,
+            ledger_id: ledger.id().get(),
+            run_ledger_id: run.ledger().get(),
+            reservations_named: named,
+            reservations_found: found,
             scopes,
             cost,
             completed: run.failure().is_none() && !run.is_cancelled(),
             withheld_leases: run.withheld_leases() as u64,
             ledger: observed,
-        }
+        })
     }
 }
 
@@ -287,16 +426,6 @@ fn role_chunk_bytes(plan: &ExpertPlan) -> [u64; 2] {
     ]
 }
 
-/// **Every** tier valid in a scope, not a subset.
-///
-/// The subset this started as was a hole with a confident name: a third charger
-/// using a tier nobody thought to list would have been missed by both sides of
-/// `ledger-charges-what-is-held`, and the check would have passed. `Tier::ALL`
-/// has its own completeness test, so a tier added later arrives here on its own.
-fn tiers_of(scope: Scope) -> Vec<Tier> {
-    Tier::valid_in(scope.kind()).collect()
-}
-
 /// What the reservations this trace can **name** account for, tier by tier.
 ///
 /// Named by identity -- the authority's own reservations and this run's -- and
@@ -305,27 +434,78 @@ fn tiers_of(scope: Scope) -> Vec<Tier> {
 /// two owners come to disagree while both look right. Anything the ledger holds
 /// beyond this sum belongs to a reservation nobody in this step can name, which
 /// is what "no third charger" means and what the equality finds.
+/// What the named reservations charge, how many this step can name, and how
+/// many of those the ledger actually holds.
+type AccountedCharges = (Vec<(Scope, Tier, u64)>, u64, u64);
+
 fn accounted_charges(
     authority: &ResidencyAuthority,
     run: &GroupedRun<'_>,
     ledger: &Ledger,
-) -> Vec<(Scope, Tier, u64)> {
-    let mut named = authority.reservation_ids();
-    named.push(run.reservation_id());
-    let mut out: BTreeMap<(Scope, Tier), u64> = BTreeMap::new();
-    for outstanding in ledger.outstanding() {
-        if !named.contains(&outstanding.id) {
-            continue;
-        }
-        for (scope, tier, bytes) in outstanding.charges {
-            let entry = out.entry((scope, tier)).or_default();
-            *entry = entry.saturating_add(bytes);
+) -> Result<AccountedCharges, Error> {
+    let mut named: Vec<moxie_memory::ReservationId> = Vec::new();
+    reserve(&mut named, 2)?;
+    for id in authority.reservation_ids() {
+        if named.len() < named.capacity() {
+            named.push(id);
         }
     }
-    out.into_iter()
-        .filter(|(_, bytes)| *bytes != 0)
-        .map(|((scope, tier), bytes)| (scope, tier, bytes))
-        .collect()
+    if named.len() == named.capacity() {
+        reserve(&mut named, 1)?;
+    }
+    named.push(run.reservation_id());
+
+    // One entry per (scope, tier) the named reservations charge, kept in the
+    // same order the observed side is built in.
+    let mut out: Vec<(Scope, Tier, u64)> = Vec::new();
+    let mut found: Vec<moxie_memory::ReservationId> = Vec::new();
+    reserve(&mut found, named.len())?;
+    let mut failure = None;
+    ledger.for_each_charge(|id, scope, tier, bytes| {
+        if failure.is_some() || !named.contains(&id) {
+            return;
+        }
+        if !found.contains(&id) {
+            if found.len() == found.capacity() {
+                failure = Some(invalid(
+                    "reservations",
+                    "more reservations were charged than this step can name".into(),
+                ));
+                return;
+            }
+            found.push(id);
+        }
+        match out.iter_mut().find(|(s, t, _)| *s == scope && *t == tier) {
+            Some(entry) => entry.2 = entry.2.saturating_add(bytes),
+            None => {
+                if out.try_reserve(1).is_err() {
+                    failure = Some(Error::CapacityExceeded {
+                        tier: Some(Tier::Host(HostTier::Pageable)),
+                        requested_bytes: core::mem::size_of::<(Scope, Tier, u64)>() as u64,
+                        available_bytes: 0,
+                    });
+                    return;
+                }
+                out.push((scope, tier, bytes));
+            }
+        }
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    out.retain(|(_, _, bytes)| *bytes != 0);
+    // Scope order then `Tier::ALL` order, so this list and the observed one are
+    // comparable row by row.
+    out.sort_by_key(|(scope, tier, _)| (*scope, tier_rank(*tier)));
+    Ok((out, named.len() as u64, found.len() as u64))
+}
+
+/// A tier's position in `Tier::ALL`, which is the order both charge lists use.
+fn tier_rank(tier: Tier) -> usize {
+    Tier::ALL
+        .iter()
+        .position(|t| *t == tier)
+        .unwrap_or(usize::MAX)
 }
 
 impl StepTrace {
@@ -335,30 +515,56 @@ impl StepTrace {
     /// cache envelope back. `nothing-outstanding` asks whether anything is still
     /// charged when the step is over, and a step still holding its own cache is
     /// not over.
+    /// `artifact` and `case` are **owned strings the caller already built**, not
+    /// `impl Into<String>`: converting a `&str` here would be an infallible
+    /// allocation inside this function, which is the one thing it may not have.
+    /// Building them is the caller's, where a failure is its own to handle.
     pub fn new(
-        artifact: impl Into<String>,
-        case: impl Into<String>,
+        artifact: String,
+        case: String,
         layers: Vec<LayerTrace>,
+        start: &StepSnapshot,
         authority: &ResidencyAuthority,
         ledger: &Ledger,
-    ) -> Self {
-        let mut totals: BTreeMap<Scope, ByteFlow> = BTreeMap::new();
+    ) -> Result<Self, Error> {
+        let mut totals: Vec<(Scope, ByteFlow)> = Vec::new();
         for layer in &layers {
             for delta in &layer.scopes {
-                let entry = totals.entry(delta.scope).or_default();
+                let entry = entry_for(&mut totals, delta.scope)?;
                 *entry = entry.plus(&delta.flow);
             }
         }
-        StepTrace {
-            schema_version: TRACE_SCHEMA_VERSION,
-            artifact: artifact.into(),
-            case: case.into(),
-            layers,
-            totals: totals.into_iter().collect(),
-            outstanding_reservations: ledger.outstanding().len(),
-            final_accounts: authority.accounts(),
-            unmeasured: UNMEASURED,
+        let mut whole: Vec<(Scope, ByteFlow)> = Vec::new();
+        let mut final_accounts: Vec<ScopeAccount> = Vec::new();
+        reserve(&mut whole, authority.scope_count())?;
+        reserve(&mut final_accounts, authority.scope_count())?;
+        let mut overflow = None;
+        authority.for_each_account(|a| {
+            if whole.len() == whole.capacity() || final_accounts.len() == final_accounts.capacity()
+            {
+                overflow = Some(a.scope);
+                return;
+            }
+            whole.push((a.scope, a.flow.since(&start.flow_of(a.scope))));
+            final_accounts.push(a);
+        });
+        if let Some(scope) = overflow {
+            return Err(invalid(
+                "scopes",
+                format!("{scope} appeared while this step was being assembled"),
+            ));
         }
+        Ok(StepTrace {
+            schema_version: TRACE_SCHEMA_VERSION,
+            artifact,
+            case,
+            layers,
+            totals,
+            outstanding_reservations: ledger.outstanding_count(),
+            final_accounts,
+            whole,
+            unmeasured: UNMEASURED,
+        })
     }
 }
 
@@ -441,6 +647,33 @@ impl LayerTrace {
         };
 
         // --- the ledger --------------------------------------------------
+        //
+        // Which ledger, before what it says. A review read a completed run's
+        // charges out of a different, empty ledger and the layer reconciled:
+        // observed and accounted were both empty, and empty equals empty.
+        c.eq(
+            "ledger-is-the-runs-own",
+            self.ledger_id,
+            self.run_ledger_id,
+            || {
+                format!(
+                    "this trace read ledger {} and the run was admitted against {}",
+                    self.ledger_id, self.run_ledger_id
+                )
+            },
+        )?;
+        c.eq(
+            "every-reservation-is-charged",
+            self.reservations_found,
+            self.reservations_named,
+            || {
+                format!(
+                    "{} of {} reservation(s) this step can name are in the ledger; one it cannot \
+                     find is one it cannot compare",
+                    self.reservations_found, self.reservations_named
+                )
+            },
+        )?;
         c.eq(
             "ledger-charges-what-is-held",
             self.ledger.len() as u64,
@@ -565,21 +798,57 @@ impl LayerTrace {
             },
         )?;
         // Found by mutation: deleting the launch counter survived the whole
-        // sweep, because nothing compared it to anything. One launch per device
-        // group is the equality it was missing, and it is worth having on its
-        // own terms -- document 07 lists launch count among the per-phase
-        // counters, and a count nobody checks is a count nobody can trust.
-        c.eq(
-            "launches-match-device-groups",
-            self.cost.launches,
-            self.cost.device_groups,
-            || {
-                format!(
-                    "{} launch(es) submitted for {} device group(s)",
-                    self.cost.launches, self.cost.device_groups
-                )
-            },
-        )?;
+        // sweep, because nothing compared it to anything. Then found by review:
+        // the first version of this equality compared it to the *group* count,
+        // and the device path submits one launch per **symbol** of the
+        // descriptor it selected -- a projection and a reduction. It was
+        // validating a quantity that was wrong by a factor of two, which is
+        // worse than not checking it.
+        let per_group = self
+            .cost
+            .device_groups
+            .saturating_mul(self.kernels_per_group);
+        if self.completed {
+            c.eq(
+                "launches-match-device-groups",
+                self.cost.launches,
+                per_group,
+                || {
+                    format!(
+                        "{} launch(es) submitted for {} device group(s) of {} symbol(s) each",
+                        self.cost.launches, self.cost.device_groups, self.kernels_per_group
+                    )
+                },
+            )?;
+        } else {
+            // A layer that failed part way through a group submitted what it
+            // submitted: at least every completed group's symbols, and at most
+            // one further group's. Both sides, because a lane that reported
+            // nothing and one that reported a whole extra group are different
+            // defects.
+            c.at_least(
+                "launches-match-device-groups",
+                self.cost.launches,
+                per_group,
+                || {
+                    format!(
+                        "a failed layer submitted {} launch(es) for {} completed device group(s)                          of {} symbol(s) each",
+                        self.cost.launches, self.cost.device_groups, self.kernels_per_group
+                    )
+                },
+            )?;
+            c.at_least(
+                "launches-match-device-groups",
+                per_group.saturating_add(self.kernels_per_group),
+                self.cost.launches,
+                || {
+                    format!(
+                        "a failed layer submitted {} launch(es), more than the {} completed                          group(s) plus the one that failed can account for",
+                        self.cost.launches, self.cost.device_groups
+                    )
+                },
+            )?;
+        }
         let slots = self.rows.saturating_mul(self.top_k);
         if self.completed {
             c.eq(
@@ -849,10 +1118,17 @@ impl StepTrace {
         // used to build `totals`. Recomputing with the same function would make
         // this a comparison of a thing to itself, and this repository has twice
         // found that shape passing over a defect.
-        let mut summed: BTreeMap<Scope, ByteFlow> = BTreeMap::new();
+        let mut summed: Vec<(Scope, ByteFlow)> = Vec::new();
         for layer in &self.layers {
             for delta in &layer.scopes {
-                let e = summed.entry(delta.scope).or_default();
+                let e = entry_for(&mut summed, delta.scope).map_err(|e| Discrepancy {
+                    check: "step-is-the-sum-of-layers",
+                    layer: Some(layer.layer),
+                    scope: Some(delta.scope),
+                    left: 0,
+                    right: 0,
+                    detail: format!("the step's totals could not be computed: {e}"),
+                })?;
                 let f = &delta.flow;
                 e.requested_bytes += f.requested_bytes;
                 e.hit_bytes += f.hit_bytes;
@@ -887,7 +1163,10 @@ impl StepTrace {
         )?;
         for (scope, total) in &self.totals {
             c.scope = Some(*scope);
-            let want = summed.get(scope).copied().unwrap_or_default();
+            let want = summed
+                .iter()
+                .find(|(s, _)| s == scope)
+                .map_or_else(ByteFlow::default, |(_, f)| *f);
             if *total != want {
                 return Err(Discrepancy {
                     check: "step-is-the-sum-of-layers",
@@ -899,6 +1178,39 @@ impl StepTrace {
                 });
             }
             c.out.equalities_checked += 1;
+        }
+        c.scope = None;
+
+        // --- the step's outer boundary -------------------------------------
+        //
+        // Every byte that **entered** a cache during this step belongs to a
+        // layer. Departures need not: a step retires its caches after its last
+        // layer, and that is cleanup rather than an omission. Stated as six
+        // equalities per scope, because a trace that only re-sums the records it
+        // was handed cannot notice one that is missing -- which is exactly what
+        // a review demonstrated by dropping the middle layer of three.
+        for (scope, whole) in &self.whole {
+            c.scope = Some(*scope);
+            let mine = summed
+                .iter()
+                .find(|(s, _)| s == scope)
+                .map_or_else(ByteFlow::default, |(_, f)| *f);
+            for (what, outer, inner) in [
+                ("requested", whole.requested_bytes, mine.requested_bytes),
+                ("hit", whole.hit_bytes, mine.hit_bytes),
+                ("coalesced", whole.coalesced_bytes, mine.coalesced_bytes),
+                ("admitted", whole.admitted_bytes, mine.admitted_bytes),
+                ("read", whole.read_bytes, mine.read_bytes),
+                ("uploaded", whole.uploaded_bytes, mine.uploaded_bytes),
+            ] {
+                c.eq("step-covers-every-byte", outer, inner, || {
+                    format!(
+                        "{scope}: the authority {what} {outer} B over this step and its layers \
+                         account for {inner} B -- a byte that entered a cache and belongs to no \
+                         layer is a layer that is missing from this trace"
+                    )
+                })?;
+            }
         }
         c.scope = None;
 

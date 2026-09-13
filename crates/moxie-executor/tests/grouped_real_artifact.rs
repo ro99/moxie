@@ -146,11 +146,13 @@ fn budget(device: moxie_types::DeviceUuid, bus: String, cache: u64, arena: u64) 
         device_pci_bus_id: bus,
         device_cache_cap_bytes: cache,
         device_cache_leased_bytes: 0,
+        device_cache_resident_bytes: 0,
         device_arena_free_bytes: arena,
         host_workspace_bytes: MIB,
         host_buffer_bytes: 4 * MIB,
         host_cache_cap_bytes: 1 << 30,
         host_cache_leased_bytes: 0,
+        host_cache_resident_bytes: 0,
         resident: ResidentChunks::none(),
     }
 }

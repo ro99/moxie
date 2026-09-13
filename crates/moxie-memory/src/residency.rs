@@ -2092,6 +2092,28 @@ impl ResidencyAuthority {
         out
     }
 
+    /// Visit every scope's account, allocating **nothing**.
+    ///
+    /// [`ResidencyAuthority::accounts`] builds a vector, which is right for a
+    /// diagnostic and wrong for a caller that must not abort. A trace is such a
+    /// caller: it runs inside a generation step, where an allocation failure has
+    /// to be a typed error rather than a process abort.
+    ///
+    /// `account` itself walks the placements and allocates nothing, so this is
+    /// allocation-free end to end.
+    pub fn for_each_account(&self, mut visit: impl FnMut(ScopeAccount)) {
+        for scope in self.caches.keys() {
+            if let Some(account) = self.account(*scope) {
+                visit(account);
+            }
+        }
+    }
+
+    /// How many scopes this authority holds a cache for.
+    pub fn scope_count(&self) -> usize {
+        self.caches.len()
+    }
+
     /// Every scope this authority holds a cache for, in scope order.
     pub fn accounts(&self) -> Vec<ScopeAccount> {
         self.caches

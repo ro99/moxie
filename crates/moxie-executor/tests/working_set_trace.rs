@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 
 use moxie_executor::grouped::{ExpertRoles, GroupedRun};
 use moxie_executor::residency::{ChunkSource, ShardSource};
-use moxie_executor::trace::{LayerSnapshot, LayerTrace, StepTrace, TRACE_SCHEMA_VERSION};
+use moxie_executor::trace::{
+    LayerSnapshot, LayerTrace, StepSnapshot, StepTrace, TRACE_SCHEMA_VERSION,
+};
 use moxie_graph::{CombineOrder, ExpertActivation, OpParams};
 use moxie_kernels::cpu_expert::{bf16_round, to_bf16_bits};
 use moxie_memory::{
@@ -256,6 +258,10 @@ fn catalogue() -> KernelCatalogue {
     .expect("one descriptor")
 }
 
+/// Kernel launches one device group submits: one per symbol of the selected
+/// descriptor, which for the expert kernel is a projection and a reduction.
+const KERNELS_PER_GROUP: u32 = 2;
+
 /// A device lane that performs uploads and computes nothing.
 ///
 /// The trace is about bytes and counts, and the numerical answer is task 0021's
@@ -289,8 +295,11 @@ impl moxie_executor::grouped::ExpertDeviceLane for Lane {
         _down: &moxie_memory::ResidencyLease,
         _staging: moxie_executor::grouped::ExpertStaging<'_>,
         _host_slots: &mut [u8],
-    ) -> std::result::Result<(), moxie_executor::grouped::LaunchRefused> {
-        Ok(())
+    ) -> std::result::Result<u32, moxie_executor::grouped::LaunchRefused> {
+        // What the production lane submits: one launch per symbol of the
+        // selected descriptor. A double reporting anything else would make the
+        // launch equality mean something different here than on a card.
+        Ok(KERNELS_PER_GROUP)
     }
 
     fn close(&mut self, _ledger: &mut Ledger) -> Result<()> {
@@ -355,6 +364,11 @@ struct Case {
 
 /// What one layer's traced run produced.
 struct LayerOutcome {
+    /// Every layer execution this call performed: the warm pass, when the case
+    /// asked for one, and then the traced run. Both are traced, because the
+    /// step's outer boundary counts the bytes of both.
+    traces: Vec<LayerTrace>,
+    /// The traced run's own record, for the assertions that are about it.
     trace: LayerTrace,
     failed: bool,
 }
@@ -388,6 +402,7 @@ fn run_layer(
     };
     let cat = catalogue();
     let cap = capability();
+    let mut traces: Vec<LayerTrace> = Vec::new();
 
     // A warm pass, if this case asked for one. It is an ordinary run through the
     // ordinary path; nothing is placed by hand.
@@ -396,7 +411,7 @@ fn run_layer(
             &mlp(),
             &combine(),
             &route(layer),
-            &budget(case, layer, union, ResidentChunks::none()),
+            &budget(case, layer, union, ResidentChunks::none(), 0, 0),
             &policy,
             None,
             device.then_some(ExpertKernels {
@@ -405,6 +420,7 @@ fn run_layer(
             }),
         )
         .unwrap();
+        let snapshot = LayerSnapshot::take(layer, authority).unwrap();
         let mut run = GroupedRun::admit(ledger, plan, roles(layer), None).unwrap();
         if device {
             run.install_lane(Box::new(Lane)).unwrap();
@@ -417,6 +433,7 @@ fn run_layer(
         };
         run.run_to_completion(authority, &mut src, TurnId::new(turn), 0, u64::MAX)
             .unwrap();
+        traces.push(snapshot.close(&run, authority, ledger).unwrap());
         run.close(ledger).unwrap();
         authority.check_invariants().unwrap();
     }
@@ -434,7 +451,18 @@ fn run_layer(
         &mlp(),
         &combine(),
         &route(layer),
-        &budget(case, layer, union, resident),
+        &budget(
+            case,
+            layer,
+            union,
+            resident,
+            if device {
+                resident_bytes_of(authority, scope)
+            } else {
+                0
+            },
+            resident_bytes_of(authority, Scope::Host),
+        ),
         &policy,
         None,
         device.then_some(ExpertKernels {
@@ -444,7 +472,7 @@ fn run_layer(
     )
     .unwrap();
 
-    let snapshot = LayerSnapshot::take(layer, authority);
+    let snapshot = LayerSnapshot::take(layer, authority).unwrap();
     let mut run = GroupedRun::admit(ledger, plan, roles(layer), None).unwrap();
     if device {
         run.install_lane(Box::new(Lane)).unwrap();
@@ -459,13 +487,27 @@ fn run_layer(
     let failed = outcome.is_err();
     run.check_invariants().unwrap();
     authority.check_invariants().unwrap();
-    let trace = snapshot.close(&run, authority, ledger);
+    let trace = snapshot.close(&run, authority, ledger).unwrap();
     if failed {
         run.cancel(authority);
     }
     let _ = run.close(ledger);
     authority.check_invariants().unwrap();
-    LayerOutcome { trace, failed }
+    traces.push(trace.clone());
+    LayerOutcome {
+        traces,
+        trace,
+        failed,
+    }
+}
+
+/// Everything a scope's cache holds right now, this route's chunks or not.
+///
+/// The quantity a review showed the exactness rule cannot do without: eviction
+/// does not reason about one plan's share of a cache, so a prediction that does
+/// is unsound exactly when somebody else's chunks are in the way.
+fn resident_bytes_of(authority: &ResidencyAuthority, scope: Scope) -> u64 {
+    authority.account(scope).map_or(0, |a| a.resident_bytes)
 }
 
 /// Where this layer's expert chunks are, read from the authority **per chunk**.
@@ -519,7 +561,14 @@ fn resident_chunks(
     out
 }
 
-fn budget(case: Case, layer: u32, union: u64, resident: ResidentChunks) -> ExpertBudget {
+fn budget(
+    case: Case,
+    layer: u32,
+    union: u64,
+    resident: ResidentChunks,
+    device_resident_bytes: u64,
+    host_resident_bytes: u64,
+) -> ExpertBudget {
     let device = case.placement == Placement::Device;
     let _ = layer;
     ExpertBudget {
@@ -531,11 +580,13 @@ fn budget(case: Case, layer: u32, union: u64, resident: ResidentChunks) -> Exper
             0
         },
         device_cache_leased_bytes: 0,
+        device_cache_resident_bytes: device_resident_bytes,
         device_arena_free_bytes: if device { 1 << 20 } else { 0 },
         host_workspace_bytes: 1 << 20,
         host_buffer_bytes: 1 << 20,
         host_cache_cap_bytes: case.host_room.bytes(union),
         host_cache_leased_bytes: 0,
+        host_cache_resident_bytes: host_resident_bytes,
         resident,
     }
 }
@@ -557,6 +608,9 @@ fn run_case(case: Case, path: &Path, x: &[u8]) -> (StepTrace, u32) {
         request = request.device(uuid(), case.device_room.bytes(union));
     }
     let mut authority = ResidencyAuthority::open(&mut ledger, &request).unwrap();
+    // Before the first layer, and before any warm pass: every byte that enters a
+    // cache from here on has to belong to a layer of this trace.
+    let start = StepSnapshot::take(&authority).unwrap();
 
     let mut layers = Vec::new();
     let mut failures = 0;
@@ -575,8 +629,10 @@ fn run_case(case: Case, path: &Path, x: &[u8]) -> (StepTrace, u32) {
         }
         // A failed layer's trace is **kept**. Its bytes were charged, moved and
         // given back like any other layer's, and a step that dropped them would
-        // reconcile a subset of itself.
-        layers.push(outcome.trace);
+        // reconcile a subset of itself. A warm pass is kept for the same reason:
+        // it is a layer execution, its bytes entered the caches, and the step's
+        // outer boundary counts them whether this test does or not.
+        layers.extend(outcome.traces);
         authority.end_turn(TurnId::new(u64::from(layer) + 1));
     }
 
@@ -590,12 +646,14 @@ fn run_case(case: Case, path: &Path, x: &[u8]) -> (StepTrace, u32) {
     // over.
     authority.close(&mut ledger).unwrap();
     let trace = StepTrace::new(
-        artifact().as_str(),
+        artifact().as_str().to_string(),
         format!("{case:?}"),
         layers,
+        &start,
         &authority,
         &ledger,
-    );
+    )
+    .unwrap();
     (trace, failures)
 }
 
@@ -784,6 +842,18 @@ fn every_equality_can_fail_and_names_itself() {
             Box::new(|t: &mut StepTrace| t.schema_version += 1),
         ),
         (
+            "ledger-is-the-runs-own",
+            Box::new(|t: &mut StepTrace| t.layers[0].ledger_id += 1),
+        ),
+        (
+            "every-reservation-is-charged",
+            Box::new(|t: &mut StepTrace| t.layers[0].reservations_named += 1),
+        ),
+        (
+            "step-covers-every-byte",
+            Box::new(|t: &mut StepTrace| t.whole[0].1.read_bytes += 1),
+        ),
+        (
             "ledger-charges-what-is-held",
             Box::new(|t: &mut StepTrace| t.layers[0].ledger[0].2 += 64),
         ),
@@ -887,7 +957,7 @@ fn every_equality_can_fail_and_names_itself() {
     }
     // Every equality `reconcile` can report must appear here. A new check with
     // no violating fixture is a check nobody has shown to be load-bearing.
-    assert_eq!(named.len(), 14);
+    assert_eq!(named.len(), 17);
 
     // The *bound* form of the prediction checks is a separate branch and needs
     // its own violations: a lower bound fails when the outcome is below it, not
@@ -1054,6 +1124,7 @@ fn a_charge_nobody_can_name_is_reported() {
         &ResidencyRequest::new("third charger", case.host_room.bytes(union)),
     )
     .unwrap();
+    let start = StepSnapshot::take(&authority).unwrap();
 
     // Somebody else's reservation, live for the whole layer. It is charged to a
     // tier this step also uses, so it cannot be spotted by its tier alone.
@@ -1072,12 +1143,14 @@ fn a_charge_nobody_can_name_is_reported() {
     let outcome = run_layer(case, 0, &path, &x, &mut ledger, &mut authority, 1);
     assert!(!outcome.failed);
     let failure = StepTrace::new(
-        artifact().as_str(),
-        "third charger",
-        vec![outcome.trace],
+        artifact().as_str().to_string(),
+        "third charger".to_string(),
+        outcome.traces,
+        &start,
         &authority,
         &ledger,
     )
+    .unwrap()
     .reconcile()
     .expect_err("a charge nobody can name must not reconcile");
     assert_eq!(failure.check, "ledger-charges-what-is-held", "{failure}");
@@ -1087,4 +1160,251 @@ fn a_charge_nobody_can_name_is_reported() {
     authority.end_turn(TurnId::new(1));
     authority.retire_all(Scope::Host);
     authority.close(&mut ledger).unwrap();
+}
+
+/// A warm chunk this layer needs, older than a cached chunk it does not.
+///
+/// The review's counterexample, kept. Experts 4 and 5 are warmed; the traced
+/// layer demands 0–4 through a cache that holds five experts. Expert 4 is the
+/// least recently used of everything resident, so this layer's own admissions
+/// evict exactly the chunk it predicted a hit on, and it reads it again —
+/// **3,840 B read against 3,072 B predicted**, when the prediction called itself
+/// exact.
+///
+/// The rule is now "nothing has to be evicted", which this configuration fails,
+/// so the prediction is a declared lower bound and the run reconciles against
+/// it. What makes this a regression rather than a one-off is the assertion that
+/// the planner does **not** call it exact: an exactness rule that drifted back
+/// to reasoning about one plan's share of the cache would fail here by name.
+#[test]
+fn a_warm_chunk_older_than_an_unrelated_one_is_not_an_exact_prediction() {
+    let dir = scratch("lru-victim");
+    let (path, x) = write_shard(&dir, 0x0023_0023);
+    let case = Case {
+        placement: Placement::Host,
+        device_room: Room::Roomy,
+        host_room: Room::Roomy,
+        warm: Warm::Cold,
+        layers: 1,
+        fail_read_at: None,
+    };
+    let mut ledger = ledger_for(case);
+    let union = union_bytes(0);
+    // Exactly the five experts layer 0 demands, and not one byte more.
+    let mut authority =
+        ResidencyAuthority::open(&mut ledger, &ResidencyRequest::new("lru", union)).unwrap();
+    let start = StepSnapshot::take(&authority).unwrap();
+
+    // Warm experts 4 and 5. Expert 4 is in layer 0's route; expert 5 is not, and
+    // it is touched later, so it is the *newer* of the two.
+    let policy = ExpertPolicy {
+        device: StrategyControl::Off,
+        host: StrategyControl::Auto,
+        host_placement: StrategyControl::Off,
+        ..ExpertPolicy::default()
+    };
+    let warm_route = [4, 5, 4, 5, 4, 5, 4, 5];
+    let warm_plan = compile_experts(
+        &mlp(),
+        &combine(),
+        &warm_route,
+        &budget(case, 0, union, ResidentChunks::none(), 0, 0),
+        &policy,
+        None,
+        None,
+    )
+    .unwrap();
+    // The warm pass is a layer execution and its bytes enter the cache, so it is
+    // traced. `step-covers-every-byte` catches it if it is not -- it caught this
+    // very test the first time it was written.
+    let warm_snapshot = LayerSnapshot::take(0, &authority).unwrap();
+    let mut warm = GroupedRun::admit(&mut ledger, warm_plan, roles(0), None).unwrap();
+    warm.load_activations(&x).unwrap();
+    let mut src = FailingSource {
+        inner: source(&path),
+        fail_at: None,
+        seen: 0,
+    };
+    warm.run_to_completion(&mut authority, &mut src, TurnId::new(90), 0, u64::MAX)
+        .unwrap();
+    let warm_trace = warm_snapshot.close(&warm, &authority, &ledger).unwrap();
+    warm.close(&mut ledger).unwrap();
+    authority.end_turn(TurnId::new(90));
+
+    let outcome = run_layer(case, 0, &path, &x, &mut ledger, &mut authority, 91);
+    assert!(!outcome.failed);
+    assert!(
+        !matches!(outcome.trace.predicted.exactness, Exactness::Exact),
+        "a cache that must evict to admit this layer cannot promise an exact \
+         prediction: {:?}",
+        outcome.trace.predicted.exactness
+    );
+    let host = outcome
+        .trace
+        .scopes
+        .iter()
+        .find(|s| s.scope == Scope::Host)
+        .expect("a host scope");
+    assert!(
+        host.flow.read_bytes > outcome.trace.predicted.host_read_bytes,
+        "this configuration is supposed to re-read an evicted warm chunk; it read \
+         {} B against {} B predicted",
+        host.flow.read_bytes,
+        outcome.trace.predicted.host_read_bytes
+    );
+    println!(
+        "warm chunk evicted by its own layer: {} B read against {} B predicted as a lower bound",
+        host.flow.read_bytes, outcome.trace.predicted.host_read_bytes
+    );
+
+    authority.end_turn(TurnId::new(91));
+    authority.retire_all(Scope::Host);
+    authority.close(&mut ledger).unwrap();
+    let mut layers = vec![warm_trace];
+    layers.extend(outcome.traces);
+    let trace = StepTrace::new(
+        artifact().as_str().to_string(),
+        "lru victim".to_string(),
+        layers,
+        &start,
+        &authority,
+        &ledger,
+    )
+    .unwrap();
+    trace
+        .reconcile()
+        .expect("a lower-bound prediction reconciles against what happened");
+}
+
+/// A layer that ran and is missing from the trace must be found.
+///
+/// The review's second counterexample, kept. Three layers executed and 11,520 B
+/// of reads happened; dropping the middle record and re-deriving the totals gave
+/// a trace that reconciled **35 checks** over two layers and never mentioned the
+/// third. Totals derived from the records supplied, and then re-summed from the
+/// same records, cannot notice one that is not there.
+///
+/// The step's own boundary can: `whole` is the authority's delta from before the
+/// first layer, and the layers must account for every byte that **entered** a
+/// cache inside it.
+#[test]
+fn a_layer_that_ran_may_not_be_left_out_of_the_step() {
+    let dir = scratch("omitted");
+    let (path, x) = write_shard(&dir, 0x0023_7070);
+    let case = Case {
+        placement: Placement::Host,
+        device_room: Room::Roomy,
+        host_room: Room::Roomy,
+        warm: Warm::Cold,
+        layers: LAYERS,
+        fail_read_at: None,
+    };
+    let (complete, failures) = run_case(case, &path, &x);
+    assert_eq!(failures, 0);
+    assert_eq!(complete.layers.len(), LAYERS as usize);
+    complete.reconcile().expect("the complete step reconciles");
+
+    let read: u64 = complete
+        .whole
+        .iter()
+        .filter(|(scope, _)| *scope == Scope::Host)
+        .map(|(_, flow)| flow.read_bytes)
+        .sum();
+    assert!(read > 0, "the step read nothing; there is nothing to omit");
+
+    // Drop the middle layer and re-derive the totals exactly as `new` would, so
+    // the forgery is internally consistent: only the outer boundary can tell.
+    let mut forged = complete.clone();
+    let dropped = forged.layers.remove(1);
+    let mut totals: std::collections::BTreeMap<Scope, moxie_memory::ByteFlow> =
+        std::collections::BTreeMap::new();
+    for layer in &forged.layers {
+        for delta in &layer.scopes {
+            let entry = totals.entry(delta.scope).or_default();
+            *entry = entry.plus(&delta.flow);
+        }
+    }
+    forged.totals = totals.into_iter().collect();
+    let failure = forged
+        .reconcile()
+        .expect_err("a step that omits an executed layer must not reconcile");
+    assert_eq!(failure.check, "step-covers-every-byte", "{failure}");
+    println!(
+        "omitted layer {} of a {}-layer step reported as: {failure}",
+        dropped.layer, LAYERS
+    );
+}
+
+/// A trace read out of somebody else's ledger must be refused.
+///
+/// The review's third counterexample, kept. Handing `close` a separate, empty
+/// ledger made the observed charges empty and the accounted charges empty, and
+/// empty equals empty: a completed run reconciled with **no recorded ledger
+/// charges at all**. Two numbers agreeing is worth nothing when both can be read
+/// from the wrong place.
+#[test]
+fn a_trace_read_from_another_ledger_is_refused() {
+    let dir = scratch("foreign-ledger");
+    let (path, x) = write_shard(&dir, 0x0023_8080);
+    let case = Case {
+        placement: Placement::Host,
+        device_room: Room::Roomy,
+        host_room: Room::Roomy,
+        warm: Warm::Cold,
+        layers: 1,
+        fail_read_at: None,
+    };
+    let mut ledger = ledger_for(case);
+    let union = union_bytes(0);
+    let mut authority =
+        ResidencyAuthority::open(&mut ledger, &ResidencyRequest::new("foreign", union)).unwrap();
+    let start = StepSnapshot::take(&authority).unwrap();
+    let stranger = ledger_for(case);
+
+    let policy = ExpertPolicy {
+        device: StrategyControl::Off,
+        host: StrategyControl::Auto,
+        host_placement: StrategyControl::Off,
+        ..ExpertPolicy::default()
+    };
+    let plan = compile_experts(
+        &mlp(),
+        &combine(),
+        &route(0),
+        &budget(case, 0, union, ResidentChunks::none(), 0, 0),
+        &policy,
+        None,
+        None,
+    )
+    .unwrap();
+    let snapshot = LayerSnapshot::take(0, &authority).unwrap();
+    let mut run = GroupedRun::admit(&mut ledger, plan, roles(0), None).unwrap();
+    run.load_activations(&x).unwrap();
+    let mut src = FailingSource {
+        inner: source(&path),
+        fail_at: None,
+        seen: 0,
+    };
+    run.run_to_completion(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
+        .unwrap();
+    // The whole point: a ledger that never admitted any of this.
+    let trace = snapshot.close(&run, &authority, &stranger).unwrap();
+    run.close(&mut ledger).unwrap();
+    authority.end_turn(TurnId::new(1));
+    authority.retire_all(Scope::Host);
+    authority.close(&mut ledger).unwrap();
+
+    let failure = StepTrace::new(
+        artifact().as_str().to_string(),
+        "foreign ledger".to_string(),
+        vec![trace],
+        &start,
+        &authority,
+        &stranger,
+    )
+    .unwrap()
+    .reconcile()
+    .expect_err("a trace read from another ledger must not reconcile");
+    assert_eq!(failure.check, "ledger-is-the-runs-own", "{failure}");
+    println!("foreign ledger reported as: {failure}");
 }
