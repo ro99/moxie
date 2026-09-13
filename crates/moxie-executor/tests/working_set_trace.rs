@@ -337,7 +337,12 @@ impl Room {
         // is not is a refusal rather than a small cache.
         let align = |bytes: u64| bytes.div_ceil(256) * 256;
         match self {
-            Room::Roomy => align(union),
+            // Every layer of the step, **plus the alignment each chunk can
+            // waste**. Sizing it to the step's bytes exactly leaves the last
+            // layer no room for padding, and a prediction that cannot promise
+            // the padding fits is a lower bound -- which would make "roomy" a
+            // configuration that never reaches the exact branch.
+            Room::Roomy => align(u64::from(LAYERS) * union + u64::from(LAYERS) * 8 * 2 * 256),
             Room::Tight => align(union.div_ceil(4).max(CHUNK)),
         }
     }
@@ -457,11 +462,11 @@ fn run_layer(
             union,
             resident,
             if device {
-                resident_bytes_of(authority, scope)
+                largest_free_of(authority, scope)
             } else {
                 0
             },
-            resident_bytes_of(authority, Scope::Host),
+            largest_free_of(authority, Scope::Host),
         ),
         &policy,
         None,
@@ -501,13 +506,16 @@ fn run_layer(
     }
 }
 
-/// Everything a scope's cache holds right now, this route's chunks or not.
+/// The largest contiguous free range in a scope's cache.
 ///
-/// The quantity a review showed the exactness rule cannot do without: eviction
-/// does not reason about one plan's share of a cache, so a prediction that does
-/// is unsound exactly when somebody else's chunks are in the way.
-fn resident_bytes_of(authority: &ResidencyAuthority, scope: Scope) -> u64 {
-    authority.account(scope).map_or(0, |a| a.resident_bytes)
+/// What admission actually needs, and what two rounds of review showed a
+/// prediction cannot do without: eviction does not reason about one plan's share
+/// of a cache, and it does not reason about totals either -- a cache with ample
+/// free bytes in pieces too small for a chunk evicts to admit one.
+fn largest_free_of(authority: &ResidencyAuthority, scope: Scope) -> u64 {
+    authority
+        .occupancy(scope)
+        .map_or(0, |o| o.largest_free_bytes)
 }
 
 /// Where this layer's expert chunks are, read from the authority **per chunk**.
@@ -566,8 +574,8 @@ fn budget(
     layer: u32,
     union: u64,
     resident: ResidentChunks,
-    device_resident_bytes: u64,
-    host_resident_bytes: u64,
+    device_free_bytes: u64,
+    host_free_bytes: u64,
 ) -> ExpertBudget {
     let device = case.placement == Placement::Device;
     let _ = layer;
@@ -580,13 +588,15 @@ fn budget(
             0
         },
         device_cache_leased_bytes: 0,
-        device_cache_resident_bytes: device_resident_bytes,
+        device_cache_largest_free_bytes: device_free_bytes,
         device_arena_free_bytes: if device { 1 << 20 } else { 0 },
         host_workspace_bytes: 1 << 20,
         host_buffer_bytes: 1 << 20,
         host_cache_cap_bytes: case.host_room.bytes(union),
         host_cache_leased_bytes: 0,
-        host_cache_resident_bytes: host_resident_bytes,
+        host_cache_largest_free_bytes: host_free_bytes,
+        cache_alignment_bytes: 256,
+        chunks_per_expert: 2,
         resident,
     }
 }
@@ -1407,4 +1417,154 @@ fn a_trace_read_from_another_ledger_is_refused() {
     .expect_err("a trace read from another ledger must not reconcile");
     assert_eq!(failure.check, "ledger-is-the-runs-own", "{failure}");
     println!("foreign ledger reported as: {failure}");
+}
+
+/// Free space that is ample in total and useless in pieces.
+///
+/// The review's second counterexample, kept and built the same way: a cache of
+/// six experts, holding five, with the free space cut into 256 B holes by
+/// retiring chunks out of order. The plan predicts **768 B of reads** and the
+/// first 512 B chunk it needs fits no hole, so admission evicts the warm expert
+/// the plan was counting on and reads it again — **1,536 B**.
+///
+/// The rule now asks whether **one contiguous run** can hold what the layer
+/// admits, padding included, so this configuration declares a lower bound and
+/// reconciles against it. The assertion that the planner does **not** call it
+/// exact is the regression: a rule that drifted back to comparing totals would
+/// fail here by name.
+#[test]
+fn free_space_in_pieces_is_not_an_exact_prediction() {
+    use moxie_executor::residency::drain_reads;
+    use moxie_memory::{AcquireRequest, Acquired, ChunkId, Content, UseClass};
+
+    let dir = scratch("fragmented");
+    let (path, x) = write_shard(&dir, 0x0023_0999);
+    let case = Case {
+        placement: Placement::Host,
+        device_room: Room::Roomy,
+        host_room: Room::Roomy,
+        warm: Warm::Cold,
+        layers: 1,
+        fail_read_at: None,
+    };
+    let mut ledger = ledger_for(case);
+    let mut authority =
+        ResidencyAuthority::open(&mut ledger, &ResidencyRequest::new("fragment", 6 * CHUNK))
+            .unwrap();
+    let mut src = source(&path);
+    let (shape, _) = moxie_plan::expert::shape_of(&mlp(), &combine()).unwrap();
+
+    // Acquire one chunk and let it go: the placement stays, which is what makes
+    // the cache full, and the lease does not, which is what makes it evictable.
+    let mut load = |authority: &mut ResidencyAuthority, chunk: &ChunkId, now: u64| {
+        let acquired = authority
+            .acquire(AcquireRequest {
+                chunk,
+                destination: Scope::Host,
+                now,
+                deadline: u64::MAX,
+                class: UseClass::demand(Content::Expert),
+                turn: TurnId::new(90),
+            })
+            .unwrap();
+        let lease = match acquired {
+            Acquired::Ready(lease) => lease,
+            Acquired::Pending { lease, work, .. } => {
+                drain_reads(authority, &mut src, work).unwrap();
+                lease
+            }
+        };
+        authority.release(lease).unwrap();
+    };
+
+    for (now, expert) in [4, 5, 1, 2, 3, 0].into_iter().enumerate() {
+        let (gate_up, down) = roles(0).chunks(expert, shape).unwrap();
+        load(&mut authority, &gate_up, now as u64);
+        load(&mut authority, &down, now as u64);
+    }
+    // Cut the free space into pieces: retire one 512 B chunk, fill it with a
+    // chunk from another layer, then retire three 256 B chunks spread through
+    // the arena. Ample free bytes, no hole bigger than 256.
+    authority
+        .retire(Scope::Host, &roles(0).chunks(0, shape).unwrap().0)
+        .unwrap();
+    load(&mut authority, &roles(1).chunks(0, shape).unwrap().0, 10);
+    for expert in [0, 1, 2] {
+        authority
+            .retire(Scope::Host, &roles(0).chunks(expert, shape).unwrap().1)
+            .unwrap();
+    }
+    authority.check_invariants().unwrap();
+
+    let occupancy = authority.occupancy(Scope::Host).unwrap();
+    assert!(
+        occupancy.free_bytes > occupancy.largest_free_bytes,
+        "this fixture is supposed to fragment the arena: {occupancy:?}"
+    );
+    println!(
+        "fragmented host cache: {} B free in {} range(s), largest {} B",
+        occupancy.free_bytes, occupancy.free_ranges, occupancy.largest_free_bytes
+    );
+
+    let resident = resident_chunks(&authority, None, 0);
+    let policy = ExpertPolicy {
+        device: StrategyControl::Off,
+        host: StrategyControl::Auto,
+        host_placement: StrategyControl::Off,
+        ..ExpertPolicy::default()
+    };
+    let plan = compile_experts(
+        &mlp(),
+        &combine(),
+        &[0, 4, 0, 4, 0, 4, 0, 4],
+        &budget(
+            case,
+            0,
+            6 * CHUNK,
+            resident,
+            0,
+            occupancy.largest_free_bytes,
+        ),
+        &policy,
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !matches!(plan.envelope().predicted.exactness, Exactness::Exact),
+        "free space in pieces cannot promise an exact prediction: {:?}",
+        plan.envelope().predicted.exactness
+    );
+
+    let start = StepSnapshot::take(&authority).unwrap();
+    let snapshot = LayerSnapshot::take(0, &authority).unwrap();
+    let mut run = GroupedRun::admit(&mut ledger, plan, roles(0), None).unwrap();
+    run.load_activations(&x).unwrap();
+    run.run_to_completion(&mut authority, &mut src, TurnId::new(91), 20, u64::MAX)
+        .unwrap();
+    authority.check_invariants().unwrap();
+    let trace = snapshot.close(&run, &authority, &ledger).unwrap();
+    run.close(&mut ledger).unwrap();
+    authority.close(&mut ledger).unwrap();
+
+    let host = trace
+        .scopes
+        .iter()
+        .find(|s| s.scope == Scope::Host)
+        .expect("a host scope");
+    println!(
+        "fragmentation forced {} B of reads against {} B predicted as a lower bound",
+        host.flow.read_bytes, trace.predicted.host_read_bytes
+    );
+    let step = StepTrace::new(
+        artifact().as_str().to_string(),
+        "fragmentation".to_string(),
+        vec![trace],
+        &start,
+        &authority,
+        &ledger,
+    )
+    .unwrap();
+    step.reconcile()
+        .expect("a lower-bound prediction reconciles against what happened");
 }

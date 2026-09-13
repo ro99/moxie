@@ -46,15 +46,25 @@ struct Injector;
 // to report failure.
 unsafe impl GlobalAlloc for Injector {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let fail = FAIL.try_with(|f| {
-            let left = f.get();
+        let _ = SERVED.try_with(|c| c.set(c.get() + 1));
+        let skipping = SKIP.try_with(|s| {
+            let left = s.get();
             if left > 0 {
-                f.set(left - 1);
+                s.set(left - 1);
             }
             left > 0
         });
-        if fail == Ok(true) {
-            return core::ptr::null_mut();
+        if skipping != Ok(true) {
+            let fail = FAIL.try_with(|f| {
+                let left = f.get();
+                if left > 0 {
+                    f.set(left - 1);
+                }
+                left > 0
+            });
+            if fail == Ok(true) {
+                return core::ptr::null_mut();
+            }
         }
         // SAFETY: the caller supplies a valid layout.
         unsafe { System.alloc(layout) }
@@ -68,12 +78,41 @@ unsafe impl GlobalAlloc for Injector {
 #[global_allocator]
 static ALLOCATOR: Injector = Injector;
 
+thread_local! {
+    /// Allocations to serve before the failing one begins.
+    static SKIP: Cell<usize> = const { Cell::new(0) };
+    /// Allocations served on this thread, for counting a body's demand.
+    static SERVED: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Fail the next `n` allocations on this thread, run `body`, then serve again.
 fn while_failing<T>(n: usize, body: impl FnOnce() -> T) -> T {
+    while_failing_at(0, n, body)
+}
+
+/// Serve `skip` allocations, then fail `n`, then serve again.
+///
+/// The parameter a review found missing. The first version of this file looped
+/// six times calling `while_failing(1, ...)`, so **every iteration failed the
+/// first allocation** and the loop index only changed the assertion message: an
+/// axis that was exercised and never varied. A failure at the sixth allocation
+/// of `close` -- inside `reservation_ids`, which built a `Vec` -- aborted the
+/// process, and this file said nothing.
+fn while_failing_at<T>(skip: usize, n: usize, body: impl FnOnce() -> T) -> T {
+    SKIP.with(|f| f.set(skip));
     FAIL.with(|f| f.set(n));
     let out = body();
+    SKIP.with(|f| f.set(0));
     FAIL.with(|f| f.set(0));
     out
+}
+
+/// How many allocations `body` asks for on this thread.
+fn allocations_of<T>(body: impl FnOnce() -> T) -> usize {
+    let before = SERVED.try_with(Cell::get).unwrap_or(0);
+    let out = body();
+    drop(out);
+    SERVED.try_with(Cell::get).unwrap_or(0) - before
 }
 
 const HIDDEN: u64 = 16;
@@ -187,13 +226,15 @@ fn a_trace_that_cannot_allocate_returns_an_error_instead_of_aborting() {
             device_pci_bus_id: BUS.into(),
             device_cache_cap_bytes: 0,
             device_cache_leased_bytes: 0,
-            device_cache_resident_bytes: 0,
+            device_cache_largest_free_bytes: u64::MAX,
             device_arena_free_bytes: 0,
             host_workspace_bytes: 1 << 20,
             host_buffer_bytes: 1 << 20,
             host_cache_cap_bytes: union,
             host_cache_leased_bytes: 0,
-            host_cache_resident_bytes: 0,
+            host_cache_largest_free_bytes: u64::MAX,
+            cache_alignment_bytes: 256,
+            chunks_per_expert: 2,
             resident: ResidentChunks::none(),
         },
         &ExpertPolicy {
@@ -211,8 +252,11 @@ fn a_trace_that_cannot_allocate_returns_an_error_instead_of_aborting() {
     // below closes a snapshot that is genuinely this layer's. Taking one after
     // the run would describe a layer that moved nothing, which the
     // reconciliation rejects and rightly so.
+    // One per injection position, plus one to measure the demand with and one
+    // for the real close. Twenty-four is comfortably more than `close` asks for;
+    // the loop below asserts it used what it needed.
     let mut snapshots = Vec::new();
-    for _ in 0..7 {
+    for _ in 0..24 {
         snapshots.push(LayerSnapshot::take(0, &authority).unwrap());
     }
     let mut run = GroupedRun::admit(
@@ -235,16 +279,21 @@ fn a_trace_that_cannot_allocate_returns_an_error_instead_of_aborting() {
     // per charged tier, and the accounted charges. Failing each of the first
     // few must refuse rather than abort, and the loop is what shows that no
     // single one of them was left infallible.
-    for budget in 0..6 {
-        // One snapshot per injection: `close` consumes it, and a
-        // `LayerSnapshot` is deliberately not `Clone` -- cloning one would be an
-        // infallible allocation inside a step, which is the defect this file is
-        // about.
+    // **Every** allocation position, not the first one six times over. How many
+    // there are is measured rather than assumed, so a position that stops being
+    // reached shows up as a change in the count.
+    let demand = allocations_of(|| {
+        let snapshot = snapshots.pop().expect("a snapshot to measure with");
+        snapshot.close(&run, &authority, &ledger)
+    });
+    assert!(demand > 0, "closing a layer asked for no memory at all");
+    println!("closing a layer asks for {demand} allocation(s); failing each in turn");
+    for position in 0..demand {
         let snapshot = snapshots.pop().expect("a snapshot per injection");
-        let refused = while_failing(1, || snapshot.close(&run, &authority, &ledger));
+        let refused = while_failing_at(position, 1, || snapshot.close(&run, &authority, &ledger));
         assert!(
             refused.is_err(),
-            "closing a layer that cannot allocate must refuse (injection {budget})"
+            "closing a layer must refuse when its allocation {position} fails"
         );
     }
     let snapshot = snapshots.pop().expect("one snapshot left");
@@ -279,8 +328,26 @@ fn a_trace_that_cannot_allocate_returns_an_error_instead_of_aborting() {
     )
     .expect("and succeeds when it can");
     step.reconcile().expect("the trace reconciles");
+    // And **reconciliation itself**, at every position it allocates in. A review
+    // found this path aborting while it built the message that says it ran out
+    // of memory: the reserve failed, and formatting the discrepancy was the
+    // second failure. A discrepancy that reports an allocation failure carries a
+    // borrowed message now, and allocates nothing.
+    let demand = allocations_of(|| step.reconcile());
+    println!("reconciling asks for {demand} allocation(s); failing each in turn");
+    for position in 0..demand.max(1) {
+        let outcome = while_failing_at(position, 4, || step.reconcile());
+        match outcome {
+            Ok(_) => {}
+            Err(discrepancy) => assert_eq!(
+                discrepancy.check, "step-is-the-sum-of-layers",
+                "reconciling under memory pressure reported {}: {discrepancy}",
+                discrepancy.check
+            ),
+        }
+    }
     println!(
-        "every trace entry point refused a failed allocation with a typed error; \
-         the step then assembled and reconciled normally"
+        "every trace entry point refused a failed allocation with a typed error, and \
+         reconciliation reported one without allocating to say so"
     );
 }

@@ -2081,15 +2081,17 @@ impl ResidencyAuthority {
     /// ledger what they cost rather than recomputing it -- document 03's
     /// admission report is the ledger's to produce, and a second arithmetic for
     /// the same bytes is how two owners come to disagree.
-    pub fn reservation_ids(&self) -> Vec<ReservationId> {
-        let mut out = Vec::new();
-        if let Some(id) = self.host.reservation_id() {
-            out.push(id);
-        }
-        if let Some(r) = self.device_envelope.as_ref() {
-            out.push(r.id());
-        }
-        out
+    ///
+    /// **A fixed-size array, not a `Vec`.** The caller is a trace taken inside a
+    /// generation step, and a review reproduced this returning a `Vec` and
+    /// aborting the process on the sixth injected allocation failure: reserving
+    /// the *destination* says nothing about a temporary the callee builds. There
+    /// is nothing here to allocate.
+    pub fn reservation_ids(&self) -> [Option<ReservationId>; 2] {
+        [
+            self.host.reservation_id(),
+            self.device_envelope.as_ref().map(Reservation::id),
+        ]
     }
 
     /// Visit every scope's account, allocating **nothing**.

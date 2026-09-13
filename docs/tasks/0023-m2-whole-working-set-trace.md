@@ -533,7 +533,7 @@ acceptance.**
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy (`--features moxie-executor/driver`) | passed |
 | CUDA-lane clippy (`--features cuda`, which compiles `xtask`'s device code) | passed — **a third lane, declared by this task**, and it was failing on two lints standing since task 0021 |
-| `cargo test --workspace --locked --offline` | **927 passed, 0 failed**, against a re-measured baseline of **918** at `aeac114` |
+| `cargo test --workspace --locked --offline` | **930 passed, 0 failed**, against a re-measured baseline of **918** at `aeac114` |
 | Device-feature workspace tests | **962 passed, 0 failed**, against a re-measured baseline of **951** at `aeac114` |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
@@ -575,7 +575,7 @@ each, no baseline, and no duration appears anywhere in the trace.
 - The **planner sweep** gained a host-residency axis and then, after the review,
   a `crowded` axis -- whether the caches already hold bytes this route does not
   name, which is the condition its second finding turned on. 10,368 combinations
-  became **62,208**, and every plan's prediction is checked against a statement
+  became **124,416**, and every plan's prediction is checked against a statement
   of the rule written independently of the planner's.
 - The **transition sweep** exercises the new conservation identities over its
   whole 800-combination product without a new harness, because they live in
@@ -590,10 +590,10 @@ each, no baseline, and no duration appears anywhere in the trace.
 
 ### Measured effect and uncertainty
 
-- **Mutation measurement: 36 of 36 caught, 0 survivors**, over four rounds
+- **Mutation measurement: 39 of 39 caught, 0 survivors**, over six rounds
   ([experiment 0004](../evidence/experiments/0004-task0023-whole-working-set-trace.md)).
-  The first was 27 of 30 and the third — after the review's six fixes — was 34 of
-  36. **Every survivor in every round was a defect or a missing fixture**, never
+  The first was 27 of 30; the third, after the first review's six fixes, was 34 of
+  36; the fifth, after the second review's three, was 38 of 39. **Every survivor in every round was a defect or a missing fixture**, never
   an opinion about test strength, and two of them were checks added in response
   to an earlier finding that nothing had yet violated: a check added because
   something was found is not itself checked until something violates it.
@@ -708,6 +708,38 @@ The reason they stood is that the declared gates name two clippy lanes, host and
 `--features moxie-executor/driver`, and **neither compiles `xtask`'s CUDA code**.
 `cargo clippy --workspace --all-targets --features cuda` is a third lane and is
 now one of this task's gates.
+
+### The second review round: three more, and one of them was my own test
+
+**Three findings, two P1, all reproduced, all fixed, none disputed.**
+
+| # | Finding | What it measured | Fix |
+|---|---|---|---|
+| 1 | **P1 — `close` still aborted.** `reservation_ids()` returned a `Vec`, built with infallible `push` | **SIGABRT**, 32 bytes, on the **sixth** allocation of `close` | It returns a fixed `[Option<ReservationId>; 2]`, and `accounted_charges` keeps its `named`/`found` sets in fixed arrays. **Reserving a destination says nothing about a temporary the callee builds** |
+| 2 | **P1 — reconciliation allocated to report that it could not allocate.** A failed `try_reserve` was turned into a `Discrepancy` by `format!` | **SIGABRT**, 82 bytes | `Discrepancy::detail` is a `Cow<'static, str>`; the allocation-failure path carries a borrowed message. Everything a caller acts on — the check's name, both sides, the layer, the scope — was already beside it |
+| 3 | **`Exact` was unsound under fragmentation.** The rule compared totals; admission needs a **contiguous** range | A 4,608 B cache holding 3,840 B in three 256 B holes predicted **768 B of reads exactly** and read **1,536 B** | The rule asks whether **one free run** can hold what the layer admits, padding included. `ExpertBudget` carries the largest contiguous free range, the alignment, and how many chunks an expert arrives in |
+
+**The first finding is half mine.** The regression I wrote for the previous
+round's P1 called `while_failing(1, ...)` six times in a loop whose index only
+changed the assertion message: **every iteration failed the first allocation**.
+An axis that was exercised and never varied — the exact failure AGENTS.md records
+from task 0021's fourth review, in a test I wrote *because* of a review. It
+sweeps every allocation position now, and the position count is measured rather
+than assumed, so a position that stops being reached shows up as a changed
+number.
+
+**The third is the third time that rule has been wrong**, and the three are a
+sequence worth keeping: it asked whether this plan's admissions fit, then whether
+its admissions and its hits fit, then whether everything resident and its
+admissions fit the cap. Each is a quantity that is not the one admission asks
+for. What admission asks for is a contiguous range, and each wrong version was
+found by a counterexample rather than by reading the rule.
+
+**A term no fixture varies.** The padding allowance the third fix introduced is
+**inert in every other fixture**, because every chunk in this workspace is a
+whole number of alignment units. It has its own pure-planner test —
+`exactness_reserves_the_alignment_a_chunk_can_waste` — for exactly the reason
+AGENTS.md gives: a parameter no fixture varies is a parameter no test checks.
 
 ### The owner resolved O1–O5 during this task
 

@@ -253,7 +253,13 @@ impl Room {
     fn of(self, layer: u64, step: u64) -> u64 {
         let align = |bytes: u64| bytes.div_ceil(256) * 256;
         match self {
-            Room::Roomy => align(step),
+            // The step's bytes **plus what alignment can waste**: two chunks per
+            // expert, each able to start up to one 256 B unit late. Sizing it to
+            // the bytes exactly leaves the last layer no room for padding, and a
+            // prediction that cannot promise the padding fits is a lower bound --
+            // which would make "roomy" a configuration that never reaches the
+            // exact branch it exists for.
+            Room::Roomy => align(step + step.div_ceil(EXPERT_TOTAL) * 2 * 256),
             Room::Tight => align(layer.div_ceil(4).max(EXPERT_TOTAL)),
             Room::Eighth => align(LAYER_EXPERTS / 8),
         }
@@ -353,8 +359,8 @@ fn run_whole_set(dir: &Path, config: &Config<'_>) -> StepResult {
                 .map_or_else(String::new, |c| c.capability().pci_bus_id.clone()),
             device_cache_cap_bytes: if device.is_some() { device_cache } else { 0 },
             device_cache_leased_bytes: 0,
-            device_cache_resident_bytes: if device.is_some() {
-                resident_bytes_of(&authority, scope)
+            device_cache_largest_free_bytes: if device.is_some() {
+                largest_free_of(&authority, scope)
             } else {
                 0
             },
@@ -363,7 +369,9 @@ fn run_whole_set(dir: &Path, config: &Config<'_>) -> StepResult {
             host_buffer_bytes: 16 * MIB,
             host_cache_cap_bytes: host_cache,
             host_cache_leased_bytes: 0,
-            host_cache_resident_bytes: resident_bytes_of(&authority, Scope::Host),
+            host_cache_largest_free_bytes: largest_free_of(&authority, Scope::Host),
+            cache_alignment_bytes: 256,
+            chunks_per_expert: 2,
             resident,
         };
         let plan = compile_experts(
@@ -433,9 +441,15 @@ fn run_whole_set(dir: &Path, config: &Config<'_>) -> StepResult {
     }
 }
 
-/// Everything a scope's cache holds right now, this route's chunks or not.
-fn resident_bytes_of(authority: &ResidencyAuthority, scope: Scope) -> u64 {
-    authority.account(scope).map_or(0, |a| a.resident_bytes)
+/// The largest contiguous free range in a scope's cache.
+///
+/// What admission actually needs. A review showed that spare capacity is not
+/// enough: a cache with ample free bytes in pieces too small for a chunk evicts
+/// to admit one, and a prediction that looked only at totals called that exact.
+fn largest_free_of(authority: &ResidencyAuthority, scope: Scope) -> u64 {
+    authority
+        .occupancy(scope)
+        .map_or(0, |o| o.largest_free_bytes)
 }
 
 /// Where this layer's expert chunks are, read from the authority per chunk.

@@ -1,7 +1,7 @@
 # Handover — task 0023 implemented and corrected; M2's exit is one clause from complete
 
-**Task 0023 is implemented, corrected after one round of independent review —
-six findings, one P1, all reproduced, all fixed, none disputed — and awaits
+**Task 0023 is implemented and corrected after two rounds of independent review
+— nine findings, three P1, all reproduced, all fixed, none disputed — and awaits
 owner acceptance.**
 It delivers M2's exit clause on traces in the shape its contract declared before
 implementation: **a whole working set, out of device memory, with byte and cost
@@ -35,7 +35,7 @@ had done.
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy (`--features moxie-executor/driver`) | passed |
 | CUDA-lane clippy (`--features cuda`) | passed — **a third lane, declared by this task**; it was failing on two lints standing since task 0021 |
-| `cargo test --workspace --locked --offline` | **927 passed, 0 failed** (918 at `aeac114`) |
+| `cargo test --workspace --locked --offline` | **930 passed, 0 failed** (918 at `aeac114`) |
 | Device-feature workspace tests | **962 passed, 0 failed** (951 at `aeac114`) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
@@ -46,9 +46,10 @@ tests and **951** device-feature tests. Task 0022's own record says why: its
 first attempt at the same comparison was taken on a half-built tree and read a
 number that was wrong.
 
-**Mutation measurement: 36 of 36 caught, 0 survivors**, over four rounds
+**Mutation measurement: 39 of 39 caught, 0 survivors**, over six rounds
 ([experiment 0004](../evidence/experiments/0004-task0023-whole-working-set-trace.md)).
-The first was 27 of 30; the third, after the review's six fixes, was 34 of 36.
+The first was 27 of 30; the third, after the first review's six fixes, was 34 of
+36; the fifth, after the second review's three, was 38 of 39.
 **Every survivor in every round was a defect or a missing fixture**, and two of
 them were checks added in response to an earlier finding that nothing had yet
 violated — a check added because something was found is not itself checked until
@@ -101,7 +102,32 @@ is capped — true, and weaker. A batch whose union is the whole expert set is
 42.5 GiB against a 24 GiB card and needs no ratio argument to be oversized. Both
 run so that neither carries the other's claim.
 
-### The review, and what its six findings have in common
+### The second round: three more, and one of them was my own test
+
+1. **P1.** `close` still aborted: `reservation_ids()` returned a `Vec` built with
+   infallible `push`, and the sixth injected failure took the process down.
+   **Reserving a destination says nothing about a temporary the callee builds.**
+   It returns a fixed array now.
+2. **P1.** Reconciliation **allocated to report that it could not allocate** — a
+   failed `try_reserve` turned into a `Discrepancy` by `format!`. The detail is a
+   `Cow<'static, str>` and the allocation-failure path borrows.
+3. **`Exact` was unsound under fragmentation**, the third wrong version of that
+   rule: it compared totals, and admission needs a **contiguous** range. A 4,608
+   B cache holding 3,840 B in three 256 B holes predicted 768 B of reads exactly
+   and read 1,536.
+
+**The first is half mine, and it is the one to carry.** The regression I wrote
+for the previous round's P1 looped six times calling `while_failing(1, ...)`, so
+**every iteration failed the first allocation** and the loop index only changed
+the assertion message. An axis that was exercised and never varied — in a test
+written *because* of a review, for a defect a review had just found. It sweeps
+every position now, and the count of positions is measured rather than assumed.
+
+**And a term no fixture varies**: the padding allowance the third fix introduced
+is inert wherever chunks are whole alignment units, which is everywhere here, so
+it has a pure-planner test of its own rather than a comfortable assumption.
+
+### The first round, and what its six findings have in common
 
 **Four of the six are one sentence: a comparison is worth nothing when both its
 sides can come from the wrong place, or when neither is the quantity it names.**

@@ -409,18 +409,21 @@ pub struct ExpertBudget {
     pub device_cache_cap_bytes: u64,
     /// Of that cap, what a live lease pins and eviction therefore cannot reach.
     pub device_cache_leased_bytes: u64,
-    /// Everything charged in that cache right now, **including chunks this plan
-    /// does not name**.
+    /// The **largest contiguous free range** in that cache's arena.
     ///
-    /// A prediction is an equality only when nothing has to be evicted, and what
-    /// decides that is the whole cache, not this plan's share of it. A review
-    /// found the first version of that rule unsound in one line: it asked only
-    /// whether this layer's own live set fit, so a layer that predicted a hit on
-    /// a warm chunk could evict exactly that chunk to make room for its own
-    /// admissions -- the warm chunk being the least recently used of them all --
-    /// and then read it again. Measured: 3,840 B read against 3,072 B predicted
-    /// exactly.
-    pub device_cache_resident_bytes: u64,
+    /// A prediction is an equality only when nothing has to be evicted, and
+    /// admission needs contiguous space rather than merely spare capacity. Two
+    /// earlier versions of this rule were unsound and a review produced a
+    /// counterexample for each:
+    ///
+    /// * asking whether this layer's own live set fit ignored what else was
+    ///   resident, so a layer could evict the warm chunk it had predicted a hit
+    ///   on -- **3,840 B read against 3,072 B predicted exactly**;
+    /// * asking whether resident plus admitted fit the cap ignored **geometry**.
+    ///   A 4,608 B cache holding 3,840 B in three 256 B holes satisfies that
+    ///   inequality and cannot admit a 512 B chunk into any of them, so it
+    ///   evicts -- **1,536 B read against 768 B predicted exactly**.
+    pub device_cache_largest_free_bytes: u64,
     /// Free bytes in the device activation arena available to this plan.
     pub device_arena_free_bytes: u64,
     /// Host FP32 workspace bytes this plan may use.
@@ -437,9 +440,19 @@ pub struct ExpertBudget {
     pub host_cache_cap_bytes: u64,
     /// Of that cap, what a live lease pins and eviction cannot reach.
     pub host_cache_leased_bytes: u64,
-    /// Everything charged in the host cache right now, including chunks this
-    /// plan does not name. See `device_cache_resident_bytes`.
-    pub host_cache_resident_bytes: u64,
+    /// The largest contiguous free range in the host cache's arena. See
+    /// `device_cache_largest_free_bytes`.
+    pub host_cache_largest_free_bytes: u64,
+    /// The alignment the caches allocate at, and how many chunks one expert's
+    /// bytes arrive in.
+    ///
+    /// Both are readings, and together they bound the padding an admission can
+    /// waste: a chunk placed at an unaligned offset costs up to one alignment
+    /// unit more than its length. Neither is model knowledge -- the planner asks
+    /// how many pieces an expert arrives in and how they are aligned, and the
+    /// caller, which owns the chunk layout, answers.
+    pub cache_alignment_bytes: u64,
+    pub chunks_per_expert: u32,
     /// Where the caches were holding this route's expert chunks.
     ///
     /// One snapshot covering both caches, because the question a plan asks of it
@@ -1515,53 +1528,71 @@ pub fn compile_experts(
     // hit disappears before it is asked for, and every prediction above is an
     // equality.
     //
-    // Two weaker conditions were tried and both were unsound, in the same way
-    // and for the same reason -- they reasoned about this plan's share of the
-    // cache and eviction does not:
+    // Three weaker conditions were tried and all three were unsound, each
+    // because it reasoned about a quantity that is not the one admission asks
+    // for:
     //
     // * "this plan's admissions fit" ignores the hits it is counting on, which
     //   its own admissions can evict;
-    // * "this plan's admissions **and** its hits fit" ignores everything *else*
-    //   resident, which is newer than a warm chunk this plan needs and is
-    //   therefore not the victim -- the warm chunk is. A review demonstrated it:
-    //   warm experts 4 and 5, then demand 0-4 through a five-expert cache, and
-    //   expert 4 is evicted by this plan's own admissions and read again.
+    // * "its admissions **and** its hits fit" ignores everything *else*
+    //   resident, which is newer than a warm chunk this plan needs and so is not
+    //   the victim -- the warm chunk is;
+    // * "everything resident **and** its admissions fit the cap" ignores that
+    //   the space has to be in one piece.
     //
-    // This condition is sufficient rather than necessary: eviction might in
-    // principle take only chunks nobody here needs. Over-declaring `LowerBound`
-    // costs a weaker claim; under-declaring it costs a wrong one.
-    let device_fits = budget
-        .device_cache_resident_bytes
-        .saturating_add(predicted.device_upload_bytes)
-        <= budget.device_cache_cap_bytes;
-    let host_fits = budget
-        .host_cache_resident_bytes
-        .saturating_add(host_admitted)
-        <= budget.host_cache_cap_bytes;
-    let device_live = budget
-        .device_cache_resident_bytes
-        .saturating_add(predicted.device_upload_bytes);
-    let host_live = budget
-        .host_cache_resident_bytes
-        .saturating_add(host_admitted);
+    // Each was found by a counterexample rather than by reading, and the last
+    // two by an independent review. The condition below is sufficient rather
+    // than necessary: eviction might in principle take only chunks nobody here
+    // needs. Over-declaring `LowerBound` costs a weaker claim; under-declaring
+    // it costs a wrong one.
+    //
+    // The third version of this condition, and the first that accounts for
+    // **geometry**. What admission needs is a contiguous range, so the question
+    // is whether one free run can hold everything this layer admits, padding
+    // included: if it can, first fit never has to displace anything -- placing a
+    // chunk in a smaller hole leaves that run untouched, and placing it in that
+    // run shrinks it by exactly what the rest still needs.
+    //
+    // The padding term is the price of not knowing the chunk lengths: an expert
+    // arrives in `chunks_per_expert` pieces and each can start up to one
+    // alignment unit late, so it can cost that much more than its bytes.
+    let padding_per_expert = budget
+        .cache_alignment_bytes
+        .saturating_mul(u64::from(budget.chunks_per_expert));
+    let device_admitting = groups
+        .iter()
+        .filter(|g| {
+            g.placement().candidate() == Candidate::Device && g.decision().transfer_bytes > 0
+        })
+        .count() as u64;
+    let host_admitting = groups
+        .iter()
+        .filter(|g| g.placement().candidate() == Candidate::Host || g.decision().transfer_bytes > 0)
+        .count() as u64;
+    let device_live = predicted
+        .device_upload_bytes
+        .saturating_add(device_admitting.saturating_mul(padding_per_expert));
+    let host_live = host_admitted.saturating_add(host_admitting.saturating_mul(padding_per_expert));
+    let device_fits = device_live <= budget.device_cache_largest_free_bytes;
+    let host_fits = host_live <= budget.host_cache_largest_free_bytes;
     predicted.exactness = match (device_fits, host_fits) {
         (true, true) => Exactness::Exact,
         (false, true) => Exactness::LowerBound {
             where_: BoundOn::DeviceCache,
             admitted_bytes: device_live,
-            displaceable_bytes: budget.device_cache_cap_bytes,
+            displaceable_bytes: budget.device_cache_largest_free_bytes,
         },
         (true, false) => Exactness::LowerBound {
             where_: BoundOn::HostCache,
             admitted_bytes: host_live,
-            displaceable_bytes: budget.host_cache_cap_bytes,
+            displaceable_bytes: budget.host_cache_largest_free_bytes,
         },
         (false, false) => Exactness::LowerBound {
             where_: BoundOn::Both,
             admitted_bytes: device_live.saturating_add(host_live),
             displaceable_bytes: budget
-                .device_cache_cap_bytes
-                .saturating_add(budget.host_cache_cap_bytes),
+                .device_cache_largest_free_bytes
+                .saturating_add(budget.host_cache_largest_free_bytes),
         },
     };
 

@@ -48,7 +48,9 @@ not tracked; what is tracked is this record and the tests the measurement produc
 | First | 30 | 27 | 3 |
 | Second, after the three fixes | 30 | **30** | 0 |
 | Third, after an independent review's six findings and their fixes | 36 | 34 | 2 |
-| Fourth, after those two | **36** | **36** | **0** |
+| Fourth, after those two | 36 | **36** | 0 |
+| Fifth, after a second review round's three findings and their fixes | 39 | 38 | 1 |
+| Sixth, after that one | **39** | **39** | **0** |
 
 The **first** measurement's three survivors were defects rather than opinions
 about test strength:
@@ -71,6 +73,22 @@ own corrections, which is the point of re-measuring after a fix:
 that is worth stating rather than filing: a check added in response to a finding
 is not itself checked until something violates it. Both rounds produced exactly
 one of those.
+
+The **fifth** round's single survivor is the fourth of its kind, and the fourth
+time the same sentence applies: **a fixture on which two behaviours agree tests
+neither.** A mutation counting device-resident chunks as reusable upload sources
+survived a test written to catch exactly it, because every expert in that fixture
+was *fully* resident -- the upload is then zero bytes and the count is clamped to
+it, so the wrong reading and the right one produce the same number. An expert
+**half** on the device, whose missing half is in neither cache, separates them.
+
+The fifth round adds four mutations for the second review round's fixes:
+naming the reservations with a `Vec` again, reporting an allocation failure by
+formatting it, comparing totals instead of contiguous space, and dropping the
+alignment reserve. The last of these is the interesting one — **every chunk in
+this workspace is a whole alignment unit, so the reserve is inert in every
+fixture that goes through an arena**. It has a pure-planner test of its own for
+that reason, and without it the mutation would survive.
 
 ### The mutations
 
@@ -113,6 +131,10 @@ one of those.
 | `M35` launches per group | the launch equality counts groups instead of kernels | the trace sweep |
 | `M36` submitted forgotten | a group that failed part way forgets what it submitted | the run sweep's launch-failure axes (**after** the third measurement) |
 | `M37` reserve is infallible | trace storage is reserved infallibly again | the allocation-failure regression |
+| `M38` reservation ids allocate | naming the reservations allocates again | the allocation-failure regression's position sweep |
+| `M39` OOM report formats | reporting an allocation failure allocates to say so | the same sweep, through `reconcile` |
+| `M40` exactness ignores geometry | exactness compares totals instead of contiguous space | the fragmentation regression |
+| `M41` padding reserve dropped | the alignment a chunk can waste is not reserved | its own pure-planner test, because every chunk here is a whole alignment unit and the term is inert in every arena-backed fixture |
 
 ## What the measurements found, beyond the survivors
 

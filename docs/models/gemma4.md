@@ -527,7 +527,8 @@ about its output.
 
   Each layer's byte and cost trace **reconciles** against the residency
   authority's own per-scope accounting and the ledger's own charges, as
-  **seventeen** named equalities rather than as a printed report.
+  **seventeen** named equalities rather than as a printed report, each with a
+  fixture that violates it.
 
   **This is still not model support and no quality claim follows.** The
   activations are synthetic and the routes are written by the test — the

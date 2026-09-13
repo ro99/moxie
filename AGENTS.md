@@ -344,6 +344,30 @@ passed it. It measures live bytes now, declares what a layer may retain, and
 performs the leak substitution itself — the gate is one somebody has watched
 fail.
 
+**Reserving a destination says nothing about a temporary the callee builds.** A
+second review round found the trace still aborting on an injected allocation
+failure: the *caller* reserved everything it needed and the callee it asked for
+reservation identities built a `Vec`. Fixed-size now. And **a report of an
+allocation failure may not allocate**: the same round found reconciliation
+formatting the message that says it ran out of memory. A `Cow<'static, str>`
+detail, borrowed on that path.
+
+**The test I wrote for a review's finding had a fake axis.** Its loop called
+`while_failing(1, ...)` six times, so **every iteration failed the first
+allocation** and the index only changed the assertion message — task 0021's
+fourth-review lesson, in a test written *because* of a review, one round later.
+It sweeps every allocation position now and **measures how many there are**
+rather than assuming.
+
+**Three wrong versions of one rule, each found by a counterexample and none by
+reading it.** Exactness asked whether this plan's admissions fit; then whether
+its admissions and its hits fit; then whether everything resident and its
+admissions fit the cap. Each is a quantity that is not the one admission asks
+for. **Admission asks for a contiguous range**: a 4,608 B cache holding 3,840 B
+in three 256 B holes satisfies every one of those inequalities and evicts anyway
+— 1,536 B read against 768 predicted exactly. When a rule is wrong three times,
+the thing to change is not the inequality but which quantity is being compared.
+
 **A lane nobody runs is a lane that holds failures.** The same review found two
 clippy lints standing in `xtask/src/gpu.rs` since task 0021. The declared gates
 named a host clippy lane and a `--features moxie-executor/driver` one, and

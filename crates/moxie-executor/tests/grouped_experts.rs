@@ -221,13 +221,15 @@ fn host_only_budget() -> ExpertBudget {
         device_pci_bus_id: BUS.into(),
         device_cache_cap_bytes: 0,
         device_cache_leased_bytes: 0,
-        device_cache_resident_bytes: 0,
+        device_cache_largest_free_bytes: u64::MAX,
         device_arena_free_bytes: 0,
         host_workspace_bytes: 1 << 20,
         host_buffer_bytes: 1 << 20,
         host_cache_cap_bytes: 1 << 30,
         host_cache_leased_bytes: 0,
-        host_cache_resident_bytes: 0,
+        host_cache_largest_free_bytes: u64::MAX,
+        cache_alignment_bytes: 256,
+        chunks_per_expert: 2,
         resident: ResidentChunks::none(),
     }
 }

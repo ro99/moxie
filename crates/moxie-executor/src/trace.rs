@@ -204,7 +204,15 @@ pub struct Discrepancy {
     pub scope: Option<Scope>,
     pub left: u64,
     pub right: u64,
-    pub detail: String,
+    /// Why, in prose.
+    ///
+    /// A `Cow` rather than a `String`, and a review is why: a discrepancy that
+    /// reports an **allocation failure** must not allocate to say so. Those
+    /// carry a borrowed `&'static str`; an ordinary mismatch formats its numbers
+    /// into an owned one. Everything a caller acts on -- the check's name, both
+    /// sides, the layer and the scope -- is beside this field and needs no
+    /// allocation either way.
+    pub detail: std::borrow::Cow<'static, str>,
 }
 
 impl core::fmt::Display for Discrepancy {
@@ -376,7 +384,17 @@ impl LayerSnapshot {
         let mut observed: Vec<(Scope, Tier, u64)> = Vec::new();
         let mut scope_list = Vec::new();
         reserve(&mut scope_list, ledger.scope_count())?;
-        scope_list.extend(ledger.scopes());
+        for scope in ledger.scopes() {
+            if scope_list.len() == scope_list.capacity() {
+                // Reserved from `scope_count`; growing here would be an
+                // unreserved allocation on a step path.
+                return Err(invalid(
+                    "scopes",
+                    "the ledger gained a scope while this layer was being closed".into(),
+                ));
+            }
+            scope_list.push(scope);
+        }
         for scope in &scope_list {
             for tier in Tier::valid_in(scope.kind()) {
                 let committed = ledger.committed(*scope, tier);
@@ -443,37 +461,43 @@ fn accounted_charges(
     run: &GroupedRun<'_>,
     ledger: &Ledger,
 ) -> Result<AccountedCharges, Error> {
-    let mut named: Vec<moxie_memory::ReservationId> = Vec::new();
-    reserve(&mut named, 2)?;
-    for id in authority.reservation_ids() {
-        if named.len() < named.capacity() {
-            named.push(id);
-        }
+    // Fixed-size, because this runs inside a generation step and every
+    // allocation on that path has to be one somebody reserved. A review found
+    // the previous version aborting the process on an injected failure inside
+    // `reservation_ids`, which built a `Vec`: reserving the destination says
+    // nothing about a temporary the callee builds.
+    //
+    // Three is the count, not a guess: the authority holds at most two -- its
+    // host cache's backing and the one envelope covering every device cache --
+    // and the run holds one.
+    let mut named: [Option<moxie_memory::ReservationId>; 3] = [None; 3];
+    let mut count = 0;
+    for id in authority.reservation_ids().into_iter().flatten() {
+        named[count] = Some(id);
+        count += 1;
     }
-    if named.len() == named.capacity() {
-        reserve(&mut named, 1)?;
-    }
-    named.push(run.reservation_id());
+    named[count] = Some(run.reservation_id());
+    count += 1;
+    let named = &named[..count];
 
-    // One entry per (scope, tier) the named reservations charge, kept in the
-    // same order the observed side is built in.
+    let mut found: [Option<moxie_memory::ReservationId>; 3] = [None; 3];
+    let mut found_count = 0usize;
     let mut out: Vec<(Scope, Tier, u64)> = Vec::new();
-    let mut found: Vec<moxie_memory::ReservationId> = Vec::new();
-    reserve(&mut found, named.len())?;
     let mut failure = None;
     ledger.for_each_charge(|id, scope, tier, bytes| {
-        if failure.is_some() || !named.contains(&id) {
+        if failure.is_some() || !named.contains(&Some(id)) {
             return;
         }
-        if !found.contains(&id) {
-            if found.len() == found.capacity() {
+        if !found[..found_count].contains(&Some(id)) {
+            if found_count == found.len() {
                 failure = Some(invalid(
                     "reservations",
                     "more reservations were charged than this step can name".into(),
                 ));
                 return;
             }
-            found.push(id);
+            found[found_count] = Some(id);
+            found_count += 1;
         }
         match out.iter_mut().find(|(s, t, _)| *s == scope && *t == tier) {
             Some(entry) => entry.2 = entry.2.saturating_add(bytes),
@@ -497,7 +521,7 @@ fn accounted_charges(
     // Scope order then `Tier::ALL` order, so this list and the observed one are
     // comparable row by row.
     out.sort_by_key(|(scope, tier, _)| (*scope, tier_rank(*tier)));
-    Ok((out, named.len() as u64, found.len() as u64))
+    Ok((out, named.len() as u64, found_count as u64))
 }
 
 /// A tier's position in `Tier::ALL`, which is the order both charge lists use.
@@ -597,7 +621,7 @@ impl Check<'_> {
             scope: self.scope,
             left,
             right,
-            detail: detail(),
+            detail: detail().into(),
         })
     }
 
@@ -621,7 +645,7 @@ impl Check<'_> {
             scope: self.scope,
             left,
             right,
-            detail: detail(),
+            detail: detail().into(),
         })
     }
 }
@@ -706,7 +730,8 @@ impl LayerTrace {
                         tier.name(),
                         a_scope,
                         a_tier.name()
-                    ),
+                    )
+                    .into(),
                 });
             }
             c.eq("ledger-charges-what-is-held", *charged, *accounted, || {
@@ -1105,7 +1130,7 @@ impl StepTrace {
                 scope: None,
                 left: u64::from(self.schema_version),
                 right: u64::from(TRACE_SCHEMA_VERSION),
-                detail: "this trace was written against another schema".into(),
+                detail: std::borrow::Cow::Borrowed("this trace was written against another schema"),
             });
         }
         for layer in &self.layers {
@@ -1121,13 +1146,19 @@ impl StepTrace {
         let mut summed: Vec<(Scope, ByteFlow)> = Vec::new();
         for layer in &self.layers {
             for delta in &layer.scopes {
-                let e = entry_for(&mut summed, delta.scope).map_err(|e| Discrepancy {
+                // **No `format!` here.** This is the path that handles an
+                // allocation failure, and a review reproduced it aborting the
+                // process while building the message that says so. The detail is
+                // static; the numbers a caller acts on are the fields beside it.
+                let e = entry_for(&mut summed, delta.scope).map_err(|_| Discrepancy {
                     check: "step-is-the-sum-of-layers",
                     layer: Some(layer.layer),
                     scope: Some(delta.scope),
                     left: 0,
                     right: 0,
-                    detail: format!("the step's totals could not be computed: {e}"),
+                    detail: std::borrow::Cow::Borrowed(
+                        "the step's totals could not be computed: out of memory",
+                    ),
                 })?;
                 let f = &delta.flow;
                 e.requested_bytes += f.requested_bytes;
@@ -1174,7 +1205,8 @@ impl StepTrace {
                     scope: Some(*scope),
                     left: total.admitted_bytes,
                     right: want.admitted_bytes,
-                    detail: format!("{scope}: totals {total:?} against the layers' sum {want:?}"),
+                    detail: format!("{scope}: totals {total:?} against the layers' sum {want:?}")
+                        .into(),
                 });
             }
             c.out.equalities_checked += 1;
