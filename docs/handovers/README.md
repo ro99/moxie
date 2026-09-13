@@ -6,8 +6,9 @@
 is the current continuation. M2 item 4 — Laguna's metadata and graph, a second
 synthetic MoE consumer, and a restricted budget smaller than its working weights
 — is implemented, corrected after three rounds of independent review (eight
-findings, two P1, all reproduced and fixed, none disputed), and awaits a further
-review and owner acceptance. The
+findings, two P1, all reproduced and fixed, none disputed; the third
+recommended acceptance with no new blocking findings), and awaits owner
+acceptance. The
 deliverable is Laguna's **routed block**: its attention tower is not composable
 from today's operation catalogue, `softplus` output gating and the yarn rotary
 ramp are both named gaps, and that narrowing was written into the contract

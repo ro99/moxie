@@ -32,8 +32,9 @@ executes a routed layer, and the selected BF16 chain still refuses `Route`,
 
 [Task 0022](../tasks/0022-m2-laguna-metadata-and-second-consumer.md) is **M2
 item 4**, **implemented on 2026-09-13, corrected after three rounds of
-independent review, and awaiting a further review and owner acceptance** (eight
-findings, two P1, all reproduced and fixed, none disputed): Laguna's metadata and its **routed block**, a second routed
+independent review, and awaiting owner acceptance** (eight findings, two P1, all
+reproduced and fixed, none disputed; the third recommended acceptance with no new
+blocking findings): Laguna's metadata and its **routed block**, a second routed
 consumer through task 0021's interface, and a restricted budget expressed as a
 ratio of working weights. **No Laguna capability row exists below and none may
 be added**: nothing reads a Laguna tensor, its weights are asymmetric INT4 at

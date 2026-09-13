@@ -182,7 +182,8 @@ mutation would survive rather than by reading the test.**
 and awaits acceptance**
 ([task 0022](docs/tasks/0022-m2-laguna-metadata-and-second-consumer.md),
 2026-09-13; three rounds found **eight** issues, two P1, all reproduced and
-fixed, none disputed): Laguna's metadata and its **routed block**, a second routed
+fixed, none disputed, and the third recommended acceptance with no new blocking
+findings): Laguna's metadata and its **routed block**, a second routed
 consumer driven through task 0021's interface, and a restricted budget expressed
 as a **ratio** of what the route demands rather than a constant. A routed layer
 at Laguna's declared expert width — 18,874,368 B per expert in BF16 — ran on all

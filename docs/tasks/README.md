@@ -59,8 +59,9 @@ not close M2**, which also needs item 4 and byte/cost traces reconciled with the
 ledger across a whole working set.
 
 **[Task 0022](0022-m2-laguna-metadata-and-second-consumer.md) is implemented,
-corrected after three rounds of independent review, and awaiting a further
-review and owner acceptance**, 2026-09-13. The rounds found **eight** issues, two
+corrected after three rounds of independent review, and awaiting owner
+acceptance**, 2026-09-13. The third round recommended acceptance with no new
+blocking findings, within this task's documented routed-block scope. The rounds found **eight** issues, two
 P1, all reproduced and fixed, none disputed — the second round's P1 was
 introduced by the first round's own fix, asking its question of the rest of the
 change found a second instance of the same class, and the third round found the

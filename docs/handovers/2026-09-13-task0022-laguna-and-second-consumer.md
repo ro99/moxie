@@ -1,7 +1,8 @@
 # Handover — task 0022 implemented; M2 item 5's remainder is next
 
-**Task 0022 is implemented, corrected after three rounds of independent review,
-and awaits a further review and owner acceptance.** It delivers roadmap **M2
+**Task 0022 is implemented, corrected after three rounds of independent review
+— the third recommending acceptance with no new blocking findings — and awaits
+owner acceptance.** It delivers roadmap **M2
 item 4** in the only shape the evidence allows, and it says so in its own
 contract rather than afterwards. **It does not close M2.**
 

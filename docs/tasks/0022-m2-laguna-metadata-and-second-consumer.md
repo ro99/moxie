@@ -470,8 +470,9 @@ Any of 3, 4, 5 is a failed task rather than a smaller one.
 
 ## Result, filled after work
 
-Status: **implemented, 2026-09-13; awaiting independent review and owner
-acceptance.** It does not close M2.
+Status: **implemented, 2026-09-13; corrected after three rounds of independent
+review, the third of which recommended acceptance with no new blocking
+findings; awaiting owner acceptance.** It does not close M2.
 
 ### Changed shared owners and consumers
 
@@ -946,3 +947,34 @@ precondition that rule quietly assumes.
 
 Both mutation batteries re-run: **39 mutations, 0 survivors** — 17 of 18 by the
 planner sweep, 7 of 21 by the run sweep, the rest by named tests.
+
+### Outcome
+
+The third round reported **no new blocking findings** and recommended acceptance
+within this task's documented routed-block scope, having independently verified
+200 default-parallelism runs with zero failures, 25/25 detection for each of the
+three allocation checks against deliberately added allocations, 301 affected
+host tests, and the architecture, specification and formatting gates. It stated
+what it had not re-run for a harness-only correction: the 39-mutation campaign
+and the GPU gates.
+
+**That recommendation is not acceptance, and it is not M2.** The reviewer said
+so in the same breath and it is worth repeating here: it accepts this task's
+scope, not Laguna model support and not M2's exit. The whole-working-set byte
+and cost trace reconciled with the resource ledger is still outstanding, and it
+is task 0023.
+
+### What the three rounds were each about, because the progression is the point
+
+Round one found defects in the work: a missing BF16 boundary, a false
+justification, two validation gaps, an overflow, and an inventory that
+contradicted its own document. Round two found a defect in **round one's fix**.
+Round three found that the **evidence for round two's fix was not evidence**,
+because the test it rested on was nondeterministic.
+
+Each round moved further from the code and closer to the claims made about it,
+and the last one is the only one that changed a rule this repository states
+rather than a line it contains. A task whose review rounds converge on its
+evidence rather than on its behaviour is a task whose behaviour is probably
+right; that is worth knowing, and it is not something any single round could
+have reported.
