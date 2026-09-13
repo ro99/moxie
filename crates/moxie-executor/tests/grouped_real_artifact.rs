@@ -27,7 +27,9 @@ use moxie_graph::{CombineOrder, ExpertActivation, OpParams};
 use moxie_memory::{
     ArtifactId, CapacitySnapshot, Ledger, ResidencyAuthority, ResidencyRequest, TurnId,
 };
-use moxie_plan::expert::{Candidate, ExpertBudget, ExpertKernels, ExpertPolicy, compile_experts};
+use moxie_plan::expert::{
+    Candidate, ExpertBudget, ExpertKernels, ExpertPolicy, ResidentChunks, compile_experts,
+};
 use moxie_storage::Shard;
 use moxie_types::{RankId, Scope, StrategyControl};
 
@@ -147,7 +149,9 @@ fn budget(device: moxie_types::DeviceUuid, bus: String, cache: u64, arena: u64) 
         device_arena_free_bytes: arena,
         host_workspace_bytes: MIB,
         host_buffer_bytes: 4 * MIB,
-        resident_experts: Vec::new(),
+        host_cache_cap_bytes: 1 << 30,
+        host_cache_leased_bytes: 0,
+        resident: ResidentChunks::none(),
     }
 }
 

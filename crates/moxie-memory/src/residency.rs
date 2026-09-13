@@ -44,7 +44,7 @@ use moxie_types::{DeviceTier, DeviceUuid, Error, HostTier, Result, Scope, Tier};
 
 use crate::arena::{Allocation, Arena};
 use crate::host::HostBuffer;
-use crate::ledger::{Ledger, Reservation};
+use crate::ledger::{Ledger, Reservation, ReservationId};
 use crate::request::{BufferRequest, PlanRequest, StageSpan};
 
 /// Alignment every cache range is placed at.
@@ -860,6 +860,193 @@ pub struct ResidencyStats {
     pub expired: u64,
 }
 
+/// One scope's byte flow: every byte that was asked of it, placed in it, moved
+/// into it, or left it.
+///
+/// Cumulative and monotone. Task 0023 built it because
+/// [`ResidencyStats`] is process-wide -- one `bytes_uploaded` for three cards --
+/// and a trace that reconciles per tier cannot be assembled from a number that
+/// summed them. AGENTS.md forbids assuming the three cards' memory is one
+/// allocation; a counter that adds them is that assumption in arithmetic.
+///
+/// Every field is counted **here and nowhere else**. The aggregate
+/// [`ResidencyStats`] is required to equal the sum over scopes of the fields it
+/// shares, and [`ResidencyAuthority::check_invariants`] states that as an
+/// equality -- which is what stops this from becoming a second, divergent tally
+/// of the same events.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ByteFlow {
+    // --- what was asked of this scope -------------------------------------
+    /// Every acquire's chunk length, whatever the acquire resolved to.
+    pub requested_bytes: u64,
+    /// Resolved by a placement already settled here.
+    pub hit_bytes: u64,
+    /// Resolved by joining a transfer already in flight. **Not** the same
+    /// outcome as a hit: nothing was here, somebody else was already fetching
+    /// it, and no reconciliation can be written without telling the two apart.
+    pub coalesced_bytes: u64,
+    /// Resolved by a refusal, which moved nothing.
+    pub refused_bytes: u64,
+
+    // --- what was placed here ---------------------------------------------
+    pub admitted_bytes: u64,
+    /// Admitted for an acquire that named this scope.
+    pub direct_admitted_bytes: u64,
+    /// Admitted as the host source of a device upload. A device acquire admits
+    /// **two** placements, and before task 0023 nothing distinguished the host
+    /// half of a device upload from a host-candidate group's own chunk.
+    pub as_source_admitted_bytes: u64,
+    /// A device admission that had to create its host source. Zero on a host
+    /// scope.
+    pub source_created_bytes: u64,
+    /// A device admission whose host source was already here -- settled, or
+    /// being read for somebody else. It saves a read of the chunk's whole
+    /// length, and before task 0023 it was counted as nothing at all.
+    pub source_reuse_bytes: u64,
+    /// A host source that was created and then rolled back, because the device
+    /// admission it was created for was refused.
+    ///
+    /// Its own term because the host really did admit those bytes and the device
+    /// really did not, so the two scopes' counts of the same event differ by
+    /// exactly this and by nothing else.
+    pub source_rollback_bytes: u64,
+
+    // --- what moved, and how each transfer ended --------------------------
+    /// An observed read completed. Host scopes only.
+    pub read_bytes: u64,
+    /// An observed upload completed. Device scopes only.
+    pub uploaded_bytes: u64,
+    /// A transfer that failed or whose waiter went away: bytes given back.
+    pub abandoned_bytes: u64,
+    /// A transfer whose outcome is unknown (R07). The bytes are withheld:
+    /// charged, unservable and unfreeable until observed.
+    pub withheld_bytes: u64,
+    /// A placement that left while still in flight, so its transfer never
+    /// reported at all. Its own term, because "the transfer ended" and "the
+    /// placement went away first" are different facts and a sum that conflates
+    /// them cannot be checked.
+    pub unfinished_bytes: u64,
+
+    // --- what left --------------------------------------------------------
+    pub evicted_bytes: u64,
+    pub retired_bytes: u64,
+    pub discarded_bytes: u64,
+}
+
+impl ByteFlow {
+    /// This flow minus an earlier snapshot of the same scope, field by field.
+    ///
+    /// What a per-layer trace is built from. Saturating, because a difference
+    /// against a *later* snapshot is a caller error rather than a negative
+    /// byte count, and the reconciliation that consumes it will fail visibly.
+    ///
+    /// A delta is attributable to one layer only because a product gate says
+    /// there is one active interactive generation. A second concurrent consumer
+    /// of the same authority would make this arithmetic meaningless, and
+    /// nothing here can detect that -- which is why it is written down.
+    #[must_use]
+    pub fn since(&self, earlier: &ByteFlow) -> ByteFlow {
+        macro_rules! d {
+            ($($f:ident),* $(,)?) => { ByteFlow { $($f: self.$f.saturating_sub(earlier.$f),)* } };
+        }
+        d!(
+            requested_bytes,
+            hit_bytes,
+            coalesced_bytes,
+            refused_bytes,
+            admitted_bytes,
+            direct_admitted_bytes,
+            as_source_admitted_bytes,
+            source_created_bytes,
+            source_reuse_bytes,
+            source_rollback_bytes,
+            read_bytes,
+            uploaded_bytes,
+            abandoned_bytes,
+            withheld_bytes,
+            unfinished_bytes,
+            evicted_bytes,
+            retired_bytes,
+            discarded_bytes,
+        )
+    }
+
+    /// Field-by-field sum, for a step total over its layers.
+    #[must_use]
+    pub fn plus(&self, other: &ByteFlow) -> ByteFlow {
+        macro_rules! a {
+            ($($f:ident),* $(,)?) => { ByteFlow { $($f: self.$f.saturating_add(other.$f),)* } };
+        }
+        a!(
+            requested_bytes,
+            hit_bytes,
+            coalesced_bytes,
+            refused_bytes,
+            admitted_bytes,
+            direct_admitted_bytes,
+            as_source_admitted_bytes,
+            source_created_bytes,
+            source_reuse_bytes,
+            source_rollback_bytes,
+            read_bytes,
+            uploaded_bytes,
+            abandoned_bytes,
+            withheld_bytes,
+            unfinished_bytes,
+            evicted_bytes,
+            retired_bytes,
+            discarded_bytes,
+        )
+    }
+}
+
+/// One scope's whole accounting position: its cumulative flow and its current
+/// levels.
+///
+/// The levels are **computed when this is read**, from the placements
+/// themselves. A level that is derivable is derived, so there is no second copy
+/// of it to drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopeAccount {
+    pub scope: Scope,
+    pub tier: Tier,
+    pub cap_bytes: u64,
+    pub flow: ByteFlow,
+    /// Everything charged here right now, in flight and quarantined included.
+    /// Equal to the cache's committed bytes and to the arena's live bytes.
+    pub resident_bytes: u64,
+    /// Of `resident_bytes`, what is withheld pending an unknown outcome.
+    pub quarantined_bytes: u64,
+    /// Of `resident_bytes`, what is `Reading` or `Uploading`.
+    pub in_flight_bytes: u64,
+    /// Of `resident_bytes`, what is in flight -- quarantined included -- and
+    /// has **not** reported a transfer outcome yet.
+    ///
+    /// The term that makes the transfer identity exact. A placement counts
+    /// exactly once: through the outcome its transfer reported, or, if nothing
+    /// has reported, through this level, or, if it left before anything
+    /// reported, through `unfinished_bytes`. A host source whose read completed
+    /// and which is later quarantined by its *upload* has already reported, so
+    /// it stays in `read_bytes` and is not counted again here.
+    pub unreported_bytes: u64,
+    /// The high-water mark of `resident_bytes`. The one level that is
+    /// maintained rather than derived, because history cannot be recomputed.
+    pub peak_resident_bytes: u64,
+}
+
+/// Why a placement left its scope.
+///
+/// A parameter of the one function that removes a placement, rather than a
+/// guess made afterwards from what is left. The three are different facts:
+/// eviction chose it, retirement was asked for, and a discard means the bytes
+/// were never worth keeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Departure {
+    Evicted,
+    Retired,
+    Discarded,
+}
+
 /// One visible placement, for reconciliation and diagnosis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutstandingChunk {
@@ -904,6 +1091,15 @@ struct Placement {
     /// accounted as demand data.
     ever_demanded: bool,
     ticket: Option<TicketId>,
+    /// Whether a transfer outcome has been reported for these bytes.
+    ///
+    /// The difference between "the read failed and gave the bytes back" and
+    /// "this placement went away before anyone said what happened to it". Both
+    /// leave an in-flight placement being dropped, and the byte identity
+    /// `admitted == moved + abandoned + unfinished + in flight + quarantined`
+    /// counts them in different terms, so the fact has to be recorded rather
+    /// than inferred from the state at the moment it is removed.
+    outcome_recorded: bool,
     /// For a device placement: where its source bytes live in the host cache,
     /// and the host placement pinning them.
     upload_source: Option<PlacementKey>,
@@ -988,6 +1184,11 @@ struct ScopeCache {
     arena: Arena,
     /// Bytes of every placement in this scope, resident and in flight.
     committed: u64,
+    /// This scope's cumulative byte flow. The one place these bytes are
+    /// counted.
+    flow: ByteFlow,
+    /// The high-water mark of `committed`, which cannot be recomputed later.
+    peak_committed: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,6 +1485,8 @@ impl ResidencyAuthority {
                     }
                 },
                 committed: 0,
+                flow: ByteFlow::default(),
+                peak_committed: 0,
             },
         );
 
@@ -1301,6 +1504,8 @@ impl ResidencyAuthority {
                             cap_bytes: *cap,
                             arena,
                             committed: 0,
+                            flow: ByteFlow::default(),
+                            peak_committed: 0,
                         },
                     );
                 }
@@ -1379,7 +1584,7 @@ impl ResidencyAuthority {
         }
         let keys: Vec<PlacementKey> = self.placements.keys().copied().collect();
         for key in keys {
-            self.drop_placement(key);
+            self.drop_placement(key, Departure::Retired);
         }
         self.host.release(ledger)?;
         if let Some(envelope) = self.device_envelope.take() {
@@ -1625,6 +1830,141 @@ impl ResidencyAuthority {
             ));
         }
 
+        // --- the conservation identities (task 0023) --------------------------
+        //
+        // Every one of these is an **equality**, checked after every operation
+        // rather than at the end of a run. A trace that reconciles is built from
+        // these numbers, so a term that can drift by one under some interleaving
+        // is a trace that means nothing -- and the only way to find that
+        // interleaving is to check the identity everywhere task 0020's
+        // transition sweep already goes.
+        let mut device_source_created = 0u64;
+        let mut host_as_source = 0u64;
+        let mut sum_read = 0u64;
+        let mut sum_uploaded = 0u64;
+        let mut sum_evicted = 0u64;
+        for scope in self.caches.keys().copied().collect::<Vec<_>>() {
+            let a = self.account(scope).expect("a cache this authority holds");
+            let f = &a.flow;
+            let named = |what: &str, left: u64, right: u64| {
+                format!("{scope}: {what} -- {left} against {right}")
+            };
+            // Every byte asked of this scope -- by an acquire that named it, or
+            // by a device acquire that needed a source here -- was hit, joined,
+            // placed or refused. The second term is not bookkeeping noise: a
+            // device acquire admits **two** placements, and a host cache whose
+            // only traffic is other scopes' upload sources has a request count
+            // of zero and a real, charged working set.
+            let asked = f.requested_bytes.saturating_add(f.as_source_admitted_bytes);
+            let resolved = f
+                .hit_bytes
+                .saturating_add(f.coalesced_bytes)
+                .saturating_add(f.admitted_bytes)
+                .saturating_add(f.refused_bytes);
+            if asked != resolved {
+                return fail(named(
+                    "request-is-hit-coalesced-admitted-or-refused",
+                    asked,
+                    resolved,
+                ));
+            }
+            let origin = f
+                .direct_admitted_bytes
+                .saturating_add(f.as_source_admitted_bytes);
+            if f.admitted_bytes != origin {
+                return fail(named("admission-has-one-origin", f.admitted_bytes, origin));
+            }
+            if scope.kind() == moxie_types::ScopeKind::Device {
+                let by_source = f.source_created_bytes.saturating_add(f.source_reuse_bytes);
+                if f.admitted_bytes != by_source {
+                    return fail(named(
+                        "a-device-admission-creates-or-reuses-a-source",
+                        f.admitted_bytes,
+                        by_source,
+                    ));
+                }
+                device_source_created =
+                    device_source_created.saturating_add(f.source_created_bytes);
+                sum_uploaded = sum_uploaded.saturating_add(f.uploaded_bytes);
+            } else {
+                host_as_source = host_as_source.saturating_add(f.as_source_admitted_bytes);
+                sum_read = sum_read.saturating_add(f.read_bytes);
+            }
+            sum_evicted = sum_evicted.saturating_add(f.evicted_bytes);
+            let gone = a
+                .resident_bytes
+                .saturating_add(f.evicted_bytes)
+                .saturating_add(f.retired_bytes)
+                .saturating_add(f.discarded_bytes);
+            if f.admitted_bytes != gone {
+                return fail(named(
+                    "admitted-is-resident-or-gone",
+                    f.admitted_bytes,
+                    gone,
+                ));
+            }
+            // One identity for both kinds of scope: exactly one of `read_bytes`
+            // and `uploaded_bytes` can be non-zero in a scope, and every other
+            // way a transfer can end has its own term. A withheld transfer
+            // (R07) has reported *nothing*, so its bytes are a level here --
+            // `quarantined_bytes` -- and `withheld_bytes` beside it counts how
+            // many entered that state without being part of this sum. Counting
+            // an unknown outcome as an outcome is how an identity gets a term
+            // that means two different things.
+            let settled = f
+                .read_bytes
+                .saturating_add(f.uploaded_bytes)
+                .saturating_add(f.abandoned_bytes)
+                .saturating_add(f.unfinished_bytes)
+                .saturating_add(a.unreported_bytes);
+            if f.admitted_bytes != settled {
+                return fail(named(
+                    "an-admission-ends-in-one-transfer-outcome",
+                    f.admitted_bytes,
+                    settled,
+                ));
+            }
+            if a.resident_bytes > a.peak_resident_bytes {
+                return fail(named(
+                    "peak-is-a-high-water-mark",
+                    a.resident_bytes,
+                    a.peak_resident_bytes,
+                ));
+            }
+        }
+        // A host source that was created and then rolled back is the one way the
+        // two counts of the same event differ: the host admitted the bytes, the
+        // device's admission was then refused, and only the host ever saw them.
+        let rollback = self
+            .account(Scope::Host)
+            .map_or(0, |a| a.flow.source_rollback_bytes);
+        if device_source_created.saturating_add(rollback) != host_as_source {
+            return fail(format!(
+                "a-source-is-admitted-where-it-lives -- devices created \
+                 {device_source_created} B of host source and {rollback} B was rolled back, \
+                 against the host's {host_as_source} B"
+            ));
+        }
+        // The aggregate is the sum of the scopes, or it is a second tally.
+        if self.stats.bytes_read != sum_read {
+            return fail(format!(
+                "stats-are-the-sum-of-scopes: bytes_read {} against {sum_read} B",
+                self.stats.bytes_read
+            ));
+        }
+        if self.stats.bytes_uploaded != sum_uploaded {
+            return fail(format!(
+                "stats-are-the-sum-of-scopes: bytes_uploaded {} against {sum_uploaded} B",
+                self.stats.bytes_uploaded
+            ));
+        }
+        if self.stats.evicted_bytes != sum_evicted {
+            return fail(format!(
+                "stats-are-the-sum-of-scopes: evicted_bytes {} against {sum_evicted} B",
+                self.stats.evicted_bytes
+            ));
+        }
+
         let occupied = self.lease_slots.iter().filter(|s| s.held.is_some()).count() as u32;
         if occupied != self.live_leases {
             return fail(format!(
@@ -1700,6 +2040,100 @@ impl ResidencyAuthority {
 
     pub const fn stats(&self) -> ResidencyStats {
         self.stats
+    }
+
+    /// One scope's whole accounting position, levels included.
+    ///
+    /// `None` when this authority has no cache for that scope. The levels are
+    /// computed here, from the placements, rather than maintained beside them.
+    pub fn account(&self, scope: Scope) -> Option<ScopeAccount> {
+        let cache = self.caches.get(&scope)?;
+        let mut quarantined = 0u64;
+        let mut in_flight = 0u64;
+        let mut unreported = 0u64;
+        for p in self.placements.values().filter(|p| p.scope == scope) {
+            if p.state == ChunkState::Quarantined {
+                quarantined = quarantined.saturating_add(p.bytes);
+            } else if p.state.is_in_flight() {
+                in_flight = in_flight.saturating_add(p.bytes);
+            }
+            if p.state.is_in_flight() && !p.outcome_recorded {
+                unreported = unreported.saturating_add(p.bytes);
+            }
+        }
+        Some(ScopeAccount {
+            scope,
+            tier: cache.tier,
+            cap_bytes: cache.cap_bytes,
+            flow: cache.flow,
+            resident_bytes: cache.committed,
+            quarantined_bytes: quarantined,
+            in_flight_bytes: in_flight,
+            unreported_bytes: unreported,
+            peak_resident_bytes: cache.peak_committed,
+        })
+    }
+
+    /// The ledger reservations this authority itself holds, by identity.
+    ///
+    /// Two at most: the host cache's backing and control, and the one envelope
+    /// covering every declared device cache. A trace uses these to ask the
+    /// ledger what they cost rather than recomputing it -- document 03's
+    /// admission report is the ledger's to produce, and a second arithmetic for
+    /// the same bytes is how two owners come to disagree.
+    pub fn reservation_ids(&self) -> Vec<ReservationId> {
+        let mut out = Vec::new();
+        if let Some(id) = self.host.reservation_id() {
+            out.push(id);
+        }
+        if let Some(r) = self.device_envelope.as_ref() {
+            out.push(r.id());
+        }
+        out
+    }
+
+    /// Every scope this authority holds a cache for, in scope order.
+    pub fn accounts(&self) -> Vec<ScopeAccount> {
+        self.caches
+            .keys()
+            .filter_map(|scope| self.account(*scope))
+            .collect()
+    }
+
+    /// Charge one acquire's request to the scope it named.
+    ///
+    /// A destination with no cache charges nothing, and its refusal charges
+    /// nothing either: both sides of `requested == hit + coalesced + admitted +
+    /// refused` skip it, so the identity holds without inventing a scope to
+    /// blame.
+    fn charge_requested(&mut self, scope: Scope, bytes: u64) {
+        if let Some(c) = self.caches.get_mut(&scope) {
+            c.flow.requested_bytes = c.flow.requested_bytes.saturating_add(bytes);
+        }
+    }
+
+    /// Record a refusal against the scope the **acquire** named.
+    ///
+    /// Not against the scope that could not find room: a device acquire whose
+    /// host source cannot be placed is one refused device acquire, and charging
+    /// the host would leave one scope with a request nothing answered and
+    /// another with an answer to no request.
+    fn charge_refused(&mut self, scope: Scope, bytes: u64) {
+        self.stats.refusals = self.stats.refusals.saturating_add(1);
+        if let Some(c) = self.caches.get_mut(&scope) {
+            c.flow.refused_bytes = c.flow.refused_bytes.saturating_add(bytes);
+        }
+    }
+
+    fn flow_mut(&mut self, scope: Scope) -> Option<&mut ByteFlow> {
+        self.caches.get_mut(&scope).map(|c| &mut c.flow)
+    }
+
+    /// Note that this placement's transfer has reported, whatever it reported.
+    fn record_outcome(&mut self, key: PlacementKey) {
+        if let Some(p) = self.placements.get_mut(&key) {
+            p.outcome_recorded = true;
+        }
     }
 
     /// Bytes resident or in flight in one scope.
@@ -1807,9 +2241,14 @@ impl ResidencyAuthority {
         &mut self,
         request: AcquireRequest<'_>,
     ) -> std::result::Result<Acquired, ResidencyRefused> {
+        // Charged before anything can refuse it, so that every outcome below --
+        // hit, coalesce, admission or refusal -- lands on a request that was
+        // already counted. A destination with no cache charges nothing on
+        // either side.
+        self.charge_requested(request.destination, request.chunk.len_bytes());
         if self.closed {
             let report = self.report_for(Scope::Host, request.chunk.len_bytes(), &[]);
-            self.stats.refusals = self.stats.refusals.saturating_add(1);
+            self.charge_refused(request.destination, request.chunk.len_bytes());
             return Err(ResidencyRefused {
                 error: invalid(
                     "acquire",
@@ -1820,7 +2259,7 @@ impl ResidencyAuthority {
         }
         if !self.caches.contains_key(&request.destination) {
             let report = self.report_for(Scope::Host, request.chunk.len_bytes(), &[]);
-            self.stats.refusals = self.stats.refusals.saturating_add(1);
+            self.charge_refused(request.destination, request.chunk.len_bytes());
             return Err(ResidencyRefused {
                 error: invalid(
                     "destination",
@@ -1835,7 +2274,7 @@ impl ResidencyAuthority {
             // longer one would spend control memory nobody reserved, which is
             // the exact defect this bound replaced.
             let report = self.report_for(request.destination, request.chunk.len_bytes(), &[]);
-            self.stats.refusals = self.stats.refusals.saturating_add(1);
+            self.charge_refused(request.destination, request.chunk.len_bytes());
             return Err(ResidencyRefused {
                 error: Error::CapacityExceeded {
                     tier: Some(Tier::Host(HostTier::Pageable)),
@@ -1852,7 +2291,7 @@ impl ResidencyAuthority {
             // which is the zero-resident case wearing the class's name. Refused
             // here rather than left to a caller to remember.
             let report = self.report_for(request.destination, request.chunk.len_bytes(), &[]);
-            self.stats.refusals = self.stats.refusals.saturating_add(1);
+            self.charge_refused(request.destination, request.chunk.len_bytes());
             return Err(ResidencyRefused {
                 error: invalid(
                     "conditional_floor_bytes",
@@ -1867,7 +2306,7 @@ impl ResidencyAuthority {
             // capacity refusal like any other -- never a growth nobody charged
             // for, and never a panic on a path a generation step takes.
             let report = self.report_for(request.destination, request.chunk.len_bytes(), &[]);
-            self.stats.refusals = self.stats.refusals.saturating_add(1);
+            self.charge_refused(request.destination, request.chunk.len_bytes());
             return Err(ResidencyRefused {
                 error: Error::CapacityExceeded {
                     tier: Some(Tier::Host(HostTier::Pageable)),
@@ -1911,6 +2350,10 @@ impl ResidencyAuthority {
                 }
             }
             self.stats.hits = self.stats.hits.saturating_add(1);
+            let bytes = request.chunk.len_bytes();
+            if let Some(flow) = self.flow_mut(request.destination) {
+                flow.hit_bytes = flow.hit_bytes.saturating_add(bytes);
+            }
             return Ok(Acquired::Ready(self.issue_lease(
                 key,
                 request.turn,
@@ -1926,7 +2369,7 @@ impl ResidencyAuthority {
                 // invariant breach inside a generation step must be reportable,
                 // not fatal. This exact shape panicked before that rule existed.
                 let report = self.report_for(request.destination, request.chunk.len_bytes(), &[]);
-                self.stats.refusals = self.stats.refusals.saturating_add(1);
+                self.charge_refused(request.destination, request.chunk.len_bytes());
                 return Err(ResidencyRefused {
                     error: invalid(
                         "chunk",
@@ -1971,6 +2414,10 @@ impl ResidencyAuthority {
                 PendingWork::Coalesced
             };
             self.stats.misses = self.stats.misses.saturating_add(1);
+            let bytes = request.chunk.len_bytes();
+            if let Some(flow) = self.flow_mut(request.destination) {
+                flow.coalesced_bytes = flow.coalesced_bytes.saturating_add(bytes);
+            }
             return Ok(Acquired::Pending {
                 lease,
                 ticket,
@@ -1983,7 +2430,7 @@ impl ResidencyAuthority {
         // reading into them would race a transfer that may still be running.
         // A refusal, never a silent second copy.
         let report = self.report_for(request.destination, request.chunk.len_bytes(), &[]);
-        self.stats.refusals = self.stats.refusals.saturating_add(1);
+        self.charge_refused(request.destination, request.chunk.len_bytes());
         Err(ResidencyRefused {
             error: invalid(
                 "chunk",
@@ -2023,7 +2470,7 @@ impl ResidencyAuthority {
         );
         if self.placements.len() + needed > self.max_placements as usize {
             let report = self.report_for(destination, incoming, &[]);
-            self.stats.refusals = self.stats.refusals.saturating_add(1);
+            self.charge_refused(destination, incoming);
             return Err(ResidencyRefused {
                 error: Error::CapacityExceeded {
                     tier: Some(Tier::Host(HostTier::Pageable)),
@@ -2040,7 +2487,7 @@ impl ResidencyAuthority {
             // Refused before anything is admitted, so a refused prediction
             // costs no bytes at all.
             let report = self.report_for(destination, incoming, &[]);
-            self.stats.refusals = self.stats.refusals.saturating_add(1);
+            self.charge_refused(destination, incoming);
             return Err(ResidencyRefused {
                 error: Error::CapacityExceeded {
                     tier: Some(self.caches[&destination].tier),
@@ -2061,7 +2508,7 @@ impl ResidencyAuthority {
             None
         };
 
-        let (key, report) = match self.place(destination, request, incoming) {
+        let (key, report) = match self.place(destination, request, incoming, destination) {
             Ok(v) => v,
             Err(e) => {
                 if let Some(HostSource { key, created, .. }) = source {
@@ -2074,6 +2521,19 @@ impl ResidencyAuthority {
         let ticket = TicketId::next();
         let queued = request.class.urgency == Urgency::Prefetch;
         let source_created = source.as_ref().is_some_and(|s| s.created);
+        if source.is_some()
+            && let Some(flow) = self.flow_mut(destination)
+        {
+            // A device admission either had to create its host source or found
+            // one already here -- settled, or being read for somebody else.
+            // Either way it is this admission's origin, and the two are
+            // separate because the second saves a read of the whole chunk.
+            if source_created {
+                flow.source_created_bytes = flow.source_created_bytes.saturating_add(incoming);
+            } else {
+                flow.source_reuse_bytes = flow.source_reuse_bytes.saturating_add(incoming);
+            }
+        }
         let source_key_opt = source.as_ref().map(|s| s.key);
         // The placement is admitted, so the promotion this acquire depends on
         // is now known to be wanted. Applying it any earlier would strand the
@@ -2222,7 +2682,7 @@ impl ResidencyAuthority {
                 }
                 state => {
                     let report = self.report_for(Scope::Host, request.chunk.len_bytes(), &[]);
-                    self.stats.refusals = self.stats.refusals.saturating_add(1);
+                    self.charge_refused(request.destination, request.chunk.len_bytes());
                     Err(ResidencyRefused {
                         error: invalid(
                             "chunk",
@@ -2242,7 +2702,12 @@ impl ResidencyAuthority {
                 destination: Scope::Host,
                 ..request
             };
-            let (key, _) = self.place(Scope::Host, host_request, request.chunk.len_bytes())?;
+            let (key, _) = self.place(
+                Scope::Host,
+                host_request,
+                request.chunk.len_bytes(),
+                request.destination,
+            )?;
             self.placements.get_mut(&key).expect("just placed").leases = 1;
             Ok(HostSource {
                 key,
@@ -2266,7 +2731,14 @@ impl ResidencyAuthority {
             created && p.leases == 0
         };
         if drop_it {
-            self.drop_placement(key);
+            let (scope, bytes) = {
+                let p = &self.placements[&key];
+                (p.scope, p.bytes)
+            };
+            if let Some(flow) = self.flow_mut(scope) {
+                flow.source_rollback_bytes = flow.source_rollback_bytes.saturating_add(bytes);
+            }
+            self.drop_placement(key, Departure::Discarded);
         }
     }
 
@@ -2285,19 +2757,25 @@ impl ResidencyAuthority {
     /// answers differ, so when the arena refuses a request the bytes admitted,
     /// this keeps evicting in the same deterministic order rather than reporting
     /// a full cache that is not full.
+    ///
+    /// `charge` is the scope the **acquire** named, which is `scope` itself for
+    /// a direct admission and the device for a host source. Refusals are charged
+    /// there, and the admission's origin is read from the same fact: a placement
+    /// whose charge is another scope is somebody's upload source.
     #[allow(clippy::result_large_err)]
     fn place(
         &mut self,
         scope: Scope,
         request: AcquireRequest<'_>,
         incoming: u64,
+        charge: Scope,
     ) -> std::result::Result<(PlacementKey, ResidencyReport), ResidencyRefused> {
         let cap = self.caches[&scope].cap_bytes;
         if incoming > cap {
             // It would not fit an empty cache, so evicting first would destroy
             // live data to no purpose. Nothing is displaced.
             let report = self.report_for(scope, incoming, &[]);
-            self.stats.refusals = self.stats.refusals.saturating_add(1);
+            self.charge_refused(charge, incoming);
             return Err(ResidencyRefused {
                 error: Error::CapacityExceeded {
                     tier: Some(self.caches[&scope].tier),
@@ -2333,7 +2811,7 @@ impl ResidencyAuthority {
                         committed_before.saturating_sub(freed),
                         named,
                     );
-                    self.stats.refusals = self.stats.refusals.saturating_add(1);
+                    self.charge_refused(charge, incoming);
                     return Err(ResidencyRefused {
                         error: Error::CapacityExceeded {
                             tier: Some(self.caches[&scope].tier),
@@ -2364,7 +2842,7 @@ impl ResidencyAuthority {
                     }
                     None => {
                         let report = self.report_after(scope, incoming, committed_before, named);
-                        self.stats.refusals = self.stats.refusals.saturating_add(1);
+                        self.charge_refused(charge, incoming);
                         return Err(ResidencyRefused {
                             error: refused.error,
                             report,
@@ -2380,6 +2858,21 @@ impl ResidencyAuthority {
         let committed_after_evictions = self.caches[&scope].committed;
         let cache = self.caches.get_mut(&scope).expect("checked");
         cache.committed = cache.committed.saturating_add(incoming);
+
+        {
+            let flow = &mut self.caches.get_mut(&scope).expect("checked").flow;
+            flow.admitted_bytes = flow.admitted_bytes.saturating_add(incoming);
+            if charge == scope {
+                flow.direct_admitted_bytes = flow.direct_admitted_bytes.saturating_add(incoming);
+            } else {
+                flow.as_source_admitted_bytes =
+                    flow.as_source_admitted_bytes.saturating_add(incoming);
+            }
+        }
+        {
+            let cache = self.caches.get_mut(&scope).expect("checked");
+            cache.peak_committed = cache.peak_committed.max(cache.committed);
+        }
 
         let key = PlacementKey(self.next_placement);
         self.next_placement += 1;
@@ -2405,6 +2898,7 @@ impl ResidencyAuthority {
                 ever_demanded: request.class.urgency == Urgency::Demand,
                 ticket: None,
                 upload_source: None,
+                outcome_recorded: false,
             },
         );
         self.index.entry(scope).or_default().insert(identity, key);
@@ -2957,11 +3451,18 @@ impl ResidencyAuthority {
             // consumer's lease; an internal pin is no different, and leaving it
             // out stranded a `Retiring` placement with zero leases: charged,
             // unevictable and holding a one-chunk cache shut forever.
-            p.leases == 0
-                && (p.state == ChunkState::Retiring || (owns && p.state != ChunkState::HostReady))
+            if p.leases > 0 {
+                None
+            } else if p.state == ChunkState::Retiring {
+                Some(Departure::Retired)
+            } else if owns && p.state != ChunkState::HostReady {
+                Some(Departure::Discarded)
+            } else {
+                None
+            }
         };
-        if drop_it {
-            self.drop_placement(source);
+        if let Some(why) = drop_it {
+            self.drop_placement(source, why);
         }
     }
 
@@ -3007,6 +3508,10 @@ impl ResidencyAuthority {
         match outcome {
             Outcome::Completed => {
                 self.stats.bytes_read = self.stats.bytes_read.saturating_add(bytes);
+                if let Some(flow) = self.flow_mut(Scope::Host) {
+                    flow.read_bytes = flow.read_bytes.saturating_add(bytes);
+                }
+                self.record_outcome(source);
                 self.placements
                     .get_mut(&source)
                     .expect("source placement")
@@ -3022,7 +3527,7 @@ impl ResidencyAuthority {
                         // they be given back, and only if nobody else is
                         // holding them: a device acquire waiting on this read
                         // still has its source pin.
-                        self.drop_if_unheld(t.placement);
+                        self.drop_if_unheld(t.placement, Departure::Retired);
                     }
                 } else {
                     // A device acquire: the second stage is now legal.
@@ -3058,6 +3563,10 @@ impl ResidencyAuthority {
                 // invisible internal retry is how a storage fault becomes a
                 // latency mystery.
                 self.stats.read_failures = self.stats.read_failures.saturating_add(1);
+                if let Some(flow) = self.flow_mut(Scope::Host) {
+                    flow.abandoned_bytes = flow.abandoned_bytes.saturating_add(bytes);
+                }
+                self.record_outcome(source);
                 self.fail_blocked_on(ticket);
                 let t = self.take_ticket(ticket).expect("live ticket");
                 self.discard(t.placement);
@@ -3082,6 +3591,9 @@ impl ResidencyAuthority {
                 // `settle_quarantined` releases it.
                 self.stats.read_failures = self.stats.read_failures.saturating_add(1);
                 self.stats.quarantined = self.stats.quarantined.saturating_add(1);
+                if let Some(flow) = self.flow_mut(Scope::Host) {
+                    flow.withheld_bytes = flow.withheld_bytes.saturating_add(bytes);
+                }
                 self.fail_blocked_on(ticket);
                 self.take_ticket(ticket);
                 self.quarantine(source);
@@ -3116,10 +3628,15 @@ impl ResidencyAuthority {
             t.owns_source,
             self.placements[&t.placement].bytes,
         );
+        let scope = self.placements[&placement].scope;
 
         match outcome {
             Outcome::Completed => {
                 self.stats.bytes_uploaded = self.stats.bytes_uploaded.saturating_add(bytes);
+                if let Some(flow) = self.flow_mut(scope) {
+                    flow.uploaded_bytes = flow.uploaded_bytes.saturating_add(bytes);
+                }
+                self.record_outcome(placement);
                 self.take_ticket(ticket);
                 {
                     let p = self
@@ -3134,7 +3651,7 @@ impl ResidencyAuthority {
                 }
                 self.settle_source(source, placement, owns);
                 if cancelled {
-                    self.drop_if_unheld(placement);
+                    self.drop_if_unheld(placement, Departure::Retired);
                 }
                 Ok(())
             }
@@ -3143,6 +3660,10 @@ impl ResidencyAuthority {
                 // so the device range goes back and the host bytes stay. A
                 // retry uploads again without re-reading.
                 self.stats.upload_failures = self.stats.upload_failures.saturating_add(1);
+                if let Some(flow) = self.flow_mut(scope) {
+                    flow.abandoned_bytes = flow.abandoned_bytes.saturating_add(bytes);
+                }
+                self.record_outcome(placement);
                 self.take_ticket(ticket);
                 self.discard(placement);
                 self.settle_source(source, placement, owns);
@@ -3153,6 +3674,9 @@ impl ResidencyAuthority {
                 // and the pin stays until `settle_quarantined` releases it.
                 self.stats.upload_failures = self.stats.upload_failures.saturating_add(1);
                 self.stats.quarantined = self.stats.quarantined.saturating_add(1);
+                if let Some(flow) = self.flow_mut(scope) {
+                    flow.withheld_bytes = flow.withheld_bytes.saturating_add(bytes);
+                }
                 self.take_ticket(ticket);
                 self.quarantine(placement);
                 self.quarantine(source);
@@ -3240,7 +3764,7 @@ impl ResidencyAuthority {
         } else {
             self.stats.demand_evicted_bytes = self.stats.demand_evicted_bytes.saturating_add(bytes);
         }
-        self.drop_placement(key);
+        self.drop_placement(key, Departure::Evicted);
     }
 
     /// Withhold a placement whose transfer state is unknown. Charged, indexed
@@ -3288,7 +3812,7 @@ impl ResidencyAuthority {
             ));
         }
         if p.leases == 0 {
-            self.drop_placement(key);
+            self.drop_placement(key, Departure::Retired);
             return Ok(ChunkState::Retiring);
         }
         self.placements
@@ -3313,7 +3837,7 @@ impl ResidencyAuthority {
             .map(|(k, _)| *k)
             .collect();
         for key in &drainable {
-            self.drop_placement(*key);
+            self.drop_placement(*key, Departure::Retired);
         }
         self.placements
             .values()
@@ -3344,7 +3868,7 @@ impl ResidencyAuthority {
                 "a quarantined placement is settled after its leases are released",
             ));
         }
-        self.drop_placement(key);
+        self.drop_placement(key, Departure::Discarded);
         // A withheld upload still pins the host bytes it was copying from.
         // That pin is the authority's, not a consumer's, and it is what kept
         // the source from being reused while the copy might still have been
@@ -3387,20 +3911,20 @@ impl ResidencyAuthority {
     ///   Its leases resolve to a typed error instead, which is what every
     ///   failure test already asserts.
     fn discard(&mut self, key: PlacementKey) {
-        self.drop_placement(key);
+        self.drop_placement(key, Departure::Discarded);
     }
 
-    fn drop_if_unheld(&mut self, key: PlacementKey) -> bool {
+    fn drop_if_unheld(&mut self, key: PlacementKey, why: Departure) -> bool {
         if self.placements.get(&key).is_none_or(|p| p.leases > 0) {
             return false;
         }
-        self.drop_placement(key);
+        self.drop_placement(key, why);
         true
     }
 
     /// Release the bytes and the index entry. Bookkeeping only: nothing here
     /// decides that it *should* happen.
-    fn drop_placement(&mut self, key: PlacementKey) {
+    fn drop_placement(&mut self, key: PlacementKey, why: Departure) {
         let Some(mut p) = self.placements.remove(&key) else {
             return;
         };
@@ -3408,6 +3932,19 @@ impl ResidencyAuthority {
             self.conditional_resident = self.conditional_resident.saturating_sub(p.bytes);
         }
         if let Some(cache) = self.caches.get_mut(&p.scope) {
+            // A placement that leaves while its transfer is still in flight
+            // never reports an outcome, so the outcome is recorded here. Without
+            // this term `admitted == moved + abandoned + withheld + in flight`
+            // would be short by exactly the bytes nobody ever heard about again.
+            if p.state.is_in_flight() && !p.outcome_recorded {
+                cache.flow.unfinished_bytes = cache.flow.unfinished_bytes.saturating_add(p.bytes);
+            }
+            let departed = match why {
+                Departure::Evicted => &mut cache.flow.evicted_bytes,
+                Departure::Retired => &mut cache.flow.retired_bytes,
+                Departure::Discarded => &mut cache.flow.discarded_bytes,
+            };
+            *departed = departed.saturating_add(p.bytes);
             cache.committed = cache.committed.saturating_sub(p.bytes);
             if let Some(allocation) = p.allocation.take() {
                 cache
@@ -3458,7 +3995,7 @@ impl ResidencyAuthority {
             retiring_done = p.leases == 0 && p.state == ChunkState::Retiring;
         }
         if retiring_done {
-            self.drop_placement(placement);
+            self.drop_placement(placement, Departure::Retired);
             return;
         }
         let Some(ticket) = ticket else { return };

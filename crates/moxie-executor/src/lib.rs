@@ -59,6 +59,11 @@ pub use grouped::{
     PlacementReport, Progress, QueueFull, QueuedGroup,
 };
 
+pub mod trace;
+pub use trace::{
+    Discrepancy, LayerSnapshot, LayerTrace, Reconciled, ScopeDelta, StepTrace, TRACE_SCHEMA_VERSION,
+};
+
 pub mod arena;
 pub use arena::{
     OperationAcquireRefused, OperationHeld, OperationLease, OperationRetireRefused,

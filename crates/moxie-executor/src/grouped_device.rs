@@ -1170,7 +1170,9 @@ mod tests {
             device_arena_free_bytes: 16 * MIB,
             host_workspace_bytes: MIB,
             host_buffer_bytes: MIB,
-            resident_experts: Vec::new(),
+            host_cache_cap_bytes: 1 << 30,
+            host_cache_leased_bytes: 0,
+            resident: moxie_plan::expert::ResidentChunks::none(),
         }
     }
 

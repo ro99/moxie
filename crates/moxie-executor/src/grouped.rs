@@ -34,8 +34,8 @@ use std::collections::VecDeque;
 
 use moxie_memory::{
     AcquireRequest, Acquired, AdmitError, ArtifactId, BufferRequest, ChunkId, Content, Ledger,
-    LedgerId, LogicalRange, PlanRequest, Reservation, ResidencyAuthority, ResidencyLease,
-    StageSpan, TensorSlot, TurnId, UseClass, WorkOrder,
+    LedgerId, LogicalRange, PlanRequest, Reservation, ReservationId, ResidencyAuthority,
+    ResidencyLease, StageSpan, TensorSlot, TurnId, UseClass, WorkOrder,
 };
 use moxie_plan::expert::{Candidate, ExpertGroup, ExpertPlan, ExpertShape, Placement};
 use moxie_types::{
@@ -1027,12 +1027,33 @@ pub struct GroupedStats {
     pub host_groups: u64,
     pub device_groups: u64,
     pub slots_written: u64,
+    /// Chunk acquires this run issued, by role: `[gate_up, down]`.
+    ///
+    /// Counts of **this run's own actions**, not of bytes: the bytes are the
+    /// residency authority's to count, and a second byte counter here would be
+    /// the second accounting owner task 0023 forbids. Multiplied by the plan's
+    /// chunk lengths they reconcile exactly against the authority's
+    /// `requested_bytes`, which is what ties one owner's record to the other's.
+    ///
+    /// A backpressure retry issues them again, and that is deliberate: the
+    /// authority counts the retried request too.
+    pub acquires_issued: [u64; 2],
+    /// Device kernel launches this run submitted. Document 07 lists launch count
+    /// among the per-phase counters; it is a count, and it is not a timing.
+    pub launches: u64,
     /// Acquires refused while the queue held work, which drained and retried.
     pub backpressure_drains: u64,
     /// Every residency lease this run has ever taken, including the ones a
     /// half-succeeded acquire gave straight back.
     pub leases_acquired: u64,
     pub leases_released: u64,
+}
+
+impl GroupedStats {
+    fn record_attempts(&mut self, attempts: [u64; 2]) {
+        self.acquires_issued[0] = self.acquires_issued[0].saturating_add(attempts[0]);
+        self.acquires_issued[1] = self.acquires_issued[1].saturating_add(attempts[1]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,6 +1108,13 @@ pub struct GroupedRun<'lane> {
     /// `None` once a device attachment took it; the attachment then owns the
     /// whole envelope and `close` gives it back through the attachment.
     reservation: Option<Reservation>,
+    /// The same reservation's identity, kept by value.
+    ///
+    /// A device attachment takes the `Reservation` itself, so after `attach` the
+    /// run cannot name what it holds -- and naming it is exactly what task
+    /// 0023's `ledger-charges-what-is-held` needs, on both sides of the attach.
+    /// An id is not an authority to release anything.
+    reservation_id: ReservationId,
     ledger: LedgerId,
     buffers: HostBuffers,
     queue: OrderQueue,
@@ -1144,6 +1172,7 @@ impl<'lane> GroupedRun<'lane> {
             }
         };
         let ledger_id = reservation.ledger();
+        let reservation_id = reservation.id();
 
         // Placement, then allocation. Binding after allocating would place the
         // pages by whichever CPU happened to run the allocation.
@@ -1189,6 +1218,7 @@ impl<'lane> GroupedRun<'lane> {
             plan,
             roles,
             reservation: Some(reservation),
+            reservation_id,
             ledger: ledger_id,
             buffers,
             queue,
@@ -1295,6 +1325,11 @@ impl<'lane> GroupedRun<'lane> {
     pub const fn queue(&self) -> &OrderQueue {
         &self.queue
     }
+    /// The ledger reservation this run holds, by identity.
+    pub const fn reservation_id(&self) -> ReservationId {
+        self.reservation_id
+    }
+
     pub const fn ledger(&self) -> LedgerId {
         self.ledger
     }
@@ -1530,6 +1565,13 @@ struct GroupAcquire {
 struct AcquireFailed {
     error: Error,
     held: Vec<ResidencyLease>,
+    /// Acquires this attempt issued, by role: `[gate_up, down]`.
+    ///
+    /// The run's record of **its own actions**, which is what lets task 0023's
+    /// trace tie the authority's `requested_bytes` to something outside the
+    /// authority. A retry after backpressure issues them again, and a count that
+    /// forgot that would make the tie an inequality.
+    attempts: [u64; 2],
 }
 
 /// Acquire one group's two chunks into `scope`, and prove they are readable.
@@ -1546,19 +1588,22 @@ fn acquire_pair<S: ChunkSource>(
     roles: &ExpertRoles,
     what: GroupAcquire,
     mut lane: Option<&mut (dyn ExpertDeviceLane + '_)>,
-) -> std::result::Result<(ResidencyLease, ResidencyLease), AcquireFailed> {
+) -> std::result::Result<(ResidencyLease, ResidencyLease, [u64; 2]), AcquireFailed> {
     let (gate_up_chunk, down_chunk) = match roles.chunks(what.expert, what.shape) {
         Ok(pair) => pair,
         Err(error) => {
             return Err(AcquireFailed {
                 error,
                 held: Vec::new(),
+                attempts: [0, 0],
             });
         }
     };
     let class = UseClass::demand(Content::Expert);
     let mut held: Vec<ResidencyLease> = Vec::with_capacity(2);
-    for chunk in [&gate_up_chunk, &down_chunk] {
+    let mut attempts = [0u64; 2];
+    for (role, chunk) in [&gate_up_chunk, &down_chunk].into_iter().enumerate() {
+        attempts[role] += 1;
         let request = AcquireRequest {
             chunk,
             destination: what.scope,
@@ -1573,6 +1618,7 @@ fn acquire_pair<S: ChunkSource>(
                 return Err(AcquireFailed {
                     error: refused.error,
                     held,
+                    attempts,
                 });
             }
         };
@@ -1582,7 +1628,13 @@ fn acquire_pair<S: ChunkSource>(
                 held.push(lease);
                 let uploads = match drain_reads(authority, source, work) {
                     Ok(uploads) => uploads,
-                    Err(error) => return Err(AcquireFailed { error, held }),
+                    Err(error) => {
+                        return Err(AcquireFailed {
+                            error,
+                            held,
+                            attempts,
+                        });
+                    }
                 };
                 for order in &uploads {
                     let Some(lane) = lane.as_deref_mut() else {
@@ -1597,10 +1649,15 @@ fn acquire_pair<S: ChunkSource>(
                                     .into(),
                             ),
                             held,
+                            attempts,
                         });
                     };
                     if let Err(error) = lane.perform_upload(authority, order) {
-                        return Err(AcquireFailed { error, held });
+                        return Err(AcquireFailed {
+                            error,
+                            held,
+                            attempts,
+                        });
                     }
                 }
             }
@@ -1626,13 +1683,14 @@ fn acquire_pair<S: ChunkSource>(
                         ),
                     ),
                     held,
+                    attempts,
                 });
             }
         }
     }
     let down = held.pop().expect("two leases");
     let gate_up = held.pop().expect("two leases");
-    Ok((gate_up, down))
+    Ok((gate_up, down, attempts))
 }
 
 impl<'lane> GroupedRun<'lane> {
@@ -1687,7 +1745,8 @@ impl<'lane> GroupedRun<'lane> {
                 self.device.as_deref_mut(),
             );
             match acquired {
-                Ok((gate_up, down)) => {
+                Ok((gate_up, down, attempts)) => {
+                    self.stats.record_attempts(attempts);
                     self.stats.leases_acquired += 2;
                     let queued = QueuedGroup {
                         index,
@@ -1716,6 +1775,7 @@ impl<'lane> GroupedRun<'lane> {
                     }
                 }
                 Err(failed) => {
+                    self.stats.record_attempts(failed.attempts);
                     self.stats.leases_acquired += failed.held.len() as u64;
                     for lease in failed.held {
                         self.release_one(authority, lease);
@@ -1861,6 +1921,10 @@ impl<'lane> GroupedRun<'lane> {
                     },
                     slots.as_mut_slice(),
                 )?;
+                // One launch per device group, counted where the launch is
+                // submitted rather than inferred from the group count -- a group
+                // that failed before submitting must not be counted as one.
+                self.stats.launches += 1;
                 self.stats.slots_written += group.slots().len() as u64;
                 Ok(())
             }

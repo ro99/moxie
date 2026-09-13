@@ -152,6 +152,16 @@ impl HostBuffer {
         core::mem::forget(core::mem::take(&mut self.data));
     }
 
+    /// The ledger reservation this buffer holds, by identity.
+    ///
+    /// Task 0023: a trace reconciles the ledger's charges against the
+    /// reservations it can **name**. Naming them by id means nothing has to
+    /// recompute what a reservation cost, which is the only way that comparison
+    /// stays a check rather than a second copy of the same arithmetic.
+    pub fn reservation_id(&self) -> Option<crate::ReservationId> {
+        self.reservation.as_ref().map(crate::Reservation::id)
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.data
     }

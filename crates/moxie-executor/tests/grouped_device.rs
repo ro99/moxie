@@ -26,7 +26,9 @@ use moxie_memory::{
     ArtifactId, CapacitySnapshot, Ledger, ResidencyAuthority, ResidencyRequest, TurnId,
 };
 use moxie_oracles::route;
-use moxie_plan::expert::{Candidate, ExpertBudget, ExpertKernels, ExpertPolicy, compile_experts};
+use moxie_plan::expert::{
+    Candidate, ExpertBudget, ExpertKernels, ExpertPolicy, ResidentChunks, compile_experts,
+};
 use moxie_storage::Shard;
 use moxie_types::{RankId, Scope, StrategyControl};
 
@@ -289,7 +291,9 @@ fn every_device_reproduces_the_oracle_bit_for_bit_for_both_gate_transforms() {
                 device_arena_free_bytes: 16 * MIB,
                 host_workspace_bytes: MIB,
                 host_buffer_bytes: MIB,
-                resident_experts: Vec::new(),
+                host_cache_cap_bytes: 1 << 30,
+                host_cache_leased_bytes: 0,
+                resident: ResidentChunks::none(),
             };
             let policy = ExpertPolicy {
                 device: StrategyControl::Required,
@@ -400,7 +404,9 @@ fn a_mixed_plan_reduces_cpu_and_gpu_slots_in_one_declared_order() {
         device_arena_free_bytes: 16 * MIB,
         host_workspace_bytes: MIB,
         host_buffer_bytes: MIB,
-        resident_experts: Vec::new(),
+        host_cache_cap_bytes: 1 << 30,
+        host_cache_leased_bytes: 0,
+        resident: ResidentChunks::none(),
     };
     // Between `CHUNK / 2` and `CHUNK`: experts reused by two or three rows
     // amortise their transfer, the singletons do not. That is the crossover the
@@ -509,7 +515,9 @@ fn a_device_cache_smaller_than_the_working_set_executes_under_backpressure() {
         device_arena_free_bytes: 16 * MIB,
         host_workspace_bytes: MIB,
         host_buffer_bytes: MIB,
-        resident_experts: Vec::new(),
+        host_cache_cap_bytes: 1 << 30,
+        host_cache_leased_bytes: 0,
+        resident: ResidentChunks::none(),
     };
     let policy = ExpertPolicy {
         device: StrategyControl::Required,
@@ -590,7 +598,9 @@ fn a_refused_attachment_leaves_nothing_charged() {
         device_arena_free_bytes: 16 * MIB,
         host_workspace_bytes: MIB,
         host_buffer_bytes: MIB,
-        resident_experts: Vec::new(),
+        host_cache_cap_bytes: 1 << 30,
+        host_cache_leased_bytes: 0,
+        resident: ResidentChunks::none(),
     };
     let device_policy = ExpertPolicy {
         device: StrategyControl::Required,
@@ -737,7 +747,9 @@ fn a_close_against_the_wrong_ledger_is_recoverable() {
         device_arena_free_bytes: 16 * MIB,
         host_workspace_bytes: MIB,
         host_buffer_bytes: MIB,
-        resident_experts: Vec::new(),
+        host_cache_cap_bytes: 1 << 30,
+        host_cache_leased_bytes: 0,
+        resident: ResidentChunks::none(),
     };
     let plan = compile_experts(
         &mlp(ExpertActivation::GeGlu),
@@ -968,7 +980,9 @@ fn the_second_consumers_shape_executes_on_every_device_under_a_restricted_budget
             device_arena_free_bytes: 0,
             host_workspace_bytes: 64 * MIB,
             host_buffer_bytes: 64 * MIB,
-            resident_experts: Vec::new(),
+            host_cache_cap_bytes: 1 << 30,
+            host_cache_leased_bytes: 0,
+            resident: ResidentChunks::none(),
         };
         let policy = ExpertPolicy {
             device: StrategyControl::Off,
@@ -1026,7 +1040,9 @@ fn the_second_consumers_shape_executes_on_every_device_under_a_restricted_budget
             device_arena_free_bytes: 256 * MIB,
             host_workspace_bytes: 64 * MIB,
             host_buffer_bytes: 64 * MIB,
-            resident_experts: Vec::new(),
+            host_cache_cap_bytes: 1 << 30,
+            host_cache_leased_bytes: 0,
+            resident: ResidentChunks::none(),
         };
         let policy = ExpertPolicy {
             device: StrategyControl::Required,
@@ -1112,7 +1128,9 @@ fn the_default_amortisation_threshold_sends_every_laguna_expert_to_the_cpu() {
         device_arena_free_bytes: 1 << 30,
         host_workspace_bytes: 64 * MIB,
         host_buffer_bytes: 64 * MIB,
-        resident_experts: Vec::new(),
+        host_cache_cap_bytes: 1 << 30,
+        host_cache_leased_bytes: 0,
+        resident: ResidentChunks::none(),
     };
     let policy = ExpertPolicy {
         device: StrategyControl::Auto,

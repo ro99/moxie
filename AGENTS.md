@@ -5,8 +5,8 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 ## Active assignment
 
 **M1 complete (M1.5 closed 2026-09-12); M2 active, items 1 and 2 accepted and
-items 3 and 4 awaiting review.** See the
-[task 0022 handover](docs/handovers/2026-09-13-task0022-laguna-and-second-consumer.md)
+items 3, 4 and 5 awaiting review.** See the
+[task 0023 handover](docs/handovers/2026-09-13-task0023-whole-working-set-trace.md)
 for the current continuation, and the
 [closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
 M1's exit evidence gate by gate.
@@ -274,11 +274,67 @@ relabels the validation and the interpretation consistently. The two runs were
 still different; they were each other's. It is now checked against an oracle
 composed with each operand in the role its name says.
 
-**Task 0023 is next**: M2 item 5's remainder and M2's exit gate — byte and cost
-traces reconciled with the resource ledger across a **whole** working set rather
-than one layer, specified in
-[the task 0022 handover](docs/handovers/2026-09-13-task0022-laguna-and-second-consumer.md)
-and not yet authored.
+**M2 item 5's remainder is implemented and awaits acceptance**
+([task 0023](docs/tasks/0023-m2-whole-working-set-trace.md), 2026-09-13): byte
+and cost traces reconciled with the resource ledger across a **whole working
+set**. **Every routed layer of the designated artifact has executed, on all three
+GPUs, at two row shapes.** At a decode-shaped batch all 30 layers agree
+**bitwise** with the CPU candidate over the same bytes on every card; at a batch
+whose route partitions the expert set, the artifact's **entire routed expert
+payload — 45,675,970,560 B, 88.5% of it and 1.77 times the largest card here —
+was demanded, admitted and computed with** through a device cache holding one
+240th of it, 15,286 evictions per card, no OOM, the three cards bitwise equal to
+each other. **The activations are synthetic and the routes are written by the
+test**, the full-payload route *constructed* so its union is the whole expert
+set, so this is not model support, no quality claim follows (**O2**) and **no
+route-distribution claim follows either**. **It does not close M2**, which is the
+owner's.
+
+**Reconciled means a named equality, not a printed report.** Thirteen of them
+tie the ledger's charges, the run's own record and the planner's prediction to
+the residency authority's per-scope byte flow, and **each has a fixture that
+violates it** — a `reconcile()` that can only succeed is a stub. **The trace
+counts nothing**: every number is read from an owner and a layer's record is the
+difference of two snapshots. The `arch-check` rule against a second residency
+owner now rejects a second *byte* owner too.
+
+**Three quantities the accounting did not have, and could not be reconciled
+without.** A device upload whose host source was already resident was counted as
+**nothing at all**, so host reads and host admissions could not be compared;
+joining a transfer in flight was not distinguished from finding the bytes
+already there; and `ResidencyStats` summed three cards into one
+`bytes_uploaded`, which is AGENTS.md's forbidden "their memory is one
+allocation" assumption written as arithmetic. **None of the three is reachable by
+mutating the code**: they are missing quantities, not wrong ones, and what finds
+them is asking what an equality between two independently maintained numbers
+would require.
+
+**A total cannot say where something is.** The planner's residency snapshot was a
+set of experts, then a byte count per expert; both are wrong for the same reason.
+An expert is more than one chunk, the authority admits and evicts chunks
+individually, and the device can hold one of an expert's chunks while the host
+holds the other. Whether an upload can copy from the host instead of reading is a
+question about **which** chunk is where. It is a per-chunk reading now, and the
+planner still never learns what a role is.
+
+**A prediction is exact or it is a declared bound, and the condition is
+coexistence.** A layer whose whole live set fits the displaceable cache admits
+every chunk once; one that does not can lose a chunk to eviction between a
+backpressure refusal and its retry. The first version of that rule asked only
+whether the layer's *admissions* fit, so a layer that predicted hits on bytes its
+own admissions then evicted called itself exact and read them again. The sweep
+found it; reading the rule did not. **Both branches have an acceptance case**,
+because an unreachable branch is a stub.
+
+**The mutation battery found two things no test was checking and one that could
+not fail.** Deleting the device launch counter survived everything, because
+nothing compared it to anything — it is an equality now. Setting the residency
+high-water mark to the current level survived, because nothing ever compared two
+readings of it. And deleting the filter that keeps only *this step's* reservations
+survived, because in every fixture the only reservations the ledger held were
+this step's: "no third charger" was the property with no fixture at all, and a
+fixture on which two behaviours agree tests neither. **All three were product or
+coverage defects rather than test-strength opinions.**
 
 M1's accepted work: shared semantic tensors/graph and the bounded host
 interpreter, sequence transactions, canonical manifest and bounded reads, the

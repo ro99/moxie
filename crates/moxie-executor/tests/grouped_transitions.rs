@@ -28,7 +28,8 @@ use moxie_memory::{
     ResidencyAuthority, ResidencyRequest, TurnId, UseClass,
 };
 use moxie_plan::expert::{
-    Candidate, ExpertBudget, ExpertKernels, ExpertPlan, ExpertPolicy, compile_experts,
+    Candidate, ExpertBudget, ExpertKernels, ExpertPlan, ExpertPolicy, ResidentChunks,
+    compile_experts,
 };
 use moxie_storage::Shard;
 use moxie_types::{DeviceUuid, Error, Result, Scope, StrategyControl};
@@ -424,7 +425,9 @@ fn plan_for(case: Case) -> ExpertPlan {
         device_arena_free_bytes: if on_device { 1 << 20 } else { 0 },
         host_workspace_bytes: 1 << 20,
         host_buffer_bytes: 1 << 20,
-        resident_experts: Vec::new(),
+        host_cache_cap_bytes: 1 << 30,
+        host_cache_leased_bytes: 0,
+        resident: ResidentChunks::none(),
     };
     let policy = ExpertPolicy {
         device: if on_device {

@@ -283,7 +283,18 @@ impl ExpertGroup {
 pub struct ExpertEnvelope {
     pub device: Vec<(DeviceTier, u64)>,
     pub host: Vec<(HostTier, u64)>,
+    /// The bytes this plan's **device** groups must have uploaded, which is what
+    /// the residency authority will admit against its own device cap.
+    ///
+    /// Its name predates task 0023 and is kept because task 0021's admission
+    /// path uses it. What it is not: a prediction of everything this plan
+    /// demands. A host-candidate group acquires its chunk through the same
+    /// authority, into the host cache, and contributes nothing here -- which is
+    /// why [`ExpertEnvelope::predicted`] exists and why a plan that sends every
+    /// expert to the CPU used to predict zero bytes and move a hundred million.
     pub residency_demand_bytes: u64,
+    /// Every tier's prediction, and whether it is an equality.
+    pub predicted: EnvelopePrediction,
 }
 
 impl ExpertEnvelope {
@@ -312,6 +323,75 @@ impl ExpertEnvelope {
     }
 }
 
+/// Whether a prediction is an equality or a declared lower bound, and why.
+///
+/// A layer whose whole admitted set fits beside what it cannot displace admits
+/// every chunk exactly once: nothing it admits can be evicted before it is done
+/// with it, because the least recently used bytes are always an earlier layer's.
+/// Its prediction is then an **equality**, and one extra admitted byte is a
+/// defect.
+///
+/// A layer that admits more than that can lose a chunk to eviction between a
+/// backpressure refusal and the retry that follows it, and admit it a second
+/// time. What it can say exactly is that it will admit **at least** what it
+/// predicted. That is not a tolerance and not slack: it is a different, weaker,
+/// exactly stated claim, and the trace checks the one the planner declared
+/// rather than assuming which applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exactness {
+    Exact,
+    LowerBound {
+        /// Which cache cannot hold this layer at once. **Diagnostic**: either
+        /// one makes the whole prediction a bound, because a device chunk
+        /// admitted twice asks the host for its source twice.
+        where_: BoundOn,
+        admitted_bytes: u64,
+        displaceable_bytes: u64,
+    },
+}
+
+/// Which side of the plan made a prediction a bound rather than an equality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundOn {
+    DeviceCache,
+    HostCache,
+    Both,
+}
+
+impl core::fmt::Display for BoundOn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            BoundOn::DeviceCache => "the device cache",
+            BoundOn::HostCache => "the host cache",
+            BoundOn::Both => "both caches",
+        })
+    }
+}
+
+/// What this plan expects the residency authority to do, in the authority's own
+/// vocabulary.
+///
+/// Field for field, these are the names
+/// [`moxie_memory::ByteFlow`](../../moxie_memory/residency/struct.ByteFlow.html)
+/// uses, so the trace compares like with like instead of translating between two
+/// descriptions of the same bytes -- which is where a reconciliation stops being
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvelopePrediction {
+    /// Bytes the device cache must admit and upload.
+    pub device_upload_bytes: u64,
+    /// Bytes a device acquire will find already on the device.
+    pub device_hit_bytes: u64,
+    /// Bytes the host cache must read from storage.
+    pub host_read_bytes: u64,
+    /// Bytes a host-candidate group will find already in the host cache.
+    pub host_hit_bytes: u64,
+    /// Bytes a device upload will find it can copy from without reading: the
+    /// host source is already there.
+    pub host_source_reuse_bytes: u64,
+    pub exactness: Exactness,
+}
+
 /// The snapshot a plan is compiled against.
 ///
 /// Every field is a **reading**, taken before compilation and not consulted
@@ -335,16 +415,149 @@ pub struct ExpertBudget {
     pub host_workspace_bytes: u64,
     /// Host bytes for the activation block, slot buffer and output.
     pub host_buffer_bytes: u64,
-    /// Experts whose chunks the snapshot found already resident on the device.
-    /// Order is irrelevant and duplicates are harmless; membership is the only
-    /// question asked of it.
-    pub resident_experts: Vec<u32>,
+    /// The residency authority's host cache cap.
+    ///
+    /// Every chunk this plan touches passes through the host cache -- a device
+    /// group's bytes are read there and uploaded from there -- so a prediction
+    /// of host reads needs this for the same reason the device prediction needs
+    /// the device cap. Task 0023 added it: without it the planner could say what
+    /// it would upload and not what it would read.
+    pub host_cache_cap_bytes: u64,
+    /// Of that cap, what a live lease pins and eviction cannot reach.
+    pub host_cache_leased_bytes: u64,
+    /// Where the caches were holding this route's expert chunks.
+    ///
+    /// One snapshot covering both caches, because the question a plan asks of it
+    /// is about both at once: a chunk already on the device is not uploaded, and
+    /// a chunk that must be uploaded is read unless the *host* has it.
+    pub resident: ResidentChunks,
+}
+
+/// Where one of an expert's chunks was found.
+///
+/// **A chunk, not an expert**, and task 0023 made it so after the trace caught
+/// the difference. An expert is more than one tensor -- this workspace's routed
+/// layers carry a gate-up and a down -- and the residency authority admits and
+/// evicts each of them separately. A cache can therefore hold half an expert,
+/// and, worse for anyone trying to summarise it, the device can hold one half
+/// while the host holds the other. No count of bytes per expert can express
+/// that: whether an upload can copy from the host instead of reading is a
+/// question about *which* chunk is where.
+///
+/// The planner still never learns what a role is. It is handed a reading and
+/// sums it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkResidency {
+    pub expert: u32,
+    pub bytes: u64,
+    /// Settled in this plan's device cache.
+    pub on_device: bool,
+    /// Settled in the host cache, where an upload could copy from it.
+    pub in_host: bool,
+}
+
+/// Where one expert's bytes sit, summed from the snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkWhere {
+    on_device: u64,
+    in_host: u64,
+    /// Of the bytes the device lacks, what the host can supply.
+    reusable: u64,
+}
+
+/// What the caches were holding when the snapshot was taken.
+///
+/// A chunk this does not mention is absent from both. An empty snapshot is a
+/// cold cache, which is why [`ResidentChunks::none`] is the common case.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResidentChunks {
+    entries: Vec<ChunkResidency>,
+}
+
+impl ResidentChunks {
+    pub const fn none() -> Self {
+        ResidentChunks {
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, chunk: ChunkResidency) {
+        self.entries.push(chunk);
+    }
+
+    /// Every expert fully resident in both caches, each expert worth
+    /// `chunk_bytes` in one piece. The convenience a test or a warm-start uses;
+    /// the general case is built chunk by chunk.
+    pub fn whole(experts: impl IntoIterator<Item = u32>, chunk_bytes: u64) -> Self {
+        let mut out = ResidentChunks::none();
+        for expert in experts {
+            out.push(ChunkResidency {
+                expert,
+                bytes: chunk_bytes,
+                on_device: true,
+                in_host: true,
+            });
+        }
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn chunks(&self) -> &[ChunkResidency] {
+        &self.entries
+    }
+
+    /// The entries, to merge two scopes' answers about the same chunk.
+    ///
+    /// The same bytes can be in both caches at once; pushing them twice would
+    /// say an expert has twice the bytes it has.
+    pub fn chunks_mut(&mut self) -> &mut [ChunkResidency] {
+        &mut self.entries
+    }
+
+    /// Where this expert's bytes are: on the device, in the host cache, and --
+    /// of what the device does **not** have -- what a host source could supply.
+    ///
+    /// Three numbers rather than two, because the third is not derivable from
+    /// the first two and the two candidates ask different questions of them. A
+    /// chunk that is in both caches is a *device* hit for a device group and a
+    /// *host* hit for a host group; only a chunk the device lacks can be reused
+    /// as an upload's source.
+    fn of(&self, expert: u32, chunk_bytes: u64) -> ChunkWhere {
+        let mut on_device = 0u64;
+        let mut in_host = 0u64;
+        let mut reusable = 0u64;
+        for c in self.entries.iter().filter(|c| c.expert == expert) {
+            if c.on_device {
+                on_device = on_device.saturating_add(c.bytes);
+            }
+            if c.in_host {
+                in_host = in_host.saturating_add(c.bytes);
+                if !c.on_device {
+                    reusable = reusable.saturating_add(c.bytes);
+                }
+            }
+        }
+        let on_device = on_device.min(chunk_bytes);
+        ChunkWhere {
+            on_device,
+            in_host: in_host.min(chunk_bytes),
+            reusable: reusable.min(chunk_bytes - on_device),
+        }
+    }
 }
 
 impl ExpertBudget {
     fn displaceable(&self) -> u64 {
         self.device_cache_cap_bytes
             .saturating_sub(self.device_cache_leased_bytes)
+    }
+
+    fn host_displaceable(&self) -> u64 {
+        self.host_cache_cap_bytes
+            .saturating_sub(self.host_cache_leased_bytes)
     }
 }
 
@@ -1099,10 +1312,25 @@ pub fn compile_experts(
     let displaceable = budget.displaceable();
     let mut groups = Vec::with_capacity(group_count);
     let mut demand_bytes = 0u64;
+    let mut predicted = EnvelopePrediction {
+        device_upload_bytes: 0,
+        device_hit_bytes: 0,
+        host_read_bytes: 0,
+        host_hit_bytes: 0,
+        host_source_reuse_bytes: 0,
+        exactness: Exactness::Exact,
+    };
+    let mut host_admitted = 0u64;
     for (expert, (rows_of, slots_of)) in grouped {
         let reuse_rows = rows_of.len() as u64;
-        let already_resident = budget.resident_experts.contains(&expert);
-        let transfer_bytes = if already_resident { 0 } else { chunk_bytes };
+        // Residency is per chunk, so a cache can hold part of an expert. What
+        // this group would transfer is what is *missing*, not all-or-nothing:
+        // treating a half-resident expert as absent overstates the transfer, and
+        // the amortisation decision is made from exactly that number.
+        let where_is = budget.resident.of(expert, chunk_bytes);
+        let device_resident = where_is.on_device;
+        let already_resident = device_resident == chunk_bytes;
+        let transfer_bytes = chunk_bytes - device_resident;
         let bytes_per_row = transfer_bytes.div_ceil(reuse_rows);
 
         let device_reason = match device_unavailable {
@@ -1161,6 +1389,59 @@ pub fn compile_experts(
                 .checked_add(chunk_bytes)
                 .ok_or_else(|| refuse(overflow("the residency demand")))?;
         }
+        // What this group will ask the authority for, in the authority's own
+        // terms. A device group that is already on the card hits; one that is
+        // not is uploaded, and its bytes are read unless the host copy is still
+        // there. A host group hits or reads. There is no fifth case: a chunk is
+        // where it is.
+        match chosen {
+            Candidate::Device => {
+                // Every byte of this expert is on the card already, or it is
+                // uploaded. Each uploaded byte is then either copied from a host
+                // source that is already there or read first. Three sums over the
+                // same chunk, and none of them is all-or-nothing.
+                predicted.device_hit_bytes = predicted
+                    .device_hit_bytes
+                    .checked_add(device_resident)
+                    .ok_or_else(|| refuse(overflow("the predicted device hits")))?;
+                predicted.device_upload_bytes = predicted
+                    .device_upload_bytes
+                    .checked_add(transfer_bytes)
+                    .ok_or_else(|| refuse(overflow("the predicted uploads")))?;
+                let reused = where_is.reusable.min(transfer_bytes);
+                predicted.host_source_reuse_bytes = predicted
+                    .host_source_reuse_bytes
+                    .checked_add(reused)
+                    .ok_or_else(|| refuse(overflow("the predicted source reuse")))?;
+                let read = transfer_bytes - reused;
+                predicted.host_read_bytes = predicted
+                    .host_read_bytes
+                    .checked_add(read)
+                    .ok_or_else(|| refuse(overflow("the predicted reads")))?;
+                host_admitted = host_admitted
+                    .checked_add(read)
+                    .ok_or_else(|| refuse(overflow("the predicted host admissions")))?;
+            }
+            Candidate::Host => {
+                // A host group reads what the host cache does not have. What the
+                // device holds is irrelevant to it: a chunk in both caches is a
+                // host hit here and a device hit over there, and the snapshot
+                // answers both questions separately for exactly that reason.
+                let in_host = where_is.in_host;
+                predicted.host_hit_bytes = predicted
+                    .host_hit_bytes
+                    .checked_add(in_host)
+                    .ok_or_else(|| refuse(overflow("the predicted host hits")))?;
+                let read = chunk_bytes - in_host;
+                predicted.host_read_bytes = predicted
+                    .host_read_bytes
+                    .checked_add(read)
+                    .ok_or_else(|| refuse(overflow("the predicted reads")))?;
+                host_admitted = host_admitted
+                    .checked_add(read)
+                    .ok_or_else(|| refuse(overflow("the predicted host admissions")))?;
+            }
+        }
         groups.push(ExpertGroup {
             expert,
             rows: rows_of,
@@ -1216,6 +1497,45 @@ pub fn compile_experts(
         ),
     ];
 
+    // Whether the predictions above are equalities.
+    //
+    // The condition is that everything this plan needs **at once** fits: what it
+    // admits *and* what it is counting on already being there. A cache that can
+    // hold all of it never evicts any of it before the plan is finished --
+    // deterministic demand LRU takes the least recently used, which is always an
+    // earlier plan's -- so every chunk is admitted once and every predicted hit
+    // is still there when it is asked for.
+    //
+    // Leaving the resident half out of this sum is a mistake this task made
+    // once: a plan that predicted a hit on bytes its own admissions then evicted
+    // reported an exact prediction and read them again.
+    let device_live = predicted
+        .device_upload_bytes
+        .saturating_add(predicted.device_hit_bytes);
+    let host_live = host_admitted
+        .saturating_add(predicted.host_hit_bytes)
+        .saturating_add(predicted.host_source_reuse_bytes);
+    let device_fits = device_live <= displaceable;
+    let host_fits = host_live <= budget.host_displaceable();
+    predicted.exactness = match (device_fits, host_fits) {
+        (true, true) => Exactness::Exact,
+        (false, true) => Exactness::LowerBound {
+            where_: BoundOn::DeviceCache,
+            admitted_bytes: device_live,
+            displaceable_bytes: displaceable,
+        },
+        (true, false) => Exactness::LowerBound {
+            where_: BoundOn::HostCache,
+            admitted_bytes: host_live,
+            displaceable_bytes: budget.host_displaceable(),
+        },
+        (false, false) => Exactness::LowerBound {
+            where_: BoundOn::Both,
+            admitted_bytes: device_live.saturating_add(host_live),
+            displaceable_bytes: displaceable.saturating_add(budget.host_displaceable()),
+        },
+    };
+
     let plan = ExpertPlan {
         kernel: if any_device { selected } else { None },
         shape,
@@ -1231,6 +1551,7 @@ pub fn compile_experts(
             device,
             host,
             residency_demand_bytes: demand_bytes,
+            predicted,
         },
         policy: *policy,
     };

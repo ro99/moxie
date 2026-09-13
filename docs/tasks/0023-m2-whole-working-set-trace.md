@@ -1,6 +1,6 @@
 # Task 0023 — M2 item 5's remainder and M2's exit: a whole working set's byte and cost trace, reconciled with the ledger
 
-Status: proposed.
+Status: implemented; awaiting independent review and owner acceptance.
 
 Roadmap **M2's exit**, in full: "real out-of-device-memory working set executes
 without OOM or hidden allocations, matches the reference, and produces byte/cost
@@ -508,4 +508,157 @@ experts of a single layer and **one 240th** of the set it serves.
 
 ## Result, filled after work
 
-To be completed.
+Status: **implemented 2026-09-13; awaiting independent review and owner
+acceptance.**
+
+### Changed shared owners and consumers
+
+| Crate | What it gained |
+|---|---|
+| `moxie-memory` | `ByteFlow` and `ScopeAccount`: per-scope byte accounting inside `ResidencyAuthority`, and eight conservation identities inside `check_invariants`. `ResidencyStats` is unchanged and is now **required to equal** the sum over scopes. `reservation_ids()` names what the authority charged, so a trace can ask the ledger what it cost instead of recomputing it |
+| `moxie-plan` | `ResidentChunks` (a per-chunk reading of both caches), `EnvelopePrediction` and `Exactness` on `ExpertEnvelope`, and `host_cache_cap_bytes` / `host_cache_leased_bytes` on `ExpertBudget`. `residency_demand_bytes` is unchanged and is now documented as what it is |
+| `moxie-executor` | `trace`: `LayerSnapshot`, `LayerTrace`, `StepTrace`, `Reconciled` and `Discrepancy`. `GroupedStats` gained `acquires_issued` and `launches` — counts of the run's own actions, never bytes — and `GroupedRun::reservation_id` |
+| `xtask` | The `a second weight-residency owner` rule rejects a second **byte** owner too, with a rejected fixture |
+| `moxie-models`, `moxie-engine` | **nothing**, as the contract required |
+
+### Commands and results
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | passed |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
+| Device-lane clippy (`--features moxie-executor/driver`) | passed |
+| `cargo test --workspace --locked --offline` | **923 passed, 0 failed**, against a re-measured baseline of **918** at `aeac114` |
+| Device-feature workspace tests | **958 passed, 0 failed**, against a re-measured baseline of **951** at `aeac114` |
+| `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
+| `cargo xtask spec-check` | passed, 10 documents |
+| `cargo xtask arch-check` | **zero failures**, 79 rejected fixtures, 21 accepted, 13 rules |
+
+Nothing failed. Nothing was skipped except the two device cases when the
+artifact is absent, which print `SKIPPED` with the reason and do not run here —
+the artifact **is** present on this machine and both ran.
+
+### The two whole-working-set cases, on real hardware
+
+| Case | Demanded | Result |
+|---|---|---|
+| `whole-set-decode`, roomy and tight, each on all three GPUs | **4,543,807,488 B** over 30 layers | All 30 layers **bitwise equal** to the CPU candidate over the same bytes, on every card and in both configurations. Roomy: exact prediction on all 30 layers, 0 backpressure drains, 1,487 evictions. Tight: exact on none, 292 drains, 1,517 evictions. 3,828 equality checks across the three cards |
+| `whole-set-full`, on all three GPUs | **45,675,970,560 B** over 30 layers | Every byte demanded **and admitted** on each card through a 190,316,544 B device cache — sixteen of one layer's 128 experts, one 240th of the set. 15,286 evictions per card, no OOM. **10,813,440** BF16 slot components bitwise equal across the three cards, which is sm_86 against sm_120 |
+
+The CPU candidate for the decode case ran **once** — 83.28 s for 30 layers in a
+debug build — because its answer does not depend on which card the device
+candidate used. Device passes were 1.99–2.21 s each and `whole-set-full` 20.24 s,
+20.63 s and 22.02 s. **None of those is a benchmark**: debug builds, one run
+each, no baseline, and no duration appears anywhere in the trace.
+
+### Host-lane coverage
+
+- The **trace sweep** enumerates 64 combinations and traces **128** layers,
+  checking **2,702** equalities of which **473** are the declared lower-bound
+  form. 56 layers produced an exact prediction, 72 a bound, and 16 did not finish
+  — each of those traced as incomplete, with its prediction skipped and counted
+  as skipped. The product and the census are **printed** by the test.
+- The **violation battery** mutates one number of a trace that reconciles and
+  requires the equality that number belongs to to be the one reported: 21
+  mutations over all **14** equalities, plus 3 against the lower-bound branch and
+  3 against a layer that did not finish.
+- The **planner sweep** gained a host-residency axis: 10,368 combinations became
+  **31,104**, and every plan's prediction is checked against a statement of the
+  rule written independently of the planner's.
+- The **transition sweep** exercises the new conservation identities over its
+  whole 800-combination product without a new harness, because they live in
+  `check_invariants`.
+- The **allocation gate** is a number: **235** heap requests per traced layer,
+  identical from layer 2 to layer 8, so a step's heap is bounded by one layer's
+  record however long the step runs. Assembling an 8-layer `StepTrace` costs 6.
+
+### Measured effect and uncertainty
+
+- **Mutation measurement: 30 of 30 caught, 0 survivors**
+  ([experiment 0004](../evidence/experiments/0004-task0023-whole-working-set-trace.md)).
+  The first measurement was 27 of 30, and each of the three survivors was a
+  defect: a missing equality (`launches-match-device-groups`), an unchecked
+  counter (the residency high-water mark) and a property with no fixture at all
+  ("no third charger"). All three are fixed and the fixes are what the second
+  measurement measures.
+- **A null result:** the sweep's failing-read axis caught no mutation the other
+  axes did not. What it produced is the incomplete-layer branch of the
+  reconciliation and the three fixtures that branch needed.
+- **No performance claim, no quality claim, no route-distribution claim.** The
+  amortisation threshold remains a declared policy parameter; both device cases
+  raise it and say so.
+
+### Two defects this task's own tests found in this task's own work
+
+**A byte count per expert cannot say where an expert is.** The planner's
+residency snapshot began as a set of experts, then as a byte count per expert.
+Both are wrong for the same reason: an expert is more than one chunk, the
+authority admits and evicts chunks individually, and the device can hold one of
+an expert's chunks while the host holds the other. Whether an upload can copy
+from the host instead of reading is a question about **which** chunk is where.
+`ResidentChunks` is a per-chunk reading, and the planner still never learns what
+a role is.
+
+**Exactness that ignored what a layer was counting on.** The first rule asked
+only whether a layer's admissions fit the displaceable cache. A layer that
+predicted hits on bytes its own admissions then evicted called itself exact and
+read them again. The condition is coexistence — what it admits **and** what it
+expects to find — and the sweep found it where reading the rule did not.
+
+### Where the implementation differs from this contract, and why
+
+A contract written before implementation is a prediction too. Six things above
+are not what was built, and each is recorded rather than quietly reconciled.
+
+1. **`ScopeAccount` gained `unreported_bytes` and `source_rollback_bytes`, and
+   the transfer identity uses the first instead of a `withheld` term.** A
+   withheld transfer (R07) has reported **nothing**, so counting it as an
+   outcome makes one term mean two things; it is a level, and a placement counts
+   exactly once — through the outcome its transfer reported, through the level if
+   nothing has reported, or through `unfinished_bytes` if it left first. The
+   rollback term is the one way the two scopes' counts of a device acquire
+   legitimately differ: the host admitted the source, the device's admission was
+   then refused, and only the host ever saw the bytes.
+2. **Identity A counts `as_source_admitted` on the asked side.** A host cache
+   whose only traffic is other scopes' upload sources has a request count of zero
+   and a real, charged working set; the identity as the contract wrote it was
+   false for exactly that cache.
+3. **`predicted-hits-are-hit` is two-sided in the bound case.** Eviction can turn
+   a predicted hit into an admission and a backpressure retry can produce a hit
+   nobody predicted, so a one-sided bound is unsound in *both* directions. What
+   is sound is `hit + evicted >= predicted` and `hit <= predicted + retried`,
+   and both terms are quantities the trace already records.
+4. **Exactness is one flag, not one per side.** `BoundOn` still names the cache
+   that could not hold the layer, and it is diagnostic: a device chunk admitted
+   twice asks the host for its source twice, so a bound on either cache is a
+   bound on both predictions. The first version treated them independently and
+   the sweep found it.
+5. **`ExpertBudget::host_resident_experts` does not exist.** It became one
+   `resident: ResidentChunks` covering both caches, per chunk, for the reason in
+   "Two defects" above: no per-expert total can say *which* chunk is where.
+6. **The per-chunk raw trace is not written to `results/`.** The contract
+   proposed it with a content hash. Nothing consumes it, and the authority keeps
+   no per-chunk history to write — by design, since the trace counts nothing. An
+   unread file with a hash beside it is not evidence, so it was dropped rather
+   than produced; `ResidencyAuthority::outstanding` still names every live
+   placement for diagnosis.
+
+Two additions arrived from the mutation measurement rather than from the
+contract: a fourteenth equality (`launches-match-device-groups`), and the
+incomplete-layer branch — a layer that did not finish is traced, reconciled and
+counted as incomplete, which the contract asked for and the first implementation
+dropped.
+
+### Deleted or replaced paths
+
+None. `ExpertBudget::resident_experts` became `ExpertBudget::resident` with a
+richer type, and every call site moved with it; no path was left behind as a
+bridge.
+
+### Remaining blockers and the next bounded task
+
+In [the handover](../handovers/2026-09-13-task0023-whole-working-set-trace.md).
+The short form: **M2 is not closed and closing it is the owner's**; nothing
+generates a token from either designated artifact; `whole-set-full` is not
+compared against the CPU candidate, by declared exclusion with the arithmetic
+attached; quality is **O2**; and O1 and O5 remain open.

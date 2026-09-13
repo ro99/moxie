@@ -15,8 +15,9 @@
 pub mod expert;
 mod selected;
 pub use expert::{
-    Candidate, ExpertBudget, ExpertEnvelope, ExpertGroup, ExpertPlan, ExpertPlanRefused,
-    ExpertPolicy, ExpertShape, GroupDecision, Placement, RejectionReason, compile_experts,
+    BoundOn, Candidate, ChunkResidency, EnvelopePrediction, Exactness, ExpertBudget,
+    ExpertEnvelope, ExpertGroup, ExpertPlan, ExpertPlanRefused, ExpertPolicy, ExpertShape,
+    GroupDecision, Placement, RejectionReason, ResidentChunks, compile_experts,
 };
 pub use selected::{
     PlannedValue, PlannedWorkspace, SelectedNode, SelectedPlanCandidate, StorageRegion,

@@ -17,9 +17,10 @@ use std::collections::BTreeMap;
 
 use moxie_graph::{CombineOrder, ExpertActivation, OpParams};
 use moxie_plan::expert::{
-    Candidate, ExpertBudget, ExpertKernels, ExpertPolicy, Placement, RejectionReason,
-    compile_experts,
+    Candidate, ChunkResidency, ExpertBudget, ExpertKernels, ExpertPolicy, Placement,
+    RejectionReason, ResidentChunks, compile_experts,
 };
+
 use moxie_types::{
     AccumulationPolicy, ActivationPrecision, DeviceCapability, DeviceTier, DeviceUuid,
     GateTransform, HostPlacement, HostTier, KernelCatalogue, KernelId, KernelOperand,
@@ -27,6 +28,14 @@ use moxie_types::{
     RoundingProfile, SemanticKernelDescriptor, SemanticKernelOp, SmVersion, StrategyControl,
     TensorLayout, WeightPrecision, WorkspaceExpression,
 };
+
+/// A route's distinct experts, in ascending order.
+fn distinct(route: &[u32]) -> Vec<u32> {
+    let mut all = route.to_vec();
+    all.sort_unstable();
+    all.dedup();
+    all
+}
 
 const BUS: &str = "0000:82:00.0";
 
@@ -250,6 +259,21 @@ fn catalogue(sm: SmVersion, g: Geometry) -> KernelCatalogue {
     .expect("one descriptor")
 }
 
+/// What the host cache holds, and whether it can hold this plan at all.
+///
+/// Three values rather than a boolean, because the host side decides two
+/// different things: whether a device upload has to read its source, and whether
+/// the prediction is an equality or a declared lower bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostResident {
+    /// An empty host cache with room for the whole plan.
+    None,
+    /// Every expert this route demands is already in the host cache.
+    All,
+    /// An empty host cache too small to hold the plan at once.
+    CacheTooSmall,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Case {
     profile: Profile,
@@ -260,6 +284,7 @@ struct Case {
     cache_fits: bool,
     amortised: Amortisation,
     resident: bool,
+    host_resident: HostResident,
     order: CombineOrder,
     with_topology: bool,
     kernels: Kernels,
@@ -328,16 +353,36 @@ impl Case {
                 g.hidden * 4
             },
             host_buffer_bytes: generous_host_buffers(g),
-            // Every expert this profile's route demands, so "resident" means
-            // no group transfers anything. Listing a fixed set would silently
-            // stop meaning that when the route changed.
-            resident_experts: if self.resident {
-                let mut all: Vec<u32> = g.route.to_vec();
-                all.sort_unstable();
-                all.dedup();
-                all
-            } else {
-                Vec::new()
+            // The host cache and what is in it. Task 0023's lesson from task
+            // 0022, applied before the fact rather than after: a parameter no
+            // fixture varies is a parameter no test checks, and the host
+            // resident set decides whether a plan predicts a read or a reuse.
+            host_cache_cap_bytes: match self.host_resident {
+                HostResident::None | HostResident::All => g.chunk() * 8,
+                HostResident::CacheTooSmall => g.chunk() - 1,
+            },
+            host_cache_leased_bytes: 0,
+            // One snapshot covering both caches. Each expert here is a single
+            // chunk -- a fixture simplification, stated rather than implied --
+            // so the device axis and the host axis become one entry per expert.
+            // Every expert this profile's route demands, so "resident" means no
+            // group transfers anything; listing a fixed set would silently stop
+            // meaning that when the route changed.
+            resident: {
+                let mut out = ResidentChunks::none();
+                let on_device = self.resident;
+                let in_host = self.host_resident == HostResident::All;
+                if on_device || in_host {
+                    for expert in distinct(g.route) {
+                        out.push(ChunkResidency {
+                            expert,
+                            bytes: g.chunk(),
+                            on_device,
+                            in_host,
+                        });
+                    }
+                }
+                out
             },
         }
     }
@@ -493,143 +538,161 @@ fn the_chooser_agrees_with_an_independent_statement_of_its_rule_across_the_produ
                                 [Amortisation::All, Amortisation::Partial, Amortisation::None]
                             {
                                 for resident in [true, false] {
-                                    for order in [
-                                        CombineOrder::AscendingExpertId,
-                                        CombineOrder::SelectionOrder,
+                                    for host_resident in [
+                                        HostResident::None,
+                                        HostResident::All,
+                                        HostResident::CacheTooSmall,
                                     ] {
-                                        for with_topology in [true, false] {
-                                            for kernels in [
-                                                Kernels::Absent,
-                                                Kernels::Matching,
-                                                Kernels::WrongSm,
-                                            ] {
-                                                let case = Case {
-                                                    profile,
-                                                    device_control,
-                                                    host_control,
-                                                    arena_fits,
-                                                    host_workspace_fits,
-                                                    cache_fits,
-                                                    amortised,
-                                                    resident,
-                                                    order,
-                                                    with_topology,
-                                                    kernels,
-                                                };
-                                                cases += 1;
-                                                *per_profile
-                                                    .entry(match profile {
-                                                        Profile::GemmaLike => "gemma-like",
-                                                        Profile::LagunaLike => "laguna-like",
-                                                    })
-                                                    .or_default() += 1;
-                                                let cat = match kernels {
-                                                    Kernels::Absent => None,
-                                                    Kernels::Matching => {
-                                                        Some(catalogue(SmVersion::SM86, g))
-                                                    }
-                                                    Kernels::WrongSm => {
-                                                        Some(catalogue(SmVersion::SM120, g))
-                                                    }
-                                                };
-                                                let cap = capability();
-                                                let injected =
-                                                    cat.as_ref().map(|c| ExpertKernels {
-                                                        capability: &cap,
-                                                        catalogue: c,
-                                                    });
-                                                let result = compile_experts(
-                                                    &mlp(g),
-                                                    &combine(g, order),
-                                                    g.route,
-                                                    &case.budget(),
-                                                    &case.policy(),
-                                                    with_topology.then_some(&topology),
-                                                    injected,
-                                                );
-                                                // Every expert's expectation. A plan
-                                                // exists only when every group has one.
-                                                let expected: Vec<Option<Candidate>> = counts
-                                                    .values()
-                                                    .map(|reuse| case.expected_choice(*reuse))
-                                                    .collect();
-                                                match result {
-                                                    Err(refusal) => {
-                                                        refused += 1;
-                                                        assert!(
-                                                            expected.iter().any(Option::is_none),
-                                                            "{case:?} was refused but every group had a \
+                                        for order in [
+                                            CombineOrder::AscendingExpertId,
+                                            CombineOrder::SelectionOrder,
+                                        ] {
+                                            for with_topology in [true, false] {
+                                                for kernels in [
+                                                    Kernels::Absent,
+                                                    Kernels::Matching,
+                                                    Kernels::WrongSm,
+                                                ] {
+                                                    let case = Case {
+                                                        profile,
+                                                        device_control,
+                                                        host_control,
+                                                        arena_fits,
+                                                        host_workspace_fits,
+                                                        cache_fits,
+                                                        amortised,
+                                                        resident,
+                                                        host_resident,
+                                                        order,
+                                                        with_topology,
+                                                        kernels,
+                                                    };
+                                                    cases += 1;
+                                                    *per_profile
+                                                        .entry(match profile {
+                                                            Profile::GemmaLike => "gemma-like",
+                                                            Profile::LagunaLike => "laguna-like",
+                                                        })
+                                                        .or_default() += 1;
+                                                    let cat = match kernels {
+                                                        Kernels::Absent => None,
+                                                        Kernels::Matching => {
+                                                            Some(catalogue(SmVersion::SM86, g))
+                                                        }
+                                                        Kernels::WrongSm => {
+                                                            Some(catalogue(SmVersion::SM120, g))
+                                                        }
+                                                    };
+                                                    let cap = capability();
+                                                    let injected =
+                                                        cat.as_ref().map(|c| ExpertKernels {
+                                                            capability: &cap,
+                                                            catalogue: c,
+                                                        });
+                                                    let result = compile_experts(
+                                                        &mlp(g),
+                                                        &combine(g, order),
+                                                        g.route,
+                                                        &case.budget(),
+                                                        &case.policy(),
+                                                        with_topology.then_some(&topology),
+                                                        injected,
+                                                    );
+                                                    // Every expert's expectation. A plan
+                                                    // exists only when every group has one.
+                                                    let expected: Vec<Option<Candidate>> = counts
+                                                        .values()
+                                                        .map(|reuse| case.expected_choice(*reuse))
+                                                        .collect();
+                                                    match result {
+                                                        Err(refusal) => {
+                                                            refused += 1;
+                                                            assert!(
+                                                                expected
+                                                                    .iter()
+                                                                    .any(Option::is_none),
+                                                                "{case:?} was refused but every group had a \
                                                      candidate: {refusal}"
-                                                        );
-                                                        assert!(
-                                                            refusal.device.is_some()
-                                                                || refusal.host.is_some(),
-                                                            "{case:?}: a refusal with no reason"
-                                                        );
-                                                        assert_eq!(
-                                                            classify(&refusal.error),
-                                                            case.expected_error(),
-                                                            "{case:?}: {refusal}"
-                                                        );
-                                                        for reason in [refusal.device, refusal.host]
-                                                            .into_iter()
-                                                            .flatten()
-                                                        {
-                                                            *reasons
-                                                                .entry(
-                                                                    reason_name(reason).to_string(),
-                                                                )
-                                                                .or_default() += 1;
-                                                        }
-                                                    }
-                                                    Ok(plan) => {
-                                                        planned += 1;
-                                                        plan.check_invariants()
-                                                            .expect("invariants");
-                                                        assert!(
-                                                            expected.iter().all(Option::is_some),
-                                                            "{case:?} produced a plan where a group had \
-                                                     no candidate"
-                                                        );
-                                                        for (group, want) in
-                                                            plan.groups().iter().zip(&expected)
-                                                        {
-                                                            assert_eq!(
-                                                                Some(group.placement().candidate()),
-                                                                *want,
-                                                                "{case:?}: expert {}",
-                                                                group.expert()
                                                             );
-                                                            *reasons
-                                                                .entry(
-                                                                    reason_name(
-                                                                        group.decision().reason,
+                                                            assert!(
+                                                                refusal.device.is_some()
+                                                                    || refusal.host.is_some(),
+                                                                "{case:?}: a refusal with no reason"
+                                                            );
+                                                            assert_eq!(
+                                                                classify(&refusal.error),
+                                                                case.expected_error(),
+                                                                "{case:?}: {refusal}"
+                                                            );
+                                                            for reason in
+                                                                [refusal.device, refusal.host]
+                                                                    .into_iter()
+                                                                    .flatten()
+                                                            {
+                                                                *reasons
+                                                                    .entry(
+                                                                        reason_name(reason)
+                                                                            .to_string(),
                                                                     )
-                                                                    .to_string(),
-                                                                )
-                                                                .or_default() += 1;
-                                                        }
-                                                        let d = plan.uses(Candidate::Device);
-                                                        let h = plan.uses(Candidate::Host);
-                                                        match (d, h) {
-                                                            (true, true) => mixed += 1,
-                                                            (true, false) => all_device += 1,
-                                                            (false, true) => all_host += 1,
-                                                            (false, false) => {
-                                                                panic!("a plan with no group")
+                                                                    .or_default() += 1;
                                                             }
                                                         }
-                                                        check_envelope(&plan, g);
-                                                        check_placement(&plan, case);
-                                                        check_reduction_order(&plan, g, order);
-                                                        // A device plan carries the
-                                                        // descriptor it selected; a
-                                                        // host-only plan carries none.
-                                                        assert_eq!(
-                                                            plan.kernel().is_some(),
-                                                            plan.uses(Candidate::Device),
-                                                            "{case:?}"
-                                                        );
+                                                        Ok(plan) => {
+                                                            planned += 1;
+                                                            plan.check_invariants()
+                                                                .expect("invariants");
+                                                            assert!(
+                                                                expected
+                                                                    .iter()
+                                                                    .all(Option::is_some),
+                                                                "{case:?} produced a plan where a group had \
+                                                     no candidate"
+                                                            );
+                                                            for (group, want) in
+                                                                plan.groups().iter().zip(&expected)
+                                                            {
+                                                                assert_eq!(
+                                                                    Some(
+                                                                        group
+                                                                            .placement()
+                                                                            .candidate()
+                                                                    ),
+                                                                    *want,
+                                                                    "{case:?}: expert {}",
+                                                                    group.expert()
+                                                                );
+                                                                *reasons
+                                                                    .entry(
+                                                                        reason_name(
+                                                                            group.decision().reason,
+                                                                        )
+                                                                        .to_string(),
+                                                                    )
+                                                                    .or_default() += 1;
+                                                            }
+                                                            let d = plan.uses(Candidate::Device);
+                                                            let h = plan.uses(Candidate::Host);
+                                                            match (d, h) {
+                                                                (true, true) => mixed += 1,
+                                                                (true, false) => all_device += 1,
+                                                                (false, true) => all_host += 1,
+                                                                (false, false) => {
+                                                                    panic!("a plan with no group")
+                                                                }
+                                                            }
+                                                            check_envelope(&plan, g);
+                                                            check_prediction(&plan, case, g);
+                                                            check_placement(&plan, case);
+                                                            check_reduction_order(&plan, g, order);
+                                                            // A device plan carries the
+                                                            // descriptor it selected; a
+                                                            // host-only plan carries none.
+                                                            assert_eq!(
+                                                                plan.kernel().is_some(),
+                                                                plan.uses(Candidate::Device),
+                                                                "{case:?}"
+                                                            );
+                                                        }
                                                     }
                                                 }
                                             }
@@ -657,7 +720,7 @@ fn the_chooser_agrees_with_an_independent_statement_of_its_rule_across_the_produ
         println!("  reason {name}: {count}");
     }
 
-    assert_eq!(cases, 2 * 3 * 3 * 2 * 2 * 2 * 3 * 2 * 2 * 2 * 3);
+    assert_eq!(cases, 2 * 3 * 3 * 2 * 2 * 2 * 3 * 2 * 3 * 2 * 2 * 3);
     assert_eq!(per_profile.len(), 2, "a profile was never swept");
     assert!(
         per_profile.values().all(|c| *c == cases / 2),
@@ -771,6 +834,126 @@ fn check_envelope(plan: &moxie_plan::expert::ExpertPlan, g: Geometry) {
     assert_eq!(envelope.residency_demand_bytes, demanded);
 }
 
+/// The prediction, recomputed from the plan's own groups rather than read back
+/// from the planner's accumulator.
+///
+/// Two things are checked, and the second is the one that matters: every chunk
+/// this plan will ask for is predicted **exactly once**, in exactly one
+/// category. A prediction that classified a chunk twice, or lost one, would pass
+/// every per-field assertion and fail this sum.
+fn check_prediction(plan: &moxie_plan::expert::ExpertPlan, case: Case, g: Geometry) {
+    use moxie_plan::expert::{BoundOn, Exactness};
+    let p = plan.envelope().predicted;
+    assert_eq!(
+        p.device_upload_bytes,
+        plan.envelope().residency_demand_bytes,
+        "{case:?}: the prediction and the demand disagree about the same bytes"
+    );
+
+    let mut device_hit = 0;
+    let mut device_upload = 0;
+    let mut host_hit = 0;
+    let mut host_read = 0;
+    let mut reuse = 0;
+    let budget = case.budget();
+    let on_device = case.resident;
+    let in_host = case.host_resident == HostResident::All;
+    // Written out from the case's two axes rather than by asking the snapshot,
+    // so this is a second statement of the rule and not a reading of the one
+    // being checked.
+    for group in plan.groups().iter() {
+        let bytes = group.chunk_bytes();
+        match group.placement().candidate() {
+            Candidate::Device if on_device => device_hit += bytes,
+            Candidate::Device => {
+                device_upload += bytes;
+                if in_host {
+                    reuse += bytes;
+                } else {
+                    host_read += bytes;
+                }
+            }
+            Candidate::Host if in_host => host_hit += bytes,
+            Candidate::Host => host_read += bytes,
+        }
+    }
+    assert_eq!(p.device_hit_bytes, device_hit, "{case:?}");
+    assert_eq!(p.device_upload_bytes, device_upload, "{case:?}");
+    assert_eq!(p.host_hit_bytes, host_hit, "{case:?}");
+    assert_eq!(p.host_read_bytes, host_read, "{case:?}");
+    assert_eq!(p.host_source_reuse_bytes, reuse, "{case:?}");
+
+    // Every chunk is accounted for exactly once **on each side**, and the two
+    // sides are not the same set: a device group's bytes are admitted on the
+    // card *and* pass through the host cache, while a device group that is
+    // already on the card never touches the host at all. Summing the five
+    // fields into one total would double-count every upload, which is what the
+    // first version of this assertion did.
+    let device_side: u64 = plan
+        .groups()
+        .iter()
+        .filter(|g| g.placement().candidate() == Candidate::Device)
+        .map(|g| g.chunk_bytes())
+        .sum();
+    assert_eq!(
+        p.device_hit_bytes + p.device_upload_bytes,
+        device_side,
+        "{case:?}: the device prediction does not cover the device groups exactly once"
+    );
+    let host_side: u64 = plan
+        .groups()
+        .iter()
+        .filter(|g| g.placement().candidate() == Candidate::Host || !g.decision().already_resident)
+        .map(|g| g.chunk_bytes())
+        .sum();
+    assert_eq!(
+        p.host_hit_bytes + p.host_read_bytes + p.host_source_reuse_bytes,
+        host_side,
+        "{case:?}: the host prediction does not cover the bytes that reach the host cache"
+    );
+
+    // An empty host cache cannot supply anything, and a full one cannot need a
+    // read. Both directions, because a prediction that ignored the host resident
+    // set would satisfy one of them by accident.
+    // An empty host cache cannot supply anything, and a full one cannot need a
+    // read -- unless the device already had the bytes, in which case nothing
+    // reaches the host cache at all. Both directions, because a prediction that
+    // ignored the host snapshot would satisfy one of them by accident.
+    if !in_host {
+        assert_eq!(p.host_source_reuse_bytes, 0, "{case:?}");
+        assert_eq!(p.host_hit_bytes, 0, "{case:?}");
+    } else {
+        assert_eq!(p.host_read_bytes, 0, "{case:?}");
+    }
+
+    // Exactness follows the two caps, and says which one bound it.
+    // The coexistence rule, stated here independently: a prediction is an
+    // equality only when everything the layer needs *at once* fits -- what it
+    // admits and what it is counting on already being there. Leaving the
+    // resident half out is the mistake this task made once, and a plan that
+    // predicted a hit on bytes its own admissions then evicted called itself
+    // exact.
+    let device_live = p.device_upload_bytes + p.device_hit_bytes;
+    let host_live = host_read + p.host_hit_bytes + p.host_source_reuse_bytes;
+    let device_fits =
+        device_live <= budget.device_cache_cap_bytes - budget.device_cache_leased_bytes;
+    let host_fits = host_live <= budget.host_cache_cap_bytes - budget.host_cache_leased_bytes;
+    match (device_fits, host_fits, p.exactness) {
+        (true, true, Exactness::Exact) => {}
+        (false, true, Exactness::LowerBound { where_, .. }) => {
+            assert_eq!(where_, BoundOn::DeviceCache, "{case:?}");
+        }
+        (true, false, Exactness::LowerBound { where_, .. }) => {
+            assert_eq!(where_, BoundOn::HostCache, "{case:?}");
+        }
+        (false, false, Exactness::LowerBound { where_, .. }) => {
+            assert_eq!(where_, BoundOn::Both, "{case:?}");
+        }
+        (d, h, e) => panic!("{case:?}: device_fits={d} host_fits={h} but exactness is {e:?}"),
+    }
+    let _ = g;
+}
+
 /// The reduction permutation, recomputed independently of the planner.
 ///
 /// Mutation testing found that the sweep passed when the plan ignored
@@ -811,6 +994,7 @@ fn a_required_placement_with_no_topology_is_an_error_rather_than_an_unplaced_buf
         host_workspace_fits: true,
         cache_fits: true,
         amortised: Amortisation::All,
+        host_resident: HostResident::None,
         resident: false,
         order: CombineOrder::AscendingExpertId,
         with_topology: false,
@@ -844,6 +1028,7 @@ fn placement_off_leaves_host_buffers_unplaced_even_with_a_topology() {
         host_workspace_fits: true,
         cache_fits: true,
         amortised: Amortisation::All,
+        host_resident: HostResident::None,
         resident: false,
         order: CombineOrder::AscendingExpertId,
         with_topology: true,
@@ -874,6 +1059,7 @@ fn a_route_that_sends_one_row_to_one_expert_twice_is_refused() {
         host_workspace_fits: true,
         cache_fits: true,
         amortised: Amortisation::All,
+        host_resident: HostResident::None,
         resident: false,
         order: CombineOrder::AscendingExpertId,
         with_topology: true,
@@ -903,6 +1089,7 @@ fn the_reduction_order_is_a_permutation_per_row_and_follows_the_declared_order()
         host_workspace_fits: true,
         cache_fits: true,
         amortised: Amortisation::All,
+        host_resident: HostResident::None,
         resident: false,
         order: CombineOrder::AscendingExpertId,
         with_topology: true,
@@ -969,6 +1156,7 @@ fn a_budget_below_the_host_buffers_or_the_reduction_refuses_every_plan() {
         host_workspace_fits: true,
         cache_fits: true,
         amortised: Amortisation::All,
+        host_resident: HostResident::None,
         resident: true,
         order: CombineOrder::AscendingExpertId,
         with_topology: true,
@@ -1158,6 +1346,7 @@ fn the_device_budget_is_checked_against_the_envelope_execution_reserves() {
         host_workspace_fits: true,
         cache_fits: true,
         amortised: Amortisation::All,
+        host_resident: HostResident::None,
         resident: false,
         order: CombineOrder::AscendingExpertId,
         with_topology: true,
@@ -1231,6 +1420,7 @@ fn a_nonfinite_combine_output_scale_is_refused_before_a_plan_exists() {
                 host_workspace_fits: true,
                 cache_fits: true,
                 amortised: Amortisation::All,
+                host_resident: HostResident::None,
                 resident: false,
                 order: CombineOrder::AscendingExpertId,
                 with_topology: false,
@@ -1245,6 +1435,7 @@ fn a_nonfinite_combine_output_scale_is_refused_before_a_plan_exists() {
                 host_workspace_fits: true,
                 cache_fits: true,
                 amortised: Amortisation::All,
+                host_resident: HostResident::None,
                 resident: false,
                 order: CombineOrder::AscendingExpertId,
                 with_topology: false,
@@ -1277,6 +1468,7 @@ fn a_nonfinite_combine_output_scale_is_refused_before_a_plan_exists() {
             host_workspace_fits: true,
             cache_fits: true,
             amortised: Amortisation::All,
+            host_resident: HostResident::None,
             resident: false,
             order: CombineOrder::AscendingExpertId,
             with_topology: false,

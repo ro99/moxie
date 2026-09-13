@@ -1583,6 +1583,17 @@ const RESIDENCY_DEFINITION_NAMES: &[&str] = &[
     "evictionpolicy",
     "evictor",
     "lrucache",
+    // Task 0023: a residency owner is also whatever *counts* residency. The
+    // trace reads the authority's own per-scope byte flow and differences two
+    // snapshots of it; a crate that declared a flow, an account or a byte
+    // counter of its own would be keeping a second tally of the same events,
+    // and a reconciliation between an owner and its own shadow proves nothing.
+    "byteflow",
+    "scopeaccount",
+    "byteaccount",
+    "bytecounter",
+    "bytetally",
+    "residencystats",
 ];
 
 /// The one crate allowed to define them.

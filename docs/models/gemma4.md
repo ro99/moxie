@@ -505,6 +505,35 @@ about its output.
   **every expert goes to the CPU candidate**, and a test asserts that. And the
   declared threshold is a **policy parameter, not a measured crossover** —
   measuring one is M6's.
+- **A whole working set, traced and reconciled: implemented**
+  ([task 0023](../tasks/0023-m2-whole-working-set-trace.md), 2026-09-13, awaiting
+  review and acceptance). **Every routed layer of this artifact has now been
+  executed, twice over, at two row shapes.**
+
+  At a decode-shaped batch — two rows of top-k 8, a distinct route per layer,
+  unions of twelve or thirteen experts — all **30** layers ran on all three GPUs
+  in two cache configurations, demanding **4,543,807,488 B**, and every layer's
+  device answer was **bitwise equal to the CPU candidate over the same bytes** on
+  every card.
+
+  At a batch whose route partitions the expert set, all 30 layers demanded and
+  admitted **45,675,970,560 B** — this artifact's **entire routed expert
+  payload**, 88.5% of it, and 1.77 times the largest card on this machine —
+  through a device cache holding **sixteen of one layer's 128 experts**, with
+  15,286 evictions per card and no OOM. The three cards' answers are bitwise
+  equal to each other, which is also sm_86 against sm_120.
+
+  Each layer's byte and cost trace **reconciles** against the residency
+  authority's own per-scope accounting and the ledger's own charges, as thirteen
+  named equalities rather than as a printed report.
+
+  **This is still not model support and no quality claim follows.** The
+  activations are synthetic and the routes are written by the test — the
+  full-payload route is *constructed* so that its union is the whole expert set,
+  which no prompt produced — so nothing about the released model's output is
+  established (**O2**), and no route-distribution claim follows either. What ran
+  is the routed expert block of each layer, not the layer: attention, the norms
+  and the shared expert are not in this path, and nothing generates a token.
 - Reference quality, actual-context prefill/decode: **not started**, and O2.
 - GPU: **one operation, qualified.** `ExpertMlp` has a device kernel on sm_86 and
   sm_120, bitwise equal to the oracle for both gate transforms. `Route` and
@@ -521,12 +550,14 @@ about its output.
 ### Blockers
 
 1. **The whole artifact still does not execute.** 51.6 GB against a 24 GiB
-   largest device. Task 0020 gave it a residency authority and task 0021 gave it
-   grouped execution, and together they ran **one layer's expert block** against
-   a two-expert budget. What is missing is everything else: an attention and
-   norm path for this variant at full scale, a graph that composes them, and the
-   byte/cost traces M2's exit asks to be reconciled with the ledger across a
-   whole working set. Nothing generates a token from this checkpoint.
+   largest device. Task 0020 gave it a residency authority, task 0021 gave it
+   grouped execution, and task 0023 streamed its **whole 45,675,970,560 B expert
+   payload** through a cache one 240th of that size, reconciled against the
+   ledger. What is missing is everything else: an attention and norm path for
+   this variant at full scale, and a graph that composes them with the routed
+   block. **Nothing generates a token from this checkpoint**, and the 88.5% of
+   the artifact that has now moved through the engine is the 88.5% that is
+   experts — the attention tower, the embedding and the norms have not.
 2. **No quality claim of any kind.** Nothing here was compared against the
    released model; that is **O2**, and it is what would also settle the
    5.5.3-versus-5.15 router-softmax dtype question.

@@ -19,7 +19,9 @@ use moxie_memory::{
     ArtifactId, CapacitySnapshot, Ledger, ResidencyAuthority, ResidencyRequest, TurnId,
 };
 use moxie_oracles::route;
-use moxie_plan::expert::{Candidate, ExpertBudget, ExpertPolicy, ExpertShape, compile_experts};
+use moxie_plan::expert::{
+    Candidate, ExpertBudget, ExpertPolicy, ExpertShape, ResidentChunks, compile_experts,
+};
 use moxie_storage::Shard;
 use moxie_types::{
     DeviceUuid, HostPlacement, HostTier, NumaNodeId, NumaTopology, Scope, StrategyControl, Tier,
@@ -222,7 +224,9 @@ fn host_only_budget() -> ExpertBudget {
         device_arena_free_bytes: 0,
         host_workspace_bytes: 1 << 20,
         host_buffer_bytes: 1 << 20,
-        resident_experts: Vec::new(),
+        host_cache_cap_bytes: 1 << 30,
+        host_cache_leased_bytes: 0,
+        resident: ResidentChunks::none(),
     }
 }
 
