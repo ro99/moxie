@@ -12,7 +12,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod expert;
 mod selected;
+pub use expert::{
+    Candidate, ExpertBudget, ExpertEnvelope, ExpertGroup, ExpertPlan, ExpertPlanRefused,
+    ExpertPolicy, ExpertShape, GroupDecision, Placement, RejectionReason, compile_experts,
+};
 pub use selected::{
     PlannedValue, PlannedWorkspace, SelectedNode, SelectedPlanCandidate, StorageRegion,
     lower_selected,
