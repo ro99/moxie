@@ -22,12 +22,19 @@ operative instructions living only in an ignored directory.
 | `evidence/support-matrix.md` | Capability claims linked to passing gate IDs | [SUPPORT-MATRIX.md](spec/templates/SUPPORT-MATRIX.md) | yes |
 | `evidence/benchmarks/` | Benchmark manifests and result summaries | — | yes |
 | `evidence/experiments/` | Accepted **and rejected** experiment conclusions | — | yes |
+| `engineering-log.md` | Lessons carried forward: what went wrong, the fix, and the shape worth remembering. **Not policy and not authoritative** — the task record is | — | yes |
 
 ## Rules
 
 Large raw traces, checkpoints and profiler output stay outside git; record a content hash, access
 location and retention policy in the record that cites them. `/results/` and `/artifacts/` are
 ignored for exactly this.
+
+**AGENTS.md is the policy entry point and is always loaded, so it holds what binds the work and
+points at everything else.** Narrative, measurements, review findings and lessons belong in
+[engineering-log.md](engineering-log.md); the authoritative account of a task is its own record in
+`tasks/`, `handovers/` and `evidence/experiments/`. The log grew inside AGENTS.md until that file was
+94% narrative, which is how an entry point stops being read as instructions.
 
 A record is not complete because a task finished. Doc 09 §E is the completion checklist; doc 07
 requires that rejected results be preserved with their mechanism and exact scope, so a later agent
