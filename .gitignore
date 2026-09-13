@@ -12,3 +12,4 @@
 /results/
 /artifacts/
 *.safetensors
+__pycache__/

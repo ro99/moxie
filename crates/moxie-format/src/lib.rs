@@ -83,6 +83,34 @@ impl core::fmt::Write for FallibleString {
     }
 }
 
+/// `<module>.<suffix>`, built with exactly one **fallible** allocation.
+///
+/// The second review's P1: the importer's refusal prose was made fallible and
+/// the *lookup names on the way to it* were not. `format!` aborts, so a helper
+/// that resolves four tensor names took the process down eight allocation
+/// positions before reaching the refusal that had just been fixed. That is task
+/// 0023's own sentence -- "reserving a destination says nothing about a
+/// temporary the callee builds" -- one layer further out.
+///
+/// A `BTreeMap<String, _>` lookup needs an owned key, and searching the map
+/// without one is linear in a header that holds 140,989 tensors, so the
+/// allocation is real work rather than a formatting convenience. What it must
+/// not be is infallible.
+pub(crate) fn join_name(module: &str, suffix: &str) -> moxie_types::Result<String> {
+    let mut out = String::new();
+    let need = module.len() + 1 + suffix.len();
+    out.try_reserve_exact(need)
+        .map_err(|_| moxie_types::Error::CapacityExceeded {
+            tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::Pageable)),
+            requested_bytes: need as u64,
+            available_bytes: 0,
+        })?;
+    out.push_str(module);
+    out.push('.');
+    out.push_str(suffix);
+    Ok(out)
+}
+
 /// A vector with exactly `capacity` reserved, or a typed capacity error.
 ///
 /// Import sizes come from an artifact's own header, so the allocation that

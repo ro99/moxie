@@ -6,8 +6,8 @@
 is the current continuation. M3 item 2's asymmetric half — compressed-tensors
 `pack-quantized` **asymmetric INT4 at group 32**, whose zero points are packed
 along the **output** axis while its codes are packed along the input axis — is
-implemented on 2026-09-13, **corrected after one independent review** (five
-findings, one P1, all reproduced, all fixed, none disputed) and **is not
+implemented on 2026-09-13, **corrected after two independent reviews** (eight
+findings, two P1, all reproduced, all fixed, none disputed) and **is not
 accepted**. Six modules of two real artifacts import, and 112,640 reconstructed
 values are checked against document 03's canonical FP32 equation over the
 source's own bytes **and** against the source's own arithmetic including the

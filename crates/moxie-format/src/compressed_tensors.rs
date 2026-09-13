@@ -274,23 +274,27 @@ pub fn source_entries<'a>(
     module: &str,
     zero_points: ZeroPointSource,
 ) -> Result<SourceEntries<'a>> {
-    let packed = header.get(&format!("{module}.weight_packed"))?;
-    let scale = header.get(&format!("{module}.weight_scale"))?;
-    let shape = header.get(&format!("{module}.weight_shape"))?;
+    // Every name is built fallibly: `format!` aborts, and this helper resolves
+    // four of them before it reaches a refusal.
+    let packed = header.get(&crate::join_name(module, "weight_packed")?)?;
+    let scale = header.get(&crate::join_name(module, "weight_scale")?)?;
+    let shape = header.get(&crate::join_name(module, "weight_shape")?)?;
     if packed.dtype != Dtype::I32 {
         return Err(invalid(format_args!(
             "{module}.weight_packed is {}; pack-quantized requires I32",
             packed.dtype.name()
         )));
     }
-    if shape.dtype != Dtype::I64 || shape.shape != vec![2] {
+    // `as_slice()` rather than `vec![2]`: the comparison needed no allocation
+    // and the one it made was infallible.
+    if shape.dtype != Dtype::I64 || shape.shape.as_slice() != [2] {
         return Err(invalid(format_args!(
             "{module}.weight_shape must be I64[2], got {} {:?}",
             shape.dtype.name(),
             shape.shape
         )));
     }
-    let name = format!("{module}.weight_zero_point");
+    let name = crate::join_name(module, "weight_zero_point")?;
     let present = header.tensors().get(&name);
     let zero_point = match (zero_points, present) {
         (ZeroPointSource::Symmetric, None) => None,

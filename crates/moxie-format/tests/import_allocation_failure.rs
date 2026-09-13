@@ -21,6 +21,12 @@
 //! adverse condition has tested the adverse condition on the happy path" -- in a
 //! file written by someone who had just read it. Every refusal below is now
 //! constructed with every allocation refused in turn.
+//!
+//! **And the sweep covers every public entry point, not only `import`.** The
+//! second review's P1: `source_entries` builds four lookup names, and making
+//! the refusal it eventually returns fallible did nothing for the `format!`
+//! calls on the way there. Eight of its eleven allocation positions aborted.
+//! A sweep that names one function has tested one function.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -28,7 +34,9 @@ use std::cell::Cell;
 use moxie_format::affine::IntWidth;
 use moxie_format::compressed_tensors::{
     Granularity, PackQuantizedSpec, PackedZeroPoints, SourceTensors, ZeroPointSource, import,
+    source_entries,
 };
+use moxie_format::safetensors::Header;
 use moxie_format::scale::ScaleDtype;
 use moxie_types::Error;
 
@@ -345,4 +353,121 @@ fn every_refusal_is_a_typed_error_with_every_allocation_refused() {
         swept >= cases.len(),
         "every case must have had at least one position refused"
     );
+}
+
+/// A minimal safetensors header over tensors whose payloads are all zero.
+fn header_with(tensors: &[(&str, &str, &[u64])]) -> Header {
+    let bytes_of = |dtype: &str, shape: &[u64]| -> u64 {
+        let width = match dtype {
+            "I32" | "F32" => 4u64,
+            "I64" | "F64" => 8,
+            _ => 2,
+        };
+        shape.iter().product::<u64>() * width
+    };
+    let mut json = String::from("{");
+    let mut at = 0u64;
+    for (i, (name, dtype, shape)) in tensors.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        let end = at + bytes_of(dtype, shape);
+        json.push_str(&format!(
+            "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":{shape:?},\
+             \"data_offsets\":[{at},{end}]}}"
+        ));
+        at = end;
+    }
+    json.push('}');
+    let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(json.as_bytes());
+    let file_len = bytes.len() as u64 + at;
+    Header::parse(&bytes, file_len).expect("well-formed header")
+}
+
+/// `source_entries` resolves four tensor names, and none of them may abort.
+///
+/// The second review's P1. The refusal this helper returns was made fallible
+/// and the names it builds on the way were not, so **eight** of its eleven
+/// allocation positions took the process down before reaching the corrected
+/// error — including the two that build task 0024's own zero-point name, after
+/// the other three entries had already resolved.
+///
+/// The header is parsed **before** the injection starts, so what is swept is
+/// the helper and not the parser.
+#[test]
+fn every_allocation_position_in_source_entries_is_a_typed_error() {
+    let complete = header_with(&[
+        ("m.weight_packed", "I32", &[8, 4]),
+        ("m.weight_scale", "BF16", &[8, 1]),
+        ("m.weight_shape", "I64", &[2]),
+        ("m.weight_zero_point", "I32", &[1, 1]),
+    ]);
+    // The review's own fixture: a module whose zero point is absent, so the
+    // refusal it reaches is the one task 0024 added.
+    let without_zero_point = header_with(&[
+        ("m.weight_packed", "I32", &[8, 4]),
+        ("m.weight_scale", "BF16", &[8, 1]),
+        ("m.weight_shape", "I64", &[2]),
+    ]);
+    // A module whose shape tensor has the wrong rank, so the `vec![2]`
+    // comparison's position is on the swept path too.
+    let wrong_shape = header_with(&[
+        ("m.weight_packed", "I32", &[8, 4]),
+        ("m.weight_scale", "BF16", &[8, 1]),
+        ("m.weight_shape", "I64", &[2, 1]),
+        ("m.weight_zero_point", "I32", &[1, 1]),
+    ]);
+
+    let cases: [(&str, &Header, ZeroPointSource, bool); 5] = [
+        (
+            "complete, asymmetric",
+            &complete,
+            ZeroPointSource::PackedAlongOutput,
+            true,
+        ),
+        (
+            "complete, read as symmetric",
+            &complete,
+            ZeroPointSource::Symmetric,
+            false,
+        ),
+        (
+            "no zero point, asymmetric",
+            &without_zero_point,
+            ZeroPointSource::PackedAlongOutput,
+            false,
+        ),
+        (
+            "no zero point, symmetric",
+            &without_zero_point,
+            ZeroPointSource::Symmetric,
+            true,
+        ),
+        (
+            "shape is I64[2,1]",
+            &wrong_shape,
+            ZeroPointSource::PackedAlongOutput,
+            false,
+        ),
+    ];
+
+    let mut swept = 0usize;
+    for (name, header, zero_points, ok) in cases {
+        let control = source_entries(header, "m", zero_points);
+        assert_eq!(control.is_ok(), ok, "{name}: control");
+        let positions = allocations_of(|| source_entries(header, "m", zero_points));
+        assert!(positions > 0, "{name} allocates nothing");
+        for at in 0..positions {
+            let refused = while_failing_at(at, 1, || source_entries(header, "m", zero_points));
+            match refused {
+                Ok(_) => {}
+                Err(Error::CapacityExceeded { .. }) | Err(Error::InvalidArtifact { .. }) => {}
+                other => panic!("{name} position {at}: {other:?}"),
+            }
+            swept += 1;
+        }
+    }
+    eprintln!("task0024 source_entries sweep: {swept} allocation position(s) refused");
+    assert!(swept >= 5, "every case must have had positions refused");
 }

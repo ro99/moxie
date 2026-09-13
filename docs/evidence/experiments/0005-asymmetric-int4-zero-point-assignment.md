@@ -2,7 +2,7 @@
 
 Date: 2026-09-13. Milestone: M3 item 2,
 [task 0024](../../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md).
-Status: **corrected after one independent review, awaiting a second.** The
+Status: **corrected after two independent reviews, awaiting a third.** The
 pinned assignment is separated from every alternative the same bytes permit —
 including the **sign**, which the first version of this record wrongly claimed
 was not separable — on four tensors across two artifacts. The mutation battery
@@ -123,11 +123,11 @@ a packed code word fall inside one scale group, so no statistic over this
 artifact separates them. Closing that needs paired output against the released
 model, which is O2's.
 
-## The mutation battery: 21 of 21 caught, 0 survivors
+## The mutation battery: 24 of 24 caught, 0 survivors
 
 The method is experiments 0002–0004's: one edit that changes behaviour and
-still compiles; apply, run every lane, record which caught it, revert. Two
-things are different here, and both came from the review.
+still compiles; apply, run every lane, record which caught it, revert. Three
+things are different here, and every one of them came from a review.
 
 **The driver is committed** — [`drivers/0005-mutations.py`](drivers/0005-mutations.py)
 — with every substitution verbatim, because the names below are not the
@@ -135,33 +135,46 @@ measurement.
 
 **Every verdict is repeated three times in both directions**: the mutant against
 the mutated tree and the control against the restored one, on the first lane
-that catches. The task contract promised this and the first run did not do it.
-No lane disagreed with itself, so nothing here is a coin flip recorded as a
-measurement.
+that catches.
 
-| Mutation | Caught by |
-|---|---|
-| `zp-sign-added-not-subtracted` | unit, artifact |
-| `zp-lane-pinned-to-zero` | unit, artifact |
-| `zp-lane-reversed` | unit, artifact |
-| `zp-word-row-is-block-major` | unit, artifact |
-| `zp-rebias-dropped` | unit, artifact |
-| `zero-points-dropped-entirely` | unit, alloccount, artifact |
-| `zp-reads-the-padding-lanes` | unit, allocfail |
-| `zp-shape-check-deleted` | unit, allocfail |
-| `zp-length-check-deleted` | unit, allocfail |
-| `spec-payload-disagreement-ignored` | unit, allocfail |
-| `spec-payload-missing-ignored` | unit, allocfail |
-| `index-disagreement-symmetric-ignored` | unit, artifact |
-| `index-missing-zero-point-ignored` | unit |
-| `zero-point-dtype-unchecked` | unit |
-| `zp-vec-allocated-infallibly` | **allocfail only** |
-| `refusal-prose-allocates-infallibly` | **allocfail only** |
-| `bf16-rounding-truncates` | unit |
-| `boundary-count-never-increments` | **artifact only** |
-| `missing-companions-always-empty` | **artifact only** |
-| `measurement-pinned-becomes-lane-reversed` | **artifact only** |
-| `measurement-sign-candidate-equals-pinned` | **artifact only** |
+**And a verdict that is not valid is not counted.** The first version appended
+unstable repeats and failing restored controls to a `nondet` list *and then
+counted them as caught*; the second review drove the driver's own `main` with a
+control that never passed and it printed "1 of 1 caught, 0 survivors". The
+verdict is a pure function now — `classify(caught_by, mutant_ok, control_ok)`
+→ `caught` / `survivor` / `unstable` / `invalid-control` — only `caught` counts,
+skips are named, and **the process exits nonzero unless every mutation is
+caught**. `--self-test` checks the rule over eight cases, including both of the
+review's, because the rule is what the headline number means.
+
+| Mutation | Verdict | Caught by |
+|---|---|---|
+| `zp-sign-added-not-subtracted` | caught | unit, artifact |
+| `zp-lane-pinned-to-zero` | caught | unit, artifact |
+| `zp-lane-reversed` | caught | unit, artifact |
+| `zp-word-row-is-block-major` | caught | unit, artifact |
+| `zp-rebias-dropped` | caught | unit, artifact |
+| `zero-points-dropped-entirely` | caught | unit, alloccount, artifact |
+| `zp-reads-the-padding-lanes` | caught | unit, allocfail |
+| `zp-shape-check-deleted` | caught | unit, allocfail |
+| `zp-length-check-deleted` | caught | unit, allocfail |
+| `spec-payload-disagreement-ignored` | caught | unit, allocfail |
+| `spec-payload-missing-ignored` | caught | unit, allocfail |
+| `index-disagreement-symmetric-ignored` | caught | unit, allocfail, artifact |
+| `index-missing-zero-point-ignored` | caught | unit, allocfail |
+| `zero-point-dtype-unchecked` | caught | unit |
+| `zp-vec-allocated-infallibly` | caught | **allocfail only** |
+| `refusal-prose-allocates-infallibly` | caught | **allocfail only** |
+| `bf16-rounding-truncates` | caught | unit |
+| `boundary-count-never-increments` | caught | **artifact only** |
+| `missing-companions-always-empty` | caught | **artifact only** |
+| `measurement-pinned-becomes-lane-reversed` | caught | **artifact only** |
+| `source-entries-names-allocate-infallibly` | caught | **allocfail only** |
+| `source-entries-zero-point-name-allocates-infallibly` | caught | **allocfail only** |
+| `inventory-filters-incomplete-modules` | caught | **artifact only** |
+| `measurement-sign-candidate-equals-pinned` | caught | **artifact only** |
+
+**24 of 24 caught, 0 survivors, 0 unstable, 0 invalid controls, 0 skipped.**
 
 Lanes: `unit` is `cargo test -p moxie-format --lib`; `allocfail` is
 `--test import_allocation_failure`; `alloccount` is
@@ -170,40 +183,28 @@ Lanes: `unit` is `cargo test -p moxie-format --lib`; `allocfail` is
 `--test gemma4_import`, which caught none — correctly, since it is the
 regression lane for the path this task did not change.
 
-### The five the review forced, and what each one is for
+### The eight the reviews forced, and what each one is for
 
-The first battery was 16 of 16 and it was measuring a suite with three holes in
-it. Every mutation added below exists because something was found, and each is
-caught by exactly the lane that was missing.
+The first battery was 16 of 16 and it was measuring a suite with five holes in
+it. **Every mutation added below exists because something was found, and nine of
+the eleven are caught by exactly one lane — the lane a finding created.**
 
-`refusal-prose-allocates-infallibly` puts the old `format!` back into the
-importer's refusal constructor. Sixteen mutations and five lanes passed it
-before, because every one of them imported something **valid**. Only the
-malformed-input sweep added after the review sees it, and what it sees is an
-abort.
+| Mutation | The hole it stands in for |
+|---|---|
+| `refusal-prose-allocates-infallibly` | the first sweep only imported **valid** inputs, so no refusal was ever constructed |
+| `source-entries-names-allocate-infallibly` | …and the second sweep only called `import`, so a second public entry point's four `format!` names were never reached |
+| `source-entries-zero-point-name-allocates-infallibly` | the same, on the name task 0024 itself added |
+| `inventory-filters-incomplete-modules` | **the original defect**, which the first regression could not detect because it tested the helper the filter ran before |
+| `missing-companions-always-empty` | the audit's decision, over a case no real artifact supplies |
+| `boundary-count-never-increments` | a rounding-boundary check on a sample where the boundary never fires |
+| `bf16-rounding-truncates` | the rounding the source-arithmetic comparison depends on |
+| `measurement-sign-candidate-equals-pinned` | the sign candidate, added after the impossibility claim turned out to be false |
 
-`boundary-count-never-increments` stops the counter that proves the source's
-BF16 rounding actually fires on the sampled values. Without that count the new
-boundary check could be satisfied by a sample where the boundary never moves
-anything, which is a check of nothing.
-
-`missing-companions-always-empty` makes the inventory audit's decision return
-"nothing missing" for every module. The real artifacts have no incomplete
-module, so this is caught only by the table-driven test written for the case the
-artifacts do not supply — which is the whole reason that test exists.
-
-`bf16-rounding-truncates` swaps round-to-nearest-even for truncation in
-`f32_to_bf16_bits`, the function the new source-arithmetic comparison depends
-on.
-
-`measurement-sign-candidate-equals-pinned` makes the sign candidate agree with
-the pinned reading. The declared thresholds reject it, which is what makes the
-sign a measurement rather than a number in a table.
-
-**Three mutations are caught by exactly one lane each and one is caught by two,
-and in every case that lane is the one the review's findings added.** A battery
-that is complete against the suite it was written for says nothing about the
-suite's holes; only a finding from outside does.
+**A battery that is complete against the suite it was written for says nothing
+about the suite's holes.** Sixteen of sixteen, then twenty-one of twenty-one,
+were both true and both measured a suite that a reviewer then walked straight
+through. Only a finding from outside can add the case; what the battery does is
+stop it coming back.
 
 ## Two facts this measurement's plumbing turned up
 

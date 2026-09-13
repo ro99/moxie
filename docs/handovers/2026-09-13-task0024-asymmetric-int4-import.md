@@ -1,10 +1,16 @@
 # Handover — task 0024 implemented and corrected: asymmetric INT4 import, and a convention that could be measured
 
-**Task 0024 is implemented on 2026-09-13, corrected after one independent
-review, and is not accepted.** The review made **five findings, one P1**; all
-five were reproduced, all five are fixed, **none is disputed**. Two of them
-reproduce to the digit in this workspace's own tests: the review's 27,501
-divergent values and its `2.1797049840291343`.
+**Task 0024 is implemented on 2026-09-13, corrected after two independent
+reviews, and is not accepted.** The two rounds made **eight findings, two P1**;
+all eight were reproduced, all eight are fixed, **none is disputed**.
+
+**The second round's three findings share one shape: each is a first-round
+correction that was narrower than it looked.** A refusal made allocation-safe
+while the lookup names on the way to it still aborted; a regression written for
+a filtering bug that tested the helper the filter ran *before*; and a driver
+that reported an invalid verdict as a caught one. Fixing a finding and guarding
+the fix are two jobs, and the second round is what happens when only the first
+is done.
 
 The corrections are summarised below and written up in full in
 [the task record](../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md#corrections-after-the-first-independent-review).
@@ -45,8 +51,8 @@ quality.
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy (`--features moxie-executor/driver`) | passed |
 | CUDA-lane clippy (`--features cuda`) | passed |
-| `cargo test --workspace --locked --offline` | **945 passed, 0 failed** (baseline **930**, re-measured at `e122de3` before implementation) |
-| Device-feature workspace tests | **980 passed, 0 failed** (task 0023 recorded 965; +15 is exactly this task's new tests) |
+| `cargo test --workspace --locked --offline` | **947 passed, 0 failed** (baseline **930**, re-measured at `e122de3` before implementation) |
+| Device-feature workspace tests | **982 passed, 0 failed** (task 0023 recorded 965; +17 is exactly this task's new tests) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | zero failures, 79 rejected fixtures, 21 accepted, 13 rules |
@@ -56,13 +62,14 @@ this machine, so every artifact lane ran. Each of them prints `SKIP` with a
 reason when its checkpoint is absent; that path was exercised while writing them
 and is not what ran here.
 
-**Mutation measurement: 21 of 21 caught, 0 survivors**, every verdict repeated
-three times in both directions, **driver committed**
+**Mutation measurement: 24 of 24 caught, 0 survivors, 0 unstable, 0 invalid
+controls, 0 skipped**, every verdict repeated three times in both directions,
+**driver committed** and its verdict rule self-tested
 ([experiment 0005](../evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md),
 [its driver](../evidence/experiments/drivers/0005-mutations.py)). The first
-measurement was 16 of 16 — a complete battery against a suite with three holes
-in it. The five mutations added after the review are each caught by exactly the
-lane a finding created, four of them by that lane alone.
+measurement was 16 of 16 against a suite with **five** holes in it, and the
+second 21 of 21 against a suite with three. Each of the eight mutations added
+after a review is caught by exactly the lane that review's finding created.
 
 ### What was read, and what it is not
 
@@ -84,6 +91,30 @@ exists; Laguna's graph still declares BF16 tensor requirements, because listing
 INT4 would advertise a path that is not there. A bit-identical repack is
 **ADR 0018's v1 quality definition** — it is not evidence about what any model
 produces, and no paired output against a released model exists (**O2**).
+
+## What the second review found, and what changed
+
+**Three findings, one P1, none disputed.**
+
+1. **P1 — `source_entries` aborted before reaching its now-safe refusal.** It
+   builds four lookup names with `format!`; eight of its eleven allocation
+   positions took the process down, two of them on task 0024's own zero-point
+   name. My eight-case refusal sweep calls only `import`, so it could not see
+   any of them. `join_name` reserves each name fallibly, the shape comparison
+   no longer builds a `Vec`, and a new sweep refuses **29** positions across
+   five `source_entries` cases with the headers parsed beforehand.
+2. **The regression for the first round's finding 3 could not detect it.** It
+   called `missing_companions` directly; the defect was a filter that ran
+   *before* that helper, so restoring the filter left all five artifact tests
+   passing. The fixture now writes a real four-module shard with one zero point
+   missing and goes through `Inventory::build`; with the filter restored it
+   fails on `left: 3, right: 4`, the review's symptom exactly.
+3. **The mutation driver counted invalid verdicts as caught.** An unstable
+   repeat or a restored control that still failed was reported *and* added to
+   the total. The verdict is a pure `classify` function now, only `caught`
+   counts, skips are named, the process exits nonzero unless every mutation is
+   caught, and `--self-test` checks the rule over eight cases including both of
+   the review's.
 
 ## What the first review found, and what changed
 

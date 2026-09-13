@@ -169,6 +169,29 @@ MUTATIONS = [
                         ((word(o / 8, g) >> (4 * (7 - o % 8) as u32)) & 0xF) as i32 - 8
                     }),
                 ),"""),
+    # --- the second review's findings ------------------------------------
+    # Its P1: the lookup names on the way to a refusal, not the refusal.
+    ("source-entries-names-allocate-infallibly", CT,
+     '''    let packed = header.get(&crate::join_name(module, "weight_packed")?)?;
+    let scale = header.get(&crate::join_name(module, "weight_scale")?)?;
+    let shape = header.get(&crate::join_name(module, "weight_shape")?)?;''',
+     '''    let packed = header.get(&format!("{module}.weight_packed"))?;
+    let scale = header.get(&format!("{module}.weight_scale"))?;
+    let shape = header.get(&format!("{module}.weight_shape"))?;'''),
+    ("source-entries-zero-point-name-allocates-infallibly", CT,
+     '    let name = crate::join_name(module, "weight_zero_point")?;',
+     '    let name = format!("{module}.weight_zero_point");'),
+    # Its finding 2: the original population filter, restored.
+    ("inventory-filters-incomplete-modules", IMP,
+     "        let mut modules: Vec<(String, u64)> = sizes.into_iter().collect();",
+     '''        let mut modules: Vec<(String, u64)> = sizes
+            .into_iter()
+            .filter(|(module, _)| {
+                SUFFIXES
+                    .iter()
+                    .all(|s| located.contains_key(&format!("{module}.{s}")))
+            })
+            .collect();'''),
     # Added after the review's finding 5: the sign candidate is load-bearing.
     ("measurement-sign-candidate-equals-pinned", IMP,
      """                (
@@ -208,45 +231,111 @@ def repeated(name, expect):
     return seen.pop() == expect
 
 
+CAUGHT = "caught"
+SURVIVOR = "survivor"
+UNSTABLE = "unstable"
+INVALID_CONTROL = "invalid-control"
+
+
+def classify(caught_by, mutant_ok, control_ok):
+    """What a mutation's run actually established.
+
+    The second review's finding: the first version appended unstable and
+    failing-control verdicts to `nondet` **and then counted them as caught**,
+    so a run whose restored control never passed printed "1 of 1 caught". A
+    mutation is caught only when the mutant fails the lane every time and the
+    restored tree passes it every time; anything else is an outcome to report,
+    not a number to add.
+
+    `mutant_ok` / `control_ok` are `True` (stably as expected), `False` (stably
+    the opposite) or `None` (the lane disagreed with itself).
+    """
+    if not caught_by:
+        return SURVIVOR
+    if mutant_ok is None or control_ok is None:
+        return UNSTABLE
+    if mutant_ok is not True:
+        return UNSTABLE
+    if control_ok is not True:
+        return INVALID_CONTROL
+    return CAUGHT
+
+
+def self_test():
+    """Deterministic checks of the verdict rule, run with `--self-test`.
+
+    The rule is what the battery's headline number means, so it is tested
+    rather than read.
+    """
+    cases = [
+        (([], True, True), SURVIVOR),
+        (([], None, None), SURVIVOR),
+        ((["unit"], True, True), CAUGHT),
+        ((["unit"], None, True), UNSTABLE),     # mutant repeats disagreed
+        ((["unit"], True, None), UNSTABLE),     # control repeats disagreed
+        ((["unit"], False, True), UNSTABLE),    # failed once, then passed
+        ((["unit"], True, False), INVALID_CONTROL),  # restored tree still fails
+        ((["unit"], False, False), UNSTABLE),
+    ]
+    bad = [(a, want, classify(*a)) for a, want in cases if classify(*a) != want]
+    for a, want, got in bad:
+        print(f"SELF-TEST FAIL {a}: want {want}, got {got}")
+    print(f"self-test: {len(cases) - len(bad)} of {len(cases)} verdict cases correct")
+    return 0 if not bad else 1
+
+
 def main():
-    only = sys.argv[1:] or None
-    results, nondet = [], []
+    if "--self-test" in sys.argv[1:]:
+        return self_test()
+    only = [a for a in sys.argv[1:] if not a.startswith("--")] or None
+    outcomes = collections.OrderedDict()
+    skipped = []
     for name, path, old, new in MUTATIONS:
         if only and name not in only:
             continue
         src = open(path).read()
         if src.count(old) != 1:
+            skipped.append((name, f"anchor occurs {src.count(old)} time(s)"))
             print(f"SKIP {name}: anchor occurs {src.count(old)} time(s)", flush=True)
             continue
         open(path, "w").write(src.replace(old, new, 1))
+        mutant_ok, caught_by = None, []
         try:
             if not build():
+                skipped.append((name, "does not compile"))
                 print(f"SKIP {name}: does not compile", flush=True)
                 continue
             caught_by = [n for n in LANES if not lane(n)]
-            first = caught_by[0] if caught_by else None
-            # Repeat the verdict on the catching lane, with the mutant in place.
-            mutant_ok = repeated(first, False) if first else None
+            if caught_by:
+                mutant_ok = repeated(caught_by[0], False)
         finally:
             open(path, "w").write(src)
-        if first:
-            assert build(), f"{name}: the tree did not rebuild after restore"
-            control_ok = repeated(first, True)
-            if mutant_ok is not True or control_ok is not True:
-                nondet.append((name, first, mutant_ok, control_ok))
-        results.append((name, caught_by))
-        status = ",".join(caught_by) if caught_by else "*** SURVIVOR ***"
-        print(f"{name:44s} {status}", flush=True)
+        control_ok = None
+        if caught_by:
+            if not build():
+                skipped.append((name, "the tree did not rebuild after restore"))
+                print(f"SKIP {name}: no rebuild after restore", flush=True)
+                continue
+            control_ok = repeated(caught_by[0], True)
+        verdict = classify(caught_by, mutant_ok, control_ok)
+        outcomes[name] = (verdict, caught_by)
+        detail = ",".join(caught_by) if caught_by else "-"
+        print(f"{name:52s} {verdict:15s} {detail}", flush=True)
 
-    survivors = [n for n, c in results if not c]
-    print(f"\n{len(results) - len(survivors)} of {len(results)} caught, "
-          f"{len(survivors)} survivor(s); "
+    counts = collections.Counter(v for v, _ in outcomes.values())
+    total = len(outcomes) + len(skipped)
+    print(f"\n{counts[CAUGHT]} of {total} caught, "
+          f"{counts[SURVIVOR]} survivor(s), {counts[UNSTABLE]} unstable, "
+          f"{counts[INVALID_CONTROL]} invalid control(s), {len(skipped)} skipped; "
           f"{REPEATS} repetition(s) of each verdict in both directions")
-    for n in survivors:
-        print(f"  SURVIVOR {n}")
-    for n, l, m, c in nondet:
-        print(f"  NONDETERMINISTIC {n} on {l}: mutant={m} control={c}")
+    for name, (verdict, _) in outcomes.items():
+        if verdict != CAUGHT:
+            print(f"  {verdict.upper()} {name}")
+    for name, why in skipped:
+        print(f"  SKIPPED {name}: {why}")
+    # An incomplete or invalid battery is not a measurement.
+    return 0 if counts[CAUGHT] == total else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

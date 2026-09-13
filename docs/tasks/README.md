@@ -125,7 +125,7 @@ M2**, which is the owner's separate decision, and **no model-quality claim
 follows** (**O2**).
 
 **[Task 0024](0024-m3-asymmetric-int4-pack-quantized-import.md) is implemented
-on 2026-09-13, corrected after one independent review — five findings, one P1,
+on 2026-09-13, corrected after two independent reviews — eight findings, two P1,
 all reproduced, all fixed, none disputed — and is not accepted**; its contract
 was authored and committed at `e122de3` before implementation. It is M3 item 2's asymmetric half: the importer
 reads compressed-tensors `pack-quantized` **asymmetric INT4 at group 32**, whose
@@ -147,10 +147,15 @@ execution**: nothing consumes a canonical INT4 tensor, W4A16 is M3 item 3, and
 Laguna's graph still declares BF16. A bit-identical repack is ADR 0018's v1
 quality definition, **not** evidence about model output. Mutation-measured **21
 of 21**, 0 survivors, with the driver committed and every verdict repeated. The
-review's P1 was the workspace's most repeated defect for the **sixth** time — a
-refusal that aborted under an allocation failure, on a sweep that only ever
-imported valid inputs — and it is fixed at the shared error type rather than in
-the six lines this task added.
+first review's P1 was the workspace's most repeated defect for the **sixth**
+time — a refusal that aborted under an allocation failure, on a sweep that only
+ever imported valid inputs — and it is fixed at the shared error type rather
+than in the six lines this task added. **The second review's three findings are
+all the same shape: a first-round correction that was narrower than it looked.**
+A refusal made safe while the lookup names reaching it still aborted; a
+regression that tested the helper the buggy filter ran *before*; and a mutation
+driver that counted an invalid verdict as a caught one. Fixing a finding and
+guarding the fix are two jobs.
 
 Reopen accepted tasks only for a demonstrated defect in accepted scope.
 

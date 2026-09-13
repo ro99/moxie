@@ -1,6 +1,6 @@
 # Task 0024 — M3 item 2: asymmetric INT4 `pack-quantized` import, zero points along the output axis
 
-Status: **implemented 2026-09-13; corrected after one independent review (five findings, one P1, all reproduced, all fixed, none disputed); awaiting a second review and owner acceptance**.
+Status: **implemented 2026-09-13; corrected after two independent reviews (eight findings, two P1, all reproduced, all fixed, none disputed); awaiting a third review and owner acceptance**.
 
 ## Identity and authority
 
@@ -289,6 +289,71 @@ else. **The "not implemented" verdict for W4A16 execution does not move.**
 
 ## Result, filled after work
 
+### Corrections after the second independent review
+
+Three findings, one P1. **All three reproduced, all three fixed, none
+disputed.** Every one of them is about a correction from the first round being
+narrower than it looked.
+
+#### 1 (P1). The refusal was made safe and the path to it was not
+
+`source_entries` builds four lookup names with `format!` and compared a shape
+against `vec![2]`. Making the error it *returns* fallible did nothing for the
+allocations on the way there: the review measured **eleven** allocation
+positions in one call and **eight of them aborted**, including the two that
+build task 0024's own zero-point name, after the other three entries had
+already resolved.
+
+**That is task 0023's sentence one layer further out** — "reserving a
+destination says nothing about a temporary the callee builds" — and my
+eight-case refusal sweep could not see it, because **every case in it calls
+`import`**. A sweep that names one function has tested one function.
+
+`crate::join_name` builds each name with one `try_reserve_exact` and returns
+`CapacityExceeded`; the shape comparison is `as_slice() != [2]` and allocates
+nothing. `every_allocation_position_in_source_entries_is_a_typed_error` parses
+its headers **before** the injection starts, so what is swept is the helper and
+not the parser, and it refuses **29** positions across five cases. Two mutations
+put the `format!` calls back.
+
+#### 2 (P2). The regression for finding 3 could not detect finding 3
+
+The test I wrote called `missing_companions` directly. The defect was a filter
+applied *before* that helper ran, so **a correct helper cannot detect a module
+that was removed before it was called** — the review restored the original
+filter and all five artifact tests passed.
+
+This is the same shape as task 0023's own "the test I wrote for a review's
+finding had a fake axis", and it is worse in one way: I had the reviewer's
+reproduction in front of me — a synthetic shard with a module missing its zero
+point — and wrote a table-driven test of the helper instead of building the
+shard.
+
+The fixture builds one now. `Source` owns its root so a synthetic artifact in a
+temporary directory is the same kind of thing as a real one;
+`the_inventory_reports_a_module_missing_a_companion_rather_than_dropping_it`
+writes a four-module shard with `m3.weight_zero_point` omitted, constructs the
+inventory **through `Inventory::build`**, and asserts both halves the filter
+breaks: the independent packed-module population (4, not 3) and the module the
+audit names. With the original filter restored it fails on `left: 3, right: 4`,
+which is the review's symptom exactly. `inventory-filters-incomplete-modules` is
+in the battery.
+
+#### 3 (P2). The driver counted invalid verdicts as caught
+
+Unstable mutant repeats and a restored control that still failed were appended
+to `nondet` **and then counted in the total anyway**. The review drove the
+driver's own `main` with a consistently failing control and it printed "1 of 1
+caught, 0 survivors".
+
+**A measurement tool that cannot report an invalid measurement is not a
+measurement tool.** The verdict is a pure function now — `classify(caught_by,
+mutant_ok, control_ok)` — returning `caught`, `survivor`, `unstable` or
+`invalid-control`; only `caught` counts, skips are tracked and named, and the
+process exits nonzero unless every mutation is caught. `--self-test` checks the
+rule over eight cases including both of the review's, because the rule is what
+the headline number means.
+
 ### Corrections after the first independent review
 
 Five findings, one P1. **All five reproduced, all five fixed, none disputed.**
@@ -436,8 +501,8 @@ Base `e122de3` (this contract). Implementation is the commits after it.
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed** |
 | Device-lane clippy (`--features moxie-executor/driver`) | **passed** |
 | CUDA-lane clippy (`--features cuda`) | **passed** |
-| `cargo test --workspace --locked --offline` | **945 passed, 0 failed**, against a baseline of **930** re-measured at `e122de3` before implementation (943 before the review's corrections) |
-| `cargo test --workspace --locked --offline --features moxie-executor/driver` | **980 passed, 0 failed** (task 0023 recorded 965; +15 is exactly this task's new tests) |
+| `cargo test --workspace --locked --offline` | **947 passed, 0 failed**, against a baseline of **930** re-measured at `e122de3` before implementation (943 after implementation, 945 after the first review) |
+| `cargo test --workspace --locked --offline --features moxie-executor/driver` | **982 passed, 0 failed** (task 0023 recorded 965; +17 is exactly this task's new tests) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified. Re-run after the corrections, because widening `Error::InvalidArtifact` touches every crate including the device lane |
 | `cargo xtask spec-check` | **passed**, 10 documents |
 | `cargo xtask arch-check` | **zero failures**, 79 rejected fixtures, 21 accepted, 13 rules |
@@ -448,19 +513,20 @@ this machine and every artifact lane ran. The four artifact tests each print
 green — that path was exercised while the tests were being written and is not
 what ran here.
 
-Fifteen new tests: seven in `moxie-format`'s own module, one
-`import_allocation_asymmetric`, **two** `import_allocation_failure`, **five** in
+Seventeen new tests: seven in `moxie-format`'s own module, one
+`import_allocation_asymmetric`, **three** `import_allocation_failure`, **six** in
 `moxie-storage/tests/asymmetric_int4_import.rs`.
 
-**Mutation measurement: 21 of 21 caught, 0 survivors**, each verdict repeated
-**three times in both directions**, driver committed
+**Mutation measurement: 24 of 24 caught, 0 survivors, 0 unstable, 0 invalid
+controls, 0 skipped**, each verdict repeated **three times in both directions**,
+driver committed and its verdict rule self-tested
 ([experiment 0005](../evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md),
 [its driver](../evidence/experiments/drivers/0005-mutations.py)). The first
-measurement was 16 of 16 and it was a complete battery against a suite with
-three holes in it: **the five mutations added after the review are each caught
-by exactly the lane a finding created**, and four of them by that lane alone. A
-battery that is complete against the suite it was written for says nothing about
-the suite's holes.
+measurement was 16 of 16 against a suite with **five** holes in it, and the
+second was 21 of 21 against a suite with three: **each of the eight mutations
+added after a review is caught by exactly the lane that review's finding
+created**, nine of the eleven by that lane alone. A battery that is complete
+against the suite it was written for says nothing about the suite's holes.
 
 ### Measured effect and uncertainty
 

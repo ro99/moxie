@@ -47,10 +47,18 @@ fn header_budget() -> HeaderBudget {
     HeaderBudget::new(64 << 20).expect("a valid header budget")
 }
 
-/// One local artifact, with the facts its bring-up record already states.
+/// One artifact, with the facts its bring-up record already states.
+///
+/// `root` is owned rather than `&'static str` so that a **synthetic** artifact
+/// in a temporary directory is the same kind of thing as a real one. The second
+/// review's finding 2 is why: the regression written for the inventory bug
+/// tested the audit's helper directly and never built an inventory, so
+/// restoring the original premature filter left all five artifact tests
+/// passing. A negative fixture has to enter through the same door the defect
+/// was behind.
 struct Source {
-    name: &'static str,
-    root: &'static str,
+    name: String,
+    root: PathBuf,
     shards: u32,
     /// The compressor version its `quantization_config` declares. Recorded
     /// because it is **not** the version of the library this reading is pinned
@@ -58,21 +66,38 @@ struct Source {
     compressor: &'static str,
 }
 
-const LAGUNA: Source = Source {
-    name: "Laguna-S-2.1-AWQ-INT4",
-    root: "/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4",
-    shards: 15,
-    compressor: "0.1.dev534+gb269f2e",
-};
+impl Source {
+    fn new(name: &str, root: impl Into<PathBuf>, shards: u32, compressor: &'static str) -> Self {
+        Self {
+            name: name.to_string(),
+            root: root.into(),
+            shards,
+            compressor,
+        }
+    }
+}
 
-const QWEN: Source = Source {
-    name: "Qwen3.8-27B-AWQ-BF16-INT4",
-    root: "/fast/models/cyankiwi/Qwen3.8-27B-AWQ-BF16-INT4",
-    shards: 6,
-    compressor: "0.1.dev535+gdc9611a",
-};
+fn laguna() -> Source {
+    Source::new(
+        "Laguna-S-2.1-AWQ-INT4",
+        "/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4",
+        15,
+        "0.1.dev534+gb269f2e",
+    )
+}
 
-const SOURCES: [Source; 2] = [LAGUNA, QWEN];
+fn qwen() -> Source {
+    Source::new(
+        "Qwen3.8-27B-AWQ-BF16-INT4",
+        "/fast/models/cyankiwi/Qwen3.8-27B-AWQ-BF16-INT4",
+        6,
+        "0.1.dev535+gdc9611a",
+    )
+}
+
+fn sources() -> [Source; 2] {
+    [laguna(), qwen()]
+}
 
 /// The packing every one of these artifacts declares: asymmetric INT4 at group
 /// 32, with the zero point packed along the output axis.
@@ -91,7 +116,8 @@ const SUFFIXES: [&str; 4] = [
 
 impl Source {
     fn shard_path(&self, n: u32) -> PathBuf {
-        Path::new(self.root).join(format!("model-{:05}-of-{:05}.safetensors", n, self.shards))
+        self.root
+            .join(format!("model-{:05}-of-{:05}.safetensors", n, self.shards))
     }
 
     fn present(&self) -> bool {
@@ -101,7 +127,8 @@ impl Source {
     fn skip(&self, what: &str) {
         eprintln!(
             "SKIP {what} for {}: {} is not present",
-            self.name, self.root
+            self.name,
+            self.root.display()
         );
     }
 }
@@ -389,8 +416,8 @@ impl Payloads {
 }
 
 fn config_of(source: &Source) -> serde_json::Value {
-    let text = std::fs::read_to_string(Path::new(source.root).join("config.json"))
-        .expect("config.json is readable");
+    let text =
+        std::fs::read_to_string(source.root.join("config.json")).expect("config.json is readable");
     serde_json::from_str(&text).expect("config.json parses")
 }
 
@@ -403,7 +430,7 @@ fn config_of(source: &Source) -> serde_json::Value {
 #[test]
 fn the_declared_packing_parameters_match_each_artifacts_own_config() {
     let mut checked = 0usize;
-    for source in &SOURCES {
+    for source in &sources() {
         if !source.present() {
             source.skip("declared packing parameters");
             continue;
@@ -464,7 +491,7 @@ fn real_asymmetric_tensors_import_and_match_the_sources_own_arithmetic() {
     // boundary check on a sample where the boundary never fires would be
     // vacuous, so this is counted and required to be nonzero.
     let mut narrowed = 0u64;
-    for source in &SOURCES {
+    for source in &sources() {
         if !source.present() {
             source.skip("asymmetric import");
             continue;
@@ -617,7 +644,7 @@ fn real_asymmetric_tensors_import_and_match_the_sources_own_arithmetic() {
 #[test]
 fn the_pinned_zero_point_lane_assignment_is_the_one_the_artifacts_bytes_support() {
     let mut measured = 0usize;
-    for source in &SOURCES {
+    for source in &sources() {
         if !source.present() {
             source.skip("zero-point lane measurement");
             continue;
@@ -754,7 +781,7 @@ fn the_pinned_zero_point_lane_assignment_is_the_one_the_artifacts_bytes_support(
 #[test]
 fn every_asymmetric_module_declares_a_packed_zero_point() {
     let mut inspected = 0usize;
-    for source in &SOURCES {
+    for source in &sources() {
         if !source.present() {
             source.skip("zero-point shape inventory");
             continue;
@@ -834,19 +861,56 @@ fn every_asymmetric_module_declares_a_packed_zero_point() {
     }
 }
 
-/// The inventory audit can actually fail.
+/// The inventory audit can actually fail — **through `Inventory::build`**.
 ///
-/// The real artifacts have no incomplete module, so on them the assertion above
-/// is satisfied by a population that never violates it — and a check nothing
-/// violates is a check nobody has watched fail. An independent review proved the
-/// point the hard way: the earlier version filtered incomplete modules out
-/// before auditing, and a shard with four packed modules, one missing its
-/// `weight_zero_point`, passed while reporting three.
+/// The second review's finding 2. The first version of this regression called
+/// `missing_companions` directly, so it could not see the defect it was written
+/// for: the bug was a filter applied *before* that helper ran, and restoring it
+/// left all five artifact tests passing. **A correct helper cannot detect a
+/// module that was removed before the helper was called.**
 ///
-/// `missing_companions` is the audit's decision, so it is tested here against a
-/// table that **contains** the case, without needing a synthetic checkpoint.
+/// This builds a real four-module shard with one module's `weight_zero_point`
+/// omitted, constructs the inventory over it exactly as the artifact tests do,
+/// and asserts both halves the filter would break: the independent
+/// packed-module population, and the module the audit must name.
 #[test]
-fn a_module_missing_a_companion_tensor_is_reported_not_dropped() {
+fn the_inventory_reports_a_module_missing_a_companion_rather_than_dropping_it() {
+    let dir = scratch_dir("inventory-negative");
+    write_synthetic_shard(&dir.join("model-00001-of-00001.safetensors"), 4, &["m3"]);
+    let source = Source::new("synthetic", &dir, 1, "n/a");
+    let inventory = Inventory::build(&source);
+
+    // The population, counted independently of the audit: four modules carry
+    // `weight_packed`, and a filter that drops the incomplete one shows up here
+    // first.
+    assert_eq!(
+        inventory.modules.len(),
+        4,
+        "every packed module must be in the audit's population, complete or not"
+    );
+    // And the audit names the one that is incomplete.
+    assert_eq!(
+        inventory.incomplete(),
+        vec![Incomplete {
+            module: "m3".to_string(),
+            missing: vec!["weight_zero_point"],
+        }]
+    );
+    // The other three are importable; the incomplete one is not.
+    assert_eq!(inventory.importable().len(), 3);
+    assert!(
+        !inventory
+            .importable()
+            .iter()
+            .any(|(module, _)| module == "m3")
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// And the audit's decision, over a table that includes cases no artifact here
+/// supplies. Complements the fixture above rather than standing in for it.
+#[test]
+fn missing_companions_names_every_absent_tensor() {
     let present: std::collections::BTreeSet<&str> = [
         "m0.weight_packed",
         "m0.weight_scale",
@@ -855,7 +919,7 @@ fn a_module_missing_a_companion_tensor_is_reported_not_dropped() {
         "m1.weight_packed",
         "m1.weight_scale",
         "m1.weight_shape",
-        // m1 has no zero point: the review's fixture.
+        // m1 has no zero point.
         "m2.weight_packed",
         "m2.weight_zero_point",
         // m2 has neither scale nor shape.
@@ -864,19 +928,101 @@ fn a_module_missing_a_companion_tensor_is_reported_not_dropped() {
     .collect();
     let located = |n: &str| present.contains(n);
 
-    assert!(
-        missing_companions("m0", located).is_empty(),
-        "a complete module has nothing missing"
-    );
+    assert!(missing_companions("m0", located).is_empty());
     assert_eq!(missing_companions("m1", located), vec!["weight_zero_point"]);
     assert_eq!(
         missing_companions("m2", located),
         vec!["weight_scale", "weight_shape"]
     );
-    // And the ordering is the declared suffix order, so a report is stable.
     assert_eq!(
         missing_companions("absent", located),
         SUFFIXES.to_vec(),
         "a module with nothing at all names every companion"
     );
+}
+
+/// A scratch directory under the system temp root, named for this test.
+fn scratch_dir(what: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "moxie-task0024-{what}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("a scratch directory");
+    dir
+}
+
+/// A safetensors shard holding `modules` valid asymmetric INT4 modules, with
+/// the named ones missing their `weight_zero_point`.
+///
+/// Logical `[8, 32]`: packed `[8, 4]` I32, one group so the scale is `[8, 1]`,
+/// and `ceil(8 / 8) = 1` zero-point word row, `[1, 1]`. Real shapes, so the
+/// inventory's own consistency checks pass and the only thing wrong with the
+/// fixture is the tensor it is missing.
+fn write_synthetic_shard(path: &Path, modules: usize, without_zero_point: &[&str]) {
+    struct Tensor {
+        name: String,
+        dtype: &'static str,
+        shape: Vec<u64>,
+        bytes: Vec<u8>,
+    }
+    let mut tensors = Vec::new();
+    for m in 0..modules {
+        let module = format!("m{m}");
+        tensors.push(Tensor {
+            name: format!("{module}.weight_packed"),
+            dtype: "I32",
+            shape: vec![8, 4],
+            bytes: vec![0x21u8; 8 * 4 * 4],
+        });
+        tensors.push(Tensor {
+            name: format!("{module}.weight_scale"),
+            dtype: "BF16",
+            shape: vec![8, 1],
+            bytes: (0..8)
+                .flat_map(|_| ((1.0f32.to_bits() >> 16) as u16).to_le_bytes())
+                .collect(),
+        });
+        let mut shape_bytes = 8i64.to_le_bytes().to_vec();
+        shape_bytes.extend_from_slice(&32i64.to_le_bytes());
+        tensors.push(Tensor {
+            name: format!("{module}.weight_shape"),
+            dtype: "I64",
+            shape: vec![2],
+            bytes: shape_bytes,
+        });
+        if !without_zero_point.contains(&module.as_str()) {
+            tensors.push(Tensor {
+                name: format!("{module}.weight_zero_point"),
+                dtype: "I32",
+                shape: vec![1, 1],
+                bytes: vec![0x33u8; 4],
+            });
+        }
+    }
+    // Safetensors requires the header's names in any order but the offsets to
+    // cover the payload exactly; lay them out in declaration order.
+    let mut json = String::from("{");
+    let mut at = 0u64;
+    let mut payload = Vec::new();
+    for (i, t) in tensors.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        let end = at + t.bytes.len() as u64;
+        json.push_str(&format!(
+            "\"{}\":{{\"dtype\":\"{}\",\"shape\":{:?},\"data_offsets\":[{at},{end}]}}",
+            t.name, t.dtype, t.shape
+        ));
+        payload.extend_from_slice(&t.bytes);
+        at = end;
+    }
+    json.push('}');
+    let mut out = (json.len() as u64).to_le_bytes().to_vec();
+    out.extend_from_slice(json.as_bytes());
+    out.extend_from_slice(&payload);
+    std::fs::write(path, out).expect("a synthetic shard");
 }
