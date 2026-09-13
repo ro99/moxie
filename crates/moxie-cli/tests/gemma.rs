@@ -1425,21 +1425,31 @@ fn the_second_synthetic_moe_consumer_generates_and_is_not_the_gemma_one() {
                 top_k,
                 experts,
                 per_expert_scale,
-                input_scale,
+                selection_bias,
+                input,
+                score,
                 ..
             } => {
                 assert_eq!(
                     top_k, experts,
                     "top_k == experts keeps the whole distribution"
                 );
-                assert!(!per_expert_scale);
-                assert_eq!(input_scale, 1.0);
+                // Opposite on every routing axis the two families differ on.
+                assert!(!per_expert_scale, "Gemma's per-expert scale, not this one");
+                assert!(selection_bias, "this one carries the bias Gemma does not");
+                assert_eq!(input, moxie_graph::RouterInput::Raw);
+                assert_eq!(score, moxie_graph::RouteScore::Sigmoid);
             }
             OpParams::ExpertMlp { activation, .. } => {
                 assert_eq!(activation, moxie_graph::ExpertActivation::SwiGlu);
             }
-            OpParams::Combine { order, .. } => {
+            OpParams::Combine {
+                order,
+                output_scale,
+                ..
+            } => {
                 assert_eq!(order, moxie_graph::CombineOrder::SelectionOrder);
+                assert_ne!(output_scale, 1.0, "a routed scaling factor Gemma has not");
             }
             _ => {}
         }

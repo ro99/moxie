@@ -58,11 +58,18 @@ writes**. **That is not model support and no quality claim follows.** **It does
 not close M2**, which also needs item 4 and byte/cost traces reconciled with the
 ledger across a whole working set.
 
-**[Task 0022](0022-m2-laguna-metadata-and-second-consumer.md) is proposed**,
-2026-09-13: M2 item 4's Laguna metadata and graph, a second routed consumer
+**[Task 0022](0022-m2-laguna-metadata-and-second-consumer.md) is implemented
+and awaiting independent review and owner acceptance**, 2026-09-13. It is M2
+item 4: Laguna's metadata and its **routed block**, a second routed consumer
 through task 0021's interface, and a restricted budget expressed as a ratio of
-working weights. Its contract is authored and committed before implementation,
-as tasks 0020 and 0021 did.
+working weights. Its contract was authored and committed at `78c493d` before
+implementation. A routed layer at Laguna's **declared expert width** —
+18,874,368 B per expert — executed on all three GPUs against a device cache of
+one eighth of what its route demands, agreeing with the CPU candidate on every
+component. **Those are weight-shaped bytes at a real artifact's declared shape,
+not its weights**: Laguna's are asymmetric INT4 at group 32 and no importer
+accepts them. **It does not close M2**, whose exit still needs byte/cost traces
+reconciled with the ledger across a whole working set.
 
 It records one narrowing in the contract rather than discovering it later.
 **Laguna's attention tower is not composable from today's operation

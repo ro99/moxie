@@ -35,7 +35,7 @@
 
 use moxie_graph::{
     CombineOrder, ExpertActivation, Graph, GraphBuilder, IndexEncoding, OpParams, OracleRegistry,
-    RopeLayout, TensorSpec, ValueId, ValueRole, Visibility,
+    RopeLayout, RouteScore, RouterInput, TensorSpec, ValueId, ValueRole, Visibility,
 };
 use moxie_model_api::{
     GraphRequirements, ModelDefinition, ModelMetadata, TensorRequirement, TensorRole,
@@ -927,11 +927,21 @@ fn route_layer(
             hidden: c.hidden,
             experts: moe.experts,
             top_k: moe.top_k,
-            eps: c.rms_eps,
-            input_scale: moe.router_input_scale,
+            // Gemma 4's router owns its input transform: a scale-free RMS
+            // normalization, the trained `router.scale` gain, then
+            // `hidden^(-1/2)`.
+            input: RouterInput::Normalized {
+                eps: c.rms_eps,
+                input_scale: moe.router_input_scale,
+            },
+            score: RouteScore::Softmax,
             per_expert_scale: true,
+            // No `e_score_correction_bias` in this family's index.
+            selection_bias: false,
         },
-        &[stream, router_scale, router_proj, per_expert],
+        // `[rows, projection, gain, per-expert scale]` -- the order
+        // `OpParams::route_operands` states.
+        &[stream, router_proj, router_scale, per_expert],
     )?;
 
     let ffn_norm_2 = weight(g, bound, "ffn_norm_2", Some(layer), vec![c.hidden])?;
@@ -973,6 +983,9 @@ fn route_layer(
             // `expert_hit`, which is expert-major, not over the row's selection
             // order.
             order: CombineOrder::AscendingExpertId,
+            // This family has no routed scaling factor: `Gemma4TextExperts`
+            // returns the accumulated buffer unscaled.
+            output_scale: 1.0,
         },
         &[route, slots],
     )?;

@@ -1919,11 +1919,12 @@ fn build_routed(
                 hidden,
                 experts,
                 top_k,
-                eps,
-                input_scale,
+                input: moxie_graph::RouterInput::Normalized { eps, input_scale },
+                score: moxie_graph::RouteScore::Softmax,
                 per_expert_scale: true,
+                selection_bias: false,
             },
-            &[attended, gain_id, proj_id, per_expert_id],
+            &[attended, proj_id, gain_id, per_expert_id],
         )
         .expect("route");
     let slots = g
@@ -1944,6 +1945,7 @@ fn build_routed(
                 hidden,
                 top_k,
                 order,
+                output_scale: 1.0,
             },
             &[route, slots],
         )

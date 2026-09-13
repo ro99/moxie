@@ -863,18 +863,38 @@ impl Interpreter {
                 hidden,
                 experts,
                 top_k,
-                eps,
-                input_scale,
+                input: router_input,
+                score,
                 per_expert_scale,
+                selection_bias,
             } => {
-                let x = input(0)?.as_float()?;
-                let gain = input(1)?.as_float()?;
-                let proj = input(2)?.as_float()?;
-                let scale = if per_expert_scale {
-                    Some(input(3)?.as_float()?)
-                } else {
-                    None
+                // Resolved from the operation's own operand list rather than
+                // from positions written out here. Two of the optional operands
+                // are `[experts]` floats, so a second enumeration that drifted
+                // by one would bind a selection bias where a coefficient scale
+                // belongs and every shape check would still pass.
+                let mut rows = None;
+                let mut gain = None;
+                let mut proj = None;
+                let mut scale = None;
+                let mut bias = None;
+                for (i, operand) in node.params.route_operands().iter().enumerate() {
+                    let slot = match operand {
+                        moxie_graph::RouteOperand::Rows => &mut rows,
+                        moxie_graph::RouteOperand::Projection => &mut proj,
+                        moxie_graph::RouteOperand::Gain => &mut gain,
+                        moxie_graph::RouteOperand::PerExpertScale => &mut scale,
+                        moxie_graph::RouteOperand::SelectionBias => &mut bias,
+                    };
+                    *slot = Some(input(i)?.as_float()?);
+                }
+                let (Some(x), Some(proj)) = (rows, proj) else {
+                    return Err(Error::InvalidArtifact {
+                        detail: "a router without rows or a projection".into(),
+                    });
                 };
+                debug_assert_eq!(per_expert_scale, scale.is_some());
+                debug_assert_eq!(selection_bias, bias.is_some());
                 // `hidden` is checked structurally when the node is built; the
                 // oracle reads the row's own width.
                 debug_assert_eq!(x.row(0).map(<[f32]>::len).unwrap_or(0), hidden as usize);
@@ -883,14 +903,15 @@ impl Interpreter {
                 for r in 0..x.rows() {
                     let route = route::router_route_row(
                         x.row(r)?,
-                        gain.data(),
+                        gain.map(|g| g.data()),
                         proj.data(),
                         scale.map(|s| s.data()),
+                        bias.map(|b| b.data()),
                         route::RouterSpec {
                             experts: experts as usize,
                             top_k: top_k as usize,
-                            eps,
-                            input_scale,
+                            input: router_input,
+                            score,
                         },
                     )?;
                     ids.extend(route.experts);
@@ -953,6 +974,7 @@ impl Interpreter {
                 hidden,
                 top_k,
                 order,
+                output_scale,
             } => {
                 let table = input(0)?.as_route()?;
                 let slots = input(1)?.as_float()?;
@@ -975,6 +997,7 @@ impl Interpreter {
                         &slots.data()[base..base + top_k as usize * width],
                         width,
                         order,
+                        output_scale,
                     )?);
                 }
                 let shape = try_shape2(table.rows(), width)?;

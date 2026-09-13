@@ -2,8 +2,17 @@
 
 ## Active handover
 
+[Task 0022 implemented; M2 item 5's remainder is next](2026-09-13-task0022-laguna-and-second-consumer.md)
+is the current continuation. M2 item 4 — Laguna's metadata and graph, a second
+synthetic MoE consumer, and a restricted budget smaller than its working weights
+— is implemented and awaits independent review and owner acceptance. The
+deliverable is Laguna's **routed block**: its attention tower is not composable
+from today's operation catalogue, `softplus` output gating and the yarn rotary
+ramp are both named gaps, and that narrowing was written into the contract
+before implementation rather than discovered during it.
+
 [Task 0021 implemented; task 0022 is M2 item 4](2026-09-12-task0021-expert-execution-plans.md)
-is the current continuation. M2 item 3 — CPU expert fallback and GPU grouped
+precedes it. M2 item 3 — CPU expert fallback and GPU grouped
 candidate plans under one interface, with bounded queues and NUMA-aware host
 placement — is implemented and awaits independent review and owner acceptance.
 **One layer's routed expert block of the designated artifact has now been

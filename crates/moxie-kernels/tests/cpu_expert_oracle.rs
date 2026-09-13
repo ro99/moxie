@@ -302,6 +302,7 @@ fn the_reduction_matches_the_oracle_in_whichever_order_it_is_given() {
             rows as u32,
             top_k as u32,
             hidden as u32,
+            1.0,
             &mut vec![0f32; hidden],
             &mut out,
         )
@@ -314,6 +315,7 @@ fn the_reduction_matches_the_oracle_in_whichever_order_it_is_given() {
                 &slot_values[r * top_k * hidden..(r + 1) * top_k * hidden],
                 hidden,
                 order,
+                1.0,
             )
             .expect("oracle");
             let want: Vec<u16> = want.iter().map(|v| to_bf16_bits(*v)).collect();

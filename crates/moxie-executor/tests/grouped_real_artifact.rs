@@ -94,6 +94,7 @@ fn combine() -> OpParams {
         hidden: HIDDEN,
         top_k: TOP_K,
         order: CombineOrder::AscendingExpertId,
+        output_scale: 1.0,
     }
 }
 

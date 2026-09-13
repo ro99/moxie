@@ -1013,11 +1013,15 @@ mod tests {
                     hidden,
                     experts: EXPERTS,
                     top_k: TOP_K,
-                    eps: 1e-6,
-                    input_scale: 1.0,
+                    input: moxie_graph::RouterInput::Normalized {
+                        eps: 1e-6,
+                        input_scale: 1.0,
+                    },
+                    score: moxie_graph::RouteScore::Softmax,
                     per_expert_scale: false,
+                    selection_bias: false,
                 },
-                &[x, gain, proj],
+                &[x, proj, gain],
             )
             .unwrap();
         let gate_up = builder
@@ -1058,6 +1062,7 @@ mod tests {
                     hidden,
                     top_k: TOP_K,
                     order: moxie_graph::CombineOrder::AscendingExpertId,
+                    output_scale: 1.0,
                 },
                 &[route, slots],
             )
@@ -1086,9 +1091,10 @@ mod tests {
                 hidden: 8,
                 experts: 2,
                 top_k: 1,
-                eps: 1e-6,
-                input_scale: 1.0,
+                input: moxie_graph::RouterInput::Raw,
+                score: moxie_graph::RouteScore::Sigmoid,
                 per_expert_scale: false,
+                selection_bias: false,
             }
             .partition_rule(),
             moxie_graph::PartitionRule::Replicated
@@ -1102,6 +1108,7 @@ mod tests {
                 activation: moxie_graph::ExpertActivation::GeGlu,
             },
             OpParams::Combine {
+                output_scale: 1.0,
                 hidden: 8,
                 top_k: 1,
                 order: moxie_graph::CombineOrder::AscendingExpertId,

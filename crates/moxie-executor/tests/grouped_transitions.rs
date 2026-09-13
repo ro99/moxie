@@ -35,16 +35,99 @@ use moxie_types::{DeviceUuid, Error, Result, Scope, StrategyControl};
 
 /// `3 * intermediate * hidden * 2` must be a whole cache alignment, so these
 /// are not arbitrary: 1,536 bytes per expert.
-const HIDDEN: u64 = 32;
-const INTERMEDIATE: u64 = 8;
-const EXPERTS: u64 = 6;
-const TOP_K: u64 = 2;
-const ROWS: u64 = 4;
-const CHUNK: u64 = 3 * INTERMEDIATE * HIDDEN * 2;
-/// Five distinct experts over four rows, so a queue of one and a queue of four
-/// behave differently.
-const ROUTE: [u32; 8] = [0, 1, 0, 2, 1, 3, 0, 4];
 const BUS: &str = "0000:82:00.0";
+
+/// Which family's routing shape a case is swept at.
+///
+/// Task 0022's second consumer goes **through** this sweep rather than beside
+/// it. The axes it changes are the ones this product already enumerates: a
+/// different top-k changes the slot arithmetic every group writes into, and a
+/// different expert count changes how often a restricted cache has to evict,
+/// which is what the queue's backpressure path exists for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Profile {
+    /// The shape task 0021 gated: five distinct experts over four rows of two.
+    GemmaLike,
+    /// Laguna's shape at fixture scale: **eight** distinct experts over four
+    /// rows of **three**, with a SwiGLU gate and a routed scaling factor.
+    LagunaLike,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Geometry {
+    hidden: u64,
+    intermediate: u64,
+    experts: u64,
+    top_k: u64,
+    rows: u64,
+    activation: ExpertActivation,
+    output_scale: f32,
+    route: &'static [u32],
+    /// A stable name for the shard this profile's weights are written to.
+    shard: &'static str,
+}
+
+impl Geometry {
+    /// `3 * intermediate * hidden * 2` must be a whole cache alignment, so
+    /// these are not arbitrary: 1,536 bytes per expert in both profiles.
+    const fn chunk(&self) -> u64 {
+        3 * self.intermediate * self.hidden * 2
+    }
+
+    /// How many groups a plan over this route has: one per **distinct** expert.
+    ///
+    /// Computed rather than written down, because it is the number the run's
+    /// completeness is judged against and the two profiles disagree about it --
+    /// five against eight.
+    fn groups(&self) -> usize {
+        let mut seen: Vec<u32> = self.route.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        seen.len()
+    }
+}
+
+impl Profile {
+    const ALL: [Profile; 2] = [Profile::GemmaLike, Profile::LagunaLike];
+
+    const fn geometry(self) -> Geometry {
+        match self {
+            Profile::GemmaLike => Geometry {
+                hidden: 32,
+                intermediate: 8,
+                experts: 6,
+                top_k: 2,
+                rows: 4,
+                activation: ExpertActivation::GeGlu,
+                output_scale: 1.0,
+                // Five distinct experts over four rows, so a queue of one and a
+                // queue of four behave differently.
+                route: &[0, 1, 0, 2, 1, 3, 0, 4],
+                shard: "gemma-like",
+            },
+            Profile::LagunaLike => Geometry {
+                hidden: 32,
+                intermediate: 8,
+                experts: 8,
+                top_k: 3,
+                rows: 4,
+                activation: ExpertActivation::SwiGlu,
+                output_scale: 2.5,
+                // Eight distinct experts over four rows of three: half again as
+                // many chunks to admit, into the same cache.
+                route: &[5, 1, 0, 7, 5, 2, 5, 3, 1, 6, 4, 5],
+                shard: "laguna-like",
+            },
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Profile::GemmaLike => "gemma-like",
+            Profile::LagunaLike => "laguna-like",
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -70,19 +153,20 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-fn write_shard(dir: &Path) -> PathBuf {
-    let gate_up = bytes(0xa1, (EXPERTS * 2 * INTERMEDIATE * HIDDEN) as usize);
-    let down = bytes(0xb2, (EXPERTS * HIDDEN * INTERMEDIATE) as usize);
+fn write_shard(dir: &Path, g: Geometry) -> PathBuf {
+    let (experts, hidden, intermediate) = (g.experts, g.hidden, g.intermediate);
+    let gate_up = bytes(0xa1, (experts * 2 * intermediate * hidden) as usize);
+    let down = bytes(0xb2, (experts * hidden * intermediate) as usize);
     let split = gate_up.len();
     let end = split + down.len();
     let header = format!(
-        "{{\"experts.gate_up_proj\":{{\"dtype\":\"BF16\",\"shape\":[{EXPERTS},{},{HIDDEN}],\
+        "{{\"experts.gate_up_proj\":{{\"dtype\":\"BF16\",\"shape\":[{experts},{},{hidden}],\
          \"data_offsets\":[0,{split}]}},\
-         \"experts.down_proj\":{{\"dtype\":\"BF16\",\"shape\":[{EXPERTS},{HIDDEN},{INTERMEDIATE}],\
+         \"experts.down_proj\":{{\"dtype\":\"BF16\",\"shape\":[{experts},{hidden},{intermediate}],\
          \"data_offsets\":[{split},{end}]}}}}",
-        2 * INTERMEDIATE
+        2 * intermediate
     );
-    let path = dir.join("model.safetensors");
+    let path = dir.join(format!("{}.safetensors", g.shard));
     let mut f = std::fs::File::create(&path).unwrap();
     f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
     f.write_all(header.as_bytes()).unwrap();
@@ -95,17 +179,20 @@ fn uuid() -> DeviceUuid {
     DeviceUuid::parse("GPU-3032cfa3-19df-028f-5ebd-43314911e0b9").unwrap()
 }
 
-fn roles() -> ExpertRoles {
+fn roles(g: Geometry) -> ExpertRoles {
     ExpertRoles {
-        artifact: ArtifactId::new("transitions-fixture-v1").unwrap(),
+        // A distinct artifact per profile: two profiles sharing one identity
+        // would let one profile's chunk satisfy the other's demand, which is a
+        // residency answer no route asked for.
+        artifact: ArtifactId::new(format!("transitions-fixture-v1-{}", g.shard)).unwrap(),
         gate_up_role: "experts_gate_up".into(),
         down_role: "experts_down".into(),
         format_version: 1,
     }
 }
 
-fn shard_source(path: &Path) -> ShardSource {
-    ShardSource::new(roles().artifact, vec![Shard::open(path).unwrap()])
+fn shard_source(path: &Path, g: Geometry) -> ShardSource {
+    ShardSource::new(roles(g).artifact, vec![Shard::open(path).unwrap()])
         .role("experts_gate_up", 0, "experts.gate_up_proj")
         .unwrap()
         .role("experts_down", 0, "experts.down_proj")
@@ -268,6 +355,7 @@ enum Cancel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Case {
+    profile: Profile,
     candidate: Candidate,
     failure: Failure,
     cancel: Cancel,
@@ -277,13 +365,15 @@ struct Case {
 }
 
 fn plan_for(case: Case) -> ExpertPlan {
+    let g = case.profile.geometry();
     let catalogue =
         moxie_types::KernelCatalogue::new(vec![moxie_types::SemanticKernelDescriptor {
             id: moxie_types::KernelId("transitions-expert".into()),
             abi_version: moxie_plan::expert::EXPERT_ABI_VERSION,
-            operation: moxie_types::SemanticKernelOp::ExpertMlp(
-                moxie_types::GateTransform::GeluTanh,
-            ),
+            operation: moxie_types::SemanticKernelOp::ExpertMlp(match g.activation {
+                ExpertActivation::GeGlu => moxie_types::GateTransform::GeluTanh,
+                ExpertActivation::SwiGlu => moxie_types::GateTransform::Silu,
+            }),
             inputs: vec![
                 moxie_types::KernelOperand::Activation(moxie_types::ActivationPrecision::expect(
                     moxie_types::Precision::Bf16,
@@ -329,7 +419,7 @@ fn plan_for(case: Case) -> ExpertPlan {
     let budget = ExpertBudget {
         device: uuid(),
         device_pci_bus_id: BUS.into(),
-        device_cache_cap_bytes: if on_device { 64 * CHUNK } else { 0 },
+        device_cache_cap_bytes: if on_device { 64 * g.chunk() } else { 0 },
         device_cache_leased_bytes: 0,
         device_arena_free_bytes: if on_device { 1 << 20 } else { 0 },
         host_workspace_bytes: 1 << 20,
@@ -349,18 +439,19 @@ fn plan_for(case: Case) -> ExpertPlan {
     };
     compile_experts(
         &OpParams::ExpertMlp {
-            hidden: HIDDEN,
-            intermediate: INTERMEDIATE,
-            experts: EXPERTS,
-            top_k: TOP_K,
-            activation: ExpertActivation::GeGlu,
+            hidden: g.hidden,
+            intermediate: g.intermediate,
+            experts: g.experts,
+            top_k: g.top_k,
+            activation: g.activation,
         },
         &OpParams::Combine {
-            hidden: HIDDEN,
-            top_k: TOP_K,
+            hidden: g.hidden,
+            top_k: g.top_k,
             order: CombineOrder::AscendingExpertId,
+            output_scale: g.output_scale,
         },
-        &ROUTE,
+        g.route,
         &budget,
         &policy,
         None,
@@ -400,9 +491,6 @@ fn agree(
 #[test]
 fn the_run_lifecycle_product_holds_its_invariants_after_every_operation() {
     let dir = scratch("sweep");
-    let path = write_shard(&dir);
-    let x = bytes(0xc3, (ROWS * HIDDEN) as usize);
-    let coefficients = vec![1.0f32; (ROWS * TOP_K) as usize];
 
     let mut cases = 0usize;
     let mut completed = 0usize;
@@ -415,381 +503,405 @@ fn the_run_lifecycle_product_holds_its_invariants_after_every_operation() {
     let mut reached: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
 
-    for candidate in [Candidate::Host, Candidate::Device] {
-        for failure in Failure::ALL {
-            for cancel in [Cancel::Never, Cancel::BeforeStart, Cancel::AfterFirstStep] {
-                for close_early in [true, false] {
-                    for queue_capacity in [1u32, 4] {
-                        let case = Case {
-                            candidate,
-                            failure,
-                            cancel,
-                            close_early,
-                            queue_capacity,
-                        };
-                        if failure.needs_lane() && candidate != Candidate::Device {
-                            continue;
-                        }
-                        cases += 1;
-
-                        let plan = plan_for(case);
-                        assert!(plan.uses(candidate));
-                        let host_cap = 1u64 << 25;
-                        let mut ledger = Ledger::new([
-                            CapacitySnapshot::new(Scope::Host, host_cap, 1 << 14).unwrap(),
-                            CapacitySnapshot::new(Scope::Device(uuid()), 1 << 25, 1 << 14).unwrap(),
-                        ])
-                        .unwrap();
-                        // A cache of two experts when the case wants a capacity
-                        // refusal, and room for all five otherwise.
-                        // Capacity has two outcomes and the sweep needs both: a
-                        // cache that holds one expert drains and recovers, and
-                        // one that holds none fails with an empty queue. The
-                        // second is the only shape in which a capacity refusal
-                        // is fatal.
-                        let cache = match (failure, case.queue_capacity) {
-                            (Failure::AcquireCapacity, 1) => CHUNK - 256,
-                            (Failure::AcquireCapacity, _) => CHUNK,
-                            _ => 64 * CHUNK,
-                        };
-                        // Small bounds: the control envelope is charged up
-                        // front, and 4,096 placements would dominate a sweep
-                        // whose plans hold five experts.
-                        let mut request = ResidencyRequest::new("sweep", cache)
-                            .max_placements(64)
-                            .max_leases(64)
-                            .prefetch_queue_capacity(8);
-                        if candidate == Candidate::Device {
-                            request = request.device(uuid(), cache);
-                        }
-                        let mut authority =
-                            ResidencyAuthority::open(&mut ledger, &request).unwrap();
-                        let mut src = Fallible {
-                            inner: shard_source(&path),
-                            seen: std::collections::BTreeSet::new(),
-                            fail_at: (failure == Failure::AcquireRead).then_some(3),
-                        };
-
-                        // A chunk left mid-read, for the readiness case.
-                        let held = if failure == Failure::Readiness {
-                            let (gate_up, _) = roles().chunks(0, plan.shape()).unwrap();
-                            let destination = match candidate {
-                                Candidate::Host => Scope::Host,
-                                Candidate::Device => Scope::Device(uuid()),
+    let mut per_profile: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for profile in Profile::ALL {
+        let g = profile.geometry();
+        let path = write_shard(&dir, g);
+        let x = bytes(0xc3, (g.rows * g.hidden) as usize);
+        let coefficients = vec![1.0f32; (g.rows * g.top_k) as usize];
+        for candidate in [Candidate::Host, Candidate::Device] {
+            for failure in Failure::ALL {
+                for cancel in [Cancel::Never, Cancel::BeforeStart, Cancel::AfterFirstStep] {
+                    for close_early in [true, false] {
+                        for queue_capacity in [1u32, 4] {
+                            let case = Case {
+                                profile,
+                                candidate,
+                                failure,
+                                cancel,
+                                close_early,
+                                queue_capacity,
                             };
-                            match authority
-                                .acquire(AcquireRequest {
-                                    chunk: &gate_up,
-                                    destination,
-                                    now: 0,
-                                    deadline: u64::MAX,
-                                    class: UseClass::demand(Content::Expert),
-                                    turn: TurnId::new(9),
-                                })
-                                .unwrap()
-                            {
-                                Acquired::Pending { lease, work, .. } => Some((lease, work)),
-                                Acquired::Ready(lease) => {
-                                    Some((lease, moxie_memory::PendingWork::Coalesced))
-                                }
+                            if failure.needs_lane() && candidate != Candidate::Device {
+                                continue;
                             }
-                        } else {
-                            None
-                        };
+                            cases += 1;
+                            *per_profile.entry(profile.name()).or_default() += 1;
 
-                        let baseline = authority.live_lease_count();
-                        let mut run = GroupedRun::admit(&mut ledger, plan, roles(), None).unwrap();
-                        if candidate == Candidate::Device {
-                            run.install_lane(Box::new(Lane {
-                                fail_load: match failure {
-                                    Failure::LoadPlain => Some(false),
-                                    Failure::LoadUnknown => Some(true),
-                                    _ => None,
-                                },
-                                fail_launch: match failure {
-                                    Failure::LaunchPlain => Some(false),
-                                    Failure::LaunchUnknown => Some(true),
-                                    _ => None,
-                                },
-                                quarantined: false,
-                            }))
+                            let plan = plan_for(case);
+                            assert!(plan.uses(candidate));
+                            let host_cap = 1u64 << 25;
+                            let mut ledger = Ledger::new([
+                                CapacitySnapshot::new(Scope::Host, host_cap, 1 << 14).unwrap(),
+                                CapacitySnapshot::new(Scope::Device(uuid()), 1 << 25, 1 << 14)
+                                    .unwrap(),
+                            ])
                             .unwrap();
-                        }
+                            // A cache of two experts when the case wants a capacity
+                            // refusal, and room for all five otherwise.
+                            // Capacity has two outcomes and the sweep needs both: a
+                            // cache that holds one expert drains and recovers, and
+                            // one that holds none fails with an empty queue. The
+                            // second is the only shape in which a capacity refusal
+                            // is fatal.
+                            let cache = match (failure, case.queue_capacity) {
+                                (Failure::AcquireCapacity, 1) => g.chunk() - 256,
+                                (Failure::AcquireCapacity, _) => g.chunk(),
+                                _ => 64 * g.chunk(),
+                            };
+                            // Small bounds: the control envelope is charged up
+                            // front, and 4,096 placements would dominate a sweep
+                            // whose plans hold five or eight experts.
+                            let mut request = ResidencyRequest::new("sweep", cache)
+                                .max_placements(64)
+                                .max_leases(64)
+                                .prefetch_queue_capacity(8);
+                            if candidate == Candidate::Device {
+                                request = request.device(uuid(), cache);
+                            }
+                            let mut authority =
+                                ResidencyAuthority::open(&mut ledger, &request).unwrap();
+                            let mut src = Fallible {
+                                inner: shard_source(&path, g),
+                                seen: std::collections::BTreeSet::new(),
+                                fail_at: (failure == Failure::AcquireRead).then_some(3),
+                            };
 
-                        agree(&run, &authority, baseline, "admit", case);
-                        // Before anything is loaded, there is nothing to run:
-                        // a step here would compute over an unwritten buffer.
-                        assert!(
-                            run.step(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
-                                .is_err(),
-                            "{case:?}: stepped before any activations were loaded"
-                        );
-                        agree(&run, &authority, baseline, "step-before-load", case);
-                        if cancel == Cancel::BeforeStart {
-                            run.cancel(&mut authority);
-                            reached
-                                .entry("cancel-before-start")
-                                .and_modify(|n| *n += 1)
-                                .or_insert(1);
-                        }
-                        agree(&run, &authority, baseline, "cancel-before-start", case);
+                            // A chunk left mid-read, for the readiness case.
+                            let held = if failure == Failure::Readiness {
+                                let (gate_up, _) = roles(g).chunks(0, plan.shape()).unwrap();
+                                let destination = match candidate {
+                                    Candidate::Host => Scope::Host,
+                                    Candidate::Device => Scope::Device(uuid()),
+                                };
+                                match authority
+                                    .acquire(AcquireRequest {
+                                        chunk: &gate_up,
+                                        destination,
+                                        now: 0,
+                                        deadline: u64::MAX,
+                                        class: UseClass::demand(Content::Expert),
+                                        turn: TurnId::new(9),
+                                    })
+                                    .unwrap()
+                                {
+                                    Acquired::Pending { lease, work, .. } => Some((lease, work)),
+                                    Acquired::Ready(lease) => {
+                                        Some((lease, moxie_memory::PendingWork::Coalesced))
+                                    }
+                                }
+                            } else {
+                                None
+                            };
 
-                        let loaded = run.load_activations(&x);
-                        agree(&run, &authority, baseline, "load", case);
-                        match (&loaded, failure) {
-                            (Err(_), Failure::LoadPlain | Failure::LoadUnknown) => {
+                            let baseline = authority.live_lease_count();
+                            let mut run =
+                                GroupedRun::admit(&mut ledger, plan, roles(g), None).unwrap();
+                            if candidate == Candidate::Device {
+                                run.install_lane(Box::new(Lane {
+                                    fail_load: match failure {
+                                        Failure::LoadPlain => Some(false),
+                                        Failure::LoadUnknown => Some(true),
+                                        _ => None,
+                                    },
+                                    fail_launch: match failure {
+                                        Failure::LaunchPlain => Some(false),
+                                        Failure::LaunchUnknown => Some(true),
+                                        _ => None,
+                                    },
+                                    quarantined: false,
+                                }))
+                                .unwrap();
+                            }
+
+                            agree(&run, &authority, baseline, "admit", case);
+                            // Before anything is loaded, there is nothing to run:
+                            // a step here would compute over an unwritten buffer.
+                            assert!(
+                                run.step(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
+                                    .is_err(),
+                                "{case:?}: stepped before any activations were loaded"
+                            );
+                            agree(&run, &authority, baseline, "step-before-load", case);
+                            if cancel == Cancel::BeforeStart {
+                                run.cancel(&mut authority);
                                 reached
-                                    .entry(failure.name())
+                                    .entry("cancel-before-start")
                                     .and_modify(|n| *n += 1)
                                     .or_insert(1);
                             }
-                            (Err(_), _) if cancel == Cancel::BeforeStart => {}
-                            (Ok(()), Failure::LoadPlain | Failure::LoadUnknown) => {
-                                panic!("{case:?}: the injected load failure never happened")
-                            }
-                            _ => {}
-                        }
+                            agree(&run, &authority, baseline, "cancel-before-start", case);
 
-                        let mut steps = 0usize;
-                        if loaded.is_ok() {
-                            loop {
-                                let progress =
-                                    run.step(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX);
-                                agree(&run, &authority, baseline, "step", case);
-                                match progress {
-                                    Ok(Progress::Done) => break,
-                                    Ok(Progress::Ran { .. }) => {
-                                        steps += 1;
-                                        if steps == 1 {
-                                            // Mid-run, with groups left: a
-                                            // reduction would be over slots
-                                            // nobody has written, and a reload
-                                            // would leave one row's slots
-                                            // computed from two inputs. Both
-                                            // must refuse, and neither is
-                                            // reachable once the run has failed
-                                            // or been cancelled -- which is why
-                                            // it is checked **here**.
-                                            assert!(
-                                                run.reduce(&coefficients).is_err(),
-                                                "{case:?}: reduced with groups left"
-                                            );
-                                            assert!(
-                                                run.load_activations(&x).is_err(),
-                                                "{case:?}: took new activations mid-run"
-                                            );
-                                            agree(&run, &authority, baseline, "mid-run", case);
-                                            reached
-                                                .entry("mid-run-refusals")
-                                                .and_modify(|n| *n += 1)
-                                                .or_insert(1);
+                            let loaded = run.load_activations(&x);
+                            agree(&run, &authority, baseline, "load", case);
+                            match (&loaded, failure) {
+                                (Err(_), Failure::LoadPlain | Failure::LoadUnknown) => {
+                                    reached
+                                        .entry(failure.name())
+                                        .and_modify(|n| *n += 1)
+                                        .or_insert(1);
+                                }
+                                (Err(_), _) if cancel == Cancel::BeforeStart => {}
+                                (Ok(()), Failure::LoadPlain | Failure::LoadUnknown) => {
+                                    panic!("{case:?}: the injected load failure never happened")
+                                }
+                                _ => {}
+                            }
+
+                            let mut steps = 0usize;
+                            if loaded.is_ok() {
+                                loop {
+                                    let progress = run.step(
+                                        &mut authority,
+                                        &mut src,
+                                        TurnId::new(1),
+                                        0,
+                                        u64::MAX,
+                                    );
+                                    agree(&run, &authority, baseline, "step", case);
+                                    match progress {
+                                        Ok(Progress::Done) => break,
+                                        Ok(Progress::Ran { .. }) => {
+                                            steps += 1;
+                                            if steps == 1 {
+                                                // Mid-run, with groups left: a
+                                                // reduction would be over slots
+                                                // nobody has written, and a reload
+                                                // would leave one row's slots
+                                                // computed from two inputs. Both
+                                                // must refuse, and neither is
+                                                // reachable once the run has failed
+                                                // or been cancelled -- which is why
+                                                // it is checked **here**.
+                                                assert!(
+                                                    run.reduce(&coefficients).is_err(),
+                                                    "{case:?}: reduced with groups left"
+                                                );
+                                                assert!(
+                                                    run.load_activations(&x).is_err(),
+                                                    "{case:?}: took new activations mid-run"
+                                                );
+                                                agree(&run, &authority, baseline, "mid-run", case);
+                                                reached
+                                                    .entry("mid-run-refusals")
+                                                    .and_modify(|n| *n += 1)
+                                                    .or_insert(1);
+                                            }
+                                            if cancel == Cancel::AfterFirstStep && steps == 1 {
+                                                run.cancel(&mut authority);
+                                                agree(
+                                                    &run,
+                                                    &authority,
+                                                    baseline,
+                                                    "cancel-mid",
+                                                    case,
+                                                );
+                                                reached
+                                                    .entry("cancel-after-step")
+                                                    .and_modify(|n| *n += 1)
+                                                    .or_insert(1);
+                                                break;
+                                            }
                                         }
-                                        if cancel == Cancel::AfterFirstStep && steps == 1 {
-                                            run.cancel(&mut authority);
-                                            agree(&run, &authority, baseline, "cancel-mid", case);
+                                        Err(_) => {
                                             reached
-                                                .entry("cancel-after-step")
+                                                .entry(failure.name())
                                                 .and_modify(|n| *n += 1)
                                                 .or_insert(1);
                                             break;
                                         }
                                     }
-                                    Err(_) => {
-                                        reached
-                                            .entry(failure.name())
-                                            .and_modify(|n| *n += 1)
-                                            .or_insert(1);
-                                        break;
+                                }
+                            }
+                            if run.stats().backpressure_drains > 0 {
+                                drained += 1;
+                                reached
+                                    .entry("acquire-capacity-drained")
+                                    .and_modify(|n| *n += 1)
+                                    .or_insert(1);
+                            }
+
+                            if !close_early {
+                                // Reducing is legal only from a complete, unfailed,
+                                // uncancelled run; every other case must refuse.
+                                let complete = run.failure().is_none()
+                                    && !run.is_cancelled()
+                                    && run.enqueued() == g.groups()
+                                    && run.queue().is_empty();
+                                let reduced = run.reduce(&coefficients).is_ok();
+                                agree(&run, &authority, baseline, "reduce", case);
+                                assert_eq!(
+                                    reduced, complete,
+                                    "{case:?}: reduce disagreed with the run's own state"
+                                );
+                            }
+
+                            // Each axis value must produce the outcome it names.
+                            // Counting that a failure "was reached" is not the same
+                            // as checking it did what it is for, and three mutants
+                            // survived on exactly that difference.
+                            // A cancellation can pre-empt the injected failure, so
+                            // the axis is only checked where it is the only thing
+                            // that can have happened.
+                            if cancel == Cancel::Never {
+                                match failure {
+                                    Failure::AcquireRead => {
+                                        assert!(
+                                            run.failure().is_some(),
+                                            "{case:?}: a corrupt read did not fail the run"
+                                        );
+                                        assert_eq!(
+                                            run.stats().backpressure_drains,
+                                            0,
+                                            "{case:?}: a corrupt read was counted as backpressure"
+                                        );
                                     }
-                                }
-                            }
-                        }
-                        if run.stats().backpressure_drains > 0 {
-                            drained += 1;
-                            reached
-                                .entry("acquire-capacity-drained")
-                                .and_modify(|n| *n += 1)
-                                .or_insert(1);
-                        }
-
-                        if !close_early {
-                            // Reducing is legal only from a complete, unfailed,
-                            // uncancelled run; every other case must refuse.
-                            let complete = run.failure().is_none()
-                                && !run.is_cancelled()
-                                && run.enqueued() == 5
-                                && run.queue().is_empty();
-                            let reduced = run.reduce(&coefficients).is_ok();
-                            agree(&run, &authority, baseline, "reduce", case);
-                            assert_eq!(
-                                reduced, complete,
-                                "{case:?}: reduce disagreed with the run's own state"
-                            );
-                        }
-
-                        // Each axis value must produce the outcome it names.
-                        // Counting that a failure "was reached" is not the same
-                        // as checking it did what it is for, and three mutants
-                        // survived on exactly that difference.
-                        // A cancellation can pre-empt the injected failure, so
-                        // the axis is only checked where it is the only thing
-                        // that can have happened.
-                        if cancel == Cancel::Never {
-                            match failure {
-                                Failure::AcquireRead => {
-                                    assert!(
-                                        run.failure().is_some(),
-                                        "{case:?}: a corrupt read did not fail the run"
-                                    );
-                                    assert_eq!(
-                                        run.stats().backpressure_drains,
-                                        0,
-                                        "{case:?}: a corrupt read was counted as backpressure"
-                                    );
-                                }
-                                Failure::Readiness => {
-                                    assert!(
-                                        run.failure().is_some(),
-                                        "{case:?}: an unreadable chunk did not fail the run"
-                                    );
-                                }
-                                Failure::LoadUnknown | Failure::LaunchUnknown => {
-                                    assert!(
-                                        run.is_withholding(),
-                                        "{case:?}: an unknown submission withheld nothing"
-                                    );
-                                    // And the **host buffers** specifically: the
-                                    // copy's source is one of them, and the lane
-                                    // quarantining its own device ranges says
-                                    // nothing about the pages being read from.
-                                    assert!(
-                                        run.buffers().is_quarantined(),
-                                        "{case:?}: the source of an unconfirmed copy was not \
+                                    Failure::Readiness => {
+                                        assert!(
+                                            run.failure().is_some(),
+                                            "{case:?}: an unreadable chunk did not fail the run"
+                                        );
+                                    }
+                                    Failure::LoadUnknown | Failure::LaunchUnknown => {
+                                        assert!(
+                                            run.is_withholding(),
+                                            "{case:?}: an unknown submission withheld nothing"
+                                        );
+                                        // And the **host buffers** specifically: the
+                                        // copy's source is one of them, and the lane
+                                        // quarantining its own device ranges says
+                                        // nothing about the pages being read from.
+                                        assert!(
+                                            run.buffers().is_quarantined(),
+                                            "{case:?}: the source of an unconfirmed copy was not \
                                          quarantined"
-                                    );
+                                        );
+                                    }
+                                    Failure::LoadPlain | Failure::LaunchPlain => {
+                                        assert!(
+                                            !run.is_withholding(),
+                                            "{case:?}: a known submission failure withheld something"
+                                        );
+                                        assert!(run.failure().is_some());
+                                    }
+                                    Failure::None | Failure::AcquireCapacity => {}
                                 }
-                                Failure::LoadPlain | Failure::LaunchPlain => {
-                                    assert!(
-                                        !run.is_withholding(),
-                                        "{case:?}: a known submission failure withheld something"
-                                    );
-                                    assert!(run.failure().is_some());
-                                }
-                                Failure::None | Failure::AcquireCapacity => {}
                             }
-                        }
-                        match run.state_name() {
-                            "failed" => failed += 1,
-                            "cancelled" => cancelled += 1,
-                            _ => {}
-                        }
-                        if run.failure().is_none() && !run.is_cancelled() && steps == 5 {
-                            completed += 1;
-                        }
-                        if run.is_withholding() {
-                            withheld_runs += 1;
-                            reached
-                                .entry("withheld")
-                                .and_modify(|n| *n += 1)
-                                .or_insert(1);
-                        }
-                        if run.withheld_leases() > 0 {
-                            reached
-                                .entry("withheld-leases")
-                                .and_modify(|n| *n += 1)
-                                .or_insert(1);
-                        }
-                        if run.buffers().is_quarantined() {
-                            reached
-                                .entry("quarantined-buffers")
-                                .and_modify(|n| *n += 1)
-                                .or_insert(1);
-                        }
-
-                        // Closing **with work still queued** is its own
-                        // transition and it used to be unreachable here: both
-                        // branches drained first, so removing the guard changed
-                        // nothing and all 144 combinations still passed. It is
-                        // exercised now, and the refusal has to leave everything
-                        // exactly where it was.
-                        let mut run = run;
-                        if !run.queue().is_empty() {
-                            let queued = run.queue().len();
-                            let held = authority.live_lease_count();
-                            let charged = ledger.scope_committed(Scope::Host);
-                            let refused = run
-                                .close(&mut ledger)
-                                .expect_err("a run still holding leases may not close");
-                            assert!(
-                                format!("{refused}").contains("still hold residency leases"),
-                                "{case:?}: {refused}"
-                            );
-                            run = refused.run;
-                            assert_eq!(
-                                run.queue().len(),
-                                queued,
-                                "{case:?}: a refused close changed the queue"
-                            );
-                            assert_eq!(
-                                authority.live_lease_count(),
-                                held,
-                                "{case:?}: a refused close moved a lease"
-                            );
-                            assert_eq!(
-                                ledger.scope_committed(Scope::Host),
-                                charged,
-                                "{case:?}: a refused close moved the charge"
-                            );
-                            agree(&run, &authority, baseline, "close-with-queued-work", case);
-                            reached
-                                .entry("close-with-queued-work")
-                                .and_modify(|n| *n += 1)
-                                .or_insert(1);
-
-                            // Then drain and let the real close proceed, which
-                            // is what a caller must do.
-                            run.cancel(&mut authority);
-                            agree(&run, &authority, baseline, "cancel-drain", case);
-                        }
-                        agree(&run, &authority, baseline, "before close", case);
-                        let withholding = run.is_withholding();
-                        let host_before = ledger.scope_committed(Scope::Host);
-                        match run.close(&mut ledger) {
-                            Ok(()) => {
-                                closed += 1;
-                                assert!(
-                                    !withholding,
-                                    "{case:?}: a withholding run released its envelope"
-                                );
-                                assert!(ledger.scope_committed(Scope::Host) < host_before);
+                            match run.state_name() {
+                                "failed" => failed += 1,
+                                "cancelled" => cancelled += 1,
+                                _ => {}
                             }
-                            Err(refused) => {
-                                close_refused += 1;
+                            if run.failure().is_none() && !run.is_cancelled() && steps == g.groups()
+                            {
+                                completed += 1;
+                            }
+                            if run.is_withholding() {
+                                withheld_runs += 1;
+                                reached
+                                    .entry("withheld")
+                                    .and_modify(|n| *n += 1)
+                                    .or_insert(1);
+                            }
+                            if run.withheld_leases() > 0 {
+                                reached
+                                    .entry("withheld-leases")
+                                    .and_modify(|n| *n += 1)
+                                    .or_insert(1);
+                            }
+                            if run.buffers().is_quarantined() {
+                                reached
+                                    .entry("quarantined-buffers")
+                                    .and_modify(|n| *n += 1)
+                                    .or_insert(1);
+                            }
+
+                            // Closing **with work still queued** is its own
+                            // transition and it used to be unreachable here: both
+                            // branches drained first, so removing the guard changed
+                            // nothing and all 144 combinations still passed. It is
+                            // exercised now, and the refusal has to leave everything
+                            // exactly where it was.
+                            let mut run = run;
+                            if !run.queue().is_empty() {
+                                let queued = run.queue().len();
+                                let held = authority.live_lease_count();
+                                let charged = ledger.scope_committed(Scope::Host);
+                                let refused = run
+                                    .close(&mut ledger)
+                                    .expect_err("a run still holding leases may not close");
                                 assert!(
-                                    withholding,
-                                    "{case:?}: close refused without withholding: {refused}"
+                                    format!("{refused}").contains("still hold residency leases"),
+                                    "{case:?}: {refused}"
                                 );
-                                // The charge stays with the memory.
-                                drop(refused);
+                                run = refused.run;
+                                assert_eq!(
+                                    run.queue().len(),
+                                    queued,
+                                    "{case:?}: a refused close changed the queue"
+                                );
+                                assert_eq!(
+                                    authority.live_lease_count(),
+                                    held,
+                                    "{case:?}: a refused close moved a lease"
+                                );
                                 assert_eq!(
                                     ledger.scope_committed(Scope::Host),
-                                    host_before,
+                                    charged,
                                     "{case:?}: a refused close moved the charge"
                                 );
-                            }
-                        }
+                                agree(&run, &authority, baseline, "close-with-queued-work", case);
+                                reached
+                                    .entry("close-with-queued-work")
+                                    .and_modify(|n| *n += 1)
+                                    .or_insert(1);
 
-                        if let Some((lease, work)) = held {
-                            let _ = moxie_executor::residency::drain_reads(
-                                &mut authority,
-                                &mut src,
-                                work,
-                            );
-                            let _ = authority.release(lease);
+                                // Then drain and let the real close proceed, which
+                                // is what a caller must do.
+                                run.cancel(&mut authority);
+                                agree(&run, &authority, baseline, "cancel-drain", case);
+                            }
+                            agree(&run, &authority, baseline, "before close", case);
+                            let withholding = run.is_withholding();
+                            let host_before = ledger.scope_committed(Scope::Host);
+                            match run.close(&mut ledger) {
+                                Ok(()) => {
+                                    closed += 1;
+                                    assert!(
+                                        !withholding,
+                                        "{case:?}: a withholding run released its envelope"
+                                    );
+                                    assert!(ledger.scope_committed(Scope::Host) < host_before);
+                                }
+                                Err(refused) => {
+                                    close_refused += 1;
+                                    assert!(
+                                        withholding,
+                                        "{case:?}: close refused without withholding: {refused}"
+                                    );
+                                    // The charge stays with the memory.
+                                    drop(refused);
+                                    assert_eq!(
+                                        ledger.scope_committed(Scope::Host),
+                                        host_before,
+                                        "{case:?}: a refused close moved the charge"
+                                    );
+                                }
+                            }
+
+                            if let Some((lease, work)) = held {
+                                let _ = moxie_executor::residency::drain_reads(
+                                    &mut authority,
+                                    &mut src,
+                                    work,
+                                );
+                                let _ = authority.release(lease);
+                            }
+                            authority.end_turn(TurnId::new(1));
+                            authority.end_turn(TurnId::new(9));
+                            let _ = authority.close(&mut ledger);
                         }
-                        authority.end_turn(TurnId::new(1));
-                        authority.end_turn(TurnId::new(9));
-                        let _ = authority.close(&mut ledger);
                     }
                 }
             }
@@ -801,6 +913,9 @@ fn the_run_lifecycle_product_holds_its_invariants_after_every_operation() {
          {cancelled} cancelled; {closed} closed, {close_refused} close(s) refused; \
          {withheld_runs} withholding, {drained} with backpressure"
     );
+    for (profile, count) in &per_profile {
+        println!("  profile {profile}: {count}");
+    }
     let mut names: Vec<_> = reached.iter().collect();
     names.sort();
     for (what, count) in &names {
@@ -809,7 +924,12 @@ fn the_run_lifecycle_product_holds_its_invariants_after_every_operation() {
 
     // Every axis value is exercised, and the counts above are the evidence
     // rather than this sentence.
-    assert_eq!(cases, 2 * 4 * 3 * 2 * 2 + 4 * 3 * 2 * 2);
+    assert_eq!(cases, 2 * (2 * 4 * 3 * 2 * 2 + 4 * 3 * 2 * 2));
+    assert_eq!(per_profile.len(), 2, "a profile was never swept");
+    assert!(
+        per_profile.values().all(|c| *c == cases / 2),
+        "the profiles did not sweep the same product: {per_profile:?}"
+    );
     for required in [
         "acquire-capacity",
         "acquire-capacity-drained",

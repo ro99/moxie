@@ -157,6 +157,12 @@ fn roles() -> ExpertRoles {
     }
 }
 
+/// The same source, opened again: a run consumes its reader, and this test
+/// opens one per device.
+fn source_at(path: &Path) -> ShardSource {
+    source(path)
+}
+
 fn source(path: &Path) -> ShardSource {
     ShardSource::new(artifact(), vec![Shard::open(path).unwrap()])
         .role("experts_gate_up", 0, "experts.gate_up_proj")
@@ -180,6 +186,7 @@ fn combine() -> OpParams {
         hidden: HIDDEN,
         top_k: TOP_K,
         order: CombineOrder::AscendingExpertId,
+        output_scale: 1.0,
     }
 }
 
@@ -225,6 +232,7 @@ fn oracle_rows(w: &Weights, activation: ExpertActivation) -> Vec<u16> {
             &values,
             HIDDEN as usize,
             CombineOrder::AscendingExpertId,
+            1.0,
         )
         .unwrap();
         out.extend(row.iter().map(|v| to_bf16_bits(*v)));
@@ -782,4 +790,377 @@ fn a_close_against_the_wrong_ledger_is_recoverable() {
     residency.close(&mut authority).unwrap();
     authority.close(&mut ledger).unwrap();
     assert!(ledger.outstanding().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Task 0022: the second consumer's shape, against a budget stated as a ratio
+// ---------------------------------------------------------------------------
+
+/// The second consumer's shape, taken from the model definition rather than
+/// repeated here.
+///
+/// `moxie_models::laguna::ARTIFACT` is what
+/// `/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4`'s own `config.json` declares,
+/// checked against it by `the_declared_geometry_matches_the_artifact_config`.
+/// Writing 3,072 and 1,024 again here would be a second answer to one
+/// question, which is how the two come to disagree.
+///
+/// The artifact stores its experts as asymmetric INT4 at group 32, which costs
+/// **5,455,920 B** and which no importer accepts; `docs/models/laguna.md`
+/// records both figures. These are weight-shaped bytes this test invents at the
+/// artifact's declared *shape*, not its weights, and no quality claim follows.
+const LAGUNA: moxie_models::laguna::ArtifactGeometry = moxie_models::laguna::ARTIFACT;
+const LAGUNA_HIDDEN: u64 = LAGUNA.hidden;
+const LAGUNA_INTERMEDIATE: u64 = LAGUNA.moe.moe_intermediate;
+const LAGUNA_CHUNK: u64 = LAGUNA.expert_bf16_bytes();
+/// `num_experts_per_tok`.
+const LAGUNA_TOP_K: u64 = LAGUNA.moe.top_k;
+/// Twelve of the artifact's 256, which is what fits a test's disk and time
+/// while still leaving a route that does not select everything.
+const LAGUNA_EXPERTS: u64 = 12;
+const LAGUNA_ROWS: u64 = 2;
+
+/// The declared restriction: the device may hold **one eighth** of what the
+/// route demands.
+///
+/// A ratio rather than a constant, because a constant stops meaning
+/// "restricted" the moment a shape changes, and `the_restricted_budget_is_a_ratio`
+/// asserts the relation rather than the number.
+const RESTRICTION: u64 = 8;
+
+fn laguna_route() -> Vec<u32> {
+    // Row 0 takes experts 0..10, row 1 takes 2..12: every expert is demanded,
+    // eight of them by both rows and four by one. Neither row is in ascending
+    // order, so the two `CombineOrder` values do not agree.
+    let mut route: Vec<u32> = (0..LAGUNA_TOP_K as u32).rev().collect();
+    route.extend((2..2 + LAGUNA_TOP_K as u32).rev());
+    route
+}
+
+fn laguna_working_set_bytes(route: &[u32]) -> u64 {
+    let mut distinct: Vec<u32> = route.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    distinct.len() as u64 * LAGUNA_CHUNK
+}
+
+fn laguna_weights(seed: u64) -> Weights {
+    let mut v = Values::new(seed);
+    Weights {
+        gate_up: v.block((LAGUNA_EXPERTS * 2 * LAGUNA_INTERMEDIATE * LAGUNA_HIDDEN) as usize),
+        down: v.block((LAGUNA_EXPERTS * LAGUNA_HIDDEN * LAGUNA_INTERMEDIATE) as usize),
+        x: v.block((LAGUNA_ROWS * LAGUNA_HIDDEN) as usize),
+        coefficients: (0..(LAGUNA_ROWS * LAGUNA_TOP_K) as usize)
+            .map(|_| v.next().abs())
+            .collect(),
+    }
+}
+
+fn laguna_write_shard(dir: &Path, w: &Weights) -> PathBuf {
+    let gate_up = to_bytes(&w.gate_up);
+    let down = to_bytes(&w.down);
+    let split = gate_up.len();
+    let end = split + down.len();
+    let header = format!(
+        "{{\"experts.gate_up_proj\":{{\"dtype\":\"BF16\",\"shape\":[{LAGUNA_EXPERTS},{},\
+         {LAGUNA_HIDDEN}],\"data_offsets\":[0,{split}]}},\
+         \"experts.down_proj\":{{\"dtype\":\"BF16\",\"shape\":[{LAGUNA_EXPERTS},{LAGUNA_HIDDEN},\
+         {LAGUNA_INTERMEDIATE}],\"data_offsets\":[{split},{end}]}}}}",
+        2 * LAGUNA_INTERMEDIATE
+    );
+    let path = dir.join("laguna-shaped.safetensors");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+    f.write_all(header.as_bytes()).unwrap();
+    f.write_all(&gate_up).unwrap();
+    f.write_all(&down).unwrap();
+    f.flush().unwrap();
+    path
+}
+
+fn laguna_mlp() -> OpParams {
+    OpParams::ExpertMlp {
+        hidden: LAGUNA_HIDDEN,
+        intermediate: LAGUNA_INTERMEDIATE,
+        experts: LAGUNA_EXPERTS,
+        top_k: LAGUNA_TOP_K,
+        // `hidden_act` is `silu`.
+        activation: ExpertActivation::SwiGlu,
+    }
+}
+
+fn laguna_combine() -> OpParams {
+    OpParams::Combine {
+        hidden: LAGUNA_HIDDEN,
+        top_k: LAGUNA_TOP_K,
+        order: CombineOrder::AscendingExpertId,
+        // `moe_routed_scaling_factor`.
+        output_scale: 2.5,
+    }
+}
+
+/// The restriction is a relation, not a number.
+///
+/// Checked on its own so that a shape change which quietly made the budget
+/// larger than the working set fails here, naming the reason, rather than
+/// turning a "restricted" case into an unrestricted one that still passes.
+#[test]
+fn the_restricted_budget_is_a_ratio_of_the_working_set() {
+    let route = laguna_route();
+    let working = laguna_working_set_bytes(&route);
+    let budget = working.div_ceil(RESTRICTION);
+    assert_eq!(working, 12 * LAGUNA_CHUNK);
+    assert!(budget < working, "the budget is not a restriction");
+    assert!(
+        budget >= LAGUNA_CHUNK,
+        "a budget below one expert refuses rather than evicts, which is a different case"
+    );
+    assert!(
+        budget < 2 * LAGUNA_CHUNK,
+        "at 1/{RESTRICTION} of a {}-expert working set the cache must hold exactly one expert",
+        working / LAGUNA_CHUNK
+    );
+    println!(
+        "laguna-shaped working set {working} B over {} expert(s); budget {budget} B at 1/{RESTRICTION}",
+        working / LAGUNA_CHUNK
+    );
+}
+
+/// The second consumer's shape, on **every** installed device, against a budget
+/// that is one eighth of what its route demands.
+///
+/// The check is that the two candidates agree: the same plan shape run all on
+/// the device and all on the host produces the same bytes. That is the gate
+/// task 0021's real-artifact case used, and it is the one that survives a
+/// shape this large -- an FP64 oracle over 61,440 components at this width is
+/// already covered bit for bit by
+/// `every_device_reproduces_the_oracle_bit_for_bit_for_both_gate_transforms`
+/// at a size a test can afford to run for both gate transforms on three cards.
+#[test]
+fn the_second_consumers_shape_executes_on_every_device_under_a_restricted_budget() {
+    let _serial = one_at_a_time();
+    let count = moxie_cuda::device_count().unwrap();
+    assert!(count > 0, "the device lane requires real hardware");
+
+    let dir = scratch("laguna-restricted");
+    let w = laguna_weights(0x1a90_0220);
+    let path = laguna_write_shard(&dir, &w);
+    let route = laguna_route();
+    let working = laguna_working_set_bytes(&route);
+    let budget_bytes = working.div_ceil(RESTRICTION);
+    let x = to_bytes(&w.x);
+
+    // The host candidate's answer, computed once: this is what every device
+    // must agree with.
+    let host = {
+        let mut ledger =
+            Ledger::new([CapacitySnapshot::new(Scope::Host, 4 << 30, 64 * MIB).unwrap()]).unwrap();
+        let mut authority =
+            ResidencyAuthority::open(&mut ledger, &ResidencyRequest::new("laguna host", working))
+                .unwrap();
+        let mut src = source_at(&path);
+        let budget = ExpertBudget {
+            device: moxie_types::DeviceUuid::parse("GPU-3032cfa3-19df-028f-5ebd-43314911e0b9")
+                .unwrap(),
+            device_pci_bus_id: "0000:82:00.0".into(),
+            device_cache_cap_bytes: 0,
+            device_cache_leased_bytes: 0,
+            device_arena_free_bytes: 0,
+            host_workspace_bytes: 64 * MIB,
+            host_buffer_bytes: 64 * MIB,
+            resident_experts: Vec::new(),
+        };
+        let policy = ExpertPolicy {
+            device: StrategyControl::Off,
+            host: StrategyControl::Required,
+            host_placement: StrategyControl::Off,
+            max_inflight_orders: 4,
+            ..ExpertPolicy::default()
+        };
+        let plan = compile_experts(
+            &laguna_mlp(),
+            &laguna_combine(),
+            &route,
+            &budget,
+            &policy,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(plan.uses(Candidate::Host) && !plan.uses(Candidate::Device));
+        let mut run = GroupedRun::admit(&mut ledger, plan, roles(), None).unwrap();
+        run.load_activations(&x).unwrap();
+        run.run_to_completion(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
+            .unwrap();
+        let out = as_u16(run.reduce(&w.coefficients).unwrap());
+        run.close(&mut ledger).unwrap();
+        authority.end_turn(TurnId::new(1));
+        authority.retire_all(Scope::Host);
+        authority.close(&mut ledger).unwrap();
+        out
+    };
+    assert_eq!(host.len(), (LAGUNA_ROWS * LAGUNA_HIDDEN) as usize);
+
+    for ordinal in 0..count {
+        let ctx = RankContext::acquire(RankId(ordinal), ordinal).unwrap();
+        let scope = Scope::Device(ctx.uuid());
+        let catalogue = moxie_kernels::expert_mlp_catalogue();
+        let mut ledger = Ledger::new([
+            CapacitySnapshot::new(Scope::Host, 4 << 30, 64 * MIB).unwrap(),
+            CapacitySnapshot::new(scope, 2 << 30, 64 * MIB).unwrap(),
+        ])
+        .unwrap();
+        let mut authority = ResidencyAuthority::open(
+            &mut ledger,
+            &ResidencyRequest::new("laguna restricted", working).device(ctx.uuid(), budget_bytes),
+        )
+        .unwrap();
+        let mut residency = DeviceResidency::create(&ctx, &mut authority).unwrap();
+        let mut src = source_at(&path);
+
+        let budget = ExpertBudget {
+            device: ctx.uuid(),
+            device_pci_bus_id: ctx.capability().pci_bus_id.clone(),
+            device_cache_cap_bytes: budget_bytes,
+            device_cache_leased_bytes: 0,
+            device_arena_free_bytes: 256 * MIB,
+            host_workspace_bytes: 64 * MIB,
+            host_buffer_bytes: 64 * MIB,
+            resident_experts: Vec::new(),
+        };
+        let policy = ExpertPolicy {
+            device: StrategyControl::Required,
+            host: StrategyControl::Auto,
+            host_placement: StrategyControl::Off,
+            max_inflight_orders: 4,
+            // Declared, because the default would refuse every group here --
+            // see `the_default_amortisation_threshold_sends_every_laguna_expert_to_the_cpu`.
+            // This case is about what residency does under a restricted budget,
+            // and the amortisation crossover is M6's to measure.
+            max_transfer_bytes_per_row: LAGUNA_CHUNK,
+            ..ExpertPolicy::default()
+        };
+        let plan = compile_experts(
+            &laguna_mlp(),
+            &laguna_combine(),
+            &route,
+            &budget,
+            &policy,
+            None,
+            Some(ExpertKernels {
+                capability: ctx.capability(),
+                catalogue: &catalogue,
+            }),
+        )
+        .unwrap();
+        assert!(plan.uses(Candidate::Device));
+
+        let mut run = GroupedRun::admit(&mut ledger, plan, roles(), None).unwrap();
+        run.attach_device(&mut ledger, &ctx, &mut residency)
+            .unwrap();
+        run.load_activations(&x).unwrap();
+        run.run_to_completion(&mut authority, &mut src, TurnId::new(2), 0, u64::MAX)
+            .unwrap();
+        let device = as_u16(run.reduce(&w.coefficients).unwrap());
+        assert_eq!(
+            device,
+            host,
+            "device {ordinal} disagreed with the host candidate on {} component(s)",
+            device.iter().zip(&host).filter(|(a, b)| a != b).count()
+        );
+        assert!(
+            run.stats().backpressure_drains > 0,
+            "a one-expert cache never refused a four-deep queue on device {ordinal}: {:?}",
+            run.stats()
+        );
+        assert!(authority.stats().evictions > 0);
+        println!(
+            "device {ordinal} ({}): laguna-shaped top-{LAGUNA_TOP_K} over {} expert(s), \
+             working set {working} B, budget {budget_bytes} B (1/{RESTRICTION}); {} drain(s), \
+             {} eviction(s); {} BF16 component(s) agree with the CPU candidate",
+            ctx.uuid(),
+            working / LAGUNA_CHUNK,
+            run.stats().backpressure_drains,
+            authority.stats().evictions,
+            host.len()
+        );
+
+        run.close(&mut ledger).unwrap();
+        authority.end_turn(TurnId::new(2));
+        authority.retire_all(scope);
+        residency.close(&mut authority).unwrap();
+        authority.close(&mut ledger).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same arithmetic AGENTS.md records for the Gemma artifact, at Laguna's
+/// numbers: **the declared default sends every expert to the CPU.**
+///
+/// One expert is 18,874,368 B in BF16, and the best reuse a two-row batch can
+/// offer is both rows, so 9,437,184 B per row against a declared default of
+/// 1 MiB. Asserted here rather than left to be rediscovered. Whether it is the
+/// *right* decision is a measurement, and the measurement is M6's.
+#[test]
+fn the_default_amortisation_threshold_sends_every_laguna_expert_to_the_cpu() {
+    let route = laguna_route();
+    let budget = ExpertBudget {
+        device: moxie_types::DeviceUuid::parse("GPU-3032cfa3-19df-028f-5ebd-43314911e0b9").unwrap(),
+        device_pci_bus_id: "0000:82:00.0".into(),
+        device_cache_cap_bytes: 64 * LAGUNA_CHUNK,
+        device_cache_leased_bytes: 0,
+        device_arena_free_bytes: 1 << 30,
+        host_workspace_bytes: 64 * MIB,
+        host_buffer_bytes: 64 * MIB,
+        resident_experts: Vec::new(),
+    };
+    let policy = ExpertPolicy {
+        device: StrategyControl::Auto,
+        host: StrategyControl::Auto,
+        host_placement: StrategyControl::Off,
+        max_inflight_orders: 4,
+        ..ExpertPolicy::default()
+    };
+    assert_eq!(
+        policy.max_transfer_bytes_per_row,
+        1024 * 1024,
+        "the declared default moved; this test's arithmetic is about that number"
+    );
+    let plan = compile_experts(
+        &laguna_mlp(),
+        &laguna_combine(),
+        &route,
+        &budget,
+        &policy,
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !plan.uses(Candidate::Device) && plan.uses(Candidate::Host),
+        "a group reached the device at 1 MiB/row"
+    );
+    for group in plan.groups() {
+        let decision = group.decision();
+        assert!(
+            decision.bytes_per_row >= LAGUNA_CHUNK / 2,
+            "expert {} amortised to {} B/row, which this fixture did not intend",
+            group.expert(),
+            decision.bytes_per_row
+        );
+    }
+    println!(
+        "laguna-shaped: {} expert(s), best reuse {} row(s), {} B/row against a 1 MiB default",
+        plan.groups().len(),
+        plan.groups()
+            .iter()
+            .map(|g| g.decision().reuse_rows)
+            .max()
+            .unwrap(),
+        plan.groups()
+            .iter()
+            .map(|g| g.decision().bytes_per_row)
+            .min()
+            .unwrap()
+    );
 }

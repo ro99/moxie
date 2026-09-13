@@ -1935,6 +1935,7 @@ impl<'lane> GroupedRun<'lane> {
             rows,
             top_k,
             hidden,
+            self.plan.output_scale(),
             accumulator,
             out.as_mut_slice(),
         )?;

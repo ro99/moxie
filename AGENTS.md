@@ -5,8 +5,8 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 ## Active assignment
 
 **M1 complete (M1.5 closed 2026-09-12); M2 active, items 1 and 2 accepted and
-item 3 awaiting review.** See the
-[task 0021 handover](docs/handovers/2026-09-12-task0021-expert-execution-plans.md)
+items 3 and 4 awaiting review.** See the
+[task 0022 handover](docs/handovers/2026-09-13-task0022-laguna-and-second-consumer.md)
 for the current continuation, and the
 [closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
 M1's exit evidence gate by gate.
@@ -33,8 +33,8 @@ a regression for each review finding. One of those findings corrected a claim
 rather than a defect: **a nonblocking acquire is necessary but not sufficient for
 deadlock freedom**, and the cycles it missed were between the demand counter and
 the prefetch gate, and along promotion's dependency chain. **The acceptance
-closes task 0020 only, not M2**, whose exit also needs item 4 and traces
-reconciled with the ledger across a whole working set.
+closes task 0020 only, not M2**, whose exit also needs traces reconciled with
+the ledger across a whole working set.
 
 **`arch-check` now passes with zero failures.** The four it reported as
 "pre-existing" from task 0014 onward were review probe crates parked under
@@ -84,8 +84,7 @@ layer 0 demand-loaded into a device cache holding **two** of ten experts, 28
 evictions, 8 backpressure drains, agreeing with the CPU candidate on 45,056 BF16
 components. **The activations are synthetic and the route is written by the
 test, so this is not model support and no quality claim follows.** M2's exit
-still needs item 4 and traces reconciled with the ledger across a whole working
-set.
+still needs traces reconciled with the ledger across a whole working set.
 
 **A property of this machine is measured or it is not known.** Three plausible
 NUMA mechanisms in a row were wrong and only the read-back showed it: a zero
@@ -179,10 +178,54 @@ this sweep's advertised axes unreachable. **Three separate coverage claims in on
 task were softer than they looked, and every one was found by asking what a
 mutation would survive rather than by reading the test.**
 
-**Task 0022 is next**: M2 item 4's Laguna metadata and graph, a second synthetic
-MoE consumer through task 0021's interface, and the restricted budget at its
-scale, specified in
-[the task 0021 handover](docs/handovers/2026-09-12-task0021-expert-execution-plans.md)
+**M2 item 4 is implemented and awaits acceptance**
+([task 0022](docs/tasks/0022-m2-laguna-metadata-and-second-consumer.md),
+2026-09-13): Laguna's metadata and its **routed block**, a second routed
+consumer driven through task 0021's interface, and a restricted budget expressed
+as a **ratio** of what the route demands rather than a constant. A routed layer
+at Laguna's declared expert width — 18,874,368 B per expert in BF16 — ran on all
+three GPUs against a device cache of one eighth of its 226,492,416 B working
+set, with 11 backpressure drains and 22 evictions per card, agreeing with the
+CPU candidate on all 6,144 components. **Those are weight-shaped bytes at a real
+artifact's declared shape, not its weights**, and no quality claim follows.
+
+**Laguna's attention tower is not composable, and the contract said so before
+the work started.** Two operations are missing and neither may be guessed:
+`softplus` attention output gating, whose equation is pinned in the artifact's
+own file but which has no shared operation; and the **yarn** rotary ramp on its
+twelve `full_attention` layers, which `modeling_laguna.py` delegates to a
+`transformers` function the artifact does not ship — the artifact declares
+5.14.1, the copy installed here is 5.5.3, and `truncate` is not declared at all.
+Gating is on all 48 layers, so **no Laguna layer's attention is composable
+today**. Both are named gap tasks, computed from the declared geometry rather
+than written down. Its weights are asymmetric INT4 at group 32 with zero points
+packed along the **output** axis — a second convention the accepted importer has
+never seen — so **no Laguna tensor was read** and M3 owns the importer.
+[The bring-up record](docs/models/laguna.md) carries the inventory and every
+open mapping question.
+
+**A parameter no fixture ever varies is a parameter no test checks.** Two
+mutants that dropped `Combine`'s new output scale survived a **10,368**-case
+sweep and every executor test, because every routed fixture in the workspace
+used a scale of exactly 1.0 until a second family arrived with 2.5. Nothing was
+weakly asserted; the assertions were strong over an input space in which the
+parameter was constant. That is the fourth review of task 0021's own lesson — a
+gate only fires on inputs something hands it — in a new place, and the question
+to ask before claiming a parameter is covered is **which fixture varies it**.
+
+**A test that compares two runs of the same code is not a test of what the code
+means.** `per_expert_scale` and `selection_bias` are both `[experts]`, so a
+swapped binding passes every shape check. The test written for exactly that
+hazard built the graph both ways and required different answers — and survived
+its own mutation, because reversing the single statement of the operand order
+relabels the validation and the interpretation consistently. The two runs were
+still different; they were each other's. It is now checked against an oracle
+composed with each operand in the role its name says.
+
+**Task 0023 is next**: M2 item 5's remainder and M2's exit gate — byte and cost
+traces reconciled with the resource ledger across a **whole** working set rather
+than one layer, specified in
+[the task 0022 handover](docs/handovers/2026-09-13-task0022-laguna-and-second-consumer.md)
 and not yet authored.
 
 M1's accepted work: shared semantic tensors/graph and the bounded host
@@ -214,8 +257,11 @@ read and **computed** with 118,947,840 B of the designated artifact's real
 expert weights — but over **synthetic activations and a route its own test
 writes**, so it establishes machinery and nothing about output. **One layer is
 not a model**: nothing composes a routed layer into a graph that generates a
-token, and the whole 51.6 GB working set has not run. M4 still owns device paged
-attention, COW forks and page streaming. M11 owns vision.
+token, and the whole 51.6 GB working set has not run. Task 0022 went a different
+way and not a further one: it ran a routed layer at **Laguna's declared expert
+shape** rather than from Laguna's bytes, because its weights are asymmetric INT4
+at group 32 and no importer accepts them. A shape is not a checkpoint. M4 still
+owns device paged attention, COW forks and page streaming. M11 owns vision.
 
 **M2 is active and proceeds in roadmap order.** The owner designated
 `/fast/models/google/gemma-4-26B-A4B-it` as M2's BF16 MoE on 2026-09-12: BF16,
@@ -242,14 +288,20 @@ expert block from them. A fact that came out of that: its experts are
 right decision is a measurement, and measuring it is M6's.
 
 `hy3-w4a16-mtp` is in scope. The Laguna checkpoint at
-`/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4` **finished downloading and was
-verified complete on 2026-09-12** — all 15 shards, each satisfying
-`8 + header + payload_end == file size`, payload ends summing to the index's
-`total_size` of 76,813,095,232 B. That check is all that has been done to it:
-**no metadata has been interpreted and no tensor read**, and its
-`configuration_laguna.py` and `modeling_laguna.py` are remote code that document
-03 forbids executing. M2 item 4 is unblocked on availability, not on inspection.
-None of the three is approved for quality, conversion or requantization: O1's
+`/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4`, revision
+`bc59f497520b23759ce61cc5164ca28bcc4f53bc`, is **complete** — all 15 shards,
+each satisfying `8 + header + payload_end == file size`, payload ends summing to
+the index's `total_size` of 76,813,095,232 B, re-verified 2026-09-13. Task 0022
+**interpreted its metadata and read no tensor**: 48 layers at hidden 3,072, a
+dense layer 0 and 47 routed layers of **256 experts at top-k 10**, SwiGLU at
+`moe_intermediate` 1,024 beside a shared expert of the same width, a **sigmoid**
+router with an `e_score_correction_bias` that moves selection only, a routed
+scaling factor of 2.5, and 85.5% of the artifact in expert weights. Its
+`configuration_laguna.py` and `modeling_laguna.py` were **read and never
+executed**, which is how document 03's "decoded according to the pinned
+exporter, never guessed from a suffix" is satisfied; executing them stays
+forbidden. Its `dflash` draft model is not on this machine and is M9's. None of
+the three artifacts is approved for quality, conversion or requantization: O1's
 catalog and O5's storage questions stay open.
 
 ## Read before editing

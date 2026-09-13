@@ -340,8 +340,16 @@ pub enum OpParams {
     },
     /// Which experts a row is sent to, and with what coefficients.
     ///
-    /// Inputs are `(rows, router gain, router projection[, per-expert scale])`
-    /// and the output is a route table of `[rows, top_k]`. The whole score
+    /// Inputs are `(rows, router projection[, router gain][, per-expert
+    /// scale][, selection bias])` and the output is a route table of
+    /// `[rows, top_k]`. The optional operands appear in exactly that order and
+    /// **two of them have the same shape**: `per_expert_scale` and
+    /// `selection_bias` are both `[experts]`, so binding them the wrong way
+    /// round is not caught by shape validation. `graph::route_operands` is the
+    /// one place that order is written down, and
+    /// `swapping_the_two_expert_vectors_changes_the_answer` in the interpreter's
+    /// reference graphs is the substitution test that makes the distinction
+    /// load-bearing rather than documented. The whole score
     /// transformation lives here rather than being composed from a norm and a
     /// linear, because document 02's `RouteSpec` makes "router score
     /// transformation, top-k/group selection, renormalization ... biases and
@@ -360,22 +368,38 @@ pub enum OpParams {
         hidden: u64,
         experts: u64,
         top_k: u64,
-        /// Epsilon of the router's own RMS normalization, which is scale-free:
-        /// the gain is the bound `router.scale` tensor, applied after it.
-        eps: f32,
-        /// The scalar multiplying the normalized, gained row before projection.
+        /// What the router does to the row before projecting it.
         ///
-        /// Gemma 4 uses `hidden^(-1/2)` (`Gemma4TextRouter.scalar_root_size`).
-        /// It is stated rather than derived from `hidden` because it is a
-        /// family choice, not an identity: a router without one passes 1.0, and
-        /// deriving it would silently impose Gemma's on every other family.
-        input_scale: f32,
-        /// Whether a per-expert coefficient scale is bound as input 3.
+        /// A parameter rather than a fixed prologue because the two families
+        /// that consume this operation disagree: Gemma 4's router owns a
+        /// scale-free normalization, a trained gain and a scalar; Laguna's
+        /// projects the block's `post_attention_layernorm` output unchanged.
+        /// Composing Gemma's prologue out of separate nodes would move a
+        /// residency decision into whatever a graph author happened to wire in
+        /// front of the router, which is what this operation exists to prevent.
+        input: RouterInput,
+        /// How logits become scores.
+        ///
+        /// Softmax couples the experts; sigmoid does not. They are different
+        /// functions rather than one function with a flag, and they select
+        /// differently once a bias is added, because a bias shifts a sigmoid
+        /// score by a different amount at every logit.
+        score: RouteScore,
+        /// Whether a per-expert coefficient scale is bound as an operand.
         ///
         /// Applied **after** renormalization and never renormalized away, so
         /// the coefficients of a scaled router do not sum to one. A combine
         /// that normalized them again would delete a trained parameter.
         per_expert_scale: bool,
+        /// Whether a per-expert additive bias is bound as an operand.
+        ///
+        /// It moves **selection only**: the coefficients are gathered from the
+        /// unbiased scores. Laguna's `e_score_correction_bias` is the
+        /// auxiliary-loss-free load balancing of arXiv:2408.15664, and a router
+        /// that gathered the biased score would still produce a well-formed
+        /// distribution -- which is why this is a parameter with its own
+        /// fixture rather than an implementation detail.
+        selection_bias: bool,
     },
     /// The gated expert feed-forward, evaluated per selected slot.
     ///
@@ -412,6 +436,15 @@ pub enum OpParams {
         /// at any precision, so an executor that reduced in completion order
         /// would produce a result no oracle predicts.
         order: CombineOrder,
+        /// A scalar applied to the **combined** row, `bf16(Σ terms · scale)`.
+        ///
+        /// Laguna's `moe_routed_scaling_factor` of 2.5 multiplies the summed
+        /// routed output before the shared expert is added to it.
+        /// `Residual { scale }` cannot express that -- it is
+        /// `bf16(bf16(a + b) · scale)`, which scales the shared expert too --
+        /// and scaling each term before summing is a different rounding
+        /// pattern. A router without one passes 1.0.
+        output_scale: f32,
     },
 }
 
@@ -428,6 +461,69 @@ pub enum ExpertActivation {
     GeGlu,
     /// `silu(gate) * up`.
     SwiGlu,
+}
+
+/// One operand of [`OpParams::Route`], in the order a router takes them.
+///
+/// This exists because two of them -- [`RouteOperand::PerExpertScale`] and
+/// [`RouteOperand::SelectionBias`] -- are both `[experts]`, so a graph that
+/// bound them the wrong way round would pass every shape check and return a
+/// confident, different answer. The fourth review of task 0021 found the same
+/// shape of defect in a kernel descriptor: a check that is half an identity is
+/// a check of something else. The answer there was to make the identity a
+/// binding, and the answer here is that there is exactly **one** statement of
+/// the order and every other part of the crate derives from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteOperand {
+    /// The rows to route, `[rows, hidden]`.
+    Rows,
+    /// The expert projection, `[experts, hidden]`.
+    Projection,
+    /// The router's own gain, `[hidden]`. Only for a `Normalized` router.
+    Gain,
+    /// The per-expert coefficient scale, `[experts]`.
+    PerExpertScale,
+    /// The per-expert selection bias, `[experts]`.
+    SelectionBias,
+}
+
+/// What a router does to a row before projecting it to expert logits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RouterInput {
+    /// `bf16(bf16(bf16(x / rms(x)) · gain) · input_scale)`, with the trained
+    /// gain bound as an operand.
+    ///
+    /// Gemma 4's router: `Gemma4RMSNorm(..., with_scale=False)` followed by
+    /// `router.scale` and `scalar_root_size`. The three BF16 boundaries are
+    /// part of the equation; dropping them changes the *selected experts* on
+    /// roughly one row in 270.
+    Normalized {
+        /// Added to the mean square before the reciprocal square root.
+        eps: f32,
+        /// The scalar multiplying the normalized, gained row. Gemma 4 uses
+        /// `hidden^(-1/2)`; it is stated rather than derived because it is a
+        /// family choice and not an identity.
+        input_scale: f32,
+    },
+    /// The row is projected as given, with no gain operand.
+    ///
+    /// Laguna's router: `F.linear(hidden_states, self.weight)` over the block's
+    /// already-normalized stream. Passing `Normalized` with a unit gain would
+    /// not be the same function -- it would normalize a second time.
+    Raw,
+}
+
+/// How a router turns logits into per-expert scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteScore {
+    /// `softmax(logits)` over the whole expert set, in FP32.
+    Softmax,
+    /// `sigmoid(logit)` per expert, independently, in FP32.
+    ///
+    /// Not softmax with a flag: the scores do not sum to one before
+    /// renormalization, and adding a selection bias moves each score by an
+    /// amount that depends on its own logit.
+    Sigmoid,
 }
 
 /// The order a routed row's expert contributions are summed in.
@@ -555,6 +651,34 @@ impl OpParams {
         }
     }
 
+    /// The operands this router takes, in order.
+    ///
+    /// The single statement of [`OpParams::Route`]'s input list: the arity, the
+    /// shape validation and every consumer read it rather than repeating it.
+    /// Returns an empty slice for every other operation.
+    pub fn route_operands(&self) -> Vec<RouteOperand> {
+        let OpParams::Route {
+            input,
+            per_expert_scale,
+            selection_bias,
+            ..
+        } = self
+        else {
+            return Vec::new();
+        };
+        let mut operands = vec![RouteOperand::Rows, RouteOperand::Projection];
+        if matches!(input, RouterInput::Normalized { .. }) {
+            operands.push(RouteOperand::Gain);
+        }
+        if *per_expert_scale {
+            operands.push(RouteOperand::PerExpertScale);
+        }
+        if *selection_bias {
+            operands.push(RouteOperand::SelectionBias);
+        }
+        operands
+    }
+
     /// How many value inputs this operation takes.
     pub fn arity(&self) -> usize {
         match self {
@@ -567,11 +691,10 @@ impl OpParams {
             OpParams::Attention { .. } => 4, // q, k, v, positions
             OpParams::Residual { .. } => 2,
             OpParams::VocabProjection { .. } => 2, // hidden, table
-            // rows, router gain, router projection, and the per-expert scale
-            // when the family has one.
-            OpParams::Route {
-                per_expert_scale, ..
-            } => 3 + usize::from(*per_expert_scale),
+            // `route_operands` is the one statement of which operands a
+            // router takes and in what order; the arity is derived from it so
+            // the two cannot drift apart.
+            OpParams::Route { .. } => self.route_operands().len(),
             OpParams::ExpertMlp { .. } => 4, // rows, route, gate/up, down
             OpParams::Combine { .. } => 2,   // route, slots
         }
@@ -725,8 +848,7 @@ impl OpParams {
                 hidden,
                 experts,
                 top_k,
-                eps,
-                input_scale,
+                input,
                 ..
             } => {
                 if hidden == 0 {
@@ -755,19 +877,21 @@ impl OpParams {
                 // tensor's is `rows * top_k * hidden`.
                 (Dim::constant(top_k) * Dim::constant(hidden)).eval(&empty)?;
                 (Dim::constant(experts) * Dim::constant(hidden)).eval(&empty)?;
-                if !(eps.is_finite() && eps > 0.0) {
-                    return Err(Error::InvalidRequest {
-                        field: "eps",
-                        detail: format!("epsilon must be finite and positive, got {eps}"),
-                    });
-                }
-                if !(input_scale.is_finite() && input_scale > 0.0) {
-                    return Err(Error::InvalidRequest {
-                        field: "router_input_scale",
-                        detail: format!(
-                            "router input scale must be finite and positive, got {input_scale}"
-                        ),
-                    });
+                if let RouterInput::Normalized { eps, input_scale } = input {
+                    if !(eps.is_finite() && eps > 0.0) {
+                        return Err(Error::InvalidRequest {
+                            field: "eps",
+                            detail: format!("epsilon must be finite and positive, got {eps}"),
+                        });
+                    }
+                    if !(input_scale.is_finite() && input_scale > 0.0) {
+                        return Err(Error::InvalidRequest {
+                            field: "router_input_scale",
+                            detail: format!(
+                                "router input scale must be finite and positive, got {input_scale}"
+                            ),
+                        });
+                    }
                 }
                 Ok(())
             }
@@ -804,11 +928,25 @@ impl OpParams {
                 (Dim::constant(top_k) * Dim::constant(hidden)).eval(&empty)?;
                 Ok(())
             }
-            OpParams::Combine { hidden, top_k, .. } => {
+            OpParams::Combine {
+                hidden,
+                top_k,
+                output_scale,
+                ..
+            } => {
                 if hidden == 0 || top_k == 0 {
                     return Err(Error::InvalidRequest {
                         field: "combine",
                         detail: format!("hidden {hidden}, top_k {top_k}"),
+                    });
+                }
+                // Finite, and that is the whole rule. Zero and negative are
+                // legal: this is a checkpoint scalar, not a probability, and
+                // the same reasoning `apply_per_expert_scale` records applies.
+                if !output_scale.is_finite() {
+                    return Err(Error::InvalidRequest {
+                        field: "combine_output_scale",
+                        detail: format!("combine output scale must be finite, got {output_scale}"),
                     });
                 }
                 (Dim::constant(top_k) * Dim::constant(hidden)).eval(&empty)?;
@@ -1343,28 +1481,39 @@ impl GraphBuilder {
                 hidden,
                 experts,
                 top_k,
-                per_expert_scale,
                 ..
             } => {
-                want_float(0)?;
-                rank(0, 2)?;
-                dim_is(0, 1, hidden)?;
-                // The router's own gain, one element per hidden channel. It is
-                // a bound weight rather than a folded constant so that a family
-                // whose router has no `scale` tensor binds ones and says so,
-                // the way the reduced Gemma graph already binds a unit gain for
-                // its value normalization.
-                want_float(1)?;
-                rank(1, 1)?;
-                dim_is(1, 0, hidden)?;
-                want_float(2)?;
-                rank(2, 2)?;
-                dim_is(2, 0, experts)?;
-                dim_is(2, 1, hidden)?;
-                if per_expert_scale {
-                    want_float(3)?;
-                    rank(3, 1)?;
-                    dim_is(3, 0, experts)?;
+                // Validated from `route_operands` rather than from a second
+                // hand-written list. Two enumerations of "which operands does a
+                // router take" is how they come to disagree, and this operation
+                // has two same-shaped optional operands whose order is the only
+                // thing separating them.
+                for (index, operand) in params.route_operands().iter().enumerate() {
+                    want_float(index)?;
+                    match operand {
+                        RouteOperand::Rows => {
+                            rank(index, 2)?;
+                            dim_is(index, 1, hidden)?;
+                        }
+                        RouteOperand::Projection => {
+                            rank(index, 2)?;
+                            dim_is(index, 0, experts)?;
+                            dim_is(index, 1, hidden)?;
+                        }
+                        // The router's own gain, one element per hidden
+                        // channel. Present only for a `Normalized` router: a
+                        // family without one does not bind ones, it declares
+                        // `Raw`, because normalizing an already-normalized
+                        // stream with a unit gain is a different function.
+                        RouteOperand::Gain => {
+                            rank(index, 1)?;
+                            dim_is(index, 0, hidden)?;
+                        }
+                        RouteOperand::PerExpertScale | RouteOperand::SelectionBias => {
+                            rank(index, 1)?;
+                            dim_is(index, 0, experts)?;
+                        }
+                    }
                 }
                 vec![s(0).shape[0].clone(), Dim::constant(top_k)]
             }

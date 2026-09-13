@@ -470,5 +470,184 @@ Any of 3, 4, 5 is a failed task rather than a smaller one.
 
 ## Result, filled after work
 
-*Empty until the work is done. Passed, failed and skipped stay separate, and a
-number that was not measured is reported as not measured.*
+Status: **implemented, 2026-09-13; awaiting independent review and owner
+acceptance.** It does not close M2.
+
+### Changed shared owners and consumers
+
+| Crate | What changed |
+|---|---|
+| `moxie-graph` | `Route` gained `RouterInput`, `RouteScore` and a `selection_bias` operand; `Combine` gained `output_scale`; `RouteOperand` and `OpParams::route_operands` are the single statement of the router's operand list, and the arity and the shape validation both derive from it |
+| `moxie-oracles` | `router_logits`, `router_scores`, `select_top_k_biased`, a `combine_row` that carries the scale, and an FP64 transcription that covers **both** families' routers |
+| `moxie-interp` | resolves the router's operands from `route_operands` rather than from positions written out again |
+| `moxie-kernels` | `combine_rows_bf16` applies the output scale once, to the finished FP32 accumulator, before the single BF16 store |
+| `moxie-plan` | `CombineSpec` carries the `Combine` node's two parameters together; `ExpertPlan` carries `output_scale` |
+| `moxie-executor` | `reduce` passes the plan's scale; **no structural change** — the second consumer goes through the interface as it stands |
+| `moxie-models` | new `laguna` module: `ARTIFACT`, `RoutedBlocks`, `Reduction`, `Gap` and `ArtifactGeometry::tower_gaps` |
+| `moxie-memory` | **nothing**, as the contract required |
+
+Base commit `551b7cd`; contract committed at `78c493d` **before** implementation.
+
+### Commands, and what each reported
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | passed |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
+| Device-lane clippy (`--features moxie-executor/driver`) | passed |
+| `cargo test --workspace --locked --offline` | **908 passed, 0 failed** (883 at task 0021, measured in an isolated worktree at `551b7cd` rather than quoted) |
+| Device-feature workspace tests | **941 passed, 0 failed** (913 at task 0021) |
+| `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
+| `cargo xtask spec-check` | passed, 10 documents |
+| `cargo xtask arch-check` | **zero failures**, 78 rejected fixtures, 21 accepted, 13 rules |
+
+Nothing failed. Nothing was skipped: the real-artifact cases print `SKIPPED`
+with a reason when their artifact is absent, and on this machine none did —
+including `the_declared_geometry_matches_the_artifact_config`, which read
+`/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4/config.json` and compared every
+declared field against `laguna::ARTIFACT`.
+
+### What executed, and what that is not
+
+**A routed layer at the artifact's declared expert shape ran on all three
+GPUs.** Top-k 10 over twelve experts of `3 · 1024 · 3072 · 2 = 18,874,368 B`
+each — a working set of **226,492,416 B** — against a device cache of
+**28,311,552 B**, one eighth of it. Each device drained backpressure **11**
+times, the authority evicted **22** times, and all **6,144** BF16 components
+agreed with the CPU candidate on every card:
+
+```text
+device 0 GPU-97fe4889-4874-a378-198e-955d2e72c4a3   11 drains, 22 evictions
+device 1 GPU-3032cfa3-19df-028f-5ebd-43314911e0b9   11 drains, 22 evictions
+device 2 GPU-81fe4578-59b2-37c4-421e-287cdac78704   11 drains, 22 evictions
+```
+
+**Those are weight-shaped bytes this task invents at the artifact's declared
+shape, not its weights.** No Laguna tensor was read. The artifact's experts are
+asymmetric INT4 at group 32, which no importer accepts, and a BF16 expert at
+that shape costs 18,874,368 B where the stored one costs 5,455,920 B. **Nothing
+about Laguna's output follows from this**, and O2 is untouched.
+
+### The two gaps, reported rather than worked around
+
+A faithful Laguna decoder layer needs two operations the catalogue has not got,
+and **both sit on attention**, so **no layer of this model is composable today**:
+
+1. **Attention output gating** — `softplus(g_proj(x))` per head, before
+   `o_proj`. Pinned in the artifact's own file, so the equation is known; what
+   is missing is a shared operation, an oracle and a second consumer.
+   `gating_types` is `per_head` on all 48 layers.
+2. **The yarn rotary ramp** on the twelve `full_attention` layers.
+   `modeling_laguna.py` implements only `compute_default_rope_parameters` and
+   delegates every other `rope_type` to a `transformers` function it does not
+   ship. The artifact declares `transformers` **5.14.1**; the copy on this
+   machine is **5.5.3**, and `truncate` — a parameter of that function — is not
+   in this config at all. One mismatched copy is not a pinned exporter.
+
+So the deliverable is the **routed block**, which is composable in full, and the
+narrowing was written into this contract before implementation rather than
+discovered afterwards. `ArtifactGeometry::tower_gaps` computes the list from the
+declared geometry, so a configuration without them reports none — both outcomes
+are reachable and both are tested.
+
+### Decisions worth finding again
+
+**Sigmoid and softmax select the same experts; the bias is what makes the
+transform decide anything.** Both transforms are monotone in the logit, so on
+their own they differ only in the *coefficients*. Add `e_score_correction_bias`
+and they stop agreeing, because a bias shifts a sigmoid score and a softmax
+probability by different relative amounts. Two fixtures say exactly that, and
+the second exists because the obvious claim — "a different score transform
+selects different experts" — is **false** and would have been written down as a
+comment otherwise.
+
+**Two parameters were deliberately not added.** Router logit softcapping (the
+artifact declares 0.0) and `norm_topk_prob = false` (both families declare true)
+have no consumer, and AGENTS.md counts an unreachable branch as a stub. A
+configuration that needs the softcap is **refused**, by name, where the gap is
+visible.
+
+**A scale on the sum is not a scale on the terms.** `Combine::output_scale`
+multiplies the FP32 accumulator once, before the single BF16 store — which is
+where `moxie_oracles::route::combine_row` already puts its rounding. The fixture
+that distinguishes the two application points is a cancellation at `2^24` with
+Laguna's own factor of 2.5: sum-then-scale gives 2.5, scale-then-sum gives 4.0.
+
+**The two `[experts]` operands are the hazard the fourth review of task 0021
+described, in a new place.** `per_expert_scale` and `selection_bias` have the
+same shape, so a swapped binding passes every shape check.
+`OpParams::route_operands` is the one statement of the order — the arity, the
+shape validation and the interpreter all read it — and an oracle-backed test
+pins what each one *means*, not merely that they differ.
+
+### Coverage, measured rather than asserted
+
+Both sweeps gained a profile axis over their whole product:
+
+- `expert_plan_matrix.rs`: **10,368** combinations, 5,184 per profile, every
+  rejection reason exercised, counts printed by the test.
+- `grouped_transitions.rs`: **288** combinations, 144 per profile, every failure
+  point, both capacity outcomes, and the authority's live-lease count reconciled
+  against the run's after **every** operation.
+
+Strength, measured by mutation: **33 of 33 caught, 0 survivors** —
+[experiment 0003](../evidence/experiments/0003-task0022-sweep-and-routed-mutations.md).
+The first measurement had **three survivors across the two batteries**, and both
+defects they found are worth carrying:
+
+1. **A parameter no fixture ever varies is a parameter no test checks.** Two
+   mutants that dropped `Combine::output_scale` on the way to the plan survived
+   the entire 10,368-combination sweep and every executor test, because every
+   fixture in the workspace used 1.0. The sweep now checks it, and a new
+   executor regression reduces the same fixture at 2.5 and at 1.0 and requires
+   both the oracle agreement and the difference.
+2. **A test that compares a thing to itself is not a test.** The
+   operand-swap test built the graph both ways and required different answers;
+   reversing `route_operands` relabels both the validation and the
+   interpretation consistently, so it survived. It is now checked against an
+   independent oracle composed with each operand in the role its name says.
+
+**A null result, reported because it is one:** the profile axis caught **no**
+mutation that the single-profile sweeps did not already catch. What it did
+produce is the fixture pressure — the first routed scale in the workspace that
+is not 1 — which is how the `output_scale` gap became visible at all.
+
+### Narrowings, reported rather than quietly dropped
+
+- **The Laguna attention tower is not composed**, for the two gaps above. M2's
+  exit gate does not need it; M7's family coverage does.
+- **No importer.** Asymmetric INT4 at group 32, with zero points packed along
+  the **output** axis while the codes are packed along the input axis, is M3's.
+  Both facts are recorded in the bring-up record.
+- **The fused/per-expert expert mapping is an open question**, not a decision:
+  the pinned model declares fused tensors, the checkpoint stores per-expert
+  ones, and the artifact's own `_checkpoint_conversion_mapping` covers only
+  `e_score_correction_bias`.
+- **The restricted-budget device case declares its amortisation threshold.** At
+  Laguna's expert size the *default* 1 MiB/row sends every expert to the CPU —
+  the same arithmetic AGENTS.md records for the Gemma artifact, asserted here by
+  `the_default_amortisation_threshold_sends_every_laguna_expert_to_the_cpu`
+  rather than left to be rediscovered. Measuring the real crossover is M6's.
+- **Twelve experts, not 256.** The device case uses twelve of the artifact's 256
+  so that the synthetic shard fits a test's disk and time. The *expert* is at
+  full declared width; the *layer* is not.
+- **The routed-block graph is stateless** and runs through
+  `Interpreter::run_stateless`. Whole-versus-chunked parity for it is
+  row-independence, which is checked.
+
+### No owner gate was resolved
+
+O1–O7 remain open. No numerical threshold, precision, context target or
+compatibility surface changed. The support matrix gained no Laguna capability
+row, because no Laguna capability exists.
+
+### Remaining blockers, and the next bounded task
+
+- **M2 is not closed.** Its exit still asks for byte/cost traces reconciled with
+  the resource ledger across a **whole** working set rather than one layer, and
+  for the real out-of-device-memory working set to execute.
+- **No performance claim.** Both lanes are debug builds and there is no baseline
+  on this machine.
+- **Quality is O2** for both families.
+- **Laguna's tower** needs two shared-operation tasks before any state schema,
+  admission figure or partition for it exists.

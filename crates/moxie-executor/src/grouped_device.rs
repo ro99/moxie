@@ -1157,6 +1157,7 @@ mod tests {
             hidden: HIDDEN,
             top_k,
             order: CombineOrder::AscendingExpertId,
+            output_scale: 1.0,
         }
     }
 

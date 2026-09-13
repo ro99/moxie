@@ -36,3 +36,4 @@
 #![forbid(unsafe_code)]
 
 pub mod gemma4;
+pub mod laguna;

@@ -51,6 +51,7 @@ dependencies = [
  "moxie-oracles",
  "moxie-state",
  "moxie-types",
+ "serde_json",
 ]
 
 [[package]]
@@ -82,6 +83,7 @@ dependencies = [
  "moxie-host",
  "moxie-kernels",
  "moxie-memory",
+ "moxie-models",
  "moxie-oracles",
  "moxie-plan",
  "moxie-storage",

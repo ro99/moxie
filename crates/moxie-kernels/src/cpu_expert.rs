@@ -298,6 +298,12 @@ pub fn expert_group_bf16(
 /// `accumulator` is `hidden` FP32 values, supplied by the caller. It used to be
 /// a `vec![0f32; hidden]` allocated here, which put an allocation outside the
 /// admitted envelope on the one path every plan takes.
+///
+/// `output_scale` multiplies the finished FP32 accumulator, once, before the
+/// single BF16 store -- the same boundary `moxie_oracles::route::combine_row`
+/// puts it at. Laguna's `moe_routed_scaling_factor` is that scalar; a family
+/// without one passes 1.0. Scaling each term as it is added would be a
+/// different rounding pattern and a different answer.
 #[allow(clippy::too_many_arguments)]
 pub fn combine_rows_bf16(
     slots: &[u8],
@@ -306,6 +312,7 @@ pub fn combine_rows_bf16(
     rows: u32,
     top_k: u32,
     hidden: u32,
+    output_scale: f32,
     accumulator: &mut [f32],
     out: &mut [u8],
 ) -> Result<()> {
@@ -355,6 +362,12 @@ pub fn combine_rows_bf16(
             available_bytes: (accumulator.len() * 4) as u64,
         });
     }
+    if !output_scale.is_finite() {
+        return Err(invalid(
+            "output_scale",
+            format!("combine output scale is {output_scale}"),
+        ));
+    }
     let acc = &mut accumulator[..hidden];
     for r in 0..rows {
         acc.iter_mut().for_each(|v| *v = 0.0);
@@ -387,7 +400,7 @@ pub fn combine_rows_bf16(
         }
         let out_row = &mut out[r * hidden * 2..(r + 1) * hidden * 2];
         for (o, value) in acc.iter().enumerate() {
-            store_bf16(out_row, o, *value);
+            store_bf16(out_row, o, value * output_scale);
         }
     }
     Ok(())
@@ -474,6 +487,7 @@ mod tests {
             1,
             2,
             2,
+            1.0,
             &mut [0f32; 2],
             &mut out,
         )

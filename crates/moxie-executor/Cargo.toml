@@ -42,6 +42,12 @@ moxie-engine.workspace = true
 # lets read `/proc`. Both are test-only; production code here names neither.
 moxie-oracles.workspace = true
 moxie-host.workspace = true
+# Task 0022: the second consumer's *declared geometry* comes from the model
+# definition rather than from literals repeated in a test. Document 02 allows
+# exactly two places to import a concrete model -- the composition root and
+# integration tests -- and `arch-check` excludes dev-dependencies in every
+# table for that reason. A fixture proves the production edge is refused.
+moxie-models.workspace = true
 
 [lints]
 workspace = true

@@ -24,6 +24,10 @@ moxie-models.workspace = true
 moxie-interp.workspace = true
 moxie-state.workspace = true
 moxie-format.workspace = true
+# Test-only, for reading a checkpoint's `config.json` and comparing it against
+# the geometry a model module declares. `arch-check` excludes dev-dependencies
+# in every table, because document 02 permits a test harness there.
+serde_json = "1"
 
 [lints]
 workspace = true

@@ -431,7 +431,9 @@ pub struct ExpertKernels<'a> {
 }
 
 /// A routed layer's expert work, decided.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: the combine's output scale is an `f32`, and a plan carries the
+// checkpoint's value rather than a canonicalised one.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExpertPlan {
     kernel: Option<SemanticKernelDescriptor>,
     shape: ExpertShape,
@@ -442,6 +444,7 @@ pub struct ExpertPlan {
     queue_capacity: u32,
     cpu_tile_lanes: u32,
     reduction_order: Vec<u32>,
+    output_scale: f32,
     envelope: ExpertEnvelope,
     policy: ExpertPolicy,
 }
@@ -472,6 +475,15 @@ impl ExpertPlan {
     /// `[rows * top_k]`: the slot position to add at each step, per row.
     pub fn reduction_order(&self) -> &[u32] {
         &self.reduction_order
+    }
+    /// The scalar the combined row is multiplied by, from the `Combine` node.
+    ///
+    /// Carried by the plan for the same reason the reduction order is: the
+    /// reduction is one operation with two parameters, and an executor that
+    /// read the order from the plan and the scale from somewhere else would
+    /// have two sources for one node's contract.
+    pub const fn output_scale(&self) -> f32 {
+        self.output_scale
     }
     pub const fn envelope(&self) -> &ExpertEnvelope {
         &self.envelope
@@ -693,12 +705,25 @@ impl From<ExpertPlanRefused> for Error {
     }
 }
 
+/// The `Combine` node's two parameters, read together.
+///
+/// One struct rather than two return values because they are one node's
+/// contract: the order decides which permutation the plan computes and the
+/// scale decides what the executor multiplies the finished sum by, and a
+/// consumer that took one from the plan and the other from elsewhere would have
+/// two sources for one operation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CombineSpec {
+    pub order: CombineOrder,
+    pub output_scale: f32,
+}
+
 /// Read the shape out of the graph's own parameters.
 ///
 /// Taking `OpParams` rather than five integers is deliberate: the plan's shape
 /// must be the node's shape, and a constructor that accepted loose numbers would
 /// let a caller plan for a layer the graph does not contain.
-pub fn shape_of(mlp: &OpParams, combine: &OpParams) -> Result<(ExpertShape, CombineOrder)> {
+pub fn shape_of(mlp: &OpParams, combine: &OpParams) -> Result<(ExpertShape, CombineSpec)> {
     let OpParams::ExpertMlp {
         hidden,
         intermediate,
@@ -713,6 +738,7 @@ pub fn shape_of(mlp: &OpParams, combine: &OpParams) -> Result<(ExpertShape, Comb
         hidden: combine_hidden,
         top_k: combine_top_k,
         order,
+        output_scale,
     } = *combine
     else {
         return Err(invalid("combine", "this is not a Combine node".into()));
@@ -734,7 +760,10 @@ pub fn shape_of(mlp: &OpParams, combine: &OpParams) -> Result<(ExpertShape, Comb
             top_k,
             activation,
         },
-        order,
+        CombineSpec {
+            order,
+            output_scale,
+        },
     ))
 }
 
@@ -760,7 +789,11 @@ pub fn compile_experts(
         device: None,
         host: None,
     };
-    let (shape, order) = shape_of(mlp, combine).map_err(refuse)?;
+    let (shape, combine_spec) = shape_of(mlp, combine).map_err(refuse)?;
+    let CombineSpec {
+        order,
+        output_scale,
+    } = combine_spec;
     if shape.hidden == 0 || shape.intermediate == 0 || shape.experts == 0 || shape.top_k == 0 {
         return Err(refuse(invalid(
             "shape",
@@ -1180,6 +1213,7 @@ pub fn compile_experts(
         queue_capacity,
         cpu_tile_lanes: policy.cpu_tile_lanes,
         reduction_order,
+        output_scale,
         envelope: ExpertEnvelope {
             device,
             host,

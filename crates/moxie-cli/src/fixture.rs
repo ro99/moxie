@@ -3,7 +3,8 @@
 use moxie_engine::{HostTensor, Program, Value};
 use moxie_graph::{
     Bindings, CombineOrder, ExpertActivation, Graph, GraphBuilder, IndexEncoding, OpParams,
-    OracleRegistry, RopeLayout, TensorSpec, ValueId, ValueRole, Visibility, reciprocal_sqrt_scale,
+    OracleRegistry, RopeLayout, RouteScore, RouterInput, TensorSpec, ValueId, ValueRole,
+    Visibility, reciprocal_sqrt_scale,
 };
 use moxie_types::{Dim, Precision, Result, SymbolId, WeightPrecision};
 
@@ -192,7 +193,10 @@ pub fn build_routed() -> Result<Fixture> {
         vec![VOCAB, WIDTH],
         11,
     )?;
-    let router_gain = parameter(&mut graph, "router gain", vec![WIDTH], 5)?;
+    // A per-expert additive bias, not a gain: this router does not normalize
+    // its input, so there is no gain tensor to bind. `e_score_correction_bias`
+    // is `[experts]` and moves selection only.
+    let selection_bias = parameter(&mut graph, "selection bias", vec![EXPERTS], 5)?;
     let router_proj = parameter(&mut graph, "router projection", vec![EXPERTS, WIDTH], 7)?;
     let gate_up = parameter(
         &mut graph,
@@ -242,16 +246,27 @@ pub fn build_routed() -> Result<Fixture> {
     // No shared expert and no per-expert scale: the routed branch is the whole
     // feed-forward here, which is what makes it a different consumer rather
     // than the same block with different numbers.
+    //
+    // Every routing parameter here is the **opposite** of the Gemma-like
+    // graph's, and since task 0022 that includes the two the second family
+    // introduced: this router projects the row it is given rather than
+    // normalizing it, scores with a sigmoid rather than a softmax, and carries
+    // a per-expert **selection bias** where Gemma carries a per-expert
+    // coefficient **scale**. Those last two are the same shape, so a graph that
+    // bound them the wrong way round would pass every shape check -- which is
+    // why this fixture binds one of each across the two consumers rather than
+    // neither.
     let route = graph.node(
         OpParams::Route {
             hidden: WIDTH,
             experts: EXPERTS,
             top_k: TOP_K,
-            eps: 1e-5,
-            input_scale: 1.0,
+            input: RouterInput::Raw,
+            score: RouteScore::Sigmoid,
             per_expert_scale: false,
+            selection_bias: true,
         },
-        &[value, router_gain, router_proj],
+        &[value, router_proj, selection_bias],
     )?;
     let slots = graph.node(
         OpParams::ExpertMlp {
@@ -268,6 +283,8 @@ pub fn build_routed() -> Result<Fixture> {
             hidden: WIDTH,
             top_k: TOP_K,
             order: CombineOrder::SelectionOrder,
+            // A routed scaling factor, where the Gemma-like graph has none.
+            output_scale: 1.5,
         },
         &[route, slots],
     )?;

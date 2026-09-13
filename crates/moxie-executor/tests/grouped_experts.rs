@@ -37,6 +37,54 @@ const BUS: &str = "0000:82:00.0";
 /// Four rows over five experts: reuse counts 3, 2, 1, 1, 1.
 const ROUTE: [u32; 8] = [0, 1, 0, 2, 1, 3, 0, 4];
 
+/// The declared restriction: the cache may hold **one fifth** of what the route
+/// demands.
+///
+/// A ratio rather than a constant, because a constant stops meaning
+/// "restricted" the moment a shape changes. Roadmap M2 item 4 asks for "an
+/// intentionally restricted memory budget smaller than its working weights",
+/// and a relation is what expresses that; the number the relation produces is
+/// printed by the case.
+const RESTRICTION: u64 = 5;
+
+/// The union of what the route demands, which is what a budget is a ratio of.
+///
+/// Document 03: "estimate union of required experts over a row batch ... Do not
+/// multiply active experts by batch rows when routes overlap." So this is the
+/// distinct count, not `rows * top_k`.
+fn working_set_bytes(route: &[u32]) -> u64 {
+    let mut distinct: Vec<u32> = route.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    distinct.len() as u64 * CHUNK
+}
+
+/// The restriction is a relation, not a number.
+///
+/// Checked on its own so that a shape change which quietly made the budget
+/// larger than the working set fails here, naming the reason, rather than
+/// turning a restricted case into an unrestricted one that still passes.
+#[test]
+fn the_restricted_budget_is_a_ratio_of_the_working_set() {
+    let working = working_set_bytes(&ROUTE);
+    let budget = working.div_ceil(RESTRICTION);
+    assert_eq!(working, 5 * CHUNK);
+    assert!(budget < working, "the budget is not a restriction");
+    assert!(
+        budget >= CHUNK,
+        "a budget below one expert refuses rather than evicts, which is a different case"
+    );
+    assert!(
+        budget < 2 * CHUNK,
+        "at 1/{RESTRICTION} of a {}-expert working set the cache must hold exactly one expert",
+        working / CHUNK
+    );
+    println!(
+        "host working set {working} B over {} expert(s); budget {budget} B at 1/{RESTRICTION}",
+        working / CHUNK
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A real safetensors shard, read through the real reader
 // ---------------------------------------------------------------------------
@@ -152,10 +200,15 @@ fn mlp() -> OpParams {
 }
 
 fn combine(order: CombineOrder) -> OpParams {
+    combine_scaled(order, 1.0)
+}
+
+fn combine_scaled(order: CombineOrder, output_scale: f32) -> OpParams {
     OpParams::Combine {
         hidden: HIDDEN,
         top_k: TOP_K,
         order,
+        output_scale,
     }
 }
 
@@ -188,6 +241,10 @@ fn ledger(host_bytes: u64) -> Ledger {
 
 /// The oracle: what the reduced rows must be, bit for bit.
 fn expected_rows(w: &Weights, order: CombineOrder) -> Vec<u16> {
+    expected_rows_scaled(w, order, 1.0)
+}
+
+fn expected_rows_scaled(w: &Weights, order: CombineOrder, output_scale: f32) -> Vec<u16> {
     let spec = route::ExpertSpec {
         experts: EXPERTS as usize,
         hidden: HIDDEN as usize,
@@ -217,6 +274,7 @@ fn expected_rows(w: &Weights, order: CombineOrder) -> Vec<u16> {
             &slots,
             HIDDEN as usize,
             order,
+            output_scale,
         )
         .unwrap();
         out.extend(row.iter().map(|v| to_bf16_bits(*v)));
@@ -359,11 +417,15 @@ fn a_budget_smaller_than_the_working_set_still_executes() {
     let path = write_shard(&dir, &w);
     let mut src = source(&path);
     let mut l = ledger(1 << 24);
-    // Room for **one** expert's two chunks at a time, against five experts.
-    // Document 06 M2 item 4 asks for "an intentionally restricted memory budget
-    // smaller than its working weights"; this is that, on the host tier.
+    // One fifth of what the route demands, which at this shape is room for
+    // **one** expert's two chunks at a time against five experts. Document 06
+    // M2 item 4 asks for "an intentionally restricted memory budget smaller
+    // than its working weights"; this is that, on the host tier, stated as the
+    // ratio `the_restricted_budget_is_a_ratio_of_the_working_set` checks.
+    let working = working_set_bytes(&ROUTE);
+    let cap = working.div_ceil(RESTRICTION);
     let mut authority =
-        ResidencyAuthority::open(&mut l, &ResidencyRequest::new("restricted", CHUNK)).unwrap();
+        ResidencyAuthority::open(&mut l, &ResidencyRequest::new("restricted", cap)).unwrap();
 
     let mut policy = host_only_policy();
     // A queue of four against a cache that holds one: every acquire past the
@@ -397,7 +459,8 @@ fn a_budget_smaller_than_the_working_set_still_executes() {
     );
     assert!(authority.stats().evictions > 0);
     println!(
-        "restricted budget: cap {CHUNK} B, {} group(s), {} backpressure drain(s), {} eviction(s)",
+        "restricted budget: working set {working} B, cap {cap} B at 1/{RESTRICTION}, {} group(s), \
+         {} backpressure drain(s), {} eviction(s)",
         run.stats().groups_run,
         run.stats().backpressure_drains,
         authority.stats().evictions
@@ -491,6 +554,7 @@ fn the_declared_reduction_order_decides_the_answer() {
         &slots,
         1,
         CombineOrder::AscendingExpertId,
+        1.0,
     )
     .unwrap();
     let selection = route::combine_row(
@@ -499,6 +563,7 @@ fn the_declared_reduction_order_decides_the_answer() {
         &slots,
         1,
         CombineOrder::SelectionOrder,
+        1.0,
     )
     .unwrap();
     assert_eq!(ascending, vec![0.0]);
@@ -526,6 +591,7 @@ fn the_declared_reduction_order_decides_the_answer() {
             1,
             3,
             1,
+            1.0,
             &mut [0f32; 1],
             &mut out,
         )
@@ -625,6 +691,7 @@ fn two_groups_of_one_run_reduce_in_the_planned_order_and_not_in_completion_order
                 hidden: H,
                 top_k: K,
                 order,
+                output_scale: 1.0,
             },
             &route,
             &host_only_budget(),
@@ -720,6 +787,7 @@ fn host_buffers_are_bound_to_the_planned_node_and_the_pages_are_read_back() {
         hidden: 1024,
         top_k: TOP_K,
         order: CombineOrder::AscendingExpertId,
+        output_scale: 1.0,
     };
     let route: Vec<u32> = (0..rows * TOP_K)
         .map(|i| ((i % TOP_K) + 2 * (i / TOP_K % 2)) as u32)
@@ -1004,6 +1072,7 @@ fn a_failed_group_ends_the_run_rather_than_yielding_a_partial_answer() {
             hidden: HIDDEN,
             top_k: 1,
             order: CombineOrder::AscendingExpertId,
+            output_scale: 1.0,
         },
         &[0],
         &host_only_budget(),
@@ -1501,5 +1570,59 @@ fn a_read_failure_is_not_backpressure() {
     run.cancel(&mut authority);
     run.close(&mut l).unwrap();
     authority.close(&mut l).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The combine's output scale reaches the reduced rows.
+///
+/// Added because a mutation battery said so: two mutants that dropped
+/// `Combine`'s `output_scale` on the way from the graph node to the plan
+/// survived the whole planner sweep and every executor test, because every
+/// fixture in the workspace used a scale of exactly 1.0. A parameter no fixture
+/// ever varies is a parameter no test checks, however many tests read it.
+///
+/// The value is Laguna's own `moe_routed_scaling_factor`.
+#[test]
+fn the_combine_output_scale_reaches_the_reduced_rows() {
+    const SCALE: f32 = 2.5;
+    let dir = scratch("output-scale");
+    let w = weights(0x51ed_2501);
+    let path = write_shard(&dir, &w);
+    let mut l = ledger(1 << 24);
+
+    let reduced = |scale: f32, l: &mut Ledger| -> Vec<u16> {
+        let mut src = source(&path);
+        let mut authority =
+            ResidencyAuthority::open(l, &ResidencyRequest::new("scale", 64 * CHUNK)).unwrap();
+        let plan = compile_experts(
+            &mlp(),
+            &combine_scaled(CombineOrder::AscendingExpertId, scale),
+            &ROUTE,
+            &host_only_budget(),
+            &host_only_policy(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.output_scale(), scale);
+        let mut run = GroupedRun::admit(l, plan, roles(), None).unwrap();
+        run.load_activations(&to_bytes(&w.x)).unwrap();
+        run.run_to_completion(&mut authority, &mut src, TurnId::new(31), 0, u64::MAX)
+            .unwrap();
+        let out = as_u16(run.reduce(&w.coefficients).unwrap());
+        run.close(l).unwrap();
+        authority.close(l).unwrap();
+        out
+    };
+
+    let scaled = reduced(SCALE, &mut l);
+    assert_eq!(
+        scaled,
+        expected_rows_scaled(&w, CombineOrder::AscendingExpertId, SCALE),
+        "the reduced rows do not carry the declared output scale"
+    );
+    // And it is not the unscaled answer: a fixture on which the two agree tests
+    // neither.
+    assert_ne!(scaled, reduced(1.0, &mut l));
     let _ = std::fs::remove_dir_all(&dir);
 }

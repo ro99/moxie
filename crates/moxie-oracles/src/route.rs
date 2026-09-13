@@ -97,6 +97,24 @@ pub fn route_row(logits: &[f32], k: usize) -> Result<Route> {
 /// the same rule and renormalises over the same mass. Two selection functions
 /// would be two tie rules the moment one of them was edited.
 pub fn select_top_k(probs: &[f32], k: usize) -> Result<Route> {
+    select_top_k_biased(probs, None, k)
+}
+
+/// Select the top `k` on **biased** scores and renormalise the **unbiased**
+/// ones.
+///
+/// Laguna's `e_score_correction_bias` is the auxiliary-loss-free load balancing
+/// of arXiv:2408.15664: `LagunaTopKRouter.forward` adds it to the scores it
+/// selects with, then gathers the coefficients from `routing_scores` -- the
+/// tensor *before* the addition. A router that gathered the biased score
+/// instead would still produce a well-formed, renormalised distribution, which
+/// is exactly why this is a separate function with its own fixture rather than
+/// an addition folded into the caller.
+///
+/// The tie rule is the shared one, applied to the **selection** score: the
+/// lower expert id wins. A bias that creates a tie is therefore broken the same
+/// way every other tie on this path is.
+pub fn select_top_k_biased(probs: &[f32], bias: Option<&[f32]>, k: usize) -> Result<Route> {
     if probs.is_empty() {
         return Err(Error::InvalidRequest {
             field: "router_probabilities",
@@ -114,6 +132,35 @@ pub fn select_top_k(probs: &[f32], k: usize) -> Result<Route> {
             detail: format!("router probability {bad} is {}", probs[bad]),
         });
     }
+    // The scores selection is ordered by. Without a bias this borrows `probs`
+    // and allocates nothing; with one it is a separate vector, because the
+    // coefficients must still come from the unbiased scores afterwards.
+    let selection = match bias {
+        None => None,
+        Some(b) => {
+            if b.len() != probs.len() {
+                return Err(Error::InvalidArtifact {
+                    detail: format!(
+                        "selection bias has {} elements for {} experts",
+                        b.len(),
+                        probs.len()
+                    ),
+                });
+            }
+            if let Some(bad) = b.iter().position(|v| !v.is_finite()) {
+                return Err(Error::Numerical {
+                    detail: format!("selection bias {bad} is {}", b[bad]),
+                });
+            }
+            let mut biased = crate::try_vec(probs.len())?;
+            biased.extend(probs.iter().zip(b).map(|(p, v)| p + v));
+            Some(biased)
+        }
+    };
+    let key: &[f32] = match &selection {
+        Some(v) => v,
+        None => probs,
+    };
     let mut order: Vec<u32> = crate::try_vec(probs.len())?;
     order.extend(0..probs.len() as u32);
     // Descending by probability, then ascending by id. The tie-break is written
@@ -124,9 +171,9 @@ pub fn select_top_k(probs: &[f32], k: usize) -> Result<Route> {
     // trust is then visible in the comparison instead of in a property of the
     // sort implementation.
     order.sort_unstable_by(|a, b| {
-        probs[*b as usize]
-            .partial_cmp(&probs[*a as usize])
-            .expect("probabilities are finite")
+        key[*b as usize]
+            .partial_cmp(&key[*a as usize])
+            .expect("selection scores are finite")
             .then(a.cmp(b))
     });
 
@@ -323,6 +370,18 @@ pub fn router_input_row(x: &[f32], gain: &[f32], input_scale: f32, eps: f32) -> 
 /// leaves it in the input dtype and the artifact declares 5.5.0.dev0. That
 /// difference is recorded in the bring-up record rather than averaged away.
 pub fn router_probabilities(t: &[f32], proj: &[f32], experts: usize) -> Result<Vec<f32>> {
+    let logits = router_logits(t, proj, experts)?;
+    router_scores(&logits, moxie_graph::RouteScore::Softmax)
+}
+
+/// The router's expert logits: a BF16 linear, checked finite.
+///
+/// Split out of [`router_probabilities`] when a second family arrived whose
+/// score transform is not a softmax. The BF16 rounding stays here, because it
+/// is a property of the **projection** -- `self.weight` is a BF16 `nn.Linear`
+/// in both pinned references -- and it happens before anything compares two
+/// experts, so it decides selection either way.
+pub fn router_logits(t: &[f32], proj: &[f32], experts: usize) -> Result<Vec<f32>> {
     let mut logits = crate::linear::linear_row(t, proj, experts, None)?;
     for l in logits.iter_mut() {
         *l = crate::bf16_round(*l);
@@ -332,7 +391,48 @@ pub fn router_probabilities(t: &[f32], proj: &[f32], experts: usize) -> Result<V
             detail: format!("router logit {bad} is {}", logits[bad]),
         });
     }
-    softmax(&logits)
+    Ok(logits)
+}
+
+/// Logits to per-expert scores, in FP32.
+///
+/// The two transforms are genuinely different functions, not one with a flag:
+///
+/// * `Softmax` couples every expert to every other through the normaliser, so
+///   the scores sum to one before any selection happens.
+/// * `Sigmoid` is per expert and independent (`torch.sigmoid(router_logits)` in
+///   `LagunaTopKRouter.forward`). The scores do not sum to one, and adding a
+///   selection bias moves each by an amount that depends on its own logit --
+///   which is why a bias under sigmoid can reorder experts that a bias under
+///   softmax would not.
+///
+/// FP32 for both, which is `transformers` 5.15's stated convention for the
+/// softmax ("fp32 for numerical stability") and what `LagunaTopKRouter.forward`
+/// does explicitly with `.float()` before the sigmoid.
+pub fn router_scores(logits: &[f32], score: moxie_graph::RouteScore) -> Result<Vec<f32>> {
+    match score {
+        moxie_graph::RouteScore::Softmax => softmax(logits),
+        moxie_graph::RouteScore::Sigmoid => {
+            let mut out = crate::try_vec(logits.len())?;
+            // `1 / (1 + e^-l)`, evaluated the stable way on each side of zero
+            // so that a large negative logit underflows to zero rather than
+            // overflowing `exp`.
+            out.extend(logits.iter().map(|l| {
+                if *l >= 0.0 {
+                    1.0 / (1.0 + (-*l).exp())
+                } else {
+                    let e = l.exp();
+                    e / (1.0 + e)
+                }
+            }));
+            if let Some(bad) = out.iter().position(|p| !p.is_finite()) {
+                return Err(Error::Numerical {
+                    detail: format!("router sigmoid score {bad} is {}", out[bad]),
+                });
+            }
+            Ok(out)
+        }
+    }
 }
 
 /// Multiply a route's coefficients by each selected expert's own scale.
@@ -373,10 +473,10 @@ pub fn apply_per_expert_scale(route: &Route, per_expert: &[f32]) -> Result<Route
 pub struct RouterSpec {
     pub experts: usize,
     pub top_k: usize,
-    /// Epsilon of the router's own scale-free RMS normalization.
-    pub eps: f32,
-    /// The scalar applied to the normalized, gained row before projection.
-    pub input_scale: f32,
+    /// What the router does to the row before projecting it.
+    pub input: moxie_graph::RouterInput,
+    /// How the logits become per-expert scores.
+    pub score: moxie_graph::RouteScore,
 }
 
 /// The closed parameters of one routed expert feed-forward.
@@ -398,14 +498,34 @@ pub struct ExpertSpec {
 /// sends rows to the wrong experts.
 pub fn router_route_row(
     x: &[f32],
-    gain: &[f32],
+    gain: Option<&[f32]>,
     proj: &[f32],
     per_expert: Option<&[f32]>,
+    selection_bias: Option<&[f32]>,
     spec: RouterSpec,
 ) -> Result<Route> {
-    let t = router_input_row(x, gain, spec.input_scale, spec.eps)?;
-    let probs = router_probabilities(&t, proj, spec.experts)?;
-    let route = select_top_k(&probs, spec.top_k)?;
+    // `Normalized` needs the gain and `Raw` must not be handed one. A router
+    // that quietly ignored a supplied gain, or quietly substituted ones for a
+    // missing one, would turn a wiring mistake into a plausible answer.
+    let t = match (spec.input, gain) {
+        (moxie_graph::RouterInput::Normalized { eps, input_scale }, Some(g)) => {
+            router_input_row(x, g, input_scale, eps)?
+        }
+        (moxie_graph::RouterInput::Raw, None) => crate::try_clone_slice(x)?,
+        (moxie_graph::RouterInput::Normalized { .. }, None) => {
+            return Err(Error::InvalidArtifact {
+                detail: "a normalizing router was given no gain".into(),
+            });
+        }
+        (moxie_graph::RouterInput::Raw, Some(_)) => {
+            return Err(Error::InvalidArtifact {
+                detail: "a raw router was given a gain".into(),
+            });
+        }
+    };
+    let logits = router_logits(&t, proj, spec.experts)?;
+    let scores = router_scores(&logits, spec.score)?;
+    let route = select_top_k_biased(&scores, selection_bias, spec.top_k)?;
     match per_expert {
         Some(scale) => apply_per_expert_scale(&route, scale),
         None => Ok(route),
@@ -630,7 +750,23 @@ pub fn combine_order(experts: &[u32], order: moxie_graph::CombineOrder) -> Resul
     Ok(slots)
 }
 
-/// `y = Σ_j w[j] · slots[j]`, summed in the stated order.
+/// `y = (Σ_j w[j] · slots[j]) · output_scale`, summed in the stated order.
+///
+/// ## The output scale, and where it is applied
+///
+/// Laguna's `moe_routed_scaling_factor` multiplies the **combined** row:
+/// `expert_output = expert_output * self.routed_scaling_factor` in
+/// `LagunaSparseMoeBlock.forward`, after `LagunaExperts.forward` has
+/// accumulated every term and before the shared expert is added. Applying it to
+/// each term before summing would be a different rounding pattern, and folding
+/// it into the residual would scale the shared expert too.
+///
+/// It multiplies the FP32 accumulator here, so the node boundary still rounds
+/// once. That is the same deviation from the pinned reference this function
+/// already carries and declares below -- the reference narrows to BF16 between
+/// additions and then scales a BF16 tensor -- not a second one. A family whose
+/// scale is exactly representable in BF16 (2.5 is) moves the deviation nowhere;
+/// one whose scale is not would round the product once instead of twice.
 ///
 /// `slots` holds this row's `top_k` expert outputs contiguously, slot `j` at
 /// `j * width`, in the route's **selection** order. `order` decides the
@@ -671,7 +807,13 @@ pub fn combine_row(
     slots: &[f32],
     width: usize,
     order: moxie_graph::CombineOrder,
+    output_scale: f32,
 ) -> Result<Vec<f32>> {
+    if !output_scale.is_finite() {
+        return Err(Error::Numerical {
+            detail: format!("combine output scale is {output_scale}"),
+        });
+    }
     if width == 0 {
         return Err(Error::InvalidRequest {
             field: "combine",
@@ -704,6 +846,11 @@ pub fn combine_row(
             *a += w * v;
         }
     }
+    if output_scale != 1.0 {
+        for a in acc.iter_mut() {
+            *a *= output_scale;
+        }
+    }
     Ok(acc)
 }
 
@@ -732,73 +879,104 @@ mod tests {
 
     use moxie_graph::{CombineOrder, ExpertActivation};
 
-    /// An FP64 transcription of `Gemma4TextRouter.forward`, written from the
-    /// pinned source rather than from [`router_route_row`].
+    /// An FP64 transcription of a router's forward pass, written from the
+    /// pinned sources rather than from [`router_route_row`].
     ///
-    /// Returns the full probability vector and the scaled coefficients, so a
-    /// test can check the selection exactly and the coefficients against a
-    /// bound.
+    /// It covers both families, because the point of a transcription is that it
+    /// was written from the reference: `Gemma4TextRouter.forward` for the
+    /// normalizing softmax router, and `LagunaTopKRouter.forward` for the raw
+    /// sigmoid router with a selection bias.
+    ///
+    /// Returns the selected ids and the coefficients, so a test can check the
+    /// selection exactly and the coefficients against a bound.
     fn fp64_router(
         x: &[f32],
-        gain: &[f32],
+        gain: Option<&[f32]>,
         proj: &[f32],
         per_expert: Option<&[f32]>,
+        selection_bias: Option<&[f32]>,
         spec: RouterSpec,
     ) -> (Vec<u32>, Vec<f64>) {
         let RouterSpec {
             experts,
             top_k,
-            eps,
-            input_scale,
+            input,
+            score,
         } = spec;
         let h = x.len();
-        // hidden_states = self.norm(hidden_states)   -- with_scale = False
-        let mean_sq: f64 = x.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / h as f64;
-        let inv = (mean_sq + eps as f64).powf(-0.5);
-        // The norm returns `.type_as(hidden_states)`, so its result is BF16
-        // before anything multiplies it, and the two multiplications that
-        // follow are BF16 tensor operations. Transcribing those boundaries is
-        // the whole point of this fixture: without them the transcription
-        // agreed with an implementation that selected different experts.
-        let t: Vec<f64> = x
-            .iter()
-            .zip(gain)
-            .map(|(v, g)| {
-                let normed = crate::bf16_round(((*v as f64) * inv) as f32) as f64;
-                let gained = crate::bf16_round((normed * (*g as f64)) as f32) as f64;
-                crate::bf16_round((gained * (input_scale as f64)) as f32) as f64
-            })
-            .collect();
-        // expert_scores = self.proj(hidden_states) -- a BF16 linear, so its
-        // output is BF16 before any two experts are compared.
+        let t: Vec<f64> = match input {
+            moxie_graph::RouterInput::Normalized { eps, input_scale } => {
+                // hidden_states = self.norm(hidden_states)  -- with_scale=False
+                let mean_sq: f64 =
+                    x.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / h as f64;
+                let inv = (mean_sq + eps as f64).powf(-0.5);
+                // The norm returns `.type_as(hidden_states)`, so its result is
+                // BF16 before anything multiplies it, and the two
+                // multiplications that follow are BF16 tensor operations.
+                // Transcribing those boundaries is the whole point of this
+                // fixture: without them the transcription agreed with an
+                // implementation that selected different experts.
+                let g = gain.expect("a normalizing router has a gain");
+                x.iter()
+                    .zip(g)
+                    .map(|(v, gv)| {
+                        let normed = crate::bf16_round(((*v as f64) * inv) as f32) as f64;
+                        let gained = crate::bf16_round((normed * (*gv as f64)) as f32) as f64;
+                        crate::bf16_round((gained * (input_scale as f64)) as f32) as f64
+                    })
+                    .collect()
+            }
+            // `router_logits = F.linear(hidden_states, self.weight)` -- the row
+            // reaches the projection exactly as the block produced it.
+            moxie_graph::RouterInput::Raw => x.iter().map(|v| *v as f64).collect(),
+        };
+        // The projection is a BF16 linear, so its output is BF16 before any two
+        // experts are compared.
         let logits: Vec<f64> = (0..experts)
             .map(|o| {
                 let acc: f64 = (0..h).map(|i| t[i] * proj[o * h + i] as f64).sum();
                 crate::bf16_round(acc as f32) as f64
             })
             .collect();
-        // router_probabilities = softmax(expert_scores)
-        let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let exps: Vec<f64> = logits.iter().map(|l| (l - max).exp()).collect();
-        let total: f64 = exps.iter().sum();
-        let probs: Vec<f64> = exps.iter().map(|e| e / total).collect();
+        let scores: Vec<f64> = match score {
+            moxie_graph::RouteScore::Softmax => {
+                let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let exps: Vec<f64> = logits.iter().map(|l| (l - max).exp()).collect();
+                let total: f64 = exps.iter().sum();
+                exps.iter().map(|e| e / total).collect()
+            }
+            // routing_scores = torch.sigmoid(router_logits)
+            moxie_graph::RouteScore::Sigmoid => {
+                logits.iter().map(|l| 1.0 / (1.0 + (-l).exp())).collect()
+            }
+        };
+        // scores_for_selection = routing_scores + self.e_score_correction_bias
+        let selection: Vec<f64> = scores
+            .iter()
+            .enumerate()
+            .map(|(e, s)| match selection_bias {
+                Some(b) => s + b[e] as f64,
+                None => *s,
+            })
+            .collect();
         // top_k_weights, top_k_index = torch.topk(...), with the lower id
         // winning a tie -- the shared rule, not torch's unspecified one.
         let mut order: Vec<u32> = (0..experts as u32).collect();
         order.sort_by(|a, b| {
-            probs[*b as usize]
-                .partial_cmp(&probs[*a as usize])
+            selection[*b as usize]
+                .partial_cmp(&selection[*a as usize])
                 .unwrap()
                 .then(a.cmp(b))
         });
         let ids: Vec<u32> = order.into_iter().take(top_k).collect();
-        // top_k_weights /= top_k_weights.sum(...)
-        let mass: f64 = ids.iter().map(|e| probs[*e as usize]).sum();
+        // routing_weights = routing_scores.gather(-1, selected_experts) -- the
+        // UNBIASED scores -- then `/= sum`.
+        let mass: f64 = ids.iter().map(|e| scores[*e as usize]).sum();
         // top_k_weights = top_k_weights * self.per_expert_scale[top_k_index]
         let weights: Vec<f64> = ids
             .iter()
             .map(|e| {
-                let w = probs[*e as usize] / mass;
+                let w = scores[*e as usize] / mass;
                 match per_expert {
                     Some(s) => w * s[*e as usize] as f64,
                     None => w,
@@ -946,11 +1124,11 @@ mod tests {
             let spec = RouterSpec {
                 experts,
                 top_k,
-                eps,
-                input_scale,
+                input: moxie_graph::RouterInput::Normalized { eps, input_scale },
+                score: moxie_graph::RouteScore::Softmax,
             };
-            let got = router_route_row(&x, &gain, &proj, Some(&scale), spec).unwrap();
-            let (ids, weights) = fp64_router(&x, &gain, &proj, Some(&scale), spec);
+            let got = router_route_row(&x, Some(&gain), &proj, Some(&scale), None, spec).unwrap();
+            let (ids, weights) = fp64_router(&x, Some(&gain), &proj, Some(&scale), None, spec);
 
             // Selection is integer and must agree exactly. A coefficient that
             // is a few ulps out is a rounding difference; a different expert is
@@ -992,11 +1170,14 @@ mod tests {
         let spec = RouterSpec {
             experts,
             top_k: 3,
-            eps: 1e-6,
-            input_scale: 1.0,
+            input: moxie_graph::RouterInput::Normalized {
+                eps: 1e-6,
+                input_scale: 1.0,
+            },
+            score: moxie_graph::RouteScore::Softmax,
         };
-        let unscaled = router_route_row(&x, &gain, &proj, None, spec).unwrap();
-        let scaled = router_route_row(&x, &gain, &proj, Some(&scale), spec).unwrap();
+        let unscaled = router_route_row(&x, Some(&gain), &proj, None, None, spec).unwrap();
+        let scaled = router_route_row(&x, Some(&gain), &proj, Some(&scale), None, spec).unwrap();
 
         assert_eq!(unscaled.experts, scaled.experts, "the scale is not a score");
         let sum: f32 = unscaled.weights.iter().sum();
@@ -1026,27 +1207,35 @@ mod tests {
         let proj = pattern(experts * hidden, 10);
         let with = router_route_row(
             &x,
-            &gain,
+            Some(&gain),
             &proj,
+            None,
             None,
             RouterSpec {
                 experts,
                 top_k: 2,
-                eps: 1e-6,
-                input_scale: 0.25,
+                input: moxie_graph::RouterInput::Normalized {
+                    eps: 1e-6,
+                    input_scale: 0.25,
+                },
+                score: moxie_graph::RouteScore::Softmax,
             },
         )
         .unwrap();
         let without = router_route_row(
             &x,
-            &gain,
+            Some(&gain),
             &proj,
+            None,
             None,
             RouterSpec {
                 experts,
                 top_k: 2,
-                eps: 1e-6,
-                input_scale: 1.0,
+                input: moxie_graph::RouterInput::Normalized {
+                    eps: 1e-6,
+                    input_scale: 1.0,
+                },
+                score: moxie_graph::RouteScore::Softmax,
             },
         )
         .unwrap();
@@ -1064,11 +1253,14 @@ mod tests {
         let spec = RouterSpec {
             experts,
             top_k: 2,
-            eps: 1e-6,
-            input_scale: 1.0,
+            input: moxie_graph::RouterInput::Normalized {
+                eps: 1e-6,
+                input_scale: 1.0,
+            },
+            score: moxie_graph::RouteScore::Softmax,
         };
-        let with = router_route_row(&x, &gain, &proj, None, spec).unwrap();
-        let without = router_route_row(&x, &ones, &proj, None, spec).unwrap();
+        let with = router_route_row(&x, Some(&gain), &proj, None, None, spec).unwrap();
+        let without = router_route_row(&x, Some(&ones), &proj, None, None, spec).unwrap();
         assert_ne!(with.weights, without.weights);
     }
 
@@ -1090,14 +1282,18 @@ mod tests {
         for _ in 0..16 {
             let r = router_route_row(
                 &x,
-                &gain,
+                Some(&gain),
                 &proj,
+                None,
                 None,
                 RouterSpec {
                     experts,
                     top_k: 2,
-                    eps: 1e-6,
-                    input_scale: 1.0,
+                    input: moxie_graph::RouterInput::Normalized {
+                        eps: 1e-6,
+                        input_scale: 1.0,
+                    },
+                    score: moxie_graph::RouteScore::Softmax,
                 },
             )
             .unwrap();
@@ -1362,6 +1558,7 @@ mod tests {
             &slots,
             1,
             CombineOrder::AscendingExpertId,
+            1.0,
         )
         .unwrap();
         let selection = combine_row(
@@ -1370,6 +1567,7 @@ mod tests {
             &slots,
             1,
             CombineOrder::SelectionOrder,
+            1.0,
         )
         .unwrap();
         assert_ne!(
@@ -1390,7 +1588,8 @@ mod tests {
             CombineOrder::AscendingExpertId,
             CombineOrder::SelectionOrder,
         ] {
-            let got = combine_row(&route.experts, &route.weights, &slots, width, order).unwrap();
+            let got =
+                combine_row(&route.experts, &route.weights, &slots, width, order, 1.0).unwrap();
             let slot_order = combine_order(&route.experts, order).unwrap();
             let mut errors = Vec::new();
             for d in 0..width {
@@ -1535,10 +1734,10 @@ mod tests {
         let spec = RouterSpec {
             experts,
             top_k: 2,
-            eps,
-            input_scale,
+            input: moxie_graph::RouterInput::Normalized { eps, input_scale },
+            score: moxie_graph::RouteScore::Softmax,
         };
-        let got = router_route_row(&x, &gain, &proj, None, spec).unwrap();
+        let got = router_route_row(&x, Some(&gain), &proj, None, None, spec).unwrap();
 
         // No tie is doing the work: every unrounded logit is distinct.
         let mut sorted = unrounded.1.clone();
@@ -1579,6 +1778,7 @@ mod tests {
             &slots,
             1,
             CombineOrder::AscendingExpertId,
+            1.0,
         )
         .unwrap();
         assert_eq!(ours, vec![1.0], "FP32 accumulation keeps the middle term");
@@ -1627,13 +1827,16 @@ mod tests {
         let spec = RouterSpec {
             experts,
             top_k,
-            eps: 1e-6,
-            input_scale: (hidden as f64).sqrt().recip() as f32,
+            input: moxie_graph::RouterInput::Normalized {
+                eps: 1e-6,
+                input_scale: (hidden as f64).sqrt().recip() as f32,
+            },
+            score: moxie_graph::RouteScore::Softmax,
         };
         let rows: Vec<Route> = (0..12)
             .map(|r| {
                 let x = pattern(hidden, r * 5 + 1);
-                router_route_row(&x, &gain, &proj, None, spec).unwrap()
+                router_route_row(&x, Some(&gain), &proj, None, None, spec).unwrap()
             })
             .collect();
 
@@ -1709,7 +1912,8 @@ mod tests {
                 &route.weights,
                 &[],
                 4,
-                CombineOrder::SelectionOrder
+                CombineOrder::SelectionOrder,
+                1.0
             )
             .is_err()
         );
@@ -1901,5 +2105,323 @@ mod tests {
                 .sum();
             assert!((combined[row][0] - want).abs() < 1e-6, "row {row}");
         }
+    }
+
+    // ---- Task 0022: the second family's router ----
+    //
+    // Laguna's router disagrees with Gemma's on three axes, and each of them is
+    // pinned in `LagunaTopKRouter.forward` and `LagunaSparseMoeBlock.forward`
+    // in the artifact's own `modeling_laguna.py`, read and never executed.
+
+    fn laguna_spec(experts: usize, top_k: usize) -> RouterSpec {
+        RouterSpec {
+            experts,
+            top_k,
+            input: moxie_graph::RouterInput::Raw,
+            score: moxie_graph::RouteScore::Sigmoid,
+        }
+    }
+
+    fn gemma_like_spec(experts: usize, top_k: usize) -> RouterSpec {
+        RouterSpec {
+            experts,
+            top_k,
+            input: moxie_graph::RouterInput::Normalized {
+                eps: 1e-6,
+                input_scale: 1.0,
+            },
+            score: moxie_graph::RouteScore::Softmax,
+        }
+    }
+
+    #[test]
+    fn the_two_score_transforms_agree_on_selection_and_disagree_on_coefficients() {
+        // Worth stating precisely, because the obvious claim is wrong: softmax
+        // and sigmoid are both **monotone** in the logit, so on their own they
+        // select the *same* experts. What they change is the coefficients --
+        // renormalised softmax probabilities and renormalised sigmoid scores
+        // are different distributions over the same set.
+        //
+        // This is the fixture that keeps the next reader from "simplifying"
+        // sigmoid into softmax on the grounds that a selection test passed.
+        let logits: Vec<f32> = vec![-2.0, 0.5, 1.25, -0.75, 3.0, 0.0];
+        let soft = router_scores(&logits, moxie_graph::RouteScore::Softmax).unwrap();
+        let sig = router_scores(&logits, moxie_graph::RouteScore::Sigmoid).unwrap();
+
+        let a = select_top_k(&soft, 3).unwrap();
+        let b = select_top_k(&sig, 3).unwrap();
+        assert_eq!(a.experts, b.experts, "both transforms are monotone");
+        assert_ne!(
+            a.weights, b.weights,
+            "if the coefficients agreed too, the transform would not be a parameter"
+        );
+
+        // And sigmoid scores are not a distribution before selection.
+        let mass: f32 = sig.iter().sum();
+        assert!(
+            (mass - 1.0).abs() > 0.1,
+            "sigmoid scores summed to {mass}, which would make this fixture indistinguishable \
+             from a softmax"
+        );
+    }
+
+    #[test]
+    fn a_selection_bias_makes_the_score_transform_decide_the_selection_too() {
+        // With a bias the transforms stop agreeing: the bias is added to the
+        // score, and a softmax score and a sigmoid score of the same logit have
+        // different magnitudes, so the same bias reorders them differently.
+        let logits: Vec<f32> = vec![-2.0, 0.5, 1.25, -0.75, 3.0, 0.0];
+        let bias: Vec<f32> = vec![0.9, 0.0, 0.0, 0.85, 0.0, 0.0];
+        let soft = router_scores(&logits, moxie_graph::RouteScore::Softmax).unwrap();
+        let sig = router_scores(&logits, moxie_graph::RouteScore::Sigmoid).unwrap();
+
+        let a = select_top_k_biased(&soft, Some(&bias), 3).unwrap();
+        let b = select_top_k_biased(&sig, Some(&bias), 3).unwrap();
+        assert_ne!(
+            a.experts, b.experts,
+            "the same bias must reorder two different score scales differently"
+        );
+    }
+
+    #[test]
+    fn the_bias_moves_the_selection_and_not_the_coefficients() {
+        // `routing_weights = routing_scores.gather(-1, selected_experts)` --
+        // the tensor **before** `+ e_score_correction_bias`. A router that
+        // gathered the biased score would produce a well-formed, renormalised
+        // distribution over the same experts, which is exactly why this needs a
+        // fixture rather than a comment.
+        let scores: Vec<f32> = vec![0.10, 0.60, 0.55, 0.05, 0.50];
+        let bias: Vec<f32> = vec![0.70, 0.0, 0.0, 0.0, 0.0];
+
+        let unbiased = select_top_k(&scores, 2).unwrap();
+        assert_eq!(unbiased.experts, vec![1, 2]);
+
+        let biased = select_top_k_biased(&scores, Some(&bias), 2).unwrap();
+        assert_eq!(biased.experts, vec![0, 1], "the bias changed the selection");
+
+        // The coefficients are the unbiased scores of the selected experts,
+        // renormalised over them.
+        let mass = scores[0] + scores[1];
+        for (w, want) in biased
+            .weights
+            .iter()
+            .zip([scores[0] / mass, scores[1] / mass])
+        {
+            assert!((w - want).abs() < 1e-6, "{w} against {want}");
+        }
+
+        // What gathering the biased score would have produced. Different, and
+        // plausible -- which is the whole point.
+        let biased_mass = (scores[0] + bias[0]) + scores[1];
+        let wrong = (scores[0] + bias[0]) / biased_mass;
+        assert!(
+            (biased.weights[0] - wrong).abs() > 0.1,
+            "the two coefficient conventions are indistinguishable on this fixture"
+        );
+    }
+
+    #[test]
+    fn a_bias_that_creates_a_tie_is_broken_by_the_shared_rule() {
+        // The tie rule applies to the **selection** score, so a bias that
+        // manufactures a tie is broken the same way every other tie is: the
+        // lower expert id wins.
+        let scores: Vec<f32> = vec![0.25, 0.50, 0.10];
+        let bias: Vec<f32> = vec![0.25, 0.0, 0.0];
+        let r = select_top_k_biased(&scores, Some(&bias), 1).unwrap();
+        assert_eq!(r.experts, vec![0], "0.25+0.25 ties 0.50; the lower id wins");
+    }
+
+    #[test]
+    fn a_raw_router_and_a_normalizing_one_each_refuse_the_other_s_operands() {
+        // A router that silently ignored a supplied gain, or silently
+        // substituted ones for a missing one, would turn a wiring mistake into
+        // a plausible answer.
+        let hidden = 8;
+        let experts = 4;
+        let x: Vec<f32> = (0..hidden).map(|i| (i as f32 - 3.0) / 4.0).collect();
+        let gain = pattern(hidden, 3);
+        let proj = pattern(experts * hidden, 5);
+
+        assert!(
+            router_route_row(&x, None, &proj, None, None, gemma_like_spec(experts, 2)).is_err(),
+            "a normalizing router accepted no gain"
+        );
+        assert!(
+            router_route_row(&x, Some(&gain), &proj, None, None, laguna_spec(experts, 2)).is_err(),
+            "a raw router accepted a gain"
+        );
+        assert!(router_route_row(&x, None, &proj, None, None, laguna_spec(experts, 2)).is_ok());
+    }
+
+    #[test]
+    fn normalizing_a_row_that_is_already_normalized_is_a_different_router() {
+        // Why `RouterInput::Raw` exists rather than "`Normalized` with a unit
+        // gain and a unit scale": the normalization is not the identity on a
+        // row whose RMS is not one, and Laguna's router projects the block's
+        // norm output directly.
+        let hidden = 8;
+        let experts = 5;
+        let x: Vec<f32> = (0..hidden).map(|i| (i as f32 - 3.0) / 2.0).collect();
+        let ones = vec![1.0f32; hidden];
+        let proj = pattern(experts * hidden, 7);
+
+        let raw = router_route_row(&x, None, &proj, None, None, laguna_spec(experts, 2)).unwrap();
+        let normed = router_route_row(
+            &x,
+            Some(&ones),
+            &proj,
+            None,
+            None,
+            RouterSpec {
+                input: moxie_graph::RouterInput::Normalized {
+                    eps: 1e-6,
+                    input_scale: 1.0,
+                },
+                ..laguna_spec(experts, 2)
+            },
+        )
+        .unwrap();
+        assert_ne!(raw.weights, normed.weights);
+    }
+
+    #[test]
+    fn the_sigmoid_router_matches_its_fp64_transcription_exactly() {
+        // The same gate task 0019 declared for the softmax router, on the path
+        // the second family takes: the **selection** is exact against a
+        // transcription written from `LagunaTopKRouter.forward`, and the
+        // coefficients are within the declared bound.
+        let hidden = 16;
+        let experts = 12;
+        for seed in 0..24u64 {
+            let x: Vec<f32> = (0..hidden)
+                .map(|i| ((i as u64 * 31 + seed * 17) % 41) as f32 / 8.0 - 2.5)
+                .collect();
+            let proj = pattern(experts * hidden, 3 + seed as usize);
+            let bias: Vec<f32> = (0..experts)
+                .map(|e| (((e as u64 + seed) % 7) as f32 - 3.0) / 16.0)
+                .collect();
+            let spec = laguna_spec(experts, 4);
+
+            let got = router_route_row(&x, None, &proj, None, Some(&bias), spec).unwrap();
+            let (ids, weights) = fp64_router(&x, None, &proj, None, Some(&bias), spec);
+            assert_eq!(
+                got.experts, ids,
+                "seed {seed}: selection is exact or it is wrong"
+            );
+            for (w, want) in got.weights.iter().zip(&weights) {
+                assert!(
+                    (*w as f64 - want).abs() <= 1e-6,
+                    "seed {seed}: {w} against {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_combine_output_scale_multiplies_the_sum_and_not_each_term() {
+        // `expert_output = expert_output * self.routed_scaling_factor` happens
+        // after `LagunaExperts.forward` has accumulated every term. Scaling
+        // each term first is a different rounding pattern, and on a cancelling
+        // fixture it is a different answer.
+        let experts = vec![0u32, 1];
+        let weights = vec![1.0f32, 1.0];
+        // Two terms that cancel to exactly 1.0 in FP32, at a magnitude where
+        // the scaled products no longer are: `2^24 · 2.5` is not representable,
+        // so scaling first loses what the cancellation was going to keep.
+        // 2.5 is the artifact's own `moe_routed_scaling_factor`.
+        let slots = vec![16_777_216.0f32, -16_777_215.0];
+        let scale = 2.5f32;
+
+        let scaled_sum = combine_row(
+            &experts,
+            &weights,
+            &slots,
+            1,
+            moxie_graph::CombineOrder::SelectionOrder,
+            scale,
+        )
+        .unwrap();
+        let unscaled = combine_row(
+            &experts,
+            &weights,
+            &slots,
+            1,
+            moxie_graph::CombineOrder::SelectionOrder,
+            1.0,
+        )
+        .unwrap();
+        // Scaling each term first, then summing.
+        let per_term: f32 = slots.iter().map(|v| v * scale).sum();
+
+        assert_eq!(unscaled[0], 1.0, "the fixture's cancellation is exact");
+        assert_eq!(scaled_sum[0], 2.5);
+        assert_eq!(per_term, 4.0);
+        assert_ne!(
+            scaled_sum[0], per_term,
+            "the two application points agree on this fixture, so it tests neither"
+        );
+    }
+
+    #[test]
+    fn a_unit_output_scale_is_exactly_the_unscaled_combination() {
+        // The multiplication is skipped at 1.0, and this is the test that says
+        // skipping it is not a shortcut with a different answer.
+        let experts = vec![2u32, 0, 1];
+        let weights = vec![0.5f32, 0.25, 0.25];
+        let slots = vec![3.0f32, -1.5, 0.75];
+        for order in [
+            moxie_graph::CombineOrder::AscendingExpertId,
+            moxie_graph::CombineOrder::SelectionOrder,
+        ] {
+            let a = combine_row(&experts, &weights, &slots, 1, order, 1.0).unwrap();
+            let b: Vec<f32> = combine_row(&experts, &weights, &slots, 1, order, 1.0)
+                .unwrap()
+                .iter()
+                .map(|v| v * 1.0)
+                .collect();
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn a_nonfinite_output_scale_is_refused() {
+        let experts = vec![0u32];
+        let weights = vec![1.0f32];
+        let slots = vec![1.0f32];
+        for bad in [f32::NAN, f32::INFINITY] {
+            assert!(
+                combine_row(
+                    &experts,
+                    &weights,
+                    &slots,
+                    1,
+                    moxie_graph::CombineOrder::SelectionOrder,
+                    bad
+                )
+                .is_err()
+            );
+        }
+        // Zero and negative are legal: this is a checkpoint scalar, not a
+        // probability, for the same reason `apply_per_expert_scale` records.
+        for legal in [0.0, -2.5] {
+            assert!(
+                combine_row(
+                    &experts,
+                    &weights,
+                    &slots,
+                    1,
+                    moxie_graph::CombineOrder::SelectionOrder,
+                    legal
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn a_selection_bias_of_the_wrong_length_or_a_nonfinite_one_is_refused() {
+        let scores = vec![0.5f32, 0.25, 0.25];
+        assert!(select_top_k_biased(&scores, Some(&[0.0, 0.0]), 2).is_err());
+        assert!(select_top_k_biased(&scores, Some(&[0.0, f32::NAN, 0.0]), 2).is_err());
     }
 }

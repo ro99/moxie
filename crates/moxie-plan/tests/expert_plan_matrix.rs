@@ -28,44 +28,113 @@ use moxie_types::{
     TensorLayout, WeightPrecision, WorkspaceExpression,
 };
 
-const HIDDEN: u64 = 8;
-const INTERMEDIATE: u64 = 4;
-const EXPERTS: u64 = 6;
-const TOP_K: u64 = 2;
-/// `3 * intermediate * hidden * 2`.
-const CHUNK: u64 = 3 * INTERMEDIATE * HIDDEN * 2;
 const BUS: &str = "0000:82:00.0";
 
-/// Four rows over five experts, with reuse counts 3, 2, 1, 1, 1 -- so one plan
-/// contains both an expert whose transfer is amortised over three rows and
-/// experts that pay it for one.
+/// Which family's routing shape a case is swept at.
 ///
-/// Every row selects its experts in **descending** id order. That is not
-/// decoration: with ascending rows the two `CombineOrder` values agree, and
-/// mutation testing showed the sweep passing while the plan ignored the
-/// parameter entirely.
-const ROUTE: [u32; 8] = [1, 0, 2, 0, 3, 1, 4, 0];
-const ROWS: u64 = 4;
+/// Task 0022's second consumer is not a second point test: a different top-k
+/// changes the slot arithmetic in every envelope figure, a different expert
+/// count changes the reuse distribution the amortisation comparison reads, and
+/// a different gate transform changes which kernel descriptor is selectable.
+/// Those are axes of the product this sweep already enumerates, so they are
+/// swept rather than sampled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Profile {
+    /// The shape tasks 0019--0021 gated: GeGLU, top-k 2 of 6, no routed scale.
+    GemmaLike,
+    /// Laguna's shape at fixture scale: SwiGLU, a **wider** top-k of 3 over a
+    /// **larger** expert set, and a routed scaling factor of 2.5.
+    LagunaLike,
+}
+
+/// One profile's routed geometry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Geometry {
+    hidden: u64,
+    intermediate: u64,
+    experts: u64,
+    top_k: u64,
+    rows: u64,
+    activation: ExpertActivation,
+    output_scale: f32,
+    /// Slot-major expert ids, `rows * top_k` of them.
+    ///
+    /// **No row is in ascending id order in both profiles.** That is not
+    /// decoration: with ascending rows the two `CombineOrder` values agree, and
+    /// mutation testing showed the sweep passing while the plan ignored the
+    /// parameter entirely.
+    route: &'static [u32],
+}
+
+impl Geometry {
+    /// `3 * intermediate * hidden * 2`: one expert's BF16 bytes.
+    const fn chunk(&self) -> u64 {
+        3 * self.intermediate * self.hidden * 2
+    }
+}
+
+impl Profile {
+    const ALL: [Profile; 2] = [Profile::GemmaLike, Profile::LagunaLike];
+
+    const fn geometry(self) -> Geometry {
+        match self {
+            // Four rows over five experts, with reuse counts 3, 2, 1, 1, 1 --
+            // so one plan contains both an expert whose transfer is amortised
+            // over three rows and experts that pay it for one.
+            Profile::GemmaLike => Geometry {
+                hidden: 8,
+                intermediate: 4,
+                experts: 6,
+                top_k: 2,
+                rows: 4,
+                activation: ExpertActivation::GeGlu,
+                output_scale: 1.0,
+                route: &[1, 0, 2, 0, 3, 1, 4, 0],
+            },
+            // Four rows of **three** over eight experts, reuse counts 4, 2 and
+            // six ones: a longer tail of single-row experts than the
+            // Gemma-like profile has, which is the distribution a top-k of ten
+            // over 256 experts produces at a batch of two.
+            Profile::LagunaLike => Geometry {
+                hidden: 12,
+                intermediate: 5,
+                experts: 8,
+                top_k: 3,
+                rows: 4,
+                activation: ExpertActivation::SwiGlu,
+                output_scale: 2.5,
+                route: &[5, 1, 0, 7, 5, 2, 5, 3, 1, 6, 4, 5],
+            },
+        }
+    }
+}
+
+/// The geometry the point tests below use.
+///
+/// They are about one behaviour each rather than about the product, so they
+/// stay on one profile; the sweep is where both are enumerated.
+const POINT: Geometry = Profile::GemmaLike.geometry();
 
 fn uuid() -> DeviceUuid {
     DeviceUuid::parse("GPU-3032cfa3-19df-028f-5ebd-43314911e0b9").expect("uuid")
 }
 
-fn mlp() -> OpParams {
+fn mlp(g: Geometry) -> OpParams {
     OpParams::ExpertMlp {
-        hidden: HIDDEN,
-        intermediate: INTERMEDIATE,
-        experts: EXPERTS,
-        top_k: TOP_K,
-        activation: ExpertActivation::GeGlu,
+        hidden: g.hidden,
+        intermediate: g.intermediate,
+        experts: g.experts,
+        top_k: g.top_k,
+        activation: g.activation,
     }
 }
 
-fn combine(order: CombineOrder) -> OpParams {
+fn combine(g: Geometry, order: CombineOrder) -> OpParams {
     OpParams::Combine {
-        hidden: HIDDEN,
-        top_k: TOP_K,
+        hidden: g.hidden,
+        top_k: g.top_k,
         order,
+        output_scale: g.output_scale,
     }
 }
 
@@ -94,7 +163,7 @@ fn topology() -> NumaTopology {
 ///
 /// Three levels rather than two, because two cannot produce a **mixed** plan:
 /// the route's reuse counts are 3, 2 and 1, so a threshold that admits one
-/// admits all of them or none. `Partial` sits between `CHUNK/2` and `CHUNK/1`,
+/// admits all of them or none. `Partial` sits between `POINT.chunk()/2` and `POINT.chunk()/1`,
 /// which is the only way this sweep reaches a plan with one expert on each
 /// candidate -- the case the whole interface exists for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,10 +174,10 @@ enum Amortisation {
 }
 
 impl Amortisation {
-    fn limit(self) -> u64 {
+    fn limit(self, g: Geometry) -> u64 {
         match self {
-            Self::All => CHUNK,
-            Self::Partial => CHUNK / 2 + 1,
+            Self::All => g.chunk(),
+            Self::Partial => g.chunk() / 2 + 1,
             Self::None => 1,
         }
     }
@@ -141,11 +210,23 @@ fn capability() -> DeviceCapability {
     }
 }
 
-fn catalogue(sm: SmVersion) -> KernelCatalogue {
+/// One descriptor, for the gate transform the profile under test asks for.
+///
+/// Deliberately **not** a catalogue holding both. A catalogue that answered
+/// every gate transform would make `Kernels::Matching` mean "some kernel
+/// exists" rather than "a kernel for this operation exists", and the second
+/// profile would stop testing the selector at all -- the fourth review's point
+/// about a gate that only fires on inputs something hands it, in the shape this
+/// sweep can reach.
+fn catalogue(sm: SmVersion, g: Geometry) -> KernelCatalogue {
+    let gate = match g.activation {
+        ExpertActivation::GeGlu => GateTransform::GeluTanh,
+        ExpertActivation::SwiGlu => GateTransform::Silu,
+    };
     KernelCatalogue::new(vec![SemanticKernelDescriptor {
-        id: KernelId(format!("fixture-expert-{}", sm.name())),
+        id: KernelId(format!("fixture-expert-{}-{gate:?}", sm.name())),
         abi_version: 1,
-        operation: SemanticKernelOp::ExpertMlp(GateTransform::GeluTanh),
+        operation: SemanticKernelOp::ExpertMlp(gate),
         inputs: vec![
             KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
             KernelOperand::RouteIndex,
@@ -171,6 +252,7 @@ fn catalogue(sm: SmVersion) -> KernelCatalogue {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Case {
+    profile: Profile,
     device_control: StrategyControl,
     host_control: StrategyControl,
     arena_fits: bool,
@@ -190,52 +272,70 @@ struct Case {
 /// and including the index staging -- the same arithmetic `compile_experts`
 /// checks feasibility with, so "the arena fits" cannot accidentally mean "the
 /// arena is short by the alignment".
-fn generous_arena() -> u64 {
+fn generous_arena(g: Geometry) -> u64 {
     let align = |bytes: u64| bytes.div_ceil(256) * 256;
-    let activations = align(ROWS * HIDDEN * 2);
-    let slots = align(ROWS * TOP_K * HIDDEN * 2);
-    let workspace = align(4 * ROWS * INTERMEDIATE * 4);
-    let staging = align(ROWS * TOP_K * 4) * 2;
+    let activations = align(g.rows * g.hidden * 2);
+    let slots = align(g.rows * g.top_k * g.hidden * 2);
+    let workspace = align(4 * g.rows * g.intermediate * 4);
+    let staging = align(g.rows * g.top_k * 4) * 2;
     activations + slots + workspace + staging
 }
 
-fn generous_host_workspace() -> u64 {
+fn generous_host_workspace(g: Geometry) -> u64 {
     // The reduction's accumulator, which every plan needs, plus a queue of four
     // tiles of 64 lanes clamped to the intermediate.
-    HIDDEN * 4 + 4 * (INTERMEDIATE + 2 * INTERMEDIATE) * 4
+    g.hidden * 4 + 4 * (g.intermediate + 2 * g.intermediate) * 4
 }
 
 /// The activation block, the slot buffer, the output, and the two `u32` index
 /// arrays -- which every plan charges, because the feasibility check and the
 /// envelope must compute the same figure.
-fn generous_host_buffers() -> u64 {
-    ROWS * HIDDEN * 2 + ROWS * TOP_K * HIDDEN * 2 + ROWS * HIDDEN * 2 + 2 * ROWS * TOP_K * 4
+fn generous_host_buffers(g: Geometry) -> u64 {
+    g.rows * g.hidden * 2
+        + g.rows * g.top_k * g.hidden * 2
+        + g.rows * g.hidden * 2
+        + 2 * g.rows * g.top_k * 4
 }
 
 impl Case {
+    fn geometry(self) -> Geometry {
+        self.profile.geometry()
+    }
+
     fn budget(self) -> ExpertBudget {
+        let g = self.geometry();
         ExpertBudget {
             device: uuid(),
             device_pci_bus_id: BUS.to_string(),
             device_cache_cap_bytes: if self.cache_fits {
-                CHUNK * 8
+                g.chunk() * 8
             } else {
-                CHUNK - 1
+                g.chunk() - 1
             },
             device_cache_leased_bytes: 0,
-            device_arena_free_bytes: if self.arena_fits { generous_arena() } else { 0 },
+            device_arena_free_bytes: if self.arena_fits {
+                generous_arena(g)
+            } else {
+                0
+            },
             // "Does not fit" means the host **tile** does not fit, not that
             // the plan is impossible: the reduction's accumulator is needed by
             // every plan, including an all-device one, so a budget below it is
             // a refusal to plan at all and is covered by its own named test.
             host_workspace_bytes: if self.host_workspace_fits {
-                generous_host_workspace()
+                generous_host_workspace(g)
             } else {
-                HIDDEN * 4
+                g.hidden * 4
             },
-            host_buffer_bytes: generous_host_buffers(),
+            host_buffer_bytes: generous_host_buffers(g),
+            // Every expert this profile's route demands, so "resident" means
+            // no group transfers anything. Listing a fixed set would silently
+            // stop meaning that when the route changed.
             resident_experts: if self.resident {
-                vec![0, 1, 2, 3, 4]
+                let mut all: Vec<u32> = g.route.to_vec();
+                all.sort_unstable();
+                all.dedup();
+                all
             } else {
                 Vec::new()
             },
@@ -246,10 +346,10 @@ impl Case {
         ExpertPolicy {
             device: self.device_control,
             host: self.host_control,
-            // `CHUNK` over one row is the largest per-row transfer this route
+            // `POINT.chunk()` over one row is the largest per-row transfer this route
             // produces, so the threshold either admits every group or no group
             // that is not already resident.
-            max_transfer_bytes_per_row: self.amortised.limit(),
+            max_transfer_bytes_per_row: self.amortised.limit(self.geometry()),
             max_inflight_orders: 4,
             cpu_tile_lanes: 64,
             host_placement: StrategyControl::Auto,
@@ -282,17 +382,18 @@ impl Case {
         if !device_open && !host_open {
             return None;
         }
-        let transfer = if self.resident { 0 } else { CHUNK };
+        let g = self.geometry();
+        let transfer = if self.resident { 0 } else { g.chunk() };
         let group_on_device = device_open
             && transfer
                 <= (if self.cache_fits {
-                    CHUNK * 8
+                    g.chunk() * 8
                 } else {
-                    CHUNK - 1
+                    g.chunk() - 1
                 })
             && {
                 let per_row = transfer.div_ceil(reuse);
-                per_row <= self.amortised.limit()
+                per_row <= self.amortised.limit(g)
             };
         if group_on_device {
             Some(Candidate::Device)
@@ -354,10 +455,10 @@ fn classify(error: &moxie_types::Error) -> ExpectedError {
     }
 }
 
-fn reuse_counts() -> BTreeMap<u32, u64> {
+fn reuse_counts(g: Geometry) -> BTreeMap<u32, u64> {
     let mut counts: BTreeMap<u32, u64> = BTreeMap::new();
-    for expert in ROUTE {
-        *counts.entry(expert).or_default() += 1;
+    for expert in g.route {
+        *counts.entry(*expert).or_default() += 1;
     }
     counts
 }
@@ -369,7 +470,6 @@ fn the_chooser_agrees_with_an_independent_statement_of_its_rule_across_the_produ
         StrategyControl::Auto,
         StrategyControl::Required,
     ];
-    let counts = reuse_counts();
     let topology = topology();
 
     let mut cases = 0usize;
@@ -380,139 +480,157 @@ fn the_chooser_agrees_with_an_independent_statement_of_its_rule_across_the_produ
     let mut all_host = 0usize;
     let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
 
-    for device_control in controls {
-        for host_control in controls {
-            for arena_fits in [true, false] {
-                for host_workspace_fits in [true, false] {
-                    for cache_fits in [true, false] {
-                        for amortised in
-                            [Amortisation::All, Amortisation::Partial, Amortisation::None]
-                        {
-                            for resident in [true, false] {
-                                for order in [
-                                    CombineOrder::AscendingExpertId,
-                                    CombineOrder::SelectionOrder,
-                                ] {
-                                    for with_topology in [true, false] {
-                                        for kernels in
-                                            [Kernels::Absent, Kernels::Matching, Kernels::WrongSm]
-                                        {
-                                            let case = Case {
-                                                device_control,
-                                                host_control,
-                                                arena_fits,
-                                                host_workspace_fits,
-                                                cache_fits,
-                                                amortised,
-                                                resident,
-                                                order,
-                                                with_topology,
-                                                kernels,
-                                            };
-                                            cases += 1;
-                                            let cat = match kernels {
-                                                Kernels::Absent => None,
-                                                Kernels::Matching => {
-                                                    Some(catalogue(SmVersion::SM86))
-                                                }
-                                                Kernels::WrongSm => {
-                                                    Some(catalogue(SmVersion::SM120))
-                                                }
-                                            };
-                                            let cap = capability();
-                                            let injected = cat.as_ref().map(|c| ExpertKernels {
-                                                capability: &cap,
-                                                catalogue: c,
-                                            });
-                                            let result = compile_experts(
-                                                &mlp(),
-                                                &combine(order),
-                                                &ROUTE,
-                                                &case.budget(),
-                                                &case.policy(),
-                                                with_topology.then_some(&topology),
-                                                injected,
-                                            );
-                                            // Every expert's expectation. A plan
-                                            // exists only when every group has one.
-                                            let expected: Vec<Option<Candidate>> = counts
-                                                .values()
-                                                .map(|reuse| case.expected_choice(*reuse))
-                                                .collect();
-                                            match result {
-                                                Err(refusal) => {
-                                                    refused += 1;
-                                                    assert!(
-                                                        expected.iter().any(Option::is_none),
-                                                        "{case:?} was refused but every group had a \
+    let mut per_profile: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for profile in Profile::ALL {
+        let g = profile.geometry();
+        let counts = reuse_counts(g);
+        for device_control in controls {
+            for host_control in controls {
+                for arena_fits in [true, false] {
+                    for host_workspace_fits in [true, false] {
+                        for cache_fits in [true, false] {
+                            for amortised in
+                                [Amortisation::All, Amortisation::Partial, Amortisation::None]
+                            {
+                                for resident in [true, false] {
+                                    for order in [
+                                        CombineOrder::AscendingExpertId,
+                                        CombineOrder::SelectionOrder,
+                                    ] {
+                                        for with_topology in [true, false] {
+                                            for kernels in [
+                                                Kernels::Absent,
+                                                Kernels::Matching,
+                                                Kernels::WrongSm,
+                                            ] {
+                                                let case = Case {
+                                                    profile,
+                                                    device_control,
+                                                    host_control,
+                                                    arena_fits,
+                                                    host_workspace_fits,
+                                                    cache_fits,
+                                                    amortised,
+                                                    resident,
+                                                    order,
+                                                    with_topology,
+                                                    kernels,
+                                                };
+                                                cases += 1;
+                                                *per_profile
+                                                    .entry(match profile {
+                                                        Profile::GemmaLike => "gemma-like",
+                                                        Profile::LagunaLike => "laguna-like",
+                                                    })
+                                                    .or_default() += 1;
+                                                let cat = match kernels {
+                                                    Kernels::Absent => None,
+                                                    Kernels::Matching => {
+                                                        Some(catalogue(SmVersion::SM86, g))
+                                                    }
+                                                    Kernels::WrongSm => {
+                                                        Some(catalogue(SmVersion::SM120, g))
+                                                    }
+                                                };
+                                                let cap = capability();
+                                                let injected =
+                                                    cat.as_ref().map(|c| ExpertKernels {
+                                                        capability: &cap,
+                                                        catalogue: c,
+                                                    });
+                                                let result = compile_experts(
+                                                    &mlp(g),
+                                                    &combine(g, order),
+                                                    g.route,
+                                                    &case.budget(),
+                                                    &case.policy(),
+                                                    with_topology.then_some(&topology),
+                                                    injected,
+                                                );
+                                                // Every expert's expectation. A plan
+                                                // exists only when every group has one.
+                                                let expected: Vec<Option<Candidate>> = counts
+                                                    .values()
+                                                    .map(|reuse| case.expected_choice(*reuse))
+                                                    .collect();
+                                                match result {
+                                                    Err(refusal) => {
+                                                        refused += 1;
+                                                        assert!(
+                                                            expected.iter().any(Option::is_none),
+                                                            "{case:?} was refused but every group had a \
                                                      candidate: {refusal}"
-                                                    );
-                                                    assert!(
-                                                        refusal.device.is_some()
-                                                            || refusal.host.is_some(),
-                                                        "{case:?}: a refusal with no reason"
-                                                    );
-                                                    assert_eq!(
-                                                        classify(&refusal.error),
-                                                        case.expected_error(),
-                                                        "{case:?}: {refusal}"
-                                                    );
-                                                    for reason in [refusal.device, refusal.host]
-                                                        .into_iter()
-                                                        .flatten()
-                                                    {
-                                                        *reasons
-                                                            .entry(reason_name(reason).to_string())
-                                                            .or_default() += 1;
-                                                    }
-                                                }
-                                                Ok(plan) => {
-                                                    planned += 1;
-                                                    plan.check_invariants().expect("invariants");
-                                                    assert!(
-                                                        expected.iter().all(Option::is_some),
-                                                        "{case:?} produced a plan where a group had \
-                                                     no candidate"
-                                                    );
-                                                    for (group, want) in
-                                                        plan.groups().iter().zip(&expected)
-                                                    {
-                                                        assert_eq!(
-                                                            Some(group.placement().candidate()),
-                                                            *want,
-                                                            "{case:?}: expert {}",
-                                                            group.expert()
                                                         );
-                                                        *reasons
-                                                            .entry(
-                                                                reason_name(
-                                                                    group.decision().reason,
+                                                        assert!(
+                                                            refusal.device.is_some()
+                                                                || refusal.host.is_some(),
+                                                            "{case:?}: a refusal with no reason"
+                                                        );
+                                                        assert_eq!(
+                                                            classify(&refusal.error),
+                                                            case.expected_error(),
+                                                            "{case:?}: {refusal}"
+                                                        );
+                                                        for reason in [refusal.device, refusal.host]
+                                                            .into_iter()
+                                                            .flatten()
+                                                        {
+                                                            *reasons
+                                                                .entry(
+                                                                    reason_name(reason).to_string(),
                                                                 )
-                                                                .to_string(),
-                                                            )
-                                                            .or_default() += 1;
-                                                    }
-                                                    let d = plan.uses(Candidate::Device);
-                                                    let h = plan.uses(Candidate::Host);
-                                                    match (d, h) {
-                                                        (true, true) => mixed += 1,
-                                                        (true, false) => all_device += 1,
-                                                        (false, true) => all_host += 1,
-                                                        (false, false) => {
-                                                            panic!("a plan with no group")
+                                                                .or_default() += 1;
                                                         }
                                                     }
-                                                    check_envelope(&plan);
-                                                    check_placement(&plan, case);
-                                                    check_reduction_order(&plan, order);
-                                                    // A device plan carries the
-                                                    // descriptor it selected; a
-                                                    // host-only plan carries none.
-                                                    assert_eq!(
-                                                        plan.kernel().is_some(),
-                                                        plan.uses(Candidate::Device),
-                                                        "{case:?}"
-                                                    );
+                                                    Ok(plan) => {
+                                                        planned += 1;
+                                                        plan.check_invariants()
+                                                            .expect("invariants");
+                                                        assert!(
+                                                            expected.iter().all(Option::is_some),
+                                                            "{case:?} produced a plan where a group had \
+                                                     no candidate"
+                                                        );
+                                                        for (group, want) in
+                                                            plan.groups().iter().zip(&expected)
+                                                        {
+                                                            assert_eq!(
+                                                                Some(group.placement().candidate()),
+                                                                *want,
+                                                                "{case:?}: expert {}",
+                                                                group.expert()
+                                                            );
+                                                            *reasons
+                                                                .entry(
+                                                                    reason_name(
+                                                                        group.decision().reason,
+                                                                    )
+                                                                    .to_string(),
+                                                                )
+                                                                .or_default() += 1;
+                                                        }
+                                                        let d = plan.uses(Candidate::Device);
+                                                        let h = plan.uses(Candidate::Host);
+                                                        match (d, h) {
+                                                            (true, true) => mixed += 1,
+                                                            (true, false) => all_device += 1,
+                                                            (false, true) => all_host += 1,
+                                                            (false, false) => {
+                                                                panic!("a plan with no group")
+                                                            }
+                                                        }
+                                                        check_envelope(&plan, g);
+                                                        check_placement(&plan, case);
+                                                        check_reduction_order(&plan, g, order);
+                                                        // A device plan carries the
+                                                        // descriptor it selected; a
+                                                        // host-only plan carries none.
+                                                        assert_eq!(
+                                                            plan.kernel().is_some(),
+                                                            plan.uses(Candidate::Device),
+                                                            "{case:?}"
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -530,13 +648,21 @@ fn the_chooser_agrees_with_an_independent_statement_of_its_rule_across_the_produ
         "expert-plan sweep: {cases} combination(s); {planned} planned ({all_device} all-device, \
          {all_host} all-host, {mixed} mixed), {refused} refused"
     );
+    for (profile, count) in &per_profile {
+        println!("  profile {profile}: {count}");
+    }
     let mut names: Vec<_> = reasons.iter().collect();
     names.sort();
     for (name, count) in &names {
         println!("  reason {name}: {count}");
     }
 
-    assert_eq!(cases, 3 * 3 * 2 * 2 * 2 * 3 * 2 * 2 * 2 * 3);
+    assert_eq!(cases, 2 * 3 * 3 * 2 * 2 * 2 * 3 * 2 * 2 * 2 * 3);
+    assert_eq!(per_profile.len(), 2, "a profile was never swept");
+    assert!(
+        per_profile.values().all(|c| *c == cases / 2),
+        "the profiles did not sweep the same product: {per_profile:?}"
+    );
     assert_eq!(planned + refused, cases);
     // Every arm of the decision is exercised, and the counts are printed above
     // rather than asserted as a sentence somewhere else.
@@ -573,10 +699,19 @@ fn reason_name(reason: RejectionReason) -> &'static str {
     }
 }
 
-fn check_envelope(plan: &moxie_plan::expert::ExpertPlan) {
+fn check_envelope(plan: &moxie_plan::expert::ExpertPlan, g: Geometry) {
+    // The `Combine` node's other parameter. Mutation testing added this line:
+    // two mutants that dropped the scale on the way from the node to the plan
+    // survived the whole sweep, because the reduction order was checked and the
+    // scale beside it was not.
+    assert_eq!(
+        plan.output_scale(),
+        g.output_scale,
+        "the plan lost the combine's output scale"
+    );
     let envelope = plan.envelope();
-    let activations = ROWS * HIDDEN * 2;
-    let slots = ROWS * TOP_K * HIDDEN * 2;
+    let activations = g.rows * g.hidden * 2;
+    let slots = g.rows * g.top_k * g.hidden * 2;
     assert_eq!(plan.activation_bytes(), activations);
     assert_eq!(plan.slot_bytes(), slots);
     // Device regions are charged in whole 256-byte ranges, because that is what
@@ -590,16 +725,16 @@ fn check_envelope(plan: &moxie_plan::expert::ExpertPlan) {
         );
         // Feasibility is computed from this same total, so an admitted plan
         // always fits the budget it was checked against.
-        assert!(envelope.total_device_bytes() <= generous_arena());
+        assert!(envelope.total_device_bytes() <= generous_arena(g));
         assert_eq!(
             envelope.device_bytes(DeviceTier::KernelWorkspace),
-            align(u64::from(plan.queue_capacity()) * ROWS * INTERMEDIATE * 4)
+            align(u64::from(plan.queue_capacity()) * g.rows * g.intermediate * 4)
         );
         // Two `RouteIndex` operands, each sized for the largest group this
         // shape can produce.
         assert_eq!(
             envelope.device_bytes(DeviceTier::TransferStaging),
-            align(ROWS * TOP_K * 4) * 2
+            align(g.rows * g.top_k * 4) * 2
         );
     } else {
         assert_eq!(envelope.total_device_bytes(), 0);
@@ -609,10 +744,10 @@ fn check_envelope(plan: &moxie_plan::expert::ExpertPlan) {
     // did not charge for is the defect this pins.
     assert_eq!(
         envelope.host_bytes(HostTier::Pageable),
-        generous_host_buffers()
+        generous_host_buffers(g)
     );
-    let reduction = HIDDEN * 4;
-    let tile = u64::from(plan.queue_capacity()) * (INTERMEDIATE + 2 * INTERMEDIATE) * 4;
+    let reduction = g.hidden * 4;
+    let tile = u64::from(plan.queue_capacity()) * (g.intermediate + 2 * g.intermediate) * 4;
     assert_eq!(
         envelope.host_bytes(HostTier::CpuWorkspace),
         if plan.uses(Candidate::Host) {
@@ -641,10 +776,10 @@ fn check_envelope(plan: &moxie_plan::expert::ExpertPlan) {
 /// Mutation testing found that the sweep passed when the plan ignored
 /// `CombineOrder` entirely -- `check_invariants` only asks whether each row is
 /// *a* permutation, and the identity is one.
-fn check_reduction_order(plan: &moxie_plan::expert::ExpertPlan, order: CombineOrder) {
-    let top_k = TOP_K as usize;
+fn check_reduction_order(plan: &moxie_plan::expert::ExpertPlan, g: Geometry, order: CombineOrder) {
+    let top_k = g.top_k as usize;
     let mut want = Vec::new();
-    for row in ROUTE.chunks_exact(top_k) {
+    for row in g.route.chunks_exact(top_k) {
         let mut positions: Vec<u32> = (0..top_k as u32).collect();
         if order == CombineOrder::AscendingExpertId {
             positions.sort_by_key(|j| (row[*j as usize], *j));
@@ -669,6 +804,7 @@ fn check_placement(plan: &moxie_plan::expert::ExpertPlan, case: Case) {
 #[test]
 fn a_required_placement_with_no_topology_is_an_error_rather_than_an_unplaced_buffer() {
     let case = Case {
+        profile: Profile::GemmaLike,
         device_control: StrategyControl::Auto,
         host_control: StrategyControl::Auto,
         arena_fits: true,
@@ -683,9 +819,9 @@ fn a_required_placement_with_no_topology_is_an_error_rather_than_an_unplaced_buf
     let mut policy = case.policy();
     policy.host_placement = StrategyControl::Required;
     let refusal = compile_experts(
-        &mlp(),
-        &combine(case.order),
-        &ROUTE,
+        &mlp(POINT),
+        &combine(POINT, case.order),
+        POINT.route,
         &case.budget(),
         &policy,
         None,
@@ -701,6 +837,7 @@ fn a_required_placement_with_no_topology_is_an_error_rather_than_an_unplaced_buf
 #[test]
 fn placement_off_leaves_host_buffers_unplaced_even_with_a_topology() {
     let case = Case {
+        profile: Profile::GemmaLike,
         device_control: StrategyControl::Off,
         host_control: StrategyControl::Auto,
         arena_fits: true,
@@ -715,9 +852,9 @@ fn placement_off_leaves_host_buffers_unplaced_even_with_a_topology() {
     let mut policy = case.policy();
     policy.host_placement = StrategyControl::Off;
     let plan = compile_experts(
-        &mlp(),
-        &combine(case.order),
-        &ROUTE,
+        &mlp(POINT),
+        &combine(POINT, case.order),
+        POINT.route,
         &case.budget(),
         &policy,
         Some(&topology()),
@@ -730,6 +867,7 @@ fn placement_off_leaves_host_buffers_unplaced_even_with_a_topology() {
 #[test]
 fn a_route_that_sends_one_row_to_one_expert_twice_is_refused() {
     let case = Case {
+        profile: Profile::GemmaLike,
         device_control: StrategyControl::Auto,
         host_control: StrategyControl::Auto,
         arena_fits: true,
@@ -743,8 +881,8 @@ fn a_route_that_sends_one_row_to_one_expert_twice_is_refused() {
     };
     let route = [0u32, 0, 1, 2, 3, 4, 5, 1];
     let refusal = compile_experts(
-        &mlp(),
-        &combine(case.order),
+        &mlp(POINT),
+        &combine(POINT, case.order),
         &route,
         &case.budget(),
         &case.policy(),
@@ -758,6 +896,7 @@ fn a_route_that_sends_one_row_to_one_expert_twice_is_refused() {
 #[test]
 fn the_reduction_order_is_a_permutation_per_row_and_follows_the_declared_order() {
     let case = Case {
+        profile: Profile::GemmaLike,
         device_control: StrategyControl::Auto,
         host_control: StrategyControl::Auto,
         arena_fits: true,
@@ -770,9 +909,9 @@ fn the_reduction_order_is_a_permutation_per_row_and_follows_the_declared_order()
         kernels: Kernels::Matching,
     };
     let ascending = compile_experts(
-        &mlp(),
-        &combine(CombineOrder::AscendingExpertId),
-        &ROUTE,
+        &mlp(POINT),
+        &combine(POINT, CombineOrder::AscendingExpertId),
+        POINT.route,
         &case.budget(),
         &case.policy(),
         Some(&topology()),
@@ -780,9 +919,9 @@ fn the_reduction_order_is_a_permutation_per_row_and_follows_the_declared_order()
     )
     .expect("plan");
     let selection = compile_experts(
-        &mlp(),
-        &combine(CombineOrder::SelectionOrder),
-        &ROUTE,
+        &mlp(POINT),
+        &combine(POINT, CombineOrder::SelectionOrder),
+        POINT.route,
         &case.budget(),
         &case.policy(),
         Some(&topology()),
@@ -802,8 +941,8 @@ fn the_reduction_order_is_a_permutation_per_row_and_follows_the_declared_order()
     // orders agreeing, which is why the sweep's own route is not that one.
     let ascending_rows = [0u32, 1, 0, 2, 1, 3, 0, 4];
     let plan = compile_experts(
-        &mlp(),
-        &combine(CombineOrder::AscendingExpertId),
+        &mlp(POINT),
+        &combine(POINT, CombineOrder::AscendingExpertId),
         &ascending_rows,
         &case.budget(),
         &case.policy(),
@@ -823,6 +962,7 @@ fn the_reduction_order_is_a_permutation_per_row_and_follows_the_declared_order()
 #[test]
 fn a_budget_below_the_host_buffers_or_the_reduction_refuses_every_plan() {
     let case = Case {
+        profile: Profile::GemmaLike,
         device_control: StrategyControl::Required,
         host_control: StrategyControl::Off,
         arena_fits: true,
@@ -834,7 +974,7 @@ fn a_budget_below_the_host_buffers_or_the_reduction_refuses_every_plan() {
         with_topology: true,
         kernels: Kernels::Matching,
     };
-    let cat = catalogue(SmVersion::SM86);
+    let cat = catalogue(SmVersion::SM86, POINT);
     let cap = capability();
     let kernels = Some(ExpertKernels {
         capability: &cap,
@@ -842,11 +982,11 @@ fn a_budget_below_the_host_buffers_or_the_reduction_refuses_every_plan() {
     });
 
     let mut budget = case.budget();
-    budget.host_buffer_bytes = generous_host_buffers() - 1;
+    budget.host_buffer_bytes = generous_host_buffers(POINT) - 1;
     let refusal = compile_experts(
-        &mlp(),
-        &combine(case.order),
-        &ROUTE,
+        &mlp(POINT),
+        &combine(POINT, case.order),
+        POINT.route,
         &budget,
         &case.policy(),
         Some(&topology()),
@@ -860,11 +1000,11 @@ fn a_budget_below_the_host_buffers_or_the_reduction_refuses_every_plan() {
     ));
 
     let mut budget = case.budget();
-    budget.host_workspace_bytes = HIDDEN * 4 - 1;
+    budget.host_workspace_bytes = POINT.hidden * 4 - 1;
     let refusal = compile_experts(
-        &mlp(),
-        &combine(case.order),
-        &ROUTE,
+        &mlp(POINT),
+        &combine(POINT, case.order),
+        POINT.route,
         &budget,
         &case.policy(),
         Some(&topology()),
@@ -880,11 +1020,11 @@ fn a_budget_below_the_host_buffers_or_the_reduction_refuses_every_plan() {
     // And the boundary: exactly the reduction, with the device candidate
     // required, plans successfully and charges only the accumulator.
     let mut budget = case.budget();
-    budget.host_workspace_bytes = HIDDEN * 4;
+    budget.host_workspace_bytes = POINT.hidden * 4;
     let plan = compile_experts(
-        &mlp(),
-        &combine(case.order),
-        &ROUTE,
+        &mlp(POINT),
+        &combine(POINT, case.order),
+        POINT.route,
         &budget,
         &case.policy(),
         Some(&topology()),
@@ -894,7 +1034,7 @@ fn a_budget_below_the_host_buffers_or_the_reduction_refuses_every_plan() {
     assert!(!plan.uses(Candidate::Host));
     assert_eq!(
         plan.envelope().host_bytes(HostTier::CpuWorkspace),
-        HIDDEN * 4
+        POINT.hidden * 4
     );
     assert_eq!(plan.tile_workspace_values(), 0);
 }
@@ -909,17 +1049,17 @@ fn a_budget_below_the_host_buffers_or_the_reduction_refuses_every_plan() {
 #[test]
 fn selection_refuses_a_descriptor_that_differs_on_any_compatibility_axis() {
     let shape = moxie_plan::expert::ExpertShape {
-        hidden: HIDDEN,
-        intermediate: INTERMEDIATE,
-        experts: EXPERTS,
-        top_k: TOP_K,
+        hidden: POINT.hidden,
+        intermediate: POINT.intermediate,
+        experts: POINT.experts,
+        top_k: POINT.top_k,
         activation: moxie_graph::ExpertActivation::GeGlu,
     };
     let cap = capability();
-    let good = catalogue(SmVersion::SM86);
+    let good = catalogue(SmVersion::SM86, POINT);
     moxie_plan::expert::select_expert_kernel(
         shape,
-        ROWS,
+        POINT.rows,
         ExpertKernels {
             capability: &cap,
             catalogue: &good,
@@ -988,7 +1128,7 @@ fn selection_refuses_a_descriptor_that_differs_on_any_compatibility_axis() {
         let catalogue = KernelCatalogue::new(vec![descriptor]).expect("one descriptor");
         let refused = moxie_plan::expert::select_expert_kernel(
             shape,
-            ROWS,
+            POINT.rows,
             ExpertKernels {
                 capability: &cap,
                 catalogue: &catalogue,
@@ -1011,6 +1151,7 @@ fn selection_refuses_a_descriptor_that_differs_on_any_compatibility_axis() {
 #[test]
 fn the_device_budget_is_checked_against_the_envelope_execution_reserves() {
     let case = Case {
+        profile: Profile::GemmaLike,
         device_control: StrategyControl::Required,
         host_control: StrategyControl::Off,
         arena_fits: true,
@@ -1022,20 +1163,20 @@ fn the_device_budget_is_checked_against_the_envelope_execution_reserves() {
         with_topology: true,
         kernels: Kernels::Matching,
     };
-    let cat = catalogue(SmVersion::SM86);
+    let cat = catalogue(SmVersion::SM86, POINT);
     let cap = capability();
     let kernels = Some(ExpertKernels {
         capability: &cap,
         catalogue: &cat,
     });
-    let exact = generous_arena();
+    let exact = generous_arena(POINT);
 
     let mut budget = case.budget();
     budget.device_arena_free_bytes = exact;
     let plan = compile_experts(
-        &mlp(),
-        &combine(case.order),
-        &ROUTE,
+        &mlp(POINT),
+        &combine(POINT, case.order),
+        POINT.route,
         &budget,
         &case.policy(),
         Some(&topology()),
@@ -1047,9 +1188,9 @@ fn the_device_budget_is_checked_against_the_envelope_execution_reserves() {
     let mut budget = case.budget();
     budget.device_arena_free_bytes = exact - 1;
     let refusal = compile_experts(
-        &mlp(),
-        &combine(case.order),
-        &ROUTE,
+        &mlp(POINT),
+        &combine(POINT, case.order),
+        POINT.route,
         &budget,
         &case.policy(),
         Some(&topology()),
