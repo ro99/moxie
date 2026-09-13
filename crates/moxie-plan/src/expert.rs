@@ -44,9 +44,10 @@ use std::collections::BTreeMap;
 
 use moxie_graph::{CombineOrder, ExpertActivation, OpParams};
 use moxie_types::{
-    DeviceCapability, DeviceTier, DeviceUuid, Error, GateTransform, HostPlacement, HostTier,
-    KernelCatalogue, NumaTopology, Result, SemanticKernelDescriptor, SemanticKernelOp,
-    StrategyControl, Tier, WorkspaceExpression,
+    AccumulationPolicy, ActivationPrecision, DeviceCapability, DeviceTier, DeviceUuid, Error,
+    GateTransform, HostPlacement, HostTier, KernelCatalogue, KernelOperand, NumaTopology,
+    Precision, Result, RoundingProfile, SemanticKernelDescriptor, SemanticKernelOp,
+    StrategyControl, Tier, WeightPrecision, WorkspaceExpression,
 };
 
 /// Bytes of one BF16 element.
@@ -217,18 +218,59 @@ pub struct GroupDecision {
 }
 
 /// One expert's work.
+///
+/// `rows` and `slots` are **not** public. They are launch indices: a changed row
+/// reads outside the activation block and a changed slot writes outside the
+/// output range, and an independent review pointed out that public `Vec` fields
+/// put both one assignment away from any caller. They are produced by
+/// [`compile_experts`], checked by [`ExpertPlan::check_invariants`], and read
+/// through accessors that hand out slices.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpertGroup {
-    pub expert: u32,
+    expert: u32,
+    rows: Vec<u32>,
+    slots: Vec<u32>,
+    placement: Placement,
+    chunk_bytes: u64,
+    decision: GroupDecision,
+}
+
+impl ExpertGroup {
+    pub const fn expert(&self) -> u32 {
+        self.expert
+    }
+
     /// Which activation rows this group reads, ascending.
-    pub rows: Vec<u32>,
+    pub fn rows(&self) -> &[u32] {
+        &self.rows
+    }
+
     /// Where each result goes in the slot-major buffer: `row * top_k + j`.
-    /// Parallel to `rows`.
-    pub slots: Vec<u32>,
-    pub placement: Placement,
+    /// Parallel to [`ExpertGroup::rows`].
+    pub fn slots(&self) -> &[u32] {
+        &self.slots
+    }
+
+    pub const fn placement(&self) -> Placement {
+        self.placement
+    }
+
     /// One expert's two chunks together: `6 * intermediate * hidden` bytes.
-    pub chunk_bytes: u64,
-    pub decision: GroupDecision,
+    pub const fn chunk_bytes(&self) -> u64 {
+        self.chunk_bytes
+    }
+
+    pub const fn decision(&self) -> GroupDecision {
+        self.decision
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
 }
 
 /// The exact bytes `admit` must reserve, per tier and scope.
@@ -449,7 +491,7 @@ impl ExpertPlan {
     pub fn groups_on(&self, candidate: Candidate) -> impl Iterator<Item = &ExpertGroup> {
         self.groups
             .iter()
-            .filter(move |g| g.placement.candidate() == candidate)
+            .filter(move |g| g.placement().candidate() == candidate)
     }
 
     pub fn uses(&self, candidate: Candidate) -> bool {
@@ -471,6 +513,36 @@ impl ExpertPlan {
         self.slot_count() * self.shape.hidden * BF16
     }
 
+    /// Bytes of **one** `u32` index array. Two are charged and two allocated.
+    pub fn index_staging_bytes(&self) -> u64 {
+        self.slot_count() * 4
+    }
+
+    /// FP32 values the reduction's accumulator needs. Every plan has one: the
+    /// reduction runs on the host whichever candidate produced the slots.
+    pub const fn reduction_workspace_values(&self) -> u64 {
+        self.shape.hidden
+    }
+
+    /// FP32 values the host tile needs, or zero when no group runs on the host.
+    pub fn tile_workspace_values(&self) -> u64 {
+        if self.uses(Candidate::Host) {
+            self.shape
+                .host_workspace_values(self.cpu_tile_lanes)
+                .unwrap_or(0)
+                * u64::from(self.queue_capacity)
+        } else {
+            0
+        }
+    }
+
+    /// Every FP32 value this plan's host workspace holds. The executor
+    /// allocates exactly this, and the envelope charges exactly this; a second
+    /// place computing it is a second chance for the two to disagree.
+    pub fn host_workspace_values(&self) -> u64 {
+        self.reduction_workspace_values() + self.tile_workspace_values()
+    }
+
     /// The structural properties every plan must have, stated once.
     ///
     /// Task 0020's twenty-three findings shared one shape -- an individually
@@ -489,41 +561,44 @@ impl ExpertPlan {
             {
                 return Err(invalid(
                     "groups",
-                    format!("expert {} follows {p}; groups must ascend", group.expert),
+                    format!("expert {} follows {p}; groups must ascend", group.expert()),
                 ));
             }
-            previous = Some(group.expert);
-            if group.rows.len() != group.slots.len() || group.rows.is_empty() {
+            previous = Some(group.expert());
+            if group.rows().len() != group.slots().len() || group.rows.is_empty() {
                 return Err(invalid(
                     "group",
                     format!(
                         "expert {} has {} row(s) and {} slot(s)",
-                        group.expert,
-                        group.rows.len(),
-                        group.slots.len()
+                        group.expert(),
+                        group.rows().len(),
+                        group.slots().len()
                     ),
                 ));
             }
-            if group.decision.reuse_rows != group.rows.len() as u64 {
+            if group.decision.reuse_rows != group.rows().len() as u64 {
                 return Err(invalid(
                     "group",
                     format!(
                         "expert {} reports {} reuse row(s) against {} assigned",
-                        group.expert,
+                        group.expert(),
                         group.decision.reuse_rows,
-                        group.rows.len()
+                        group.rows().len()
                     ),
                 ));
             }
-            if group.decision.chosen != group.placement.candidate()
+            if group.decision.chosen != group.placement().candidate()
                 || group.decision.rejected != group.decision.chosen.other()
             {
                 return Err(invalid(
                     "group",
-                    format!("expert {}'s decision and placement disagree", group.expert),
+                    format!(
+                        "expert {}'s decision and placement disagree",
+                        group.expert()
+                    ),
                 ));
             }
-            for (row, slot) in group.rows.iter().zip(&group.slots) {
+            for (row, slot) in group.rows.iter().zip(group.slots()) {
                 let slot = *slot as u64;
                 if slot >= slots || slot / self.shape.top_k != u64::from(*row) {
                     return Err(invalid(
@@ -773,23 +848,93 @@ pub fn compile_experts(
         .and_then(|v| v.checked_mul(shape.intermediate))
         .and_then(|v| v.checked_mul(F32))
         .ok_or_else(|| refuse(overflow("the device workspace")))?;
-    let device_needed = activation_bytes
-        .checked_add(slot_bytes)
-        .and_then(|v| v.checked_add(device_workspace_bytes))
-        .ok_or_else(|| refuse(overflow("the device envelope")))?;
-    let host_workspace_bytes = shape
-        .host_workspace_values(policy.cpu_tile_lanes)
-        .and_then(|v| v.checked_mul(F32))
-        .and_then(|v| v.checked_mul(u64::from(queue_capacity)))
-        .ok_or_else(|| refuse(overflow("the host workspace")))?;
+    // One `u32` per slot, twice: which rows a launch serves and where each
+    // result goes. Charged and allocated on **every** plan rather than only on
+    // one with a device group, because a figure the feasibility check and the
+    // envelope compute differently is exactly how a plan comes to need memory it
+    // did not reserve. It is `rows * top_k * 4` bytes -- 128 for the designated
+    // artifact at two rows -- so the conservative direction costs nothing.
     let index_staging_bytes = rows
         .checked_mul(shape.top_k)
         .and_then(|v| v.checked_mul(4))
         .ok_or_else(|| refuse(overflow("the index staging")))?;
+
+    // The device regions, aligned exactly as `DeviceArena` will partition them
+    // and as the executor will allocate them. An independent review admitted a
+    // plan needing 1,280 device bytes against a 640-byte budget, because
+    // feasibility was checked on the unaligned figure and without the staging.
+    let aligned = |bytes: u64| {
+        align_device(bytes).ok_or_else(|| refuse(overflow("an aligned device region")))
+    };
+    let device_activation_region = aligned(activation_bytes)?
+        .checked_add(aligned(slot_bytes)?)
+        .ok_or_else(|| refuse(overflow("the device activation region")))?;
+    let device_workspace_region = aligned(device_workspace_bytes)?;
+    let device_staging_region = aligned(index_staging_bytes)?
+        .checked_mul(2)
+        .ok_or_else(|| refuse(overflow("the device staging region")))?;
+    let device_needed = device_activation_region
+        .checked_add(device_workspace_region)
+        .and_then(|v| v.checked_add(device_staging_region))
+        .ok_or_else(|| refuse(overflow("the device envelope")))?;
+
+    // The host side, split by who needs it. The reduction's FP32 accumulator is
+    // needed by **every** plan, including an all-device one: the reduction runs
+    // on the host. The tile is needed only by a host group. A review found the
+    // first allocated privately, outside the envelope, and the second allocated
+    // on a GPU-only plan that charged nothing for it.
+    let reduction_workspace_bytes = shape
+        .hidden
+        .checked_mul(F32)
+        .ok_or_else(|| refuse(overflow("the reduction workspace")))?;
+    let tile_workspace_bytes = shape
+        .host_workspace_values(policy.cpu_tile_lanes)
+        .and_then(|v| v.checked_mul(F32))
+        .and_then(|v| v.checked_mul(u64::from(queue_capacity)))
+        .ok_or_else(|| refuse(overflow("the host tile workspace")))?;
+    let host_workspace_bytes = reduction_workspace_bytes
+        .checked_add(tile_workspace_bytes)
+        .ok_or_else(|| refuse(overflow("the host workspace")))?;
     let host_buffer_bytes = activation_bytes
         .checked_add(slot_bytes)
         .and_then(|v| v.checked_add(rows * shape.hidden * BF16))
+        .and_then(|v| v.checked_add(index_staging_bytes.checked_mul(2)?))
         .ok_or_else(|| refuse(overflow("the host buffers")))?;
+
+    // Plan-level preconditions, before any candidate is considered. Both hold
+    // for every plan -- a device-only plan still reads its activations from a
+    // host buffer, stages its indices there and reduces there -- so failing
+    // either is a refusal to plan at all rather than one candidate's reason.
+    if host_buffer_bytes > budget.host_buffer_bytes {
+        let reason = RejectionReason::HostBuffersTooSmall {
+            needed: host_buffer_bytes,
+            free: budget.host_buffer_bytes,
+        };
+        return Err(ExpertPlanRefused {
+            error: Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::Pageable)),
+                requested_bytes: host_buffer_bytes,
+                available_bytes: budget.host_buffer_bytes,
+            },
+            device: Some(reason),
+            host: Some(reason),
+        });
+    }
+    if reduction_workspace_bytes > budget.host_workspace_bytes {
+        let reason = RejectionReason::HostWorkspaceTooSmall {
+            needed: reduction_workspace_bytes,
+            free: budget.host_workspace_bytes,
+        };
+        return Err(ExpertPlanRefused {
+            error: Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::CpuWorkspace)),
+                requested_bytes: reduction_workspace_bytes,
+                available_bytes: budget.host_workspace_bytes,
+            },
+            device: Some(reason),
+            host: Some(reason),
+        });
+    }
 
     if policy.device == StrategyControl::Required && policy.host == StrategyControl::Required {
         // Each is blocked by the other, and the refusal says so on both sides:
@@ -839,11 +984,6 @@ pub fn compile_experts(
         Some(RejectionReason::HostWorkspaceTooSmall {
             needed: host_workspace_bytes,
             free: budget.host_workspace_bytes,
-        })
-    } else if host_buffer_bytes > budget.host_buffer_bytes {
-        Some(RejectionReason::HostBuffersTooSmall {
-            needed: host_buffer_bytes,
-            free: budget.host_buffer_bytes,
         })
     } else {
         None
@@ -1002,36 +1142,33 @@ pub fn compile_experts(
 
     let any_device = groups
         .iter()
-        .any(|g| g.placement.candidate() == Candidate::Device);
+        .any(|g| g.placement().candidate() == Candidate::Device);
     let any_host = groups
         .iter()
-        .any(|g| g.placement.candidate() == Candidate::Host);
+        .any(|g| g.placement().candidate() == Candidate::Host);
     let mut device = Vec::new();
     if any_device {
-        let aligned = |bytes: u64| {
-            align_device(bytes).ok_or_else(|| refuse(overflow("an aligned device region")))
-        };
-        device.push((
-            DeviceTier::Activations,
-            aligned(activation_bytes)? + aligned(slot_bytes)?,
-        ));
-        device.push((
-            DeviceTier::KernelWorkspace,
-            aligned(device_workspace_bytes)?,
-        ));
-        // The two `RouteIndex` operands: which rows a launch serves and where
-        // each result goes. Sized for the largest group a plan of this shape can
-        // produce, which is every slot, so a group's staging is admitted before
-        // the group is known.
-        device.push((
-            DeviceTier::TransferStaging,
-            aligned(index_staging_bytes)? * 2,
-        ));
+        device.push((DeviceTier::Activations, device_activation_region));
+        device.push((DeviceTier::KernelWorkspace, device_workspace_region));
+        // The two `RouteIndex` operands, sized for the largest group a plan of
+        // this shape can produce -- every slot -- so a group's staging is
+        // admitted before the group is known.
+        device.push((DeviceTier::TransferStaging, device_staging_region));
     }
-    let mut host = vec![(HostTier::Pageable, host_buffer_bytes)];
-    if any_host {
-        host.push((HostTier::CpuWorkspace, host_workspace_bytes));
-    }
+    // `CpuWorkspace` is charged on every plan, because the reduction runs on the
+    // host whichever candidate produced the slots. Only a plan with a host group
+    // also charges the tile.
+    let host = vec![
+        (HostTier::Pageable, host_buffer_bytes),
+        (
+            HostTier::CpuWorkspace,
+            if any_host {
+                host_workspace_bytes
+            } else {
+                reduction_workspace_bytes
+            },
+        ),
+    ];
 
     let plan = ExpertPlan {
         kernel: if any_device { selected } else { None },
@@ -1085,6 +1222,30 @@ fn reduction_permutation(route_experts: &[u32], top_k: usize, order: CombineOrde
     out
 }
 
+/// The ABI this planner and `moxie-executor`'s grouped launch implement
+/// together. A descriptor declaring any other number describes a different
+/// argument list, and selecting it would pass the wrong bytes to a kernel that
+/// cannot say so.
+pub const EXPERT_ABI_VERSION: u32 = 1;
+
+/// The operand roles a grouped expert kernel takes, in order: the activation
+/// block, the `u32` selection index, the fused gate/up slice and the fused down
+/// slice.
+///
+/// Checked, not assumed. An independent review selected a descriptor with
+/// **no inputs at all**, ABI 999 and an FP32 output for this BF16 executor,
+/// because selection matched on operation, SM, layout, workspace and shape and
+/// on nothing else. Document 02 requires capability validation to check "each
+/// operand's role, shape and dtype".
+fn operand_roles() -> Vec<KernelOperand> {
+    vec![
+        KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+        KernelOperand::RouteIndex,
+        KernelOperand::Weight(WeightPrecision::expect(Precision::Bf16)),
+        KernelOperand::Weight(WeightPrecision::expect(Precision::Bf16)),
+    ]
+}
+
 /// Select the one catalogue descriptor that serves this operation on this
 /// device, or fail.
 ///
@@ -1108,6 +1269,11 @@ pub fn select_expert_kernel(
         .iter()
         .filter(|d| {
             d.operation == operation
+                && d.abi_version == EXPERT_ABI_VERSION
+                && d.inputs == operand_roles()
+                && d.output == ActivationPrecision::expect(Precision::Bf16)
+                && d.accumulation == AccumulationPolicy::Bf16InF32Acc
+                && d.rounding == RoundingProfile::FinalBf16Rne
                 && d.sm.major == kernels.capability.compute_major
                 && d.sm.minor == kernels.capability.compute_minor
                 && d.layout == moxie_types::TensorLayout::ContiguousRowMajorV1

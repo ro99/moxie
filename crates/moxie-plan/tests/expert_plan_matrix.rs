@@ -186,20 +186,30 @@ struct Case {
 /// Generous enough that the only binding constraint is the one the case turns
 /// off. Computed the same way the planner does, so a case that means "the arena
 /// fits" cannot accidentally mean "the arena is one byte short".
+/// Exactly what an admitted plan of this shape needs, in whole 256-byte ranges
+/// and including the index staging -- the same arithmetic `compile_experts`
+/// checks feasibility with, so "the arena fits" cannot accidentally mean "the
+/// arena is short by the alignment".
 fn generous_arena() -> u64 {
-    let activations = ROWS * HIDDEN * 2;
-    let slots = ROWS * TOP_K * HIDDEN * 2;
-    let workspace = 4 * ROWS * INTERMEDIATE * 4;
-    activations + slots + workspace
+    let align = |bytes: u64| bytes.div_ceil(256) * 256;
+    let activations = align(ROWS * HIDDEN * 2);
+    let slots = align(ROWS * TOP_K * HIDDEN * 2);
+    let workspace = align(4 * ROWS * INTERMEDIATE * 4);
+    let staging = align(ROWS * TOP_K * 4) * 2;
+    activations + slots + workspace + staging
 }
 
 fn generous_host_workspace() -> u64 {
-    // queue capacity 4, one tile of 64 lanes clamped to the intermediate.
-    4 * (INTERMEDIATE + 2 * INTERMEDIATE) * 4
+    // The reduction's accumulator, which every plan needs, plus a queue of four
+    // tiles of 64 lanes clamped to the intermediate.
+    HIDDEN * 4 + 4 * (INTERMEDIATE + 2 * INTERMEDIATE) * 4
 }
 
+/// The activation block, the slot buffer, the output, and the two `u32` index
+/// arrays -- which every plan charges, because the feasibility check and the
+/// envelope must compute the same figure.
 fn generous_host_buffers() -> u64 {
-    ROWS * HIDDEN * 2 + ROWS * TOP_K * HIDDEN * 2 + ROWS * HIDDEN * 2
+    ROWS * HIDDEN * 2 + ROWS * TOP_K * HIDDEN * 2 + ROWS * HIDDEN * 2 + 2 * ROWS * TOP_K * 4
 }
 
 impl Case {
@@ -214,10 +224,14 @@ impl Case {
             },
             device_cache_leased_bytes: 0,
             device_arena_free_bytes: if self.arena_fits { generous_arena() } else { 0 },
+            // "Does not fit" means the host **tile** does not fit, not that
+            // the plan is impossible: the reduction's accumulator is needed by
+            // every plan, including an all-device one, so a budget below it is
+            // a refusal to plan at all and is covered by its own named test.
             host_workspace_bytes: if self.host_workspace_fits {
                 generous_host_workspace()
             } else {
-                0
+                HIDDEN * 4
             },
             host_buffer_bytes: generous_host_buffers(),
             resident_experts: if self.resident {
@@ -464,15 +478,17 @@ fn the_chooser_agrees_with_an_independent_statement_of_its_rule_across_the_produ
                                                         plan.groups().iter().zip(&expected)
                                                     {
                                                         assert_eq!(
-                                                            Some(group.placement.candidate()),
+                                                            Some(group.placement().candidate()),
                                                             *want,
                                                             "{case:?}: expert {}",
-                                                            group.expert
+                                                            group.expert()
                                                         );
                                                         *reasons
                                                             .entry(
-                                                                reason_name(group.decision.reason)
-                                                                    .to_string(),
+                                                                reason_name(
+                                                                    group.decision().reason,
+                                                                )
+                                                                .to_string(),
                                                             )
                                                             .or_default() += 1;
                                                     }
@@ -572,6 +588,9 @@ fn check_envelope(plan: &moxie_plan::expert::ExpertPlan) {
             envelope.device_bytes(DeviceTier::Activations),
             align(activations) + align(slots)
         );
+        // Feasibility is computed from this same total, so an admitted plan
+        // always fits the budget it was checked against.
+        assert!(envelope.total_device_bytes() <= generous_arena());
         assert_eq!(
             envelope.device_bytes(DeviceTier::KernelWorkspace),
             align(u64::from(plan.queue_capacity()) * ROWS * INTERMEDIATE * 4)
@@ -585,21 +604,34 @@ fn check_envelope(plan: &moxie_plan::expert::ExpertPlan) {
     } else {
         assert_eq!(envelope.total_device_bytes(), 0);
     }
-    if plan.uses(Candidate::Host) {
-        assert_eq!(
-            envelope.host_bytes(HostTier::CpuWorkspace),
-            u64::from(plan.queue_capacity()) * (INTERMEDIATE + 2 * INTERMEDIATE) * 4
-        );
-    } else {
-        assert_eq!(envelope.host_bytes(HostTier::CpuWorkspace), 0);
-    }
+    // The reduction accumulator is charged on every plan; only a plan with a
+    // host group also charges the tile. A GPU-only plan that allocated a tile it
+    // did not charge for is the defect this pins.
+    assert_eq!(
+        envelope.host_bytes(HostTier::Pageable),
+        generous_host_buffers()
+    );
+    let reduction = HIDDEN * 4;
+    let tile = u64::from(plan.queue_capacity()) * (INTERMEDIATE + 2 * INTERMEDIATE) * 4;
+    assert_eq!(
+        envelope.host_bytes(HostTier::CpuWorkspace),
+        if plan.uses(Candidate::Host) {
+            reduction + tile
+        } else {
+            reduction
+        }
+    );
+    assert_eq!(
+        plan.host_workspace_values() * 4,
+        envelope.host_bytes(HostTier::CpuWorkspace)
+    );
     // The residency demand is reported and is exactly the non-resident device
     // groups' chunks -- it is not in either tier list, because the residency
     // authority admits those bytes and charging them here would charge twice.
     let demanded: u64 = plan
         .groups_on(Candidate::Device)
-        .filter(|g| !g.decision.already_resident)
-        .map(|g| g.chunk_bytes)
+        .filter(|g| !g.decision().already_resident)
+        .map(|g| g.chunk_bytes())
         .sum();
     assert_eq!(envelope.residency_demand_bytes, demanded);
 }
@@ -630,7 +662,7 @@ fn check_placement(plan: &moxie_plan::expert::ExpertPlan, case: Case) {
     };
     assert_eq!(plan.host_placement(), expected);
     for group in plan.groups_on(Candidate::Host) {
-        assert_eq!(group.placement, Placement::Host(expected));
+        assert_eq!(group.placement(), Placement::Host(expected));
     }
 }
 
@@ -780,4 +812,252 @@ fn the_reduction_order_is_a_permutation_per_row_and_follows_the_declared_order()
     )
     .expect("plan");
     assert_eq!(plan.reduction_order(), &[0, 1, 0, 1, 0, 1, 0, 1]);
+}
+
+/// The two plan-level preconditions: a budget that cannot hold the host buffers
+/// or the reduction's accumulator refuses every plan, whatever the controls say.
+///
+/// Both are needed by an **all-device** plan too -- its activations are read
+/// from a host buffer, its indices are staged there, and its slots are reduced
+/// there -- so neither is a candidate's reason.
+#[test]
+fn a_budget_below_the_host_buffers_or_the_reduction_refuses_every_plan() {
+    let case = Case {
+        device_control: StrategyControl::Required,
+        host_control: StrategyControl::Off,
+        arena_fits: true,
+        host_workspace_fits: true,
+        cache_fits: true,
+        amortised: Amortisation::All,
+        resident: true,
+        order: CombineOrder::AscendingExpertId,
+        with_topology: true,
+        kernels: Kernels::Matching,
+    };
+    let cat = catalogue(SmVersion::SM86);
+    let cap = capability();
+    let kernels = Some(ExpertKernels {
+        capability: &cap,
+        catalogue: &cat,
+    });
+
+    let mut budget = case.budget();
+    budget.host_buffer_bytes = generous_host_buffers() - 1;
+    let refusal = compile_experts(
+        &mlp(),
+        &combine(case.order),
+        &ROUTE,
+        &budget,
+        &case.policy(),
+        Some(&topology()),
+        kernels,
+    )
+    .expect_err("one byte short of the host buffers");
+    assert_eq!(classify(&refusal.error), ExpectedError::Capacity);
+    assert!(matches!(
+        refusal.host,
+        Some(RejectionReason::HostBuffersTooSmall { .. })
+    ));
+
+    let mut budget = case.budget();
+    budget.host_workspace_bytes = HIDDEN * 4 - 1;
+    let refusal = compile_experts(
+        &mlp(),
+        &combine(case.order),
+        &ROUTE,
+        &budget,
+        &case.policy(),
+        Some(&topology()),
+        kernels,
+    )
+    .expect_err("one byte short of the reduction accumulator");
+    assert_eq!(classify(&refusal.error), ExpectedError::Capacity);
+    assert!(matches!(
+        refusal.host,
+        Some(RejectionReason::HostWorkspaceTooSmall { .. })
+    ));
+
+    // And the boundary: exactly the reduction, with the device candidate
+    // required, plans successfully and charges only the accumulator.
+    let mut budget = case.budget();
+    budget.host_workspace_bytes = HIDDEN * 4;
+    let plan = compile_experts(
+        &mlp(),
+        &combine(case.order),
+        &ROUTE,
+        &budget,
+        &case.policy(),
+        Some(&topology()),
+        kernels,
+    )
+    .expect("a device-only plan needs no tile");
+    assert!(!plan.uses(Candidate::Host));
+    assert_eq!(
+        plan.envelope().host_bytes(HostTier::CpuWorkspace),
+        HIDDEN * 4
+    );
+    assert_eq!(plan.tile_workspace_values(), 0);
+}
+
+/// Kernel selection checks the whole compatibility surface, one axis at a time.
+///
+/// An independent review selected a descriptor with **ABI 999, no inputs at all
+/// and an FP32 output** for this BF16 executor, because selection matched on
+/// operation, SM, layout, workspace and shape and on nothing else. Every axis
+/// below is proven load-bearing by substitution: change it alone and the
+/// catalogue no longer serves this operation.
+#[test]
+fn selection_refuses_a_descriptor_that_differs_on_any_compatibility_axis() {
+    let shape = moxie_plan::expert::ExpertShape {
+        hidden: HIDDEN,
+        intermediate: INTERMEDIATE,
+        experts: EXPERTS,
+        top_k: TOP_K,
+        activation: moxie_graph::ExpertActivation::GeGlu,
+    };
+    let cap = capability();
+    let good = catalogue(SmVersion::SM86);
+    moxie_plan::expert::select_expert_kernel(
+        shape,
+        ROWS,
+        ExpertKernels {
+            capability: &cap,
+            catalogue: &good,
+        },
+    )
+    .expect("the unmodified descriptor is selectable");
+
+    /// One named change to a descriptor, applied alone.
+    type Change = Box<dyn Fn(&mut SemanticKernelDescriptor)>;
+    let mutate: Vec<(&str, Change)> = vec![
+        (
+            "abi",
+            Box::new(|d: &mut SemanticKernelDescriptor| d.abi_version = 999),
+        ),
+        (
+            "no inputs",
+            Box::new(|d: &mut SemanticKernelDescriptor| d.inputs.clear()),
+        ),
+        (
+            "an activation where the index belongs",
+            Box::new(|d: &mut SemanticKernelDescriptor| {
+                d.inputs[1] =
+                    KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16));
+            }),
+        ),
+        (
+            "an FP32 weight",
+            Box::new(|d: &mut SemanticKernelDescriptor| {
+                d.inputs[2] = KernelOperand::Weight(WeightPrecision::expect(Precision::F32));
+            }),
+        ),
+        (
+            "an FP32 output",
+            Box::new(|d: &mut SemanticKernelDescriptor| {
+                d.output = ActivationPrecision::expect(Precision::F32);
+            }),
+        ),
+        (
+            "a different accumulator",
+            Box::new(|d: &mut SemanticKernelDescriptor| {
+                d.accumulation = AccumulationPolicy::F32;
+            }),
+        ),
+        (
+            "the wrong gate transform",
+            Box::new(|d: &mut SemanticKernelDescriptor| {
+                d.operation = SemanticKernelOp::ExpertMlp(GateTransform::Silu);
+            }),
+        ),
+        (
+            "a zero workspace",
+            Box::new(|d: &mut SemanticKernelDescriptor| {
+                d.workspace = WorkspaceExpression::Zero;
+            }),
+        ),
+        (
+            "one symbol instead of two",
+            Box::new(|d: &mut SemanticKernelDescriptor| {
+                d.symbols.truncate(1);
+            }),
+        ),
+    ];
+    for (what, change) in mutate {
+        let mut descriptor = good.descriptors()[0].clone();
+        change(&mut descriptor);
+        let catalogue = KernelCatalogue::new(vec![descriptor]).expect("one descriptor");
+        let refused = moxie_plan::expert::select_expert_kernel(
+            shape,
+            ROWS,
+            ExpertKernels {
+                capability: &cap,
+                catalogue: &catalogue,
+            },
+        );
+        assert!(
+            refused.is_err(),
+            "a descriptor with {what} was selected for this executor"
+        );
+    }
+}
+
+/// Device feasibility is computed from the envelope execution will reserve:
+/// whole 256-byte ranges, index staging included.
+///
+/// A review admitted a plan needing 1,280 device bytes against a 640-byte
+/// budget, because feasibility used the unaligned figure and left the staging
+/// out. The boundary is asserted from both sides, so neither the alignment nor
+/// the staging can be dropped without this failing.
+#[test]
+fn the_device_budget_is_checked_against_the_envelope_execution_reserves() {
+    let case = Case {
+        device_control: StrategyControl::Required,
+        host_control: StrategyControl::Off,
+        arena_fits: true,
+        host_workspace_fits: true,
+        cache_fits: true,
+        amortised: Amortisation::All,
+        resident: false,
+        order: CombineOrder::AscendingExpertId,
+        with_topology: true,
+        kernels: Kernels::Matching,
+    };
+    let cat = catalogue(SmVersion::SM86);
+    let cap = capability();
+    let kernels = Some(ExpertKernels {
+        capability: &cap,
+        catalogue: &cat,
+    });
+    let exact = generous_arena();
+
+    let mut budget = case.budget();
+    budget.device_arena_free_bytes = exact;
+    let plan = compile_experts(
+        &mlp(),
+        &combine(case.order),
+        &ROUTE,
+        &budget,
+        &case.policy(),
+        Some(&topology()),
+        kernels,
+    )
+    .expect("exactly the envelope fits");
+    assert_eq!(plan.envelope().total_device_bytes(), exact);
+
+    let mut budget = case.budget();
+    budget.device_arena_free_bytes = exact - 1;
+    let refusal = compile_experts(
+        &mlp(),
+        &combine(case.order),
+        &ROUTE,
+        &budget,
+        &case.policy(),
+        Some(&topology()),
+        kernels,
+    )
+    .expect_err("one byte short of the envelope");
+    assert!(matches!(
+        refusal.device,
+        Some(RejectionReason::DeviceArenaTooSmall { .. })
+    ));
 }

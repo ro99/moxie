@@ -22,7 +22,6 @@ use std::time::Instant;
 
 use moxie_cuda::RankContext;
 use moxie_executor::grouped::{ExpertRoles, GroupedRun};
-use moxie_executor::grouped_device::{DeviceExperts, ExpertLane};
 use moxie_executor::residency::{DeviceResidency, ShardSource};
 use moxie_graph::{CombineOrder, ExpertActivation, OpParams};
 use moxie_memory::{
@@ -189,13 +188,13 @@ fn the_default_policy_sends_this_layers_experts_to_the_cpu() {
     assert!(
         plan.groups()
             .iter()
-            .all(|g| g.placement.candidate() == Candidate::Host),
+            .all(|g| g.placement().candidate() == Candidate::Host),
         "the default 1 MiB/row threshold should refuse an 11.9 MB expert over two rows"
     );
     let worst = plan
         .groups()
         .iter()
-        .map(|g| g.decision.bytes_per_row)
+        .map(|g| g.decision().bytes_per_row)
         .max()
         .unwrap();
     println!(
@@ -285,43 +284,27 @@ fn a_real_layers_experts_execute_on_the_gpu_and_agree_with_the_cpu_candidate() {
     assert!(
         plan.groups()
             .iter()
-            .all(|g| g.placement.candidate() == Candidate::Device)
+            .all(|g| g.placement().candidate() == Candidate::Device)
     );
     assert_eq!(plan.envelope().residency_demand_bytes, 10 * EXPERT_TOTAL);
 
     let started = Instant::now();
     let mut run = GroupedRun::admit(&mut ledger, plan, roles(), None).unwrap();
-    let reservation = run.detach_reservation().unwrap();
-    let mut experts = DeviceExperts::attach(
+    run.attach_device(
         &mut ledger,
-        reservation,
         &ctx,
-        run.plan(),
+        &mut residency,
         moxie_kernels::EXPERT_MLP_FATBIN,
     )
     .unwrap();
-    {
-        let mut lane = ExpertLane {
-            experts: &mut experts,
-            residency: &mut residency,
-        };
-        run.load_activations_with(&x, &mut lane).unwrap();
-        run.run_to_completion_with(
-            &mut authority,
-            &mut src,
-            Some(&mut lane),
-            TurnId::new(1),
-            0,
-            u64::MAX,
-        )
+    run.load_activations(&x).unwrap();
+    run.run_to_completion(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
         .unwrap();
-    }
     let device_slots = run.buffers().slots().to_vec();
     let device_stats = run.stats();
     let residency_stats = authority.stats();
     let device_elapsed = started.elapsed();
     run.close(&mut ledger).unwrap();
-    experts.close(&mut ledger).unwrap();
     authority.end_turn(TurnId::new(1));
     authority.retire_all(scope);
     residency.close(&mut authority).unwrap();

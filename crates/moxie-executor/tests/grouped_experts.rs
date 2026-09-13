@@ -21,7 +21,9 @@ use moxie_memory::{
 use moxie_oracles::route;
 use moxie_plan::expert::{Candidate, ExpertBudget, ExpertPolicy, ExpertShape, compile_experts};
 use moxie_storage::Shard;
-use moxie_types::{DeviceUuid, HostPlacement, HostTier, Scope, StrategyControl, Tier};
+use moxie_types::{
+    DeviceUuid, HostPlacement, HostTier, NumaNodeId, NumaTopology, Scope, StrategyControl, Tier,
+};
 
 const HIDDEN: u64 = 16;
 const INTERMEDIATE: u64 = 8;
@@ -256,7 +258,7 @@ fn a_host_plan_reproduces_the_oracle_bit_for_bit() {
     assert!(
         plan.groups()
             .iter()
-            .all(|g| g.placement.candidate() == Candidate::Host)
+            .all(|g| g.placement().candidate() == Candidate::Host)
     );
 
     let mut run = GroupedRun::admit(&mut l, plan, roles(), None).unwrap();
@@ -524,6 +526,7 @@ fn the_declared_reduction_order_decides_the_answer() {
             1,
             3,
             1,
+            &mut [0f32; 1],
             &mut out,
         )
         .unwrap();
@@ -839,4 +842,444 @@ fn the_expert_chunks_are_the_declared_slices_of_the_fused_tensors() {
     assert_eq!(down.len_bytes(), 3_964_928);
     assert_eq!(down.range().offset_bytes(), 3 * 3_964_928);
     assert!(roles.chunks(128, shape).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Regressions for the independent review of task 0021
+// ---------------------------------------------------------------------------
+
+/// Allocation equals charge, on both shapes of plan.
+///
+/// A review found three buffers allocated outside the envelope: the reduction's
+/// FP32 accumulator (inside the kernel, on the path every plan takes), a host
+/// tile on a GPU-only plan that charged none, and two index arrays per launch.
+/// Comparing these two numbers would have caught all three, so the comparison is
+/// the test.
+#[test]
+fn the_run_allocates_exactly_what_the_envelope_charged() {
+    let mut l = ledger(1 << 24);
+    let plan = compile_experts(
+        &mlp(),
+        &combine(CombineOrder::AscendingExpertId),
+        &ROUTE,
+        &host_only_budget(),
+        &host_only_policy(),
+        None,
+        None,
+    )
+    .unwrap();
+    let charged = plan.envelope().host_bytes(HostTier::Pageable)
+        + plan.envelope().host_bytes(HostTier::CpuWorkspace);
+    let run = GroupedRun::admit(&mut l, plan, roles(), None).unwrap();
+    assert_eq!(run.buffers().allocated_bytes(), charged);
+    assert_eq!(l.scope_committed(Scope::Host), charged);
+    run.close(&mut l).unwrap();
+    assert_eq!(l.scope_committed(Scope::Host), 0);
+}
+
+/// A run that was never given activations refuses to execute.
+///
+/// It used to compute over the zeroed buffer and report success, which is a
+/// confident answer about an input nobody supplied.
+#[test]
+fn a_run_without_activations_refuses_rather_than_computing_over_zeros() {
+    let dir = scratch("no-activations");
+    let w = weights(0x0000_1111);
+    let path = write_shard(&dir, &w);
+    let mut src = source(&path);
+    let mut l = ledger(1 << 24);
+    let mut authority =
+        ResidencyAuthority::open(&mut l, &ResidencyRequest::new("experts", 64 * CHUNK)).unwrap();
+    let plan = compile_experts(
+        &mlp(),
+        &combine(CombineOrder::AscendingExpertId),
+        &ROUTE,
+        &host_only_budget(),
+        &host_only_policy(),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut run = GroupedRun::admit(&mut l, plan, roles(), None).unwrap();
+    let error = run
+        .run_to_completion(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
+        .expect_err("no activations were loaded");
+    assert!(format!("{error}").contains("activation"), "{error}");
+    assert_eq!(run.stats().groups_run, 0);
+    run.close(&mut l).unwrap();
+    authority.close(&mut l).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Activations freeze once a group has run.
+///
+/// Replacing them mid-run would leave one row's slots computed from two
+/// different inputs, and the reduction cannot tell.
+#[test]
+fn activations_cannot_be_replaced_once_a_group_has_run() {
+    let dir = scratch("frozen");
+    let w = weights(0x0000_2222);
+    let path = write_shard(&dir, &w);
+    let mut src = source(&path);
+    let mut l = ledger(1 << 24);
+    let mut authority =
+        ResidencyAuthority::open(&mut l, &ResidencyRequest::new("experts", 64 * CHUNK)).unwrap();
+    let plan = compile_experts(
+        &mlp(),
+        &combine(CombineOrder::AscendingExpertId),
+        &ROUTE,
+        &host_only_budget(),
+        &host_only_policy(),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut run = GroupedRun::admit(&mut l, plan, roles(), None).unwrap();
+    let x = to_bytes(&w.x);
+    run.load_activations(&x).unwrap();
+    // Before any group has run, a reload is allowed.
+    run.load_activations(&x).unwrap();
+    run.step(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
+        .unwrap();
+    let error = run
+        .load_activations(&x)
+        .expect_err("a run in flight must not take new activations");
+    assert!(format!("{error}").contains("frozen"), "{error}");
+    run.cancel(&mut authority);
+    run.close(&mut l).unwrap();
+    authority.close(&mut l).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A failed group ends the run: no reduction, no `Done`, no partial answer.
+///
+/// The counterexample the review drove: a chunk another ticket was already
+/// reading, so the group's weights were not readable. The group failed and the
+/// run carried on to reduce successfully over a slot buffer that had never been
+/// written, then reported `Done` with zero groups executed.
+#[test]
+fn a_failed_group_ends_the_run_rather_than_yielding_a_partial_answer() {
+    let dir = scratch("failed-group");
+    let w = weights(0x0000_3333);
+    let path = write_shard(&dir, &w);
+    let mut src = source(&path);
+    let mut l = ledger(1 << 24);
+    let mut authority =
+        ResidencyAuthority::open(&mut l, &ResidencyRequest::new("experts", 64 * CHUNK)).unwrap();
+
+    // Hold expert 0's gate/up chunk in `Reading`: another ticket owns the read,
+    // so an acquire coalesces onto it and the bytes are not there. This
+    // executor has no waiting path, which is the point.
+    let shape = ExpertShape {
+        hidden: HIDDEN,
+        intermediate: INTERMEDIATE,
+        experts: EXPERTS,
+        top_k: 1,
+        activation: ExpertActivation::GeGlu,
+    };
+    let (gate_up, _) = roles().chunks(0, shape).unwrap();
+    let pending = authority
+        .acquire(moxie_memory::AcquireRequest {
+            chunk: &gate_up,
+            destination: Scope::Host,
+            now: 0,
+            deadline: u64::MAX,
+            class: moxie_memory::UseClass::demand(moxie_memory::Content::Expert),
+            turn: TurnId::new(1),
+        })
+        .unwrap();
+    let moxie_memory::Acquired::Pending { lease, work, .. } = pending else {
+        panic!("the first acquire of a cold chunk is pending");
+    };
+
+    let plan = compile_experts(
+        &OpParams::ExpertMlp {
+            hidden: HIDDEN,
+            intermediate: INTERMEDIATE,
+            experts: EXPERTS,
+            top_k: 1,
+            activation: ExpertActivation::GeGlu,
+        },
+        &OpParams::Combine {
+            hidden: HIDDEN,
+            top_k: 1,
+            order: CombineOrder::AscendingExpertId,
+        },
+        &[0],
+        &host_only_budget(),
+        &host_only_policy(),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut run = GroupedRun::admit(&mut l, plan, roles(), None).unwrap();
+    run.load_activations(&to_bytes(&w.x[..HIDDEN as usize]))
+        .unwrap();
+
+    let error = run
+        .step(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
+        .expect_err("the only group's weights are not readable");
+    // The failure must come from the **acquire**, where its cause is: the
+    // chunk is not ready and this executor has no waiting path. Discovering it
+    // one step later, when the authority refuses to hand out a `Reading` chunk,
+    // is the behaviour the readiness check replaced.
+    assert!(
+        format!("{error}").contains("no waiting path"),
+        "the acquire must be what refused: {error}"
+    );
+    assert!(
+        run.queue().is_empty(),
+        "nothing should have been queued behind a group that could not be acquired"
+    );
+    assert_eq!(run.stats().groups_run, 0);
+    assert!(run.failure().is_some());
+    // Every door is shut, and each one separately: the run neither reduces, nor
+    // reports completion, nor accepts more work.
+    assert!(run.reduce(&[1.0]).is_err());
+    assert!(
+        run.step(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
+            .is_err()
+    );
+    assert!(
+        run.load_activations(&to_bytes(&w.x[..HIDDEN as usize]))
+            .is_err()
+    );
+
+    run.close(&mut l).unwrap();
+    moxie_executor::residency::drain_reads(&mut authority, &mut src, work).unwrap();
+    authority.release(lease).unwrap();
+    authority.close(&mut l).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A placement the plan declared `required` refuses admission rather than
+/// quietly landing on the heap.
+///
+/// The reproducer is a topology whose node lists a CPU this machine does not
+/// have, so the affinity call fails: `auto` reports that and proceeds, and
+/// `required` must not.
+#[test]
+fn a_required_placement_that_cannot_be_honoured_refuses_admission() {
+    let topology = NumaTopology::new(
+        vec![moxie_types::NumaNode {
+            id: NumaNodeId::new(0),
+            cpus: vec![9999],
+            total_bytes: 1 << 30,
+            free_bytes: 1 << 29,
+        }],
+        vec![(BUS.to_string(), Some(NumaNodeId::new(0)))],
+    )
+    .unwrap();
+    let mut policy = host_only_policy();
+    policy.host_placement = StrategyControl::Required;
+    let plan = compile_experts(
+        &mlp(),
+        &combine(CombineOrder::AscendingExpertId),
+        &ROUTE,
+        &host_only_budget(),
+        &policy,
+        Some(&topology),
+        None,
+    )
+    .unwrap();
+    let mut l = ledger(1 << 24);
+    let refused = GroupedRun::admit(&mut l, plan, roles(), Some(&topology))
+        .expect_err("the thread cannot be bound to a CPU that does not exist");
+    assert!(
+        format!("{refused}").contains("placement is required"),
+        "{refused}"
+    );
+    // A refused admission charges nothing.
+    assert_eq!(l.scope_committed(Scope::Host), 0);
+    assert!(l.outstanding().is_empty());
+
+    // The same topology under `auto` admits and reports what it got.
+    let mut policy = host_only_policy();
+    policy.host_placement = StrategyControl::Auto;
+    let plan = compile_experts(
+        &mlp(),
+        &combine(CombineOrder::AscendingExpertId),
+        &ROUTE,
+        &host_only_budget(),
+        &policy,
+        Some(&topology),
+        None,
+    )
+    .unwrap();
+    let run = GroupedRun::admit(&mut l, plan, roles(), Some(&topology)).unwrap();
+    assert!(!run.placement().is_bound());
+    assert_eq!(run.placement().page_policy, "heap");
+    run.close(&mut l).unwrap();
+}
+
+/// A launch whose submission state is unknown withholds its operands.
+///
+/// Exercised through a lane double rather than a destructive CUDA fault: the
+/// property under test is the **executor's**, which is that it must not release
+/// weight leases a live copy or launch may still be reading. Releasing them
+/// would let the authority evict those bytes -- R07, and document 02's rule that
+/// retirement is event-driven.
+#[test]
+fn an_unknown_submission_state_withholds_the_weight_leases() {
+    #[derive(Debug)]
+    struct AlwaysUnknown;
+
+    impl moxie_executor::grouped::ExpertDeviceLane for AlwaysUnknown {
+        fn load_activations(&mut self, _x: &[u8]) -> moxie_types::Result<()> {
+            Ok(())
+        }
+        /// A faithful double: it reports the upload to the authority, because
+        /// the authority is what decides whether a chunk is readable and the
+        /// executor now checks that before dispatching.
+        fn perform_upload(
+            &mut self,
+            authority: &mut ResidencyAuthority,
+            order: &moxie_memory::WorkOrder,
+        ) -> moxie_types::Result<()> {
+            authority.complete_upload(order.ticket(), moxie_memory::Outcome::Completed)
+        }
+        fn run_group(
+            &mut self,
+            _authority: &ResidencyAuthority,
+            _group: &moxie_plan::expert::ExpertGroup,
+            _gate_up: &moxie_memory::ResidencyLease,
+            _down: &moxie_memory::ResidencyLease,
+            _staging: moxie_executor::grouped::ExpertStaging<'_>,
+            _host_slots: &mut [u8],
+        ) -> Result<(), moxie_executor::grouped::LaunchRefused> {
+            Err(moxie_executor::grouped::LaunchRefused {
+                error: moxie_types::Error::DeviceLost {
+                    device: 0,
+                    detail: "the event could not be recorded".into(),
+                },
+                submission_unknown: true,
+            })
+        }
+        fn close(self: Box<Self>, _ledger: &mut Ledger) -> moxie_types::Result<()> {
+            Ok(())
+        }
+    }
+
+    let dir = scratch("unknown-submission");
+    let w = weights(0x0000_4444);
+    let path = write_shard(&dir, &w);
+    let mut src = source(&path);
+
+    // A plan whose groups really are on the device, so `perform` goes through
+    // the lane. The catalogue is synthetic: what is under test is the
+    // executor's response to an unknown submission state, not a kernel.
+    let capability = moxie_types::DeviceCapability {
+        ordinal: 1,
+        uuid: uuid(),
+        name: "fixture".into(),
+        compute_major: 8,
+        compute_minor: 6,
+        total_memory_bytes: 24 << 30,
+        multiprocessor_count: 82,
+        pci_bus_id: BUS.into(),
+        peer_access: Vec::new(),
+    };
+    let catalogue =
+        moxie_types::KernelCatalogue::new(vec![moxie_types::SemanticKernelDescriptor {
+            id: moxie_types::KernelId("fixture-expert".into()),
+            abi_version: moxie_plan::expert::EXPERT_ABI_VERSION,
+            operation: moxie_types::SemanticKernelOp::ExpertMlp(
+                moxie_types::GateTransform::GeluTanh,
+            ),
+            inputs: vec![
+                moxie_types::KernelOperand::Activation(moxie_types::ActivationPrecision::expect(
+                    moxie_types::Precision::Bf16,
+                )),
+                moxie_types::KernelOperand::RouteIndex,
+                moxie_types::KernelOperand::Weight(moxie_types::WeightPrecision::expect(
+                    moxie_types::Precision::Bf16,
+                )),
+                moxie_types::KernelOperand::Weight(moxie_types::WeightPrecision::expect(
+                    moxie_types::Precision::Bf16,
+                )),
+            ],
+            output: moxie_types::ActivationPrecision::expect(moxie_types::Precision::Bf16),
+            accumulation: moxie_types::AccumulationPolicy::Bf16InF32Acc,
+            rounding: moxie_types::RoundingProfile::FinalBf16Rne,
+            layout: moxie_types::TensorLayout::ContiguousRowMajorV1,
+            shape: moxie_types::KernelShapeBounds {
+                max_rows: 1024,
+                max_input: 1024,
+                max_output: 1024,
+            },
+            sm: moxie_types::SmVersion::SM86,
+            workspace: moxie_types::WorkspaceExpression::RowsTimesIntermediateF32,
+            image_sha256: [5; 32],
+            symbols: vec![
+                moxie_types::KernelSymbol("project".into()),
+                moxie_types::KernelSymbol("down".into()),
+            ],
+        }])
+        .unwrap();
+    let mut budget = host_only_budget();
+    budget.device_arena_free_bytes = 1 << 20;
+    budget.device_cache_cap_bytes = 64 * CHUNK;
+    let mut policy = host_only_policy();
+    policy.device = StrategyControl::Required;
+    let plan = compile_experts(
+        &mlp(),
+        &combine(CombineOrder::AscendingExpertId),
+        &ROUTE,
+        &budget,
+        &policy,
+        None,
+        Some(moxie_plan::expert::ExpertKernels {
+            capability: &capability,
+            catalogue: &catalogue,
+        }),
+    )
+    .unwrap();
+    assert!(plan.uses(Candidate::Device));
+
+    // The device envelope needs a device scope in the ledger.
+    let mut l = Ledger::new([
+        CapacitySnapshot::new(Scope::Host, 1 << 24, 1 << 16).unwrap(),
+        CapacitySnapshot::new(Scope::Device(uuid()), 1 << 24, 1 << 16).unwrap(),
+    ])
+    .unwrap();
+    let mut authority = ResidencyAuthority::open(
+        &mut l,
+        &ResidencyRequest::new("experts", 64 * CHUNK).device(uuid(), 64 * CHUNK),
+    )
+    .unwrap();
+    let mut run = GroupedRun::admit(&mut l, plan, roles(), None).unwrap();
+    run.install_lane(Box::new(AlwaysUnknown)).unwrap();
+    run.load_activations(&to_bytes(&w.x)).unwrap();
+
+    assert_eq!(authority.live_lease_count(), 0);
+    let error = run
+        .step(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
+        .expect_err("the lane reported an unknown submission state");
+    assert!(format!("{error}").contains("event"), "{error}");
+    assert_eq!(
+        run.withheld_leases(),
+        2,
+        "an unknown submission must withhold both of the group's leases"
+    );
+    // The queue had already acquired the groups behind this one; they are
+    // legitimately held and are given back by `cancel`. What must survive that
+    // is exactly the two the failed launch may still be reading.
+    run.cancel(&mut authority);
+    assert!(run.queue().is_empty());
+    assert_eq!(
+        authority.live_lease_count(),
+        2,
+        "the authority still counts the withheld pair, which is what keeps those \
+         bytes unevictable"
+    );
+    assert_eq!(run.withheld_leases(), 2);
+    assert!(
+        run.buffers().is_quarantined(),
+        "the host buffers a launch may still be reading must not be unmapped"
+    );
+    assert!(run.failure().is_some());
+    // A second lane cannot be installed over the first.
+    assert!(run.install_lane(Box::new(AlwaysUnknown)).is_err());
+    run.close(&mut l).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

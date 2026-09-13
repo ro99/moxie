@@ -302,6 +302,7 @@ fn the_reduction_matches_the_oracle_in_whichever_order_it_is_given() {
             rows as u32,
             top_k as u32,
             hidden as u32,
+            &mut vec![0f32; hidden],
             &mut out,
         )
         .expect("combine");

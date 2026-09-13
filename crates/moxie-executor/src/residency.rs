@@ -328,6 +328,16 @@ mod device {
             Scope::Device(self.ctx.uuid())
         }
 
+        /// Which authority this backing entitles. A lease is an *offset*, and an
+        /// offset resolved inside another authority's allocation names the
+        /// wrong bytes -- an independent review drove authority A's leases
+        /// through authority B's backing on a real GPU and got a confident,
+        /// different answer. Anything that turns a lease into an address checks
+        /// this first, exactly as `perform_upload` already did.
+        pub fn authority_id(&self) -> Option<moxie_memory::AuthorityId> {
+            self.backing.as_ref().map(DeviceBacking::authority)
+        }
+
         /// The device address of one offset inside this cache's allocation.
         ///
         /// Crate-internal: a raw device address is not something a caller

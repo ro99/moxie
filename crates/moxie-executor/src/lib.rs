@@ -54,8 +54,9 @@ pub use residency::{ChunkSource, ShardSource, drain_reads, perform_read};
 
 pub mod grouped;
 pub use grouped::{
-    BufferAddresses, ExpertRoles, GroupedAdmitRefused, GroupedCloseRefused, GroupedRun,
-    GroupedStats, HostBuffers, OrderQueue, PlacementReport, Progress, QueueFull, QueuedGroup,
+    BufferAddresses, ExpertDeviceLane, ExpertRoles, ExpertStaging, GroupedAdmitRefused,
+    GroupedCloseRefused, GroupedRun, GroupedStats, HostBuffers, LaunchRefused, OrderQueue,
+    PlacementReport, Progress, QueueFull, QueuedGroup,
 };
 
 pub mod arena;

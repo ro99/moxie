@@ -28,9 +28,10 @@ use core::ffi::c_void;
 use moxie_cuda::{Event, Module, ModuleImage, RankContext, ResolvedModule, Stream, TrustedImage};
 use moxie_memory::{Ledger, Reservation, ResidencyAuthority, ResidencyLease};
 use moxie_plan::expert::{ExpertGroup, ExpertPlan};
-use moxie_types::{DeviceTier, Error, Result, SemanticKernelDescriptor};
+use moxie_types::{DeviceTier, Error, Result, Scope, SemanticKernelDescriptor};
 
 use crate::arena::{DeviceArena, DeviceRange};
+use crate::grouped::{ExpertDeviceLane, ExpertStaging, GroupedRun, LaunchRefused};
 use crate::residency::DeviceResidency;
 
 /// 256-byte alignment, as every other device range in this crate uses.
@@ -60,6 +61,10 @@ pub struct DeviceExperts<'ctx> {
     slot_index: Option<DeviceRange<'ctx>>,
     hidden: u64,
     intermediate: u64,
+    /// The batch this attachment was built for. Launch indices are checked
+    /// against these, not against whatever a caller's `ExpertGroup` claims.
+    rows: u64,
+    slot_count: u64,
     activations_loaded: bool,
 }
 
@@ -240,6 +245,8 @@ impl<'ctx> DeviceExperts<'ctx> {
             slot_index: taken.next(),
             hidden: plan.shape().hidden,
             intermediate: plan.shape().intermediate,
+            rows: plan.rows(),
+            slot_count: plan.slot_count(),
             activations_loaded: false,
         })
     }
@@ -274,6 +281,16 @@ impl<'ctx> DeviceExperts<'ctx> {
 
     /// Run one group: stage its indices, project, reduce, and read its slots
     /// back into the host slot buffer.
+    ///
+    /// Every operand is checked **before** anything is enqueued. The leases are
+    /// checked against the authority that issued them *and* against the backing
+    /// they are about to be resolved through, because a lease is an offset and an
+    /// offset means nothing without the allocation it belongs to: a review drove
+    /// authority A's leases through authority B's backing on a real GPU and got
+    /// a confident, different answer. The indices are checked against this
+    /// attachment's own extents, because `ExpertGroup` is data and a row index
+    /// one larger than the batch reads outside the activation block.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_group(
         &mut self,
         authority: &ResidencyAuthority,
@@ -281,70 +298,178 @@ impl<'ctx> DeviceExperts<'ctx> {
         gate_up: &ResidencyLease,
         down: &ResidencyLease,
         residency: &DeviceResidency<'ctx>,
+        staging: ExpertStaging<'_>,
         host_slots: &mut [u8],
-    ) -> Result<()> {
+    ) -> std::result::Result<(), LaunchRefused> {
+        let plain = |error: Error| LaunchRefused {
+            error,
+            submission_unknown: false,
+        };
         if !self.activations_loaded {
-            return Err(invalid(
+            return Err(plain(invalid(
                 "activations",
                 "no activation block has been uploaded to this device".into(),
-            ));
+            )));
         }
-        let assignments = group.rows.len() as u64;
-        if assignments == 0 {
-            return Err(invalid("group", "a group with no assignment".into()));
+        // The backing must belong to the authority that issued these leases and
+        // to this attachment's device. Without both checks a lease's offset is
+        // resolved inside whatever allocation the caller happened to pass.
+        if residency.authority_id() != Some(authority.id()) {
+            return Err(plain(invalid(
+                "backing",
+                format!(
+                    "this residency backs authority {:?}; the leases came from {}",
+                    residency.authority_id().map(moxie_memory::AuthorityId::get),
+                    authority.id().get()
+                ),
+            )));
+        }
+        if residency.scope() != Scope::Device(self.ctx.uuid()) {
+            return Err(plain(invalid(
+                "backing",
+                format!(
+                    "this residency is {}; this attachment is on {}",
+                    residency.scope(),
+                    self.ctx.uuid()
+                ),
+            )));
         }
 
-        let (gate_up_offset, gate_up_len) = authority.device_range(gate_up)?;
-        let (down_offset, down_len) = authority.device_range(down)?;
+        let assignments = group.rows().len() as u64;
+        if assignments == 0 || group.slots().len() as u64 != assignments {
+            return Err(plain(invalid(
+                "group",
+                format!(
+                    "{} row(s) against {} slot(s)",
+                    group.rows().len(),
+                    group.slots().len()
+                ),
+            )));
+        }
+        if assignments > self.slot_count {
+            return Err(plain(invalid(
+                "group",
+                format!(
+                    "{assignments} assignment(s) exceed the {} this attachment admitted",
+                    self.slot_count
+                ),
+            )));
+        }
+        for row in group.rows() {
+            if u64::from(*row) >= self.rows {
+                return Err(plain(invalid(
+                    "group",
+                    format!("row {row} is outside the {} this plan batches", self.rows),
+                )));
+            }
+        }
+        let width = self.hidden * 2;
+        for slot in group.slots() {
+            if u64::from(*slot) >= self.slot_count {
+                return Err(plain(invalid(
+                    "group",
+                    format!(
+                        "slot {slot} is outside the {} this plan produces",
+                        self.slot_count
+                    ),
+                )));
+            }
+        }
+        if host_slots.len() as u64 != self.slot_count * width {
+            return Err(plain(Error::InvalidArtifact {
+                detail: format!(
+                    "the host slot buffer is {} B, expected {}",
+                    host_slots.len(),
+                    self.slot_count * width
+                ),
+            }));
+        }
+        let index_bytes = (assignments * 4) as usize;
+        if staging.rows.len() < index_bytes || staging.slots.len() < index_bytes {
+            return Err(plain(Error::CapacityExceeded {
+                tier: Some(moxie_types::Tier::Device(DeviceTier::TransferStaging)),
+                requested_bytes: assignments * 4,
+                available_bytes: staging.rows.len().min(staging.slots.len()) as u64,
+            }));
+        }
+
+        let (gate_up_offset, gate_up_len) = authority.device_range(gate_up).map_err(plain)?;
+        let (down_offset, down_len) = authority.device_range(down).map_err(plain)?;
         let expected_gate_up = 2 * self.intermediate * self.hidden * 2;
         let expected_down = self.hidden * self.intermediate * 2;
         if gate_up_len != expected_gate_up || down_len != expected_down {
-            return Err(Error::InvalidArtifact {
+            return Err(plain(Error::InvalidArtifact {
                 detail: format!(
                     "expert {} is {gate_up_len} + {down_len} B resident, expected \
                      {expected_gate_up} + {expected_down}",
-                    group.expert
+                    group.expert()
                 ),
-            });
+            }));
         }
-        let mut gate_up_ptr = residency.device_address(gate_up_offset, gate_up_len)?;
-        let mut down_ptr = residency.device_address(down_offset, down_len)?;
+        let mut gate_up_ptr = residency
+            .device_address(gate_up_offset, gate_up_len)
+            .map_err(plain)?;
+        let mut down_ptr = residency
+            .device_address(down_offset, down_len)
+            .map_err(plain)?;
 
-        // The index arrays are the operation's `RouteIndex` operand: which rows
-        // this launch serves and where each result belongs.
-        let rows: Vec<u8> = group.rows.iter().flat_map(|r| r.to_le_bytes()).collect();
-        let slots: Vec<u8> = group.slots.iter().flat_map(|s| s.to_le_bytes()).collect();
+        // The index arrays are the operation's `RouteIndex` operand, written
+        // into admitted host storage that outlives the copy.
+        for (index, row) in group.rows().iter().enumerate() {
+            staging.rows[index * 4..index * 4 + 4].copy_from_slice(&row.to_le_bytes());
+        }
+        for (index, slot) in group.slots().iter().enumerate() {
+            staging.slots[index * 4..index * 4 + 4].copy_from_slice(&slot.to_le_bytes());
+        }
         let row_range = self.row_index.as_ref().expect("live range");
         let slot_range = self.slot_index.as_ref().expect("live range");
+
+        // From here on an enqueue may have happened, so every failure is
+        // reported with the submission state unknown and the caller withholds.
+        let unknown = |error: Error| LaunchRefused {
+            error,
+            submission_unknown: true,
+        };
         // SAFETY: both copies are enqueued on this stream and the launches that
         // read them are enqueued after, on the same stream, so ordering is the
-        // stream's; the event at the end of this function is what releases the
-        // host vectors.
+        // stream's; the staging slices are the run's admitted buffers, which
+        // outlive the copy or are quarantined with it.
         unsafe {
-            row_range.copy_from_host_async(&rows, &self.stream)?;
-            slot_range.copy_from_host_async(&slots, &self.stream)?;
+            row_range
+                .copy_from_host_async(&staging.rows[..index_bytes], &self.stream)
+                .map_err(unknown)?;
+            slot_range
+                .copy_from_host_async(&staging.slots[..index_bytes], &self.stream)
+                .map_err(unknown)?;
         }
 
         let mut x_ptr = self
             .activations
             .as_ref()
             .expect("live range")
-            .device_address()?;
-        let mut slots_ptr = self.slots.as_ref().expect("live range").device_address()?;
+            .device_address()
+            .map_err(unknown)?;
+        let mut slots_ptr = self
+            .slots
+            .as_ref()
+            .expect("live range")
+            .device_address()
+            .map_err(unknown)?;
         let mut workspace_ptr = self
             .workspace
             .as_ref()
             .expect("live range")
-            .device_address()?;
-        let mut row_ptr = row_range.device_address()?;
-        let mut slot_ptr = slot_range.device_address()?;
+            .device_address()
+            .map_err(unknown)?;
+        let mut row_ptr = row_range.device_address().map_err(unknown)?;
+        let mut slot_ptr = slot_range.device_address().map_err(unknown)?;
         let mut count = assignments;
         let mut hidden = self.hidden;
         let mut intermediate = self.intermediate;
 
         let lanes = assignments
             .checked_mul(self.intermediate)
-            .ok_or_else(|| invalid("launch", "projection grid overflowed".into()))?;
+            .ok_or_else(|| unknown(invalid("launch", "projection grid overflowed".into())))?;
         let mut project: [*mut c_void; 7] = [
             (&raw mut x_ptr).cast(),
             (&raw mut row_ptr).cast(),
@@ -355,24 +480,26 @@ impl<'ctx> DeviceExperts<'ctx> {
             (&raw mut intermediate).cast(),
         ];
         // SAFETY: the selected descriptor fixes this symbol's ABI; every
-        // pointer names a checked admitted range or a live residency lease, and
-        // every dimension was bounded during pure lowering. The ranges outlive
-        // the launch because the event below is waited on before this function
-        // returns.
+        // pointer names a checked admitted range or a live residency lease
+        // resolved through this attachment's own backing, and every index was
+        // bounds-checked above. The ranges outlive the launch because the event
+        // below is waited on, or the operands are withheld.
         unsafe {
-            self.module.launch_async(
-                0,
-                &self.stream,
-                (grid(lanes)?, 1, 1),
-                (BLOCK, 1, 1),
-                0,
-                &mut project,
-            )?;
+            self.module
+                .launch_async(
+                    0,
+                    &self.stream,
+                    (grid(lanes).map_err(unknown)?, 1, 1),
+                    (BLOCK, 1, 1),
+                    0,
+                    &mut project,
+                )
+                .map_err(unknown)?;
         }
 
         let components = assignments
             .checked_mul(self.hidden)
-            .ok_or_else(|| invalid("launch", "down grid overflowed".into()))?;
+            .ok_or_else(|| unknown(invalid("launch", "down grid overflowed".into())))?;
         let mut down_params: [*mut c_void; 7] = [
             (&raw mut workspace_ptr).cast(),
             (&raw mut down_ptr).cast(),
@@ -384,37 +511,37 @@ impl<'ctx> DeviceExperts<'ctx> {
         ];
         // SAFETY: as above, for the second symbol of the same descriptor.
         unsafe {
-            self.module.launch_async(
-                1,
-                &self.stream,
-                (grid(components)?, 1, 1),
-                (BLOCK, 1, 1),
-                0,
-                &mut down_params,
-            )?;
+            self.module
+                .launch_async(
+                    1,
+                    &self.stream,
+                    (grid(components).map_err(unknown)?, 1, 1),
+                    (BLOCK, 1, 1),
+                    0,
+                    &mut down_params,
+                )
+                .map_err(unknown)?;
         }
 
-        let event = Event::new(self.ctx)?;
-        event.record(&self.stream)?;
-        event.synchronize()?;
+        let event = Event::new(self.ctx).map_err(unknown)?;
+        event.record(&self.stream).map_err(unknown)?;
+        event.synchronize().map_err(unknown)?;
 
         // Read back only this group's slots. The device slot buffer never held
         // the host groups' results, so copying it whole would overwrite them.
-        let width = usize::try_from(self.hidden * 2)
-            .map_err(|_| invalid("hidden", "a row wider than this address space".into()))?;
+        // Past the event, nothing is in flight: a readback failure is ordinary.
+        let width = usize::try_from(width).map_err(|_| {
+            plain(invalid(
+                "hidden",
+                "a row wider than this address space".into(),
+            ))
+        })?;
         let base = self.slots.as_ref().expect("live range");
-        for slot in &group.slots {
-            let offset = u64::from(*slot)
-                .checked_mul(self.hidden * 2)
-                .ok_or_else(|| invalid("slot", "slot offset overflowed".into()))?;
-            let start = (*slot as usize)
-                .checked_mul(width)
-                .ok_or_else(|| invalid("slot", "host slot offset overflowed".into()))?;
-            let end = start
-                .checked_add(width)
-                .filter(|end| *end <= host_slots.len())
-                .ok_or_else(|| invalid("slot", "slot lies outside the host buffer".into()))?;
-            base.copy_to_host_at(offset, &mut host_slots[start..end])?;
+        for slot in group.slots() {
+            let offset = u64::from(*slot) * self.hidden * 2;
+            let start = (*slot as usize) * width;
+            base.copy_to_host_at(offset, &mut host_slots[start..start + width])
+                .map_err(plain)?;
         }
         Ok(())
     }
@@ -489,18 +616,19 @@ impl core::fmt::Display for AttachRefused {
 
 impl std::error::Error for AttachRefused {}
 
-/// The device lane a [`crate::grouped::GroupedRun`] drives.
+/// The device lane a [`GroupedRun`] drives, owned by that run.
 ///
-/// It pairs the two halves a device group needs and which are owned separately
-/// for good reason: the residency cache is the authority's one allocation and
-/// outlives any plan, while the arena and module belong to this plan alone.
+/// It pairs the two halves a device group needs, which are owned differently on
+/// purpose: the attachment belongs to this plan alone and dies with it, while
+/// the residency cache is the authority's one allocation and outlives any plan,
+/// so it is borrowed.
 #[derive(Debug)]
 pub struct ExpertLane<'a, 'ctx> {
-    pub experts: &'a mut DeviceExperts<'ctx>,
-    pub residency: &'a mut DeviceResidency<'ctx>,
+    experts: DeviceExperts<'ctx>,
+    residency: &'a mut DeviceResidency<'ctx>,
 }
 
-impl crate::grouped::ExpertDeviceLane for ExpertLane<'_, '_> {
+impl ExpertDeviceLane for ExpertLane<'_, '_> {
     fn load_activations(&mut self, x: &[u8]) -> Result<()> {
         self.experts.load_activations(x)
     }
@@ -512,9 +640,27 @@ impl crate::grouped::ExpertDeviceLane for ExpertLane<'_, '_> {
     ) -> Result<()> {
         // The stream is the attachment's, so the upload and the launches that
         // read it are ordered by the same stream rather than by hope.
-        self.residency
+        match self
+            .residency
             .perform_upload(authority, self.experts.stream(), order)
-            .map_err(|refused| refused.error)
+        {
+            Ok(()) => Ok(()),
+            Err(refused) => {
+                // A refusal that never reaches the authority leaves the
+                // placement `Uploading` forever, and the cache then refuses to
+                // close because a range it never filled is still live. The
+                // ticket belongs to *this* authority -- the check that refused
+                // was about the backing -- so settling it here is correct and is
+                // the only place that can.
+                let outcome = if refused.submission_unknown {
+                    moxie_memory::Outcome::SubmissionUnknown(refused.error.clone())
+                } else {
+                    moxie_memory::Outcome::Failed(refused.error.clone())
+                };
+                let _ = authority.complete_upload(order.ticket(), outcome);
+                Err(refused.error)
+            }
+        }
     }
 
     fn run_group(
@@ -523,9 +669,72 @@ impl crate::grouped::ExpertDeviceLane for ExpertLane<'_, '_> {
         group: &ExpertGroup,
         gate_up: &ResidencyLease,
         down: &ResidencyLease,
+        staging: ExpertStaging<'_>,
         host_slots: &mut [u8],
-    ) -> Result<()> {
-        self.experts
-            .run_group(authority, group, gate_up, down, self.residency, host_slots)
+    ) -> std::result::Result<(), LaunchRefused> {
+        self.experts.run_group(
+            authority,
+            group,
+            gate_up,
+            down,
+            self.residency,
+            staging,
+            host_slots,
+        )
+    }
+
+    fn close(self: Box<Self>, ledger: &mut Ledger) -> Result<()> {
+        self.experts.close(ledger)
+    }
+}
+
+impl<'lane> GroupedRun<'lane> {
+    /// Attach a device to this run: reserve its arena, resolve its kernel, and
+    /// keep both inside the run.
+    ///
+    /// The reservation never leaves the run. An earlier design handed it out and
+    /// let the caller release it while these host buffers stayed live and
+    /// writable -- a charge of zero against memory the run could still use. One
+    /// owner, one `close`.
+    pub fn attach_device<'a, 'ctx>(
+        &mut self,
+        ledger: &mut Ledger,
+        ctx: &'ctx RankContext,
+        residency: &'a mut DeviceResidency<'ctx>,
+        image: &'static [u8],
+    ) -> Result<()>
+    where
+        'a: 'lane,
+        'ctx: 'lane,
+    {
+        if residency.scope() != Scope::Device(ctx.uuid()) {
+            return Err(invalid(
+                "residency",
+                format!(
+                    "this residency is {}; the attachment is on {}",
+                    residency.scope(),
+                    ctx.uuid()
+                ),
+            ));
+        }
+        let reservation = self.take_reservation_for_device()?;
+        let experts = match DeviceExperts::attach(ledger, reservation, ctx, self.plan(), image) {
+            Ok(experts) => experts,
+            Err(refused) => {
+                match refused.reservation {
+                    // No arena took it: it goes straight back into the run, so
+                    // the host buffers and their charge stay together.
+                    Some(reservation) => self.restore_reservation(reservation),
+                    // An arena took it and released it on the way out. The
+                    // charge is gone, so the buffers go now rather than
+                    // outliving it -- which is the gap this whole ownership
+                    // change exists to close.
+                    None => self.envelope_was_released(&refused.error),
+                }
+                return Err(refused.error);
+            }
+        };
+        self.install_lane(Box::new(ExpertLane { experts, residency }))?;
+        Ok(())
     }
 }

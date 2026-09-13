@@ -294,6 +294,11 @@ pub fn expert_group_bf16(
 /// carrying it as an explicit permutation is what lets the executor reduce a
 /// plan that mixed a host group and a device group without either candidate's
 /// completion order reaching the sum.
+///
+/// `accumulator` is `hidden` FP32 values, supplied by the caller. It used to be
+/// a `vec![0f32; hidden]` allocated here, which put an allocation outside the
+/// admitted envelope on the one path every plan takes.
+#[allow(clippy::too_many_arguments)]
 pub fn combine_rows_bf16(
     slots: &[u8],
     weights: &[f32],
@@ -301,6 +306,7 @@ pub fn combine_rows_bf16(
     rows: u32,
     top_k: u32,
     hidden: u32,
+    accumulator: &mut [f32],
     out: &mut [u8],
 ) -> Result<()> {
     let rows = rows as usize;
@@ -342,7 +348,14 @@ pub fn combine_rows_bf16(
             ),
         });
     }
-    let mut acc = vec![0f32; hidden];
+    if accumulator.len() < hidden {
+        return Err(Error::CapacityExceeded {
+            tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::CpuWorkspace)),
+            requested_bytes: (hidden * 4) as u64,
+            available_bytes: (accumulator.len() * 4) as u64,
+        });
+    }
+    let acc = &mut accumulator[..hidden];
     for r in 0..rows {
         acc.iter_mut().for_each(|v| *v = 0.0);
         let row_order = &order[r * top_k..(r + 1) * top_k];
@@ -454,8 +467,17 @@ mod tests {
     #[test]
     fn an_order_that_is_not_a_permutation_is_refused() {
         let mut out = vec![0u8; 4];
-        let err =
-            combine_rows_bf16(&[0u8; 8], &[1.0, 1.0], &[0, 0], 1, 2, 2, &mut out).unwrap_err();
+        let err = combine_rows_bf16(
+            &[0u8; 8],
+            &[1.0, 1.0],
+            &[0, 0],
+            1,
+            2,
+            2,
+            &mut [0f32; 2],
+            &mut out,
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("twice"), "{err}");
     }
 }

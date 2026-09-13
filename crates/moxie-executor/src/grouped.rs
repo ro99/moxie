@@ -51,7 +51,7 @@ use crate::residency::{ChunkSource, drain_reads};
 /// in this crate that may hold a device address. A host-lane double can also
 /// implement it, which is how the device *sequencing* is exercised without
 /// hardware while the device *arithmetic* is exercised only on hardware.
-pub trait ExpertDeviceLane {
+pub trait ExpertDeviceLane: core::fmt::Debug {
     /// Put the activation block on the device, once per run.
     fn load_activations(&mut self, x: &[u8]) -> Result<()>;
     /// Perform one upload order the residency authority issued, and report its
@@ -62,15 +62,60 @@ pub trait ExpertDeviceLane {
         order: &WorkOrder,
     ) -> Result<()>;
     /// Run one group and read its slots back into `host_slots`.
+    ///
+    /// `staging` is admitted host storage for the two `u32` index operands. The
+    /// lane writes them there rather than into vectors of its own: an index
+    /// array allocated per group is an allocation outside the envelope, and one
+    /// that a submitted copy may still be reading when it drops is worse than
+    /// that.
     fn run_group(
         &mut self,
         authority: &ResidencyAuthority,
         group: &ExpertGroup,
         gate_up: &ResidencyLease,
         down: &ResidencyLease,
+        staging: ExpertStaging<'_>,
         host_slots: &mut [u8],
-    ) -> Result<()>;
+    ) -> std::result::Result<(), LaunchRefused>;
+    /// Give the device envelope back. Called by [`GroupedRun::close`].
+    fn close(self: Box<Self>, ledger: &mut Ledger) -> Result<()>;
 }
+
+/// Admitted host storage for one launch's two `u32` index operands.
+#[derive(Debug)]
+pub struct ExpertStaging<'a> {
+    /// `[assignments]` little-endian `u32`: which activation row each serves.
+    pub rows: &'a mut [u8],
+    /// `[assignments]` little-endian `u32`: where each result goes.
+    pub slots: &'a mut [u8],
+}
+
+/// A failed launch, and whether anything may still be reading its operands.
+///
+/// The distinction is the whole point, and it is document 02's: "an upload owns
+/// or leases its source bytes through a completion event", and a failure after
+/// an enqueue leaves the submission state **unknown**. A caller that released
+/// the weight leases on such a failure would let the authority evict bytes a
+/// live copy or launch is reading. `moxie_executor::residency::UploadRefused`
+/// carries the same flag for the same reason.
+#[derive(Debug)]
+#[must_use = "an unknown submission means the operands must be withheld, not released"]
+pub struct LaunchRefused {
+    pub error: Error,
+    pub submission_unknown: bool,
+}
+
+impl core::fmt::Display for LaunchRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.error)?;
+        if self.submission_unknown {
+            f.write_str(" (submission state unknown)")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for LaunchRefused {}
 
 /// BF16 bytes per element.
 const BF16: u64 = 2;
@@ -765,30 +810,42 @@ impl PlacedF32 {
 }
 
 /// The host side of one run: the activation block, the slot buffer, the reduced
-/// output and the FP32 tile workspace.
+/// output, the FP32 workspace and the two `u32` index arrays.
+///
+/// Every one of them is charged in the plan's envelope and allocated here, and
+/// nothing else allocates during a run. Two buffers are in this list because a
+/// review found them being allocated privately: the reduction's accumulator
+/// (inside the kernel, on the one path every plan takes) and the index staging
+/// (per group, per launch, and outside NUMA placement).
 #[derive(Debug)]
 pub struct HostBuffers {
     x: Placed,
     slots: Placed,
     out: Placed,
+    /// The reduction's accumulator first, then the host tile. A device-only
+    /// plan has no tile and this is exactly the accumulator.
     workspace: PlacedF32,
+    row_index: Placed,
+    slot_index: Placed,
+    /// Set when something with an unknown submission state may still be reading
+    /// these pages. A quarantined buffer's mappings are **not** unmapped on
+    /// drop, exactly as `DeviceArena` keeps its allocation: document 02 forbids
+    /// `Drop` alone from freeing memory a transfer may still touch.
+    quarantined: bool,
 }
 
 impl HostBuffers {
     /// Allocate and **first-touch** every page, so placement is decided now
     /// rather than by whichever thread happens to write first.
-    fn allocate(
-        x: usize,
-        slots: usize,
-        out: usize,
-        workspace: usize,
-        policy: Option<NodePolicy>,
-    ) -> Result<Self> {
+    fn allocate(extents: HostExtents, policy: Option<NodePolicy>) -> Result<Self> {
         let mut buffers = HostBuffers {
-            x: Placed::allocate(x, policy)?,
-            slots: Placed::allocate(slots, policy)?,
-            out: Placed::allocate(out, policy)?,
-            workspace: PlacedF32::allocate(workspace, policy)?,
+            x: Placed::allocate(extents.x, policy)?,
+            slots: Placed::allocate(extents.slots, policy)?,
+            out: Placed::allocate(extents.out, policy)?,
+            workspace: PlacedF32::allocate(extents.workspace_values, policy)?,
+            row_index: Placed::allocate(extents.index, policy)?,
+            slot_index: Placed::allocate(extents.index, policy)?,
+            quarantined: false,
         };
         buffers.touch();
         Ok(buffers)
@@ -802,14 +859,16 @@ impl HostBuffers {
         // buffer is known-zero, so the compiler may delete the store. Writing a
         // non-zero byte through a `black_box` and clearing it makes the fault
         // unavoidable.
-        for page in self.x.as_mut_slice().chunks_mut(PAGE) {
-            first_touch(page);
-        }
-        for page in self.slots.as_mut_slice().chunks_mut(PAGE) {
-            first_touch(page);
-        }
-        for page in self.out.as_mut_slice().chunks_mut(PAGE) {
-            first_touch(page);
+        for buffer in [
+            &mut self.x,
+            &mut self.slots,
+            &mut self.out,
+            &mut self.row_index,
+            &mut self.slot_index,
+        ] {
+            for page in buffer.as_mut_slice().chunks_mut(PAGE) {
+                first_touch(page);
+            }
         }
         for page in self.workspace.as_mut_slice().chunks_mut(PAGE / 4) {
             let value = &mut page[0];
@@ -817,6 +876,12 @@ impl HostBuffers {
             std::hint::black_box(&mut *value);
             *value = 0.0;
         }
+    }
+
+    /// Withhold these pages from the allocator forever. Irreversible, and that
+    /// is the point.
+    fn quarantine(&mut self) {
+        self.quarantined = true;
     }
 
     pub fn slots(&self) -> &[u8] {
@@ -833,6 +898,58 @@ impl HostBuffers {
         self.x.owns_pages()
     }
 
+    pub fn is_quarantined(&self) -> bool {
+        self.quarantined
+    }
+
+    /// Every host byte this run allocated.
+    ///
+    /// It exists so a test can assert **allocation equals charge**. A review
+    /// found three buffers allocated outside the envelope -- the reduction's
+    /// accumulator, the index staging, and a host tile on a plan that charged
+    /// none -- and every one of them would have been caught by comparing these
+    /// two numbers.
+    pub fn allocated_bytes(&self) -> u64 {
+        (self.x.as_slice().len()
+            + self.slots.as_slice().len()
+            + self.out.as_slice().len()
+            + self.row_index.as_slice().len()
+            + self.slot_index.as_slice().len()) as u64
+            + self.workspace_bytes()
+    }
+
+    fn workspace_bytes(&self) -> u64 {
+        match &self.workspace {
+            #[cfg(feature = "numa")]
+            PlacedF32::Mapped(m) => m.as_slice().len() as u64,
+            PlacedF32::Heap(v) => (v.len() * 4) as u64,
+        }
+    }
+
+    /// Give every page back **now**.
+    ///
+    /// Only a device attachment can reach the situation this exists for, so it
+    /// is compiled only with one.
+    ///
+    /// Used on exactly one path: a device attachment that failed after an arena
+    /// had taken and released this run's reservation. The charge is already
+    /// gone, so leaving the buffers allocated would recreate the very gap
+    /// between accounting and live memory that moving the attachment inside the
+    /// run closed. Nothing asynchronous can be reading them -- attaching copies
+    /// nothing -- and a quarantined run is never on this path.
+    #[cfg(feature = "driver")]
+    fn release_now(&mut self) {
+        if self.quarantined {
+            return;
+        }
+        self.x = Placed::Heap(Vec::new());
+        self.slots = Placed::Heap(Vec::new());
+        self.out = Placed::Heap(Vec::new());
+        self.row_index = Placed::Heap(Vec::new());
+        self.slot_index = Placed::Heap(Vec::new());
+        self.workspace = PlacedF32::Heap(Vec::new());
+    }
+
     /// The addresses a placement read-back is taken at. Reading `numa_maps` is
     /// `moxie-host`'s alone (ADR 0006), so this hands out the addresses and the
     /// measurement happens where it is permitted.
@@ -843,6 +960,31 @@ impl HostBuffers {
             output: self.out.as_ptr() as u64,
             workspace: self.workspace.as_ptr() as u64,
         }
+    }
+}
+
+impl Drop for HostBuffers {
+    fn drop(&mut self) {
+        if !self.quarantined {
+            return;
+        }
+        // Keep the mappings alive, the way `DeviceArena` keeps its allocation
+        // when its reservation is still outstanding. A leak that is visible in
+        // `GroupedRun::withheld_leases` beats unmapping pages a copy whose
+        // submission state is unknown may still be reading.
+        for buffer in [
+            &mut self.x,
+            &mut self.slots,
+            &mut self.out,
+            &mut self.row_index,
+            &mut self.slot_index,
+        ] {
+            std::mem::forget(std::mem::replace(buffer, Placed::Heap(Vec::new())));
+        }
+        std::mem::forget(std::mem::replace(
+            &mut self.workspace,
+            PlacedF32::Heap(Vec::new()),
+        ));
     }
 }
 
@@ -885,29 +1027,66 @@ pub enum Progress {
     /// Every group has run. The slot buffer is complete.
     Done,
 }
+/// What a run has been told and what has happened to it.
+///
+/// A state rather than a pair of booleans, because the review found two ways the
+/// booleans were not enough: a run whose group failed carried on to produce a
+/// confident partial answer, and a run that was never given activations produced
+/// a confident answer over zeros.
+#[derive(Debug)]
+enum RunState {
+    /// Admitted, with no activations yet. Nothing may execute.
+    Admitted,
+    /// Activations loaded. Execution may start; they may still be replaced.
+    Loaded,
+    /// At least one group has run. Activations are frozen: replacing them now
+    /// would reduce contributions computed from two different inputs into one
+    /// row.
+    Running,
+    /// Abandoned. Nothing further executes and nothing may be read out.
+    Cancelled,
+    /// A group failed. The slot buffer is incomplete, so **no** answer can be
+    /// produced from it: a row reduced over fewer slots than it selected is a
+    /// wrong answer, not a partial one.
+    Failed(Error),
+}
 
 /// One admitted, placed, executable expert plan.
+///
+/// It owns everything the plan needs for its whole life: the reservation, the
+/// host buffers, the queue, the thread's placement, and -- when there is one --
+/// the device attachment. That is deliberate and it is a correction. The
+/// reservation used to be handed out to a device attachment while the host
+/// buffers stayed live and usable here, so releasing it left a charge of zero
+/// against memory this run could still write. One owner, one `close`.
 #[derive(Debug)]
 #[must_use = "an unclosed run keeps its reservation charged"]
-pub struct GroupedRun {
+pub struct GroupedRun<'lane> {
     plan: ExpertPlan,
     roles: ExpertRoles,
+    /// `None` once a device attachment took it; the attachment then owns the
+    /// whole envelope and `close` gives it back through the attachment.
     reservation: Option<Reservation>,
     ledger: LedgerId,
     buffers: HostBuffers,
     queue: OrderQueue,
     placement: PlacementReport,
     guard: Option<affinity::AffinityGuard>,
+    device: Option<Box<dyn ExpertDeviceLane + 'lane>>,
     next_group: usize,
     stats: GroupedStats,
-    cancelled: bool,
-    /// True once a device attachment took the reservation. The charge is then
-    /// that attachment's to release, and this run's `close` must not release it
-    /// a second time.
-    detached: bool,
+    state: RunState,
+    /// True when a device attachment took the reservation, failed, and released
+    /// it on the way out. There is then nothing left for `close` to release.
+    envelope_released: bool,
+    /// Leases that cannot be given back, because a transfer or launch whose
+    /// submission state is unknown may still be reading the bytes they pin.
+    /// They stay here until the run dies, and the authority keeps counting
+    /// them: R07's rule is that withholding wins.
+    withheld: Vec<ResidencyLease>,
 }
 
-impl GroupedRun {
+impl<'lane> GroupedRun<'lane> {
     /// Reserve the plan's envelope atomically, then place and allocate the host
     /// buffers.
     ///
@@ -920,30 +1099,23 @@ impl GroupedRun {
         roles: ExpertRoles,
         topology: Option<&NumaTopology>,
     ) -> std::result::Result<Self, GroupedAdmitRefused> {
-        Self::admit_inner(ledger, plan, roles, topology)
-    }
-
-    fn admit_inner(
-        ledger: &mut Ledger,
-        plan: ExpertPlan,
-        roles: ExpertRoles,
-        topology: Option<&NumaTopology>,
-    ) -> std::result::Result<Self, GroupedAdmitRefused> {
-        macro_rules! invalid_out {
-            ($plan:expr, $error:expr) => {
-                return Err(GroupedAdmitRefused::Invalid {
-                    plan: Box::new($plan),
-                    error: $error,
-                })
-            };
-        }
         let request = match Self::request_for(&plan) {
             Ok(request) => request,
-            Err(error) => invalid_out!(plan, error),
+            Err(error) => {
+                return Err(GroupedAdmitRefused::Invalid {
+                    plan: Box::new(plan),
+                    error,
+                });
+            }
         };
         let reservation = match ledger.admit(&request) {
             Ok(reservation) => reservation,
-            Err(AdmitError::Invalid(error)) => invalid_out!(plan, error),
+            Err(AdmitError::Invalid(error)) => {
+                return Err(GroupedAdmitRefused::Invalid {
+                    plan: Box::new(plan),
+                    error,
+                });
+            }
             Err(AdmitError::Rejected(rejection)) => {
                 return Err(GroupedAdmitRefused::Rejected {
                     plan: Box::new(plan),
@@ -955,7 +1127,19 @@ impl GroupedRun {
 
         // Placement, then allocation. Binding after allocating would place the
         // pages by whichever CPU happened to run the allocation.
-        let (guard, placement, page_policy) = Self::bind(&plan, topology);
+        let (guard, placement, page_policy) = match Self::bind(&plan, topology) {
+            Ok(bound) => bound,
+            Err(error) => {
+                // `required` means the admission fails, not that the buffers go
+                // somewhere else quietly. A review admitted a plan whose
+                // placement was `required` and whose report said `"heap"`.
+                let _ = ledger.release(reservation);
+                return Err(GroupedAdmitRefused::Invalid {
+                    plan: Box::new(plan),
+                    error,
+                });
+            }
+        };
         let extents = Self::host_extents(&plan);
         let queue = OrderQueue::with_capacity(plan.queue_capacity());
         let (extents, queue) = match (extents, queue) {
@@ -965,17 +1149,22 @@ impl GroupedRun {
                 // failure between `admit` and the first byte cannot leave the
                 // ledger charged for a run that never existed.
                 let _ = ledger.release(reservation);
-                invalid_out!(plan, error)
+                return Err(GroupedAdmitRefused::Invalid {
+                    plan: Box::new(plan),
+                    error,
+                });
             }
         };
-        let buffers =
-            match HostBuffers::allocate(extents.0, extents.1, extents.2, extents.3, page_policy) {
-                Ok(buffers) => buffers,
-                Err(error) => {
-                    let _ = ledger.release(reservation);
-                    invalid_out!(plan, error)
-                }
-            };
+        let buffers = match HostBuffers::allocate(extents, page_policy) {
+            Ok(buffers) => buffers,
+            Err(error) => {
+                let _ = ledger.release(reservation);
+                return Err(GroupedAdmitRefused::Invalid {
+                    plan: Box::new(plan),
+                    error,
+                });
+            }
+        };
         Ok(GroupedRun {
             plan,
             roles,
@@ -985,25 +1174,44 @@ impl GroupedRun {
             queue,
             placement,
             guard,
+            device: None,
             next_group: 0,
             stats: GroupedStats::default(),
-            cancelled: false,
-            detached: false,
+            state: RunState::Admitted,
+            envelope_released: false,
+            withheld: Vec::new(),
         })
     }
 
+    /// Bind this thread for the plan's placement, or fail.
+    ///
+    /// `Off` and `Auto` return an unbound report with its reason; `Required`
+    /// returns an error, which `admit` turns into a refusal that releases the
+    /// reservation. Document 01: "`required` errors when unsupported or
+    /// inadmissible", and a report that says `"heap"` while the caller asked for
+    /// a node is the silent disabling that rule forbids.
     fn bind(
         plan: &ExpertPlan,
         topology: Option<&NumaTopology>,
-    ) -> (
+    ) -> Result<(
         Option<affinity::AffinityGuard>,
         PlacementReport,
         Option<NodePolicy>,
-    ) {
+    )> {
         let requested = plan.host_placement();
         let strict = plan.policy().host_placement == StrategyControl::Required;
-        let unbound = |reason: &'static str| {
-            (
+        let unbound = |reason: &'static str| -> Result<(
+            Option<affinity::AffinityGuard>,
+            PlacementReport,
+            Option<NodePolicy>,
+        )> {
+            if strict {
+                return Err(invalid(
+                    "host_placement",
+                    format!("placement is required and {reason}"),
+                ));
+            }
+            Ok((
                 None,
                 PlacementReport {
                     requested,
@@ -1012,7 +1220,7 @@ impl GroupedRun {
                     page_policy: "heap",
                 },
                 None,
-            )
+            ))
         };
         if plan.policy().host_placement == StrategyControl::Off {
             return unbound("the placement control is off");
@@ -1038,7 +1246,7 @@ impl GroupedRun {
             NodePolicy::Preferred(node.get())
         };
         match affinity::AffinityGuard::bind(cpus) {
-            Ok((guard, bound_cpus)) => (
+            Ok((guard, bound_cpus)) => Ok((
                 Some(guard),
                 PlacementReport {
                     requested,
@@ -1047,7 +1255,7 @@ impl GroupedRun {
                     page_policy: if strict { "mbind" } else { "preferred" },
                 },
                 Some(policy),
-            ),
+            )),
             Err(_) => unbound("the thread could not be bound"),
         }
     }
@@ -1067,12 +1275,63 @@ impl GroupedRun {
     pub const fn queue(&self) -> &OrderQueue {
         &self.queue
     }
+    pub const fn ledger(&self) -> LedgerId {
+        self.ledger
+    }
     pub const fn is_cancelled(&self) -> bool {
-        self.cancelled
+        matches!(self.state, RunState::Cancelled)
+    }
+    /// The error that ended this run, if one did.
+    pub const fn failure(&self) -> Option<&Error> {
+        match &self.state {
+            RunState::Failed(error) => Some(error),
+            _ => None,
+        }
+    }
+    /// Leases this run can never give back, because something whose submission
+    /// state is unknown may still be reading them. Nonzero is a visible leak,
+    /// and that is the intent: the alternative is an invisible one.
+    pub fn withheld_leases(&self) -> usize {
+        self.withheld.len()
+    }
+    pub fn has_device(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// Refuse if this run is in no state to do more work.
+    fn usable(&self) -> Result<()> {
+        match &self.state {
+            RunState::Cancelled => Err(Error::Cancelled { at: "expert-run" }),
+            RunState::Failed(error) => Err(invalid(
+                "run",
+                format!("this run failed and cannot continue: {error}"),
+            )),
+            RunState::Admitted | RunState::Loaded | RunState::Running => Ok(()),
+        }
+    }
+
+    /// Record a failure and refuse everything afterwards.
+    fn fail(&mut self, error: Error) -> Error {
+        if !matches!(self.state, RunState::Failed(_) | RunState::Cancelled) {
+            self.state = RunState::Failed(error.clone());
+        }
+        error
     }
 
     /// Load the activation block. `[rows, hidden]` BF16, exactly.
+    ///
+    /// Once a group has run the activations are frozen: a second load would
+    /// leave one row's slots computed from two different inputs, and the
+    /// reduction cannot tell. A run that was never loaded refuses to execute
+    /// rather than computing over zeros -- which is what it used to do.
     pub fn load_activations(&mut self, x: &[u8]) -> Result<()> {
+        self.usable()?;
+        if matches!(self.state, RunState::Running) {
+            return Err(invalid(
+                "activations",
+                "this run has already executed a group; its activations are frozen".into(),
+            ));
+        }
         if x.len() as u64 != self.plan.activation_bytes() {
             return Err(Error::InvalidArtifact {
                 detail: format!(
@@ -1085,17 +1344,11 @@ impl GroupedRun {
             });
         }
         self.buffers.x.as_mut_slice().copy_from_slice(x);
+        if let Some(lane) = self.device.as_mut() {
+            lane.load_activations(self.buffers.x.as_slice())?;
+        }
+        self.state = RunState::Loaded;
         Ok(())
-    }
-
-    /// Load the activation block and put it on the device too.
-    pub fn load_activations_with(
-        &mut self,
-        x: &[u8],
-        lane: &mut dyn ExpertDeviceLane,
-    ) -> Result<()> {
-        self.load_activations(x)?;
-        lane.load_activations(self.buffers.x.as_slice())
     }
 }
 
@@ -1129,7 +1382,14 @@ struct AcquireFailed {
     held: Vec<ResidencyLease>,
 }
 
-/// Acquire one group's two chunks into `scope`.
+/// Acquire one group's two chunks into `scope`, and prove they are readable.
+///
+/// The readiness check is not belt and braces. An acquire can come back
+/// `Coalesced` -- another ticket owns the read -- and this executor has no
+/// waiting path, so the bytes are simply not there. A review drove exactly that
+/// case and the group failed one step later, at the point where the authority
+/// refuses to hand out a chunk that is still `Reading`. Failing at the acquire
+/// keeps the failure where its cause is.
 fn acquire_pair<S: ChunkSource>(
     authority: &mut ResidencyAuthority,
     source: &mut S,
@@ -1137,15 +1397,7 @@ fn acquire_pair<S: ChunkSource>(
     what: GroupAcquire,
     mut lane: Option<&mut (dyn ExpertDeviceLane + '_)>,
 ) -> std::result::Result<(ResidencyLease, ResidencyLease), AcquireFailed> {
-    let GroupAcquire {
-        shape,
-        expert,
-        scope,
-        turn,
-        now,
-        deadline,
-    } = what;
-    let (gate_up_chunk, down_chunk) = match roles.chunks(expert, shape) {
+    let (gate_up_chunk, down_chunk) = match roles.chunks(what.expert, what.shape) {
         Ok(pair) => pair,
         Err(error) => {
             return Err(AcquireFailed {
@@ -1159,11 +1411,11 @@ fn acquire_pair<S: ChunkSource>(
     for chunk in [&gate_up_chunk, &down_chunk] {
         let request = AcquireRequest {
             chunk,
-            destination: scope,
-            now,
-            deadline,
+            destination: what.scope,
+            now: what.now,
+            deadline: what.deadline,
             class,
-            turn,
+            turn: what.turn,
         };
         let acquired = match authority.acquire(request) {
             Ok(acquired) => acquired,
@@ -1203,13 +1455,37 @@ fn acquire_pair<S: ChunkSource>(
                 }
             }
         }
+        // Readable, or this group does not run. `state_of` is the authority's
+        // own answer; nothing here infers readiness from the absence of an
+        // error.
+        let ready = match what.scope {
+            Scope::Host => moxie_memory::ChunkState::HostReady,
+            Scope::Device(_) => moxie_memory::ChunkState::DeviceReady,
+        };
+        match authority.state_of(what.scope, chunk) {
+            Some(state) if state == ready => {}
+            other => {
+                return Err(AcquireFailed {
+                    error: invalid(
+                        "chunk",
+                        format!(
+                            "{chunk} is {} on {}, not {}; this executor has no waiting path",
+                            other.map_or("absent", moxie_memory::ChunkState::name),
+                            what.scope,
+                            ready.name()
+                        ),
+                    ),
+                    held,
+                });
+            }
+        }
     }
     let down = held.pop().expect("two leases");
     let gate_up = held.pop().expect("two leases");
     Ok((gate_up, down))
 }
 
-impl GroupedRun {
+impl<'lane> GroupedRun<'lane> {
     /// Perform at most one group, filling the bounded queue first.
     ///
     /// The loop, in full: enqueue acquired groups until the queue is full or the
@@ -1226,32 +1502,27 @@ impl GroupedRun {
         now: u64,
         deadline: u64,
     ) -> Result<Progress> {
-        self.step_with(authority, source, None, turn, now, deadline)
-    }
-
-    /// The same step, with a device lane for the groups the plan put there.
-    pub fn step_with<S: ChunkSource>(
-        &mut self,
-        authority: &mut ResidencyAuthority,
-        source: &mut S,
-        mut lane: Option<&mut (dyn ExpertDeviceLane + '_)>,
-        turn: TurnId,
-        now: u64,
-        deadline: u64,
-    ) -> Result<Progress> {
-        if self.cancelled {
-            return Err(Error::Cancelled { at: "expert-run" });
+        self.usable()?;
+        if matches!(self.state, RunState::Admitted) {
+            return Err(invalid(
+                "activations",
+                "no activation block has been loaded; a run over an unwritten buffer would \
+                 produce a confident answer about zeros"
+                    .into(),
+            ));
         }
+        self.state = RunState::Running;
+
         while self.next_group < self.plan.groups().len() && !self.queue.is_full() {
             let index = self.next_group;
             let group = &self.plan.groups()[index];
-            let scope = match group.placement {
+            let scope = match group.placement() {
                 Placement::Device(uuid) => Scope::Device(uuid),
                 Placement::Host(_) => Scope::Host,
             };
-            let expert = group.expert;
-            let candidate = group.placement.candidate();
-            match acquire_pair(
+            let expert = group.expert();
+            let candidate = group.placement().candidate();
+            let acquired = acquire_pair(
                 authority,
                 source,
                 &self.roles,
@@ -1263,8 +1534,9 @@ impl GroupedRun {
                     now,
                     deadline,
                 },
-                lane.as_deref_mut(),
-            ) {
+                self.device.as_deref_mut(),
+            );
+            match acquired {
                 Ok((gate_up, down)) => {
                     let queued = QueuedGroup {
                         index,
@@ -1288,7 +1560,7 @@ impl GroupedRun {
                             let error = full.error();
                             let (gate_up, down) = (full.group.gate_up, full.group.down);
                             self.release_pair(authority, gate_up, down);
-                            return Err(error);
+                            return Err(self.fail(error));
                         }
                     }
                 }
@@ -1297,7 +1569,7 @@ impl GroupedRun {
                         self.release_one(authority, lease);
                     }
                     if self.queue.is_empty() {
-                        return Err(failed.error);
+                        return Err(self.fail(failed.error));
                     }
                     // Backpressure: the cache cannot hold another expert while
                     // this one is pinned. Drain and try again next call.
@@ -1311,15 +1583,33 @@ impl GroupedRun {
         };
         let expert = queued.expert;
         let candidate = queued.candidate;
-        let result = self.perform(authority, &queued, lane);
-        self.release_pair(authority, queued.gate_up, queued.down);
-        result?;
-        self.stats.groups_run += 1;
-        match candidate {
-            Candidate::Host => self.stats.host_groups += 1,
-            Candidate::Device => self.stats.device_groups += 1,
+        let outcome = self.perform(authority, &queued);
+        match outcome {
+            Ok(()) => {
+                self.release_pair(authority, queued.gate_up, queued.down);
+                self.stats.groups_run += 1;
+                match candidate {
+                    Candidate::Host => self.stats.host_groups += 1,
+                    Candidate::Device => self.stats.device_groups += 1,
+                }
+                Ok(Progress::Ran { expert, candidate })
+            }
+            Err(refused) => {
+                if refused.submission_unknown {
+                    // Something may still be reading the bytes these leases pin.
+                    // Releasing them would let the authority evict weights a
+                    // live copy or launch is touching -- R07, and document 02's
+                    // rule that retirement is event-driven. They are withheld
+                    // and stay visible in `ResidencyAuthority::outstanding`.
+                    self.withheld.push(queued.gate_up);
+                    self.withheld.push(queued.down);
+                    self.buffers.quarantine();
+                } else {
+                    self.release_pair(authority, queued.gate_up, queued.down);
+                }
+                Err(self.fail(refused.error))
+            }
         }
-        Ok(Progress::Ran { expert, candidate })
     }
 
     /// Run every group, then reduce. The bounded queue still governs how many
@@ -1332,21 +1622,8 @@ impl GroupedRun {
         now: u64,
         deadline: u64,
     ) -> Result<()> {
-        self.run_to_completion_with(authority, source, None, turn, now, deadline)
-    }
-
-    /// Run every group, with a device lane for the groups the plan put there.
-    pub fn run_to_completion_with<S: ChunkSource>(
-        &mut self,
-        authority: &mut ResidencyAuthority,
-        source: &mut S,
-        mut lane: Option<&mut (dyn ExpertDeviceLane + '_)>,
-        turn: TurnId,
-        now: u64,
-        deadline: u64,
-    ) -> Result<()> {
         loop {
-            match self.step_with(authority, source, lane.as_deref_mut(), turn, now, deadline)? {
+            match self.step(authority, source, turn, now, deadline)? {
                 Progress::Done => return Ok(()),
                 Progress::Ran { .. } => {}
             }
@@ -1357,52 +1634,77 @@ impl GroupedRun {
         &mut self,
         authority: &ResidencyAuthority,
         queued: &QueuedGroup,
-        lane: Option<&mut (dyn ExpertDeviceLane + '_)>,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), LaunchRefused> {
         let group = &self.plan.groups()[queued.index];
+        let plain = |error: Error| LaunchRefused {
+            error,
+            submission_unknown: false,
+        };
         match queued.candidate {
             Candidate::Host => {
-                let gate_up = authority.chunk_bytes(&queued.gate_up)?;
-                let down = authority.chunk_bytes(&queued.down)?;
+                let gate_up = authority.chunk_bytes(&queued.gate_up).map_err(plain)?;
+                let down = authority.chunk_bytes(&queued.down).map_err(plain)?;
                 let shape = self.plan.shape();
+                let reduction = self.plan.reduction_workspace_values() as usize;
+                let lanes = self.plan.cpu_tile_lanes();
+                let hidden = u32::try_from(shape.hidden)
+                    .map_err(|_| plain(invalid("hidden", "hidden exceeds u32".into())))?;
+                let intermediate = u32::try_from(shape.intermediate).map_err(|_| {
+                    plain(invalid("intermediate", "intermediate exceeds u32".into()))
+                })?;
+                let HostBuffers {
+                    x,
+                    slots,
+                    workspace,
+                    ..
+                } = &mut self.buffers;
+                let (_, tile) = workspace.as_mut_slice().split_at_mut(reduction);
                 moxie_kernels::cpu_expert::expert_group_bf16(
-                    self.buffers.x.as_slice(),
+                    x.as_slice(),
                     moxie_kernels::cpu_expert::ExpertAssignment {
-                        rows: &group.rows,
-                        slots: &group.slots,
+                        rows: group.rows(),
+                        slots: group.slots(),
                     },
                     gate_up,
                     down,
                     shape.gate_transform(),
                     moxie_kernels::cpu_expert::ExpertShape {
-                        hidden: u32::try_from(shape.hidden)
-                            .map_err(|_| invalid("hidden", "hidden exceeds u32".into()))?,
-                        intermediate: u32::try_from(shape.intermediate).map_err(|_| {
-                            invalid("intermediate", "intermediate exceeds u32".into())
-                        })?,
+                        hidden,
+                        intermediate,
                     },
-                    moxie_kernels::cpu_expert::ExpertTiling::lanes(self.plan.cpu_tile_lanes()),
-                    self.buffers.workspace.as_mut_slice(),
-                    self.buffers.slots.as_mut_slice(),
-                )?;
-                self.stats.slots_written += group.slots.len() as u64;
+                    moxie_kernels::cpu_expert::ExpertTiling::lanes(lanes),
+                    tile,
+                    slots.as_mut_slice(),
+                )
+                .map_err(plain)?;
+                self.stats.slots_written += group.slots().len() as u64;
                 Ok(())
             }
             Candidate::Device => {
-                let Some(lane) = lane else {
-                    return Err(Error::UnsupportedKernel {
+                let Some(lane) = self.device.as_deref_mut() else {
+                    return Err(plain(Error::UnsupportedKernel {
                         operation: "expert_mlp",
                         detail: "this plan has device groups and no device lane to run them".into(),
-                    });
+                    }));
                 };
+                let HostBuffers {
+                    slots,
+                    row_index,
+                    slot_index,
+                    ..
+                } = &mut self.buffers;
                 lane.run_group(
                     authority,
                     group,
                     &queued.gate_up,
                     &queued.down,
-                    self.buffers.slots.as_mut_slice(),
+                    ExpertStaging {
+                        rows: row_index.as_mut_slice(),
+                        slots: slot_index.as_mut_slice(),
+                    },
+                    slots.as_mut_slice(),
                 )?;
-                self.stats.slots_written += group.slots.len() as u64;
+                self.stats.slots_written += group.slots().len() as u64;
                 Ok(())
             }
         }
@@ -1414,9 +1716,8 @@ impl GroupedRun {
             Err(refused) => {
                 // The lease comes back rather than being destroyed. Dropping it
                 // here is the one thing that would strand the pin, so it is
-                // forgotten deliberately and stays visible in
-                // `ResidencyAuthority::outstanding`.
-                drop(refused);
+                // kept where it stays visible instead.
+                self.withheld.push(refused.lease);
             }
         }
     }
@@ -1431,34 +1732,15 @@ impl GroupedRun {
         self.release_one(authority, down);
     }
 
-    /// Hand the envelope's reservation to a device attachment.
-    ///
-    /// A `DeviceArena` owns the charge it materialises -- that is how task 0010
-    /// made "simulated placement presented as a reservation" impossible to
-    /// write -- so the reservation has to move rather than be borrowed. After
-    /// this, [`GroupedRun::close`] releases nothing and the attachment's own
-    /// `close` is what gives the envelope back.
-    pub fn detach_reservation(&mut self) -> Result<Reservation> {
-        let reservation = self.reservation.take().ok_or_else(|| {
-            invalid(
-                "reservation",
-                "this run has no reservation to hand over".into(),
-            )
-        })?;
-        self.detached = true;
-        Ok(reservation)
-    }
-
     /// Reduce every row's slots in the plan's declared order.
     ///
     /// `coefficients` is `[rows * top_k]`, slot-major: the route's own weights.
     /// Every slot must already have been written, which
     /// [`GroupedRun::run_to_completion`] guarantees and which this checks by
-    /// refusing to reduce a run that has groups left.
+    /// refusing to reduce a run that has groups left, that failed, or that was
+    /// cancelled.
     pub fn reduce(&mut self, coefficients: &[f32]) -> Result<&[u8]> {
-        if self.cancelled {
-            return Err(Error::Cancelled { at: "expert-run" });
-        }
+        self.usable()?;
         if self.next_group < self.plan.groups().len() || !self.queue.is_empty() {
             return Err(invalid(
                 "reduce",
@@ -1471,16 +1753,32 @@ impl GroupedRun {
             ));
         }
         let shape = self.plan.shape();
-        let (slots, out) = (&self.buffers.slots, &mut self.buffers.out);
+        let rows = u32::try_from(self.plan.rows())
+            .map_err(|_| invalid("rows", "rows exceed u32".into()))?;
+        let top_k =
+            u32::try_from(shape.top_k).map_err(|_| invalid("top_k", "top_k exceeds u32".into()))?;
+        let hidden = u32::try_from(shape.hidden)
+            .map_err(|_| invalid("hidden", "hidden exceeds u32".into()))?;
+        let reduction = self.plan.reduction_workspace_values() as usize;
+        let order = self.plan.reduction_order();
+        let HostBuffers {
+            slots,
+            out,
+            workspace,
+            ..
+        } = &mut self.buffers;
+        let (accumulator, _) = workspace.as_mut_slice().split_at_mut(reduction);
+        // The accumulator comes from the admitted workspace. It used to be a
+        // private `vec![0f32; hidden]` inside the kernel, which is an allocation
+        // outside the envelope on the one path that runs for every plan.
         moxie_kernels::cpu_expert::combine_rows_bf16(
             slots.as_slice(),
             coefficients,
-            self.plan.reduction_order(),
-            u32::try_from(self.plan.rows())
-                .map_err(|_| invalid("rows", "rows exceed u32".into()))?,
-            u32::try_from(shape.top_k).map_err(|_| invalid("top_k", "top_k exceeds u32".into()))?,
-            u32::try_from(shape.hidden)
-                .map_err(|_| invalid("hidden", "hidden exceeds u32".into()))?,
+            order,
+            rows,
+            top_k,
+            hidden,
+            accumulator,
             out.as_mut_slice(),
         )?;
         Ok(self.buffers.out.as_slice())
@@ -1492,9 +1790,11 @@ impl GroupedRun {
     /// and the reservation stays charged until [`GroupedRun::close`] releases
     /// it. Cancellation retires the *intent*; it does not make bytes free.
     pub fn cancel(&mut self, authority: &mut ResidencyAuthority) {
-        self.cancelled = true;
         while let Some(queued) = self.queue.pop() {
             self.release_pair(authority, queued.gate_up, queued.down);
+        }
+        if !matches!(self.state, RunState::Failed(_)) {
+            self.state = RunState::Cancelled;
         }
         // Nothing further will be enqueued: the plan is treated as exhausted so
         // a second cancel, or a stray `step`, cannot start new work.
@@ -1506,13 +1806,17 @@ impl GroupedRun {
     /// Refuses while the queue still holds leases, because releasing the
     /// reservation under a live lease is the shape of R02 this workspace has
     /// already met twice: the ledger saying zero while something is still using
-    /// the bytes.
+    /// the bytes. Consuming `self` is the other half of that: the host buffers
+    /// die with the charge rather than outliving it.
     // The refusal carries the whole run back, because destroying it on the
     // error path is the one thing that would strand the envelope. Boxing it to
     // satisfy a size lint would put an allocation on the failure path of the
     // function whose job is not to lose anything.
     #[allow(clippy::result_large_err)]
-    pub fn close(mut self, ledger: &mut Ledger) -> std::result::Result<(), GroupedCloseRefused> {
+    pub fn close(
+        mut self,
+        ledger: &mut Ledger,
+    ) -> std::result::Result<(), GroupedCloseRefused<'lane>> {
         if !self.queue.is_empty() {
             return Err(GroupedCloseRefused {
                 error: invalid(
@@ -1525,11 +1829,23 @@ impl GroupedRun {
                 run: self,
             });
         }
-        if self.detached {
-            // The device attachment owns the charge. Releasing here as well
-            // would double-release, which the ledger refuses -- but relying on
-            // that refusal instead of knowing whose charge it is is exactly the
-            // kind of accounting that made R02 possible.
+        // The device attachment owns the whole envelope once it has taken the
+        // reservation, so closing it is what gives the charge back. Doing it
+        // here, inside the run's own `close`, is what keeps the host buffers
+        // from outliving their reservation. A lane that never took one -- a
+        // test double, or a backend that admits separately -- leaves the
+        // reservation here and it is released below.
+        if let Some(lane) = self.device.take() {
+            if let Err(error) = lane.close(ledger) {
+                return Err(GroupedCloseRefused { error, run: self });
+            }
+            if self.reservation.is_none() {
+                self.envelope_released = true;
+            }
+        }
+        if self.envelope_released {
+            // A device attachment took the reservation, failed, and released it
+            // on the way out; the buffers went with it. There is nothing left.
             self.guard = None;
             return Ok(());
         }
@@ -1555,26 +1871,76 @@ impl GroupedRun {
         }
     }
 
-    pub const fn ledger(&self) -> LedgerId {
-        self.ledger
+    /// Hand the plan's reservation to a device attachment, from inside this run.
+    ///
+    /// Crate-internal on purpose: the reservation never leaves the run, so there
+    /// is no window in which the charge is released while these host buffers are
+    /// still writable. `crate::grouped_device` is the only caller.
+    #[cfg(feature = "driver")]
+    pub(crate) fn take_reservation_for_device(&mut self) -> Result<Reservation> {
+        if self.device.is_some() {
+            return Err(invalid(
+                "device",
+                "this run already has a device attachment".into(),
+            ));
+        }
+        self.reservation.take().ok_or_else(|| {
+            invalid(
+                "reservation",
+                "this run has no reservation to hand over".into(),
+            )
+        })
+    }
+
+    /// Give this run a device lane.
+    ///
+    /// Public because [`ExpertDeviceLane`] is: `crate::grouped_device` is this
+    /// crate's implementation of it, and a test double or another backend is a
+    /// legitimate second one. What is **not** public is handing the plan's
+    /// reservation to such a lane -- that stays inside this crate, so the
+    /// charge cannot be separated from the buffers it pays for.
+    pub fn install_lane(&mut self, lane: Box<dyn ExpertDeviceLane + 'lane>) -> Result<()> {
+        if self.device.is_some() {
+            return Err(invalid(
+                "device",
+                "this run already has a device lane".into(),
+            ));
+        }
+        self.device = Some(lane);
+        Ok(())
+    }
+
+    /// Put a reservation back when a device attachment refused before taking it.
+    #[cfg(feature = "driver")]
+    pub(crate) fn restore_reservation(&mut self, reservation: Reservation) {
+        self.reservation = Some(reservation);
+    }
+
+    /// Record that an attachment took the reservation and released it on the way
+    /// out, and give the host buffers back with it.
+    #[cfg(feature = "driver")]
+    pub(crate) fn envelope_was_released(&mut self, error: &Error) {
+        self.envelope_released = true;
+        self.buffers.release_now();
+        self.fail(error.clone());
     }
 }
 
 /// A refused close, carrying the run back intact.
 #[derive(Debug)]
 #[must_use = "the envelope is still charged; correct the cause and close again"]
-pub struct GroupedCloseRefused {
+pub struct GroupedCloseRefused<'lane> {
     pub error: Error,
-    pub run: GroupedRun,
+    pub run: GroupedRun<'lane>,
 }
 
-impl core::fmt::Display for GroupedCloseRefused {
+impl core::fmt::Display for GroupedCloseRefused<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.error)
     }
 }
 
-impl Drop for GroupedRun {
+impl Drop for GroupedRun<'_> {
     fn drop(&mut self) {
         // A dropped run's reservation stays charged and visible in
         // `Ledger::outstanding`, exactly like a dropped `Reservation`. Releasing
@@ -1585,7 +1951,7 @@ impl Drop for GroupedRun {
     }
 }
 
-impl GroupedRun {
+impl GroupedRun<'_> {
     /// The exact ledger request for a plan's envelope.
     ///
     /// Separated so a caller can `preview` it without admitting: document 02
@@ -1622,19 +1988,30 @@ impl GroupedRun {
         Ok(request)
     }
 
-    fn host_extents(plan: &ExpertPlan) -> Result<(usize, usize, usize, usize)> {
-        let workspace_values = plan
-            .shape()
-            .host_workspace_values(plan.cpu_tile_lanes())
-            .ok_or_else(|| invalid("workspace", "the host workspace extent overflows".into()))?;
-        Ok((
-            usize::try_from(plan.activation_bytes()).map_err(|_| too_large("activations"))?,
-            usize::try_from(plan.slot_bytes()).map_err(|_| too_large("slots"))?,
-            usize::try_from(plan.rows() * plan.shape().hidden * BF16)
-                .map_err(|_| too_large("output"))?,
-            usize::try_from(workspace_values).map_err(|_| too_large("workspace"))?,
-        ))
+    /// Every host extent, taken from the plan's own accessors so the allocation
+    /// and the charge cannot disagree.
+    fn host_extents(plan: &ExpertPlan) -> Result<HostExtents> {
+        let usize_of =
+            |bytes: u64, what: &'static str| usize::try_from(bytes).map_err(|_| too_large(what));
+        Ok(HostExtents {
+            x: usize_of(plan.activation_bytes(), "activations")?,
+            slots: usize_of(plan.slot_bytes(), "slots")?,
+            out: usize_of(plan.rows() * plan.shape().hidden * BF16, "output")?,
+            workspace_values: usize_of(plan.host_workspace_values(), "workspace")?,
+            index: usize_of(plan.index_staging_bytes(), "index staging")?,
+        })
     }
+}
+
+/// The host side's extents, in the units each buffer is allocated in.
+#[derive(Debug, Clone, Copy)]
+struct HostExtents {
+    x: usize,
+    slots: usize,
+    out: usize,
+    workspace_values: usize,
+    /// **One** index array. Two are allocated.
+    index: usize,
 }
 
 fn tier_name_host(tier: HostTier) -> &'static str {
@@ -1671,7 +2048,8 @@ fn tier_name_device(tier: DeviceTier) -> &'static str {
 /// A refused admission, carrying the plan back and the ledger's own report.
 #[derive(Debug)]
 pub enum GroupedAdmitRefused {
-    /// The request could not be evaluated.
+    /// The request could not be evaluated, or the placement it required could
+    /// not be honoured.
     Invalid { plan: Box<ExpertPlan>, error: Error },
     /// It was evaluated and does not fit. The report says which constraint bound
     /// and what the legal alternatives are, which is what document 03 requires a
