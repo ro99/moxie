@@ -280,19 +280,64 @@ def self_test():
     bad = [(a, want, classify(*a)) for a, want in cases if classify(*a) != want]
     for a, want, got in bad:
         print(f"SELF-TEST FAIL {a}: want {want}, got {got}")
-    print(f"self-test: {len(cases) - len(bad)} of {len(cases)} verdict cases correct")
-    return 0 if not bad else 1
+
+    # Selector validation, the third review's P3. A mistyped name must not
+    # quietly become an empty battery that exits successfully.
+    fake = [("a", None, None, None), ("b", None, None, None)]
+    selector_cases = [
+        (["a"], (["a"], [])),
+        (["a", "b"], (["a", "b"], [])),
+        (["typo"], ([], ["typo"])),
+        (["a", "typo"], (["a"], ["typo"])),
+        ([], ([], [])),
+    ]
+    sbad = []
+    for requested, (want_chosen, want_unknown) in selector_cases:
+        chosen, unknown = select(requested, fake)
+        got = ([c[0] for c in chosen], unknown)
+        if got != (want_chosen, want_unknown):
+            sbad.append((requested, (want_chosen, want_unknown), got))
+            print(f"SELF-TEST FAIL select({requested}): want "
+                  f"{(want_chosen, want_unknown)}, got {got}")
+
+    total = len(cases) + len(selector_cases)
+    print(f"self-test: {total - len(bad) - len(sbad)} of {total} cases correct "
+          f"({len(cases)} verdict, {len(selector_cases)} selector)")
+    return 0 if not bad and not sbad else 1
+
+
+def select(requested, mutations):
+    """Split requested names into (chosen, unknown), preserving battery order.
+
+    The third review's P3: a mistyped selector ran nothing and exited 0 with
+    "0 of 0 caught". A battery that silently omits the work it was asked for
+    reports a number about a different battery.
+    """
+    known = [name for name, _, _, _ in mutations]
+    unknown = [r for r in requested if r not in known]
+    chosen = [m for m in mutations if m[0] in requested]
+    return chosen, unknown
 
 
 def main():
     if "--self-test" in sys.argv[1:]:
         return self_test()
-    only = [a for a in sys.argv[1:] if not a.startswith("--")] or None
+    requested = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if requested:
+        battery, unknown = select(requested, MUTATIONS)
+        if unknown:
+            for name in unknown:
+                print(f"UNKNOWN MUTATION {name}", flush=True)
+            print(f"refusing to run: {len(unknown)} unknown selector(s)")
+            return 2
+        if not battery:
+            print("refusing to run: the selected battery is empty")
+            return 2
+    else:
+        battery = MUTATIONS
     outcomes = collections.OrderedDict()
     skipped = []
-    for name, path, old, new in MUTATIONS:
-        if only and name not in only:
-            continue
+    for name, path, old, new in battery:
         src = open(path).read()
         if src.count(old) != 1:
             skipped.append((name, f"anchor occurs {src.count(old)} time(s)"))

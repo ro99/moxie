@@ -28,8 +28,12 @@ revision, expected size and retention. `/models` and `/fast/models` remain
 read-only inputs to an agent. The roadmap's M3 items are in
 [06-implementation-roadmap.md](docs/spec/06-implementation-roadmap.md).
 
-**M3's first task is implemented and not accepted: task 0024, M3 item 2's
-asymmetric half** ([task 0024](docs/tasks/0024-m3-asymmetric-int4-pack-quantized-import.md),
+**M3's first task is accepted: task 0024, M3 item 2's asymmetric half**
+(owner, 2026-09-13, after three rounds of independent review — eight findings,
+two P1, all reproduced, all fixed, none disputed; the third recommended
+acceptance "within task 0024's declared importer-only M3 item 2 scope"). **The
+acceptance closes task 0024 only, not M3 item 2**, which also wants group-128
+symmetric INT4 and the AutoRound/AutoGPTQ packing ([task 0024](docs/tasks/0024-m3-asymmetric-int4-pack-quantized-import.md),
 2026-09-13, contract committed at `e122de3` before implementation). The importer
 reads compressed-tensors `pack-quantized` **asymmetric INT4 at group 32**, whose
 `weight_zero_point` is packed along the **output** axis while the codes are
@@ -105,12 +109,14 @@ not, in either commit. The driver is tracked now, at
 [`docs/evidence/experiments/drivers/0005-mutations.py`](docs/evidence/experiments/drivers/0005-mutations.py),
 and every verdict is repeated three times in both directions because the
 contract promised that and the first run did not do it. **21 of 21 caught, 0
-survivors** at the time, **24 of 24** after a second review — where the first
+survivors** when measured, **24 of 24** after a second review — where the first
 battery was 16 of 16 and complete against a suite with **five** holes in it.
-**Each of the eight mutations added after a review is caught by exactly the lane
-that review's finding created**, nine of the eleven by that lane alone: a
-battery that is complete against the suite it was written for says nothing about
-the suite's holes, and only a finding from outside can add the case.
+**Eight mutations were added after a review, and every one of them is caught by
+exactly one lane**; seven of the eight by a check a finding added, the eighth by
+a pre-existing test, because an existing lane acquiring a new regression is not
+a lane a review created. A battery that is complete against the suite it was
+written for says nothing about the suite's holes, and only a finding from
+outside can add the case.
 
 **An impossibility claim is a claim, and this one contradicted its own
 document.** The record said the statistic could not separate a zero point that is

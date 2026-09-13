@@ -1,6 +1,15 @@
 # Task 0024 — M3 item 2: asymmetric INT4 `pack-quantized` import, zero points along the output axis
 
-Status: **implemented 2026-09-13; corrected after two independent reviews (eight findings, two P1, all reproduced, all fixed, none disputed); awaiting a third review and owner acceptance**.
+Status: **accepted by the owner on 2026-09-13**, after three rounds of
+independent review — eight findings, two P1, all reproduced, all fixed, none
+disputed; the third reported no new blocking findings and recommended acceptance
+"within task 0024's declared importer-only M3 item 2 scope". Two nonblocking P3
+corrections from that round are applied.
+
+**The acceptance closes task 0024 only.** It does not close M3 item 2, which
+also wants group-128 symmetric INT4 and the AutoRound/AutoGPTQ packing, and it
+establishes **no** W4A16 execution, **no** model-output quality, **no**
+cross-shard production resolution.
 
 ## Identity and authority
 
@@ -289,6 +298,30 @@ else. **The "not implemented" verdict for W4A16 execution does not move.**
 
 ## Result, filled after work
 
+### Corrections after the third independent review
+
+Two findings, both **P3**, both nonblocking; the round recommended acceptance.
+
+**The driver accepted unknown mutation selectors.** `nonexistent-mutation`
+exited 0 with "0 of 0 caught", and a mixed valid/unknown selection silently
+dropped the unknown one. A battery that quietly omits the work it was asked for
+reports a number about a different battery. `select()` is a pure function now,
+unknown names and an empty selection are refused with exit 2, and five selector
+cases joined the three-case self-test — 13 of 13.
+
+**The evidence prose contradicted its own table.** The battery grew 16 → 21 →
+24, which is **eight** additions; the prose said "nine of the eleven", conflating
+"added after a review" with "caught by exactly one lane" (eleven mutations are
+single-lane, of which eight were added). The task index also still headlined 21
+of 21. Corrected in all four places, and the counts are now derived from the
+recorded table rather than restated from memory. The review also drew a
+distinction I had blurred: **an existing lane acquiring a new regression is not
+a lane the review created** — `bf16-rounding-truncates` is caught by
+`moxie-format`'s pre-existing BF16 tests, so it is seven of eight, not eight.
+
+Historical measurements stay as they were, dated: 16 of 16 on the first run, 21
+of 21 after the first review.
+
 ### Corrections after the second independent review
 
 Three findings, one P1. **All three reproduced, all three fixed, none
@@ -523,10 +556,12 @@ driver committed and its verdict rule self-tested
 ([experiment 0005](../evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md),
 [its driver](../evidence/experiments/drivers/0005-mutations.py)). The first
 measurement was 16 of 16 against a suite with **five** holes in it, and the
-second was 21 of 21 against a suite with three: **each of the eight mutations
-added after a review is caught by exactly the lane that review's finding
-created**, nine of the eleven by that lane alone. A battery that is complete
-against the suite it was written for says nothing about the suite's holes.
+second 21 of 21 against a suite with three. **Eight mutations were added after a
+review — five then three — and every one of them is caught by exactly one
+lane**; seven by a check a finding added, and `bf16-rounding-truncates` by a
+pre-existing BF16 test, because an existing lane acquiring a new regression is
+not a lane a review created. A battery that is complete against the suite it was
+written for says nothing about the suite's holes.
 
 ### Measured effect and uncertainty
 

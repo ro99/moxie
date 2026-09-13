@@ -344,7 +344,8 @@ has been computed, because nothing can plan it.
    their own tasks, no Laguna layer is composable and no state schema exists.
 2. ~~**The importer**: asymmetric INT4 group 32 with output-axis-packed zero
    points.~~ **Closed 2026-09-13 by
-   [task 0024](../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md).**
+   [task 0024](../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md), accepted by the
+   owner after three rounds of independent review.**
    What replaces it is narrower: **nothing executes a canonical INT4 tensor.**
    The W4A16 path is M3 item 3, and the graph's `TensorRequirement`s stay BF16
    until one exists, because listing INT4 would advertise a path that is not

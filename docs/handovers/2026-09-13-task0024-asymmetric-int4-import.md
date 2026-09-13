@@ -1,8 +1,15 @@
 # Handover — task 0024 implemented and corrected: asymmetric INT4 import, and a convention that could be measured
 
-**Task 0024 is implemented on 2026-09-13, corrected after two independent
-reviews, and is not accepted.** The two rounds made **eight findings, two P1**;
-all eight were reproduced, all eight are fixed, **none is disputed**.
+**Task 0024 is accepted by the owner on 2026-09-13**, after three rounds of
+independent review. The rounds made **eight findings, two P1**; all eight were
+reproduced, all eight are fixed, **none is disputed**. The third round reported
+no new blocking findings and recommended acceptance "within task 0024's declared
+importer-only M3 item 2 scope", with two nonblocking P3 corrections that are
+applied.
+
+**The acceptance closes task 0024 only.** It does not close M3 item 2, and it
+establishes no W4A16 execution, no model-output quality and no cross-shard
+production resolution.
 
 **The second round's three findings share one shape: each is a first-round
 correction that was narrower than it looked.** A refusal made allocation-safe
@@ -68,8 +75,11 @@ controls, 0 skipped**, every verdict repeated three times in both directions,
 ([experiment 0005](../evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md),
 [its driver](../evidence/experiments/drivers/0005-mutations.py)). The first
 measurement was 16 of 16 against a suite with **five** holes in it, and the
-second 21 of 21 against a suite with three. Each of the eight mutations added
-after a review is caught by exactly the lane that review's finding created.
+second 21 of 21 against a suite with three. **Eight mutations were added after a
+review — five then three — and every one is caught by exactly one lane**; seven
+by a check a finding added, and `bf16-rounding-truncates` by a pre-existing BF16
+test, because an existing lane acquiring a new regression is not a lane a review
+created.
 
 ### What was read, and what it is not
 

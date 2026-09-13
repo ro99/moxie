@@ -124,10 +124,12 @@ its union is the whole expert set. **The acceptance closes task 0023 only, not
 M2**, which is the owner's separate decision, and **no model-quality claim
 follows** (**O2**).
 
-**[Task 0024](0024-m3-asymmetric-int4-pack-quantized-import.md) is implemented
-on 2026-09-13, corrected after two independent reviews — eight findings, two P1,
-all reproduced, all fixed, none disputed — and is not accepted**; its contract
-was authored and committed at `e122de3` before implementation. It is M3 item 2's asymmetric half: the importer
+**[Task 0024](0024-m3-asymmetric-int4-pack-quantized-import.md) is accepted by
+the owner on 2026-09-13**, after three rounds of independent review — eight
+findings, two P1, all reproduced, all fixed, none disputed; the third reported
+no new blocking findings and recommended acceptance within the task's declared
+importer-only scope. **The acceptance closes task 0024 only, not M3 item 2.**
+Its contract was authored and committed at `e122de3` before implementation. It is M3 item 2's asymmetric half: the importer
 reads compressed-tensors `pack-quantized` **asymmetric INT4 at group 32**, whose
 `weight_zero_point` is packed along the **output** axis while the codes are
 packed along the input axis — two conventions inside one tensor group,
@@ -145,8 +147,10 @@ pinned library, because a zero-point word's lanes are different output channels
 both artifacts declare untagged development compressor versions. **Import is not
 execution**: nothing consumes a canonical INT4 tensor, W4A16 is M3 item 3, and
 Laguna's graph still declares BF16. A bit-identical repack is ADR 0018's v1
-quality definition, **not** evidence about model output. Mutation-measured **21
-of 21**, 0 survivors, with the driver committed and every verdict repeated. The
+quality definition, **not** evidence about model output. Mutation-measured **24 of
+24**, 0 survivors, 0 unstable, 0 invalid controls, 0 skipped, with the driver
+committed, every verdict repeated three times in both directions, and its
+verdict rule self-tested. The
 first review's P1 was the workspace's most repeated defect for the **sixth**
 time — a refusal that aborted under an allocation failure, on a sweep that only
 ever imported valid inputs — and it is fixed at the shared error type rather

@@ -186,8 +186,16 @@ regression lane for the path this task did not change.
 ### The eight the reviews forced, and what each one is for
 
 The first battery was 16 of 16 and it was measuring a suite with five holes in
-it. **Every mutation added below exists because something was found, and nine of
-the eleven are caught by exactly one lane — the lane a finding created.**
+it. **Eight mutations were added after a review** — five after the first, three
+after the second — taking the battery from 16 to 24. **Every one of the eight is
+caught by exactly one lane**, and seven of the eight by a check that a review's
+finding added. The eighth, `bf16-rounding-truncates`, is caught by
+`moxie-format`'s **pre-existing** BF16 rounding tests: an existing lane
+acquiring a new regression is not a lane a review created, and the third review
+was right to separate the two.
+
+Eleven of the twenty-four are caught by exactly one lane; the eight added after
+a review are all of them plus three that were single-lane from the start.
 
 | Mutation | The hole it stands in for |
 |---|---|
@@ -201,10 +209,10 @@ the eleven are caught by exactly one lane — the lane a finding created.**
 | `measurement-sign-candidate-equals-pinned` | the sign candidate, added after the impossibility claim turned out to be false |
 
 **A battery that is complete against the suite it was written for says nothing
-about the suite's holes.** Sixteen of sixteen, then twenty-one of twenty-one,
-were both true and both measured a suite that a reviewer then walked straight
-through. Only a finding from outside can add the case; what the battery does is
-stop it coming back.
+about the suite's holes.** 16 of 16 (first run) and 21 of 21 (after the first
+review) were both true when measured and both described a suite a reviewer then
+walked straight through. Only a finding from outside can add the case; what the
+battery does is stop it coming back.
 
 ## Two facts this measurement's plumbing turned up
 
