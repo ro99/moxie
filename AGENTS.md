@@ -156,7 +156,7 @@ device, and M2 item 4's restricted budget makes it oversized by construction.
 Task 0019 composed its routed block over synthetic weights at reduced scale and
 recorded the artifact's inventory in
 [the bring-up record](docs/models/gemma4.md#the-26b-a4b-moe-variant). Task 0020
-made its expert bytes resident on demand -- the experts are fused per layer, so
+made its expert bytes resident on demand — the experts are fused per layer, so
 that needed the bounded ranged read it added — and task 0021 ran one layer's
 expert block from them. A fact that came out of that: its experts are
 **11,894,784 B each**, so at a two-row decode batch the best reuse available is
