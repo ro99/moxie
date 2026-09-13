@@ -58,11 +58,21 @@ writes**. **That is not model support and no quality claim follows.** **It does
 not close M2**, which also needs item 4 and byte/cost traces reconciled with the
 ledger across a whole working set.
 
-**Task 0022 is next**: M2 item 4's Laguna metadata and graph, a second synthetic
-MoE consumer through this interface, and the restricted budget at its scale,
-specified in
-[the task 0021 handover](../handovers/2026-09-12-task0021-expert-execution-plans.md#next-task).
-Its contract has not been authored.
+**[Task 0022](0022-m2-laguna-metadata-and-second-consumer.md) is proposed**,
+2026-09-13: M2 item 4's Laguna metadata and graph, a second routed consumer
+through task 0021's interface, and a restricted budget expressed as a ratio of
+working weights. Its contract is authored and committed before implementation,
+as tasks 0020 and 0021 did.
+
+It records one narrowing in the contract rather than discovering it later.
+**Laguna's attention tower is not composable from today's operation
+catalogue**: `softplus` attention output gating has no shared operation, and the
+yarn RoPE ramp on its twelve `full_attention` layers is implemented nowhere in
+the artifact — `modeling_laguna.py` delegates it to a `transformers` function
+the artifact does not ship, and the locally installed copy is 5.5.3 against the
+artifact's declared 5.14.1. Both are named gap tasks. The deliverable is the
+**routed block**, which is composable in full from pinned sources, and which is
+what M2's exit gate needs.
 
 Reopen accepted tasks only for a demonstrated defect in accepted scope.
 
