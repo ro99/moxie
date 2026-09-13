@@ -6,12 +6,17 @@ Status: **proposed, contract only; no implementation or acceptance claimed**.
 
 - Task ID 0025; M3 item 1. Engineering assignment: shared offline publication
   slice. Reviewer/acceptance: repository owner under the existing review process.
-- Writable root `/home/rodrigo/Developer/moxie`, branch `main`. **Base
-  re-recorded on 2026-09-13 as `adf47cb` with a clean tree**, as this contract
-  asked: it was authored at `645e75902ea6bd201f60ac78628178ddc734d985` while
-  task 0024's corrections were still in flight. Those are committed and pushed;
-  ADRs 0021/0022 and this contract are committed at `74e0709`. Re-record again
-  if the tree has moved before implementation starts.
+- Writable root `/home/rodrigo/Developer/moxie`, branch `main`. **Implementation
+  base re-recorded on 2026-09-13 as `44a94c4` with a clean tree**, which is the
+  third recording this contract has asked for and the one implementation
+  actually started from: it was authored at
+  `645e75902ea6bd201f60ac78628178ddc734d985` while task 0024's corrections were
+  still in flight, re-recorded at `adf47cb` when they landed, and the entry
+  point was rewritten at `44a94c4` afterwards. ADRs 0021/0022 and this contract
+  are committed at `74e0709`; [ADR 0023](../decisions/adr/0023-canonical-affine-payload-and-repack-journal.md),
+  which fixes the canonical affine payload layout and the journal this contract
+  asks for, is committed with this re-recording and **before** any
+  implementation commit.
 - Legacy root `/home/rodrigo/Developer/strata`, read-only at
   `2dc566eb8e440fff4837ac75ca1dad1b20c2264e`; checkpoint roots `/models` and
   `/fast/models` remain read-only to the implementing agent.
