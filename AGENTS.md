@@ -105,11 +105,12 @@ not, in either commit. The driver is tracked now, at
 [`docs/evidence/experiments/drivers/0005-mutations.py`](docs/evidence/experiments/drivers/0005-mutations.py),
 and every verdict is repeated three times in both directions because the
 contract promised that and the first run did not do it. **21 of 21 caught, 0
-survivors** — where the first battery was 16 of 16 and complete against a suite
-with three holes in it. **The five mutations added after the review are each
-caught by exactly the lane a finding created**, four of them by that lane alone:
-a battery that is complete against the suite it was written for says nothing
-about the suite's holes, and only a finding from outside can.
+survivors** at the time, **24 of 24** after a second review — where the first
+battery was 16 of 16 and complete against a suite with **five** holes in it.
+**Each of the eight mutations added after a review is caught by exactly the lane
+that review's finding created**, nine of the eleven by that lane alone: a
+battery that is complete against the suite it was written for says nothing about
+the suite's holes, and only a finding from outside can add the case.
 
 **An impossibility claim is a claim, and this one contradicted its own
 document.** The record said the statistic could not separate a zero point that is
@@ -120,6 +121,39 @@ measurement **two paragraphs earlier**. Measured: **0.52 against 2.18**. Third
 instance of a record contradicting a fact it already contains, and the first of
 the three that was an argument rather than arithmetic — which is easier to wave
 through, not harder.
+
+**A second review, three findings, one P1 — and all three are first-round
+corrections that were narrower than they looked.** This is the sentence to carry
+out of task 0024: **fixing a finding and guarding the fix are two jobs**, and a
+round that does only the first buys another round.
+
+**A sweep that names one function has tested one function.** The first review's
+P1 was refusals that abort; the fix made the refusal prose fallible and the
+sweep that proved it calls **only `import`**. `source_entries` — the same
+module, the same public surface — still built four lookup names with `format!`,
+and eight of its eleven allocation positions aborted, two of them on the
+zero-point name this task itself added. Task 0023's "reserving a destination
+says nothing about a temporary the callee builds", one layer further out. When a
+class of defect is found, ask **which entry points reach that class**, not which
+line was named.
+
+**A correct helper cannot detect a row that was removed before it was called.**
+The regression written for the inventory's premature filter tested
+`missing_companions` directly — and the defect was the filter that ran *before*
+it, so restoring the bug left every artifact test passing. The reviewer had
+supplied a synthetic shard as the reproduction and I wrote a table test of the
+helper instead. **A negative fixture has to enter through the same door the
+defect was behind**; the fixture builds a real shard through `Inventory::build`
+now and fails on `left: 3, right: 4`.
+
+**A measurement tool that cannot report an invalid measurement is not one.** The
+mutation driver appended unstable repeats and failing restored controls to a
+`nondet` list **and counted them as caught anyway** — a review drove its `main`
+with a control that never passed and read "1 of 1 caught, 0 survivors". The
+verdict is a pure function now, only `caught` counts, skips are named, the
+process **exits nonzero** unless every mutation is caught, and the rule is
+self-tested over eight cases rather than read. **Test the thing that produces
+your evidence, not only the thing the evidence is about.**
 
 **The paragraph on task 0022 below says "no Laguna tensor was read". That was
 true when it was written.** Three of its tensors have now been read and
