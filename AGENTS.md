@@ -67,9 +67,9 @@ Three claims about task 0020's test strength were wrong in the same way: the
 property was asserted rather than measured. The sweep prints what it exercised,
 and an equivalent mutant is reported as such instead of being counted as a gap.
 
-**M2 item 3 is implemented, corrected after two rounds of independent review,
-and awaits a further one**
-([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), 2026-09-12; four
+**M2 item 3 is implemented, corrected after four rounds of independent review,
+and awaits acceptance**
+([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), 2026-09-12; the four
 rounds found **twenty-one** issues, fourteen P1, all reproduced and fixed, none
 disputed): CPU
 expert fallback and GPU grouped candidate plans under one interface, with an
@@ -97,8 +97,8 @@ node 0's **5.1 GB** (**4,471 of 6,144** on the wrong node). `required` now means
 affinity or bandwidth claim forward.
 
 **Ask of every check what else reaches the resource it guards, and what the next
-call does with what it set.** These are two questions and task 0021's two review
-rounds are one each.
+call does with what it set.** These are two questions and task 0021's first two
+review rounds are one each.
 
 Nine of the ten first-round findings were one sentence: **a check that existed on one path
 and was missing on the neighbouring one.** The upload path validated the backing
@@ -131,16 +131,21 @@ fifteenth is round four's: one of the sweep's advertised axes was **unreachable*
 — both branches drained the queue before closing, so `close`'s queued-work
 refusal could be deleted with all 144 combinations still passing.
 
-**A numerical gate cannot check an identity.** Task 0021's declared gate is
-bitwise equality with an FP64 oracle, and a descriptor carrying this build's own
-package hash with the **other activation's** projection symbol passed it
-trivially: every GPU returned exactly SwiGLU for a GeGLU plan, 3,959 of 4,096
-components wrong, because the result is a correct evaluation of the wrong
-function and the oracle is chosen by the same descriptor that chose the symbol.
-A selected descriptor must **be** one the built-in package declares — operation,
-ABI, operand roles, precisions, rounding, layout, shape bounds, SM, workspace and
-symbols together. Half an identity check is not a weaker check; it is a check of
-something else.
+**A gate only fires on inputs something actually hands it.** A descriptor
+carrying this build's own package hash with the **other activation's** projection
+symbol was resolved and launched, and every GPU computed SwiGLU for a GeGLU plan
+— 3,959 of 4,096 components wrong. Task 0021's declared gate is bitwise equality
+with an FP64 oracle for the activation the **plan** requested, so it *would* have
+failed on that; the review measured those wrong components with it. What was
+missing was that **no case ever built an inconsistent descriptor**: every plan
+came from the built-in catalogue, so descriptor consistency was an assumption the
+tests carried rather than a property they checked. A strong gate over a narrow
+input space is still a narrow test.
+
+The fix is a binding, not a better gate: a selected descriptor must **be** one
+the built-in package declares — operation, ABI, operand roles, precisions,
+rounding, layout, shape bounds, SM, workspace and symbols together. Half an
+identity check is not a weaker check; it is a check of something else.
 
 **A public function may not assert a safety contract on its caller's behalf, and
 may not hand out what it is responsible for retaining.** Round three: the device

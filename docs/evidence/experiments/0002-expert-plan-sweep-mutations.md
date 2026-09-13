@@ -179,8 +179,15 @@ the returned run and close it properly. The guard is in the battery: **15 of 15*
 **Three separate coverage claims in one task were softer than they looked.** Regressions that
 asserted the symptom rather than the check. Sweep axes that recorded being reached without checking
 what they caused. And an advertised axis that was unreachable. Every one was found by asking what a
-mutation would survive; **none** by reading the test, and none by the three independent review
+mutation would survive; **none** by reading the test, and none by the four independent review
 rounds that read the same code.
+
+They share one cause, and the fourth round's other finding makes it plain. A descriptor whose
+symbols contradicted its declared operation was launched, and the numerical gate that would have
+caught it had simply never been handed one: every plan in every test came from the built-in
+catalogue, so descriptor consistency was an assumption the fixtures shared rather than a property
+they varied. **A strong gate over a narrow input space is still a narrow test**, and assertions
+cannot make up the difference.
 
 That is the argument for keeping these batteries, and it is stronger than "the sweep is thorough."
 An axis that is exercised is not an axis that is checked, and only a mutation can tell the two

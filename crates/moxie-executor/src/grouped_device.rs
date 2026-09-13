@@ -235,10 +235,15 @@ impl<'ctx> DeviceExperts<'ctx> {
             // rest of the descriptor is one this package actually declares. A
             // review kept the built-in GeGLU descriptor's operation, ABI and
             // hash and swapped its projection symbol for the SiLU one: planning,
-            // attachment and execution all succeeded, and the answer was SwiGLU
-            // on all three GPUs -- 3,959 of 4,096 components wrong, and wrong in
-            // a way no gate would have noticed, because it was exactly the other
-            // activation.
+            // attachment and execution all succeeded and every GPU computed
+            // SwiGLU for a GeGLU plan.
+            //
+            // The numerical gate **would** have caught that -- it compares
+            // against the oracle for the activation the *plan* requested, which
+            // is how the review measured 3,959 of 4,096 wrong components. What
+            // was missing was that nothing ever presented it an inconsistent
+            // descriptor: every case built its plan from this catalogue, so
+            // descriptor consistency was an assumption no test varied.
             //
             // So the descriptor must **be** one of the built-in package's own.
             // That binds operation, ABI, operand roles, precisions, rounding,
@@ -1537,9 +1542,14 @@ mod tests {
     /// The review's counterexample is the third case: the built-in GeGLU
     /// descriptor with its projection symbol swapped for the SiLU one. Operation,
     /// ABI and hash all matched, execution succeeded, and the answer was
-    /// **exactly SwiGLU** -- 3,959 of 4,096 components wrong on device 0. A
-    /// numerical gate cannot catch that, because the result is a correct
-    /// evaluation of the wrong function.
+    /// **exactly SwiGLU** -- 3,959 of 4,096 components wrong on device 0,
+    /// measured against the very gate that would have failed on it.
+    ///
+    /// That is the point of this case. The numerical gate compares against the
+    /// oracle for the activation the *plan* requested, so it detects the
+    /// substitution; what no case did was **make** the substitution. Every plan
+    /// came from this build's own catalogue, so a descriptor inconsistent with
+    /// its package was an input the tests never had.
     #[test]
     fn a_descriptor_the_package_does_not_declare_is_refused() {
         let _guard = crate::DRIVER_TEST_LOCK

@@ -792,11 +792,19 @@ the SiLU one. Planning, attachment and execution all succeeded, and every GPU
 returned **exactly SwiGLU**: 3,959, 3,962 and 3,962 of 4,096 components differed
 from GeGLU.
 
-That is the worst shape a numerical defect can take. The declared gate for this
-kernel is bitwise equality with task 0019's oracle, and it would not have fired
-for a moment — the result is a **correct evaluation of the wrong function**, and
-the oracle it is compared against is chosen by the same descriptor that chose the
-wrong symbol.
+**The numerical gate was not blind to this — nothing ever showed it to the
+gate.** `every_device_reproduces_the_oracle_bit_for_bit_for_both_gate_transforms`
+compares against the oracle for the activation the **plan** requested, not
+anything derived from the descriptor, so it detects the substitution; the review
+measured those wrong components with exactly that oracle. What no case did was
+**build an inconsistent descriptor**. Every plan in every test came from this
+build's own catalogue, so "the descriptor's symbols match its declared operation"
+was an assumption the tests carried rather than a property they checked.
+
+An earlier version of this record, and of AGENTS.md, said the gate "could not
+fire because the oracle is chosen by the same descriptor". That was wrong, the
+fifth review corrected it, and the correction matters: the lesson is about the
+**input space a gate is given**, not about the gate.
 
 The fix is the only form of the check that cannot be half-satisfied: the
 descriptor must **be** one of the built-in package's own, comparing operation,
@@ -820,14 +828,19 @@ and closes properly. The guard is in the mutation battery, which is **15 of 15**
 
 ### The pattern this makes, and it is the task's own
 
-This is the **third** coverage claim in task 0021 that was softer than it looked,
-after three of the first round's regressions asserting symptoms and three of the
-sweep's axes recording that they were reached without checking what they caused.
-All three were found the same way — by asking what a mutation would survive — and
-none by reading the test. The record of that is in
-[experiment 0002](../evidence/experiments/0002-expert-plan-sweep-mutations.md),
-and the general form is in AGENTS.md: **an axis that is exercised is not an axis
-that is checked.**
+Both of this round's findings are the same shape, and it is the shape three
+earlier rounds also found: **a check that is never handed the input it exists
+for.** The numerical gate would have caught a swapped symbol and was never given
+one. The sweep's close-ordering axis would have caught a missing queued-work
+guard and never reached it. Earlier: regressions that asserted symptoms, and
+sweep axes that recorded being reached without checking what they caused.
+
+Every one was found by asking what a **mutation** would survive, and none by
+reading the test — including by the four independent review rounds that read the
+same code. The record is in
+[experiment 0002](../evidence/experiments/0002-expert-plan-sweep-mutations.md);
+the general form is in AGENTS.md: **a strong gate over a narrow input space is
+still a narrow test.**
 
 ### Evidence
 

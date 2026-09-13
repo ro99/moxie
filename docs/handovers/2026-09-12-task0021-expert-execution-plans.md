@@ -227,11 +227,12 @@ reached without checking what they caused, and a sweep axis that was unreachable
 altogether. Every one was found by asking what a mutation would survive; none by
 reading the test.
 
-Also from round four: **the strongest numerical gate cannot check a binding.**
-The declared gate here is bitwise equality with an FP64 oracle, and a descriptor
-that named the wrong kernel symbol passed it trivially, because the oracle is
-chosen by the same descriptor. Identity has to be established separately from
-arithmetic.
+Also from round four: **a gate only fires on inputs something hands it.** The
+declared gate here is bitwise equality with an FP64 oracle for the activation the
+plan requested, and it would have caught a descriptor naming the wrong kernel
+symbol — no test had ever constructed one. When a property is an assumption every
+fixture shares, no amount of strength in the assertions reaches it. Identity also
+has to be established as a binding, separately from arithmetic.
 
 Third — and this is the first review's lesson rather than mine — **ask of every
 check what else reaches the resource it guards.** Nine of its ten findings were a
