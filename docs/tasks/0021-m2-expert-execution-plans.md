@@ -1,12 +1,15 @@
 # Task 0021 — M2 expert execution plans: one interface over a CPU and a GPU candidate
 
-Status: **implemented and corrected after one round of independent review;
+Status: **implemented and corrected after two rounds of independent review;
 awaiting a further review and owner acceptance.** The contract above was written
 and committed at `cdda4f4` before any implementation, per the working rule that
-produced tasks 0013–0020. The review found **ten** issues — seven P1 and three
-P2 — and **all ten were reproduced and fixed; none was disputed.** See
-[Result](#result-filled-after-work) and
-[Independent review](#independent-review-and-what-it-changed).
+produced tasks 0013–0020. The two rounds found **fifteen** issues — twelve P1
+and three P2 — and **all fifteen were reproduced and fixed; none was disputed.**
+**Two of the second round's five were the other half of the first round's own
+findings**, so the first round's record that "all ten are closed" was premature
+and is corrected below. See [Result](#result-filled-after-work),
+[Independent review](#independent-review-and-what-it-changed) and
+[Second independent review](#second-independent-review).
 
 **This task does not close M2.** It delivers roadmap M2 **item 3** only. Item 4's
 Laguna metadata, its second synthetic MoE consumer and M2's exit gate — "a real
@@ -458,8 +461,8 @@ contract required. No new crate, and one new workspace edge (`xtask` ->
 | `cargo fmt --all -- --check` | passed |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
 | Device-lane clippy (`--features moxie-executor/driver`) | passed |
-| `cargo test --workspace --locked --offline` | **880 passed, 0 failed** (823 at task 0020; 871 before the review's corrections) |
-| Device-feature workspace tests | **906 passed, 0 failed** (843 at task 0020; 895 before the corrections) |
+| `cargo test --workspace --locked --offline` | **882 passed, 0 failed** (823 at task 0020; 871 before the reviews' corrections) |
+| Device-feature workspace tests | **910 passed, 0 failed** (843 at task 0020; 895 before the corrections) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified (39 at task 0020) |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | **zero failures**, 78 rejected fixtures, 21 accepted, 13 rules |
@@ -657,3 +660,57 @@ The gates after the corrections: **880 host tests**, **906 device-feature
 tests**, **42/42 real GPU cases** on both architectures, both clippy lanes,
 `spec-check`, and `arch-check` with zero failures. The planner mutation battery
 is **16 of 16** after one stale mutation site was re-pointed.
+
+**This round's closing claim was premature.** Two of the second round's five
+findings are the other half of findings 1 and 2 above: the launch path reported
+an unknown submission and the *activation upload* path did not, and the buffers
+were quarantined while the *charge* was still released. Saying "all ten are
+closed" was a claim about the fixes rather than a measurement of them, which is
+the same error AGENTS.md already records three times over test coverage.
+
+## Second independent review
+
+The second round ran against the corrections and reported **five** findings,
+three P1 and two P2, with five reproducers. Every one reproduced before anything
+was changed; **none was disputed.**
+
+| # | Severity | Finding | Fix |
+|---|---|---|---|
+| 1 | P1 | `close` ignored withheld leases and quarantined buffers. **Reproduced**: unknown launch → cancel → close released 640 host bytes whose buffers stay allocated forever. The attachment had no such state either | `close` refuses while anything is withheld and names it; dropping the refused run leaves the charge outstanding and visible. The attachment quarantines its own ranges on the same condition |
+| 2 | P1 | Activation uploads returned ordinary errors after an enqueue, and a failed reload left the previous load's `Loaded` state. **Reproduced with a lane double**: the reload failed and execution then used the rejected input | The upload reports its submission state, an unknown one quarantines the source, and **any** failed load is terminal |
+| 3 | P1 | Neither lease's `scope()` was checked. **Reproduced on two real GPUs**: one authority's 3090 leases resolved inside its 5060 Ti backing and produced another expert's output | Both lease scopes are checked against the attachment's device before any offset is resolved |
+| 4 | P2 | A refused close consumed the lane and discarded the arena its refusal handed back. **Reproduced**: close against the wrong ledger, then the correct one — "already been closed", reservation still outstanding | Ledger identity is checked before anything is touched, the lane closes by borrow, and a refused arena is put back |
+| 5 | P2 | Any acquire failure was counted as backpressure when the queue held work. **Reproduced**: a one-shot `InvalidArtifact` read became one drain, retried into a success, and never surfaced | Backpressure is `CapacityExceeded` and nothing else; every other failure ends the run |
+
+### What these had in common, and it is not what the first round's had
+
+The first round's findings were **parallel paths never compared to each other**.
+These are **the same path, one step later**. Quarantine was set correctly at the
+moment of failure and then ignored by the next call. A failure was made terminal
+for a *group* and not for a *load*. A backing was checked and the lease inside it
+was not. The reviewer's own summary is the sharpest statement of it: "checking
+quarantine immediately after failure missed what `cancel → close` did next."
+
+That is an argument for the runtime transition sweep this task does not yet
+have, and the handover carries it to task 0022 as such rather than as a
+suggestion.
+
+### Evidence
+
+Six more regressions. The substitution battery is now **eighteen checks, all
+eighteen load-bearing** — and it earned that again: four survived on the first
+attempt, three because the mutation was aimed at the wrong one of two identical
+lines and one because the check it removed was genuinely redundant. **That last
+line was deleted**: a state reset before the activation upload that no test could
+reach, because the failure path already moves the state.
+
+**One check is not covered and is not claimed to be.** The attachment-level
+quarantine in `DeviceExperts::close` sits behind the run-level one, which *is*
+covered by a lane double; reaching it directly needs a CUDA fault after an
+enqueue, which this task does not inject. It is defence in depth, reported as
+untested rather than counted.
+
+Gates after this round: **882 host tests**, **910 device-feature tests**,
+**42/42 real GPU cases**, both clippy lanes, `spec-check`, `arch-check` with zero
+failures, and the real-artifact execution still agreeing with the host candidate
+on all 45,056 components.

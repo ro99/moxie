@@ -67,11 +67,11 @@ Three claims about task 0020's test strength were wrong in the same way: the
 property was asserted rather than measured. The sweep prints what it exercised,
 and an equivalent mutant is reported as such instead of being counted as a gap.
 
-**M2 item 3 is implemented, corrected after one round of independent review,
+**M2 item 3 is implemented, corrected after two rounds of independent review,
 and awaits a further one**
-([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), 2026-09-12; the
-review found **ten** issues, seven P1, all reproduced and fixed, none disputed):
-CPU
+([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), 2026-09-12; the two
+rounds found **fifteen** issues, twelve P1, all reproduced and fixed, none
+disputed): CPU
 expert fallback and GPU grouped candidate plans under one interface, with an
 admitted envelope, a bounded queue that refuses rather than waits, NUMA-placed
 host buffers, and a reduction over a permutation the plan computes so partial
@@ -96,8 +96,11 @@ node 0's **5.1 GB** (**4,471 of 6,144** on the wrong node). `required` now means
 `mbind` and the gate is every page. Do not carry an unverified placement,
 affinity or bandwidth claim forward.
 
-**Ask of every check what else reaches the resource it guards.** Nine of the ten
-findings against task 0021 were one sentence: **a check that existed on one path
+**Ask of every check what else reaches the resource it guards, and what the next
+call does with what it set.** These are two questions and task 0021's two review
+rounds are one each.
+
+Nine of the ten first-round findings were one sentence: **a check that existed on one path
 and was missing on the neighbouring one.** The upload path validated the backing
 a lease is resolved through and the launch path did not — authority A's leases
 driven through authority B's backing returned a confident, different answer on a
@@ -110,6 +113,17 @@ never compared to each other. The tenth finding is why it matters that the
 question be asked at all — `ExpertGroup`'s launch indices were public `Vec`
 fields, so the answer was "anything".
 
+The second round was **the same path, one step later**: quarantine set correctly
+at the moment of failure and ignored by `close`, which then released the charge
+for buffers that can never be freed; a failure made terminal for a *group* and
+not for a *load*; a backing checked and the lease inside it not. Two of its five
+were the other half of the first round's own, so **"all ten are closed" was a
+claim about fixes rather than a measurement of them** — the same error AGENTS.md
+already records three times over test coverage. The answer is the method task
+0020 established and task 0021 applied only to its planner: **enumerate the
+run's product too** — candidate × failure point × cancellation × close ordering,
+with an invariant after every call. Task 0022 is to build it.
+
 **Measure the tests, then fix what the measurement finds.** Task 0021's sweep
 started at 13 of 16 mutations with two survivors. One survivor was a **product
 defect** — a refusal reporting `CapacityExceeded` where a `required` candidate's
@@ -119,8 +133,11 @@ parameter passed. It is 16 of 16 now. A fixture on which two behaviours agree
 tests neither, and an unreachable branch is a stub: one was found and deleted
 the same way. The same battery applied to the review's twelve regressions found
 **three that asserted the symptom rather than the check** and would have passed
-with the check removed. A regression is not load-bearing until a substitution
-says so.
+with the check removed; the second round's six added four more, three of them
+aimed at the wrong one of two identical lines. It is eighteen of eighteen now. A
+regression is not load-bearing until a substitution says so — and when a
+substitution says a check is redundant, **delete the check**: one line went that
+way, a state reset the failure path already performed.
 
 **Task 0022 is next**: M2 item 4's Laguna metadata and graph, a second synthetic
 MoE consumer through task 0021's interface, and the restricted budget at its

@@ -110,6 +110,31 @@ can fire, and one pins the device budget at the exact byte from both sides. It i
 A regression is not load-bearing because it was written for a defect. It is load-bearing when a
 substitution says so, and a quarter of these were not.
 
+**A second review round then found five more defects**, three P1, and two of them were the *other
+half* of findings the first round's corrections had claimed to close: an unknown submission was
+reported on the launch path and not on the activation-upload path, and the buffers were quarantined
+while the charge was still released. The battery grew to eighteen checks and **four of the six new
+ones survived their first substitution** — three because the mutation was aimed at the wrong one of
+two identical lines, and one because the check it removed was genuinely redundant. That last line
+was **deleted**: when a substitution says a check cannot be observed, the honest answer is to remove
+it, not to write a test that reaches it by another route.
+
+It is **eighteen of eighteen** now. One check is deliberately **not** in the battery and is not
+claimed as covered: the attachment-level quarantine in `DeviceExperts::close` sits behind a
+run-level check that is covered, and reaching it directly needs a CUDA fault injected after an
+enqueue, which this task does not do.
+
+## What still has no battery, and should
+
+Both review rounds found defects in the **executor's** transitions, and the only enumerated product
+in task 0021 is the **planner's**. The second round's shape says why that matters: its findings were
+the same path one step later, which is precisely what a sweep over run states would enumerate and
+what reading each function in isolation does not. The reviewer's own sentence is the clearest
+statement of it — "checking quarantine immediately after failure missed what `cancel → close` did
+next." The axes are known: candidate × failure point × cancellation × close ordering, with a
+structural invariant after every call and its strength measured by mutation, the way
+`residency_transitions.rs` does for task 0020's authority. Task 0022 carries it.
+
 ## Reproducing it
 
 The driver is a short script; it is reproduced here rather than committed as a tool, because it
