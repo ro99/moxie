@@ -53,7 +53,10 @@ pub struct DeviceExperts<'ctx> {
     stream: Stream<'ctx>,
     module: ResolvedModule<'ctx>,
     descriptor: SemanticKernelDescriptor,
-    arena: DeviceArena<'ctx>,
+    /// `None` only between taking it for `close` and putting it back on a
+    /// refusal, so a failed cleanup never destroys the handle to a charged
+    /// allocation.
+    arena: Option<DeviceArena<'ctx>>,
     activations: Option<DeviceRange<'ctx>>,
     slots: Option<DeviceRange<'ctx>>,
     workspace: Option<DeviceRange<'ctx>>,
@@ -66,6 +69,11 @@ pub struct DeviceExperts<'ctx> {
     rows: u64,
     slot_count: u64,
     activations_loaded: bool,
+    /// Set when a copy or launch was enqueued and its completion could not be
+    /// established. The ranges it may still be reading are then never released:
+    /// `close` refuses, and dropping keeps the arena and its charge, exactly as
+    /// `DeviceArena` already does with its own allocation.
+    quarantined: bool,
 }
 
 /// The byte extents this attachment needs, derived from the plan alone.
@@ -237,7 +245,7 @@ impl<'ctx> DeviceExperts<'ctx> {
             stream,
             module,
             descriptor,
-            arena,
+            arena: Some(arena),
             activations: taken.next(),
             slots: taken.next(),
             workspace: taken.next(),
@@ -248,6 +256,7 @@ impl<'ctx> DeviceExperts<'ctx> {
             rows: plan.rows(),
             slot_count: plan.slot_count(),
             activations_loaded: false,
+            quarantined: false,
         })
     }
 
@@ -260,23 +269,61 @@ impl<'ctx> DeviceExperts<'ctx> {
     }
 
     /// Upload the activation block once per run.
-    pub fn load_activations(&mut self, x: &[u8]) -> Result<()> {
+    ///
+    /// Every failure after the copy is enqueued is reported with the submission
+    /// state **unknown**: the source is the run's host buffer and something may
+    /// still be reading it. This path used to return an ordinary error, which is
+    /// the launch path's old defect on its neighbour.
+    pub fn load_activations(&mut self, x: &[u8]) -> std::result::Result<(), LaunchRefused> {
+        let plain = |error: Error| LaunchRefused {
+            error,
+            submission_unknown: false,
+        };
+        if self.quarantined {
+            return Err(plain(invalid(
+                "attachment",
+                "this attachment is quarantined; its ranges may still be in use".into(),
+            )));
+        }
         let range = self.activations.as_ref().expect("live range");
         if x.len() as u64 > range.bytes() {
-            return Err(invalid(
+            return Err(plain(invalid(
                 "activations",
                 format!("{} B exceeds the admitted {} B", x.len(), range.bytes()),
-            ));
+            )));
         }
         // SAFETY: the copy is enqueued on this attachment's own stream and the
         // event below is waited on before anything reads the destination, so the
         // source cannot be reused while the copy is in flight (document 02).
-        unsafe { range.copy_from_host_async(x, &self.stream)? };
-        let event = Event::new(self.ctx)?;
-        event.record(&self.stream)?;
-        event.synchronize()?;
+        if let Err(error) = unsafe { range.copy_from_host_async(x, &self.stream) } {
+            // The enqueue itself failed, so nothing was submitted.
+            return Err(plain(error));
+        }
+        // Past the enqueue, every failure leaves the source in use and this
+        // attachment unable to give its ranges back.
+        let mut unknown = |error: Error| {
+            self.quarantined = true;
+            LaunchRefused {
+                error,
+                submission_unknown: true,
+            }
+        };
+        let event = match Event::new(self.ctx) {
+            Ok(event) => event,
+            Err(error) => return Err(unknown(error)),
+        };
+        if let Err(error) = event.record(&self.stream) {
+            return Err(unknown(error));
+        }
+        if let Err(error) = event.synchronize() {
+            return Err(unknown(error));
+        }
         self.activations_loaded = true;
         Ok(())
+    }
+
+    pub const fn is_quarantined(&self) -> bool {
+        self.quarantined
     }
 
     /// Run one group: stage its indices, project, reduce, and read its slots
@@ -301,10 +348,40 @@ impl<'ctx> DeviceExperts<'ctx> {
         staging: ExpertStaging<'_>,
         host_slots: &mut [u8],
     ) -> std::result::Result<(), LaunchRefused> {
+        let result = self.run_group_inner(
+            authority, group, gate_up, down, residency, staging, host_slots,
+        );
+        // One place decides that this attachment can never give its ranges back,
+        // rather than each of the dozen early returns remembering to.
+        if let Err(refused) = &result
+            && refused.submission_unknown
+        {
+            self.quarantine();
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_group_inner(
+        &mut self,
+        authority: &ResidencyAuthority,
+        group: &ExpertGroup,
+        gate_up: &ResidencyLease,
+        down: &ResidencyLease,
+        residency: &DeviceResidency<'ctx>,
+        staging: ExpertStaging<'_>,
+        host_slots: &mut [u8],
+    ) -> std::result::Result<(), LaunchRefused> {
         let plain = |error: Error| LaunchRefused {
             error,
             submission_unknown: false,
         };
+        if self.quarantined {
+            return Err(plain(invalid(
+                "attachment",
+                "this attachment is quarantined; its ranges may still be in use".into(),
+            )));
+        }
         if !self.activations_loaded {
             return Err(plain(invalid(
                 "activations",
@@ -324,7 +401,8 @@ impl<'ctx> DeviceExperts<'ctx> {
                 ),
             )));
         }
-        if residency.scope() != Scope::Device(self.ctx.uuid()) {
+        let here = Scope::Device(self.ctx.uuid());
+        if residency.scope() != here {
             return Err(plain(invalid(
                 "backing",
                 format!(
@@ -333,6 +411,24 @@ impl<'ctx> DeviceExperts<'ctx> {
                     self.ctx.uuid()
                 ),
             )));
+        }
+        // And the leases' own scope. One authority may hold a cache on **every**
+        // device, so matching the backing to the attachment says nothing about
+        // where these particular leases live: a review resolved a 3090 lease's
+        // offset inside a 5060 Ti backing, under one authority, and computed
+        // another expert's weights. Checking the backing and not the lease is
+        // the same half-check, one level down.
+        for (what, lease) in [("gate/up", gate_up), ("down", down)] {
+            if lease.scope() != here {
+                return Err(plain(invalid(
+                    "lease",
+                    format!(
+                        "the {what} lease is resident on {}; this attachment is on {}",
+                        lease.scope(),
+                        here
+                    ),
+                )));
+            }
         }
 
         let assignments = group.rows().len() as u64;
@@ -425,7 +521,8 @@ impl<'ctx> DeviceExperts<'ctx> {
         let slot_range = self.slot_index.as_ref().expect("live range");
 
         // From here on an enqueue may have happened, so every failure is
-        // reported with the submission state unknown and the caller withholds.
+        // reported with the submission state unknown, the caller withholds, and
+        // this attachment quarantines its own ranges.
         let unknown = |error: Error| LaunchRefused {
             error,
             submission_unknown: true,
@@ -546,9 +643,44 @@ impl<'ctx> DeviceExperts<'ctx> {
         Ok(())
     }
 
+    /// Mark this attachment's ranges as unreleasable. Irreversible.
+    fn quarantine(&mut self) {
+        self.quarantined = true;
+    }
+
     /// Release every range and give the arena -- and with it the reservation --
     /// back to the ledger.
-    pub fn close(mut self, ledger: &mut Ledger) -> Result<()> {
+    ///
+    /// Refuses while this attachment is quarantined: a copy or launch whose
+    /// completion could not be established may still be reading these ranges,
+    /// and releasing them would report the memory free. Dropping a refused
+    /// attachment keeps the arena, its allocation and its charge, which is
+    /// `DeviceArena`'s own rule.
+    // The refusal carries the whole attachment back, because destroying it on
+    // the error path is what left a charged arena unreachable. Boxing it to
+    // satisfy a size lint would put an allocation on the failure path of the
+    // function whose job is not to lose anything.
+    #[allow(clippy::result_large_err)]
+    pub fn close(
+        mut self,
+        ledger: &mut Ledger,
+    ) -> std::result::Result<(), DeviceCloseRefused<'ctx>> {
+        if self.quarantined {
+            return Err(DeviceCloseRefused {
+                error: invalid(
+                    "close",
+                    "this attachment is quarantined; something may still be reading its ranges"
+                        .into(),
+                ),
+                experts: self,
+            });
+        }
+        let Some(mut arena) = self.arena.take() else {
+            return Err(DeviceCloseRefused {
+                error: invalid("close", "this attachment has already been closed".into()),
+                experts: self,
+            });
+        };
         for range in [
             self.activations.take(),
             self.slots.take(),
@@ -559,9 +691,44 @@ impl<'ctx> DeviceExperts<'ctx> {
         .into_iter()
         .flatten()
         {
-            self.arena.release(range).map_err(|refused| refused.error)?;
+            if let Err(refused) = arena.release(range) {
+                // Put both back, so the attachment stays whole and closable
+                // again rather than becoming an unreachable charge.
+                let error = refused.error;
+                self.activations = Some(refused.range);
+                self.arena = Some(arena);
+                return Err(DeviceCloseRefused {
+                    error,
+                    experts: self,
+                });
+            }
         }
-        self.arena.close(ledger).map_err(|refused| refused.error)
+        // `ArenaCloseRefused` hands the arena back; discarding it would destroy
+        // the only handle to an allocation that is still charged.
+        match arena.close(ledger) {
+            Ok(()) => Ok(()),
+            Err(refused) => {
+                self.arena = Some(refused.arena);
+                Err(DeviceCloseRefused {
+                    error: refused.error,
+                    experts: self,
+                })
+            }
+        }
+    }
+}
+
+/// A refused attachment close, carrying the attachment back.
+#[derive(Debug)]
+#[must_use = "the device envelope is still charged; correct the cause and close again"]
+pub struct DeviceCloseRefused<'ctx> {
+    pub error: Error,
+    pub experts: DeviceExperts<'ctx>,
+}
+
+impl core::fmt::Display for DeviceCloseRefused<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.error)
     }
 }
 
@@ -624,13 +791,21 @@ impl std::error::Error for AttachRefused {}
 /// so it is borrowed.
 #[derive(Debug)]
 pub struct ExpertLane<'a, 'ctx> {
-    experts: DeviceExperts<'ctx>,
+    /// `None` only between taking it for `close` and putting it back on a
+    /// refusal.
+    experts: Option<DeviceExperts<'ctx>>,
     residency: &'a mut DeviceResidency<'ctx>,
 }
 
 impl ExpertDeviceLane for ExpertLane<'_, '_> {
-    fn load_activations(&mut self, x: &[u8]) -> Result<()> {
-        self.experts.load_activations(x)
+    fn load_activations(&mut self, x: &[u8]) -> std::result::Result<(), LaunchRefused> {
+        match self.experts.as_mut() {
+            Some(experts) => experts.load_activations(x),
+            None => Err(LaunchRefused {
+                error: invalid("attachment", "this lane has already been closed".into()),
+                submission_unknown: false,
+            }),
+        }
     }
 
     fn perform_upload(
@@ -640,10 +815,14 @@ impl ExpertDeviceLane for ExpertLane<'_, '_> {
     ) -> Result<()> {
         // The stream is the attachment's, so the upload and the launches that
         // read it are ordered by the same stream rather than by hope.
-        match self
-            .residency
-            .perform_upload(authority, self.experts.stream(), order)
-        {
+        let ExpertLane { experts, residency } = self;
+        let Some(experts) = experts.as_ref() else {
+            return Err(invalid(
+                "attachment",
+                "this lane has already been closed".into(),
+            ));
+        };
+        match residency.perform_upload(authority, experts.stream(), order) {
             Ok(()) => Ok(()),
             Err(refused) => {
                 // A refusal that never reaches the authority leaves the
@@ -672,19 +851,40 @@ impl ExpertDeviceLane for ExpertLane<'_, '_> {
         staging: ExpertStaging<'_>,
         host_slots: &mut [u8],
     ) -> std::result::Result<(), LaunchRefused> {
-        self.experts.run_group(
-            authority,
-            group,
-            gate_up,
-            down,
-            self.residency,
-            staging,
-            host_slots,
+        let ExpertLane { experts, residency } = self;
+        let Some(experts) = experts.as_mut() else {
+            return Err(LaunchRefused {
+                error: invalid("attachment", "this lane has already been closed".into()),
+                submission_unknown: false,
+            });
+        };
+        experts.run_group(
+            authority, group, gate_up, down, residency, staging, host_slots,
         )
     }
 
-    fn close(self: Box<Self>, ledger: &mut Ledger) -> Result<()> {
-        self.experts.close(ledger)
+    fn close(&mut self, ledger: &mut Ledger) -> Result<()> {
+        let Some(experts) = self.experts.take() else {
+            return Err(invalid(
+                "attachment",
+                "this lane has already been closed".into(),
+            ));
+        };
+        match experts.close(ledger) {
+            Ok(()) => Ok(()),
+            Err(refused) => {
+                // Put it back, so the run can close again once the cause is
+                // corrected rather than losing the handle to a charged arena.
+                self.experts = Some(refused.experts);
+                Err(refused.error)
+            }
+        }
+    }
+
+    fn is_quarantined(&self) -> bool {
+        self.experts
+            .as_ref()
+            .is_some_and(DeviceExperts::is_quarantined)
     }
 }
 
@@ -734,7 +934,10 @@ impl<'lane> GroupedRun<'lane> {
                 return Err(refused.error);
             }
         };
-        self.install_lane(Box::new(ExpertLane { experts, residency }))?;
+        self.install_lane(Box::new(ExpertLane {
+            experts: Some(experts),
+            residency,
+        }))?;
         Ok(())
     }
 }

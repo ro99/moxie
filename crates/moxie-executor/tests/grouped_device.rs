@@ -1065,3 +1065,256 @@ fn a_group_from_another_plan_is_refused_before_anything_is_enqueued() {
     authority.close(&mut ledger).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A lease resident on another device is refused, even under one authority.
+///
+/// One authority may hold a cache on **every** device, so matching the backing
+/// to the attachment says nothing about where these particular leases live. A
+/// second review resolved a 3090 lease's offset inside a 5060 Ti backing, under
+/// a single authority, and computed another expert's weights. Checking the
+/// backing and not the lease is the same half-check, one level down.
+#[test]
+fn a_launch_refuses_leases_resident_on_another_device() {
+    let _serial = one_at_a_time();
+    let count = moxie_cuda::device_count().unwrap();
+    if count < 2 {
+        println!("SKIPPED: this case needs two GPUs; {count} visible");
+        return;
+    }
+    let here = RankContext::acquire(RankId(0), 0).unwrap();
+    let there = RankContext::acquire(RankId(1), 1).unwrap();
+    let dir = scratch("foreign-device");
+    let w = weights(0x0d0d_0d0d);
+    let path = write_shard(&dir, &w);
+    let catalogue = moxie_kernels::expert_mlp_catalogue();
+
+    let mut ledger = Ledger::new([
+        CapacitySnapshot::new(Scope::Host, 128 * MIB, MIB).unwrap(),
+        CapacitySnapshot::new(Scope::Device(here.uuid()), 128 * MIB, MIB).unwrap(),
+        CapacitySnapshot::new(Scope::Device(there.uuid()), 128 * MIB, MIB).unwrap(),
+    ])
+    .unwrap();
+    // **One** authority, two device caches.
+    let mut authority = ResidencyAuthority::open(
+        &mut ledger,
+        &ResidencyRequest::new("both", 64 * CHUNK)
+            .device(here.uuid(), 8 * CHUNK)
+            .device(there.uuid(), 8 * CHUNK),
+    )
+    .unwrap();
+    let residency_here = DeviceResidency::create(&here, &mut authority).unwrap();
+    let mut residency_there = DeviceResidency::create(&there, &mut authority).unwrap();
+
+    let budget = ExpertBudget {
+        device: here.uuid(),
+        device_pci_bus_id: here.capability().pci_bus_id.clone(),
+        device_cache_cap_bytes: 8 * CHUNK,
+        device_cache_leased_bytes: 0,
+        device_arena_free_bytes: 16 * MIB,
+        host_workspace_bytes: MIB,
+        host_buffer_bytes: MIB,
+        resident_experts: Vec::new(),
+    };
+    let plan = compile_experts(
+        &mlp(ExpertActivation::GeGlu),
+        &combine(),
+        &route(),
+        &budget,
+        &ExpertPolicy {
+            device: StrategyControl::Required,
+            host: StrategyControl::Auto,
+            host_placement: StrategyControl::Off,
+            ..ExpertPolicy::default()
+        },
+        None,
+        Some(ExpertKernels {
+            capability: here.capability(),
+            catalogue: &catalogue,
+        }),
+    )
+    .unwrap();
+    let group = plan.groups()[0].clone();
+    let request = GroupedRun::request_for(&plan).unwrap();
+    let reservation = ledger.admit(&request).unwrap();
+    let mut experts = DeviceExperts::attach(
+        &mut ledger,
+        reservation,
+        &here,
+        &plan,
+        moxie_kernels::EXPERT_MLP_FATBIN,
+    )
+    .unwrap();
+    experts.load_activations(&to_bytes(&w.x)).unwrap();
+
+    // Leases resident on the **other** device, from the same authority.
+    let mut src = source(&path);
+    let (gate_up_chunk, down_chunk) = roles().chunks(group.expert(), plan.shape()).unwrap();
+    let mut elsewhere = Vec::new();
+    for chunk in [&gate_up_chunk, &down_chunk] {
+        let acquired = authority
+            .acquire(moxie_memory::AcquireRequest {
+                chunk,
+                destination: Scope::Device(there.uuid()),
+                now: 0,
+                deadline: u64::MAX,
+                class: moxie_memory::UseClass::demand(moxie_memory::Content::Expert),
+                turn: TurnId::new(1),
+            })
+            .unwrap();
+        match acquired {
+            moxie_memory::Acquired::Ready(lease) => elsewhere.push(lease),
+            moxie_memory::Acquired::Pending { lease, work, .. } => {
+                // The copy goes to the other device, so it needs that device's
+                // own stream: the attachment's belongs to this one.
+                let their_stream = moxie_cuda::Stream::new(&there).unwrap();
+                for order in
+                    moxie_executor::residency::drain_reads(&mut authority, &mut src, work).unwrap()
+                {
+                    residency_there
+                        .perform_upload(&mut authority, &their_stream, &order)
+                        .unwrap();
+                }
+                elsewhere.push(lease);
+            }
+        }
+    }
+
+    let mut staging_rows = vec![0u8; 256];
+    let mut staging_slots = vec![0u8; 256];
+    let mut host_slots = vec![0u8; (plan.slot_count() * HIDDEN * 2) as usize];
+    let refused = experts
+        .run_group(
+            &authority,
+            &group,
+            &elsewhere[0],
+            &elsewhere[1],
+            &residency_here,
+            moxie_executor::grouped::ExpertStaging {
+                rows: &mut staging_rows,
+                slots: &mut staging_slots,
+            },
+            &mut host_slots,
+        )
+        .expect_err("a lease resident elsewhere must not resolve here");
+    assert!(
+        !refused.submission_unknown,
+        "the refusal must come before anything is enqueued"
+    );
+    assert!(
+        format!("{}", refused.error).contains("resident on"),
+        "the refusal must name where the lease lives: {}",
+        refused.error
+    );
+    assert!(host_slots.iter().all(|byte| *byte == 0));
+
+    for lease in elsewhere {
+        authority.release(lease).unwrap();
+    }
+    experts.close(&mut ledger).unwrap();
+    authority.end_turn(TurnId::new(1));
+    authority.retire_all(Scope::Device(here.uuid()));
+    authority.retire_all(Scope::Device(there.uuid()));
+    residency_here.close(&mut authority).unwrap();
+    residency_there.close(&mut authority).unwrap();
+    authority.close(&mut ledger).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A close against the wrong ledger changes nothing and can be retried.
+///
+/// A second review closed against another ledger, lost the attachment to the
+/// refusal, and could not then close against the right one: the retry reported
+/// "already been closed" while the original reservation stayed outstanding.
+#[test]
+fn a_close_against_the_wrong_ledger_is_recoverable() {
+    let _serial = one_at_a_time();
+    let count = moxie_cuda::device_count().unwrap();
+    assert!(count > 0, "the device lane requires real hardware");
+    let ctx = RankContext::acquire(RankId(0), 0).unwrap();
+    let scope = Scope::Device(ctx.uuid());
+    let catalogue = moxie_kernels::expert_mlp_catalogue();
+
+    let mut ledger = Ledger::new([
+        CapacitySnapshot::new(Scope::Host, 64 * MIB, MIB).unwrap(),
+        CapacitySnapshot::new(scope, 64 * MIB, MIB).unwrap(),
+    ])
+    .unwrap();
+    let mut other = Ledger::new([
+        CapacitySnapshot::new(Scope::Host, 64 * MIB, MIB).unwrap(),
+        CapacitySnapshot::new(scope, 64 * MIB, MIB).unwrap(),
+    ])
+    .unwrap();
+    let mut authority = ResidencyAuthority::open(
+        &mut ledger,
+        &ResidencyRequest::new("retry", 8 * CHUNK).device(ctx.uuid(), CHUNK),
+    )
+    .unwrap();
+    let mut residency = DeviceResidency::create(&ctx, &mut authority).unwrap();
+
+    let budget = ExpertBudget {
+        device: ctx.uuid(),
+        device_pci_bus_id: ctx.capability().pci_bus_id.clone(),
+        device_cache_cap_bytes: 8 * CHUNK,
+        device_cache_leased_bytes: 0,
+        device_arena_free_bytes: 16 * MIB,
+        host_workspace_bytes: MIB,
+        host_buffer_bytes: MIB,
+        resident_experts: Vec::new(),
+    };
+    let plan = compile_experts(
+        &mlp(ExpertActivation::GeGlu),
+        &combine(),
+        &route(),
+        &budget,
+        &ExpertPolicy {
+            device: StrategyControl::Required,
+            host: StrategyControl::Auto,
+            host_placement: StrategyControl::Off,
+            ..ExpertPolicy::default()
+        },
+        None,
+        Some(ExpertKernels {
+            capability: ctx.capability(),
+            catalogue: &catalogue,
+        }),
+    )
+    .unwrap();
+    let mut run = GroupedRun::admit(&mut ledger, plan, roles(), None).unwrap();
+    run.attach_device(
+        &mut ledger,
+        &ctx,
+        &mut residency,
+        moxie_kernels::EXPERT_MLP_FATBIN,
+    )
+    .unwrap();
+    let charged = ledger.scope_committed(scope);
+    assert!(charged > 0);
+
+    let run = {
+        let refused = run
+            .close(&mut other)
+            .expect_err("this run belongs to another ledger");
+        // The run-level check, by its own words: nothing was touched. Letting the
+        // arena refuse instead would mean the ranges had already been released
+        // into it before the ledger was even looked at.
+        assert!(
+            format!("{refused}").contains("nothing was released"),
+            "{refused}"
+        );
+        // Nothing moved: the charge is where it was, and the attachment
+        // survives the refusal intact.
+        assert_eq!(ledger.scope_committed(scope), charged);
+        assert_eq!(other.scope_committed(scope), 0);
+        let run = refused.run;
+        assert!(run.has_device());
+        run
+    };
+
+    // And the retry against the right ledger works. What is left charged
+    // afterwards is the residency cache's own capacity, not this run's.
+    run.close(&mut ledger).unwrap();
+    assert_eq!(ledger.scope_committed(scope), CHUNK);
+    residency.close(&mut authority).unwrap();
+    authority.close(&mut ledger).unwrap();
+    assert!(ledger.outstanding().is_empty());
+}

@@ -1121,11 +1121,16 @@ fn a_required_placement_that_cannot_be_honoured_refuses_admission() {
 /// retirement is event-driven.
 #[test]
 fn an_unknown_submission_state_withholds_the_weight_leases() {
-    #[derive(Debug)]
-    struct AlwaysUnknown;
+    #[derive(Debug, Default)]
+    struct AlwaysUnknown {
+        quarantined: bool,
+    }
 
     impl moxie_executor::grouped::ExpertDeviceLane for AlwaysUnknown {
-        fn load_activations(&mut self, _x: &[u8]) -> moxie_types::Result<()> {
+        fn load_activations(
+            &mut self,
+            _x: &[u8],
+        ) -> Result<(), moxie_executor::grouped::LaunchRefused> {
             Ok(())
         }
         /// A faithful double: it reports the upload to the authority, because
@@ -1147,6 +1152,9 @@ fn an_unknown_submission_state_withholds_the_weight_leases() {
             _staging: moxie_executor::grouped::ExpertStaging<'_>,
             _host_slots: &mut [u8],
         ) -> Result<(), moxie_executor::grouped::LaunchRefused> {
+            // A faithful double quarantines itself, as the real attachment does:
+            // one place decides that its ranges can never be released.
+            self.quarantined = true;
             Err(moxie_executor::grouped::LaunchRefused {
                 error: moxie_types::Error::DeviceLost {
                     device: 0,
@@ -1155,8 +1163,11 @@ fn an_unknown_submission_state_withholds_the_weight_leases() {
                 submission_unknown: true,
             })
         }
-        fn close(self: Box<Self>, _ledger: &mut Ledger) -> moxie_types::Result<()> {
+        fn close(&mut self, _ledger: &mut Ledger) -> moxie_types::Result<()> {
             Ok(())
+        }
+        fn is_quarantined(&self) -> bool {
+            self.quarantined
         }
     }
 
@@ -1248,7 +1259,8 @@ fn an_unknown_submission_state_withholds_the_weight_leases() {
     )
     .unwrap();
     let mut run = GroupedRun::admit(&mut l, plan, roles(), None).unwrap();
-    run.install_lane(Box::new(AlwaysUnknown)).unwrap();
+    run.install_lane(Box::new(AlwaysUnknown::default()))
+        .unwrap();
     run.load_activations(&to_bytes(&w.x)).unwrap();
 
     assert_eq!(authority.live_lease_count(), 0);
@@ -1279,7 +1291,215 @@ fn an_unknown_submission_state_withholds_the_weight_leases() {
     );
     assert!(run.failure().is_some());
     // A second lane cannot be installed over the first.
-    assert!(run.install_lane(Box::new(AlwaysUnknown)).is_err());
+    assert!(
+        run.install_lane(Box::new(AlwaysUnknown::default()))
+            .is_err()
+    );
+
+    // And the charge stays with the memory. `close` refuses -- nothing can ever
+    // establish completion for an unknown submission, so releasing the envelope
+    // would report zero against buffers that stay allocated forever. Dropping
+    // the refused run leaves the charge outstanding and **visible**, exactly as
+    // a dropped `Reservation` and a dropped `DeviceArena` already do.
+    let charged = l.scope_committed(Scope::Host);
+    assert!(charged > 0);
+    let refused = run
+        .close(&mut l)
+        .expect_err("a withholding run may not release its envelope");
+    assert!(
+        format!("{refused}").contains("withheld lease"),
+        "the refusal must name what it is withholding: {refused}"
+    );
+    drop(refused);
+    assert_eq!(
+        l.scope_committed(Scope::Host),
+        charged,
+        "the charge must stay with the memory it pays for"
+    );
+    assert!(!l.outstanding().is_empty(), "and stay visible");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A failed activation load ends the run, and never leaves a previous load's
+/// state behind.
+///
+/// The host buffer is the upload's source, so it is written before the upload
+/// and cannot be un-written when the upload fails. A second review reproduced
+/// the consequence: a successful load, then a failed reload, then execution and
+/// reduction that succeeded **using the input whose load returned an error**.
+#[test]
+fn a_failed_activation_load_ends_the_run() {
+    #[derive(Debug, Default)]
+    struct RefusesSecondLoad {
+        loads: usize,
+        quarantined: bool,
+    }
+
+    impl moxie_executor::grouped::ExpertDeviceLane for RefusesSecondLoad {
+        fn load_activations(
+            &mut self,
+            _x: &[u8],
+        ) -> Result<(), moxie_executor::grouped::LaunchRefused> {
+            self.loads += 1;
+            if self.loads == 1 {
+                return Ok(());
+            }
+            self.quarantined = true;
+            Err(moxie_executor::grouped::LaunchRefused {
+                error: moxie_types::Error::DeviceLost {
+                    device: 0,
+                    detail: "the activation copy could not be confirmed".into(),
+                },
+                submission_unknown: true,
+            })
+        }
+        fn perform_upload(
+            &mut self,
+            authority: &mut ResidencyAuthority,
+            order: &moxie_memory::WorkOrder,
+        ) -> moxie_types::Result<()> {
+            authority.complete_upload(order.ticket(), moxie_memory::Outcome::Completed)
+        }
+        fn run_group(
+            &mut self,
+            _authority: &ResidencyAuthority,
+            _group: &moxie_plan::expert::ExpertGroup,
+            _gate_up: &moxie_memory::ResidencyLease,
+            _down: &moxie_memory::ResidencyLease,
+            _staging: moxie_executor::grouped::ExpertStaging<'_>,
+            _host_slots: &mut [u8],
+        ) -> Result<(), moxie_executor::grouped::LaunchRefused> {
+            Ok(())
+        }
+        fn close(&mut self, _ledger: &mut Ledger) -> moxie_types::Result<()> {
+            Ok(())
+        }
+        fn is_quarantined(&self) -> bool {
+            self.quarantined
+        }
+    }
+
+    let dir = scratch("failed-reload");
+    let w = weights(0x0000_5555);
+    let path = write_shard(&dir, &w);
+    let mut src = source(&path);
+    let mut l = ledger(1 << 24);
+    let mut authority =
+        ResidencyAuthority::open(&mut l, &ResidencyRequest::new("experts", 64 * CHUNK)).unwrap();
+    let plan = compile_experts(
+        &mlp(),
+        &combine(CombineOrder::AscendingExpertId),
+        &ROUTE,
+        &host_only_budget(),
+        &host_only_policy(),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut run = GroupedRun::admit(&mut l, plan, roles(), None).unwrap();
+    run.install_lane(Box::new(RefusesSecondLoad::default()))
+        .unwrap();
+
+    let x = to_bytes(&w.x);
+    run.load_activations(&x).expect("the first load succeeds");
+    let error = run
+        .load_activations(&x)
+        .expect_err("the second load's copy could not be confirmed");
+    assert!(format!("{error}").contains("activation copy"), "{error}");
+
+    // Every door is shut. Before the fix, the run kept the previous load's
+    // `Loaded` state and executed with the rejected input.
+    assert!(run.failure().is_some());
+    assert!(
+        run.run_to_completion(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
+            .is_err()
+    );
+    assert!(run.reduce(&w.coefficients).is_err());
+    assert!(run.buffers().is_quarantined());
+    assert_eq!(run.stats().groups_run, 0);
+
+    // And the envelope stays charged, because the copy's source is one of the
+    // buffers that may still be being read.
+    let refused = run
+        .close(&mut l)
+        .expect_err("a quarantined run may not release its envelope");
+    assert!(format!("{refused}").contains("quarantined"), "{refused}");
+    drop(refused);
+    authority.close(&mut l).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A read failure is a failure, not backpressure.
+///
+/// Backpressure is one condition -- the cache cannot hold another expert while
+/// this one is pinned -- and draining and retrying is the right answer to that
+/// and to nothing else. A second review reproduced a one-shot `InvalidArtifact`
+/// read being counted as a drain, retried into a success, and never surfaced.
+#[test]
+fn a_read_failure_is_not_backpressure() {
+    /// Fails the *second* distinct chunk it is asked for, once, then behaves.
+    struct FailsOnce {
+        inner: ShardSource,
+        seen: std::collections::BTreeSet<String>,
+        failed: bool,
+    }
+
+    impl moxie_executor::residency::ChunkSource for FailsOnce {
+        fn read_chunk(
+            &mut self,
+            chunk: &moxie_memory::ChunkId,
+            into: &mut [u8],
+        ) -> moxie_types::Result<()> {
+            let key = format!("{chunk}");
+            let first_time = self.seen.insert(key);
+            if first_time && !self.failed && self.seen.len() == 3 {
+                self.failed = true;
+                return Err(moxie_types::Error::InvalidArtifact {
+                    detail: "a short read".into(),
+                });
+            }
+            self.inner.read_chunk(chunk, into)
+        }
+    }
+
+    let dir = scratch("read-failure");
+    let w = weights(0x0000_6666);
+    let path = write_shard(&dir, &w);
+    let mut src = FailsOnce {
+        inner: source(&path),
+        seen: std::collections::BTreeSet::new(),
+        failed: false,
+    };
+    let mut l = ledger(1 << 24);
+    let mut authority =
+        ResidencyAuthority::open(&mut l, &ResidencyRequest::new("experts", 64 * CHUNK)).unwrap();
+    let plan = compile_experts(
+        &mlp(),
+        &combine(CombineOrder::AscendingExpertId),
+        &ROUTE,
+        &host_only_budget(),
+        &host_only_policy(),
+        None,
+        None,
+    )
+    .unwrap();
+    let mut run = GroupedRun::admit(&mut l, plan, roles(), None).unwrap();
+    run.load_activations(&to_bytes(&w.x)).unwrap();
+
+    let error = run
+        .run_to_completion(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
+        .expect_err("a corrupt read must not be retried into a result");
+    assert!(format!("{error}").contains("short read"), "{error}");
+    assert_eq!(
+        run.stats().backpressure_drains,
+        0,
+        "a read failure is not the cache refusing an expert"
+    );
+    assert!(run.failure().is_some());
+    assert!(run.reduce(&w.coefficients).is_err());
+
+    run.cancel(&mut authority);
     run.close(&mut l).unwrap();
+    authority.close(&mut l).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -53,7 +53,14 @@ use crate::residency::{ChunkSource, drain_reads};
 /// hardware while the device *arithmetic* is exercised only on hardware.
 pub trait ExpertDeviceLane: core::fmt::Debug {
     /// Put the activation block on the device, once per run.
-    fn load_activations(&mut self, x: &[u8]) -> Result<()>;
+    ///
+    /// It reports the submission state for the same reason a launch does: the
+    /// copy is enqueued before the event that proves it finished, so a failure
+    /// after the enqueue leaves something reading the source. A review found
+    /// this path still returning an ordinary error while the launch path had
+    /// been corrected -- the same check on one path and not the neighbouring
+    /// one that produced most of the first review's findings.
+    fn load_activations(&mut self, x: &[u8]) -> std::result::Result<(), LaunchRefused>;
     /// Perform one upload order the residency authority issued, and report its
     /// outcome to the authority.
     fn perform_upload(
@@ -78,7 +85,17 @@ pub trait ExpertDeviceLane: core::fmt::Debug {
         host_slots: &mut [u8],
     ) -> std::result::Result<(), LaunchRefused>;
     /// Give the device envelope back. Called by [`GroupedRun::close`].
-    fn close(self: Box<Self>, ledger: &mut Ledger) -> Result<()>;
+    ///
+    /// It takes `&mut self` rather than `Box<Self>` so that a refusal leaves the
+    /// lane intact and the run can close again after the cause is corrected.
+    /// Consuming the lane on the error path destroyed the only handle to an
+    /// arena that was still charged: a review closed against the wrong ledger
+    /// and could not then close against the right one.
+    fn close(&mut self, ledger: &mut Ledger) -> Result<()>;
+
+    /// Whether this lane is holding resources whose fate is unknown. A run that
+    /// contains one may never release its envelope.
+    fn is_quarantined(&self) -> bool;
 }
 
 /// Admitted host storage for one launch's two `u32` index operands.
@@ -1343,9 +1360,19 @@ impl<'lane> GroupedRun<'lane> {
                 ),
             });
         }
+        // The host buffer is the upload's source, so it is written first and
+        // cannot be un-written if the upload then fails. That is precisely why
+        // a failure here is **terminal**: the run holds activations nobody
+        // accepted, and an earlier successful load's `Loaded` state would
+        // otherwise let it compute with them. A review reproduced exactly that.
         self.buffers.x.as_mut_slice().copy_from_slice(x);
-        if let Some(lane) = self.device.as_mut() {
-            lane.load_activations(self.buffers.x.as_slice())?;
+        if let Some(lane) = self.device.as_mut()
+            && let Err(refused) = lane.load_activations(self.buffers.x.as_slice())
+        {
+            if refused.submission_unknown {
+                self.buffers.quarantine();
+            }
+            return Err(self.fail(refused.error));
         }
         self.state = RunState::Loaded;
         Ok(())
@@ -1568,11 +1595,16 @@ impl<'lane> GroupedRun<'lane> {
                     for lease in failed.held {
                         self.release_one(authority, lease);
                     }
-                    if self.queue.is_empty() {
+                    // Backpressure is **one** condition: the cache cannot hold
+                    // another expert while this one is pinned. Draining and
+                    // retrying is the right answer to that and to nothing else.
+                    // A review reproduced a one-shot `InvalidArtifact` read
+                    // failure being counted as a drain, retried into a success,
+                    // and never surfaced -- a corrupt read reported as a result.
+                    let recoverable = matches!(failed.error, Error::CapacityExceeded { .. });
+                    if !recoverable || self.queue.is_empty() {
                         return Err(self.fail(failed.error));
                     }
-                    // Backpressure: the cache cannot hold another expert while
-                    // this one is pinned. Drain and try again next call.
                     self.stats.backpressure_drains += 1;
                     break;
                 }
@@ -1817,6 +1849,18 @@ impl<'lane> GroupedRun<'lane> {
         mut self,
         ledger: &mut Ledger,
     ) -> std::result::Result<(), GroupedCloseRefused<'lane>> {
+        // Identity before mutation. A close against the wrong ledger used to
+        // release ranges first and fail afterwards, and the lane it consumed on
+        // the way was the only handle to an arena that was still charged.
+        if ledger.id() != self.ledger {
+            return Err(GroupedCloseRefused {
+                error: invalid(
+                    "close",
+                    "this run belongs to another ledger; nothing was released".into(),
+                ),
+                run: self,
+            });
+        }
         if !self.queue.is_empty() {
             return Err(GroupedCloseRefused {
                 error: invalid(
@@ -1829,16 +1873,32 @@ impl<'lane> GroupedRun<'lane> {
                 run: self,
             });
         }
+        // Withholding wins, and the charge goes with the memory. A run holding
+        // leases or pages whose fate is unknown can never establish completion,
+        // so releasing its envelope would report zero against bytes that stay
+        // allocated forever. Refusing hands the run back; dropping it then keeps
+        // the charge outstanding and visible in `Ledger::outstanding`, exactly
+        // as a dropped `Reservation` and a dropped `DeviceArena` already do.
+        //
+        // A review reproduced the alternative: an unknown launch, a cancel, and
+        // a close that released 640 host bytes whose buffers were quarantined
+        // and intentionally leaked.
+        if let Some(error) = self.withholding() {
+            return Err(GroupedCloseRefused { error, run: self });
+        }
         // The device attachment owns the whole envelope once it has taken the
         // reservation, so closing it is what gives the charge back. Doing it
         // here, inside the run's own `close`, is what keeps the host buffers
         // from outliving their reservation. A lane that never took one -- a
         // test double, or a backend that admits separately -- leaves the
         // reservation here and it is released below.
-        if let Some(lane) = self.device.take() {
+        if let Some(lane) = self.device.as_deref_mut() {
+            // A refusal leaves the lane in place, so the run stays whole and can
+            // be closed again once the cause is corrected.
             if let Err(error) = lane.close(ledger) {
                 return Err(GroupedCloseRefused { error, run: self });
             }
+            self.device = None;
             if self.reservation.is_none() {
                 self.envelope_released = true;
             }
@@ -1869,6 +1929,36 @@ impl<'lane> GroupedRun<'lane> {
                 Err(GroupedCloseRefused { error, run: self })
             }
         }
+    }
+
+    /// Why this run may never give its envelope back, if it may not.
+    fn withholding(&self) -> Option<Error> {
+        let lane_quarantined = self
+            .device
+            .as_deref()
+            .is_some_and(ExpertDeviceLane::is_quarantined);
+        if self.withheld.is_empty() && !self.buffers.is_quarantined() && !lane_quarantined {
+            return None;
+        }
+        Some(invalid(
+            "close",
+            format!(
+                "{} withheld lease(s), host buffers {}, device ranges {}: something whose \
+                 submission state is unknown may still be reading them, so this envelope stays \
+                 charged. Drop the run to leave the charge outstanding and visible",
+                self.withheld.len(),
+                if self.buffers.is_quarantined() {
+                    "quarantined"
+                } else {
+                    "clean"
+                },
+                if lane_quarantined {
+                    "quarantined"
+                } else {
+                    "clean"
+                },
+            ),
+        ))
     }
 
     /// Hand the plan's reservation to a device attachment, from inside this run.
