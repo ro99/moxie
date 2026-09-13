@@ -39,7 +39,12 @@ const BUS: &str = "0000:82:00.0";
 /// Four rows over five experts, with reuse counts 3, 2, 1, 1, 1 -- so one plan
 /// contains both an expert whose transfer is amortised over three rows and
 /// experts that pay it for one.
-const ROUTE: [u32; 8] = [0, 1, 0, 2, 1, 3, 0, 4];
+///
+/// Every row selects its experts in **descending** id order. That is not
+/// decoration: with ascending rows the two `CombineOrder` values agree, and
+/// mutation testing showed the sweep passing while the plan ignored the
+/// parameter entirely.
+const ROUTE: [u32; 8] = [1, 0, 2, 0, 3, 1, 4, 0];
 const ROWS: u64 = 4;
 
 fn uuid() -> DeviceUuid {
@@ -285,6 +290,56 @@ impl Case {
     }
 }
 
+/// Which error a refusal must carry, stated independently of the planner.
+///
+/// The sweep asserted only *that* a case was refused until mutation testing
+/// showed two mutants surviving on that alone: one that let a `required`
+/// candidate fall back with a capacity error instead of an actionable one, and
+/// one that accepted two `required` candidates at once. A refusal's reason is
+/// part of its contract, so it is part of what is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedError {
+    /// Both candidates are `required`.
+    StrategyContradiction,
+    /// A `required` candidate is not admissible.
+    RequiredUnavailable,
+    /// Neither candidate fits, and neither was required.
+    Capacity,
+}
+
+impl Case {
+    fn expected_error(self) -> ExpectedError {
+        if self.device_control == StrategyControl::Required
+            && self.host_control == StrategyControl::Required
+        {
+            ExpectedError::StrategyContradiction
+        } else if self.device_control == StrategyControl::Required
+            || self.host_control == StrategyControl::Required
+        {
+            ExpectedError::RequiredUnavailable
+        } else {
+            ExpectedError::Capacity
+        }
+    }
+}
+
+fn classify(error: &moxie_types::Error) -> ExpectedError {
+    match error {
+        moxie_types::Error::CapacityExceeded { .. } => ExpectedError::Capacity,
+        moxie_types::Error::InvalidRequest {
+            field: "strategy",
+            detail,
+        } => {
+            if detail.contains("both candidates are `required`") {
+                ExpectedError::StrategyContradiction
+            } else {
+                ExpectedError::RequiredUnavailable
+            }
+        }
+        other => panic!("a refusal carried an unexpected error: {other}"),
+    }
+}
+
 fn reuse_counts() -> BTreeMap<u32, u64> {
     let mut counts: BTreeMap<u32, u64> = BTreeMap::new();
     for expert in ROUTE {
@@ -383,6 +438,11 @@ fn the_chooser_agrees_with_an_independent_statement_of_its_rule_across_the_produ
                                                             || refusal.host.is_some(),
                                                         "{case:?}: a refusal with no reason"
                                                     );
+                                                    assert_eq!(
+                                                        classify(&refusal.error),
+                                                        case.expected_error(),
+                                                        "{case:?}: {refusal}"
+                                                    );
                                                     for reason in [refusal.device, refusal.host]
                                                         .into_iter()
                                                         .flatten()
@@ -428,6 +488,7 @@ fn the_chooser_agrees_with_an_independent_statement_of_its_rule_across_the_produ
                                                     }
                                                     check_envelope(&plan);
                                                     check_placement(&plan, case);
+                                                    check_reduction_order(&plan, order);
                                                     // A device plan carries the
                                                     // descriptor it selected; a
                                                     // host-only plan carries none.
@@ -541,6 +602,24 @@ fn check_envelope(plan: &moxie_plan::expert::ExpertPlan) {
         .map(|g| g.chunk_bytes)
         .sum();
     assert_eq!(envelope.residency_demand_bytes, demanded);
+}
+
+/// The reduction permutation, recomputed independently of the planner.
+///
+/// Mutation testing found that the sweep passed when the plan ignored
+/// `CombineOrder` entirely -- `check_invariants` only asks whether each row is
+/// *a* permutation, and the identity is one.
+fn check_reduction_order(plan: &moxie_plan::expert::ExpertPlan, order: CombineOrder) {
+    let top_k = TOP_K as usize;
+    let mut want = Vec::new();
+    for row in ROUTE.chunks_exact(top_k) {
+        let mut positions: Vec<u32> = (0..top_k as u32).collect();
+        if order == CombineOrder::AscendingExpertId {
+            positions.sort_by_key(|j| (row[*j as usize], *j));
+        }
+        want.extend(positions);
+    }
+    assert_eq!(plan.reduction_order(), want.as_slice(), "{order:?}");
 }
 
 fn check_placement(plan: &moxie_plan::expert::ExpertPlan, case: Case) {
@@ -680,23 +759,25 @@ fn the_reduction_order_is_a_permutation_per_row_and_follows_the_declared_order()
     .expect("plan");
 
     assert_eq!(selection.reduction_order(), &[0, 1, 0, 1, 0, 1, 0, 1]);
-    // Row 0 selected experts 0 then 1, so ascending id keeps that order; row 2
-    // selected 1 then 3, likewise. Every row of this route is already ascending,
-    // so the two orders agree here -- which is asserted rather than assumed,
-    // because a chooser that ignored the parameter would also pass a fixture
-    // where they differ by accident.
-    assert_eq!(ascending.reduction_order(), selection.reduction_order());
+    // `ROUTE`'s rows are descending by expert id, so ascending order reverses
+    // every one of them. The two parameters must therefore disagree here, and
+    // asserting that they do is what keeps a chooser that ignores the parameter
+    // from passing.
+    assert_eq!(ascending.reduction_order(), &[1, 0, 1, 0, 1, 0, 1, 0]);
+    assert_ne!(ascending.reduction_order(), selection.reduction_order());
 
-    let reversed = [1u32, 0, 2, 0, 3, 1, 4, 0];
-    let ascending = compile_experts(
+    // And the converse: a route whose rows are already ascending leaves the two
+    // orders agreeing, which is why the sweep's own route is not that one.
+    let ascending_rows = [0u32, 1, 0, 2, 1, 3, 0, 4];
+    let plan = compile_experts(
         &mlp(),
         &combine(CombineOrder::AscendingExpertId),
-        &reversed,
+        &ascending_rows,
         &case.budget(),
         &case.policy(),
         Some(&topology()),
         None,
     )
     .expect("plan");
-    assert_eq!(ascending.reduction_order(), &[1, 0, 1, 0, 1, 0, 1, 0]);
+    assert_eq!(plan.reduction_order(), &[0, 1, 0, 1, 0, 1, 0, 1]);
 }

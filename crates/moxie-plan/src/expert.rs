@@ -962,17 +962,14 @@ pub fn compile_experts(
                 });
             }
         };
-        // A `required` device candidate passed the plan-wide gate but can
-        // still be inadmissible for one expert -- the cache is per chunk. That
-        // is exactly the case document 04 wants an actionable error for, and
-        // falling back here would be the silent disabling it forbids.
-        if chosen == Candidate::Host && policy.device == StrategyControl::Required {
-            return Err(ExpertPlanRefused {
-                error: required_error("gpu-grouped", reason),
-                device: Some(reason),
-                host: host_unavailable,
-            });
-        }
+        // There is deliberately no "device is `required` and this group fell
+        // back" branch here. Mutation testing found one, and found that
+        // disabling it changed nothing: when the device candidate is
+        // `required`, the host candidate is `OtherCandidateRequired` for the
+        // whole plan, so a device-inadmissible group always lands in the
+        // both-refused arm above -- which reports the required candidate's own
+        // reason. The branch was unreachable, and an unreachable branch is a
+        // stub, however reasonable it looks.
         if chosen == Candidate::Device && !already_resident {
             demand_bytes = demand_bytes
                 .checked_add(chunk_bytes)
