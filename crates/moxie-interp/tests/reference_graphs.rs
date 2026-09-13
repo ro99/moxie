@@ -1923,6 +1923,7 @@ fn build_routed(
                 score: moxie_graph::RouteScore::Softmax,
                 per_expert_scale: true,
                 selection_bias: false,
+                coefficient: moxie_graph::RouteCoefficient::Fp32,
             },
             &[attended, proj_id, gain_id, per_expert_id],
         )

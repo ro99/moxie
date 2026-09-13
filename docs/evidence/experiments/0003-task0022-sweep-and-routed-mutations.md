@@ -1,8 +1,9 @@
 # 0003 — Measuring task 0022's extended sweeps and its new routed parameters, by mutation
 
 Date: 2026-09-13. Milestone: M2, [task 0022](../../tasks/0022-m2-laguna-metadata-and-second-consumer.md).
-Status: **accepted**; 33 of 33 mutations caught, 0 survivors — after two corrections the first
-measurement forced.
+Status: **accepted**; **37 of 37** mutations caught, 0 survivors, after an independent review's six
+findings were fixed and four of its checks were added to the batteries. The measurement before the
+review was 33 of 33, after two corrections the first measurement forced.
 
 Companion to [experiment 0002](0002-expert-plan-sweep-mutations.md), which measured the same two
 sweeps before task 0022 extended them.
@@ -163,6 +164,41 @@ Specifically **not** covered:
   That is worth reporting as a null result rather than leaving unsaid. What the extension did
   produce is the *fixture pressure* that made the `output_scale` gap visible at all — the second
   profile is the first fixture in the workspace with a scale that is not 1.
+
+## Re-measured after the independent review
+
+The review that requested changes on task 0022 reported that it had **not** re-run the mutation
+campaign, so it was re-run against the corrected code, with a mutation added for each check the
+review's findings produced:
+
+| Added mutation | Crate | Caught by |
+|---|---|---|
+| `coefficient-narrowing-dropped` | oracles | a named test |
+| `planner-accepts-a-nonfinite-scale` | plan | a named test |
+| `scaled-store-overflow-unchecked` | kernels | a named test |
+| `doubling-unchecked` | models | a named test |
+
+Totals after the corrections: planner battery **18 mutations, 17 by the sweep, 1 by a named test, 0
+survivors**; run and routed battery **19 mutations, 7 by the run sweep, 12 by named tests, 0
+survivors**. All six of the review's regressions were separately put through the substitution
+battery — remove the check, run only that regression, require it to fail — at **6 of 6
+load-bearing**.
+
+### What this campaign could not have found, demonstrated
+
+Two of the review's six findings were **outside every battery here**, and saying so is more useful
+than the totals above. One was a number in prose: the expert inventory multiplied a per-layer cost
+by all 47 routed layers in a document that had already recorded that two of them cost something
+else, understating the working set by 6.87 GB. The other was an omission shared by an
+implementation and its "independent" FP64 transcription, written from the same source by the same
+reader — the two agreed, and a bitwise gate passed on their agreement.
+
+A mutation battery measures a test suite against mutations of the **code**. It cannot reach an
+arithmetic claim that lives in a record, and it cannot reach a boundary that the oracle and the
+implementation are both missing, because mutating either one moves them apart and the test fails
+for the right reason by accident. The structural answers are elsewhere: make the record's arithmetic
+executable, and check a transcription against a quantity computed from the source's stated equation
+rather than against the implementation it is supposed to be independent of.
 
 ## Reproducing it
 

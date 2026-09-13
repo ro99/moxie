@@ -178,9 +178,11 @@ this sweep's advertised axes unreachable. **Three separate coverage claims in on
 task were softer than they looked, and every one was found by asking what a
 mutation would survive rather than by reading the test.**
 
-**M2 item 4 is implemented and awaits acceptance**
+**M2 item 4 is implemented, corrected after one round of independent review,
+and awaits acceptance**
 ([task 0022](docs/tasks/0022-m2-laguna-metadata-and-second-consumer.md),
-2026-09-13): Laguna's metadata and its **routed block**, a second routed
+2026-09-13; the round found **six** issues, one P1, all reproduced and fixed,
+none disputed): Laguna's metadata and its **routed block**, a second routed
 consumer driven through task 0021's interface, and a restricted budget expressed
 as a **ratio** of what the route demands rather than a constant. A routed layer
 at Laguna's declared expert width — 18,874,368 B per expert in BF16 — ran on all
@@ -203,6 +205,31 @@ packed along the **output** axis — a second convention the accepted importer h
 never seen — so **no Laguna tensor was read** and M3 owns the importer.
 [The bring-up record](docs/models/laguna.md) carries the inventory and every
 open mapping question.
+
+**A transcription is independent of the implementation, not of the reader.**
+The review's P1 was a BF16 boundary this implementation did not have:
+`LagunaTopKRouter.forward` ends with
+`routing_weights.to(hidden_states.dtype)`, and the coefficients were being
+returned in FP32 — `[0.5938455, 0.4061545]` where the source has
+`[0.59375, 0.40625]`, on every combined row. It survived a **bitwise** gate,
+because the FP64 transcription was written from the same source by the same
+reader and omitted the same cast; the two agreed, and their agreement proved
+only that one omission had been made twice. The boundary is post-selection, so
+"the selection is exact" could never have seen it. Check a transcription against
+a quantity computed from the source's stated equation, not against the
+implementation it is supposed to be independent of.
+
+**A number in prose is outside every battery this repository has.** Two of the
+same review's findings were arithmetic in a record that contradicted a fact the
+same record already contained: the expert inventory multiplied a per-layer cost
+by all 47 routed layers two paragraphs after recording that two of them cost
+something else, understating the working set by **6.87 GB**; and a nearby line
+put this machine's aggregate VRAM at "72 GiB" when
+[the hardware inventory](docs/evidence/hardware-inventory.md) had already
+measured **62.6 GiB**. Mutation testing measures a suite against mutations of the
+*code* and cannot reach either. Make a record's arithmetic **executable** — the
+expert inventory now sums over the layers and a test checks every one of them
+against the artifact's own `data_offsets`.
 
 **A parameter no fixture ever varies is a parameter no test checks.** Two
 mutants that dropped `Combine`'s new output scale survived a **10,368**-case
@@ -296,7 +323,10 @@ the index's `total_size` of 76,813,095,232 B, re-verified 2026-09-13. Task 0022
 dense layer 0 and 47 routed layers of **256 experts at top-k 10**, SwiGLU at
 `moe_intermediate` 1,024 beside a shared expert of the same width, a **sigmoid**
 router with an `e_score_correction_bias` that moves selection only, a routed
-scaling factor of 2.5, and 85.5% of the artifact in expert weights. Its
+scaling factor of 2.5, and **94.41%** of the artifact in expert weights —
+72,515,874,816 B, summed over the routed layers rather than multiplied, because
+the quantizer left layers 46 and 47 in BF16 and a multiplication cannot say so.
+Its
 `configuration_laguna.py` and `modeling_laguna.py` were **read and never
 executed**, which is how document 03's "decoded according to the pinned
 exporter, never guessed from a suffix" is satisfied; executing them stays

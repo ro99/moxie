@@ -55,7 +55,7 @@
 
 use moxie_graph::{
     CombineOrder, ExpertActivation, Graph, GraphBuilder, IndexEncoding, OpParams, OracleRegistry,
-    RouteScore, RouterInput, TensorSpec, ValueId, ValueRole,
+    RouteCoefficient, RouteScore, RouterInput, TensorSpec, ValueId, ValueRole,
 };
 use moxie_model_api::{
     GraphRequirements, ModelDefinition, ModelMetadata, TensorRequirement, TensorRole,
@@ -200,6 +200,28 @@ pub struct ArtifactGeometry {
     pub dense_layers: &'static [u32],
     /// `tie_word_embeddings`. False here: `lm_head` is its own tensor.
     pub tied_embeddings: bool,
+    /// Routed layers whose experts the quantizer left in **BF16**.
+    ///
+    /// `quantization_config.ignore` names every module of layers 0, 46 and 47,
+    /// and layer 0 has no routed experts, so these two are the routed layers
+    /// that cost the BF16 figure rather than the packed one. Recorded as data
+    /// because it is a quantizer's sensitivity choice, not a family rule.
+    ///
+    /// This field exists because a record got the arithmetic wrong without it:
+    /// multiplying the packed per-layer cost by all 47 sparse layers understated
+    /// the expert working set by **6.87 GB**, in the same document that recorded
+    /// the exception three paragraphs earlier.
+    pub bf16_expert_layers: &'static [u32],
+    /// One routed expert as the artifact stores it: packed INT4 codes, BF16
+    /// scales, packed zero points and the shape vector.
+    ///
+    /// Measured from shard headers, not derived: the zero points are packed
+    /// along the **output** axis while the codes are packed along the input
+    /// axis, and a derivation that assumed one convention for both would be
+    /// wrong by a factor.
+    pub stored_expert_bytes: u64,
+    /// The artifact's `total_size`.
+    pub artifact_bytes: u64,
     pub max_trained_position: u64,
     pub moe: MoeGeometry,
 }
@@ -231,6 +253,9 @@ pub const ARTIFACT: ArtifactGeometry = ArtifactGeometry {
     attention_gate: AttentionGate::PerHead,
     dense_layers: &[0],
     tied_embeddings: false,
+    bf16_expert_layers: &[46, 47],
+    stored_expert_bytes: 5_455_920,
+    artifact_bytes: 76_813_095_232,
     max_trained_position: 1_048_576,
     moe: MoeGeometry {
         experts: 256,
@@ -263,6 +288,38 @@ impl ArtifactGeometry {
     /// geometry demands, and the one a restricted budget is a ratio of.
     pub const fn expert_bf16_bytes(&self) -> u64 {
         3 * self.moe.moe_intermediate * self.hidden * 2
+    }
+
+    /// Whether layer `l`'s routed experts are stored in BF16 rather than packed.
+    pub fn bf16_expert_layer(&self, layer: u32) -> bool {
+        self.bf16_expert_layers.contains(&layer)
+    }
+
+    /// One routed layer's experts, as the artifact stores them.
+    ///
+    /// `None` for a layer that has no routed experts.
+    pub fn layer_expert_bytes(&self, layer: u32) -> Option<u64> {
+        if layer >= self.layers || self.dense_layer(layer) {
+            return None;
+        }
+        Some(
+            self.moe.experts
+                * if self.bf16_expert_layer(layer) {
+                    self.expert_bf16_bytes()
+                } else {
+                    self.stored_expert_bytes
+                },
+        )
+    }
+
+    /// Every routed layer's experts, as the artifact stores them.
+    ///
+    /// Summed over the layers rather than multiplied by their count, because
+    /// they do not all cost the same and a multiplication cannot say so.
+    pub fn expert_bytes_total(&self) -> u64 {
+        (0..self.layers)
+            .filter_map(|l| self.layer_expert_bytes(l))
+            .sum()
     }
 
     /// The operations a faithful decoder layer of this geometry needs and the
@@ -529,14 +586,16 @@ impl RoutedBlocks {
     pub fn compose(&self, oracles: &OracleRegistry, rows: SymbolId) -> Result<Composition> {
         let c = &self.config;
         width("vocab * hidden", c.vocab, c.hidden)?;
+        // The doubling is checked **first**. `2 * moe_intermediate` used to be
+        // evaluated inline and handed to `width`, so an intermediate of
+        // `1 << 63` overflowed before the checked multiplication ever ran and
+        // panicked in a debug build -- reached through a public constructor
+        // that had already accepted the configuration.
+        let gate_up_rows = width("2 * moe_intermediate", 2, c.moe.moe_intermediate)?;
         width(
             "experts * 2 * moe_intermediate * hidden",
             c.moe.experts,
-            width(
-                "2 * moe_intermediate * hidden",
-                2 * c.moe.moe_intermediate,
-                c.hidden,
-            )?,
+            width("2 * moe_intermediate * hidden", gate_up_rows, c.hidden)?,
         )?;
         width(
             "shared_intermediate * hidden",
@@ -576,7 +635,7 @@ impl RoutedBlocks {
         )?;
 
         for layer in 0..c.blocks {
-            stream = routed_block(&mut g, &mut bound, c, layer, stream)?;
+            stream = routed_block(&mut g, &mut bound, c, layer, stream, gate_up_rows)?;
         }
 
         let normed = g.node(
@@ -637,6 +696,10 @@ fn routed_block(
     c: &BlockConfig,
     layer: u32,
     residual: ValueId,
+    // `2 * moe_intermediate`, checked once by the caller and reused here rather
+    // than recomputed. One question, answered once -- and recomputing it is how
+    // the checked extent and the extent a tensor is actually given come apart.
+    gate_up_rows: u64,
 ) -> Result<ValueId> {
     let moe = c.moe;
     let ffn_norm = weight(g, bound, "ffn_norm", Some(layer), vec![c.hidden])?;
@@ -706,6 +769,10 @@ fn routed_block(
             score: RouteScore::Sigmoid,
             per_expert_scale: false,
             selection_bias: true,
+            // `routing_weights = routing_weights.to(hidden_states.dtype)`, the
+            // last statement of `LagunaTopKRouter.forward`. The model dtype is
+            // BF16, and this narrowing reaches every combined row.
+            coefficient: RouteCoefficient::Bf16,
         },
         &[normed, router_proj, selection_bias],
     )?;
@@ -720,7 +787,7 @@ fn routed_block(
         bound,
         "experts_gate_up",
         Some(layer),
-        vec![moe.experts, 2 * moe.moe_intermediate, c.hidden],
+        vec![moe.experts, gate_up_rows, c.hidden],
     )?;
     let expert_down = weight(
         g,

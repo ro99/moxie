@@ -743,6 +743,19 @@ pub fn shape_of(mlp: &OpParams, combine: &OpParams) -> Result<(ExpertShape, Comb
     else {
         return Err(invalid("combine", "this is not a Combine node".into()));
     };
+    // Validated here, not only in `GraphBuilder`. `compile_experts` takes
+    // `&OpParams` directly -- every test in this crate supplies one that never
+    // passed through a graph -- so a node's own `check_params` is not on this
+    // path. A review reproduced `compile_experts(...) -> Ok(plan)` with a NaN
+    // scale: the plan then reserves an envelope and runs every expert before
+    // the reduction finally refuses, which is a refusal after the work rather
+    // than before it.
+    if !output_scale.is_finite() {
+        return Err(invalid(
+            "combine_output_scale",
+            format!("combine output scale must be finite, got {output_scale}"),
+        ));
+    }
     if combine_hidden != hidden || combine_top_k != top_k {
         return Err(invalid(
             "combine",

@@ -1020,6 +1020,7 @@ mod tests {
                     score: moxie_graph::RouteScore::Softmax,
                     per_expert_scale: false,
                     selection_bias: false,
+                    coefficient: moxie_graph::RouteCoefficient::Fp32,
                 },
                 &[x, proj, gain],
             )
@@ -1095,6 +1096,7 @@ mod tests {
                 score: moxie_graph::RouteScore::Sigmoid,
                 per_expert_scale: false,
                 selection_bias: false,
+                coefficient: moxie_graph::RouteCoefficient::Bf16,
             }
             .partition_rule(),
             moxie_graph::PartitionRule::Replicated

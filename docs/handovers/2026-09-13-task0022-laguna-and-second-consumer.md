@@ -1,8 +1,16 @@
 # Handover — task 0022 implemented; M2 item 5's remainder is next
 
-**Task 0022 is implemented and awaits independent review and owner acceptance.**
-It delivers roadmap **M2 item 4** in the only shape the evidence allows, and it
-says so in its own contract rather than afterwards. **It does not close M2.**
+**Task 0022 is implemented, corrected after one round of independent review,
+and awaits a further review and owner acceptance.** It delivers roadmap **M2
+item 4** in the only shape the evidence allows, and it says so in its own
+contract rather than afterwards. **It does not close M2.**
+
+The review found **six** issues — one P1, five P2 — all reproduced, all fixed,
+none disputed. Four were the shape task 0021's four rounds kept finding: **a
+check on one path and not on the neighbouring one.** The other two are a shape
+worth naming separately, because no mutation battery can reach it: **a record
+and a transcription that each contradicted a fact their own document already
+contained.**
 
 ## Workspace identity
 
@@ -124,6 +132,42 @@ single-profile sweeps did not already catch. What it produced was the fixture
 pressure — the first routed scale in the workspace that is not 1 — which is how
 the `output_scale` gap became visible at all.
 
+### What the review found, and the two lessons that are not about code
+
+**A transcription is independent of the implementation, not of the reader.**
+The P1 was a missing BF16 boundary: `LagunaTopKRouter.forward` ends with
+`routing_weights.to(hidden_states.dtype)` and this implementation returned FP32
+coefficients — `[0.5938455, 0.4061545]` where the source has
+`[0.59375, 0.40625]`. It survived a *bitwise* gate against an FP64
+transcription because the transcription was written from the same source by the
+same reader and omitted the same cast. The two agreed, and their agreement
+proved only that one omission had been made twice. The boundary is
+post-selection, so the "selection is exact" gate could never have seen it. The
+fixture now checks the narrowed values against `bf16_round` of an independently
+computed quotient.
+
+**A number in prose is outside every battery this repository has.** The
+inventory said all 47 routed layers cost the quantized per-layer figure, two
+paragraphs after recording that layers 46 and 47 keep BF16 experts — understating
+the expert working set by **6.87 GB** (72,515,874,816 B and 94.41%, not
+65,645,629,440 B and 85.5%). And a nearby line put the machine's aggregate VRAM
+at "72 GiB" when this repository had already measured **62.6 GiB** and written it
+down. Mutation testing measures a suite against mutations of the *code*; neither
+of these was reachable that way. The structural answer is to make the arithmetic
+executable, which it now is: `expert_bytes_total` sums over the layers instead
+of multiplying, and a test checks every layer against the artifact's own
+`data_offsets`.
+
+The other four are ordinary and were ordinary to fix: the planner accepted a
+`NaN` output scale because `compile_experts` takes `&OpParams` and
+`GraphBuilder`'s validation is not on that path; a scaled reduction could store
+BF16 infinity from two finite operands and return `Ok(())`; and
+`2 * moe_intermediate` overflowed *before* being handed to the checked
+multiplication helper, so checked arithmetic ran after the overflow it was there
+to prevent.
+
+All six regressions were substitution-tested: **6 of 6 load-bearing.**
+
 ## Remaining hypotheses and blockers
 
 - **M2 is not closed.** Its exit still asks that a real out-of-device-memory
@@ -180,7 +224,7 @@ layer.
   sweeps at their extended products and the restricted-budget device case on all
   three cards.
 
-**Three habits from this task should be applied there rather than rediscovered.**
+**Four habits from this task should be applied there rather than rediscovered.**
 
 First, **ask what the input space is, not only what the assertion says.** The
 `output_scale` gap was not a weak test. It was a strong test over fixtures that
@@ -192,7 +236,13 @@ the code means.** The operand-swap check survived its own mutation because both
 halves read the same single statement of the order. When a property is about
 *meaning*, the comparison has to be against something written independently.
 
-Third — and this is the contract's own doing rather than the measurement's —
+Third, **check a transcription against a quantity, not against the
+implementation.** Two independently written things that share a reader share the
+reader's omissions. When a reference exists, the transcription's agreement with
+the implementation is worth nothing on its own; what is worth something is
+agreement with a number computed from the source's own stated equation.
+
+Fourth — and this is the contract's own doing rather than the measurement's —
 **write the narrowing into the contract, before implementing.** Laguna's tower
 was going to be impossible whichever order the work was done in. Discovering it
 halfway would have produced either a guessed yarn ramp or a task that quietly

@@ -1202,3 +1202,96 @@ fn the_device_budget_is_checked_against_the_envelope_execution_reserves() {
         Some(RejectionReason::DeviceArenaTooSmall { .. })
     ));
 }
+
+/// A nonfinite output scale is refused **before** a plan exists.
+///
+/// `GraphBuilder` rejects the value when a node is built, but `compile_experts`
+/// takes `&OpParams` directly and every test in this crate hands it one that
+/// never passed through a graph. A review reproduced `Ok(plan)` with `NaN`: the
+/// plan then reserves its envelope and runs every expert before the reduction
+/// finally refuses, which is a refusal after the work instead of before it.
+#[test]
+fn a_nonfinite_combine_output_scale_is_refused_before_a_plan_exists() {
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let combine = OpParams::Combine {
+            hidden: POINT.hidden,
+            top_k: POINT.top_k,
+            order: CombineOrder::AscendingExpertId,
+            output_scale: bad,
+        };
+        let refusal = compile_experts(
+            &mlp(POINT),
+            &combine,
+            POINT.route,
+            &Case {
+                profile: Profile::GemmaLike,
+                device_control: StrategyControl::Off,
+                host_control: StrategyControl::Auto,
+                arena_fits: true,
+                host_workspace_fits: true,
+                cache_fits: true,
+                amortised: Amortisation::All,
+                resident: false,
+                order: CombineOrder::AscendingExpertId,
+                with_topology: false,
+                kernels: Kernels::Absent,
+            }
+            .budget(),
+            &Case {
+                profile: Profile::GemmaLike,
+                device_control: StrategyControl::Off,
+                host_control: StrategyControl::Auto,
+                arena_fits: true,
+                host_workspace_fits: true,
+                cache_fits: true,
+                amortised: Amortisation::All,
+                resident: false,
+                order: CombineOrder::AscendingExpertId,
+                with_topology: false,
+                kernels: Kernels::Absent,
+            }
+            .policy(),
+            None,
+            None,
+        )
+        .expect_err("a plan was produced for a scale of {bad}");
+        assert!(
+            format!("{refusal}").contains("output scale"),
+            "{bad}: {refusal}"
+        );
+    }
+    // And a finite scale still plans, including zero and a negative one --
+    // this is a checkpoint scalar, not a probability.
+    for good in [1.0f32, 0.0, -2.5] {
+        let combine = OpParams::Combine {
+            hidden: POINT.hidden,
+            top_k: POINT.top_k,
+            order: CombineOrder::AscendingExpertId,
+            output_scale: good,
+        };
+        let case = Case {
+            profile: Profile::GemmaLike,
+            device_control: StrategyControl::Off,
+            host_control: StrategyControl::Auto,
+            arena_fits: true,
+            host_workspace_fits: true,
+            cache_fits: true,
+            amortised: Amortisation::All,
+            resident: false,
+            order: CombineOrder::AscendingExpertId,
+            with_topology: false,
+            kernels: Kernels::Absent,
+        };
+        let plan = compile_experts(
+            &mlp(POINT),
+            &combine,
+            POINT.route,
+            &case.budget(),
+            &case.policy(),
+            None,
+            None,
+        )
+        .expect("a finite scale plans");
+        assert_eq!(plan.output_scale(), good);
+    }
+}

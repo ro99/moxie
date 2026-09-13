@@ -35,7 +35,8 @@
 
 use moxie_graph::{
     CombineOrder, ExpertActivation, Graph, GraphBuilder, IndexEncoding, OpParams, OracleRegistry,
-    RopeLayout, RouteScore, RouterInput, TensorSpec, ValueId, ValueRole, Visibility,
+    RopeLayout, RouteCoefficient, RouteScore, RouterInput, TensorSpec, ValueId, ValueRole,
+    Visibility,
 };
 use moxie_model_api::{
     GraphRequirements, ModelDefinition, ModelMetadata, TensorRequirement, TensorRole,
@@ -938,6 +939,10 @@ fn route_layer(
             per_expert_scale: true,
             // No `e_score_correction_bias` in this family's index.
             selection_bias: false,
+            // `Gemma4TextRouter.forward` returns `top_k_weights` as the softmax
+            // and the per-expert scale produced it; there is no cast on the way
+            // out, unlike Laguna's router.
+            coefficient: RouteCoefficient::Fp32,
         },
         // `[rows, projection, gain, per-expert scale]` -- the order
         // `OpParams::route_operands` states.

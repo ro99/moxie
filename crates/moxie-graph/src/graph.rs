@@ -400,6 +400,26 @@ pub enum OpParams {
         /// distribution -- which is why this is a parameter with its own
         /// fixture rather than an implementation detail.
         selection_bias: bool,
+        /// The precision the coefficients are narrowed to **as they leave the
+        /// router**.
+        ///
+        /// The two pinned references differ, and the difference is the last
+        /// statement of each router's `forward`:
+        /// `Gemma4TextRouter` returns `top_k_weights` as the softmax and the
+        /// per-expert scale produced it, while `LagunaTopKRouter` ends with
+        /// `routing_weights = routing_weights.to(hidden_states.dtype)`, a BF16
+        /// narrowing. On the logits `[0, 1]` that is `[0.59375, 0.40625]`
+        /// against `[0.5938455, 0.4061545]`, and every combined row downstream
+        /// carries the difference.
+        ///
+        /// **This is a statement about values, not about storage.** A route
+        /// table holds FP32 coefficients either way and
+        /// [`OpParams::output_role`] still says `F32`, because that role is
+        /// what the byte trace M2's exit gate reconciles against the ledger --
+        /// the same reason the index encoding there says `U32`. Narrowing the
+        /// value and narrowing the buffer are different claims, and only the
+        /// first one is the reference's.
+        coefficient: RouteCoefficient,
     },
     /// The gated expert feed-forward, evaluated per selected slot.
     ///
@@ -461,6 +481,16 @@ pub enum ExpertActivation {
     GeGlu,
     /// `silu(gate) * up`.
     SwiGlu,
+}
+
+/// The precision a router narrows its coefficients to before emitting them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RouteCoefficient {
+    /// Emitted as computed. `Gemma4TextRouter.forward` has no cast.
+    Fp32,
+    /// Narrowed to BF16. `LagunaTopKRouter.forward`'s last statement is
+    /// `routing_weights.to(hidden_states.dtype)`, and the model dtype is BF16.
+    Bf16,
 }
 
 /// One operand of [`OpParams::Route`], in the order a router takes them.

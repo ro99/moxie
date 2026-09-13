@@ -31,8 +31,9 @@ executes a routed layer, and the selected BF16 chain still refuses `Route`,
 `ExpertMlp` and `Combine`.
 
 [Task 0022](../tasks/0022-m2-laguna-metadata-and-second-consumer.md) is **M2
-item 4**, **implemented on 2026-09-13 and awaiting independent review and owner
-acceptance**: Laguna's metadata and its **routed block**, a second routed
+item 4**, **implemented on 2026-09-13, corrected after one round of independent
+review, and awaiting a further review and owner acceptance** (six findings, one
+P1, all reproduced and fixed, none disputed): Laguna's metadata and its **routed block**, a second routed
 consumer through task 0021's interface, and a restricted budget expressed as a
 ratio of working weights. **No Laguna capability row exists below and none may
 be added**: nothing reads a Laguna tensor, its weights are asymmetric INT4 at
@@ -42,7 +43,13 @@ implemented nowhere the artifact ships, so both are recorded as gaps rather than
 guessed. What it adds to this matrix is routed-operation *parameters*
 (`G-MOE-ROUTING-HOST`) and second-consumer coverage on the existing expert-plan
 gates. Gates: 908 host tests, 941 device-feature tests, 42/42 real GPU cases,
-both clippy lanes, `spec-check`, `arch-check` with zero failures.
+both clippy lanes, `spec-check`, `arch-check` with zero failures — 915 and 948
+after the review's corrections. The P1 was a **missing BF16 boundary**: the
+router's own `routing_weights.to(hidden_states.dtype)`, which survived a bitwise
+gate because the FP64 transcription omitted the same cast. `Route` carries it as
+a parameter now, Gemma 4 passes the opposite value, and the fixture checks
+against an independently computed quantity rather than against the
+implementation.
 
 [Task 0021](../tasks/0021-m2-expert-execution-plans.md) is **M2 item 3**,
 **implemented on 2026-09-12, corrected after four rounds of independent

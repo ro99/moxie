@@ -105,6 +105,7 @@ A "gap" row is a path that **cannot be composed today** and is not composed.
 | Router score transform | `LagunaTopKRouter.forward` — `F.linear(x, W).float()`, then `torch.sigmoid` | `Route { input: Raw, score: Sigmoid }` | **closed by task 0022** | `the_sigmoid_router_matches_its_fp64_transcription_exactly` |
 | Selection bias | `scores_for_selection = routing_scores + e_score_correction_bias`, then `topk`; the coefficients are gathered from `routing_scores` | `Route { selection_bias: true }`, a bound `[experts]` operand | **closed by task 0022** | `the_bias_moves_the_selection_and_not_the_coefficients` |
 | Renormalisation | `routing_weights /= routing_weights.sum(-1)` when `norm_topk_prob` | `Route`, unconditional — both families declare true | none | task 0019's accepted fixtures |
+| Coefficient narrowing | `routing_weights = routing_weights.to(hidden_states.dtype)` — the router's **last** statement, and the model dtype is BF16. `Gemma4TextRouter.forward` has no such cast | `Route { coefficient: Bf16 }` | **closed after review** — it was missing | `the_coefficients_carry_the_routers_own_output_narrowing`, and the FP64 transcription carries it too |
 | Expert feed-forward | `LagunaExperts.forward` — `linear(x, gate_up_proj[e]).chunk(2, -1)`, `act(gate) * up`, `linear(·, down_proj[e])` | `ExpertMlp { activation: SwiGlu }` over the fused `[E, 2I, H]` / `[E, H, I]` tensors | none (task 0019) | task 0019's per-expert FP64 fixture |
 | Combination | `index_add_` over `expert_hit`, which is expert-major | `Combine { order: AscendingExpertId }` | none (task 0019) | task 0019's both-orders fixture |
 | Routed scaling factor | `expert_output = expert_output * self.routed_scaling_factor`, **after** the accumulation and **before** the shared expert is added | `Combine { output_scale: 2.5 }` | **closed by task 0022** | `the_combine_output_scale_multiplies_the_sum_and_not_each_term` |
@@ -120,6 +121,28 @@ A "gap" row is a path that **cannot be composed today** and is not composed.
 | Vision / audio | none declared | — | — | — |
 
 ### The two gaps, and why neither may be guessed
+
+### A boundary that was missing, and how it got past a bitwise gate
+
+The first version of this record omitted the router's coefficient cast. The
+transcription written "independently" from the pinned source omitted it too, so
+the two agreed — and their agreement proved only that the same reader had made
+the same omission twice. An independent review found it, with the smallest
+possible reproduction: on the logits `[0, 1]` the source's coefficients are
+`[0.59375, 0.40625]` and the unnarrowed ones are `[0.5938455, 0.4061545]`, and
+every combined row downstream carries the difference.
+
+It is post-selection, so it routes no row differently. That is exactly why it
+survived: the gates this family's routing had were *selection* exactness and
+agreement with a transcription that shared the gap. **A transcription is only
+independent of the implementation, not of the reader.** The fixture now checks
+the narrowed values against `bf16_round` of an independently computed quotient,
+so agreeing for the wrong reason is no longer possible.
+
+`Route` says this about **values, not storage**: a route table holds FP32
+coefficients either way and `output_role` still declares `F32`, because that
+role is what M2's exit gate reconciles against the ledger. Narrowing a value and
+narrowing a buffer are different claims.
 
 **Attention output gating.** The equation is pinned in the artifact's own file,
 so it is *known*. What does not exist is a shared operation: `softplus` is not
@@ -225,13 +248,29 @@ M3's:
 |---|---|
 | One routed expert, as stored (INT4 + scales + zero points + shape) | **5,455,920 B** |
 | One routed expert, in BF16 at the same logical shape | **18,874,368 B** |
-| One sparse layer's 256 experts, as stored | **1,396,715,520 B** |
-| All 47 sparse layers' experts, as stored | **65,645,629,440 B** — 85.5% of the artifact |
+| One routed layer's 256 experts, **quantized** (45 of them) | **1,396,715,520 B** |
+| One routed layer's 256 experts, **BF16** (layers 46 and 47) | **4,831,838,208 B** |
+| All 47 routed layers' experts, as stored | **72,515,874,816 B** — **94.41%** of the artifact |
 | Whole artifact | 76,813,095,232 B |
 
-At 76.8 GB the artifact fits neither a 24 GiB device nor the aggregate 72 GiB of
-the three cards with room for activations and state, so executing it needs M2's
-host-backed residency **and** an importer that does not exist.
+**That total is a sum over the layers, not a multiplication.** An earlier
+version of this record multiplied the quantized per-layer cost by all 47 routed
+layers and reported 65,645,629,440 B / 85.5% — understating the expert working
+set by **6,870,245,376 B**, in a document that had already recorded two
+paragraphs earlier that layers 46 and 47 keep BF16 experts. An independent
+review found it. The arithmetic is executable now:
+`ArtifactGeometry::expert_bytes_total` sums `layer_expert_bytes` over the
+routed layers, and `the_expert_inventory_matches_the_artifact_headers` checks
+every layer against the artifact's own `data_offsets`.
+
+At 76.8 GB the artifact fits neither a 24 GiB device nor the machine's
+**measured 62.6 GiB** of aggregate device memory — `cuDeviceTotalMem` reports
+24,123 MiB on each 3090 and 15,883 MiB on the 5060 Ti, per
+[the hardware inventory](../evidence/hardware-inventory.md) — with room for
+activations and state. Executing it needs M2's host-backed residency **and** an
+importer that does not exist. An earlier version of this line said "the
+aggregate 72 GiB of the three cards", which was neither the nominal 64 GiB nor
+the measured figure this repository had already recorded.
 
 ### State schema, partitions and admission
 

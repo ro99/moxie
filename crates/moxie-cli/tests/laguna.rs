@@ -10,8 +10,8 @@
 
 use moxie_engine::{HostTensor, Value};
 use moxie_graph::{
-    Bindings, CombineOrder, ExpertActivation, GraphBuilder, OpParams, OracleRegistry, RouteScore,
-    RouterInput, TensorSpec, ValueId, ValueRole,
+    Bindings, CombineOrder, ExpertActivation, GraphBuilder, OpParams, OracleRegistry,
+    RouteCoefficient, RouteScore, RouterInput, TensorSpec, ValueId, ValueRole,
 };
 use moxie_interp::Interpreter;
 use moxie_models::laguna::{
@@ -325,6 +325,7 @@ fn the_two_expert_vectors_are_told_apart_by_an_oracle_not_only_by_each_other() {
                     score: RouteScore::Sigmoid,
                     per_expert_scale: true,
                     selection_bias: true,
+                    coefficient: RouteCoefficient::Bf16,
                 },
                 &operands,
             )
@@ -373,6 +374,7 @@ fn the_two_expert_vectors_are_told_apart_by_an_oracle_not_only_by_each_other() {
         top_k: top_k as usize,
         input: RouterInput::Raw,
         score: RouteScore::Sigmoid,
+        coefficient: RouteCoefficient::Bf16,
     };
     let expert_spec = moxie_oracles::route::ExpertSpec {
         experts: experts as usize,
@@ -468,6 +470,88 @@ fn the_reduction_says_what_the_block_is_not() {
     assert!(r.routed_block_only);
 }
 
+/// The expert inventory, against the artifact's own shard headers.
+///
+/// A review found the record's figure wrong by **6.87 GB**: it multiplied the
+/// packed per-layer cost by all 47 routed layers, in a document that had
+/// already recorded that two of them keep BF16 experts. The arithmetic is
+/// executable now, and this is what makes it so — it reads the index and the
+/// headers, sums the expert tensors, and compares against what `ARTIFACT`
+/// declares. Metadata only: `data_offsets`, never a payload.
+#[test]
+fn the_expert_inventory_matches_the_artifact_headers() {
+    let index_path = format!("{ARTIFACT_ROOT}/model.safetensors.index.json");
+    let Ok(text) = std::fs::read_to_string(&index_path) else {
+        eprintln!("SKIPPED: {index_path} is not present on this machine");
+        return;
+    };
+    let index: serde_json::Value = serde_json::from_str(&text).expect("index parses");
+    let map = index["weight_map"].as_object().expect("weight_map");
+
+    // One header read per shard, not per tensor.
+    let mut headers: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    for shard in map.values() {
+        let shard = shard.as_str().expect("shard name");
+        if headers.contains_key(shard) {
+            continue;
+        }
+        let mut f = std::fs::File::open(format!("{ARTIFACT_ROOT}/{shard}")).expect("shard");
+        let mut len = [0u8; 8];
+        std::io::Read::read_exact(&mut f, &mut len).expect("header length");
+        let mut buf = vec![0u8; u64::from_le_bytes(len) as usize];
+        std::io::Read::read_exact(&mut f, &mut buf).expect("header");
+        headers.insert(
+            shard.to_string(),
+            serde_json::from_slice(&buf).expect("header parses"),
+        );
+    }
+
+    let mut measured: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+    for (name, shard) in map {
+        if !name.contains(".mlp.experts.") || name.contains("e_score_correction_bias") {
+            continue;
+        }
+        let layer: u32 = name
+            .split('.')
+            .nth(2)
+            .expect("layer")
+            .parse()
+            .expect("index");
+        let entry = &headers[shard.as_str().expect("shard")][name]["data_offsets"];
+        let bytes = entry[1].as_u64().expect("end") - entry[0].as_u64().expect("start");
+        *measured.entry(layer).or_default() += bytes;
+    }
+
+    for (layer, bytes) in &measured {
+        assert_eq!(
+            ARTIFACT.layer_expert_bytes(*layer),
+            Some(*bytes),
+            "layer {layer}"
+        );
+    }
+    let routed: Vec<u32> = (0..ARTIFACT.layers)
+        .filter(|l| ARTIFACT.layer_expert_bytes(*l).is_some())
+        .collect();
+    assert_eq!(
+        routed.len(),
+        measured.len(),
+        "the declared routed layers are not the ones with expert tensors"
+    );
+    let total: u64 = measured.values().sum();
+    assert_eq!(ARTIFACT.expert_bytes_total(), total);
+    assert_eq!(total, 72_515_874_816);
+
+    // And the fraction the record quotes, to a tenth of a percent.
+    let fraction = total as f64 / ARTIFACT.artifact_bytes as f64;
+    assert!((fraction - 0.9441).abs() < 0.0005, "{fraction}");
+
+    // The exception is load-bearing: assuming every routed layer cost the
+    // packed figure is the error the review found, and it is this large.
+    let uniform = 47 * ARTIFACT.moe.experts * ARTIFACT.stored_expert_bytes;
+    assert_eq!(total - uniform, 6_870_245_376);
+}
+
 #[test]
 fn one_expert_of_the_artifact_costs_what_the_record_says() {
     // The figure a BF16 fixture at this geometry demands, and the one a
@@ -475,8 +559,13 @@ fn one_expert_of_the_artifact_costs_what_the_record_says() {
     // cost is smaller because its experts are INT4; that number is in
     // `docs/models/laguna.md` and is not this one.
     assert_eq!(ARTIFACT.expert_bf16_bytes(), 18_874_368);
+    assert_eq!(ARTIFACT.stored_expert_bytes, 5_455_920);
     assert_eq!(ARTIFACT.moe.experts, 256);
     assert_eq!(ARTIFACT.moe.top_k, 10);
+    // The two routed layers the quantizer left alone cost the BF16 figure.
+    assert_eq!(ARTIFACT.layer_expert_bytes(1), Some(1_396_715_520));
+    assert_eq!(ARTIFACT.layer_expert_bytes(46), Some(4_831_838_208));
+    assert_eq!(ARTIFACT.layer_expert_bytes(0), None, "layer 0 is dense");
 }
 
 #[test]
@@ -615,4 +704,38 @@ fn the_declared_geometry_matches_the_artifact_config() {
         !w["symmetric"].as_bool().unwrap(),
         "asymmetric, which the accepted importer refuses"
     );
+}
+
+/// An intermediate width that overflows its own doubling is refused, not a
+/// panic.
+///
+/// `2 * moe_intermediate` used to be evaluated inline before being handed to
+/// the checked multiplication helper, so a review reached a debug-build panic
+/// through `BlockConfig` -- a public type whose constructor had already
+/// accepted the value. Checked arithmetic that runs after the overflow is not
+/// checked arithmetic.
+#[test]
+fn an_overflowing_intermediate_width_is_refused_rather_than_panicking() {
+    let mut config = BlockConfig::reduced();
+    config.moe.moe_intermediate = 1 << 63;
+    let model = RoutedBlocks::reduced(config, "probe").expect("the width is checked at compose");
+    let err = model
+        .compose(&oracles(), SymbolId(0))
+        .expect_err("compose accepted an intermediate that cannot be doubled");
+    assert!(format!("{err}").contains("moe_intermediate"), "{err}");
+
+    // Every other product on this path is refused too, and the stage differs by
+    // field -- which is worth asserting rather than papering over, because
+    // "refused somewhere" is the property and "refused at compose" is not.
+    let mut wide_hidden = BlockConfig::reduced();
+    wide_hidden.hidden = 1 << 62;
+    let model = RoutedBlocks::reduced(wide_hidden, "probe").expect("hidden is checked at compose");
+    assert!(model.compose(&oracles(), SymbolId(0)).is_err());
+
+    // A vocabulary that cannot be a `u32` never reaches composition: the
+    // metadata refuses it first, because `ModelMetadata::vocab_size` is one.
+    let mut wide_vocab = BlockConfig::reduced();
+    wide_vocab.vocab = 1 << 62;
+    let err = RoutedBlocks::reduced(wide_vocab, "probe").expect_err("vocabulary");
+    assert!(format!("{err}").contains("vocabulary"), "{err}");
 }

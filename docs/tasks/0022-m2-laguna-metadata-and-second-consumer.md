@@ -104,7 +104,7 @@ index, or bounded shard headers, and each has a named authority:
 | `max_position_embeddings` | 1,048,576 — **not** an admissible context here (R19) | `config.json` |
 | `rope_parameters.sliding_attention` | `default`, theta 10,000, `partial_rotary_factor` 1.0 | `config.json`; `compute_default_rope_parameters` is in the artifact's own file |
 | Per-expert disk bytes | **5,455,920 B** (3 × [packed 1,572,864 + scales 196,608 + zero points 49,152 + shape 16]) | shard header `data_offsets` |
-| One sparse layer's 256 experts | **1,396,715,520 B**; all 47 sparse layers **65,645,629,440 B**, 85.5% of the artifact | the same |
+| One routed layer's 256 experts | **1,396,715,520 B** quantized; **4,831,838,208 B** on layers 46 and 47, whose experts the quantizer left in BF16. All 47 routed layers: **72,515,874,816 B**, **94.41%** of the artifact — a sum over the layers, not a multiplication | the same |
 
 **Not interpreted, and each is a stop rather than a guess:**
 
@@ -651,3 +651,152 @@ row, because no Laguna capability exists.
 - **Quality is O2** for both families.
 - **Laguna's tower** needs two shared-operation tasks before any state schema,
   admission figure or partition for it exists.
+
+## Independent review, and what it changed
+
+An independent review of `78c493d` and `f2513fa` requested changes before
+acceptance and raised **six** findings — one P1 and five P2. **All six were
+reproduced, all six are fixed, none is disputed.** The reviewer also reported
+independently re-running 908 host tests, 42/42 GPU gates, the eight
+grouped-device integration tests, both sweep counts, `arch-check`, `spec-check`
+and formatting, and said plainly what they had **not** re-run: the complete
+device-feature suite, the clippy lanes and the mutation campaign.
+
+### 1 (P1) — The router's coefficient narrowing was missing
+
+`LagunaTopKRouter.forward` ends with
+`routing_weights = routing_weights.to(hidden_states.dtype)`. The model dtype is
+BF16; this implementation returned FP32 coefficients. On the logits `[0, 1]` the
+source's are `[0.59375, 0.40625]` and the unnarrowed ones are
+`[0.5938455, 0.4061545]`, and every combined row downstream carries the
+difference.
+
+`Route` gained a `coefficient: RouteCoefficient` parameter, applied as the
+router's last step. Gemma 4 passes `Fp32` — `Gemma4TextRouter.forward` has no
+such cast — so the two families disagree on it, which is what makes it a
+parameter and not a constant.
+
+**It says values, not storage.** A route table holds FP32 either way and
+`output_role` still declares `F32`, because that role is what the byte trace
+M2's exit gate reconciles against the ledger — the same reason the index
+encoding there says `U32` rather than `U64`.
+
+**Why a bitwise gate did not catch it, which is the part worth keeping.** The
+FP64 transcription was written from the same pinned source by the same reader,
+and it omitted the same cast. The two agreed, and their agreement proved only
+that one reader made one omission twice. **A transcription is independent of the
+implementation, not of the reader.** The fixture now checks the narrowed values
+against `bf16_round` of an independently computed quotient, so agreeing for the
+wrong reason is no longer available. The boundary is post-selection, so it
+routed no row differently — which is exactly why the *selection is exact* gate
+never saw it.
+
+### 2 (P2) — The output-scale rounding justification was false
+
+`combine_row` claimed that an exactly representable scale such as 2.5 "moves the
+deviation nowhere". It does not. The reviewer's counterexample, reproduced
+exactly: BF16 slots `[1, 0.0031433105]` with unit coefficients give
+`bf16(sum · 2.5) = 2.515625` here against `bf16(bf16(sum) · 2.5) = 2.5` in the
+reference.
+
+Representability makes the *multiplication* exact and says nothing about the
+operand, and the reference's operand has already been through a BF16 buffer. The
+claim is corrected, the deviation is declared as a **second** one rather than as
+the accumulation deviation restated, and
+`an_exactly_representable_scale_still_moves_the_boundary` is the counterexample
+as a test so it cannot quietly come back. The FP32 accumulation convention is
+unchanged: reopening task 0019's accepted contract is not this task's to do, and
+which of the two answers is closer to the released model is O2's question.
+
+### 3 (P2) — The planner accepted a nonfinite output scale
+
+`compile_experts` takes `&OpParams` directly, so `GraphBuilder`'s validation is
+not on that path — and every test in `moxie-plan` supplies a node that never
+passed through a graph. The reviewer reproduced `Ok(plan)` with `NaN`. The plan
+then reserves its envelope and runs every expert before the reduction finally
+refuses, which is a refusal after the work rather than before it. `shape_of`
+validates it now, and zero and negative still plan, because this is a checkpoint
+scalar and not a probability.
+
+### 4 (P2) — A scaled reduction could overflow to infinity and return success
+
+One BF16 slot of `2.0`, a unit coefficient and a **finite** scale of `f32::MAX`
+produced BF16 infinity (`0x7f80`) while `combine_rows_bf16` returned `Ok(())`
+and `GroupedRun::reduce` reported success. Both operands were finite, so no
+earlier check could have caught it. The store checks the narrowed result and
+returns `Error::Numerical`, and a representable large scale is still accepted —
+the check is a bound, not a refusal of large scales.
+
+### 5 (P2) — Invalid dimensions panicked before the checked arithmetic ran
+
+`2 * moe_intermediate` was evaluated inline and *then* handed to `width`, the
+checked helper. An intermediate of `1 << 63` passed `RoutedBlocks::reduced` and
+panicked in `compose` in a debug build, through a public constructor that had
+already accepted the configuration. The doubling is checked first and the
+checked extent is threaded through composition instead of being recomputed.
+Checked arithmetic that runs after the overflow is not checked arithmetic.
+
+### 6 (P2) — The expert inventory understated the working set by 6.87 GB
+
+The record multiplied the quantized per-layer cost by all 47 routed layers and
+reported **65,645,629,440 B / 85.5%**, in a document that had already recorded
+two paragraphs earlier that layers 46 and 47 keep BF16 experts. Measured from
+the artifact's own headers: `45 × 1,396,715,520 + 2 × 4,831,838,208 =`
+**72,515,874,816 B**, **94.41%**.
+
+The correction is not a better number. `ArtifactGeometry` now carries
+`bf16_expert_layers` and `stored_expert_bytes`, `expert_bytes_total` **sums over
+the layers instead of multiplying**, and
+`the_expert_inventory_matches_the_artifact_headers` reads the index and every
+shard header and checks each layer against what `ARTIFACT` declares. The
+bring-up record, the task record and AGENTS.md all carry the corrected figure.
+
+The reviewer also corrected the nearby VRAM line: "the aggregate 72 GiB of the
+three cards" was neither the nominal 64 GiB nor the **62.6 GiB** this repository
+had already measured and recorded in its own hardware inventory. That is
+AGENTS.md's "do not carry an unverified placement, affinity or bandwidth claim
+forward" applied to a number that did not even need measuring, because the
+measurement was three directories away.
+
+### What the six have in common
+
+Four of them — 1, 3, 4 and 5 — are the **same** shape as the four rounds against
+task 0021: *a check that exists on one path and not on the neighbouring one*.
+`GraphBuilder` validates the scale and `compile_experts` does not. The
+oracle narrows the combination's output and the router does not narrow its
+coefficients. `expert_row` is guarded against nonfinite results and the scaled
+store was not. `width` is checked and its own argument was not.
+
+The other two are a different and more uncomfortable shape: **a record and a
+transcription that each contradicted a fact the same document already
+contained.** The inventory multiplied past its own exception; the transcription
+omitted the boundary its own source shows. Neither is a reasoning error that
+more care at the keyboard would have caught, and neither was reachable by the
+mutation batteries, which measure a test suite against mutations of the *code*
+and say nothing about a number written in prose. The executable inventory is the
+structural answer to the first; checking a transcription against an
+independently computed quantity rather than against the implementation is the
+answer to the second.
+
+### Evidence
+
+All six regressions were put through the substitution battery this repository
+requires — remove the check, run only that regression, require it to fail:
+**6 of 6 load-bearing**, 0 that asserted a symptom.
+
+| Gate, after the corrections | Result |
+|---|---|
+| `cargo fmt --all -- --check` | passed |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
+| Device-lane clippy | passed |
+| `cargo test --workspace --locked --offline` | **915 passed, 0 failed** (908 before the corrections) |
+| Device-feature workspace tests | **948 passed, 0 failed** (941 before the corrections) |
+| `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped** |
+| `cargo xtask spec-check` | passed, 10 documents |
+| `cargo xtask arch-check` | **zero failures** |
+
+Both mutation batteries were re-run against the corrected code, with the
+review's four new checks added to them: **37 mutations, 0 survivors** — 17 of 18
+caught by the planner sweep and 7 of 19 by the run sweep, the rest by named
+tests. The reviewer said explicitly that they had not re-run the mutation
+campaign; this is that re-run.

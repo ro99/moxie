@@ -58,16 +58,24 @@ writes**. **That is not model support and no quality claim follows.** **It does
 not close M2**, which also needs item 4 and byte/cost traces reconciled with the
 ledger across a whole working set.
 
-**[Task 0022](0022-m2-laguna-metadata-and-second-consumer.md) is implemented
-and awaiting independent review and owner acceptance**, 2026-09-13. It is M2
+**[Task 0022](0022-m2-laguna-metadata-and-second-consumer.md) is implemented,
+corrected after one round of independent review, and awaiting a further review
+and owner acceptance**, 2026-09-13. The round found **six** issues, one P1, all
+reproduced and fixed, none disputed. It is M2
 item 4: Laguna's metadata and its **routed block**, a second routed consumer
 through task 0021's interface, and a restricted budget expressed as a ratio of
 working weights. Its contract was authored and committed at `78c493d` before
 implementation. A routed layer at Laguna's **declared expert width** —
 18,874,368 B per expert — executed on all three GPUs against a device cache of
 one eighth of what its route demands, agreeing with the CPU candidate on every
-component. **Those are weight-shaped bytes at a real artifact's declared shape,
-not its weights**: Laguna's are asymmetric INT4 at group 32 and no importer
+component. The P1 was a **missing BF16 boundary** — the router's own
+`routing_weights.to(hidden_states.dtype)` — which survived a *bitwise* gate
+because the FP64 transcription was written by the same reader and omitted the
+same cast: **a transcription is independent of the implementation, not of the
+reader.** Two other findings were a record and a claim that each contradicted a
+fact their own document already contained, and neither was reachable by any
+mutation battery. **Those are weight-shaped bytes at a real artifact's declared
+shape, not its weights**: Laguna's are asymmetric INT4 at group 32 and no importer
 accepts them. **It does not close M2**, whose exit still needs byte/cost traces
 reconciled with the ledger across a whole working set.
 

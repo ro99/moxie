@@ -477,6 +477,8 @@ pub struct RouterSpec {
     pub input: moxie_graph::RouterInput,
     /// How the logits become per-expert scores.
     pub score: moxie_graph::RouteScore,
+    /// The precision the coefficients are narrowed to on the way out.
+    pub coefficient: moxie_graph::RouteCoefficient,
 }
 
 /// The closed parameters of one routed expert feed-forward.
@@ -526,9 +528,36 @@ pub fn router_route_row(
     let logits = router_logits(&t, proj, spec.experts)?;
     let scores = router_scores(&logits, spec.score)?;
     let route = select_top_k_biased(&scores, selection_bias, spec.top_k)?;
-    match per_expert {
-        Some(scale) => apply_per_expert_scale(&route, scale),
-        None => Ok(route),
+    let route = match per_expert {
+        Some(scale) => apply_per_expert_scale(&route, scale)?,
+        None => route,
+    };
+    Ok(narrow_coefficients(route, spec.coefficient))
+}
+
+/// The router's last statement, when it has one.
+///
+/// `LagunaTopKRouter.forward` ends with
+/// `routing_weights = routing_weights.to(hidden_states.dtype)`;
+/// `Gemma4TextRouter.forward` has no such cast and returns what the softmax and
+/// the per-expert scale produced. It is applied **after** the per-expert scale
+/// because it is the value that leaves the router, and no inspected family has
+/// both -- a family that did would have to say which order its own source uses.
+///
+/// The values are narrowed; the storage is not. A [`Route`] holds `f32` either
+/// way, and `OpParams::output_role` still declares `F32`, because that role is
+/// what a byte trace reconciles against the ledger.
+pub fn narrow_coefficients(route: Route, coefficient: moxie_graph::RouteCoefficient) -> Route {
+    match coefficient {
+        moxie_graph::RouteCoefficient::Fp32 => route,
+        moxie_graph::RouteCoefficient::Bf16 => Route {
+            weights: route
+                .weights
+                .iter()
+                .map(|w| crate::bf16_round(*w))
+                .collect(),
+            experts: route.experts,
+        },
     }
 }
 
@@ -762,11 +791,24 @@ pub fn combine_order(experts: &[u32], order: moxie_graph::CombineOrder) -> Resul
 /// it into the residual would scale the shared expert too.
 ///
 /// It multiplies the FP32 accumulator here, so the node boundary still rounds
-/// once. That is the same deviation from the pinned reference this function
-/// already carries and declares below -- the reference narrows to BF16 between
-/// additions and then scales a BF16 tensor -- not a second one. A family whose
-/// scale is exactly representable in BF16 (2.5 is) moves the deviation nowhere;
-/// one whose scale is not would round the product once instead of twice.
+/// once, which is this crate's convention everywhere.
+///
+/// **That is a second deviation from the pinned reference, not the same one**,
+/// and an earlier version of this comment claimed otherwise: it said an exactly
+/// representable scale such as 2.5 "moves the deviation nowhere". A review
+/// showed that is false, and `an_exactly_representable_scale_still_moves_the_boundary`
+/// is the counterexample:
+///
+/// ```text
+/// BF16 slots [1, 0.0031433105], unit coefficients, scale 2.5
+///   this reference:  bf16(sum · 2.5)        = 2.515625
+///   the reference:   bf16(bf16(sum) · 2.5)  = 2.5
+/// ```
+///
+/// Being representable makes the *multiplication* exact; it says nothing about
+/// the operand, and the reference's operand has already been through a BF16
+/// buffer. Whether either deviation matters to output quality is O2's question
+/// and needs paired output against the released model.
 ///
 /// `slots` holds this row's `top_k` expert outputs contiguously, slot `j` at
 /// `j * width`, in the route's **selection** order. `order` decides the
@@ -902,6 +944,7 @@ mod tests {
             top_k,
             input,
             score,
+            coefficient,
         } = spec;
         let h = x.len();
         let t: Vec<f64> = match input {
@@ -977,9 +1020,14 @@ mod tests {
             .iter()
             .map(|e| {
                 let w = scores[*e as usize] / mass;
-                match per_expert {
+                let w = match per_expert {
                     Some(s) => w * s[*e as usize] as f64,
                     None => w,
+                };
+                // routing_weights = routing_weights.to(hidden_states.dtype)
+                match coefficient {
+                    moxie_graph::RouteCoefficient::Fp32 => w,
+                    moxie_graph::RouteCoefficient::Bf16 => crate::bf16_round(w as f32) as f64,
                 }
             })
             .collect();
@@ -1126,6 +1174,7 @@ mod tests {
                 top_k,
                 input: moxie_graph::RouterInput::Normalized { eps, input_scale },
                 score: moxie_graph::RouteScore::Softmax,
+                coefficient: moxie_graph::RouteCoefficient::Fp32,
             };
             let got = router_route_row(&x, Some(&gain), &proj, Some(&scale), None, spec).unwrap();
             let (ids, weights) = fp64_router(&x, Some(&gain), &proj, Some(&scale), None, spec);
@@ -1175,6 +1224,7 @@ mod tests {
                 input_scale: 1.0,
             },
             score: moxie_graph::RouteScore::Softmax,
+            coefficient: moxie_graph::RouteCoefficient::Fp32,
         };
         let unscaled = router_route_row(&x, Some(&gain), &proj, None, None, spec).unwrap();
         let scaled = router_route_row(&x, Some(&gain), &proj, Some(&scale), None, spec).unwrap();
@@ -1219,6 +1269,7 @@ mod tests {
                     input_scale: 0.25,
                 },
                 score: moxie_graph::RouteScore::Softmax,
+                coefficient: moxie_graph::RouteCoefficient::Fp32,
             },
         )
         .unwrap();
@@ -1236,6 +1287,7 @@ mod tests {
                     input_scale: 1.0,
                 },
                 score: moxie_graph::RouteScore::Softmax,
+                coefficient: moxie_graph::RouteCoefficient::Fp32,
             },
         )
         .unwrap();
@@ -1258,6 +1310,7 @@ mod tests {
                 input_scale: 1.0,
             },
             score: moxie_graph::RouteScore::Softmax,
+            coefficient: moxie_graph::RouteCoefficient::Fp32,
         };
         let with = router_route_row(&x, Some(&gain), &proj, None, None, spec).unwrap();
         let without = router_route_row(&x, Some(&ones), &proj, None, None, spec).unwrap();
@@ -1294,6 +1347,7 @@ mod tests {
                         input_scale: 1.0,
                     },
                     score: moxie_graph::RouteScore::Softmax,
+                    coefficient: moxie_graph::RouteCoefficient::Fp32,
                 },
             )
             .unwrap();
@@ -1736,6 +1790,7 @@ mod tests {
             top_k: 2,
             input: moxie_graph::RouterInput::Normalized { eps, input_scale },
             score: moxie_graph::RouteScore::Softmax,
+            coefficient: moxie_graph::RouteCoefficient::Fp32,
         };
         let got = router_route_row(&x, Some(&gain), &proj, None, None, spec).unwrap();
 
@@ -1832,6 +1887,7 @@ mod tests {
                 input_scale: (hidden as f64).sqrt().recip() as f32,
             },
             score: moxie_graph::RouteScore::Softmax,
+            coefficient: moxie_graph::RouteCoefficient::Fp32,
         };
         let rows: Vec<Route> = (0..12)
             .map(|r| {
@@ -2119,6 +2175,8 @@ mod tests {
             top_k,
             input: moxie_graph::RouterInput::Raw,
             score: moxie_graph::RouteScore::Sigmoid,
+            // Laguna's router narrows on the way out.
+            coefficient: moxie_graph::RouteCoefficient::Bf16,
         }
     }
 
@@ -2131,6 +2189,7 @@ mod tests {
                 input_scale: 1.0,
             },
             score: moxie_graph::RouteScore::Softmax,
+            coefficient: moxie_graph::RouteCoefficient::Fp32,
         }
     }
 
@@ -2423,5 +2482,99 @@ mod tests {
         let scores = vec![0.5f32, 0.25, 0.25];
         assert!(select_top_k_biased(&scores, Some(&[0.0, 0.0]), 2).is_err());
         assert!(select_top_k_biased(&scores, Some(&[0.0, f32::NAN, 0.0]), 2).is_err());
+    }
+
+    #[test]
+    fn the_coefficients_carry_the_routers_own_output_narrowing() {
+        // `LagunaTopKRouter.forward` ends with
+        // `routing_weights = routing_weights.to(hidden_states.dtype)`;
+        // `Gemma4TextRouter.forward` has no such cast. An independent review
+        // found this boundary missing, with the reproduction below: on the
+        // logits [0, 1] the source's coefficients are [0.59375, 0.40625] and
+        // the unnarrowed ones are [0.5938455, 0.4061545].
+        //
+        // It is post-selection, so it changes no expert. It changes every
+        // combined row, which is why it is part of the contract rather than a
+        // precision detail.
+        let scores = router_scores(&[0.0, 1.0], moxie_graph::RouteScore::Sigmoid).unwrap();
+        let route = select_top_k(&scores, 2).unwrap();
+        assert_eq!(route.experts, vec![1, 0]);
+
+        let narrowed = narrow_coefficients(route.clone(), moxie_graph::RouteCoefficient::Bf16);
+        assert_eq!(narrowed.weights, vec![0.593_75, 0.406_25]);
+        assert_ne!(narrowed.weights, route.weights);
+
+        // And `Fp32` is the identity, so a family without the cast is not
+        // silently given one.
+        assert_eq!(
+            narrow_coefficients(route.clone(), moxie_graph::RouteCoefficient::Fp32).weights,
+            route.weights
+        );
+    }
+
+    #[test]
+    fn the_narrowing_reaches_the_router_and_the_transcription_alike() {
+        // The gate that matters: the whole router, and the FP64 transcription
+        // written from the pinned source, must agree **with** the cast. The
+        // review's point was that a transcription which omits the same boundary
+        // agrees for the wrong reason, so this checks the narrowed values
+        // against `bf16_round` applied to an independently computed quotient.
+        let hidden = 12;
+        let experts = 7;
+        let x: Vec<f32> = (0..hidden).map(|i| (i as f32 - 5.0) / 4.0).collect();
+        let proj = pattern(experts * hidden, 9);
+        let bias: Vec<f32> = (0..experts).map(|e| (e as f32 - 3.0) / 32.0).collect();
+
+        let narrowing = laguna_spec(experts, 3);
+        let plain = RouterSpec {
+            coefficient: moxie_graph::RouteCoefficient::Fp32,
+            ..narrowing
+        };
+
+        let got = router_route_row(&x, None, &proj, None, Some(&bias), narrowing).unwrap();
+        let raw = router_route_row(&x, None, &proj, None, Some(&bias), plain).unwrap();
+        assert_eq!(got.experts, raw.experts, "the cast is after selection");
+        assert_ne!(
+            got.weights, raw.weights,
+            "this fixture cannot tell a narrowed router from an unnarrowed one"
+        );
+        for (w, r) in got.weights.iter().zip(&raw.weights) {
+            assert_eq!(*w, crate::bf16_round(*r));
+        }
+
+        // The FP64 transcription carries it too, so its agreement is not the
+        // agreement of two implementations that share an omission.
+        let (ids, weights) = fp64_router(&x, None, &proj, None, Some(&bias), narrowing);
+        assert_eq!(got.experts, ids);
+        for (w, want) in got.weights.iter().zip(&weights) {
+            assert_eq!(*w as f64, *want, "the transcription did not narrow");
+        }
+    }
+
+    #[test]
+    fn an_exactly_representable_scale_still_moves_the_boundary() {
+        // The review's counterexample to a claim this file used to make. 2.5 is
+        // exactly representable in BF16, and that still does not make
+        // `bf16(sum · 2.5)` equal `bf16(bf16(sum) · 2.5)`: the reference's
+        // operand has already been through a BF16 buffer, and representability
+        // is a property of the *scale*, not of the product.
+        let slots = vec![1.0f32, 0.003_143_310_5];
+        let ours = combine_row(
+            &[0, 1],
+            &[1.0, 1.0],
+            &slots,
+            1,
+            moxie_graph::CombineOrder::AscendingExpertId,
+            2.5,
+        )
+        .unwrap();
+        let ours = crate::bf16_round(ours[0]);
+        let reference = crate::bf16_round(crate::bf16_round(slots[0] + slots[1]) * 2.5);
+        assert_eq!(ours, 2.515_625);
+        assert_eq!(reference, 2.5);
+        assert_ne!(
+            ours, reference,
+            "the two boundaries agree on this fixture, so it demonstrates nothing"
+        );
     }
 }

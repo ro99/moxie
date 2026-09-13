@@ -867,6 +867,7 @@ impl Interpreter {
                 score,
                 per_expert_scale,
                 selection_bias,
+                coefficient,
             } => {
                 // Resolved from the operation's own operand list rather than
                 // from positions written out here. Two of the optional operands
@@ -912,16 +913,19 @@ impl Interpreter {
                             top_k: top_k as usize,
                             input: router_input,
                             score,
+                            coefficient,
                         },
                     )?;
                     ids.extend(route.experts);
                     weights.extend(route.weights);
                 }
-                // The coefficients are not rounded to BF16 here. The route's
-                // declared output role says FP32, for the same reason the
-                // vocabulary projection's logits stay FP32: these are a
-                // renormalised distribution's tail, and eight of them weight
-                // everything the layer produces.
+                // Whether the coefficients were narrowed to BF16 is the
+                // router's own `coefficient` parameter, applied by
+                // `router_route_row` as the reference's last statement. The
+                // route table still *stores* FP32 either way, and the declared
+                // output role still says FP32, because that role is what a byte
+                // trace reconciles against the ledger -- narrowing a value and
+                // narrowing a buffer are different claims.
                 Value::Route(RouteTable::new(top_k as usize, ids, weights)?)
             }
             OpParams::ExpertMlp {

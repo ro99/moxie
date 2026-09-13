@@ -3,8 +3,8 @@
 use moxie_engine::{HostTensor, Program, Value};
 use moxie_graph::{
     Bindings, CombineOrder, ExpertActivation, Graph, GraphBuilder, IndexEncoding, OpParams,
-    OracleRegistry, RopeLayout, RouteScore, RouterInput, TensorSpec, ValueId, ValueRole,
-    Visibility, reciprocal_sqrt_scale,
+    OracleRegistry, RopeLayout, RouteCoefficient, RouteScore, RouterInput, TensorSpec, ValueId,
+    ValueRole, Visibility, reciprocal_sqrt_scale,
 };
 use moxie_types::{Dim, Precision, Result, SymbolId, WeightPrecision};
 
@@ -265,6 +265,8 @@ pub fn build_routed() -> Result<Fixture> {
             score: RouteScore::Sigmoid,
             per_expert_scale: false,
             selection_bias: true,
+            // Narrowed on the way out, where the Gemma-like graph's are not.
+            coefficient: RouteCoefficient::Bf16,
         },
         &[value, router_proj, selection_bias],
     )?;

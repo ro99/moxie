@@ -400,7 +400,22 @@ pub fn combine_rows_bf16(
         }
         let out_row = &mut out[r * hidden * 2..(r + 1) * hidden * 2];
         for (o, value) in acc.iter().enumerate() {
-            store_bf16(out_row, o, value * output_scale);
+            // Checked at the store, because a finite scale and a finite sum can
+            // still leave BF16's range: a review reached BF16 infinity from a
+            // slot of 2.0 and a scale of `f32::MAX` while this returned
+            // `Ok(())` and `GroupedRun::reduce` reported success. The FFI
+            // boundary owes a typed error, not a quiet infinity that the next
+            // layer consumes.
+            let scaled = value * output_scale;
+            let narrowed = bf16_round(scaled);
+            if !narrowed.is_finite() {
+                return Err(Error::Numerical {
+                    detail: format!(
+                        "row {r} lane {o} reduces to {scaled}, which is {narrowed} in BF16"
+                    ),
+                });
+            }
+            store_bf16(out_row, o, scaled);
         }
     }
     Ok(())

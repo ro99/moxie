@@ -327,3 +327,49 @@ fn the_reduction_matches_the_oracle_in_whichever_order_it_is_given() {
         }
     }
 }
+
+/// A scaled reduction that leaves BF16's range is a typed error, not a quiet
+/// infinity.
+///
+/// A review reached BF16 infinity from a single slot of 2.0, a unit
+/// coefficient and a **finite** scale, while this kernel returned `Ok(())` and
+/// `GroupedRun::reduce` reported success. Both operands were finite, so no
+/// earlier check could have caught it; the store is where it becomes
+/// unrepresentable, and the store is where it is refused.
+#[test]
+fn a_scaled_reduction_that_overflows_bf16_is_a_typed_error() {
+    let slots: Vec<u8> = to_bf16_bits(2.0f32).to_le_bytes().to_vec();
+    let mut out = vec![0u8; 2];
+    let mut accumulator = vec![0f32; 1];
+    let err = combine_rows_bf16(
+        &slots,
+        &[1.0],
+        &[0],
+        1,
+        1,
+        1,
+        f32::MAX,
+        &mut accumulator,
+        &mut out,
+    )
+    .expect_err("an overflowing scale returned success");
+    assert!(matches!(err, moxie_types::Error::Numerical { .. }), "{err}");
+
+    // The largest scale that still lands inside BF16 is accepted, so the check
+    // is a bound rather than a refusal of large scales.
+    let mut out = vec![0u8; 2];
+    combine_rows_bf16(
+        &slots,
+        &[1.0],
+        &[0],
+        1,
+        1,
+        1,
+        1.0e38,
+        &mut accumulator,
+        &mut out,
+    )
+    .expect("a representable product is accepted");
+    let bits = u16::from_le_bytes([out[0], out[1]]);
+    assert_ne!(bits, 0x7f80, "the accepted case stored an infinity");
+}
