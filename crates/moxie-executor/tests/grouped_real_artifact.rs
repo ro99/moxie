@@ -290,13 +290,8 @@ fn a_real_layers_experts_execute_on_the_gpu_and_agree_with_the_cpu_candidate() {
 
     let started = Instant::now();
     let mut run = GroupedRun::admit(&mut ledger, plan, roles(), None).unwrap();
-    run.attach_device(
-        &mut ledger,
-        &ctx,
-        &mut residency,
-        moxie_kernels::EXPERT_MLP_FATBIN,
-    )
-    .unwrap();
+    run.attach_device(&mut ledger, &ctx, &mut residency)
+        .unwrap();
     run.load_activations(&x).unwrap();
     run.run_to_completion(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
         .unwrap();

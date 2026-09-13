@@ -122,12 +122,23 @@ impl<'ctx> DeviceExperts<'ctx> {
     /// materialises: that is how task 0010 made "simulated placement presented
     /// as a reservation" impossible to write, and splitting the ownership would
     /// undo it.
+    /// The image is **not** a parameter.
+    ///
+    /// `TrustedImage::from_build_output` is unsafe and its contract is that the
+    /// bytes are "an entire, unmodified cubin or fatbin as produced by the
+    /// pinned CUDA toolchain at build time"; it checks four magic bytes and
+    /// warns that the driver will read past the slice if the image claims to be
+    /// larger. A public function taking `&'static [u8]` cannot establish that,
+    /// so it asserted a safety contract on its caller's behalf. It now names
+    /// this build's own fatbin at the call site, exactly as
+    /// `crate::chain` does, and checks that the descriptor the **plan** selected
+    /// identifies that same package -- a review attached a plan whose image hash
+    /// was all zero and loaded the real fatbin anyway.
     pub fn attach(
         ledger: &mut Ledger,
         reservation: Reservation,
         ctx: &'ctx RankContext,
         plan: &ExpertPlan,
-        image: &'static [u8],
     ) -> std::result::Result<Self, AttachRefused> {
         let fail = |reservation: Reservation, error| AttachRefused {
             reservation: Some(reservation),
@@ -219,10 +230,24 @@ impl<'ctx> DeviceExperts<'ctx> {
         }
 
         let module = (|| -> Result<ResolvedModule<'ctx>> {
+            // Identity before loading: the descriptor the plan selected must
+            // name the package about to be loaded, or the plan and the code are
+            // two different things.
+            if descriptor.image_sha256 != expert_package_sha256()? {
+                return Err(Error::UnsupportedKernel {
+                    operation: "expert_mlp",
+                    detail: "the selected descriptor does not identify this build's grouped \
+                             expert package"
+                        .into(),
+                });
+            }
             // SAFETY: the image is this build's own fatbin, embedded by
-            // `moxie-kernels`'s build script. That provenance is exactly what
-            // `TrustedImage` asks the caller to assert.
-            let trusted = unsafe { TrustedImage::from_build_output(image)? };
+            // `moxie-kernels`'s build script through `include_bytes!` of its
+            // `build.rs` output. That provenance is exactly what `TrustedImage`
+            // asks the caller to assert, and it is why the bytes are named here
+            // rather than accepted from a caller who cannot assert it.
+            let trusted =
+                unsafe { TrustedImage::from_build_output(moxie_kernels::EXPERT_MLP_FATBIN)? };
             let names: Vec<String> = descriptor
                 .symbols
                 .iter()
@@ -274,7 +299,11 @@ impl<'ctx> DeviceExperts<'ctx> {
     /// state **unknown**: the source is the run's host buffer and something may
     /// still be reading it. This path used to return an ordinary error, which is
     /// the launch path's old defect on its neighbour.
-    pub fn load_activations(&mut self, x: &[u8]) -> std::result::Result<(), LaunchRefused> {
+    /// Crate-internal: after an unknown submission the **caller's** buffer is
+    /// still being read, and only `GroupedRun` retains one. A public entry point
+    /// taking a borrowed slice ends that borrow on return, so a direct caller
+    /// could free the source while the copy is in flight.
+    pub(crate) fn load_activations(&mut self, x: &[u8]) -> std::result::Result<(), LaunchRefused> {
         let plain = |error: Error| LaunchRefused {
             error,
             submission_unknown: false,
@@ -285,11 +314,26 @@ impl<'ctx> DeviceExperts<'ctx> {
                 "this attachment is quarantined; its ranges may still be in use".into(),
             )));
         }
+        // The **exact** logical extent. The range is padded to 256 bytes, so
+        // "no larger than the allocation" accepted an empty block and left the
+        // device holding whatever the previous load put there -- which a review
+        // reproduced against a 4,096-byte activation block.
+        let expected = self.rows * self.hidden * 2;
+        if x.len() as u64 != expected {
+            return Err(plain(Error::InvalidArtifact {
+                detail: format!(
+                    "activations are {} B, expected exactly {expected} for [{}, {}] BF16",
+                    x.len(),
+                    self.rows,
+                    self.hidden
+                ),
+            }));
+        }
         let range = self.activations.as_ref().expect("live range");
-        if x.len() as u64 > range.bytes() {
+        if expected > range.bytes() {
             return Err(plain(invalid(
                 "activations",
-                format!("{} B exceeds the admitted {} B", x.len(), range.bytes()),
+                format!("{expected} B exceeds the admitted {} B", range.bytes()),
             )));
         }
         // SAFETY: the copy is enqueued on this attachment's own stream and the
@@ -337,8 +381,11 @@ impl<'ctx> DeviceExperts<'ctx> {
     /// a confident, different answer. The indices are checked against this
     /// attachment's own extents, because `ExpertGroup` is data and a row index
     /// one larger than the batch reads outside the activation block.
+    /// Crate-internal, for the reason [`DeviceExperts::load_activations`] gives:
+    /// the staging buffers and the weight leases are the **run's**, and the run
+    /// is what withholds them when a launch's submission state is unknown.
     #[allow(clippy::too_many_arguments)]
-    pub fn run_group(
+    pub(crate) fn run_group(
         &mut self,
         authority: &ResidencyAuthority,
         group: &ExpertGroup,
@@ -732,6 +779,28 @@ impl core::fmt::Display for DeviceCloseRefused<'_> {
     }
 }
 
+/// The grouped expert package's build identity, as bytes.
+///
+/// `moxie-kernels` records it as lowercase hex at build time; this parses it
+/// once so a descriptor can be compared against the package it claims.
+fn expert_package_sha256() -> Result<[u8; 32]> {
+    let text = moxie_kernels::EXPERT_MLP_FATBIN_SHA256;
+    if text.len() != 64 {
+        return Err(Error::InvalidArtifact {
+            detail: format!("the kernel package digest is {} characters", text.len()),
+        });
+    }
+    let mut out = [0u8; 32];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).map_err(|_| {
+            Error::InvalidArtifact {
+                detail: "the kernel package digest is not hexadecimal".into(),
+            }
+        })?;
+    }
+    Ok(out)
+}
+
 fn grid(elements: u64) -> Result<u32> {
     let blocks = elements.div_ceil(u64::from(BLOCK));
     u32::try_from(blocks).map_err(|_| invalid("launch", "grid exceeds one dimension".into()))
@@ -901,7 +970,6 @@ impl<'lane> GroupedRun<'lane> {
         ledger: &mut Ledger,
         ctx: &'ctx RankContext,
         residency: &'a mut DeviceResidency<'ctx>,
-        image: &'static [u8],
     ) -> Result<()>
     where
         'a: 'lane,
@@ -918,7 +986,7 @@ impl<'lane> GroupedRun<'lane> {
             ));
         }
         let reservation = self.take_reservation_for_device()?;
-        let experts = match DeviceExperts::attach(ledger, reservation, ctx, self.plan(), image) {
+        let experts = match DeviceExperts::attach(ledger, reservation, ctx, self.plan()) {
             Ok(experts) => experts,
             Err(refused) => {
                 match refused.reservation {
@@ -939,5 +1007,542 @@ impl<'lane> GroupedRun<'lane> {
             residency,
         }))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The operand checks a `GroupedRun` cannot reach.
+    //!
+    //! `run_group` is crate-internal precisely because the run is what owns and
+    //! retains its operands, so the three checks below -- a foreign authority's
+    //! backing, a lease resident on another device, and a group from another
+    //! plan -- have no external caller to test them through. They live here,
+    //! beside the code, and they need real hardware.
+
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    use moxie_cuda::RankContext;
+    use moxie_graph::{CombineOrder, ExpertActivation, OpParams};
+    use moxie_memory::{
+        AcquireRequest, Acquired, ArtifactId, CapacitySnapshot, Content, Ledger,
+        ResidencyAuthority, ResidencyRequest, TurnId, UseClass,
+    };
+    use moxie_plan::expert::{
+        ExpertBudget, ExpertKernels, ExpertPolicy, ExpertShape, compile_experts,
+    };
+    use moxie_storage::Shard;
+    use moxie_types::{RankId, StrategyControl};
+
+    use crate::grouped::{ExpertRoles, ExpertStaging, GroupedRun};
+    use crate::residency::{ShardSource, drain_reads};
+
+    use super::*;
+
+    const HIDDEN: u64 = 64;
+    const INTERMEDIATE: u64 = 16;
+    const EXPERTS: u64 = 4;
+    const TOP_K: u64 = 2;
+    const ROWS: u64 = 4;
+    const CHUNK: u64 = 3 * INTERMEDIATE * HIDDEN * 2;
+    const MIB: u64 = 1024 * 1024;
+    /// Two rows share both experts, two do not: three distinct experts.
+    const ROUTE: [u32; 8] = [0, 1, 0, 1, 0, 2, 1, 3];
+
+    fn values(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(len * 2);
+        for _ in 0..len {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let unit = ((state >> 40) as f32) / ((1u32 << 24) as f32) - 0.5;
+            out.extend_from_slice(&moxie_kernels::cpu_expert::to_bf16_bits(unit).to_le_bytes());
+        }
+        out
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("moxie-grouped-unit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_shard(dir: &Path) -> PathBuf {
+        let gate_up = values(0x11, (EXPERTS * 2 * INTERMEDIATE * HIDDEN) as usize);
+        let down = values(0x22, (EXPERTS * HIDDEN * INTERMEDIATE) as usize);
+        let split = gate_up.len();
+        let end = split + down.len();
+        let header = format!(
+            "{{\"experts.gate_up_proj\":{{\"dtype\":\"BF16\",\"shape\":[{EXPERTS},{},{HIDDEN}],\
+             \"data_offsets\":[0,{split}]}},\
+             \"experts.down_proj\":{{\"dtype\":\"BF16\",\"shape\":[{EXPERTS},{HIDDEN},{INTERMEDIATE}],\
+             \"data_offsets\":[{split},{end}]}}}}",
+            2 * INTERMEDIATE
+        );
+        let path = dir.join("model.safetensors");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header.as_bytes()).unwrap();
+        f.write_all(&gate_up).unwrap();
+        f.write_all(&down).unwrap();
+        path
+    }
+
+    fn roles() -> ExpertRoles {
+        ExpertRoles {
+            artifact: ArtifactId::new("grouped-unit-fixture-v1").unwrap(),
+            gate_up_role: "experts_gate_up".into(),
+            down_role: "experts_down".into(),
+            format_version: 1,
+        }
+    }
+
+    fn source(path: &Path) -> ShardSource {
+        ShardSource::new(roles().artifact, vec![Shard::open(path).unwrap()])
+            .role("experts_gate_up", 0, "experts.gate_up_proj")
+            .unwrap()
+            .role("experts_down", 0, "experts.down_proj")
+            .unwrap()
+    }
+
+    fn mlp(experts: u64, top_k: u64) -> OpParams {
+        OpParams::ExpertMlp {
+            hidden: HIDDEN,
+            intermediate: INTERMEDIATE,
+            experts,
+            top_k,
+            activation: ExpertActivation::GeGlu,
+        }
+    }
+
+    fn combine(top_k: u64) -> OpParams {
+        OpParams::Combine {
+            hidden: HIDDEN,
+            top_k,
+            order: CombineOrder::AscendingExpertId,
+        }
+    }
+
+    fn budget(ctx: &RankContext) -> ExpertBudget {
+        ExpertBudget {
+            device: ctx.uuid(),
+            device_pci_bus_id: ctx.capability().pci_bus_id.clone(),
+            device_cache_cap_bytes: 8 * CHUNK,
+            device_cache_leased_bytes: 0,
+            device_arena_free_bytes: 16 * MIB,
+            host_workspace_bytes: MIB,
+            host_buffer_bytes: MIB,
+            resident_experts: Vec::new(),
+        }
+    }
+
+    fn policy() -> ExpertPolicy {
+        ExpertPolicy {
+            device: StrategyControl::Required,
+            host: StrategyControl::Auto,
+            host_placement: StrategyControl::Off,
+            ..ExpertPolicy::default()
+        }
+    }
+
+    fn plan_for(ctx: &RankContext, route: &[u32], experts: u64, top_k: u64) -> ExpertPlan {
+        let catalogue = moxie_kernels::expert_mlp_catalogue();
+        compile_experts(
+            &mlp(experts, top_k),
+            &combine(top_k),
+            route,
+            &budget(ctx),
+            &policy(),
+            None,
+            Some(ExpertKernels {
+                capability: ctx.capability(),
+                catalogue: &catalogue,
+            }),
+        )
+        .expect("a device plan")
+    }
+
+    /// Acquire one expert's two chunks into `scope`, uploading through
+    /// `residency` on `stream`.
+    fn resident<'ctx>(
+        authority: &mut ResidencyAuthority,
+        residency: &mut DeviceResidency<'ctx>,
+        stream: &moxie_cuda::Stream<'ctx>,
+        source: &mut ShardSource,
+        scope: Scope,
+        expert: u32,
+        shape: ExpertShape,
+    ) -> Vec<moxie_memory::ResidencyLease> {
+        let (gate_up, down) = roles().chunks(expert, shape).unwrap();
+        let mut leases = Vec::new();
+        for chunk in [&gate_up, &down] {
+            let acquired = authority
+                .acquire(AcquireRequest {
+                    chunk,
+                    destination: scope,
+                    now: 0,
+                    deadline: u64::MAX,
+                    class: UseClass::demand(Content::Expert),
+                    turn: TurnId::new(1),
+                })
+                .unwrap();
+            match acquired {
+                Acquired::Ready(lease) => leases.push(lease),
+                Acquired::Pending { lease, work, .. } => {
+                    for order in drain_reads(authority, source, work).unwrap() {
+                        residency.perform_upload(authority, stream, &order).unwrap();
+                    }
+                    leases.push(lease);
+                }
+            }
+        }
+        leases
+    }
+
+    struct Staging {
+        rows: Vec<u8>,
+        slots: Vec<u8>,
+        host_slots: Vec<u8>,
+    }
+
+    fn staging(slot_count: u64) -> Staging {
+        Staging {
+            rows: vec![0u8; 256],
+            slots: vec![0u8; 256],
+            host_slots: vec![0u8; (slot_count * HIDDEN * 2) as usize],
+        }
+    }
+
+    /// A lease resolved through another authority's backing is refused, and the
+    /// same call through the right backing succeeds.
+    #[test]
+    fn a_launch_refuses_leases_that_belong_to_another_authority() {
+        let _guard = crate::DRIVER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if moxie_cuda::device_count().unwrap() == 0 {
+            eprintln!("SKIPPED: no CUDA device");
+            return;
+        }
+        let ctx = RankContext::acquire(RankId(0), 0).unwrap();
+        let scope = Scope::Device(ctx.uuid());
+        let dir = scratch("foreign-authority");
+        let path = write_shard(&dir);
+
+        let mut ledger = Ledger::new([
+            CapacitySnapshot::new(Scope::Host, 128 * MIB, MIB).unwrap(),
+            CapacitySnapshot::new(scope, 128 * MIB, MIB).unwrap(),
+        ])
+        .unwrap();
+        let mut a = ResidencyAuthority::open(
+            &mut ledger,
+            &ResidencyRequest::new("a", 64 * CHUNK).device(ctx.uuid(), 8 * CHUNK),
+        )
+        .unwrap();
+        let mut b = ResidencyAuthority::open(
+            &mut ledger,
+            &ResidencyRequest::new("b", 64 * CHUNK).device(ctx.uuid(), 8 * CHUNK),
+        )
+        .unwrap();
+        let mut ra = DeviceResidency::create(&ctx, &mut a).unwrap();
+        let rb = DeviceResidency::create(&ctx, &mut b).unwrap();
+
+        let plan = plan_for(&ctx, &ROUTE, EXPERTS, TOP_K);
+        let group = plan.groups()[0].clone();
+        let request = GroupedRun::request_for(&plan).unwrap();
+        let reservation = ledger.admit(&request).unwrap();
+        let mut experts = DeviceExperts::attach(&mut ledger, reservation, &ctx, &plan).unwrap();
+        experts
+            .load_activations(&values(0x33, (ROWS * HIDDEN) as usize))
+            .unwrap();
+
+        let mut src = source(&path);
+        let leases = resident(
+            &mut a,
+            &mut ra,
+            experts.stream(),
+            &mut src,
+            scope,
+            group.expert(),
+            plan.shape(),
+        );
+        let mut s = staging(plan.slot_count());
+        let refused = experts
+            .run_group(
+                &a,
+                &group,
+                &leases[0],
+                &leases[1],
+                &rb,
+                ExpertStaging {
+                    rows: &mut s.rows,
+                    slots: &mut s.slots,
+                },
+                &mut s.host_slots,
+            )
+            .expect_err("authority A's leases must not resolve inside B's allocation");
+        assert!(!refused.submission_unknown);
+        assert!(
+            format!("{}", refused.error).contains("backing"),
+            "{}",
+            refused.error
+        );
+        assert!(s.host_slots.iter().all(|byte| *byte == 0));
+
+        // The same call through A's own backing succeeds, so the check refused
+        // and not the fixture.
+        experts
+            .run_group(
+                &a,
+                &group,
+                &leases[0],
+                &leases[1],
+                &ra,
+                ExpertStaging {
+                    rows: &mut s.rows,
+                    slots: &mut s.slots,
+                },
+                &mut s.host_slots,
+            )
+            .expect("the right backing resolves the same leases");
+        assert!(s.host_slots.iter().any(|byte| *byte != 0));
+
+        for lease in leases {
+            a.release(lease).unwrap();
+        }
+        experts.close(&mut ledger).unwrap();
+        a.end_turn(TurnId::new(1));
+        a.retire_all(scope);
+        ra.close(&mut a).unwrap();
+        rb.close(&mut b).unwrap();
+        a.close(&mut ledger).unwrap();
+        b.close(&mut ledger).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One authority, two device caches: a lease resident elsewhere is refused.
+    #[test]
+    fn a_launch_refuses_leases_resident_on_another_device() {
+        let _guard = crate::DRIVER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let count = moxie_cuda::device_count().unwrap();
+        if count < 2 {
+            eprintln!("SKIPPED: this case needs two GPUs; {count} visible");
+            return;
+        }
+        let here = RankContext::acquire(RankId(0), 0).unwrap();
+        let there = RankContext::acquire(RankId(1), 1).unwrap();
+        let dir = scratch("foreign-device");
+        let path = write_shard(&dir);
+
+        let mut ledger = Ledger::new([
+            CapacitySnapshot::new(Scope::Host, 128 * MIB, MIB).unwrap(),
+            CapacitySnapshot::new(Scope::Device(here.uuid()), 128 * MIB, MIB).unwrap(),
+            CapacitySnapshot::new(Scope::Device(there.uuid()), 128 * MIB, MIB).unwrap(),
+        ])
+        .unwrap();
+        // **One** authority, two device caches.
+        let mut authority = ResidencyAuthority::open(
+            &mut ledger,
+            &ResidencyRequest::new("both", 64 * CHUNK)
+                .device(here.uuid(), 8 * CHUNK)
+                .device(there.uuid(), 8 * CHUNK),
+        )
+        .unwrap();
+        let residency_here = DeviceResidency::create(&here, &mut authority).unwrap();
+        let mut residency_there = DeviceResidency::create(&there, &mut authority).unwrap();
+
+        let plan = plan_for(&here, &ROUTE, EXPERTS, TOP_K);
+        let group = plan.groups()[0].clone();
+        let request = GroupedRun::request_for(&plan).unwrap();
+        let reservation = ledger.admit(&request).unwrap();
+        let mut experts = DeviceExperts::attach(&mut ledger, reservation, &here, &plan).unwrap();
+        experts
+            .load_activations(&values(0x44, (ROWS * HIDDEN) as usize))
+            .unwrap();
+
+        let mut src = source(&path);
+        let their_stream = moxie_cuda::Stream::new(&there).unwrap();
+        let elsewhere = resident(
+            &mut authority,
+            &mut residency_there,
+            &their_stream,
+            &mut src,
+            Scope::Device(there.uuid()),
+            group.expert(),
+            plan.shape(),
+        );
+        let mut s = staging(plan.slot_count());
+        let refused = experts
+            .run_group(
+                &authority,
+                &group,
+                &elsewhere[0],
+                &elsewhere[1],
+                &residency_here,
+                ExpertStaging {
+                    rows: &mut s.rows,
+                    slots: &mut s.slots,
+                },
+                &mut s.host_slots,
+            )
+            .expect_err("a lease resident elsewhere must not resolve here");
+        assert!(!refused.submission_unknown);
+        assert!(
+            format!("{}", refused.error).contains("resident on"),
+            "{}",
+            refused.error
+        );
+        assert!(s.host_slots.iter().all(|byte| *byte == 0));
+
+        for lease in elsewhere {
+            authority.release(lease).unwrap();
+        }
+        experts.close(&mut ledger).unwrap();
+        authority.end_turn(TurnId::new(1));
+        authority.retire_all(Scope::Device(here.uuid()));
+        authority.retire_all(Scope::Device(there.uuid()));
+        residency_here.close(&mut authority).unwrap();
+        residency_there.close(&mut authority).unwrap();
+        authority.close(&mut ledger).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A group from another plan names indices this attachment does not have.
+    #[test]
+    fn a_group_from_another_plan_is_refused_before_anything_is_enqueued() {
+        let _guard = crate::DRIVER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if moxie_cuda::device_count().unwrap() == 0 {
+            eprintln!("SKIPPED: no CUDA device");
+            return;
+        }
+        let ctx = RankContext::acquire(RankId(0), 0).unwrap();
+        let scope = Scope::Device(ctx.uuid());
+        let dir = scratch("stranger-group");
+        let path = write_shard(&dir);
+
+        // The wide plan's first group names rows the narrow attachment lacks.
+        let wide = plan_for(&ctx, &ROUTE, EXPERTS, TOP_K);
+        let stranger = wide.groups()[0].clone();
+        assert!(stranger.rows().iter().any(|row| *row >= 2));
+
+        // Two rows, eight slots each: the assignment-count bound is satisfied so
+        // the **row** bound is the one that has to bite. A fixture that trips
+        // three checks at once pins none of them.
+        let narrow_route: Vec<u32> = (0..16).collect();
+        let narrow = plan_for(&ctx, &narrow_route, 16, 8);
+        assert_eq!(narrow.rows(), 2);
+        assert!(stranger.rows().len() as u64 <= narrow.slot_count());
+
+        let mut ledger = Ledger::new([
+            CapacitySnapshot::new(Scope::Host, 64 * MIB, MIB).unwrap(),
+            CapacitySnapshot::new(scope, 64 * MIB, MIB).unwrap(),
+        ])
+        .unwrap();
+        let mut authority = ResidencyAuthority::open(
+            &mut ledger,
+            &ResidencyRequest::new("narrow", 64 * CHUNK).device(ctx.uuid(), 8 * CHUNK),
+        )
+        .unwrap();
+        let mut residency = DeviceResidency::create(&ctx, &mut authority).unwrap();
+        let request = GroupedRun::request_for(&narrow).unwrap();
+        let reservation = ledger.admit(&request).unwrap();
+        let mut experts = DeviceExperts::attach(&mut ledger, reservation, &ctx, &narrow).unwrap();
+        experts
+            .load_activations(&values(0x55, (2 * HIDDEN) as usize))
+            .unwrap();
+
+        let mut src = source(&path);
+        let leases = resident(
+            &mut authority,
+            &mut residency,
+            experts.stream(),
+            &mut src,
+            scope,
+            stranger.expert(),
+            wide.shape(),
+        );
+        let mut s = staging(narrow.slot_count());
+        let refused = experts
+            .run_group(
+                &authority,
+                &stranger,
+                &leases[0],
+                &leases[1],
+                &residency,
+                ExpertStaging {
+                    rows: &mut s.rows,
+                    slots: &mut s.slots,
+                },
+                &mut s.host_slots,
+            )
+            .expect_err("a group from another plan names indices this attachment lacks");
+        assert!(!refused.submission_unknown);
+        let message = format!("{}", refused.error);
+        assert!(
+            message.contains("row ") && message.contains("batches"),
+            "the refusal must name the row index it rejected: {message}"
+        );
+        assert!(s.host_slots.iter().all(|byte| *byte == 0));
+
+        for lease in leases {
+            authority.release(lease).unwrap();
+        }
+        experts.close(&mut ledger).unwrap();
+        authority.end_turn(TurnId::new(1));
+        authority.retire_all(scope);
+        residency.close(&mut authority).unwrap();
+        authority.close(&mut ledger).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An activation block of the wrong logical size is refused, whatever the
+    /// allocation's padding allows.
+    #[test]
+    fn an_activation_block_must_be_exactly_its_logical_extent() {
+        let _guard = crate::DRIVER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if moxie_cuda::device_count().unwrap() == 0 {
+            eprintln!("SKIPPED: no CUDA device");
+            return;
+        }
+        let ctx = RankContext::acquire(RankId(0), 0).unwrap();
+        let scope = Scope::Device(ctx.uuid());
+        let mut ledger = Ledger::new([
+            CapacitySnapshot::new(Scope::Host, 64 * MIB, MIB).unwrap(),
+            CapacitySnapshot::new(scope, 64 * MIB, MIB).unwrap(),
+        ])
+        .unwrap();
+        let plan = plan_for(&ctx, &ROUTE, EXPERTS, TOP_K);
+        let exact = (ROWS * HIDDEN * 2) as usize;
+        let request = GroupedRun::request_for(&plan).unwrap();
+        let reservation = ledger.admit(&request).unwrap();
+        let mut experts = DeviceExperts::attach(&mut ledger, reservation, &ctx, &plan).unwrap();
+
+        experts.load_activations(&values(0x66, exact / 2)).unwrap();
+        // Empty, short and long are all refused. Before the fix, the range's
+        // 256-byte padding let an empty reload through and the device kept the
+        // previous block.
+        for wrong in [0usize, exact - 2, exact + 2] {
+            let refused = experts
+                .load_activations(&vec![0u8; wrong])
+                .expect_err("only the exact logical extent is an activation block");
+            assert!(!refused.submission_unknown);
+            assert!(
+                format!("{}", refused.error).contains("expected exactly"),
+                "{}",
+                refused.error
+            );
+        }
+        experts.close(&mut ledger).unwrap();
+        assert!(ledger.outstanding().is_empty());
     }
 }

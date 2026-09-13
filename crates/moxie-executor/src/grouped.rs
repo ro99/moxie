@@ -1029,6 +1029,9 @@ pub struct GroupedStats {
     pub slots_written: u64,
     /// Acquires refused while the queue held work, which drained and retried.
     pub backpressure_drains: u64,
+    /// Every residency lease this run has ever taken, including the ones a
+    /// half-succeeded acquire gave straight back.
+    pub leases_acquired: u64,
     pub leases_released: u64,
 }
 
@@ -1311,8 +1314,128 @@ impl<'lane> GroupedRun<'lane> {
     pub fn withheld_leases(&self) -> usize {
         self.withheld.len()
     }
+
+    /// Whether this run is holding **anything** whose fate is unknown -- leases,
+    /// host pages, or the attachment's device ranges. A run that is may never
+    /// release its envelope, and `close` refuses while it is true.
+    pub fn is_withholding(&self) -> bool {
+        self.withholding().is_some()
+    }
     pub fn has_device(&self) -> bool {
         self.device.is_some()
+    }
+
+    /// The structural properties a run must have after **every** operation.
+    ///
+    /// Stated once, here, so a sweep can call it after each call rather than
+    /// each test re-deriving what "consistent" means. That is task 0020's
+    /// method, and both review rounds of this task argued for it: round one's
+    /// findings were checks missing on a neighbouring path, round two's were the
+    /// same path one step later -- `close` disagreeing with a state the failure
+    /// had set correctly. A sweep over the run's own product is what enumerates
+    /// that, and `tests/grouped_transitions.rs` is it.
+    pub fn check_invariants(&self) -> Result<()> {
+        let groups = self.plan.groups().len();
+        let queued = self.queue.len();
+        if (self.queue.capacity() as usize) < queued {
+            return Err(invalid(
+                "queue",
+                format!("{queued} entries in a queue of {}", self.queue.capacity()),
+            ));
+        }
+        if self.next_group > groups {
+            return Err(invalid(
+                "next_group",
+                format!("{} of {groups} group(s) enqueued", self.next_group),
+            ));
+        }
+        if self.stats.groups_run as usize + queued > self.next_group {
+            return Err(invalid(
+                "stats",
+                format!(
+                    "{} run plus {queued} queued exceeds the {} enqueued",
+                    self.stats.groups_run, self.next_group
+                ),
+            ));
+        }
+        if self.stats.slots_written > self.plan.slot_count() {
+            return Err(invalid(
+                "stats",
+                format!(
+                    "{} slot(s) written of {}",
+                    self.stats.slots_written,
+                    self.plan.slot_count()
+                ),
+            ));
+        }
+        // Every lease this run ever took is accounted for **exactly** once:
+        // given back, still queued, or withheld. An inequality would let a lease
+        // go missing; this is the exact pin balance task 0020's sweep added for
+        // the same reason.
+        let accounted = self.stats.leases_released + self.withheld.len() as u64 + 2 * queued as u64;
+        if accounted != self.stats.leases_acquired {
+            return Err(invalid(
+                "leases",
+                format!(
+                    "{accounted} accounted for ({} released, {} withheld, {queued} queued) \
+                     against {} acquired",
+                    self.stats.leases_released,
+                    self.withheld.len(),
+                    self.stats.leases_acquired
+                ),
+            ));
+        }
+        // Withholding and quarantine are consequences of failure, and of
+        // nothing else. A run holding either while it still looks usable is the
+        // exact shape the second review found in `close`.
+        let failed = matches!(self.state, RunState::Failed(_));
+        if !self.withheld.is_empty() && !failed {
+            return Err(invalid(
+                "withheld",
+                format!(
+                    "{} lease(s) withheld while the run is {}",
+                    self.withheld.len(),
+                    self.state_name()
+                ),
+            ));
+        }
+        if self.buffers.is_quarantined() && !failed {
+            return Err(invalid(
+                "quarantine",
+                format!("buffers quarantined while the run is {}", self.state_name()),
+            ));
+        }
+        if self.envelope_released && self.reservation.is_some() {
+            return Err(invalid(
+                "reservation",
+                "the envelope is recorded as released and is still held".into(),
+            ));
+        }
+        if matches!(self.state, RunState::Admitted)
+            && (self.next_group != 0 || self.stats.groups_run != 0)
+        {
+            return Err(invalid(
+                "state",
+                "a run with no activations has already done work".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The run's state, for a report.
+    pub const fn state_name(&self) -> &'static str {
+        match self.state {
+            RunState::Admitted => "admitted",
+            RunState::Loaded => "loaded",
+            RunState::Running => "running",
+            RunState::Cancelled => "cancelled",
+            RunState::Failed(_) => "failed",
+        }
+    }
+
+    /// How many of the plan's groups have been acquired so far.
+    pub const fn enqueued(&self) -> usize {
+        self.next_group
     }
 
     /// Refuse if this run is in no state to do more work.
@@ -1565,6 +1688,7 @@ impl<'lane> GroupedRun<'lane> {
             );
             match acquired {
                 Ok((gate_up, down)) => {
+                    self.stats.leases_acquired += 2;
                     let queued = QueuedGroup {
                         index,
                         expert,
@@ -1592,6 +1716,7 @@ impl<'lane> GroupedRun<'lane> {
                     }
                 }
                 Err(failed) => {
+                    self.stats.leases_acquired += failed.held.len() as u64;
                     for lease in failed.held {
                         self.release_one(authority, lease);
                     }
