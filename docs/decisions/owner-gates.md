@@ -26,7 +26,32 @@ claim than they made.
 
 ## O1 — Initial release catalog
 
-**Status:** OPEN
+**Status:** RESOLVED 2026-09-13
+
+**Owner ruling, 2026-09-13 — verbatim, recorded here; ADR 0017 implements it.** The owner presented ten candidates (listed in `quantization-candidates.md`) and ruled:
+
+> v1 catalog is those ten, in this order: Gemma, Glimmer, GLM, DeepSeek, Qwen, Laguna, Inkling, Hy3. Image-capable and native speculative-head (MTP/`dflash`) variants are in v1. Requantization is not allowed. Never. Moxie will only repack; any quantization will be done using an external program.
+
+Expanded to exact revisions, in the ruled order (ten distinct artifacts; GLM and Qwen each cover two revisions the candidate list distinguishes):
+
+| # | Candidate | Revision | Notes |
+|---|---|---|---|
+| 1 | `cyankiwi/gemma-4-31B-it-AWQ-8bit` | `34ca187d836de874b2c7e3edf48f439b9f583772` | image-text-to-text, M11 vision tower present |
+| 2 | `cyankiwi/Muse-Glimmer-30B-AWQ-INT4` | `cba01edf73e0f0f4f013615cc01281ea04e79f85` | asymmetric INT4 g32 |
+| 3 | `canada-quant/glm-5.3-w4a16-mtp` | `1c86622dfd7ecca80909ff1524ac1b3618b8da6f` | symmetric INT4 g128, MTP |
+| 4 | `Intel/GLM-5.3-Flash-W4A16-AutoRound` | `5eee1846f0321058ed73745f9aa16f2aaf0fc0a0` | symmetric INT4 g128, AutoRound, MTP |
+| 5 | `Intel/DeepSeek-V4-Flash-0731-W4A16-AutoRound` | `c838af0996ae78d27a0184d3da9772f46eb34e25` | symmetric INT4 g128, AutoRound |
+| 6 | `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` | `4c67bf686b7f7fd386bae6b07ab59e8ff1d5b897` | symmetric INT4 g128, AutoRound |
+| 7 | `cyankiwi/Qwen3.8-27B-AWQ-BF16-INT4` | `6fcdc07bfd6e872632f79680e786c5d17fcafaee` | asymmetric INT4 g32 |
+| 8 | `cyankiwi/Laguna-S-2.1-AWQ-INT4` | `bc59f497520b23759ce61cc5164ca28bcc4f53bc` | asymmetric INT4 g32, declares `dflash` draft (M9, not on disk) |
+| 9 | `cyankiwi/Inkling-Small-AWQ-INT4` | `599a903386348a364fe30ab0a67dcc61ff9e8008` | asymmetric INT4 g32 |
+| 10 | `canada-quant/hy3-w4a16-mtp` | `49228b990c704e4efd67ac420a8e3d5272f820c0` | symmetric INT4 g128, MTP |
+
+DeepSeek V4.1-Flash W4A16 AutoRound: not in v1. No quantized artifact exists; when available it will be quantized externally and ingested as a new source revision. Moxie never quantizes — no quantizer/calibration code in Moxie, ever. This amends document 03's type-2 path; see ADR 0017.
+
+` /fast/models/google/gemma-4-26B-A4B-it` remains M2's BF16 workhorse and is **not** part of the v1 catalog.
+
+**Historical candidate list and evidence remain below for provenance; they are not the ruling.**
 
 **New owner candidate list:** [ten inspected checkpoint configurations](../evidence/quantization-candidates.md). This updates investigation priorities but does not finalize release membership/order or authorize downloads. Model metadata includes new families/variants; common integer packing does not prove their graph mathematics are already supported.
 
@@ -70,7 +95,13 @@ catalog.
 
 ## O2 — Acceptable quality loss for the selected integer artifacts
 
-**Status:** OPEN
+**Status:** RESOLVED 2026-09-13
+
+**Owner ruling, 2026-09-13 — verbatim, recorded here; ADR 0018 implements it.** For v1's ten catalog revisions, acceptable loss is bit-identical repack. Publisher quality is accepted as-is for v1. No task/conversation gate for Moxie. Any future external quantization (e.g., DeepSeek V4.1-Flash) gets its own O2 evidence package as a new source revision when it exists.
+
+For v1 this means: Moxie guarantees `W=(Q-Z)*S` preserved bit-exact (codes, zero points, group mapping, scale values and dtype, logical column identity) via value-preserving repack plus manifest/chunking. The one non-trivial verification is paired logits vs the released checkpoint where layout is ambiguous (notably Gemma-4-31B lane order within a packed word, which sits inside one group-32 group). Publisher's own INT4/INT8 quality vs its BF16 parent is not Moxie's gate and is accepted as-is; no perplexity / task / conversation tolerance is imposed for v1.
+
+**Historical evidence remains below for provenance; it is not the ruling.**
 
 **M0 evidence.** GLM-5.3-NVFP4 is **W4A4**: it ships `input_scale` activation
 scales. Document 03's initial canonical profile is weight-only with BF16
@@ -94,7 +125,15 @@ tolerances are not owner approval.
 
 ## O3 — Legacy surface compatibility
 
-**Status:** OPEN
+**Status:** RESOLVED 2026-09-13
+
+**Owner ruling, 2026-09-13 — verbatim, recorded here; ADRs 0016 and 0010 implement it.** The owner ruled:
+
+> we definitely do not need to be backward compatible with Strata! This is a huge mistake! I do not even know how this surface! The ones that we need to support are the ones that are supported will be built with time, the goal is to have something like llama.cpp and deepseek-recipe
+
+No Strata HTTP/CLI field, flag, preset, template, or response extension must be byte-compatible. Strata compatibility is not a product requirement. The supported surface is what Moxie builds over time, defined by [ADR 0016](adr/0016-tunable-contact-surface.md) (llama.cpp-style tunable contact surface: every behavior-affecting choice is a documented tunable with default, scope, `auto`/`required` semantics) and [ADR 0010](adr/0010-recipe-boundary-oracle.md) (deepseek-recipe as oracle/optional dependency for DeepSeek V4/V4.1 rendering and protocol validation at the application boundary). No alias or deprecation of Strata surfaces is required.
+
+**Historical question and default remain below for provenance; they are not the ruling.**
 
 Which legacy HTTP/CLI fields, flags, presets, templates, and response extensions must be
 byte-compatible? Which may be deprecated?
@@ -104,10 +143,13 @@ provide an explicit compatibility alias. The earlier isolated answer "No" is not
 a ruling.
 
 **Roadmap-default constraint (resolves nothing):** [ADR 0016](adr/0016-tunable-contact-surface.md) pins the tunable-surface rule M8 items 2/4 and M11 item 2 are judged against — no silent constants, presets plus explicit override, `auto` reports / `required` errors, unknown semantic fields rejected. Single-user non-parity recorded there. The compatibility ruling itself stays with the owner.
-
 ## O4 — Intrinsic low-bit auxiliary state
 
-**Status:** OPEN
+**Status:** RESOLVED 2026-09-13
+
+**Owner ruling, 2026-09-13 — verbatim, recorded here; ADR 0019 implements it.** The owner ruled: allow intrinsic low-bit auxiliary state when it is part of the released mathematics. A model-defined low-bit index/compressed representation (e.g., MLA/absorbed, sparse index, Engram table dtype) is allowed as a shared semantic operation with oracle and shape/precision/state contract. Generic KV/cache compression below 16 bits remains forbidden.
+
+**Historical question and default remain below for provenance; they are not the ruling.**
 
 Does the cache restriction (nothing below 16 bits) also forbid a model's intrinsic low-bit
 auxiliary index/cache representation, when that representation is part of the released mathematics?
@@ -115,10 +157,13 @@ auxiliary index/cache representation, when that representation is part of the re
 **Blocks:** enabling such a representation. Default until answered: physical cache >= 16 bits,
 preserving required rounding in the values. Report infeasibility or fidelity failure rather than
 taking a silent exception.
-
 ## O5 — Storage and conversion authorization
 
-**Status:** OPEN
+**Status:** RESOLVED 2026-09-13
+
+**Owner ruling, 2026-09-13 — verbatim, recorded here; ADR 0020 implements it.** The owner ruled: storage and conversion is user-managed. Repack is done via an external script pointing to the chosen directory; Moxie only points to the repacked (canonical) file. No agent-initiated bulk download, copy, or conversion without a task naming exact artifact, revision, expected size and retention. Designated roots remain `/models` and `/fast/models`; canonicals for the ten v1 revisions (O1) are authorized to be materialized there.
+
+**Historical evidence and M2 sequencing questions remain below for provenance; they are not the ruling.**
 
 **M0 evidence.** Free space: `/` 551 G, `/fast` 1.4 T, `/data` 286 G,
 `/archive` 1.3 T (spinning). Converting GLM-5.3-NVFP4 (433 G) fits on `/fast`;
@@ -176,7 +221,6 @@ requantization. A task must still name the exact artifact, source revision, expe
 retention policy before an agent mutates storage. The rewrite request is not blanket permission for
 terabytes of new data. **It also now blocks M2's sequencing**, per the four
 questions above.
-
 ## O6 — Performance limits and acceptable regression
 
 **Status:** OPEN
