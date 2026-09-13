@@ -31,8 +31,8 @@ executes a routed layer, and the selected BF16 chain still refuses `Route`,
 `ExpertMlp` and `Combine`.
 
 [Task 0022](../tasks/0022-m2-laguna-metadata-and-second-consumer.md) is **M2
-item 4**, **implemented on 2026-09-13, corrected after one round of independent
-review, and awaiting a further review and owner acceptance** (six findings, one
+item 4**, **implemented on 2026-09-13, corrected after two rounds of independent
+review, and awaiting a further review and owner acceptance** (seven findings, two
 P1, all reproduced and fixed, none disputed): Laguna's metadata and its **routed block**, a second routed
 consumer through task 0021's interface, and a restricted budget expressed as a
 ratio of working weights. **No Laguna capability row exists below and none may
@@ -49,7 +49,14 @@ router's own `routing_weights.to(hidden_states.dtype)`, which survived a bitwise
 gate because the FP64 transcription omitted the same cast. `Route` carries it as
 a parameter now, Gemma 4 passes the opposite value, and the fixture checks
 against an independently computed quantity rather than against the
-implementation.
+implementation. A second round then found a **P1 the first round's own fix
+introduced**: the narrowing built its result with `collect()`, and an allocation
+failure on that path aborts the process instead of returning a typed error a
+transaction can roll back — `softmax`'s defect, in the same module, for the third
+time. It rounds in place now, and `route_operands`, which the interpreter calls
+once per `Route` node per step, holds its bounded list inline for the same
+reason. Both are counted by an isolated allocator-counting executable, and both
+are load-bearing under substitution.
 
 [Task 0021](../tasks/0021-m2-expert-execution-plans.md) is **M2 item 3**,
 **implemented on 2026-09-12, corrected after four rounds of independent

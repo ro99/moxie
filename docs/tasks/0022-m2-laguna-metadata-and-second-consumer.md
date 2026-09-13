@@ -800,3 +800,79 @@ review's four new checks added to them: **37 mutations, 0 survivors** — 17 of 
 caught by the planner sweep and 7 of 19 by the run sweep, the rest by named
 tests. The reviewer said explicitly that they had not re-run the mutation
 campaign; this is that re-run.
+
+## Second independent review
+
+The second round confirmed all six of the first round's corrections and found
+**one new P1 — a regression the first round's own fix introduced.** It is
+reproduced, fixed, and not disputed. The reviewer again said plainly what they
+had not re-run: the complete workspace and the mutation batteries.
+
+### The narrowing allocated, and an allocation failure here aborts the process
+
+`narrow_coefficients` built a second coefficient vector with
+`.iter().map(...).collect()`. Every other allocation on this path is fallible,
+for a reason this module already recorded once: an allocation failure inside a
+generation step must be a typed error the transaction can roll back, not a panic
+that takes the rollback, the lease release and the next generation with it. The
+reviewer injected a failure during narrowing only and got **SIGABRT**,
+`memory allocation of 8 bytes failed`, on the BF16 arm while the FP32 arm
+succeeded without allocating.
+
+The fix is stronger than the `try_vec` the rest of the path uses: the function
+takes the route **by value**, so it rounds in place and there is nothing to
+allocate. `narrowing_a_routes_coefficients_requests_no_heap` counts allocator
+calls and requires zero.
+
+**This is `softmax`'s defect, in the same module, for the third time.** Task
+0019's record says it plainly — "it used to use plain `collect()`, which was
+harmless while routing was an unreached M0 fixture and became a process abort
+the moment task 0019 put it under the interpreter". The correction for the first
+review's P1 put a new function on that same path and did not carry the rule
+across. A fix is a new caller, and a new caller on a path with a discipline has
+to satisfy it.
+
+### And the same defect once more, found by asking the review's question of the
+### rest of the change
+
+Applying the reviewer's own question to everything else task 0022 added to that
+path found one more: `OpParams::route_operands` returned a `Vec`, and the
+**interpreter calls it once per `Route` node per step**. Same class, same path,
+same consequence, and the review did not find it because it was looking at the
+function it had a reproduction for.
+
+The operand list is bounded by construction — five operands, each pushed at most
+once — so it is held inline in a `RouteOperands` value and allocates nothing.
+`a_routers_operand_list_requests_no_heap` counts allocator calls for the widest
+list, the narrowest, and a non-router operation.
+
+Reported here rather than folded silently into the P1's fix, because **the count
+matters**: the first round's fix introduced one defect of this class and the
+same change already contained another. One reproduction found one of them.
+
+### Evidence
+
+Both regressions live in a new isolated executable with a counting global
+allocator, `moxie-oracles/tests/route_allocation.rs`, which is the harness
+`moxie-state` and `moxie-memory` already use for the same kind of claim. They
+count allocator **calls** rather than injecting a failure, because "requires no
+allocation" is the property and a call count states it directly.
+
+Substitution: **3 of 3 load-bearing** — restoring the `collect()` fails the
+narrowing test and the whole-router test, and a single spurious `Vec` inside
+`route_operands` fails the operand test.
+
+| Gate, after the second round | Result |
+|---|---|
+| `cargo fmt --all -- --check` | passed |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
+| Device-lane clippy | passed |
+| `cargo test --workspace --locked --offline` | **918 passed, 0 failed** (915 after the first round) |
+| Device-feature workspace tests | **951 passed, 0 failed** (948 after the first round) |
+| `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped** |
+| `cargo xtask spec-check` | passed, 10 documents |
+| `cargo xtask arch-check` | **zero failures** |
+
+Both mutation batteries were re-run again, with a mutation added for each new
+check: **39 mutations, 0 survivors** — 17 of 18 by the planner sweep, 7 of 21 by the run
+sweep, the rest by named tests.

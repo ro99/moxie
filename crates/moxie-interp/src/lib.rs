@@ -879,7 +879,8 @@ impl Interpreter {
                 let mut proj = None;
                 let mut scale = None;
                 let mut bias = None;
-                for (i, operand) in node.params.route_operands().iter().enumerate() {
+                let operands = node.params.route_operands();
+                for (i, operand) in operands.as_slice().iter().enumerate() {
                     let slot = match operand {
                         moxie_graph::RouteOperand::Rows => &mut rows,
                         moxie_graph::RouteOperand::Projection => &mut proj,

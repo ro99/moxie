@@ -483,6 +483,62 @@ pub enum ExpertActivation {
     SwiGlu,
 }
 
+/// A router's operand list: at most five, held inline.
+///
+/// Not a `Vec`. `OpParams::route_operands` is called by the **interpreter**,
+/// once per `Route` node per step, and an infallible heap allocation inside a
+/// generation step aborts the process on failure instead of returning a typed
+/// error the transaction can roll back. This module's `softmax` carried that
+/// defect once and had it fixed; a review found it again in
+/// `narrow_coefficients`; applying the review's own question to the rest of the
+/// same change found it here. The list is bounded by construction, so the fix
+/// is to have nothing to allocate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteOperands {
+    operands: [RouteOperand; Self::MAX],
+    len: usize,
+}
+
+impl RouteOperands {
+    /// Rows, projection, gain, per-expert scale, selection bias.
+    pub const MAX: usize = 5;
+
+    fn new() -> Self {
+        Self {
+            operands: [RouteOperand::Rows; Self::MAX],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, operand: RouteOperand) {
+        // Unreachable by construction: there are five distinct operands and
+        // each is pushed at most once. A `debug_assert` rather than a silent
+        // truncation, because a truncated operand list would be a wrong arity
+        // that every shape check would then agree with.
+        debug_assert!(
+            self.len < Self::MAX,
+            "a router has at most {} operands",
+            Self::MAX
+        );
+        if self.len < Self::MAX {
+            self.operands[self.len] = operand;
+            self.len += 1;
+        }
+    }
+
+    pub fn as_slice(&self) -> &[RouteOperand] {
+        &self.operands[..self.len]
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// The precision a router narrows its coefficients to before emitting them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RouteCoefficient {
@@ -685,8 +741,12 @@ impl OpParams {
     ///
     /// The single statement of [`OpParams::Route`]'s input list: the arity, the
     /// shape validation and every consumer read it rather than repeating it.
-    /// Returns an empty slice for every other operation.
-    pub fn route_operands(&self) -> Vec<RouteOperand> {
+    /// Empty for every other operation.
+    ///
+    /// Allocates nothing -- see [`RouteOperands`] for why that is a
+    /// requirement here and not a micro-optimisation.
+    pub fn route_operands(&self) -> RouteOperands {
+        let mut operands = RouteOperands::new();
         let OpParams::Route {
             input,
             per_expert_scale,
@@ -694,9 +754,10 @@ impl OpParams {
             ..
         } = self
         else {
-            return Vec::new();
+            return operands;
         };
-        let mut operands = vec![RouteOperand::Rows, RouteOperand::Projection];
+        operands.push(RouteOperand::Rows);
+        operands.push(RouteOperand::Projection);
         if matches!(input, RouterInput::Normalized { .. }) {
             operands.push(RouteOperand::Gain);
         }
@@ -1518,7 +1579,7 @@ impl GraphBuilder {
                 // router take" is how they come to disagree, and this operation
                 // has two same-shaped optional operands whose order is the only
                 // thing separating them.
-                for (index, operand) in params.route_operands().iter().enumerate() {
+                for (index, operand) in params.route_operands().as_slice().iter().enumerate() {
                     want_float(index)?;
                     match operand {
                         RouteOperand::Rows => {

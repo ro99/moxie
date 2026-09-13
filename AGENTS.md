@@ -178,10 +178,10 @@ this sweep's advertised axes unreachable. **Three separate coverage claims in on
 task were softer than they looked, and every one was found by asking what a
 mutation would survive rather than by reading the test.**
 
-**M2 item 4 is implemented, corrected after one round of independent review,
+**M2 item 4 is implemented, corrected after two rounds of independent review,
 and awaits acceptance**
 ([task 0022](docs/tasks/0022-m2-laguna-metadata-and-second-consumer.md),
-2026-09-13; the round found **six** issues, one P1, all reproduced and fixed,
+2026-09-13; the rounds found **seven** issues, two P1, all reproduced and fixed,
 none disputed): Laguna's metadata and its **routed block**, a second routed
 consumer driven through task 0021's interface, and a restricted budget expressed
 as a **ratio** of what the route demands rather than a constant. A routed layer
@@ -205,6 +205,19 @@ packed along the **output** axis — a second convention the accepted importer h
 never seen — so **no Laguna tensor was read** and M3 owns the importer.
 [The bring-up record](docs/models/laguna.md) carries the inventory and every
 open mapping question.
+
+**A fix is a new caller, and a new caller on a path with a discipline has to
+satisfy it.** The second review's only finding was a defect the **first round's
+own correction** introduced: `narrow_coefficients` built its result with
+`collect()`, and an allocation failure there aborts the process instead of
+returning a typed error the transaction can roll back. That is `softmax`'s
+defect, in the same module, for the **third** time — task 0019's record states
+the rule and the reason in as many words. A diff review of a fix will not catch
+this, because the fix looks like the thing it replaced; the question to ask is
+what discipline the *path* has. Asking it of the rest of the same change found a
+second instance the review had not reached: `route_operands` returned a `Vec`
+and the interpreter calls it once per `Route` node per step. Two of one class in
+one change, and one reproduction found one of them.
 
 **A transcription is independent of the implementation, not of the reader.**
 The review's P1 was a BF16 boundary this implementation did not have:

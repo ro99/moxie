@@ -1,12 +1,14 @@
 # Handover — task 0022 implemented; M2 item 5's remainder is next
 
-**Task 0022 is implemented, corrected after one round of independent review,
+**Task 0022 is implemented, corrected after two rounds of independent review,
 and awaits a further review and owner acceptance.** It delivers roadmap **M2
 item 4** in the only shape the evidence allows, and it says so in its own
 contract rather than afterwards. **It does not close M2.**
 
-The review found **six** issues — one P1, five P2 — all reproduced, all fixed,
-none disputed. Four were the shape task 0021's four rounds kept finding: **a
+The first review found **six** issues — one P1, five P2 — all reproduced, all
+fixed, none disputed. The second found **one more P1, introduced by the first
+round's own fix**, and a sweep for the same defect class in the same change
+found a second instance the review had not reached. Four were the shape task 0021's four rounds kept finding: **a
 check on one path and not on the neighbouring one.** The other two are a shape
 worth naming separately, because no mutation battery can reach it: **a record
 and a transcription that each contradicted a fact their own document already
@@ -167,6 +169,34 @@ multiplication helper, so checked arithmetic ran after the overflow it was there
 to prevent.
 
 All six regressions were substitution-tested: **6 of 6 load-bearing.**
+
+### The second round: a fix that introduced a defect, and the same one beside it
+
+The second round confirmed the six corrections and found **one new P1, which the
+first round's own fix introduced.** `narrow_coefficients` built its result with
+`.iter().map(...).collect()`; an allocation failure injected during narrowing
+gave **SIGABRT**, `memory allocation of 8 bytes failed`. Every other allocation
+on that path is fallible, because an allocation failure inside a generation step
+must be a typed error the transaction can roll back rather than a panic that
+takes the rollback, the lease release and the next generation with it.
+
+**This is `softmax`'s defect, in the same module, for the third time.** Task
+0019's record states the rule and the reason in as many words. The correction
+for the first round's P1 added a new function to that path and did not carry the
+rule across. The answer is stronger than the fallible allocation the rest of the
+path uses: the function takes the route by value, so it rounds **in place** and
+has nothing to allocate.
+
+Then, applying the reviewer's question to the rest of the same change rather
+than only to the function they had a reproduction for: `route_operands` returned
+a `Vec` and **the interpreter calls it once per `Route` node per step.** Same
+class, same path, same consequence. The operand list is bounded by construction,
+so it is held inline now.
+
+Two of this class in one change, and one reproduction found one of them. **A fix
+is a new caller, and a new caller on a path with a discipline has to satisfy it
+— which is not something a diff review of the fix will tell you, because the fix
+looks like the thing it replaced.**
 
 ## Remaining hypotheses and blockers
 

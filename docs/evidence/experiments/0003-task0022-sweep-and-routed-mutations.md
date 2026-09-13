@@ -1,9 +1,9 @@
 # 0003 — Measuring task 0022's extended sweeps and its new routed parameters, by mutation
 
 Date: 2026-09-13. Milestone: M2, [task 0022](../../tasks/0022-m2-laguna-metadata-and-second-consumer.md).
-Status: **accepted**; **37 of 37** mutations caught, 0 survivors, after an independent review's six
-findings were fixed and four of its checks were added to the batteries. The measurement before the
-review was 33 of 33, after two corrections the first measurement forced.
+Status: **accepted**; **39 of 39** mutations caught, 0 survivors, after two rounds of independent
+review. The measurement before the reviews was 33 of 33, after two corrections the first measurement
+forced; the reviews' seven findings added six checks to the batteries.
 
 Companion to [experiment 0002](0002-expert-plan-sweep-mutations.md), which measured the same two
 sweeps before task 0022 extended them.
@@ -184,6 +184,18 @@ survivors**. All six of the review's regressions were separately put through the
 battery — remove the check, run only that regression, require it to fail — at **6 of 6
 load-bearing**.
 
+A second round then found one more P1 — introduced by the first round's own fix — and a sweep for the
+same defect class in the same change found a second instance. Both are allocation discipline rather
+than arithmetic, and both are in the battery now:
+
+| Added mutation | Crate | Caught by |
+|---|---|---|
+| `narrowing-allocates` | oracles | a named test |
+| `operand-list-allocates` | graph | a named test |
+
+Totals: planner battery **18 mutations, 17 by the sweep, 0 survivors**; run and routed battery
+**21 mutations, 7 by the run sweep, 0 survivors**.
+
 ### What this campaign could not have found, demonstrated
 
 Two of the review's six findings were **outside every battery here**, and saying so is more useful
@@ -196,7 +208,14 @@ reader — the two agreed, and a bitwise gate passed on their agreement.
 A mutation battery measures a test suite against mutations of the **code**. It cannot reach an
 arithmetic claim that lives in a record, and it cannot reach a boundary that the oracle and the
 implementation are both missing, because mutating either one moves them apart and the test fails
-for the right reason by accident. The structural answers are elsewhere: make the record's arithmetic
+for the right reason by accident.
+
+The second round adds a third: **it cannot reach a property no test in the suite was about.** The
+`collect()` in `narrow_coefficients` was not a wrong answer — every numerical mutation of that
+function was caught, because the arithmetic was right. It was a wrong *failure mode*, reachable only
+by a test that asks what the function does to the heap, and there was no such test on this path
+until the review produced one. Both allocation checks above are load-bearing under substitution, and
+both were written after the fact. The structural answers are elsewhere: make the record's arithmetic
 executable, and check a transcription against a quantity computed from the source's stated equation
 rather than against the implementation it is supposed to be independent of.
 

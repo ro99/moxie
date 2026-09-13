@@ -547,18 +547,24 @@ pub fn router_route_row(
 /// The values are narrowed; the storage is not. A [`Route`] holds `f32` either
 /// way, and `OpParams::output_role` still declares `F32`, because that role is
 /// what a byte trace reconciles against the ledger.
-pub fn narrow_coefficients(route: Route, coefficient: moxie_graph::RouteCoefficient) -> Route {
-    match coefficient {
-        moxie_graph::RouteCoefficient::Fp32 => route,
-        moxie_graph::RouteCoefficient::Bf16 => Route {
-            weights: route
-                .weights
-                .iter()
-                .map(|w| crate::bf16_round(*w))
-                .collect(),
-            experts: route.experts,
-        },
+pub fn narrow_coefficients(mut route: Route, coefficient: moxie_graph::RouteCoefficient) -> Route {
+    // **In place, and infallibly.** The first version of this function built a
+    // second vector with `collect()`, which aborts the process on allocation
+    // failure -- and an allocation failure inside a generation step must be a
+    // typed error the transaction can roll back, not a panic that takes the
+    // rollback, the lease release and the next generation with it.
+    //
+    // That is the same defect `softmax` in this module carried and had fixed
+    // once already; a review found it here. The answer is stronger than the
+    // fallible `try_vec` the rest of this path uses: the route is taken **by
+    // value**, so there is nothing to allocate. `narrowing_a_routes_coefficients_requests_no_heap`
+    // counts allocator calls and is what keeps that true.
+    if coefficient == moxie_graph::RouteCoefficient::Bf16 {
+        for w in route.weights.iter_mut() {
+            *w = crate::bf16_round(*w);
+        }
     }
+    route
 }
 
 /// One expert's gated feed-forward over one row, from the **fused** tensors.
