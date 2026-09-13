@@ -449,8 +449,11 @@ closed; expert partitioning is **M5**.
 ### Integration proof
 
 **Nothing in this repository executes this checkpoint.** What exists after task
-0019 is a reduced synthetic graph with this variant's shape of mathematics, over
-weights the composition root invents.
+0019 is a reduced synthetic graph with this variant's shape of mathematics over
+weights the composition root invents; what task 0021 adds is **one layer's
+expert block computed from this artifact's real weights over synthetic
+activations**. Neither is the checkpoint running, and neither supports a claim
+about its output.
 
 - **Adapter contains metadata/graph only: yes.** `moxie_models::gemma4` still
   depends on `moxie-types`, `moxie-graph` and `moxie-model-api` and nothing
@@ -481,20 +484,49 @@ weights the composition root invents.
   `Route`, `ExpertMlp` and `Combine`. What made it possible is
   `Shard::read_tensor_range`: the experts are fused, so serving one through the
   whole-tensor reader would have read 1,522,532,352 B to use 11,894,784.
-- CPU expert fallback and grouped GPU candidate plans: **not started** — M2
-  item 3.
+- **CPU expert fallback and grouped GPU candidate plans: implemented**
+  ([task 0021](../tasks/0021-m2-expert-execution-plans.md), 2026-09-12, awaiting
+  review and acceptance). **One layer's routed expert block of this artifact has
+  now been executed.** Layer 0, two rows of top-k 8 selecting ten distinct
+  experts, **118,947,840 B** demand-loaded through the residency authority into
+  a device cache holding **two** of them — 28 evictions, 8 backpressure drains —
+  computed by the grouped BF16 kernel on a real GPU, and agreeing with the host
+  candidate over the same bytes on all **45,056** BF16 slot components.
+
+  **That is not model support and no quality claim follows from it.** The
+  activations are synthetic and the route is written by the test, so nothing
+  about the released model's output is established; that is **O2**. One layer is
+  not a model: nothing composes a routed layer into a graph that generates a
+  token, and the whole 51.6 GB working set has not been executed.
+
+  Two facts about this artifact came out of it. Its experts are **11,894,784 B
+  each**, so at a two-row decode batch the best reuse available is 5,947,392 B
+  per row; against the declared default amortisation threshold of 1 MiB per row,
+  **every expert goes to the CPU candidate**, and a test asserts that. And the
+  declared threshold is a **policy parameter, not a measured crossover** —
+  measuring one is M6's.
 - Reference quality, actual-context prefill/decode: **not started**, and O2.
-- GPU and distributed: **not applicable.** No device kernel; the selected BF16
-  chain refuses all three routed operations as `UnsupportedKernel`, asserted by
-  a test rather than assumed from a catch-all.
-- Support matrix updated: gates `G-MOE-ROUTING-HOST`, and `G-RESIDENCY-HOST` /
-  `G-RESIDENCY-DEVICE` at task 0020.
+- GPU: **one operation, qualified.** `ExpertMlp` has a device kernel on sm_86 and
+  sm_120, bitwise equal to the oracle for both gate transforms. `Route` and
+  `Combine` do **not**: routing stays host-side and the reduction runs on the
+  host, so the selected BF16 chain still refuses all three as
+  `UnsupportedKernel`, asserted by a test.
+- Distributed: **not applicable.** One plan targets one device; spreading a
+  layer's experts across the three cards is expert partitioning, which is M5,
+  and `PartitionRule::NotDetermined` still fails closed.
+- Support matrix updated: gates `G-MOE-ROUTING-HOST`, `G-RESIDENCY-HOST` /
+  `G-RESIDENCY-DEVICE` at task 0020, and `G-EXPERT-PLAN-HOST` /
+  `G-EXPERT-PLAN-DEVICE` at task 0021.
 
 ### Blockers
 
-1. **Execution of this artifact needs a residency authority it does not have.**
-   51.6 GB against a 24 GiB largest device. Task 0020 owns that, and until then
-   the routed graph runs only at reduced scale over synthetic weights.
+1. **The whole artifact still does not execute.** 51.6 GB against a 24 GiB
+   largest device. Task 0020 gave it a residency authority and task 0021 gave it
+   grouped execution, and together they ran **one layer's expert block** against
+   a two-expert budget. What is missing is everything else: an attention and
+   norm path for this variant at full scale, a graph that composes them, and the
+   byte/cost traces M2's exit asks to be reconciled with the ledger across a
+   whole working set. Nothing generates a token from this checkpoint.
 2. **No quality claim of any kind.** Nothing here was compared against the
    released model; that is **O2**, and it is what would also settle the
    5.5.3-versus-5.15 router-softmax dtype question.

@@ -1,8 +1,9 @@
 # Task 0021 — M2 expert execution plans: one interface over a CPU and a GPU candidate
 
-Status: **contract, written and committed before implementation**, per the
-working rule that produced tasks 0013–0020. See
-[Result](#result-filled-after-work), which is empty until the work is done.
+Status: **implemented at the commit this record accompanies; awaiting
+independent review and owner acceptance.** The contract above was written and
+committed at `cdda4f4` before any implementation, per the working rule that
+produced tasks 0013–0020. See [Result](#result-filled-after-work).
 
 **This task does not close M2.** It delivers roadmap M2 **item 3** only. Item 4's
 Laguna metadata, its second synthetic MoE consumer and M2's exit gate — "a real
@@ -15,9 +16,10 @@ ledger" — are outstanding after it, and the scope boundary is restated under
 
 - Task ID / milestone / owner: 0021 / **M2 item 3, expert execution plans** /
   implementation agent; acceptance belongs to the owner.
-- Writable root `/home/rodrigo/Developer/moxie`, branch `main`, base `8b230ab`
-  (task 0020 acceptance record). Working tree clean at authoring; no initial
-  dirty paths.
+- Writable root `/home/rodrigo/Developer/moxie`, branch `main`, base `b087b92`
+  (the owner's support-matrix rows for the task-0020 narrowings, one commit above
+  the task 0020 acceptance record `8b230ab`). Working tree clean at authoring; no
+  initial dirty paths.
 - Read-only legacy `/home/rodrigo/Developer/strata` at
   `2dc566eb8e440fff4837ac75ca1dad1b20c2264e`. Its untracked `.pi/` and
   `tests/p2p/` are preserved and are not source evidence.
@@ -431,4 +433,162 @@ a model-owned execution path or a bulk write, stop at that gate and report it.
 
 ## Result, filled after work
 
-*(empty until the work is done)*
+### Changed shared owners and consumers
+
+| Crate | What it gained |
+|---|---|
+| `moxie-types` | `NumaTopology` / `NumaNode` / `NumaNodeId` / `HostPlacement`; `GateTransform`; `SemanticKernelOp::ExpertMlp(GateTransform)`; `KernelOperand::RouteIndex`; `WorkspaceExpression::RowsTimesIntermediateF32` |
+| `moxie-host` | `numa`: the sysfs topology reading and the `numa_maps` read-back |
+| `moxie-plan` | `expert`: the plan, the chooser, the envelope, the reduction permutation, kernel selection |
+| `moxie-kernels` | `cpu_expert` (host expert kernel and host reduction); `cuda/expert_mlp.cu`; `expert_mlp_catalogue` |
+| `moxie-executor` | `grouped` (bounded queue, placed host buffers, the run); `grouped_device` (arena, launches, readback); the `numa` feature |
+| `xtask` | one `test-gpu` case, `grouped_expert_mlp` |
+
+**`moxie-memory` gained nothing and `moxie-models` gained nothing**, as the
+contract required. No new crate, and one new workspace edge (`xtask` -> 
+`moxie-oracles`, test-lane only).
+
+### Commands, and what each reported
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | passed |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | passed |
+| Device-lane clippy (`--features moxie-executor/driver`) | passed |
+| `cargo test --workspace --locked --offline` | **871 passed, 0 failed** (823 at task 0020) |
+| Device-feature workspace tests | **894 passed, 0 failed** (843 at task 0020) |
+| `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified (39 at task 0020) |
+| `cargo xtask spec-check` | passed, 10 documents |
+| `cargo xtask arch-check` | **zero failures**, 78 rejected fixtures, 21 accepted, 13 rules |
+
+Nothing failed. Nothing was skipped: the real-artifact cases print `SKIPPED`
+with a reason when `/fast/models/google/gemma-4-26B-A4B-it` is absent, and **on
+this machine they were not skipped**.
+
+### Measured effect, and its uncertainty
+
+**The CPU kernel is bitwise equal to the oracle**, for both gate transforms,
+over every fixture, with the tile width proven numerically inert across six
+tile sizes.
+
+**The device kernel is bitwise equal to the oracle**: 36,864 BF16 components
+across all three GPUs and both gate transforms, plus 45,056 more against the CPU
+candidate on real weights. Reaching that needed `__fmul_rn` / `__fadd_rn` and
+`__dmul_rn` / `__dadd_rn` throughout — nvcc contracts `a * b + c` into an FMA by
+default, which is a different rounding pattern and therefore a different answer.
+**The declared uncertainty stands and is untested**: CUDA's device `tanh`/`exp`
+in FP64 may differ from the host libm's by under an ulp, and no fixture here
+constructs a case where such a difference straddles a BF16 tie point. That case
+is covered contractually by `route::expert_error_bound` and is **not shown
+absent**.
+
+**A real layer executed.** 118,947,840 B of the designated artifact's layer 0 —
+ten distinct experts across two rows of top-k 8 — demand-loaded through the
+residency authority into a device cache holding **two** of them, executed behind
+a queue four deep, with 28 evictions and 8 backpressure drains, agreeing with
+the CPU candidate on all 45,056 BF16 slot components. **This is not model
+support**: the activations are synthetic and the route is written by the test,
+so no quality claim follows (**O2**). Nothing under any checkpoint root was
+written, copied, converted or downloaded.
+
+**NUMA placement is measured, and the measurement changed the design three
+times.** Writing zero to first-touch a known-zero buffer can be deleted by the
+compiler. First touch does not place pages the allocator has already faulted —
+glibc raises its mmap threshold after a large mapped block is freed and then
+serves from the brk heap, and a 32 MiB "placed" buffer had **3,317 of 8,192
+pages on the wrong node**. And even with fresh pages and the thread bound, the
+default policy prefers local and then falls back rather than reclaiming: node 1
+on this machine has **334 MB** free against node 0's **5.1 GB**, and **4,471 of
+6,144 pages** landed on node 0. So `required` means `mbind`, and the gate is
+every page: **6,144 of 6,144** on the planned node, read back from `numa_maps`.
+With `auto` it is a preference, and the test prints what it got.
+
+**No performance claim.** `GroupedStats` records groups, slots, backpressure
+drains and leases because document 03 requires them recorded. There is no
+baseline on this machine, both lanes are debug builds, and the one wall-clock
+pair printed by the real-artifact case (device 57 ms, host 2.8 s including
+118 MB of disk reads, one run each) is labelled as not a benchmark where it is
+printed. None of these numbers is a measurement of anything but itself.
+
+### Coverage, measured rather than asserted
+
+The sweep prints what it covered: **5,184 combinations** over both controls,
+both plan-wide admissibilities, the per-expert cache, three amortisation levels,
+residency, reduction order, topology and three kernel-catalogue states — 1,348
+planned (224 all-device, 1,120 all-host, 4 mixed) and 3,836 refused, with every
+rejection reason exercised at least once.
+
+Its strength is **measured**: 16 deliberate mutations of the chooser, **16
+caught by the sweep**, 0 survivors — after two rounds of strengthening that the
+first measurement forced (13 of 16, two survivors). Both survivors were real
+gaps and one was a real defect in the product code. The battery, the two
+lessons and what the number does *not* establish are in
+[experiment 0002](../evidence/experiments/0002-expert-plan-sweep-mutations.md).
+
+### Decisions worth finding again
+
+**The choice is arithmetic, and its threshold is declared.**
+`bytes_per_row = transfer_bytes / reuse_rows` is document 03's "row reuse
+amortizes transfer" as a quantity. The threshold it meets is a policy parameter
+reported with every decision and is **not** a measured crossover; measuring one
+is M6's. A consequence worth stating: at the designated artifact's 11,894,784-byte
+experts and a two-row decode batch, the declared **default sends every expert to
+the CPU candidate**, and a test asserts that rather than leaving it to be
+rediscovered.
+
+**Partial outputs are placed, not accumulated.** Every group writes distinct
+slots; the reduction runs once, per row, over a permutation the plan computed.
+Nothing sums into a shared accumulator, so no sum can depend on which candidate
+finished first. The device readback is per-slot for the same reason: the device
+slot buffer never held the host groups' results.
+
+**Backpressure is what makes a small budget work.** An acquire the authority
+refuses while the queue holds work drains and retries; with an empty queue it is
+propagated. Without that, a bounded queue deeper than the cache would be a
+refusal rather than a schedule.
+
+**An unreachable branch is a stub.** Mutation testing found a "the device
+candidate is `required` and this group fell back" branch that no test could
+reach, because `required` on one candidate excludes the other for the whole
+plan. It was deleted, not tested.
+
+### Narrowings, decided during implementation and reported rather than dropped
+
+- **The reduction runs on the host, always.** Device slots are copied back and
+  reduced there, so a mixed plan and an all-device plan reduce identical bytes in
+  an identical order. A device `Combine` kernel would have to reproduce that
+  order exactly and is not needed to establish it; it is M6's.
+- **`Route` stays host-side.** The route table is an *input* to an expert plan.
+  A device `Route` kernel is not in this task and the selected BF16 chain still
+  refuses it.
+- **One device per plan.** `Placement::Device` names the plan's own device.
+  Spreading a layer's experts across the three cards is expert partitioning,
+  which is **M5**, and this task must not decide it quietly.
+- **The residency authority's host cache is not NUMA-placed.** It is task 0020's
+  buffer, allocated before any plan exists, and it is the largest host buffer in
+  the system. "NUMA-aware host placement" is true of this task's buffers and not
+  yet of that one.
+- **The device workspace bound uses `rows`, not the largest group.** The largest
+  group is not known until the assignment exists and the assignment must not
+  depend on the envelope, so the charge over-reserves by construction.
+
+### No owner gate was resolved
+
+O1–O7 remain open. No numerical threshold, precision, context target or
+compatibility surface changed. No quality claim is made and none follows.
+
+### Remaining blockers, and the next bounded task
+
+- **M2 is not closed.** Item 4 — Laguna metadata and graph, a second synthetic
+  MoE consumer through this interface, and the restricted-budget case at its
+  scale — is outstanding, and M2's exit asks for byte/cost traces reconciled
+  with the resource ledger across a *whole* working set rather than one layer.
+- **One layer is not a model.** Nothing composes a routed layer into a graph
+  that generates a token, and no quality claim follows from a layer that matches
+  its own reference on synthetic input.
+- **The declared policy has no measured crossover.** M6 owns that, and the plan
+  already carries the fields a measurement would fill.
+- **Expert partitioning is M5** and `PartitionRule::NotDetermined` still fails
+  closed.
+- The next bounded task is named in
+  [the handover](../handovers/2026-09-12-task0021-expert-execution-plans.md).

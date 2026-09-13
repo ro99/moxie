@@ -4,9 +4,9 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 
 ## Active assignment
 
-**M1 complete (M1.5 closed 2026-09-12); M2 active, items 1 and 2 accepted.** See
-the
-[task 0020 handover](docs/handovers/2026-09-12-task0020-weight-residency-authority.md)
+**M1 complete (M1.5 closed 2026-09-12); M2 active, items 1 and 2 accepted and
+item 3 awaiting review.** See the
+[task 0021 handover](docs/handovers/2026-09-12-task0021-expert-execution-plans.md)
 for the current continuation, and the
 [closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
 M1's exit evidence gate by gate.
@@ -33,8 +33,8 @@ a regression for each review finding. One of those findings corrected a claim
 rather than a defect: **a nonblocking acquire is necessary but not sufficient for
 deadlock freedom**, and the cycles it missed were between the demand counter and
 the prefetch gate, and along promotion's dependency chain. **The acceptance
-closes task 0020 only, not M2**: nothing executes a routed layer, which is item
-3.
+closes task 0020 only, not M2**, whose exit also needs item 4 and traces
+reconciled with the ledger across a whole working set.
 
 **`arch-check` now passes with zero failures.** The four it reported as
 "pre-existing" from task 0014 onward were review probe crates parked under
@@ -64,11 +64,48 @@ promoted order passed all 200 combinations — and its strength must be
 
 **State coverage as a number the test prints, never as a sentence in a record.**
 Three claims about task 0020's test strength were wrong in the same way: the
-property was asserted rather than measured. The sweep now prints what it
-exercised, and an equivalent mutant is reported as such instead of being counted
-as a gap. Apply all of this to M2 item 3's queues rather than rediscovering it. **Task 0021 is next**: M2 item 3's CPU expert fallback and GPU
-grouped candidate plans under one interface, specified in
-[the task 0020 handover](docs/handovers/2026-09-12-task0020-weight-residency-authority.md)
+property was asserted rather than measured. The sweep prints what it exercised,
+and an equivalent mutant is reported as such instead of being counted as a gap.
+
+**M2 item 3 is implemented and awaits review**
+([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), 2026-09-12): CPU
+expert fallback and GPU grouped candidate plans under one interface, with an
+admitted envelope, a bounded queue that refuses rather than waits, NUMA-placed
+host buffers, and a reduction over a permutation the plan computes so partial
+outputs are **placed, not accumulated**. The grouped kernel is **bitwise** equal
+to task 0019's oracle on all three GPUs for both gate transforms — which needed
+`__fmul_rn`/`__fadd_rn` and `__dmul_rn`/`__dadd_rn` throughout, because nvcc
+contracts into an FMA by default and that is a different answer. **One layer's
+routed expert block of the designated artifact executed**: 118,947,840 B of
+layer 0 demand-loaded into a device cache holding **two** of ten experts, 28
+evictions, 8 backpressure drains, agreeing with the CPU candidate on 45,056 BF16
+components. **The activations are synthetic and the route is written by the
+test, so this is not model support and no quality claim follows.** M2's exit
+still needs item 4 and traces reconciled with the ledger across a whole working
+set.
+
+**A property of this machine is measured or it is not known.** Three plausible
+NUMA mechanisms in a row were wrong and only the read-back showed it: a zero
+store the compiler may delete, first touch on pages the allocator had already
+faulted elsewhere (**3,317 of 8,192** on the wrong node), and the default policy
+falling back rather than reclaiming, because node 1 has **334 MB** free against
+node 0's **5.1 GB** (**4,471 of 6,144** on the wrong node). `required` now means
+`mbind` and the gate is every page. Do not carry an unverified placement,
+affinity or bandwidth claim forward.
+
+**Measure the tests, then fix what the measurement finds.** Task 0021's sweep
+started at 13 of 16 mutations with two survivors. One survivor was a **product
+defect** — a refusal reporting `CapacityExceeded` where a `required` candidate's
+own reason belonged — and the other was a fixture whose every row was already
+ascending, so the two reduction orders agreed and a planner ignoring the
+parameter passed. It is 16 of 16 now. A fixture on which two behaviours agree
+tests neither, and an unreachable branch is a stub: one was found and deleted
+the same way.
+
+**Task 0022 is next**: M2 item 4's Laguna metadata and graph, a second synthetic
+MoE consumer through task 0021's interface, and the restricted budget at its
+scale, specified in
+[the task 0021 handover](docs/handovers/2026-09-12-task0021-expert-execution-plans.md)
 and not yet authored.
 
 M1's accepted work: shared semantic tensors/graph and the bounded host
@@ -95,12 +132,13 @@ fixture over invented weights and may not be described as model support; the
 importer produces canonical tensors that nothing runs, and its packed-word lane
 order is cited from the pinned reader rather than verified, so **no quality
 claim follows from a successful import** — that needs paired output against the
-released model, which is O2. Task 0020 demand-read 107,053,056 B of the
-designated artifact's real expert weights through the residency authority and
-verified every range against an independent read; **reading is not executing**,
-nothing computed with those bytes, and a demand-loaded expert is not model
-support. M4 still owns device paged attention, COW forks and page streaming. M11
-owns vision.
+released model, which is O2. Task 0021 went one step further than task 0020's
+read and **computed** with 118,947,840 B of the designated artifact's real
+expert weights — but over **synthetic activations and a route its own test
+writes**, so it establishes machinery and nothing about output. **One layer is
+not a model**: nothing composes a routed layer into a graph that generates a
+token, and the whole 51.6 GB working set has not run. M4 still owns device paged
+attention, COW forks and page streaming. M11 owns vision.
 
 **M2 is active and proceeds in roadmap order.** The owner designated
 `/fast/models/google/gemma-4-26B-A4B-it` as M2's BF16 MoE on 2026-09-12: BF16,
@@ -118,9 +156,13 @@ device, and M2 item 4's restricted budget makes it oversized by construction.
 Task 0019 composed its routed block over synthetic weights at reduced scale and
 recorded the artifact's inventory in
 [the bring-up record](docs/models/gemma4.md#the-26b-a4b-moe-variant). Task 0020
-made its expert bytes resident on demand — the experts are fused per layer, so
-that needed the bounded ranged read it added — but **nothing runs it**, which is
-what M2 item 3 exists to make possible.
+made its expert bytes resident on demand -- the experts are fused per layer, so
+that needed the bounded ranged read it added — and task 0021 ran one layer's
+expert block from them. A fact that came out of that: its experts are
+**11,894,784 B each**, so at a two-row decode batch the best reuse available is
+5,947,392 B per row, and against the declared default amortisation threshold of
+1 MiB per row **every expert goes to the CPU candidate**. Whether that is the
+right decision is a measurement, and measuring it is M6's.
 
 `hy3-w4a16-mtp` is in scope. The Laguna checkpoint at
 `/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4` **finished downloading and was

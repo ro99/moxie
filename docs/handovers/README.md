@@ -2,11 +2,17 @@
 
 ## Active handover
 
-[Task 0020 accepted; task 0021 is M2 item 3](2026-09-12-task0020-weight-residency-authority.md)
-is the current continuation. M2 item 2's residency authority was accepted on
-2026-09-12 after seven rounds of independent review, and this artifact's own
-expert bytes have been read through it; **nothing executes a routed layer**,
-which is item 3.
+[Task 0021 implemented; task 0022 is M2 item 4](2026-09-12-task0021-expert-execution-plans.md)
+is the current continuation. M2 item 3 — CPU expert fallback and GPU grouped
+candidate plans under one interface, with bounded queues and NUMA-aware host
+placement — is implemented and awaits independent review and owner acceptance.
+**One layer's routed expert block of the designated artifact has now been
+executed**, over synthetic activations and a route the test writes: that is not
+model support and no quality claim follows from it.
+
+[Task 0020 accepted](2026-09-12-task0020-weight-residency-authority.md) precedes
+it: M2 item 2's residency authority, accepted on 2026-09-12 after seven rounds
+of independent review.
 
 The milestone context below remains in force.
 

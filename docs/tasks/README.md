@@ -43,16 +43,26 @@ against an independent read. **Reading is not executing**: nothing computes with
 those bytes and no checkpoint runs. **It does not close M2**, which also needs
 items 3–5 and a real working set that executes.
 
-**[Task 0021](0021-m2-expert-execution-plans.md) is active**: M2 item 3's CPU
-expert fallback and GPU grouped candidate plans under one interface, assigned by
-[the task 0020 handover](../handovers/2026-09-12-task0020-weight-residency-authority.md#next-task).
-Its contract was authored and committed before implementation, and states the
-five terms the handover required: the grouped operand layout and how a residency
-lease becomes it, the deterministic choice between the candidates and what it
-reports about the rejected one, the bounded queue's admitted capacity and its
-refusal, measured NUMA placement on this machine, and the reduction of partial
-outputs. **It does not close M2**, which also needs item 4 and a real working set
-that executes.
+**[Task 0021](0021-m2-expert-execution-plans.md) is implemented and awaiting
+independent review and owner acceptance**, 2026-09-12. It is M2 item 3: CPU
+expert fallback and GPU grouped candidate plans under one interface, with an
+admitted envelope, a bounded queue that refuses rather than waits, NUMA-placed
+host buffers whose pages are **read back** rather than asserted, and a reduction
+whose order is an explicit permutation the plan computes. Its contract was
+authored and committed at `cdda4f4` before implementation. The grouped kernel is
+**bitwise** equal to task 0019's oracle on all three GPUs for both gate
+transforms, and **one layer's routed expert block of
+`/fast/models/google/gemma-4-26B-A4B-it` executed** — 118,947,840 B into a
+two-expert device cache — over **synthetic activations and a route the test
+writes**. **That is not model support and no quality claim follows.** **It does
+not close M2**, which also needs item 4 and byte/cost traces reconciled with the
+ledger across a whole working set.
+
+**Task 0022 is next**: M2 item 4's Laguna metadata and graph, a second synthetic
+MoE consumer through this interface, and the restricted budget at its scale,
+specified in
+[the task 0021 handover](../handovers/2026-09-12-task0021-expert-execution-plans.md#next-task).
+Its contract has not been authored.
 
 Reopen accepted tasks only for a demonstrated defect in accepted scope.
 
