@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 
 use moxie_format::affine::IntWidth;
 use moxie_format::compressed_tensors::{
-    Granularity, PackQuantizedSpec, TensorTriple, decode_weight_shape, import, scale_dtype_of,
-    triple_entries,
+    Granularity, PackQuantizedSpec, SourceTensors, ZeroPointSource, decode_weight_shape, import,
+    scale_dtype_of, source_entries,
 };
 use moxie_format::safetensors::Dtype;
 use moxie_format::scale::ScaleDtype;
@@ -35,7 +35,7 @@ fn spec() -> PackQuantizedSpec {
     PackQuantizedSpec {
         width: IntWidth::Int8,
         granularity: Granularity::Group { size: 32 },
-        symmetric: true,
+        zero_points: ZeroPointSource::Symmetric,
     }
 }
 
@@ -121,7 +121,12 @@ fn real_pack_quantized_tensors_import_to_canonical_affine_form() {
             else {
                 continue;
             };
-            let (packed_e, scale_e, shape_e) = triple_entries(s.header(), &module).unwrap();
+            let e = source_entries(s.header(), &module, ZeroPointSource::Symmetric).unwrap();
+            let (packed_e, scale_e, shape_e) = (e.packed, e.scale, e.shape);
+            assert!(
+                e.zero_point.is_none(),
+                "{module} is a symmetric source and must carry no zero point"
+            );
             // The scale dtype comes from the header, not from the config --
             // the artifact declares `scale_dtype: null`.
             let scale_dtype = scale_dtype_of(scale_e.dtype).unwrap();
@@ -151,7 +156,7 @@ fn real_pack_quantized_tensors_import_to_canonical_affine_form() {
             let scale = s.tensor_bytes(&format!("{module}.weight_scale")).unwrap();
             let tensor = import(
                 &spec(),
-                TensorTriple {
+                SourceTensors {
                     packed: &packed,
                     // The shapes the header declared, so the importer checks
                     // the axes rather than trusting the byte counts.
@@ -159,6 +164,7 @@ fn real_pack_quantized_tensors_import_to_canonical_affine_form() {
                     scale: &scale,
                     scale_shape: &scale_shape,
                     scale_dtype,
+                    zero_point: None,
                     logical,
                 },
             )
@@ -219,5 +225,12 @@ fn an_absent_module_is_a_typed_error_and_not_a_fabricated_tensor() {
             .get("model.language_model.layers.0.nonexistent")
             .is_err()
     );
-    assert!(triple_entries(s.header(), "model.language_model.layers.0.nonexistent").is_err());
+    assert!(
+        source_entries(
+            s.header(),
+            "model.language_model.layers.0.nonexistent",
+            ZeroPointSource::Symmetric
+        )
+        .is_err()
+    );
 }

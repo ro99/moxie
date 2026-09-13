@@ -1,6 +1,6 @@
 # Task 0024 — M3 item 2: asymmetric INT4 `pack-quantized` import, zero points along the output axis
 
-Status: **proposed**.
+Status: **implemented 2026-09-13, awaiting independent review and owner acceptance**.
 
 ## Identity and authority
 
@@ -289,4 +289,141 @@ else. **The "not implemented" verdict for W4A16 execution does not move.**
 
 ## Result, filled after work
 
-*(empty until the work is done)*
+### Changed shared owners and consumers
+
+`moxie_format::compressed_tensors` is the sole owner and the only production
+module whose behaviour changed. `moxie-format/src/affine.rs` was **not** changed:
+the canonical descriptor already carried `ZeroPoints::PerGroup`, which is what
+"what is missing is a verified source contract, not a canonical capability"
+meant when task 0018 wrote the refusal.
+
+| Change | Why |
+|---|---|
+| `PackQuantizedSpec::symmetric: bool` → `zero_points: ZeroPointSource` | The boolean said only that *some* zero points exist; the importer has to know **where**. `Symmetric` and `PackedAlongOutput` name conventions. |
+| `TensorTriple` → `SourceTensors`, with `zero_point: Option<PackedZeroPoints>` | A "triple" that can be four tensors is a name that has stopped being true. |
+| `triple_entries` → `source_entries(header, module, zero_points)` → `SourceEntries` | It now resolves a fourth entry, validates its dtype, and **requires the declared serialization and the tensor index to agree in both directions**. |
+| `decode_zero_points` | The new decode. Refuses before any code is unpacked, so a malformed zero point does not cost a whole tensor's work first. |
+| The `Error::Unsupported` refusal of asymmetric sources | Deleted. |
+
+Consumers updated: `moxie-storage/tests/gemma4_import.rs` (the symmetric
+real-artifact lane, unchanged in behaviour), `moxie-format/tests/import_allocation.rs`.
+Two comments that recorded the old refusal as a *reason* were corrected rather
+than deleted — `moxie-models/src/laguna.rs` and `moxie-cli/tests/laguna.rs` —
+because the reason changed and the conclusion did not: **Laguna's graph still
+declares BF16 tensor requirements, since nothing executes a canonical INT4
+tensor.**
+
+Base `e122de3` (this contract). Implementation is the commits after it.
+
+### Commands and results — passed, failed and skipped separately
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | **passed** |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed** |
+| Device-lane clippy (`--features moxie-executor/driver`) | **passed** |
+| CUDA-lane clippy (`--features cuda`) | **passed** |
+| `cargo test --workspace --locked --offline` | **943 passed, 0 failed**, against a baseline of **930** re-measured at `e122de3` before implementation |
+| `cargo test --workspace --locked --offline --features moxie-executor/driver` | **978 passed, 0 failed** (task 0023 recorded 965; +13 is exactly this task's new tests) |
+| `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified. Nothing here touches the device; run to show nothing broke |
+| `cargo xtask spec-check` | **passed**, 10 documents |
+| `cargo xtask arch-check` | **zero failures**, 79 rejected fixtures, 21 accepted, 13 rules |
+
+**Nothing failed.** **Nothing was skipped**: both real artifacts are present on
+this machine and every artifact lane ran. The four artifact tests each print
+`SKIP` with a reason when their checkpoint is absent, so a fresh clone stays
+green — that path was exercised while the tests were being written and is not
+what ran here.
+
+Thirteen new tests: seven in `moxie-format`'s own module, one
+`import_allocation_asymmetric`, one `import_allocation_failure`, four in
+`moxie-storage/tests/asymmetric_int4_import.rs`.
+
+**Mutation measurement: 16 of 16 caught, 0 survivors**, first measurement, no
+corrections needed
+([experiment 0005](../evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md)).
+Two mutations are caught by exactly one lane each and both are that lane's
+reason for existing: `zp-vec-allocated-infallibly` only by the injected
+allocation-failure sweep, and `measurement-pinned-becomes-lane-reversed` — a
+mutation of the *measurement* rather than the product — only by the artifact
+lane.
+
+### Measured effect and uncertainty
+
+**The zero-point lane assignment is measured, not assumed.** `mean |mean_code −
+z|` in codes, on four tensors across the two artifacts:
+
+| Artifact | Module | pinned | lane-reversed | block-major | block reversed |
+|---|---|---:|---:|---:|---:|
+| Laguna | `layers.1.mlp.experts.0.down_proj` | **0.5236** | 1.4900 | 1.4853 | 1.4817 |
+| Laguna | `layers.1.mlp.experts.0.gate_proj` | **0.5183** | 1.5661 | 1.5652 | 1.5670 |
+| Qwen3.8-27B | `layers.11.self_attn.k_proj` | **0.5163** | 1.7629 | 1.7809 | 1.7839 |
+| Qwen3.8-27B | `layers.11.self_attn.v_proj` | **0.5300** | 1.5751 | 1.5741 | 1.5776 |
+
+Declared thresholds were 1.0 and 1.2, written into this contract before the
+measurement; the margin is 2.8–3.5×. **Uncertainty, stated:** this rules out the
+three specific alternatives the same bytes permit. It does not establish the
+**code** word's lane order, which stays exactly where task 0018 left it, and the
+zero-point **sign** is taken from two independent statements of `(q − z) · s`
+(document 03 and the pinned library) rather than measured — a mean absolute
+deviation cannot separate `+z` from `−z` on a distribution centred near zero.
+
+**112,640 reconstructed values are bitwise equal** to the source's own
+arithmetic, computed from the raw bytes by a transcription that follows the
+library's *unpack procedure* rather than this importer's closed-form index. That
+is ADR 0018's bit-identical repack at tensor scale. **It is not a quality
+claim** and no paired output against any released model exists.
+
+**No performance claim.** Nothing was timed and the import path has no
+duration field.
+
+### Three things the work turned up that were not in the contract
+
+1. **A module's four tensors need not share a shard.** Laguna keeps them
+   together for 34,739 of 34,740 modules; Qwen3.8-27B for **none** of its 256.
+   `source_entries` takes one `Header` by design and cannot see across that
+   split. An index resolver is M3 item 1's manifest work; this task records the
+   gap and its artifact lane resolves per tensor in the test.
+2. **Laguna's shard headers exceed the default header budget.** 140,989 tensors
+   means about a megabyte of header per shard and a 16.5 MB admitted peak
+   estimate against `HeaderBudget::DEFAULT`'s 8 MiB — a default calibrated on
+   Gemma 4's 17–64 KB headers. The default refusing it is the budget working.
+   The artifact lane states 64 MiB for a read-only inspection; **the default is
+   unchanged**, and any production path opening this artifact must state one.
+3. **The existing allocation test's own docstring caught a mistake immediately.**
+   Adding the asymmetric allocation count as a second test in
+   `import_allocation.rs` made the symmetric fixed cost read 3, 13 and 25 as the
+   two tests interleaved on the global counter — which that file's first
+   paragraph says will happen. It is its own executable now. A measurement taken
+   while something else allocates is not a measurement.
+
+### Deleted and replaced paths
+
+- The `Error::Unsupported { capability: "asymmetric pack-quantized import" }`
+  refusal and the negative fixture asserting it. Replaced by fixtures asserting
+  the refusals that remain: a spec and a payload that disagree, an index and a
+  declaration that disagree, a zero point of the wrong dtype, and every
+  mis-declared zero-point shape including the **unpacked** one.
+- No bridge, no temporary path, nothing deferred behind a flag.
+
+### Remaining blockers and the next bounded task
+
+- **Nothing executes a canonical INT4 tensor.** W4A16/W8A16 is M3 item 3 and no
+  kernel exists. This is the largest remaining gap in M3 and the reason no
+  capability row moved out of "not implemented" for execution.
+- **Group-128 symmetric INT4 with `actorder: "static"`** is M3 item 2's
+  remainder. Both local candidates declare it, and what `static` means for
+  logical column identity must be read from the pinned exporter first — document
+  03 forbids ignoring a permutation, and a permutation folded into the weights
+  changes which activation column each canonical column means.
+- **AutoRound / AutoGPTQ packing** is the second serialization, still not
+  implemented.
+- **Laguna's attention tower** is unchanged: `softplus` output gating and the
+  yarn rotary ramp are still gaps, and no Laguna layer is composable.
+- **The fused/per-expert role mapping** the Laguna record records as open
+  question 1 is untouched: this task imports at tensor granularity and the
+  canonical form needs no fused layout.
+- **O2 and O5 bound what any of this may be called.** A bit-identical repack is
+  v1's quality definition, not evidence about output, and nothing may be written
+  under a checkpoint root without a task naming artifact, revision, expected
+  size and retention. **This task wrote nothing.**

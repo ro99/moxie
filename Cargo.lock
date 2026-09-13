@@ -199,6 +199,7 @@ version = "0.0.0"
 dependencies = [
  "moxie-format",
  "moxie-types",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,8 +1,11 @@
 # Model bring-up contract — Laguna
 
-Status: **metadata and the routed block only.** Nothing executes this
-checkpoint, nothing reads a tensor of it, and no quality claim follows from
-anything in this record. Its attention tower is **not composable** from today's
+Status: **metadata, the routed block, and an importer that reads its weights.**
+Nothing executes this checkpoint and no quality claim follows from anything in
+this record. Since [task 0024](../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md)
+(2026-09-13) its tensors **are** read — three of them import to canonical affine
+form, bitwise equal to the source's own arithmetic — and that is a statement
+about a reader agreeing with a file, not about a model. Its attention tower is **not composable** from today's
 operation catalogue; the two gaps that block it are named below with the
 evidence that they may not be guessed.
 
@@ -29,9 +32,9 @@ roadmap M2 item 4.
 | Tokenizer | `tokenizer.json`, 100,352 vocabulary entries; `tokenizer_config.json` names a `tokenizers` backend |
 | Trained positional range | `max_position_embeddings` 1,048,576 — **not** an admissible context here (R19) |
 | Declared draft model | `poolside/Laguna-S-2.1-DFlash`, method `dflash`, 15 speculative tokens. **Not present on this machine and not inspected.** M9's |
-| O1 catalog decision | **OPEN.** `hy3-w4a16-mtp` is in scope per AGENTS.md, which authorises inspection and nothing else |
-| O2 quality decision | **OPEN.** No paired quality evidence exists |
-| O5 storage/conversion authorization | **OPEN.** Nothing may be copied, converted or requantized |
+| O1 catalog decision | **RESOLVED 2026-09-13** ([ADR 0017](../decisions/adr/0017-v1-catalog-and-no-quantizer.md)) — Laguna is **number 8** of the ten pinned v1 revisions, at the revision above. Task 0022 recorded this row as OPEN because it was, until the owner ruled mid-task |
+| O2 quality decision | **RESOLVED 2026-09-13** ([ADR 0018](../decisions/adr/0018-v1-quality-is-bit-identical-repack.md)) — v1's acceptable loss is a **bit-identical repack** `W=(Q-Z)*S`, publisher quality accepted as-is. Task 0024 shows this artifact's tensors repack bit-identically; **no paired output evidence exists and none is claimed** |
+| O5 storage/conversion authorization | **RESOLVED 2026-09-13** ([ADR 0020](../decisions/adr/0020-user-managed-storage-and-canonical-materialization.md)) — user-managed: Moxie reads the canonical file, repacking is an external script the user runs, and **no agent-initiated bulk download, copy or conversion** may start without a task naming artifact, revision, expected size and retention. Nothing here has written a byte |
 
 **No download was made.** The artifact finished downloading on 2026-09-12,
 before this task, and was verified complete then and again now.
@@ -231,16 +234,35 @@ Read from one shard's headers for `model.layers.1.mlp.experts.0`:
 `384 · 8 = 3,072` input channels, `3,072 / 32 = 96` groups — consistent with
 group 32 and eight INT4 codes per word.
 
-**Two facts the existing importer cannot yet absorb**, both blocking and both
-M3's:
+**Two facts the existing importer could not absorb. Both are closed by
+[task 0024](../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md)
+(2026-09-13), which reads this artifact's tensors:**
 
-- **Asymmetric.** `PackQuantizedSpec` in `moxie-format` refuses an asymmetric
-  source today; task 0018's accepted scope was symmetric INT8 group 32.
+- **Asymmetric.** `PackQuantizedSpec` refused an asymmetric source through task
+  0018, whose accepted scope was symmetric INT8 group 32. It now carries a
+  named `ZeroPointSource` instead of a `symmetric` boolean, because the boolean
+  said only that *some* zero points exist and the importer has to know **where**.
 - **The zero points are packed along the *output* axis.** `weight_packed` is
   `[1024, 3072/8]` — eight codes per word along the **input** axis — while
   `weight_zero_point` is `[1024/8, 96]`, eight per word along the **output**
-  axis. Two packing conventions in one tensor group, and the existing reader has
-  seen only the first.
+  axis. Two packing conventions in one tensor group, and the reader had seen
+  only the first. The mapping is pinned to `compressed-tensors` 0.17.0's
+  `pack_to_int32(..., packed_dim=0)` and **measured** against this artifact's
+  own codes, which the symmetric case could never do: a zero-point word's lanes
+  are different output channels, so their statistics separate the readings
+  ([experiment 0005](../evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md)).
+
+**Reading a tensor is not executing one.** `model.layers.1.mlp.experts.0`'s
+three projections import to canonical affine form and every reconstructed value
+is bitwise equal to the source's own `(q - z) * s`. Nothing computes with them:
+W4A16 is M3 item 3 and no kernel exists. **No quality claim follows** (**O2**),
+and nothing was written under any checkpoint root (**O5**).
+
+**One thing the import turned up about this artifact's own shape.** Its index
+holds 140,989 tensors, so one shard's header is about a megabyte serialized and
+its admitted peak estimate is 16.5 MB — above `HeaderBudget::DEFAULT`'s 8 MiB,
+which is calibrated on Gemma 4's 17–64 KB headers. The default refusing it is
+the budget working; any path that opens this artifact has to state a budget.
 
 ### Cost, at this artifact's scale
 
@@ -296,8 +318,11 @@ has been computed, because nothing can plan it.
 - **No private runtime, cache, transfer, sampler or branch evaluator.**
   `moxie-memory` gained nothing; `arch-check`'s "a second weight-residency
   owner" rule passes.
-- **Reference quality: none, and none is claimed.** O2 is open and needs paired
-  output against the released model.
+- **Reference quality: none, and none is claimed.** O2 is **resolved** for v1 as
+  a bit-identical repack with the publisher's own quality accepted as-is
+  ([ADR 0018](../decisions/adr/0018-v1-quality-is-bit-identical-repack.md));
+  what task 0024 shows is that this artifact's tensors repack bit-identically at
+  tensor scale, which is the repack half and not a statement about output.
 - **What runs:** a synthetic stack of Laguna-shaped routed blocks, through the
   shared host interpreter, over weights the test invents. It is row-independent,
   which is the stateless form of whole-versus-chunked parity. **It is not
@@ -312,13 +337,22 @@ has been computed, because nothing can plan it.
 
 1. **The attention tower**, on the two gaps above. Until both are closed by
    their own tasks, no Laguna layer is composable and no state schema exists.
-2. **The importer**: asymmetric INT4 group 32 with output-axis-packed zero
-   points. M3's.
+2. ~~**The importer**: asymmetric INT4 group 32 with output-axis-packed zero
+   points.~~ **Closed 2026-09-13 by
+   [task 0024](../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md).**
+   What replaces it is narrower: **nothing executes a canonical INT4 tensor.**
+   The W4A16 path is M3 item 3, and the graph's `TensorRequirement`s stay BF16
+   until one exists, because listing INT4 would advertise a path that is not
+   there.
 3. **The fused/per-expert mapping**, which the artifact's own conversion mapping
    does not cover.
-4. **O1** — the catalog gate is open; inspection is not approval.
-5. **O2** — no quality evidence of any kind.
-6. **O5** — nothing may be copied, converted or requantized.
+4. ~~**O1**~~ — resolved 2026-09-13; Laguna is number 8 of the v1 catalog.
+   Catalog membership is not support: the blockers above are what support needs.
+5. **O2** — resolved as repack-only, and the repack half is now shown at tensor
+   scale. **No paired output against the released model exists**, which is what
+   any statement about this model's quality would need.
+6. ~~**O5**~~ — resolved as user-managed. Still no bulk write without a task
+   naming artifact, revision, expected size and retention.
 7. **Context**: 1,048,576 declared is not an admissible context here, and the
    yarn gap means the long-context positional path is exactly the part that is
    not established.
@@ -327,7 +361,11 @@ has been computed, because nothing can plan it.
 
 ## Bring-up cost
 
-One session on 2026-09-13, within [task 0022](../tasks/0022-m2-laguna-metadata-and-second-consumer.md).
+One session on 2026-09-13, within [task 0022](../tasks/0022-m2-laguna-metadata-and-second-consumer.md),
+plus one within [task 0024](../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md)
+the same day for the importer — which is shared work in `moxie-format` that this
+family happened to be the occasion for, and which three other local artifacts
+consume unchanged.
 By ownership: `moxie-models` gained one module; `moxie-graph`, `moxie-oracles`
 and `moxie-interp` gained the routed parameters this family needs;
 `moxie-memory` gained nothing. Three shared operation **parameters** added, all

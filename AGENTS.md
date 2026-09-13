@@ -8,8 +8,10 @@ This repository builds one NVIDIA inference engine for one interactive user, inc
 1 and 2 on 2026-09-12, items 3, 4 and 5 on 2026-09-13 — and the owner authorized
 M3 on 2026-09-13. M3 is the milestone the next task comes from.** M2's formal
 closure statement is still the owner's to make and is not claimed here. See the
+[task 0024 handover](docs/handovers/2026-09-13-task0024-asymmetric-int4-import.md)
+for the current continuation, the
 [task 0023 handover](docs/handovers/2026-09-13-task0023-whole-working-set-trace.md)
-for the current continuation, and the
+for M2's last task, and the
 [closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
 M1's exit evidence gate by gate.
 
@@ -23,6 +25,60 @@ download, copy or conversion may start** without a task naming artifact,
 revision, expected size and retention. `/models` and `/fast/models` remain
 read-only inputs to an agent. The roadmap's M3 items are in
 [06-implementation-roadmap.md](docs/spec/06-implementation-roadmap.md).
+
+**M3's first task is implemented and not accepted: task 0024, M3 item 2's
+asymmetric half** ([task 0024](docs/tasks/0024-m3-asymmetric-int4-pack-quantized-import.md),
+2026-09-13, contract committed at `e122de3` before implementation). The importer
+reads compressed-tensors `pack-quantized` **asymmetric INT4 at group 32**, whose
+`weight_zero_point` is packed along the **output** axis while the codes are
+packed along the input axis: **two packing conventions inside one tensor group,
+distinguished by nothing in either name.** That is R16 in its exact form, and it
+is why the shapes are validated rather than derived from byte counts. Six
+modules of `/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4` and
+`/fast/models/cyankiwi/Qwen3.8-27B-AWQ-BF16-INT4` import with **112,640
+reconstructed values bitwise equal** to the source's own `(q-z)*s`, computed
+from the raw bytes by a transcription that follows the pinned library's *unpack
+procedure* rather than this importer's closed-form index. **Import is not
+execution**: nothing consumes a canonical INT4 tensor, W4A16 is M3 item 3, and
+Laguna's graph still declares BF16 tensor requirements — listing INT4 would
+advertise a path that is not there. A bit-identical repack is **ADR 0018's v1
+quality definition, not evidence about model output.** Mutation-measured 16 of
+16, 0 survivors, first measurement.
+
+**What a symmetric source could never establish, and this one can.** Task 0018
+recorded that a *code* word's lane order cannot be checked against an artifact,
+because all its lanes fall inside one scale group. A **zero-point** word's lanes
+are different **output channels**, whose codes have different statistics, so the
+assignment is a measurable property of the file. It was measured — `mean |mean
+code − z|` of **0.52** for the pinned reading against **1.48–1.78** for every
+alternative the same shape permits, on four tensors across two artifacts, with
+the thresholds written into the contract beforehand
+([experiment 0005](docs/evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md)).
+That mattered rather than being a flourish: both artifacts declare compressor
+versions (`0.1.dev534+gb269f2e`, `0.1.dev535+gdc9611a`) that are untagged
+development builds and pin nothing, and this repository already refused one
+mismatched `transformers` copy as a pinned exporter for yarn. **When a
+convention cannot be checked, say so and pin it; when it can, measure it.** The
+code word's lane order is still unchecked and stays where task 0018 left it.
+
+**The paragraph on task 0022 below says "no Laguna tensor was read". That was
+true when it was written.** Three of its tensors have now been read and
+imported; nothing computes with them. The older paragraph is left as it was,
+because rewriting a record to match later work erases what was true when it was
+written — and this sentence exists so that a reader meets the correction before
+the stale claim rather than after it. The same applies to that section's "O1's
+catalog and O5's storage questions stay open": the owner resolved O1–O5 on
+2026-09-13, and [the Laguna bring-up record](docs/models/laguna.md), which is a
+living record rather than a task's, carries the rulings.
+
+**Two facts about these artifacts that only reading them produced.** A module's
+four tensors **need not share a shard** — Laguna keeps them together for 34,739
+of 34,740 modules and Qwen3.8-27B for **none** of its 256, so a caller needs an
+index resolver, which is M3 item 1's. And Laguna's **140,989** tensors put a
+shard header at about a megabyte serialized, a 16.5 MB admitted peak against
+`HeaderBudget::DEFAULT`'s 8 MiB: the default refusing it is the budget working,
+the default is unchanged, and any production path that opens this artifact has
+to state one.
 
 **M2 item 1's routed-expert mathematics is accepted**
 ([task 0019](docs/tasks/0019-m2-routed-expert-semantics.md), 2026-09-12, after

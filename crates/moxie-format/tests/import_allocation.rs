@@ -13,7 +13,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 use moxie_format::affine::IntWidth;
-use moxie_format::compressed_tensors::{Granularity, PackQuantizedSpec, TensorTriple, import};
+use moxie_format::compressed_tensors::{
+    Granularity, PackQuantizedSpec, SourceTensors, ZeroPointSource, import,
+};
 use moxie_format::scale::ScaleDtype;
 
 struct Counter;
@@ -51,7 +53,7 @@ fn importing_allocates_a_bounded_number_of_times_regardless_of_row_count() {
         let spec = PackQuantizedSpec {
             width: IntWidth::Int4,
             granularity: Granularity::Group { size: 32 },
-            symmetric: true,
+            zero_points: ZeroPointSource::Symmetric,
         };
         let per_word = spec.values_per_word();
         let packed_columns = columns.div_ceil(per_word);
@@ -62,16 +64,17 @@ fn importing_allocates_a_bounded_number_of_times_regardless_of_row_count() {
             .collect();
         let packed_shape = [rows as u64, packed_columns as u64];
         let scale_shape = [rows as u64, groups as u64];
-        let triple = TensorTriple {
+        let src = SourceTensors {
             packed: &packed,
             packed_shape: &packed_shape,
             scale: &scale,
             scale_shape: &scale_shape,
             scale_dtype: ScaleDtype::Bf16,
+            zero_point: None,
             logical: (rows, columns),
         };
         let before = CALLS.load(SeqCst);
-        let tensor = import(&spec, triple).unwrap();
+        let tensor = import(&spec, src).unwrap();
         let used = CALLS.load(SeqCst) - before;
         assert_eq!(tensor.descriptor().out_features, rows);
         counts.push((rows, used));

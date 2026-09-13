@@ -693,7 +693,8 @@ fn the_declared_geometry_matches_the_artifact_config() {
         partial_rotary.numerator as f64 / partial_rotary.denominator as f64
     );
 
-    // And the quantization the importer does not yet accept.
+    // And the quantization: asymmetric INT4 at group 32, which task 0024's
+    // importer reads and no kernel executes.
     let q = &c["quantization_config"];
     assert_eq!(q["quant_method"], "compressed-tensors");
     assert_eq!(q["format"], "pack-quantized");
@@ -702,7 +703,8 @@ fn the_declared_geometry_matches_the_artifact_config() {
     assert_eq!(w["group_size"].as_u64().unwrap(), 32);
     assert!(
         !w["symmetric"].as_bool().unwrap(),
-        "asymmetric, which the accepted importer refuses"
+        "asymmetric, which task 0024's importer reads through \
+         `ZeroPointSource::PackedAlongOutput`"
     );
 }
 

@@ -45,4 +45,38 @@ c85a8abaad496b6fc430c4e3560a55efc32322a6260aea63e33c5d607c4affb4
 - **MTP in the name is insufficient.** Inspect the tensor index, head shapes, quantization exclusions, tokenizer and released proposer semantics. Lossless repacking must retain auxiliary heads; it does not implement a verifier or guarantee speedup.
 - **Metadata is not quality evidence.** In particular, `model_free=true` / `iters=0` and a recognizable publisher are not proofs of calibration quality. Quantized-source import parity and released-model quality remain separate checks.
 
-Not determined here: actual scale tensor dtypes, actual zero-point packing/offsets, presence and semantics of every `g_idx`/permutation, complete MTP tensor coverage, model licenses/calibration datasets, numerical quality, exact CUDA kernel compatibility, artifact storage needed, and throughput. Pinned tensor indexes/headers, exporter source and small licensed tensor fixtures settle import questions; full reference/quality/performance gates settle the rest. No weights need to be downloaded just to establish these metadata distinctions.
+## What task 0024 settled, from the local artifacts' own headers (2026-09-13)
+
+Read-only inspection of `/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4` and
+`/fast/models/cyankiwi/Qwen3.8-27B-AWQ-BF16-INT4`, through the reader under
+test. "Not determined here" above is narrowed by exactly this much:
+
+- **Scale tensor dtypes are BF16** in both, read from each tensor's own header
+  while both configs declare `scale_dtype: null` — which is why document 03
+  says to read the header.
+- **The zero points are packed along the output axis**, `I32[ceil(out/8),
+  groups]`, one 4-bit biased-unsigned value per lane, `z = raw - 8`. The codes
+  are packed along the **input** axis in the same tensor group. Two conventions,
+  one module, distinguished by nothing in either name. Every one of Laguna's
+  34,740 asymmetric modules and Qwen3.8's 256 declares that shape.
+- **The equation is `(q - z) * s`**, from the pinned compressor's own
+  `_dequantize` — document 03's equation and sign.
+- **`actorder` is null** in both, so the grouping is contiguous and no
+  permutation is carried. The two canada-quant rows declare `actorder=static`
+  instead, which is a different question and **not** settled here: the group-128
+  symmetric INT4 import is the next importer task, and what `static` means for
+  logical column identity has to be read from the exporter before anything
+  consumes those artifacts.
+- **A module's four tensors need not share a shard.** Qwen3.8-27B splits every
+  one of its 256 modules — codes and zero points in shards 1–2, scales
+  elsewhere. An index resolver is M3 item 1's.
+
+The lane assignment inside a zero-point word was **measured** against the
+artifacts' own codes rather than taken from the library
+([experiment 0005](experiments/0005-asymmetric-int4-zero-point-assignment.md)),
+because both artifacts declare compressor versions that are untagged development
+builds and pin nothing. The lane order inside a **code** word is still not
+determinable from any local artifact, exactly as task 0018 recorded.
+
+Still not determined: the semantics of `actorder=static` and of every
+`g_idx`/permutation, complete MTP tensor coverage, model licenses/calibration datasets, numerical quality, exact CUDA kernel compatibility, artifact storage needed, and throughput. Pinned tensor indexes/headers, exporter source and small licensed tensor fixtures settle import questions; full reference/quality/performance gates settle the rest. No weights need to be downloaded just to establish these metadata distinctions.

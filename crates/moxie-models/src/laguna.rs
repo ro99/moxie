@@ -486,9 +486,11 @@ fn required(name: &str, layer: Option<u32>) -> Result<TensorRequirement> {
     Ok(TensorRequirement {
         role: role(name, layer),
         // BF16 only, and that is a statement about this graph rather than about
-        // the family: the artifact's routed experts are INT4 and would need an
-        // importer that accepts asymmetric group-32 sources, which does not
-        // exist. Listing INT4 here would advertise a path that is not there.
+        // the family: the artifact's routed experts are INT4. Task 0024's
+        // importer now reads them into canonical affine form, but **nothing
+        // executes a canonical INT4 tensor** -- W4A16 is M3 item 3 and no
+        // kernel exists. Listing INT4 here would advertise a path that is not
+        // there.
         allowed: vec![WeightPrecision::new(Precision::Bf16)?],
         required: true,
     })

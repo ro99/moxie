@@ -4,7 +4,9 @@
 
 **M1 complete (M1.5 closed 2026-09-12); M2's five items are all accepted — items
 1 and 2 on 2026-09-12, items 3, 4 and 5 on 2026-09-13 — and the owner authorized
-M3 on 2026-09-13, so the next contract is an M3 contract.** M2's formal closure
+M3 on 2026-09-13. [Task 0024](0024-m3-asymmetric-int4-pack-quantized-import.md)
+is M3's first contract: implemented 2026-09-13, awaiting independent review and
+owner acceptance.** M2's formal closure
 statement is still the owner's to make and is not claimed here. M3's own gates
 are already ruled on: O2 repack-only (ADR 0018) and O5 user-managed storage and
 conversion (ADR 0020), so no bulk download, copy or conversion may be started by
@@ -119,6 +121,26 @@ and every discrepancy constructible without allocating. All 30 routed layers of
 its union is the whole expert set. **The acceptance closes task 0023 only, not
 M2**, which is the owner's separate decision, and **no model-quality claim
 follows** (**O2**).
+
+**[Task 0024](0024-m3-asymmetric-int4-pack-quantized-import.md) is implemented
+on 2026-09-13 and is not accepted**; its contract was authored and committed at
+`e122de3` before implementation. It is M3 item 2's asymmetric half: the importer
+reads compressed-tensors `pack-quantized` **asymmetric INT4 at group 32**, whose
+`weight_zero_point` is packed along the **output** axis while the codes are
+packed along the input axis — two conventions inside one tensor group,
+distinguished by nothing in either name, which is R16 in its exact form. Six
+modules of `/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4` and
+`/fast/models/cyankiwi/Qwen3.8-27B-AWQ-BF16-INT4` import, with **112,640
+reconstructed values bitwise equal** to the source's own `(q-z)*s` computed
+independently from the raw bytes. The lane assignment inside a zero-point word
+is **measured** against the artifacts' own codes rather than taken from the
+pinned library, because a zero-point word's lanes are different output channels
+— the check a *code* word can never support, and a check that mattered because
+both artifacts declare untagged development compressor versions. **Import is not
+execution**: nothing consumes a canonical INT4 tensor, W4A16 is M3 item 3, and
+Laguna's graph still declares BF16. A bit-identical repack is ADR 0018's v1
+quality definition, **not** evidence about model output. Mutation-measured 16 of
+16, 0 survivors.
 
 Reopen accepted tasks only for a demonstrated defect in accepted scope.
 

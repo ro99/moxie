@@ -10,5 +10,12 @@ publish = false
 moxie-types.workspace = true
 moxie-format.workspace = true
 
+[dev-dependencies]
+# Test-only, for reading an artifact's `config.json` and checking that the
+# packing parameters an importer is handed are the ones the artifact declares.
+# `arch-check` excludes dev-dependencies, because document 02 permits a test
+# harness there.
+serde_json = "1"
+
 [lints]
 workspace = true

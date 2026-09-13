@@ -2,8 +2,19 @@
 
 ## Active handover
 
+[Task 0024 implemented: asymmetric INT4 import](2026-09-13-task0024-asymmetric-int4-import.md)
+is the current continuation. M3 item 2's asymmetric half — compressed-tensors
+`pack-quantized` **asymmetric INT4 at group 32**, whose zero points are packed
+along the **output** axis while its codes are packed along the input axis — is
+implemented on 2026-09-13 and **has had no independent review and is not
+accepted**. Six modules of two real artifacts import with 112,640 reconstructed
+values bitwise equal to the source's own arithmetic, and the zero-point lane
+assignment is **measured** against the artifacts' own codes rather than taken
+from the pinned library. **Import is not execution**: nothing consumes a
+canonical INT4 tensor, and W4A16 is M3 item 3.
+
 [Task 0023 accepted; M3 is authorized](2026-09-13-task0023-whole-working-set-trace.md)
-is the current continuation. M2 item 5's remainder — byte and cost traces
+precedes it, and is M2's last task. M2 item 5's remainder — byte and cost traces
 reconciled with the resource ledger across a **whole working set** rather than
 one layer — was accepted by the owner on 2026-09-13, after three rounds of
 independent review (ten findings, four P1, all reproduced and fixed, none
