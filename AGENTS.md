@@ -368,6 +368,24 @@ in three 256 B holes satisfies every one of those inequalities and evicts anyway
 — 1,536 B read against 768 predicted exactly. When a rule is wrong three times,
 the thing to change is not the inequality but which quantity is being compared.
 
+**A diagnostic that cannot be built is a process that cannot report anything.**
+A third review round found an *ordinary* discrepancy still formatting its prose:
+a mismatch plus one failed allocation was **SIGABRT, 114 bytes**. The fix before
+it had made the path that *handles* an allocation failure safe and left the
+ordinary paths alone, on the argument that a mismatch is not an out-of-memory
+context. **That argument is wrong: under memory pressure a mismatch is as likely
+as an allocation failure.** An error's prose is `&'static str` now and its
+numbers are structured fields; `Display` composes them, so whether rendering
+allocates is the caller's decision rather than a step's. The field was walked
+down three times -- `String`, `Cow`, `&'static str` -- once per review round, and
+each step was somebody else finding what the previous one left.
+
+**Test the failure path under the failure.** The sweep written for the previous
+P1 reconciled only a **valid** trace, so it never constructed a diagnostic and
+could not have caught this. Every equality is violated in turn with every
+allocation refused now. A gate that exercises the happy path under the adverse
+condition has tested the adverse condition on the happy path.
+
 **A lane nobody runs is a lane that holds failures.** The same review found two
 clippy lints standing in `xtask/src/gpu.rs` since task 0021. The declared gates
 named a host clippy lane and a `--features moxie-executor/driver` one, and

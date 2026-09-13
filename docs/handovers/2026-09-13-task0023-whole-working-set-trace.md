@@ -1,8 +1,8 @@
 # Handover — task 0023 implemented and corrected; M2's exit is one clause from complete
 
-**Task 0023 is implemented and corrected after two rounds of independent review
-— nine findings, three P1, all reproduced, all fixed, none disputed — and awaits
-owner acceptance.**
+**Task 0023 is implemented and corrected after three rounds of independent
+review — ten findings, four P1, all reproduced, all fixed, none disputed — and
+awaits owner acceptance.**
 It delivers M2's exit clause on traces in the shape its contract declared before
 implementation: **a whole working set, out of device memory, with byte and cost
 traces reconciled against the resource ledger as named equalities.**
@@ -46,7 +46,7 @@ tests and **951** device-feature tests. Task 0022's own record says why: its
 first attempt at the same comparison was taken on a half-built tree and read a
 number that was wrong.
 
-**Mutation measurement: 39 of 39 caught, 0 survivors**, over six rounds
+**Mutation measurement: 41 of 41 caught, 0 survivors**, over seven rounds
 ([experiment 0004](../evidence/experiments/0004-task0023-whole-working-set-trace.md)).
 The first was 27 of 30; the third, after the first review's six fixes, was 34 of
 36; the fifth, after the second review's three, was 38 of 39.
@@ -101,6 +101,25 @@ which *fits* every card here and is out-of-device-memory only because the cache
 is capped — true, and weaker. A batch whose union is the whole expert set is
 42.5 GiB against a 24 GiB card and needs no ratio argument to be oversized. Both
 run so that neither carries the other's claim.
+
+### The third round: one P1, and it was my own reasoning
+
+An **ordinary** discrepancy still allocated: `Check::eq` built its prose with
+`format!` before converting it into a `Cow`. A ledger-identity mismatch with one
+allocation failing was **SIGABRT, 114 bytes**.
+
+The previous round's fix made the path that *handles* an allocation failure
+allocation-free and left the ordinary mismatch paths formatting, on the argument
+that a mismatch is not an out-of-memory context. **That argument is wrong in one
+line: under memory pressure a mismatch is as likely as an allocation failure**,
+and a diagnostic that cannot be built is a process that cannot report anything.
+`Discrepancy::detail` is a `&'static str` now — the field has been walked down
+three times, once per review round — and `Display` composes the structured
+numbers, so whether rendering allocates is the caller's decision.
+
+And the test that fix needed and did not have: the OOM sweep reconciled only a
+**valid** trace, so it never built a diagnostic. All seventeen equalities are now
+violated in turn with **every** allocation refused.
 
 ### The second round: three more, and one of them was my own test
 

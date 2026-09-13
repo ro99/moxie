@@ -346,6 +346,124 @@ fn a_trace_that_cannot_allocate_returns_an_error_instead_of_aborting() {
             ),
         }
     }
+    // --- and every *ordinary* discrepancy, with the allocator refusing --------
+    //
+    // A third review round found this: the previous fix made the path that
+    // *handles* an allocation failure safe, and left the ordinary mismatch paths
+    // formatting their prose. A ledger-identity mismatch plus one failed
+    // allocation was **SIGABRT, 114 bytes**. The reasoning that stopped short
+    // was mine and it was wrong: under memory pressure a mismatch is as likely
+    // as an allocation failure, and a diagnostic that cannot be built is a
+    // process that cannot report anything.
+    //
+    // So: every equality, violated, with **every** allocation failing. Each must
+    // report the same check it reports with memory available. A `detail` that
+    // went back to being formatted would abort here rather than in production.
+    /// One violation of one named equality.
+    type Violation = (&'static str, Box<dyn Fn(&mut StepTrace)>);
+
+    let violations: Vec<Violation> = vec![
+        (
+            "schema-version-is-this-one",
+            Box::new(|t: &mut StepTrace| t.schema_version += 1),
+        ),
+        (
+            "ledger-is-the-runs-own",
+            Box::new(|t: &mut StepTrace| t.layers[0].ledger_id += 1),
+        ),
+        (
+            "every-reservation-is-charged",
+            Box::new(|t: &mut StepTrace| t.layers[0].reservations_named += 1),
+        ),
+        (
+            "ledger-charges-what-is-held",
+            Box::new(|t: &mut StepTrace| t.layers[0].ledger[0].2 += 64),
+        ),
+        (
+            "cache-cap-is-the-reservation",
+            Box::new(|t: &mut StepTrace| {
+                t.layers[0].scopes[0].resident_bytes = t.layers[0].scopes[0].cap_bytes + 1;
+            }),
+        ),
+        (
+            "requests-are-attempts",
+            Box::new(|t: &mut StepTrace| t.layers[0].cost.acquires_issued[0] += 1),
+        ),
+        (
+            "run-ran-the-plan",
+            Box::new(|t: &mut StepTrace| t.layers[0].cost.groups_run += 1),
+        ),
+        (
+            "launches-match-device-groups",
+            Box::new(|t: &mut StepTrace| t.layers[0].cost.launches += 1),
+        ),
+        (
+            "slots-are-written-once",
+            Box::new(|t: &mut StepTrace| t.layers[0].cost.slots_written += 1),
+        ),
+        (
+            "leases-balance",
+            Box::new(|t: &mut StepTrace| t.layers[0].cost.leases_released += 1),
+        ),
+        (
+            "predicted-uploads-are-uploaded",
+            Box::new(|t: &mut StepTrace| t.layers[0].predicted.device_upload_bytes += 1),
+        ),
+        (
+            "predicted-reads-are-read",
+            Box::new(|t: &mut StepTrace| t.layers[0].predicted.host_read_bytes += 1),
+        ),
+        (
+            "predicted-hits-are-hit",
+            Box::new(|t: &mut StepTrace| t.layers[0].predicted.host_hit_bytes += 1),
+        ),
+        (
+            "predicted-source-reuse-is-reused",
+            Box::new(|t: &mut StepTrace| t.layers[0].predicted.host_source_reuse_bytes += 1),
+        ),
+        (
+            "step-is-the-sum-of-layers",
+            Box::new(|t: &mut StepTrace| t.totals[0].1.admitted_bytes += 1),
+        ),
+        (
+            "step-covers-every-byte",
+            Box::new(|t: &mut StepTrace| t.whole[0].1.read_bytes += 1),
+        ),
+        (
+            "nothing-outstanding",
+            Box::new(|t: &mut StepTrace| t.outstanding_reservations += 1),
+        ),
+    ];
+
+    for (expected, violate) in &violations {
+        let mut broken = step.clone();
+        violate(&mut broken);
+        // With memory available, to learn what it reports.
+        let plain = broken
+            .reconcile()
+            .expect_err("the violation must be reported");
+        assert_eq!(plain.check, *expected, "reported as {}", plain.check);
+        // And with **every** allocation refused, which must change nothing.
+        let starved = while_failing_at(0, usize::MAX, || broken.reconcile())
+            .expect_err("the violation must be reported under memory pressure too");
+        // The expected check, or the one that says the storage for the step's
+        // own arithmetic could not be reserved -- the step-level checks need a
+        // scope list and cannot be reached without one. What must never happen is
+        // an abort, and what must never change is that a *layer*-level violation
+        // is still named: those are checked before anything is allocated.
+        let out_of_memory = starved.check == "step-is-the-sum-of-layers"
+            && starved.detail.contains("out of memory");
+        assert!(
+            starved.check == *expected || out_of_memory,
+            "under memory pressure it reported {} instead of {expected}",
+            starved.check
+        );
+    }
+    println!(
+        "{} equalities reported the same failure with every allocation refused",
+        violations.len()
+    );
+
     println!(
         "every trace entry point refused a failed allocation with a typed error, and \
          reconciliation reported one without allocating to say so"

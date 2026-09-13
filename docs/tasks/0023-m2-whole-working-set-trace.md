@@ -590,7 +590,7 @@ each, no baseline, and no duration appears anywhere in the trace.
 
 ### Measured effect and uncertainty
 
-- **Mutation measurement: 39 of 39 caught, 0 survivors**, over six rounds
+- **Mutation measurement: 41 of 41 caught, 0 survivors**, over seven rounds
   ([experiment 0004](../evidence/experiments/0004-task0023-whole-working-set-trace.md)).
   The first was 27 of 30; the third, after the first review's six fixes, was 34 of
   36; the fifth, after the second review's three, was 38 of 39. **Every survivor in every round was a defect or a missing fixture**, never
@@ -740,6 +740,37 @@ found by a counterexample rather than by reading the rule.
 whole number of alignment units. It has its own pure-planner test —
 `exactness_reserves_the_alignment_a_chunk_can_waste` — for exactly the reason
 AGENTS.md gives: a parameter no fixture varies is a parameter no test checks.
+
+### The third review round: one P1, and it was my own reasoning
+
+**One finding, P1, reproduced and fixed.** An **ordinary** discrepancy still
+allocated: `Check::eq` called a closure that built a `String` with `format!` and
+converted it into a `Cow`. A ledger-identity mismatch with one allocation failing
+was **SIGABRT, 114 bytes**.
+
+**The reasoning that stopped short is recorded here because it was mine.** The
+previous round's fix made the path that *handles* an allocation failure
+allocation-free and deliberately left the ordinary mismatch paths formatting,
+on the argument that a mismatch is not an out-of-memory context. That argument is
+wrong in one line: **under memory pressure a mismatch is as likely as an
+allocation failure**, and a diagnostic that cannot be built is a process that
+cannot report anything at all. The field has now been walked down three times —
+`String`, then `Cow<'static, str>`, then `&'static str` — and each step was a
+review finding.
+
+`Discrepancy::detail` is a `&'static str`. Every one of the thirty-two
+construction sites carries a static description of what its equality means; the
+numbers are the structured fields beside it, and `Display` composes them, so
+whether *rendering* allocates is the caller's decision rather than a step's.
+Anything richer — which tiers, which flows, which counts — is in the `StepTrace`
+the caller already holds.
+
+**The test the previous round's fix needed and did not have**: the OOM sweep
+reconciled only a *valid* trace, so it never constructed a diagnostic at all.
+Every one of the **seventeen** equalities is now violated in turn with **every**
+allocation refused, and each must report the same check it reports with memory
+available. Two mutations measure it: one makes an ordinary discrepancy build its
+prose, one makes the out-of-memory report build its own.
 
 ### The owner resolved O1–O5 during this task
 

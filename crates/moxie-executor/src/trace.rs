@@ -204,15 +204,22 @@ pub struct Discrepancy {
     pub scope: Option<Scope>,
     pub left: u64,
     pub right: u64,
-    /// Why, in prose.
+    /// What the equality means, in prose.
     ///
-    /// A `Cow` rather than a `String`, and a review is why: a discrepancy that
-    /// reports an **allocation failure** must not allocate to say so. Those
-    /// carry a borrowed `&'static str`; an ordinary mismatch formats its numbers
-    /// into an owned one. Everything a caller acts on -- the check's name, both
-    /// sides, the layer and the scope -- is beside this field and needs no
-    /// allocation either way.
-    pub detail: std::borrow::Cow<'static, str>,
+    /// **`&'static str`, so that constructing a discrepancy allocates nothing.**
+    /// Three review findings walked this field down to here. It was a `String`
+    /// built by `format!`, which aborted the process when the thing being
+    /// reported *was* an allocation failure; then a `Cow` whose ordinary arm
+    /// still formatted, which aborted when an ordinary mismatch happened to
+    /// coincide with memory pressure -- **114 bytes**, reported by a review, on a
+    /// ledger-identity mismatch.
+    ///
+    /// The numbers a caller acts on are the fields beside this one, and
+    /// [`Discrepancy`]'s `Display` composes them: rendering writes into the
+    /// caller's formatter, so whether *that* allocates is the caller's decision
+    /// and not a step's. Anything richer -- which tiers, which flows, which
+    /// counts -- is in the `StepTrace` the caller already holds.
+    pub detail: &'static str,
 }
 
 impl core::fmt::Display for Discrepancy {
@@ -609,7 +616,7 @@ impl Check<'_> {
         check: &'static str,
         left: u64,
         right: u64,
-        detail: impl FnOnce() -> String,
+        detail: &'static str,
     ) -> Result<(), Discrepancy> {
         self.out.equalities_checked += 1;
         if left == right {
@@ -621,7 +628,7 @@ impl Check<'_> {
             scope: self.scope,
             left,
             right,
-            detail: detail().into(),
+            detail,
         })
     }
 
@@ -632,7 +639,7 @@ impl Check<'_> {
         check: &'static str,
         left: u64,
         right: u64,
-        detail: impl FnOnce() -> String,
+        detail: &'static str,
     ) -> Result<(), Discrepancy> {
         self.out.equalities_checked += 1;
         self.out.bounds_checked += 1;
@@ -645,7 +652,7 @@ impl Check<'_> {
             scope: self.scope,
             left,
             right,
-            detail: detail().into(),
+            detail,
         })
     }
 }
@@ -679,39 +686,19 @@ impl LayerTrace {
             "ledger-is-the-runs-own",
             self.ledger_id,
             self.run_ledger_id,
-            || {
-                format!(
-                    "this trace read ledger {} and the run was admitted against {}",
-                    self.ledger_id, self.run_ledger_id
-                )
-            },
+            "the ledger this trace read is not the one the run was admitted against",
         )?;
         c.eq(
             "every-reservation-is-charged",
             self.reservations_found,
             self.reservations_named,
-            || {
-                format!(
-                    "{} of {} reservation(s) this step can name are in the ledger; one it cannot \
-                     find is one it cannot compare",
-                    self.reservations_found, self.reservations_named
-                )
-            },
+            "a reservation this step can name is not in the ledger, so its charge cannot be compared",
         )?;
         c.eq(
             "ledger-charges-what-is-held",
             self.ledger.len() as u64,
             self.accounted.len() as u64,
-            || {
-                format!(
-                    "the ledger holds {} charged tier(s) against {} the authority's caps and this \
-                     plan's envelope account for: charged {:?}, accounted {:?}",
-                    self.ledger.len(),
-                    self.accounted.len(),
-                    self.ledger,
-                    self.accounted
-                )
-            },
+            "the ledger holds a different number of charged tiers than the authority's caps and this plan's envelope account for",
         )?;
         for ((scope, tier, charged), (a_scope, a_tier, accounted)) in
             self.ledger.iter().zip(self.accounted.iter())
@@ -724,23 +711,15 @@ impl LayerTrace {
                     scope: Some(*scope),
                     left: *charged,
                     right: *accounted,
-                    detail: format!(
-                        "the ledger charges {} {} where the envelope accounts for {} {}",
-                        scope,
-                        tier.name(),
-                        a_scope,
-                        a_tier.name()
-                    )
-                    .into(),
+                    detail: "the ledger charges a tier the envelope does not account for",
                 });
             }
-            c.eq("ledger-charges-what-is-held", *charged, *accounted, || {
-                format!(
-                    "{scope} {}: charged {charged} B, accounted {accounted} B -- a difference is a \
-                     third charger",
-                    tier.name()
-                )
-            })?;
+            c.eq(
+            "ledger-charges-what-is-held",
+                *charged,
+                *accounted,
+                "a tier's charge differs from what the authority's caps and this plan's envelope account for -- a difference is a third charger",
+            )?;
         }
         c.scope = None;
 
@@ -750,12 +729,7 @@ impl LayerTrace {
                 "cache-cap-is-the-reservation",
                 delta.resident_bytes.min(delta.cap_bytes),
                 delta.resident_bytes,
-                || {
-                    format!(
-                        "{} holds {} B against a {} B cap",
-                        delta.scope, delta.resident_bytes, delta.cap_bytes
-                    )
-                },
+                "a scope holds more than its cap; the first figure is the cap it was clamped to",
             )?;
         }
         c.scope = None;
@@ -769,16 +743,12 @@ impl LayerTrace {
         let attempted = self.cost.acquires_issued[0]
             .saturating_mul(self.chunk_bytes[0])
             .saturating_add(self.cost.acquires_issued[1].saturating_mul(self.chunk_bytes[1]));
-        c.eq("requests-are-attempts", requested, attempted, || {
-            format!(
-                "the authority was asked for {requested} B; the run issued {} gate-up and {} down \
-                 acquire(s) of {} and {} B",
-                self.cost.acquires_issued[0],
-                self.cost.acquires_issued[1],
-                self.chunk_bytes[0],
-                self.chunk_bytes[1]
-            )
-        })?;
+        c.eq(
+            "requests-are-attempts",
+            requested,
+            attempted,
+            "the bytes the authority was asked for are not the run's own acquire count times the plan's chunk lengths",
+        )?;
         // A layer that failed still has to account for its bytes, and every
         // identity above applies to it unchanged. What changes is what its
         // *counts* may be: it ran some prefix of its plan, so the equality below
@@ -789,24 +759,14 @@ impl LayerTrace {
                 "run-ran-the-plan",
                 self.cost.groups_run,
                 self.groups,
-                || {
-                    format!(
-                        "{} group(s) ran against a plan of {}",
-                        self.cost.groups_run, self.groups
-                    )
-                },
+                "a completed layer ran a different number of groups than its plan has",
             )?;
         } else {
             c.at_least(
                 "run-ran-the-plan",
                 self.groups,
                 self.cost.groups_run,
-                || {
-                    format!(
-                        "a failed layer ran {} group(s) of a plan of {}",
-                        self.cost.groups_run, self.groups
-                    )
-                },
+                "a failed layer ran more groups than its plan has",
             )?;
         }
         c.eq(
@@ -815,12 +775,7 @@ impl LayerTrace {
                 .host_groups
                 .saturating_add(self.cost.device_groups),
             self.cost.groups_run,
-            || {
-                format!(
-                    "{} host and {} device group(s) against {} run",
-                    self.cost.host_groups, self.cost.device_groups, self.cost.groups_run
-                )
-            },
+            "the host and device group counts do not sum to the groups run",
         )?;
         // Found by mutation: deleting the launch counter survived the whole
         // sweep, because nothing compared it to anything. Then found by review:
@@ -835,15 +790,10 @@ impl LayerTrace {
             .saturating_mul(self.kernels_per_group);
         if self.completed {
             c.eq(
-                "launches-match-device-groups",
+            "launches-match-device-groups",
                 self.cost.launches,
                 per_group,
-                || {
-                    format!(
-                        "{} launch(es) submitted for {} device group(s) of {} symbol(s) each",
-                        self.cost.launches, self.cost.device_groups, self.kernels_per_group
-                    )
-                },
+                "the launches the lane reported are not one per symbol of the descriptor for every device group",
             )?;
         } else {
             // A layer that failed part way through a group submitted what it
@@ -852,27 +802,13 @@ impl LayerTrace {
             // nothing and one that reported a whole extra group are different
             // defects.
             c.at_least(
-                "launches-match-device-groups",
+            "launches-match-device-groups",
                 self.cost.launches,
-                per_group,
-                || {
-                    format!(
-                        "a failed layer submitted {} launch(es) for {} completed device group(s)                          of {} symbol(s) each",
-                        self.cost.launches, self.cost.device_groups, self.kernels_per_group
-                    )
-                },
-            )?;
+                per_group, "a failed layer submitted fewer launches than its completed device groups account for")?;
             c.at_least(
-                "launches-match-device-groups",
+            "launches-match-device-groups",
                 per_group.saturating_add(self.kernels_per_group),
-                self.cost.launches,
-                || {
-                    format!(
-                        "a failed layer submitted {} launch(es), more than the {} completed                          group(s) plus the one that failed can account for",
-                        self.cost.launches, self.cost.device_groups
-                    )
-                },
-            )?;
+                self.cost.launches, "a failed layer submitted more launches than its completed groups plus the one that failed can account for")?;
         }
         let slots = self.rows.saturating_mul(self.top_k);
         if self.completed {
@@ -880,24 +816,14 @@ impl LayerTrace {
                 "slots-are-written-once",
                 self.cost.slots_written,
                 slots,
-                || {
-                    format!(
-                        "{} slot(s) written against {} rows of top-k {}",
-                        self.cost.slots_written, self.rows, self.top_k
-                    )
-                },
+                "a completed layer wrote a different number of slots than rows times top-k",
             )?;
         } else {
             c.at_least(
                 "slots-are-written-once",
                 slots,
                 self.cost.slots_written,
-                || {
-                    format!(
-                        "a failed layer wrote {} slot(s) of {slots}",
-                        self.cost.slots_written
-                    )
-                },
+                "a failed layer wrote more slots than rows times top-k",
             )?;
         }
         // Exact in both cases, and the withheld term is why. A run that failed
@@ -911,12 +837,7 @@ impl LayerTrace {
             self.cost
                 .leases_released
                 .saturating_add(self.withheld_leases),
-            || {
-                format!(
-                    "{} lease(s) taken, {} given back, {} withheld",
-                    self.cost.leases_acquired, self.cost.leases_released, self.withheld_leases
-                )
-            },
+            "the leases taken are not the leases given back plus the leases withheld",
         )?;
 
         // --- the prediction ----------------------------------------------
@@ -969,82 +890,44 @@ impl LayerTrace {
                 "predicted-uploads-are-uploaded",
                 device.admitted_bytes,
                 p.device_upload_bytes,
-                || {
-                    format!(
-                        "device admissions: {} B happened, {} B was predicted exactly",
-                        device.admitted_bytes, p.device_upload_bytes
-                    )
-                },
+                "device admissions differ from what was predicted exactly",
             )?;
             c.eq(
                 "predicted-hits-are-hit",
                 device.hit_bytes,
                 p.device_hit_bytes,
-                || {
-                    format!(
-                        "device hits: {} B happened, {} B was predicted exactly",
-                        device.hit_bytes, p.device_hit_bytes
-                    )
-                },
+                "device hits differ from what was predicted exactly",
             )?;
             c.eq(
                 "predicted-source-reuse-is-reused",
                 device.source_reuse_bytes,
                 p.host_source_reuse_bytes,
-                || {
-                    format!(
-                        "reused host sources: {} B happened, {} B was predicted exactly",
-                        device.source_reuse_bytes, p.host_source_reuse_bytes
-                    )
-                },
+                "reused host sources differ from what was predicted exactly",
             )?;
         } else {
             c.at_least(
                 "predicted-uploads-are-uploaded",
                 device.admitted_bytes,
                 p.device_upload_bytes,
-                || {
-                    format!(
-                        "device admissions: {} B against a declared lower bound of {} B",
-                        device.admitted_bytes, p.device_upload_bytes
-                    )
-                },
+                "device admissions are below the declared lower bound",
             )?;
             c.at_least(
-                "predicted-hits-are-hit",
+            "predicted-hits-are-hit",
                 device.hit_bytes.saturating_add(device.evicted_bytes),
                 p.device_hit_bytes,
-                || {
-                    format!(
-                        "device hits: {} B happened and {} B was evicted, against {} B predicted \
-                         resident -- a predicted hit can only be lost to an eviction",
-                        device.hit_bytes, device.evicted_bytes, p.device_hit_bytes
-                    )
-                },
+                "device hits plus evictions are below what was predicted resident: a predicted hit can only be lost to an eviction",
             )?;
             c.at_least(
-                "predicted-hits-are-hit",
+            "predicted-hits-are-hit",
                 p.device_hit_bytes.saturating_add(device_retried),
                 device.hit_bytes,
-                || {
-                    format!(
-                        "device hits: {} B happened against {} B predicted plus {} B of retried \
-                         requests -- an unpredicted hit can only come from a retry",
-                        device.hit_bytes, p.device_hit_bytes, device_retried
-                    )
-                },
+                "device hits exceed what was predicted plus the retried requests: an unpredicted hit can only come from a retry",
             )?;
             c.at_least(
                 "predicted-source-reuse-is-reused",
                 device.source_reuse_bytes.saturating_add(host.evicted_bytes),
                 p.host_source_reuse_bytes,
-                || {
-                    format!(
-                        "reused host sources: {} B happened and {} B was evicted from the host, \
-                         against {} B predicted",
-                        device.source_reuse_bytes, host.evicted_bytes, p.host_source_reuse_bytes
-                    )
-                },
+                "reused host sources plus host evictions are below what was predicted",
             )?;
         }
 
@@ -1053,59 +936,32 @@ impl LayerTrace {
                 "predicted-reads-are-read",
                 host.read_bytes,
                 p.host_read_bytes,
-                || {
-                    format!(
-                        "host reads: {} B happened, {} B was predicted exactly",
-                        host.read_bytes, p.host_read_bytes
-                    )
-                },
+                "host reads differ from what was predicted exactly",
             )?;
             c.eq(
                 "predicted-hits-are-hit",
                 host.hit_bytes,
                 p.host_hit_bytes,
-                || {
-                    format!(
-                        "host hits: {} B happened, {} B was predicted exactly",
-                        host.hit_bytes, p.host_hit_bytes
-                    )
-                },
+                "host hits differ from what was predicted exactly",
             )?;
         } else {
             c.at_least(
                 "predicted-reads-are-read",
                 host.read_bytes,
                 p.host_read_bytes,
-                || {
-                    format!(
-                        "host reads: {} B against a declared lower bound of {} B",
-                        host.read_bytes, p.host_read_bytes
-                    )
-                },
+                "host reads are below the declared lower bound",
             )?;
             c.at_least(
                 "predicted-hits-are-hit",
                 host.hit_bytes.saturating_add(host.evicted_bytes),
                 p.host_hit_bytes,
-                || {
-                    format!(
-                        "host hits: {} B happened and {} B was evicted, against {} B predicted \
-                         resident",
-                        host.hit_bytes, host.evicted_bytes, p.host_hit_bytes
-                    )
-                },
+                "host hits plus evictions are below what was predicted resident",
             )?;
             c.at_least(
                 "predicted-hits-are-hit",
                 p.host_hit_bytes.saturating_add(host_retried),
                 host.hit_bytes,
-                || {
-                    format!(
-                        "host hits: {} B happened against {} B predicted plus {} B of retried \
-                         requests",
-                        host.hit_bytes, p.host_hit_bytes, host_retried
-                    )
-                },
+                "host hits exceed what was predicted plus the retried requests",
             )?;
         }
         Ok(())
@@ -1130,7 +986,7 @@ impl StepTrace {
                 scope: None,
                 left: u64::from(self.schema_version),
                 right: u64::from(TRACE_SCHEMA_VERSION),
-                detail: std::borrow::Cow::Borrowed("this trace was written against another schema"),
+                detail: "this trace was written against another schema",
             });
         }
         for layer in &self.layers {
@@ -1156,9 +1012,7 @@ impl StepTrace {
                     scope: Some(delta.scope),
                     left: 0,
                     right: 0,
-                    detail: std::borrow::Cow::Borrowed(
-                        "the step's totals could not be computed: out of memory",
-                    ),
+                    detail: "the step's totals could not be computed: out of memory",
                 })?;
                 let f = &delta.flow;
                 e.requested_bytes += f.requested_bytes;
@@ -1190,7 +1044,7 @@ impl StepTrace {
             "step-is-the-sum-of-layers",
             self.totals.len() as u64,
             summed.len() as u64,
-            || "the step's totals cover a different set of scopes than its layers".into(),
+            "the step's totals cover a different set of scopes than its layers",
         )?;
         for (scope, total) in &self.totals {
             c.scope = Some(*scope);
@@ -1205,8 +1059,7 @@ impl StepTrace {
                     scope: Some(*scope),
                     left: total.admitted_bytes,
                     right: want.admitted_bytes,
-                    detail: format!("{scope}: totals {total:?} against the layers' sum {want:?}")
-                        .into(),
+                    detail: "the step's totals are not the sum of its layers' flows",
                 });
             }
             c.out.equalities_checked += 1;
@@ -1227,21 +1080,44 @@ impl StepTrace {
                 .iter()
                 .find(|(s, _)| s == scope)
                 .map_or_else(ByteFlow::default, |(_, f)| *f);
+            // One static message per flow, so a failure says **which** inflow
+            // the layers do not account for without formatting anything: a
+            // discrepancy has to be constructible when there is no memory to
+            // build prose with.
             for (what, outer, inner) in [
-                ("requested", whole.requested_bytes, mine.requested_bytes),
-                ("hit", whole.hit_bytes, mine.hit_bytes),
-                ("coalesced", whole.coalesced_bytes, mine.coalesced_bytes),
-                ("admitted", whole.admitted_bytes, mine.admitted_bytes),
-                ("read", whole.read_bytes, mine.read_bytes),
-                ("uploaded", whole.uploaded_bytes, mine.uploaded_bytes),
+                (
+                    "the layers do not account for every byte the authority was asked for",
+                    whole.requested_bytes,
+                    mine.requested_bytes,
+                ),
+                (
+                    "the layers do not account for every cache hit",
+                    whole.hit_bytes,
+                    mine.hit_bytes,
+                ),
+                (
+                    "the layers do not account for every coalesced acquire",
+                    whole.coalesced_bytes,
+                    mine.coalesced_bytes,
+                ),
+                (
+                    "the layers do not account for every byte admitted -- a byte that entered a \
+                     cache and belongs to no layer is a layer missing from this trace",
+                    whole.admitted_bytes,
+                    mine.admitted_bytes,
+                ),
+                (
+                    "the layers do not account for every byte read",
+                    whole.read_bytes,
+                    mine.read_bytes,
+                ),
+                (
+                    "the layers do not account for every byte uploaded",
+                    whole.uploaded_bytes,
+                    mine.uploaded_bytes,
+                ),
             ] {
-                c.eq("step-covers-every-byte", outer, inner, || {
-                    format!(
-                        "{scope}: the authority {what} {outer} B over this step and its layers \
-                         account for {inner} B -- a byte that entered a cache and belongs to no \
-                         layer is a layer that is missing from this trace"
-                    )
-                })?;
+                c.eq("step-covers-every-byte", outer, inner, what)?;
             }
         }
         c.scope = None;
@@ -1250,21 +1126,16 @@ impl StepTrace {
             "nothing-outstanding",
             self.outstanding_reservations as u64,
             0,
-            || {
-                format!(
-                    "{} reservation(s) were still charged when the step ended",
-                    self.outstanding_reservations
-                )
-            },
+            "reservations were still charged when the step ended",
         )?;
         for account in &self.final_accounts {
             c.scope = Some(account.scope);
-            c.eq("nothing-outstanding", account.resident_bytes, 0, || {
-                format!(
-                    "{} still holds {} B after the step",
-                    account.scope, account.resident_bytes
-                )
-            })?;
+            c.eq(
+                "nothing-outstanding",
+                account.resident_bytes,
+                0,
+                "a scope still holds bytes after the step",
+            )?;
             let gone = account
                 .flow
                 .evicted_bytes
@@ -1274,12 +1145,7 @@ impl StepTrace {
                 "nothing-outstanding",
                 account.flow.admitted_bytes,
                 gone,
-                || {
-                    format!(
-                        "{} admitted {} B and released {} B",
-                        account.scope, account.flow.admitted_bytes, gone
-                    )
-                },
+                "a scope's admissions are not all evicted, retired or discarded",
             )?;
         }
         Ok(out)

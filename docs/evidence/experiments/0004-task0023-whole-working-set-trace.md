@@ -50,7 +50,8 @@ not tracked; what is tracked is this record and the tests the measurement produc
 | Third, after an independent review's six findings and their fixes | 36 | 34 | 2 |
 | Fourth, after those two | 36 | **36** | 0 |
 | Fifth, after a second review round's three findings and their fixes | 39 | 38 | 1 |
-| Sixth, after that one | **39** | **39** | **0** |
+| Sixth, after that one | 39 | 39 | 0 |
+| Seventh, with two mutations for a third review round's P1 | **41** | **41** | **0** |
 
 The **first** measurement's three survivors were defects rather than opinions
 about test strength:
@@ -135,6 +136,8 @@ that reason, and without it the mutation would survive.
 | `M39` OOM report formats | reporting an allocation failure allocates to say so | the same sweep, through `reconcile` |
 | `M40` exactness ignores geometry | exactness compares totals instead of contiguous space | the fragmentation regression |
 | `M41` padding reserve dropped | the alignment a chunk can waste is not reserved | its own pure-planner test, because every chunk here is a whole alignment unit and the term is inert in every arena-backed fixture |
+| `M42` detail formats again | an ordinary discrepancy builds its prose instead of borrowing it | the starvation loop over all seventeen violated equalities |
+| `M39` OOM report formats | the out-of-memory report builds its own prose | the same loop |
 
 ## What the measurements found, beyond the survivors
 
