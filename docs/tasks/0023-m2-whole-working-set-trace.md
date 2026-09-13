@@ -534,7 +534,7 @@ acceptance.**
 | Device-lane clippy (`--features moxie-executor/driver`) | passed |
 | CUDA-lane clippy (`--features cuda`, which compiles `xtask`'s device code) | passed — **a third lane, declared by this task**, and it was failing on two lints standing since task 0021 |
 | `cargo test --workspace --locked --offline` | **930 passed, 0 failed**, against a re-measured baseline of **918** at `aeac114` |
-| Device-feature workspace tests | **962 passed, 0 failed**, against a re-measured baseline of **951** at `aeac114` |
+| Device-feature workspace tests | **965 passed, 0 failed**, against a re-measured baseline of **951** at `aeac114` |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | **zero failures**, 79 rejected fixtures, 21 accepted, 13 rules |

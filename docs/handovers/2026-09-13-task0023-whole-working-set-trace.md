@@ -36,7 +36,7 @@ had done.
 | Device-lane clippy (`--features moxie-executor/driver`) | passed |
 | CUDA-lane clippy (`--features cuda`) | passed — **a third lane, declared by this task**; it was failing on two lints standing since task 0021 |
 | `cargo test --workspace --locked --offline` | **930 passed, 0 failed** (918 at `aeac114`) |
-| Device-feature workspace tests | **962 passed, 0 failed** (951 at `aeac114`) |
+| Device-feature workspace tests | **965 passed, 0 failed** (951 at `aeac114`) |
 | `cargo xtask-cuda test-gpu` | **42 passed, 0 failed, 0 skipped**; sm_86 and sm_120 qualified |
 | `cargo xtask spec-check` | passed, 10 documents |
 | `cargo xtask arch-check` | zero failures, 79 rejected fixtures, 21 accepted, 13 rules |
