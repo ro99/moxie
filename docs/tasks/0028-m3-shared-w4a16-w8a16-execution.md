@@ -296,8 +296,58 @@ Run on this tree, all three GPUs present:
   one module published in 59.5 s (nearly all of it hashing the 5.37 GB source
   shard) and executed on all three UUIDs, 9,216 output elements per device,
   worst 2.000 ULP.
-- Host and device-feature suites, and the mutation battery once on the final
-  tree: see the handover for the counts.
+- `cargo test --workspace --locked --offline`: **1,085 passed, 0 failed, 0
+  ignored**.
+- `cargo test --workspace --features moxie-executor/driver --locked --offline`:
+  **1,125 passed, 0 failed, 0 ignored**.
+- `cargo xtask mutation-check --battery 0028`, once on the final tree:
+  **7 of 7 mutants caught, 1 of 1 expected survivor held**, 0 unstable, 0
+  broken controls, and `git status` clean afterwards. Every device mutation was
+  caught by the device lane and every host mutation by the host lane. The
+  substitutions are ways of getting a **plausible wrong answer** rather than a
+  crash — an INT4 nibble pair read backwards, a zero point never subtracted,
+  every group using the first group's scale, BF16 scales decoded as F16, and
+  the weight tile loaded untransposed — because those are exactly the defects a
+  tolerance cannot catch by being tight. The independence control removes the
+  resident-component length check, which no fixture violates, and it held: the
+  numerical lanes are not depending on a bounds check for their answer.
+
+### One gate unmeasured, and one finding handed back
+
+**`cargo xtask mutation-check --battery 0006` is UNMEASURED on this tree, not
+passed.** Two things stopped it, in that order.
+
+First it **could not run at all**, and could not have run on the previous tree
+either. Its `budget` lane measures peak
+live heap through a global allocator; the lane's own lock stops one test
+resetting the other's peak but not the other test's live bytes being counted
+into it, so the number depends on how loaded the machine is. Two baseline runs
+on an identical clean tree reported it as "fails" and as "disagrees with
+itself", and the battery refused to build verdicts on either — correctly.
+
+The lane now runs with `--test-threads=1`, which gives the measurement the
+isolation it already assumes and weakens no assertion. **The fix belongs in
+`crates/moxie-repack/tests/budget.rs`**, whose two tests should not share a
+process-wide counter at all; that crate is task 0027's and deferred, so this is
+recorded rather than fixed here.
+
+That worked — the battery got past its baseline and into the substitutions —
+and then it **ran past a two-hour limit I set on it and was killed
+mid-substitution**, leaving `if cancelled() { ... }` replaced by
+`let _ = &cancelled;` live in `crates/moxie-repack/src/write/run.rs`. This is
+the scar the engineering log records, and the recovery built for it worked
+exactly as designed: the next invocation printed *"restored
+crates/moxie-repack/src/write/run.rs from an interrupted run before measuring
+anything"*, `git status` came back clean, and `git diff` confirmed the
+substitution was the only change the kill had left.
+
+It was **not re-run**, and that is a decision rather than an oversight. T0006
+measures the repack publication path, which this task did not touch; the battery
+that measures *this* task's work is T0028 and it passed. A second two-hour-plus
+run risks the same mid-substitution kill for a regression check on unchanged
+code. **Recorded as unmeasured**, and a full T0006 run belongs in whatever picks
+up `moxie-repack` next — together with the `budget.rs` fix, which would make it
+runnable without the serialisation workaround.
 
 ### What this does not do
 

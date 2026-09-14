@@ -109,8 +109,42 @@ Measured on this tree with all three GPUs present:
 - `cargo test -p moxie-executor --features driver --test affine_linear_real_module`:
   the real module published in 59.5 s and executed on three UUIDs, 9,216 output
   elements per device, worst 2.000 ULP.
-- Host suite, device-feature suite and the mutation battery: counts recorded in
-  the task record's gate list.
+- `cargo xtask mutation-check --battery 0028`: **7 of 7 mutants caught, 1 of 1
+  expected survivor held**, 0 unstable, 0 broken controls, `git status` clean
+  afterwards. The substitutions are plausible wrong *answers* — a nibble pair
+  read backwards, a zero point never subtracted, one group's scale used for
+  every group, BF16 scales decoded as F16, the weight tile loaded untransposed
+  — which is why the battery needs device lanes and why a tolerance alone could
+  not have caught any of them.
+- `cargo test --workspace --locked --offline`: **1,085 passed, 0 failed, 0
+  ignored**.
+- `cargo test --workspace --features moxie-executor/driver --locked --offline`:
+  **1,125 passed, 0 failed, 0 ignored**.
+- `cargo xtask mutation-check --battery 0006`: **UNMEASURED, not passed.** See
+  below.
+
+## One thing to fix that is not this task's
+
+**`moxie-repack`'s `budget` lane cannot be trusted under load**, and the T0006
+mutation battery refused to run because of it. It measures peak live heap
+through a global allocator; its lock stops one test resetting the other's peak
+but not the other test's live bytes being counted into it. Two baselines on an
+identical clean tree called it "fails" and "disagrees with itself"; run alone it
+passes ten times out of ten. The lane now runs with `--test-threads=1`, which is
+the isolation the measurement already assumes and not a weakened assertion. The
+real fix is in `crates/moxie-repack/tests/budget.rs` — those two tests should
+not share a process-wide counter — and that crate is task 0027's, deferred.
+
+With the lane serialised the battery reached its substitutions and then **ran
+past a two-hour limit and was killed mid-substitution**, leaving a mutation live
+in `crates/moxie-repack/src/write/run.rs`. The recovery that exists for exactly
+this worked: the next invocation restored the file, cleared the marker and said
+so, and `git diff` confirmed the substitution was the only thing the kill left.
+The battery was **not re-run** — it measures the repack path, which this task
+did not touch, and the battery that measures this task's work passed. T0006 is
+therefore **unmeasured on this tree**, and a full run belongs with the
+`budget.rs` fix in whoever picks up `moxie-repack`. Budget four hours or more,
+and do not run anything else on the machine while it goes.
 
 ## What is next, and what is not
 
