@@ -56,6 +56,16 @@ moxie-models = { path = "crates/moxie-models" }
 [profile.release]
 debug = 1
 
+# The codec's inner loops -- SHA-256, nibble packing, scale decoding -- run over
+# every byte of every artifact a test touches, and an unoptimized build runs
+# them at roughly 12 MB/s. That is what made task 0025's real-artifact lane
+# spend seven and a half minutes hashing one 5.37 GB shard. Optimizing this one
+# package in dev builds changes nothing about what the code does or which tests
+# run; it changes how long a gate takes to tell you the answer. Debug
+# information is kept, so a backtrace through it still names lines.
+[profile.dev.package.moxie-format]
+opt-level = 2
+
 # Applied to every crate via `[lints] workspace = true`. Document 02 requires the
 # FFI boundary to be audited, not merely compiled: unsafe code must be justified
 # in writing at each site.
