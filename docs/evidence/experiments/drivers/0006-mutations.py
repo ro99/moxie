@@ -52,6 +52,11 @@ LANES = {
                  "--test", "manifest_v1"],
     "publication": ["cargo", "test", "-p", "moxie-repack", "--offline", "--locked",
                     "--test", "publication"],
+    # Added for task 0026: the ledger enumeration walks `Site::ALL`, so the
+    # shard-header boundaries the safetensors writer introduced are consulted
+    # by a lane rather than only by the suite nobody mutates.
+    "workflow": ["cargo", "test", "-p", "moxie-repack", "--offline", "--locked",
+                 "--test", "workflow"],
     "roundtrip": ["cargo", "test", "-p", "moxie-repack", "--offline", "--locked",
                   "--test", "round_trip"],
     "cli": ["cargo", "test", "-p", "moxie-repack", "--offline", "--locked", "--test", "cli"],
@@ -81,12 +86,15 @@ MUTATIONS = [
     ("published-validation-skipped", RUN,
      """        faults.check(Site::Validate)?;
         let artifact = Artifact::open_unpublished(&self.dest, &staged, ByteBudget::default())?;
-        for t in &sealed {""",
+        let mut roles: Vec<&str> = sealed.iter().map(|t| t.role.as_str()).collect();""",
      """        let artifact = Artifact::open_unpublished(&self.dest, &staged, ByteBudget::default())?;
-        for t in sealed.iter().take(0) {""", CAUGHT),
+        let mut roles: Vec<&str> = sealed.iter().take(0).map(|t| t.role.as_str()).collect();""",
+     CAUGHT),
     ("source-digest-is-a-constant", RLIB,
-     '        let (digest, bytes) = sources.file_digest(&file, buffers.source_tile_mut())?;',
-     '        let (digest, bytes) = ("0".repeat(64), 0u64);\n        let _ = buffers.source_tile_mut();',
+     """        let (digest, bytes) =
+            sources.file_digest_cancellable(&file, buffers.source_tile_mut(), cancelled)?;""",
+     """        let (digest, bytes) = ("0".repeat(64), 0u64);
+        let _ = (buffers.source_tile_mut(), &cancelled);""",
      CAUGHT),
     ("unit-source-digest-is-recorded-not-checked", WORK,
      "fn sha256_of(bytes: &[u8]) -> String {\n    let mut h = StreamingSha256::new();\n    h.update(bytes);\n    h.finalize_hex()\n}",
@@ -116,27 +124,27 @@ MUTATIONS = [
      "    if v.version != SELECTION_VERSION {",
      "    if false && v.version != SELECTION_VERSION {", CAUGHT),
     ("manifest-schema-version-not-checked", MAN,
-     "    if v.schema_version != SCHEMA_VERSION {",
-     "    if false && v.schema_version != SCHEMA_VERSION {", CAUGHT),
+     "    if !SUPPORTED_SCHEMA_VERSIONS.contains(&v.schema_version) {",
+     "    if false && !SUPPORTED_SCHEMA_VERSIONS.contains(&v.schema_version) {", CAUGHT),
 
     # --- premature publication and false completion --------------------------
     ("manifest-staged-under-its-final-name", RUN,
      "        let staged = self.dest.join(STAGED_MANIFEST_FILE);",
      "        let staged = self.dest.join(MANIFEST_FILE);", CAUGHT),
     ("incomplete-tensors-can-be-sealed", RUN,
-     "            if p.done != t.request.length {",
-     "            if false && p.done != t.request.length {", CAUGHT),
+     "            if p.done != c.len {",
+     "            if false && p.done != c.len {", CAUGHT),
     ("journal-recorded-before-the-bytes-are-durable", RUN,
-     """        write_at(&mut file, offset, bytes, faults)
+     """        write_at(&mut file, offset, bytes, faults, Site::ChunkWrite)
             .map_err(|e| invalid(format!("cannot write {}: {e}", path.display())))?;
         faults.check(Site::ChunkSync)?;
         file.sync_all()
             .map_err(|e| invalid(format!("cannot sync {}: {e}", path.display())))?;
 
         let unit = CompletedUnit {
-            tensor: role.to_string(),
+            tensor: component.to_string(),
             index,
-            chunk: planned.chunk.clone(),
+            chunk: planned.file.clone(),
             offset,
             len: bytes.len() as u64,
             sha256: sha256_hex(bytes),
@@ -144,24 +152,24 @@ MUTATIONS = [
         };
         append_durably(&mut self.journal, &journal::unit_line(&unit), faults)?;""",
      """        let unit = CompletedUnit {
-            tensor: role.to_string(),
+            tensor: component.to_string(),
             index,
-            chunk: planned.chunk.clone(),
+            chunk: planned.file.clone(),
             offset,
             len: bytes.len() as u64,
             sha256: sha256_hex(bytes),
             source_sha256: source_sha256.to_string(),
         };
         append_durably(&mut self.journal, &journal::unit_line(&unit), faults)?;
-        write_at(&mut file, offset, bytes, faults)
+        write_at(&mut file, offset, bytes, faults, Site::ChunkWrite)
             .map_err(|e| invalid(format!("cannot write {}: {e}", path.display())))?;
         faults.check(Site::ChunkSync)?;
         file.sync_all()
             .map_err(|e| invalid(format!("cannot sync {}: {e}", path.display())))?;""",
      CAUGHT),
     ("resume-trusts-the-journals-offsets", RUN,
-     "        if unit.chunk != planned.chunk || unit.offset != planned.offset + progress.done {",
-     "        if false && (unit.chunk != planned.chunk || unit.offset != planned.offset + progress.done) {",
+     "        if unit.chunk != planned.file || unit.offset != planned.file_offset + progress.done {",
+     "        if false && (unit.chunk != planned.file || unit.offset != planned.file_offset + progress.done) {",
      SURVIVOR),
 
     # --- syncs and error handling -------------------------------------------
@@ -178,9 +186,33 @@ MUTATIONS = [
         }
         let dir = File::open(&self.dest).map_err(|e| {""", CAUGHT),
     ("write-errors-are-swallowed", RUN,
-     """        write_at(&mut file, offset, bytes, faults)
+     """        write_at(&mut file, offset, bytes, faults, Site::ChunkWrite)
             .map_err(|e| invalid(format!("cannot write {}: {e}", path.display())))?;""",
-     """        let _ = write_at(&mut file, offset, bytes, faults);""", CAUGHT),
+     """        let _ = write_at(&mut file, offset, bytes, faults, Site::ChunkWrite);""", CAUGHT),
+    # The `workflow` lane exists for this one: the ledger enumeration is the
+    # only gate that fails a run at `shard-create` and then asks who still
+    # holds an admission.
+    ("header-failure-leaks-the-admission", RUN,
+     """        if let Err(e) = run.write_shard_headers(faults) {
+            // The same rule as the journal handle above, at the error path the
+            // safetensors header pass added: a start that refuses releases what
+            // it admitted. `begin` never hands back a `Run` it failed to build,
+            // so nothing above this can release the scratch on its behalf.
+            run.abandon(ledger)?;
+            return Err(e);
+        }""",
+     """        run.write_shard_headers(faults)?;""",
+     CAUGHT),
+    ("shard-header-sync-skipped", RUN,
+     """            faults.check(Site::ShardHeaderSync)?;
+            file.sync_all()
+                .map_err(|e| invalid(format!("cannot sync '{}': {e}", shard.file)))?;""",
+     """            let _ = &file;""", CAUGHT),
+    ("shard-header-never-written", RUN,
+     """            write_at(&mut file, 0, header, faults, Site::ShardHeaderWrite).map_err(|e| {
+                invalid(format!("cannot write the header of '{}': {e}", shard.file))
+            })?;""",
+     """            let _ = (&mut file, header);""", CAUGHT),
     ("journal-sync-skipped", RUN,
      """    faults.check(Site::JournalSync)?;
     file.sync_data()
@@ -205,8 +237,8 @@ MUTATIONS = [
      "            if alone > budget.chunk_file_bytes() {",
      "            if false && alone > budget.chunk_file_bytes() {", CAUGHT),
     ("plan-ignores-the-disk-budget", PLAN,
-     "        if total > budget.disk_bytes() {",
-     "        if false && total > budget.disk_bytes() {", CAUGHT),
+     "        if total_disk > budget.disk_bytes() {",
+     "        if false && total_disk > budget.disk_bytes() {", CAUGHT),
     ("tile-is-the-whole-scratch", RLIB,
      "        (self.scratch_bytes / 2).max(1)",
      "        (4usize << 20).max(self.scratch_bytes)", CAUGHT),
@@ -216,8 +248,9 @@ MUTATIONS = [
 
     # --- cancellation ordering ----------------------------------------------
     ("cancellation-not-checked-between-units", RLIB,
-     "            if cancelled() {\n                let outcome = run.cancel(ledger)?;",
-     "            if false && cancelled() {\n                let outcome = run.cancel(ledger)?;", CAUGHT),
+     "            if cancelled() {\n                let outcome = run_slot.take().expect(\"a run\").cancel(ledger)?;",
+     "            if false && cancelled() {\n                let outcome = run_slot.take().expect(\"a run\").cancel(ledger)?;",
+     CAUGHT),
     ("cancellation-not-checked-before-publish", RUN,
      """        if cancelled() {
             // The last point at which cancellation can be honoured: after this
@@ -245,13 +278,20 @@ MUTATIONS = [
     ("scale-block-not-validated", PAY,
      "        if !v.is_finite() || v <= 0.0 {",
      "        if false && (!v.is_finite() || v <= 0.0) {", CAUGHT),
-    # `if need != length {` occurs twice in this file -- the BF16 byte-count
-    # rule is the other one -- so the anchor carries the line that follows it.
+    # The `Placement::Chunk` length guard appears twice in this file -- the
+    # BF16 byte-count rule is the other one -- so the anchor carries the error
+    # message that follows it. The rule is v1-only: a v2 component's length is
+    # its shard header's claim, which `moxie-storage` checks when it opens.
     ("affine-length-rule-deleted", MAN,
-     """            if need != length {
+     """            if let Placement::Chunk { length, .. } = &placement
+                && need != *length
+            {
                 return Err(invalid(format_args!(
                     "tensor '{role}': a {} {out_features}x{in_features} tensor with {} \\""",
-     """            if false && need != length {
+     """            if let Placement::Chunk { length, .. } = &placement
+                && false
+                && need != *length
+            {
                 return Err(invalid(format_args!(
                     "tensor '{role}': a {} {out_features}x{in_features} tensor with {} \\""",
      CAUGHT),

@@ -30,11 +30,17 @@ pub enum Site {
     JournalAppend,
     /// Syncing a journal record.
     JournalSync,
-    /// Creating a chunk file.
+    /// Creating a shard file, in the pass that writes its header.
+    ShardCreate,
+    /// Writing a shard's safetensors header.
+    ShardHeaderWrite,
+    /// Syncing a shard's safetensors header.
+    ShardHeaderSync,
+    /// Opening a shard file to write a payload unit into it.
     ChunkCreate,
     /// Writing payload bytes.
     ChunkWrite,
-    /// Syncing a chunk file.
+    /// Syncing a shard file after a payload unit.
     ChunkSync,
     /// Reading staged bytes back, on resume or for a rehash.
     ChunkReadBack,
@@ -65,6 +71,9 @@ impl Site {
         Site::JournalCreate,
         Site::JournalAppend,
         Site::JournalSync,
+        Site::ShardCreate,
+        Site::ShardHeaderWrite,
+        Site::ShardHeaderSync,
         Site::ChunkCreate,
         Site::ChunkWrite,
         Site::ChunkSync,
@@ -86,6 +95,9 @@ impl Site {
             Site::JournalCreate => "journal-create",
             Site::JournalAppend => "journal-append",
             Site::JournalSync => "journal-sync",
+            Site::ShardCreate => "shard-create",
+            Site::ShardHeaderWrite => "shard-header-write",
+            Site::ShardHeaderSync => "shard-header-sync",
             Site::ChunkCreate => "chunk-create",
             Site::ChunkWrite => "chunk-write",
             Site::ChunkSync => "chunk-sync",

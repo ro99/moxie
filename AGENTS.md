@@ -24,9 +24,9 @@ all accepted, and M2's formal closure statement remains the owner's to make.
 | | |
 |---|---|
 | Accepted | [Task 0024](docs/tasks/0024-m3-asymmetric-int4-pack-quantized-import.md) — M3 item 2's asymmetric INT4 import (owner, 2026-09-13, after three review rounds). **Importer-only**: no execution, no quality claim. |
-| Implemented, unreviewed | [Task 0025](docs/tasks/0025-m3-offline-repack-publication.md) — M3 item 1's offline repack and canonical publication: `moxie-repack` and [ADR 0023](docs/decisions/adr/0023-canonical-affine-payload-and-repack-journal.md), with the writer folded back in by [ADR 0024](docs/decisions/adr/0024-one-storage-crate-and-a-write-module.md). **Bytes only**, and it does not close M3 item 1. |
+| Implemented, unreviewed | [Task 0025](docs/tasks/0025-m3-offline-repack-publication.md) — M3 item 1's offline repack, corrected after one independent review (ten findings, all fixed), and [task 0026](docs/tasks/0026-m3-canonical-safetensors-publication.md) — the same publication as **safetensors shards** under the owner's packaging ruling. **Bytes only**, and neither closes M3 item 1. |
 | Next | M3 item 3 — shared W4A16/W8A16 paths. The largest gap in the milestone: nothing here executes a quantized weight. |
-| Continuation | [The task 0025 handover](docs/handovers/2026-09-13-task0025-offline-repack-publication.md) |
+| Continuation | [The task 0026 handover](docs/handovers/2026-09-14-task0026-safetensors-publication.md), which carries task 0025's forward |
 
 **Nothing in this repository executes a checkpoint.** Tensors have been
 imported, expert bytes made resident, real expert weights computed with over
@@ -46,7 +46,7 @@ work:
 - **v1 quality is a bit-identical repack** `W=(Q-Z)*S` ([ADR 0018](docs/decisions/adr/0018-v1-quality-is-bit-identical-repack.md)), publisher quality accepted as-is. A repack is not evidence about model output.
 - **Storage and conversion are user-managed** ([ADR 0020](docs/decisions/adr/0020-user-managed-storage-and-canonical-materialization.md)). **No agent-initiated bulk download, copy or conversion** may start without a task naming artifact, revision, expected size and retention. `/models` and `/fast/models` are read-only inputs.
 - **Repack is a Moxie program the user runs offline**, not an external script ([ADR 0021](docs/decisions/adr/0021-repack-is-a-moxie-program.md)); `moxie-repack` is its placement ([ADR 0022](docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md)), and the writer is a **module of that program** ([ADR 0024](docs/decisions/adr/0024-one-storage-crate-and-a-write-module.md)): nothing else can name it, so no rule is needed. A new crate needs several consumers and something distinct to own; one consumer plus a rule to maintain is a module.
-- **The canonical affine payload and the repack journal are fixed** ([ADR 0023](docs/decisions/adr/0023-canonical-affine-payload-and-repack-journal.md)): codes, then scales, then zero points, contiguous, one checksum; the journal is private, versioned and never part of a published artifact.
+- **A published artifact is safetensors shards plus a TOML manifest** (owner, 2026-09-14; [ADR 0022](docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md) amended, schema in [ADR 0025](docs/decisions/adr/0025-canonical-safetensors-schema.md)). No custom container. Each shard must open with the **reference implementation**; the manifest, not `__metadata__`, defines what the tensors mean. The affine mathematics of [ADR 0023](docs/decisions/adr/0023-canonical-affine-payload-and-repack-journal.md) is unchanged, and its journal stays private and out of the artifact.
 
 Ask about an open gate in a batch, before dependent conclusions or irreversible
 work. A task cannot resolve an owner gate through local inference.

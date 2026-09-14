@@ -58,7 +58,8 @@ survivors, because it is a different fact.
 |---|---|
 | `format` | `cargo test -p moxie-format --lib` |
 | `manifest` | `cargo test -p moxie-format --test manifest_v1` |
-| `publication` | `cargo test -p moxie-storage-write` |
+| `publication` | `cargo test -p moxie-repack --test publication` |
+| `workflow` | `cargo test -p moxie-repack --test workflow` (added 2026-09-14) |
 | `roundtrip` | `cargo test -p moxie-repack --test round_trip` |
 | `cli` | `cargo test -p moxie-repack --test cli` |
 | `budget` | `cargo test -p moxie-repack --test budget` |
@@ -132,6 +133,74 @@ reports skips separately and refuses to exit zero with any.
 
 **Three tests and two anchors later, the second run is the measurement above.**
 
+## Re-run for task 0026, against the safetensors writer (2026-09-14)
+
+Task 0026 replaced the container the publication path writes, so this battery
+was re-run against it. **It did not agree with itself on the first attempt, and
+that is the whole value of re-running it.**
+
+| What the re-run said | What it was |
+|---|---|
+| 9 mutations `SKIPPED`, "anchor occurs 0 time(s)" | The rewrite moved the code under them: `t.request.length` became `c.len`, `planned.chunk` became `planned.file`, `file_digest` gained a cancellation argument, one schema version became a supported set, and the affine length rule became a `Placement::Chunk` guard. Re-anchored. **A mutation that does not apply is not evidence**, which is why the driver refuses to exit zero with any. |
+| `chunk-sync-skipped` and `write-errors-are-swallowed` survived | The safetensors header pass reused `chunk-create`, `chunk-write` and `chunk-sync`, so every fault injected for a payload unit fired at a *header* first and the suites kept failing for an unrelated reason. The header pass now owns `shard-create`, `shard-header-write` and `shard-header-sync`, and `write_at` takes its boundary as a parameter. |
+| `cancellation-not-checked-before-publish` survived | Task 0025's finding-9 correction added a cancellation check inside the validation loop, and the existing test's closure stopped there rather than at the last gate before the rename. A new test answers *no* to every boundary but the last, and asserts how many there are. |
+| The `unit-checksum-not-compared` scare before all this | The corruption fixtures flipped `bytes[3]`, which after the rewrite lands in the shard header that every `begin` rewrites. They now compute `payload_start = 8 + header_len`. |
+
+Adding the `workflow` lane then produced 7 invalid controls and 3 broken
+controls at once -- the driver's way of saying **a lane is red on the clean
+tree**. It was: `every_injected_failure_leaves_the_ledger_empty` had been
+failing since `d719f67`, because `Run::begin` admits the read-back scratch and
+the new header pass returned with a bare `?`, leaking it. That is review finding
+7 at an error path that postdates finding 7's fix.
+`header-failure-leaks-the-admission` is now a mutation, and `workflow` is the
+only lane that catches it.
+
+**Result on the corrected tree: 30 of 30 mutant(s) caught, 3 of 3 expected
+survivor(s) held; 0 survivor(s), 0 unstable, 0 invalid control(s), 0 broken
+control(s), 0 skipped; 3 repetition(s) of each verdict in both directions.**
+
+| Axis | Mutation | Verdict | Caught by |
+|---|---|---|---|
+| Checksums | `unit-checksum-not-compared` | caught | `publication` |
+|  | `tensor-hash-never-sees-the-bytes` | caught | `publication`, `roundtrip`, `cli`, `budget` |
+|  | `published-validation-skipped` | caught | `publication` |
+|  | `source-digest-is-a-constant` | caught | `roundtrip`, `cli`, `budget` |
+|  | `unit-source-digest-is-recorded-not-checked` | control-held | — |
+| Source, plan and version binding | `resume-ignores-its-binding` | caught | `publication`, `cli` |
+|  | `run-binding-omits-the-source-digests` | caught | `cli` |
+|  | `journal-version-not-checked` | caught | `format` |
+|  | `selection-version-not-checked` | caught | `format` |
+|  | `manifest-schema-version-not-checked` | caught | `manifest` |
+| Premature publication and false completion | `manifest-staged-under-its-final-name` | caught | `publication`, `roundtrip`, `cli`, `budget` |
+|  | `incomplete-tensors-can-be-sealed` | caught | `publication` |
+|  | `journal-recorded-before-the-bytes-are-durable` | caught | `publication` |
+|  | `resume-trusts-the-journals-offsets` | control-held | — |
+| Syncs, error handling and the admission | `chunk-sync-skipped` | caught | `publication`, `cli` |
+|  | `directory-sync-skipped` | caught | `publication` |
+|  | `write-errors-are-swallowed` | caught | `publication` |
+|  | `header-failure-leaks-the-admission` | caught | `workflow` |
+|  | `shard-header-sync-skipped` | caught | `publication` |
+|  | `shard-header-never-written` | caught | `publication`, `roundtrip`, `cli`, `budget` |
+|  | `journal-sync-skipped` | caught | `publication` |
+| Budgets | `unit-size-not-checked-against-the-scratch` | caught | `publication` |
+|  | `disk-budget-not-checked-while-writing` | control-held | — |
+|  | `chunk-file-limit-ignored-by-the-plan` | caught | `cli` |
+|  | `plan-ignores-the-disk-budget` | caught | `cli` |
+|  | `tile-is-the-whole-scratch` | caught | `workflow`, `roundtrip`, `budget` |
+|  | `header-budget-flag-ignored` | caught | `cli` |
+| Cancellation ordering | `cancellation-not-checked-between-units` | caught | `cli`, `budget` |
+|  | `cancellation-not-checked-before-publish` | caught | `publication` |
+| The canonical payload | `payload-sections-in-the-wrong-order` | caught | `format`, `manifest`, `roundtrip` |
+|  | `zero-point-section-dropped` | caught | `format`, `manifest`, `roundtrip`, `cli`, `budget` |
+|  | `scale-block-not-validated` | caught | `format` |
+|  | `affine-length-rule-deleted` | caught | `manifest` |
+
+The three architecture-rule mutations from the first run are gone with the rule
+they policed: [ADR 0024](../../decisions/adr/0024-one-storage-crate-and-a-write-module.md)
+folded the writer into the only program that writes, and nothing outside a
+program can name a module inside it. The module boundary is what replaced the
+rule, and no substitution in the driver can weaken it.
+
 ## What the battery does not establish
 
 - **It measures the tests, not the artifact.** A caught mutation says a gate can
@@ -139,7 +208,7 @@ reports skips separately and refuses to exit zero with any.
   expected-bytes fixtures are what address that, and they are built from the
   values the test wrote rather than from the encoder.
 - **It is not exhaustive.** Thirty-odd single edits over a state machine with
-  seventeen named boundaries is a sample. The enumeration in
+  twenty named boundaries is a sample. The enumeration in
   `publication.rs` is the systematic half; this is the adversarial one.
 - **No quality, execution or performance claim follows.** Nothing here runs a
   model, a kernel or a benchmark.

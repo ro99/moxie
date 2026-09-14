@@ -759,10 +759,22 @@ fn staged_bytes_that_no_longer_match_the_journal_are_discarded_and_recomputed() 
     let scratch = Scratch::new("corrupted");
     let dest = scratch.join("artifact");
     run_to_end(&dest, &Faults::none(), false, Some(2)).expect("a cancelled run");
-    // Corrupt one byte of the first unit's staged payload.
+    // Corrupt one byte of the first unit's staged **payload**.
+    //
+    // Past the header, deliberately: a shard's first eight bytes are its
+    // header length, which every `begin` rewrites from the plan, so a byte
+    // flipped there is repaired before the resume even looks -- and this test
+    // would pass while checking nothing. The mutation battery found exactly
+    // that when the container changed.
     let chunk = dest.join(moxie_repack::write::shard_name(1, 1));
-    let mut bytes = std::fs::read(&chunk).expect("a staged chunk");
-    bytes[3] ^= 0xFF;
+    let mut bytes = std::fs::read(&chunk).expect("a staged shard");
+    let header_len = u64::from_le_bytes(bytes[..8].try_into().expect("eight bytes")) as usize;
+    let payload_start = 8 + header_len;
+    assert!(
+        bytes.len() > payload_start,
+        "the staged shard holds no payload yet"
+    );
+    bytes[payload_start] ^= 0xFF;
     std::fs::write(&chunk, &bytes).expect("corrupting it");
 
     let (outcome, _, _) = run_to_end(&dest, &Faults::none(), true, None).expect("it recovers");
@@ -936,6 +948,79 @@ fn cancellation_observed_after_validation_still_stops_before_the_rename() {
         "it published despite being cancelled"
     );
     assert!(asked.get() >= 2, "the second boundary was never consulted");
+    assert!(ledger.outstanding().is_empty());
+}
+
+/// Cancellation that arrives after the **last** byte has been validated, at the
+/// one boundary between a complete validation and the rename.
+///
+/// The battery found this one: with a check before staging and a check inside
+/// the validation loop, a closure that cancels "from the second question
+/// onwards" stops inside the loop and never reaches the final gate, so deleting
+/// that gate changed nothing. This test answers "no" to every boundary but the
+/// last, which is the only way to observe the gate that is actually last.
+#[test]
+fn cancellation_at_the_final_gate_still_stops_before_the_rename() {
+    let scratch = Scratch::new("cancel-final-gate");
+    let dest = scratch.join("artifact");
+    let mut ledger = ledger();
+    let start = Run::begin(
+        &dest,
+        plan(),
+        binding(),
+        budget(),
+        &Options::default(),
+        &mut ledger,
+        &Faults::none(),
+        &|| false,
+    )
+    .expect("it starts");
+    let mut run = match start {
+        Start::Fresh(run) => run,
+        other => panic!("{other:?}"),
+    };
+    for request in requests() {
+        let bytes = payload(request_len(&request), request_len(&request) as usize);
+        for (at, len) in units(&request) {
+            run.write_unit(
+                &component_of(&request),
+                &bytes[at as usize..at as usize + len],
+                HEX,
+                &Faults::none(),
+            )
+            .expect("every unit writes");
+        }
+    }
+    let sealed = run.seal().expect("it seals");
+    let text = manifest::encode(&manifest_for(&sealed)).expect("it encodes");
+    // One question before staging, one per distinct role while validating, and
+    // one last question before the rename. Spelling the count out is what makes
+    // "the last one" nameable -- and if the publication path ever asks a
+    // different number of times, this test says so instead of drifting.
+    let mut roles: Vec<&str> = sealed.iter().map(|t| t.role.as_str()).collect();
+    roles.dedup();
+    let expected = roles.len() + 2;
+    let asked = std::cell::Cell::new(0usize);
+    let cancelled = || {
+        asked.set(asked.get() + 1);
+        asked.get() >= expected
+    };
+    let outcome = run
+        .publish(&text, &cancelled, &Faults::none(), &mut ledger)
+        .expect("cancellation is not an error");
+    assert_eq!(
+        asked.get(),
+        expected,
+        "the publication path asked about cancellation a different number of times"
+    );
+    assert!(
+        matches!(outcome, Outcome::Cancelled { .. }),
+        "cancellation at the final gate gave {outcome:?}"
+    );
+    assert!(
+        !dest.join(MANIFEST_FILE).exists(),
+        "it published despite being cancelled at the last gate"
+    );
     assert!(ledger.outstanding().is_empty());
 }
 

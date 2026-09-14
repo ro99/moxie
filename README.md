@@ -133,6 +133,16 @@ shard and, for a quantized module, its packing parameters. Nothing is discovered
 pattern, or inferred from a name, which is what keeps ADR 0020's "no agent-initiated bulk
 conversion" a property of the tool rather than a promise about how it is invoked.
 
+A published artifact is a directory: a TOML manifest plus one or more
+`model-NNNNN-of-NNNNN.safetensors` shards that open with the **reference
+safetensors implementation** (owner ruling, 2026-09-14; schema in
+[ADR 0025](docs/decisions/adr/0025-canonical-safetensors-schema.md)). A logical
+tensor becomes one, two or three physical ones — `U8` packed INT4 codes, `I8`
+INT8 codes, scales in the source's own dtype, `I16` zero points — and the
+manifest says what they mean. It is **not** a model Transformers can load: no
+`config.json`, tokenizer or index is written, and nothing here executes a
+canonical tensor.
+
 Measured capabilities, and nothing else: BF16 passthrough, and compressed-tensors `pack-quantized`
 INT4/INT8 at group 32, group 128 and per-channel, symmetric or with zero points packed along the
 output axis. AutoGPTQ/AutoRound packing, activation-order maps, tokenizers, fused expert role

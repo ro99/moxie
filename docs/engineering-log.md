@@ -33,6 +33,8 @@ Each links into the entries below.
 | A recovery that only knows the states it imagined | task 0025's empty journal and its own leftover lock file |
 | An undo that reverses the decision but not the state it already changed | task 0025's running checksum |
 | A boundary invented before it had two sides | task 0025's `moxie-storage-write`, which forced a second copy of the reader's `pread` |
+| A format assumption nobody asked the format about | task 0026's eight-byte alignment, refused by the reference reader |
+| A new boundary that hides the boundary beside it | task 0026's shard-header pass, which absorbed every payload fault |
 | A test measured by assertion rather than by mutation | tasks 0020, 0021, 0022, 0023, 0024 |
 | A record contradicting a fact it already contains | task 0022's expert inventory, task 0022's VRAM figure, task 0024's sign claim |
 | A comparison whose two sides are not independent | task 0022's FP64 transcription, task 0024's FP32-versus-BF16 arithmetic |
@@ -40,6 +42,67 @@ Each links into the entries below.
 
 ## Entries, newest first
 
+
+**A new durable boundary can make an old one untestable (2026-09-14).** The
+safetensors writer added a pass that writes and syncs every shard's header
+before the first payload unit. It reused the boundaries already there --
+`chunk-create`, `chunk-write`, `chunk-sync` -- because they are the same three
+syscalls. The mutation battery said what that cost: `chunk-sync-skipped` and
+`write-errors-are-swallowed`, both caught before, now **survived**. Every fault
+injected for a payload unit fired at a header first, so the tests kept failing
+for a reason that had nothing to do with the code under test.
+
+Nothing about the product was wrong. The *measurement* was, and it had been
+quietly wrong since the header pass was added. The fix is naming:
+`shard-create`, `shard-header-write` and `shard-header-sync` are their own
+boundaries, and `write_at` takes the boundary it is writing at as a parameter,
+with the reason in a comment beside it.
+
+The same run found a third: `cancellation-not-checked-before-publish` survived
+because an earlier correction had added a cancellation check *inside* the
+validation loop, and the existing test's "cancel from the second question
+onwards" closure now stopped there and never reached the final gate before the
+rename. A test that cancels at the last boundary -- and asserts how many
+boundaries there are -- is what makes that gate observable again.
+
+**The lesson: a boundary is only tested while it is the only thing that can
+fail there.** Two boundaries sharing one name is not a naming preference, it is
+a test that measures whichever one comes first. The battery is what turned an
+invisible regression in the gates into three lines of output.
+
+**The container changed, and the reference implementation decided the schema
+(2026-09-14).** The owner replaced the custom `.mox` container with safetensors
+shards plus a TOML manifest, and asked that the schema be fixed before the code.
+[ADR 0025](decisions/adr/0025-canonical-safetensors-schema.md) fixed it:
+component naming, physical shapes, shard mapping, checksum scope, migration.
+
+**The first version of that schema was wrong, and measuring found it in one
+minute.** It aligned each component's payload to eight bytes, for the benefit of
+a future mapping consumer. Before writing a single shard, a four-line script
+asked the reference implementation what it thought:
+
+```text
+gap=False: LOADED
+gap=True:  SafetensorError: invalid offset for tensor `w.scales`
+```
+
+Every aligned shard would have been refused by the one reader the owner's ruling
+names. Reading the reference source afterwards confirmed the rule --
+`Metadata::validate` requires `s != start` to fail -- plus two more the writer
+already satisfied: declared length equals shape times dtype size, and the file
+must end exactly at the last tensor. `validate()` sorts by offset first, so
+header key order is free.
+
+The lesson is not "read the spec". It is that **a format decision's evidence has
+to come from the format's own implementation, and it is available before the
+code that depends on it.** The cost of asking was a scratch file; the cost of
+not asking would have been a schema, a writer, a reader and a task's worth of
+tests built on a file nothing else can open.
+
+That is also why the acceptance gate for this work is
+[a script that opens every published shard with the reference reader](evidence/experiments/drivers/0007-reference-reader.py)
+and compares each component's dtype, shape and checksum against the manifest,
+rather than our reader agreeing with our writer.
 
 **Task 0025 — the offline repacker — is implemented and not reviewed
 (2026-09-13).** `moxie-repack` inspects a selection, converts it in bounded work

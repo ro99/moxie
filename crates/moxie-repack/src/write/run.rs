@@ -321,7 +321,14 @@ impl Run {
         // that header, and a resumed run writes into the same file it would
         // have. Rewriting an identical header is idempotent, and cheap -- a
         // header is kilobytes.
-        run.write_shard_headers(faults)?;
+        if let Err(e) = run.write_shard_headers(faults) {
+            // The same rule as the journal handle above, at the error path the
+            // safetensors header pass added: a start that refuses releases what
+            // it admitted. `begin` never hands back a `Run` it failed to build,
+            // so nothing above this can release the scratch on its behalf.
+            run.abandon(ledger)?;
+            return Err(e);
+        }
 
         if resuming {
             match run.recover(&journal_path, faults, cancelled) {
@@ -584,13 +591,13 @@ impl Run {
     /// Write every shard's header, once, durably.
     fn write_shard_headers(&mut self, faults: &Faults) -> Result<()> {
         for shard in self.plan.shards() {
-            faults.check(Site::ChunkCreate)?;
+            faults.check(Site::ShardCreate)?;
             let mut file = open_confined(&self.dest, &shard.file, false)?;
             let header = shard.layout.header_bytes();
-            write_at(&mut file, 0, header, faults).map_err(|e| {
+            write_at(&mut file, 0, header, faults, Site::ShardHeaderWrite).map_err(|e| {
                 invalid(format!("cannot write the header of '{}': {e}", shard.file))
             })?;
-            faults.check(Site::ChunkSync)?;
+            faults.check(Site::ShardHeaderSync)?;
             file.sync_all()
                 .map_err(|e| invalid(format!("cannot sync '{}': {e}", shard.file)))?;
         }
@@ -663,7 +670,7 @@ impl Run {
         let path = self.dest.join(&planned.file);
         faults.check(Site::ChunkCreate)?;
         let mut file = open_confined(&self.dest, &planned.file, false)?;
-        write_at(&mut file, offset, bytes, faults)
+        write_at(&mut file, offset, bytes, faults, Site::ChunkWrite)
             .map_err(|e| invalid(format!("cannot write {}: {e}", path.display())))?;
         faults.check(Site::ChunkSync)?;
         file.sync_all()
@@ -1045,10 +1052,22 @@ fn append_durably(file: &mut File, line: &str, faults: &Faults) -> Result<()> {
         .map_err(|e| invalid(format!("cannot sync the journal: {e}")))
 }
 
-/// Write at an absolute offset without touching the file's own cursor.
-fn write_at(file: &mut File, offset: u64, bytes: &[u8], faults: &Faults) -> std::io::Result<()> {
+/// Write at an absolute offset without touching the file's own cursor, failing
+/// first at the boundary the caller names.
+///
+/// The site is a parameter because a shard's header and a shard's payload are
+/// two different durable boundaries that happen to share a syscall: the header
+/// pass runs on every `begin`, so a fault injected for a payload unit would
+/// otherwise always fire at a header first and measure the wrong thing.
+fn write_at(
+    file: &mut File,
+    offset: u64,
+    bytes: &[u8],
+    faults: &Faults,
+    site: Site,
+) -> std::io::Result<()> {
     faults
-        .check(Site::ChunkWrite)
+        .check(site)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     #[cfg(unix)]
     {
