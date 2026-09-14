@@ -12,7 +12,17 @@ const LANES_T0006: &[Lane] = &[
     Lane { name: "workflow", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"workflow"#] },
     Lane { name: "roundtrip", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"round_trip"#] },
     Lane { name: "cli", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"cli"#] },
-    Lane { name: "budget", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"budget"#] },
+    // `--test-threads=1` because this lane measures peak **live** heap through
+    // a global allocator. Its own lock stops one test resetting the other's
+    // peak, but not the other test's live bytes being counted into it, so the
+    // lane is load-dependent: two baseline runs on an identical clean tree
+    // reported "fails" and "disagrees with itself", and the battery correctly
+    // refused to build verdicts on either. Serialising the executable is not a
+    // weakened assertion -- it is the isolation the measurement already
+    // assumes. The **fix** belongs in `crates/moxie-repack/tests/budget.rs`,
+    // whose two tests should not share a process-wide counter at all; until
+    // then this keeps the battery runnable, which an unrunnable battery is not.
+    Lane { name: "budget", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"budget"#, r#"--"#, r#"--test-threads=1"#] },
     Lane { name: "malformed", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"malformed"#] },
     Lane { name: "round2", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"round2"#] },
     Lane { name: "admission", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"admission"#] },
