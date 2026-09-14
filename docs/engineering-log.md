@@ -93,6 +93,27 @@ unreached, which is how that gap announced itself; the missing case is now a tes
 of its own. This is task 0021's descriptor and task 0023's valid-only sweep
 again: the sweep covers the paths the scenario that generated it happened to take.
 
+**The regression for a fix is what finds the fix incomplete (2026-09-13).** An
+independent review of task 0025 made ten findings, five P1: a symlink escape
+that wrote through a private file before validation rejected it, a cross-shard
+resolver applying none of the importer's dtype and symmetric/asymmetric checks,
+a source that could change after its digest was taken, a torn journal that was
+parsed around but never repaired, metadata allocating outside the ledger, a disk
+budget covering payload only, reservations leaking on every early return, a
+panic on a scratch too small for one zero-point word, minutes of reading with no
+cancellation check, and directory entries synced without their parents. All ten
+reproduced and fixed.
+
+The part worth remembering: **writing the regression for finding 4 found that
+the fix for finding 4 was wrong.** The tear was truncated and synced, and the
+run's own journal handle was still positioned at the length the file had when it
+was opened -- so the next record landed past the new end, behind a hole of NUL
+bytes, and the journal was unparseable in a new way. The fix looked right, the
+suite was green, and a test that tore the journal *twice* took four lines to
+disprove it. This is task 0024's second-round shape exactly: fixing a finding
+and guarding the fix are two jobs, and the second one is where the first one's
+mistakes are.
+
 **The crate that should have been a module.** The writer went into
 `moxie-storage-write`, its own crate, because ADR 0022 said a dependency edge
 would make "who may publish a checkpoint" machine-checkable. The owner rejected

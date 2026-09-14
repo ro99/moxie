@@ -318,7 +318,7 @@ is in the ignored `results/task0025/gates.log`.
 | `xtask` device lints | `... --features cuda` | **passed** |
 | Specification | `cargo xtask spec-check` | **passed**, 10 documents present and unchanged |
 | Architecture | `cargo xtask arch-check` | **passed**: 79 rejected fixtures, 21 accepted, 13 rules. The task added a write-authority rule and eight fixtures; [ADR 0024](../decisions/adr/0024-one-storage-crate-and-a-write-module.md) removed all of them with the crate they policed |
-| Host tests | `cargo test --workspace --locked --offline` | **1,014 passed, 0 failed, 0 ignored, 0 skipped** (task 0024 recorded 947) |
+| Host tests | `cargo test --workspace --locked --offline` | **1,097 passed, 0 failed, 0 ignored, 0 skipped** (task 0024 recorded 947; 1,014 before the review's corrections, +83 for the seven regressions they needed) |
 | Device-feature tests | `cargo test --workspace --locked --offline --features moxie-executor/driver` | **1,049 passed, 0 failed, 0 ignored** |
 
 **Nothing failed and nothing was skipped.** The real-artifact lane ran rather
@@ -336,10 +336,11 @@ The two clippy lanes that need CUDA were run because this task changes
 |---|---|
 | `moxie-format` unit and `manifest_v1` | The payload codec against **bytes written out by hand**, the journal's torn-tail and version rules, the selection's refusals, and manifest v1 round-tripping through its own writer — including awkward strings, the opaque architecture tree and partial completeness |
 | `the_streaming_converter_and_the_whole_tensor_import_agree` | One codec, not two: every tile size that lands on and off a word, a group and the padded tail produces the same bytes as a whole-tensor import |
-| `moxie-repack::publication` | 16 tests, including **35 enumerated failure cases** — every visit to every named durable boundary — each checked for no readable artifact before the rename, a resumable destination after, and a byte-identical republish; plus cancellation at the publication boundary, a corrupted staged unit, bytes past the journal, a torn journal line, a rebound plan, a stale lock and an oversized unit |
+| `moxie-repack::publication` | 18 tests, including **35 enumerated failure cases** — every visit to every named durable boundary — each checked for no readable artifact before the rename, a resumable destination after, and a byte-identical republish; plus cancellation at the publication boundary, a corrupted staged unit, bytes past the journal, a torn journal line, a rebound plan, a stale lock and an oversized unit |
 | `moxie-repack::round_trip` | Every signed INT4 and INT8 code, asymmetric zero points, all three scale encodings, group and axis tails, symmetric and asymmetric modules, split shards, mixed BF16, several chunk files, and a tensor 32 times the scratch |
 | `moxie-repack::cli` | The real binary: exit statuses, refusals, an actual `SIGABRT` restart, a changed source refused, budgets required, inspection writing nothing |
 | `moxie-repack::budget` | **208,461 B peak live heap** against a 134,217,728 B admission while publishing 2,107,392 B through a 65,536 B scratch, every admitted byte returned, and resume peaks flat across four attempts (58,183 / 57,560 / 57,560 / 57,560 B) |
+| `moxie-repack::workflow` | The review's own cases, at the workflow boundary: a source changed after hashing, malformed entry dtypes, a symmetric selection over an asymmetric source, a scratch too small for a zero-point word, a total budget below the working set, and **an injected failure at every named boundary leaving the ledger empty** |
 | `moxie-repack::real_module` | The Laguna module below |
 
 ### Mutation measurement
@@ -441,6 +442,30 @@ crate outside the program can name the writer, so the `arch-check` rule and its
 eight fixtures were removed rather than maintained. The general rule it
 establishes: a crate needs several consumers *and* something distinct to own —
 one consumer plus a rule someone has to maintain is a module.
+
+### The independent review, and what it found
+
+A review of the six commits made **ten findings, five of them P1**. All ten are
+reproduced, all ten are fixed, none is disputed.
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 P1 | A private file replaced by a symlink was followed: `File::create` truncated the target and validation rejected the escape *after the damage*. Publishing beneath the source root also succeeded. | One `open_confined` helper for every write — component name, `symlink_metadata` refusal, and `O_NOFOLLOW` to close the gap between the check and the open. Destination/source overlap refused both ways, including a destination that does not exist yet. |
+| 2 P1 | The cross-shard resolver applied none of `source_entries`' checks: `F32` codes, an `F64` shape, and a symmetric selection over a source carrying zero points all published. | The rules are `validate_source_entries` now, and both resolvers call it. The zero-point entry passed in is the one the **source** has, which is what lets the disagreement be seen. |
+| 3 P1 | A source changed after its digest was taken published under the old digest. | Every source is hashed again after conversion and before anything is exposed. A second full pass over every source file; the real-module lane went from 31 to 61 seconds. |
+| 4 P1 | A torn journal tail was never truncated, so the next record appended onto the fragment and the journal became unparseable for good. | The tear is truncated and synced before anything appends — **and the run's own handle is repositioned**, which the regression for this finding is what caught: it was still positioned past the repaired end, writing a hole of NULs. |
+| 5 P1 | Headers, selections, plans and manifests allocated outside the ledger; `units_of` materialized every unit; the fault recorder retained every visit. `--total-bytes 2048` published, and inspection accepted zero. | Metadata is charged at the caps the format crate declares, units are produced by an iterator, the recorder is a fixed counter per boundary, and `Budgets::validate` refuses a total that cannot hold the working set. |
+| 6 P2 | The disk budget covered payload only: 5,005 bytes published against 4,096. | The plan checks payload **plus** a bound on journal and staged manifest. |
+| 7 P2 | An injected chunk-write failure left all three reservations outstanding. | The workflow is wrapped: every path releases the buffers and abandons the run, which stays resumable. Measured across every named boundary. |
+| 8 P2 | `--scratch-bytes 8` exited 101 — the planner forced a word-sized zero-point block into a four-byte tile. | The minimum tile is computed during planning and refused with the number, before output exists. |
+| 9 P2 | Whole-file hashing, recovery and validation read for minutes without consulting cancellation. | All three check between slices, units and tensors. |
+| 10 P2 | Only the destination was synced, not the parents of directories the run created. | Every created directory's parent is synced. |
+
+`cargo fmt --all -- --check` was also failing at the reviewed head, in four
+files. Seven regressions were added for the fixes that had none: the symlink
+escape, repeated interruption during recovery, the dtype refusals, the
+symmetric-over-asymmetric refusal, the source-changed refusal, ledger cleanup at
+every boundary, and the scratch and total-budget refusals.
 
 ### Explicit limits of this task
 

@@ -1,7 +1,10 @@
 # Handover — task 0025 implemented: the offline repacker, and what an enumeration found in it
 
-**Task 0025 is implemented and not reviewed.** Everything here is a claim until
-a review reproduces it. It is **M3 item 1's** bounded offline repack and
+**Task 0025 is implemented and corrected after one independent review.** That
+review made **ten findings, five P1**; all ten were reproduced, all ten are
+fixed, none is disputed, and seven regressions were added for the fixes that had
+none. The [task record](../tasks/0025-m3-offline-repack-publication.md#the-independent-review-and-what-it-found)
+carries the table. It has **not** been reviewed again since. It is **M3 item 1's** bounded offline repack and
 canonical publication: `moxie-repack` inspects an explicit selection, converts it
 in bounded work units, resumes an interrupted run, validates the result through
 the production reader and publishes a manifest-v1 directory with one rename.
@@ -103,7 +106,13 @@ for the full account, including every gate's numbers. In short:
 
 ## Remaining hypotheses and blockers
 
-- **The task is not reviewed and not accepted.** Everything above is a claim.
+- **The corrections are not reviewed and the task is not accepted.** One round
+  found ten; a second round is what says whether the fixes hold. The shape to
+  look for is the one this round already produced once: the regression written
+  for finding 4 found that the fix for finding 4 was incomplete — the journal
+  handle was still positioned past the repaired tail. **Fixing a finding and
+  guarding the fix are two jobs**, which is the task 0024 handover's sentence,
+  one task later.
 - **Nothing executes a canonical INT4 tensor.** M3 item 3 — shared W4A16/W8A16
   dense and expert paths for SM86, SM120 qualified separately — is untouched and
   is the largest remaining gap in the milestone. Publishing an artifact changes

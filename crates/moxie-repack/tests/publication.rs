@@ -240,6 +240,7 @@ fn run_to_end(
         &options,
         &mut ledger,
         faults,
+        &|| false,
     )?;
     let mut run = match start {
         Start::Fresh(run) | Start::Resumed(run, _) => run,
@@ -419,6 +420,7 @@ fn every_failure_point_leaves_a_resumable_destination_that_publishes_the_same_ar
                         },
                         &mut ledger,
                         &Faults::none(),
+                        &|| false,
                     )
                     .expect("a published destination reports itself");
                     assert!(
@@ -608,6 +610,7 @@ fn a_published_destination_is_never_overwritten() {
         &Options::default(),
         &mut ledger,
         &Faults::none(),
+        &|| false,
     )
     .expect("begin reports rather than refuses");
     match start {
@@ -636,6 +639,7 @@ fn a_directory_this_run_did_not_create_is_refused() {
         &Options::default(),
         &mut ledger,
         &Faults::none(),
+        &|| false,
     )
     .unwrap_err();
     assert!(e.to_string().contains("someone-elses-file"), "{e}");
@@ -667,6 +671,7 @@ fn a_second_run_is_refused_while_one_owns_the_destination() {
         &Options::default(),
         &mut ledger,
         &Faults::none(),
+        &|| false,
     )
     .expect("the first run starts");
     let held = match first {
@@ -684,6 +689,7 @@ fn a_second_run_is_refused_while_one_owns_the_destination() {
         &Options::default(),
         &mut second_ledger,
         &Faults::none(),
+        &|| false,
     )
     .unwrap_err();
     assert!(e.to_string().contains("owns this destination"), "{e}");
@@ -718,6 +724,7 @@ fn a_resume_bound_to_a_different_plan_is_refused() {
             },
             &mut ledger,
             &Faults::none(),
+            &|| false,
         )
         .unwrap_err();
         assert!(
@@ -879,6 +886,7 @@ fn cancellation_observed_after_validation_still_stops_before_the_rename() {
         &Options::default(),
         &mut ledger,
         &Faults::none(),
+        &|| false,
     )
     .expect("it starts");
     let mut run = match start {
@@ -921,6 +929,95 @@ fn cancellation_observed_after_validation_still_stops_before_the_rename() {
     assert!(ledger.outstanding().is_empty());
 }
 
+/// A private file replaced by a symbolic link is refused, and the link's target
+/// is untouched.
+///
+/// The review's reproduction: cancel a run, point `.moxie-repack-manifest` at
+/// an unrelated file, resume. `File::create` followed the link and truncated
+/// the target, and validation rejected the escape afterwards -- after the
+/// damage. Confinement happens before the mutation now, and this is what says
+/// so.
+#[test]
+fn a_private_file_replaced_by_a_symlink_is_refused_before_anything_is_written() {
+    for victim_name in [
+        ".moxie-repack-manifest",
+        "chunk0.bin",
+        ".moxie-repack-journal",
+    ] {
+        let scratch = Scratch::new("symlink");
+        let dest = scratch.join("artifact");
+        let outsider = scratch.join("someone-elses-data");
+        std::fs::write(&outsider, b"a file this run has no business touching")
+            .expect("the outsider exists");
+        run_to_end(&dest, &Faults::none(), false, Some(1)).expect("a cancelled run");
+
+        let victim = dest.join(victim_name);
+        let _ = std::fs::remove_file(&victim);
+        std::os::unix::fs::symlink(&outsider, &victim).expect("the symlink is planted");
+
+        let outcome = run_to_end(&dest, &Faults::none(), true, None);
+        // Whatever it does, it does not write through the link.
+        assert_eq!(
+            std::fs::read(&outsider).expect("the outsider survives"),
+            b"a file this run has no business touching",
+            "{victim_name}: the run wrote through a symbolic link"
+        );
+        match outcome {
+            Err(e) => assert!(
+                e.to_string().contains("symbolic link") || e.to_string().contains("journal"),
+                "{victim_name}: refused for an unrelated reason: {e}"
+            ),
+            Ok((outcome, _, _)) => panic!("{victim_name}: {outcome:?} through a symlink"),
+        }
+    }
+}
+
+/// A torn journal survives being torn, resumed, interrupted and resumed again.
+///
+/// The review's reproduction: parsing ignored the torn tail and recovery never
+/// truncated it, so the next record was appended onto the fragment and the
+/// journal became unparseable for good. The existing test ran straight to
+/// publication, which deletes the journal and hid it.
+#[test]
+fn a_torn_journal_survives_repeated_interruption() {
+    let reference_dir = Scratch::new("torn-twice-reference");
+    let reference = reference_dir.join("artifact");
+    run_to_end(&reference, &Faults::none(), false, None).expect("the reference publishes");
+    let reference_bytes = artifact_bytes(&reference);
+
+    let scratch = Scratch::new("torn-twice");
+    let dest = scratch.join("artifact");
+    let journal = dest.join(".moxie-repack-journal");
+    run_to_end(&dest, &Faults::none(), false, Some(1)).expect("a cancelled run");
+
+    // Tear the tail, resume far enough to append a record onto the repair, and
+    // stop again.
+    let torn = {
+        let mut text = std::fs::read_to_string(&journal).expect("a journal");
+        text.push_str("unit = { tensor = \"layers.0.w\", index = 9, chunk");
+        text
+    };
+    std::fs::write(&journal, &torn).expect("tearing it");
+    run_to_end(&dest, &Faults::none(), true, Some(1)).expect("a second cancelled run");
+
+    // The repair has to have happened: the journal parses, and what follows the
+    // repaired tail is a whole record rather than an append onto a fragment.
+    let after = std::fs::read_to_string(&journal).expect("a journal");
+    assert!(
+        !after.contains("index = 9, chunk\nunit"),
+        "a record was appended onto the torn fragment:\n{after}"
+    );
+
+    // Tear it once more, then finish. This is the sequence that used to leave
+    // the destination unusable.
+    let mut text = std::fs::read_to_string(&journal).expect("a journal");
+    text.push_str("unit = { tensor = ");
+    std::fs::write(&journal, &text).expect("tearing it again");
+    let (outcome, _, _) = run_to_end(&dest, &Faults::none(), true, None).expect("it publishes");
+    assert!(matches!(outcome, Outcome::Published { .. }), "{outcome:?}");
+    assert_eq!(artifact_bytes(&dest), reference_bytes);
+}
+
 #[test]
 fn a_unit_above_the_admitted_scratch_is_refused() {
     let scratch = Scratch::new("oversized");
@@ -934,6 +1031,7 @@ fn a_unit_above_the_admitted_scratch_is_refused() {
         &Options::default(),
         &mut ledger,
         &Faults::none(),
+        &|| false,
     )
     .expect("it starts");
     let mut run = match start {

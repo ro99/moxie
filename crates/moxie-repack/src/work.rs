@@ -123,109 +123,153 @@ fn block_rows(tile: usize, per_row: usize, granularity: usize) -> usize {
     (rows / granularity.max(1)).max(1) * granularity.max(1)
 }
 
+/// One tensor's units, produced **one at a time**.
+///
+/// The conversion loop needs the next unit, never the list, and an independent
+/// review found the list being built: an allocation proportional to the
+/// conversion, in a program whose budget exists to bound exactly that. A 400 GB
+/// tensor at half-megabyte tiles is 800,000 descriptors nobody reads twice.
+///
+/// The section order is ADR 0023's -- codes, scales, zero points -- so
+/// concatenating what this yields is the canonical payload, and the arithmetic
+/// is [`block_rows`], shared with [`unit_count`] so the two can never disagree.
+#[derive(Debug)]
+pub struct Units<'a> {
+    tensor: &'a Resolved,
+    tile: usize,
+    /// 0 = codes (or the whole payload, for BF16), 1 = scales, 2 = zero
+    /// points, 3 = finished.
+    section: u8,
+    /// Next output row, or next byte for a BF16 passthrough.
+    row: usize,
+    /// Where the next unit's bytes start in the canonical payload.
+    at: u64,
+    rows: usize,
+    scales_start: u64,
+    zeros_start: Option<u64>,
+}
+
+impl<'a> Units<'a> {
+    fn new(tensor: &'a Resolved, tile: usize) -> Result<Self> {
+        let (rows, scales_start, zeros_start) = match &tensor.kind {
+            ResolvedKind::Bf16 { len, .. } => (*len as usize, 0, None),
+            ResolvedKind::PackQuantized { plan, section, .. } => {
+                let ext = payload::extents(plan.descriptor(), *section)?;
+                (
+                    plan.out_features(),
+                    ext.scales().start as u64,
+                    ext.zero_points().map(|z| z.start as u64),
+                )
+            }
+        };
+        Ok(Self {
+            tensor,
+            tile,
+            section: 0,
+            row: 0,
+            at: 0,
+            rows,
+            scales_start,
+            zeros_start,
+        })
+    }
+}
+
+impl Iterator for Units<'_> {
+    type Item = Unit;
+
+    fn next(&mut self) -> Option<Unit> {
+        match &self.tensor.kind {
+            ResolvedKind::Bf16 { len, .. } => {
+                if self.at >= *len {
+                    return None;
+                }
+                let take = ((*len - self.at) as usize).min(self.tile);
+                let unit = Unit {
+                    canonical_offset: self.at,
+                    canonical_len: take,
+                    source: UnitSource::Bytes {
+                        offset: self.at,
+                        len: take,
+                    },
+                };
+                self.at += take as u64;
+                Some(unit)
+            }
+            ResolvedKind::PackQuantized { plan, .. } => loop {
+                if self.section > 2 {
+                    return None;
+                }
+                if self.row >= self.rows {
+                    // Move to the next section, at its own start offset.
+                    self.section += 1;
+                    self.row = 0;
+                    match self.section {
+                        1 => self.at = self.scales_start,
+                        2 => self.at = self.zeros_start?,
+                        _ => return None,
+                    }
+                    continue;
+                }
+                let (per_row, granularity, canonical_row) = match self.section {
+                    0 => (
+                        plan.source_code_row_bytes()
+                            .max(plan.canonical_code_row_bytes()),
+                        1,
+                        plan.canonical_code_row_bytes(),
+                    ),
+                    1 => (plan.scale_row_bytes(), 1, plan.scale_row_bytes()),
+                    _ => (
+                        plan.canonical_zero_point_row_bytes()
+                            .max(plan.source_zero_point_word_row_bytes()),
+                        plan.zero_points_per_word(),
+                        plan.canonical_zero_point_row_bytes(),
+                    ),
+                };
+                let block = block_rows(self.tile, per_row, granularity);
+                let start = self.row;
+                let end = (start + block).min(self.rows);
+                let len = (end - start) * canonical_row;
+                let source = match self.section {
+                    0 => UnitSource::Codes { start, end },
+                    1 => UnitSource::Scales { start, end },
+                    _ => UnitSource::Zeros { start, end },
+                };
+                let unit = Unit {
+                    canonical_offset: self.at,
+                    canonical_len: len,
+                    source,
+                };
+                self.at += len as u64;
+                self.row = end;
+                return Some(unit);
+            },
+        }
+    }
+}
+
+/// One tensor's units, lazily. Refuses a tile too small to hold a block first,
+/// so the refusal arrives before any output exists rather than as a panic
+/// partway through.
+pub fn units(tensor: &Resolved, tile: usize) -> Result<Units<'_>> {
+    let need = minimum_tile_bytes(tensor)?;
+    if tile < need {
+        return Err(invalid(format!(
+            "tensor '{}' needs at least {need} byte(s) of payload tile and this run admitted \
+             {tile}: raise --scratch-bytes to at least {}",
+            tensor.role,
+            need * 2
+        )));
+    }
+    Units::new(tensor, tile.max(1))
+}
+
 /// Split one resolved tensor into units no larger than `tile`.
 ///
 /// The three sections are consecutive, in ADR 0023's order, so concatenating
 /// every unit's bytes is exactly the canonical payload.
 pub fn units_of(tensor: &Resolved, tile: usize) -> Result<Vec<Unit>> {
-    let need = minimum_tile_bytes(tensor)?;
-    if tile < need {
-        return Err(invalid(format!(
-            "tensor '{}' needs at least {need} byte(s) of payload tile and this run admitted \
-             {tile}: raise --scratch-bytes to at least {} so that both tiles fit",
-            tensor.role,
-            need * 2
-        )));
-    }
-    let tile = tile.max(1);
-    let mut units = Vec::new();
-    match &tensor.kind {
-        ResolvedKind::Bf16 { len, .. } => {
-            let mut at = 0u64;
-            while at < *len {
-                let take = ((*len - at) as usize).min(tile);
-                units.push(Unit {
-                    canonical_offset: at,
-                    canonical_len: take,
-                    source: UnitSource::Bytes {
-                        offset: at,
-                        len: take,
-                    },
-                });
-                at += take as u64;
-            }
-        }
-        ResolvedKind::PackQuantized { plan, section, .. } => {
-            let ext = payload::extents(plan.descriptor(), *section)?;
-            let rows = plan.out_features();
-
-            // Codes. The tile has to hold one source row and one canonical
-            // row, so the block is bounded by the larger of the two.
-            let per_row = plan
-                .source_code_row_bytes()
-                .max(plan.canonical_code_row_bytes());
-            let block = block_rows(tile, per_row, 1);
-            let mut at = ext.codes().start as u64;
-            let mut row = 0;
-            while row < rows {
-                let end = (row + block).min(rows);
-                let len = (end - row) * plan.canonical_code_row_bytes();
-                units.push(Unit {
-                    canonical_offset: at,
-                    canonical_len: len,
-                    source: UnitSource::Codes { start: row, end },
-                });
-                at += len as u64;
-                row = end;
-            }
-
-            // Scales.
-            let per_row = plan.scale_row_bytes().max(1);
-            let block = block_rows(tile, per_row, 1);
-            let mut at = ext.scales().start as u64;
-            let mut row = 0;
-            while row < rows {
-                let end = (row + block).min(rows);
-                let len = (end - row) * per_row;
-                units.push(Unit {
-                    canonical_offset: at,
-                    canonical_len: len,
-                    source: UnitSource::Scales { start: row, end },
-                });
-                at += len as u64;
-                row = end;
-            }
-
-            // Zero points, in blocks that start on a source word boundary:
-            // the lanes of one word are consecutive **output channels**, so a
-            // block that began mid-word would need bytes the caller did not
-            // read.
-            if *section == ZeroPointSection::PerGroup {
-                let per_word = plan.zero_points_per_word();
-                let per_row = plan
-                    .canonical_zero_point_row_bytes()
-                    .max(plan.source_zero_point_word_row_bytes())
-                    .max(1);
-                let block = block_rows(tile, per_row, per_word);
-                let mut at = ext
-                    .zero_points()
-                    .expect("an asymmetric tensor has the section")
-                    .start as u64;
-                let mut row = 0;
-                while row < rows {
-                    let end = (row + block).min(rows);
-                    let len = (end - row) * plan.canonical_zero_point_row_bytes();
-                    units.push(Unit {
-                        canonical_offset: at,
-                        canonical_len: len,
-                        source: UnitSource::Zeros { start: row, end },
-                    });
-                    at += len as u64;
-                    row = end;
-                }
-            }
-        }
-    }
+    let units: Vec<Unit> = units(tensor, tile)?.collect();
     if units.is_empty() {
         return Err(invalid(format!(
             "tensor '{}' produced no work units",

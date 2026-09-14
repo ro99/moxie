@@ -595,7 +595,7 @@ pub fn inspect(
             source_bytes: r.source_bytes,
             chunk: planned.chunk.clone(),
             offset: planned.offset,
-            units: work::units_of(r, budgets.tile_bytes())?.len(),
+            units: work::unit_count(r, budgets.tile_bytes())?,
         });
     }
     let units: u64 = tensors.iter().map(|t| t.units as u64).sum();
@@ -812,7 +812,16 @@ fn repack_inner(
         schema_version: manifest::SCHEMA_VERSION,
     };
 
-    let start = Run::begin(destination, plan, binding, write, options, ledger, faults)?;
+    let start = Run::begin(
+        destination,
+        plan,
+        binding,
+        write,
+        options,
+        ledger,
+        faults,
+        cancelled,
+    )?;
     let (resumed, units_reused, resume_detail) = match start {
         Start::AlreadyPublished { artifact } => {
             return Err(invalid(format!(
@@ -849,7 +858,9 @@ fn repack_inner(
     let before_read = sources.bytes_read();
     for r in &resolved {
         let done = run_slot.as_ref().expect("a run").bytes_done(&r.role)?;
-        for unit in work::units_of(r, budgets.tile_bytes())? {
+        let mut covered = 0u64;
+        for unit in work::units(r, budgets.tile_bytes())? {
+            covered += unit.canonical_len as u64;
             if cancelled() {
                 let outcome = run_slot.take().expect("a run").cancel(ledger)?;
                 return Ok(RepackReport {
@@ -892,6 +903,16 @@ fn repack_inner(
                 "unit {units_written} of '{}': {} byte(s) at {}",
                 r.role, unit.canonical_len, unit.canonical_offset
             ));
+        }
+        // The units are generated one at a time now, so the coverage check the
+        // materialized list used to make is made here instead: a tensor whose
+        // units do not add up to its payload would otherwise be caught only by
+        // the seal, after the work.
+        if covered != r.canonical_bytes {
+            return Err(invalid(format!(
+                "tensor '{}': its units cover {covered} byte(s) of a {} byte payload",
+                r.role, r.canonical_bytes
+            )));
         }
     }
 

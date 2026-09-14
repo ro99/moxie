@@ -171,6 +171,7 @@ pub struct Options {
 
 impl Run {
     /// Open a destination: fresh, resumed, or already published.
+    #[allow(clippy::too_many_arguments)]
     pub fn begin(
         dest: &Path,
         plan: OutputPlan,
@@ -179,6 +180,7 @@ impl Run {
         options: &Options,
         ledger: &mut Ledger,
         faults: &Faults,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<Start> {
         let dest = dest.to_path_buf();
         if dest.join(MANIFEST_FILE).exists() {
@@ -309,7 +311,7 @@ impl Run {
         }
 
         if resuming {
-            match run.recover(&journal_path, faults) {
+            match run.recover(&journal_path, faults, cancelled) {
                 Ok(report) => Ok(Start::Resumed(run, report)),
                 Err(e) => {
                     // Same rule as above: a start that refuses releases what
@@ -329,7 +331,12 @@ impl Run {
     /// re-read from the staged chunk file and rehashed; a mismatch discards the
     /// unit and everything after it in that tensor, because a tensor's bytes
     /// are a sequence and a hole in it cannot be filled out of order.
-    fn recover(&mut self, journal_path: &Path, faults: &Faults) -> Result<ResumeReport> {
+    fn recover(
+        &mut self,
+        journal_path: &Path,
+        faults: &Faults,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ResumeReport> {
         let text = moxie_storage::read_text_capped(journal_path, journal::MAX_JOURNAL_BYTES)?;
         let state: JournalState = journal::parse(&text)?;
         // **Repair the tear before anything appends to it.** Parsing ignores a
@@ -354,6 +361,21 @@ impl Run {
                     journal_path.display()
                 ))
             })?;
+            // **And move this run's own handle back to the repaired end.** It
+            // was positioned at the length the file had when it was opened,
+            // which is now past EOF, so the next record would be written after
+            // a hole of zero bytes -- a journal that parses as neither the old
+            // text nor the new one. The regression that found this tore the
+            // tail, resumed, and tore it again.
+            use std::io::Seek;
+            self.journal
+                .seek(std::io::SeekFrom::Start(keep as u64))
+                .map_err(|e| {
+                    invalid(format!(
+                        "cannot reposition {} after repairing it: {e}",
+                        journal_path.display()
+                    ))
+                })?;
         }
         let recorded = state.binding.clone().ok_or_else(|| {
             invalid("this journal records no plan: `begin` should have started over".into())
@@ -377,6 +399,14 @@ impl Run {
         let mut stopped: BTreeMap<String, bool> = BTreeMap::new();
         let mut staged_bytes: u64 = 0;
         for unit in &state.units {
+            // Recovery rehashes every byte it reuses, which for a large run is
+            // minutes of reading. A cancellation only observed afterwards is a
+            // cancellation nobody experiences.
+            if cancelled() {
+                return Err(invalid(
+                    "cancelled while rehashing the staged units of an interrupted run".into(),
+                ));
+            }
             let Some(planned) = self.plan.tensor(&unit.tensor).cloned() else {
                 return Err(invalid(format!(
                     "the journal records a unit for tensor '{}', which this plan does not \
