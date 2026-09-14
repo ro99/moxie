@@ -117,6 +117,9 @@ Measured on this tree, after every correction:
   ignored**.
 - `cargo test -p moxie-executor --features driver --locked --offline`: **104
   passed, 0 failed, 0 ignored**.
+- `cargo test --workspace --features moxie-executor/driver --locked --offline`:
+  **1,111 passed across 97 suites, 0 failed, 0 ignored, 0 filtered out**. The
+  real-artifact and whole-working-set lanes ran rather than skipping.
 
 **The full mutation battery has not been run on this tree.** It is about four
 hours, and the tree has changed in every one of the last four review rounds, so
