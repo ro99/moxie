@@ -126,20 +126,28 @@ impl OutputPlan {
                 // `HEADER_ALLOWANCE` keeps room for the header the shard will
                 // need; the exact size is known only once its tensors are, and
                 // a plan that ignored it could exceed the budget by a header.
-                if component.len + HEADER_ALLOWANCE > budget.chunk_file_bytes() {
+                let alone =
+                    component.len + header_estimate(std::iter::once(component.name.as_str()));
+                if alone > budget.chunk_file_bytes() {
                     return Err(invalid(format!(
-                        "tensor '{}' component '{}' needs {} byte(s) and the admitted shard limit \
-                         is {}: a larger component requires a larger admitted shard size, never a \
-                         component split across shards",
+                        "tensor '{}' component '{}' needs {} byte(s) with its header entry and \
+                         the admitted shard limit is {}: a larger component requires a larger \
+                         admitted shard size, never a component split across shards",
                         request.role,
                         component.kind.name(),
-                        component.len,
+                        alone,
                         budget.chunk_file_bytes()
                     )));
                 }
-                if !current.is_empty()
-                    && used + component.len + HEADER_ALLOWANCE > budget.chunk_file_bytes()
-                {
+                let with_next = used
+                    + component.len
+                    + header_estimate(
+                        current
+                            .iter()
+                            .map(|(_, c)| c.name.as_str())
+                            .chain(std::iter::once(component.name.as_str())),
+                    );
+                if !current.is_empty() && with_next > budget.chunk_file_bytes() {
                     groups.push(std::mem::take(&mut current));
                     used = 0;
                 }
@@ -301,13 +309,23 @@ impl OutputPlan {
     }
 }
 
-/// Room reserved for a shard's header when components are grouped.
+/// Room a shard's JSON header needs, estimated from what it will contain.
 ///
-/// The exact header is known only once a shard's tensor list is, and the list
-/// is what grouping decides -- so grouping reserves this much and the built
-/// layout is checked against the budget afterwards. Sixty-four kibibytes holds
-/// a JSON header for hundreds of components.
-pub const HEADER_ALLOWANCE: u64 = 64 * 1024;
+/// The exact header is known only once the tensor list is, and the list is what
+/// grouping decides -- so grouping estimates, and the built layout is checked
+/// against the budget afterwards, where the real size is known. The estimate is
+/// per entry rather than a flat reserve: a flat one large enough for a big
+/// shard refuses every small one, which is what a 64 KiB constant did to a
+/// 10 KiB tensor in a 64 KiB shard.
+///
+/// One entry is `"<name>":{"dtype":"BF16","shape":[a,b],"data_offsets":[x,y]}`
+/// -- the name, plus punctuation, plus three numbers that do not exceed twenty
+/// digits each. A hundred and sixty bytes covers it with room to spare.
+pub fn header_estimate<'a>(names: impl Iterator<Item = &'a str>) -> u64 {
+    const PER_ENTRY: u64 = 160;
+    const FIXED: u64 = 256;
+    FIXED + names.map(|n| n.len() as u64 + PER_ENTRY).sum::<u64>()
+}
 
 /// `model-00001-of-00003.safetensors`, the convention the ecosystem reads.
 pub fn shard_name(index: usize, total: usize) -> String {

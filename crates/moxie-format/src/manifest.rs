@@ -1447,9 +1447,16 @@ impl IdentityWriter {
 /// complete model" is enforced.
 pub fn encode(manifest: &Manifest) -> Result<String> {
     let mut doc = toml::map::Map::new();
+    // The version a manifest **is**, taken from its own rows rather than from
+    // what this writer prefers: encoding a version 1 manifest as version 2
+    // would relabel an artifact nobody converted.
+    let version = match manifest.tensors.first().map(|t| &t.placement) {
+        Some(Placement::Chunk { .. }) => 1,
+        _ => SCHEMA_VERSION,
+    };
     doc.insert(
         "schema_version".into(),
-        toml::Value::Integer(i64::from(SCHEMA_VERSION)),
+        toml::Value::Integer(i64::from(version)),
     );
     doc.insert(
         "required_features".into(),

@@ -152,9 +152,23 @@ fn round_trip(label: &str, module: &Module, scale_dtype: &'static str, split_sha
     );
 
     // The published payload, against bytes this test built from the values it
-    // wrote into the shard.
+    // wrote into the shard. The components stream in canonical order, so what
+    // comes back is exactly ADR 0023's concatenation -- the same bytes, now
+    // carried as three physical safetensors tensors.
     let expected = module.expected_canonical(scale_dtype);
-    let published = std::fs::read(out.join("chunk0.bin")).expect("the chunk");
+    let artifact = moxie_storage::Artifact::open(&out).expect("the artifact opens");
+    let mut published = Vec::new();
+    let mut scratch = vec![0u8; 4096];
+    artifact
+        .stream_tensor(
+            "model.layers.0.mlp.down_proj.weight",
+            &mut scratch,
+            &mut |slice| {
+                published.extend_from_slice(slice);
+                Ok(())
+            },
+        )
+        .expect("every component verifies against its own checksum");
     assert_eq!(published.len(), expected.len(), "{label}: canonical length");
     assert_eq!(published, expected, "{label}: canonical bytes");
 
@@ -397,13 +411,31 @@ fn a_mixed_selection_publishes_both_precisions_with_bf16_bits_unchanged() {
     let result = run(&args);
     assert_eq!(result.outcome(), "published", "{}", result.stdout);
 
-    let published = std::fs::read(out.join("chunk0.bin")).expect("the chunk");
-    let quantized = module.expected_canonical("BF16");
-    assert_eq!(&published[..quantized.len()], &quantized[..]);
-    // The BF16 tensor starts at the next 16-byte boundary and its bits are
-    // exactly the bits that went in.
-    let at = quantized.len().next_multiple_of(16);
-    assert_eq!(&published[at..at + norm.len()], &norm[..]);
+    let artifact = moxie_storage::Artifact::open(&out).expect("the artifact opens");
+    let mut scratch = vec![0u8; 4096];
+    let mut quantized_read = Vec::new();
+    artifact
+        .stream_tensor(
+            "model.layers.0.mlp.down_proj.weight",
+            &mut scratch,
+            &mut |s| {
+                quantized_read.extend_from_slice(s);
+                Ok(())
+            },
+        )
+        .expect("the quantized tensor verifies");
+    assert_eq!(quantized_read, module.expected_canonical("BF16"));
+    // The BF16 tensor is its own component, and its bits are exactly the bits
+    // that went in -- including the subnormal, the negative zero and the
+    // largest finite BF16.
+    let mut norm_read = Vec::new();
+    artifact
+        .stream_tensor("model.norm.weight", &mut scratch, &mut |s| {
+            norm_read.extend_from_slice(s);
+            Ok(())
+        })
+        .expect("the BF16 tensor verifies");
+    assert_eq!(norm_read, norm);
     let manifest = std::fs::read_to_string(out.join("manifest.toml")).expect("a manifest");
     assert!(
         manifest.contains("precision = \"affine-int4-v1\""),
@@ -434,7 +466,8 @@ fn several_tensors_fill_several_chunk_files() {
     let selection_path = scratch.join("selection.toml");
     selection.write(&selection_path);
     let out = scratch.join("artifact");
-    // 1200 bytes per chunk file holds one 1024-byte tensor and not two.
+    // 1600 bytes per shard holds one 1024-byte tensor plus the header entry
+    // its long name needs, and not two: a component never spans shards.
     let result = run(&[
         "repack",
         "--selection",
@@ -450,7 +483,7 @@ fn several_tensors_fill_several_chunk_files() {
         "--scratch-bytes",
         "1MiB",
         "--chunk-file-bytes",
-        "1200",
+        "1600",
         "--disk-bytes",
         "64MiB",
     ]);
@@ -459,9 +492,9 @@ fn several_tensors_fill_several_chunk_files() {
         .expect("the artifact")
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("chunk"))
+        .filter(|n| n.ends_with(".safetensors"))
         .collect();
-    assert_eq!(names.len(), 4, "one chunk file per tensor: {names:?}");
+    assert_eq!(names.len(), 4, "one shard per tensor: {names:?}");
     let verify = run(&[
         "verify",
         "--artifact",
@@ -519,9 +552,14 @@ fn a_tensor_larger_than_the_scratch_streams_in_several_units() {
         "131072 bytes in 8 KiB tiles: {}",
         result.stdout
     );
-    assert_eq!(
-        std::fs::read(out.join("chunk0.bin")).expect("the chunk"),
-        payload,
-        "the streamed bytes are the source bytes"
-    );
+    let artifact = moxie_storage::Artifact::open(&out).expect("the artifact opens");
+    let mut streamed = Vec::new();
+    let mut scratch = vec![0u8; 8192];
+    artifact
+        .stream_tensor(name, &mut scratch, &mut |s| {
+            streamed.extend_from_slice(s);
+            Ok(())
+        })
+        .expect("it verifies");
+    assert_eq!(streamed, payload, "the streamed bytes are the source bytes");
 }

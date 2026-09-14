@@ -420,7 +420,11 @@ impl Artifact {
                     let len = entry.len();
                     let mut source = OpenChunk { file: &shard.file };
                     self.pump_into(
-                        &format!("{role}.{}", c.kind.name()),
+                        // The component's own name, which is what the manifest
+                        // records and what a safetensors reader shows: the
+                        // role for a BF16 weight, `role.codes` and friends for
+                        // an affine one.
+                        &c.name,
                         &mut source,
                         begin,
                         len,
@@ -464,58 +468,18 @@ impl Artifact {
         sink: &mut dyn FnMut(&[u8]) -> Result<()>,
     ) -> Result<u64> {
         let slice = scratch.len().min(self.budget.bytes()).max(1);
-        let mut hasher = StreamingSha256::new();
-        let mut bf16 = Bf16StreamValidator::new();
-        let mut done: u64 = 0;
-        while done < length {
-            let want = usize::try_from((length - done).min(slice as u64)).map_err(|_| {
-                Error::InvalidArtifact {
-                    detail: format!("{what}: slice length does not fit this platform").into(),
-                }
-            })?;
-            let buf = &mut scratch[..want];
-            let at = offset
-                .checked_add(done)
-                .ok_or_else(|| Error::InvalidArtifact {
-                    detail: format!("{what}: offset {offset} + {done} overflows").into(),
-                })?;
-            match source.read_at(at, buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    return Err(Error::InvalidArtifact {
-                        detail: format!(
-                            "{what}: short read at {at} for {want} bytes: truncation: {e}"
-                        )
-                        .into(),
-                    });
-                }
-            }
-            hasher.update(buf);
-            if matches!(precision, TensorPrecision::Bf16V1) {
-                bf16.feed(buf)?;
-            }
-            sink(buf)?;
-            done += want as u64;
-        }
-        if matches!(precision, TensorPrecision::Bf16V1) {
-            bf16.finish()?;
-        }
-        let got = hasher.finalize_bytes();
-        let want = decode_hex32(want_sha256).map_err(|()| Error::InvalidArtifact {
-            detail: "stored checksum is not 64 hex digits".into(),
-        })?;
-        if got != want {
-            return Err(Error::InvalidArtifact {
-                detail: format!(
-                    "{what}: checksum mismatch: expected {want_sha256}, computed {}; everything \
-                     the sink was handed is explicitly not to be trusted",
-                    str::from_utf8(&hex_of(&got)).unwrap_or("?")
-                )
-                .into(),
-            });
-        }
-        Ok(done)
+        pump_stream(
+            what,
+            source,
+            offset,
+            length,
+            want_sha256,
+            precision,
+            slice,
+            scratch,
+            sink,
+        )?;
+        Ok(length)
     }
 
     /// Verify one tensor's payload against its recorded checksum.
@@ -1185,6 +1149,13 @@ fn resolve_chunk(canonical_dir: &Path, dir: &Path, name: &str) -> Result<PathBuf
 /// length cannot allocate during a read. The allocation gate tests measure
 /// this, on short and long paths alike. Interrupted syscalls retry without
 /// advancing; every other I/O failure is truncation naming the chunk.
+/// Fill a caller's whole buffer from one range, through the shared pump.
+///
+/// Only the unit tests below reach this shape now -- the artifact reader
+/// streams -- and they are the reason it stays: interruption retry, truncation
+/// and the BF16 boundary are properties of [`pump_stream`], and these are the
+/// cases that hold it to them.
+#[cfg(test)]
 fn pump_range<S: RangeSource>(
     source: &mut S,
     offset: u64,
@@ -1194,30 +1165,72 @@ fn pump_range<S: RangeSource>(
     budget: ByteBudget,
     chunk: &str,
 ) -> Result<()> {
+    let length = dest.len() as u64;
+    let slice = budget.bytes().max(1);
+    pump_stream(
+        chunk,
+        source,
+        offset,
+        length,
+        want_sha256,
+        precision,
+        slice,
+        dest,
+        &mut |_| Ok(()),
+    )
+}
+
+/// Read one byte range in bounded slices, hashing it, validating BF16
+/// finiteness when the bytes are BF16, and handing each slice to `sink`.
+///
+/// The one pump in this crate. `dest` is where the bytes land -- the caller's
+/// buffer when it wants them all, a scratch buffer when it only wants them
+/// streamed -- and `sink` sees each slice as it arrives. No reader-owned
+/// allocation exceeds `slice`.
+///
+/// The bytes are trustworthy only once this returns `Ok`: the checksum is
+/// verified after the last slice, which is why the error says so in as many
+/// words.
+#[allow(clippy::too_many_arguments)]
+fn pump_stream<S: RangeSource>(
+    what: &str,
+    source: &mut S,
+    offset: u64,
+    length: u64,
+    want_sha256: &str,
+    precision: TensorPrecision,
+    slice: usize,
+    dest: &mut [u8],
+    sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
     let mut hasher = StreamingSha256::new();
     let mut bf16 = Bf16StreamValidator::new();
-    let slice = budget.bytes().max(1);
-    let total = dest.len();
-    let mut done = 0usize;
-    while done < total {
-        let end = (done + slice).min(total);
-        let buf = &mut dest[done..end];
+    let streaming = (dest.len() as u64) < length;
+    let mut done: u64 = 0;
+    while done < length {
+        let want = usize::try_from((length - done).min(slice as u64)).map_err(|_| {
+            Error::InvalidArtifact {
+                detail: format!("{what}: slice length does not fit this platform").into(),
+            }
+        })?;
+        // Streaming reuses the front of the buffer; filling writes in place.
+        let at = if streaming { 0 } else { done as usize };
+        let buf = &mut dest[at..at + want];
         let pos = offset
-            .checked_add(done as u64)
+            .checked_add(done)
             .ok_or_else(|| Error::InvalidArtifact {
-                detail: format!("tensor offset {offset} + {done} overflows").into(),
+                detail: format!("{what}: offset {offset} + {done} overflows").into(),
             })?;
-        // An interrupted syscall is retried without advancing: the tensor
-        // offset has not moved, so no byte is skipped or duplicated.
-        // Anything else -- including premature EOF -- is truncation naming
-        // the chunk, never a silent short read.
+        // An interrupted syscall is retried without advancing: the offset has
+        // not moved, so no byte is skipped or duplicated. Anything else --
+        // including premature EOF -- is truncation, never a silent short read.
         match source.read_at(pos, buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 return Err(Error::InvalidArtifact {
                     detail: format!(
-                        "short read of chunk '{chunk}' at {pos} for {} bytes: truncation: {e}",
+                        "short read of chunk '{what}' at {pos} for {} bytes: truncation: {e}",
                         buf.len()
                     )
                     .into(),
@@ -1228,7 +1241,8 @@ fn pump_range<S: RangeSource>(
         if matches!(precision, TensorPrecision::Bf16V1) {
             bf16.feed(buf)?;
         }
-        done = end;
+        sink(buf)?;
+        done += want as u64;
     }
     if matches!(precision, TensorPrecision::Bf16V1) {
         bf16.finish()?;
@@ -1240,9 +1254,11 @@ fn pump_range<S: RangeSource>(
     if got != want {
         return Err(Error::InvalidArtifact {
             detail: format!(
-                "checksum mismatch: expected {want_sha256}, computed {}; the destination buffer's contents are explicitly not to be trusted",
+                "{what}: checksum mismatch: expected {want_sha256}, computed {}; everything the \
+                 sink was handed is explicitly not to be trusted",
                 str::from_utf8(&hex_of(&got)).unwrap_or("?")
-            ).into(),
+            )
+            .into(),
         });
     }
     Ok(())

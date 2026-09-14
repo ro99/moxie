@@ -235,7 +235,7 @@ fn a_repack_holds_its_budget_and_gives_every_admitted_byte_back() {
     let published: u64 = std::fs::read_dir(&out)
         .expect("the artifact")
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("chunk"))
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
         .map(|e| e.metadata().expect("a file").len())
         .sum();
     let expected = module.expected_canonical("BF16").len() as u64;

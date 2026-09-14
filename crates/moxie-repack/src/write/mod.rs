@@ -23,7 +23,7 @@ pub mod plan;
 pub mod run;
 
 pub use fault::{Faults, Site};
-pub use plan::{OutputPlan, PlacedComponent, TensorRequest};
+pub use plan::{OutputPlan, PlacedComponent, TensorRequest, shard_name};
 pub use run::{
     JOURNAL_FILE, LOCK_FILE, MANIFEST_FILE, Options, Outcome, ResumeReport, Run,
     STAGED_MANIFEST_FILE, SealedTensor, Start,

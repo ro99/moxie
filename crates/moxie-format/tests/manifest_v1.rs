@@ -1,19 +1,25 @@
 //! Manifest v1 acceptance: every documented rejection rule actually rejects.
 //!
+//! Version 1 -- raw chunk files -- is no longer what a repack **writes**, and
+//! [ADR 0025](../../../docs/decisions/adr/0025-canonical-safetensors-schema.md)
+//! keeps its reader: existing artifacts are neither reinterpreted nor
+//! converted. These are that reader's rules, and they stay until the
+//! transitional path expires.
+//!
 //! Malformed manifests are built here as strings, one per rule, so each
 //! rejection names the rule it proves.
 
 use std::collections::BTreeMap;
 
 use moxie_format::manifest::{
-    self, MAX_ARCH_DEPTH, MAX_ARCH_NODES, MAX_MANIFEST_BYTES, MAX_TENSORS, SCHEMA_VERSION,
+    self, MAX_ARCH_DEPTH, MAX_ARCH_NODES, MAX_MANIFEST_BYTES, MAX_TENSORS,
 };
 
 const HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 fn header() -> String {
     format!(
-        r#"schema_version = {SCHEMA_VERSION}
+        r#"schema_version = 1
 required_features = []
 endianness = "little"
 
@@ -130,9 +136,11 @@ fn the_committed_fixture_parses() {
 
 #[test]
 fn schema_version_is_refused_by_version_before_any_other_field() {
+    // Version 3: version 2 is a schema this reader now accepts (ADR 0025), so
+    // the refusal has to be tested with a version nothing knows.
     let bad = manifest_with(&bf16_tensor("w", "2, 2", "c.bin", 0, 8, 0)).replacen(
         "schema_version = 1",
-        "schema_version = 2",
+        "schema_version = 3",
         1,
     );
     err_contains(manifest::parse(&bad), "version");
@@ -145,7 +153,7 @@ fn a_future_version_is_refused_even_when_v1_fields_are_gone() {
     // ran before the version check. The version is gated first now, so a
     // future schema with missing or changed v1 fields still fails on version.
     err_contains(
-        manifest::parse("schema_version = 2\n"),
+        manifest::parse("schema_version = 3\n"),
         "refused by version",
     );
     let future = "schema_version = 99\nrequired_features = []\nendianness = \"sideways\"\n";
@@ -241,8 +249,13 @@ fn offset_plus_length_that_wraps_is_an_error_not_an_in_range_value() {
     // Now the wrapping range, expressed directly (TOML i64 cannot hold u64::MAX,
     // so this exercises validate_chunks' checked_add via a hand-built manifest).
     let mut evil = m;
-    evil.tensors[0].offset = u64::MAX;
-    evil.tensors[0].length = 16;
+    evil.tensors[0].placement = manifest::Placement::Chunk {
+        chunk: "c.bin".into(),
+        offset: u64::MAX,
+        length: 16,
+        sha256: HEX.into(),
+        alignment: 2,
+    };
     err_contains(manifest::validate_chunks(&evil, &chunks), "overflows");
 }
 

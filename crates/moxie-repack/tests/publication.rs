@@ -96,24 +96,26 @@ fn payload(seed: u64, len: usize) -> Vec<u8> {
 
 /// Two tensors, one of them large enough to need several units.
 fn requests() -> Vec<TensorRequest> {
-    vec![
-        TensorRequest {
-            role: "layers.0.w".into(),
-            shape: vec![64, 80],
+    [("layers.0.w", vec![64u64, 80]), ("layers.0.norm", vec![16])]
+        .into_iter()
+        .map(|(role, shape)| TensorRequest {
+            role: role.into(),
+            components: moxie_format::canonical::bf16_components(role, &shape)
+                .expect("a bf16 component"),
+            shape,
             precision: TensorPrecision::Bf16V1,
             affine: None,
-            length: 64 * 80 * 2,
-            alignment: 16,
-        },
-        TensorRequest {
-            role: "layers.0.norm".into(),
-            shape: vec![16],
-            precision: TensorPrecision::Bf16V1,
-            affine: None,
-            length: 32,
-            alignment: 16,
-        },
-    ]
+        })
+        .collect()
+}
+
+/// One request's single component, which is what a unit is written against.
+fn component_of(request: &TensorRequest) -> String {
+    request.components[0].name.clone()
+}
+
+fn request_len(request: &TensorRequest) -> u64 {
+    request.payload_bytes()
 }
 
 fn plan() -> OutputPlan {
@@ -126,8 +128,9 @@ fn plan() -> OutputPlan {
 fn units(request: &TensorRequest) -> Vec<(u64, usize)> {
     let mut out = Vec::new();
     let mut at = 0u64;
-    while at < request.length {
-        let take = ((request.length - at) as usize).min(budget().scratch_bytes());
+    let len = request_len(request);
+    while at < len {
+        let take = ((len - at) as usize).min(budget().scratch_bytes());
         out.push((at, take));
         at += take as u64;
     }
@@ -160,21 +163,24 @@ fn empty_metadata() -> moxie_format::manifest::OpaqueArchMetadata {
 fn manifest_for(sealed: &[moxie_repack::write::SealedTensor]) -> Manifest {
     let mut tensors = Vec::new();
     for (order, request) in requests().iter().enumerate() {
-        let s = sealed
-            .iter()
-            .find(|s| s.role == request.role)
-            .expect("every tensor is sealed");
         tensors.push(Tensor {
             role: request.role.clone(),
             shape: request.shape.clone(),
             precision: request.precision,
-            chunk: s.chunk.clone(),
-            offset: s.offset,
-            length: s.length,
-            sha256: s.sha256.clone(),
-            alignment: request.alignment,
             logical_order: order as u64,
             affine: None,
+            placement: moxie_format::manifest::Placement::Components(
+                sealed
+                    .iter()
+                    .filter(|s| s.role == request.role)
+                    .map(|s| moxie_format::manifest::Component {
+                        kind: s.kind,
+                        file: s.file.clone(),
+                        name: s.name.clone(),
+                        sha256: s.sha256.clone(),
+                    })
+                    .collect(),
+            ),
         });
     }
     Manifest {
@@ -254,8 +260,8 @@ fn run_to_end(
     let cancelled = std::cell::Cell::new(false);
     let check = || cancelled.get();
     for request in requests() {
-        let bytes = payload(request.length, request.length as usize);
-        let done = run.bytes_done(&request.role)?;
+        let bytes = payload(request_len(&request), request_len(&request) as usize);
+        let done = run.bytes_done(&component_of(&request))?;
         for (at, len) in units(&request) {
             if at + len as u64 <= done {
                 continue;
@@ -265,7 +271,7 @@ fn run_to_end(
                 return Ok((outcome, String::new(), written));
             }
             match run.write_unit(
-                &request.role,
+                &component_of(&request),
                 &bytes[at as usize..at as usize + len],
                 HEX,
                 faults,
@@ -324,7 +330,11 @@ fn an_uninterrupted_run_publishes_and_verifies() {
     assert!(written > 1, "the large tensor takes several units");
     // The private files are gone and the artifact is what is left.
     let names: Vec<String> = artifact_bytes(&dest).keys().cloned().collect();
-    assert_eq!(names, ["chunk0.bin", "manifest.toml"]);
+    assert_eq!(
+        names,
+        ["manifest.toml", "model-00001-of-00001.safetensors"],
+        "a published artifact is a manifest plus conforming shards (ADR 0025)"
+    );
     assert!(!dest.join(".moxie-repack-journal").exists());
     assert!(!dest.join(".moxie-repack-lock").exists());
     // And it opens through the production reader.
@@ -580,7 +590,7 @@ fn bytes_are_durable_before_the_record_that_claims_them() {
     // together; visit two is the first unit's record.
     let faults = Faults::none().fail_at(Site::JournalAppend, 2);
     run_to_end(&dest, &faults, false, None).unwrap_err();
-    let staged = std::fs::metadata(dest.join("chunk0.bin"))
+    let staged = std::fs::metadata(dest.join(moxie_repack::write::shard_name(1, 1)))
         .expect("the chunk exists")
         .len();
     assert!(
@@ -750,7 +760,7 @@ fn staged_bytes_that_no_longer_match_the_journal_are_discarded_and_recomputed() 
     let dest = scratch.join("artifact");
     run_to_end(&dest, &Faults::none(), false, Some(2)).expect("a cancelled run");
     // Corrupt one byte of the first unit's staged payload.
-    let chunk = dest.join("chunk0.bin");
+    let chunk = dest.join(moxie_repack::write::shard_name(1, 1));
     let mut bytes = std::fs::read(&chunk).expect("a staged chunk");
     bytes[3] ^= 0xFF;
     std::fs::write(&chunk, &bytes).expect("corrupting it");
@@ -771,7 +781,7 @@ fn bytes_past_the_journal_are_truncated_on_resume() {
     let scratch = Scratch::new("overshoot");
     let dest = scratch.join("artifact");
     run_to_end(&dest, &Faults::none(), false, Some(2)).expect("a cancelled run");
-    let chunk = dest.join("chunk0.bin");
+    let chunk = dest.join(moxie_repack::write::shard_name(1, 1));
     let before = std::fs::metadata(&chunk).expect("a chunk").len();
     // Append what a crashed unit would have left.
     let mut bytes = std::fs::read(&chunk).expect("a chunk");
@@ -894,10 +904,10 @@ fn cancellation_observed_after_validation_still_stops_before_the_rename() {
         other => panic!("{other:?}"),
     };
     for request in requests() {
-        let bytes = payload(request.length, request.length as usize);
+        let bytes = payload(request_len(&request), request_len(&request) as usize);
         for (at, len) in units(&request) {
             run.write_unit(
-                &request.role,
+                &component_of(&request),
                 &bytes[at as usize..at as usize + len],
                 HEX,
                 &Faults::none(),
@@ -939,9 +949,10 @@ fn cancellation_observed_after_validation_still_stops_before_the_rename() {
 /// so.
 #[test]
 fn a_private_file_replaced_by_a_symlink_is_refused_before_anything_is_written() {
+    let shard = moxie_repack::write::shard_name(1, 1);
     for victim_name in [
         ".moxie-repack-manifest",
-        "chunk0.bin",
+        shard.as_str(),
         ".moxie-repack-journal",
     ] {
         let scratch = Scratch::new("symlink");

@@ -153,7 +153,12 @@ pub struct InspectReport {
     pub selection_digest: String,
     pub tensors: Vec<TensorReport>,
     pub files: Vec<String>,
+    /// Bytes of canonical tensor data: the components, and nothing else.
     pub canonical_payload_bytes: u64,
+    /// Bytes the shards occupy, which is the above plus each shard's JSON
+    /// header. Reported separately because a header is not tensor data and a
+    /// disk plan has to count both.
+    pub shard_bytes: u64,
     pub chunk_files: usize,
     pub largest_chunk_bytes: u64,
     pub source_payload_bytes: u64,
@@ -638,7 +643,8 @@ pub fn inspect(
         source_root: sources.root().to_path_buf(),
         selection_digest: selection_digest(selection),
         plan_digest: plan.digest(),
-        canonical_payload_bytes: plan.payload_bytes(),
+        canonical_payload_bytes: resolved.iter().map(|r| r.canonical_bytes).sum(),
+        shard_bytes: plan.payload_bytes(),
         chunk_files: plan.shards().len(),
         largest_chunk_bytes: plan
             .shards()

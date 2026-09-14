@@ -235,7 +235,20 @@ fn the_real_module_repacks_reopens_and_reconstructs_every_value() {
         .iter()
         .find(|t| t.role == ROLE)
         .expect("the role is in the manifest");
-    assert_eq!(tensor.length as usize, EXPECTED_CANONICAL_BYTES);
+    // The canonical payload is now three physical tensors, and their lengths
+    // add up to what one byte range used to hold: the bytes did not change,
+    // their container did (ADR 0025).
+    let components = tensor.components().expect("a version 2 tensor");
+    assert_eq!(components.len(), 3, "codes, scales and zero points");
+    let published: u64 = components
+        .iter()
+        .map(|c| {
+            artifact
+                .shard_entry(&c.file, &c.name)
+                .expect("the shard declares it")
+        })
+        .sum();
+    assert_eq!(published as usize, EXPECTED_CANONICAL_BYTES);
     let mut payload = Vec::with_capacity(EXPECTED_CANONICAL_BYTES);
     let mut scratch = vec![0u8; 64 * 1024];
     let read = artifact

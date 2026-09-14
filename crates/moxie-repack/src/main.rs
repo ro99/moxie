@@ -273,6 +273,10 @@ fn print_inspect(r: &InspectReport, budgets: &Budgets) {
         );
     }
     println!("canonical-payload-bytes: {}", r.canonical_payload_bytes);
+    println!(
+        "shard-bytes: {} (the components plus each shard's header)",
+        r.shard_bytes
+    );
     println!("chunk-files: {}", r.chunk_files);
     println!("largest-chunk-bytes: {}", r.largest_chunk_bytes);
     println!("source-payload-bytes: {}", r.source_payload_bytes);

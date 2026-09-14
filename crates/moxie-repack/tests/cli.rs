@@ -268,12 +268,14 @@ fn an_insufficient_budget_is_refused_before_any_payload_is_created() {
     assert_eq!(r.status, 2, "{}{}", r.stdout, r.stderr);
     assert_eq!(r.outcome(), "failed");
     assert!(
-        r.says("larger admitted file limit"),
+        r.says("larger admitted shard size"),
         "the refusal names the limit: {}",
         r.stdout
     );
     assert!(
-        !std::path::Path::new(&out).join("chunk0.bin").exists(),
+        !std::path::Path::new(&out)
+            .join(moxie_repack::write::shard_name(1, 1))
+            .exists(),
         "a refused plan created a payload"
     );
     // And the same for the disk budget: a chunk limit that fits, and a disk
@@ -297,7 +299,7 @@ fn an_insufficient_budget_is_refused_before_any_payload_is_created() {
     let r = run(&borrowed);
     assert_eq!(r.status, 2, "{}{}", r.stdout, r.stderr);
     assert!(
-        r.says("larger admitted file limit") || r.says("disk budget"),
+        r.says("larger admitted shard size") || r.says("disk budget"),
         "a selection above both disk limits is refused, naming one: {}",
         r.stdout
     );
@@ -326,18 +328,15 @@ fn a_disk_budget_below_the_selection_is_refused_on_its_own() {
         "64MiB",
         "--scratch-bytes",
         "1MiB",
-        // The arithmetic, because these numbers have to be exact for the
-        // disk rule to be the one that fires. The quantized tensor is 640
-        // canonical bytes and the BF16 one is 16, at alignment 16. A 655-byte
-        // chunk-file limit admits the first tensor (640 + 15 of possible
-        // alignment) and forces the second into a second chunk, so the
-        // selection needs 656 bytes of disk in two files -- one more than the
-        // 655 admitted. A limit large enough to hold both would make the
-        // chunk-file rule fire first, which is the case above.
+        // A shard limit large enough for every component, so the shard rule
+        // cannot fire, and a disk budget below what the shards plus the
+        // journal and manifest need. The components are 512 + 64 + 64 + 16
+        // bytes and the shard adds a JSON header, so 800 is under the total
+        // and over any single component.
         "--chunk-file-bytes",
-        "655",
+        "4KiB",
         "--disk-bytes",
-        "655",
+        "4KiB",
     ]);
     assert_eq!(r.status, 2, "{}{}", r.stdout, r.stderr);
     assert!(
@@ -346,7 +345,9 @@ fn a_disk_budget_below_the_selection_is_refused_on_its_own() {
         r.stdout
     );
     assert!(
-        !std::path::Path::new(&out).join("chunk0.bin").exists(),
+        !std::path::Path::new(&out)
+            .join(moxie_repack::write::shard_name(1, 1))
+            .exists(),
         "a refused plan created a payload"
     );
 }
@@ -377,7 +378,8 @@ fn a_published_destination_is_refused_rather_than_overwritten() {
     let f = Fixture::new("cli-existing");
     let out = f.path("artifact");
     assert_eq!(f.repack(&out, &[]).outcome(), "published");
-    let before = std::fs::read(std::path::Path::new(&out).join("chunk0.bin")).expect("a chunk");
+    let shard = moxie_repack::write::shard_name(1, 1);
+    let before = std::fs::read(std::path::Path::new(&out).join(&shard)).expect("a shard");
     let again = f.repack(&out, &[]);
     assert_eq!(again.status, 2, "{}{}", again.stdout, again.stderr);
     assert!(
@@ -391,7 +393,7 @@ fn a_published_destination_is_refused_rather_than_overwritten() {
         again.stdout
     );
     assert_eq!(
-        std::fs::read(std::path::Path::new(&out).join("chunk0.bin")).expect("a chunk"),
+        std::fs::read(std::path::Path::new(&out).join(&shard)).expect("a shard"),
         before,
         "the published artifact was touched"
     );
@@ -566,8 +568,9 @@ fn an_aborted_process_restarts_and_publishes_an_identical_artifact() {
         .field("artifact-identity")
         .expect("an identity")
         .to_string();
-    let reference_chunk =
-        std::fs::read(std::path::Path::new(&reference).join("chunk0.bin")).expect("a chunk");
+    let reference_shard =
+        std::fs::read(std::path::Path::new(&reference).join(moxie_repack::write::shard_name(1, 1)))
+            .expect("a shard");
 
     for after in 1..=3 {
         let out = f.path(&format!("aborted-{after}"));
@@ -594,8 +597,9 @@ fn an_aborted_process_restarts_and_publishes_an_identical_artifact() {
             "a restarted run published a different artifact"
         );
         assert_eq!(
-            std::fs::read(std::path::Path::new(&out).join("chunk0.bin")).expect("a chunk"),
-            reference_chunk
+            std::fs::read(std::path::Path::new(&out).join(moxie_repack::write::shard_name(1, 1)))
+                .expect("a shard"),
+            reference_shard
         );
     }
 }
@@ -624,17 +628,21 @@ fn verify_refuses_a_corrupted_artifact_and_says_which_tensor() {
     let f = Fixture::new("cli-corrupt");
     let out = f.path("artifact");
     assert_eq!(f.repack(&out, &[]).outcome(), "published");
-    let chunk = std::path::Path::new(&out).join("chunk0.bin");
-    let mut bytes = std::fs::read(&chunk).expect("a chunk");
-    bytes[7] ^= 0xFF;
+    let chunk = std::path::Path::new(&out).join(moxie_repack::write::shard_name(1, 1));
+    let mut bytes = std::fs::read(&chunk).expect("a shard");
+    // The **last** byte, which is tensor data. Corrupting one of the first
+    // eight would break the header length, and an unreadable shard is a
+    // different failure from a payload that no longer matches its checksum.
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
     std::fs::write(&chunk, bytes).expect("corrupting it");
     let v = run(&["verify", "--artifact", &out, "--scratch-bytes", "4096"]);
     assert_eq!(v.status, 2, "{}{}", v.stdout, v.stderr);
     assert_eq!(v.outcome(), "failed");
     assert!(v.says("checksum mismatch"), "{}", v.stdout);
     assert!(
-        v.says("model.layers.0.mlp.down_proj.weight"),
-        "the refusal names the tensor: {}",
+        v.says("model.norm.weight"),
+        "the refusal names the component whose bytes moved: {}",
         v.stdout
     );
 }
