@@ -49,7 +49,11 @@ through the production reader and publishes a manifest-v1 directory atomically.
 Commands are `inspect`, `repack`, and `verify`; there is no unchecked publish.
 
 The sole canonical write-I/O owner is `moxie-storage-write`, the storage write
-half selected in ADR 0022. Reuse the I/O-free format importer/serializer and
+half selected in ADR 0022. **Superseded after implementation by
+[ADR 0024](../decisions/adr/0024-one-storage-crate-and-a-write-module.md)**, on
+the owner's ruling: the writer is a module of `moxie-repack`, not a crate. The
+contract is left as it was written; the result section records what changed and
+why. Reuse the I/O-free format importer/serializer and
 `moxie-storage` reader. The binary handles arguments/reporting; it cannot contain
 a second decoder, hash implementation, manifest validator or filesystem writer.
 
@@ -292,8 +296,8 @@ points, with the boundary ADR 0022 drew:
 | `moxie-format::manifest::encode` | The writer half of manifest v1. It re-parses its own output and compares artifact identity before returning. |
 | `moxie-format::compressed_tensors::PackQuantizedPlan` | The streaming importer. `import` is written in terms of it, so a whole-tensor import and a tiled repack are one codec. |
 | `moxie-storage::Artifact::{stream_tensor, verify_tensor, open_unpublished}` | Verification without decoding, and validating a manifest that is not published yet. |
-| `moxie-storage-write` | Confined output creation, bounded chunk writing, the journal's file half, atomic publication. |
-| `moxie-repack` | Arguments, the offline workflow, reporting. No second decoder, hash, validator or writer. |
+| `moxie-storage::{read_range, read_text_capped}` | The bounded-read primitives the writer needs, public, in the crate that owns file I/O. |
+| `moxie-repack` | Arguments, the offline workflow, reporting, and its `write` module: confined output creation, bounded chunk writing, the journal's file half, atomic publication. No second decoder, hash, validator or read path. |
 
 The destination directory **is** the staging area: chunk files are written under
 their final names and what makes the artifact unreadable is that `manifest.toml`
@@ -313,7 +317,7 @@ is in the ignored `results/task0025/gates.log`.
 | Device-lane lints | `... --features moxie-executor/driver` | **passed** |
 | `xtask` device lints | `... --features cuda` | **passed** |
 | Specification | `cargo xtask spec-check` | **passed**, 10 documents present and unchanged |
-| Architecture | `cargo xtask arch-check` | **passed**: 85 rejected fixtures, 23 accepted, **14 rules exercised** — one more rule and eight more fixtures than before |
+| Architecture | `cargo xtask arch-check` | **passed**: 79 rejected fixtures, 21 accepted, 13 rules. The task added a write-authority rule and eight fixtures; [ADR 0024](../decisions/adr/0024-one-storage-crate-and-a-write-module.md) removed all of them with the crate they policed |
 | Host tests | `cargo test --workspace --locked --offline` | **1,014 passed, 0 failed, 0 ignored, 0 skipped** (task 0024 recorded 947) |
 | Device-feature tests | `cargo test --workspace --locked --offline --features moxie-executor/driver` | **1,049 passed, 0 failed, 0 ignored** |
 
@@ -332,7 +336,7 @@ The two clippy lanes that need CUDA were run because this task changes
 |---|---|
 | `moxie-format` unit and `manifest_v1` | The payload codec against **bytes written out by hand**, the journal's torn-tail and version rules, the selection's refusals, and manifest v1 round-tripping through its own writer — including awkward strings, the opaque architecture tree and partial completeness |
 | `the_streaming_converter_and_the_whole_tensor_import_agree` | One codec, not two: every tile size that lands on and off a word, a group and the padded tail produces the same bytes as a whole-tensor import |
-| `moxie-storage-write::publication` | 16 tests, including **35 enumerated failure cases** — every visit to every named durable boundary — each checked for no readable artifact before the rename, a resumable destination after, and a byte-identical republish; plus cancellation at the publication boundary, a corrupted staged unit, bytes past the journal, a torn journal line, a rebound plan, a stale lock and an oversized unit |
+| `moxie-repack::publication` | 16 tests, including **35 enumerated failure cases** — every visit to every named durable boundary — each checked for no readable artifact before the rename, a resumable destination after, and a byte-identical republish; plus cancellation at the publication boundary, a corrupted staged unit, bytes past the journal, a torn journal line, a rebound plan, a stale lock and an oversized unit |
 | `moxie-repack::round_trip` | Every signed INT4 and INT8 code, asymmetric zero points, all three scale encodings, group and axis tails, symmetric and asymmetric modules, split shards, mixed BF16, several chunk files, and a tensor 32 times the scratch |
 | `moxie-repack::cli` | The real binary: exit statuses, refusals, an actual `SIGABRT` restart, a changed source refused, budgets required, inspection writing nothing |
 | `moxie-repack::budget` | **208,461 B peak live heap** against a 134,217,728 B admission while publishing 2,107,392 B through a 65,536 B scratch, every admitted byte returned, and resume peaks flat across four attempts (58,183 / 57,560 / 57,560 / 57,560 B) |
@@ -359,12 +363,15 @@ fire. The two skips were the battery failing to measure — one anchor reformatt
 by `cargo fmt`, one matching two places in one file — and a mutation that does
 not apply is not evidence.
 
-**The independence control matters most for the architecture rule.** Five of its
-six negative fixtures would also be refused by the dependency allowlist, so the
-fixtures alone say nothing about the new rule. The control adds
-`moxie-storage-write` to `moxie-engine`'s allowlist and requires the battery to
-stay green, because the write-authority rule still rejects those fixtures. It
-held.
+**Three of those measurements are now gone with what they measured.** The
+battery carried two mutations of the write-authority `arch-check` rule and one
+independence control proving the rule was not the dependency allowlist in
+disguise — the control added `moxie-storage-write` to `moxie-engine`'s allowlist
+and required the battery to stay green. All three held when they ran. ADR 0024
+then deleted the rule, because a module inside the only program that writes
+cannot be reached by anything else, and there is no longer a rule for a
+substitution to weaken. The remaining battery is 26 mutants and 3 expected
+survivors, and **it has not been re-run since the merge**.
 
 ### What the real module measured
 
@@ -415,6 +422,25 @@ A fourth came from measured coverage rather than from a failure:
 clean run had **zero** cases for it. The gate prints its coverage table and
 refuses to pass with more than one unreached boundary, which is how the gap
 announced itself; it has a test of its own now.
+
+### The crate split, and why it is gone
+
+The first implementation put canonical write I/O in its own crate,
+`moxie-storage-write`, as ADR 0022 specified and this contract required. **The
+owner rejected it on review, and was right.** It had one consumer by design, and
+the boundary forced the writer to grow its own `read_exact_at`, byte-range pump
+and capped text read — the first character-identical to the reader's, because
+the reader's was private. Two copies of "read bytes at an offset, bounded" in one
+workspace is the duplication this repository exists to refuse, and the split is
+what created it.
+
+[ADR 0024](../decisions/adr/0024-one-storage-crate-and-a-write-module.md) folds
+the writer into `moxie-repack::write`, makes the two primitives public on
+`moxie-storage`, and deletes the duplicate. Confinement got **stronger**: no
+crate outside the program can name the writer, so the `arch-check` rule and its
+eight fixtures were removed rather than maintained. The general rule it
+establishes: a crate needs several consumers *and* something distinct to own —
+one consumer plus a rule someone has to maintain is a module.
 
 ### Explicit limits of this task
 

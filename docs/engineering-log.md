@@ -32,6 +32,7 @@ Each links into the entries below.
 | A gate that never sees the input it exists for | task 0021's descriptor, task 0023's valid-only sweep, task 0024's import-only sweep, task 0025's never-visited boundary |
 | A recovery that only knows the states it imagined | task 0025's empty journal and its own leftover lock file |
 | An undo that reverses the decision but not the state it already changed | task 0025's running checksum |
+| A boundary invented before it had two sides | task 0025's `moxie-storage-write`, which forced a second copy of the reader's `pread` |
 | A test measured by assertion rather than by mutation | tasks 0020, 0021, 0022, 0023, 0024 |
 | A record contradicting a fact it already contains | task 0022's expert inventory, task 0022's VRAM figure, task 0024's sign claim |
 | A comparison whose two sides are not independent | task 0022's FP64 transcription, task 0024's FP32-versus-BF16 arithmetic |
@@ -43,8 +44,9 @@ Each links into the entries below.
 **Task 0025 — the offline repacker — is implemented and not reviewed
 (2026-09-13).** `moxie-repack` inspects a selection, converts it in bounded work
 units, resumes an interrupted run, validates through the production reader and
-publishes a manifest-v1 directory with one rename; `moxie-storage-write` is the
-write authority ADR 0022 separated from the reader, and
+publishes a manifest-v1 directory with one rename; its `write` module is the
+write authority (ADR 0022 put that in its own crate, ADR 0024 folded it back --
+see below), and
 [ADR 0023](decisions/adr/0023-canonical-affine-payload-and-repack-journal.md)
 fixes the two encodings it needed — the canonical affine payload and the restart
 journal — **before** the code that writes them. One Laguna module round-trips
@@ -91,17 +93,31 @@ unreached, which is how that gap announced itself; the missing case is now a tes
 of its own. This is task 0021's descriptor and task 0023's valid-only sweep
 again: the sweep covers the paths the scenario that generated it happened to take.
 
+**The crate that should have been a module.** The writer went into
+`moxie-storage-write`, its own crate, because ADR 0022 said a dependency edge
+would make "who may publish a checkpoint" machine-checkable. The owner rejected
+it on sight and the implementation had already proved him right: one consumer by
+design, and a boundary that forced the writer to grow its own `read_exact_at` —
+character-identical to the reader's private one — plus a byte-range pump and a
+capped text read. The fix ([ADR 0024](decisions/adr/0024-one-storage-crate-and-a-write-module.md))
+is a module inside the one program that writes, two primitives made public on
+`moxie-storage`, and the deletion of a rule, six negative fixtures and two
+accepted ones. **Confinement got stronger by deleting the thing that enforced
+it**: nothing outside the program can name a module that is inside it. The
+lesson for the next crate: a crate needs several consumers *and* something
+distinct to own. One consumer plus a rule someone maintains is a module, and
+inventing the crate first is what makes the duplication necessary.
+
 **A fixture rejected for an unrelated rule is not evidence the rule under test
-works — and the way to show it is to remove the *other* protection.** The new
-`arch-check` rule refuses any crate that can **reach** `moxie-storage-write`,
-however the edge is spelled: renamed, `cfg`-gated, optional, a build dependency,
-or one crate removed. Six negative fixtures cover those spellings, but five of
-them would also be refused by the dependency allowlist, so the fixtures alone
-prove nothing about the new rule. The battery therefore carries an **independence
-control**: a substitution that adds `moxie-storage-write` to `moxie-engine`'s
-allowlist, and must **not** be caught, because the write-authority rule still
-rejects the fixtures. It held. The driver reports controls separately from
-mutants for exactly this reason.
+works — and the way to show it is to remove the *other* protection.** The
+`arch-check` rule written for the write-authority crate edge had six negative
+fixtures, five of which the dependency allowlist would also have refused, so the
+fixtures alone said nothing about the new rule. The battery therefore carried an
+**independence control**: a substitution that widened the allowlist and had to
+leave the battery green, because the new rule still rejected those fixtures. It
+held. The rule is gone now with the crate it policed, and the technique is the
+part worth keeping: when two protections overlap, remove the other one and see
+whether the gate still fires.
 
 **A gate nobody wants to run is a gate that stops running.** The manifest cap
 fixture parses a document with 1,048,577 tables in it, and took 99 seconds; the

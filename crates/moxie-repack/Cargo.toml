@@ -14,7 +14,6 @@ path = "src/main.rs"
 moxie-types.workspace = true
 moxie-format.workspace = true
 moxie-storage.workspace = true
-moxie-storage-write.workspace = true
 moxie-memory.workspace = true
 moxie-host.workspace = true
 

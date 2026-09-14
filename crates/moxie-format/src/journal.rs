@@ -7,8 +7,9 @@
 //!
 //! This module is its schema, exactly as [`crate::manifest`] is the manifest's:
 //! it turns records into lines and a `&str` into validated records, and never
-//! learns that a file exists. `moxie-storage-write` owns the file half --
-//! creating it, appending to it, syncing it, and reading it back under a cap.
+//! learns that a file exists. The offline repacker's `write` module owns the
+//! file half -- creating it, appending to it, syncing it, and reading it back
+//! under a cap through `moxie-storage`.
 //!
 //! Every line is one complete TOML document with exactly one key. Two
 //! properties follow, and both are load-bearing:

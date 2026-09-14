@@ -37,9 +37,9 @@ quality definition — a statement about bytes, not about what a model produces.
 See [the task record](../tasks/0025-m3-offline-repack-publication.md#result-filled-after-work)
 for the full account, including every gate's numbers. In short:
 
-- Two new crates — `moxie-storage-write` (the write authority ADR 0022
-  separated from the reader) and `moxie-repack` (the program ADR 0021 assigns
-  the offline workflow to) — plus four new shared modules in `moxie-format`:
+- One new crate — `moxie-repack`, the program ADR 0021 assigns the offline
+  workflow to, whose `write` module owns canonical publication — plus four new
+  shared modules in `moxie-format`:
   the canonical payload codec, the restart journal's schema, the selection
   schema, and manifest v1's **writer**.
 - The importer is now written in terms of a streaming `PackQuantizedPlan`, so a
@@ -48,12 +48,17 @@ for the full account, including every gate's numbers. In short:
 - Manifest validation no longer accepts any length for an affine tensor: ADR
   0023 fixes the payload layout, so the length is the descriptor's own
   arithmetic.
-- `arch-check` gains a **reachability** rule for canonical write authority, with
-  six negative fixtures covering direct, renamed, `cfg`-gated, optional, build
-  and transitive edges, and two accepted fixtures.
+- The writer was briefly its own crate, as ADR 0022 specified. The owner
+  rejected that on review and
+  [ADR 0024](../decisions/adr/0024-one-storage-crate-and-a-write-module.md)
+  folds it into the program: one consumer by design, and the boundary had forced
+  a second copy of the reader's `pread`. `moxie-storage` gains two public
+  bounded-read primitives instead, and the `arch-check` rule written for the
+  crate edge is deleted along with its eight fixtures — nothing outside the
+  program can name a module that is inside it.
 - Every gate passes with nothing failed, ignored or skipped: **1,014 host
   tests**, 1,049 device-feature tests, three clippy lanes, `spec-check`, and
-  `arch-check` at 85 rejected fixtures, 23 accepted and **14 rules**.
+  `arch-check` at 79 rejected fixtures, 21 accepted and 13 rules.
 - The mutation battery measures **29 of 29 mutants caught and 4 of 4 expected
   survivors held**. Its first run caught 24 of 28 and left four survivors and
   two skips; three tests and two anchors closed five of those, and the sixth is

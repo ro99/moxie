@@ -184,7 +184,6 @@ dependencies = [
  "moxie-host",
  "moxie-memory",
  "moxie-storage",
- "moxie-storage-write",
  "moxie-types",
 ]
 
@@ -212,16 +211,6 @@ dependencies = [
  "moxie-format",
  "moxie-types",
  "serde_json",
-]
-
-[[package]]
-name = "moxie-storage-write"
-version = "0.0.0"
-dependencies = [
- "moxie-format",
- "moxie-memory",
- "moxie-storage",
- "moxie-types",
 ]
 
 [[package]]

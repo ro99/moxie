@@ -24,7 +24,7 @@ all accepted, and M2's formal closure statement remains the owner's to make.
 | | |
 |---|---|
 | Accepted | [Task 0024](docs/tasks/0024-m3-asymmetric-int4-pack-quantized-import.md) — M3 item 2's asymmetric INT4 import (owner, 2026-09-13, after three review rounds). **Importer-only**: no execution, no quality claim. |
-| Implemented, unreviewed | [Task 0025](docs/tasks/0025-m3-offline-repack-publication.md) — M3 item 1's offline repack and canonical publication: `moxie-repack`, `moxie-storage-write` and [ADR 0023](docs/decisions/adr/0023-canonical-affine-payload-and-repack-journal.md). **Bytes only**, and it does not close M3 item 1. |
+| Implemented, unreviewed | [Task 0025](docs/tasks/0025-m3-offline-repack-publication.md) — M3 item 1's offline repack and canonical publication: `moxie-repack` and [ADR 0023](docs/decisions/adr/0023-canonical-affine-payload-and-repack-journal.md), with the writer folded back in by [ADR 0024](docs/decisions/adr/0024-one-storage-crate-and-a-write-module.md). **Bytes only**, and it does not close M3 item 1. |
 | Next | M3 item 3 — shared W4A16/W8A16 paths. The largest gap in the milestone: nothing here executes a quantized weight. |
 | Continuation | [The task 0025 handover](docs/handovers/2026-09-13-task0025-offline-repack-publication.md) |
 
@@ -45,7 +45,7 @@ work:
 - **Moxie never quantizes** ([ADR 0017](docs/decisions/adr/0017-v1-catalog-and-no-quantizer.md)). Quantization happens externally and enters as a new source revision. The v1 catalog is ten pinned revisions; `gemma-4-26B-A4B-it` is **not** in it and is M2's BF16 workhorse.
 - **v1 quality is a bit-identical repack** `W=(Q-Z)*S` ([ADR 0018](docs/decisions/adr/0018-v1-quality-is-bit-identical-repack.md)), publisher quality accepted as-is. A repack is not evidence about model output.
 - **Storage and conversion are user-managed** ([ADR 0020](docs/decisions/adr/0020-user-managed-storage-and-canonical-materialization.md)). **No agent-initiated bulk download, copy or conversion** may start without a task naming artifact, revision, expected size and retention. `/models` and `/fast/models` are read-only inputs.
-- **Repack is a Moxie program the user runs offline**, not an external script ([ADR 0021](docs/decisions/adr/0021-repack-is-a-moxie-program.md)); `moxie-repack` and `moxie-storage-write` are its placement ([ADR 0022](docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md)), and only `moxie-repack` may reach the writer — `arch-check` enforces that by reachability, not by the allowlist alone.
+- **Repack is a Moxie program the user runs offline**, not an external script ([ADR 0021](docs/decisions/adr/0021-repack-is-a-moxie-program.md)); `moxie-repack` is its placement ([ADR 0022](docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md)), and the writer is a **module of that program** ([ADR 0024](docs/decisions/adr/0024-one-storage-crate-and-a-write-module.md)): nothing else can name it, so no rule is needed. A new crate needs several consumers and something distinct to own; one consumer plus a rule to maintain is a module.
 - **The canonical affine payload and the repack journal are fixed** ([ADR 0023](docs/decisions/adr/0023-canonical-affine-payload-and-repack-journal.md)): codes, then scales, then zero points, contiguous, one checksum; the journal is private, versioned and never part of a published artifact.
 
 Ask about an open gate in a batch, before dependent conclusions or irreversible

@@ -11,7 +11,7 @@ use moxie_format::manifest::{AffineFields, TensorPrecision};
 use moxie_format::sha256::StreamingSha256;
 use moxie_types::{Error, Result};
 
-use crate::WriteBudget;
+use crate::write::WriteBudget;
 
 fn invalid(detail: String) -> Error {
     Error::InvalidArtifact {

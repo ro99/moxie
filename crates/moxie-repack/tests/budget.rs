@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 use common::{Entry, Module, Scratch, SelectionBuilder, write_shard};
 use moxie_repack::Budgets;
-use moxie_storage_write::{Faults, Options, Outcome};
+use moxie_repack::write::{Faults, Options, Outcome};
 
 struct Counter;
 static LIVE: AtomicUsize = AtomicUsize::new(0);

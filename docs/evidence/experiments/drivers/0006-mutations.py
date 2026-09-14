@@ -33,9 +33,9 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))))
 
-RUN = os.path.join(ROOT, "crates/moxie-storage-write/src/run.rs")
-PLAN = os.path.join(ROOT, "crates/moxie-storage-write/src/plan.rs")
-WLIB = os.path.join(ROOT, "crates/moxie-storage-write/src/lib.rs")
+RUN = os.path.join(ROOT, "crates/moxie-repack/src/write/run.rs")
+PLAN = os.path.join(ROOT, "crates/moxie-repack/src/write/plan.rs")
+WLIB = os.path.join(ROOT, "crates/moxie-repack/src/write/mod.rs")
 PAY = os.path.join(ROOT, "crates/moxie-format/src/payload.rs")
 JOU = os.path.join(ROOT, "crates/moxie-format/src/journal.rs")
 MAN = os.path.join(ROOT, "crates/moxie-format/src/manifest.rs")
@@ -50,7 +50,8 @@ LANES = {
     "format": ["cargo", "test", "-p", "moxie-format", "--lib", "--offline", "--locked"],
     "manifest": ["cargo", "test", "-p", "moxie-format", "--offline", "--locked",
                  "--test", "manifest_v1"],
-    "publication": ["cargo", "test", "-p", "moxie-storage-write", "--offline", "--locked"],
+    "publication": ["cargo", "test", "-p", "moxie-repack", "--offline", "--locked",
+                    "--test", "publication"],
     "roundtrip": ["cargo", "test", "-p", "moxie-repack", "--offline", "--locked",
                   "--test", "round_trip"],
     "cli": ["cargo", "test", "-p", "moxie-repack", "--offline", "--locked", "--test", "cli"],
@@ -255,39 +256,11 @@ MUTATIONS = [
                     "tensor '{role}': a {} {out_features}x{in_features} tensor with {} \\""",
      CAUGHT),
 
-    # --- the architecture rule, and its independence from the allowlist -----
-    ("write-authority-rule-disabled", ARCH,
-     "    out.extend(check_write_authority(root, workspace.as_ref())?);",
-     "    let _ = check_write_authority(root, workspace.as_ref())?;", CAUGHT),
-    ("write-authority-consumers-widened", ARCH,
-     'const WRITE_AUTHORITY_CONSUMERS: &[&str] = &["moxie-repack"];',
-     'const WRITE_AUTHORITY_CONSUMERS: &[&str] = &["moxie-repack", "moxie-engine", "moxie-cli"];',
-     CAUGHT),
-    ("allowlist-permits-the-writer-in-the-engine", ARCH,
-     """        (
-            "moxie-engine",
-            Allowed {
-                // ADR 0011: explicit bounded host-reference generation.
-                workspace: &[
-                    "moxie-types",
-                    "moxie-graph",
-                    "moxie-interp",
-                    "moxie-state",
-                    "moxie-memory",
-                ],""",
-     """        (
-            "moxie-engine",
-            Allowed {
-                // ADR 0011: explicit bounded host-reference generation.
-                workspace: &[
-                    "moxie-types",
-                    "moxie-graph",
-                    "moxie-interp",
-                    "moxie-state",
-                    "moxie-memory",
-                    "moxie-storage-write",
-                ],""",
-     SURVIVOR),
+    # The write-authority rule and its fixtures are gone with the crate they
+    # policed: the writer is a module of the only program that writes, so
+    # nothing else can name it and there is no rule left to mutate. What
+    # replaced the rule is the module boundary itself, which no substitution
+    # in this file can weaken.
 ]
 
 
@@ -297,7 +270,7 @@ def lane(name):
 
 
 def build():
-    for extra in (["-p", "moxie-format"], ["-p", "moxie-storage-write", "--tests"],
+    for extra in (["-p", "moxie-format"], ["-p", "moxie-storage", "--tests"],
                   ["-p", "moxie-repack", "--tests"], ["-p", "xtask"]):
         r = subprocess.run(["cargo", "build", "--offline", "--locked"] + extra,
                            cwd=ROOT, capture_output=True, text=True)

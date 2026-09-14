@@ -1,25 +1,22 @@
-//! Canonical write authority: the storage owner's write half.
+//! Canonical write authority: creating, staging and publishing an artifact.
 //!
-//! [ADR 0022] splits writing out of `moxie-storage` into its own crate rather
-//! than putting it behind a feature, for one concrete reason: Cargo unifies
-//! features across a workspace build, so a writer behind a feature in the
-//! reader's crate would be compiled into every process that reads a checkpoint.
-//! A separate crate makes "who can write a canonical artifact" a dependency
-//! edge, and `arch-check` refuses that edge everywhere but the offline
-//! repacker.
+//! This lives inside the program that publishes, and that is the whole
+//! confinement: no other crate can reach it, because it is not a crate. An
+//! earlier arrangement made it one (`moxie-storage-write`) so that a
+//! dependency edge could be forbidden. It bought a rule and cost a second copy
+//! of the reader's `pread`, which is the duplication this repository exists to
+//! refuse. The module boundary is stronger and free: `moxie-engine` cannot call
+//! what it cannot name, and it cannot name what is not in its dependency tree.
 //!
-//! What this crate owns: confined output creation, bounded chunk writing, the
-//! restart journal's file half, and atomic publication. What it does not own:
-//! the canonical encoding (that is `moxie-format`, I/O-free), reading
-//! (`moxie-storage`), what to select or how to convert it (`moxie-repack`),
-//! residency, CUDA, models, or a quantizer.
+//! What it owns: confined output creation, bounded chunk writing, the restart
+//! journal's file half, and atomic publication. What it does not own: the
+//! canonical encoding (`moxie-format`, I/O-free), reading (`moxie-storage`,
+//! whose bounded-read primitives this module calls rather than reimplements),
+//! what to select or how to convert it (the rest of this program), residency,
+//! CUDA, models, or a quantizer.
 //!
 //! It never overwrites a published artifact, never writes outside the
 //! destination it was given, and never deletes a file it did not create.
-//!
-//! [ADR 0022]: ../../../docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md
-
-#![forbid(unsafe_code)]
 
 pub mod fault;
 pub mod plan;

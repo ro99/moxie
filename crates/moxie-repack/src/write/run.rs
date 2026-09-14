@@ -53,9 +53,9 @@ use moxie_memory::{HostBuffer, Ledger};
 use moxie_storage::{Artifact, ByteBudget};
 use moxie_types::{HostTier, Result};
 
-use crate::fault::{Faults, Site};
-use crate::plan::{OutputPlan, PlannedTensor};
-use crate::{WriteBudget, invalid};
+use crate::write::fault::{Faults, Site};
+use crate::write::plan::{OutputPlan, PlannedTensor};
+use crate::write::{WriteBudget, invalid};
 
 /// The journal file's name inside the destination.
 pub const JOURNAL_FILE: &str = ".moxie-repack-journal";
@@ -305,7 +305,7 @@ impl Run {
     /// unit and everything after it in that tensor, because a tensor's bytes
     /// are a sequence and a hole in it cannot be filled out of order.
     fn recover(&mut self, journal_path: &Path, faults: &Faults) -> Result<ResumeReport> {
-        let text = read_capped(journal_path, journal::MAX_JOURNAL_BYTES)?;
+        let text = moxie_storage::read_text_capped(journal_path, journal::MAX_JOURNAL_BYTES)?;
         let state: JournalState = journal::parse(&text)?;
         let recorded = state.binding.clone().ok_or_else(|| {
             invalid("this journal records no plan: `begin` should have started over".into())
@@ -444,7 +444,7 @@ impl Run {
             .hasher
             .clone();
         let mut unit_hasher = StreamingSha256::new();
-        read_range(
+        moxie_storage::read_range(
             &path,
             unit.offset,
             unit.len,
@@ -785,7 +785,7 @@ impl Run {
 
 /// Whether a journal file carries the plan line that binds a run.
 fn journal_binds(path: &Path) -> Result<bool> {
-    let text = read_capped(path, journal::MAX_JOURNAL_BYTES)?;
+    let text = moxie_storage::read_text_capped(path, journal::MAX_JOURNAL_BYTES)?;
     Ok(journal::parse(&text)?.binding.is_some())
 }
 
@@ -872,66 +872,3 @@ fn write_at(file: &mut File, offset: u64, bytes: &[u8], faults: &Faults) -> std:
     }
 }
 
-/// Read one byte range in scratch-sized slices.
-fn read_range(
-    path: &Path,
-    offset: u64,
-    len: u64,
-    scratch: &mut [u8],
-    sink: &mut dyn FnMut(&[u8]) -> Result<()>,
-) -> Result<()> {
-    let file =
-        File::open(path).map_err(|e| invalid(format!("cannot open {}: {e}", path.display())))?;
-    let meta = file
-        .metadata()
-        .map_err(|e| invalid(format!("cannot stat {}: {e}", path.display())))?;
-    if offset + len > meta.len() {
-        return Err(invalid(format!(
-            "{} holds {} byte(s); the range {offset}..{} is past its end",
-            path.display(),
-            meta.len(),
-            offset + len
-        )));
-    }
-    let slice = scratch.len().max(1);
-    let mut done = 0u64;
-    while done < len {
-        let want = ((len - done) as usize).min(slice);
-        let buf = &mut scratch[..want];
-        read_exact_at(&file, offset + done, buf)
-            .map_err(|e| invalid(format!("cannot read {}: {e}", path.display())))?;
-        sink(buf)?;
-        done += want as u64;
-    }
-    Ok(())
-}
-
-fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        file.read_exact_at(buf, offset)
-    }
-    #[cfg(not(unix))]
-    {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut owned = file.try_clone()?;
-        owned.seek(SeekFrom::Start(offset))?;
-        owned.read_exact(buf)
-    }
-}
-
-fn read_capped(path: &Path, cap: usize) -> Result<String> {
-    let meta = std::fs::metadata(path)
-        .map_err(|e| invalid(format!("cannot stat {}: {e}", path.display())))?;
-    if meta.len() > cap as u64 {
-        return Err(invalid(format!(
-            "{} is {} byte(s), above the {cap} byte cap checked before reading",
-            path.display(),
-            meta.len()
-        )));
-    }
-    let bytes =
-        std::fs::read(path).map_err(|e| invalid(format!("cannot read {}: {e}", path.display())))?;
-    String::from_utf8(bytes).map_err(|e| invalid(format!("{} is not UTF-8: {e}", path.display())))
-}

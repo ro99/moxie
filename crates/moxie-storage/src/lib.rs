@@ -835,6 +835,92 @@ impl RangeSource for OpenChunk<'_> {
     }
 }
 
+/// Read one exact byte range of a file, in scratch-sized slices.
+///
+/// Public because this crate is where bounded file reads live, and a caller
+/// that has to re-read bytes it wrote -- the offline repacker, rehashing a
+/// staged unit before it trusts a journal entry -- would otherwise hand-roll
+/// `pread` again. It did, in an earlier arrangement, and the copy was
+/// character-identical to [`OpenChunk::read_at`].
+///
+/// The range is checked against the file's length before anything is read, and
+/// `sink` sees the bytes in file order, never more than `scratch` at a time.
+pub fn read_range(
+    path: &Path,
+    offset: u64,
+    len: u64,
+    scratch: &mut [u8],
+    sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    if scratch.is_empty() {
+        return Err(Error::InvalidArtifact {
+            detail: "a zero-byte scratch buffer cannot read anything".into(),
+        });
+    }
+    let file = File::open(path).map_err(|e| Error::InvalidArtifact {
+        detail: format!("cannot open {}: {e}", path.display()).into(),
+    })?;
+    let end = offset.checked_add(len).ok_or_else(|| Error::InvalidArtifact {
+        detail: format!("range {offset}..+{len} of {} overflows", path.display()).into(),
+    })?;
+    let have = file
+        .metadata()
+        .map_err(|e| Error::InvalidArtifact {
+            detail: format!("cannot stat {}: {e}", path.display()).into(),
+        })?
+        .len();
+    if end > have {
+        return Err(Error::InvalidArtifact {
+            detail: format!(
+                "{} holds {have} byte(s); the range {offset}..{end} is past its end",
+                path.display()
+            )
+            .into(),
+        });
+    }
+    let mut source = OpenChunk { file: &file };
+    let mut done = 0u64;
+    while done < len {
+        let want = usize::try_from((len - done).min(scratch.len() as u64)).map_err(|_| {
+            Error::InvalidArtifact {
+                detail: "slice length does not fit this platform".into(),
+            }
+        })?;
+        let buf = &mut scratch[..want];
+        source
+            .read_at(offset + done, buf)
+            .map_err(|e| Error::InvalidArtifact {
+                detail: format!("cannot read {}: {e}", path.display()).into(),
+            })?;
+        sink(buf)?;
+        done += want as u64;
+    }
+    Ok(())
+}
+
+/// Read a whole text file, refusing anything above `cap` **before** reading it.
+///
+/// The rule `manifest.toml` is read under, made available to the other small
+/// text file this repository's tooling reads back: the repacker's private
+/// restart journal.
+pub fn read_text_capped(path: &Path, cap: usize) -> Result<String> {
+    let have = std::fs::metadata(path)
+        .map_err(|e| Error::InvalidArtifact {
+            detail: format!("cannot stat {}: {e}", path.display()).into(),
+        })?
+        .len();
+    if have > cap as u64 {
+        return Err(Error::InvalidArtifact {
+            detail: format!(
+                "{} is {have} byte(s), above the {cap} byte cap checked before reading",
+                path.display()
+            )
+            .into(),
+        });
+    }
+    read_file_capped(path)
+}
+
 /// Read `manifest.toml` through a capped reader that errors at the limit
 /// rather than reading the file and then measuring it.
 fn read_manifest_capped(dir: &Path) -> Result<String> {

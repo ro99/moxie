@@ -4,7 +4,8 @@
 //! an external script, and [ADR 0022] places it here: argument parsing, the
 //! offline workflow and reporting, over the shared codec (`moxie-format`), the
 //! shared reader (`moxie-storage`) and the shared writer
-//! (`moxie-storage-write`). It contains no second decoder, hash
+//! (its own `write` module, which calls the reader's bounded primitives rather
+//! than repeating them). It contains no second decoder, hash
 //! implementation, manifest validator or filesystem writer, and `arch-check`
 //! is what keeps that true rather than this paragraph.
 //!
@@ -39,6 +40,7 @@
 
 pub mod source;
 pub mod work;
+pub mod write;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -59,7 +61,7 @@ use moxie_format::scale::ScaleDtype;
 use moxie_format::selection::{Selection, SelectionKind};
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_storage::{Artifact, ByteBudget, HeaderBudget};
-use moxie_storage_write::{Faults, Outcome, OutputPlan, Run, Start, TensorRequest, WriteBudget};
+use crate::write::{Faults, Outcome, OutputPlan, Run, Start, TensorRequest, WriteBudget};
 use moxie_types::{HostTier, Result, Scope, Tier};
 
 use crate::source::{Sources, invalid};
@@ -577,7 +579,7 @@ pub fn repack(
     sources: &mut Sources,
     destination: &Path,
     budgets: &Budgets,
-    options: &moxie_storage_write::Options,
+    options: &crate::write::Options,
     faults: &Faults,
     cancelled: &dyn Fn() -> bool,
     ledger: &mut Ledger,
@@ -729,7 +731,7 @@ pub fn run_digest(plan: &str, selection: &str, sources: &[(String, String)]) -> 
 pub fn build_manifest(
     selection: &Selection,
     resolved: &[Resolved],
-    sealed: &[moxie_storage_write::SealedTensor],
+    sealed: &[crate::write::SealedTensor],
     source_digests: &[(String, String)],
 ) -> Result<Manifest> {
     let mut tensors = Vec::with_capacity(resolved.len());

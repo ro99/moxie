@@ -27,7 +27,7 @@ use moxie_format::manifest::{
     SourceFile, Tensor, TensorPrecision,
 };
 use moxie_memory::{CapacitySnapshot, Ledger};
-use moxie_storage_write::{
+use moxie_repack::write::{
     Faults, MANIFEST_FILE, Options, Outcome, OutputPlan, Run, Site, Start, TensorRequest,
     WriteBudget,
 };
@@ -155,7 +155,7 @@ fn empty_metadata() -> moxie_format::manifest::OpaqueArchMetadata {
         .metadata
 }
 
-fn manifest_for(sealed: &[moxie_storage_write::SealedTensor]) -> Manifest {
+fn manifest_for(sealed: &[moxie_repack::write::SealedTensor]) -> Manifest {
     let mut tensors = Vec::new();
     for (order, request) in requests().iter().enumerate() {
         let s = sealed
@@ -647,7 +647,7 @@ fn a_directory_this_run_did_not_create_is_refused() {
     // and writing the journal header leaves exactly the lock, and a
     // destination that can never be used again is not a recovery.
     std::fs::remove_file(dest.join("someone-elses-file")).expect("removing it");
-    std::fs::write(dest.join(moxie_storage_write::LOCK_FILE), b"pid 1").expect("a stale lock");
+    std::fs::write(dest.join(moxie_repack::write::LOCK_FILE), b"pid 1").expect("a stale lock");
     let (outcome, _, _) = run_to_end(&dest, &Faults::none(), true, None).expect("it starts over");
     assert!(matches!(outcome, Outcome::Published { .. }), "{outcome:?}");
 }

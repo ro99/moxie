@@ -41,8 +41,8 @@ mean that Moxie has imported or supports them.
 | `docs/spec/templates/` | Forms used to author living records | yes |
 | `docs/decisions/`, `docs/tasks/`, `docs/handovers/`, `docs/models/`, `docs/evidence/` | Living records: owner-gate register, ADRs, task contracts, handovers, bring-up contracts, support matrix, benchmark manifests, experiment conclusions | yes |
 | `crates/` | Shared engine crates. `moxie-types`, `moxie-graph`, `moxie-model-api`, `moxie-format`, `moxie-oracles`, `moxie-state`, `moxie-cuda`, `moxie-kernels` | yes |
-| `crates/moxie-storage`, `crates/moxie-storage-write` | The canonical reader, and the write half that ADR 0022 separated from it. Only `moxie-repack` may reach the writer, and `arch-check` enforces that by reachability | yes |
-| `crates/moxie-repack/` | `moxie-repack`: the offline inspector, repacker and verifier (ADR 0021/0022) | yes |
+| `crates/moxie-storage` | The one crate that touches the filesystem for checkpoints: bounded reads, chunk validation, and the bounded-read primitives the repacker writes through | yes |
+| `crates/moxie-repack/` | `moxie-repack`: the offline inspector, repacker and verifier (ADR 0021/0022), whose `write` module owns canonical publication (ADR 0024) | yes |
 | `xtask/` | Command index and its architecture-check fixtures | yes |
 
 The reference documents are kept local at the owner's direction and do not reach the remote. Everything

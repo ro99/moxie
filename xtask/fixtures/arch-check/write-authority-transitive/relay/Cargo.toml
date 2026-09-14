@@ -1,7 +1,0 @@
-[package]
-name = "relay"
-version = "0.0.0"
-edition = "2024"
-
-[dependencies]
-moxie-storage-write = { path = "../../../../../crates/moxie-storage-write" }
