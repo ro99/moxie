@@ -224,6 +224,10 @@ pub struct TensorReport {
 pub struct Resolved {
     pub role: String,
     pub alignment: u64,
+    /// The physical tensors this becomes ([ADR 0025]).
+    ///
+    /// [ADR 0025]: ../../../docs/decisions/adr/0025-canonical-safetensors-schema.md
+    pub components: Vec<moxie_format::canonical::Component>,
     pub shape: Vec<u64>,
     pub precision: TensorPrecision,
     pub affine: Option<AffineFields>,
@@ -298,6 +302,7 @@ pub fn resolve(selection: &Selection, sources: &mut Sources) -> Result<Vec<Resol
                 Resolved {
                     role: t.role.clone(),
                     alignment: t.alignment,
+                    components: moxie_format::canonical::bf16_components(&t.role, &entry.shape)?,
                     shape: entry.shape.clone(),
                     precision: TensorPrecision::Bf16V1,
                     affine: None,
@@ -416,6 +421,11 @@ pub fn resolve(selection: &Selection, sources: &mut Sources) -> Result<Vec<Resol
                 Resolved {
                     role: t.role.clone(),
                     alignment: t.alignment,
+                    components: moxie_format::canonical::affine_components(
+                        &t.role,
+                        plan.descriptor(),
+                        section,
+                    )?,
                     shape: vec![d.out_features as u64, d.in_features as u64],
                     precision: match d.width {
                         moxie_format::affine::IntWidth::Int4 => TensorPrecision::AffineInt4V1,
@@ -482,8 +492,7 @@ pub fn output_plan(
             shape: r.shape.clone(),
             precision: r.precision,
             affine: r.affine.clone(),
-            length: r.canonical_bytes,
-            alignment: r.alignment,
+            components: r.components.clone(),
         })
         .collect();
     OutputPlan::build(requests, budget, overhead_bytes)
@@ -586,15 +595,23 @@ pub fn inspect(
     let resolved = resolve(selection, sources)?;
     let plan = output_plan(&resolved, &write, overhead_bound(&resolved, budgets)?)?;
     let mut tensors = Vec::with_capacity(resolved.len());
-    for (r, planned) in resolved.iter().zip(plan.tensors()) {
+    for r in resolved.iter() {
         tensors.push(TensorReport {
             role: r.role.clone(),
             profile: r.profile(),
             shape: r.shape.clone(),
             canonical_bytes: r.canonical_bytes,
             source_bytes: r.source_bytes,
-            chunk: planned.chunk.clone(),
-            offset: planned.offset,
+            chunk: plan
+                .components_of(&r.role)
+                .map(|c| c.file.clone())
+                .next()
+                .unwrap_or_default(),
+            offset: plan
+                .components_of(&r.role)
+                .map(|c| c.file_offset)
+                .next()
+                .unwrap_or(0),
             units: work::unit_count(r, budgets.tile_bytes())?,
         });
     }
@@ -622,8 +639,13 @@ pub fn inspect(
         selection_digest: selection_digest(selection),
         plan_digest: plan.digest(),
         canonical_payload_bytes: plan.payload_bytes(),
-        chunk_files: plan.chunks().len(),
-        largest_chunk_bytes: plan.chunks().iter().map(|(_, l)| *l).max().unwrap_or(0),
+        chunk_files: plan.shards().len(),
+        largest_chunk_bytes: plan
+            .shards()
+            .iter()
+            .map(|s| s.file_len())
+            .max()
+            .unwrap_or(0),
         source_payload_bytes: resolved.iter().map(|r| r.source_bytes).sum(),
         headers_parsed: sources.headers_parsed(),
         header_bytes_read: sources.bytes_read(),
@@ -857,7 +879,6 @@ fn repack_inner(
     let mut bytes_written = 0u64;
     let before_read = sources.bytes_read();
     for r in &resolved {
-        let done = run_slot.as_ref().expect("a run").bytes_done(&r.role)?;
         let mut covered = 0u64;
         for unit in work::units(r, budgets.tile_bytes())? {
             covered += unit.canonical_len as u64;
@@ -875,18 +896,23 @@ fn repack_inner(
                     source_digests,
                 });
             }
-            if unit.canonical_offset + unit.canonical_len as u64 <= done {
+            // Each unit belongs to one physical component, and progress is
+            // per component now: a shard holds three tensors of one logical
+            // weight, each with its own offsets and its own checksum.
+            let component = unit.component().tensor_name(&r.role);
+            let done = run_slot.as_ref().expect("a run").bytes_done(&component)?;
+            if unit.component_offset + unit.canonical_len as u64 <= done {
                 // Already durable and already rehashed by the resume.
                 continue;
             }
-            if unit.canonical_offset < done {
+            if unit.component_offset < done {
                 // Units are whole or absent, so a resumed tensor always
                 // restarts on a unit boundary. Landing inside one means the
                 // plan changed under a resume the binding should have refused.
                 return Err(invalid(format!(
-                    "tensor '{}': a unit starting at {} lands inside the {} durable byte(s): \
-                     units are whole or absent",
-                    r.role, unit.canonical_offset, done
+                    "component '{component}': a unit starting at {} lands inside the {} durable \
+                     byte(s): units are whole or absent",
+                    unit.component_offset, done
                 )));
             }
             let source_sha = work::convert_unit(r, &unit, sources, buffers, ledger)?;
@@ -894,14 +920,14 @@ fn repack_inner(
             run_slot
                 .as_mut()
                 .expect("a run")
-                .write_unit(&r.role, bytes, &source_sha, faults)?;
+                .write_unit(&component, bytes, &source_sha, faults)?;
             units_written += 1;
             bytes_written += unit.canonical_len as u64;
             // One line per durable unit, which is also the boundary the
             // program's cancellation and simulated-crash options count.
             progress(&format!(
-                "unit {units_written} of '{}': {} byte(s) at {}",
-                r.role, unit.canonical_len, unit.canonical_offset
+                "unit {units_written} of '{component}': {} byte(s) at {}",
+                unit.canonical_len, unit.component_offset
             ));
         }
         // The units are generated one at a time now, so the coverage check the
@@ -971,21 +997,27 @@ pub fn build_manifest(
 ) -> Result<Manifest> {
     let mut tensors = Vec::with_capacity(resolved.len());
     for (order, r) in resolved.iter().enumerate() {
-        let s = sealed
-            .iter()
-            .find(|s| s.role == r.role)
-            .ok_or_else(|| invalid(format!("tensor '{}' was not sealed", r.role)))?;
+        if !sealed.iter().any(|s| s.role == r.role) {
+            return Err(invalid(format!("tensor '{}' was not sealed", r.role)));
+        }
         tensors.push(Tensor {
             role: r.role.clone(),
             shape: r.shape.clone(),
             precision: r.precision,
-            chunk: s.chunk.clone(),
-            offset: s.offset,
-            length: s.length,
-            sha256: s.sha256.clone(),
-            alignment: r.alignment,
             logical_order: order as u64,
             affine: r.affine.clone(),
+            placement: moxie_format::manifest::Placement::Components(
+                sealed
+                    .iter()
+                    .filter(|s| s.role == r.role)
+                    .map(|s| moxie_format::manifest::Component {
+                        kind: s.kind,
+                        file: s.file.clone(),
+                        name: s.name.clone(),
+                        sha256: s.sha256.clone(),
+                    })
+                    .collect(),
+            ),
         });
     }
     Ok(Manifest {
@@ -1065,16 +1097,28 @@ pub fn verify(artifact_dir: &Path, scratch: &mut [u8]) -> Result<VerifyReport> {
     for t in &artifact.manifest().tensors {
         bytes += artifact.verify_tensor(&t.role, scratch)?;
     }
-    let mut chunks: BTreeMap<&str, u64> = BTreeMap::new();
+    // Bytes in the shards that no component claims. A safetensors shard has a
+    // header, which belongs to no tensor, so the accounting subtracts it: what
+    // is left over after the header and every component is a file holding
+    // bytes nothing describes.
+    let mut claimed: BTreeMap<&str, u64> = BTreeMap::new();
     for t in &artifact.manifest().tensors {
-        *chunks.entry(t.chunk.as_str()).or_default() += t.length;
+        for c in t.components().unwrap_or(&[]) {
+            let entry = artifact
+                .shard_entry(&c.file, &c.name)
+                .ok_or_else(|| invalid(format!("component '{}' is not open", c.name)))?;
+            *claimed.entry(c.file.as_str()).or_default() += entry;
+        }
     }
     let mut unclaimed = 0u64;
-    for (chunk, claimed) in chunks {
+    for (file, bytes) in claimed {
         let len = artifact
-            .chunk_len(chunk)
-            .ok_or_else(|| invalid(format!("chunk '{chunk}' was validated but has no length")))?;
-        unclaimed += len.saturating_sub(claimed);
+            .chunk_len(file)
+            .ok_or_else(|| invalid(format!("shard '{file}' was validated but has no length")))?;
+        let header = artifact
+            .shard_header_len(file)
+            .ok_or_else(|| invalid(format!("shard '{file}' has no header length")))?;
+        unclaimed += len.saturating_sub(bytes + header);
     }
     Ok(VerifyReport {
         unclaimed_bytes: unclaimed,

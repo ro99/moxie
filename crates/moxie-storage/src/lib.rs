@@ -79,8 +79,21 @@ impl Default for ByteBudget {
 pub struct Artifact {
     manifest: Manifest,
     dir: PathBuf,
-    chunks: BTreeMap<String, ChunkFile>,
+    payloads: Payloads,
     budget: ByteBudget,
+}
+
+/// Where an opened artifact's bytes are.
+///
+/// Version 1 keeps raw chunk files and the reader it always had; version 2 is
+/// safetensors shards ([ADR 0025]). Nothing converts between them and nothing
+/// reinterprets one as the other.
+///
+/// [ADR 0025]: ../../../docs/decisions/adr/0025-canonical-safetensors-schema.md
+#[derive(Debug)]
+enum Payloads {
+    Chunks(BTreeMap<String, ChunkFile>),
+    Shards(BTreeMap<String, Shard>),
 }
 
 #[derive(Debug)]
@@ -164,39 +177,103 @@ impl Artifact {
             )
             .into(),
         })?;
-        let mut lengths = BTreeMap::new();
-        let mut chunks = BTreeMap::new();
-        // One entry per chunk name referenced, so a manifest naming the same
-        // chunk twice stats it once.
-        let mut names: Vec<&String> = manifest.tensors.iter().map(|t| &t.chunk).collect();
-        names.sort();
-        names.dedup();
-        for name in names {
-            let resolved = resolve_chunk(&canonical_dir, dir, name)?;
-            let file = File::open(&resolved).map_err(|e| Error::InvalidArtifact {
-                detail: format!("cannot open chunk '{}': {e}", resolved.display()).into(),
-            })?;
-            let len = file
-                .metadata()
-                .map_err(|e| Error::InvalidArtifact {
-                    detail: format!("cannot stat chunk '{}': {e}", resolved.display()).into(),
-                })?
-                .len();
-            lengths.insert(name.clone(), len);
-            chunks.insert(
-                name.clone(),
-                ChunkFile {
-                    path: resolved,
-                    file,
-                    len,
-                },
-            );
-        }
-        manifest::validate_chunks(&manifest, &lengths)?;
+        // Which payload shape this manifest describes is a property of its
+        // rows, not a guess: a tensor either names a chunk range or names its
+        // components, and the schema validator has already refused a manifest
+        // that mixes them.
+        let is_v1 = manifest
+            .tensors
+            .first()
+            .map(|t| t.chunk_range().is_some())
+            .unwrap_or(false);
+        let payloads =
+            if is_v1 {
+                let mut lengths = BTreeMap::new();
+                let mut chunks = BTreeMap::new();
+                // One entry per chunk name referenced, so a manifest naming the
+                // same chunk twice stats it once.
+                let mut names: Vec<&str> = manifest
+                    .tensors
+                    .iter()
+                    .filter_map(|t| t.chunk_range().map(|(chunk, _, _, _)| chunk))
+                    .collect();
+                names.sort();
+                names.dedup();
+                for name in names {
+                    let resolved = resolve_chunk(&canonical_dir, dir, name)?;
+                    let file = File::open(&resolved).map_err(|e| Error::InvalidArtifact {
+                        detail: format!("cannot open chunk '{}': {e}", resolved.display()).into(),
+                    })?;
+                    let len = file
+                        .metadata()
+                        .map_err(|e| Error::InvalidArtifact {
+                            detail: format!("cannot stat chunk '{}': {e}", resolved.display())
+                                .into(),
+                        })?
+                        .len();
+                    lengths.insert(name.to_string(), len);
+                    chunks.insert(
+                        name.to_string(),
+                        ChunkFile {
+                            path: resolved,
+                            file,
+                            len,
+                        },
+                    );
+                }
+                manifest::validate_chunks(&manifest, &lengths)?;
+                Payloads::Chunks(chunks)
+            } else {
+                let mut names: Vec<&str> = manifest
+                    .tensors
+                    .iter()
+                    .flat_map(|t| t.components().unwrap_or(&[]))
+                    .map(|c| c.file.as_str())
+                    .collect();
+                names.sort();
+                names.dedup();
+                let mut shards = BTreeMap::new();
+                for name in names {
+                    let resolved = resolve_chunk(&canonical_dir, dir, name)?;
+                    let shard = Shard::open_with_limits(&resolved, budget, HeaderBudget::DEFAULT)?;
+                    shards.insert(name.to_string(), shard);
+                }
+                // Every component must be a tensor the shard actually declares,
+                // and its declared length is the shard's to state. Checked at
+                // open, so a missing or renamed component is found before a read
+                // rather than during one.
+                for t in &manifest.tensors {
+                    for c in t.components().unwrap_or(&[]) {
+                        let shard =
+                            shards
+                                .get(c.file.as_str())
+                                .ok_or_else(|| Error::InvalidArtifact {
+                                    detail: format!(
+                                        "tensor '{}' names shard '{}', which is not open",
+                                        t.role, c.file
+                                    )
+                                    .into(),
+                                })?;
+                        shard.header().get(&c.name).map_err(|e| {
+                            Error::InvalidArtifact {
+                        detail: format!(
+                            "tensor '{}' component '{}': shard '{}' declares no tensor '{}': {e}",
+                            t.role,
+                            c.kind.name(),
+                            c.file,
+                            c.name
+                        )
+                        .into(),
+                    }
+                        })?;
+                    }
+                }
+                Payloads::Shards(shards)
+            };
         Ok(Self {
             manifest,
             dir: canonical_dir,
-            chunks,
+            payloads,
             budget,
         })
     }
@@ -212,12 +289,37 @@ impl Artifact {
 
     /// Statted length of one chunk file, by chunk name.
     pub fn chunk_len(&self, chunk: &str) -> Option<u64> {
-        self.chunks.get(chunk).map(|c| c.len)
+        match &self.payloads {
+            Payloads::Chunks(chunks) => chunks.get(chunk).map(|c| c.len),
+            Payloads::Shards(shards) => shards.get(chunk).map(|s| s.len()),
+        }
     }
 
     /// Canonical path of one chunk file, by chunk name.
     pub fn chunk_path(&self, chunk: &str) -> Option<&Path> {
-        self.chunks.get(chunk).map(|c| c.path.as_path())
+        match &self.payloads {
+            Payloads::Chunks(chunks) => chunks.get(chunk).map(|c| c.path.as_path()),
+            Payloads::Shards(shards) => shards.get(chunk).map(|s| s.path()),
+        }
+    }
+
+    /// One component's payload length, from the shard that declares it.
+    pub fn shard_entry(&self, file: &str, name: &str) -> Option<u64> {
+        match &self.payloads {
+            Payloads::Shards(shards) => shards
+                .get(file)
+                .and_then(|s| s.header().get(name).ok())
+                .map(|e| e.len()),
+            Payloads::Chunks(_) => None,
+        }
+    }
+
+    /// One shard's header length: bytes that belong to no component.
+    pub fn shard_header_len(&self, file: &str) -> Option<u64> {
+        match &self.payloads {
+            Payloads::Shards(shards) => shards.get(file).map(|s| s.header().payload_start),
+            Payloads::Chunks(_) => None,
+        }
     }
 
     pub fn read_budget(&self) -> ByteBudget {
@@ -270,32 +372,112 @@ impl Artifact {
                 detail: "a zero-byte scratch buffer cannot stream anything".into(),
             });
         }
-        let chunk = self
-            .chunks
-            .get(&t.chunk)
-            .ok_or_else(|| Error::InvalidArtifact {
-                detail: format!("chunk '{}' was validated but is not open", t.chunk).into(),
-            })?;
+        match (&self.payloads, &t.placement) {
+            (
+                Payloads::Chunks(chunks),
+                manifest::Placement::Chunk {
+                    chunk,
+                    offset,
+                    length,
+                    sha256,
+                    ..
+                },
+            ) => {
+                let file = chunks
+                    .get(chunk.as_str())
+                    .ok_or_else(|| Error::InvalidArtifact {
+                        detail: format!("chunk '{chunk}' was validated but is not open").into(),
+                    })?;
+                let mut source = OpenChunk { file: &file.file };
+                self.pump_into(
+                    role,
+                    &mut source,
+                    *offset,
+                    *length,
+                    sha256,
+                    t.precision,
+                    scratch,
+                    sink,
+                )
+            }
+            (Payloads::Shards(shards), manifest::Placement::Components(components)) => {
+                // The components stream in canonical order -- codes, then
+                // scales, then zero points -- so what a consumer sees is
+                // exactly ADR 0023's payload, whichever container it came out
+                // of. Each component is verified against **its own** checksum,
+                // which is the scope ADR 0025 records.
+                let mut total = 0u64;
+                for c in components {
+                    let shard =
+                        shards
+                            .get(c.file.as_str())
+                            .ok_or_else(|| Error::InvalidArtifact {
+                                detail: format!("shard '{}' was validated but is not open", c.file)
+                                    .into(),
+                            })?;
+                    let entry = shard.header().get(&c.name)?;
+                    let begin = entry.file_offset(shard.header());
+                    let len = entry.len();
+                    let mut source = OpenChunk { file: &shard.file };
+                    self.pump_into(
+                        &format!("{role}.{}", c.kind.name()),
+                        &mut source,
+                        begin,
+                        len,
+                        &c.sha256,
+                        // BF16 finiteness is checked for a BF16 component;
+                        // packed codes, scales and zero points are not BF16
+                        // numbers and must not be read as any.
+                        match c.kind {
+                            moxie_format::canonical::ComponentKind::Weights => t.precision,
+                            _ => TensorPrecision::AffineInt8V1,
+                        },
+                        scratch,
+                        sink,
+                    )?;
+                    total += len;
+                }
+                Ok(total)
+            }
+            _ => Err(Error::InvalidArtifact {
+                detail: format!(
+                    "tensor '{role}' is placed one way and this artifact is opened the other; \
+                     nothing here converts between the two schema versions"
+                )
+                .into(),
+            }),
+        }
+    }
+
+    /// Read one byte range in scratch-sized slices, hashing it, validating
+    /// BF16 finiteness when the bytes are BF16, and handing each slice on.
+    #[allow(clippy::too_many_arguments)]
+    fn pump_into<S: RangeSource>(
+        &self,
+        what: &str,
+        source: &mut S,
+        offset: u64,
+        length: u64,
+        want_sha256: &str,
+        precision: TensorPrecision,
+        scratch: &mut [u8],
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<u64> {
         let slice = scratch.len().min(self.budget.bytes()).max(1);
-        let total = t.length;
         let mut hasher = StreamingSha256::new();
         let mut bf16 = Bf16StreamValidator::new();
-        let mut source = OpenChunk { file: &chunk.file };
         let mut done: u64 = 0;
-        while done < total {
-            let want = usize::try_from((total - done).min(slice as u64)).map_err(|_| {
+        while done < length {
+            let want = usize::try_from((length - done).min(slice as u64)).map_err(|_| {
                 Error::InvalidArtifact {
-                    detail: format!("tensor '{role}': slice length does not fit this platform")
-                        .into(),
+                    detail: format!("{what}: slice length does not fit this platform").into(),
                 }
             })?;
             let buf = &mut scratch[..want];
-            let at = t
-                .offset
+            let at = offset
                 .checked_add(done)
                 .ok_or_else(|| Error::InvalidArtifact {
-                    detail: format!("tensor '{role}': offset {} + {done} overflows", t.offset)
-                        .into(),
+                    detail: format!("{what}: offset {offset} + {done} overflows").into(),
                 })?;
             match source.read_at(at, buf) {
                 Ok(()) => {}
@@ -303,34 +485,31 @@ impl Artifact {
                 Err(e) => {
                     return Err(Error::InvalidArtifact {
                         detail: format!(
-                            "tensor '{role}': short read of chunk '{}' at {at} for {want} bytes: \
-                         truncation: {e}",
-                            t.chunk
+                            "{what}: short read at {at} for {want} bytes: truncation: {e}"
                         )
                         .into(),
                     });
                 }
             }
             hasher.update(buf);
-            if matches!(t.precision, TensorPrecision::Bf16V1) {
+            if matches!(precision, TensorPrecision::Bf16V1) {
                 bf16.feed(buf)?;
             }
             sink(buf)?;
             done += want as u64;
         }
-        if matches!(t.precision, TensorPrecision::Bf16V1) {
+        if matches!(precision, TensorPrecision::Bf16V1) {
             bf16.finish()?;
         }
         let got = hasher.finalize_bytes();
-        let want = decode_hex32(&t.sha256).map_err(|()| Error::InvalidArtifact {
+        let want = decode_hex32(want_sha256).map_err(|()| Error::InvalidArtifact {
             detail: "stored checksum is not 64 hex digits".into(),
         })?;
         if got != want {
             return Err(Error::InvalidArtifact {
                 detail: format!(
-                    "tensor '{role}': checksum mismatch: expected {}, computed {}; everything the \
-                 sink was handed is explicitly not to be trusted",
-                    t.sha256,
+                    "{what}: checksum mismatch: expected {want_sha256}, computed {}; everything \
+                     the sink was handed is explicitly not to be trusted",
                     str::from_utf8(&hex_of(&got)).unwrap_or("?")
                 )
                 .into(),
@@ -379,9 +558,14 @@ impl Artifact {
                 ).into(),
             });
         }
-        let need: usize = t.length.try_into().map_err(|_| Error::InvalidArtifact {
-            detail: format!("tensor '{role}' length {} does not fit in usize", t.length).into(),
-        })?;
+        // One BF16 tensor, whichever container holds it: a chunk range in
+        // version 1, the single `weights` component in version 2.
+        let need: usize = {
+            let elements: u64 = t.shape.iter().product();
+            usize::try_from(elements * 2).map_err(|_| Error::InvalidArtifact {
+                detail: format!("tensor '{role}' does not fit this platform").into(),
+            })?
+        };
         if into.len() < need {
             return Err(Error::InvalidArtifact {
                 detail: format!(
@@ -390,29 +574,24 @@ impl Artifact {
                 ).into(),
             });
         }
-        let chunk = self
-            .chunks
-            .get(&t.chunk)
-            .ok_or_else(|| Error::InvalidArtifact {
-                detail: format!("chunk '{}' was validated but is not open", t.chunk).into(),
-            })?;
-        let dest = &mut into[..need];
-        let mut source = OpenChunk { file: &chunk.file };
-        pump_range(
-            &mut source,
-            t.offset,
-            dest,
-            &t.sha256,
-            t.precision,
-            self.budget,
-            &t.chunk,
-        )
-        .map_err(|e| match e {
-            Error::InvalidArtifact { detail } => Error::InvalidArtifact {
-                detail: format!("tensor '{role}': {detail}").into(),
-            },
-            other => other,
+        let mut at = 0usize;
+        let mut scratch = [0u8; 8192];
+        let read = self.stream_tensor(role, &mut scratch, &mut |slice| {
+            let end = at + slice.len();
+            if end > need {
+                return Err(Error::InvalidArtifact {
+                    detail: format!("tensor '{role}' streamed more than its {need} bytes").into(),
+                });
+            }
+            into[at..end].copy_from_slice(slice);
+            at = end;
+            Ok(())
         })?;
+        if read as usize != need || at != need {
+            return Err(Error::InvalidArtifact {
+                detail: format!("tensor '{role}' streamed {read} of {need} bytes").into(),
+            });
+        }
         Ok(need)
     }
 }

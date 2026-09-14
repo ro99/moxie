@@ -10,6 +10,7 @@
 //! journal record "unit 7 of this tensor" and mean something after a restart.
 
 use moxie_format::StreamingSha256;
+use moxie_format::canonical::ComponentKind;
 use moxie_format::compressed_tensors::PackQuantizedPlan;
 use moxie_format::payload::{self, ZeroPointSection};
 use moxie_memory::{BufferRequest, HostBuffer, Ledger, PlanRequest, Reservation, StageSpan};
@@ -21,10 +22,27 @@ use crate::{Budgets, Resolved, ResolvedKind};
 /// One bounded unit of work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unit {
-    /// Where this unit's bytes start inside the tensor's canonical payload.
+    /// Where this unit's bytes start inside the tensor's canonical payload:
+    /// the concatenation ADR 0023 describes, which is still what a consumer
+    /// streaming the whole tensor sees.
     pub canonical_offset: u64,
+    /// Where they start inside **their own component**, which is where they
+    /// are written now that each component is a physical safetensors tensor.
+    pub component_offset: u64,
     pub canonical_len: usize,
     pub source: UnitSource,
+}
+
+impl Unit {
+    /// Which physical component these bytes belong to.
+    pub fn component(&self) -> ComponentKind {
+        match self.source {
+            UnitSource::Bytes { .. } => ComponentKind::Weights,
+            UnitSource::Codes { .. } => ComponentKind::Codes,
+            UnitSource::Scales { .. } => ComponentKind::Scales,
+            UnitSource::Zeros { .. } => ComponentKind::ZeroPoints,
+        }
+    }
 }
 
 /// What a unit reads.
@@ -187,6 +205,8 @@ impl Iterator for Units<'_> {
                 let take = ((*len - self.at) as usize).min(self.tile);
                 let unit = Unit {
                     canonical_offset: self.at,
+                    // One component, so the two offsets coincide.
+                    component_offset: self.at,
                     canonical_len: take,
                     source: UnitSource::Bytes {
                         offset: self.at,
@@ -235,8 +255,14 @@ impl Iterator for Units<'_> {
                     1 => UnitSource::Scales { start, end },
                     _ => UnitSource::Zeros { start, end },
                 };
+                let section_start = match self.section {
+                    0 => 0,
+                    1 => self.scales_start,
+                    _ => self.zeros_start.unwrap_or(self.at),
+                };
                 let unit = Unit {
                     canonical_offset: self.at,
+                    component_offset: self.at - section_start,
                     canonical_len: len,
                     source,
                 };

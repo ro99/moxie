@@ -22,6 +22,7 @@
 
 pub mod affine;
 pub mod bf16;
+pub mod canonical;
 pub mod compressed_tensors;
 pub mod journal;
 pub mod manifest;

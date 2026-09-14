@@ -54,10 +54,24 @@ follow the convention the ecosystem already reads,
 known from the plan before anything is written. One shard is allowed and named
 the same way.
 
-Each component's payload starts on an **eight-byte boundary** within the
-shard's data section. Safetensors requires no alignment; this costs at most
-seven bytes per component and keeps a future mapping consumer from copying. The
-padding bytes are zero and belong to no component.
+Component payloads are **contiguous**: each begins exactly where the previous
+ended, and the JSON header is padded to eight bytes so the data section starts
+aligned.
+
+This paragraph originally aligned every component to eight bytes, for the
+benefit of a future mapping consumer. **The reference implementation refuses
+that**, measured with `safetensors` 0.7.0 on this machine before any shard was
+written:
+
+```text
+gap=False: LOADED
+gap=True:  SafetensorError: Error while deserializing header:
+           invalid offset for tensor `w.scales`
+```
+
+A schema whose files the reference reader rejects fails the one thing the
+owner's packaging ruling asks of them, so contiguity is the rule and alignment
+is the header's only.
 
 ### Checksum scope
 

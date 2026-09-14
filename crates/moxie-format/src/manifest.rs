@@ -82,8 +82,19 @@ use crate::payload::ZeroPointSection as PayloadZeroPoints;
 use crate::scale::ScaleDtype as PayloadScaleDtype;
 use crate::sha256::sha256_hex;
 
-/// Manifests this reader accepts.
-pub const SCHEMA_VERSION: u32 = 1;
+/// The schema a repack **writes**: canonical v2, safetensors shards plus this
+/// manifest ([ADR 0025]).
+///
+/// [ADR 0025]: ../../../docs/decisions/adr/0025-canonical-safetensors-schema.md
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// The schemas this reader **accepts**.
+///
+/// Version 1 -- raw chunk files -- keeps its meaning and its reader: ADR 0025
+/// says existing v1 artifacts are neither reinterpreted nor converted. Nothing
+/// writes one any more. The transitional read path expires at M11 item 4, or
+/// earlier if a task establishes that no v1 artifact exists outside tests.
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2];
 /// A manifest is kilobytes; four orders of magnitude of headroom constrains no
 /// real artifact while bounding the parse itself.
 pub const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
@@ -176,16 +187,36 @@ struct RawTensor {
     role: String,
     shape: Vec<i64>,
     precision: String,
-    chunk: String,
-    offset: i64,
-    length: i64,
-    sha256: String,
-    alignment: i64,
+    /// Version 1 placement: one byte range of one raw chunk file. Absent in
+    /// version 2, where the components below say where the bytes are.
+    #[serde(default)]
+    chunk: Option<String>,
+    #[serde(default)]
+    offset: Option<i64>,
+    #[serde(default)]
+    length: Option<i64>,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    alignment: Option<i64>,
+    /// Version 2 placement: one entry per physical safetensors tensor.
+    #[serde(default)]
+    components: Vec<RawComponent>,
     logical_order: i64,
     group_rule: Option<String>,
     scale_dtype: Option<String>,
     zero_point: Option<String>,
     group_index: Option<Vec<i64>>,
+}
+
+/// One physical tensor of a version-2 artifact.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawComponent {
+    kind: String,
+    file: String,
+    name: String,
+    sha256: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -270,13 +301,66 @@ pub struct Tensor {
     pub role: String,
     pub shape: Vec<u64>,
     pub precision: TensorPrecision,
-    pub chunk: String,
-    pub offset: u64,
-    pub length: u64,
-    pub sha256: String,
-    pub alignment: u64,
     pub logical_order: u64,
     pub affine: Option<AffineFields>,
+    /// Where this tensor's bytes are, which is the one thing the two schema
+    /// versions disagree about.
+    pub placement: Placement,
+}
+
+/// Where a tensor's bytes live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    /// Version 1: one byte range of one raw chunk file, one checksum.
+    Chunk {
+        chunk: String,
+        offset: u64,
+        length: u64,
+        sha256: String,
+        alignment: u64,
+    },
+    /// Version 2: one or more physical safetensors tensors, each in a named
+    /// shard, each with its own checksum ([ADR 0025]).
+    ///
+    /// [ADR 0025]: ../../../docs/decisions/adr/0025-canonical-safetensors-schema.md
+    Components(Vec<Component>),
+}
+
+/// One physical tensor of a version-2 artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Component {
+    pub kind: crate::canonical::ComponentKind,
+    /// The shard file, a single path component of the artifact directory.
+    pub file: String,
+    /// The tensor's name inside that shard.
+    pub name: String,
+    /// SHA-256 of this component's payload bytes -- its `data_offsets` range,
+    /// and nothing else.
+    pub sha256: String,
+}
+
+impl Tensor {
+    /// The v1 byte range, when this tensor has one.
+    pub fn chunk_range(&self) -> Option<(&str, u64, u64, &str)> {
+        match &self.placement {
+            Placement::Chunk {
+                chunk,
+                offset,
+                length,
+                sha256,
+                ..
+            } => Some((chunk.as_str(), *offset, *length, sha256.as_str())),
+            Placement::Components(_) => None,
+        }
+    }
+
+    /// The v2 components, when this tensor has them.
+    pub fn components(&self) -> Option<&[Component]> {
+        match &self.placement {
+            Placement::Components(c) => Some(c),
+            Placement::Chunk { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,32 +455,38 @@ fn invalid_static(detail: &'static str) -> Error {
 pub fn parse(text: &str) -> Result<Manifest> {
     // Version first: a future schema is refused by version before any v1
     // field is looked at, even when v1's fields are missing or changed.
-    check_version(text)?;
+    let version = check_version(text)?;
     let raw: RawManifest = toml::from_str(text)
         .map_err(|e| invalid(format_args!("manifest does not parse as TOML v1: {e}")))?;
-    validate_raw(raw)
+    validate_raw(raw, version)
 }
 
 /// Chunk-file lengths, by chunk name, from statting the artifact directory.
 /// Passed in so this crate stays I/O-free: it validates numbers, never files.
 pub fn validate_chunks(manifest: &Manifest, chunks: &BTreeMap<String, u64>) -> Result<()> {
     for t in &manifest.tensors {
-        let len = chunks.get(&t.chunk).ok_or_else(|| {
+        // Version 2 places its bytes in safetensors shards, whose own headers
+        // carry the ranges; `moxie-storage` checks those against the shard it
+        // opened. This rule is version 1's, and applies to version 1's rows.
+        let Some((chunk, offset, length, _)) = t.chunk_range() else {
+            continue;
+        };
+        let len = chunks.get(chunk).ok_or_else(|| {
             invalid(format_args!(
-                "tensor '{}' names chunk '{}', which does not exist",
-                t.role, t.chunk
+                "tensor '{}' names chunk '{chunk}', which does not exist",
+                t.role
             ))
         })?;
-        let end = t.offset.checked_add(t.length).ok_or_else(|| {
+        let end = offset.checked_add(length).ok_or_else(|| {
             invalid(format_args!(
-                "tensor '{}' offset {} + length {} overflows",
-                t.role, t.offset, t.length
+                "tensor '{}' offset {offset} + length {length} overflows",
+                t.role
             ))
         })?;
         if end > *len {
             return Err(invalid(format_args!(
-                "tensor '{}' describes bytes {}..{end} but chunk '{}' holds {len} bytes: truncation",
-                t.role, t.offset, t.chunk
+                "tensor '{}' describes bytes {offset}..{end} but chunk '{chunk}' holds {len} bytes: truncation",
+                t.role
             )));
         }
     }
@@ -412,7 +502,7 @@ struct VersionOnly {
     schema_version: u32,
 }
 
-fn check_version(text: &str) -> Result<()> {
+fn check_version(text: &str) -> Result<u32> {
     let v: VersionOnly = toml::from_str(text).map_err(|e| {
         // Malformed TOML, or no version at all: still a rejection, and the
         // message says which.
@@ -423,16 +513,16 @@ fn check_version(text: &str) -> Result<()> {
             invalid(format_args!("manifest does not parse as TOML v1: {e}"))
         }
     })?;
-    if v.schema_version != SCHEMA_VERSION {
+    if !SUPPORTED_SCHEMA_VERSIONS.contains(&v.schema_version) {
         return Err(invalid(format_args!(
-            "schema_version is {}, this reader accepts only version {}: refused by version before any other field",
-            v.schema_version, SCHEMA_VERSION
+            "schema_version is {}, this reader accepts only {SUPPORTED_SCHEMA_VERSIONS:?}: refused by version before any other field",
+            v.schema_version
         )));
     }
-    Ok(())
+    Ok(v.schema_version)
 }
 
-fn validate_raw(raw: RawManifest) -> Result<Manifest> {
+fn validate_raw(raw: RawManifest, version: u32) -> Result<Manifest> {
     // The version was already gated by `check_version` before deserializing
     // this schema; re-checking here would only repeat it.
     for f in &raw.required_features {
@@ -478,7 +568,7 @@ fn validate_raw(raw: RawManifest) -> Result<Manifest> {
 
     let mut tensors = Vec::with_capacity(raw.tensors.len());
     for t in raw.tensors {
-        tensors.push(validate_tensor(t)?);
+        tensors.push(validate_tensor(t, version)?);
     }
     // Every role unique: a manifest whose second entry silently wins is refused.
     let mut roles = BTreeSet::new();
@@ -610,9 +700,8 @@ fn to_u64(v: i64, field: &str) -> Result<u64> {
     })
 }
 
-fn validate_tensor(t: RawTensor) -> Result<Tensor> {
+fn validate_tensor(t: RawTensor, version: u32) -> Result<Tensor> {
     let role = nonempty(t.role, "tensors.role")?;
-    validate_chunk_name(&t.chunk).map_err(|d| invalid(format_args!("tensor '{role}': {d}")))?;
     if t.shape.is_empty() {
         return Err(invalid(format_args!(
             "tensor '{role}': shape must be non-empty"
@@ -638,25 +727,116 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
             )));
         }
     };
-    let offset = to_u64(t.offset, &format!("tensor '{role}' offset"))?;
-    let length = to_u64(t.length, &format!("tensor '{role}' length"))?;
-    if length == 0 {
-        return Err(invalid(format_args!(
-            "tensor '{role}': length 0 describes no bytes"
-        )));
-    }
-    let sha256 = validate_sha256(t.sha256, &format!("tensor '{role}' sha256"))?;
-    let alignment = to_u64(t.alignment, &format!("tensor '{role}' alignment"))?;
-    if !alignment.is_power_of_two() {
-        return Err(invalid(format_args!(
-            "tensor '{role}': alignment {alignment} is not a power of two"
-        )));
-    }
-    if offset % alignment != 0 {
-        return Err(invalid(format_args!(
-            "tensor '{role}': offset {offset} is not a multiple of alignment {alignment}"
-        )));
-    }
+    // Exactly one placement, and it must be the one this schema version
+    // describes. A row carrying both, or neither, is a manifest whose reader
+    // would have to guess which half to believe.
+    let v1_fields = t.chunk.is_some()
+        || t.offset.is_some()
+        || t.length.is_some()
+        || t.sha256.is_some()
+        || t.alignment.is_some();
+    let placement = match version {
+        1 => {
+            if !t.components.is_empty() {
+                return Err(invalid(format_args!(
+                    "tensor '{role}': a version 1 manifest places bytes in a chunk, not in \
+                     components"
+                )));
+            }
+            let chunk = t.chunk.ok_or_else(|| {
+                invalid(format_args!("tensor '{role}': version 1 requires a chunk"))
+            })?;
+            validate_chunk_name(&chunk)
+                .map_err(|d| invalid(format_args!("tensor '{role}': {d}")))?;
+            let offset = to_u64(
+                t.offset
+                    .ok_or_else(|| invalid(format_args!("tensor '{role}': no offset")))?,
+                &format!("tensor '{role}' offset"),
+            )?;
+            let length = to_u64(
+                t.length
+                    .ok_or_else(|| invalid(format_args!("tensor '{role}': no length")))?,
+                &format!("tensor '{role}' length"),
+            )?;
+            if length == 0 {
+                return Err(invalid(format_args!(
+                    "tensor '{role}': length 0 describes no bytes"
+                )));
+            }
+            let sha256 = validate_sha256(
+                t.sha256
+                    .ok_or_else(|| invalid(format_args!("tensor '{role}': no sha256")))?,
+                &format!("tensor '{role}' sha256"),
+            )?;
+            let alignment = to_u64(
+                t.alignment
+                    .ok_or_else(|| invalid(format_args!("tensor '{role}': no alignment")))?,
+                &format!("tensor '{role}' alignment"),
+            )?;
+            if !alignment.is_power_of_two() {
+                return Err(invalid(format_args!(
+                    "tensor '{role}': alignment {alignment} is not a power of two"
+                )));
+            }
+            if offset % alignment != 0 {
+                return Err(invalid(format_args!(
+                    "tensor '{role}': offset {offset} is not a multiple of alignment {alignment}"
+                )));
+            }
+            Placement::Chunk {
+                chunk,
+                offset,
+                length,
+                sha256,
+                alignment,
+            }
+        }
+        _ => {
+            if v1_fields {
+                return Err(invalid(format_args!(
+                    "tensor '{role}': a version 2 manifest places bytes in safetensors \
+                     components, so chunk/offset/length/sha256/alignment have no meaning here"
+                )));
+            }
+            if t.components.is_empty() {
+                return Err(invalid(format_args!(
+                    "tensor '{role}': a version 2 tensor needs at least one component"
+                )));
+            }
+            let mut components = Vec::with_capacity(t.components.len());
+            let mut kinds = BTreeSet::new();
+            for c in t.components {
+                let kind = crate::canonical::ComponentKind::parse(&c.kind).ok_or_else(|| {
+                    invalid(format_args!(
+                        "tensor '{role}': component kind '{}' is outside \
+                         {{weights, codes, scales, zero_points}}",
+                        c.kind
+                    ))
+                })?;
+                if !kinds.insert(kind) {
+                    return Err(invalid(format_args!(
+                        "tensor '{role}': component '{}' appears twice",
+                        c.kind
+                    )));
+                }
+                validate_chunk_name(&c.file).map_err(|d| {
+                    invalid(format_args!("tensor '{role}' component '{}': {d}", c.kind))
+                })?;
+                let name = nonempty(c.name, "component.name")?;
+                let sha256 = validate_sha256(
+                    c.sha256,
+                    &format!("tensor '{role}' component '{}' sha256", c.kind),
+                )?;
+                components.push(Component {
+                    kind,
+                    file: c.file,
+                    name,
+                    sha256,
+                });
+            }
+            Placement::Components(components)
+        }
+    };
     let logical_order = to_u64(t.logical_order, &format!("tensor '{role}' logical_order"))?;
 
     // Checked shape product, before anything multiplies by it.
@@ -681,7 +861,9 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
             let need = elements.checked_mul(2).ok_or_else(|| {
                 invalid(format_args!("tensor '{role}': BF16 byte count overflows"))
             })?;
-            if need != length {
+            if let Placement::Chunk { length, .. } = &placement
+                && need != *length
+            {
                 return Err(invalid(format_args!(
                     "tensor '{role}': shape product {elements} * 2 BF16 bytes = {need}, but length is {length}: shape and byte count disagree"
                 )));
@@ -847,7 +1029,9 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
                     "tensor '{role}': its payload length cannot be computed: {e}"
                 ))
             })?;
-            if need != length {
+            if let Placement::Chunk { length, .. } = &placement
+                && need != *length
+            {
                 return Err(invalid(format_args!(
                     "tensor '{role}': a {} {out_features}x{in_features} tensor with {} \
                      zero point(s) occupies {need} canonical byte(s), but length is {length}: \
@@ -868,32 +1052,71 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
         }
     };
 
+    // Version 2: the component set must be exactly the one the descriptor
+    // implies. The shard headers say how big each one is -- `moxie-storage`
+    // checks that against what it opened -- but whether a tensor has zero
+    // points at all is this manifest's own claim, and it must agree with
+    // itself.
+    if let Placement::Components(components) = &placement {
+        let expected: Vec<crate::canonical::ComponentKind> = match (&affine, precision) {
+            (None, _) => vec![crate::canonical::ComponentKind::Weights],
+            (Some(a), _) => {
+                let mut kinds = vec![
+                    crate::canonical::ComponentKind::Codes,
+                    crate::canonical::ComponentKind::Scales,
+                ];
+                if a.zero_point == ZeroPointMode::PerGroup {
+                    kinds.push(crate::canonical::ComponentKind::ZeroPoints);
+                }
+                kinds
+            }
+        };
+        let mut found: Vec<crate::canonical::ComponentKind> =
+            components.iter().map(|c| c.kind).collect();
+        found.sort();
+        let mut want = expected.clone();
+        want.sort();
+        if found != want {
+            return Err(invalid(format_args!(
+                "tensor '{role}' is {} with {} zero point(s) and carries {found:?}; it must carry \
+                 exactly {want:?}",
+                precision.name(),
+                match &affine {
+                    Some(a) if a.zero_point == ZeroPointMode::PerGroup => "per-group",
+                    _ => "no",
+                }
+            )));
+        }
+    }
+
     Ok(Tensor {
         role,
         shape,
         precision,
-        chunk: t.chunk,
-        offset,
-        length,
-        sha256,
-        alignment,
         logical_order,
         affine,
+        placement,
     })
 }
 
 /// No two tensors' byte ranges may intersect, per chunk -- including the
 /// total-containment case a pairwise "starts inside" test misses.
 fn check_overlap(tensors: &[Tensor]) -> Result<()> {
-    let mut by_chunk: BTreeMap<&str, Vec<&Tensor>> = BTreeMap::new();
+    let mut by_chunk: BTreeMap<&str, Vec<(&Tensor, u64, u64)>> = BTreeMap::new();
     for t in tensors {
-        by_chunk.entry(t.chunk.as_str()).or_default().push(t);
+        // A version 2 tensor's ranges are the shard header's, and
+        // `moxie-storage` checks them against the shard it opened. This rule
+        // is version 1's, where the manifest is the only thing that knows.
+        if let Some((chunk, offset, length, _)) = t.chunk_range() {
+            by_chunk.entry(chunk).or_default().push((t, offset, length));
+        }
     }
     for (chunk, mut list) in by_chunk {
-        list.sort_by_key(|t| (t.offset, t.length));
+        list.sort_by_key(|(_, offset, length)| (*offset, *length));
         for w in list.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            let a_end = a.offset.checked_add(a.length).ok_or_else(|| {
+            let (a, a_offset, a_length) = w[0];
+            let (b, b_offset, _) = w[1];
+            let a_end = a_offset.checked_add(a_length).ok_or_else(|| {
                 invalid(format_args!(
                     "tensor '{}' offset + length overflows",
                     a.role
@@ -901,10 +1124,10 @@ fn check_overlap(tensors: &[Tensor]) -> Result<()> {
             })?;
             // Sorted by offset, so any intersection means b starts inside
             // a -- including b wholly contained in a.
-            if b.offset < a_end {
+            if b_offset < a_end {
                 return Err(invalid(format_args!(
-                    "tensors '{}' ({}..{a_end}) and '{}' ({}..) overlap in chunk '{chunk}', including containment",
-                    a.role, a.offset, b.role, b.offset
+                    "tensors '{}' ({a_offset}..{a_end}) and '{}' ({b_offset}..) overlap in chunk '{chunk}', including containment",
+                    a.role, b.role
                 )));
             }
         }
@@ -1032,11 +1255,35 @@ pub fn artifact_identity(manifest: &Manifest) -> String {
             w.u64(*d);
         }
         w.str(t.precision.name());
-        w.str(&t.chunk);
-        w.u64(t.offset);
-        w.u64(t.length);
-        w.str(&t.sha256);
-        w.u64(t.alignment);
+        // Placement participates in identity, and the two shapes are tagged
+        // differently so a v1 range and a v2 component set can never hash to
+        // the same artifact.
+        match &t.placement {
+            Placement::Chunk {
+                chunk,
+                offset,
+                length,
+                sha256,
+                alignment,
+            } => {
+                w.tag("chunk-placement");
+                w.str(chunk);
+                w.u64(*offset);
+                w.u64(*length);
+                w.str(sha256);
+                w.u64(*alignment);
+            }
+            Placement::Components(components) => {
+                w.tag("component-placement");
+                w.u64(components.len() as u64);
+                for c in components {
+                    w.str(c.kind.name());
+                    w.str(&c.file);
+                    w.str(&c.name);
+                    w.str(&c.sha256);
+                }
+            }
+        }
         w.u64(t.logical_order);
         if let Some(a) = &t.affine {
             w.tag("affine");
@@ -1375,11 +1622,33 @@ fn tensor_table(t: &Tensor) -> Result<toml::Value> {
         "precision".into(),
         toml::Value::String(t.precision.name().into()),
     );
-    e.insert("chunk".into(), toml::Value::String(t.chunk.clone()));
-    e.insert("offset".into(), to_i64(t.offset, "offset")?);
-    e.insert("length".into(), to_i64(t.length, "length")?);
-    e.insert("sha256".into(), toml::Value::String(t.sha256.clone()));
-    e.insert("alignment".into(), to_i64(t.alignment, "alignment")?);
+    match &t.placement {
+        Placement::Chunk {
+            chunk,
+            offset,
+            length,
+            sha256,
+            alignment,
+        } => {
+            e.insert("chunk".into(), toml::Value::String(chunk.clone()));
+            e.insert("offset".into(), to_i64(*offset, "offset")?);
+            e.insert("length".into(), to_i64(*length, "length")?);
+            e.insert("sha256".into(), toml::Value::String(sha256.clone()));
+            e.insert("alignment".into(), to_i64(*alignment, "alignment")?);
+        }
+        Placement::Components(components) => {
+            let mut rows = Vec::with_capacity(components.len());
+            for c in components {
+                let mut row = toml::map::Map::new();
+                row.insert("kind".into(), toml::Value::String(c.kind.name().into()));
+                row.insert("file".into(), toml::Value::String(c.file.clone()));
+                row.insert("name".into(), toml::Value::String(c.name.clone()));
+                row.insert("sha256".into(), toml::Value::String(c.sha256.clone()));
+                rows.push(toml::Value::Table(row));
+            }
+            e.insert("components".into(), toml::Value::Array(rows));
+        }
+    }
     e.insert(
         "logical_order".into(),
         to_i64(t.logical_order, "logical_order")?,

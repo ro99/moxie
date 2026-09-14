@@ -20,7 +20,7 @@
 //!
 //! [ADR 0015]: ../../../docs/decisions/adr/0015-serde-json-for-safetensors-headers.md
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use moxie_types::{Error, HostTier, Result, Tier};
 
@@ -597,6 +597,248 @@ impl Header {
     }
 }
 
+// --- the writer half ---------------------------------------------------------
+
+/// One tensor a shard will contain, before its offsets are known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedTensor {
+    pub name: String,
+    pub dtype: Dtype,
+    pub shape: Vec<u64>,
+    /// Payload length in bytes. Checked against the dtype and shape, because a
+    /// length that disagrees with them is a tensor nobody can read.
+    pub len: u64,
+}
+
+/// Where one planned tensor's bytes land in the shard, once the header is
+/// fixed: `data_offsets` inside the payload, and the absolute file offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedTensor {
+    pub name: String,
+    pub dtype: Dtype,
+    pub shape: Vec<u64>,
+    pub begin: u64,
+    pub end: u64,
+    /// `begin` plus the header, which is what a writer seeks to.
+    pub file_offset: u64,
+}
+
+impl PlacedTensor {
+    pub fn len(&self) -> u64 {
+        self.end - self.begin
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.end == self.begin
+    }
+}
+
+/// A built safetensors header: the exact bytes to write, and where every
+/// tensor's payload goes after them.
+#[derive(Debug, Clone)]
+pub struct ShardLayout {
+    header: Vec<u8>,
+    tensors: Vec<PlacedTensor>,
+    payload_bytes: u64,
+}
+
+impl ShardLayout {
+    /// The eight-byte length prefix followed by the JSON header, ready to write
+    /// at offset zero.
+    pub fn header_bytes(&self) -> &[u8] {
+        &self.header
+    }
+
+    pub fn tensors(&self) -> &[PlacedTensor] {
+        &self.tensors
+    }
+
+    pub fn tensor(&self, name: &str) -> Option<&PlacedTensor> {
+        self.tensors.iter().find(|t| t.name == name)
+    }
+
+    /// Total file length: header plus payload, including any alignment padding
+    /// between tensors.
+    pub fn file_len(&self) -> u64 {
+        self.header.len() as u64 + self.payload_bytes
+    }
+}
+
+/// Alignment of the JSON header, and **the reason tensor payloads have none**.
+///
+/// The header is padded to eight bytes, which is what the ecosystem's own
+/// writer does, so the data section starts aligned. Tensor payloads are then
+/// **contiguous**: each one begins exactly where the previous ended.
+///
+/// That is not a preference. The reference implementation refuses a gap --
+/// measured, not recalled, with `safetensors` 0.7.0 on this machine:
+///
+/// ```text
+/// gap=False: LOADED
+/// gap=True:  SafetensorError: Error while deserializing header:
+///            invalid offset for tensor `w.scales`
+/// ```
+///
+/// [ADR 0025] originally aligned every payload to eight bytes for the benefit
+/// of a future mapping consumer. That would have produced shards the reference
+/// reader rejects, which is the one thing the owner's packaging ruling asks
+/// these files to do.
+///
+/// [ADR 0025]: ../../../docs/decisions/adr/0025-canonical-safetensors-schema.md
+pub const HEADER_ALIGNMENT: u64 = 8;
+
+/// Build a shard's header from planned tensors and optional metadata.
+///
+/// I/O-free, like the rest of this crate: it returns the bytes and the
+/// placements, and never learns that a file exists. The result is parsed back
+/// by [`Header::parse`] before it is returned, so a header this function emits
+/// is one this crate's reader accepts -- by construction rather than by test
+/// coverage, which is the same rule `manifest::encode` follows.
+pub fn build_shard(
+    tensors: &[PlannedTensor],
+    metadata: &BTreeMap<String, String>,
+) -> Result<ShardLayout> {
+    if tensors.is_empty() {
+        return Err(invalid_static(
+            "a safetensors shard with no tensors describes nothing",
+        ));
+    }
+    if tensors.len() > MAX_TENSORS {
+        return Err(invalid(format_args!(
+            "{} tensors is above the {MAX_TENSORS} cap this reader accepts",
+            tensors.len()
+        )));
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut placed: Vec<PlacedTensor> = Vec::with_capacity(tensors.len());
+    let mut at: u64 = 0;
+    for t in tensors {
+        if !seen.insert(t.name.as_str()) {
+            return Err(invalid(format_args!(
+                "tensor '{}' is planned twice; the second entry would silently win",
+                t.name
+            )));
+        }
+        if t.name.len() > MAX_NAME_BYTES {
+            return Err(invalid(format_args!(
+                "tensor name '{}' is {} bytes, above the {MAX_NAME_BYTES} cap",
+                t.name,
+                t.name.len()
+            )));
+        }
+        if t.shape.len() > MAX_RANK {
+            return Err(invalid(format_args!(
+                "tensor '{}' has rank {}, above the {MAX_RANK} cap",
+                t.name,
+                t.shape.len()
+            )));
+        }
+        // The declared length must be the one the dtype and shape imply.
+        // Anything else is a tensor whose header lies about its own size.
+        let mut elements: u64 = 1;
+        for d in &t.shape {
+            elements = elements.checked_mul(*d).ok_or_else(|| {
+                invalid(format_args!("tensor '{}': shape product overflows", t.name))
+            })?;
+        }
+        let need = elements
+            .checked_mul(t.dtype.bytes() as u64)
+            .ok_or_else(|| invalid(format_args!("tensor '{}': byte count overflows", t.name)))?;
+        if need != t.len {
+            return Err(invalid(format_args!(
+                "tensor '{}' declares {} byte(s) but {:?} {:?} needs {need}",
+                t.name, t.len, t.dtype, t.shape
+            )));
+        }
+        // Contiguous: the reference implementation refuses any gap.
+        let begin = at;
+        let end = begin
+            .checked_add(t.len)
+            .ok_or_else(|| invalid(format_args!("tensor '{}': range overflows", t.name)))?;
+        placed.push(PlacedTensor {
+            name: t.name.clone(),
+            dtype: t.dtype,
+            shape: t.shape.clone(),
+            begin,
+            end,
+            // Filled in once the header length is known.
+            file_offset: 0,
+        });
+        at = end;
+    }
+    let payload_bytes = at;
+
+    // The JSON header, built with the same library that parses it.
+    let mut map = serde_json::Map::new();
+    if !metadata.is_empty() {
+        let mut meta = serde_json::Map::new();
+        for (k, v) in metadata {
+            meta.insert(k.clone(), serde_json::Value::String(v.clone()));
+        }
+        map.insert("__metadata__".into(), serde_json::Value::Object(meta));
+    }
+    for t in &placed {
+        let mut entry = serde_json::Map::new();
+        entry.insert(
+            "dtype".into(),
+            serde_json::Value::String(t.dtype.name().to_string()),
+        );
+        entry.insert(
+            "shape".into(),
+            serde_json::Value::Array(
+                t.shape
+                    .iter()
+                    .map(|d| serde_json::Value::Number((*d).into()))
+                    .collect(),
+            ),
+        );
+        entry.insert(
+            "data_offsets".into(),
+            serde_json::Value::Array(vec![
+                serde_json::Value::Number(t.begin.into()),
+                serde_json::Value::Number(t.end.into()),
+            ]),
+        );
+        map.insert(t.name.clone(), serde_json::Value::Object(entry));
+    }
+    let mut json = serde_json::to_vec(&serde_json::Value::Object(map))
+        .map_err(|e| invalid(format_args!("the header does not serialize: {e}")))?;
+    // Pad the JSON to eight bytes, which is what the ecosystem's own writer
+    // does and what keeps the first tensor's file offset aligned.
+    while !json.len().is_multiple_of(HEADER_ALIGNMENT as usize) {
+        json.push(b' ');
+    }
+    if json.len() as u64 > MAX_HEADER_BYTES {
+        return Err(invalid(format_args!(
+            "the header is {} byte(s), above the {MAX_HEADER_BYTES} cap",
+            json.len()
+        )));
+    }
+    let mut header = Vec::with_capacity(8 + json.len());
+    header.extend_from_slice(&(json.len() as u64).to_le_bytes());
+    header.extend_from_slice(&json);
+
+    let base = header.len() as u64;
+    for t in &mut placed {
+        t.file_offset = base + t.begin;
+    }
+
+    // Out through this crate's own reader, on the complete file length, so a
+    // header that would not parse is never handed to a writer.
+    let file_len = base + payload_bytes;
+    let parsed = Header::parse(&header, file_len)?;
+    if parsed.tensors().len() != placed.len() {
+        return Err(invalid_static(
+            "the built header parses back with a different tensor count",
+        ));
+    }
+    Ok(ShardLayout {
+        header,
+        tensors: placed,
+        payload_bytes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,5 +1116,86 @@ mod tests {
         let h = Header::parse(&bytes[..prefix], bytes.len() as u64).unwrap();
         assert!(h.get("a").unwrap().is_empty());
         assert_eq!(h.covered_bytes(), 4);
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    fn planned(name: &str, dtype: Dtype, shape: Vec<u64>) -> PlannedTensor {
+        let len = shape.iter().product::<u64>() * dtype.bytes() as u64;
+        PlannedTensor {
+            name: name.into(),
+            dtype,
+            shape,
+            len,
+        }
+    }
+
+    /// What a shard this crate builds looks like, checked against this crate's
+    /// own reader and against the format's arithmetic written out by hand.
+    #[test]
+    fn a_built_shard_parses_back_with_the_ranges_it_planned() {
+        let tensors = vec![
+            planned("w.codes", Dtype::U8, vec![4, 3]),
+            planned("w.scales", Dtype::Bf16, vec![4, 1]),
+            planned("w.zero_points", Dtype::I16, vec![4, 1]),
+        ];
+        let metadata = BTreeMap::from([("moxie.schema".to_string(), "canonical-v2".to_string())]);
+        let layout = build_shard(&tensors, &metadata).expect("it builds");
+
+        // Eight-byte length prefix, then a JSON header padded to eight.
+        let declared = u64::from_le_bytes(layout.header_bytes()[..8].try_into().unwrap());
+        assert_eq!(declared as usize, layout.header_bytes().len() - 8);
+        assert!(declared.is_multiple_of(8), "the header is padded to eight");
+
+        // Payloads are **contiguous**, because the reference implementation
+        // refuses a gap: each tensor begins exactly where the last ended.
+        let mut last_end = 0;
+        for t in layout.tensors() {
+            assert_eq!(t.begin, last_end, "{} leaves a gap", t.name);
+            assert_eq!(t.file_offset, layout.header_bytes().len() as u64 + t.begin);
+            last_end = t.end;
+        }
+        // 12 code bytes, then 8 scale bytes, then 8 zero-point bytes. Written
+        // out rather than recomputed by the code.
+        assert_eq!(layout.tensor("w.codes").unwrap().begin, 0);
+        assert_eq!(layout.tensor("w.scales").unwrap().begin, 12);
+        assert_eq!(layout.tensor("w.zero_points").unwrap().begin, 20);
+        assert_eq!(layout.file_len(), layout.header_bytes().len() as u64 + 28);
+
+        // And this crate's reader agrees with the plan.
+        let header = Header::parse(&layout.header_bytes()[8..], layout.file_len())
+            .or_else(|_| Header::parse(layout.header_bytes(), layout.file_len()))
+            .expect("it parses");
+        for t in layout.tensors() {
+            let entry = header.get(&t.name).expect("the reader finds it");
+            assert_eq!(entry.dtype, t.dtype);
+            assert_eq!(entry.shape, t.shape);
+            assert_eq!(entry.begin, t.begin);
+            assert_eq!(entry.end, t.end);
+        }
+    }
+
+    #[test]
+    fn a_header_that_lies_about_a_tensors_size_is_refused() {
+        let mut wrong = planned("w", Dtype::F32, vec![2, 2]);
+        wrong.len = 15;
+        let e = build_shard(&[wrong], &BTreeMap::new()).unwrap_err();
+        assert!(e.to_string().contains("needs 16"), "{e}");
+    }
+
+    #[test]
+    fn structurally_impossible_shards_are_refused() {
+        assert!(build_shard(&[], &BTreeMap::new()).is_err());
+        let twice = vec![
+            planned("w", Dtype::U8, vec![2]),
+            planned("w", Dtype::U8, vec![2]),
+        ];
+        let e = build_shard(&twice, &BTreeMap::new()).unwrap_err();
+        assert!(e.to_string().contains("planned twice"), "{e}");
+        let deep = planned("w", Dtype::U8, vec![1; MAX_RANK + 1]);
+        assert!(build_shard(&[deep], &BTreeMap::new()).is_err());
     }
 }

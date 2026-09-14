@@ -54,7 +54,7 @@ use moxie_storage::{Artifact, ByteBudget};
 use moxie_types::{HostTier, Result};
 
 use crate::write::fault::{Faults, Site};
-use crate::write::plan::{OutputPlan, PlannedTensor};
+use crate::write::plan::{OutputPlan, PlacedComponent};
 use crate::write::{WriteBudget, invalid};
 
 /// The journal file's name inside the destination.
@@ -131,9 +131,16 @@ struct Progress {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedTensor {
     pub role: String,
-    pub chunk: String,
-    pub offset: u64,
+    pub kind: moxie_format::canonical::ComponentKind,
+    /// The tensor's name inside its shard.
+    pub name: String,
+    /// The shard file it lives in.
+    pub file: String,
     pub length: u64,
+    /// SHA-256 of this component's payload bytes, which is the scope
+    /// [ADR 0025] records.
+    ///
+    /// [ADR 0025]: ../../../docs/decisions/adr/0025-canonical-safetensors-schema.md
     pub sha256: String,
 }
 
@@ -299,9 +306,9 @@ impl Run {
             scratch,
             sealed: None,
         };
-        for t in run.plan.tensors() {
+        for c in run.plan.components() {
             run.progress.insert(
-                t.request.role.clone(),
+                c.name.clone(),
                 Progress {
                     done: 0,
                     next_index: 0,
@@ -309,6 +316,12 @@ impl Run {
                 },
             );
         }
+        // Every shard exists with its header written and synced before any
+        // payload byte is placed: the offsets this plan fixed are offsets past
+        // that header, and a resumed run writes into the same file it would
+        // have. Rewriting an identical header is idempotent, and cheap -- a
+        // header is kilobytes.
+        run.write_shard_headers(faults)?;
 
         if resuming {
             match run.recover(&journal_path, faults, cancelled) {
@@ -407,7 +420,7 @@ impl Run {
                     "cancelled while rehashing the staged units of an interrupted run".into(),
                 ));
             }
-            let Some(planned) = self.plan.tensor(&unit.tensor).cloned() else {
+            let Some(planned) = self.plan.component(&unit.tensor).cloned() else {
                 return Err(invalid(format!(
                     "the journal records a unit for tensor '{}', which this plan does not \
                      describe",
@@ -437,19 +450,24 @@ impl Run {
         // Bytes past the last journaled unit are a crash between a payload
         // write and its journal line: the chunk file is truncated back to what
         // the journal accounts for, so the next unit writes where it expects.
-        for (name, _) in self.plan.chunks() {
+        for shard in self.plan.shards() {
+            let name = &shard.file;
             let path = self.dest.join(name);
             let Ok(meta) = std::fs::metadata(&path) else {
                 continue;
             };
+            // Never below the header: those bytes are the shard's index, not
+            // payload, and truncating them would leave a file no reader can
+            // open.
             let accounted = self
                 .plan
-                .tensors()
+                .components()
                 .iter()
-                .filter(|t| &t.chunk == name)
-                .map(|t| t.offset + self.progress[&t.request.role].done)
+                .filter(|c| &c.file == name)
+                .map(|c| c.file_offset + self.progress[&c.name].done)
                 .max()
-                .unwrap_or(0);
+                .unwrap_or(0)
+                .max(shard.layout.header_bytes().len() as u64);
             if meta.len() > accounted {
                 report.truncated_bytes += meta.len() - accounted;
                 let file = open_confined(&self.dest, name, false)?;
@@ -471,7 +489,7 @@ impl Run {
     /// tensor's running hash, or refuse it.
     fn reuse_unit(
         &mut self,
-        planned: &PlannedTensor,
+        planned: &PlacedComponent,
         unit: &CompletedUnit,
         faults: &Faults,
     ) -> Result<()> {
@@ -485,20 +503,20 @@ impl Run {
                 unit.index, progress.next_index
             )));
         }
-        if unit.chunk != planned.chunk || unit.offset != planned.offset + progress.done {
+        if unit.chunk != planned.file || unit.offset != planned.file_offset + progress.done {
             return Err(invalid(format!(
                 "unit {} claims {}@{} but the plan puts those bytes at {}@{}",
                 unit.index,
                 unit.chunk,
                 unit.offset,
-                planned.chunk,
-                planned.offset + progress.done
+                planned.file,
+                planned.file_offset + progress.done
             )));
         }
-        if progress.done + unit.len > planned.request.length {
+        if progress.done + unit.len > planned.len {
             return Err(invalid(format!(
                 "unit {} would take tensor '{}' past its {} byte(s)",
-                unit.index, unit.tensor, planned.request.length
+                unit.index, unit.tensor, planned.len
             )));
         }
         // The bytes themselves, rehashed from the file in one pass that feeds
@@ -556,19 +574,35 @@ impl Run {
     }
 
     /// How many of a tensor's payload bytes are already durable.
-    pub fn bytes_done(&self, role: &str) -> Result<u64> {
+    pub fn bytes_done(&self, component: &str) -> Result<u64> {
         self.progress
-            .get(role)
+            .get(component)
             .map(|p| p.done)
-            .ok_or_else(|| invalid(format!("tensor '{role}' is not in this plan")))
+            .ok_or_else(|| invalid(format!("component '{component}' is not in this plan")))
+    }
+
+    /// Write every shard's header, once, durably.
+    fn write_shard_headers(&mut self, faults: &Faults) -> Result<()> {
+        for shard in self.plan.shards() {
+            faults.check(Site::ChunkCreate)?;
+            let mut file = open_confined(&self.dest, &shard.file, false)?;
+            let header = shard.layout.header_bytes();
+            write_at(&mut file, 0, header, faults).map_err(|e| {
+                invalid(format!("cannot write the header of '{}': {e}", shard.file))
+            })?;
+            faults.check(Site::ChunkSync)?;
+            file.sync_all()
+                .map_err(|e| invalid(format!("cannot sync '{}': {e}", shard.file)))?;
+        }
+        Ok(())
     }
 
     /// Whether every tensor's payload is complete.
     pub fn is_complete(&self) -> bool {
         self.plan
-            .tensors()
+            .components()
             .iter()
-            .all(|t| self.progress[&t.request.role].done == t.request.length)
+            .all(|c| self.progress[&c.name].done == c.len)
     }
 
     /// Write one bounded work unit: append, sync, then journal.
@@ -578,41 +612,42 @@ impl Run {
     /// restart discards -- but never a record with no bytes.
     pub fn write_unit(
         &mut self,
-        role: &str,
+        component: &str,
         bytes: &[u8],
         source_sha256: &str,
         faults: &Faults,
     ) -> Result<()> {
         let planned = self
             .plan
-            .tensor(role)
+            .component(component)
             .cloned()
-            .ok_or_else(|| invalid(format!("tensor '{role}' is not in this plan")))?;
+            .ok_or_else(|| invalid(format!("component '{component}' is not in this plan")))?;
         let progress = self
             .progress
-            .get(role)
-            .ok_or_else(|| invalid(format!("tensor '{role}' has no progress")))?;
+            .get(component)
+            .ok_or_else(|| invalid(format!("component '{component}' has no progress")))?;
         if bytes.is_empty() {
             return Err(invalid(format!(
-                "tensor '{role}': an empty unit is not work"
+                "component '{component}': an empty unit is not work"
             )));
         }
         if bytes.len() > self.budget.scratch_bytes() {
             return Err(invalid(format!(
-                "tensor '{role}': a {}-byte unit is above the admitted {}-byte payload scratch",
+                "component '{component}': a {}-byte unit is above the admitted {}-byte payload \
+                 scratch",
                 bytes.len(),
                 self.budget.scratch_bytes()
             )));
         }
         let done = progress.done;
         let end = done + bytes.len() as u64;
-        if end > planned.request.length {
+        if end > planned.len {
             return Err(invalid(format!(
-                "tensor '{role}': this unit ends at {end} of a {} byte payload",
-                planned.request.length
+                "component '{component}': this unit ends at {end} of a {} byte payload",
+                planned.len
             )));
         }
-        let offset = planned.offset + done;
+        let offset = planned.file_offset + done;
         let index = progress.next_index;
 
         let new_disk = self.disk_used + bytes.len() as u64;
@@ -625,9 +660,9 @@ impl Run {
             )));
         }
 
-        let path = self.dest.join(&planned.chunk);
+        let path = self.dest.join(&planned.file);
         faults.check(Site::ChunkCreate)?;
-        let mut file = open_confined(&self.dest, &planned.chunk, false)?;
+        let mut file = open_confined(&self.dest, &planned.file, false)?;
         write_at(&mut file, offset, bytes, faults)
             .map_err(|e| invalid(format!("cannot write {}: {e}", path.display())))?;
         faults.check(Site::ChunkSync)?;
@@ -635,9 +670,9 @@ impl Run {
             .map_err(|e| invalid(format!("cannot sync {}: {e}", path.display())))?;
 
         let unit = CompletedUnit {
-            tensor: role.to_string(),
+            tensor: component.to_string(),
             index,
-            chunk: planned.chunk.clone(),
+            chunk: planned.file.clone(),
             offset,
             len: bytes.len() as u64,
             sha256: sha256_hex(bytes),
@@ -645,7 +680,7 @@ impl Run {
         };
         append_durably(&mut self.journal, &journal::unit_line(&unit), faults)?;
 
-        let progress = self.progress.get_mut(role).expect("checked above");
+        let progress = self.progress.get_mut(component).expect("checked above");
         progress.hasher.update(bytes);
         progress.done = end;
         progress.next_index += 1;
@@ -658,33 +693,27 @@ impl Run {
         if let Some(sealed) = &self.sealed {
             return Ok(sealed.clone());
         }
-        let mut out = Vec::with_capacity(self.plan.tensors().len());
-        for t in self.plan.tensors() {
-            let p = &self.progress[&t.request.role];
-            if p.done != t.request.length {
+        let mut out = Vec::with_capacity(self.plan.components().len());
+        for c in self.plan.components() {
+            let p = &self.progress[&c.name];
+            if p.done != c.len {
                 return Err(invalid(format!(
-                    "tensor '{}' has {} of {} byte(s): an incomplete tensor cannot be published",
-                    t.request.role, p.done, t.request.length
+                    "component '{}' has {} of {} byte(s): an incomplete tensor cannot be published",
+                    c.name, p.done, c.len
                 )));
             }
             let mut hasher = StreamingSha256::new();
             core::mem::swap(
                 &mut hasher,
-                &mut self
-                    .progress
-                    .get_mut(&t.request.role)
-                    .expect("present")
-                    .hasher,
+                &mut self.progress.get_mut(&c.name).expect("present").hasher,
             );
-            let sha256 = hasher.finalize_hex();
-            // The hasher is consumed, so put an equivalent one back: sealing
-            // twice must not return two different digests.
             out.push(SealedTensor {
-                role: t.request.role.clone(),
-                chunk: t.chunk.clone(),
-                offset: t.offset,
-                length: t.request.length,
-                sha256,
+                role: c.role.clone(),
+                kind: c.kind,
+                name: c.name.clone(),
+                file: c.file.clone(),
+                length: c.len,
+                sha256: hasher.finalize_hex(),
             });
         }
         self.sealed = Some(out.clone());
@@ -748,18 +777,24 @@ impl Run {
         // tensor's checksum against the bytes on disk.
         faults.check(Site::Validate)?;
         let artifact = Artifact::open_unpublished(&self.dest, &staged, ByteBudget::default())?;
-        for t in &sealed {
+        let mut roles: Vec<&str> = sealed.iter().map(|t| t.role.as_str()).collect();
+        roles.dedup();
+        for role in roles {
             // Validation reads every published byte, and a cancellation only
             // observed after all of them is a cancellation nobody experiences.
             if cancelled() {
                 let bytes = self.progress.values().map(|p| p.done).sum();
                 return self.cancel_with(bytes, ledger);
             }
-            let read = artifact.verify_tensor(&t.role, self.scratch.bytes_mut())?;
-            if read != t.length {
+            let want: u64 = sealed
+                .iter()
+                .filter(|t| t.role == role)
+                .map(|t| t.length)
+                .sum();
+            let read = artifact.verify_tensor(role, self.scratch.bytes_mut())?;
+            if read != want {
                 return Err(invalid(format!(
-                    "tensor '{}' verified {read} byte(s) against a planned {}",
-                    t.role, t.length
+                    "tensor '{role}' verified {read} byte(s) against a planned {want}"
                 )));
             }
         }

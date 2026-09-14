@@ -1,13 +1,23 @@
-//! The output plan: which tensor's payload goes where, decided before a byte
-//! is written.
+//! The output plan: which physical tensor goes in which shard, decided before
+//! a byte is written.
 //!
-//! Manifest v1 assigns a tensor to **one** chunk, so a tensor's payload is one
-//! contiguous range of one chunk file and a tensor larger than the admitted
-//! chunk-file limit is a refusal rather than a tensor split across rows. The
-//! bounded work units that fill that range are the repacker's business; the
-//! range is this module's.
+//! [ADR 0025] makes a canonical artifact one or more conforming safetensors
+//! shards plus a manifest. A logical tensor becomes one, two or three physical
+//! tensors, and **a component never spans shards**: a component larger than the
+//! admitted shard size is a refusal, not a tensor split across files.
+//!
+//! Every offset in a safetensors shard depends on the exact header, so the
+//! header is built here -- from the complete component list, before the run
+//! starts -- and every later write goes to an offset this plan fixed. That is
+//! also what lets a resumed run write into the same places.
+//!
+//! [ADR 0025]: ../../../docs/decisions/adr/0025-canonical-safetensors-schema.md
 
+use std::collections::BTreeMap;
+
+use moxie_format::canonical::{Component, ComponentKind};
 use moxie_format::manifest::{AffineFields, TensorPrecision};
+use moxie_format::safetensors::{self, PlannedTensor as ShardTensor, ShardLayout};
 use moxie_format::sha256::StreamingSha256;
 use moxie_types::{Error, Result};
 
@@ -19,7 +29,7 @@ fn invalid(detail: String) -> Error {
     }
 }
 
-/// One tensor a caller wants published.
+/// One tensor a caller wants published, with the components it becomes.
 #[derive(Debug, Clone)]
 pub struct TensorRequest {
     pub role: String,
@@ -28,36 +38,54 @@ pub struct TensorRequest {
     /// Present exactly for affine precisions; the manifest validator refuses a
     /// disagreement either way.
     pub affine: Option<AffineFields>,
-    /// The canonical payload length, from the shared codec (ADR 0023).
-    pub length: u64,
-    /// Byte alignment for the payload's start inside its chunk.
-    pub alignment: u64,
+    /// The physical tensors this becomes, in canonical order.
+    pub components: Vec<Component>,
 }
 
-/// One tensor's place in the output.
-#[derive(Debug, Clone)]
-pub struct PlannedTensor {
-    pub request: TensorRequest,
-    pub chunk: String,
-    pub offset: u64,
-    pub logical_order: u64,
-}
-
-impl PlannedTensor {
-    pub fn end(&self) -> u64 {
-        self.offset + self.request.length
+impl TensorRequest {
+    pub fn payload_bytes(&self) -> u64 {
+        self.components.iter().map(|c| c.len).sum()
     }
 }
 
-/// Every tensor's place, plus the disk the run will need.
+/// One component, placed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedComponent {
+    pub role: String,
+    pub kind: ComponentKind,
+    /// The tensor's name inside its shard.
+    pub name: String,
+    /// The shard file.
+    pub file: String,
+    /// Absolute offset in that file, past the header.
+    pub file_offset: u64,
+    pub len: u64,
+}
+
+/// One shard: its name, its exact header bytes, and what it holds.
+#[derive(Debug, Clone)]
+pub struct ShardPlan {
+    pub file: String,
+    pub layout: ShardLayout,
+}
+
+impl ShardPlan {
+    /// Total file length: header plus every payload.
+    pub fn file_len(&self) -> u64 {
+        self.layout.file_len()
+    }
+}
+
+/// Where every component goes.
 #[derive(Debug, Clone)]
 pub struct OutputPlan {
-    tensors: Vec<PlannedTensor>,
-    chunks: Vec<(String, u64)>,
+    components: Vec<PlacedComponent>,
+    shards: Vec<ShardPlan>,
+    requests: Vec<TensorRequest>,
 }
 
 impl OutputPlan {
-    /// Assign chunks and offsets.
+    /// Assign components to shards and fix every offset.
     ///
     /// Tensors keep the caller's order, which becomes their `logical_order`:
     /// the selection's order is a decision the caller made and this must not
@@ -73,143 +101,174 @@ impl OutputPlan {
                     .into(),
             ));
         }
-        let mut tensors = Vec::with_capacity(requests.len());
-        let mut chunks: Vec<(String, u64)> = Vec::new();
-        let mut current: Option<(String, u64)> = None;
-        for (order, request) in requests.into_iter().enumerate() {
-            if request.length == 0 {
+        // Group components into shards first; the names need the total, and
+        // the offsets need the headers, which need the names.
+        let mut groups: Vec<Vec<(String, Component)>> = Vec::new();
+        let mut current: Vec<(String, Component)> = Vec::new();
+        let mut used: u64 = 0;
+        for request in &requests {
+            if request.components.is_empty() {
                 return Err(invalid(format!(
-                    "tensor '{}' has a zero-length payload: length 0 describes no bytes",
+                    "tensor '{}' has no components: nothing to publish",
                     request.role
                 )));
             }
-            if !request.alignment.is_power_of_two() {
-                return Err(invalid(format!(
-                    "tensor '{}': alignment {} is not a power of two",
-                    request.role, request.alignment
-                )));
+            for component in &request.components {
+                if component.len == 0 {
+                    return Err(invalid(format!(
+                        "tensor '{}' component '{}' is empty",
+                        request.role,
+                        component.kind.name()
+                    )));
+                }
+                // A component that cannot fit one shard at all is refused
+                // here, naming the limit, rather than split across files.
+                // `HEADER_ALLOWANCE` keeps room for the header the shard will
+                // need; the exact size is known only once its tensors are, and
+                // a plan that ignored it could exceed the budget by a header.
+                if component.len + HEADER_ALLOWANCE > budget.chunk_file_bytes() {
+                    return Err(invalid(format!(
+                        "tensor '{}' component '{}' needs {} byte(s) and the admitted shard limit \
+                         is {}: a larger component requires a larger admitted shard size, never a \
+                         component split across shards",
+                        request.role,
+                        component.kind.name(),
+                        component.len,
+                        budget.chunk_file_bytes()
+                    )));
+                }
+                if !current.is_empty()
+                    && used + component.len + HEADER_ALLOWANCE > budget.chunk_file_bytes()
+                {
+                    groups.push(std::mem::take(&mut current));
+                    used = 0;
+                }
+                used += component.len;
+                current.push((request.role.clone(), component.clone()));
             }
-            // A tensor that cannot fit one chunk file at all: refused here,
-            // naming the limit, rather than split across manifest rows. The
-            // chunk-file limit is a disk-plan parameter, so a larger tensor
-            // needs a larger admitted limit -- not a different manifest shape.
-            let alone = request
-                .length
-                .checked_add(request.alignment - 1)
-                .ok_or_else(|| invalid(format!("tensor '{}': size overflows", request.role)))?;
-            if alone > budget.chunk_file_bytes() {
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
+
+        // Now the names, and then the headers that fix every offset.
+        let total = groups.len();
+        let mut shards = Vec::with_capacity(total);
+        let mut components = Vec::new();
+        for (index, group) in groups.into_iter().enumerate() {
+            let file = shard_name(index + 1, total);
+            let planned: Vec<ShardTensor> = group
+                .iter()
+                .map(|(_, c)| ShardTensor {
+                    name: c.name.clone(),
+                    dtype: c.dtype,
+                    shape: c.shape.clone(),
+                    len: c.len,
+                })
+                .collect();
+            let mut metadata = BTreeMap::new();
+            metadata.insert(
+                moxie_format::canonical::SCHEMA_TAG_KEY.to_string(),
+                moxie_format::canonical::SCHEMA_TAG.to_string(),
+            );
+            let layout = safetensors::build_shard(&planned, &metadata)?;
+            if layout.file_len() > budget.chunk_file_bytes() {
                 return Err(invalid(format!(
-                    "tensor '{}' needs {} byte(s) but the admitted chunk-file limit is {}: a \
-                     larger tensor requires a larger admitted file limit, never a tensor split \
-                     across manifest rows",
-                    request.role,
-                    request.length,
+                    "shard '{file}' would be {} byte(s), above the admitted shard limit of {}",
+                    layout.file_len(),
                     budget.chunk_file_bytes()
                 )));
             }
-            let (name, used) = match current.take() {
-                Some(open) => open,
-                None => (format!("chunk{}.bin", chunks.len()), 0u64),
-            };
-            let offset = used.next_multiple_of(request.alignment);
-            let end = offset
-                .checked_add(request.length)
-                .ok_or_else(|| invalid(format!("tensor '{}': range overflows", request.role)))?;
-            if end > budget.chunk_file_bytes() {
-                // Close this chunk and open the next one, then place it there.
-                chunks.push((name, used));
-                let name = format!("chunk{}.bin", chunks.len());
-                tensors.push(PlannedTensor {
-                    chunk: name.clone(),
-                    offset: 0,
-                    logical_order: order as u64,
-                    request: request.clone(),
+            for (role, component) in group {
+                let placed = layout.tensor(&component.name).ok_or_else(|| {
+                    invalid(format!(
+                        "component '{}' was planned into '{file}' but the header does not carry it",
+                        component.name
+                    ))
+                })?;
+                components.push(PlacedComponent {
+                    role,
+                    kind: component.kind,
+                    name: component.name.clone(),
+                    file: file.clone(),
+                    file_offset: placed.file_offset,
+                    len: placed.len(),
                 });
-                current = Some((name, request.length));
-                continue;
             }
-            tensors.push(PlannedTensor {
-                chunk: name.clone(),
-                offset,
-                logical_order: order as u64,
-                request,
-            });
-            current = Some((name, end));
+            shards.push(ShardPlan { file, layout });
         }
-        if let Some(open) = current {
-            chunks.push(open);
-        }
-        let payload: u64 = chunks.iter().map(|(_, len)| *len).sum();
-        // The disk budget covers the **whole** plan, not the payload alone: an
-        // independent review published 5,005 bytes against a 4,096-byte budget
-        // because the journal and the staged manifest were reported in an
-        // estimate and enforced nowhere. `overhead_bytes` is the caller's bound
-        // on those two, and it is checked here rather than printed.
-        let total = payload
+
+        let payload: u64 = shards.iter().map(|s| s.file_len()).sum();
+        // The disk budget covers the **whole** plan: shards, the journal and
+        // the staged manifest.
+        let total_disk = payload
             .checked_add(overhead_bytes)
             .ok_or_else(|| invalid("the disk plan overflows".into()))?;
-        if total > budget.disk_bytes() {
+        if total_disk > budget.disk_bytes() {
             return Err(invalid(format!(
-                "this selection needs {total} byte(s) of disk -- {payload} of payload plus at \
+                "this selection needs {total_disk} byte(s) of disk -- {payload} of shards plus at \
                  most {overhead_bytes} of journal and staged manifest -- above the admitted disk \
                  budget of {}",
                 budget.disk_bytes()
             )));
         }
-        Ok(Self { tensors, chunks })
+        Ok(Self {
+            components,
+            shards,
+            requests,
+        })
     }
 
-    pub fn tensors(&self) -> &[PlannedTensor] {
-        &self.tensors
+    pub fn requests(&self) -> &[TensorRequest] {
+        &self.requests
     }
 
-    pub fn tensor(&self, role: &str) -> Option<&PlannedTensor> {
-        self.tensors.iter().find(|t| t.request.role == role)
+    pub fn components(&self) -> &[PlacedComponent] {
+        &self.components
     }
 
-    /// Chunk names and their final lengths.
-    pub fn chunks(&self) -> &[(String, u64)] {
-        &self.chunks
+    pub fn shards(&self) -> &[ShardPlan] {
+        &self.shards
+    }
+
+    pub fn component(&self, name: &str) -> Option<&PlacedComponent> {
+        self.components.iter().find(|c| c.name == name)
+    }
+
+    /// Every component of one role, in canonical order.
+    pub fn components_of(&self, role: &str) -> impl Iterator<Item = &PlacedComponent> {
+        self.components.iter().filter(move |c| c.role == role)
     }
 
     pub fn payload_bytes(&self) -> u64 {
-        self.chunks.iter().map(|(_, len)| *len).sum()
+        self.shards.iter().map(|s| s.file_len()).sum()
     }
 
-    /// A digest over everything the output layout is: role, shape, precision,
-    /// descriptor, length, chunk and offset, each length-prefixed.
-    ///
-    /// Part of the run binding, so a resume whose plan has changed in any of
-    /// those respects is refused rather than continued into a mixed artifact.
-    /// Length-prefixed for the reason [`moxie_format::manifest::artifact_identity`]
-    /// is: bare delimiters are legal inside roles, so concatenation has to be
-    /// injective on its own.
+    /// A digest over everything the output layout is: every role, its
+    /// components, their names, dtypes, shapes, shards and offsets, each
+    /// length-prefixed so concatenation is injective.
     pub fn digest(&self) -> String {
         let mut h = StreamingSha256::new();
         let mut field = |bytes: &[u8]| {
-            // A closure over one hasher, so no caller can forget the length.
             h.update(&(bytes.len() as u64).to_le_bytes());
             h.update(bytes);
         };
-        field(b"output-plan-v1");
-        for t in &self.tensors {
-            field(t.request.role.as_bytes());
-            field(&t.request.shape.len().to_le_bytes());
-            for d in &t.request.shape {
+        field(b"output-plan-v2");
+        for r in &self.requests {
+            field(r.role.as_bytes());
+            field(&r.shape.len().to_le_bytes());
+            for d in &r.shape {
                 field(&d.to_le_bytes());
             }
-            field(t.request.precision.name().as_bytes());
-            match &t.request.affine {
+            field(r.precision.name().as_bytes());
+            match &r.affine {
                 None => field(b"dense"),
                 Some(a) => {
-                    // `Debug` of a fieldless enum is its variant name. It feeds
-                    // a **binding**, not an identity anyone stores: the only
-                    // consequence of a rendering changing between builds is
-                    // that a resume refuses and redoes the work, and the
-                    // binding's `converter` field -- which carries this crate's
-                    // version -- already refuses across builds. The artifact's
-                    // own identity is `manifest::artifact_identity`, which
-                    // spells every field out.
+                    // `Debug` of a fieldless enum is its variant name, and this
+                    // feeds a resume binding rather than an identity anyone
+                    // stores: a rendering that changed between builds costs a
+                    // redone run, and the binding's converter field already
+                    // refuses across builds.
                     field(b"affine");
                     field(format!("{:?}", a.group_rule).as_bytes());
                     field(format!("{:?}", a.scale_dtype).as_bytes());
@@ -225,12 +284,32 @@ impl OutputPlan {
                     }
                 }
             }
-            field(&t.request.length.to_le_bytes());
-            field(&t.request.alignment.to_le_bytes());
-            field(t.chunk.as_bytes());
-            field(&t.offset.to_le_bytes());
-            field(&t.logical_order.to_le_bytes());
+        }
+        for c in &self.components {
+            field(c.role.as_bytes());
+            field(c.kind.name().as_bytes());
+            field(c.name.as_bytes());
+            field(c.file.as_bytes());
+            field(&c.file_offset.to_le_bytes());
+            field(&c.len.to_le_bytes());
+        }
+        for s in &self.shards {
+            field(s.file.as_bytes());
+            field(s.layout.header_bytes());
         }
         h.finalize_hex()
     }
+}
+
+/// Room reserved for a shard's header when components are grouped.
+///
+/// The exact header is known only once a shard's tensor list is, and the list
+/// is what grouping decides -- so grouping reserves this much and the built
+/// layout is checked against the budget afterwards. Sixty-four kibibytes holds
+/// a JSON header for hundreds of components.
+pub const HEADER_ALLOWANCE: u64 = 64 * 1024;
+
+/// `model-00001-of-00003.safetensors`, the convention the ecosystem reads.
+pub fn shard_name(index: usize, total: usize) -> String {
+    format!("model-{index:05}-of-{total:05}.safetensors")
 }
