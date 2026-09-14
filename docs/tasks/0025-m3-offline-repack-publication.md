@@ -319,7 +319,7 @@ is in the ignored `results/task0025/gates.log`.
 | Specification | `cargo xtask spec-check` | **passed**, 10 documents present and unchanged |
 | Architecture | `cargo xtask arch-check` | **passed**: 79 rejected fixtures, 21 accepted, 13 rules. The task added a write-authority rule and eight fixtures; [ADR 0024](../decisions/adr/0024-one-storage-crate-and-a-write-module.md) removed all of them with the crate they policed |
 | Host tests | `cargo test --workspace --locked --offline` | **1,097 passed, 0 failed, 0 ignored, 0 skipped** (task 0024 recorded 947; 1,014 before the review's corrections, +83 for the seven regressions they needed) |
-| Device-feature tests | `cargo test --workspace --locked --offline --features moxie-executor/driver` | **1,049 passed, 0 failed, 0 ignored** |
+| Device-feature tests | `cargo test --workspace --locked --offline --features moxie-executor/driver` | **1,057 passed, 0 failed, 0 ignored** |
 
 **Nothing failed and nothing was skipped.** The real-artifact lane ran rather
 than skipping: its source is present on this machine, and it prints `SKIP` with

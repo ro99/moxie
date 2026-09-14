@@ -1,9 +1,21 @@
 # ADR 0022 — User programs and canonical write authority
 
-- ID / date / author / status: 0022 / 2026-09-13 / engineer lead (implementation agent) / adopted technical ruling; implementation pending.
-- Classification: roadmap default, selected under the owner's explicit delegation of program placement. This is a design decision, not a measured performance choice or a new owner ruling.
+- ID / date / author / status: 0022 / 2026-09-13; amended 2026-09-14 / engineer lead (implementation agent), packaging amendment directed by the repository owner / adopted; safetensors publication implementation pending.
+- Classification: program placement was a roadmap default selected under the owner's explicit delegation. The 2026-09-14 safetensors packaging amendment is an **owner ruling**, replacing the requested custom `.mox` container. Neither is a measured performance claim.
 - Scope and owning shared component: application composition roots; `moxie-format` and the storage boundary; `xtask` architecture enforcement.
 - Supersedes / superseded by: resolves the placement gap in [ADR 0021](0021-repack-is-a-moxie-program.md) and [the assigned handover](../../handovers/2026-09-13-repack-user-surface-gap.md). Amends document 02's storage row by splitting write I/O into a separate crate, document 05's surface inventory, document 07's command placement, and document 06's M3/M11 packaging distinction **by reference only**. ADRs 0017–0021 retain their owner-gate substance.
+
+**Amendment precedence.** [ADR 0024](0024-one-storage-crate-and-a-write-module.md)
+supersedes the original crate split and write-authority rule below: the writer
+is `moxie-repack::write`. Those passages remain as the original placement record.
+The 2026-09-14 packaging decision below supersedes this ADR's former M11
+container deferral, ADR 0024's reference to that deferral, and
+[ADR 0005](0005-toml-manifest-with-separate-chunks.md)'s raw-chunk container
+choice for future published artifacts. It also supersedes
+[ADR 0023](0023-canonical-affine-payload-and-repack-journal.md)'s single affine
+byte-range layout where the new safetensors mapping requires separate physical
+tensors. Existing manifest-v1 artifacts retain their original interpretation;
+the affine mathematical contract and private-journal boundary remain unchanged.
 
 ## Problem and mechanism
 
@@ -98,21 +110,64 @@ until a separately recorded M8 compatibility/deletion decision; no rename today.
   hashes payloads; it does not repair or publish. Publication is the final
   validated step of `repack`, with no separate unchecked `publish` command.
 
-### Packaging and `.mox`
+### Packaging: safetensors shards and a Moxie manifest
 
-M3 writes **manifest-v1 directories**, with `manifest.toml` and separately
-addressable chunks, as ADR 0005 specifies. Paths with a `.mox` suffix may name
-such directories; the suffix is neither a format discriminator nor a promise
-of a regular file. Inspection reports directory/schema/completeness explicitly.
-Existing suffix-free directories remain valid. No ZIP wrapper, magic single-file
-header, or silent format conversion is introduced.
+**Owner decision, 2026-09-14:** use safetensors for published tensor files,
+including repacked models intended for the Hugging Face Hub. Drop the custom
+`.mox` container requirement. This is a format decision now, not a choice
+deferred to M11.
 
-The final single-file `.mox` packaging decision is **deferred to M11 item 4**,
-before installation/migration documentation and release examples are finalized.
-That task must record an ADR selecting directory packaging or a versioned
-container, with bounded random access, restartability, crash publication and
-reader migration evidence. This deferral does not block M3's directory writer
-and does not claim the owner's shorthand settles a container specification.
+A published canonical artifact is a directory containing **one or more
+`.safetensors` shards plus a small, versioned Moxie manifest**. Retain TOML for
+the manifest. A single tensor file is allowed when appropriate; a whole model
+need not fit one file. No custom `.mox` binary container or archive wrapper is
+required. Renaming a raw chunk to `.safetensors` does not satisfy this decision:
+each shard must conform to the safetensors format and open with its reference
+implementation.
+
+The reason is an established data-only tensor format, ecosystem tooling, and a
+smaller custom container-maintenance burden. The
+[safetensors documentation](https://huggingface.co/docs/safetensors/index)
+describes tensor loading without pickle's arbitrary-code execution and supports
+selective tensor reads. The
+[format specification](https://github.com/huggingface/safetensors#format)
+defines typed, shaped tensor ranges and string-valued optional metadata.
+This does not establish that the existing TOML/raw-chunk format executes code,
+nor does changing containers fix filesystem, allocation or publication defects.
+
+Safetensors stores physical tensors; the Moxie manifest defines their canonical
+meaning. Preserve logical roles and shapes, grouping and logical column
+identity, packing/version, scale dtype, zero-point mode, provenance, checksums,
+exclusions, and completeness. Packed INT4 codes may use `U8` storage, INT8 codes
+`I8`, scales their original FP16/BF16/FP32 dtype, and zero points `I16`, with
+BF16 weights stored directly. The precise component naming, physical shapes,
+shard mapping and checksum scope must be fixed in a versioned schema before
+implementation. No regrouping, requantization, scale rounding or change to
+`W=(Q-Z)*S` is authorized. A safetensors file alone does not define those
+semantics or make the artifact executable by Transformers or another engine.
+
+The implementation belongs to **M3 item 1**, through a bounded follow-up task
+with a schema/migration decision before code. M11 item 4 retains program
+distribution, installation and migration documentation; it no longer selects a
+custom tensor container. Task 0025's existing manifest-v1/raw-chunk results stay
+evidence for that implementation only, and do not establish safetensors output.
+Its ongoing correctness corrections remain necessary.
+
+The follow-up must establish bounded header and payload access, admitted RAM
+and total staging disk, source identity checks, restart and cancellation,
+confined writes, and durable publication. Write and validate shards before
+atomically publishing the manifest; a private restart journal never becomes
+part of the published artifact. Retain checksum and numerical validation:
+safetensors permits NaN/Inf values and does not enforce Moxie's scale rules.
+Test shards with the reference safetensors reader as well as the production
+Moxie reader, and compare all canonical components against independent source
+oracles. Record how existing manifest-v1 artifacts are read or explicitly
+refused, and the expiry of any transitional path, without silently
+reinterpreting or converting them.
+
+This decision authorizes no Hub upload, bulk conversion, source mutation,
+download, model-support claim or performance claim. Container adoption does
+not resolve the open owner gates.
 
 ## Evidence and acceptance
 
