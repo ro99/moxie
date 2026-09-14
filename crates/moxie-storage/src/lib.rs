@@ -860,9 +860,11 @@ pub fn read_range(
     let file = File::open(path).map_err(|e| Error::InvalidArtifact {
         detail: format!("cannot open {}: {e}", path.display()).into(),
     })?;
-    let end = offset.checked_add(len).ok_or_else(|| Error::InvalidArtifact {
-        detail: format!("range {offset}..+{len} of {} overflows", path.display()).into(),
-    })?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidArtifact {
+            detail: format!("range {offset}..+{len} of {} overflows", path.display()).into(),
+        })?;
     let have = file
         .metadata()
         .map_err(|e| Error::InvalidArtifact {

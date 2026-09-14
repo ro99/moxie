@@ -404,14 +404,21 @@ fn writing_into_the_source_is_refused() {
     // run must not write beside.
     let r = f.repack(&f.path("src"), &[]);
     assert_eq!(r.status, 2, "{}{}", r.stdout, r.stderr);
-    assert!(
-        r.says("refusing to write into a directory this run did not create"),
-        "{}",
-        r.stdout
-    );
+    assert!(r.says("overlaps the source root"), "{}", r.stdout);
     assert!(
         f.scratch.join("src").join("shard-a.safetensors").exists(),
         "the source shard survived"
+    );
+    // And beneath it, which an independent review found published happily: the
+    // destination does not exist yet, so the check has to reason about the path
+    // it would become rather than the nearest directory that happens to exist.
+    let beneath = f.path("src/published-here");
+    let r = f.repack(&beneath, &[]);
+    assert_eq!(r.status, 2, "{}{}", r.stdout, r.stderr);
+    assert!(r.says("overlaps the source root"), "{}", r.stdout);
+    assert!(
+        !std::path::Path::new(&beneath).exists(),
+        "a refused destination was created anyway"
     );
 }
 

@@ -62,7 +62,11 @@ impl OutputPlan {
     /// Tensors keep the caller's order, which becomes their `logical_order`:
     /// the selection's order is a decision the caller made and this must not
     /// silently reorder it.
-    pub fn build(requests: Vec<TensorRequest>, budget: &WriteBudget) -> Result<Self> {
+    pub fn build(
+        requests: Vec<TensorRequest>,
+        budget: &WriteBudget,
+        overhead_bytes: u64,
+    ) -> Result<Self> {
         if requests.is_empty() {
             return Err(invalid(
                 "an empty selection publishes nothing: a manifest describes at least one tensor"
@@ -135,10 +139,19 @@ impl OutputPlan {
         if let Some(open) = current {
             chunks.push(open);
         }
-        let total: u64 = chunks.iter().map(|(_, len)| *len).sum();
+        let payload: u64 = chunks.iter().map(|(_, len)| *len).sum();
+        // The disk budget covers the **whole** plan, not the payload alone: an
+        // independent review published 5,005 bytes against a 4,096-byte budget
+        // because the journal and the staged manifest were reported in an
+        // estimate and enforced nowhere. `overhead_bytes` is the caller's bound
+        // on those two, and it is checked here rather than printed.
+        let total = payload
+            .checked_add(overhead_bytes)
+            .ok_or_else(|| invalid("the disk plan overflows".into()))?;
         if total > budget.disk_bytes() {
             return Err(invalid(format!(
-                "this selection publishes {total} byte(s) of payload, above the admitted disk \
+                "this selection needs {total} byte(s) of disk -- {payload} of payload plus at \
+                 most {overhead_bytes} of journal and staged manifest -- above the admitted disk \
                  budget of {}",
                 budget.disk_bytes()
             )));

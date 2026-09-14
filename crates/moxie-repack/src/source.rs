@@ -119,6 +119,23 @@ impl Sources {
         Ok(&self.open.as_ref().expect("just opened").1)
     }
 
+    /// Whether a shard declares a tensor at all, without reading it.
+    ///
+    /// The cross-shard resolver needs this to see a companion the selection did
+    /// **not** declare: a symmetric selection over a module that carries zero
+    /// points is a disagreement, and the only way to notice is to look.
+    pub fn declares(&mut self, file: &str, name: &str) -> Result<bool> {
+        let shard = self.shard(file)?;
+        Ok(shard.header().tensors().contains_key(name))
+    }
+
+    /// One tensor's full header entry, for the shared validation the
+    /// single-header resolver applies.
+    pub fn raw_entry(&mut self, file: &str, name: &str) -> Result<TensorEntry> {
+        let shard = self.shard(file)?;
+        Ok(shard.header().get(name)?.clone())
+    }
+
     /// One tensor's header entry, with the file it came from.
     pub fn entry(&mut self, file: &str, name: &str) -> Result<SourceTensor> {
         let shard = self.shard(file)?;
@@ -165,6 +182,34 @@ impl Sources {
         Ok(bytes)
     }
 
+    /// Re-hash every file and refuse if any digest has moved.
+    ///
+    /// A digest taken at the start of a run is a statement about the file **at
+    /// that moment**. An independent review changed a source immediately after
+    /// its digest was computed and the run published the new bytes under the
+    /// old digest. Hashing through a retained handle does not fix that -- an
+    /// in-place write reaches every handle -- so the only honest check is to
+    /// hash again after the conversion and before anything is exposed, and to
+    /// say what that costs: a second full pass over every source file.
+    pub fn verify_unchanged(
+        &mut self,
+        recorded: &[(String, String)],
+        scratch: &mut [u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        for (file, digest) in recorded {
+            let (now, _) = self.file_digest_cancellable(file, scratch, cancelled)?;
+            if &now != digest {
+                return Err(invalid(format!(
+                    "source file '{file}' hashed {digest} when this run started and {now} now: \
+                     it changed underneath the conversion, and publishing would record a digest \
+                     that describes bytes nobody has"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// SHA-256 of a whole source file, streamed through `scratch`.
     ///
     /// The manifest's `source.files.sha256` has exactly one meaning, so this
@@ -172,6 +217,20 @@ impl Sources {
     /// happened to read, in a field that says "this file", would be publishing
     /// a false checksum -- and a later whole-artifact claim would inherit it.
     pub fn file_digest(&mut self, file: &str, scratch: &mut [u8]) -> Result<(String, u64)> {
+        self.file_digest_cancellable(file, scratch, &|| false)
+    }
+
+    /// The same, checked against cancellation between slices.
+    ///
+    /// A whole-file hash of a 5 GB shard is minutes of reading, and a
+    /// cancellation that is only observed after it is a cancellation nobody
+    /// experiences. Bounded buffers bound memory, not latency.
+    pub fn file_digest_cancellable(
+        &mut self,
+        file: &str,
+        scratch: &mut [u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(String, u64)> {
         use moxie_format::StreamingSha256;
         let path = self.path_of(file)?;
         // The shard cache holds a handle to this file; opening it again for a
@@ -188,6 +247,11 @@ impl Sources {
                 .map_err(|e| invalid(format!("cannot read {}: {e}", path.display())))?;
             if n == 0 {
                 break;
+            }
+            if cancelled() {
+                return Err(invalid(format!(
+                    "cancelled while hashing {file} after {total} byte(s)"
+                )));
             }
             hasher.update(&scratch[..n]);
             total += n as u64;

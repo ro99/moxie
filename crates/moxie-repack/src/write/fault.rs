@@ -117,13 +117,26 @@ struct Armed {
 }
 
 /// A run's fault plan. Empty by default.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Faults {
     armed: Vec<Armed>,
-    /// Every site visited, in order, whether or not it fired. The enumeration
-    /// gate reports measured coverage from this rather than from a promise
-    /// that a boundary was reached.
-    visits: std::cell::RefCell<Vec<Site>>,
+    /// How many times each site was visited, **counted rather than listed**.
+    ///
+    /// The first version kept every visit in a `Vec`, which grew with the
+    /// conversion -- an unbounded allocation on the ordinary path, in a program
+    /// whose whole point is bounded memory, and one an independent review
+    /// found. A counter per named boundary is fixed-size and answers the same
+    /// two questions: how often, and which boundaries were reached at all.
+    visits: std::cell::RefCell<[u64; Site::ALL.len()]>,
+}
+
+impl Default for Faults {
+    fn default() -> Self {
+        Self {
+            armed: Vec::new(),
+            visits: std::cell::RefCell::new([0; Site::ALL.len()]),
+        }
+    }
 }
 
 impl Faults {
@@ -144,7 +157,9 @@ impl Faults {
 
     /// Called at each boundary. Returns the injected failure, or `Ok`.
     pub fn check(&self, site: Site) -> Result<()> {
-        self.visits.borrow_mut().push(site);
+        if let Some(at) = Site::ALL.iter().position(|s| *s == site) {
+            self.visits.borrow_mut()[at] += 1;
+        }
         for a in &self.armed {
             if a.site != site {
                 continue;
@@ -167,18 +182,22 @@ impl Faults {
 
     /// How many times a site was visited.
     pub fn visits(&self, site: Site) -> usize {
-        self.visits.borrow().iter().filter(|s| **s == site).count()
+        Site::ALL
+            .iter()
+            .position(|s| *s == site)
+            .map(|at| self.visits.borrow()[at] as usize)
+            .unwrap_or(0)
     }
 
     /// Every site visited at least once, for measured coverage.
     pub fn visited_sites(&self) -> Vec<Site> {
-        let mut out: Vec<Site> = Vec::new();
-        for s in self.visits.borrow().iter() {
-            if !out.contains(s) {
-                out.push(*s);
-            }
-        }
-        out
+        let counts = self.visits.borrow();
+        Site::ALL
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| counts[*at] > 0)
+            .map(|(_, s)| *s)
+            .collect()
     }
 
     /// Whether any armed fault is still waiting to fire. A gate that expected

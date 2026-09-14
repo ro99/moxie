@@ -117,7 +117,9 @@ fn requests() -> Vec<TensorRequest> {
 }
 
 fn plan() -> OutputPlan {
-    OutputPlan::build(requests(), &budget()).expect("a plan")
+    // The disk budget now covers the journal and the staged manifest too,
+    // so the plan is built with the same overhead bound the program uses.
+    OutputPlan::build(requests(), &budget(), 8 * 1024).expect("a plan")
 }
 
 /// Units of at most 4096 bytes, the admitted scratch.

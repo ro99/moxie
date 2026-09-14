@@ -22,8 +22,8 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use moxie_repack::{Budgets, InspectReport, RepackReport, VerifyReport};
 use moxie_repack::write::{Faults, Options, Outcome, Site};
+use moxie_repack::{Budgets, InspectReport, RepackReport, VerifyReport};
 
 const USAGE: &str = "\
 moxie-repack — offline canonical inspection, repack and verification

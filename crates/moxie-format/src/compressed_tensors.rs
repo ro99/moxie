@@ -279,6 +279,39 @@ pub fn source_entries<'a>(
     let packed = header.get(&crate::join_name(module, "weight_packed")?)?;
     let scale = header.get(&crate::join_name(module, "weight_scale")?)?;
     let shape = header.get(&crate::join_name(module, "weight_shape")?)?;
+    let name = crate::join_name(module, "weight_zero_point")?;
+    let zero_point = header.tensors().get(&name);
+    validate_source_entries(module, packed, shape, zero_point, zero_points)?;
+    Ok(SourceEntries {
+        packed,
+        scale,
+        shape,
+        zero_point,
+    })
+}
+
+/// Every rule [`source_entries`] applies to a module's declared entries,
+/// separated from the lookup so that a caller resolving them **across shards**
+/// applies the same ones.
+///
+/// An independent review published a module whose `weight_packed` and zero
+/// points were declared `F32` and whose `weight_shape` was `F64`, and published
+/// a **symmetric** selection over a source that carries asymmetric zero points,
+/// silently dropping them. Both are refused here, and both callers go through
+/// this function now: the single-header resolver above, and the cross-shard
+/// resolver in the offline repacker -- the gap task 0024 recorded as the one a
+/// production caller would have to fill.
+///
+/// `zero_point` is the entry the source actually carries, if any -- **not** the
+/// one the selection expected. Passing what was found is what lets the
+/// declared-versus-present disagreement be seen at all.
+pub fn validate_source_entries(
+    module: &str,
+    packed: &TensorEntry,
+    shape: &TensorEntry,
+    zero_point: Option<&TensorEntry>,
+    zero_points: ZeroPointSource,
+) -> Result<()> {
     if packed.dtype != Dtype::I32 {
         return Err(invalid(format_args!(
             "{module}.weight_packed is {}; pack-quantized requires I32",
@@ -294,37 +327,29 @@ pub fn source_entries<'a>(
             shape.shape
         )));
     }
-    let name = crate::join_name(module, "weight_zero_point")?;
-    let present = header.tensors().get(&name);
-    let zero_point = match (zero_points, present) {
-        (ZeroPointSource::Symmetric, None) => None,
+    match (zero_points, zero_point) {
+        (ZeroPointSource::Symmetric, None) => {}
         (ZeroPointSource::PackedAlongOutput, Some(e)) => {
             if e.dtype != Dtype::I32 {
                 return Err(invalid(format_args!(
-                    "{name} is {}; a packed zero point is I32",
+                    "{module}.weight_zero_point is {}; a packed zero point is I32",
                     e.dtype.name()
                 )));
             }
-            Some(e)
         }
         (ZeroPointSource::Symmetric, Some(_)) => {
             return Err(invalid(format_args!(
-                "{module} is declared symmetric but serializes {name}; the config and the \
-                 tensor index disagree about this module's zero points"
+                "{module} is declared symmetric but serializes {module}.weight_zero_point; the \
+                 config and the tensor index disagree about this module's zero points"
             )));
         }
         (ZeroPointSource::PackedAlongOutput, None) => {
             return Err(invalid(format_args!(
-                "{module} is declared asymmetric but has no {name}"
+                "{module} is declared asymmetric but has no {module}.weight_zero_point"
             )));
         }
-    };
-    Ok(SourceEntries {
-        packed,
-        scale,
-        shape,
-        zero_point,
-    })
+    }
+    Ok(())
 }
 
 /// The declared shapes of one `pack-quantized` module, without its payloads.

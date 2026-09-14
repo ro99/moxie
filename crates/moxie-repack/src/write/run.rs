@@ -232,8 +232,33 @@ impl Run {
             }
         } else {
             faults.check(Site::DestinationCreate)?;
+            // Every directory this creates, deepest last, so each one's parent
+            // can be synced below: on Linux a new directory entry is durable
+            // only once the directory holding it is synced, and reporting
+            // `Published` while the destination's own existence is unconfirmed
+            // would be the same overstatement the durability outcome exists to
+            // avoid.
+            let mut created: Vec<PathBuf> = Vec::new();
+            let mut ancestor = dest.clone();
+            while !ancestor.exists() {
+                created.push(ancestor.clone());
+                match ancestor.parent() {
+                    Some(parent) => ancestor = parent.to_path_buf(),
+                    None => break,
+                }
+            }
             std::fs::create_dir_all(&dest)
                 .map_err(|e| invalid(format!("cannot create {}: {e}", dest.display())))?;
+            for made in created.iter().rev() {
+                if let Some(parent) = made.parent() {
+                    let handle = File::open(parent).map_err(|e| {
+                        invalid(format!("cannot open {} to sync it: {e}", parent.display()))
+                    })?;
+                    handle
+                        .sync_all()
+                        .map_err(|e| invalid(format!("cannot sync {}: {e}", parent.display())))?;
+                }
+            }
         }
 
         take_lock(&dest, options, faults)?;
@@ -307,6 +332,29 @@ impl Run {
     fn recover(&mut self, journal_path: &Path, faults: &Faults) -> Result<ResumeReport> {
         let text = moxie_storage::read_text_capped(journal_path, journal::MAX_JOURNAL_BYTES)?;
         let state: JournalState = journal::parse(&text)?;
+        // **Repair the tear before anything appends to it.** Parsing ignores a
+        // torn final line, but leaving it on disk means the next record is
+        // written onto the fragment and the journal becomes unparseable for
+        // good. An independent review reproduced exactly that: cancel, tear,
+        // resume, cancel, and the next resume could never read the journal
+        // again. The existing test ran straight through to publication, which
+        // deletes the journal and hid it.
+        if state.torn_tail_bytes > 0 {
+            let keep = text.len() - state.torn_tail_bytes;
+            let file = open_confined(&self.dest, JOURNAL_FILE, false)?;
+            file.set_len(keep as u64).map_err(|e| {
+                invalid(format!(
+                    "cannot truncate the torn journal {}: {e}",
+                    journal_path.display()
+                ))
+            })?;
+            file.sync_all().map_err(|e| {
+                invalid(format!(
+                    "cannot sync the repaired journal {}: {e}",
+                    journal_path.display()
+                ))
+            })?;
+        }
         let recorded = state.binding.clone().ok_or_else(|| {
             invalid("this journal records no plan: `begin` should have started over".into())
         })?;
@@ -374,10 +422,7 @@ impl Run {
                 .unwrap_or(0);
             if meta.len() > accounted {
                 report.truncated_bytes += meta.len() - accounted;
-                let file = OpenOptions::new()
-                    .write(true)
-                    .open(&path)
-                    .map_err(|e| invalid(format!("cannot truncate {}: {e}", path.display())))?;
+                let file = open_confined(&self.dest, name, false)?;
                 file.set_len(accounted)
                     .map_err(|e| invalid(format!("cannot truncate {}: {e}", path.display())))?;
                 file.sync_all()
@@ -552,12 +597,7 @@ impl Run {
 
         let path = self.dest.join(&planned.chunk);
         faults.check(Site::ChunkCreate)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|e| invalid(format!("cannot open chunk {}: {e}", path.display())))?;
+        let mut file = open_confined(&self.dest, &planned.chunk, false)?;
         write_at(&mut file, offset, bytes, faults)
             .map_err(|e| invalid(format!("cannot write {}: {e}", path.display())))?;
         faults.check(Site::ChunkSync)?;
@@ -663,8 +703,9 @@ impl Run {
         let staged = self.dest.join(STAGED_MANIFEST_FILE);
         faults.check(Site::ManifestWrite)?;
         {
-            let mut file = File::create(&staged)
-                .map_err(|e| invalid(format!("cannot create {}: {e}", staged.display())))?;
+            let mut file = open_confined(&self.dest, STAGED_MANIFEST_FILE, false)?;
+            file.set_len(0)
+                .map_err(|e| invalid(format!("cannot truncate {}: {e}", staged.display())))?;
             file.write_all(manifest_text.as_bytes())
                 .map_err(|e| invalid(format!("cannot write {}: {e}", staged.display())))?;
             faults.check(Site::ManifestSync)?;
@@ -678,6 +719,12 @@ impl Run {
         faults.check(Site::Validate)?;
         let artifact = Artifact::open_unpublished(&self.dest, &staged, ByteBudget::default())?;
         for t in &sealed {
+            // Validation reads every published byte, and a cancellation only
+            // observed after all of them is a cancellation nobody experiences.
+            if cancelled() {
+                let bytes = self.progress.values().map(|p| p.done).sum();
+                return self.cancel_with(bytes, ledger);
+            }
             let read = artifact.verify_tensor(&t.role, self.scratch.bytes_mut())?;
             if read != t.length {
                 return Err(invalid(format!(
@@ -796,53 +843,132 @@ fn open_journal(
     binding: &RunBinding,
     faults: &Faults,
 ) -> Result<File> {
+    let dest = path
+        .parent()
+        .ok_or_else(|| invalid("the journal has no destination directory".into()))?;
     if resuming {
-        return OpenOptions::new()
-            .append(true)
-            .open(path)
-            .map_err(|e| invalid(format!("cannot open {}: {e}", path.display())));
+        let file = open_confined(dest, JOURNAL_FILE, false)?;
+        let len = file
+            .metadata()
+            .map_err(|e| invalid(format!("cannot stat {}: {e}", path.display())))?
+            .len();
+        // Append by position rather than by `O_APPEND`, so that the torn-tail
+        // repair below can shorten the file and the next record still lands
+        // where the repair left off.
+        use std::io::Seek;
+        let mut file = file;
+        file.seek(std::io::SeekFrom::Start(len))
+            .map_err(|e| invalid(format!("cannot seek {}: {e}", path.display())))?;
+        return Ok(file);
     }
     faults.check(Site::JournalCreate)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|e| invalid(format!("cannot create {}: {e}", path.display())))?;
+    let mut file = open_confined(dest, JOURNAL_FILE, true)?;
     append_durably(&mut file, &journal::header_lines(binding), faults)?;
     Ok(file)
+}
+
+/// Open a file inside the destination for writing, refusing every escape
+/// **before** a byte is written.
+///
+/// Three checks, and all three are needed. The name must be a single component
+/// of the destination, checked on the string. The path must not already be a
+/// symlink, checked with `symlink_metadata`, which does not follow one. And the
+/// open itself passes `O_NOFOLLOW`, which closes the window between the two.
+///
+/// An independent review cancelled a run, replaced `.moxie-repack-manifest`
+/// with a symlink to an unrelated file and resumed: `File::create` followed it
+/// and truncated the target, and the escape was rejected afterwards -- by
+/// validation, after the damage. Confinement has to happen before the mutation,
+/// not after it.
+fn open_confined(dest: &Path, name: &str, create_new: bool) -> Result<File> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+        return Err(invalid(format!(
+            "'{name}' is not a single component of the destination"
+        )));
+    }
+    let path = dest.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(invalid(format!(
+                    "{} is a symbolic link: this run writes only files it created, and following \
+                     one would write outside the destination it was given",
+                    path.display()
+                )));
+            }
+            if !meta.is_file() {
+                return Err(invalid(format!("{} is not a regular file", path.display())));
+            }
+            if create_new {
+                return Err(invalid(format!("{} already exists", path.display())));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(invalid(format!("cannot stat {}: {e}", path.display())));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).truncate(false);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true);
+    }
+    #[cfg(unix)]
+    {
+        // `O_NOFOLLOW`: if the final component is a symbolic link, the open
+        // fails rather than following it. The stat above can go stale between
+        // the check and the open; this cannot.
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NOFOLLOW: i32 = 0o400000;
+        options.custom_flags(O_NOFOLLOW);
+    }
+    options
+        .open(&path)
+        .map_err(|e| invalid(format!("cannot open {}: {e}", path.display())))
 }
 
 /// Take the exclusive run lock, or explain who has it.
 fn take_lock(dest: &Path, options: &Options, faults: &Faults) -> Result<()> {
     let lock = dest.join(LOCK_FILE);
     faults.check(Site::LockAcquire)?;
-    match OpenOptions::new().write(true).create_new(true).open(&lock) {
-        Ok(mut file) => {
-            let _ = writeln!(file, "moxie-repack pid {}", std::process::id());
-            let _ = file.sync_all();
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if options.take_over_interrupted_run {
-                std::fs::remove_file(&lock).map_err(|e| {
-                    invalid(format!(
-                        "cannot remove the stale lock {}: {e}",
-                        lock.display()
-                    ))
-                })?;
-                take_lock(dest, &Options::default(), faults)
-            } else {
-                Err(invalid(format!(
-                    "{} exists: another run owns this destination, or one was interrupted. This \
-                     program cannot tell those apart -- that needs process liveness, which one \
-                     crate owns (ADR 0006) -- so continuing an interrupted run is an explicit \
-                     choice",
+    // `symlink_metadata` does not follow a link, so a lock file replaced by one
+    // is a refusal rather than a write somewhere else.
+    let held = match std::fs::symlink_metadata(&lock) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(invalid(format!(
+                    "{} is a symbolic link: a run lock is a file this program created",
                     lock.display()
-                )))
+                )));
             }
+            true
         }
-        Err(e) => Err(invalid(format!("cannot take {}: {e}", lock.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(invalid(format!("cannot stat {}: {e}", lock.display()))),
+    };
+    if held {
+        if !options.take_over_interrupted_run {
+            return Err(invalid(format!(
+                "{} exists: another run owns this destination, or one was interrupted. This \
+                 program cannot tell those apart -- that needs process liveness, which one \
+                 crate owns (ADR 0006) -- so continuing an interrupted run is an explicit \
+                 choice",
+                lock.display()
+            )));
+        }
+        std::fs::remove_file(&lock).map_err(|e| {
+            invalid(format!(
+                "cannot remove the stale lock {}: {e}",
+                lock.display()
+            ))
+        })?;
     }
+    let mut file = open_confined(dest, LOCK_FILE, true)?;
+    let _ = writeln!(file, "moxie-repack pid {}", std::process::id());
+    let _ = file.sync_all();
+    Ok(())
 }
 
 fn append_durably(file: &mut File, line: &str, faults: &Faults) -> Result<()> {
@@ -871,4 +997,3 @@ fn write_at(file: &mut File, offset: u64, bytes: &[u8], faults: &Faults) -> std:
         file.write_all(bytes)
     }
 }
-

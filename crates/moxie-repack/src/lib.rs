@@ -45,6 +45,7 @@ pub mod write;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::write::{Faults, Outcome, OutputPlan, Run, Start, TensorRequest, WriteBudget};
 use moxie_format::affine::Grouping;
 use moxie_format::compressed_tensors::{
     DeclaredSource, PackQuantizedPlan, ZeroPointSource, decode_weight_shape, scale_dtype_of,
@@ -61,7 +62,6 @@ use moxie_format::scale::ScaleDtype;
 use moxie_format::selection::{Selection, SelectionKind};
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_storage::{Artifact, ByteBudget, HeaderBudget};
-use crate::write::{Faults, Outcome, OutputPlan, Run, Start, TensorRequest, WriteBudget};
 use moxie_types::{HostTier, Result, Scope, Tier};
 
 use crate::source::{Sources, invalid};
@@ -97,6 +97,45 @@ pub struct Budgets {
 }
 
 impl Budgets {
+    /// What this program allocates besides its payload tiles, bounded.
+    ///
+    /// One source header at the declared budget, the selection text, the
+    /// manifest text and the journal buffer. Every one of them is capped by a
+    /// constant this repository already declares, so the floor is arithmetic
+    /// rather than a guess.
+    pub fn metadata_floor_bytes(&self) -> u64 {
+        self.header_bytes
+            + moxie_format::selection::MAX_SELECTION_BYTES as u64
+            + moxie_format::manifest::MAX_MANIFEST_BYTES as u64
+    }
+
+    /// Refuse a budget that cannot hold what the run will hold.
+    ///
+    /// An independent review published with `--total-bytes 2048` -- consumed
+    /// entirely by the three admitted buffers, with every header, selection,
+    /// plan and manifest allocation outside the ledger -- and inspected with a
+    /// total of zero. A total that does not cover the working set is not an
+    /// admission, it is a number.
+    pub fn validate(&self) -> Result<()> {
+        if self.scratch_bytes == 0 || self.header_bytes == 0 || self.chunk_file_bytes == 0 {
+            return Err(invalid(
+                "every budget must be positive: a zero budget admits nothing and refuses nothing"
+                    .into(),
+            ));
+        }
+        let tiles = 3u64 * self.scratch_bytes as u64 / 2;
+        let need = tiles + self.metadata_floor_bytes();
+        if self.total_bytes < need {
+            return Err(invalid(format!(
+                "--total-bytes {} cannot hold this run: {tiles} byte(s) of payload tiles plus at \
+                 most {} of header, selection and manifest. Admit at least {need}",
+                self.total_bytes,
+                self.metadata_floor_bytes()
+            )));
+        }
+        Ok(())
+    }
+
     /// Bytes for one tile of the payload scratch. Two tiles are live at once --
     /// the source bytes and the canonical bytes they convert into -- so each is
     /// half of what was admitted.
@@ -288,6 +327,39 @@ pub fn resolve(selection: &Selection, sources: &mut Sources) -> Result<Vec<Resol
 
                 let (packed_file, packed_name) = named("weight_packed")?;
                 let packed = sources.entry(&packed_file, &packed_name)?;
+
+                // The importer's own entry rules, applied to entries resolved
+                // across shards. An independent review published a module whose
+                // packed codes and zero points were declared F32 and whose
+                // shape was F64, and published a symmetric selection over a
+                // source carrying zero points -- because this path looked at
+                // shapes and never at what the single-header resolver checks.
+                // The zero-point entry passed in is the one the **source**
+                // carries, found wherever the selection's files put it, not the
+                // one the selection expected.
+                let zero_point_name = format!("{module}.weight_zero_point");
+                let declared_zero_point = match files.get("weight_zero_point") {
+                    Some(file) => sources
+                        .declares(file, &zero_point_name)?
+                        .then(|| sources.raw_entry(file, &zero_point_name))
+                        .transpose()?,
+                    // A symmetric selection names no zero-point file, so the
+                    // companion is looked for beside the codes, which is where
+                    // every inspected writer puts it.
+                    None => sources
+                        .declares(&packed_file, &zero_point_name)?
+                        .then(|| sources.raw_entry(&packed_file, &zero_point_name))
+                        .transpose()?,
+                };
+                let packed_entry = sources.raw_entry(&packed_file, &packed_name)?;
+                let shape_entry = sources.raw_entry(&shape_file, &shape_name)?;
+                moxie_format::compressed_tensors::validate_source_entries(
+                    module,
+                    &packed_entry,
+                    &shape_entry,
+                    declared_zero_point.as_ref(),
+                    spec.zero_points,
+                )?;
                 let (scale_file, scale_name) = named("weight_scale")?;
                 let scale = sources.entry(&scale_file, &scale_name)?;
                 let scale_dtype = scale_dtype_of(scale.dtype)?;
@@ -394,7 +466,15 @@ pub fn resolve(selection: &Selection, sources: &mut Sources) -> Result<Vec<Resol
 }
 
 /// Build the output plan from resolved tensors.
-pub fn output_plan(resolved: &[Resolved], budget: &WriteBudget) -> Result<OutputPlan> {
+///
+/// `overhead_bytes` is the bound on what the run writes **besides** payload --
+/// the journal and the staged manifest -- so that the disk budget covers the
+/// whole plan rather than the part that is easy to count.
+pub fn output_plan(
+    resolved: &[Resolved],
+    budget: &WriteBudget,
+    overhead_bytes: u64,
+) -> Result<OutputPlan> {
     let requests = resolved
         .iter()
         .map(|r| TensorRequest {
@@ -406,7 +486,71 @@ pub fn output_plan(resolved: &[Resolved], budget: &WriteBudget) -> Result<Output
             alignment: r.alignment,
         })
         .collect();
-    OutputPlan::build(requests, budget)
+    OutputPlan::build(requests, budget, overhead_bytes)
+}
+
+/// Refuse a destination that overlaps the source root, either way round.
+///
+/// The destination usually does not exist yet, so the nearest existing ancestor
+/// is what gets canonicalized: a path under `/fast/models/...` that has not been
+/// created is still a path under the checkpoint root.
+pub fn separate_source_and_destination(source_root: &Path, destination: &Path) -> Result<()> {
+    // The destination usually does not exist yet, so the nearest existing
+    // ancestor is canonicalized and the missing components are put back on.
+    // Comparing the ancestor itself would refuse every destination that merely
+    // shares a parent directory with the source.
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = destination.to_path_buf();
+    let mut dest = loop {
+        if let Ok(canonical) = probe.canonicalize() {
+            break canonical;
+        }
+        match (probe.file_name(), probe.parent()) {
+            (Some(name), Some(parent)) if parent != probe => {
+                missing.push(name.to_os_string());
+                probe = parent.to_path_buf();
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "no part of {} resolves to a real directory",
+                    destination.display()
+                )));
+            }
+        }
+    };
+    for name in missing.iter().rev() {
+        dest.push(name);
+    }
+    if dest.starts_with(source_root) || source_root.starts_with(&dest) {
+        return Err(invalid(format!(
+            "the destination {} overlaps the source root {}: checkpoint roots are read-only \
+             inputs, and a repack never writes inside the artifact it is reading",
+            dest.display(),
+            source_root.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The journal and staged manifest a run of this shape can write, bounded.
+///
+/// Both are proportional to counts this program already knows -- units and
+/// tensors -- and both are removed at publication. The disk budget is checked
+/// against payload **plus** this, because a budget that covers only the part
+/// that is easy to count is not a budget.
+pub fn overhead_bound(resolved: &[Resolved], budgets: &Budgets) -> Result<u64> {
+    let mut units = 0u64;
+    let mut group_index_entries = 0u64;
+    for r in resolved {
+        units += work::unit_count(r, budgets.tile_bytes())? as u64;
+        if let Some(a) = &r.affine
+            && let Some(map) = &a.group_index
+        {
+            group_index_entries += map.len() as u64;
+        }
+    }
+    let estimate = StagingEstimate::of(0, units, resolved.len() as u64, group_index_entries);
+    Ok(estimate.journal_bound_bytes + estimate.manifest_bound_bytes)
 }
 
 /// A write budget from the program's budgets.
@@ -437,9 +581,10 @@ pub fn inspect(
     sources: &mut Sources,
     budgets: &Budgets,
 ) -> Result<InspectReport> {
+    budgets.validate()?;
     let write = write_budget(budgets)?;
     let resolved = resolve(selection, sources)?;
-    let plan = output_plan(&resolved, &write)?;
+    let plan = output_plan(&resolved, &write, overhead_bound(&resolved, budgets)?)?;
     let mut tensors = Vec::with_capacity(resolved.len());
     for (r, planned) in resolved.iter().zip(plan.tensors()) {
         tensors.push(TensorReport {
@@ -573,6 +718,12 @@ pub struct RepackReport {
 }
 
 /// The whole offline workflow: convert, validate, publish.
+///
+/// A wrapper around the workflow whose only job is that **no failure leaves a
+/// reservation outstanding**. An independent review injected the first
+/// chunk-write failure and found all three charges still held: the early `?`
+/// returns walked past the release at the end. Cleanup that lives at the end of
+/// a function only runs for the paths that reach it.
 #[allow(clippy::too_many_arguments)]
 pub fn repack(
     selection: &Selection,
@@ -585,18 +736,66 @@ pub fn repack(
     ledger: &mut Ledger,
     progress: &mut dyn FnMut(&str),
 ) -> Result<RepackReport> {
+    budgets.validate()?;
+    let mut buffers = work::Buffers::admit(ledger, budgets)?;
+    let mut run_slot: Option<Run> = None;
+    let result = repack_inner(
+        selection,
+        sources,
+        destination,
+        budgets,
+        options,
+        faults,
+        cancelled,
+        ledger,
+        progress,
+        &mut buffers,
+        &mut run_slot,
+    );
+    // Whatever happened, give back what was admitted. A run still in the slot
+    // is one that neither published nor cancelled, so it is abandoned: its
+    // staged state stays on disk and remains resumable, which is the whole
+    // point of the journal.
+    if let Some(run) = run_slot.take() {
+        let _ = run.abandon(ledger);
+    }
+    let _ = buffers.release(ledger);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn repack_inner(
+    selection: &Selection,
+    sources: &mut Sources,
+    destination: &Path,
+    budgets: &Budgets,
+    options: &crate::write::Options,
+    faults: &Faults,
+    cancelled: &dyn Fn() -> bool,
+    ledger: &mut Ledger,
+    progress: &mut dyn FnMut(&str),
+    buffers: &mut work::Buffers,
+    run_slot: &mut Option<Run>,
+) -> Result<RepackReport> {
+    budgets.validate()?;
+    // The destination may not be the source, or inside it, or hold it. A repack
+    // that publishes beneath the checkpoint it is reading is writing into a
+    // read-only input, and an independent review found that publishing beneath
+    // the source root succeeded. Checked on canonical paths, so a symlink into
+    // the source root is caught with the rest.
+    separate_source_and_destination(sources.root(), destination)?;
     let write = write_budget(budgets)?;
     let resolved = resolve(selection, sources)?;
-    let plan = output_plan(&resolved, &write)?;
+    let plan = output_plan(&resolved, &write, overhead_bound(&resolved, budgets)?)?;
 
     // Source identity before anything is written: the whole-file digests the
     // manifest will record, which are also what binds a resume. Hashing a
     // whole file is deliberate -- `source.files.sha256` means "this file", and
     // a digest of the ranges this run happened to read is not that.
-    let mut buffers = work::Buffers::admit(ledger, budgets)?;
     let mut source_digests: Vec<(String, String)> = Vec::new();
     for file in selection.files() {
-        let (digest, bytes) = sources.file_digest(&file, buffers.source_tile_mut())?;
+        let (digest, bytes) =
+            sources.file_digest_cancellable(&file, buffers.source_tile_mut(), cancelled)?;
         progress(&format!(
             "hashed source {file}: {bytes} byte(s) -> {digest}"
         ));
@@ -614,16 +813,18 @@ pub fn repack(
     };
 
     let start = Run::begin(destination, plan, binding, write, options, ledger, faults)?;
-    let (mut run, resumed, units_reused, resume_detail) = match start {
+    let (resumed, units_reused, resume_detail) = match start {
         Start::AlreadyPublished { artifact } => {
-            buffers.release(ledger)?;
             return Err(invalid(format!(
                 "{} already holds a published manifest: this slice never overwrites a published \
                  artifact and never updates a model in place",
                 artifact.display()
             )));
         }
-        Start::Fresh(run) => (run, false, 0, Vec::new()),
+        Start::Fresh(run) => {
+            *run_slot = Some(run);
+            (false, 0, Vec::new())
+        }
         Start::Resumed(run, report) => {
             let mut detail = vec![format!(
                 "resumed: {} unit(s) and {} byte(s) reused; {} byte(s) past the journal \
@@ -638,7 +839,8 @@ pub fn repack(
             for line in &detail {
                 progress(line);
             }
-            (run, true, report.reused_units, detail)
+            *run_slot = Some(run);
+            (true, report.reused_units, detail)
         }
     };
 
@@ -646,11 +848,10 @@ pub fn repack(
     let mut bytes_written = 0u64;
     let before_read = sources.bytes_read();
     for r in &resolved {
-        let done = run.bytes_done(&r.role)?;
+        let done = run_slot.as_ref().expect("a run").bytes_done(&r.role)?;
         for unit in work::units_of(r, budgets.tile_bytes())? {
             if cancelled() {
-                let outcome = run.cancel(ledger)?;
-                buffers.release(ledger)?;
+                let outcome = run_slot.take().expect("a run").cancel(ledger)?;
                 return Ok(RepackReport {
                     outcome,
                     artifact_identity: String::new(),
@@ -677,9 +878,12 @@ pub fn repack(
                     r.role, unit.canonical_offset, done
                 )));
             }
-            let source_sha = work::convert_unit(r, &unit, sources, &mut buffers, ledger)?;
+            let source_sha = work::convert_unit(r, &unit, sources, buffers, ledger)?;
             let bytes = buffers.canonical(unit.canonical_len);
-            run.write_unit(&r.role, bytes, &source_sha, faults)?;
+            run_slot
+                .as_mut()
+                .expect("a run")
+                .write_unit(&r.role, bytes, &source_sha, faults)?;
             units_written += 1;
             bytes_written += unit.canonical_len as u64;
             // One line per durable unit, which is also the boundary the
@@ -691,12 +895,22 @@ pub fn repack(
         }
     }
 
-    let sealed = run.seal()?;
+    // **Before anything is exposed, hash every source again.** The digests
+    // recorded above describe the files as they were when the run started; a
+    // source that changed since would otherwise be published under a digest
+    // that describes bytes nobody has. This is a second full pass over every
+    // source file, and that cost is the price of the claim.
+    progress("re-hashing every source to confirm it did not change");
+    sources.verify_unchanged(&source_digests, buffers.source_tile_mut(), cancelled)?;
+
+    let sealed = run_slot.as_mut().expect("a run").seal()?;
     let manifest = build_manifest(selection, &resolved, &sealed, &source_digests)?;
     let text = manifest::encode(&manifest)?;
     let artifact_identity = manifest::artifact_identity(&manifest);
-    let outcome = run.publish(&text, cancelled, faults, ledger)?;
-    buffers.release(ledger)?;
+    let outcome = run_slot
+        .take()
+        .expect("a run")
+        .publish(&text, cancelled, faults, ledger)?;
     Ok(RepackReport {
         outcome,
         artifact_identity,

@@ -40,11 +40,103 @@ pub enum UnitSource {
     Zeros { start: usize, end: usize },
 }
 
+/// The smallest payload tile this tensor can be converted with.
+///
+/// A zero-point block must cover whole source words, because one word holds
+/// several consecutive **output channels**; so the minimum is a word's worth of
+/// canonical zero points, not a row's. An independent review passed
+/// `--scratch-bytes 8` for an asymmetric INT4 `[8,8]` per-channel fixture and
+/// got exit 101: the block was forced to a word and the slice that received it
+/// held four bytes. A budget too small to do the work is a refusal with a
+/// number in it, stated before anything is created -- not a panic partway
+/// through.
+pub fn minimum_tile_bytes(tensor: &Resolved) -> Result<usize> {
+    Ok(match &tensor.kind {
+        ResolvedKind::Bf16 { .. } => 1,
+        ResolvedKind::PackQuantized { plan, section, .. } => {
+            let codes = plan
+                .source_code_row_bytes()
+                .max(plan.canonical_code_row_bytes());
+            let scales = plan.scale_row_bytes();
+            let zeros = if *section == ZeroPointSection::PerGroup {
+                let per_word = plan.zero_points_per_word();
+                plan.canonical_zero_point_row_bytes()
+                    .checked_mul(per_word)
+                    .ok_or_else(|| invalid("zero-point block size overflows".into()))?
+                    .max(plan.source_zero_point_word_row_bytes())
+            } else {
+                0
+            };
+            codes.max(scales).max(zeros).max(1)
+        }
+    })
+}
+
+/// How many units a tensor takes, **without building them**.
+///
+/// Inspection needs the count and the disk plan needs it; neither needs the
+/// list. An independent review found `units_of` materializing every unit of
+/// every tensor -- an allocation that grows with the conversion, in a program
+/// whose budget is supposed to bound exactly that.
+pub fn unit_count(tensor: &Resolved, tile: usize) -> Result<usize> {
+    let need = minimum_tile_bytes(tensor)?;
+    if tile < need {
+        return Err(invalid(format!(
+            "tensor '{}' needs at least {need} byte(s) of payload tile and this run admitted \
+             {tile}: raise --scratch-bytes to at least {}",
+            tensor.role,
+            need * 2
+        )));
+    }
+    Ok(match &tensor.kind {
+        ResolvedKind::Bf16 { len, .. } => (*len as usize).div_ceil(tile.max(1)),
+        ResolvedKind::PackQuantized { plan, section, .. } => {
+            let rows = plan.out_features();
+            let codes = rows.div_ceil(block_rows(
+                tile,
+                plan.source_code_row_bytes()
+                    .max(plan.canonical_code_row_bytes()),
+                1,
+            ));
+            let scales = rows.div_ceil(block_rows(tile, plan.scale_row_bytes(), 1));
+            let zeros = if *section == ZeroPointSection::PerGroup {
+                rows.div_ceil(block_rows(
+                    tile,
+                    plan.canonical_zero_point_row_bytes()
+                        .max(plan.source_zero_point_word_row_bytes()),
+                    plan.zero_points_per_word(),
+                ))
+            } else {
+                0
+            };
+            codes + scales + zeros
+        }
+    })
+}
+
+/// Rows per block, rounded down to a multiple of `granularity`.
+///
+/// One definition, used by the counter and by the splitter, so the two can
+/// never disagree about how many units there are.
+fn block_rows(tile: usize, per_row: usize, granularity: usize) -> usize {
+    let rows = (tile / per_row.max(1)).max(1);
+    (rows / granularity.max(1)).max(1) * granularity.max(1)
+}
+
 /// Split one resolved tensor into units no larger than `tile`.
 ///
 /// The three sections are consecutive, in ADR 0023's order, so concatenating
 /// every unit's bytes is exactly the canonical payload.
 pub fn units_of(tensor: &Resolved, tile: usize) -> Result<Vec<Unit>> {
+    let need = minimum_tile_bytes(tensor)?;
+    if tile < need {
+        return Err(invalid(format!(
+            "tensor '{}' needs at least {need} byte(s) of payload tile and this run admitted \
+             {tile}: raise --scratch-bytes to at least {} so that both tiles fit",
+            tensor.role,
+            need * 2
+        )));
+    }
     let tile = tile.max(1);
     let mut units = Vec::new();
     match &tensor.kind {
@@ -72,7 +164,7 @@ pub fn units_of(tensor: &Resolved, tile: usize) -> Result<Vec<Unit>> {
             let per_row = plan
                 .source_code_row_bytes()
                 .max(plan.canonical_code_row_bytes());
-            let block = (tile / per_row.max(1)).max(1);
+            let block = block_rows(tile, per_row, 1);
             let mut at = ext.codes().start as u64;
             let mut row = 0;
             while row < rows {
@@ -89,7 +181,7 @@ pub fn units_of(tensor: &Resolved, tile: usize) -> Result<Vec<Unit>> {
 
             // Scales.
             let per_row = plan.scale_row_bytes().max(1);
-            let block = (tile / per_row).max(1);
+            let block = block_rows(tile, per_row, 1);
             let mut at = ext.scales().start as u64;
             let mut row = 0;
             while row < rows {
@@ -114,7 +206,7 @@ pub fn units_of(tensor: &Resolved, tile: usize) -> Result<Vec<Unit>> {
                     .canonical_zero_point_row_bytes()
                     .max(plan.source_zero_point_word_row_bytes())
                     .max(1);
-                let block = ((tile / per_row).max(1) / per_word).max(1) * per_word;
+                let block = block_rows(tile, per_row, per_word);
                 let mut at = ext
                     .zero_points()
                     .expect("an asymmetric tensor has the section")
@@ -157,13 +249,30 @@ pub struct Buffers {
     canonical: HostBuffer,
     columns: Vec<i32>,
     columns_charge: Option<Reservation>,
+    /// The whole-run metadata charge: headers, selection, manifest.
+    metadata_charge: Option<Reservation>,
 }
 
 impl Buffers {
-    /// Admit both tiles. The column scratch starts empty and grows once, to
-    /// the widest row any tensor has, when the first conversion needs it.
+    /// Admit both tiles **and the metadata this run holds beside them**.
+    ///
+    /// Headers, the selection text, the plan and the manifest are allocations
+    /// this program makes for the whole run, and an independent review found
+    /// every one of them outside the ledger -- so a 2,048-byte total admitted
+    /// three buffers and accounted for nothing else. They are charged here, at
+    /// the caps the format crate declares, and released with the tiles.
     pub fn admit(ledger: &mut Ledger, budgets: &Budgets) -> Result<Self> {
         let tile = budgets.tile_bytes();
+        let metadata = budgets.metadata_floor_bytes();
+        let mut plan = PlanRequest::new("repack metadata", ["live"])?;
+        plan.buffer(BufferRequest::new(
+            "headers, selection and manifest",
+            Scope::Host,
+            Tier::Host(HostTier::Pageable),
+            metadata,
+            StageSpan::at(0),
+        ))?;
+        let metadata_charge = ledger.admit(&plan).map_err(moxie_types::Error::from)?;
         let source =
             HostBuffer::allocate_in(ledger, "repack source tile", HostTier::Pageable, tile, 0)?;
         let canonical =
@@ -173,6 +282,7 @@ impl Buffers {
             canonical,
             columns: Vec::new(),
             columns_charge: None,
+            metadata_charge: Some(metadata_charge),
         })
     }
 
@@ -224,9 +334,18 @@ impl Buffers {
     }
 
     /// Give every admitted byte back.
+    ///
+    /// Tolerant of being called twice: the failure path calls it after an
+    /// error that may already have released, and a cleanup that panics on a
+    /// second call is a cleanup nobody can put in an error path.
     pub fn release(&mut self, ledger: &mut Ledger) -> Result<()> {
-        self.source.release(ledger)?;
-        self.canonical.release(ledger)?;
+        let _ = self.source.release(ledger);
+        let _ = self.canonical.release(ledger);
+        if let Some(charge) = self.metadata_charge.take() {
+            ledger
+                .release(charge)
+                .map_err(|e| invalid(format!("cannot release the metadata charge: {e:?}")))?;
+        }
         if let Some(charge) = self.columns_charge.take() {
             ledger
                 .release(charge)
