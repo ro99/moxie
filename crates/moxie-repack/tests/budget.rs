@@ -5,6 +5,12 @@
 //! two tests measuring it in one process race and neither number means
 //! anything. That is task 0024's lesson, in the file that would repeat it.
 //!
+//! One executable was not enough. The two tests here still ran concurrently,
+//! and both reset the peak, so a run could read a peak *below* the live bytes
+//! it started from and subtract past zero -- which is how this file failed.
+//! Every measurement now takes `MEASURING` first: inside that lock, the peak
+//! belongs to one test.
+//!
 //! What is measured here is peak **live** heap across a whole repack, not the
 //! number of allocations: a bounded converter is one whose working set does
 //! not grow with the tensor, and a tensor many times the scratch is the case
@@ -56,6 +62,24 @@ unsafe impl GlobalAlloc for Counter {
 
 #[global_allocator]
 static A: Counter = Counter;
+
+/// Held for the whole of one measurement, so no other test resets the peak
+/// underneath it.
+static MEASURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `body` as the only measured work in this process, and report what the
+/// peak rose to above the live bytes it started from.
+fn measure<T>(body: impl FnOnce() -> T) -> (T, usize, usize) {
+    // A poisoned lock means another test panicked, which is already a failure
+    // being reported; it does not make this measurement wrong.
+    let guard = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
+    let before = LIVE.load(SeqCst);
+    PEAK.store(before, SeqCst);
+    let out = body();
+    let peak = PEAK.load(SeqCst);
+    drop(guard);
+    (out, peak.saturating_sub(before), before)
+}
 
 /// One BF16 tensor many times the payload scratch, plus a quantized module.
 fn fixture(scratch: &Scratch, elements: usize) -> (Module, std::path::PathBuf) {
@@ -165,21 +189,20 @@ fn a_repack_holds_its_budget_and_gives_every_admitted_byte_back() {
         moxie_repack::open_sources(&scratch.join("src"), &budgets).expect("the sources");
     let mut ledger = moxie_repack::ledger_for(&budgets).expect("a ledger");
 
-    let before = LIVE.load(SeqCst);
-    PEAK.store(before, SeqCst);
-    let report = moxie_repack::repack(
-        &selection,
-        &mut sources,
-        &out,
-        &budgets,
-        &Options::default(),
-        &Faults::none(),
-        &|| false,
-        &mut ledger,
-        &mut |_| {},
-    )
-    .expect("it publishes");
-    let peak = PEAK.load(SeqCst) - before;
+    let (report, peak, before) = measure(|| {
+        moxie_repack::repack(
+            &selection,
+            &mut sources,
+            &out,
+            &budgets,
+            &Options::default(),
+            &Faults::none(),
+            &|| false,
+            &mut ledger,
+            &mut |_| {},
+        )
+        .expect("it publishes")
+    });
     let after = LIVE.load(SeqCst);
 
     assert!(
@@ -281,28 +304,28 @@ fn repeated_cancellation_and_resume_grow_neither_heap_nor_disk() {
         let seen = std::cell::Cell::new(0usize);
         let cancel = |_: &str| {};
         let cancelled = || seen.get() >= stop_after;
-        let before = LIVE.load(SeqCst);
-        PEAK.store(before, SeqCst);
-        let report = moxie_repack::repack(
-            &selection,
-            &mut sources,
-            &out,
-            &budgets,
-            &Options {
-                take_over_interrupted_run: true,
-            },
-            &Faults::none(),
-            &cancelled,
-            &mut ledger,
-            &mut |line: &str| {
-                if line.starts_with("unit ") {
-                    seen.set(seen.get() + 1);
-                }
-                cancel(line);
-            },
-        );
+        let (report, peak, _) = measure(|| {
+            moxie_repack::repack(
+                &selection,
+                &mut sources,
+                &out,
+                &budgets,
+                &Options {
+                    take_over_interrupted_run: true,
+                },
+                &Faults::none(),
+                &cancelled,
+                &mut ledger,
+                &mut |line: &str| {
+                    if line.starts_with("unit ") {
+                        seen.set(seen.get() + 1);
+                    }
+                    cancel(line);
+                },
+            )
+        });
         let report = report.expect("each attempt either cancels or publishes");
-        peaks.push(PEAK.load(SeqCst) - before);
+        peaks.push(peak);
         disks.push(scratch.bytes_used());
         assert!(
             ledger.outstanding().is_empty(),

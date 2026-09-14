@@ -246,6 +246,44 @@ fn bytes(raw: &str) -> Result<u64, String> {
 /// type one: every value in it is already in the checkpoint's `config.json` and
 /// its shard headers. This reads those, writes the file, and says what it left
 /// out and why. It converts nothing.
+/// Refuse a plan whose output would land inside the checkpoint it describes.
+///
+/// A checkpoint is a **read-only input**. Writing the plan, or the staging file
+/// beside it, into that directory would leave this program's own output among
+/// the source files it later hashes, and would modify a directory the user did
+/// not offer for writing.
+///
+/// The directory is what is compared, canonically, because the plan file itself
+/// does not exist yet and because `../` and symbolic links make a textual
+/// comparison say whatever the path was spelled like.
+fn plan_output_outside(root: &std::path::Path, out: &std::path::Path) -> Result<(), String> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", root.display()))?;
+    let parent = match out.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let canonical_parent = parent.canonicalize().map_err(|e| {
+        format!(
+            "cannot resolve {} to write {} into: {e}",
+            parent.display(),
+            out.display()
+        )
+    })?;
+    if canonical_parent.starts_with(&canonical_root) {
+        return Err(format!(
+            "{} is inside the checkpoint at {}. A checkpoint is a read-only input here, so the \
+             plan is written outside it: run this from another directory, or pass --out-plan with \
+             a path outside {}",
+            canonical_parent.display(),
+            canonical_root.display(),
+            canonical_root.display()
+        ));
+    }
+    Ok(())
+}
+
 fn command_plan(flags: &mut Flags) -> i32 {
     let Some(root) = flags.source_root.clone() else {
         eprintln!("moxie-repack: plan needs --source-root");
@@ -279,6 +317,19 @@ fn command_plan(flags: &mut Flags) -> i32 {
                 .unwrap_or_else(|| "checkpoint".into());
             std::path::PathBuf::from(format!("./{leaf}.plan.toml"))
         });
+    // **Checked before anything is created or removed.** The comment above says
+    // never inside the source root; nothing enforced it. The default resolves
+    // against the current directory, so running `plan` from inside a checkpoint
+    // wrote the plan into the checkpoint -- independent review did exactly that
+    // -- and an explicit `--out-plan` pointing in there had the same gap. The
+    // staging file shares this directory, so this one check covers both.
+    match plan_output_outside(&root, &out_selection) {
+        Ok(()) => {}
+        Err(why) => {
+            eprintln!("moxie-repack: {why}");
+            return 1;
+        }
+    }
     if out_selection.exists() && !flags.force {
         eprintln!(
             "moxie-repack: {} already exists. Pass --force to replace it, or name another path \
@@ -306,7 +357,14 @@ fn command_plan(flags: &mut Flags) -> i32 {
         let (revision, recorded_digests) =
             moxie_repack::discover::recorded_provenance(&root, &discovery.files);
         let binding = moxie_repack::discover::SourceBinding {
-            root: root.to_string_lossy().into_owned(),
+            // **Absolute.** A relative root recorded as given resolves against
+            // whatever directory the second command runs from, which is not
+            // where the plan was made.
+            root: root
+                .canonicalize()
+                .unwrap_or_else(|_| root.clone())
+                .to_string_lossy()
+                .into_owned(),
             model,
             revision,
             license: "see the checkpoint's own licence files".into(),
@@ -319,9 +377,21 @@ fn command_plan(flags: &mut Flags) -> i32 {
             recorded_digests,
             // Derived from the checkpoint, and overridden by any flag the user
             // gave: explicit always wins over automatic.
-            options: flags
-                .budgets()
-                .unwrap_or_else(|_| moxie_repack::discover::automatic_budgets(&discovery)),
+            // Automatic, with any flag the user gave overriding **that field**.
+            // All-or-nothing fallback discarded a lone `--disk-bytes`.
+            options: {
+                let auto = moxie_repack::discover::automatic_budgets(&discovery)?;
+                moxie_repack::Budgets {
+                    total_bytes: flags.total_bytes.unwrap_or(auto.total_bytes),
+                    header_bytes: flags.header_bytes.unwrap_or(auto.header_bytes),
+                    scratch_bytes: flags
+                        .scratch_bytes
+                        .map(|v| v as usize)
+                        .unwrap_or(auto.scratch_bytes),
+                    chunk_file_bytes: flags.chunk_file_bytes.unwrap_or(auto.chunk_file_bytes),
+                    disk_bytes: flags.disk_bytes.unwrap_or(auto.disk_bytes),
+                }
+            },
         };
         let text = moxie_repack::discover::to_plan_toml(&discovery, &binding)?;
         Ok((discovery, text))
@@ -347,8 +417,46 @@ fn command_plan(flags: &mut Flags) -> i32 {
             // Published by rename: a plan is either the whole document or it
             // is not there, never a half-written file a second command would
             // read.
+            // **Create it, never open what is already there.** `fs::write`
+            // follows a symlink, so a staging path that someone has pointed
+            // into the read-only checkpoint would be written through before the
+            // rename ever happened -- independent review overwrote a
+            // `config.json` that way. `create_new` refuses any existing path,
+            // symlink included, and `O_NOFOLLOW` closes the window between the
+            // check and the open.
             let staging = out_selection.with_extension("toml.partial");
-            if let Err(e) = std::fs::write(&staging, &text)
+            match std::fs::symlink_metadata(&staging) {
+                // A symbolic link here is not a leftover, it is a redirection.
+                Ok(m) if m.file_type().is_symlink() => {
+                    println!("outcome: refused");
+                    eprintln!(
+                        "moxie-repack: {} is a symbolic link. This program writes only files it \
+                         creates, and following one would write wherever it points",
+                        staging.display()
+                    );
+                    return 2;
+                }
+                // A leftover from an interrupted plan is ours to clear.
+                Ok(_) => {
+                    if let Err(e) = std::fs::remove_file(&staging) {
+                        println!("outcome: refused");
+                        eprintln!("moxie-repack: cannot clear {}: {e}", staging.display());
+                        return 2;
+                    }
+                }
+                Err(_) => {}
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                const O_NOFOLLOW: i32 = 0o400000;
+                options.custom_flags(O_NOFOLLOW);
+            }
+            if let Err(e) = options
+                .open(&staging)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
                 .and_then(|()| std::fs::rename(&staging, &out_selection))
             {
                 let _ = std::fs::remove_file(&staging);
@@ -379,10 +487,14 @@ fn command_plan(flags: &mut Flags) -> i32 {
             }
             println!();
             println!("Read it, edit it if you want, then:");
+            // **The two-command form.** This printed the advanced invocation --
+            // `--selection`, `--source-root` and five budgets -- which is the
+            // one this task exists to stop a normal user needing. The plan
+            // carries the root and the budgets; the second command needs
+            // neither.
             println!(
-                "  moxie-repack repack --selection {} --source-root {} --out <dir> <budgets>",
-                out_selection.display(),
-                root.display()
+                "  moxie-repack repack --plan {} --out <dir>",
+                out_selection.display()
             );
             0
         }
@@ -506,6 +618,36 @@ fn print_inspect(r: &InspectReport, budgets: &Budgets) {
     println!("outcome: inspected");
 }
 
+impl Flags {
+    /// Budgets from the command line, falling back **field by field** to what a
+    /// plan recorded.
+    ///
+    /// Precedence is what the docs promise: flag, then plan, then the automatic
+    /// value the plan already resolved. All-or-nothing fallback made that
+    /// promise false.
+    fn merged_budgets(&self, plan: Option<[u64; 5]>) -> Result<Budgets, String> {
+        let pick = |flag: Option<u64>, index: usize, name: &str| -> Result<u64, String> {
+            match (flag, plan) {
+                (Some(v), _) => Ok(v),
+                (None, Some(p)) => Ok(p[index]),
+                (None, None) => Err(format!(
+                    "{name} is required: this document records no resolved options, so every \
+                     budget has to be given"
+                )),
+            }
+        };
+        let scratch = pick(self.scratch_bytes, 2, "--scratch-bytes")?;
+        Ok(Budgets {
+            total_bytes: pick(self.total_bytes, 0, "--total-bytes")?,
+            header_bytes: pick(self.header_bytes, 1, "--header-bytes")?,
+            scratch_bytes: usize::try_from(scratch)
+                .map_err(|_| "--scratch-bytes does not fit this platform".to_string())?,
+            chunk_file_bytes: pick(self.chunk_file_bytes, 3, "--chunk-file-bytes")?,
+            disk_bytes: pick(self.disk_bytes, 4, "--disk-bytes")?,
+        })
+    }
+}
+
 fn command_repack(flags: &mut Flags) -> i32 {
     // Two ways in. `--plan` is the normal one: the plan carries where its
     // checkpoint is and what it resolved, so neither is asked for twice.
@@ -555,23 +697,18 @@ fn command_repack(flags: &mut Flags) -> i32 {
             }
         },
     };
-    // The plan's resolved options, unless flags override them: explicit wins,
-    // and the run prints what it used either way.
-    let budgets = match flags.budgets() {
+    // **Per field, not all or nothing.** `--disk-bytes N` with nothing else used
+    // to fall back to every value the plan recorded, silently discarding the one
+    // number the user gave. Each field takes the flag when there is one, then
+    // the plan's value; a field with neither is refused by name.
+    let budgets = match flags
+        .merged_budgets(moxie_format::plan::resolved_options(&plan_text).unwrap_or(None))
+    {
         Ok(b) => b,
-        Err(flag_error) => match moxie_format::plan::resolved_options(&plan_text) {
-            Ok(Some([total, header, scratch, chunk, disk])) => moxie_repack::Budgets {
-                total_bytes: total,
-                header_bytes: header,
-                scratch_bytes: scratch as usize,
-                chunk_file_bytes: chunk,
-                disk_bytes: disk,
-            },
-            _ => {
-                eprintln!("moxie-repack: {flag_error}");
-                return 1;
-            }
-        },
+        Err(e) => {
+            eprintln!("moxie-repack: {e}");
+            return 1;
+        }
     };
     println!(
         "settings: total={} header={} scratch={} shard-max={} disk={}",
@@ -595,6 +732,11 @@ fn command_repack(flags: &mut Flags) -> i32 {
 
     let result = (|| {
         let selection = moxie_repack::read_selection(&selection_path)?;
+        // **Is this still the checkpoint the plan describes?** Asked before
+        // anything is created. A plan binds the config and index it was
+        // generated from, so a checkpoint that has gained or lost tensors is
+        // refused rather than published as the old subset.
+        moxie_repack::discover::confirm_binding(&root, &plan_text)?;
         // **A partial conversion is not a model.** The normal path refuses one,
         // because an artifact missing tensors that opens and verifies is the
         // most expensive kind of wrong. Converting a subset on purpose stays
@@ -612,7 +754,7 @@ fn command_repack(flags: &mut Flags) -> i32 {
             let shown: Vec<&str> = missing.iter().take(3).map(String::as_str).collect();
             return Err(moxie_types::Error::InvalidArtifact {
                 detail: format!(
-                    "this plan is partial: {} tensor(s) are not covered, starting with {shown:?}.                      A partial artifact opens for inspection and refuses every read, so it is not                      a model. Pass --allow-partial to convert the covered subset deliberately",
+                    "this plan is partial: {} tensor(s) are not covered, starting with {shown:?}. A partial artifact opens for inspection and refuses every read, so it is not a model. Pass --allow-partial to convert the covered subset deliberately",
                     missing.len()
                 )
                 .into(),

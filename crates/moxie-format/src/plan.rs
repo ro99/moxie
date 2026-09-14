@@ -80,6 +80,10 @@ struct RawPlan {
     #[serde(default)]
     #[allow(dead_code)]
     options: Option<toml::Value>,
+    /// Present in a generated plan; read through `declared_binding`.
+    #[serde(default)]
+    #[allow(dead_code)]
+    binding: Option<toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -115,7 +119,19 @@ struct RawBf16 {
 pub fn declared_entries(text: &str) -> Result<usize> {
     let raw: RawPlan =
         toml::from_str(text).map_err(|e| invalid(format_args!("plan does not parse: {e}")))?;
-    let modules = raw.weights.as_ref().map(|w| w.modules.len()).unwrap_or(0);
+    let modules = raw
+        .weights
+        .as_ref()
+        .map(|w| {
+            let named: std::collections::BTreeSet<&str> =
+                w.modules.iter().map(|(m, _)| m.as_str()).collect();
+            w.modules.len()
+                + w.split
+                    .iter()
+                    .filter(|s| !named.contains(s.module.as_str()))
+                    .count()
+        })
+        .unwrap_or(0);
     let bf16 = raw.bf16.as_ref().map(|b| b.tensors.len()).unwrap_or(0);
     Ok(modules + bf16)
 }
@@ -125,7 +141,19 @@ pub fn expand(text: &str) -> Result<Selection> {
     let raw: RawPlan =
         toml::from_str(text).map_err(|e| invalid(format_args!("plan does not parse: {e}")))?;
 
-    let modules = raw.weights.as_ref().map(|w| w.modules.len()).unwrap_or(0);
+    let modules = raw
+        .weights
+        .as_ref()
+        .map(|w| {
+            let named: std::collections::BTreeSet<&str> =
+                w.modules.iter().map(|(m, _)| m.as_str()).collect();
+            w.modules.len()
+                + w.split
+                    .iter()
+                    .filter(|s| !named.contains(s.module.as_str()))
+                    .count()
+        })
+        .unwrap_or(0);
     let bf16 = raw.bf16.as_ref().map(|b| b.tensors.len()).unwrap_or(0);
     let entries = modules + bf16;
     if entries == 0 {
@@ -189,7 +217,21 @@ pub fn expand(text: &str) -> Result<Selection> {
         };
         let split: std::collections::BTreeMap<&str, &RawSplit> =
             w.split.iter().map(|s| (s.module.as_str(), s)).collect();
-        for (module, index) in &w.modules {
+        // **Every module, from both lists.** A module whose tensors span shards
+        // appears only in `[[weights.split]]`, and iterating `modules` alone
+        // dropped it silently -- a plan could say `complete` while the
+        // expansion omitted a quantized module, and the artifact would publish
+        // without it. Independent review reproduced exactly that.
+        let mut all: Vec<(&String, Option<usize>)> =
+            w.modules.iter().map(|(m, i)| (m, Some(*i))).collect();
+        let named: std::collections::BTreeSet<&str> =
+            w.modules.iter().map(|(m, _)| m.as_str()).collect();
+        for s in &w.split {
+            if !named.contains(s.module.as_str()) {
+                all.push((&s.module, None));
+            }
+        }
+        for (module, index) in all {
             out.push_str("\n[[tensor]]\n");
             out.push_str(&format!("role = {}\n", string(&format!("{module}.weight"))));
             out.push_str("kind = \"pack-quantized\"\n");
@@ -220,7 +262,13 @@ pub fn expand(text: &str) -> Result<Selection> {
                     }
                 }
                 None => {
-                    let file = string(&shard(*index, module)?);
+                    let Some(index) = index else {
+                        return Err(invalid(format_args!(
+                            "module '{module}' is listed only under [[weights.split]] and that \
+                             entry names no shard for it"
+                        )));
+                    };
+                    let file = string(&shard(index, module)?);
                     for suffix in MODULE_SUFFIXES {
                         if suffix == "weight_zero_point" && w.zero_points == "symmetric" {
                             continue;
@@ -241,6 +289,17 @@ pub fn expand(text: &str) -> Result<Selection> {
         }
     }
     let mut selection = crate::selection::parse(&out)?;
+    // **What the plan says it selects is what came out.** The split-module bug
+    // was invisible because nothing compared the two: the plan counted 37
+    // entries, the expansion produced 36, and the missing one was a quantized
+    // module the artifact then published without.
+    if selection.tensors.len() != entries {
+        return Err(invalid(format_args!(
+            "this plan names {entries} tensor(s) and expands to {}: a plan that does not expand \
+             to what it counts would publish an artifact missing what it dropped",
+            selection.tensors.len()
+        )));
+    }
     selection.source_bytes = text.len() as u64;
     Ok(selection)
 }
@@ -365,4 +424,25 @@ pub fn resolved_options(text: &str) -> Result<Option<[u64; 5]>> {
             o.disk_bytes,
         ]
     }))
+}
+
+/// The `[binding]` a generated plan carries: what it was generated from.
+///
+/// `None` for a hand-written selection, which binds nothing of the kind.
+pub fn declared_binding(text: &str) -> Result<Option<(String, String, usize)>> {
+    #[derive(Deserialize)]
+    struct WithBinding {
+        binding: Option<Binding>,
+    }
+    #[derive(Deserialize)]
+    struct Binding {
+        config_sha256: String,
+        index_sha256: String,
+        index_tensors: usize,
+    }
+    let parsed: WithBinding =
+        toml::from_str(text).map_err(|e| invalid(format_args!("plan does not parse: {e}")))?;
+    Ok(parsed
+        .binding
+        .map(|b| (b.config_sha256, b.index_sha256, b.index_tensors)))
 }

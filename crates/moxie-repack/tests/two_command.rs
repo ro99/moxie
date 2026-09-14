@@ -142,6 +142,19 @@ fn plan_then_repack_needs_no_flags_and_no_hand_editing() {
     assert_eq!(r.status, 0, "plan failed: {}{}", r.stdout, r.stderr);
     assert!(r.stdout.contains("outcome: planned"), "{}", r.stdout);
     assert!(plan.is_file(), "no plan was written");
+    // What it tells the user to run next is the **two-command** form. It used
+    // to print the advanced invocation -- `--selection`, `--source-root` and
+    // five budgets -- which is exactly what this path exists to remove.
+    assert!(
+        r.stdout.contains("repack --plan ") && r.stdout.contains(" --out <dir>"),
+        "the next command it printed is not the two-command form: {}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains("<budgets>"),
+        "it still asks the user for budgets: {}",
+        r.stdout
+    );
 
     // The checkpoint is untouched: a source root is a read-only input.
     let names: Vec<String> = std::fs::read_dir(&root)
@@ -371,4 +384,598 @@ fn an_unmeasured_packing_is_refused_by_name() {
         "a refused plan was written anyway"
     );
     let _ = binary();
+}
+
+/// A module whose tensors span shards is expanded, not dropped.
+///
+/// `to_plan_toml` writes such a module **only** under `[[weights.split]]`, and
+/// expansion iterated `weights.modules` alone. The plan said `complete`, the
+/// expansion produced one fewer tensor, and the artifact published without the
+/// quantized module entirely.
+#[test]
+fn a_split_module_survives_the_round_trip() {
+    let scratch = Scratch::new("split-module");
+    let root = scratch.join("checkpoint");
+    std::fs::create_dir_all(&root).expect("a checkpoint directory");
+
+    let rows = 4usize;
+    let columns = 64usize;
+    let groups = columns / 32;
+    let m = Module {
+        rows,
+        columns,
+        group: 32,
+        bits: 4,
+        codes: (0..rows)
+            .map(|o| {
+                (0..columns)
+                    .map(|k| ((o * 7 + k * 3) % 16) as u32)
+                    .collect()
+            })
+            .collect(),
+        scales: (0..rows)
+            .map(|o| (0..groups).map(|g| 0.5 + ((o + g) % 3) as f32).collect())
+            .collect(),
+        zeros: Vec::new(),
+    };
+    let module = "model.layers.0.mlp.down_proj";
+    // packed and shape in one shard, scale in another: the measured exception.
+    write_shard(
+        &root.join("a.safetensors"),
+        &[
+            Entry::new(
+                &format!("{module}.weight_packed"),
+                "I32",
+                m.packed_shape(),
+                m.packed(),
+            ),
+            Entry::new(
+                &format!("{module}.weight_shape"),
+                "I64",
+                vec![2],
+                m.weight_shape(),
+            ),
+            Entry::new(
+                "model.norm.weight",
+                "BF16",
+                vec![8],
+                bf16_bytes(1.0).repeat(8),
+            ),
+        ],
+    );
+    write_shard(
+        &root.join("b.safetensors"),
+        &[Entry::new(
+            &format!("{module}.weight_scale"),
+            "BF16",
+            m.scale_shape(),
+            m.scale_payload("BF16"),
+        )],
+    );
+    std::fs::write(
+        root.join("model.safetensors.index.json"),
+        format!(
+            r#"{{"metadata":{{}},"weight_map":{{
+ "{module}.weight_packed":"a.safetensors",
+ "{module}.weight_shape":"a.safetensors",
+ "{module}.weight_scale":"b.safetensors",
+ "model.norm.weight":"a.safetensors"
+}}}}"#
+        ),
+    )
+    .expect("an index");
+    std::fs::write(
+        root.join("config.json"),
+        r#"{"model_type":"fixture","architectures":["FixtureForCausalLM"],
+ "quantization_config":{"format":"pack-quantized","quant_method":"compressed-tensors",
+ "ignore":[],"config_groups":{"group_0":{"weights":{"num_bits":4,"group_size":32,
+ "symmetric":true,"strategy":"group","type":"int","actorder":null}}}}}"#,
+    )
+    .expect("a config");
+
+    let plan = scratch.join("model.plan.toml");
+    let r = run(&[
+        "plan",
+        "--source-root",
+        root.to_str().expect("utf-8"),
+        "--out-plan",
+        plan.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(r.status, 0, "{}{}", r.stdout, r.stderr);
+    let text = std::fs::read_to_string(&plan).expect("the plan reads");
+    assert!(
+        text.contains("[[weights.split]]"),
+        "the fixture did not produce a split module:\n{text}"
+    );
+    assert!(text.contains("status = \"complete\""), "{text}");
+
+    let out = scratch.join("artifact");
+    let r = run(&[
+        "repack",
+        "--plan",
+        plan.to_str().expect("utf-8"),
+        "--out",
+        out.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(r.status, 0, "{}{}", r.stdout, r.stderr);
+
+    // The quantized module is **in** the artifact, not silently missing.
+    let manifest = std::fs::read_to_string(out.join("manifest.toml")).expect("a manifest");
+    assert!(
+        manifest.contains(&format!("{module}.weight")),
+        "the split module was dropped from the artifact:\n{manifest}"
+    );
+    assert!(manifest.contains("model.norm.weight"));
+}
+
+/// A staging path that is a symbolic link is refused, and its target untouched.
+///
+/// `fs::write` follows a link. Independent review pointed `<plan>.toml.partial`
+/// at a checkpoint's `config.json` and watched planning overwrite it, before
+/// the atomic rename ever came into it.
+#[test]
+#[cfg(unix)]
+fn a_symlinked_staging_path_is_refused_and_its_target_untouched() {
+    let scratch = Scratch::new("symlink-staging");
+    let root = checkpoint(&scratch, false);
+    let victim = root.join("config.json");
+    let before = std::fs::read(&victim).expect("the config reads");
+
+    let plan = scratch.join("victim.toml");
+    let staging = scratch.join("victim.toml.partial");
+    std::os::unix::fs::symlink(&victim, &staging).expect("the link is made");
+
+    let r = run(&[
+        "plan",
+        "--source-root",
+        root.to_str().expect("utf-8"),
+        "--out-plan",
+        plan.to_str().expect("utf-8"),
+    ]);
+    assert_ne!(r.status, 0, "it wrote through the link: {}", r.stdout);
+    assert_eq!(
+        std::fs::read(&victim).expect("the config reads"),
+        before,
+        "the link's target was overwritten"
+    );
+    assert!(!plan.exists(), "a plan was published anyway");
+}
+
+/// A plan is refused once its checkpoint has gained a tensor.
+///
+/// Every shard the plan named was byte-identical; the model was not the same
+/// model. A source digest alone cannot see that.
+#[test]
+fn a_plan_whose_checkpoint_changed_is_refused() {
+    let scratch = Scratch::new("stale-plan");
+    let root = checkpoint(&scratch, false);
+    let plan = scratch.join("model.plan.toml");
+    let r = run(&[
+        "plan",
+        "--source-root",
+        root.to_str().expect("utf-8"),
+        "--out-plan",
+        plan.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(r.status, 0, "{}{}", r.stdout, r.stderr);
+
+    // A new indexed tensor in a new shard: the plan still describes the old set.
+    write_shard(
+        &root.join("model-00002-of-00002.safetensors"),
+        &[Entry::new(
+            "model.added.weight",
+            "BF16",
+            vec![4],
+            bf16_bytes(1.0).repeat(4),
+        )],
+    );
+    let index = root.join("model.safetensors.index.json");
+    let text = std::fs::read_to_string(&index).expect("the index reads");
+    let patched = text.replace(
+        " }\n}",
+        ",\n  \"model.added.weight\": \"model-00002-of-00002.safetensors\"\n }\n}",
+    );
+    assert_ne!(patched, text, "the index was not extended");
+    std::fs::write(&index, patched).expect("the index writes");
+
+    let out = scratch.join("artifact");
+    let r = run(&[
+        "repack",
+        "--plan",
+        plan.to_str().expect("utf-8"),
+        "--out",
+        out.to_str().expect("utf-8"),
+    ]);
+    assert_ne!(
+        r.status, 0,
+        "a stale plan published the old subset as complete: {}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("has changed") || r.stderr.contains("has changed"),
+        "the refusal does not name the change: {}{}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(!out.join("manifest.toml").exists());
+}
+
+/// One override is honoured, and the rest still come from the plan.
+#[test]
+fn a_single_override_does_not_discard_the_others() {
+    let scratch = Scratch::new("override-precedence");
+    let root = checkpoint(&scratch, false);
+    let plan = scratch.join("model.plan.toml");
+    let r = run(&[
+        "plan",
+        "--source-root",
+        root.to_str().expect("utf-8"),
+        "--out-plan",
+        plan.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(r.status, 0, "{}{}", r.stdout, r.stderr);
+
+    // One flag, deliberately too small to convert with. It must be the value
+    // the run uses, not silently replaced by the plan's.
+    let out = scratch.join("artifact");
+    let r = run(&[
+        "repack",
+        "--plan",
+        plan.to_str().expect("utf-8"),
+        "--out",
+        out.to_str().expect("utf-8"),
+        "--disk-bytes",
+        "1",
+    ]);
+    assert!(
+        r.stdout.contains("disk=1"),
+        "the override was discarded: {}{}",
+        r.stdout,
+        r.stderr
+    );
+    assert_ne!(r.status, 0, "a 1-byte disk budget converted: {}", r.stdout);
+}
+
+/// A plan made with a relative root is usable from another directory.
+#[test]
+fn a_plan_records_an_absolute_source_root() {
+    let scratch = Scratch::new("relative-root");
+    let root = checkpoint(&scratch, false);
+    let plan = scratch.join("model.plan.toml");
+
+    // Generated with a *relative* --source-root, from the checkpoint's parent.
+    let out = std::process::Command::new(common::binary())
+        .args([
+            "plan",
+            "--source-root",
+            "checkpoint",
+            "--out-plan",
+            plan.to_str().expect("utf-8"),
+        ])
+        .current_dir(root.parent().expect("a parent"))
+        .output()
+        .expect("the binary runs");
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(&plan).expect("the plan reads");
+    assert!(
+        text.contains(&format!("root = \"{}\"", root.display())),
+        "the plan did not record an absolute root:\n{}",
+        text.lines().find(|l| l.starts_with("root =")).unwrap_or("")
+    );
+
+    // And it converts from an unrelated directory.
+    let artifact = scratch.join("artifact");
+    let out = std::process::Command::new(common::binary())
+        .args([
+            "repack",
+            "--plan",
+            plan.to_str().expect("utf-8"),
+            "--out",
+            artifact.to_str().expect("utf-8"),
+        ])
+        .current_dir("/tmp")
+        .output()
+        .expect("the binary runs");
+    assert!(
+        out.status.success(),
+        "a plan made with a relative root failed elsewhere: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A BF16-only checkpoint of `count` tensors, for the sizing rules.
+///
+/// Every tensor is eight bytes. What is being measured is the **count**: one
+/// journal record per work unit, and a unit never spans two tensors.
+fn bf16_checkpoint(scratch: &Scratch, name: &str, count: usize) -> std::path::PathBuf {
+    let root = scratch.join(name);
+    std::fs::create_dir_all(&root).expect("a checkpoint directory");
+    let shard = "model-00001-of-00001.safetensors";
+
+    let entries: Vec<Entry> = (0..count)
+        .map(|i| {
+            Entry::new(
+                &format!("model.layers.{i}.self_attn.q_proj.weight"),
+                "BF16",
+                vec![4],
+                bf16_bytes(1.0).repeat(4),
+            )
+        })
+        .collect();
+    write_shard(&root.join(shard), &entries);
+
+    let mut index = String::from("{\n \"metadata\": {},\n \"weight_map\": {\n");
+    for (i, e) in entries.iter().enumerate() {
+        index.push_str(&format!(
+            "  \"{}\": \"{shard}\"{}\n",
+            e.name,
+            if i + 1 == entries.len() { "" } else { "," }
+        ));
+    }
+    index.push_str(" }\n}\n");
+    std::fs::write(root.join("model.safetensors.index.json"), index).expect("an index");
+    std::fs::write(
+        root.join("config.json"),
+        "{\n  \"model_type\": \"fixture\",\n  \"architectures\": [\"FixtureForCausalLM\"]\n}\n",
+    )
+    .expect("a config");
+    root
+}
+
+/// The `[binding]` digests describe the checkpoint the plan was **built from**,
+/// even when it changes before the plan is written.
+///
+/// The digests used to be fields a caller filled in by reading `config.json`
+/// and the index a second time. Independent review changed the index between
+/// the two reads: the plan's selection then described the old checkpoint and
+/// its binding described the new one, so `repack` confirmed the binding and
+/// published the old subset under `completeness = "complete"`.
+///
+/// The test changes the index in exactly that window -- after `discover`
+/// returns, before `to_plan_toml` is called -- and nothing in it can supply a
+/// digest, because `SourceBinding` no longer has the fields.
+#[test]
+fn a_plan_is_bound_to_the_checkpoint_it_was_built_from() {
+    let scratch = Scratch::new("binding-window");
+    let root = checkpoint(&scratch, false);
+    let index = root.join("model.safetensors.index.json");
+    let as_discovered = std::fs::read(&index).expect("the index reads");
+
+    let budgets = moxie_repack::Budgets {
+        total_bytes: 2 << 30,
+        header_bytes: 64 << 20,
+        scratch_bytes: 1 << 20,
+        chunk_file_bytes: 1 << 30,
+        disk_bytes: 1 << 30,
+    };
+    let mut sources = moxie_repack::open_sources(&root, &budgets).expect("the sources");
+    let discovery = moxie_repack::discover::discover(&root, &mut sources).expect("a discovery");
+
+    // **The window.** The checkpoint gains a tensor between being read and
+    // being described.
+    write_shard(
+        &root.join("model-00002-of-00002.safetensors"),
+        &[Entry::new(
+            "model.added.weight",
+            "BF16",
+            vec![4],
+            bf16_bytes(1.0).repeat(4),
+        )],
+    );
+    let text = std::fs::read_to_string(&index).expect("the index reads");
+    let patched = text.replace(
+        " }\n}",
+        ",\n  \"model.added.weight\": \"model-00002-of-00002.safetensors\"\n }\n}",
+    );
+    assert_ne!(patched, text, "the index was not extended");
+    std::fs::write(&index, patched).expect("the index writes");
+
+    let binding = moxie_repack::discover::SourceBinding {
+        root: root.to_string_lossy().into_owned(),
+        model: "fixture/binding-window".into(),
+        revision: None,
+        license: "fixture".into(),
+        quantizer: "declared-by-the-checkpoint".into(),
+        tokenizer: moxie_repack::discover::asset_identity(&root, "tokenizer.json"),
+        template: moxie_repack::discover::asset_identity(&root, "chat_template.jinja"),
+        recorded_digests: Vec::new(),
+        options: moxie_repack::discover::automatic_budgets(&discovery).expect("budgets"),
+    };
+    let plan_text =
+        moxie_repack::discover::to_plan_toml(&discovery, &binding).expect("a plan document");
+
+    // Bound to what it describes: the index as discovery parsed it.
+    let expected = moxie_format::sha256_hex(&as_discovered);
+    assert!(
+        plan_text.contains(&format!("index_sha256 = \"{expected}\"")),
+        "the plan is bound to a checkpoint it did not describe:\n{}",
+        plan_text
+            .lines()
+            .find(|l| l.starts_with("index_sha256"))
+            .unwrap_or("(no index_sha256 line)")
+    );
+
+    // And so the second command refuses it, rather than publishing the old
+    // subset of a model that has changed.
+    let plan = scratch.join("window.plan.toml");
+    std::fs::write(&plan, &plan_text).expect("the plan writes");
+    let out = scratch.join("artifact");
+    let r = run(&[
+        "repack",
+        "--plan",
+        plan.to_str().expect("utf-8"),
+        "--out",
+        out.to_str().expect("utf-8"),
+    ]);
+    assert_ne!(
+        r.status, 0,
+        "a plan bound to a different moment converted: {}",
+        r.stdout
+    );
+    assert!(!out.join("manifest.toml").exists());
+}
+
+/// A checkpoint with more tensors than a resume journal can record is refused
+/// while planning, not handed a scratch size the reader rejects.
+///
+/// Every work unit appends one journal line and a unit never spans two tensors,
+/// so the record count has a floor no tile size lowers. The sizing loop raised
+/// the scratch against that floor until it hit 1 GiB, wrote the plan, and
+/// `repack` then failed on the planner's own number: `536870912 is not a valid
+/// read budget`.
+#[test]
+fn a_checkpoint_the_journal_cannot_record_is_refused_while_planning() {
+    let scratch = Scratch::new("journal-floor");
+    // Independent review's own fixture size.
+    let root = bf16_checkpoint(&scratch, "many", 32_000);
+    let plan = scratch.join("many.plan.toml");
+    let r = run(&[
+        "plan",
+        "--source-root",
+        root.to_str().expect("utf-8"),
+        "--out-plan",
+        plan.to_str().expect("utf-8"),
+    ]);
+    assert_ne!(
+        r.status, 0,
+        "a plan its own defaults reject was emitted: {}",
+        r.stdout
+    );
+    assert!(
+        r.stderr.contains("journal"),
+        "the refusal does not say what cannot fit: {}{}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(!plan.exists(), "a refused plan was left behind");
+
+    // The whole contract, so a future sizing rule cannot satisfy this by
+    // emitting an unusable plan instead: whatever is written has to be usable.
+    if plan.exists() {
+        let text = std::fs::read_to_string(&plan).expect("the plan reads");
+        let scratch_bytes: u64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("scratch_bytes = "))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("the plan records a scratch size");
+        assert!(
+            scratch_bytes / 2 <= 256 * 1024 * 1024,
+            "a {scratch_bytes} byte scratch implies a tile the reader refuses"
+        );
+    }
+}
+
+/// Whatever the tensor count, a plan that is emitted carries a payload tile the
+/// reader admits -- which is what `repack` opens its sources with.
+#[test]
+fn an_emitted_plan_carries_a_tile_the_reader_admits() {
+    let scratch = Scratch::new("tile-limit");
+    let root = bf16_checkpoint(&scratch, "moderate", 2_000);
+    let plan = scratch.join("moderate.plan.toml");
+    let r = run(&[
+        "plan",
+        "--source-root",
+        root.to_str().expect("utf-8"),
+        "--out-plan",
+        plan.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(r.status, 0, "{}{}", r.stdout, r.stderr);
+
+    let text = std::fs::read_to_string(&plan).expect("the plan reads");
+    let scratch_bytes: u64 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("scratch_bytes = "))
+        .and_then(|v| v.trim().parse().ok())
+        .expect("the plan records a scratch size");
+    // `ByteBudget` admits at most 256 MiB, and two tiles come out of the
+    // scratch. A plan above this is one `open_sources` refuses.
+    assert!(
+        scratch_bytes / 2 <= 256 * 1024 * 1024,
+        "a {scratch_bytes} byte scratch implies a tile the reader refuses"
+    );
+
+    // Proved by using it, not by reading it.
+    let out = scratch.join("artifact");
+    let r = run(&[
+        "repack",
+        "--plan",
+        plan.to_str().expect("utf-8"),
+        "--out",
+        out.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(
+        r.status, 0,
+        "the planner's own budgets were refused by repack: {}{}",
+        r.stdout, r.stderr
+    );
+}
+
+/// Planning never writes inside the checkpoint it is reading.
+///
+/// The default output resolves against the current directory, so running the
+/// command from inside a checkpoint put the plan -- and the staging file it is
+/// renamed from -- among the source files. An explicit `--out-plan` pointing in
+/// there had the same gap.
+#[test]
+fn planning_refuses_to_write_inside_the_checkpoint() {
+    let scratch = Scratch::new("write-inside");
+    let root = checkpoint(&scratch, false);
+    let before: std::collections::BTreeSet<String> = std::fs::read_dir(&root)
+        .expect("the checkpoint lists")
+        .map(|e| {
+            e.expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+
+    // The default path, from inside the checkpoint.
+    let out = std::process::Command::new(binary())
+        .args(["plan", "--source-root", "."])
+        .current_dir(&root)
+        .output()
+        .expect("the binary runs");
+    assert!(
+        !out.status.success(),
+        "planning wrote into the checkpoint it was reading: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // And an explicit path inside it.
+    let inside = root.join("plan.toml");
+    let r = run(&[
+        "plan",
+        "--source-root",
+        root.to_str().expect("utf-8"),
+        "--out-plan",
+        inside.to_str().expect("utf-8"),
+    ]);
+    assert_ne!(
+        r.status, 0,
+        "an explicit path inside the checkpoint was accepted: {}",
+        r.stdout
+    );
+
+    let after: std::collections::BTreeSet<String> = std::fs::read_dir(&root)
+        .expect("the checkpoint lists")
+        .map(|e| {
+            e.expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(
+        before,
+        after,
+        "the checkpoint gained files: {:?}",
+        after.difference(&before).collect::<Vec<_>>()
+    );
 }

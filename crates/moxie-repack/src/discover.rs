@@ -58,6 +58,20 @@ pub struct Discovery {
     /// Bytes of source payload the selected tensors occupy, which bounds what
     /// the conversion writes.
     pub source_payload_bytes: u64,
+    /// Source payload bytes of each selected tensor, largest first. Work units
+    /// are cut inside a tensor and never across two, so this -- not the total
+    /// above -- is what says how many units a tile size implies.
+    pub component_bytes: Vec<u64>,
+    /// SHA-256 of the **exact** `config.json` bytes this discovery parsed.
+    ///
+    /// Recorded here rather than re-read when the plan is written: a second
+    /// read is a second moment, and a checkpoint that changed in between would
+    /// be described by a plan built from the first read and bound to the
+    /// second. Independent review reproduced exactly that.
+    pub config_sha256: String,
+    /// SHA-256 of the **exact** index bytes this discovery parsed, for the same
+    /// reason.
+    pub index_sha256: String,
 }
 
 impl Discovery {
@@ -287,6 +301,34 @@ pub fn discover(root: &Path, sources: &mut Sources) -> Result<Discovery> {
     for (name, _) in &bf16 {
         source_payload_bytes += sizes.get(name).copied().unwrap_or(0);
     }
+    // The same bytes again, per **canonical component**. A budget derived from
+    // the total alone is wrong in the direction that matters: a work unit lives
+    // inside one component, so raising the tile cannot merge two of them and
+    // the unit count has a floor the total cannot see.
+    //
+    // A module's components are its codes, its scales and, when it has them,
+    // its zero points -- `weight_shape` is two integers of metadata, not a
+    // component. Their source lengths stand in for their canonical ones: codes
+    // and scales are the same length either way, and i16 zero points are half
+    // their i32 source, so the count this produces is an upper bound.
+    let mut component_bytes: Vec<u64> = Vec::with_capacity(modules.len() * 3 + bf16.len());
+    for (module, module_files) in &modules {
+        for suffix in module_files.keys() {
+            if suffix == "weight_shape" {
+                continue;
+            }
+            component_bytes.push(
+                sizes
+                    .get(&format!("{module}.{suffix}"))
+                    .copied()
+                    .unwrap_or(0),
+            );
+        }
+    }
+    for (name, _) in &bf16 {
+        component_bytes.push(sizes.get(name).copied().unwrap_or(0));
+    }
+    component_bytes.sort_unstable_by(|a, b| b.cmp(a));
 
     Ok(Discovery {
         checkpoint,
@@ -298,10 +340,14 @@ pub fn discover(root: &Path, sources: &mut Sources) -> Result<Discovery> {
         unaccounted,
         max_header_bytes,
         source_payload_bytes,
+        component_bytes,
+        // Hashed from the bytes parsed above, not from a second read of the
+        // same paths.
+        config_sha256: moxie_format::sha256_hex(text.as_bytes()),
+        index_sha256: moxie_format::sha256_hex(index_text.as_bytes()),
     })
 }
 
-/// The `pack-quantized` spec a checkpoint's declaration implies.
 /// The `pack-quantized` spec a checkpoint's declaration implies.
 pub fn spec_of(checkpoint: &CheckpointDeclaration) -> Result<PackQuantizedSpec> {
     let q = checkpoint.quantization.as_ref().ok_or_else(|| {
@@ -367,6 +413,20 @@ pub fn to_plan_toml(discovery: &Discovery, source: &SourceBinding) -> Result<Str
     out.push_str(&source.to_toml());
 
     // What the second command needs so it does not ask again.
+    out.push_str("\n[binding]\n");
+    out.push_str("# What this plan was generated from. `repack` reads these again and\n");
+    out.push_str("# refuses if they have changed: a plan describes a checkpoint as it was,\n");
+    out.push_str("# and a checkpoint that has gained or lost tensors is a different model.\n");
+    out.push_str(&format!(
+        "config_sha256 = {}\n",
+        string(&discovery.config_sha256)
+    ));
+    out.push_str(&format!(
+        "index_sha256 = {}\n",
+        string(&discovery.index_sha256)
+    ));
+    out.push_str(&format!("index_tensors = {}\n", discovery.index_tensors));
+
     out.push_str("\n[options]\n");
     out.push_str("# Chosen automatically from this checkpoint. Any of them can be\n");
     out.push_str("# overridden on the command line, which wins over what is written here.\n");
@@ -505,6 +565,12 @@ pub struct SourceBinding {
     pub recorded_digests: Vec<(String, String)>,
     /// The budgets this plan resolved, so `repack --plan` needs none of them.
     pub options: crate::Budgets,
+    // **No digests here.** They used to be fields a caller filled in, and the
+    // caller filled them in by reading `config.json` and the index a second
+    // time -- a second moment, describing a checkpoint that may have changed
+    // since the one the plan above describes. They now come from the
+    // `Discovery` this binding is written beside, where they cannot disagree
+    // with it, so there is nothing left for a caller to get wrong.
 }
 
 impl SourceBinding {
@@ -601,7 +667,7 @@ pub fn asset_identity(root: &Path, file: &str) -> AssetIdentity {
 /// chosen, the run prints it, and any explicit flag overrides it.
 ///
 /// [ADR 0026]: ../../../docs/decisions/adr/0026-generated-plans-and-automatic-budgets.md
-pub fn automatic_budgets(discovery: &Discovery) -> crate::Budgets {
+pub fn automatic_budgets(discovery: &Discovery) -> Result<crate::Budgets> {
     // One source header, at the peak its parse costs rather than its serialized
     // length, with room for a checkpoint whose largest header is bigger than
     // the one measured here.
@@ -610,10 +676,7 @@ pub fn automatic_budgets(discovery: &Discovery) -> crate::Budgets {
         .saturating_mul(2)
         .max(16 << 20);
 
-    // A work unit large enough that a whole model does not produce more journal
-    // records than a resume can read back, and small enough to stay a bounded
-    // allocation. Both tiles come out of this.
-    let scratch_bytes: usize = 64 << 20;
+    let scratch_bytes = automatic_scratch_bytes(discovery)?;
 
     // The canonical payload is the source's represented weights, which a
     // bit-identical repack neither grows nor shrinks materially. The margin
@@ -643,11 +706,181 @@ pub fn automatic_budgets(discovery: &Discovery) -> crate::Budgets {
         .saturating_add(entries.saturating_mul(4 * 1024))
         .saturating_add(512 << 20);
 
-    crate::Budgets {
+    Ok(crate::Budgets {
         total_bytes,
         header_bytes,
         scratch_bytes,
         chunk_file_bytes,
         disk_bytes,
+    })
+}
+
+/// The largest payload tile the reader will accept, and so the largest half of
+/// a scratch allowance there is any point choosing.
+///
+/// Derived from the reader rather than written down again: a planner that
+/// picked a tile the reader refuses would be handing out a plan whose very
+/// first `open_sources` fails, which is what independent review saw when a
+/// 32,000-tensor checkpoint drove this to a 1 GiB scratch.
+fn max_tile_bytes() -> u64 {
+    let admits = |b: u64| {
+        usize::try_from(b)
+            .ok()
+            .is_some_and(|m| moxie_storage::ByteBudget::new(m).is_some())
+    };
+    // Doubled until it is refused, then the last accepted power of two. The
+    // reader's limit is a power of two, so this lands on it exactly; if it ever
+    // stops being one, this is the largest usable tile below it, which is still
+    // a tile the reader admits.
+    let mut tile: u64 = 1;
+    while let Some(next) = tile.checked_mul(2) {
+        if !admits(next) {
+            break;
+        }
+        tile = next;
     }
+    tile
+}
+
+/// How many journal records a tile size implies, through the units that are
+/// actually cut.
+///
+/// A unit lives **inside one tensor**: the converter walks each tensor's
+/// sections and splits each into tile-sized pieces, so raising the tile can
+/// never combine two tensors into one record. Dividing the payload total by the
+/// tile misses that entirely, and the sizing loop that did so kept raising the
+/// scratch against a floor it could not move.
+fn units_at_tile(component_bytes: &[u64], tile: u64) -> u64 {
+    let tile = tile.max(1);
+    component_bytes
+        .iter()
+        .map(|b| b.div_ceil(tile).max(1))
+        .fold(0u64, |a, b| a.saturating_add(b))
+}
+
+/// A work-unit size whose journal a resume can read back, or a refusal.
+///
+/// **A refusal is a real outcome here.** Every unit appends one journal line,
+/// the journal has a cap checked before it is parsed, and the smallest unit
+/// count is one per tensor whatever the tile. A checkpoint with more tensors
+/// than that cap allows cannot be planned at these defaults, and saying so is
+/// the honest answer -- the previous loop instead raised the scratch to 1 GiB,
+/// emitted the plan, and let `repack` fail on its own defaults one command
+/// later.
+fn automatic_scratch_bytes(discovery: &Discovery) -> Result<usize> {
+    // What one record costs, generously: the fixed part of a unit line plus the
+    // longest name in this plan.
+    let widest = discovery
+        .modules
+        .iter()
+        .map(|(m, _)| m.len())
+        .chain(discovery.bf16.iter().map(|(n, _)| n.len()))
+        .max()
+        .unwrap_or(64) as u64;
+    // **The run's own rule**, not a second estimate of it: a planner whose
+    // arithmetic differs from the writer's can emit a plan the writer rejects,
+    // which is the defect being fixed here.
+    let journal_of = |units: u64| crate::StagingEstimate::journal_bound_for(units, widest);
+    let cap = moxie_format::journal::MAX_JOURNAL_BYTES as u64;
+
+    let components: &[u64] = &discovery.component_bytes;
+    let max_tile = max_tile_bytes();
+    let max_scratch = max_tile.saturating_mul(2);
+
+    // The floor: one record per tensor, which no tile size goes below.
+    let floor = units_at_tile(components, u64::MAX).max(1);
+    if journal_of(floor) > cap {
+        return Err(invalid(format!(
+            "this checkpoint's {} selected tensor(s) hold {floor} component(s), and a conversion \
+             writes at least one resume-journal record for each: {} byte(s), above the {cap} byte \
+             cap a resume can read back. A work unit is cut inside a component and never across \
+             two, so no scratch size lowers this -- it is a limit of the journal format, not of \
+             the budgets. Convert this checkpoint in parts with a hand-written selection",
+            discovery.selected().max(1),
+            journal_of(floor)
+        )));
+    }
+
+    let mut scratch: u64 = (64 << 20).min(max_scratch);
+    loop {
+        let tile = (scratch / 2).max(1);
+        if journal_of(units_at_tile(components, tile)) <= cap {
+            break;
+        }
+        if scratch >= max_scratch {
+            // Unreachable while the floor check above holds -- the floor is
+            // what `max_tile` converges to -- but a sizing rule that could
+            // return an unusable number if that ever stopped being true is the
+            // bug being fixed, so it refuses instead.
+            return Err(invalid(format!(
+                "this checkpoint needs a payload tile above the {max_tile} byte(s) a reader                  admits before its resume journal fits. Convert it in parts with a hand-written                  selection"
+            )));
+        }
+        scratch = scratch.saturating_mul(2).min(max_scratch);
+    }
+
+    // Everything downstream of this is a `usize`, and the reader is what set
+    // the ceiling, so the conversion cannot fail -- but it is checked rather
+    // than asserted.
+    let tile = (scratch / 2).max(1);
+    let tile_usize = usize::try_from(tile)
+        .ok()
+        .filter(|t| moxie_storage::ByteBudget::new(*t).is_some());
+    if tile_usize.is_none() {
+        return Err(invalid(format!(
+            "{tile} byte(s) is not a payload tile this machine's reader admits"
+        )));
+    }
+    usize::try_from(scratch).map_err(|_| {
+        invalid(format!(
+            "{scratch} byte(s) of scratch does not fit this machine"
+        ))
+    })
+}
+
+/// Refuse a plan whose checkpoint has changed since it was generated.
+///
+/// A source shard digest is not enough. Independent review generated a plan,
+/// added an indexed BF16 tensor in a new shard, and watched `repack` publish
+/// the old subset under `completeness = "complete"` -- every shard the plan
+/// named was byte-identical, and the model was still a different model.
+///
+/// So the plan binds what **defines** the model: its `config.json` and its
+/// index, by content, plus how many tensors that index named.
+pub fn confirm_binding(root: &Path, plan_text: &str) -> Result<()> {
+    let Some((config_sha, index_sha, index_tensors)) =
+        moxie_format::plan::declared_binding(plan_text)?
+    else {
+        // A hand-written selection binds nothing of the kind; the advanced path
+        // is the user saying what to convert.
+        return Ok(());
+    };
+    let config = moxie_storage::read_text_capped(
+        &root.join("config.json"),
+        moxie_format::checkpoint_config::MAX_CONFIG_BYTES,
+    )?;
+    let now_config = moxie_format::sha256_hex(config.as_bytes());
+    if now_config != config_sha {
+        return Err(invalid(format!(
+            "this checkpoint's config.json has changed since the plan was generated ({config_sha} \
+             became {now_config}). What the plan says about packing may no longer describe it, so \
+             it is refused rather than applied. Generate a new plan"
+        )));
+    }
+    let index_text = moxie_storage::read_text_capped(
+        &root.join("model.safetensors.index.json"),
+        moxie_format::checkpoint_config::MAX_INDEX_BYTES,
+    )?;
+    let now_index = moxie_format::sha256_hex(index_text.as_bytes());
+    if now_index != index_sha {
+        let now = moxie_format::checkpoint_config::parse_index(&index_text)?;
+        return Err(invalid(format!(
+            "this checkpoint's tensor index has changed since the plan was generated: it named \
+             {index_tensors} tensor(s) and now names {}. A plan describes a checkpoint as it was, \
+             and publishing the old subset as complete would be describing a model nobody has. \
+             Generate a new plan",
+            now.len()
+        )));
+    }
+    Ok(())
 }

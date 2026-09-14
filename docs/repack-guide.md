@@ -74,21 +74,44 @@ works out which tensors exist and how they are packed, and writes a plan you can
 read. It converts nothing and **never writes inside the checkpoint**.
 
 ```console
-$ moxie-repack plan --source-root /fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4
-architecture: LagunaForCausalLM
-shards-read: 15
-modules: 34740
-bf16-tensors: 2029
-selected: 36769
+$ moxie-repack plan --source-root /fast/models/cyankiwi/Qwen3.8-27B-AWQ-BF16-INT4
+architecture: Qwen3_5ForConditionalGeneration
+shards-read: 6
+modules: 256
+bf16-tensors: 943
+selected: 1199
 skipped: 0
-selection-bytes: 1885861
+selection-bytes: 96960
 outcome: planned
-selection: ./Laguna-S-2.1-AWQ-INT4.plan.toml
+selection: ./Qwen3.8-27B-AWQ-BF16-INT4.plan.toml
 quantization: 4-bit, Group { size: 32 }, PackedAlongOutput
 
 Read it, edit it if you want, then:
-  moxie-repack repack --plan ./Laguna-S-2.1-AWQ-INT4.plan.toml --out <dir>
+  moxie-repack repack --plan ./Qwen3.8-27B-AWQ-BF16-INT4.plan.toml --out <dir>
 ```
+
+### A limit worth knowing before you start
+
+**There is a ceiling on how many tensors one conversion can cover**, and the
+largest checkpoints are above it. A conversion records every work unit in a
+resume journal, a unit is cut inside one component of one tensor and never
+across two, and the journal has a hard 16 MiB cap because a resume has to read
+it back. So the smallest journal a conversion can write is one record per
+component — around **28,000 components**, roughly 9,000 quantized modules.
+
+`plan` checks this first and refuses with the arithmetic:
+
+```console
+$ moxie-repack plan --source-root /fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4
+outcome: refused
+moxie-repack: invalid artifact: this checkpoint's 36769 selected tensor(s) hold
+106249 component(s), and a conversion writes at least one resume-journal record
+for each: 61522267 byte(s), above the 16777216 byte cap a resume can read back.
+```
+
+No budget changes this — it is a limit of the journal format. Converting such a
+checkpoint in parts needs a hand-written selection (below). Raising the cap is
+open work, not a setting.
 
 The plan records where the checkpoint is and which resource settings it chose,
 so the second command needs neither again.
@@ -187,10 +210,14 @@ Sizes take a plain byte count or a `KiB`/`MiB`/`GiB` suffix.
 That is the intended way to find the right numbers — `inspect` reports the same
 refusals without creating anything.
 
-A note on `--scratch-bytes`: it is the strongest lever you have. Every work unit
-writes one journal record, so a very small scratch on a large tensor produces a
-very large journal, and a journal has its own hard cap because a resume has to
-read it back. If a plan is refused for its journal size, raise the scratch.
+A note on `--scratch-bytes`: it is the strongest lever you have **for one large
+tensor**. Every work unit writes one journal record, so a very small scratch on a
+large tensor produces a very large journal, and a journal has its own hard cap
+because a resume has to read it back.
+
+It is not a lever on tensor **count**. A unit never spans two components, so a
+checkpoint with more components than the cap allows is refused whatever the
+scratch is — see the ceiling above.
 
 ---
 
@@ -257,7 +284,7 @@ Refusals name what they refused and why. The common ones:
 | Message contains | What it means |
 |---|---|
 | `cannot hold this run` | `--total-bytes` is below the tiles plus metadata. The message states the minimum |
-| `journal byte(s)` | The plan would write a journal larger than a resume can read back. Raise `--scratch-bytes` |
+| `journal byte(s)` | The plan would write a journal larger than a resume can read back. If it names a *tensor*, raise `--scratch-bytes`; if it names a **component count**, no budget helps — the checkpoint is above the ceiling described above |
 | `above the admitted disk budget` | `--disk-bytes` does not cover payload plus staging. The message states the total |
 | `bound to a different plan` | This destination belongs to a different run. Use a fresh `--out`, or the selection it was started with |
 | `changed while this run was reading it` | A source file moved under the run. Nothing is published, because the digest would describe bytes nobody has |

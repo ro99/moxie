@@ -319,6 +319,26 @@ impl StagingEstimate {
         }
     }
 
+    /// What a journal of `units` records costs, when the longest role in the
+    /// plan is `longest_role_bytes` long.
+    ///
+    /// The **same arithmetic** `of` uses above, exposed so the planner sizes
+    /// work units by the rule the run will bound itself by rather than by an
+    /// estimate of its own. Independent review found a planner whose separate
+    /// estimate chose a scratch the run then rejected; one rule cannot disagree
+    /// with itself. Using the longest role for every record is the upper bound,
+    /// so a plan this admits is one the run admits.
+    pub fn journal_bound_for(units: u64, longest_role_bytes: u64) -> u64 {
+        let component_name = longest_role_bytes.saturating_add(16);
+        Self::JOURNAL_HEADER_BOUND.saturating_add(
+            units.saturating_mul(
+                Self::JOURNAL_LINE_FIXED
+                    .saturating_add(component_name)
+                    .saturating_add(Self::FILE_NAME_BOUND),
+            ),
+        )
+    }
+
     /// The destination's largest moment, which is what a disk budget has to
     /// cover: payload, the staged manifest, and **two** journals -- compaction
     /// writes its replacement beside the original before renaming over it.

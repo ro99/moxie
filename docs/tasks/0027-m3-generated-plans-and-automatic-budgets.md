@@ -68,9 +68,9 @@ and `model.safetensors.index.json` only; no payload, no checkpoint Python.
 
 | Root | Declared | Index tensors | Module shape | Plannable today | Blocker |
 |---|---|---:|---|---|---|
-| `cyankiwi/Laguna-S-2.1-AWQ-INT4` | compressed-tensors pack-quantized, 4-bit, group 32, asymmetric | 140,989 | 34,740 × 4 + 2,029 others | **yes** | — |
-| `cyankiwi/Inkling-Small-AWQ-INT4` | same, 4-bit group 32 asymmetric | 124,328 | 30,880 × 4 + 808 others | **yes** | — |
-| `cyankiwi/Muse-Glimmer-30B-AWQ-INT4` | same | 2,654 | 406 × 4 + 1,030 others | **yes** | — |
+| `cyankiwi/Laguna-S-2.1-AWQ-INT4` | compressed-tensors pack-quantized, 4-bit, group 32, asymmetric | 140,989 | 34,740 × 4 + 2,029 others | **no** | 106,249 canonical components need 61,522,267 journal bytes against a 16,777,216 cap (below) |
+| `cyankiwi/Inkling-Small-AWQ-INT4` | same, 4-bit group 32 asymmetric | 124,328 | 30,880 × 4 + 808 others | **no** | 93,448 components, 55,138,416 journal bytes (below) |
+| `cyankiwi/Muse-Glimmer-30B-AWQ-INT4` | same | 2,654 | 406 × 4 + 1,030 others | **yes**, partial | 1,030 F16 tensors skipped; F16 passthrough is a named continuation |
 | `cyankiwi/Qwen3.8-27B-AWQ-BF16-INT4` | same | 1,967 | 256 × 4 + 943 others | **yes** | — |
 | `cyankiwi/gemma-4-31B-it-AWQ-8bit` | compressed-tensors, **8-bit, symmetric** | 2,008 | 410 × **3** + 368 others | **yes** | — |
 | `google/gemma-4-26B-A4B-it` | none — a BF16 checkpoint | 1,013 | no modules; fused expert tensors | **yes**, BF16 only | — |
@@ -78,6 +78,44 @@ and `model.safetensors.index.json` only; no payload, no checkpoint Python.
 | `canada-quant/hy3-w4a16-mtp` | same, `actorder: static` | 138,146 | 45,504 × 3 | **no** | as above |
 | `Intel/GLM-5.3-Flash-W4A16-AutoRound` | **auto-round**, 4-bit, group 128, symmetric | 113,074 | 37,152 × `qweight`/`qzeros`/`scales` | **no** | A different packing, not a different spelling: GPTQ-style `qweight`/`qzeros`/`scales`, which no shared importer in this repository reads |
 | `Intel/Qwen3.8-Flash-Next-W4A16-AutoRound` | same | 224,280 | 73,728 × same | **no** | as above |
+
+### The two largest checkpoints cannot be converted at any budget
+
+This is the correction the re-review's finding 8 exposed, and it is a capability
+statement, not a budget one.
+
+Every work unit appends one resume-journal record, a unit is cut **inside** one
+canonical component and never across two, and `MAX_JOURNAL_BYTES` is 16 MiB —
+checked both before a run starts (`plan_disk_bytes`) and before a journal is
+parsed. So the minimum journal a conversion writes is one record per component,
+and no scratch size, tile size or disk budget lowers it.
+
+Measured by running `plan` read-only against every present root on this tree
+(nothing was written into `/fast/models`; the plans went to a scratch directory):
+
+| Root | Selected | Components | Minimum journal | Outcome |
+|---|---:|---:|---:|---|
+| `Laguna-S-2.1-AWQ-INT4` | 36,769 | 106,249 | 61,522,267 B | **refused** |
+| `Inkling-Small-AWQ-INT4` | 31,688 | 93,448 | 55,138,416 B | **refused** |
+| `Muse-Glimmer-30B-AWQ-INT4` | 406 | — | — | planned, `partial` (1,030 F16 skipped) |
+| `Qwen3.8-27B-AWQ-BF16-INT4` | 1,199 | — | — | planned, complete |
+| `gemma-4-31B-it-AWQ-8bit` | 1,188 | — | — | planned, complete |
+| `google/gemma-4-26B-A4B-it` | 1,013 | — | — | planned, complete |
+
+**This is not a regression.** `repack` has always refused these: its own
+`plan_disk_bytes` makes the identical check on the resolved plan. What changed is
+*when* the user learns it — the planner used to emit a plan, and before the
+sizing fix it emitted one carrying a 1 GiB scratch that `repack` then rejected as
+an invalid read budget. The refusal now arrives at the first command, with the
+number and the reason.
+
+**It is left as a named continuation, not fixed here.** Raising the cap is a
+journal-format decision with a resume-read cost attached, and this task's scope
+is the two-command flow for what is already implemented. The honest statement of
+today's capability is: *at the role lengths these checkpoints use, the flow
+converts up to roughly 28,000 canonical components — about 9,000 quantized
+modules. The two largest local checkpoints are three to four times that and are
+refused with the number and the reason.*
 
 **DeepSeek V4 Flash / V4.1 Flash are not present locally.** No root under
 `/fast/models` carries them, so no coverage claim is made either way; their
@@ -192,6 +230,71 @@ claim that F16 cannot be preserved — nothing here has established anything abo
 F16 in a canonical artifact. Its quantized modules plan fine; its F16
 embeddings, norms and `lm_head` are listed per tensor with that reason rather
 than quietly omitted.
+
+### Independent review of `19073a1`: six findings, then three more
+
+Reproduced on local fixtures; no real checkpoint was converted.
+
+| # | Finding | What it was, and what closes it |
+|---|---|---|
+| 1 P1 | **A split module was planned and then dropped** | `to_plan_toml` writes a module whose tensors span shards **only** under `[[weights.split]]`, and `plan::expand` iterated `weights.modules` alone. The plan said `complete`; the expansion produced one fewer tensor; the artifact published without the quantized module. Expansion now covers both lists, the declared entry count includes split-only modules, and `expand` **refuses** when what a plan counts and what it expands disagree — the parity check that would have caught this at the source |
+| 2 P1 | **A symlinked staging path wrote into the checkpoint** | `fs::write` follows a link, so `<plan>.toml.partial` pointed at a `config.json` was written through before the atomic rename mattered. The staging path is refused outright when it is a symbolic link, cleared when it is a leftover, and created with `create_new` plus `O_NOFOLLOW` |
+| 3 P1 | **A stale plan published an old subset as complete** | Every shard the plan named was byte-identical while the model had gained a tensor, so a source digest could not see it. The plan now binds its `config.json` and index **by content**, with the index's tensor count, and `repack` re-reads both and refuses before writing anything |
+| 4 P2 | **One override discarded the rest** | `flags.budgets()` is all-or-nothing, so `--disk-bytes N` alone fell back to every automatic value — the documented `flag > plan > auto` precedence was false. Merged per field now, on both the plan and repack sides |
+| 5 P2 | **A relative `--source-root` did not travel** | Recorded as given, so a plan consumed from another directory resolved it against the wrong one. Canonicalized before it is written |
+| 6 P2 | **The planner could reject its own plan** | A 32,000-tensor BF16 fixture planned successfully and then refused at repack, because each tensor writes at least one journal record and the fixed 64 MiB work unit put the journal over what a resume can read back. The unit size is derived from the journal bound and rises until the plan it implies fits |
+
+Findings 1 and 3 are the same shape as the correctness failures of tasks 0025
+and 0026: a claim — `completeness = "complete"` — checked against a copy of
+itself rather than against what it describes.
+
+**Five regressions, not six.** The first report of this round claimed a
+regression per finding. There were five: findings 4 and 6 shared no test of
+their own for the large-tensor-count case, and the sizing fix went in without
+one. Re-review said so, and it was right. The count is stated here because
+miscounting one's own evidence is the failure this task keeps recording.
+
+### Re-review of the same round: three findings remained
+
+| # | Finding | What it was, and what closes it |
+|---|---|---|
+| 7 P1 | **A plan could be bound to a checkpoint it did not describe** | The `[binding]` digests were fields a caller filled in, and `command_plan` filled them by reading `config.json` and the index a **second** time, after discovery. Review changed the index in that window: the plan's selection described the old checkpoint, its binding described the new one, `repack` confirmed the binding and published the old subset as complete. The digests are now computed from the exact bytes `discover` parsed, and the two fields are **removed from `SourceBinding`** so no caller can supply a different moment. A failed read is the error discovery already returns, never an empty digest |
+| 8 P2 | **The sizing rule raised the scratch against a floor it could not move, and landed on an invalid one** | A work unit lives inside one tensor, so the record count has a floor of one per tensor whatever the tile. The loop divided the payload total by the tile, kept doubling, and stopped at 1 GiB — implying a 512 MiB payload tile, which `ByteBudget` refuses: `536870912 is not a valid read budget`. Units are now counted **per component**, the reader's own limit is the ceiling, and a checkpoint whose floor exceeds the journal allowance is **refused while planning** rather than handed a plan the next command rejects |
+| 9 P2 | **Planning still wrote inside the source root** | The comment said never; nothing enforced it. The default output resolves against the current directory, so running `plan` from inside a checkpoint put the plan — and the staging file it is renamed from — among the source files, and an explicit `--out-plan` inside it had the same gap. The canonical output *directory* is now compared against the canonical root before anything is created or removed, which covers the staging file too |
+
+Findings 7 and 8 are worth naming separately from the round above. Finding 7 is
+finding 3's fix applied to a copy of the data rather than to the data, which is
+the same error one level in. Finding 8 is a budget derived from a total when the
+quantity it bounds is per-item — the rule was arithmetically incapable of
+reaching its own goal, and a ceiling check would have surfaced that immediately.
+
+**How each was measured.** Every fix was mutated back and the suite re-run; each
+mutation failed exactly one test, and no other:
+
+| Fix | Mutation | Result |
+|---|---|---|
+| 7 | `to_plan_toml` reads both digests from disk again | only `a_plan_is_bound_to_the_checkpoint_it_was_built_from` failed |
+| 8 | the pre-fix sizing loop restored verbatim | only `a_checkpoint_the_journal_cannot_record_is_refused_while_planning` failed |
+| 9 | the output-location check removed from `command_plan` | only `planning_refuses_to_write_inside_the_checkpoint` failed |
+
+`an_emitted_plan_carries_a_tile_the_reader_admits` is a **guard, not a
+regression**: at 2,000 tensors the old rule also chose a valid tile, so it
+passes with and without the fix. It is kept because it is what the 32,000-tensor
+refusal must not be satisfied by — emitting an unusable plan instead of a
+refusal — and the refusal test now asserts that clause too.
+
+### A test that measured a race instead of a program
+
+`crates/moxie-repack/tests/budget.rs` failed the host suite with `attempt to
+subtract with overflow`. The file's own header says two tests measuring one
+global allocator race and neither number means anything — and the file contains
+two tests, both resetting the peak, running concurrently. A run could read a
+peak below the live bytes it started from and subtract past zero.
+
+Both measurements now take a mutex for their whole duration. **There is no
+regression test for this**: the failure is a race, and the fix removes the
+concurrency rather than detecting it. The evidence is the observed failure and
+the suite passing after.
 
 ### A process failure: an unauthorized conversion was started
 
