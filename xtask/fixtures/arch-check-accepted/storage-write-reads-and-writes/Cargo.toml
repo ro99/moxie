@@ -1,0 +1,14 @@
+[package]
+name = "moxie-storage-write"
+version = "0.0.0"
+edition = "2024"
+
+# The writer itself: it reads through the reader, encodes through the codec and
+# admits its buffers through the ledger. It is allowed to reach itself, which
+# is the case the reachability rule has to exempt without exempting anything
+# else.
+[dependencies]
+moxie-types = { path = "../../../../crates/moxie-types" }
+moxie-format = { path = "../../../../crates/moxie-format" }
+moxie-storage = { path = "../../../../crates/moxie-storage" }
+moxie-memory = { path = "../../../../crates/moxie-memory" }

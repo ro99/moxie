@@ -1,0 +1,95 @@
+//! Canonical write authority: the storage owner's write half.
+//!
+//! [ADR 0022] splits writing out of `moxie-storage` into its own crate rather
+//! than putting it behind a feature, for one concrete reason: Cargo unifies
+//! features across a workspace build, so a writer behind a feature in the
+//! reader's crate would be compiled into every process that reads a checkpoint.
+//! A separate crate makes "who can write a canonical artifact" a dependency
+//! edge, and `arch-check` refuses that edge everywhere but the offline
+//! repacker.
+//!
+//! What this crate owns: confined output creation, bounded chunk writing, the
+//! restart journal's file half, and atomic publication. What it does not own:
+//! the canonical encoding (that is `moxie-format`, I/O-free), reading
+//! (`moxie-storage`), what to select or how to convert it (`moxie-repack`),
+//! residency, CUDA, models, or a quantizer.
+//!
+//! It never overwrites a published artifact, never writes outside the
+//! destination it was given, and never deletes a file it did not create.
+//!
+//! [ADR 0022]: ../../../docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md
+
+#![forbid(unsafe_code)]
+
+pub mod fault;
+pub mod plan;
+pub mod run;
+
+pub use fault::{Faults, Site};
+pub use plan::{OutputPlan, PlannedTensor, TensorRequest};
+pub use run::{
+    JOURNAL_FILE, LOCK_FILE, MANIFEST_FILE, Options, Outcome, ResumeReport, Run,
+    STAGED_MANIFEST_FILE, SealedTensor, Start,
+};
+
+use moxie_types::{Error, Result};
+
+/// This crate's refusals.
+pub(crate) fn invalid(detail: String) -> Error {
+    Error::InvalidArtifact {
+        detail: detail.into(),
+    }
+}
+
+/// What a run may spend: memory, per-file disk, and total disk.
+///
+/// Every one of them is required rather than defaulted. A repack is an
+/// operation on a user's disk, and "how much may it use" is not a question a
+/// library should answer on the user's behalf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteBudget {
+    scratch_bytes: usize,
+    chunk_file_bytes: u64,
+    disk_bytes: u64,
+}
+
+impl WriteBudget {
+    /// The largest scratch a run may admit. Not a default: a ceiling, so a
+    /// caller cannot ask for a gigabyte of "bounded" staging.
+    pub const MAX_SCRATCH_BYTES: usize = 64 * 1024 * 1024;
+
+    pub fn new(scratch_bytes: usize, chunk_file_bytes: u64, disk_bytes: u64) -> Result<Self> {
+        if scratch_bytes == 0 || scratch_bytes > Self::MAX_SCRATCH_BYTES {
+            return Err(invalid(format!(
+                "payload scratch must be between 1 and {} byte(s), got {scratch_bytes}",
+                Self::MAX_SCRATCH_BYTES
+            )));
+        }
+        if chunk_file_bytes == 0 {
+            return Err(invalid("a chunk file of zero bytes holds no tensor".into()));
+        }
+        if disk_bytes < chunk_file_bytes {
+            return Err(invalid(format!(
+                "the disk budget ({disk_bytes}) is below one chunk file ({chunk_file_bytes}): the \
+                 run could not write its first chunk"
+            )));
+        }
+        Ok(Self {
+            scratch_bytes,
+            chunk_file_bytes,
+            disk_bytes,
+        })
+    }
+
+    pub fn scratch_bytes(self) -> usize {
+        self.scratch_bytes
+    }
+
+    pub fn chunk_file_bytes(self) -> u64 {
+        self.chunk_file_bytes
+    }
+
+    pub fn disk_bytes(self) -> u64 {
+        self.disk_bytes
+    }
+}

@@ -415,6 +415,15 @@ impl AffineTensor {
         &self.zero_points
     }
 
+    /// The packed codes, logical row-major with each row byte-aligned.
+    ///
+    /// Borrowed rather than copied: [`crate::payload`] writes them into a
+    /// caller's payload range, and a repacker that copied a tensor's codes to
+    /// hand them over would hold two copies of the largest section.
+    pub fn codes(&self) -> &[u8] {
+        &self.codes
+    }
+
     pub fn scales(&self) -> &ScaleValues {
         &self.scales
     }

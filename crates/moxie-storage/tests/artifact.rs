@@ -409,9 +409,11 @@ fn a_nonfinite_bf16_weight_is_caught_at_load() {
 #[test]
 fn an_affine_tensor_validates_then_refuses_to_read_naming_m3() {
     let dir = test_dir("affine");
-    // 8x32 INT4: packed codes would be 128 bytes; the payload is reserved but
-    // never decoded by v1.
-    let payload = prng_bytes(7, 128);
+    // 8x32 INT4 with one group per row and f16 scales: ADR 0023's arithmetic
+    // is 128 code byte(s) plus 8 two-byte scales. The payload is reserved and
+    // its bytes can be verified; what v1's `read_tensor` will not do is decode
+    // them into weights.
+    let payload = prng_bytes(7, 144);
     write_artifact(
         &dir,
         &[TensorSpec {
@@ -426,9 +428,15 @@ fn an_affine_tensor_validates_then_refuses_to_read_naming_m3() {
         complete(),
     );
     let art = Artifact::open(&dir).expect("affine descriptors validate in v1");
-    let mut out = vec![0u8; 128];
+    let mut out = vec![0u8; 144];
     let e = art.read_tensor("q", &mut out).unwrap_err();
     assert!(e.to_string().contains("M3"), "{e}");
+    // Verification is a different question from decoding, and task 0025 needs
+    // the answer: the bytes a repack published are checkable without a kernel
+    // to run them through.
+    let mut scratch = vec![0u8; 16];
+    art.verify_tensor("q", &mut scratch)
+        .expect("an affine tensor's bytes verify against their checksum");
     std::fs::remove_dir_all(&dir).ok();
 }
 

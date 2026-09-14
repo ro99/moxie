@@ -107,6 +107,55 @@ impl Artifact {
         Self::from_manifest(dir, manifest, budget)
     }
 
+    /// Open an artifact whose manifest is **not yet published**.
+    ///
+    /// The publisher's validation step, and the reason it exists is that there
+    /// must not be a second validator. A repack writes its chunk files under
+    /// their final names and its manifest under a private name; publication is
+    /// the rename that gives the manifest its real one. Validating before that
+    /// rename means opening a directory whose manifest is somewhere else, and
+    /// the alternative -- publish, then check -- is checking after the artifact
+    /// is already visible.
+    ///
+    /// The manifest path is confined to `dir`: this opens a candidate manifest
+    /// for the directory it belongs to, never one from elsewhere.
+    ///
+    /// Everything else is the published path's behaviour, byte for byte: the
+    /// same parser, the same chunk resolution, the same validation.
+    pub fn open_unpublished(dir: &Path, manifest_path: &Path, budget: ByteBudget) -> Result<Self> {
+        let canonical_dir = dir.canonicalize().map_err(|e| Error::InvalidArtifact {
+            detail: format!(
+                "artifact directory {} does not canonicalize: {e}",
+                dir.display()
+            )
+            .into(),
+        })?;
+        let canonical_manifest =
+            manifest_path
+                .canonicalize()
+                .map_err(|e| Error::InvalidArtifact {
+                    detail: format!(
+                        "candidate manifest {} does not canonicalize: {e}",
+                        manifest_path.display()
+                    )
+                    .into(),
+                })?;
+        if canonical_manifest.parent() != Some(canonical_dir.as_path()) {
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "candidate manifest {} is not directly inside {}: a manifest describes the \
+                     directory it lives in",
+                    canonical_manifest.display(),
+                    canonical_dir.display()
+                )
+                .into(),
+            });
+        }
+        let text = read_file_capped(&canonical_manifest)?;
+        let manifest = manifest::parse(&text)?;
+        Self::from_manifest(dir, manifest, budget)
+    }
+
     fn from_manifest(dir: &Path, manifest: Manifest, budget: ByteBudget) -> Result<Self> {
         let canonical_dir = dir.canonicalize().map_err(|e| Error::InvalidArtifact {
             detail: format!(
@@ -180,6 +229,125 @@ impl Artifact {
         manifest::artifact_identity(&self.manifest)
     }
 
+    /// Stream one tensor's payload through a caller-supplied sink, hashing it.
+    ///
+    /// This is the **verification** primitive, and it is deliberately not
+    /// [`Artifact::read_tensor`]:
+    ///
+    /// * It works for **affine** tensors. Reading one as a weight needs a decoder
+    ///   and a kernel, which is M3 item 3; checking that the bytes a repack
+    ///   published are the bytes it hashed needs neither.
+    /// * It works on a **partial** artifact. A partial artifact is not a loadable
+    ///   model and `read_tensor` refuses it for that reason; refusing to check the
+    ///   checksums of a partial artifact would mean the one command that can tell a
+    ///   user their selection is intact does not work on selections.
+    /// * It never holds the tensor. The caller supplies `scratch`, which is capped
+    ///   by the artifact's read budget, and sees the payload as a sequence of
+    ///   slices in file order.
+    ///
+    /// The sink must treat what it is handed as **provisional**: the checksum is
+    /// verified after the last slice, so bytes are trustworthy only once this
+    /// returns `Ok`. That is the same rule `read_tensor` states about its
+    /// destination buffer, moved to where a streaming consumer can see it.
+    ///
+    /// Returns the number of bytes streamed, which is the tensor's manifest length.
+    pub fn stream_tensor(
+        &self,
+        role: &str,
+        scratch: &mut [u8],
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<u64> {
+        let t = self
+            .manifest
+            .tensors
+            .iter()
+            .find(|t| t.role == role)
+            .ok_or_else(|| Error::InvalidArtifact {
+                detail: format!("no tensor named '{role}'").into(),
+            })?;
+        if scratch.is_empty() {
+            return Err(Error::InvalidArtifact {
+                detail: "a zero-byte scratch buffer cannot stream anything".into(),
+            });
+        }
+        let chunk = self
+            .chunks
+            .get(&t.chunk)
+            .ok_or_else(|| Error::InvalidArtifact {
+                detail: format!("chunk '{}' was validated but is not open", t.chunk).into(),
+            })?;
+        let slice = scratch.len().min(self.budget.bytes()).max(1);
+        let total = t.length;
+        let mut hasher = StreamingSha256::new();
+        let mut bf16 = Bf16StreamValidator::new();
+        let mut source = OpenChunk { file: &chunk.file };
+        let mut done: u64 = 0;
+        while done < total {
+            let want = usize::try_from((total - done).min(slice as u64)).map_err(|_| {
+                Error::InvalidArtifact {
+                    detail: format!("tensor '{role}': slice length does not fit this platform")
+                        .into(),
+                }
+            })?;
+            let buf = &mut scratch[..want];
+            let at = t
+                .offset
+                .checked_add(done)
+                .ok_or_else(|| Error::InvalidArtifact {
+                    detail: format!("tensor '{role}': offset {} + {done} overflows", t.offset)
+                        .into(),
+                })?;
+            match source.read_at(at, buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!(
+                            "tensor '{role}': short read of chunk '{}' at {at} for {want} bytes: \
+                         truncation: {e}",
+                            t.chunk
+                        )
+                        .into(),
+                    });
+                }
+            }
+            hasher.update(buf);
+            if matches!(t.precision, TensorPrecision::Bf16V1) {
+                bf16.feed(buf)?;
+            }
+            sink(buf)?;
+            done += want as u64;
+        }
+        if matches!(t.precision, TensorPrecision::Bf16V1) {
+            bf16.finish()?;
+        }
+        let got = hasher.finalize_bytes();
+        let want = decode_hex32(&t.sha256).map_err(|()| Error::InvalidArtifact {
+            detail: "stored checksum is not 64 hex digits".into(),
+        })?;
+        if got != want {
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "tensor '{role}': checksum mismatch: expected {}, computed {}; everything the \
+                 sink was handed is explicitly not to be trusted",
+                    t.sha256,
+                    str::from_utf8(&hex_of(&got)).unwrap_or("?")
+                )
+                .into(),
+            });
+        }
+        Ok(done)
+    }
+
+    /// Verify one tensor's payload against its recorded checksum.
+    ///
+    /// [`Artifact::stream_tensor`] with a sink that keeps nothing: the bytes
+    /// are read, hashed and dropped, so verifying a 400 GB artifact costs the
+    /// scratch buffer.
+    pub fn verify_tensor(&self, role: &str, scratch: &mut [u8]) -> Result<u64> {
+        self.stream_tensor(role, scratch, &mut |_| Ok(()))
+    }
+
     /// Read one tensor into a caller-supplied buffer.
     ///
     /// Returns the tensor's byte length. If the buffer is smaller than the
@@ -206,7 +374,7 @@ impl Artifact {
         if t.precision.is_affine() {
             return Err(Error::InvalidArtifact {
                 detail: format!(
-                    "tensor '{role}' is {}: manifest v1 describes affine tensors and refuses to read them; decoding arrives in M3",
+                    "tensor '{role}' is {}: this reads weights, and decoding an affine tensor into weights arrives in M3 item 3. Its bytes can be checked now -- `verify_tensor` and `stream_tensor` hash them against the manifest without decoding anything",
                     t.precision.name()
                 ).into(),
             });
@@ -670,7 +838,12 @@ impl RangeSource for OpenChunk<'_> {
 /// Read `manifest.toml` through a capped reader that errors at the limit
 /// rather than reading the file and then measuring it.
 fn read_manifest_capped(dir: &Path) -> Result<String> {
-    let path = dir.join("manifest.toml");
+    read_file_capped(&dir.join("manifest.toml"))
+}
+
+/// The same cap, for a manifest that is not yet called `manifest.toml`.
+fn read_file_capped(path: &Path) -> Result<String> {
+    let path = path.to_path_buf();
     let mut f = File::open(&path).map_err(|e| Error::InvalidArtifact {
         detail: format!("cannot open {}: {e}", path.display()).into(),
     })?;

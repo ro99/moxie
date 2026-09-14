@@ -12,6 +12,7 @@ members = [
     "crates/moxie-memory",
     "crates/moxie-host",
     "crates/moxie-storage",
+    "crates/moxie-storage-write",
     "crates/moxie-cuda",
     "crates/moxie-kernels",
     "crates/moxie-plan",
@@ -19,6 +20,7 @@ members = [
     "crates/moxie-engine",
     "crates/moxie-models",
     "crates/moxie-cli",
+    "crates/moxie-repack",
     "xtask",
 ]
 exclude = ["xtask/fixtures"]
@@ -42,6 +44,8 @@ moxie-sampling = { path = "crates/moxie-sampling" }
 moxie-memory = { path = "crates/moxie-memory" }
 moxie-host = { path = "crates/moxie-host" }
 moxie-storage = { path = "crates/moxie-storage" }
+moxie-storage-write = { path = "crates/moxie-storage-write" }
+moxie-repack = { path = "crates/moxie-repack" }
 moxie-cuda = { path = "crates/moxie-cuda" }
 moxie-kernels = { path = "crates/moxie-kernels" }
 moxie-plan = { path = "crates/moxie-plan" }

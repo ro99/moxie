@@ -335,7 +335,13 @@ fn zero_or_negative_dimensions_are_rejected() {
 
 #[test]
 fn affine_descriptor_closed_set_is_enforced_at_the_manifest() {
-    let affine = |extra: &str| {
+    // ADR 0023's arithmetic for `[8, 32]` INT4: 8 rows x 16 packed code
+    // byte(s) = 128, plus one group per row. A symmetric tensor adds 8
+    // two-byte scales and nothing else (144); an asymmetric one adds 8 i16
+    // zero points as well (160). The length is a parameter here because a
+    // fixture that carried one length for both would be testing the length
+    // rule rather than the descriptor rule it is named for.
+    let affine = |length: u32, extra: &str| {
         format!(
             r#"[[tensors]]
 role = "q"
@@ -343,7 +349,7 @@ shape = [8, 32]
 precision = "affine-int4-v1"
 chunk = "c.bin"
 offset = 0
-length = 128
+length = {length}
 sha256 = "{HEX}"
 alignment = 16
 logical_order = 0
@@ -351,8 +357,10 @@ logical_order = 0
 "#
         )
     };
-    let good =
-        affine("group_rule = \"contiguous-32\"\nscale_dtype = \"f16\"\nzero_point = \"symmetric\"");
+    let good = affine(
+        144,
+        "group_rule = \"contiguous-32\"\nscale_dtype = \"f16\"\nzero_point = \"symmetric\"",
+    );
     manifest::parse(&manifest_with(&good)).expect("closed descriptor validates");
     for (bad_extra, needle) in [
         (
@@ -372,13 +380,17 @@ logical_order = 0
             "group_rule",
         ),
     ] {
-        err_contains(manifest::parse(&manifest_with(&affine(bad_extra))), needle);
+        err_contains(
+            manifest::parse(&manifest_with(&affine(144, bad_extra))),
+            needle,
+        );
     }
     // group-128 is the other closed value; per-channel is explicit.
     for rule in ["contiguous-128", "per-channel"] {
-        let ok = affine(&format!(
-            "group_rule = \"{rule}\"\nscale_dtype = \"bf16\"\nzero_point = \"per-group\""
-        ));
+        let ok = affine(
+            160,
+            &format!("group_rule = \"{rule}\"\nscale_dtype = \"bf16\"\nzero_point = \"per-group\""),
+        );
         manifest::parse(&manifest_with(&ok)).expect(rule);
     }
     // A BF16 tensor must not carry affine fields.
@@ -406,7 +418,8 @@ shape = [1, 64]
 precision = "affine-int8-v1"
 chunk = "c.bin"
 offset = 0
-length = 64
+# 64 code byte(s), 2 f32 scales, 2 i16 zero points: ADR 0023.
+length = 76
 sha256 = "{HEX}"
 alignment = 16
 logical_order = 0
@@ -448,7 +461,8 @@ shape = [1, 64]
 precision = "affine-int8-v1"
 chunk = "c.bin"
 offset = 0
-length = 64
+# 64 code byte(s), 2 f32 scales, 2 i16 zero points: ADR 0023.
+length = 76
 sha256 = "{HEX}"
 alignment = 16
 logical_order = 0
@@ -727,4 +741,172 @@ fn opaque_metadata_with_delimiters_is_stable_and_distinct() {
             &manifest::parse(&with_meta("[architecture.metadata]\ns = \"x\\u0000y\"")).unwrap()
         )
     );
+}
+
+// --- the writer half (task 0025) --------------------------------------------
+
+/// An affine tensor's `length` is no longer free. ADR 0023 fixes the payload as
+/// three contiguous sections, so the length is a function of the descriptor and
+/// a manifest that disagrees describes a range no writer could have produced.
+#[test]
+fn an_affine_length_that_disagrees_with_the_descriptor_is_rejected() {
+    let affine = |length: i64, zero_point: &str| {
+        format!(
+            r#"[[tensors]]
+role = "q"
+shape = [4, 64]
+precision = "affine-int4-v1"
+chunk = "c.bin"
+offset = 0
+length = {length}
+sha256 = "{HEX}"
+alignment = 16
+logical_order = 0
+group_rule = "contiguous-32"
+scale_dtype = "f32"
+zero_point = "{zero_point}"
+"#
+        )
+    };
+    // 4 rows x 32 packed byte(s) = 128 codes; 4 rows x 2 groups = 8 entries.
+    // Symmetric: 128 + 8*4 = 160. Per-group: 160 + 8*2 = 176.
+    manifest::parse(&manifest_with(&affine(160, "symmetric"))).expect("symmetric length");
+    manifest::parse(&manifest_with(&affine(176, "per-group"))).expect("asymmetric length");
+    // The codes alone, which is what a writer that forgot the scale table
+    // would emit -- and exactly the length manifest v1 used to accept.
+    err_contains(
+        manifest::parse(&manifest_with(&affine(128, "symmetric"))),
+        "occupies 160 canonical byte(s)",
+    );
+    // The symmetric length on an asymmetric tensor: the zero-point section is
+    // missing, so a reader would decode the scales as zero points.
+    err_contains(
+        manifest::parse(&manifest_with(&affine(160, "per-group"))),
+        "occupies 176 canonical byte(s)",
+    );
+    // And one byte too many, which no section arithmetic produces.
+    err_contains(
+        manifest::parse(&manifest_with(&affine(177, "per-group"))),
+        "occupies 176 canonical byte(s)",
+    );
+}
+
+#[test]
+fn every_manifest_this_reader_accepts_round_trips_through_the_writer() {
+    let affine = r#"[[tensors]]
+role = "layers.0.q"
+shape = [4, 64]
+precision = "affine-int4-v1"
+chunk = "chunk0.bin"
+offset = 0
+length = 176
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+alignment = 16
+logical_order = 0
+group_rule = "contiguous-32"
+scale_dtype = "f32"
+zero_point = "per-group"
+group_index = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+"#;
+    let mixed = format!(
+        "{affine}{}",
+        bf16_tensor("layers.0.norm", "8", "chunk0.bin", 176, 16, 1)
+    );
+    for text in [valid_one(), manifest_with(&mixed)] {
+        let parsed = manifest::parse(&text).expect("the fixture parses");
+        let encoded = manifest::encode(&parsed).expect("it encodes");
+        let again = manifest::parse(&encoded).expect("the encoding parses");
+        assert_eq!(
+            manifest::artifact_identity(&parsed),
+            manifest::artifact_identity(&again),
+            "identity survives the round trip"
+        );
+        // Field by field, not only by identity: identity hashes the fields it
+        // is defined over, so comparing only identities would miss a field
+        // identity does not cover.
+        assert_eq!(format!("{parsed:?}"), format!("{again:?}"));
+        // Deterministic: encoding twice is byte-identical, so republishing
+        // unchanged content changes no byte.
+        assert_eq!(encoded, manifest::encode(&again).expect("re-encodes"));
+    }
+}
+
+/// The characters a hand-written quoter gets wrong. The serializer owns this,
+/// and the test exists because "the `toml` crate escapes it" is a claim about a
+/// dependency that this repository's own fixtures should demonstrate.
+#[test]
+fn awkward_strings_survive_encoding() {
+    for role in [
+        "a\"quoted\"role",
+        "a\\backslash",
+        "a\nnewline",
+        "a\ttab",
+        "unicode-\u{00e9}\u{4e2d}",
+        "trailing-space ",
+    ] {
+        let text = manifest_with(&bf16_tensor(
+            &role
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\t', "\\t"),
+            "2, 2",
+            "c.bin",
+            0,
+            8,
+            0,
+        ));
+        let parsed = manifest::parse(&text).expect("the fixture parses");
+        assert_eq!(
+            parsed.tensors[0].role, role,
+            "the fixture says what it means"
+        );
+        let encoded = manifest::encode(&parsed).expect("it encodes");
+        let again = manifest::parse(&encoded).expect("the encoding parses");
+        assert_eq!(again.tensors[0].role, role);
+        assert_eq!(
+            manifest::artifact_identity(&parsed),
+            manifest::artifact_identity(&again)
+        );
+    }
+}
+
+/// The opaque architecture tree is re-emitted, not interpreted: a nested table,
+/// an array of mixed scalars and a float all come back unchanged.
+#[test]
+fn the_opaque_architecture_tree_survives_encoding() {
+    let text = valid_one().replace(
+        "[architecture.metadata]\nhidden = 8",
+        "[architecture.metadata]\nhidden = 8\nratio = 2.5\nflags = [true, \"x\", 3]\n\
+         [architecture.metadata.rope]\ntheta = 10000\nkind = \"yarn\"",
+    );
+    let parsed = manifest::parse(&text).expect("the fixture parses");
+    let encoded = manifest::encode(&parsed).expect("it encodes");
+    let again = manifest::parse(&encoded).expect("the encoding parses");
+    assert_eq!(
+        format!("{:?}", parsed.architecture.metadata.0),
+        format!("{:?}", again.architecture.metadata.0)
+    );
+    assert_eq!(
+        manifest::artifact_identity(&parsed),
+        manifest::artifact_identity(&again)
+    );
+}
+
+#[test]
+fn a_partial_manifest_encodes_as_partial_with_its_missing_roles() {
+    let text = valid_one().replace(
+        "status = \"complete\"\nmissing = []",
+        "status = \"partial\"\nmissing = [\"layers.1.q\", \"layers.1.k\"]",
+    );
+    let parsed = manifest::parse(&text).expect("the fixture parses");
+    let encoded = manifest::encode(&parsed).expect("it encodes");
+    assert!(encoded.contains("status = \"partial\""), "{encoded}");
+    let again = manifest::parse(&encoded).expect("the encoding parses");
+    match again.completeness {
+        manifest::Completeness::Partial { missing } => {
+            assert_eq!(missing, ["layers.1.q", "layers.1.k"]);
+        }
+        other => panic!("completeness was flattened to {other:?}"),
+    }
 }

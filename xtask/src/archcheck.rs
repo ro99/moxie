@@ -50,6 +50,8 @@ pub mod rule {
     pub const TELEMETRY_OUTSIDE_HOST: &str = "machine telemetry outside moxie-host";
     pub const MEMORY_PROBES_THE_MACHINE: &str = "memory depends on the host sensor";
     pub const SECOND_RESIDENCY_OWNER: &str = "a second weight-residency owner";
+    pub const WRITE_AUTHORITY_REACHED: &str =
+        "canonical write authority outside the offline repacker";
 
     pub const ALL: &[&str] = &[
         FORBIDDEN_DEPENDENCY,
@@ -65,6 +67,7 @@ pub mod rule {
         TELEMETRY_OUTSIDE_HOST,
         MEMORY_PROBES_THE_MACHINE,
         SECOND_RESIDENCY_OWNER,
+        WRITE_AUTHORITY_REACHED,
     ];
 }
 
@@ -169,6 +172,43 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
             "moxie-storage",
             Allowed {
                 workspace: &["moxie-types", "moxie-format"],
+                third_party: NONE,
+            },
+        ),
+        // The write half (ADR 0022, task 0025). A separate crate rather than a
+        // feature of `moxie-storage`, because Cargo unifies features across a
+        // workspace build: a writer behind a feature would be compiled into
+        // every process that reads a checkpoint. `moxie-memory` is here for
+        // admitted offline buffers, and nothing else is -- no CUDA, no models,
+        // no residency.
+        (
+            "moxie-storage-write",
+            Allowed {
+                workspace: &[
+                    "moxie-types",
+                    "moxie-format",
+                    "moxie-storage",
+                    "moxie-memory",
+                ],
+                third_party: NONE,
+            },
+        ),
+        // The offline repacker (ADR 0021/0022): the one program that may
+        // invoke canonical write authority. It is a composition root for the
+        // offline workflow, which is why it may name the writer -- and the
+        // `write-authority` rule below is what keeps that list of one honest,
+        // including through a rename or a crate in between.
+        (
+            "moxie-repack",
+            Allowed {
+                workspace: &[
+                    "moxie-types",
+                    "moxie-format",
+                    "moxie-storage",
+                    "moxie-storage-write",
+                    "moxie-memory",
+                    "moxie-host",
+                ],
                 third_party: NONE,
             },
         ),
@@ -1599,6 +1639,24 @@ const RESIDENCY_DEFINITION_NAMES: &[&str] = &[
 /// The one crate allowed to define them.
 const RESIDENCY_OWNER: &str = "moxie-memory";
 
+/// The crate that owns canonical write authority (ADR 0022).
+const WRITE_AUTHORITY: &str = "moxie-storage-write";
+
+/// The crates that may reach it, and the only ones.
+///
+/// One name, and the rule exists because the allowlist alone cannot keep it
+/// that way. The allowlist checks **direct** edges against a per-crate list; a
+/// path through one permitted crate to the writer is a chain of individually
+/// permitted edges. This rule is reachability instead: whatever the spelling --
+/// a rename, a `cfg`-gated table, an optional feature, a build dependency, or
+/// another crate in between -- if a production dependency path from a crate
+/// ends at the writer, that crate can write a canonical artifact.
+///
+/// Widening this list is the architectural change ADR 0022 describes, not an
+/// edit: the point of splitting the writer out of `moxie-storage` was that
+/// "who may write a checkpoint" became a dependency edge a machine can check.
+const WRITE_AUTHORITY_CONSUMERS: &[&str] = &["moxie-repack"];
+
 /// The checker's own source, where every rule's forbidden vocabulary is
 /// declared -- model family names, forbidden import prefixes, and the telemetry
 /// paths above.
@@ -2120,6 +2178,91 @@ fn check_tree(root: &Path) -> Result<Vec<Violation>, String> {
             }
         }
     }
+
+    // Rule 14 (task 0025): canonical write authority has one user.
+    //
+    // A whole-tree pass rather than a per-crate one, because what it checks is
+    // **reach**: every rule above looks at one manifest's own edges, and a
+    // path to the writer through a crate that is itself permitted is a chain
+    // of edges no single manifest's list can see.
+    out.extend(check_write_authority(root, workspace.as_ref())?);
+    Ok(out)
+}
+
+/// Every crate in the tree that can reach the canonical writer.
+///
+/// Fails closed in one specific way: an edge whose identity could not be
+/// resolved is already reported by `UNRESOLVABLE_DEPENDENCY` above, and is
+/// treated here as reaching nothing, so this rule never invents a path. What it
+/// does see is every edge `production_deps` sees -- renamed, `cfg`-gated,
+/// optional, and build dependencies included -- and the transitive closure of
+/// them.
+fn check_write_authority(
+    root: &Path,
+    workspace: Option<&Workspace<'_>>,
+) -> Result<Vec<Violation>, String> {
+    let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for manifest in find_manifests(root)? {
+        let text = std::fs::read_to_string(&manifest)
+            .map_err(|e| format!("{}: {e}", manifest.display()))?;
+        let doc: toml::Value =
+            toml::from_str(&text).map_err(|e| format!("{}: {e}", manifest.display()))?;
+        let Some(name) = doc
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let dir = manifest.parent().expect("manifest has a directory");
+        let entry = edges.entry(name.to_string()).or_default();
+        for d in production_deps(&doc, dir, workspace) {
+            for id in d.identities {
+                entry.insert(id);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for name in edges.keys() {
+        if name == WRITE_AUTHORITY || WRITE_AUTHORITY_CONSUMERS.contains(&name.as_str()) {
+            continue;
+        }
+        // Shortest path, so the message names the chain rather than only its
+        // endpoints: "through" is the part a reader needs to act on.
+        let mut seen: BTreeSet<&str> = BTreeSet::from([name.as_str()]);
+        let mut queue: Vec<Vec<&str>> = vec![vec![name.as_str()]];
+        while let Some(path) = queue.first().cloned() {
+            queue.remove(0);
+            let tail = *path.last().expect("a non-empty path");
+            let Some(next) = edges.get(tail) else {
+                continue;
+            };
+            for id in next {
+                if id == WRITE_AUTHORITY {
+                    let mut chain: Vec<&str> = path.clone();
+                    chain.push(WRITE_AUTHORITY);
+                    out.push(Violation {
+                        crate_name: name.clone(),
+                        rule: rule::WRITE_AUTHORITY_REACHED,
+                        detail: format!(
+                            "reaches the canonical writer: {}. Only {WRITE_AUTHORITY_CONSUMERS:?} \
+                             may, and widening that is ADR 0022's decision rather than an edit",
+                            chain.join(" -> ")
+                        ),
+                    });
+                    queue.clear();
+                    break;
+                }
+                if seen.insert(id.as_str()) {
+                    let mut longer = path.clone();
+                    longer.push(id.as_str());
+                    queue.push(longer);
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
     Ok(out)
 }
 

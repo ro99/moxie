@@ -100,7 +100,7 @@ use crate::affine::{
     AffineDescriptor, AffineTensor, Grouping, IntWidth, ZeroPoints, rebias_code, rebias_zero_point,
 };
 use crate::safetensors::{Dtype, Header, TensorEntry};
-use crate::scale::{ScaleDtype, ScaleValues};
+use crate::scale::ScaleDtype;
 use moxie_types::{Error, Result};
 
 /// This module's refusals, composed **fallibly**.
@@ -327,229 +327,522 @@ pub fn source_entries<'a>(
     })
 }
 
+/// The declared shapes of one `pack-quantized` module, without its payloads.
+///
+/// What a caller can learn from headers alone. [`PackQuantizedPlan::new`]
+/// validates them against each other, so a selection can be inspected, sized
+/// and refused before a payload byte is read -- which is what makes an offline
+/// inspection cost the headers rather than the artifact.
+#[derive(Debug, Clone, Copy)]
+pub struct DeclaredSource<'a> {
+    /// `weight_packed`'s declared shape, `[out_features, packed_columns]`.
+    pub packed_shape: &'a [u64],
+    /// `weight_scale`'s declared shape.
+    pub scale_shape: &'a [u64],
+    /// Read from `weight_scale`'s **own** header entry, never from a model's
+    /// general dtype field.
+    pub scale_dtype: ScaleDtype,
+    /// `weight_zero_point`'s declared shape, present exactly when the spec
+    /// declares an asymmetric source.
+    pub zero_point_shape: Option<&'a [u64]>,
+    /// Logical `[out_features, in_features]`, from the `weight_shape` payload.
+    pub logical: (usize, usize),
+}
+
+/// One module's validated geometry, and the conversion of any **row range** of
+/// it into canonical bytes.
+///
+/// This is the streaming half of the importer, and the reason it exists is
+/// task 0025's budget: a repack admits at most a megabyte of payload scratch,
+/// and the real proof module's codes alone are a megabyte and a half. A whole
+/// tensor cannot be the unit of work.
+///
+/// It is **not a second decoder**. [`import`] is written in terms of these
+/// methods, so a whole-tensor import and a tiled repack execute the same
+/// arithmetic over the same bytes; the only difference is how much of it is in
+/// memory at once. `the_streaming_converter_and_the_whole_tensor_import_agree`
+/// is the regression that keeps that true.
+#[derive(Debug, Clone)]
+pub struct PackQuantizedPlan {
+    spec: PackQuantizedSpec,
+    desc: AffineDescriptor,
+    packed_columns: usize,
+    groups_per_row: usize,
+}
+
+impl PackQuantizedPlan {
+    /// Validate the declared shapes against each other and against the logical
+    /// shape `weight_shape` is the authority for.
+    ///
+    /// Every rule [`import`] used to apply inline is here, so a caller that
+    /// inspects before reading gets the same refusals a caller that reads
+    /// would have got, at header cost.
+    pub fn new(spec: &PackQuantizedSpec, declared: DeclaredSource<'_>) -> Result<Self> {
+        // The spec and the tensor index are two independently obtained facts
+        // about one module. Neither may be read while the other is ignored.
+        match (spec.zero_points, declared.zero_point_shape.is_some()) {
+            (ZeroPointSource::Symmetric, false) | (ZeroPointSource::PackedAlongOutput, true) => {}
+            (ZeroPointSource::Symmetric, true) => {
+                return Err(invalid_static(
+                    "a symmetric pack-quantized source carries no weight_zero_point, but one was \
+                     supplied",
+                ));
+            }
+            (ZeroPointSource::PackedAlongOutput, false) => {
+                return Err(invalid_static(
+                    "an asymmetric pack-quantized source requires its weight_zero_point payload",
+                ));
+            }
+        }
+
+        let (out_features, in_features) = declared.logical;
+        if out_features == 0 || in_features == 0 {
+            return Err(invalid(format_args!(
+                "empty logical shape {out_features}x{in_features}"
+            )));
+        }
+        let per_word = spec.values_per_word();
+        let packed_columns = in_features.div_ceil(per_word);
+        // The declared axes, before the byte counts. A transposed or otherwise
+        // incompatible shape can have exactly the right number of bytes.
+        let want_packed = [out_features as u64, packed_columns as u64];
+        if declared.packed_shape != want_packed {
+            return Err(invalid(format_args!(
+                "weight_packed is declared {:?}; {out_features}x{in_features} at {} bit(s) \
+                 requires {want_packed:?}",
+                declared.packed_shape,
+                spec.width.bits()
+            )));
+        }
+
+        let grouping = match spec.granularity {
+            Granularity::Channel => Grouping::PerOutputChannel,
+            Granularity::Group { size } => Grouping::Contiguous { size },
+        };
+        let desc = AffineDescriptor {
+            width: spec.width,
+            out_features,
+            in_features,
+            grouping,
+            // Contiguous. `actorder` is null in every inspected asymmetric
+            // artifact; a source that carried a permutation would have to
+            // supply the map here, and document 03 forbids ignoring one.
+            group_index: None,
+            scale_dtype: declared.scale_dtype,
+        };
+        desc.validate()?;
+        let groups_per_row = desc.groups_per_row()?;
+        desc.group_entries()?;
+        desc.code_bytes()?;
+
+        // Per-channel sources serialize the scale as `[out, 1]`; some writers
+        // emit `[out]`. Both are accepted, and nothing else is: a scale whose
+        // rows do not match the output channels is a different tensor, not a
+        // reshape.
+        let scale_ok = declared.scale_shape == [out_features as u64, groups_per_row as u64]
+            || (groups_per_row == 1 && declared.scale_shape == [out_features as u64]);
+        if !scale_ok {
+            return Err(invalid(format_args!(
+                "weight_scale is declared {:?}; {out_features} output channel(s) with \
+                 {groups_per_row} group(s) each requires [{out_features}, {groups_per_row}]",
+                declared.scale_shape
+            )));
+        }
+
+        if let Some(shape) = declared.zero_point_shape {
+            let zp_rows = out_features.div_ceil(per_word);
+            let want = [zp_rows as u64, groups_per_row as u64];
+            // Exactly this shape. The scale rule also accepts a
+            // one-dimensional `[out]`, because a writer was seen to emit it;
+            // no writer has been seen to emit a one-dimensional zero point,
+            // and accepting a shape nothing produces is a branch no fixture
+            // can justify.
+            if shape != want {
+                return Err(invalid(format_args!(
+                    "weight_zero_point is declared {shape:?}; {out_features} output channel(s) at \
+                     {} bit(s) with {groups_per_row} group(s) each requires {want:?} -- zero \
+                     points are packed along the output axis, unlike the codes",
+                    spec.width.bits()
+                )));
+            }
+        }
+
+        Ok(Self {
+            spec: *spec,
+            desc,
+            packed_columns,
+            groups_per_row,
+        })
+    }
+
+    pub fn descriptor(&self) -> &AffineDescriptor {
+        &self.desc
+    }
+
+    pub fn out_features(&self) -> usize {
+        self.desc.out_features
+    }
+
+    pub fn groups_per_row(&self) -> usize {
+        self.groups_per_row
+    }
+
+    /// Output channels packed into one source zero-point word: the rule that
+    /// makes a row range's zero points readable without reading the whole
+    /// table.
+    pub fn zero_points_per_word(&self) -> usize {
+        self.spec.values_per_word()
+    }
+
+    /// Source bytes one output row of `weight_packed` occupies.
+    pub fn source_code_row_bytes(&self) -> usize {
+        self.packed_columns * 4
+    }
+
+    /// Canonical bytes one output row of codes occupies.
+    pub fn canonical_code_row_bytes(&self) -> usize {
+        self.spec.width.row_stride(self.desc.in_features)
+    }
+
+    /// Bytes one output row of the scale table occupies, source and canonical
+    /// alike: the source's order and dtype **are** the canonical ones.
+    pub fn scale_row_bytes(&self) -> usize {
+        self.groups_per_row * self.desc.scale_dtype.bytes()
+    }
+
+    /// Source bytes one **word row** of `weight_zero_point` occupies. A word
+    /// row covers [`Self::zero_points_per_word`] output channels.
+    pub fn source_zero_point_word_row_bytes(&self) -> usize {
+        self.groups_per_row * 4
+    }
+
+    /// Canonical bytes one output row of zero points occupies.
+    pub fn canonical_zero_point_row_bytes(&self) -> usize {
+        self.groups_per_row * crate::payload::ZERO_POINT_BYTES
+    }
+
+    /// The total source payload lengths this module must have, in the order
+    /// `(packed, scale, zero_point)`.
+    pub fn source_lengths(&self) -> Result<(usize, usize, Option<usize>)> {
+        let packed = self
+            .source_code_row_bytes()
+            .checked_mul(self.desc.out_features)
+            .ok_or_else(|| invalid_static("packed byte count overflows usize"))?;
+        let scale = self
+            .scale_row_bytes()
+            .checked_mul(self.desc.out_features)
+            .ok_or_else(|| invalid_static("scale byte count overflows usize"))?;
+        let zero_point = match self.spec.zero_points {
+            ZeroPointSource::Symmetric => None,
+            ZeroPointSource::PackedAlongOutput => Some(
+                self.source_zero_point_word_row_bytes()
+                    .checked_mul(self.desc.out_features.div_ceil(self.zero_points_per_word()))
+                    .ok_or_else(|| invalid_static("zero-point byte count overflows usize"))?,
+            ),
+        };
+        Ok((packed, scale, zero_point))
+    }
+
+    /// Check a row range against the output axis.
+    fn check_rows(&self, rows: core::ops::Range<usize>) -> Result<usize> {
+        if rows.start >= rows.end || rows.end > self.desc.out_features {
+            return Err(invalid(format_args!(
+                "row range {}..{} is not a non-empty range inside {} output channel(s)",
+                rows.start, rows.end, self.desc.out_features
+            )));
+        }
+        Ok(rows.end - rows.start)
+    }
+
+    /// Convert one range of output rows of `weight_packed` into canonical
+    /// packed codes.
+    ///
+    /// `src` is exactly those rows' source bytes and nothing else, so a caller
+    /// reads only what it converts. `scratch` holds one row of signed codes and
+    /// is supplied by the caller, because an allocation per tile is exactly the
+    /// per-row allocation task 0018's review removed from this path.
+    pub fn convert_code_rows(
+        &self,
+        rows: core::ops::Range<usize>,
+        src: &[u8],
+        scratch: &mut [i32],
+        out: &mut [u8],
+    ) -> Result<()> {
+        let n = self.check_rows(rows)?;
+        let src_stride = self.source_code_row_bytes();
+        let out_stride = self.canonical_code_row_bytes();
+        if src.len() != n * src_stride {
+            return Err(invalid(format_args!(
+                "{n} source code row(s) are {} byte(s), got {}",
+                n * src_stride,
+                src.len()
+            )));
+        }
+        if out.len() != n * out_stride {
+            return Err(invalid(format_args!(
+                "{n} canonical code row(s) are {} byte(s), the destination holds {}",
+                n * out_stride,
+                out.len()
+            )));
+        }
+        if scratch.len() != self.desc.in_features {
+            return Err(invalid(format_args!(
+                "the code scratch holds {} value(s) for a {}-wide row",
+                scratch.len(),
+                self.desc.in_features
+            )));
+        }
+        let bits = self.spec.width.bits();
+        let mask: u32 = (1u32 << bits) - 1;
+        let per_word = self.spec.values_per_word();
+        for row in 0..n {
+            let row_src = &src[row * src_stride..(row + 1) * src_stride];
+            for (k, slot) in scratch.iter_mut().enumerate() {
+                let at = (k / per_word) * 4;
+                let word = u32::from_le_bytes(
+                    row_src[at..at + 4]
+                        .try_into()
+                        .expect("four bytes, length checked above"),
+                );
+                let lane = k % per_word;
+                let raw = (word >> (lane as u32 * bits)) & mask;
+                *slot = rebias_code(self.spec.width, raw)?;
+            }
+            crate::affine::pack_row_into(
+                self.spec.width,
+                scratch,
+                &mut out[row * out_stride..(row + 1) * out_stride],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Convert one range of output rows of `weight_scale`.
+    ///
+    /// The source's table is already row-major `(output channel, group)` in the
+    /// canonical dtype, so the bytes are preserved exactly -- and validated:
+    /// a non-finite or non-positive scale is refused rather than copied.
+    pub fn convert_scale_rows(
+        &self,
+        rows: core::ops::Range<usize>,
+        src: &[u8],
+        out: &mut [u8],
+    ) -> Result<()> {
+        let n = self.check_rows(rows)?;
+        let stride = self.scale_row_bytes();
+        if src.len() != n * stride {
+            return Err(invalid(format_args!(
+                "{n} source scale row(s) are {} byte(s), got {}",
+                n * stride,
+                src.len()
+            )));
+        }
+        crate::payload::write_scale_block(self.desc.scale_dtype, src, out)
+    }
+
+    /// The source word rows that hold output rows `rows`.
+    ///
+    /// Zero points are packed along the **output** axis, so a canonical row
+    /// block maps to a word-row block, and a block that does not start on a
+    /// word boundary would need the other lanes of its first word. Refused
+    /// rather than silently widened: a converter that quietly read a larger
+    /// range than the caller admitted would break the budget it was given.
+    pub fn zero_point_word_rows(
+        &self,
+        rows: core::ops::Range<usize>,
+    ) -> Result<core::ops::Range<usize>> {
+        self.check_rows(rows.clone())?;
+        let per_word = self.zero_points_per_word();
+        if !rows.start.is_multiple_of(per_word) {
+            return Err(invalid(format_args!(
+                "zero-point row block starts at {}, which is not a multiple of the {per_word} \
+                 output channel(s) packed into one source word",
+                rows.start
+            )));
+        }
+        if !rows.end.is_multiple_of(per_word) && rows.end != self.desc.out_features {
+            return Err(invalid(format_args!(
+                "zero-point row block ends at {}, which is neither a multiple of {per_word} nor \
+                 the last of {} output channel(s)",
+                rows.end, self.desc.out_features
+            )));
+        }
+        Ok(rows.start / per_word..rows.end.div_ceil(per_word))
+    }
+
+    /// One canonical zero point, decoded from the source word table.
+    ///
+    /// The pinned compressor's `packed_dim=0`: word row `o / values_per_word`,
+    /// lane `o % values_per_word`. `src` covers the word rows
+    /// [`Self::zero_point_word_rows`] returned for the block, and `base_row` is
+    /// that block's first output row. Padding lanes above `out_features` exist
+    /// whenever the output axis is not a multiple of the packing factor and are
+    /// **never read** -- what a writer padded with is not this reader's
+    /// business.
+    fn zero_point_value(&self, src: &[u8], base_row: usize, o: usize, g: usize) -> Result<i16> {
+        let per_word = self.zero_points_per_word();
+        let word_row = o / per_word - base_row / per_word;
+        let lane = (o % per_word) as u32;
+        let at = (word_row * self.groups_per_row + g) * 4;
+        let word = u32::from_le_bytes(
+            src[at..at + 4]
+                .try_into()
+                .expect("four bytes, length checked by the caller"),
+        );
+        let bits = self.spec.width.bits();
+        let mask: u32 = (1u32 << bits) - 1;
+        let raw = (word >> (lane * bits)) & mask;
+        rebias_zero_point(self.spec.width, raw)
+    }
+
+    /// Length-check a zero-point source block for `rows`.
+    fn check_zero_point_src(&self, rows: core::ops::Range<usize>, src: &[u8]) -> Result<()> {
+        let words = self.zero_point_word_rows(rows)?;
+        let need = (words.end - words.start) * self.source_zero_point_word_row_bytes();
+        if src.len() != need {
+            return Err(invalid(format_args!(
+                "this zero-point block is {need} source byte(s), got {}",
+                src.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Convert one range of output rows of `weight_zero_point` into canonical
+    /// payload bytes.
+    pub fn convert_zero_point_rows(
+        &self,
+        rows: core::ops::Range<usize>,
+        src: &[u8],
+        out: &mut [u8],
+    ) -> Result<()> {
+        let n = self.check_rows(rows.clone())?;
+        self.check_zero_point_src(rows.clone(), src)?;
+        let stride = self.canonical_zero_point_row_bytes();
+        if out.len() != n * stride {
+            return Err(invalid(format_args!(
+                "{n} canonical zero-point row(s) are {} byte(s), the destination holds {}",
+                n * stride,
+                out.len()
+            )));
+        }
+        let width = crate::payload::ZERO_POINT_BYTES;
+        for (row, o) in rows.clone().enumerate() {
+            for g in 0..self.groups_per_row {
+                let z = self.zero_point_value(src, rows.start, o, g)?;
+                let at = row * stride + g * width;
+                crate::payload::write_zero_point(z, &mut out[at..at + width])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The same conversion, into canonical `i16` **values**.
+    ///
+    /// [`import`] builds a whole `ZeroPoints::PerGroup` and needs the values;
+    /// a repacker writing a chunk needs the bytes. Both loop over the one
+    /// `zero_point_value` above, so there is a single statement of where a
+    /// zero point lives in a source word.
+    pub fn zero_point_values(
+        &self,
+        rows: core::ops::Range<usize>,
+        src: &[u8],
+        out: &mut Vec<i16>,
+    ) -> Result<()> {
+        let n = self.check_rows(rows.clone())?;
+        self.check_zero_point_src(rows.clone(), src)?;
+        if out.capacity() < out.len() + n * self.groups_per_row {
+            return Err(invalid(format_args!(
+                "the zero-point destination has room for {} more value(s), this block needs {}",
+                out.capacity() - out.len(),
+                n * self.groups_per_row
+            )));
+        }
+        for o in rows.clone() {
+            for g in 0..self.groups_per_row {
+                out.push(self.zero_point_value(src, rows.start, o, g)?);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Import one `pack-quantized` tensor into canonical affine form.
 ///
 /// Every length is checked against the logical shape from `weight_shape`, which
 /// is the authority; the packed, scale and zero-point shapes are validated
 /// against it rather than used to derive it.
 pub fn import(spec: &PackQuantizedSpec, src: SourceTensors<'_>) -> Result<AffineTensor> {
-    // The spec and the payload are two independently obtained facts about one
-    // tensor. Neither is allowed to be read while the other is ignored.
-    match (spec.zero_points, src.zero_point.is_some()) {
-        (ZeroPointSource::Symmetric, false) | (ZeroPointSource::PackedAlongOutput, true) => {}
-        (ZeroPointSource::Symmetric, true) => {
-            return Err(invalid_static(
-                "a symmetric pack-quantized source carries no weight_zero_point, but one was \
-                 supplied",
-            ));
-        }
-        (ZeroPointSource::PackedAlongOutput, false) => {
-            return Err(invalid_static(
-                "an asymmetric pack-quantized source requires its weight_zero_point payload",
-            ));
-        }
-    }
-
+    // One validated geometry, shared with the streaming converter: every rule
+    // that used to be written out here is in `PackQuantizedPlan::new`, so an
+    // inspection that refuses a module and an import that refuses it refuse it
+    // for the same reason and with the same words.
+    let plan = PackQuantizedPlan::new(
+        spec,
+        DeclaredSource {
+            packed_shape: src.packed_shape,
+            scale_shape: src.scale_shape,
+            scale_dtype: src.scale_dtype,
+            zero_point_shape: src.zero_point.map(|z| z.shape),
+            logical: src.logical,
+        },
+    )?;
+    let desc = plan.descriptor().clone();
     let (out_features, in_features) = src.logical;
-    if out_features == 0 || in_features == 0 {
-        return Err(invalid(format_args!(
-            "empty logical shape {out_features}x{in_features}"
-        )));
-    }
-    let per_word = spec.values_per_word();
-    let packed_columns = in_features.div_ceil(per_word);
-    // The declared axes, before the byte counts. A transposed or otherwise
-    // incompatible shape can have exactly the right number of bytes.
-    let want_packed = [out_features as u64, packed_columns as u64];
-    if src.packed_shape != want_packed {
-        return Err(invalid(format_args!(
-            "weight_packed is declared {:?}; {out_features}x{in_features} at {} bit(s) \
-             requires {want_packed:?}",
-            src.packed_shape,
-            spec.width.bits()
-        )));
-    }
-    let need_words = packed_columns
-        .checked_mul(out_features)
-        .ok_or_else(|| invalid_static("packed word count overflows usize"))?;
-    let need_packed = need_words
-        .checked_mul(4)
-        .ok_or_else(|| invalid_static("packed byte count overflows usize"))?;
+    let (need_packed, need_scale, need_zero_point) = plan.source_lengths()?;
     if src.packed.len() != need_packed {
         return Err(invalid(format_args!(
             "weight_packed is {} byte(s); {out_features}x{in_features} at {} bit(s) needs \
-             {need_packed} ({out_features}x{packed_columns} I32 words)",
+             {need_packed} ({out_features}x{} I32 words)",
             src.packed.len(),
-            spec.width.bits()
+            spec.width.bits(),
+            plan.source_code_row_bytes() / 4
         )));
     }
-
-    let grouping = match spec.granularity {
-        Granularity::Channel => Grouping::PerOutputChannel,
-        Granularity::Group { size } => Grouping::Contiguous { size },
-    };
-    let desc = AffineDescriptor {
-        width: spec.width,
-        out_features,
-        in_features,
-        grouping,
-        // Contiguous. `actorder` is null in every inspected asymmetric
-        // artifact; a source that carried a permutation would have to supply
-        // the map here, and document 03 forbids ignoring one.
-        group_index: None,
-        scale_dtype: src.scale_dtype,
-    };
-    desc.validate()?;
-
-    let entries = desc.group_entries()?;
-    let groups_per_row = desc.groups_per_row()?;
-    // Per-channel sources serialize the scale as `[out, 1]`; some writers emit
-    // `[out]`. Both are accepted, and nothing else is: a scale whose rows do
-    // not match the output channels is a different tensor, not a reshape.
-    let scale_ok = src.scale_shape == [out_features as u64, groups_per_row as u64]
-        || (groups_per_row == 1 && src.scale_shape == [out_features as u64]);
-    if !scale_ok {
-        return Err(invalid(format_args!(
-            "weight_scale is declared {:?}; {out_features} output channel(s) with \
-             {groups_per_row} group(s) each requires [{out_features}, {groups_per_row}]",
-            src.scale_shape
-        )));
-    }
-    let need_scale = entries
-        .checked_mul(src.scale_dtype.bytes())
-        .ok_or_else(|| invalid_static("scale byte count overflows usize"))?;
     if src.scale.len() != need_scale {
         return Err(invalid(format_args!(
-            "weight_scale is {} byte(s); {entries} {} scale(s) need {need_scale}",
+            "weight_scale is {} byte(s); {} {} scale(s) need {need_scale}",
             src.scale.len(),
+            desc.group_entries()?,
             src.scale_dtype.name()
         )));
     }
+    if let (Some(zp), Some(need)) = (src.zero_point, need_zero_point)
+        && zp.payload.len() != need
+    {
+        return Err(invalid(format_args!(
+            "weight_zero_point is {} byte(s); {}x{} I32 words need {need}",
+            zp.payload.len(),
+            out_features.div_ceil(plan.zero_points_per_word()),
+            plan.groups_per_row()
+        )));
+    }
 
+    let entries = desc.group_entries()?;
     // The zero points, before anything reads a code: a refusal here must not
     // come after a whole tensor has been unpacked.
     let zero_points = match src.zero_point {
         None => ZeroPoints::Symmetric,
-        Some(zp) => decode_zero_points(spec, zp, out_features, groups_per_row, entries)?,
+        Some(zp) => {
+            let mut values = crate::try_vec::<i16>(entries)?;
+            plan.zero_point_values(0..out_features, zp.payload, &mut values)?;
+            ZeroPoints::PerGroup(values)
+        }
     };
 
     // Unpack into canonical packed codes: logical row-major, each row
-    // byte-aligned, which is what `AffineTensor` stores.
-    let mut codes = crate::try_vec::<i32>(in_features)?;
+    // byte-aligned, which is what `AffineTensor` stores. One destination and
+    // one row scratch, both reserved once -- the streaming converter's tile is
+    // the same call with a shorter row range.
+    let mut scratch = crate::try_vec::<i32>(in_features)?;
+    scratch.resize(in_features, 0);
     let code_bytes = desc.code_bytes()?;
     let mut out = crate::try_vec::<u8>(code_bytes)?;
     out.resize(code_bytes, 0);
-    let bits = spec.width.bits();
-    let mask: u32 = (1u32 << bits) - 1;
-    for o in 0..out_features {
-        codes.clear();
-        for k in 0..in_features {
-            let word_index = o * packed_columns + k / per_word;
-            let at = word_index * 4;
-            let word = u32::from_le_bytes(
-                src.packed[at..at + 4]
-                    .try_into()
-                    .expect("four bytes, length checked above"),
-            );
-            let lane = k % per_word;
-            let raw = (word >> (lane as u32 * bits)) & mask;
-            codes.push(rebias_code(spec.width, raw)?);
-        }
-        // Into the already reserved destination: no per-row allocation, so
-        // there is no infallible allocation anywhere on this path.
-        let stride = spec.width.row_stride(in_features);
-        crate::affine::pack_row_into(spec.width, &codes, &mut out[o * stride..(o + 1) * stride])?;
-    }
+    plan.convert_code_rows(0..out_features, src.packed, &mut scratch, &mut out)?;
 
-    let scales = decode_scales(src.scale, src.scale_dtype, entries)?;
+    let scales = crate::payload::decode_scale_section(src.scale_dtype, src.scale, entries)?;
     AffineTensor::new(desc, out, scales, zero_points)
-}
-
-/// Decode `weight_zero_point` into canonical `(output channel, group)` order.
-///
-/// The packing is the pinned compressor's `packed_dim=0`: word row
-/// `o / values_per_word`, lane `o % values_per_word`. Padding lanes above
-/// `out_features` exist whenever the output axis is not a multiple of
-/// `values_per_word`, and are **never read** -- the loop is over logical output
-/// channels, so what a writer padded with is not this reader's business.
-fn decode_zero_points(
-    spec: &PackQuantizedSpec,
-    zp: PackedZeroPoints<'_>,
-    out_features: usize,
-    groups_per_row: usize,
-    entries: usize,
-) -> Result<ZeroPoints> {
-    let per_word = spec.values_per_word();
-    let zp_rows = out_features.div_ceil(per_word);
-    let want = [zp_rows as u64, groups_per_row as u64];
-    // Exactly this shape. The scale rule also accepts a one-dimensional
-    // `[out]`, because a writer was seen to emit it; no writer has been seen to
-    // emit a one-dimensional zero point, and accepting a shape nothing produces
-    // is a branch no fixture can justify.
-    if zp.shape != want {
-        return Err(invalid(format_args!(
-            "weight_zero_point is declared {:?}; {out_features} output channel(s) at {} bit(s) \
-             with {groups_per_row} group(s) each requires {want:?} -- zero points are packed \
-             along the output axis, unlike the codes",
-            zp.shape,
-            spec.width.bits()
-        )));
-    }
-    let need = zp_rows
-        .checked_mul(groups_per_row)
-        .and_then(|w| w.checked_mul(4))
-        .ok_or_else(|| invalid_static("zero-point byte count overflows usize"))?;
-    if zp.payload.len() != need {
-        return Err(invalid(format_args!(
-            "weight_zero_point is {} byte(s); {zp_rows}x{groups_per_row} I32 words need {need}",
-            zp.payload.len()
-        )));
-    }
-
-    let bits = spec.width.bits();
-    let mask: u32 = (1u32 << bits) - 1;
-    let mut values = crate::try_vec::<i16>(entries)?;
-    for o in 0..out_features {
-        let row = o / per_word;
-        let lane = (o % per_word) as u32;
-        for g in 0..groups_per_row {
-            let at = (row * groups_per_row + g) * 4;
-            let word = u32::from_le_bytes(
-                zp.payload[at..at + 4]
-                    .try_into()
-                    .expect("four bytes, length checked above"),
-            );
-            let raw = (word >> (lane * bits)) & mask;
-            values.push(rebias_zero_point(spec.width, raw)?);
-        }
-    }
-    Ok(ZeroPoints::PerGroup(values))
-}
-
-fn decode_scales(bytes: &[u8], dtype: ScaleDtype, entries: usize) -> Result<ScaleValues> {
-    Ok(match dtype {
-        ScaleDtype::Bf16 | ScaleDtype::F16 => {
-            let mut v = crate::try_vec::<u16>(entries)?;
-            v.extend(
-                bytes
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]])),
-            );
-            match dtype {
-                ScaleDtype::Bf16 => ScaleValues::Bf16(v),
-                _ => ScaleValues::F16(v),
-            }
-        }
-        ScaleDtype::F32 => {
-            let mut v = crate::try_vec::<f32>(entries)?;
-            v.extend(
-                bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
-            );
-            ScaleValues::F32(v)
-        }
-    })
 }
 
 #[cfg(test)]
@@ -1623,5 +1916,201 @@ mod tests {
         bytes.extend_from_slice(json.as_bytes());
         let file_len = bytes.len() as u64 + at;
         Header::parse(&bytes, file_len).expect("well-formed header")
+    }
+
+    /// The streaming converter and the whole-tensor import must produce the
+    /// same canonical payload, byte for byte, at every tile size.
+    ///
+    /// This is what makes "one codec" a property of the code rather than a
+    /// claim: `import` is written in terms of `PackQuantizedPlan`, and a repack
+    /// drives the same methods with a shorter row range. A tile boundary that
+    /// fell in the wrong place -- mid-word on the output axis, mid-group on the
+    /// input axis, or across the padded tail -- would show up here as different
+    /// bytes rather than as a wrong weight nobody notices.
+    #[test]
+    fn the_streaming_converter_and_the_whole_tensor_import_agree() {
+        for width in [IntWidth::Int4, IntWidth::Int8] {
+            for zero_points in [
+                ZeroPointSource::Symmetric,
+                ZeroPointSource::PackedAlongOutput,
+            ] {
+                // 17 rows: not a multiple of either packing factor, so the
+                // last zero-point word row is a partial one. 130 columns: a
+                // partial group and, at INT4, a tail nibble.
+                let (rows, columns, groups) = (17usize, 130usize, 130usize.div_ceil(32));
+                let spec = PackQuantizedSpec {
+                    width,
+                    granularity: Granularity::Group { size: 32 },
+                    zero_points,
+                };
+                let (lo, hi) = width.code_range();
+                let span = (hi - lo + 1) as usize;
+                let packed = pack(width, rows, columns, |o, k| {
+                    lo + ((k * 7 + o) % span) as i32
+                });
+                let scale = bf16_scales(rows * groups);
+                let zeros: Vec<Vec<i16>> = (0..rows)
+                    .map(|o| {
+                        (0..groups)
+                            .map(|g| (lo + ((o + g * 3) % span) as i32) as i16)
+                            .collect()
+                    })
+                    .collect();
+                let zp = pack_zero_points(width, &zeros, groups);
+                let zp_shape = zero_point_shape(width, rows, groups);
+                let packed_shape = packed_shape(width, rows, columns);
+                let scale_shape = scale_shape(Granularity::Group { size: 32 }, rows, columns);
+                let src = SourceTensors {
+                    packed: &packed,
+                    packed_shape: &packed_shape,
+                    scale: &scale,
+                    scale_shape: &scale_shape,
+                    scale_dtype: ScaleDtype::Bf16,
+                    zero_point: match zero_points {
+                        ZeroPointSource::Symmetric => None,
+                        ZeroPointSource::PackedAlongOutput => Some(PackedZeroPoints {
+                            payload: &zp,
+                            shape: &zp_shape,
+                        }),
+                    },
+                    logical: (rows, columns),
+                };
+                let whole = import(&spec, src).unwrap();
+                let section = crate::payload::ZeroPointSection::of(whole.zero_points());
+                let extents = crate::payload::extents(whole.descriptor(), section).unwrap();
+                let mut expected = vec![0u8; extents.total()];
+                crate::payload::encode(&whole, &mut expected).unwrap();
+
+                let plan = PackQuantizedPlan::new(
+                    &spec,
+                    DeclaredSource {
+                        packed_shape: &packed_shape,
+                        scale_shape: &scale_shape,
+                        scale_dtype: ScaleDtype::Bf16,
+                        zero_point_shape: match zero_points {
+                            ZeroPointSource::Symmetric => None,
+                            ZeroPointSource::PackedAlongOutput => Some(&zp_shape),
+                        },
+                        logical: (rows, columns),
+                    },
+                )
+                .unwrap();
+
+                // Tile sizes that land on and off every boundary there is: one
+                // row, a partial word, a whole word, more than one word, and
+                // the whole tensor.
+                for tile in [1usize, 3, 4, 8, 9, 16, rows] {
+                    let mut got = vec![0u8; extents.total()];
+                    let mut scratch = vec![0i32; columns];
+                    // Codes, tile by tile.
+                    let mut at = extents.codes().start;
+                    let mut row = 0;
+                    while row < rows {
+                        let end = (row + tile).min(rows);
+                        let src_stride = plan.source_code_row_bytes();
+                        let out_bytes = (end - row) * plan.canonical_code_row_bytes();
+                        plan.convert_code_rows(
+                            row..end,
+                            &packed[row * src_stride..end * src_stride],
+                            &mut scratch,
+                            &mut got[at..at + out_bytes],
+                        )
+                        .unwrap();
+                        at += out_bytes;
+                        row = end;
+                    }
+                    assert_eq!(at, extents.codes().end, "codes filled the code section");
+                    // Scales, tile by tile.
+                    let mut at = extents.scales().start;
+                    let mut row = 0;
+                    while row < rows {
+                        let end = (row + tile).min(rows);
+                        let stride = plan.scale_row_bytes();
+                        plan.convert_scale_rows(
+                            row..end,
+                            &scale[row * stride..end * stride],
+                            &mut got[at..at + (end - row) * stride],
+                        )
+                        .unwrap();
+                        at += (end - row) * stride;
+                        row = end;
+                    }
+                    assert_eq!(at, extents.scales().end);
+                    // Zero points, in word-aligned tiles.
+                    if let Some(range) = extents.zero_points() {
+                        let per_word = plan.zero_points_per_word();
+                        let block = tile.max(per_word).next_multiple_of(per_word);
+                        let mut at = range.start;
+                        let mut row = 0;
+                        while row < rows {
+                            let end = (row + block).min(rows);
+                            let words = plan.zero_point_word_rows(row..end).unwrap();
+                            let word_bytes = plan.source_zero_point_word_row_bytes();
+                            let out_bytes = (end - row) * plan.canonical_zero_point_row_bytes();
+                            plan.convert_zero_point_rows(
+                                row..end,
+                                &zp[words.start * word_bytes..words.end * word_bytes],
+                                &mut got[at..at + out_bytes],
+                            )
+                            .unwrap();
+                            at += out_bytes;
+                            row = end;
+                        }
+                        assert_eq!(at, range.end);
+                    }
+                    assert_eq!(got, expected, "{width:?} {zero_points:?} at tile {tile}");
+                }
+            }
+        }
+    }
+
+    /// A zero-point tile that does not start on a source word boundary is
+    /// refused, rather than quietly reading the lanes it was not given.
+    #[test]
+    fn an_unaligned_zero_point_tile_is_refused() {
+        let spec = PackQuantizedSpec {
+            width: IntWidth::Int4,
+            granularity: Granularity::Group { size: 32 },
+            zero_points: ZeroPointSource::PackedAlongOutput,
+        };
+        let (rows, columns, groups) = (16usize, 64usize, 2usize);
+        let wide_packed = packed_shape(IntWidth::Int4, rows, columns);
+        let wide_scale = scale_shape(Granularity::Group { size: 32 }, rows, columns);
+        let wide_zp = zero_point_shape(IntWidth::Int4, rows, groups);
+        let plan = PackQuantizedPlan::new(
+            &spec,
+            DeclaredSource {
+                packed_shape: &wide_packed,
+                scale_shape: &wide_scale,
+                scale_dtype: ScaleDtype::Bf16,
+                zero_point_shape: Some(&wide_zp),
+                logical: (rows, columns),
+            },
+        )
+        .unwrap();
+        // Eight output channels per I32 word at INT4.
+        assert_eq!(plan.zero_points_per_word(), 8);
+        assert_eq!(plan.zero_point_word_rows(0..8).unwrap(), 0..1);
+        assert_eq!(plan.zero_point_word_rows(8..16).unwrap(), 1..2);
+        let e = plan.zero_point_word_rows(3..8).unwrap_err();
+        assert!(e.to_string().contains("not a multiple"), "{e}");
+        let e = plan.zero_point_word_rows(0..5).unwrap_err();
+        assert!(e.to_string().contains("neither a multiple"), "{e}");
+        // The last block may end short of a word, because the tensor does.
+        let short_packed = packed_shape(IntWidth::Int4, 13, columns);
+        let short_scale = scale_shape(Granularity::Group { size: 32 }, 13, columns);
+        let short_zp = zero_point_shape(IntWidth::Int4, 13, groups);
+        let plan = PackQuantizedPlan::new(
+            &spec,
+            DeclaredSource {
+                packed_shape: &short_packed,
+                scale_shape: &short_scale,
+                scale_dtype: ScaleDtype::Bf16,
+                zero_point_shape: Some(&short_zp),
+                logical: (13, columns),
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.zero_point_word_rows(8..13).unwrap(), 1..2);
     }
 }

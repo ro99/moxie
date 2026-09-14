@@ -78,6 +78,7 @@ use moxie_types::{Error, Result};
 use serde::Deserialize;
 
 use crate::affine::{AffineDescriptor, Grouping, IntWidth};
+use crate::payload::ZeroPointSection as PayloadZeroPoints;
 use crate::scale::ScaleDtype as PayloadScaleDtype;
 use crate::sha256::sha256_hex;
 
@@ -770,11 +771,14 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
                     Some(out)
                 }
             };
-            // NOTE: no `product(shape) * element_size == length` check for
-            // affine tensors. Their chunk payload (codes, scales, zero points)
-            // has no single element size, and its exact layout is M3's reader
-            // contract. V1 reserves the byte range and validates the
-            // descriptor; the reader refuses to read the tensor.
+            // The affine payload layout is no longer open. [ADR 0023] fixes
+            // it -- codes, then scales, then zero points, contiguous -- so the
+            // length check this validator could not make in M1 is made below,
+            // after the descriptor is built: the three section sizes are a
+            // function of the descriptor, and a `length` that disagrees with
+            // them describes a range no writer could have produced.
+            //
+            // [ADR 0023]: ../../../docs/decisions/adr/0023-canonical-affine-payload-and-repack-journal.md
             //
             // The descriptor is then checked by the shared
             // `AffineDescriptor::validate`, not by a second copy of its
@@ -832,6 +836,29 @@ fn validate_tensor(t: RawTensor) -> Result<Tensor> {
                     "tensor '{role}': shared affine descriptor rejects it: {e}"
                 ))
             })?;
+            // ADR 0023's arithmetic, from the shared codec rather than a
+            // second copy of it here.
+            let section = match zero_point {
+                ZeroPointMode::Symmetric => PayloadZeroPoints::Absent,
+                ZeroPointMode::PerGroup => PayloadZeroPoints::PerGroup,
+            };
+            let need = crate::payload::length_of(&desc, section).map_err(|e| {
+                invalid(format_args!(
+                    "tensor '{role}': its payload length cannot be computed: {e}"
+                ))
+            })?;
+            if need != length {
+                return Err(invalid(format_args!(
+                    "tensor '{role}': a {} {out_features}x{in_features} tensor with {} \
+                     zero point(s) occupies {need} canonical byte(s), but length is {length}: \
+                     codes, scales and zero points are contiguous sections of one range (ADR 0023)",
+                    precision.name(),
+                    match section {
+                        PayloadZeroPoints::Absent => "no",
+                        PayloadZeroPoints::PerGroup => "per-group",
+                    }
+                )));
+            }
             Some(AffineFields {
                 group_rule,
                 scale_dtype,
@@ -1143,4 +1170,260 @@ impl IdentityWriter {
     fn finish(self) -> Vec<u8> {
         self.buf
     }
+}
+
+// --- the writer half ---------------------------------------------------------
+
+/// Encode a validated manifest as `manifest.toml`.
+///
+/// The inverse of [`parse`], and the only place canonical manifest text is
+/// produced. Three properties make it safe to publish what this returns:
+///
+/// * **It goes through the same parser on the way out.** `encode` re-parses its
+///   own output and compares the artifact identity before returning it, so a
+///   manifest this function emits is one this reader accepts, by construction
+///   rather than by test coverage. A writer that could emit text its own reader
+///   rejects is a publication step that can fail after the bytes are durable.
+/// * **It escapes nothing by hand.** The document is built as a `toml::Value`
+///   and serialized by the `toml` crate, which ADR 0005 already admitted for
+///   exactly this file. A role containing a quote, a newline or a non-ASCII
+///   character is the serializer's problem, not a hand-written quoting rule's --
+///   ADR 0004 is four reviews of what hand-written text handling costs here.
+/// * **It is deterministic.** Table keys are serialized in sorted order and
+///   tensors in the order the manifest holds them, so two encodes of one
+///   manifest are byte-identical and a republish of unchanged content changes
+///   no byte.
+///
+/// It does **not** decide content: completeness, exclusions, provenance and
+/// identity fields are whatever the caller put in the `Manifest`. Deciding
+/// those is the repacker's job and is where "a selected module is not a
+/// complete model" is enforced.
+pub fn encode(manifest: &Manifest) -> Result<String> {
+    let mut doc = toml::map::Map::new();
+    doc.insert(
+        "schema_version".into(),
+        toml::Value::Integer(i64::from(SCHEMA_VERSION)),
+    );
+    doc.insert(
+        "required_features".into(),
+        toml::Value::Array(
+            manifest
+                .required_features
+                .iter()
+                .map(|f| toml::Value::String(f.clone()))
+                .collect(),
+        ),
+    );
+    doc.insert(
+        "endianness".into(),
+        toml::Value::String(
+            match manifest.endianness {
+                Endianness::Little => "little",
+            }
+            .into(),
+        ),
+    );
+
+    let mut source = toml::map::Map::new();
+    source.insert(
+        "model".into(),
+        toml::Value::String(manifest.source.model.clone()),
+    );
+    source.insert(
+        "revision".into(),
+        toml::Value::String(manifest.source.revision.clone()),
+    );
+    source.insert(
+        "license".into(),
+        toml::Value::String(manifest.source.license.clone()),
+    );
+    source.insert(
+        "files".into(),
+        toml::Value::Array(
+            manifest
+                .source
+                .files
+                .iter()
+                .map(|f| {
+                    let mut t = toml::map::Map::new();
+                    t.insert("path".into(), toml::Value::String(f.path.clone()));
+                    t.insert("sha256".into(), toml::Value::String(f.sha256.clone()));
+                    toml::Value::Table(t)
+                })
+                .collect(),
+        ),
+    );
+    doc.insert("source".into(), toml::Value::Table(source));
+    doc.insert("tokenizer".into(), identity_table(&manifest.tokenizer));
+    doc.insert("template".into(), identity_table(&manifest.template));
+
+    let mut arch = toml::map::Map::new();
+    arch.insert(
+        "name".into(),
+        toml::Value::String(manifest.architecture.name.clone()),
+    );
+    arch.insert(
+        "version".into(),
+        toml::Value::String(manifest.architecture.version.clone()),
+    );
+    // The opaque tree, re-emitted exactly as it was parsed. This crate hashes
+    // it into artifact identity and never reads a field of it, so it is copied
+    // rather than interpreted here too.
+    arch.insert("metadata".into(), manifest.architecture.metadata.0.clone());
+    doc.insert("architecture".into(), toml::Value::Table(arch));
+
+    let mut prov = toml::map::Map::new();
+    prov.insert(
+        "scale_convention".into(),
+        toml::Value::String(manifest.provenance.scale_convention.clone()),
+    );
+    prov.insert(
+        "quantizer".into(),
+        toml::Value::String(manifest.provenance.quantizer.clone()),
+    );
+    prov.insert(
+        "calibration".into(),
+        toml::Value::String(manifest.provenance.calibration.clone()),
+    );
+    doc.insert("provenance".into(), toml::Value::Table(prov));
+
+    let mut tensors = Vec::new();
+    for t in &manifest.tensors {
+        tensors.push(tensor_table(t)?);
+    }
+    doc.insert("tensors".into(), toml::Value::Array(tensors));
+
+    doc.insert(
+        "excluded".into(),
+        toml::Value::Array(
+            manifest
+                .excluded
+                .iter()
+                .map(|e| {
+                    let mut t = toml::map::Map::new();
+                    t.insert("role".into(), toml::Value::String(e.role.clone()));
+                    t.insert("reason".into(), toml::Value::String(e.reason.clone()));
+                    toml::Value::Table(t)
+                })
+                .collect(),
+        ),
+    );
+
+    let mut completeness = toml::map::Map::new();
+    match &manifest.completeness {
+        Completeness::Complete => {
+            completeness.insert("status".into(), toml::Value::String("complete".into()));
+            completeness.insert("missing".into(), toml::Value::Array(Vec::new()));
+        }
+        Completeness::Partial { missing } => {
+            completeness.insert("status".into(), toml::Value::String("partial".into()));
+            completeness.insert(
+                "missing".into(),
+                toml::Value::Array(
+                    missing
+                        .iter()
+                        .map(|m| toml::Value::String(m.clone()))
+                        .collect(),
+                ),
+            );
+        }
+    }
+    doc.insert("completeness".into(), toml::Value::Table(completeness));
+
+    let text = toml::to_string(&toml::Value::Table(doc))
+        .map_err(|e| invalid(format_args!("manifest does not serialize: {e}")))?;
+
+    // Out through the reader. A publication that emits text its own validator
+    // refuses would fail at the worst possible moment -- after the payload is
+    // durable -- and identity is compared as well as validity, so a field lost
+    // in encoding is caught rather than published.
+    let reparsed = parse(&text).map_err(|e| {
+        invalid(format_args!(
+            "the encoded manifest does not parse back: {e}"
+        ))
+    })?;
+    if artifact_identity(&reparsed) != artifact_identity(manifest) {
+        return Err(invalid_static(
+            "the encoded manifest parses back to a different artifact identity",
+        ));
+    }
+    Ok(text)
+}
+
+fn identity_table(id: &Identity) -> toml::Value {
+    let mut t = toml::map::Map::new();
+    t.insert("name".into(), toml::Value::String(id.name.clone()));
+    t.insert("version".into(), toml::Value::String(id.version.clone()));
+    t.insert("digest".into(), toml::Value::String(id.digest.clone()));
+    toml::Value::Table(t)
+}
+
+fn tensor_table(t: &Tensor) -> Result<toml::Value> {
+    let to_i64 = |v: u64, field: &str| -> Result<toml::Value> {
+        i64::try_from(v)
+            .map(toml::Value::Integer)
+            .map_err(|_| invalid(format_args!("tensor '{}': {field} {v} exceeds i64", t.role)))
+    };
+    let mut e = toml::map::Map::new();
+    e.insert("role".into(), toml::Value::String(t.role.clone()));
+    let mut shape = Vec::with_capacity(t.shape.len());
+    for d in &t.shape {
+        shape.push(to_i64(*d, "shape dimension")?);
+    }
+    e.insert("shape".into(), toml::Value::Array(shape));
+    e.insert(
+        "precision".into(),
+        toml::Value::String(t.precision.name().into()),
+    );
+    e.insert("chunk".into(), toml::Value::String(t.chunk.clone()));
+    e.insert("offset".into(), to_i64(t.offset, "offset")?);
+    e.insert("length".into(), to_i64(t.length, "length")?);
+    e.insert("sha256".into(), toml::Value::String(t.sha256.clone()));
+    e.insert("alignment".into(), to_i64(t.alignment, "alignment")?);
+    e.insert(
+        "logical_order".into(),
+        to_i64(t.logical_order, "logical_order")?,
+    );
+    if let Some(a) = &t.affine {
+        e.insert(
+            "group_rule".into(),
+            toml::Value::String(
+                match a.group_rule {
+                    GroupRule::Contiguous32 => "contiguous-32",
+                    GroupRule::Contiguous128 => "contiguous-128",
+                    GroupRule::PerChannel => "per-channel",
+                }
+                .into(),
+            ),
+        );
+        e.insert(
+            "scale_dtype".into(),
+            toml::Value::String(
+                match a.scale_dtype {
+                    ScaleDtype::F16 => "f16",
+                    ScaleDtype::Bf16 => "bf16",
+                    ScaleDtype::F32 => "f32",
+                }
+                .into(),
+            ),
+        );
+        e.insert(
+            "zero_point".into(),
+            toml::Value::String(
+                match a.zero_point {
+                    ZeroPointMode::Symmetric => "symmetric",
+                    ZeroPointMode::PerGroup => "per-group",
+                }
+                .into(),
+            ),
+        );
+        if let Some(map) = &a.group_index {
+            let mut idx = Vec::with_capacity(map.len());
+            for g in map {
+                idx.push(toml::Value::Integer(i64::from(*g)));
+            }
+            e.insert("group_index".into(), toml::Value::Array(idx));
+        }
+    }
+    Ok(toml::Value::Table(e))
 }

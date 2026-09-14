@@ -1,0 +1,14 @@
+[package]
+name = "moxie-cli"
+version = "0.0.0"
+edition = "2024"
+
+# Nothing here names the writer. `relay` does, and this depends on `relay`:
+# the per-crate allowlist checks a manifest's own edges, so a path through one
+# crate is what it cannot see. The write-authority rule is reachability, and
+# the message it prints names the whole chain.
+[dependencies]
+relay = { path = "relay" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "canonical write authority outside the offline repacker"

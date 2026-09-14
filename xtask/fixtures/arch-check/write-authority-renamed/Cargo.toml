@@ -1,0 +1,13 @@
+[package]
+name = "moxie-engine"
+version = "0.0.0"
+edition = "2024"
+
+# The same edge behind an alias. An allowlist that inspected the key would see
+# `moxie-storage`, which every reader is allowed; the identity is resolved from
+# the `package` rename and from the path target's own manifest.
+[dependencies]
+moxie-storage = { package = "moxie-storage-write", path = "../../../../crates/moxie-storage-write" }
+
+[package.metadata.moxie-arch-check]
+expect-rule = "canonical write authority outside the offline repacker"

@@ -23,10 +23,13 @@
 pub mod affine;
 pub mod bf16;
 pub mod compressed_tensors;
+pub mod journal;
 pub mod manifest;
+pub mod payload;
 pub mod quantize;
 pub mod safetensors;
 pub mod scale;
+pub mod selection;
 pub mod sha256;
 
 pub use sha256::{StreamingSha256, sha256_hex};
