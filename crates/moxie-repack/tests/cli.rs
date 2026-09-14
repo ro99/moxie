@@ -34,7 +34,11 @@ impl Fixture {
                 .map(|o| (0..columns).map(|k| ((o + k) % 16) as u32).collect())
                 .collect(),
             scales: (0..rows)
-                .map(|o| (0..groups).map(|g| 0.5 + 0.25 * ((o + g) % 3) as f32).collect())
+                .map(|o| {
+                    (0..groups)
+                        .map(|g| 0.5 + 0.25 * ((o + g) % 3) as f32)
+                        .collect()
+                })
                 .collect(),
             zeros: (0..rows)
                 .map(|o| (0..groups).map(|g| ((o * 3 + g) % 16) as u32).collect())
@@ -87,7 +91,11 @@ impl Fixture {
                 "packed-along-output",
                 &files,
             )
-            .bf16("model.norm.weight", "model.norm.weight", "shard-a.safetensors")
+            .bf16(
+                "model.norm.weight",
+                "model.norm.weight",
+                "shard-a.safetensors",
+            )
             .write(&scratch.join("selection.toml"));
         Self { scratch, module }
     }
@@ -159,7 +167,11 @@ fn inspect_reports_the_selection_and_writes_nothing() {
         "completeness",
         "estimated-time",
     ] {
-        assert!(r.field(field).is_some(), "inspect reports no {field}:\n{}", r.stdout);
+        assert!(
+            r.field(field).is_some(),
+            "inspect reports no {field}:\n{}",
+            r.stdout
+        );
     }
     // The canonical size is the descriptor's arithmetic, not a guess.
     let expected = f.module.expected_canonical("BF16").len() + 16;
@@ -218,7 +230,10 @@ fn a_run_without_its_budgets_is_refused_before_it_starts() {
         let r = run(&kept);
         assert_eq!(r.status, 1, "{missing}: {}{}", r.stdout, r.stderr);
         assert!(r.says(missing), "{missing}: {}", r.stderr);
-        assert!(!f.scratch.join("artifact").exists(), "{missing} wrote a destination");
+        assert!(
+            !f.scratch.join("artifact").exists(),
+            "{missing} wrote a destination"
+        );
     }
 }
 
@@ -288,6 +303,54 @@ fn an_insufficient_budget_is_refused_before_any_payload_is_created() {
     );
 }
 
+/// The disk budget on its own, with the chunk-file limit out of the way.
+///
+/// The mutation battery found this gap: the case above set both limits low, the
+/// chunk-file rule fired first, and deleting the disk-budget check changed
+/// nothing any test could see. Two rules that can both fire need a case each.
+#[test]
+fn a_disk_budget_below_the_selection_is_refused_on_its_own() {
+    let f = Fixture::new("cli-disk-budget");
+    let out = f.path("artifact");
+    let r = run(&[
+        "repack",
+        "--selection",
+        &f.path("selection.toml"),
+        "--source-root",
+        &f.path("src"),
+        "--out",
+        &out,
+        "--total-bytes",
+        "128MiB",
+        "--header-bytes",
+        "64MiB",
+        "--scratch-bytes",
+        "1MiB",
+        // The arithmetic, because these numbers have to be exact for the
+        // disk rule to be the one that fires. The quantized tensor is 640
+        // canonical bytes and the BF16 one is 16, at alignment 16. A 655-byte
+        // chunk-file limit admits the first tensor (640 + 15 of possible
+        // alignment) and forces the second into a second chunk, so the
+        // selection needs 656 bytes of disk in two files -- one more than the
+        // 655 admitted. A limit large enough to hold both would make the
+        // chunk-file rule fire first, which is the case above.
+        "--chunk-file-bytes",
+        "655",
+        "--disk-bytes",
+        "655",
+    ]);
+    assert_eq!(r.status, 2, "{}{}", r.stdout, r.stderr);
+    assert!(
+        r.says("above the admitted disk budget"),
+        "the refusal names the disk budget: {}",
+        r.stdout
+    );
+    assert!(
+        !std::path::Path::new(&out).join("chunk0.bin").exists(),
+        "a refused plan created a payload"
+    );
+}
+
 #[test]
 fn a_bounded_repack_publishes_and_verifies_and_reports_what_it_did() {
     let f = Fixture::new("cli-repack");
@@ -317,8 +380,16 @@ fn a_published_destination_is_refused_rather_than_overwritten() {
     let before = std::fs::read(std::path::Path::new(&out).join("chunk0.bin")).expect("a chunk");
     let again = f.repack(&out, &[]);
     assert_eq!(again.status, 2, "{}{}", again.stdout, again.stderr);
-    assert!(again.says("already holds a published manifest"), "{}", again.stdout);
-    assert!(again.says("never updates a model in place"), "{}", again.stdout);
+    assert!(
+        again.says("already holds a published manifest"),
+        "{}",
+        again.stdout
+    );
+    assert!(
+        again.says("never updates a model in place"),
+        "{}",
+        again.stdout
+    );
     assert_eq!(
         std::fs::read(std::path::Path::new(&out).join("chunk0.bin")).expect("a chunk"),
         before,
@@ -390,7 +461,11 @@ fn a_missing_or_unsupported_source_is_refused_by_name() {
         "64MiB",
     ]);
     assert_eq!(r.status, 2);
-    assert!(r.says("refused by name rather than guessed at"), "{}", r.stdout);
+    assert!(
+        r.says("refused by name rather than guessed at"),
+        "{}",
+        r.stdout
+    );
 
     // A selection naming a tensor that is not in the shard.
     let absent = text.replace("model.norm.weight", "model.absent.weight");
@@ -426,7 +501,11 @@ fn failed_cancelled_published_and_durability_unconfirmed_are_distinct() {
     let r = f.repack(&cancelled, &["--test-cancel-after-units", "1"]);
     assert_eq!(r.status, 3, "{}{}", r.stdout, r.stderr);
     assert_eq!(r.outcome(), "cancelled");
-    assert!(!std::path::Path::new(&cancelled).join("manifest.toml").exists());
+    assert!(
+        !std::path::Path::new(&cancelled)
+            .join("manifest.toml")
+            .exists()
+    );
     // And it resumes to a published artifact.
     let r = f.repack(&cancelled, &["--take-over-interrupted-run"]);
     assert_eq!(r.status, 0, "{}{}", r.stdout, r.stderr);
@@ -446,7 +525,11 @@ fn failed_cancelled_published_and_durability_unconfirmed_are_distinct() {
     let r = f.repack(&unconfirmed, &["--test-fail-at", "publish-durability:1"]);
     assert_eq!(r.status, 4, "{}{}", r.stdout, r.stderr);
     assert_eq!(r.outcome(), "published-durability-unconfirmed");
-    assert!(std::path::Path::new(&unconfirmed).join("manifest.toml").exists());
+    assert!(
+        std::path::Path::new(&unconfirmed)
+            .join("manifest.toml")
+            .exists()
+    );
     let v = run(&[
         "verify",
         "--artifact",
@@ -472,7 +555,10 @@ fn an_aborted_process_restarts_and_publishes_an_identical_artifact() {
     let reference = f.path("reference");
     let r = f.repack(&reference, &[]);
     assert_eq!(r.outcome(), "published");
-    let reference_identity = r.field("artifact-identity").expect("an identity").to_string();
+    let reference_identity = r
+        .field("artifact-identity")
+        .expect("an identity")
+        .to_string();
     let reference_chunk =
         std::fs::read(std::path::Path::new(&reference).join("chunk0.bin")).expect("a chunk");
 
@@ -487,7 +573,9 @@ fn an_aborted_process_restarts_and_publishes_an_identical_artifact() {
             "an aborted run left a readable artifact"
         );
         assert!(
-            std::path::Path::new(&out).join(".moxie-repack-journal").exists(),
+            std::path::Path::new(&out)
+                .join(".moxie-repack-journal")
+                .exists(),
             "an aborted run left no journal to resume from"
         );
         let r = f.repack(&out, &["--take-over-interrupted-run"]);
@@ -512,7 +600,11 @@ fn an_interrupted_runs_lock_is_not_taken_over_silently() {
     let out = f.path("locked");
     let r = f.repack(&out, &["--test-abort-after-units", "1"]);
     assert_ne!(r.status, 0);
-    assert!(std::path::Path::new(&out).join(".moxie-repack-lock").exists());
+    assert!(
+        std::path::Path::new(&out)
+            .join(".moxie-repack-lock")
+            .exists()
+    );
     let r = f.repack(&out, &[]);
     assert_eq!(r.status, 2, "{}{}", r.stdout, r.stderr);
     assert!(r.says("owns this destination"), "{}", r.stdout);
@@ -537,6 +629,91 @@ fn verify_refuses_a_corrupted_artifact_and_says_which_tensor() {
         v.says("model.layers.0.mlp.down_proj.weight"),
         "the refusal names the tensor: {}",
         v.stdout
+    );
+}
+
+/// `source.files.sha256` means "this file", so the manifest must carry the
+/// file's own digest -- compared here against one this test computes itself.
+#[test]
+fn the_manifest_records_each_source_files_own_digest() {
+    let f = Fixture::new("cli-digest");
+    let out = f.path("artifact");
+    let r = f.repack(&out, &[]);
+    assert_eq!(r.outcome(), "published", "{}", r.stdout);
+    let shard = std::fs::read(f.scratch.join("src").join("shard-a.safetensors")).expect("a shard");
+    let expected = moxie_format::sha256_hex(&shard);
+    let manifest = std::fs::read_to_string(std::path::Path::new(&out).join("manifest.toml"))
+        .expect("a manifest");
+    assert!(
+        manifest.contains(&format!("sha256 = \"{expected}\"")),
+        "the manifest does not carry the source file's own digest ({expected}):\n{manifest}"
+    );
+    assert!(
+        r.says(&expected),
+        "the run did not report the digest it recorded: {}",
+        r.stdout
+    );
+}
+
+/// A source that changed between two attempts is refused rather than
+/// half-converted: the binding covers the source's content, not its name.
+#[test]
+fn a_source_that_changed_under_a_resumed_run_is_refused() {
+    let f = Fixture::new("cli-source-changed");
+    let out = f.path("cancelled");
+    let r = f.repack(&out, &["--test-cancel-after-units", "1"]);
+    assert_eq!(r.outcome(), "cancelled", "{}", r.stdout);
+
+    // Append a byte to the shard. Every declared tensor range is untouched, so
+    // a check that looked only at shapes or at the ranges it reads would not
+    // notice.
+    let shard = f.scratch.join("src").join("shard-a.safetensors");
+    let mut bytes = std::fs::read(&shard).expect("a shard");
+    bytes.push(0);
+    std::fs::write(&shard, bytes).expect("changing it");
+
+    let r = f.repack(&out, &["--take-over-interrupted-run"]);
+    assert_eq!(r.status, 2, "{}{}", r.stdout, r.stderr);
+    assert!(
+        r.says("bound to a different plan"),
+        "a changed source was not refused: {}",
+        r.stdout
+    );
+    assert!(
+        !std::path::Path::new(&out).join("manifest.toml").exists(),
+        "a run over a changed source published anyway"
+    );
+}
+
+/// The header budget is a real bound, not a formality: a shard whose header
+/// costs more than the run admitted is refused, and the refusal is the budget
+/// working.
+#[test]
+fn a_header_budget_too_small_for_the_source_is_refused() {
+    let f = Fixture::new("cli-header-budget");
+    let r = run(&[
+        "inspect",
+        "--selection",
+        &f.path("selection.toml"),
+        "--source-root",
+        &f.path("src"),
+        "--total-bytes",
+        "128MiB",
+        // Smaller than the fixed overhead of any header parse.
+        "--header-bytes",
+        "4096",
+        "--scratch-bytes",
+        "1MiB",
+        "--chunk-file-bytes",
+        "4MiB",
+        "--disk-bytes",
+        "64MiB",
+    ]);
+    assert_eq!(r.status, 2, "{}{}", r.stdout, r.stderr);
+    assert!(
+        r.says("capacity exceeded") || r.says("exceed"),
+        "the refusal names the budget: {}",
+        r.stdout
     );
 }
 

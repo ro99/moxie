@@ -1,12 +1,23 @@
 # Model bring-up contract — Laguna
 
-Status: **metadata, the routed block, and an importer that reads its weights.**
-Nothing executes this checkpoint and no quality claim follows from anything in
-this record. Since [task 0024](../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md)
+Status: **metadata, the routed block, an importer that reads its weights, and
+one module repacked into a canonical artifact.** Nothing executes this
+checkpoint and no quality claim follows from anything in this record. Since
+[task 0024](../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md)
 (2026-09-13) its tensors **are** read — three of them import to canonical affine
 form, matching document 03's canonical equation over the source's bytes bitwise
 and rounding exactly to the source's own BF16 arithmetic — and that is a
-statement about a reader agreeing with a file, not about a model. Its attention tower is **not composable** from today's
+statement about a reader agreeing with a file, not about a model.
+[Task 0025](../tasks/0025-m3-offline-repack-publication.md) then **published**
+one of them: `model.layers.1.mlp.experts.0.down_proj` was repacked into a
+1,966,080-byte partial manifest-v1 directory under `/tmp`, reopened through the
+production reader, and all **3,145,728** of its values reconstructed and checked
+against the canonical equation and the source's own BF16 boundary separately.
+That is a statement about **bytes surviving a round trip**, which is
+[ADR 0018](../decisions/adr/0018-v1-quality-is-bit-identical-repack.md)'s v1
+quality definition and is not evidence about what this model produces. Nothing
+was written under any checkpoint root, and **nothing executes a canonical INT4
+tensor** — no kernel for one exists. Its attention tower is **not composable** from today's
 operation catalogue; the two gaps that block it are named below with the
 evidence that they may not be guessed.
 

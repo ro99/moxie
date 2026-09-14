@@ -635,6 +635,26 @@ impl Run {
         faults: &Faults,
         ledger: &mut Ledger,
     ) -> Result<Outcome> {
+        let result = self.publish_inner(manifest_text, cancelled, faults, ledger);
+        if result.is_err() {
+            // A failed publication still gives back what it admitted. Dropping
+            // the buffer would free the bytes and leave the charge standing,
+            // which is the leak `Ledger::outstanding` exists to make visible --
+            // and this is the one path that reaches the end of a run without
+            // going through publish or cancel.
+            let _ = self.scratch.release(ledger);
+            let _ = std::fs::remove_file(self.dest.join(LOCK_FILE));
+        }
+        result
+    }
+
+    fn publish_inner(
+        &mut self,
+        manifest_text: &str,
+        cancelled: &dyn Fn() -> bool,
+        faults: &Faults,
+        ledger: &mut Ledger,
+    ) -> Result<Outcome> {
         let sealed = self.seal()?;
         if cancelled() {
             let bytes = self.progress.values().map(|p| p.done).sum();
@@ -737,12 +757,12 @@ impl Run {
     }
 
     /// Stop, leaving a documented resumable state.
-    pub fn cancel(self, ledger: &mut Ledger) -> Result<Outcome> {
+    pub fn cancel(mut self, ledger: &mut Ledger) -> Result<Outcome> {
         let bytes = self.progress.values().map(|p| p.done).sum();
         self.cancel_with(bytes, ledger)
     }
 
-    fn cancel_with(mut self, bytes_done: u64, ledger: &mut Ledger) -> Result<Outcome> {
+    fn cancel_with(&mut self, bytes_done: u64, ledger: &mut Ledger) -> Result<Outcome> {
         // The staged manifest is the one thing a cancelled run removes: it is
         // the only file whose presence could later be mistaken for a validated
         // state, and it is cheap to rebuild.

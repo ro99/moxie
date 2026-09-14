@@ -527,6 +527,67 @@ fn cancellation_is_resumable_and_publishes_the_same_artifact() {
         assert!(matches!(outcome, Outcome::Published { .. }), "{outcome:?}");
         assert_eq!(artifact_bytes(&dest), reference_bytes);
     }
+
+    // Cancellation observed at the publication boundary itself -- every unit
+    // written, nothing published yet -- is still cancellation. This is the
+    // check the per-unit one cannot make: it fires after the last unit, so
+    // only the boundary check before the rename can see it.
+    let scratch = Scratch::new("cancel-at-the-boundary");
+    let dest = scratch.join("artifact");
+    let units = requests().iter().map(|r| units(r).len()).sum::<usize>();
+    let (outcome, _, written) =
+        run_to_end(&dest, &Faults::none(), false, Some(units)).expect("cancellation at the edge");
+    assert_eq!(written, units, "every unit was written before cancelling");
+    assert!(
+        matches!(outcome, Outcome::Cancelled { .. }),
+        "cancellation at the publication boundary gave {outcome:?}"
+    );
+    assert!(
+        !dest.join(MANIFEST_FILE).exists(),
+        "a run cancelled at the boundary published anyway"
+    );
+    // And it is still resumable into exactly the reference artifact.
+    let (outcome, _, _) = run_to_end(&dest, &Faults::none(), true, None).expect("it finishes");
+    assert!(matches!(outcome, Outcome::Published { .. }), "{outcome:?}");
+    assert_eq!(artifact_bytes(&dest), reference_bytes);
+}
+
+/// The order is the contract: a unit's bytes are durable **before** the record
+/// that claims them exists. A crash can therefore leave bytes with no record --
+/// which a restart discards -- but never a record with no bytes.
+#[test]
+fn bytes_are_durable_before_the_record_that_claims_them() {
+    // Failing the sync of the first chunk write means no unit line may exist.
+    let scratch = Scratch::new("order-sync");
+    let dest = scratch.join("artifact");
+    let faults = Faults::none().fail_at(Site::ChunkSync, 1);
+    run_to_end(&dest, &faults, false, None).unwrap_err();
+    let journal = std::fs::read_to_string(dest.join(".moxie-repack-journal")).expect("a journal");
+    assert!(
+        !journal.contains("unit = "),
+        "a unit was recorded before its bytes were durable:\n{journal}"
+    );
+
+    // Failing the *journal append* for the first unit means its bytes are
+    // already on disk: the record is what is missing, not the payload.
+    let scratch = Scratch::new("order-journal");
+    let dest = scratch.join("artifact");
+    // Visit one is the header, whose version and plan lines are appended
+    // together; visit two is the first unit's record.
+    let faults = Faults::none().fail_at(Site::JournalAppend, 2);
+    run_to_end(&dest, &faults, false, None).unwrap_err();
+    let staged = std::fs::metadata(dest.join("chunk0.bin"))
+        .expect("the chunk exists")
+        .len();
+    assert!(
+        staged >= budget().scratch_bytes() as u64,
+        "{staged} byte(s) staged: the payload should already be durable"
+    );
+    let journal = std::fs::read_to_string(dest.join(".moxie-repack-journal")).expect("a journal");
+    assert!(!journal.contains("unit = "), "{journal}");
+    // And the restart discards those unrecorded bytes and rewrites them.
+    let (outcome, _, _) = run_to_end(&dest, &Faults::none(), true, None).expect("it recovers");
+    assert!(matches!(outcome, Outcome::Published { .. }), "{outcome:?}");
 }
 
 #[test]
@@ -769,6 +830,93 @@ fn a_failure_while_rehashing_a_resumed_unit_is_recoverable() {
     };
     assert_eq!(identity, reference_identity);
     assert_eq!(artifact_bytes(&dest), reference_bytes);
+}
+
+/// An I/O failure fails the run **naming the boundary it happened at**.
+///
+/// The enumeration above accepts either outcome at every site, because most of
+/// them can legitimately end either way -- and the mutation battery found what
+/// that costs: swallowing the error from a payload write survived every gate,
+/// because the checksum and the resume machinery repair the damage on the next
+/// attempt. Repairing a failure is not the same as reporting it, and a run that
+/// silently redoes work it was told had failed is one nobody can debug.
+#[test]
+fn an_injected_write_failure_fails_the_run_and_names_the_boundary() {
+    let scratch = Scratch::new("write-failure");
+    let dest = scratch.join("artifact");
+    let faults = Faults::none().fail_at(Site::ChunkWrite, 1);
+    let e = run_to_end(&dest, &faults, false, None).unwrap_err();
+    assert!(
+        e.to_string().contains("chunk-write"),
+        "the failure does not name the boundary it happened at: {e}"
+    );
+    assert!(faults.all_fired(), "the injected failure never fired");
+    assert!(!dest.join(MANIFEST_FILE).exists());
+    // And it is still resumable.
+    let (outcome, _, _) = run_to_end(&dest, &Faults::none(), true, None).expect("it recovers");
+    assert!(matches!(outcome, Outcome::Published { .. }), "{outcome:?}");
+}
+
+/// Cancellation observed **after** validation, in the last moment before the
+/// rename, is still cancellation.
+///
+/// The battery found this one too: with the per-unit check and the pre-staging
+/// check both in place, removing the check between validation and the rename
+/// changed nothing any test could see. That check is the one that matters most,
+/// because it is the last point at which stopping is still free.
+#[test]
+fn cancellation_observed_after_validation_still_stops_before_the_rename() {
+    let scratch = Scratch::new("cancel-after-validation");
+    let dest = scratch.join("artifact");
+    let mut ledger = ledger();
+    let start = Run::begin(
+        &dest,
+        plan(),
+        binding(),
+        budget(),
+        &Options::default(),
+        &mut ledger,
+        &Faults::none(),
+    )
+    .expect("it starts");
+    let mut run = match start {
+        Start::Fresh(run) => run,
+        other => panic!("{other:?}"),
+    };
+    for request in requests() {
+        let bytes = payload(request.length, request.length as usize);
+        for (at, len) in units(&request) {
+            run.write_unit(
+                &request.role,
+                &bytes[at as usize..at as usize + len],
+                HEX,
+                &Faults::none(),
+            )
+            .expect("every unit writes");
+        }
+    }
+    let sealed = run.seal().expect("it seals");
+    let text = manifest::encode(&manifest_for(&sealed)).expect("it encodes");
+    // False at the first boundary, true afterwards: cancellation arrives while
+    // the artifact is being validated.
+    let asked = std::cell::Cell::new(0usize);
+    let cancelled = || {
+        asked.set(asked.get() + 1);
+        asked.get() > 1
+    };
+    let outcome = run
+        .publish(&text, &cancelled, &Faults::none(), &mut ledger)
+        .expect("cancellation is not an error");
+    assert!(
+        matches!(outcome, Outcome::Cancelled { .. }),
+        "cancellation after validation gave {outcome:?}"
+    );
+    assert!(
+        !dest.join(MANIFEST_FILE).exists(),
+        "it published despite being cancelled"
+    );
+    assert!(asked.get() >= 2, "the second boundary was never consulted");
+    assert!(ledger.outstanding().is_empty());
 }
 
 #[test]

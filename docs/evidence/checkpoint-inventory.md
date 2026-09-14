@@ -274,3 +274,32 @@ O1 is still open and still blocks the bring-up order and the catalog; a
 downloaded artifact is not a catalog decision. O2 is still open and no quality
 statement exists. O5 is still open and nothing may be converted or requantized.
 Laguna, GLM-5.2 and DeepSeek remain absent under these roots.
+
+## Update 2026-09-13 — one Laguna shard hashed whole, and the hash checked against the hub's
+
+[Task 0025](../tasks/0025-m3-offline-repack-publication.md) repacked one module
+of `/fast/models/cyankiwi/Laguna-S-2.1-AWQ-INT4`, revision
+`bc59f497520b23759ce61cc5164ca28bcc4f53bc`, and item 4 of
+[artifact-roots.md](artifact-roots.md) asks for the content hash of the files
+used. One file was used:
+
+```text
+279766e8604281c8dc41130f837793174a16068072eca47769b96855b4348748  model-00001-of-00015.safetensors  (5,369,738,904 B)
+```
+
+**Computed here, and independently confirmed.** The repacker streams the whole
+file through its admitted scratch and records that digest in the published
+manifest's `source.files`, because `sha256` in that field means "this file" and
+a digest of the ranges a run happened to read would be a false checksum. The
+same value appears in the artifact's own
+`.cache/huggingface/download/model-00001-of-00015.safetensors.metadata`, written
+when it was downloaded — two independent statements of one fact, which is what
+a revision string on its own is not.
+
+The other fourteen shards of this artifact are **not** hashed: nothing read
+them. Saying which files were verified matters more than a reassuring total.
+
+Retention: unchanged. The artifact stays where it is, read-only; **nothing was
+written, converted, copied or deleted under any checkpoint root**. The repacked
+module went to a temporary directory under `/tmp` and was removed when its test
+finished.

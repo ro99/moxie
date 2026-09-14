@@ -29,7 +29,9 @@ Each links into the entries below.
 | Shape | Where it keeps appearing |
 |---|---|
 | An allocation that aborts instead of returning a typed error | tasks 0019, 0021, 0022, 0023, 0024 — six times, each on a path added after the previous fix |
-| A gate that never sees the input it exists for | task 0021's descriptor, task 0023's valid-only sweep, task 0024's import-only sweep |
+| A gate that never sees the input it exists for | task 0021's descriptor, task 0023's valid-only sweep, task 0024's import-only sweep, task 0025's never-visited boundary |
+| A recovery that only knows the states it imagined | task 0025's empty journal and its own leftover lock file |
+| An undo that reverses the decision but not the state it already changed | task 0025's running checksum |
 | A test measured by assertion rather than by mutation | tasks 0020, 0021, 0022, 0023, 0024 |
 | A record contradicting a fact it already contains | task 0022's expert inventory, task 0022's VRAM figure, task 0024's sign claim |
 | A comparison whose two sides are not independent | task 0022's FP64 transcription, task 0024's FP32-versus-BF16 arithmetic |
@@ -38,7 +40,80 @@ Each links into the entries below.
 ## Entries, newest first
 
 
-**Repack user-surface ruling (2026-09-13):** [ADR 0022](docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md) resolves the engineer-lead placement gap: `moxie-repack` is the offline program; canonical write I/O is isolated in `moxie-storage-write`. M3 retains manifest-v1 directories; final single-file `.mox` packaging is assigned to M11 item 4. [Task 0025](docs/tasks/0025-m3-offline-repack-publication.md) is the proposed first publication contract, not an implementation or acceptance. Its write-authority architecture rule is pending implementation.
+**Task 0025 — the offline repacker — is implemented and not reviewed
+(2026-09-13).** `moxie-repack` inspects a selection, converts it in bounded work
+units, resumes an interrupted run, validates through the production reader and
+publishes a manifest-v1 directory with one rename; `moxie-storage-write` is the
+write authority ADR 0022 separated from the reader, and
+[ADR 0023](decisions/adr/0023-canonical-affine-payload-and-repack-journal.md)
+fixes the two encodings it needed — the canonical affine payload and the restart
+journal — **before** the code that writes them. One Laguna module round-trips
+with all **3,145,728** values checked against document 03's canonical FP32
+equation and against the source's own BF16 boundary separately. **Nothing
+executes a canonical INT4 tensor**; that is M3 item 3 and it is untouched.
+
+Four lessons, and three of them came from the same test.
+
+**The enumeration is the test.** Every durable boundary in the publication state
+machine is *named*, a clean run measures how many times each is visited, and the
+gate fails every visit to every boundary in turn — 35 cases — checking the same
+three invariants each time: no readable artifact before the publication rename, a
+resumable destination after the failure, and a restarted run publishing
+**byte-identical** output with the same artifact identity. Writing it found three
+defects that no amount of reading the code had:
+
+1. **An undo that reversed the decision and not the state.** A resumed unit
+   whose staged bytes fail their checksum is discarded and recomputed — and the
+   first version had already folded those bytes into the *tensor's* running hash
+   before comparing. The tensor then published a checksum computed over bytes
+   that had been overwritten, and every later check agreed with it, because they
+   all came from the same wrong hash. The fix is to clone the running hash,
+   commit it only on acceptance, and it is two lines. Finding it needed a test
+   that corrupted a staged byte and then demanded the *published* artifact match
+   an uninterrupted run's, byte for byte.
+2. **A recovery that only knew the states it had imagined.** The journal file
+   existing was treated as proof that a run existed. A crash between creating it
+   and writing its plan line therefore left a destination that could never be
+   used again: no plan to bind a resume to, and a file whose presence refused a
+   fresh start. A journal with no plan line records no run, and starting over is
+   the only reading that does not strand the directory.
+3. **The same shape once more, one layer out.** "Refuse a directory this run did
+   not create" was checked by asking whether the destination was empty — and a
+   run that crashed after taking its lock leaves exactly one file: its own lock.
+   The check now names what it found, and a directory holding only this
+   program's own private files is one of its own interrupted runs.
+
+**A boundary a clean run never reaches is a boundary the enumeration does not
+cover, and only measured coverage says so.** `chunk-read-back` is visited only on
+a resume, so the enumeration derived from a clean run had zero cases for it. The
+gate prints its coverage table and asserts that at most one boundary is
+unreached, which is how that gap announced itself; the missing case is now a test
+of its own. This is task 0021's descriptor and task 0023's valid-only sweep
+again: the sweep covers the paths the scenario that generated it happened to take.
+
+**A fixture rejected for an unrelated rule is not evidence the rule under test
+works — and the way to show it is to remove the *other* protection.** The new
+`arch-check` rule refuses any crate that can **reach** `moxie-storage-write`,
+however the edge is spelled: renamed, `cfg`-gated, optional, a build dependency,
+or one crate removed. Six negative fixtures cover those spellings, but five of
+them would also be refused by the dependency allowlist, so the fixtures alone
+prove nothing about the new rule. The battery therefore carries an **independence
+control**: a substitution that adds `moxie-storage-write` to `moxie-engine`'s
+allowlist, and must **not** be caught, because the write-authority rule still
+rejects the fixtures. It held. The driver reports controls separately from
+mutants for exactly this reason.
+
+**A gate nobody wants to run is a gate that stops running.** The manifest cap
+fixture parses a document with 1,048,577 tables in it, and took 99 seconds; the
+real-artifact lane hashed one 5.37 GB shard at 12 MB/s and took seven and a half
+minutes. Both were unoptimized *dependencies* and an unoptimized codec in a dev
+build. `[profile.dev.package."*"]` and `[profile.dev.package.moxie-format]` at
+`opt-level = 2` cut them to 15 seconds and 30 seconds. Nothing about what runs
+changed — the artifact identity is the same either way — and that is the point:
+this was never a correctness trade, it was a gate that had quietly become
+expensive enough to skip.
+
+**Repack user-surface ruling (2026-09-13):** [ADR 0022](decisions/adr/0022-user-programs-and-canonical-write-authority.md) resolves the engineer-lead placement gap: `moxie-repack` is the offline program; canonical write I/O is isolated in `moxie-storage-write`. M3 retains manifest-v1 directories; final single-file `.mox` packaging is assigned to M11 item 4. [Task 0025](tasks/0025-m3-offline-repack-publication.md) is the proposed first publication contract, not an implementation or acceptance. Its write-authority architecture rule is pending implementation.
 
 **Task 0025 is the next task**, and it comes before M3 item 3 for three reasons
 rather than one: repack is roadmap item **1** while the importers tasks 0018 and
@@ -56,11 +131,11 @@ was written, before this ruling existed; it is corrected in place.
 M3 on 2026-09-13; **M3's first contract, task 0024, is accepted by the owner the
 same day** after three rounds of independent review.** M2's formal
 closure statement is still the owner's to make and is not claimed here. See the
-[task 0024 handover](docs/handovers/2026-09-13-task0024-asymmetric-int4-import.md)
+[task 0024 handover](handovers/2026-09-13-task0024-asymmetric-int4-import.md)
 for the current continuation, the
-[task 0023 handover](docs/handovers/2026-09-13-task0023-whole-working-set-trace.md)
+[task 0023 handover](handovers/2026-09-13-task0023-whole-working-set-trace.md)
 for M2's last task, and the
-[closure handover](docs/handovers/2026-09-12-m1-closure-to-m2.md), which carries
+[closure handover](handovers/2026-09-12-m1-closure-to-m2.md), which carries
 M1's exit evidence gate by gate.
 
 **M3 — canonical INT4/INT8/BF16 with quality separation — is authorized (owner,
@@ -72,14 +147,14 @@ repacking is a Moxie program the user runs offline — not an external script �
 download, copy or conversion may start** without a task naming artifact,
 revision, expected size and retention. `/models` and `/fast/models` remain
 read-only inputs to an agent. The roadmap's M3 items are in
-[06-implementation-roadmap.md](docs/spec/06-implementation-roadmap.md).
+[06-implementation-roadmap.md](spec/06-implementation-roadmap.md).
 
 **M3's first task is accepted: task 0024, M3 item 2's asymmetric half**
 (owner, 2026-09-13, after three rounds of independent review — eight findings,
 two P1, all reproduced, all fixed, none disputed; the third recommended
 acceptance "within task 0024's declared importer-only M3 item 2 scope"). **The
 acceptance closes task 0024 only, not M3 item 2**, which also wants group-128
-symmetric INT4 and the AutoRound/AutoGPTQ packing ([task 0024](docs/tasks/0024-m3-asymmetric-int4-pack-quantized-import.md),
+symmetric INT4 and the AutoRound/AutoGPTQ packing ([task 0024](tasks/0024-m3-asymmetric-int4-pack-quantized-import.md),
 2026-09-13, contract committed at `e122de3` before implementation). The importer
 reads compressed-tensors `pack-quantized` **asymmetric INT4 at group 32**, whose
 `weight_zero_point` is packed along the **output** axis while the codes are
@@ -107,7 +182,7 @@ assignment is a measurable property of the file. It was measured — `mean |mean
 code − z|` of **0.52** for the pinned reading against **1.48–1.78** for every
 alternative the same shape permits, on four tensors across two artifacts, with
 the thresholds written into the contract beforehand
-([experiment 0005](docs/evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md)).
+([experiment 0005](evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md)).
 That mattered rather than being a flourish: both artifacts declare compressor
 versions (`0.1.dev534+gb269f2e`, `0.1.dev535+gdc9611a`) that are untagged
 development builds and pin nothing, and this repository already refused one
@@ -152,7 +227,7 @@ make the filtered subset a separately named thing.**
 **The mutation names are not the measurement; the exact substitutions are.**
 Experiment 0005 said its driver was "reproduced in the task record" and it was
 not, in either commit. The driver is tracked now, at
-[`docs/evidence/experiments/drivers/0005-mutations.py`](docs/evidence/experiments/drivers/0005-mutations.py),
+[`docs/evidence/experiments/drivers/0005-mutations.py`](evidence/experiments/drivers/0005-mutations.py),
 and every verdict is repeated three times in both directions because the
 contract promised that and the first run did not do it. **21 of 21 caught, 0
 survivors** when measured, **24 of 24** after a second review — where the first
@@ -214,7 +289,7 @@ because rewriting a record to match later work erases what was true when it was
 written — and this sentence exists so that a reader meets the correction before
 the stale claim rather than after it. The same applies to that section's "O1's
 catalog and O5's storage questions stay open": the owner resolved O1–O5 on
-2026-09-13, and [the Laguna bring-up record](docs/models/laguna.md), which is a
+2026-09-13, and [the Laguna bring-up record](models/laguna.md), which is a
 living record rather than a task's, carries the rulings.
 
 **Two facts about these artifacts that only reading them produced.** A module's
@@ -227,7 +302,7 @@ the default is unchanged, and any production path that opens this artifact has
 to state one.
 
 **M2 item 1's routed-expert mathematics is accepted**
-([task 0019](docs/tasks/0019-m2-routed-expert-semantics.md), 2026-09-12, after
+([task 0019](tasks/0019-m2-routed-expert-semantics.md), 2026-09-12, after
 three rounds of independent review): `Route`, `ExpertMlp` and `Combine` as
 shared operations with FP64 oracles, the pinned BF16 boundaries that decide
 which experts a row selects, and two consumers carrying opposite routing
@@ -236,7 +311,7 @@ parameters.
 **M2 item 2's residency authority is accepted** (2026-09-12, after seven rounds
 of independent review — twenty-seven findings, all reproduced, all fixed, none
 disputed; the seventh recommended acceptance with no new blocking findings)
-([task 0020](docs/tasks/0020-m2-weight-residency-authority.md)):
+([task 0020](tasks/0020-m2-weight-residency-authority.md)):
 `moxie_memory::residency` is the **one** production weight-residency owner, with
 document 03's chunk identity, its lifecycle and failure transitions, coalescing,
 event-bound device uploads whose allocation is tied to its reservation,
@@ -253,7 +328,7 @@ the ledger across a whole working set.
 
 **`arch-check` now passes with zero failures.** The four it reported as
 "pre-existing" from task 0014 onward were review probe crates parked under
-`results/`, which [docs/README.md](docs/README.md) declares ignored scratch; the
+`results/`, which [docs/README.md](README.md) declares ignored scratch; the
 crate walk now excludes root scratch **by reachability, computed exactly**, and
 **fails closed** — checking everything — when reachability cannot be computed. Do
 not carry a standing failure count forward as background noise; that is how a
@@ -284,7 +359,7 @@ and an equivalent mutant is reported as such instead of being counted as a gap.
 
 **M2 item 3 is accepted by the owner on 2026-09-13**, after four rounds of
 independent review
-([task 0021](docs/tasks/0021-m2-expert-execution-plans.md), implemented
+([task 0021](tasks/0021-m2-expert-execution-plans.md), implemented
 2026-09-12; the four
 rounds found **twenty-one** issues, fourteen P1, all reproduced and fixed, none
 disputed): CPU
@@ -396,7 +471,7 @@ mutation would survive rather than by reading the test.**
 
 **M2 item 4 is accepted by the owner on 2026-09-13**, after three rounds of
 independent review
-([task 0022](docs/tasks/0022-m2-laguna-metadata-and-second-consumer.md),
+([task 0022](tasks/0022-m2-laguna-metadata-and-second-consumer.md),
 implemented 2026-09-13; three rounds found **eight** issues, two P1, all
 reproduced and fixed, none disputed, and the third recommended acceptance with
 no new blocking
@@ -421,7 +496,7 @@ today**. Both are named gap tasks, computed from the declared geometry rather
 than written down. Its weights are asymmetric INT4 at group 32 with zero points
 packed along the **output** axis — a second convention the accepted importer has
 never seen — so **no Laguna tensor was read** and M3 owns the importer.
-[The bring-up record](docs/models/laguna.md) carries the inventory and every
+[The bring-up record](models/laguna.md) carries the inventory and every
 open mapping question.
 
 **A substitution result from a nondeterministic test is not evidence, whichever
@@ -467,7 +542,7 @@ same record already contained: the expert inventory multiplied a per-layer cost
 by all 47 routed layers two paragraphs after recording that two of them cost
 something else, understating the working set by **6.87 GB**; and a nearby line
 put this machine's aggregate VRAM at "72 GiB" when
-[the hardware inventory](docs/evidence/hardware-inventory.md) had already
+[the hardware inventory](evidence/hardware-inventory.md) had already
 measured **62.6 GiB**. Mutation testing measures a suite against mutations of the
 *code* and cannot reach either. Make a record's arithmetic **executable** — the
 expert inventory now sums over the layers and a test checks every one of them
@@ -495,7 +570,7 @@ composed with each operand in the role its name says.
 rounds of independent review — ten findings, four P1, all reproduced, all fixed,
 none disputed; the third recommended acceptance "within its declared M2
 engineering scope")
-([task 0023](docs/tasks/0023-m2-whole-working-set-trace.md)): byte
+([task 0023](tasks/0023-m2-whole-working-set-trace.md)): byte
 and cost traces reconciled with the resource ledger across a **whole working
 set**. **Every routed layer of the designated artifact has executed, on all three
 GPUs, at two row shapes.** At a decode-shaped batch all 30 layers agree
@@ -656,11 +731,11 @@ resource ledger and admission, event-backed leases, the device arena, the
 admitted graph resource plan, the selected BF16 device chain, appendable paged
 state, transactional sampler history, the generation service and diagnostic CLI
 (tasks 0003–0015), the reduced Gemma graph
-([0016](docs/tasks/0016-m1-gemma-reduced-graph.md)), per-layer paged geometry and
+([0016](tasks/0016-m1-gemma-reduced-graph.md)), per-layer paged geometry and
 window reclamation
-([0017](docs/tasks/0017-m4-per-layer-kv-geometry-and-window-eviction.md),
+([0017](tasks/0017-m4-per-layer-kv-geometry-and-window-eviction.md),
 accepted 2026-09-12), and the compressed-tensors importer
-([0018](docs/tasks/0018-m3-compressed-tensors-int8-importer.md), accepted
+([0018](tasks/0018-m3-compressed-tensors-int8-importer.md), accepted
 2026-09-12 within its import-only scope).
 
 **M1.5 closed on the reduced graph, and the arithmetic is why.** Roadmap M1 item
@@ -700,7 +775,7 @@ expert explicitly. At 51.6 GB it fits aggregate VRAM but no single 24 GiB
 device, and M2 item 4's restricted budget makes it oversized by construction.
 Task 0019 composed its routed block over synthetic weights at reduced scale and
 recorded the artifact's inventory in
-[the bring-up record](docs/models/gemma4.md#the-26b-a4b-moe-variant). Task 0020
+[the bring-up record](models/gemma4.md#the-26b-a4b-moe-variant). Task 0020
 made its expert bytes resident on demand — the experts are fused per layer, so
 that needed the bounded ranged read it added — and task 0021 ran one layer's
 expert block from them. A fact that came out of that: its experts are

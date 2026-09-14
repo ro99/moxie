@@ -254,7 +254,202 @@ be silently widened to make this task pass.
 
 ## Result, filled after work
 
-Not implemented. This contract was authored with ADR 0022 to resolve the assigned
-handover's placement blocker. No task-0025 test, mutation score, repack output,
-model support or acceptance result is claimed. Record the committed contract
-identity and implementation baseline here before filling measured results.
+Status: **implemented; not reviewed and not accepted.** Everything below is a
+claim until a review reproduces it.
+
+### Identity
+
+- Contract committed at `74e0709` by a concurrent agent; base re-recorded and
+  [ADR 0023](../decisions/adr/0023-canonical-affine-payload-and-repack-journal.md)
+  committed at `aaeff60`, **before** any implementation commit. Implementation
+  base `44a94c4`, clean tree.
+- Legacy root `/home/rodrigo/Developer/strata` at
+  `2dc566eb8e440fff4837ac75ca1dad1b20c2264e`, **read-only and unmodified**. The
+  checkpoint I/O ADR 0022 names was inspected as the contract asks:
+  `include/strata/platform/checkpoint_io.hpp` (40 lines) and
+  `src/platform/checkpoint_io.cpp` (109 lines). It is a **reader and nothing
+  else** — shards opened `O_RDONLY`, bounded positional `pread` with `EINTR`
+  retried without advancing, premature EOF reported as an error rather than a
+  short read, and no writer, journal, publication or rename anywhere in it.
+  That confirms ADR 0022's "there is no legacy writer to migrate or delete"
+  rather than repeating it, and the two properties it does have are already
+  what `moxie-storage`'s pump does. Nothing was ported and nothing was deleted.
+- **Nothing under `/models` or `/fast/models` was written, converted, deleted or
+  modified.** One shard was opened read-only and read through: 5,369,738,904
+  bytes of `model-00001-of-00015.safetensors`, hashed, plus 1,818,624 bytes of
+  declared tensor ranges converted.
+
+### What was built
+
+Two new crates, four new modules in the shared codec and three new reader entry
+points, with the boundary ADR 0022 drew:
+
+| Component | What it owns |
+|---|---|
+| `moxie-format::payload` | The canonical affine payload: three contiguous sections, one range, one checksum. The **only** place those bytes are laid out. |
+| `moxie-format::journal` | The restart journal's schema: one TOML document per line, parsed from a `&str`, I/O-free. |
+| `moxie-format::selection` | What a user asked to be repacked, as text. No discovery, no patterns, no inference. |
+| `moxie-format::manifest::encode` | The writer half of manifest v1. It re-parses its own output and compares artifact identity before returning. |
+| `moxie-format::compressed_tensors::PackQuantizedPlan` | The streaming importer. `import` is written in terms of it, so a whole-tensor import and a tiled repack are one codec. |
+| `moxie-storage::Artifact::{stream_tensor, verify_tensor, open_unpublished}` | Verification without decoding, and validating a manifest that is not published yet. |
+| `moxie-storage-write` | Confined output creation, bounded chunk writing, the journal's file half, atomic publication. |
+| `moxie-repack` | Arguments, the offline workflow, reporting. No second decoder, hash, validator or writer. |
+
+The destination directory **is** the staging area: chunk files are written under
+their final names and what makes the artifact unreadable is that `manifest.toml`
+does not exist yet. Publication is one rename of a privately named, already
+validated manifest. Payload bytes never move after they are durable, and the
+failure case needs no second copy of the disk.
+
+### Gates
+
+Run at the implementation tree, each result recorded separately; the raw log
+is in the ignored `results/task0025/gates.log`.
+
+| Gate | Command | Result |
+|---|---|---|
+| Formatting | `cargo fmt --all -- --check` | **passed** |
+| Host lints | `cargo clippy --workspace --all-targets --locked -- -D warnings` | **passed** |
+| Device-lane lints | `... --features moxie-executor/driver` | **passed** |
+| `xtask` device lints | `... --features cuda` | **passed** |
+| Specification | `cargo xtask spec-check` | **passed**, 10 documents present and unchanged |
+| Architecture | `cargo xtask arch-check` | **passed**: 85 rejected fixtures, 23 accepted, **14 rules exercised** — one more rule and eight more fixtures than before |
+| Host tests | `cargo test --workspace --locked --offline` | **1,014 passed, 0 failed, 0 ignored, 0 skipped** (task 0024 recorded 947) |
+| Device-feature tests | `cargo test --workspace --locked --offline --features moxie-executor/driver` | **1,049 passed, 0 failed, 0 ignored** |
+
+**Nothing failed and nothing was skipped.** The real-artifact lane ran rather
+than skipping: its source is present on this machine, and it prints `SKIP` with
+a reason when it is not. No GPU execution gate is claimed — this task executes
+nothing on a device, and the device-feature lane is here to show that shared
+changes did not break that build, not as evidence about kernels.
+
+The two clippy lanes that need CUDA were run because this task changes
+`moxie-format` and `moxie-storage`, which both compile in them.
+
+### What the suites measure
+
+| Suite | What it establishes |
+|---|---|
+| `moxie-format` unit and `manifest_v1` | The payload codec against **bytes written out by hand**, the journal's torn-tail and version rules, the selection's refusals, and manifest v1 round-tripping through its own writer — including awkward strings, the opaque architecture tree and partial completeness |
+| `the_streaming_converter_and_the_whole_tensor_import_agree` | One codec, not two: every tile size that lands on and off a word, a group and the padded tail produces the same bytes as a whole-tensor import |
+| `moxie-storage-write::publication` | 16 tests, including **35 enumerated failure cases** — every visit to every named durable boundary — each checked for no readable artifact before the rename, a resumable destination after, and a byte-identical republish; plus cancellation at the publication boundary, a corrupted staged unit, bytes past the journal, a torn journal line, a rebound plan, a stale lock and an oversized unit |
+| `moxie-repack::round_trip` | Every signed INT4 and INT8 code, asymmetric zero points, all three scale encodings, group and axis tails, symmetric and asymmetric modules, split shards, mixed BF16, several chunk files, and a tensor 32 times the scratch |
+| `moxie-repack::cli` | The real binary: exit statuses, refusals, an actual `SIGABRT` restart, a changed source refused, budgets required, inspection writing nothing |
+| `moxie-repack::budget` | **208,461 B peak live heap** against a 134,217,728 B admission while publishing 2,107,392 B through a 65,536 B scratch, every admitted byte returned, and resume peaks flat across four attempts (58,183 / 57,560 / 57,560 / 57,560 B) |
+| `moxie-repack::real_module` | The Laguna module below |
+
+### Mutation measurement
+
+**29 of 29 mutants caught, 4 of 4 expected survivors held, 0 survivors, 0
+unstable, 0 invalid controls, 0 skipped**, every verdict repeated three times in
+both directions, driver committed and its verdict rule self-tested at 15 of 15
+cases ([experiment 0006](../evidence/experiments/0006-repack-publication-mutations.md),
+[its driver](../evidence/experiments/drivers/0006-mutations.py)).
+
+The first run of that battery caught 24 of 28 and left **four survivors and two
+skips**, and all six were worth having: an ignored payload-write error survived
+every gate because the resume machinery repaired it, the disk-budget rule had no
+case of its own because the chunk-file rule fired first in the one that was
+supposed to cover it, and the cancellation check between validation and the
+rename — the last point at which stopping is free — was covered by nothing.
+Three tests closed those. The fourth survivor is declared **equivalent** with
+its argument written out: the plan already refuses a selection above the disk
+budget and no unit can exceed its planned range, so the runtime counter cannot
+fire. The two skips were the battery failing to measure — one anchor reformatted
+by `cargo fmt`, one matching two places in one file — and a mutation that does
+not apply is not evidence.
+
+**The independence control matters most for the architecture rule.** Five of its
+six negative fixtures would also be refused by the dependency allowlist, so the
+fixtures alone say nothing about the new rule. The control adds
+`moxie-storage-write` to `moxie-engine`'s allowlist and requires the battery to
+stay green, because the write-authority rule still rejects those fixtures. It
+held.
+
+### What the real module measured
+
+`model.layers.1.mlp.experts.0.down_proj` of `Laguna-S-2.1-AWQ-INT4` revision
+`bc59f497520b23759ce61cc5164ca28bcc4f53bc`, repacked into a temporary directory
+under `/tmp` and reopened through the production reader:
+
+| Quantity | Value |
+|---|---|
+| Canonical payload | **1,966,080 B** — 1,572,864 code + 196,608 BF16 scale + 196,608 i16 zero-point bytes, exactly the contract's header-derived expectation |
+| Source payload converted | 1,818,624 B in three tensors, plus the 16-byte `weight_shape` read as metadata (the contract's 1,818,640 B counts that sixteen) |
+| Work units | 5, each at most 1 MiB, against a 1 MiB admitted payload scratch |
+| Values reconstructed and checked | **3,145,728**, every one of them |
+| Canonical FP32 agreement | bitwise, all 3,145,728 |
+| Source BF16-boundary agreement | exact, all 3,145,728; the boundary **moves 777,575** of them, and the gate requires that count to be nonzero |
+| Code range | `[-8, 7]` — the whole INT4 range appears |
+| Zero-point range | `[-6, 5]` — the asymmetric lane is exercised, not a symmetric tensor in disguise |
+| Whole-file digest | `279766e8604281c8dc41130f837793174a16068072eca47769b96855b4348748`, **equal to the digest the hub recorded at download** in `.cache/huggingface/download/…metadata` |
+| Directory on disk | 1,967,394 B, against the task's 64 MiB scratch cap |
+| Wall clock | ~30 s, nearly all of it hashing the 5.37 GB source shard |
+
+The two comparisons are kept apart on purpose. Document 03 fixes canonical
+reconstruction at FP32; the pinned `_dequantize` casts to `scale.dtype` — BF16
+for this artifact — before subtracting and multiplying, so the source's own
+value is a BF16 number. Task 0024's review found the first version of that test
+calling one by the other's name, and this record does not repeat it.
+
+### What was found while building it
+
+The publication enumeration — every visit to every named durable boundary,
+failed in turn — found three defects that reading the code had not:
+
+1. **A discarded unit whose bytes were already in the tensor's checksum.** A
+   resumed unit that fails its own hash is discarded and recomputed; the first
+   version folded its bytes into the tensor's running hash *before* comparing,
+   so the published checksum covered bytes that were then overwritten, and every
+   later check agreed with it. The running hash is cloned and committed only on
+   acceptance now.
+2. **A journal interrupted before its plan line stranded the destination.** The
+   file existing was read as proof that a run existed. A journal with no plan
+   line records no run, and `begin` starts over.
+3. **A directory holding only this program's own lock file was refused as
+   somebody else's data.** The check now names what it found and distinguishes
+   its own private files from a user's.
+
+A fourth came from measured coverage rather than from a failure:
+`chunk-read-back` is only visited on a resume, so an enumeration derived from a
+clean run had **zero** cases for it. The gate prints its coverage table and
+refuses to pass with more than one unreached boundary, which is how the gap
+announced itself; it has a test of its own now.
+
+### Explicit limits of this task
+
+- **Nothing executes a canonical INT4 tensor.** Publishing one changes nothing
+  about that: W4A16/W8A16 is M3 item 3, no kernel exists, and this task adds no
+  capability row for execution.
+- **A repack is bytes.** ADR 0018 makes a bit-identical repack the v1 quality
+  definition; it is not evidence about model output, and no paired output
+  against any released model exists (**O2**).
+- **A completed selection is not a complete model.** One module publishes a
+  *partial* artifact, the reader opens it for inspection and refuses every
+  tensor read, and `inspect` says so in as many words.
+- **Source discovery does not exist.** A selection names which shard holds each
+  tensor; nothing reads a `model.safetensors.index.json`, expands a pattern or
+  infers placement. Cross-shard *resolution* works and is tested; cross-shard
+  *discovery* is not built.
+- **Liveness is not detectable here.** A lock file outlives a crashed run, and
+  telling a crashed run from a live one needs process liveness — which means
+  this machine's own telemetry, and ADR 0006 gives that to one crate. Taking
+  over an interrupted run is therefore an explicit flag, not a guess.
+- **AutoGPTQ/AutoRound packing, activation-order maps, a quantizer, fused expert
+  role mapping, tokenizers, whole-catalog conversion and single-file `.mox`
+  packaging** are all refused by name. M3 item 2's remainder and M11 item 4.
+- **No GPU, distributed, prefill/decode, sampling or context effect.** None is
+  applicable to an offline CPU task, and no timing here is a performance claim
+  (**O6**, **O7**).
+
+### Next bounded task
+
+**M3 item 3 — shared W4A16/W8A16 dense and expert paths for SM86, with SM120
+qualified separately.** It is the largest remaining gap in the milestone and now
+has something to execute from: a canonical artifact a reader can open, rather
+than a fixture built in a test. Document 03 bounds it before it starts —
+weight-only paths with BF16 preferred and FP32 accumulation, **not** INT4xINT4
+or INT8xINT8 MMA, and "bounded reference dequantization is not an acceptable
+final fast path by assertion". M3 item 2's remainder (group-128 symmetric INT4,
+whose real content is what `actorder: "static"` means for logical column
+identity) is smaller and also open.

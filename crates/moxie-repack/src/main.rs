@@ -276,7 +276,16 @@ fn print_inspect(r: &InspectReport, budgets: &Budgets) {
     println!("chunk-files: {}", r.chunk_files);
     println!("largest-chunk-bytes: {}", r.largest_chunk_bytes);
     println!("source-payload-bytes: {}", r.source_payload_bytes);
-    println!("staging-disk-peak-bytes: {}", r.canonical_payload_bytes);
+    println!("staging-disk-peak-bytes: {}", r.staging.total());
+    println!(
+        "staging-disk-peak-detail: payload {} B exactly, plus at most {} B of journal and {} B of \
+         staged manifest, both removed at publication",
+        r.staging.payload_bytes, r.staging.journal_bound_bytes, r.staging.manifest_bound_bytes
+    );
+    println!(
+        "note: free space is not checked here; a disk-full condition is a typed failure at the \
+         write that hits it, not something an estimate prevents"
+    );
     println!("admitted-ram-bytes: {}", budgets.total_bytes);
     println!("payload-scratch-bytes: {}", budgets.scratch_bytes);
     println!("header-budget-bytes: {}", budgets.header_bytes);
@@ -449,7 +458,17 @@ fn command_verify(flags: &mut Flags) -> i32 {
         eprintln!("moxie-repack: --scratch-bytes does not fit this platform");
         return 1;
     };
-    let mut scratch = vec![0u8; scratch_bytes.max(1)];
+    // Reserved fallibly: this size comes from the command line, and an
+    // allocator that aborts turns "--scratch-bytes 1TiB" into a crash with no
+    // message. It is the one allocation in this program a user sizes directly.
+    let want = scratch_bytes.max(1);
+    let mut scratch: Vec<u8> = Vec::new();
+    if scratch.try_reserve_exact(want).is_err() {
+        println!("outcome: refused");
+        println!("error: cannot reserve {want} byte(s) of verification scratch");
+        return 2;
+    }
+    scratch.resize(want, 0);
     match moxie_repack::verify(&artifact, &mut scratch) {
         Ok(r) => {
             print_verify(&r);
@@ -468,6 +487,11 @@ fn print_verify(r: &VerifyReport) {
     println!("artifact-identity: {}", r.identity);
     println!("tensors: {}", r.tensors);
     println!("bytes-verified: {}", r.bytes_verified);
+    println!(
+        "unclaimed-bytes: {} (alignment padding between tensors lands here; anything more is a \
+         chunk holding bytes no tensor describes)",
+        r.unclaimed_bytes
+    );
     match &r.completeness {
         moxie_format::manifest::Completeness::Complete => println!("completeness: complete"),
         moxie_format::manifest::Completeness::Partial { missing } => {

@@ -43,6 +43,13 @@ Device lane (needs `cargo xtask-cuda`):
   capacity                Measure every device and admit a plan against the ledger;
                           allocates nothing
 
+Not an `xtask` command -- a user program, built by this workspace:
+  moxie-repack inspect|repack|verify
+                          Offline canonical inspection, bounded repack and
+                          verification (ADR 0021/0022). `cargo run -p
+                          moxie-repack -- --help` for its arguments; every
+                          budget it spends is required on the command line
+
 Not yet implemented; they land with the milestone that defines them:
   test-topology           M5   TP/PP/expert transport, failure and cancellation
   quality                 M3   Pinned artifact/reference comparison

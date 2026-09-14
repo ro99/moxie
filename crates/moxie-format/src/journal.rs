@@ -72,12 +72,26 @@ pub struct CompletedUnit {
     pub len: u64,
     /// SHA-256 of the bytes this unit wrote.
     pub sha256: String,
-    /// SHA-256 of the **source** bytes it converted, so a source that changed
-    /// under a resumed run is caught rather than half-converted.
+    /// SHA-256 of the **source** bytes this unit converted.
+    ///
+    /// **Recorded provenance, not a check.** What refuses a source that changed
+    /// under a resumed run is the run binding, whose digest covers every source
+    /// file **whole** and is recomputed on every start; re-reading each
+    /// completed unit's source range to compare this field would buy nothing
+    /// and cost the reads a resume exists to avoid. It is written down because
+    /// a journal that says which bytes produced which output is worth having
+    /// when something has gone wrong, and task 0025's mutation battery carries
+    /// an independence control that says out loud that nothing compares it.
     pub source_sha256: String,
 }
 
 /// How far a run had got when it last wrote to its journal.
+///
+/// **Recorded and reported, never branched on.** A restart revalidates and
+/// republishes whatever the phase says, because the alternative is trusting a
+/// marker about bytes that may have changed since it was written -- and the
+/// work it would save is one pass of checksums the run has to be able to do
+/// anyway. What the phase is for is telling a person what happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     /// Units are still being written.

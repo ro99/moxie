@@ -189,6 +189,14 @@ impl OutputPlan {
             match &t.request.affine {
                 None => field(b"dense"),
                 Some(a) => {
+                    // `Debug` of a fieldless enum is its variant name. It feeds
+                    // a **binding**, not an identity anyone stores: the only
+                    // consequence of a rendering changing between builds is
+                    // that a resume refuses and redoes the work, and the
+                    // binding's `converter` field -- which carries this crate's
+                    // version -- already refuses across builds. The artifact's
+                    // own identity is `manifest::artifact_identity`, which
+                    // spells every field out.
                     field(b"affine");
                     field(format!("{:?}", a.group_rule).as_bytes());
                     field(format!("{:?}", a.scale_dtype).as_bytes());

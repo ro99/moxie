@@ -72,7 +72,11 @@ fn fixture(scratch: &Scratch, elements: usize) -> (Module, std::path::PathBuf) {
             .map(|o| (0..columns).map(|k| ((o + k) % 16) as u32).collect())
             .collect(),
         scales: (0..rows)
-            .map(|o| (0..groups).map(|g| 0.5 + 0.25 * ((o + g) % 3) as f32).collect())
+            .map(|o| {
+                (0..groups)
+                    .map(|g| 0.5 + 0.25 * ((o + g) % 3) as f32)
+                    .collect()
+            })
             .collect(),
         zeros: (0..rows)
             .map(|o| (0..groups).map(|g| ((o * 3 + g) % 16) as u32).collect())
@@ -128,7 +132,11 @@ fn fixture(scratch: &Scratch, elements: usize) -> (Module, std::path::PathBuf) {
             "packed-along-output",
             &files,
         )
-        .bf16("model.big.weight", "model.big.weight", "shard-a.safetensors")
+        .bf16(
+            "model.big.weight",
+            "model.big.weight",
+            "shard-a.safetensors",
+        )
         .write(&selection);
     (module, selection)
 }
@@ -195,9 +203,7 @@ fn a_repack_holds_its_budget_and_gives_every_admitted_byte_back() {
     eprintln!(
         "task0025 budget: peak live heap {peak} B, admitted {admitted} B, \
          payload scratch {} B, units {}, published {} B",
-        budgets.scratch_bytes,
-        report.units_written,
-        report.bytes_written
+        budgets.scratch_bytes, report.units_written, report.bytes_written
     );
     assert!(
         (peak as u64) < admitted,
@@ -243,8 +249,15 @@ fn a_repack_holds_its_budget_and_gives_every_admitted_byte_back() {
         "{published} B is above the admitted disk budget"
     );
     // No private file survives a publish.
-    for private in [".moxie-repack-journal", ".moxie-repack-lock", ".moxie-repack-manifest"] {
-        assert!(!out.join(private).exists(), "{private} survived the publish");
+    for private in [
+        ".moxie-repack-journal",
+        ".moxie-repack-lock",
+        ".moxie-repack-manifest",
+    ] {
+        assert!(
+            !out.join(private).exists(),
+            "{private} survived the publish"
+        );
     }
 }
 

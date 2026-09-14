@@ -41,6 +41,8 @@ mean that Moxie has imported or supports them.
 | `docs/spec/templates/` | Forms used to author living records | yes |
 | `docs/decisions/`, `docs/tasks/`, `docs/handovers/`, `docs/models/`, `docs/evidence/` | Living records: owner-gate register, ADRs, task contracts, handovers, bring-up contracts, support matrix, benchmark manifests, experiment conclusions | yes |
 | `crates/` | Shared engine crates. `moxie-types`, `moxie-graph`, `moxie-model-api`, `moxie-format`, `moxie-oracles`, `moxie-state`, `moxie-cuda`, `moxie-kernels` | yes |
+| `crates/moxie-storage`, `crates/moxie-storage-write` | The canonical reader, and the write half that ADR 0022 separated from it. Only `moxie-repack` may reach the writer, and `arch-check` enforces that by reachability | yes |
+| `crates/moxie-repack/` | `moxie-repack`: the offline inspector, repacker and verifier (ADR 0021/0022) | yes |
 | `xtask/` | Command index and its architecture-check fixtures | yes |
 
 The reference documents are kept local at the owner's direction and do not reach the remote. Everything
@@ -105,6 +107,9 @@ through the device build would leave that independence untested.
 | `cargo xtask-cuda test-gpu [--profile sm_NN]` | CUDA 13.0 + the cards | Real launches on every visible device; **fails** when a required architecture has no passing device |
 | `cargo xtask-cuda test-bf16-chain` | CUDA 13.0 + one card | Reduced H8/H17 selected semantic chain used by Compute Sanitizer |
 | `cargo xtask-cuda probe [--out <path>]` | CUDA 13.0 + the cards | Bounded hardware and topology inventory |
+| `moxie-repack inspect --selection <file> --source-root <dir> <budgets>` | a source checkpoint | Headers only: what a selection is, what it would cost, and what is refused. Writes nothing |
+| `moxie-repack repack --selection <file> --source-root <dir> --out <dir> <budgets>` | a source checkpoint | Converts a selection in bounded units, resumes an interrupted run, validates through the production reader, publishes with one rename |
+| `moxie-repack verify --artifact <dir> --scratch-bytes <n>` | a published artifact | Re-reads every payload through the production reader and checks it against its recorded checksum |
 
 `cargo xtask` builds with no CUDA feature: it links no driver and runs no `nvcc`. `cargo xtask-cuda`
 adds `--features cuda`, which compiles the fatbins and links `libcuda`. A device command invoked
@@ -113,6 +118,33 @@ run is unmeasured, never passing.
 
 `test-topology`, `quality`, `bench` and `support-matrix --verify` are named in the index and are
 **not implemented**; they arrive with the milestones that define them.
+
+### The offline repacker
+
+`moxie-repack` is the program [ADR 0021](docs/decisions/adr/0021-repack-is-a-moxie-program.md) and
+[ADR 0022](docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md) place canonical
+write authority in, and task 0025 is what built it. Five budgets are required on every invocation —
+`--total-bytes`, `--header-bytes`, `--scratch-bytes`, `--chunk-file-bytes` and `--disk-bytes` — and
+there is no default for any of them: how much of a user's machine a tool may spend is not a question
+a tool should answer on the user's behalf.
+
+What it converts is a **selection**: a small TOML document naming each tensor, its role, its source
+shard and, for a quantized module, its packing parameters. Nothing is discovered, expanded from a
+pattern, or inferred from a name, which is what keeps ADR 0020's "no agent-initiated bulk
+conversion" a property of the tool rather than a promise about how it is invoked.
+
+Measured capabilities, and nothing else: BF16 passthrough, and compressed-tensors `pack-quantized`
+INT4/INT8 at group 32, group 128 and per-channel, symmetric or with zero points packed along the
+output axis. AutoGPTQ/AutoRound packing, activation-order maps, tokenizers, fused expert role
+mapping and whole-catalog conversion are **refused by name**. Exit status distinguishes the
+outcomes: 0 published or verified, 1 a command-line error, 2 refused or failed (leaving a resumable
+destination), 3 cancelled, and 4 **published, durability unconfirmed** — the artifact exists and the
+confirming `fsync` did not report success, which is neither a failure nor a success.
+
+A repack is a statement about bytes. It is
+[ADR 0018](docs/decisions/adr/0018-v1-quality-is-bit-identical-repack.md)'s v1 quality definition
+and says nothing about what a model produces; a selection of part of a model publishes a **partial**
+artifact, which the reader opens for inspection and refuses to load.
 
 ### GPU device ordering
 
@@ -141,6 +173,18 @@ heterogeneous stage involving the 5060 Ti are not comparable placements, and doc
 link widths and simultaneous-transfer behavior to be measured rather than assumed (R12).
 
 ## Current state and the next assignment
+
+**M3 is authorized** (owner, 2026-09-13). M1 is complete and M2's five items are all accepted; M2's
+formal closure statement remains the owner's to make. The list below is the historical record of
+how the earlier milestones closed and is not the current assignment — [AGENTS.md](AGENTS.md) holds
+that, and is the only file that does.
+
+The most recent completed work is [task 0024](docs/tasks/0024-m3-asymmetric-int4-pack-quantized-import.md),
+M3 item 2's asymmetric INT4 importer, accepted on 2026-09-13 after three rounds of independent
+review, and [task 0025](docs/tasks/0025-m3-offline-repack-publication.md), M3 item 1's offline
+repack and canonical publication — the `moxie-repack` program documented above. Neither establishes
+model execution or output quality: **nothing in this repository executes a quantized weight**, which
+is M3 item 3 and the largest remaining gap in the milestone.
 
 **M1.4 complete; M1.5 active.** The owner accepted
 [task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md) on 2026-09-10 after independent

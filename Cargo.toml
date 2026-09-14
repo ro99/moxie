@@ -66,6 +66,14 @@ debug = 1
 [profile.dev.package.moxie-format]
 opt-level = 2
 
+# Third-party dependencies in dev builds. `"*"` covers dependencies only, never
+# a workspace crate, so nothing in this repository is compiled differently by
+# it. The manifest cap fixture parses a document with 1,048,577 tables in it to
+# prove the cap is checked before validation, and an unoptimized TOML parser
+# spends a minute and a half on that one test.
+[profile.dev.package."*"]
+opt-level = 2
+
 # Applied to every crate via `[lints] workspace = true`. Document 02 requires the
 # FFI boundary to be audited, not merely compiled: unsafe code must be justified
 # in writing at each site.

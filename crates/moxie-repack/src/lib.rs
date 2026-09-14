@@ -120,6 +120,49 @@ pub struct InspectReport {
     pub header_bytes_read: u64,
     pub completeness: Completeness,
     pub plan_digest: String,
+    /// An upper bound on what the destination directory holds at its largest,
+    /// with the pieces it is made of.
+    ///
+    /// The payload is exact -- it is the descriptors' own arithmetic. The other
+    /// two are bounds rather than sizes, because the manifest's length depends
+    /// on the text in it and the journal's on how many units a run takes; both
+    /// are derived from counts this inspection already knows, and both are
+    /// removed at publication.
+    pub staging: StagingEstimate,
+}
+
+/// What the destination holds at its peak, in three named parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagingEstimate {
+    pub payload_bytes: u64,
+    pub journal_bound_bytes: u64,
+    pub manifest_bound_bytes: u64,
+}
+
+impl StagingEstimate {
+    /// Bytes per journal line, generously: a role of any plausible length, two
+    /// 64-hex digests and the numbers.
+    const JOURNAL_LINE_BOUND: u64 = 1024;
+    /// Bytes per manifest tensor entry, generously, plus a fixed header
+    /// allowance for the identity, provenance and completeness sections.
+    const MANIFEST_TENSOR_BOUND: u64 = 2048;
+    const MANIFEST_FIXED_BOUND: u64 = 16 * 1024;
+
+    fn of(payload_bytes: u64, units: u64, tensors: u64, group_index_entries: u64) -> Self {
+        Self {
+            payload_bytes,
+            journal_bound_bytes: (units + 2) * Self::JOURNAL_LINE_BOUND,
+            manifest_bound_bytes: Self::MANIFEST_FIXED_BOUND
+                + tensors * Self::MANIFEST_TENSOR_BOUND
+                // A group-index map is the one manifest field whose length is
+                // a tensor's own dimension rather than a constant.
+                + group_index_entries * 8,
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.payload_bytes + self.journal_bound_bytes + self.manifest_bound_bytes
+    }
 }
 
 /// One selected tensor, as inspection sees it.
@@ -408,7 +451,24 @@ pub fn inspect(
             units: work::units_of(r, budgets.tile_bytes())?.len(),
         });
     }
+    let units: u64 = tensors.iter().map(|t| t.units as u64).sum();
+    let group_index_entries: u64 = resolved
+        .iter()
+        .map(|r| {
+            r.affine
+                .as_ref()
+                .and_then(|a| a.group_index.as_ref())
+                .map(|m| m.len() as u64)
+                .unwrap_or(0)
+        })
+        .sum();
     Ok(InspectReport {
+        staging: StagingEstimate::of(
+            plan.payload_bytes(),
+            units,
+            resolved.len() as u64,
+            group_index_entries,
+        ),
         model: selection.model.clone(),
         revision: selection.revision.clone(),
         source_root: sources.root().to_path_buf(),
@@ -752,6 +812,13 @@ pub struct VerifyReport {
     pub tensors: usize,
     pub bytes_verified: u64,
     pub completeness: Completeness,
+    /// Bytes in the chunk files that no tensor's range covers.
+    ///
+    /// Alignment padding between tensors is legitimate and lands here, so this
+    /// is not an error on its own. It is reported because the alternative is a
+    /// verifier that reads every byte it was told about and stays silent about
+    /// the ones it was not.
+    pub unclaimed_bytes: u64,
 }
 
 /// Re-read a published artifact through the production reader.
@@ -761,7 +828,19 @@ pub fn verify(artifact_dir: &Path, scratch: &mut [u8]) -> Result<VerifyReport> {
     for t in &artifact.manifest().tensors {
         bytes += artifact.verify_tensor(&t.role, scratch)?;
     }
+    let mut chunks: BTreeMap<&str, u64> = BTreeMap::new();
+    for t in &artifact.manifest().tensors {
+        *chunks.entry(t.chunk.as_str()).or_default() += t.length;
+    }
+    let mut unclaimed = 0u64;
+    for (chunk, claimed) in chunks {
+        let len = artifact
+            .chunk_len(chunk)
+            .ok_or_else(|| invalid(format!("chunk '{chunk}' was validated but has no length")))?;
+        unclaimed += len.saturating_sub(claimed);
+    }
     Ok(VerifyReport {
+        unclaimed_bytes: unclaimed,
         artifact: artifact.dir().to_path_buf(),
         identity: artifact.identity(),
         tensors: artifact.manifest().tensors.len(),

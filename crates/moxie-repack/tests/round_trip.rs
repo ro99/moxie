@@ -155,11 +155,7 @@ fn round_trip(label: &str, module: &Module, scale_dtype: &'static str, split_sha
     // wrote into the shard.
     let expected = module.expected_canonical(scale_dtype);
     let published = std::fs::read(out.join("chunk0.bin")).expect("the chunk");
-    assert_eq!(
-        published.len(),
-        expected.len(),
-        "{label}: canonical length"
-    );
+    assert_eq!(published.len(), expected.len(), "{label}: canonical length");
     assert_eq!(published, expected, "{label}: canonical bytes");
 
     // And the production reader agrees the bytes are the bytes their
@@ -331,7 +327,9 @@ fn a_mixed_selection_publishes_both_precisions_with_bf16_bits_unchanged() {
     let name = "model.layers.0.mlp.down_proj";
     // A BF16 payload with awkward values in it: a subnormal, a negative zero
     // and the largest finite BF16. None of them may change.
-    let norm_bits: Vec<u16> = vec![0x0001, 0x8000, 0x7F7F, 0x3F80, 0xBF80, 0x0080, 0x3F00, 0x4049];
+    let norm_bits: Vec<u16> = vec![
+        0x0001, 0x8000, 0x7F7F, 0x3F80, 0xBF80, 0x0080, 0x3F00, 0x4049,
+    ];
     let norm: Vec<u8> = norm_bits.iter().flat_map(|b| b.to_le_bytes()).collect();
     write_shard(
         &src.join("shard-a.safetensors"),
@@ -378,7 +376,11 @@ fn a_mixed_selection_publishes_both_precisions_with_bf16_bits_unchanged() {
             "packed-along-output",
             &files,
         )
-        .bf16("model.norm.weight", "model.norm.weight", "shard-a.safetensors");
+        .bf16(
+            "model.norm.weight",
+            "model.norm.weight",
+            "shard-a.safetensors",
+        );
     let selection_path = scratch.join("selection.toml");
     selection.write(&selection_path);
     let out = scratch.join("artifact");
@@ -403,7 +405,10 @@ fn a_mixed_selection_publishes_both_precisions_with_bf16_bits_unchanged() {
     let at = quantized.len().next_multiple_of(16);
     assert_eq!(&published[at..at + norm.len()], &norm[..]);
     let manifest = std::fs::read_to_string(out.join("manifest.toml")).expect("a manifest");
-    assert!(manifest.contains("precision = \"affine-int4-v1\""), "{manifest}");
+    assert!(
+        manifest.contains("precision = \"affine-int4-v1\""),
+        "{manifest}"
+    );
     assert!(manifest.contains("precision = \"bf16-v1\""), "{manifest}");
 }
 
@@ -419,7 +424,9 @@ fn several_tensors_fill_several_chunk_files() {
     let mut selection = SelectionBuilder::new("synthetic");
     for i in 0..4 {
         let name = format!("model.layers.{i}.norm.weight");
-        let payload: Vec<u8> = (0..512u16).flat_map(|v| (v & 0x7F7F).to_le_bytes()).collect();
+        let payload: Vec<u8> = (0..512u16)
+            .flat_map(|v| (v & 0x7F7F).to_le_bytes())
+            .collect();
         entries.push(Entry::new(&name, "BF16", vec![512], payload));
         selection = selection.bf16(&name, &name, "shard-a.safetensors");
     }
