@@ -331,9 +331,8 @@ impl Buffers {
     /// every one of them outside the ledger -- so a 2,048-byte total admitted
     /// three buffers and accounted for nothing else. They are charged here, at
     /// the caps the format crate declares, and released with the tiles.
-    pub fn admit(ledger: &mut Ledger, budgets: &Budgets) -> Result<Self> {
+    pub fn admit(ledger: &mut Ledger, budgets: &Budgets, metadata: u64) -> Result<Self> {
         let tile = budgets.tile_bytes();
-        let metadata = budgets.metadata_floor_bytes();
         let mut plan = PlanRequest::new("repack metadata", ["live"])?;
         plan.buffer(BufferRequest::new(
             "headers, selection and manifest",

@@ -595,6 +595,35 @@ impl Header {
     pub fn covers_payload_exactly(&self) -> bool {
         self.covered_bytes() == self.payload_len
     }
+
+    /// Refuse a shard whose tensors do not cover its payload exactly.
+    ///
+    /// The lenient parse above is for **source** files, which this repository
+    /// reads but did not write: trailing slack there is unusual rather than
+    /// corrupt, and reporting it is the honest response. A **canonical**
+    /// artifact is different. The owner's packaging ruling says a published
+    /// shard must open with the reference implementation, and the reference
+    /// refuses exactly this: `Metadata::validate` requires the ranges to start
+    /// at zero, leave no gap, and end where the file ends
+    /// (`buffer_end + N_LEN + n != buffer_len`). Independent review appended
+    /// garbage to a published shard and watched `verify` call it verified while
+    /// `safetensors` 0.7.0 called it "file not fully covered".
+    ///
+    /// With overlaps already refused and every range inside the payload, an
+    /// exact byte total is the same statement as "contiguous from zero".
+    pub fn require_exact_coverage(&self) -> Result<()> {
+        let covered = self.covered_bytes();
+        if covered != self.payload_len {
+            return Err(invalid(format_args!(
+                "this shard's {} tensor(s) cover {covered} of its {} payload byte(s): a canonical \
+                 shard is covered exactly, and the reference implementation refuses the \
+                 difference",
+                self.tensors.len(),
+                self.payload_len
+            )));
+        }
+        Ok(())
+    }
 }
 
 // --- the writer half ---------------------------------------------------------
@@ -881,6 +910,7 @@ mod tests {
         assert_eq!(h.get("a").unwrap().shape, vec![2, 3]);
         assert_eq!(h.get("b").unwrap().file_offset(&h), prefix as u64 + 24);
         assert!(h.covers_payload_exactly());
+        h.require_exact_coverage().expect("a covered payload");
         assert_eq!(h.covered_bytes(), 48);
         assert!(h.get("missing").is_err());
     }
@@ -1107,6 +1137,30 @@ mod tests {
         );
         over.push_str(r#"},"t":{"dtype":"U8","shape":[0],"data_offsets":[0,0]}}"#);
         assert!(parse(&raw(over)).is_err());
+    }
+
+    /// The parse stays lenient about slack, and `require_exact_coverage` is
+    /// what a canonical artifact is held to.
+    ///
+    /// The reference implementation refuses a file whose tensors do not reach
+    /// its end -- "file not fully covered" -- and independent review appended
+    /// garbage to a published shard and watched `verify` accept it. Source
+    /// files this repository reads but did not write stay lenient, and say so.
+    #[test]
+    fn payload_slack_parses_but_is_refused_for_a_canonical_shard() {
+        // Eight declared bytes in a twelve-byte payload: four nobody claims.
+        let bytes = file(&[("a", "U8", &[8], 0, 8)], 12);
+        let prefix = Header::prefix_len(&bytes).unwrap() as usize;
+        let h = Header::parse(&bytes[..prefix], bytes.len() as u64).unwrap();
+        assert_eq!(h.covered_bytes(), 8);
+        assert!(!h.covers_payload_exactly());
+        let e = h
+            .require_exact_coverage()
+            .expect_err("a canonical shard is covered exactly");
+        assert!(
+            e.to_string().contains("cover 8 of its 12"),
+            "the refusal does not name what was uncovered: {e}"
+        );
     }
 
     #[test]

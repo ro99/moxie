@@ -186,76 +186,97 @@ impl Artifact {
             .first()
             .map(|t| t.chunk_range().is_some())
             .unwrap_or(false);
-        let payloads =
-            if is_v1 {
-                let mut lengths = BTreeMap::new();
-                let mut chunks = BTreeMap::new();
-                // One entry per chunk name referenced, so a manifest naming the
-                // same chunk twice stats it once.
-                let mut names: Vec<&str> = manifest
-                    .tensors
-                    .iter()
-                    .filter_map(|t| t.chunk_range().map(|(chunk, _, _, _)| chunk))
-                    .collect();
-                names.sort();
-                names.dedup();
-                for name in names {
-                    let resolved = resolve_chunk(&canonical_dir, dir, name)?;
-                    let file = File::open(&resolved).map_err(|e| Error::InvalidArtifact {
-                        detail: format!("cannot open chunk '{}': {e}", resolved.display()).into(),
+        let payloads = if is_v1 {
+            let mut lengths = BTreeMap::new();
+            let mut chunks = BTreeMap::new();
+            // One entry per chunk name referenced, so a manifest naming the
+            // same chunk twice stats it once.
+            let mut names: Vec<&str> = manifest
+                .tensors
+                .iter()
+                .filter_map(|t| t.chunk_range().map(|(chunk, _, _, _)| chunk))
+                .collect();
+            names.sort();
+            names.dedup();
+            for name in names {
+                let resolved = resolve_chunk(&canonical_dir, dir, name)?;
+                let file = File::open(&resolved).map_err(|e| Error::InvalidArtifact {
+                    detail: format!("cannot open chunk '{}': {e}", resolved.display()).into(),
+                })?;
+                let len = file
+                    .metadata()
+                    .map_err(|e| Error::InvalidArtifact {
+                        detail: format!("cannot stat chunk '{}': {e}", resolved.display()).into(),
+                    })?
+                    .len();
+                lengths.insert(name.to_string(), len);
+                chunks.insert(
+                    name.to_string(),
+                    ChunkFile {
+                        path: resolved,
+                        file,
+                        len,
+                    },
+                );
+            }
+            manifest::validate_chunks(&manifest, &lengths)?;
+            Payloads::Chunks(chunks)
+        } else {
+            let mut names: Vec<&str> = manifest
+                .tensors
+                .iter()
+                .flat_map(|t| t.components().unwrap_or(&[]))
+                .map(|c| c.file.as_str())
+                .collect();
+            names.sort();
+            names.dedup();
+            let mut shards = BTreeMap::new();
+            for name in names {
+                let resolved = resolve_chunk(&canonical_dir, dir, name)?;
+                let shard = Shard::open_with_limits(&resolved, budget, HeaderBudget::DEFAULT)?;
+                shards.insert(name.to_string(), shard);
+            }
+            // A canonical shard is covered exactly. Checked before any
+            // component is looked up, because a shard carrying bytes no
+            // tensor claims is refused by the reference implementation and
+            // must be refused here (ADR 0025).
+            for (name, shard) in &shards {
+                shard
+                    .header()
+                    .require_exact_coverage()
+                    .map_err(|e| Error::InvalidArtifact {
+                        detail: format!("shard '{name}': {e}").into(),
                     })?;
-                    let len = file
-                        .metadata()
-                        .map_err(|e| Error::InvalidArtifact {
-                            detail: format!("cannot stat chunk '{}': {e}", resolved.display())
+            }
+            // Every component must be the tensor the **descriptor** implies:
+            // present, and of that dtype, that shape and that byte length.
+            // Checked at open, so a renamed, re-typed or re-shaped component
+            // is found before a read rather than during one -- and derived
+            // from the descriptor rather than from the manifest's own
+            // component row, which is the claim under test.
+            for t in &manifest.tensors {
+                let expected = t
+                    .expected_components()
+                    .map_err(|e| Error::InvalidArtifact {
+                        detail: format!(
+                            "tensor '{}': its components cannot be derived: {e}",
+                            t.role
+                        )
+                        .into(),
+                    })?;
+                for (c, want) in t.components().unwrap_or(&[]).iter().zip(expected.iter()) {
+                    let shard =
+                        shards
+                            .get(c.file.as_str())
+                            .ok_or_else(|| Error::InvalidArtifact {
+                                detail: format!(
+                                    "tensor '{}' names shard '{}', which is not open",
+                                    t.role, c.file
+                                )
                                 .into(),
-                        })?
-                        .len();
-                    lengths.insert(name.to_string(), len);
-                    chunks.insert(
-                        name.to_string(),
-                        ChunkFile {
-                            path: resolved,
-                            file,
-                            len,
-                        },
-                    );
-                }
-                manifest::validate_chunks(&manifest, &lengths)?;
-                Payloads::Chunks(chunks)
-            } else {
-                let mut names: Vec<&str> = manifest
-                    .tensors
-                    .iter()
-                    .flat_map(|t| t.components().unwrap_or(&[]))
-                    .map(|c| c.file.as_str())
-                    .collect();
-                names.sort();
-                names.dedup();
-                let mut shards = BTreeMap::new();
-                for name in names {
-                    let resolved = resolve_chunk(&canonical_dir, dir, name)?;
-                    let shard = Shard::open_with_limits(&resolved, budget, HeaderBudget::DEFAULT)?;
-                    shards.insert(name.to_string(), shard);
-                }
-                // Every component must be a tensor the shard actually declares,
-                // and its declared length is the shard's to state. Checked at
-                // open, so a missing or renamed component is found before a read
-                // rather than during one.
-                for t in &manifest.tensors {
-                    for c in t.components().unwrap_or(&[]) {
-                        let shard =
-                            shards
-                                .get(c.file.as_str())
-                                .ok_or_else(|| Error::InvalidArtifact {
-                                    detail: format!(
-                                        "tensor '{}' names shard '{}', which is not open",
-                                        t.role, c.file
-                                    )
-                                    .into(),
-                                })?;
-                        shard.header().get(&c.name).map_err(|e| {
-                            Error::InvalidArtifact {
+                            })?;
+                    let entry = shard.header().get(&c.name).map_err(|e| {
+                        Error::InvalidArtifact {
                         detail: format!(
                             "tensor '{}' component '{}': shard '{}' declares no tensor '{}': {e}",
                             t.role,
@@ -265,11 +286,31 @@ impl Artifact {
                         )
                         .into(),
                     }
-                        })?;
+                    })?;
+                    if entry.dtype != want.dtype
+                        || entry.shape != want.shape
+                        || entry.len() != want.len
+                    {
+                        return Err(Error::InvalidArtifact {
+                                detail: format!(
+                                    "tensor '{}' component '{}': shard '{}' declares it {}                                      shape-{:?} of {} byte(s); the descriptor implies {}                                      shape-{:?} of {} byte(s)",
+                                    t.role,
+                                    c.kind.name(),
+                                    c.file,
+                                    entry.dtype.name(),
+                                    entry.shape,
+                                    entry.len(),
+                                    want.dtype.name(),
+                                    want.shape,
+                                    want.len
+                                )
+                                .into(),
+                            });
                     }
                 }
-                Payloads::Shards(shards)
-            };
+            }
+            Payloads::Shards(shards)
+        };
         Ok(Self {
             manifest,
             dir: canonical_dir,
@@ -489,6 +530,38 @@ impl Artifact {
     /// scratch buffer.
     pub fn verify_tensor(&self, role: &str, scratch: &mut [u8]) -> Result<u64> {
         self.stream_tensor(role, scratch, &mut |_| Ok(()))
+    }
+
+    /// The same, asked about cancellation between slices.
+    ///
+    /// `Ok(None)` means the caller cancelled. A whole-tensor verification is a
+    /// whole-tensor read: independent review pointed out that checking only
+    /// between logical tensors leaves a large one running to completion after
+    /// the user has asked to stop. The scratch buffer is the bound on how much
+    /// I/O a cancellation can still be waiting on.
+    pub fn verify_tensor_cancellable(
+        &self,
+        role: &str,
+        scratch: &mut [u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<u64>> {
+        let stopped = std::cell::Cell::new(false);
+        let result = self.stream_tensor(role, scratch, &mut |_| {
+            if cancelled() {
+                stopped.set(true);
+                return Err(Error::InvalidArtifact {
+                    detail: "cancelled".into(),
+                });
+            }
+            Ok(())
+        });
+        match result {
+            Ok(n) => Ok(Some(n)),
+            // The flag, not the message: only this sink sets it, so a genuine
+            // checksum failure can never be mistaken for a cancellation.
+            Err(_) if stopped.get() => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Read one tensor into a caller-supplied buffer.
@@ -786,6 +859,74 @@ impl Shard {
         })
     }
 
+    /// This open file's identity, as the kernel knows it.
+    ///
+    /// `(device, inode)` on unix, taken from the **handle** rather than the
+    /// path: a path can be renamed over between two questions, and a reader
+    /// that asks the path twice is asking about two different files without
+    /// being told. Elsewhere, length and modification time, which is weaker and
+    /// says so.
+    pub fn file_key(&self) -> Result<(u64, u64)> {
+        let meta = self.file.metadata().map_err(|e| Error::InvalidArtifact {
+            detail: format!("cannot stat the open {}: {e}", self.path.display()).into(),
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok((meta.dev(), meta.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            Ok((meta.len(), mtime))
+        }
+    }
+
+    /// SHA-256 of this shard's whole file, read through **this** handle.
+    ///
+    /// Not by reopening the path. Independent review replaced a source file
+    /// between an inspection and the repack that followed it: the cached handle
+    /// still held the old inode while a fresh open of the same name hashed the
+    /// new one, so the artifact carried the old file's values under the new
+    /// file's digest. One open file description answers both questions.
+    ///
+    /// `Ok(None)` means the caller cancelled: a cancellation is not a corrupt
+    /// artifact and must not be reported as one.
+    pub fn digest_whole_file(
+        &self,
+        scratch: &mut [u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<(String, u64)>> {
+        if scratch.is_empty() {
+            return Err(Error::InvalidArtifact {
+                detail: "a zero-byte scratch buffer cannot hash anything".into(),
+            });
+        }
+        let mut hasher = moxie_format::StreamingSha256::new();
+        let mut done = 0u64;
+        let mut source = OpenChunk { file: &self.file };
+        while done < self.len {
+            if cancelled() {
+                return Ok(None);
+            }
+            let want = core::cmp::min(scratch.len() as u64, self.len - done) as usize;
+            let buf = &mut scratch[..want];
+            source
+                .read_at(done, buf)
+                .map_err(|e| Error::InvalidArtifact {
+                    detail: format!("cannot read {}: {e}", self.path.display()).into(),
+                })?;
+            hasher.update(buf);
+            done += want as u64;
+        }
+        Ok(Some((hasher.finalize_hex(), done)))
+    }
+
     /// The header bytes this shard was admitted for.
     pub fn header_budget(&self) -> HeaderBudget {
         self.header_budget
@@ -1049,6 +1190,21 @@ pub fn read_range(
 /// text file this repository's tooling reads back: the repacker's private
 /// restart journal.
 pub fn read_text_capped(path: &Path, cap: usize) -> Result<String> {
+    let bytes = read_bytes_capped(path, cap)?;
+    String::from_utf8(bytes).map_err(|e| Error::InvalidArtifact {
+        detail: format!("{} is not UTF-8: {e}", path.display()).into(),
+    })
+}
+
+/// The same, returning bytes.
+///
+/// A file whose last record was interrupted mid-write can end inside a
+/// multi-byte character, and the repacker's journal recovery exists precisely
+/// to discard such a tail. Decoding the whole file as UTF-8 first would refuse
+/// it before recovery ever saw it -- independent review reproduced that with a
+/// record torn inside a Unicode string -- so the caller that knows where its
+/// records end takes the bytes and decodes the part it has committed.
+pub fn read_bytes_capped(path: &Path, cap: usize) -> Result<Vec<u8>> {
     let have = std::fs::metadata(path)
         .map_err(|e| Error::InvalidArtifact {
             detail: format!("cannot stat {}: {e}", path.display()).into(),
@@ -1063,7 +1219,7 @@ pub fn read_text_capped(path: &Path, cap: usize) -> Result<String> {
             .into(),
         });
     }
-    read_file_capped(path)
+    read_file_capped_bytes(path, cap)
 }
 
 /// Read `manifest.toml` through a capped reader that errors at the limit
@@ -1074,6 +1230,21 @@ fn read_manifest_capped(dir: &Path) -> Result<String> {
 
 /// The same cap, for a manifest that is not yet called `manifest.toml`.
 fn read_file_capped(path: &Path) -> Result<String> {
+    let bytes = read_file_capped_bytes(path, moxie_format::manifest::MAX_MANIFEST_BYTES)?;
+    String::from_utf8(bytes).map_err(|e| Error::InvalidArtifact {
+        detail: format!("{} is not UTF-8: {e}", path.display()).into(),
+    })
+}
+
+/// Read a whole file, stopping at `cap` rather than reading it and measuring
+/// afterwards.
+///
+/// The cap is the caller's. It used to be the manifest's in every case, so a
+/// caller that admitted a larger journal was refused at a limit it had never
+/// asked for: independent review produced a valid 4,354,889-byte journal that
+/// a resume could not reopen, because the manifest's 4 MiB bound was applied to
+/// it.
+fn read_file_capped_bytes(path: &Path, cap: usize) -> Result<Vec<u8>> {
     let path = path.to_path_buf();
     let mut f = File::open(&path).map_err(|e| Error::InvalidArtifact {
         detail: format!("cannot open {}: {e}", path.display()).into(),
@@ -1088,18 +1259,17 @@ fn read_file_capped(path: &Path) -> Result<String> {
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > moxie_format::manifest::MAX_MANIFEST_BYTES {
+        if buf.len() > cap {
             return Err(Error::InvalidArtifact {
                 detail: format!(
-                    "manifest.toml exceeds the {} byte cap before parsing: it bounds the parse itself",
-                    moxie_format::manifest::MAX_MANIFEST_BYTES
-                ).into(),
+                    "{} exceeds the {cap} byte cap before parsing: it bounds the parse itself",
+                    path.display()
+                )
+                .into(),
             });
         }
     }
-    String::from_utf8(buf).map_err(|e| Error::InvalidArtifact {
-        detail: format!("manifest.toml is not UTF-8: {e}").into(),
-    })
+    Ok(buf)
 }
 
 /// Confine a chunk reference to the artifact directory.

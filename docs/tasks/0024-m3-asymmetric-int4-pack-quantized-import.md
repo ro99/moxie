@@ -482,7 +482,7 @@ substitutions "repeated in both directions" — the first run did each once, and
 neither the record nor I said so.
 
 The driver is tracked now, at
-[`docs/evidence/experiments/drivers/0005-mutations.py`](../evidence/experiments/drivers/0005-mutations.py),
+`tools/experiments/0005-mutations.py` (retired 2026-09-14),
 with every substitution verbatim. Each verdict is repeated **three times in both
 directions** — mutant against the mutated tree, control against the restored one
 — and a lane that disagrees with itself is reported as nondeterministic rather
@@ -554,7 +554,7 @@ Seventeen new tests: seven in `moxie-format`'s own module, one
 controls, 0 skipped**, each verdict repeated **three times in both directions**,
 driver committed and its verdict rule self-tested
 ([experiment 0005](../evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md),
-[its driver](../evidence/experiments/drivers/0005-mutations.py)). The first
+its driver (retired 2026-09-14)). The first
 measurement was 16 of 16 against a suite with **five** holes in it, and the
 second 21 of 21 against a suite with three. **Eight mutations were added after a
 review — five then three — and every one of them is caught by exactly one

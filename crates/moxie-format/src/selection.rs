@@ -229,6 +229,19 @@ pub struct Selection {
     pub completeness: Completeness,
     pub excluded: Vec<(String, String)>,
     pub tensors: Vec<SelectedTensor>,
+    /// Bytes of the document this was parsed from.
+    ///
+    /// Kept because a caller admitting memory for the parsed form needs the
+    /// size of what produced it: every name in those structures came from this
+    /// text, and the cap on the text is a cap on all of them together.
+    pub source_bytes: u64,
+}
+
+impl Selection {
+    /// Bytes of the document this selection was parsed from.
+    pub fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,6 +530,7 @@ pub fn parse(text: &str) -> Result<Selection> {
     }
 
     Ok(Selection {
+        source_bytes: text.len() as u64,
         model: nonempty(raw.source.model, "source.model")?,
         revision: nonempty(raw.source.revision, "source.revision")?,
         license: nonempty(raw.source.license, "source.license")?,

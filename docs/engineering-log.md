@@ -35,6 +35,8 @@ Each links into the entries below.
 | A boundary invented before it had two sides | task 0025's `moxie-storage-write`, which forced a second copy of the reader's `pread` |
 | A format assumption nobody asked the format about | task 0026's eight-byte alignment, refused by the reference reader |
 | A new boundary that hides the boundary beside it | task 0026's shard-header pass, which absorbed every payload fault |
+| A claim checked against a copy of itself | task 0026's component validation, shape check, source digest and memory bound |
+| A tool that measures the tree it is editing | the mutation battery, twice: killed mid-substitution, and left unrunnable for two tasks |
 | A test measured by assertion rather than by mutation | tasks 0020, 0021, 0022, 0023, 0024 |
 | A record contradicting a fact it already contains | task 0022's expert inventory, task 0022's VRAM figure, task 0024's sign claim |
 | A comparison whose two sides are not independent | task 0022's FP64 transcription, task 0024's FP32-versus-BF16 arithmetic |
@@ -42,6 +44,71 @@ Each links into the entries below.
 
 ## Entries, newest first
 
+
+**Tooling belongs in the tooling crate, and the port found the rot
+(2026-09-14).** The mutation batteries were Python scripts living under
+`docs/`. The owner asked why, given that `xtask` exists for exactly this. There
+was no good answer: they substitute one string in a tracked file, shell out to
+`cargo test`, and compare exit codes, all of which is `std`.
+
+The port to `cargo xtask mutation-check` paid for itself in its first run. The
+Rust self-test also checks that **every anchor matches exactly once** -- which
+the Python driver only did while running, four hours at a time -- and it
+immediately reported that thirteen of experiment 0005's twenty-four anchors had
+matched nothing since before `ccfd7fa`. Tasks 0025 and 0026 had rewritten the
+importer that battery measured, and nothing noticed because nothing re-ran it.
+A mutation that does not apply is not evidence, so that battery was retired
+rather than carried as a number nobody can reproduce.
+
+The restore got stronger in the move, too, and for a reason with a scar: a
+battery killed mid-substitution left `if false && got != unit.sha256` in this
+repository's resume path, and the gates were re-run against it before the
+device suite failed a corruption test and gave it away. A signal handler cannot
+fix that -- `SIGKILL` catches nobody -- so the original is now parked on disk
+**before** the substitution and cleared after it is put back, and the next run
+restores whatever a killed one left.
+
+One script stays outside the workspace: the reference `safetensors` reader.
+That is not a tooling decision but a dependency one. Linking the reference would
+breach the task's no-new-dependency constraint and weaken the claim -- our
+reader agreeing with a crate we vendored is a weaker statement than our bytes
+being accepted by an implementation that has never heard of us. It is invoked
+as `cargo xtask reference-check`, so every gate here is still one command.
+
+**Six ways to check a claim against a copy of itself (2026-09-14).** A second
+independent review of the safetensors publication returned fourteen findings,
+six of them P1. Listed separately they look unrelated. Together they are one
+mistake:
+
+* A component was checked to **exist** in its shard, never to be the dtype, the
+  shape and the byte length its descriptor implies. Retyping a published `BF16`
+  component to `F16` verified.
+* A component list was validated as a **sorted set of kinds** and then streamed
+  in the order given. Reversing it verified, and streamed reversed.
+* A source file was **hashed by reopening its path** while its tensors were read
+  through a cached handle. Replace the file between the two and the artifact
+  holds one file's values under another file's digest.
+* A memory bound counted **serialized text** -- the selection cap, the manifest
+  cap -- while the run held the structures parsed out of it. Five thousand
+  tensors peaked at twice the admitted total.
+* Staging estimates were **per-record constants** while the records carry names
+  of any length. A 1,000-character role overran a 160,000-byte budget.
+* A published shard was held to **our own parser**, which reports payload slack,
+  while the owner's ruling names the reference implementation, which refuses it.
+
+The fix in every case is the same move: derive the expectation from something
+that is not the artifact, and hold the artifact to it. The descriptor derives
+the components. The kernel's `(dev, ino)` derives file identity. The selection's
+own byte length derives the memory bound. The reference implementation derives
+what a conforming shard is.
+
+**And the tests have to be able to fail.** Two of these corrections needed a
+second attempt, both caught by writing the regression first: binding a source to
+one handle made the run self-consistent while making an atomic replacement
+invisible -- strictly worse than before, since the re-hash had been catching it
+-- and a cancellation test that keyed on a hard-coded count became
+self-fulfilling the moment the code asked one more question. A test that cannot
+distinguish the fix from the defect is not evidence either.
 
 **A new durable boundary can make an old one untestable (2026-09-14).** The
 safetensors writer added a pass that writes and syncs every shard's header
@@ -100,7 +167,7 @@ not asking would have been a schema, a writer, a reader and a task's worth of
 tests built on a file nothing else can open.
 
 That is also why the acceptance gate for this work is
-[a script that opens every published shard with the reference reader](evidence/experiments/drivers/0007-reference-reader.py)
+[`cargo xtask reference-check`](../tools/experiments/0007-reference-reader.py)
 and compares each component's dtype, shape and checksum against the manifest,
 rather than our reader agreeing with our writer.
 
@@ -327,7 +394,7 @@ make the filtered subset a separately named thing.**
 **The mutation names are not the measurement; the exact substitutions are.**
 Experiment 0005 said its driver was "reproduced in the task record" and it was
 not, in either commit. The driver is tracked now, at
-[`docs/evidence/experiments/drivers/0005-mutations.py`](evidence/experiments/drivers/0005-mutations.py),
+`tools/experiments/0005-mutations.py` (retired 2026-09-14),
 and every verdict is repeated three times in both directions because the
 contract promised that and the first run did not do it. **21 of 21 caught, 0
 survivors** when measured, **24 of 24** after a second review — where the first

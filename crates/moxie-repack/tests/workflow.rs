@@ -143,7 +143,13 @@ fn a_module_whose_entries_are_the_wrong_dtype_is_refused() {
         let selection = moxie_repack::read_selection(&selection_path).expect("a selection");
         let budgets = budgets();
         let mut sources = moxie_repack::open_sources(&src, &budgets).expect("the sources");
-        let e = moxie_repack::inspect(&selection, &mut sources, &budgets).unwrap_err();
+        let e = moxie_repack::inspect(
+            &selection,
+            &mut sources,
+            &budgets,
+            &mut moxie_repack::ledger_for(&budgets).expect("a ledger"),
+        )
+        .unwrap_err();
         assert!(e.to_string().contains(needle), "{packed}/{shape}: {e}");
     }
 }
@@ -162,7 +168,13 @@ fn a_symmetric_selection_over_an_asymmetric_source_is_refused() {
     let selection = moxie_repack::read_selection(&selection_path).expect("a selection");
     let budgets = budgets();
     let mut sources = moxie_repack::open_sources(&src, &budgets).expect("the sources");
-    let e = moxie_repack::inspect(&selection, &mut sources, &budgets).unwrap_err();
+    let e = moxie_repack::inspect(
+        &selection,
+        &mut sources,
+        &budgets,
+        &mut moxie_repack::ledger_for(&budgets).expect("a ledger"),
+    )
+    .unwrap_err();
     assert!(
         e.to_string().contains("declared symmetric but serializes"),
         "{e}"
@@ -295,7 +307,13 @@ fn a_scratch_too_small_for_a_zero_point_word_is_refused_before_any_output() {
     let mut budgets = budgets();
     budgets.scratch_bytes = 8;
     let mut sources = moxie_repack::open_sources(&src, &budgets).expect("the sources");
-    let e = moxie_repack::inspect(&selection, &mut sources, &budgets).unwrap_err();
+    let e = moxie_repack::inspect(
+        &selection,
+        &mut sources,
+        &budgets,
+        &mut moxie_repack::ledger_for(&budgets).expect("a ledger"),
+    )
+    .unwrap_err();
     assert!(
         e.to_string().contains("needs at least"),
         "the refusal does not say how much is needed: {e}"
@@ -336,7 +354,13 @@ fn a_total_budget_below_the_working_set_is_refused() {
         let mut budgets = budgets();
         budgets.total_bytes = total;
         let mut sources = moxie_repack::open_sources(&src, &budgets).expect("the sources");
-        let e = moxie_repack::inspect(&selection, &mut sources, &budgets).unwrap_err();
+        let e = moxie_repack::inspect(
+            &selection,
+            &mut sources,
+            &budgets,
+            &mut moxie_repack::ledger_for(&budgets).expect("a ledger"),
+        )
+        .unwrap_err();
         assert!(
             e.to_string().contains("cannot hold this run") || e.to_string().contains("positive"),
             "total {total}: {e}"

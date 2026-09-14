@@ -155,6 +155,10 @@ pub struct Run {
     progress: BTreeMap<String, Progress>,
     /// Bytes written to chunk files by this process, for the disk budget.
     disk_used: u64,
+    /// Journal and staged-manifest bytes written so far, charged against the
+    /// plan's own allowance so the destination cannot quietly exceed the disk
+    /// budget the plan was accepted under.
+    overhead_used: u64,
     /// Read-back scratch, admitted from the ledger like every other byte this
     /// run holds.
     scratch: HostBuffer,
@@ -200,16 +204,10 @@ impl Run {
         // between creating the file and recording what it was for: it accounts
         // for nothing, because a unit cannot be recorded before the header.
         // Removing it and starting over is the only reading that does not
-        // strand the destination.
-        let resuming = journal_path.exists() && journal_binds(&journal_path)?;
-        if journal_path.exists() && !resuming {
-            std::fs::remove_file(&journal_path).map_err(|e| {
-                invalid(format!(
-                    "cannot remove the empty journal {}: {e}",
-                    journal_path.display()
-                ))
-            })?;
-        }
+        // strand the destination -- but the removal is a **mutation**, so it
+        // waits for the lock below. Reading is all that happens here.
+        let empty_journal = journal_path.exists();
+        let resuming = empty_journal && journal_binds(&journal_path)?;
         if dest.exists() {
             if !resuming {
                 // A directory holding only this program's own private files is
@@ -272,6 +270,18 @@ impl Run {
 
         take_lock(&dest, options, faults)?;
 
+        // Under the lock, and not before it: removing another run's file is a
+        // mutation, and the whole point of the lock is that one run at a time
+        // decides what this destination holds.
+        if empty_journal && !resuming {
+            std::fs::remove_file(&journal_path).map_err(|e| {
+                invalid(format!(
+                    "cannot remove the empty journal {}: {e}",
+                    journal_path.display()
+                ))
+            })?;
+        }
+
         faults.check(Site::Allocate)?;
         let mut scratch = HostBuffer::allocate_in(
             ledger,
@@ -303,6 +313,7 @@ impl Run {
             journal,
             progress: BTreeMap::new(),
             disk_used: 0,
+            overhead_used: 0,
             scratch,
             sealed: None,
         };
@@ -321,26 +332,34 @@ impl Run {
         // that header, and a resumed run writes into the same file it would
         // have. Rewriting an identical header is idempotent, and cheap -- a
         // header is kilobytes.
-        if let Err(e) = run.write_shard_headers(faults) {
-            // The same rule as the journal handle above, at the error path the
-            // safetensors header pass added: a start that refuses releases what
-            // it admitted. `begin` never hands back a `Run` it failed to build,
-            // so nothing above this can release the scratch on its behalf.
-            run.abandon(ledger)?;
-            return Err(e);
-        }
-
+        //
+        // On a **resume** it happens after `recover`, never before: recovery is
+        // where the journal's binding is checked, and independent review
+        // resumed with a different selection, was correctly refused, and found
+        // the existing shard already rewritten. A destination that is not this
+        // run's is a destination this run does not touch.
+        //
+        // A start that refuses releases what it admitted. `begin` never hands
+        // back a `Run` it failed to build, so nothing above can release the
+        // scratch on its behalf.
         if resuming {
-            match run.recover(&journal_path, faults, cancelled) {
-                Ok(report) => Ok(Start::Resumed(run, report)),
+            let report = match run.recover(&journal_path, faults, cancelled) {
+                Ok(report) => report,
                 Err(e) => {
-                    // Same rule as above: a start that refuses releases what
-                    // it admitted.
                     run.abandon(ledger)?;
-                    Err(e)
+                    return Err(e);
                 }
+            };
+            if let Err(e) = run.write_shard_headers(faults) {
+                run.abandon(ledger)?;
+                return Err(e);
             }
+            Ok(Start::Resumed(run, report))
         } else {
+            if let Err(e) = run.write_shard_headers(faults) {
+                run.abandon(ledger)?;
+                return Err(e);
+            }
             Ok(Start::Fresh(run))
         }
     }
@@ -357,8 +376,26 @@ impl Run {
         faults: &Faults,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ResumeReport> {
-        let text = moxie_storage::read_text_capped(journal_path, journal::MAX_JOURNAL_BYTES)?;
-        let state: JournalState = journal::parse(&text)?;
+        // Bytes, not text: a record torn inside a multi-byte character makes
+        // the file invalid UTF-8 past its last committed newline, and that is
+        // the state this recovery exists to repair.
+        let bytes = moxie_storage::read_bytes_capped(journal_path, journal::MAX_JOURNAL_BYTES)?;
+        let state: JournalState = journal::parse_bytes(&bytes)?;
+        // **Whose run is this?** Asked before anything is changed. A journal
+        // bound to a different plan means this destination is not ours to
+        // repair, rewrite or append to, and independent review found the tear
+        // repair and the shard-header pass both running ahead of this question.
+        let recorded = state.binding.clone().ok_or_else(|| {
+            invalid("this journal records no plan: `begin` should have started over".into())
+        })?;
+        if recorded != self.binding {
+            return Err(invalid(format!(
+                "this destination holds a run bound to a different plan: recorded {:?}, requested \
+                 {:?}. A resume binds source content, converter version, selection and output \
+                 plan; a difference is a refusal, not a merge",
+                recorded, self.binding
+            )));
+        }
         // **Repair the tear before anything appends to it.** Parsing ignores a
         // torn final line, but leaving it on disk means the next record is
         // written onto the fragment and the journal becomes unparseable for
@@ -367,7 +404,7 @@ impl Run {
         // again. The existing test ran straight through to publication, which
         // deletes the journal and hid it.
         if state.torn_tail_bytes > 0 {
-            let keep = text.len() - state.torn_tail_bytes;
+            let keep = bytes.len() - state.torn_tail_bytes;
             let file = open_confined(&self.dest, JOURNAL_FILE, false)?;
             file.set_len(keep as u64).map_err(|e| {
                 invalid(format!(
@@ -396,17 +433,6 @@ impl Run {
                         journal_path.display()
                     ))
                 })?;
-        }
-        let recorded = state.binding.clone().ok_or_else(|| {
-            invalid("this journal records no plan: `begin` should have started over".into())
-        })?;
-        if recorded != self.binding {
-            return Err(invalid(format!(
-                "this destination holds a run bound to a different plan: recorded {:?}, requested \
-                 {:?}. A resume binds source content, converter version, selection and output \
-                 plan; a difference is a refusal, not a merge",
-                recorded, self.binding
-            )));
         }
         let mut report = ResumeReport {
             reused_units: 0,
@@ -604,6 +630,27 @@ impl Run {
         Ok(())
     }
 
+    /// Charge `bytes` against the plan's staging allowance, or refuse.
+    ///
+    /// The journal and the staged manifest are the destination's other two
+    /// files, and the disk budget was checked against payload **plus** a bound
+    /// on them. Independent review found that bound was a per-record constant
+    /// rather than a function of the names in the records, so a long role
+    /// overran it: a 160,000-byte budget retained 166,026 bytes. The bound is
+    /// proportional now, and this is what makes it a limit rather than a guess.
+    fn charge_overhead(&mut self, bytes: u64, what: &str) -> Result<()> {
+        let used = self.overhead_used + bytes;
+        if used > self.plan.overhead_bytes() {
+            return Err(invalid(format!(
+                "writing {bytes} more byte(s) of {what} would take this run's staging files to \
+                 {used}, above the {} byte(s) its disk plan reserved for them",
+                self.plan.overhead_bytes()
+            )));
+        }
+        self.overhead_used = used;
+        Ok(())
+    }
+
     /// Whether every tensor's payload is complete.
     pub fn is_complete(&self) -> bool {
         self.plan
@@ -685,7 +732,9 @@ impl Run {
             sha256: sha256_hex(bytes),
             source_sha256: source_sha256.to_string(),
         };
-        append_durably(&mut self.journal, &journal::unit_line(&unit), faults)?;
+        let line = journal::unit_line(&unit);
+        self.charge_overhead(line.len() as u64, "journal")?;
+        append_durably(&mut self.journal, &line, faults)?;
 
         let progress = self.progress.get_mut(component).expect("checked above");
         progress.hasher.update(bytes);
@@ -767,6 +816,7 @@ impl Run {
             return self.cancel_with(bytes, ledger);
         }
         let staged = self.dest.join(STAGED_MANIFEST_FILE);
+        self.charge_overhead(manifest_text.len() as u64, "staged manifest")?;
         faults.check(Site::ManifestWrite)?;
         {
             let mut file = open_confined(&self.dest, STAGED_MANIFEST_FILE, false)?;
@@ -789,16 +839,21 @@ impl Run {
         for role in roles {
             // Validation reads every published byte, and a cancellation only
             // observed after all of them is a cancellation nobody experiences.
-            if cancelled() {
-                let bytes = self.progress.values().map(|p| p.done).sum();
-                return self.cancel_with(bytes, ledger);
-            }
+            // Asked **inside** the read as well as before it: one tensor can be
+            // gigabytes, and the scratch buffer is what bounds how long a
+            // cancellation still waits.
             let want: u64 = sealed
                 .iter()
                 .filter(|t| t.role == role)
                 .map(|t| t.length)
                 .sum();
-            let read = artifact.verify_tensor(role, self.scratch.bytes_mut())?;
+            let Some(read) =
+                artifact.verify_tensor_cancellable(role, self.scratch.bytes_mut(), cancelled)?
+            else {
+                drop(artifact);
+                let bytes = self.progress.values().map(|p| p.done).sum();
+                return self.cancel_with(bytes, ledger);
+            };
             if read != want {
                 return Err(invalid(format!(
                     "tensor '{role}' verified {read} byte(s) against a planned {want}"
@@ -904,8 +959,8 @@ impl Run {
 
 /// Whether a journal file carries the plan line that binds a run.
 fn journal_binds(path: &Path) -> Result<bool> {
-    let text = moxie_storage::read_text_capped(path, journal::MAX_JOURNAL_BYTES)?;
-    Ok(journal::parse(&text)?.binding.is_some())
+    let bytes = moxie_storage::read_bytes_capped(path, journal::MAX_JOURNAL_BYTES)?;
+    Ok(journal::parse_bytes(&bytes)?.binding.is_some())
 }
 
 /// Open the journal: append to an existing one, or create it with its header.
@@ -996,9 +1051,40 @@ fn open_confined(dest: &Path, name: &str, create_new: bool) -> Result<File> {
         const O_NOFOLLOW: i32 = 0o400000;
         options.custom_flags(O_NOFOLLOW);
     }
-    options
+    let file = options
         .open(&path)
-        .map_err(|e| invalid(format!("cannot open {}: {e}", path.display())))
+        .map_err(|e| invalid(format!("cannot open {}: {e}", path.display())))?;
+    // The check that `O_NOFOLLOW` cannot make: a **hard link**. A regular file
+    // inside the destination can be a second name for a file anywhere on the
+    // same filesystem, and writing through it writes there. Independent review
+    // cancelled a run, hard-linked an unrelated file over a private name, and
+    // watched publication overwrite it.
+    //
+    // Made on the opened handle rather than on the path, so nothing can be
+    // swapped in between the question and the write. A file this run created
+    // has exactly one name; anything else is an alias it did not make.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file
+            .metadata()
+            .map_err(|e| invalid(format!("cannot stat the open {}: {e}", path.display())))?;
+        if !meta.is_file() {
+            return Err(invalid(format!(
+                "{} is not a regular file once opened",
+                path.display()
+            )));
+        }
+        if meta.nlink() != 1 {
+            return Err(invalid(format!(
+                "{} has {} names: a hard link makes it a second name for a file this run did not \
+                 create, and writing through it writes outside the destination",
+                path.display(),
+                meta.nlink()
+            )));
+        }
+    }
+    Ok(file)
 }
 
 /// Take the exclusive run lock, or explain who has it.

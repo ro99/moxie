@@ -308,6 +308,100 @@ pub struct Tensor {
     pub placement: Placement,
 }
 
+impl Tensor {
+    /// This tensor's affine descriptor, from the fields the manifest carries.
+    ///
+    /// The same decomposition the validator applies -- last dimension is input
+    /// channels, the leading product is output channels -- in one place, so a
+    /// reader deriving physical shapes cannot disagree with the validator that
+    /// accepted them.
+    pub fn affine_descriptor(&self) -> Result<AffineDescriptor> {
+        let a = self.affine.as_ref().ok_or_else(|| {
+            invalid(format_args!(
+                "tensor '{}' is {} and carries no affine fields",
+                self.role,
+                self.precision.name()
+            ))
+        })?;
+        let width = match self.precision {
+            TensorPrecision::AffineInt4V1 => IntWidth::Int4,
+            TensorPrecision::AffineInt8V1 => IntWidth::Int8,
+            TensorPrecision::Bf16V1 => {
+                return Err(invalid(format_args!(
+                    "tensor '{}' is bf16-v1 and has no affine descriptor",
+                    self.role
+                )));
+            }
+        };
+        if self.shape.is_empty() {
+            return Err(invalid(format_args!(
+                "tensor '{}': an affine tensor needs a shape",
+                self.role
+            )));
+        }
+        let in_features = usize::try_from(self.shape[self.shape.len() - 1]).map_err(|_| {
+            invalid(format_args!(
+                "tensor '{}': input dimension does not fit",
+                self.role
+            ))
+        })?;
+        let mut out_features: usize = 1;
+        for d in &self.shape[..self.shape.len() - 1] {
+            let d = usize::try_from(*d).map_err(|_| {
+                invalid(format_args!(
+                    "tensor '{}': a leading dimension does not fit",
+                    self.role
+                ))
+            })?;
+            out_features = out_features.checked_mul(d).ok_or_else(|| {
+                invalid(format_args!(
+                    "tensor '{}': leading-dimension product overflows",
+                    self.role
+                ))
+            })?;
+        }
+        Ok(AffineDescriptor {
+            width,
+            out_features,
+            in_features,
+            grouping: match a.group_rule {
+                GroupRule::Contiguous32 => Grouping::Contiguous { size: 32 },
+                GroupRule::Contiguous128 => Grouping::Contiguous { size: 128 },
+                GroupRule::PerChannel => Grouping::PerOutputChannel,
+            },
+            group_index: a.group_index.clone(),
+            scale_dtype: match a.scale_dtype {
+                ScaleDtype::F16 => PayloadScaleDtype::F16,
+                ScaleDtype::Bf16 => PayloadScaleDtype::Bf16,
+                ScaleDtype::F32 => PayloadScaleDtype::F32,
+            },
+        })
+    }
+
+    /// The physical tensors this logical one becomes, with their dtypes, their
+    /// shapes and their byte lengths ([ADR 0025]).
+    ///
+    /// Derived from the descriptor, never from what an artifact claims: this is
+    /// the expectation a reader holds a shard's header **against**. A manifest
+    /// that merely names three components of the right kinds has said nothing
+    /// about whether the bytes on disk are the right width or shape.
+    ///
+    /// [ADR 0025]: ../../../docs/decisions/adr/0025-canonical-safetensors-schema.md
+    pub fn expected_components(&self) -> Result<Vec<crate::canonical::Component>> {
+        match self.precision {
+            TensorPrecision::Bf16V1 => crate::canonical::bf16_components(&self.role, &self.shape),
+            TensorPrecision::AffineInt4V1 | TensorPrecision::AffineInt8V1 => {
+                let desc = self.affine_descriptor()?;
+                let section = match self.affine.as_ref().map(|a| a.zero_point) {
+                    Some(ZeroPointMode::PerGroup) => PayloadZeroPoints::PerGroup,
+                    _ => PayloadZeroPoints::Absent,
+                };
+                crate::canonical::affine_components(&self.role, &desc, section)
+            }
+        }
+    }
+}
+
 /// Where a tensor's bytes live.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Placement {
@@ -1052,51 +1146,52 @@ fn validate_tensor(t: RawTensor, version: u32) -> Result<Tensor> {
         }
     };
 
-    // Version 2: the component set must be exactly the one the descriptor
-    // implies. The shard headers say how big each one is -- `moxie-storage`
-    // checks that against what it opened -- but whether a tensor has zero
-    // points at all is this manifest's own claim, and it must agree with
-    // itself.
-    if let Placement::Components(components) = &placement {
-        let expected: Vec<crate::canonical::ComponentKind> = match (&affine, precision) {
-            (None, _) => vec![crate::canonical::ComponentKind::Weights],
-            (Some(a), _) => {
-                let mut kinds = vec![
-                    crate::canonical::ComponentKind::Codes,
-                    crate::canonical::ComponentKind::Scales,
-                ];
-                if a.zero_point == ZeroPointMode::PerGroup {
-                    kinds.push(crate::canonical::ComponentKind::ZeroPoints);
-                }
-                kinds
-            }
-        };
-        let mut found: Vec<crate::canonical::ComponentKind> =
-            components.iter().map(|c| c.kind).collect();
-        found.sort();
-        let mut want = expected.clone();
-        want.sort();
-        if found != want {
-            return Err(invalid(format_args!(
-                "tensor '{role}' is {} with {} zero point(s) and carries {found:?}; it must carry \
-                 exactly {want:?}",
-                precision.name(),
-                match &affine {
-                    Some(a) if a.zero_point == ZeroPointMode::PerGroup => "per-group",
-                    _ => "no",
-                }
-            )));
-        }
-    }
-
-    Ok(Tensor {
+    // Version 2: the components must be exactly the ones the descriptor
+    // implies, **in order**. Not a set: `stream_tensor` concatenates them in
+    // the order the manifest lists, and codes-then-scales-then-zero-points is
+    // the canonical byte stream ([ADR 0023]). A sorted comparison accepted a
+    // reversed list and then streamed it reversed, which is a different tensor
+    // with the same identity.
+    let tensor = Tensor {
         role,
         shape,
         precision,
         logical_order,
         affine,
         placement,
-    })
+    };
+    if let Placement::Components(components) = &tensor.placement {
+        let expected = tensor.expected_components().map_err(|e| {
+            invalid(format_args!(
+                "tensor '{}': its components cannot be derived: {e}",
+                tensor.role
+            ))
+        })?;
+        if components.len() != expected.len() {
+            return Err(invalid(format_args!(
+                "tensor '{}' carries {} component(s); its descriptor implies {}: {:?}",
+                tensor.role,
+                components.len(),
+                expected.len(),
+                expected.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
+            )));
+        }
+        for (got, want) in components.iter().zip(expected.iter()) {
+            if got.kind != want.kind || got.name != want.name {
+                return Err(invalid(format_args!(
+                    "tensor '{}': component {:?} named '{}' is not the '{}' this descriptor \
+                     implies at that position. The order is the canonical byte stream, not a \
+                     set (ADR 0023/0025)",
+                    tensor.role,
+                    got.kind.name(),
+                    got.name,
+                    want.name
+                )));
+            }
+        }
+    }
+
+    Ok(tensor)
 }
 
 /// No two tensors' byte ranges may intersect, per chunk -- including the
@@ -1216,10 +1311,23 @@ fn check_arch_walk(value: &toml::Value, depth: usize, nodes: &mut usize) -> Resu
 /// `"x\\0y"+"z"` and `"x"+"y\\0z"` would hash identically. With each
 /// segment carrying its own length, concatenation is injective and no two
 /// distinct manifests share a digest.
+/// The version a manifest **is**, from its own rows.
+///
+/// A manifest whose tensors carry chunk ranges is a version 1 manifest however
+/// new the code reading it. Deriving this from `SCHEMA_VERSION` instead would
+/// relabel every artifact nobody converted -- and, through `artifact_identity`,
+/// would change their identities.
+pub fn schema_version_of(manifest: &Manifest) -> u32 {
+    match manifest.tensors.first().map(|t| &t.placement) {
+        Some(Placement::Chunk { .. }) => 1,
+        _ => SCHEMA_VERSION,
+    }
+}
+
 pub fn artifact_identity(manifest: &Manifest) -> String {
     let mut w = IdentityWriter::new();
     w.tag("manifest-v1");
-    w.field_u64("schema", SCHEMA_VERSION as u64);
+    w.field_u64("schema", schema_version_of(manifest) as u64);
     w.field_str("source-model", &manifest.source.model);
     w.field_str("source-revision", &manifest.source.revision);
     w.field_str("source-license", &manifest.source.license);
@@ -1255,9 +1363,11 @@ pub fn artifact_identity(manifest: &Manifest) -> String {
             w.u64(*d);
         }
         w.str(t.precision.name());
-        // Placement participates in identity, and the two shapes are tagged
-        // differently so a v1 range and a v2 component set can never hash to
-        // the same artifact.
+        // Placement participates in identity. A version 1 range is written
+        // **exactly** as version 1 wrote it -- no tag, five bare fields --
+        // because an artifact nobody converted must keep the identity it was
+        // published with. A version 2 component set is tagged, and the schema
+        // field above already differs, so the two shapes cannot collide.
         match &t.placement {
             Placement::Chunk {
                 chunk,
@@ -1266,7 +1376,6 @@ pub fn artifact_identity(manifest: &Manifest) -> String {
                 sha256,
                 alignment,
             } => {
-                w.tag("chunk-placement");
                 w.str(chunk);
                 w.u64(*offset);
                 w.u64(*length);
@@ -1450,10 +1559,7 @@ pub fn encode(manifest: &Manifest) -> Result<String> {
     // The version a manifest **is**, taken from its own rows rather than from
     // what this writer prefers: encoding a version 1 manifest as version 2
     // would relabel an artifact nobody converted.
-    let version = match manifest.tensors.first().map(|t| &t.placement) {
-        Some(Placement::Chunk { .. }) => 1,
-        _ => SCHEMA_VERSION,
-    };
+    let version = schema_version_of(manifest);
     doc.insert(
         "schema_version".into(),
         toml::Value::Integer(i64::from(version)),

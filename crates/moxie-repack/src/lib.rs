@@ -57,10 +57,10 @@ use moxie_format::manifest::{
     TensorPrecision, ZeroPointMode,
 };
 use moxie_format::payload::{self, ZeroPointSection};
-use moxie_format::safetensors::Dtype;
+use moxie_format::safetensors::{Dtype, TensorEntry};
 use moxie_format::scale::ScaleDtype;
 use moxie_format::selection::{Selection, SelectionKind};
-use moxie_memory::{CapacitySnapshot, Ledger};
+use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, Reservation, StageSpan};
 use moxie_storage::{Artifact, ByteBudget, HeaderBudget};
 use moxie_types::{HostTier, Result, Scope, Tier};
 
@@ -107,6 +107,41 @@ impl Budgets {
         self.header_bytes
             + moxie_format::selection::MAX_SELECTION_BYTES as u64
             + moxie_format::manifest::MAX_MANIFEST_BYTES as u64
+    }
+
+    /// Bytes each selected tensor can hold in **parsed** form, at once.
+    ///
+    /// The selection's own text is counted separately; this is the per-tensor
+    /// cost of everything built from it that is live at the same time: the
+    /// parsed selection entry, the resolved tensor, up to three canonical
+    /// components, the manifest row, the plan's placed components, the shard
+    /// header's JSON, the progress map with its hasher, and the report row.
+    /// Every one of those is a `String`, a `Vec` or a map node with its own
+    /// allocation header, which is why the number is this large for structures
+    /// that look small.
+    ///
+    /// Measured, not guessed: `tests/admission.rs` runs an inspection under an
+    /// instrumented allocator and fails if the peak live heap exceeds what this
+    /// admits.
+    const PER_TENSOR_METADATA_BYTES: u64 = 4096;
+    /// How many times a role's own bytes are retained across those structures.
+    const ROLE_RETENTIONS: u64 = 16;
+
+    /// What this program may hold besides its payload tiles, for **this**
+    /// selection.
+    ///
+    /// A constant floor was not a bound. Independent review inspected 5,000
+    /// tensors under a 9,438,720-byte total and measured about 19,969,672 bytes
+    /// of peak live heap, because `header + MAX_SELECTION_BYTES +
+    /// MAX_MANIFEST_BYTES` are three facts about serialized text and none about
+    /// the structures parsed out of it. This is proportional to the two
+    /// quantities that actually drive those structures: how many tensors were
+    /// selected, and how many bytes of names the selection carries.
+    pub fn metadata_bound(&self, selection_bytes: u64, tensors: u64) -> u64 {
+        self.header_bytes
+            + moxie_format::manifest::MAX_MANIFEST_BYTES as u64
+            + selection_bytes.saturating_mul(Self::ROLE_RETENTIONS)
+            + tensors.saturating_mul(Self::PER_TENSOR_METADATA_BYTES)
     }
 
     /// Refuse a budget that cannot hold what the run will hold.
@@ -185,24 +220,61 @@ pub struct StagingEstimate {
     pub manifest_bound_bytes: u64,
 }
 
+/// What one selected tensor contributes to the staging files.
+///
+/// Every field is a length this program already knows before it writes
+/// anything, and the role's own byte length is one of them. A **constant** per
+/// line is not a bound: independent review selected a 1,000-character role and
+/// watched a 160,000-byte disk budget retain 166,026 bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct TensorStaging {
+    pub role_bytes: u64,
+    pub units: u64,
+    pub components: u64,
+    pub group_index_entries: u64,
+}
+
 impl StagingEstimate {
-    /// Bytes per journal line, generously: a role of any plausible length, two
-    /// 64-hex digests and the numbers.
-    const JOURNAL_LINE_BOUND: u64 = 1024;
-    /// Bytes per manifest tensor entry, generously, plus a fixed header
-    /// allowance for the identity, provenance and completeness sections.
-    const MANIFEST_TENSOR_BOUND: u64 = 2048;
+    /// Everything in a journal unit line except the names: the keys, two
+    /// 64-hex digests, the numbers and the newline.
+    const JOURNAL_LINE_FIXED: u64 = 384;
+    /// The version line and the binding line, which carry three digests and a
+    /// converter identity and no role.
+    const JOURNAL_HEADER_BOUND: u64 = 4096;
+    /// A shard or chunk file name. This program generates them
+    /// (`model-NNNNN-of-NNNNN.safetensors`, 31 bytes); the allowance is four
+    /// times that so a longer scheme cannot quietly invalidate the bound.
+    const FILE_NAME_BOUND: u64 = 128;
+    /// A manifest tensor entry's keys, shape, precision and affine fields,
+    /// without its role or its components.
+    const MANIFEST_TENSOR_FIXED: u64 = 1024;
+    /// One component row: its checksum, its keys, and room for the file name.
+    const MANIFEST_COMPONENT_FIXED: u64 = 256;
     const MANIFEST_FIXED_BOUND: u64 = 16 * 1024;
 
-    fn of(payload_bytes: u64, units: u64, tensors: u64, group_index_entries: u64) -> Self {
-        Self {
-            payload_bytes,
-            journal_bound_bytes: (units + 2) * Self::JOURNAL_LINE_BOUND,
-            manifest_bound_bytes: Self::MANIFEST_FIXED_BOUND
-                + tensors * Self::MANIFEST_TENSOR_BOUND
+    fn of(payload_bytes: u64, tensors: &[TensorStaging]) -> Self {
+        let mut journal = Self::JOURNAL_HEADER_BOUND;
+        let mut manifest = Self::MANIFEST_FIXED_BOUND;
+        for t in tensors {
+            // A unit names its component, which is the role plus the longest
+            // suffix this schema has (`.zero_points`, 12 bytes).
+            let component_name = t.role_bytes + 16;
+            journal +=
+                t.units * (Self::JOURNAL_LINE_FIXED + component_name + Self::FILE_NAME_BOUND);
+            // The role appears once as the tensor's own, and once inside each
+            // component's name.
+            manifest += Self::MANIFEST_TENSOR_FIXED
+                + t.role_bytes
+                + t.components
+                    * (Self::MANIFEST_COMPONENT_FIXED + component_name + Self::FILE_NAME_BOUND)
                 // A group-index map is the one manifest field whose length is
                 // a tensor's own dimension rather than a constant.
-                + group_index_entries * 8,
+                + t.group_index_entries * 8;
+        }
+        Self {
+            payload_bytes,
+            journal_bound_bytes: journal,
+            manifest_bound_bytes: manifest,
         }
     }
 
@@ -353,13 +425,34 @@ pub fn resolve(selection: &Selection, sources: &mut Sources) -> Result<Vec<Resol
                         .declares(file, &zero_point_name)?
                         .then(|| sources.raw_entry(file, &zero_point_name))
                         .transpose()?,
-                    // A symmetric selection names no zero-point file, so the
-                    // companion is looked for beside the codes, which is where
-                    // every inspected writer puts it.
-                    None => sources
-                        .declares(&packed_file, &zero_point_name)?
-                        .then(|| sources.raw_entry(&packed_file, &zero_point_name))
-                        .transpose()?,
+                    // A symmetric selection names no zero-point file, so every
+                    // shard the selection declares **for this module** is asked.
+                    // Looking only beside the codes was the first fix and it was
+                    // not enough: independent review put the codes in one shard
+                    // and the scales with nonzero zero points in another, both
+                    // named by the selection, and the symmetric claim published.
+                    // A module split across shards is the normal case here --
+                    // Qwen3.8-27B splits all 256 of them -- so "beside the
+                    // codes" is not where a companion has to be.
+                    None => {
+                        let mut searched: Vec<&str> = files.values().map(String::as_str).collect();
+                        searched.sort_unstable();
+                        searched.dedup();
+                        let mut found: Option<(String, TensorEntry)> = None;
+                        for file in searched {
+                            if sources.declares(file, &zero_point_name)? {
+                                let entry = sources.raw_entry(file, &zero_point_name)?;
+                                if let Some((first, _)) = &found {
+                                    return Err(invalid(format!(
+                                        "tensor '{}': {zero_point_name} is declared by both                                          '{first}' and '{file}'; a module's zero points live in                                          one shard, and two copies is a source this repacker                                          will not guess about",
+                                        t.role
+                                    )));
+                                }
+                                found = Some((file.to_string(), entry));
+                            }
+                        }
+                        found.map(|(_, entry)| entry)
+                    }
                 };
                 let packed_entry = sources.raw_entry(&packed_file, &packed_name)?;
                 let shape_entry = sources.raw_entry(&shape_file, &shape_name)?;
@@ -508,13 +601,24 @@ pub fn output_plan(
 /// The destination usually does not exist yet, so the nearest existing ancestor
 /// is what gets canonicalized: a path under `/fast/models/...` that has not been
 /// created is still a path under the checkpoint root.
-pub fn separate_source_and_destination(source_root: &Path, destination: &Path) -> Result<()> {
+pub fn separate_source_and_destination(source_root: &Path, destination: &Path) -> Result<PathBuf> {
     // The destination usually does not exist yet, so the nearest existing
     // ancestor is canonicalized and the missing components are put back on.
     // Comparing the ancestor itself would refuse every destination that merely
     // shares a parent directory with the source.
     let mut missing: Vec<std::ffi::OsString> = Vec::new();
-    let mut probe = destination.to_path_buf();
+    // A relative destination is relative to where the user is standing, and
+    // `--out new-output` is the ordinary way to say "here". Walking a bare
+    // relative path's ancestors reaches the empty path, which canonicalizes to
+    // nothing -- independent review hit exactly that and was told no part of
+    // `new-output` resolves to a real directory.
+    let mut probe = if destination.is_absolute() {
+        destination.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| invalid(format!("cannot read the current directory: {e}")))?
+            .join(destination)
+    };
     let mut dest = loop {
         if let Ok(canonical) = probe.canonicalize() {
             break canonical;
@@ -543,7 +647,10 @@ pub fn separate_source_and_destination(source_root: &Path, destination: &Path) -
             source_root.display()
         )));
     }
-    Ok(())
+    // The absolute destination, which is what everything downstream must use:
+    // a relative path reaches `Run::begin` as written, and syncing the parent
+    // of a bare name asks the filesystem to open the empty path.
+    Ok(dest)
 }
 
 /// The journal and staged manifest a run of this shape can write, bounded.
@@ -553,18 +660,40 @@ pub fn separate_source_and_destination(source_root: &Path, destination: &Path) -
 /// against payload **plus** this, because a budget that covers only the part
 /// that is easy to count is not a budget.
 pub fn overhead_bound(resolved: &[Resolved], budgets: &Budgets) -> Result<u64> {
-    let mut units = 0u64;
-    let mut group_index_entries = 0u64;
-    for r in resolved {
-        units += work::unit_count(r, budgets.tile_bytes())? as u64;
-        if let Some(a) = &r.affine
-            && let Some(map) = &a.group_index
-        {
-            group_index_entries += map.len() as u64;
-        }
+    let estimate = StagingEstimate::of(0, &staging_shape(resolved, budgets)?);
+    let total = estimate.journal_bound_bytes + estimate.manifest_bound_bytes;
+    // The journal has a cap of its own, and a plan whose journal cannot be read
+    // back is a plan that cannot be resumed. Independent review produced a
+    // valid 4.35 MB journal from an 8 MiB source at a 1 KiB scratch; raising
+    // the reader's limit without bounding the writer would leave the same run
+    // unresumable at a larger size.
+    if estimate.journal_bound_bytes > moxie_format::journal::MAX_JOURNAL_BYTES as u64 {
+        return Err(invalid(format!(
+            "this selection would write up to {} journal byte(s), above the              {} byte cap a resume can read back. Larger work units (a bigger --scratch-bytes)              mean fewer records",
+            estimate.journal_bound_bytes,
+            moxie_format::journal::MAX_JOURNAL_BYTES
+        )));
     }
-    let estimate = StagingEstimate::of(0, units, resolved.len() as u64, group_index_entries);
-    Ok(estimate.journal_bound_bytes + estimate.manifest_bound_bytes)
+    Ok(total)
+}
+
+/// The per-tensor shape of the staging files, from what is already resolved.
+fn staging_shape(resolved: &[Resolved], budgets: &Budgets) -> Result<Vec<TensorStaging>> {
+    let mut out = Vec::with_capacity(resolved.len());
+    for r in resolved {
+        out.push(TensorStaging {
+            role_bytes: r.role.len() as u64,
+            units: work::unit_count(r, budgets.tile_bytes())? as u64,
+            components: r.components.len() as u64,
+            group_index_entries: r
+                .affine
+                .as_ref()
+                .and_then(|a| a.group_index.as_ref())
+                .map(|m| m.len() as u64)
+                .unwrap_or(0),
+        });
+    }
+    Ok(out)
 }
 
 /// A write budget from the program's budgets.
@@ -594,8 +723,43 @@ pub fn inspect(
     selection: &Selection,
     sources: &mut Sources,
     budgets: &Budgets,
+    ledger: &mut Ledger,
 ) -> Result<InspectReport> {
     budgets.validate()?;
+    // **Admitted before it is built, not measured after.** Everything below
+    // this line -- the resolved tensors, the plan, every shard header, the
+    // report -- is the allocation this charge stands for.
+    let charge = admit_metadata(ledger, selection, budgets)?;
+    let report = inspect_inner(selection, sources, budgets);
+    ledger
+        .release(charge)
+        .map_err(|e| invalid(format!("cannot release the metadata charge: {e:?}")))?;
+    report
+}
+
+/// Admit what this selection's parsed form will occupy.
+fn admit_metadata(
+    ledger: &mut Ledger,
+    selection: &Selection,
+    budgets: &Budgets,
+) -> Result<Reservation> {
+    let bound = budgets.metadata_bound(selection.source_bytes(), selection.tensors.len() as u64);
+    let mut plan = PlanRequest::new("repack metadata", ["live"])?;
+    plan.buffer(BufferRequest::new(
+        "parsed selection, plan, headers and report",
+        Scope::Host,
+        Tier::Host(HostTier::Pageable),
+        bound,
+        StageSpan::at(0),
+    ))?;
+    ledger.admit(&plan).map_err(moxie_types::Error::from)
+}
+
+fn inspect_inner(
+    selection: &Selection,
+    sources: &mut Sources,
+    budgets: &Budgets,
+) -> Result<InspectReport> {
     let write = write_budget(budgets)?;
     let resolved = resolve(selection, sources)?;
     let plan = output_plan(&resolved, &write, overhead_bound(&resolved, budgets)?)?;
@@ -620,24 +784,8 @@ pub fn inspect(
             units: work::unit_count(r, budgets.tile_bytes())?,
         });
     }
-    let units: u64 = tensors.iter().map(|t| t.units as u64).sum();
-    let group_index_entries: u64 = resolved
-        .iter()
-        .map(|r| {
-            r.affine
-                .as_ref()
-                .and_then(|a| a.group_index.as_ref())
-                .map(|m| m.len() as u64)
-                .unwrap_or(0)
-        })
-        .sum();
     Ok(InspectReport {
-        staging: StagingEstimate::of(
-            plan.payload_bytes(),
-            units,
-            resolved.len() as u64,
-            group_index_entries,
-        ),
+        staging: StagingEstimate::of(plan.payload_bytes(), &staging_shape(&resolved, budgets)?),
         model: selection.model.clone(),
         revision: selection.revision.clone(),
         source_root: sources.root().to_path_buf(),
@@ -765,7 +913,11 @@ pub fn repack(
     progress: &mut dyn FnMut(&str),
 ) -> Result<RepackReport> {
     budgets.validate()?;
-    let mut buffers = work::Buffers::admit(ledger, budgets)?;
+    // What the parsed selection, the plan, the shard headers and the manifest
+    // will hold -- admitted before any of them is built, and proportional to
+    // this selection rather than to a constant.
+    let metadata = budgets.metadata_bound(selection.source_bytes(), selection.tensors.len() as u64);
+    let mut buffers = work::Buffers::admit(ledger, budgets, metadata)?;
     let mut run_slot: Option<Run> = None;
     let result = repack_inner(
         selection,
@@ -811,7 +963,7 @@ fn repack_inner(
     // read-only input, and an independent review found that publishing beneath
     // the source root succeeded. Checked on canonical paths, so a symlink into
     // the source root is caught with the rest.
-    separate_source_and_destination(sources.root(), destination)?;
+    let destination = &separate_source_and_destination(sources.root(), destination)?;
     let write = write_budget(budgets)?;
     let resolved = resolve(selection, sources)?;
     let plan = output_plan(&resolved, &write, overhead_bound(&resolved, budgets)?)?;
@@ -822,8 +974,27 @@ fn repack_inner(
     // a digest of the ranges this run happened to read is not that.
     let mut source_digests: Vec<(String, String)> = Vec::new();
     for file in selection.files() {
-        let (digest, bytes) =
-            sources.file_digest_cancellable(&file, buffers.source_tile_mut(), cancelled)?;
+        // A cancellation here is a cancellation, not a corrupt source. It
+        // arrives before any destination exists, so there is nothing to resume
+        // and nothing to clean up but the admitted buffers the caller releases.
+        let Some((digest, bytes)) =
+            sources.file_digest_cancellable(&file, buffers.source_tile_mut(), cancelled)?
+        else {
+            return Ok(RepackReport {
+                outcome: Outcome::Cancelled {
+                    destination: destination.to_path_buf(),
+                    bytes_done: 0,
+                },
+                artifact_identity: String::new(),
+                units_written: 0,
+                units_reused: 0,
+                bytes_written: 0,
+                source_bytes_read: 0,
+                resumed: false,
+                resume_detail: Vec::new(),
+                source_digests,
+            });
+        };
         progress(&format!(
             "hashed source {file}: {bytes} byte(s) -> {digest}"
         ));
@@ -954,7 +1125,20 @@ fn repack_inner(
     // that describes bytes nobody has. This is a second full pass over every
     // source file, and that cost is the price of the claim.
     progress("re-hashing every source to confirm it did not change");
-    sources.verify_unchanged(&source_digests, buffers.source_tile_mut(), cancelled)?;
+    if !sources.verify_unchanged(&source_digests, buffers.source_tile_mut(), cancelled)? {
+        let outcome = run_slot.take().expect("a run").cancel(ledger)?;
+        return Ok(RepackReport {
+            outcome,
+            artifact_identity: String::new(),
+            units_written,
+            units_reused,
+            bytes_written,
+            source_bytes_read: sources.bytes_read() - before_read,
+            resumed,
+            resume_detail,
+            source_digests,
+        });
+    }
 
     let sealed = run_slot.as_mut().expect("a run").seal()?;
     let manifest = build_manifest(selection, &resolved, &sealed, &source_digests)?;

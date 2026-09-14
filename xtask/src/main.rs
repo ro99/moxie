@@ -21,6 +21,7 @@ mod archcheck;
 mod capacity;
 #[cfg(feature = "cuda")]
 mod gpu;
+mod mutationcheck;
 #[cfg(feature = "cuda")]
 mod probe;
 mod speccheck;
@@ -32,6 +33,16 @@ cargo xtask-cuda <command>       device lane: --features cuda
 Host lane:
   arch-check              Dependency direction, model ownership, negative fixtures
   spec-check [--update]   Normative specification present and unmodified
+  mutation-check [--battery <tag>] [--self-test] [name ...]
+                          Can the gates fail? One substitution at a time against
+                          tracked source, every lane run, only `caught` counts.
+                          Edits source in place and restores it, including after
+                          a kill. Run it on a clean tree
+  reference-check --artifact <dir>
+                          Open every published shard with the **reference**
+                          safetensors implementation and hold each component to
+                          the descriptor. Needs python3 with `safetensors`: the
+                          reference is deliberately not linked by this workspace
   index                   List command contracts and their required lane
 
 Device lane (needs `cargo xtask-cuda`):
@@ -94,6 +105,8 @@ fn main() -> std::process::ExitCode {
     let code = match cmd {
         "arch-check" => archcheck::run(),
         "spec-check" => speccheck::run(args.iter().any(|a| a == "--update")),
+        "mutation-check" => mutationcheck::run(&args[1..]),
+        "reference-check" => mutationcheck::reference_check(&args[1..]),
 
         #[cfg(feature = "cuda")]
         "test-gpu" => gpu::run(flag("--profile")),

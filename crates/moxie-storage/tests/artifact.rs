@@ -855,3 +855,47 @@ fn admission_refuses_against_the_estimated_peak_not_the_serialized_length() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A capped read honours the cap it was given, not the manifest's.
+///
+/// `read_text_capped(path, cap)` checked `cap` and then called a reader that
+/// independently applied `MAX_MANIFEST_BYTES`. Independent review produced a
+/// valid 4,354,889-byte journal that a resume could not reopen, refused at a
+/// limit nobody had asked for.
+#[test]
+fn a_capped_read_uses_the_callers_cap() {
+    let dir = budget_tempdir();
+    let path = dir.join("big.txt");
+    let size = moxie_format::manifest::MAX_MANIFEST_BYTES + 4096;
+    std::fs::write(&path, "x".repeat(size)).expect("the file writes");
+
+    // Above the manifest's own cap, and inside the one this caller declared.
+    let text = moxie_storage::read_text_capped(&path, size + 1).expect("the caller's cap applies");
+    assert_eq!(text.len(), size);
+
+    // And a cap below the file is still a refusal, before the read.
+    let e = moxie_storage::read_text_capped(&path, size - 1).expect_err("above the cap");
+    assert!(
+        e.to_string().contains("above the"),
+        "the refusal does not name the cap: {e}"
+    );
+}
+
+/// Bytes, for a file whose tail may not be UTF-8 yet.
+#[test]
+fn a_capped_byte_read_does_not_decode() {
+    let dir = budget_tempdir();
+    let path = dir.join("torn.bin");
+    let mut bytes = b"line one\n".to_vec();
+    bytes.extend_from_slice(&[0xE4, 0xB8]); // a three-byte character, cut short
+    std::fs::write(&path, &bytes).expect("the file writes");
+
+    assert!(
+        moxie_storage::read_text_capped(&path, 1024).is_err(),
+        "a torn character is not text"
+    );
+    assert_eq!(
+        moxie_storage::read_bytes_capped(&path, 1024).expect("bytes are bytes"),
+        bytes
+    );
+}

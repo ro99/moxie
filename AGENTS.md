@@ -24,7 +24,7 @@ all accepted, and M2's formal closure statement remains the owner's to make.
 | | |
 |---|---|
 | Accepted | [Task 0024](docs/tasks/0024-m3-asymmetric-int4-pack-quantized-import.md) — M3 item 2's asymmetric INT4 import (owner, 2026-09-13, after three review rounds). **Importer-only**: no execution, no quality claim. |
-| Implemented, unreviewed | [Task 0025](docs/tasks/0025-m3-offline-repack-publication.md) — M3 item 1's offline repack, corrected after one independent review (ten findings, all fixed), and [task 0026](docs/tasks/0026-m3-canonical-safetensors-publication.md) — the same publication as **safetensors shards** under the owner's packaging ruling. **Bytes only**, and neither closes M3 item 1. |
+| Implemented, unreviewed | [Task 0025](docs/tasks/0025-m3-offline-repack-publication.md) — M3 item 1's offline repack, and [task 0026](docs/tasks/0026-m3-canonical-safetensors-publication.md) — the same publication as **safetensors shards** under the owner's packaging ruling. Corrected after **two** independent reviews: ten findings, then fourteen, all fixed with a regression each. **Bytes only**, and neither closes M3 item 1. |
 | Next | M3 item 3 — shared W4A16/W8A16 paths. The largest gap in the milestone: nothing here executes a quantized weight. |
 | Continuation | [The task 0026 handover](docs/handovers/2026-09-14-task0026-safetensors-publication.md), which carries task 0025's forward |
 

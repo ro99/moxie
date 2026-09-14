@@ -349,7 +349,7 @@ The two clippy lanes that need CUDA were run because this task changes
 unstable, 0 invalid controls, 0 skipped**, every verdict repeated three times in
 both directions, driver committed and its verdict rule self-tested at 15 of 15
 cases ([experiment 0006](../evidence/experiments/0006-repack-publication-mutations.md),
-[its driver](../evidence/experiments/drivers/0006-mutations.py)).
+[its driver](../../xtask/src/mutationcheck.rs)).
 
 The first run of that battery caught 24 of 28 and left **four survivors and two
 skips**, and all six were worth having: an ignored payload-write error survived

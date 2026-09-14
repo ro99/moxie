@@ -82,6 +82,9 @@ pub struct OutputPlan {
     components: Vec<PlacedComponent>,
     shards: Vec<ShardPlan>,
     requests: Vec<TensorRequest>,
+    /// What the journal and the staged manifest are allowed to occupy, which
+    /// the disk budget above was checked against.
+    overhead_bytes: u64,
 }
 
 impl OutputPlan {
@@ -224,7 +227,17 @@ impl OutputPlan {
             components,
             shards,
             requests,
+            overhead_bytes,
         })
+    }
+
+    /// What the journal and the staged manifest may occupy together.
+    ///
+    /// Not a prediction: the run charges every byte it writes to them against
+    /// this and stops at the limit, so the disk budget the plan was checked
+    /// against is the disk the destination actually holds.
+    pub fn overhead_bytes(&self) -> u64 {
+        self.overhead_bytes
     }
 
     pub fn requests(&self) -> &[TensorRequest] {

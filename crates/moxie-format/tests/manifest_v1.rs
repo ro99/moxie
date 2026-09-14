@@ -923,3 +923,25 @@ fn a_partial_manifest_encodes_as_partial_with_its_missing_roles() {
         other => panic!("completeness was flattened to {other:?}"),
     }
 }
+
+/// A version 1 artifact keeps the identity it was published with.
+///
+/// The digest below was produced by the implementation **before** manifest v2
+/// existed, at `d719f67^`, over the fixture beside this test. It is pinned
+/// rather than recomputed because a round trip of the current implementation
+/// against itself cannot see this class of regression: independent review found
+/// that identity had begun hashing `SCHEMA_VERSION = 2` for v1 manifests and
+/// had gained a `chunk-placement` tag, so every unconverted v1 artifact
+/// silently changed identity. Both are reverted; this fixes that in place.
+#[test]
+fn a_version_1_manifest_keeps_its_published_identity() {
+    let text = include_str!("fixtures/v1-identity.toml");
+    let m = manifest::parse(text).expect("the fixture parses");
+    assert_eq!(manifest::schema_version_of(&m), 1, "it is a v1 manifest");
+    assert_eq!(
+        manifest::artifact_identity(&m),
+        "a42a4a35439104dd1c332a680afac3ebc58011a48166c71712b8d1d3eabac0ff",
+        "a version 1 artifact's identity changed: an artifact nobody converted \
+         must keep the identity it was published with"
+    );
+}

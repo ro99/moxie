@@ -73,7 +73,7 @@ and is not what ran here.
 controls, 0 skipped**, every verdict repeated three times in both directions,
 **driver committed** and its verdict rule self-tested
 ([experiment 0005](../evidence/experiments/0005-asymmetric-int4-zero-point-assignment.md),
-[its driver](../evidence/experiments/drivers/0005-mutations.py)). The first
+its driver (retired 2026-09-14)). The first
 measurement was 16 of 16 against a suite with **five** holes in it, and the
 second 21 of 21 against a suite with three. **Eight mutations were added after a
 review — five then three — and every one is caught by exactly one lane**; seven

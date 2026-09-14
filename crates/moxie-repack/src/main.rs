@@ -234,7 +234,10 @@ fn command_inspect(flags: &mut Flags) -> i32 {
     let report = (|| {
         let selection = moxie_repack::read_selection(&selection_path)?;
         let mut sources = moxie_repack::open_sources(&root, &budgets)?;
-        moxie_repack::inspect(&selection, &mut sources, &budgets)
+        // An inspection admits what it is about to build, against the same
+        // total a repack would: reporting a cost is itself work with a cost.
+        let mut ledger = moxie_repack::ledger_for(&budgets)?;
+        moxie_repack::inspect(&selection, &mut sources, &budgets, &mut ledger)
     })();
     match report {
         Ok(r) => {

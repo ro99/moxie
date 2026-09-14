@@ -1,0 +1,518 @@
+// The substitutions, generated once from the batteries this replaces and then
+// owned here.
+//
+// Included by `mutationcheck.rs` rather than declared as a module: it is a
+// table, not an interface, and nothing outside the battery may name it.
+
+/// The `T0006` battery's lanes, in the order they run.
+const LANES_T0006: &[Lane] = &[
+    Lane { name: "format", argv: &[r#"test"#, r#"-p"#, r#"moxie-format"#, r#"--lib"#, r#"--offline"#, r#"--locked"#] },
+    Lane { name: "manifest", argv: &[r#"test"#, r#"-p"#, r#"moxie-format"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"manifest_v1"#] },
+    Lane { name: "publication", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"publication"#] },
+    Lane { name: "workflow", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"workflow"#] },
+    Lane { name: "roundtrip", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"round_trip"#] },
+    Lane { name: "cli", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"cli"#] },
+    Lane { name: "budget", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"budget"#] },
+    Lane { name: "malformed", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"malformed"#] },
+    Lane { name: "round2", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"round2"#] },
+    Lane { name: "admission", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"admission"#] },
+    Lane { name: "storage", argv: &[r#"test"#, r#"-p"#, r#"moxie-storage"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"artifact"#] },
+    Lane { name: "arch", argv: &[r#"run"#, r#"--offline"#, r#"--locked"#, r#"-q"#, r#"--bin"#, r#"xtask"#, r#"--"#, r#"arch-check"#] },
+];
+
+/// The `T0006` battery.
+const BATTERY_T0006: &[Mutation] = &[
+    Mutation {
+        name: "unit-checksum-not-compared",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        if got != unit.sha256 {"#,
+        to: r#"        if false && got != unit.sha256 {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "tensor-hash-never-sees-the-bytes",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        progress.hasher.update(bytes);"#,
+        to: r#"        let _ = &mut progress.hasher;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "published-validation-skipped",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        faults.check(Site::Validate)?;
+        let artifact = Artifact::open_unpublished(&self.dest, &staged, ByteBudget::default())?;
+        let mut roles: Vec<&str> = sealed.iter().map(|t| t.role.as_str()).collect();"#,
+        to: r#"        let artifact = Artifact::open_unpublished(&self.dest, &staged, ByteBudget::default())?;
+        let mut roles: Vec<&str> = sealed.iter().take(0).map(|t| t.role.as_str()).collect();"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "source-digest-is-a-constant",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"        let Some((digest, bytes)) =
+            sources.file_digest_cancellable(&file, buffers.source_tile_mut(), cancelled)?
+        else {"#,
+        to: r#"        let Some((digest, bytes)) = Some(("0".repeat(64), 0u64)).filter(|_| {
+            sources
+                .file_digest_cancellable(&file, buffers.source_tile_mut(), cancelled)
+                .is_ok()
+        }) else {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "unit-source-digest-is-recorded-not-checked",
+        file: "crates/moxie-repack/src/work.rs",
+        from: r#"fn sha256_of(bytes: &[u8]) -> String {
+    let mut h = StreamingSha256::new();
+    h.update(bytes);
+    h.finalize_hex()
+}"#,
+        to: r#"fn sha256_of(bytes: &[u8]) -> String {
+    let _ = bytes;
+    "0".repeat(64)
+}"#,
+        expect: Expect::Survivor,
+    },
+    Mutation {
+        name: "resume-ignores-its-binding",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        if recorded != self.binding {"#,
+        to: r#"        if false && recorded != self.binding {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "run-binding-omits-the-source-digests",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"    field(b"repack-run-v1");
+    field(plan.as_bytes());
+    field(selection.as_bytes());
+    for (file, digest) in sources {
+        field(file.as_bytes());
+        field(digest.as_bytes());
+    }"#,
+        to: r#"    field(b"repack-run-v1");
+    field(plan.as_bytes());
+    field(selection.as_bytes());
+    let _ = sources;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "journal-version-not-checked",
+        file: "crates/moxie-format/src/journal.rs",
+        from: r#"                if v != JOURNAL_VERSION {"#,
+        to: r#"                if false && v != JOURNAL_VERSION {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "selection-version-not-checked",
+        file: "crates/moxie-format/src/selection.rs",
+        from: r#"    if v.version != SELECTION_VERSION {"#,
+        to: r#"    if false && v.version != SELECTION_VERSION {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "manifest-schema-version-not-checked",
+        file: "crates/moxie-format/src/manifest.rs",
+        from: r#"    if !SUPPORTED_SCHEMA_VERSIONS.contains(&v.schema_version) {"#,
+        to: r#"    if false && !SUPPORTED_SCHEMA_VERSIONS.contains(&v.schema_version) {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "manifest-staged-under-its-final-name",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        let staged = self.dest.join(STAGED_MANIFEST_FILE);"#,
+        to: r#"        let staged = self.dest.join(MANIFEST_FILE);"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "incomplete-tensors-can-be-sealed",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"            if p.done != c.len {"#,
+        to: r#"            if false && p.done != c.len {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "journal-recorded-before-the-bytes-are-durable",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        write_at(&mut file, offset, bytes, faults, Site::ChunkWrite)
+            .map_err(|e| invalid(format!("cannot write {}: {e}", path.display())))?;
+        faults.check(Site::ChunkSync)?;
+        file.sync_all()
+            .map_err(|e| invalid(format!("cannot sync {}: {e}", path.display())))?;
+
+        let unit = CompletedUnit {"#,
+        to: r#"        let unit = CompletedUnit {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "journal-recorded-before-the-bytes-are-durable-tail",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        let line = journal::unit_line(&unit);
+        self.charge_overhead(line.len() as u64, "journal")?;
+        append_durably(&mut self.journal, &line, faults)?;"#,
+        to: r#"        let line = journal::unit_line(&unit);
+        self.charge_overhead(line.len() as u64, "journal")?;
+        append_durably(&mut self.journal, &line, faults)?;
+        write_at(&mut file, offset, bytes, faults, Site::ChunkWrite)
+            .map_err(|e| invalid(format!("cannot write {}: {e}", path.display())))?;
+        faults.check(Site::ChunkSync)?;
+        file.sync_all()
+            .map_err(|e| invalid(format!("cannot sync {}: {e}", path.display())))?;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "resume-trusts-the-journals-offsets",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        if unit.chunk != planned.file || unit.offset != planned.file_offset + progress.done {"#,
+        to: r#"        if false && (unit.chunk != planned.file || unit.offset != planned.file_offset + progress.done) {"#,
+        expect: Expect::Survivor,
+    },
+    Mutation {
+        name: "chunk-sync-skipped",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        faults.check(Site::ChunkSync)?;
+        file.sync_all()
+            .map_err(|e| invalid(format!("cannot sync {}: {e}", path.display())))?;"#,
+        to: r#"        let _ = &file;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "directory-sync-skipped",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        faults.check(Site::DirectorySync)?;
+        let dir = File::open(&self.dest).map_err(|e| {"#,
+        to: r#"        if true {
+            return Ok(());
+        }
+        let dir = File::open(&self.dest).map_err(|e| {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "write-errors-are-swallowed",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        write_at(&mut file, offset, bytes, faults, Site::ChunkWrite)
+            .map_err(|e| invalid(format!("cannot write {}: {e}", path.display())))?;"#,
+        to: r#"        let _ = write_at(&mut file, offset, bytes, faults, Site::ChunkWrite);"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "header-failure-leaks-the-admission",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"            if let Err(e) = run.write_shard_headers(faults) {
+                run.abandon(ledger)?;
+                return Err(e);
+            }
+            Ok(Start::Fresh(run))"#,
+        to: r#"            run.write_shard_headers(faults)?;
+            Ok(Start::Fresh(run))"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "shard-header-sync-skipped",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"            faults.check(Site::ShardHeaderSync)?;
+            file.sync_all()
+                .map_err(|e| invalid(format!("cannot sync '{}': {e}", shard.file)))?;"#,
+        to: r#"            let _ = &file;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "shard-header-never-written",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"            write_at(&mut file, 0, header, faults, Site::ShardHeaderWrite).map_err(|e| {
+                invalid(format!("cannot write the header of '{}': {e}", shard.file))
+            })?;"#,
+        to: r#"            let _ = (&mut file, header);"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "journal-sync-skipped",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"    faults.check(Site::JournalSync)?;
+    file.sync_data()
+        .map_err(|e| invalid(format!("cannot sync the journal: {e}")))"#,
+        to: r#"    Ok(())"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "unit-size-not-checked-against-the-scratch",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        if bytes.len() > self.budget.scratch_bytes() {"#,
+        to: r#"        if false && bytes.len() > self.budget.scratch_bytes() {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "disk-budget-not-checked-while-writing",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        if new_disk > self.budget.disk_bytes() {"#,
+        to: r#"        if false && new_disk > self.budget.disk_bytes() {"#,
+        expect: Expect::Survivor,
+    },
+    Mutation {
+        name: "chunk-file-limit-ignored-by-the-plan",
+        file: "crates/moxie-repack/src/write/plan.rs",
+        from: r#"            if alone > budget.chunk_file_bytes() {"#,
+        to: r#"            if false && alone > budget.chunk_file_bytes() {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "plan-ignores-the-disk-budget",
+        file: "crates/moxie-repack/src/write/plan.rs",
+        from: r#"        if total_disk > budget.disk_bytes() {"#,
+        to: r#"        if false && total_disk > budget.disk_bytes() {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "tile-is-the-whole-scratch",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"        (self.scratch_bytes / 2).max(1)"#,
+        to: r#"        (4usize << 20).max(self.scratch_bytes)"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "header-budget-flag-ignored",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"    HeaderBudget::new(budgets.header_bytes).ok_or_else(|| {"#,
+        to: r#"    Some(HeaderBudget::DEFAULT).ok_or_else(|| {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "cancellation-not-checked-between-units",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"            if cancelled() {
+                let outcome = run_slot.take().expect("a run").cancel(ledger)?;"#,
+        to: r#"            if false && cancelled() {
+                let outcome = run_slot.take().expect("a run").cancel(ledger)?;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "cancellation-not-checked-before-publish",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        if cancelled() {
+            // The last point at which cancellation can be honoured: after this
+            // the artifact exists.
+            let bytes = self.progress.values().map(|p| p.done).sum();
+            return self.cancel_with(bytes, ledger);
+        }"#,
+        to: r#"        let _ = &cancelled;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "payload-sections-in-the-wrong-order",
+        file: "crates/moxie-format/src/payload.rs",
+        from: r#"    Ok(PayloadExtents {
+        codes: 0..code_bytes,
+        scales: code_bytes..scales_end,
+        zero_points,
+    })"#,
+        to: r#"    Ok(PayloadExtents {
+        codes: (scales_end - code_bytes)..scales_end,
+        scales: 0..scale_bytes,
+        zero_points,
+    })"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "zero-point-section-dropped",
+        file: "crates/moxie-format/src/payload.rs",
+        from: r#"            Some(scales_end..end)"#,
+        to: r#"            let _ = end;
+            None"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "scale-block-not-validated",
+        file: "crates/moxie-format/src/payload.rs",
+        from: r#"        if !v.is_finite() || v <= 0.0 {"#,
+        to: r#"        if false && (!v.is_finite() || v <= 0.0) {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "affine-length-rule-deleted",
+        file: "crates/moxie-format/src/manifest.rs",
+        from: r#"            if let Placement::Chunk { length, .. } = &placement
+                && need != *length
+            {
+                return Err(invalid(format_args!(
+                    "tensor '{role}': a {} {out_features}x{in_features} tensor with {} \"#,
+        to: r#"            if let Placement::Chunk { length, .. } = &placement
+                && false
+                && need != *length
+            {
+                return Err(invalid(format_args!(
+                    "tensor '{role}': a {} {out_features}x{in_features} tensor with {} \"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "component-dtype-and-shape-not-checked",
+        file: "crates/moxie-storage/src/lib.rs",
+        from: r#"                    if entry.dtype != want.dtype
+                        || entry.shape != want.shape
+                        || entry.len() != want.len
+                    {"#,
+        to: r#"                    if false
+                        && (entry.dtype != want.dtype
+                            || entry.shape != want.shape
+                            || entry.len() != want.len)
+                    {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "component-order-not-checked",
+        file: "crates/moxie-format/src/manifest.rs",
+        from: r#"            if got.kind != want.kind || got.name != want.name {"#,
+        to: r#"            if false && (got.kind != want.kind || got.name != want.name) {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "payload-coverage-not-required",
+        file: "crates/moxie-format/src/safetensors.rs",
+        from: r#"        if covered != self.payload_len {"#,
+        to: r#"        if false && covered != self.payload_len {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "hard-links-are-followed",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        if meta.nlink() != 1 {"#,
+        to: r#"        if false && meta.nlink() != 1 {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "source-identity-not-rebound",
+        file: "crates/moxie-repack/src/source.rs",
+        from: r#"                Some(seen) if *seen != key => {"#,
+        to: r#"                Some(seen) if false && *seen != key => {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "source-replacement-not-detected",
+        file: "crates/moxie-repack/src/source.rs",
+        from: r#"        self.confirm_identities()?;"#,
+        to: r#"        let _ = self.confirm_identities();"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "metadata-bound-is-a-constant-again",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"        self.header_bytes
+            + moxie_format::manifest::MAX_MANIFEST_BYTES as u64
+            + selection_bytes.saturating_mul(Self::ROLE_RETENTIONS)
+            + tensors.saturating_mul(Self::PER_TENSOR_METADATA_BYTES)"#,
+        to: r#"        let _ = (selection_bytes, tensors);
+        self.metadata_floor_bytes()"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "staging-bound-ignores-the-names",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"            let component_name = t.role_bytes + 16;"#,
+        to: r#"            let component_name = 0;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "resume-rewrites-before-it-checks",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        if resuming {
+            let report = match run.recover(&journal_path, faults, cancelled) {
+                Ok(report) => report,
+                Err(e) => {
+                    run.abandon(ledger)?;
+                    return Err(e);
+                }
+            };
+            if let Err(e) = run.write_shard_headers(faults) {"#,
+        to: r#"        if resuming {
+            if let Err(e) = run.write_shard_headers(faults) {
+                run.abandon(ledger)?;
+                return Err(e);
+            }
+            let report = match run.recover(&journal_path, faults, cancelled) {
+                Ok(report) => report,
+                Err(e) => {
+                    run.abandon(ledger)?;
+                    return Err(e);
+                }
+            };
+            if let Err(e) = run.write_shard_headers(faults) {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "torn-tail-found-after-decoding",
+        file: "crates/moxie-format/src/journal.rs",
+        from: r#"    let (complete_bytes, torn) = match bytes.iter().rposition(|b| *b == b'\n') {
+        Some(at) => (&bytes[..=at], bytes.len() - at - 1),
+        None => (&bytes[..0], bytes.len()),
+    };
+    let complete = core::str::from_utf8(complete_bytes).map_err(|e| {"#,
+        to: r#"    let checked = core::str::from_utf8(bytes).map_err(|e| {
+        invalid(format_args!("the journal is not UTF-8: {e}"))
+    })?;
+    let (complete_bytes, torn) = match checked.rfind('\n') {
+        Some(at) => (&bytes[..=at], bytes.len() - at - 1),
+        None => (&bytes[..0], bytes.len()),
+    };
+    let complete = core::str::from_utf8(complete_bytes).map_err(|e| {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "capped-read-uses-the-manifests-cap",
+        file: "crates/moxie-storage/src/lib.rs",
+        from: r#"    read_file_capped_bytes(path, cap)"#,
+        to: r#"    read_file_capped_bytes(path, moxie_format::manifest::MAX_MANIFEST_BYTES)"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "journal-cap-not-enforced-on-the-plan",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"    if estimate.journal_bound_bytes > moxie_format::journal::MAX_JOURNAL_BYTES as u64 {"#,
+        to: r#"    if false && estimate.journal_bound_bytes > moxie_format::journal::MAX_JOURNAL_BYTES as u64 {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "cancelled-hashing-is-an-error-again",
+        file: "crates/moxie-repack/src/source.rs",
+        from: r#"        let shard = self.shard(file)?;
+        let digested = shard.digest_whole_file(scratch, cancelled)?;"#,
+        to: r#"        let shard = self.shard(file)?;
+        let digested = shard.digest_whole_file(scratch, &|| false)?;
+        let _ = cancelled;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "split-module-companion-search-narrowed",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"                        let mut searched: Vec<&str> = files.values().map(String::as_str).collect();"#,
+        to: r#"                        let mut searched: Vec<&str> = vec![packed_file.as_str()];"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "relative-destinations-are-not-resolved",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"    let mut probe = if destination.is_absolute() {
+        destination.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| invalid(format!("cannot read the current directory: {e}")))?
+            .join(destination)
+    };"#,
+        to: r#"    let mut probe = destination.to_path_buf();"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "v1-identity-follows-the-current-schema",
+        file: "crates/moxie-format/src/manifest.rs",
+        from: r#"    w.field_u64("schema", schema_version_of(manifest) as u64);"#,
+        to: r#"    w.field_u64("schema", SCHEMA_VERSION as u64);"#,
+        expect: Expect::Caught,
+    },
+];
+
+/// What `T0006` rebuilds between substitutions.
+const BUILDS_T0006: &[&[&str]] = &[
+    &["-p", "moxie-format"],
+    &["-p", "moxie-storage", "--tests"],
+    &["-p", "moxie-repack", "--tests"],
+    &["-p", "xtask"],
+];
+

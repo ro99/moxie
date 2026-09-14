@@ -33,10 +33,28 @@ against the clean one — and a lane that disagrees with itself is reported as
 unstable rather than counted. Only `caught` counts.
 
 The driver is committed, at
-[drivers/0006-mutations.py](drivers/0006-mutations.py), and its verdict rule is
-self-tested (`--self-test`): **15 of 15** cases, ten of the verdict rule and five
-of the selector, because a mistyped selector that silently runs nothing would
-report a number about a different battery.
+[`cargo xtask mutation-check`](../../../xtask/src/mutationcheck.rs), and its
+verdict rule is self-tested (`--self-test`): **65 of 65** cases — ten of the
+verdict rule, five of the selector, because a mistyped selector that silently
+runs nothing would report a number about a different battery, and **fifty
+anchor checks**, because a substitution that no longer matches its line is a
+gate nobody measured.
+
+It became an `xtask` command on 2026-09-14, from a Python script under `docs/`.
+The owner's question was the right one — tooling belongs in the tooling crate —
+and the port paid for itself immediately: the anchor half of the self-test,
+which the Python driver only performed while running, found that **thirteen of
+experiment 0005's twenty-four anchors had matched nothing since before
+`ccfd7fa`**. That battery was retired rather than carried; [its record](0005-asymmetric-int4-zero-point-assignment.md)
+says so.
+
+The substitution table is now type-checked, the driver is covered by `fmt`,
+`clippy` and the workspace suite like any other code here, and a run stopped by
+a signal — including `SIGKILL`, which no handler can catch — leaves a marker
+that the next run finds and restores. That last one is not hypothetical: a
+battery killed mid-substitution left `if false && got != unit.sha256` in the
+resume path of this repository's writer, and the gates were re-run against it
+before anyone noticed.
 
 ### What is new here: the independence control
 

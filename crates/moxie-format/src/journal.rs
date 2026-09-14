@@ -171,18 +171,37 @@ pub fn phase_line(phase: Phase) -> String {
 /// manifest is: a journal written by a later repacker is not one this repacker
 /// may continue.
 pub fn parse(text: &str) -> Result<JournalState> {
-    if text.len() > MAX_JOURNAL_BYTES {
+    parse_bytes(text.as_bytes())
+}
+
+/// Parse a journal from its bytes, which is what a torn tail makes necessary.
+///
+/// A record interrupted part-way through can end inside a multi-byte character,
+/// and a journal is UTF-8 only up to its last committed newline. Decoding the
+/// whole file first refuses exactly the state this recovery exists for --
+/// independent review reproduced it by tearing a record inside a Unicode
+/// string -- so the committed prefix is found **on the bytes**, and only that
+/// prefix is decoded.
+pub fn parse_bytes(bytes: &[u8]) -> Result<JournalState> {
+    if bytes.len() > MAX_JOURNAL_BYTES {
         return Err(invalid(format_args!(
             "journal is {} byte(s), above the {MAX_JOURNAL_BYTES} cap checked before parsing",
-            text.len()
+            bytes.len()
         )));
     }
     // A final line without its newline is a torn append: the bytes were
-    // written and the crash arrived before the rest of the record.
-    let (complete, torn) = match text.rfind('\n') {
-        Some(at) => (&text[..=at], text.len() - at - 1),
-        None => ("", text.len()),
+    // written and the crash arrived before the rest of the record. A newline is
+    // 0x0A, which never appears inside a multi-byte UTF-8 sequence, so the byte
+    // search cannot split a character.
+    let (complete_bytes, torn) = match bytes.iter().rposition(|b| *b == b'\n') {
+        Some(at) => (&bytes[..=at], bytes.len() - at - 1),
+        None => (&bytes[..0], bytes.len()),
     };
+    let complete = core::str::from_utf8(complete_bytes).map_err(|e| {
+        invalid(format_args!(
+            "the journal's committed records are not UTF-8: {e}"
+        ))
+    })?;
 
     let mut version: Option<u32> = None;
     let mut binding: Option<RunBinding> = None;

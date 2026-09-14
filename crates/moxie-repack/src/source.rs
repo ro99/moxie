@@ -40,6 +40,16 @@ pub struct Sources {
     header_budget: HeaderBudget,
     read_budget: ByteBudget,
     open: Option<(String, Shard)>,
+    /// The kernel identity of every source file this run has opened.
+    ///
+    /// One shard is cached at a time, so a file can be closed and reopened
+    /// while a run is in progress. If what the name resolves to has changed in
+    /// between, everything measured before it refers to a file that is no
+    /// longer there. Independent review replaced a source between an inspection
+    /// and the repack that followed, and the artifact carried the old file's
+    /// values under the new file's digest. This makes the second open a
+    /// refusal.
+    identities: BTreeMap<String, (u64, u64)>,
     /// Bytes read through this cache, for honest reporting.
     bytes_read: u64,
     headers_parsed: u64,
@@ -64,6 +74,7 @@ impl Sources {
             header_budget,
             read_budget,
             open: None,
+            identities: BTreeMap::new(),
             bytes_read: 0,
             headers_parsed: 0,
         })
@@ -113,6 +124,25 @@ impl Sources {
         if self.open.as_ref().map(|(f, _)| f.as_str()) != Some(file) {
             let path = self.path_of(file)?;
             let shard = Shard::open_with_limits(&path, self.read_budget, self.header_budget)?;
+            // The identity of the file actually opened, from its handle. A run
+            // reads one source under one identity or it stops: continuing over
+            // a replacement would publish bytes from one file described by
+            // another file's digest.
+            let key = shard.file_key()?;
+            match self.identities.get(file) {
+                Some(seen) if *seen != key => {
+                    return Err(invalid(format!(
+                        "source file '{file}' has been replaced since this run first opened it: \
+                         it was {seen:?} and is now {key:?}. A repack reads one set of bytes, and \
+                         continuing would describe the bytes it converted with a digest of bytes \
+                         it never saw"
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    self.identities.insert(file.to_string(), key);
+                }
+            }
             self.headers_parsed += 1;
             self.open = Some((file.to_string(), shard));
         }
@@ -191,14 +221,24 @@ impl Sources {
     /// in-place write reaches every handle -- so the only honest check is to
     /// hash again after the conversion and before anything is exposed, and to
     /// say what that costs: a second full pass over every source file.
+    /// `Ok(false)` means the caller cancelled part-way through.
     pub fn verify_unchanged(
         &mut self,
         recorded: &[(String, String)],
         scratch: &mut [u8],
         cancelled: &dyn Fn() -> bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        // **Does the name still point at the file we read?** Hashing through
+        // the retained handle is what keeps the conversion and the digest
+        // describing the same bytes -- but it also means an atomic replacement
+        // is invisible to it, because the old inode is still there and still
+        // readable. The path is what the manifest's `source.files` names, so
+        // the path is what has to still resolve here.
+        self.confirm_identities()?;
         for (file, digest) in recorded {
-            let (now, _) = self.file_digest_cancellable(file, scratch, cancelled)?;
+            let Some((now, _)) = self.file_digest_cancellable(file, scratch, cancelled)? else {
+                return Ok(false);
+            };
             if &now != digest {
                 return Err(invalid(format!(
                     "source file '{file}' hashed {digest} when this run started and {now} now: \
@@ -207,17 +247,44 @@ impl Sources {
                 )));
             }
         }
+        Ok(true)
+    }
+
+    /// Every source file this run has opened still resolves to the file it
+    /// opened.
+    ///
+    /// Independent review replaced a shard between an inspection and the repack
+    /// that followed it. Two different failures hide in that: reading one file
+    /// while hashing another, which the retained handle now prevents, and
+    /// publishing a digest for a path that no longer holds those bytes, which
+    /// only a fresh look at the path can catch.
+    pub fn confirm_identities(&mut self) -> Result<()> {
+        let files: Vec<String> = self.identities.keys().cloned().collect();
+        for file in files {
+            let path = self.path_of(&file)?;
+            let now = path_key(&path)?;
+            let seen = self.identities[&file];
+            if now != seen {
+                return Err(invalid(format!(
+                    "source file '{file}' has been replaced since this run first opened it: it \
+                     was {seen:?} and is now {now:?}. The digest this run would publish describes \
+                     bytes that are no longer at that path"
+                )));
+            }
+        }
         Ok(())
     }
 
-    /// SHA-256 of a whole source file, streamed through `scratch`.
+    /// SHA-256 of a whole source file, read through the handle this run is
+    /// already using for that file.
     ///
     /// The manifest's `source.files.sha256` has exactly one meaning, so this
     /// computes exactly that. A repack that recorded a digest of the ranges it
     /// happened to read, in a field that says "this file", would be publishing
     /// a false checksum -- and a later whole-artifact claim would inherit it.
     pub fn file_digest(&mut self, file: &str, scratch: &mut [u8]) -> Result<(String, u64)> {
-        self.file_digest_cancellable(file, scratch, &|| false)
+        self.file_digest_cancellable(file, scratch, &|| false)?
+            .ok_or_else(|| invalid("hashing was cancelled by a caller that cannot cancel".into()))
     }
 
     /// The same, checked against cancellation between slices.
@@ -225,39 +292,49 @@ impl Sources {
     /// A whole-file hash of a 5 GB shard is minutes of reading, and a
     /// cancellation that is only observed after it is a cancellation nobody
     /// experiences. Bounded buffers bound memory, not latency.
+    ///
+    /// `Ok(None)` is that cancellation. It used to be an `InvalidArtifact`
+    /// naming the file, which independent review received in place of
+    /// `Outcome::Cancelled`: a stop the caller asked for is not a corrupt
+    /// source, and a run that reports one as the other teaches its user to
+    /// distrust the difference.
     pub fn file_digest_cancellable(
         &mut self,
         file: &str,
         scratch: &mut [u8],
         cancelled: &dyn Fn() -> bool,
-    ) -> Result<(String, u64)> {
-        use moxie_format::StreamingSha256;
-        let path = self.path_of(file)?;
-        // The shard cache holds a handle to this file; opening it again for a
-        // sequential read is deliberate, so hashing never moves a shared
-        // cursor.
-        let mut handle = std::fs::File::open(&path)
-            .map_err(|e| invalid(format!("cannot open {}: {e}", path.display())))?;
-        let mut hasher = StreamingSha256::new();
-        let mut total = 0u64;
-        loop {
-            use std::io::Read;
-            let n = handle
-                .read(scratch)
-                .map_err(|e| invalid(format!("cannot read {}: {e}", path.display())))?;
-            if n == 0 {
-                break;
-            }
-            if cancelled() {
-                return Err(invalid(format!(
-                    "cancelled while hashing {file} after {total} byte(s)"
-                )));
-            }
-            hasher.update(&scratch[..n]);
-            total += n as u64;
+    ) -> Result<Option<(String, u64)>> {
+        // Through the shard cache, so the bytes hashed are the bytes read: the
+        // same open file description answers both questions, and a file swapped
+        // under this run is refused by `shard` rather than silently hashed.
+        let shard = self.shard(file)?;
+        let digested = shard.digest_whole_file(scratch, cancelled)?;
+        if let Some((_, total)) = &digested {
+            self.bytes_read += *total;
         }
-        self.bytes_read += total;
-        Ok((hasher.finalize_hex(), total))
+        Ok(digested)
+    }
+}
+
+/// A path's identity, as the kernel knows it: the same pair `Shard::file_key`
+/// reports for an open handle.
+fn path_key(path: &Path) -> Result<(u64, u64)> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| invalid(format!("cannot stat {}: {e}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        Ok((meta.len(), mtime))
     }
 }
 

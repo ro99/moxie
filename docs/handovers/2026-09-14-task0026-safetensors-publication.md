@@ -34,10 +34,10 @@ boundary set that safetensors grew from 17 named durable boundaries to 20.
   SHA-256 matching the manifest. Reconstructing from **its** bytes gives
   3,145,728 finite values, codes spanning the whole INT4 range, zero points
   spanning `[-6, 5]` — the figures task 0025 measured from raw chunks.
-- All eight gates pass: fmt, three clippy lanes, spec-check, arch-check (79
-  rejected fixtures, 21 accepted, 13 rules), **1,028** host tests across 92
-  suites and the device-feature lane, with nothing failed, ignored or skipped.
-  The real-artifact lane ran rather than skipping.
+- All eight gates pass on this tree: fmt, three clippy lanes, spec-check,
+  arch-check (79 rejected fixtures, 21 accepted, 13 rules), **1,045** host tests
+  across 95 suites and **1,080** device-feature tests across 95, with nothing
+  failed, ignored or skipped. The real-artifact lane ran rather than skipping.
 - **Two defects were found after the implementation commits, by re-running the
   mutation battery, and both are fixed.** The safetensors header pass leaked an
   admitted reservation when it failed (review finding 7, at an error path that
@@ -60,6 +60,27 @@ boundary set that safetensors grew from 17 named durable boundaries to 20.
   checksums match the manifest, artifact identity
   `8285637189fdf76c2f8d9dae7b9ff721a80a349cb9e2301794c04dcc55ada29b`.
 
+- **A second independent review found fourteen more, six of them P1, and all
+  fourteen are corrected** with a regression each. The pattern across them: a
+  claim was compared against a copy of itself. A component was checked to exist
+  but not to be the dtype, shape and length its descriptor implies; a component
+  list was compared as a set while it was streamed as a sequence; a source was
+  hashed by reopening a path while it was read through a cached handle; a
+  memory bound counted serialized text while the run held parsed structures; a
+  shard was held to our parser while the ruling names the reference
+  implementation. The task record carries the table.
+- Two of those corrections needed a second attempt, and my own tests caught
+  both: binding the source to one handle made the run self-consistent while
+  hiding the replacement it was supposed to reject, and the final-gate
+  cancellation test went self-fulfilling once validation began asking per slice.
+- **The mutation batteries are `cargo xtask mutation-check` now**, not Python
+  under `docs/`. The port's self-test checks every anchor, which immediately
+  found that thirteen of experiment 0005's twenty-four had matched nothing since
+  before `ccfd7fa`; that battery was retired rather than carried. The restore is
+  a marker file written before each substitution, so a run killed by `SIGKILL`
+  leaves nothing behind -- which had already happened once here, leaving
+  `if false && got != unit.sha256` in the writer while gates ran against it.
+
 ## Decisions
 
 - **[ADR 0025](../decisions/adr/0025-canonical-safetensors-schema.md)** fixes
@@ -75,10 +96,25 @@ boundary set that safetensors grew from 17 named durable boundaries to 20.
   nothing is converted, and the transitional read path expires at M11 item 4 or
   earlier if a task shows no v1 artifact exists outside tests.
 
+## What is not measured
+
+**The mutation battery has not been run against the second review's
+corrections.** Started, stopped after 7 of 50; a full run is about four hours.
+The sixteen substitutions covering the round-2 protections have not been shown
+to be caught by any lane. Each has a regression that was watched to fail before
+its fix went in — weaker evidence than the battery, and the evidence that
+exists. `cargo xtask mutation-check` runs it; `--self-test` verifies the verdict
+rule, the selector and all 50 anchors in seconds.
+
+The 30-of-30 battery result in the records describes `ccfd7fa`. The eight gates
+below describe this tree.
+
 ## Remaining hypotheses and blockers
 
-- **Not reviewed.** Task 0025 needed ten corrections after one review; this
-  changed the container underneath all of them.
+- **Reviewed twice, not accepted.** Ten findings in the first round and
+  fourteen in the second, all corrected. The second round's shape -- six P1
+  findings about validation comparing a claim against itself -- is the reason
+  to expect a third round rather than to assume none.
 - **A shard is not a model.** No `config.json`, tokenizer or `model.safetensors.index.json`
   is written, and nothing claims Transformers can load the result. Whether to
   write those is a catalog/packaging question nobody has been assigned.

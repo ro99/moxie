@@ -129,7 +129,7 @@ The method is experiments 0002–0004's: one edit that changes behaviour and
 still compiles; apply, run every lane, record which caught it, revert. Three
 things are different here, and every one of them came from a review.
 
-**The driver is committed** — [`drivers/0005-mutations.py`](drivers/0005-mutations.py)
+**The driver was committed** — `tools/experiments/0005-mutations.py`
 — with every substitution verbatim, because the names below are not the
 measurement.
 
@@ -244,7 +244,7 @@ cargo test -p moxie-format  --locked --offline --test import_allocation_asymmetr
 The mutation driver is committed, with every substitution verbatim:
 
 ```text
-python3 docs/evidence/experiments/drivers/0005-mutations.py
+python3 tools/experiments/0005-mutations.py   # as it was run, at task 0024
 ```
 
 The first version of this record said it was "reproduced in the task record's
@@ -262,3 +262,18 @@ Artifacts read, read-only, nothing written (**O5**):
 `/home/rodrigo/.cache/uv/archive-v0/uqs9z2Tvizx6-8cq0I0rd/compressed_tensors`,
 file hashes in
 [the task contract](../../tasks/0024-m3-asymmetric-int4-pack-quantized-import.md#the-serialization).
+
+## The driver was retired on 2026-09-14
+
+**This record's numbers stand; its driver no longer runs.** When the mutation
+batteries moved into `cargo xtask mutation-check`, the port's self-test checks
+that every anchor still matches exactly once — and found that **thirteen of
+this battery's twenty-four** matched nothing, already, at `ccfd7fa`. Tasks 0025
+and 0026 rewrote the importer paths these substitutions were anchored to, and
+nothing noticed because nothing re-ran them.
+
+A mutation that does not apply is not evidence, which is this battery's own
+rule, so the driver was removed rather than carried as a number nobody can
+reproduce. What it measured is above, and it was measured against the tree at
+task 0024. Re-anchoring it to today's code would be a different measurement of
+different code, and that is a task's decision rather than a rename.

@@ -1,0 +1,48 @@
+schema_version = 1
+required_features = []
+endianness = "little"
+excluded = []
+
+[source]
+model = "identity-fixture"
+revision = "r1"
+license = "unlicensed-test-fixture"
+[[source.files]]
+path = "shard-a.safetensors"
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[tokenizer]
+name = "none"
+version = "not-selected"
+digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+[template]
+name = "none"
+version = "not-selected"
+digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+[architecture]
+name = "fixture"
+version = "1"
+[architecture.metadata]
+note = "opaque"
+
+[provenance]
+scale_convention = "affine-v1"
+quantizer = "none"
+calibration = "none"
+
+[completeness]
+status = "partial"
+missing = ["everything else"]
+
+[[tensors]]
+role = "model.norm.weight"
+shape = [8]
+precision = "bf16-v1"
+chunk = "chunk-00000"
+offset = 0
+length = 16
+sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+alignment = 64
+logical_order = 0

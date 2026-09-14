@@ -125,8 +125,8 @@ contiguous now and the ADR carries the measurement.
 | `cargo xtask arch-check` | **passed**: 79 rejected fixtures, 21 accepted, 13 rules |
 | Host tests | **1,028 passed, 0 failed, 0 ignored, 0 skipped**, 92 suites |
 | Device-feature tests | **1,063 passed, 0 failed, 0 ignored**, 92 suites |
-| Reference reader | every shard accepted by `safetensors` 0.7.0; every component's dtype, shape and SHA-256 matched the manifest ([driver](../evidence/experiments/drivers/0007-reference-reader.py)) |
-| Mutation battery | **30 of 30 caught, 3 of 3 controls held, 0 survivors, 0 unstable, 0 skipped** |
+| Reference reader | every shard accepted by `safetensors` 0.7.0; every component's dtype, shape and SHA-256 matched the manifest (`cargo xtask reference-check`) |
+| Mutation battery | **not re-run after the second review's corrections** — see below |
 
 **Nothing failed and nothing was skipped.** The real-artifact lane ran rather
 than skipping -- 63.5 s of it -- and prints `SKIP` with a reason when its source
@@ -189,6 +189,69 @@ rename. `cancellation_at_the_final_gate_still_stops_before_the_rename` answers
 so a change in that count fails the test instead of silently moving where it
 cancels.
 
+### The second independent review: fourteen findings, all corrected
+
+The reviewer withdrew the admission-leak finding against `ccfd7fa` and confirmed
+the corrected host figure. Fourteen remained. Every one has a fix and a
+regression that fails without it.
+
+| # | Finding | What it was, and what closes it |
+|---|---|---|
+| 1 P1 | Canonical verification did not validate physical dtype and shape | Opening a v2 artifact checked that a component **existed**. A published BF16 component retyped to `F16` verified; a logical shape changed from `[2048]` to `[2047]` verified. `Tensor::expected_components()` derives the physical tensors from the descriptor, and `Artifact::open` holds every shard entry to that dtype, shape **and** byte length. The reference driver recomputes the descriptor itself rather than comparing a shard against its own header. |
+| 2 P1 | Hard links wrote outside the destination | `O_NOFOLLOW` cannot see a hard link: it is a second name for an inode, not a link to follow. `open_confined` now fstats the **opened handle** and refuses `nlink != 1`. A file this run created has one name. |
+| 3 P1 | Source hashes could describe different bytes from those repacked | Tensor reads used a cached handle while hashing reopened the path. Hashing now goes through the shard's own handle (`Shard::digest_whole_file`), so one open file description answers both questions -- **and** `Sources` records each file's `(dev, ino)` at first open, rechecks it on every reopen, and re-stats every path during the pre-publication re-hash. The first fix alone made the run self-consistent while making an atomic replacement invisible; both halves are needed. |
+| 4 P1 | A symmetric selection discarded cross-shard zero points | The companion search looked only beside the codes. A module split across shards is the normal case here -- Qwen3.8-27B splits all 256 -- so every shard the selection names for that module is searched, and two copies are a refusal rather than a guess. |
+| 5 P1 | The declared total did not bound metadata | `header + MAX_SELECTION_BYTES + MAX_MANIFEST_BYTES` are three facts about serialized text and none about the structures parsed out of it. `metadata_bound(selection_bytes, tensors)` is proportional to both, admitted through the ledger **before** anything is built, and `inspect` now takes a ledger. `tests/admission.rs` measures peak live heap under an instrumented allocator and fails if it exceeds the admission -- and asserts the old floor **is** exceeded, so the test cannot pass with the defect present. |
+| 6 P1 | Component order could change the byte stream | Validation compared a sorted set of kinds while `stream_tensor` concatenated the supplied order. Kind **and** name are now compared positionally against the descriptor, because the order is the canonical payload. |
+| 7 P2 | Staging estimates were not upper bounds | Fixed per-record allowances are not bounds when a role is 1,000 characters. They are proportional to actual name lengths now, and the run **charges** every journal and manifest byte against the plan's allowance, so the estimate is a limit rather than a guess. |
+| 8 P2 | A refused resume changed the destination first | The header pass and the tear repair both ran ahead of the binding check. Recovery checks the binding before it changes anything, headers are written after recovery accepts, and the empty-journal removal waits for the lock. |
+| 9 P2 | Admitted runs could produce unreadable journals | `read_text_capped` checked the caller's cap and then applied the manifest's. The cap is the caller's now, and a plan whose journal would exceed `MAX_JOURNAL_BYTES` is refused before the run starts, saying which budget to change. |
+| 10 P2 | A torn UTF-8 journal tail stranded the run | The whole file was decoded before recovery could discard the tail. The committed prefix is found **on the bytes** -- `0x0A` never appears inside a multi-byte sequence -- and only that prefix is decoded. |
+| 11 P2 | Cancellation was unbounded in validation and misclassified | Verification now asks between slices, bounded by the scratch buffer, and a cancelled source hash returns `Outcome::Cancelled` instead of `InvalidArtifact`. |
+| 12 P2 | An ordinary relative `--out` was refused | Walking a bare relative path's ancestors reaches the empty path. Relative destinations resolve against the current directory, and the absolute path is what everything downstream uses. |
+| 13 P2 | Verification accepted shards the reference refuses | Appending garbage verified here and failed there with "file not fully covered". `require_exact_coverage` refuses it for canonical artifacts; the parse stays lenient for **source** files this repository reads but did not write, and says so. |
+| 14 P2 | v1 artifact identities changed | Identity hashed `SCHEMA_VERSION = 2` for v1 manifests and added a `chunk-placement` tag. Both reverted, and the digest is pinned to `a42a4a35439104dd1c332a680afac3ebc58011a48166c71712b8d1d3eabac0ff`, taken from the implementation at `d719f67^` -- not from a round trip of this implementation against itself. |
+
+Two of these corrected a first attempt of my own, and the tests are what caught
+both. Finding 3's retained handle made the run self-consistent while hiding the
+replacement, which the regression published happily until the path check was
+added. And the final-gate cancellation test became self-fulfilling the moment
+validation began asking per slice: it now **measures** how many boundaries a
+publication has, from a run that never cancels, and answers yes only on the
+last.
+
+### The mutation battery: not re-run, and what that leaves unmeasured
+
+**The battery has not been run against the second review's corrections.** It was
+started and stopped after 7 of 50 substitutions, because a full run is about
+four hours and this work is being handed back for review now. Seven is not a
+measurement and is not reported as one; the partial run agreed with the previous
+one on every case it reached.
+
+What that costs, precisely: the sixteen new substitutions covering the round-2
+protections -- descriptor-derived dtype and shape, component order, payload
+coverage, hard links, source identity, the metadata bound, the journal cap, the
+torn UTF-8 tail, cancellation classification, relative destinations and v1
+identity -- **have not been shown to be caught by any lane.** Each has a
+regression that fails without its fix, and each regression was watched to fail
+before the fix went in, which is weaker evidence than the battery and is the
+evidence that exists.
+
+Nothing else is affected. The eight gates above ran to completion on this tree,
+and the 30-of-30 result recorded earlier stands for the tree it measured
+(`ccfd7fa`), not for this one.
+
+To run it:
+
+```
+cargo xtask mutation-check              # ~4 hours, 50 substitutions, 12 lanes
+cargo xtask mutation-check --self-test  # seconds: verdict rule, selector, every anchor
+```
+
+The self-test is worth running first either way: it checks that all 50 anchors
+still match exactly once, which is how a battery stops measuring without
+saying so.
+
 ### The real module, read by the reference implementation
 
 `model.layers.1.mlp.experts.0.down_proj` of `Laguna-S-2.1-AWQ-INT4` revision
@@ -234,12 +297,15 @@ byte for byte. Three cases failed at or after the publication boundary and
 published anyway, which is the documented outcome there.
 
 The battery ([experiment 0006](../evidence/experiments/0006-repack-publication-mutations.md))
-was re-run against the safetensors writer: **30 of 30 mutants caught, 3 of 3
-expected survivors held, 0 survivors, 0 unstable, 0 invalid controls, 0 broken
-controls, 0 skipped**, three repetitions of every verdict in both directions.
-Getting there took re-anchoring nine mutations the rewrite had moved, adding
-the `workflow` lane, and the two product corrections above. The experiment
-record carries what each attempt said.
+was re-run against the safetensors writer at `ccfd7fa`: **30 of 30 mutants
+caught, 3 of 3 expected survivors held, 0 survivors, 0 unstable, 0 invalid
+controls, 0 broken controls, 0 skipped**, three repetitions of every verdict in
+both directions. Getting there took re-anchoring nine mutations the rewrite had
+moved, adding the `workflow` lane, and the two product corrections above.
+
+**That figure describes `ccfd7fa`, not this tree.** The second review's
+corrections added sixteen substitutions and have not been measured; the section
+above says exactly what that leaves open.
 
 ### Limits
 

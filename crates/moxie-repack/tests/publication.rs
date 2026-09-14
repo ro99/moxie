@@ -951,77 +951,87 @@ fn cancellation_observed_after_validation_still_stops_before_the_rename() {
     assert!(ledger.outstanding().is_empty());
 }
 
-/// Cancellation that arrives after the **last** byte has been validated, at the
-/// one boundary between a complete validation and the rename.
+/// Cancellation that arrives at the **last** gate, after everything has been
+/// validated and before the rename.
 ///
 /// The battery found this one: with a check before staging and a check inside
 /// the validation loop, a closure that cancels "from the second question
 /// onwards" stops inside the loop and never reaches the final gate, so deleting
-/// that gate changed nothing. This test answers "no" to every boundary but the
-/// last, which is the only way to observe the gate that is actually last.
+/// that gate changed nothing.
+///
+/// Naming "the last question" cannot be done by counting the gates in the
+/// source -- that count changed the moment validation began asking between
+/// slices rather than between tensors, and a test that hard-codes it silently
+/// starts cancelling somewhere else. So it is **measured**: one run publishes
+/// with a closure that always answers no and counts, and a second, identical
+/// run answers yes only on the call with that number.
 #[test]
 fn cancellation_at_the_final_gate_still_stops_before_the_rename() {
+    fn run_with(dest: &Path, cancel_on: Option<usize>) -> (Option<Outcome>, usize) {
+        let mut ledger = ledger();
+        let start = Run::begin(
+            dest,
+            plan(),
+            binding(),
+            budget(),
+            &Options::default(),
+            &mut ledger,
+            &Faults::none(),
+            &|| false,
+        )
+        .expect("it starts");
+        let mut run = match start {
+            Start::Fresh(run) => run,
+            other => panic!("{other:?}"),
+        };
+        for request in requests() {
+            let bytes = payload(request_len(&request), request_len(&request) as usize);
+            for (at, len) in units(&request) {
+                run.write_unit(
+                    &component_of(&request),
+                    &bytes[at as usize..at as usize + len],
+                    HEX,
+                    &Faults::none(),
+                )
+                .expect("every unit writes");
+            }
+        }
+        let sealed = run.seal().expect("it seals");
+        let text = manifest::encode(&manifest_for(&sealed)).expect("it encodes");
+        let asked = std::cell::Cell::new(0usize);
+        let cancelled = || {
+            asked.set(asked.get() + 1);
+            Some(asked.get()) == cancel_on
+        };
+        let outcome = run
+            .publish(&text, &cancelled, &Faults::none(), &mut ledger)
+            .expect("publication is not an error");
+        assert!(ledger.outstanding().is_empty());
+        (Some(outcome), asked.get())
+    }
+
+    // How many times this publication asks, measured rather than assumed.
+    let measured_dir = Scratch::new("cancel-final-measure");
+    let (outcome, total) = run_with(&measured_dir.join("artifact"), None);
+    assert!(
+        matches!(outcome, Some(Outcome::Published { .. })),
+        "the measuring run must publish: {outcome:?}"
+    );
+    assert!(total >= 2, "only {total} cancellation boundary/boundaries");
+
+    // And now: no to every one of them but the last.
     let scratch = Scratch::new("cancel-final-gate");
     let dest = scratch.join("artifact");
-    let mut ledger = ledger();
-    let start = Run::begin(
-        &dest,
-        plan(),
-        binding(),
-        budget(),
-        &Options::default(),
-        &mut ledger,
-        &Faults::none(),
-        &|| false,
-    )
-    .expect("it starts");
-    let mut run = match start {
-        Start::Fresh(run) => run,
-        other => panic!("{other:?}"),
-    };
-    for request in requests() {
-        let bytes = payload(request_len(&request), request_len(&request) as usize);
-        for (at, len) in units(&request) {
-            run.write_unit(
-                &component_of(&request),
-                &bytes[at as usize..at as usize + len],
-                HEX,
-                &Faults::none(),
-            )
-            .expect("every unit writes");
-        }
-    }
-    let sealed = run.seal().expect("it seals");
-    let text = manifest::encode(&manifest_for(&sealed)).expect("it encodes");
-    // One question before staging, one per distinct role while validating, and
-    // one last question before the rename. Spelling the count out is what makes
-    // "the last one" nameable -- and if the publication path ever asks a
-    // different number of times, this test says so instead of drifting.
-    let mut roles: Vec<&str> = sealed.iter().map(|t| t.role.as_str()).collect();
-    roles.dedup();
-    let expected = roles.len() + 2;
-    let asked = std::cell::Cell::new(0usize);
-    let cancelled = || {
-        asked.set(asked.get() + 1);
-        asked.get() >= expected
-    };
-    let outcome = run
-        .publish(&text, &cancelled, &Faults::none(), &mut ledger)
-        .expect("cancellation is not an error");
-    assert_eq!(
-        asked.get(),
-        expected,
-        "the publication path asked about cancellation a different number of times"
-    );
+    let (outcome, asked) = run_with(&dest, Some(total));
+    assert_eq!(asked, total, "it asked a different number of times");
     assert!(
-        matches!(outcome, Outcome::Cancelled { .. }),
+        matches!(outcome, Some(Outcome::Cancelled { .. })),
         "cancellation at the final gate gave {outcome:?}"
     );
     assert!(
         !dest.join(MANIFEST_FILE).exists(),
         "it published despite being cancelled at the last gate"
     );
-    assert!(ledger.outstanding().is_empty());
 }
 
 /// A private file replaced by a symbolic link is refused, and the link's target
@@ -1110,6 +1120,44 @@ fn a_torn_journal_survives_repeated_interruption() {
     text.push_str("unit = { tensor = ");
     std::fs::write(&journal, &text).expect("tearing it again");
     let (outcome, _, _) = run_to_end(&dest, &Faults::none(), true, None).expect("it publishes");
+    assert!(matches!(outcome, Outcome::Published { .. }), "{outcome:?}");
+    assert_eq!(artifact_bytes(&dest), reference_bytes);
+}
+
+/// A record torn **inside a multi-byte character** is still a torn record.
+///
+/// The ASCII repair passed while the reader still decoded the whole file as
+/// UTF-8 before recovery could discard the tail: independent review interrupted
+/// a record inside a Unicode string and the resume failed immediately, before
+/// the code that exists to handle exactly this ever ran. A newline is 0x0A and
+/// never appears inside a multi-byte sequence, so the committed prefix is found
+/// on the bytes and only that prefix is decoded.
+#[test]
+fn a_journal_torn_inside_a_multibyte_character_still_resumes() {
+    let reference_dir = Scratch::new("torn-utf8-reference");
+    let reference = reference_dir.join("artifact");
+    run_to_end(&reference, &Faults::none(), false, None).expect("the reference publishes");
+    let reference_bytes = artifact_bytes(&reference);
+
+    let scratch = Scratch::new("torn-utf8");
+    let dest = scratch.join("artifact");
+    let journal = dest.join(".moxie-repack-journal");
+    run_to_end(&dest, &Faults::none(), false, Some(1)).expect("a cancelled run");
+
+    // Append a record and cut it in the middle of a three-byte character, which
+    // is what an interrupted write of a record carrying one looks like.
+    let mut bytes = std::fs::read(&journal).expect("a journal");
+    let fragment = "unit = { tensor = \"layers.0.\u{4e16}";
+    let fragment = fragment.as_bytes();
+    bytes.extend_from_slice(&fragment[..fragment.len() - 1]);
+    assert!(
+        String::from_utf8(bytes.clone()).is_err(),
+        "this journal is still valid UTF-8, so it does not reproduce the finding"
+    );
+    std::fs::write(&journal, &bytes).expect("tearing it");
+
+    let (outcome, _, _) =
+        run_to_end(&dest, &Faults::none(), true, None).expect("a torn character is recoverable");
     assert!(matches!(outcome, Outcome::Published { .. }), "{outcome:?}");
     assert_eq!(artifact_bytes(&dest), reference_bytes);
 }
