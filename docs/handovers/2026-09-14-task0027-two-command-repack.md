@@ -1,9 +1,17 @@
 # Handover — task 0027: a two-command repack, and repacking made provisional
 
-**Implemented, reviewed four times, not accepted.** The bounded scope the owner
-set is finished: a normal user points at a checkpoint directory, gets a TOML
-plan, and passes that plan to `repack`. No hand-authored tensor entries, no
-packing parameters, no five mandatory budget flags.
+**Deferred as unfinished, by owner decision on 2026-09-14.** Reviewed four
+times, not accepted, and explicitly **not a prerequisite for quantized
+execution** — no further converter review cycle gates anything else.
+
+What works is the two-command path itself: a user points at a checkpoint
+directory, gets a TOML plan, and passes that plan to `repack`. No hand-authored
+tensor entries, no packing parameters, no five mandatory budget flags.
+
+What is **unmet** is the whole-model workflow. The two largest checkpoints on
+this machine are refused, and refusing early with the arithmetic is more honest
+than the plan-then-fail it replaced but is not the same as delivering the
+workflow.
 
 ```console
 $ moxie-repack plan   --source-root /fast/models/ORG/MODEL --out-plan ./model.plan.toml
@@ -56,8 +64,13 @@ journal is one record per component:
 This is not a regression — `repack` always refused them, through the identical
 check on the resolved plan. What changed is **when** the user is told, and with
 what. The ceiling is roughly 28,000 components, about 9,000 quantized modules.
-Raising it is a journal-format decision with a resume-read cost, and it is left
-as named work rather than taken inside this task's scope.
+
+**The ceiling belongs to this program's restart journal**, not to safetensors,
+the canonical format, or anything about inference: one record per canonical
+component, a 16 MiB cap on a journal a resume must read back, and a work unit
+cut inside one component and never across two. All three are `moxie-repack`
+choices and all three are changeable. Whoever picks this up should revisit the
+cap rather than design around it.
 
 The task record's coverage matrix has been corrected: those two roots are no
 longer listed as plannable.
@@ -132,8 +145,8 @@ no regression test: the fix removes the concurrency rather than detecting it.
 
 ## Next task
 
-**M3 shared W4A16/W8A16 execution**, after this is accepted — a sequencing
-recommendation, not an owner requirement, and not a licence to close M3 or begin
-unlimited runtime work. Document 03 bounds it: weight-only paths, BF16 preferred
+**M3 shared W4A16/W8A16 execution.** The owner's 2026-09-14 decision makes this
+the next work directly: accepting this converter is **not** a precondition. It
+is still not a licence to close M3 or begin unlimited runtime work. Document 03 bounds it: weight-only paths, BF16 preferred
 with FP32 accumulation, SM86 first and SM120 qualified separately, and bounded
 reference dequantization is not an acceptable final fast path by assertion.

@@ -1,6 +1,9 @@
 # Task 0027 — M3: generated plans, automatic budgets, and a two-command path
 
-Status: **active**; contract written before implementation.
+Status: **deferred, unfinished**, by owner decision on 2026-09-14. Not
+accepted, not abandoned, and **not a prerequisite for quantized execution**.
+The contract was written before implementation and is kept as written; what
+follows records what it did and did not deliver.
 
 ## Identity and authority
 
@@ -38,6 +41,41 @@ and establishing the DeepSeek V4 Flash / V4.1 Flash revisions.
 After this is validated and handed over, the next implementation priority is
 **M3 shared W4A16/W8A16 execution** — a sequencing recommendation, not an owner
 requirement, and not a licence to close M3 or start unlimited runtime work.
+
+## Deferral: what is unmet, and why this stops here
+
+**The owner's decision, 2026-09-14, after the fourth review round:**
+
+> We can move on without accepting 0027 as finished. My recommendation is to
+> defer the unfinished user-facing repacker and record its limitations, rather
+> than make another converter review cycle a prerequisite for quantized
+> execution.
+>
+> The tensor ceiling is a limit of this journal implementation, not of
+> safetensors or inference. Claude is now refusing oversized conversions
+> earlier, which is more honest, but it still leaves the requested whole-model
+> workflow unmet.
+
+**The requested workflow is unmet.** The acceptance criterion below says a
+normal user points at a checkpoint directory and gets a usable plan. For the two
+largest checkpoints on this machine the user gets a refusal instead. Refusing at
+the first command with the arithmetic is better than the plan-then-fail it
+replaced, and it is **not** the same as delivering the workflow. Nothing in this
+record should be read as claiming otherwise.
+
+**The ceiling belongs to this journal implementation.** It is not a property of
+safetensors, of the canonical format, or of inference. One resume-journal record
+per canonical component, a 16 MiB cap on a journal a resume must read back, and
+a work unit that is cut inside one component and never across two — three
+choices in `moxie-repack`'s restart machinery, all changeable, none of them
+forced by anything the model or the file format requires. Whoever picks this up
+should treat the cap as the thing to revisit, not as a boundary to design
+around.
+
+**What deferral means here.** No further converter review cycle is a gate on
+anything else. The code stays on `main`, passing every gate; the plan format,
+the ADRs and the experiment contract stand; the named continuations stay named.
+What does not happen is a claim that the user-facing repacker is finished.
 
 ## The acceptance criterion, in the owner's words
 
@@ -110,8 +148,9 @@ an invalid read budget. The refusal now arrives at the first command, with the
 number and the reason.
 
 **It is left as a named continuation, not fixed here.** Raising the cap is a
-journal-format decision with a resume-read cost attached, and this task's scope
-is the two-command flow for what is already implemented. The honest statement of
+decision about **this program's restart journal** — not about safetensors, the
+canonical format or inference — and it carries a resume-read cost. This task's
+scope is the two-command flow for what is already implemented. The honest statement of
 today's capability is: *at the role lengths these checkpoints use, the flow
 converts up to roughly 28,000 canonical components — about 9,000 quantized
 modules. The two largest local checkpoints are three to four times that and are

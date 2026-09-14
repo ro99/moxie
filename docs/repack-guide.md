@@ -109,9 +109,16 @@ moxie-repack: invalid artifact: this checkpoint's 36769 selected tensor(s) hold
 for each: 61522267 byte(s), above the 16777216 byte cap a resume can read back.
 ```
 
-No budget changes this — it is a limit of the journal format. Converting such a
-checkpoint in parts needs a hand-written selection (below). Raising the cap is
-open work, not a setting.
+No budget changes this. It is a limit of **this program's restart journal** —
+one record per component, a 16 MiB cap on a journal a resume must read back, and
+a work unit cut inside one component — and not a limit of safetensors, of the
+canonical format, or of anything about inference. All three are changeable;
+raising the cap is open work, not a setting.
+
+**So the whole-model workflow is not delivered for the largest checkpoints.**
+Converting one in parts needs a hand-written selection (below). This is recorded
+as unfinished rather than worked around; see
+[task 0027](tasks/0027-m3-generated-plans-and-automatic-budgets.md).
 
 The plan records where the checkpoint is and which resource settings it chose,
 so the second command needs neither again.

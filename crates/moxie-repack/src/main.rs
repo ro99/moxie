@@ -360,9 +360,15 @@ fn command_plan(flags: &mut Flags) -> i32 {
             // **Absolute.** A relative root recorded as given resolves against
             // whatever directory the second command runs from, which is not
             // where the plan was made.
+            // A root that will not resolve is an error, not a relative path
+            // written down anyway: the plan would name a directory the second
+            // command resolves somewhere else.
             root: root
                 .canonicalize()
-                .unwrap_or_else(|_| root.clone())
+                .map_err(|e| moxie_types::Error::InvalidArtifact {
+                    detail: format!("cannot resolve {} to an absolute path: {e}", root.display())
+                        .into(),
+                })?
                 .to_string_lossy()
                 .into_owned(),
             model,
