@@ -63,6 +63,14 @@ pub const JOURNAL_FILE: &str = ".moxie-repack-journal";
 pub const LOCK_FILE: &str = ".moxie-repack-lock";
 /// The staged manifest's name, before it becomes `manifest.toml`.
 pub const STAGED_MANIFEST_FILE: &str = ".moxie-repack-manifest";
+/// Where a compacted journal is built before it replaces the journal.
+///
+/// Compaction used to truncate the only journal and rewrite it in place, so an
+/// interruption between the two left staged shards with no binding to say whose
+/// they were -- and `begin` then refused the destination as one it did not
+/// create. Independent review reproduced both reachable states. A replacement
+/// file and a rename mean the journal is always one of two complete documents.
+pub const COMPACT_JOURNAL_FILE: &str = ".moxie-repack-journal-new";
 /// What a published artifact's manifest is called.
 pub const MANIFEST_FILE: &str = "manifest.toml";
 
@@ -170,6 +178,14 @@ pub struct Run {
     /// plan's own allowance so the destination cannot quietly exceed the disk
     /// budget the plan was accepted under.
     overhead_used: u64,
+    /// Journal bytes this destination holds, tracked against the journal's own
+    /// cap rather than only against the combined staging allowance.
+    ///
+    /// The two limits are different questions: the staging allowance is about
+    /// the disk budget a user declared, and `MAX_JOURNAL_BYTES` is about whether
+    /// a resume can read the file back at all. Independent review wrote a
+    /// 17,517,998-byte journal inside an admitted run and could not resume it.
+    journal_used: u64,
     /// Read-back scratch, admitted from the ledger like every other byte this
     /// run holds.
     scratch: HostBuffer,
@@ -234,7 +250,7 @@ impl Run {
                     let name = entry.file_name().to_string_lossy().into_owned();
                     if !matches!(
                         name.as_str(),
-                        LOCK_FILE | JOURNAL_FILE | STAGED_MANIFEST_FILE
+                        LOCK_FILE | JOURNAL_FILE | STAGED_MANIFEST_FILE | COMPACT_JOURNAL_FILE
                     ) {
                         foreign.push(name);
                     }
@@ -284,6 +300,16 @@ impl Run {
         // Under the lock, and not before it: removing another run's file is a
         // mutation, and the whole point of the lock is that one run at a time
         // decides what this destination holds.
+        //
+        // A **fresh** start has already established the destination is its own:
+        // it either created it, or found nothing in it but this program's
+        // private files. A resume has not -- the journal's binding is what says
+        // whose it is -- so a resuming run leaves the leftover alone until
+        // `recover` accepts. Independent review resumed with a different plan,
+        // was correctly refused, and found the replacement already deleted.
+        if !resuming {
+            remove_leftover_replacement(&dest)?;
+        }
         if empty_journal && !resuming {
             std::fs::remove_file(&journal_path).map_err(|e| {
                 invalid(format!(
@@ -325,6 +351,7 @@ impl Run {
             progress: BTreeMap::new(),
             disk_used: 0,
             overhead_used: 0,
+            journal_used: 0,
             scratch,
             sealed: None,
         };
@@ -404,6 +431,20 @@ impl Run {
         // bound to a different plan means this destination is not ours to
         // repair, rewrite or append to, and independent review found the tear
         // repair and the shard-header pass both running ahead of this question.
+        // The raw journal buffer has done its work -- it was parsed, and the
+        // tear repair below needs only its length. Dropping it here is what
+        // keeps recovery's peak to one copy of the records rather than the
+        // bytes and the records together.
+        let journal_bytes_len = bytes.len();
+        drop(bytes);
+        // **What this destination already holds, before anything is decided.**
+        // These used to be set after compaction, so the peak check below always
+        // compared zero against the allowance and could refuse nothing.
+        self.journal_used = journal_bytes_len as u64;
+        self.overhead_used = self.journal_used
+            + std::fs::metadata(self.dest.join(STAGED_MANIFEST_FILE))
+                .map(|m| m.len())
+                .unwrap_or(0);
         let recorded = state.binding.clone().ok_or_else(|| {
             invalid("this journal records no plan: `begin` should have started over".into())
         })?;
@@ -423,7 +464,7 @@ impl Run {
         // again. The existing test ran straight through to publication, which
         // deletes the journal and hid it.
         if state.torn_tail_bytes > 0 {
-            let keep = bytes.len() - state.torn_tail_bytes;
+            let keep = journal_bytes_len - state.torn_tail_bytes;
             let file = open_confined(&self.dest, JOURNAL_FILE, false)?;
             file.set_len(keep as u64).map_err(|e| {
                 invalid(format!(
@@ -464,8 +505,10 @@ impl Run {
         };
         let mut stopped: BTreeMap<String, bool> = BTreeMap::new();
         let mut staged_bytes: u64 = 0;
-        let mut kept: Vec<CompletedUnit> = Vec::new();
-        for unit in &state.units {
+        // Indices, not clones: the parsed records are already live and the
+        // admission covers one copy of them, not two.
+        let mut kept: Vec<usize> = Vec::new();
+        for (position, unit) in state.units.iter().enumerate() {
             // Recovery rehashes every byte it reuses, which for a large run is
             // minutes of reading. A cancellation only observed afterwards is a
             // cancellation nobody experiences.
@@ -490,7 +533,7 @@ impl Run {
                 Ok(()) => {
                     report.reused_units += 1;
                     report.reused_bytes += unit.len;
-                    kept.push(unit.clone());
+                    kept.push(position);
                 }
                 Err(e) => {
                     stopped.insert(unit.tensor.clone(), true);
@@ -508,35 +551,85 @@ impl Run {
         // then 487,370. Removing records is the safe direction -- a unit with no
         // record is rewritten, which is the invariant the whole journal exists
         // to keep -- so a crash during this rewrite costs work, never bytes.
-        let compacted = {
-            let mut text = journal::header_lines(&self.binding);
-            for unit in &kept {
-                text.push_str(&journal::unit_line(unit));
-            }
-            text
-        };
-        {
-            use std::io::{Seek, Write};
-            let mut file = open_confined(&self.dest, JOURNAL_FILE, false)?;
-            file.set_len(0)
-                .map_err(|e| invalid(format!("cannot compact the journal: {e}")))?;
-            file.write_all(compacted.as_bytes())
-                .map_err(|e| invalid(format!("cannot rewrite the journal: {e}")))?;
-            file.sync_all()
-                .map_err(|e| invalid(format!("cannot sync the compacted journal: {e}")))?;
-            // And this run's own handle to the new end, as the tear repair does.
-            self.journal
-                .seek(std::io::SeekFrom::Start(compacted.len() as u64))
-                .map_err(|e| invalid(format!("cannot reposition the journal: {e}")))?;
+        // The binding was accepted above, so this destination is this run's and
+        // a leftover replacement is its own litter to clear -- and clearing it
+        // before writing the new one is what keeps the peak to two journals.
+        remove_leftover_replacement(&self.dest)?;
+
+        // Built into a replacement and renamed over, never truncated in place:
+        // at every instant the journal is either the document this recovery
+        // read or the one it wrote, and both carry the binding. Streamed rather
+        // than assembled, because the original bytes and the parsed records are
+        // already live and a third full copy is what the admission was found
+        // not to cover.
+        // **Both journals exist at once**, so the peak is charged before the
+        // second one is written. Compaction only ever removes records, so the
+        // original's size bounds the replacement's.
+        let peak = self.overhead_used + self.journal_used;
+        if peak > self.plan.overhead_bytes() {
+            return Err(invalid(format!(
+                "compacting this journal would hold {peak} byte(s) of staging files at once -- \
+                 the original and its replacement together -- above the {} byte(s) its disk plan \
+                 reserved for them",
+                self.plan.overhead_bytes()
+            )));
         }
-        report.journal_compacted_to = compacted.len() as u64;
+        let compacted_len = {
+            use std::io::{Seek, Write};
+            let mut file = open_confined(&self.dest, COMPACT_JOURNAL_FILE, false)?;
+            file.set_len(0)
+                .map_err(|e| invalid(format!("cannot truncate the journal replacement: {e}")))?;
+            faults.check(Site::JournalCompactWrite)?;
+            let mut written = 0u64;
+            let header = journal::header_lines(&self.binding);
+            file.write_all(header.as_bytes())
+                .map_err(|e| invalid(format!("cannot write the journal replacement: {e}")))?;
+            written += header.len() as u64;
+            drop(header);
+            for index in &kept {
+                let line = journal::unit_line(&state.units[*index]);
+                file.write_all(line.as_bytes())
+                    .map_err(|e| invalid(format!("cannot write the journal replacement: {e}")))?;
+                written += line.len() as u64;
+            }
+            faults.check(Site::JournalCompactSync)?;
+            file.sync_all()
+                .map_err(|e| invalid(format!("cannot sync the journal replacement: {e}")))?;
+            drop(file);
+
+            faults.check(Site::JournalCompactPublish)?;
+            std::fs::rename(
+                self.dest.join(COMPACT_JOURNAL_FILE),
+                self.dest.join(JOURNAL_FILE),
+            )
+            .map_err(|e| invalid(format!("cannot put the compacted journal in place: {e}")))?;
+            // The rename is durable only once the directory holding it is.
+            let dir = File::open(&self.dest).map_err(|e| {
+                invalid(format!(
+                    "cannot open {} to sync it: {e}",
+                    self.dest.display()
+                ))
+            })?;
+            dir.sync_all()
+                .map_err(|e| invalid(format!("cannot sync {}: {e}", self.dest.display())))?;
+
+            // The old handle refers to the replaced inode; reopen and append at
+            // the new end.
+            self.journal = open_confined(&self.dest, JOURNAL_FILE, false)?;
+            self.journal
+                .seek(std::io::SeekFrom::Start(written))
+                .map_err(|e| invalid(format!("cannot reposition the journal: {e}")))?;
+            written
+        };
+        report.journal_compacted_to = compacted_len;
         // The staging files this destination **already holds** are this run's to
         // account for. Starting the count at zero let a resumed run spend the
         // whole allowance again on top of what was there.
         let staged_manifest = std::fs::metadata(self.dest.join(STAGED_MANIFEST_FILE))
             .map(|m| m.len())
             .unwrap_or(0);
-        self.overhead_used = compacted.len() as u64 + staged_manifest;
+        self.overhead_used = compacted_len + staged_manifest;
+        self.journal_used = compacted_len;
 
         // Bytes past the last journaled unit are a crash between a payload
         // write and its journal line: the chunk file is truncated back to what
@@ -696,6 +789,23 @@ impl Run {
     /// rather than a function of the names in the records, so a long role
     /// overran it: a 160,000-byte budget retained 166,026 bytes. The bound is
     /// proportional now, and this is what makes it a limit rather than a guess.
+    /// Charge `bytes` against the journal's own cap, which is what a resume can
+    /// read back, and then against the staging allowance.
+    fn charge_journal(&mut self, bytes: u64) -> Result<()> {
+        let used = self.journal_used + bytes;
+        if used > journal::MAX_JOURNAL_BYTES as u64 {
+            return Err(invalid(format!(
+                "this record would take the journal to {used} byte(s), above the {} it must stay \
+                 under to be read back on a resume. A destination whose journal cannot be \
+                 reopened is not resumable, so the record is refused rather than written",
+                journal::MAX_JOURNAL_BYTES
+            )));
+        }
+        self.charge_overhead(bytes, "journal")?;
+        self.journal_used = used;
+        Ok(())
+    }
+
     fn charge_overhead(&mut self, bytes: u64, what: &str) -> Result<()> {
         let used = self.overhead_used + bytes;
         if used > self.plan.overhead_bytes() {
@@ -791,7 +901,7 @@ impl Run {
             source_sha256: source_sha256.to_string(),
         };
         let line = journal::unit_line(&unit);
-        self.charge_overhead(line.len() as u64, "journal")?;
+        self.charge_journal(line.len() as u64)?;
         append_durably(&mut self.journal, &line, faults)?;
 
         let progress = self.progress.get_mut(component).expect("checked above");
@@ -1013,6 +1123,25 @@ impl Run {
         let _ = std::fs::remove_file(self.dest.join(LOCK_FILE));
         self.scratch.release(ledger)
     }
+}
+
+/// Remove a replacement left by an interrupted compaction.
+///
+/// It accounts for nothing: the journal beside it is the authoritative document
+/// whichever side of the rename the interruption fell on. Removing it frees the
+/// disk it holds before a run plans around that space -- but only once the
+/// caller has established the destination is its own.
+fn remove_leftover_replacement(dest: &Path) -> Result<()> {
+    let leftover = dest.join(COMPACT_JOURNAL_FILE);
+    if leftover.exists() {
+        std::fs::remove_file(&leftover).map_err(|e| {
+            invalid(format!(
+                "cannot remove the leftover journal replacement {}: {e}",
+                leftover.display()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// Whether a journal file carries the plan line that binds a run.

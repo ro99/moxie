@@ -38,6 +38,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod discover;
 pub mod source;
 pub mod work;
 pub mod write;
@@ -104,9 +105,14 @@ impl Budgets {
     /// constant this repository already declares, so the floor is arithmetic
     /// rather than a guess.
     pub fn metadata_floor_bytes(&self) -> u64 {
-        self.header_bytes
-            + moxie_format::selection::MAX_SELECTION_BYTES as u64
-            + moxie_format::manifest::MAX_MANIFEST_BYTES as u64
+        // **Not the selection cap.** That constant rose to 64 MiB so a plan for
+        // a real model would fit, and using it here charged every run for the
+        // largest plan anyone could write -- a 72 MiB floor on a checkpoint
+        // with three tensors. What a selection actually costs is
+        // `metadata_bound`, which is proportional to the one in hand and is
+        // what the ledger admits. This stays a floor: the two allocations whose
+        // size is genuinely fixed by a cap rather than by the input.
+        self.header_bytes + moxie_format::manifest::MAX_MANIFEST_BYTES as u64
     }
 
     /// Bytes each selected tensor can hold in **parsed** form, at once.
@@ -313,8 +319,11 @@ impl StagingEstimate {
         }
     }
 
+    /// The destination's largest moment, which is what a disk budget has to
+    /// cover: payload, the staged manifest, and **two** journals -- compaction
+    /// writes its replacement beside the original before renaming over it.
     pub fn total(&self) -> u64 {
-        self.payload_bytes + self.journal_bound_bytes + self.manifest_bound_bytes
+        self.payload_bytes + 2 * self.journal_bound_bytes + self.manifest_bound_bytes
     }
 }
 
@@ -700,7 +709,12 @@ pub fn overhead_bound(
     selection_bytes: u64,
 ) -> Result<u64> {
     let estimate = StagingEstimate::of(0, &staging_shape(resolved, budgets)?, selection_bytes);
-    let total = estimate.journal_bound_bytes + estimate.manifest_bound_bytes;
+    // **Two journals, not one.** Compaction writes its replacement beside the
+    // original and renames over it, so for the length of that write the
+    // destination holds both. Independent review measured a 250,000-byte disk
+    // budget retaining 326,868 bytes at the moment of the second write. The
+    // plan reserves the peak, not the resting size.
+    let total = 2 * estimate.journal_bound_bytes + estimate.manifest_bound_bytes;
     // The journal has a cap of its own, and a plan whose journal cannot be read
     // back is a plan that cannot be resumed. Independent review produced a
     // valid 4.35 MB journal from an 8 MiB source at a 1 KiB scratch; raising
@@ -721,7 +735,10 @@ fn staging_shape(resolved: &[Resolved], budgets: &Budgets) -> Result<Vec<TensorS
     let mut out = Vec::with_capacity(resolved.len());
     for r in resolved {
         out.push(TensorStaging {
-            role_bytes: r.role.len() as u64,
+            // The **serialized** length: what a journal line and a manifest row
+            // actually cost. A role is a user-supplied string and escaping can
+            // multiply it sixfold.
+            role_bytes: moxie_format::journal::escaped_len(&r.role) as u64,
             units: work::unit_count(r, budgets.tile_bytes())? as u64,
             components: r.components.len() as u64,
             group_index_entries: r

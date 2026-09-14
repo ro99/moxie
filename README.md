@@ -121,6 +121,17 @@ run is unmeasured, never passing.
 
 ### The offline repacker
 
+**→ [Using `moxie-repack`](docs/repack-guide.md)** is the user guide.
+
+**This step is experimental and provisional.** Moxie cannot execute a checkpoint
+yet, so there is **no evidence that repacking makes inference faster**, and the
+artifacts it produces are not runnable by Moxie today. It exists to develop and
+evaluate shared execution. Whether it is kept is decided by a measurement that
+is not yet runnable ([ADR 0027](docs/decisions/adr/0027-repacking-is-provisional-pending-measured-inference-benefit.md),
+[experiment 0007](docs/evidence/experiments/0007-offline-versus-load-time-preparation.md)).
+Byte-exactness, conformant packaging and compact plans are facts about bytes,
+not about speed.
+
 `moxie-repack` is the program [ADR 0021](docs/decisions/adr/0021-repack-is-a-moxie-program.md) and
 [ADR 0022](docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md) place canonical
 write authority in, and task 0025 is what built it. Five budgets are required on every invocation —

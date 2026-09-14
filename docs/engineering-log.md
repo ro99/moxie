@@ -36,6 +36,7 @@ Each links into the entries below.
 | A format assumption nobody asked the format about | task 0026's eight-byte alignment, refused by the reference reader |
 | A new boundary that hides the boundary beside it | task 0026's shard-header pass, which absorbed every payload fault |
 | A claim checked against a copy of itself | task 0026's component validation, shape check, source digest and memory bound |
+| Optimizing the architecture, and calling it a user benefit | offline repacking, built and packaged before its performance hypothesis was tested |
 | A tool that measures the tree it is editing | the mutation battery, twice: killed mid-substitution, and left unrunnable for two tasks |
 | A test measured by assertion rather than by mutation | tasks 0020, 0021, 0022, 0023, 0024 |
 | A record contradicting a fact it already contains | task 0022's expert inventory, task 0022's VRAM figure, task 0024's sign claim |
@@ -44,6 +45,40 @@ Each links into the entries below.
 
 ## Entries, newest first
 
+
+**An internal improvement is not a demonstrated user benefit (2026-09-14).**
+Offline repacking was sold to the owner on an architectural argument: one
+canonical layout, no per-format branching in the execution path, cheaper
+importers. All three are true statements about the code. **None of them is a
+statement about inference speed**, and the owner said so when he challenged the
+pitch.
+
+What had accumulated by then: a canonical schema, a safetensors writer, a
+manifest, a journal and restart protocol, a publication state machine, a
+mutation battery, four rounds of independent review, and a compact plan format
+for 34,740-module checkpoints. Real work, carefully done, and **not one measured
+number about prefill or decode** — because this repository cannot execute a
+checkpoint at all, so the hypothesis the whole thing rests on has never been
+runnable.
+
+The failure is not that the hypothesis might be wrong. It is the **order**: the
+tooling grew to four review rounds of polish before anything tested whether the
+step it automates is worth taking. A cheaper sequence existed — establish the
+comparison first, or at least write the acceptance contract first, so the
+criterion could not be fitted to the result later.
+
+What was done about it: [ADR 0027](decisions/adr/0027-repacking-is-provisional-pending-measured-inference-benefit.md)
+makes repacking **provisional** and bounds its scope;
+[experiment 0007](evidence/experiments/0007-offline-versus-load-time-preparation.md)
+is the acceptance contract, written **before** any result exists, with its three
+outcomes and its fairness rules fixed in advance. It says plainly that sunk cost
+is not acceptance evidence, which is the trap this shape of mistake sets on the
+way out.
+
+**The lesson to carry:** when a design's justification is performance, the first
+artifact should be the measurement contract, not the implementation. And an
+agent proposing such a design should say which parts are measured and which are
+hypothesis — the pitch that started this did not.
 
 **Tooling belongs in the tooling crate, and the port found the rot
 (2026-09-14).** The mutation batteries were Python scripts living under

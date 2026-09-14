@@ -1,5 +1,12 @@
 # ADR 0022 — User programs and canonical write authority
 
+> **Superseded in part by [ADR 0027](0027-repacking-is-provisional-pending-measured-inference-benefit.md) (2026-09-14).**
+> Write authority and packaging are unchanged. What changed is that canonical
+> materialization is **provisional**, not a permanent prerequisite for all users,
+> and that the selection is generated rather than hand-authored
+> ([ADR 0026](0026-generated-plans-and-automatic-budgets.md)). The text below stands as written.
+
+
 - ID / date / author / status: 0022 / 2026-09-13; amended 2026-09-14 / engineer lead (implementation agent), packaging amendment directed by the repository owner / adopted; safetensors publication implementation pending.
 - Classification: program placement was a roadmap default selected under the owner's explicit delegation. The 2026-09-14 safetensors packaging amendment is an **owner ruling**, replacing the requested custom `.mox` container. Neither is a measured performance claim.
 - Scope and owning shared component: application composition roots; `moxie-format` and the storage boundary; `xtask` architecture enforcement.

@@ -164,6 +164,18 @@ taking a silent exception.
 **Owner ruling, 2026-09-13 — verbatim, recorded here; ADR 0020 implements it.** The owner ruled: storage and conversion is user-managed. Repack is done via an external script pointing to the chosen directory; Moxie only points to the repacked (canonical) file. No agent-initiated bulk download, copy, or conversion without a task naming exact artifact, revision, expected size and retention. Designated roots remain `/models` and `/fast/models`; canonicals for the ten v1 revisions (O1) are authorized to be materialized there.
 **Correction, 2026-09-13 ([ADR 0021](adr/0021-repack-is-a-moxie-program.md)).** The "external script" phrasing above is wrong for repack and is preserved here only for provenance. Repack is a Moxie program the user runs offline — not an external script. Unchanged: user-run, one authorized entry at a time, no agent bulk write without artifact + revision + size + retention named, roots `/models` and `/fast/models`, ten authorized revisions. "External" stays correct only for quantization (O1/ADR 0017: never in Moxie).
 
+**Clarification, 2026-09-14 ([ADR 0027](adr/0027-repacking-is-provisional-pending-measured-inference-benefit.md)).**
+O5 **authorizes** materialization; it does not make it mandatory or permanent.
+The owner's requirement is that offline repacking is acceptable **if it brings
+worthwhile inference performance improvements**, and no such measurement exists
+or is currently runnable. Repacking is therefore **provisional**: an
+experimental artifact and input path, whose retention is decided by
+[experiment 0007](../evidence/experiments/0007-offline-versus-load-time-preparation.md)
+once shared execution makes that comparison possible. Nothing in this
+clarification changes what is authorized, the read-only status of the source
+roots, or the no-agent-bulk-write rule. **O6 and O7 remain unresolved and are
+not touched by it.**
+
 **Historical evidence and M2 sequencing questions remain below for provenance; they are not the ruling.**
 
 **M0 evidence.** Free space: `/` 551 G, `/fast` 1.4 T, `/data` 286 G,

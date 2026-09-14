@@ -148,10 +148,10 @@ const BATTERY_T0006: &[Mutation] = &[
         name: "journal-recorded-before-the-bytes-are-durable-tail",
         file: "crates/moxie-repack/src/write/run.rs",
         from: r#"        let line = journal::unit_line(&unit);
-        self.charge_overhead(line.len() as u64, "journal")?;
+        self.charge_journal(line.len() as u64)?;
         append_durably(&mut self.journal, &line, faults)?;"#,
         to: r#"        let line = journal::unit_line(&unit);
-        self.charge_overhead(line.len() as u64, "journal")?;
+        self.charge_journal(line.len() as u64)?;
         append_durably(&mut self.journal, &line, faults)?;
         write_at(&mut file, offset, bytes, faults, Site::ChunkWrite)
             .map_err(|e| invalid(format!("cannot write {}: {e}", path.display())))?;
@@ -533,20 +533,11 @@ const BATTERY_T0006: &[Mutation] = &[
     Mutation {
         name: "journal-history-not-compacted",
         file: "crates/moxie-repack/src/write/run.rs",
-        from: r#"        let compacted = {
-            let mut text = journal::header_lines(&self.binding);
-            for unit in &kept {
-                text.push_str(&journal::unit_line(unit));
-            }
-            text
-        };"#,
-        to: r#"        let compacted = {
-            let mut text = moxie_storage::read_text_capped(journal_path, journal::MAX_JOURNAL_BYTES)
-                .unwrap_or_default();
-            let _ = &kept;
-            text.push_str("");
-            text
-        };"#,
+        from: r#"            for index in &kept {
+                let line = journal::unit_line(&state.units[*index]);"#,
+        to: r#"            for index in 0..state.units.len() {
+                let _ = &kept;
+                let line = journal::unit_line(&state.units[index]);"#,
         expect: Expect::Caught,
     },
     Mutation {
@@ -580,6 +571,69 @@ const BATTERY_T0006: &[Mutation] = &[
         _ => SCHEMA_VERSION,
     }
 }"#,
+        expect: Expect::Caught,
+    },
+    // --- round 4 -------------------------------------------------------------
+    Mutation {
+        name: "compaction-truncates-in-place",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"            let mut file = open_confined(&self.dest, COMPACT_JOURNAL_FILE, false)?;"#,
+        to: r#"            let mut file = open_confined(&self.dest, JOURNAL_FILE, false)?;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "journal-cap-not-enforced-per-append",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        if used > journal::MAX_JOURNAL_BYTES as u64 {"#,
+        to: r#"        if false && used > journal::MAX_JOURNAL_BYTES as u64 {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "journal-sizing-ignores-escaping",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"            role_bytes: moxie_format::journal::escaped_len(&r.role) as u64,"#,
+        to: r#"            role_bytes: r.role.len() as u64,"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "escaped-len-undercounts",
+        file: "crates/moxie-format/src/journal.rs",
+        from: r#"            c if (c as u32) < 0x20 || c as u32 == 0x7f => 6,"#,
+        to: r#"            c if (c as u32) < 0x20 || c as u32 == 0x7f => 1,"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "compaction-peak-not-budgeted",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        let peak = self.overhead_used + self.journal_used;
+        if peak > self.plan.overhead_bytes() {"#,
+        to: r#"        let peak = self.overhead_used + self.journal_used;
+        if false && peak > self.plan.overhead_bytes() {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "plan-budgets-for-one-journal",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"    let total = 2 * estimate.journal_bound_bytes + estimate.manifest_bound_bytes;"#,
+        to: r#"    let total = estimate.journal_bound_bytes + estimate.manifest_bound_bytes;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "leftover-replacement-is-kept",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"    let leftover = dest.join(COMPACT_JOURNAL_FILE);
+    if leftover.exists() {"#,
+        to: r#"    let leftover = dest.join(COMPACT_JOURNAL_FILE);
+    if false && leftover.exists() {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "leftover-cleared-before-the-binding-check",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        if !resuming {
+            remove_leftover_replacement(&dest)?;
+        }"#,
+        to: r#"        remove_leftover_replacement(&dest)?;"#,
         expect: Expect::Caught,
     },
 ];

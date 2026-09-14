@@ -369,11 +369,19 @@ fn every_failure_point_leaves_a_resumable_destination_that_publishes_the_same_ar
         run_to_end(&reference, &Faults::none(), false, None).expect("the reference publishes");
     let reference_bytes = artifact_bytes(&reference);
 
-    // How many times each boundary is visited in a clean run, measured rather
-    // than assumed: a boundary that gained a visit gains enumeration cases.
+    // How many times each boundary is visited, measured rather than assumed: a
+    // boundary that gained a visit gains enumeration cases.
+    //
+    // The scenario **includes a resume**, because some boundaries only exist on
+    // one: journal compaction runs when an interrupted run is recovered, and
+    // enumerating a clean run alone would leave its writes, its sync and its
+    // replacement untested. Independent review asked for exactly that after
+    // compaction was added.
     let counting = Faults::none();
     let counted_dir = Scratch::new("counted");
-    run_to_end(&counted_dir.join("artifact"), &counting, false, None).expect("it publishes");
+    let counted = counted_dir.join("artifact");
+    run_to_end(&counted, &counting, false, Some(2)).expect("it cancels");
+    run_to_end(&counted, &counting, true, None).expect("it publishes");
     let visited = counting.visited_sites();
 
     let mut cases = 0usize;
@@ -387,7 +395,11 @@ fn every_failure_point_leaves_a_resumable_destination_that_publishes_the_same_ar
             let scratch = Scratch::new("enumerated");
             let dest = scratch.join("artifact");
             let faults = Faults::none().fail_at(site, visit as u64);
-            let first = run_to_end(&dest, &faults, false, None);
+            // The same shape the visits were counted over: stop part-way, then
+            // resume. A boundary that only a resume reaches is failed on the
+            // resume.
+            let first = run_to_end(&dest, &faults, false, Some(2))
+                .and_then(|_| run_to_end(&dest, &faults, true, None));
             assert!(
                 faults.all_fired(),
                 "{site:?} visit {visit} never fired: this case measured nothing"
@@ -1202,4 +1214,77 @@ fn a_unit_above_the_admitted_scratch_is_refused() {
     let e = run.seal().unwrap_err();
     assert!(e.to_string().contains("cannot be published"), "{e}");
     run.abandon(&mut ledger).expect("it releases");
+}
+
+/// The journal's own cap refuses a record even when the plan allowed it.
+///
+/// The plan bounds the journal, and this is the **second** net: a per-append
+/// check that does not depend on the planner having been right. Independent
+/// review asked for it "independently of the combined staging allowance", and a
+/// run driven through a correct planner can never show it, because a correct
+/// plan never lets the append path reach the cap. So the plan here is built
+/// with a deliberately generous allowance -- 64 MiB against the journal's
+/// 16 MiB -- over a tensor whose units are small enough to produce more records
+/// than the cap admits.
+#[test]
+fn the_journal_cap_refuses_a_record_the_plan_allowed() {
+    use moxie_repack::write::{TensorRequest, WriteBudget};
+
+    let scratch = Scratch::new("journal-cap-runtime");
+    let dest = scratch.join("artifact");
+
+    // One BF16 tensor, written in 256-byte units: each record is a few hundred
+    // bytes, so the cap arrives well before the payload runs out.
+    // Enough payload that the cap is reached before the tensor ends: 39,062
+    // records was just short of it.
+    let elements = 12_000_000u64;
+    let role = "cap.probe.weight";
+    let components =
+        moxie_format::canonical::bf16_components(role, &[elements]).expect("components");
+    let request = TensorRequest {
+        role: role.to_string(),
+        shape: vec![elements],
+        precision: moxie_format::manifest::TensorPrecision::Bf16V1,
+        affine: None,
+        components,
+    };
+    let write = WriteBudget::new(512, 256 << 20, 256 << 20).expect("a write budget");
+    let generous = OutputPlan::build(vec![request], &write, 64 << 20).expect("a plan");
+
+    let mut ledger = ledger();
+    let start = Run::begin(
+        &dest,
+        generous,
+        binding(),
+        write,
+        &Options::default(),
+        &mut ledger,
+        &Faults::none(),
+        &|| false,
+    )
+    .expect("it starts");
+    let mut run = match start {
+        Start::Fresh(run) => run,
+        other => panic!("{other:?}"),
+    };
+
+    let component = role.to_string();
+    let unit = vec![0u8; 256];
+    let mut records = 0usize;
+    let refusal = loop {
+        match run.write_unit(&component, &unit, HEX, &Faults::none()) {
+            Ok(()) => records += 1,
+            Err(e) => break e.to_string(),
+        }
+        assert!(
+            records < 200_000,
+            "the journal grew past {records} records with no limit"
+        );
+    };
+    assert!(
+        refusal.contains("read back on a resume"),
+        "the refusal is not the journal's own cap, after {records} record(s): {refusal}"
+    );
+    eprintln!("task0026 journal cap: refused after {records} record(s)");
+    run.abandon(&mut ledger).expect("it abandons");
 }

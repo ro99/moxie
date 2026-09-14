@@ -28,12 +28,25 @@ use moxie_repack::{Budgets, InspectReport, RepackReport, VerifyReport};
 const USAGE: &str = "\
 moxie-repack — offline canonical inspection, repack and verification
 
+The usual path, two commands and no other flags:
+
+  moxie-repack plan   --source-root <checkpoint> [--out-plan <file>]
+  moxie-repack repack --plan <file> --out <dir>
+
+`plan` reads the checkpoint's own config and safetensors index, writes a plan
+you can read, and converts nothing. The plan records where the checkpoint is and
+which resource settings it chose, so `repack` needs neither again.
+
+Everything below is advanced: a hand-written selection, or overriding what the
+plan chose. A flag always wins over the plan, which wins over the automatic
+default.
+
   moxie-repack inspect --selection <file> --source-root <dir> <budgets>
   moxie-repack repack  --selection <file> --source-root <dir> --out <dir> <budgets> [options]
   moxie-repack verify  --artifact <dir> --scratch-bytes <n>
 
-Budgets (all required; there is no default for what a tool may spend on a
-user's machine):
+Budgets (required only on the advanced paths; `plan` chooses them from the
+checkpoint and records what it chose):
   --total-bytes <n>        total admitted dynamic working memory
   --header-bytes <n>       peak heap admitted for one source header
   --scratch-bytes <n>      payload scratch: one source tile plus one canonical tile
@@ -41,6 +54,11 @@ user's machine):
   --disk-bytes <n>         total payload bytes this run may write
 
 Options:
+  --out-plan <file>             where `plan` writes the plan (default: ./<model>.plan.toml)
+  --plan <file>                 the plan `repack` should convert
+  --force                       replace an existing plan
+  --allow-partial               convert a plan that does not cover the whole model
+  --out-selection <file>        deprecated spelling of --out-plan
   --take-over-interrupted-run   continue a destination whose lock file survived a crash
   --test-fail-at <site>:<n>     fail the nth visit to a named durable boundary
   --test-abort-after-units <n>  abort the process after n units, to exercise restart
@@ -72,6 +90,7 @@ fn run(args: &[String]) -> i32 {
         }
     };
     match command.as_str() {
+        "plan" => command_plan(&mut flags),
         "inspect" => command_inspect(&mut flags),
         "repack" => command_repack(&mut flags),
         "verify" => command_verify(&mut flags),
@@ -92,6 +111,11 @@ struct Flags {
     selection: Option<PathBuf>,
     source_root: Option<PathBuf>,
     out: Option<PathBuf>,
+    out_selection: Option<PathBuf>,
+    out_plan: Option<PathBuf>,
+    plan: Option<PathBuf>,
+    force: bool,
+    allow_partial: bool,
     artifact: Option<PathBuf>,
     total_bytes: Option<u64>,
     header_bytes: Option<u64>,
@@ -120,6 +144,11 @@ impl Flags {
                 "--selection" => out.selection = Some(PathBuf::from(value()?)),
                 "--source-root" => out.source_root = Some(PathBuf::from(value()?)),
                 "--out" => out.out = Some(PathBuf::from(value()?)),
+                "--out-selection" => out.out_selection = Some(PathBuf::from(value()?)),
+                "--out-plan" => out.out_plan = Some(PathBuf::from(value()?)),
+                "--plan" => out.plan = Some(PathBuf::from(value()?)),
+                "--force" => out.force = true,
+                "--allow-partial" => out.allow_partial = true,
                 "--artifact" => out.artifact = Some(PathBuf::from(value()?)),
                 "--total-bytes" => out.total_bytes = Some(bytes(&value()?)?),
                 "--header-bytes" => out.header_bytes = Some(bytes(&value()?)?),
@@ -209,6 +238,160 @@ fn bytes(raw: &str) -> Result<u64, String> {
         .map_err(|_| format!("{raw:?} is not a byte count"))?;
     n.checked_mul(scale)
         .ok_or_else(|| format!("{raw:?} overflows a byte count"))
+}
+
+/// `plan` — read a checkpoint and write the selection it implies.
+///
+/// The selection exists so a conversion is explicit, not so a person has to
+/// type one: every value in it is already in the checkpoint's `config.json` and
+/// its shard headers. This reads those, writes the file, and says what it left
+/// out and why. It converts nothing.
+fn command_plan(flags: &mut Flags) -> i32 {
+    let Some(root) = flags.source_root.clone() else {
+        eprintln!("moxie-repack: plan needs --source-root");
+        return 1;
+    };
+    if flags.selection.is_some() {
+        eprintln!("moxie-repack: plan takes no --selection; it writes one");
+        return 1;
+    }
+    // Planning needs to parse headers before it can say what this checkpoint
+    // would cost, so it reads them under a bounded bootstrap allowance and then
+    // derives the real budgets from what it found.
+    let bootstrap = moxie_repack::Budgets {
+        total_bytes: 2 << 30,
+        header_bytes: 512 << 20,
+        scratch_bytes: 1 << 20,
+        chunk_file_bytes: 4 << 30,
+        disk_bytes: 1 << 30,
+    };
+    // **Never inside the source root.** A checkpoint is a read-only input, and
+    // writing a plan into one would be this program writing where it promised
+    // not to.
+    let out_selection = flags
+        .out_plan
+        .clone()
+        .or_else(|| flags.out_selection.clone())
+        .unwrap_or_else(|| {
+            let leaf = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "checkpoint".into());
+            std::path::PathBuf::from(format!("./{leaf}.plan.toml"))
+        });
+    if out_selection.exists() && !flags.force {
+        eprintln!(
+            "moxie-repack: {} already exists. Pass --force to replace it, or name another path \
+             with --out-plan",
+            out_selection.display()
+        );
+        return 1;
+    }
+
+    let result = (|| -> moxie_types::Result<(moxie_repack::discover::Discovery, String)> {
+        let mut sources = moxie_repack::open_sources(&root, &bootstrap)?;
+        let discovery = moxie_repack::discover::discover(&root, &mut sources)?;
+        let org = root
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        let leaf = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unnamed-checkpoint".into());
+        let model = match org {
+            Some(o) => format!("{o}/{leaf}"),
+            None => leaf,
+        };
+        let (revision, recorded_digests) =
+            moxie_repack::discover::recorded_provenance(&root, &discovery.files);
+        let binding = moxie_repack::discover::SourceBinding {
+            root: root.to_string_lossy().into_owned(),
+            model,
+            revision,
+            license: "see the checkpoint's own licence files".into(),
+            quantizer: match &discovery.checkpoint.quantization {
+                Some(_) => "declared-by-the-checkpoint".into(),
+                None => "none-the-source-is-bf16".into(),
+            },
+            tokenizer: moxie_repack::discover::asset_identity(&root, "tokenizer.json"),
+            template: moxie_repack::discover::asset_identity(&root, "chat_template.jinja"),
+            recorded_digests,
+            // Derived from the checkpoint, and overridden by any flag the user
+            // gave: explicit always wins over automatic.
+            options: flags
+                .budgets()
+                .unwrap_or_else(|_| moxie_repack::discover::automatic_budgets(&discovery)),
+        };
+        let text = moxie_repack::discover::to_plan_toml(&discovery, &binding)?;
+        Ok((discovery, text))
+    })();
+
+    match result {
+        Ok((discovery, text)) => {
+            println!("architecture: {}", discovery.checkpoint.architecture);
+            println!("shards-read: {}", discovery.files.len());
+            println!("modules: {}", discovery.modules.len());
+            println!("bf16-tensors: {}", discovery.bf16.len());
+            println!("selected: {}", discovery.selected());
+            println!("skipped: {}", discovery.skipped.len());
+            println!("selection-bytes: {}", text.len());
+            // Parsed back before it is offered: a selection this program could
+            // not read is not a selection, and finding that out at repack time
+            // would waste the user's next command.
+            if let Err(e) = moxie_format::selection::parse(&text) {
+                println!("outcome: refused");
+                eprintln!("moxie-repack: the generated selection does not parse: {e}");
+                return 2;
+            }
+            // Published by rename: a plan is either the whole document or it
+            // is not there, never a half-written file a second command would
+            // read.
+            let staging = out_selection.with_extension("toml.partial");
+            if let Err(e) = std::fs::write(&staging, &text)
+                .and_then(|()| std::fs::rename(&staging, &out_selection))
+            {
+                let _ = std::fs::remove_file(&staging);
+                println!("outcome: refused");
+                eprintln!(
+                    "moxie-repack: cannot write {}: {e}",
+                    out_selection.display()
+                );
+                return 2;
+            }
+            println!("outcome: planned");
+            println!("selection: {}", out_selection.display());
+            match &discovery.checkpoint.quantization {
+                Some(q) => println!(
+                    "quantization: {}-bit, {:?}, {:?}",
+                    q.bits, q.granularity, q.zero_points
+                ),
+                None => println!("quantization: none declared; BF16 tensors only"),
+            }
+            for (what, why) in discovery.skipped.iter().take(20) {
+                println!("  skipped {what}: {why}");
+            }
+            if discovery.skipped.len() > 20 {
+                println!(
+                    "  ... and {} more, all in the file",
+                    discovery.skipped.len() - 20
+                );
+            }
+            println!();
+            println!("Read it, edit it if you want, then:");
+            println!(
+                "  moxie-repack repack --selection {} --source-root {} --out <dir> <budgets>",
+                out_selection.display(),
+                root.display()
+            );
+            0
+        }
+        Err(e) => {
+            println!("outcome: refused");
+            eprintln!("moxie-repack: {e}");
+            2
+        }
+    }
 }
 
 fn command_inspect(flags: &mut Flags) -> i32 {
@@ -324,21 +507,80 @@ fn print_inspect(r: &InspectReport, budgets: &Budgets) {
 }
 
 fn command_repack(flags: &mut Flags) -> i32 {
-    let (Some(selection_path), Some(root), Some(out)) = (
-        flags.selection.clone(),
-        flags.source_root.clone(),
-        flags.out.clone(),
-    ) else {
-        eprintln!("moxie-repack: repack needs --selection, --source-root and --out");
-        return 1;
-    };
-    let budgets = match flags.budgets() {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("moxie-repack: {e}");
+    // Two ways in. `--plan` is the normal one: the plan carries where its
+    // checkpoint is and what it resolved, so neither is asked for twice.
+    // `--selection` with explicit flags is the advanced one, unchanged.
+    let from_plan = flags.plan.is_some();
+    let selection_path = match (flags.plan.clone(), flags.selection.clone()) {
+        (Some(_), Some(_)) => {
+            eprintln!("moxie-repack: pass --plan or --selection, not both");
+            return 1;
+        }
+        (Some(p), None) | (None, Some(p)) => p,
+        (None, None) => {
+            eprintln!(
+                "moxie-repack: repack needs --plan <file> --out <dir>\n\
+                 \n\
+                 Generate a plan first:\n\
+                 \x20 moxie-repack plan --source-root <checkpoint> --out-plan <file>"
+            );
             return 1;
         }
     };
+    let Some(out) = flags.out.clone() else {
+        eprintln!("moxie-repack: repack needs --out <dir>");
+        return 1;
+    };
+    let plan_text = match std::fs::read_to_string(&selection_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "moxie-repack: cannot read {}: {e}",
+                selection_path.display()
+            );
+            return 1;
+        }
+    };
+    // The plan's root, unless the command line names one: explicit wins.
+    let root = match flags.source_root.clone() {
+        Some(r) => r,
+        None => match moxie_format::plan::source_root(&plan_text) {
+            Ok(Some(r)) => PathBuf::from(r),
+            _ => {
+                eprintln!(
+                    "moxie-repack: this document records no source root, so --source-root is \
+                     needed. A plan from `moxie-repack plan` carries one"
+                );
+                return 1;
+            }
+        },
+    };
+    // The plan's resolved options, unless flags override them: explicit wins,
+    // and the run prints what it used either way.
+    let budgets = match flags.budgets() {
+        Ok(b) => b,
+        Err(flag_error) => match moxie_format::plan::resolved_options(&plan_text) {
+            Ok(Some([total, header, scratch, chunk, disk])) => moxie_repack::Budgets {
+                total_bytes: total,
+                header_bytes: header,
+                scratch_bytes: scratch as usize,
+                chunk_file_bytes: chunk,
+                disk_bytes: disk,
+            },
+            _ => {
+                eprintln!("moxie-repack: {flag_error}");
+                return 1;
+            }
+        },
+    };
+    println!(
+        "settings: total={} header={} scratch={} shard-max={} disk={}",
+        budgets.total_bytes,
+        budgets.header_bytes,
+        budgets.scratch_bytes,
+        budgets.chunk_file_bytes,
+        budgets.disk_bytes
+    );
     let faults = flags.faults();
     let options = Options {
         take_over_interrupted_run: flags.take_over,
@@ -353,6 +595,29 @@ fn command_repack(flags: &mut Flags) -> i32 {
 
     let result = (|| {
         let selection = moxie_repack::read_selection(&selection_path)?;
+        // **A partial conversion is not a model.** The normal path refuses one,
+        // because an artifact missing tensors that opens and verifies is the
+        // most expensive kind of wrong. Converting a subset on purpose stays
+        // available and has to be asked for.
+        // **Only on the generated path.** `--plan` means "convert this model",
+        // so a plan that does not cover it is refused. A hand-written selection
+        // that declares `status = "partial"` is already a deliberate subset --
+        // the person wrote that line -- and refusing it would break the
+        // explicit path this flag exists to preserve.
+        if from_plan
+            && let moxie_format::selection::Completeness::Partial { missing } =
+                &selection.completeness
+            && !flags.allow_partial
+        {
+            let shown: Vec<&str> = missing.iter().take(3).map(String::as_str).collect();
+            return Err(moxie_types::Error::InvalidArtifact {
+                detail: format!(
+                    "this plan is partial: {} tensor(s) are not covered, starting with {shown:?}.                      A partial artifact opens for inspection and refuses every read, so it is not                      a model. Pass --allow-partial to convert the covered subset deliberately",
+                    missing.len()
+                )
+                .into(),
+            });
+        }
         let mut sources = moxie_repack::open_sources(&root, &budgets)?;
         let mut ledger = moxie_repack::ledger_for(&budgets)?;
         let mut progress = |line: &str| {

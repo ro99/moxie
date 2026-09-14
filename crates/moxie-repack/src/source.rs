@@ -154,6 +154,39 @@ impl Sources {
         Ok(shard.header().tensors().contains_key(name))
     }
 
+    /// The serialized length of a shard's header.
+    ///
+    /// What an automatic header budget has to admit the parse of.
+    pub fn header_bytes(&mut self, file: &str) -> Result<u64> {
+        let shard = self.shard(file)?;
+        Ok(shard.header().payload_start.saturating_sub(8))
+    }
+
+    /// Every tensor a shard declares, with its dtype and its byte length.
+    pub fn header_entries_sized(&mut self, file: &str) -> Result<Vec<(String, Dtype, u64)>> {
+        let shard = self.shard(file)?;
+        Ok(shard
+            .header()
+            .tensors()
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.dtype, entry.len()))
+            .collect())
+    }
+
+    /// Every tensor a shard declares, with its dtype.
+    ///
+    /// What a generated selection is built from: which tensors exist and where
+    /// they are. Headers only -- no payload is read.
+    pub fn header_entries(&mut self, file: &str) -> Result<Vec<(String, Dtype)>> {
+        let shard = self.shard(file)?;
+        Ok(shard
+            .header()
+            .tensors()
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.dtype))
+            .collect())
+    }
+
     /// One tensor's full header entry, for the shared validation the
     /// single-header resolver applies.
     pub fn raw_entry(&mut self, file: &str, name: &str) -> Result<TensorEntry> {

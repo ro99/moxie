@@ -1,6 +1,10 @@
 # Documentation placement contract
 
-Two categories, with different version-control treatment.
+Three categories, with different version-control treatment.
+
+**User documentation** — how to operate what this repository builds. Written for
+someone using a program rather than changing it. Tracked. Today that is
+[repack-guide.md](repack-guide.md); the rest of the table is the record system.
 
 **Reference documents** — the normative specification. They describe contracts that were decided
 before implementation and change rarely. Kept local, **not tracked**, at the owner's direction.
@@ -22,6 +26,7 @@ operative instructions living only in an ignored directory.
 | `evidence/support-matrix.md` | Capability claims linked to passing gate IDs | [SUPPORT-MATRIX.md](spec/templates/SUPPORT-MATRIX.md) | yes |
 | `evidence/benchmarks/` | Benchmark manifests and result summaries | — | yes |
 | `evidence/experiments/` | Accepted **and rejected** experiment conclusions | — | yes |
+| `repack-guide.md` | **User documentation** for `moxie-repack`: how to run it, every selection field, the budgets, outcomes, resuming, what is supported, what each refusal means | — | yes |
 | `engineering-log.md` | Lessons carried forward: what went wrong, the fix, and the shape worth remembering. **Not policy and not authoritative** — the task record is | — | yes |
 
 ## Rules

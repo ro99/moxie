@@ -1,5 +1,13 @@
 # ADR 0021 — Repack is a Moxie program, not an external script
 
+> **Superseded in part by [ADR 0027](0027-repacking-is-provisional-pending-measured-inference-benefit.md) (2026-09-14).**
+> Repack remains a Moxie program the user runs offline. What changed is its
+> **justification and mandatory nature**: the step is provisional until it shows
+> measured inference benefit, and the "every budget required on the command line"
+> clause is replaced by automatic defaults with explicit overrides
+> ([ADR 0026](0026-generated-plans-and-automatic-budgets.md)). The text below stands as written.
+
+
 - ID / date / author / status: 0021 / 2026-09-13 / owner-directed correction, recorded by implementation agent / adopted.
 - Classification: owner requirement (correction to how O5 was recorded). It changes no catalog, precision, quality, or storage-authorization substance.
 - Scope and owning shared component: `moxie-format` / `moxie-storage` (repack logic, manifest, chunk writing/reading); O5 gate text; the active `AGENTS.md` paragraph; the `laguna.md` O5 row. It names **no binary or crate placement** — that is open for the engineer lead (see the companion handover).

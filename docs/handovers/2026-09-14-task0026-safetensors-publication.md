@@ -96,6 +96,23 @@ boundary set that safetensors grew from 17 named durable boundaries to 20.
   nothing is converted, and the transitional read path expires at M11 item 4 or
   earlier if a task shows no v1 artifact exists outside tests.
 
+## Status correction, 2026-09-14: this work is provisional
+
+**Offline repacking is provisional** ([ADR 0027](../decisions/adr/0027-repacking-is-provisional-pending-measured-inference-benefit.md)).
+The owner's requirement is that it brings **worthwhile inference performance
+improvements**. No such measurement exists, and none is runnable until shared
+execution does.
+
+Nothing in this handover — the schema, the reference-reader conformance, the
+byte guarantees, the enumeration — is evidence about inference speed. All of it
+is evidence about bytes and structure. Retention of the step is decided by
+[experiment 0007](../evidence/experiments/0007-offline-versus-load-time-preparation.md),
+whose criterion is predeclared and whose outcomes are fixed in advance.
+
+The correctness obligations here are **unchanged** by that status: provisional
+is not a waiver, and the outstanding review corrections are part of the bounded
+scope in [task 0027](../tasks/0027-m3-generated-plans-and-automatic-budgets.md).
+
 ## What is not measured
 
 **The mutation battery has not been run against the second review's
@@ -130,9 +147,12 @@ below describe this tree.
 
 ## Next task
 
-**M3 item 3 — shared W4A16/W8A16 dense and expert paths**, unchanged from task
-0025's handover, and now with a canonical artifact in a format the ecosystem
-reads to execute from. Document 03 bounds it before it starts: weight-only
+**M3 shared W4A16/W8A16 execution**, after task 0027's bounded CLI scope is
+validated and handed over — a sequencing recommendation, not an owner
+requirement, and not a licence to close M3 or begin unlimited runtime work. It
+is also what makes [experiment 0007](../evidence/experiments/0007-offline-versus-load-time-preparation.md)
+runnable, which is what decides whether the work in this handover is retained at
+all. Document 03 bounds it before it starts: weight-only
 paths, BF16 preferred with FP32 accumulation, SM86 first and SM120 qualified
 separately, and bounded reference dequantization is not an acceptable final
 fast path by assertion.

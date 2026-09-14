@@ -924,3 +924,492 @@ fn hashing_a_source_that_grew_refuses_instead_of_hashing_a_prefix() {
         "the refusal does not name the length it would have hashed to: {e}"
     );
 }
+
+/// An interruption during journal compaction leaves a resumable destination.
+///
+/// Compaction used to truncate the only journal and rewrite it in place, so a
+/// failure between the two left staged shards with no binding to say whose they
+/// were: `begin` then refused the destination as one it had not created, with
+/// takeover enabled or not. Independent review reproduced both reachable
+/// states. The journal is a replacement and a rename now, so at every instant
+/// it is one of two complete documents.
+#[test]
+fn an_interrupted_compaction_still_resumes() {
+    for site in [
+        moxie_repack::write::Site::JournalCompactWrite,
+        moxie_repack::write::Site::JournalCompactSync,
+        moxie_repack::write::Site::JournalCompactPublish,
+    ] {
+        let scratch = Scratch::new(&format!("compaction-{}", site.name()));
+        let src = scratch.join("src");
+        std::fs::create_dir_all(&src).expect("a source directory");
+        let values = 4096usize;
+        write_shard(
+            &src.join("s.safetensors"),
+            &[Entry::new(
+                "model.norm.weight",
+                "BF16",
+                vec![values as u64],
+                bf16_bytes(1.0).repeat(values),
+            )],
+        );
+        let selection_path = scratch.join("selection.toml");
+        SelectionBuilder::new("compaction")
+            .bf16("model.norm.weight", "model.norm.weight", "s.safetensors")
+            .write(&selection_path);
+        let selection = moxie_repack::read_selection(&selection_path).expect("it parses");
+        let budgets = budgets(1 << 10);
+        let out = scratch.join("out");
+
+        // Stop part-way, so there is a journal to compact.
+        let mut sources = moxie_repack::open_sources(&src, &budgets).expect("sources");
+        let mut ledger = moxie_repack::ledger_for(&budgets).expect("a ledger");
+        let units = std::cell::Cell::new(0usize);
+        let stop = || units.get() > 4;
+        moxie_repack::repack(
+            &selection,
+            &mut sources,
+            &out,
+            &budgets,
+            &Options::default(),
+            &Faults::none(),
+            &stop,
+            &mut ledger,
+            &mut |line: &str| {
+                if line.starts_with("unit ") {
+                    units.set(units.get() + 1);
+                }
+            },
+        )
+        .expect("cancellation is not an error");
+
+        // Fail inside compaction, on the resume.
+        let mut sources = moxie_repack::open_sources(&src, &budgets).expect("sources");
+        let mut ledger = moxie_repack::ledger_for(&budgets).expect("a ledger");
+        let faults = Faults::none().fail_at(site, 1);
+        let interrupted = moxie_repack::repack(
+            &selection,
+            &mut sources,
+            &out,
+            &budgets,
+            &Options {
+                take_over_interrupted_run: true,
+            },
+            &faults,
+            &|| false,
+            &mut ledger,
+            &mut |_| {},
+        );
+        assert!(
+            interrupted.is_err(),
+            "failing at {} did not fail the run",
+            site.name()
+        );
+        assert!(faults.all_fired(), "{} never fired", site.name());
+        assert!(ledger.outstanding().is_empty());
+
+        // **And the destination is inside its disk budget at that moment.**
+        // Compaction holds the original and its replacement at once;
+        // independent review measured 326,868 retained bytes against a 250,000
+        // byte budget, because the plan reserved one journal and the run wrote
+        // two.
+        let retained: u64 = std::fs::read_dir(&out)
+            .expect("the destination reads")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        assert!(
+            retained <= budgets.disk_bytes,
+            "failing at {} left {retained} byte(s) against a {}-byte disk budget",
+            site.name(),
+            budgets.disk_bytes
+        );
+
+        // And the destination is still ours to finish.
+        let mut sources = moxie_repack::open_sources(&src, &budgets).expect("sources");
+        let mut ledger = moxie_repack::ledger_for(&budgets).expect("a ledger");
+        let report = moxie_repack::repack(
+            &selection,
+            &mut sources,
+            &out,
+            &budgets,
+            &Options {
+                take_over_interrupted_run: true,
+            },
+            &Faults::none(),
+            &|| false,
+            &mut ledger,
+            &mut |_| {},
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "a destination interrupted at {} cannot be resumed: {e}",
+                site.name()
+            )
+        });
+        assert!(
+            matches!(report.outcome, Outcome::Published { .. }),
+            "resuming after {} gave {:?}",
+            site.name(),
+            report.outcome
+        );
+        assert!(
+            !out.join(".moxie-repack-journal-new").exists(),
+            "a leftover journal replacement survived the run that followed {}",
+            site.name()
+        );
+    }
+}
+
+/// A **fresh** run clears a leftover replacement it finds.
+///
+/// This is where the cleanup is observable. A resuming run compacts, and
+/// compaction truncates and rewrites the replacement anyway, so not removing it
+/// first changes nothing there. A run that never compacts is the case that
+/// exposes it -- and a leftover left lying in a destination counts against the
+/// disk budget the next plan is checked against.
+#[test]
+fn a_fresh_run_clears_a_leftover_journal_replacement() {
+    let scratch = Scratch::new("fresh-leftover");
+    let src = scratch.join("src");
+    std::fs::create_dir_all(&src).expect("a source directory");
+    write_shard(
+        &src.join("s.safetensors"),
+        &[Entry::new(
+            "model.norm.weight",
+            "BF16",
+            vec![512],
+            bf16_bytes(1.0).repeat(512),
+        )],
+    );
+    let selection_path = scratch.join("selection.toml");
+    SelectionBuilder::new("fresh-leftover")
+        .bf16("model.norm.weight", "model.norm.weight", "s.safetensors")
+        .write(&selection_path);
+    let selection = moxie_repack::read_selection(&selection_path).expect("it parses");
+    let budgets = budgets(1 << 10);
+    let out = scratch.join("out");
+    std::fs::create_dir_all(&out).expect("the destination");
+
+    // What an interruption between the write and the rename leaves behind, in a
+    // destination with no journal: nothing here is resuming anything.
+    let leftover = out.join(".moxie-repack-journal-new");
+    std::fs::write(&leftover, vec![b'x'; 64 * 1024]).expect("the leftover writes");
+
+    let mut sources = moxie_repack::open_sources(&src, &budgets).expect("sources");
+    let mut ledger = moxie_repack::ledger_for(&budgets).expect("a ledger");
+    let report = moxie_repack::repack(
+        &selection,
+        &mut sources,
+        &out,
+        &budgets,
+        &Options::default(),
+        &Faults::none(),
+        &|| false,
+        &mut ledger,
+        &mut |_| {},
+    )
+    .expect("a leftover replacement does not block a fresh run");
+    assert!(
+        matches!(report.outcome, Outcome::Published { .. }),
+        "{:?}",
+        report.outcome
+    );
+    assert!(
+        !leftover.exists(),
+        "a fresh run left someone's interrupted replacement in the destination"
+    );
+    assert!(ledger.outstanding().is_empty());
+}
+
+/// A leftover replacement from an interrupted compaction is cleared, and does
+/// not count against the destination twice.
+///
+/// The file accounts for nothing -- the journal beside it is authoritative
+/// whichever side of the rename the interruption fell on -- so a run that finds
+/// one removes it before planning around the disk it holds.
+#[test]
+fn a_leftover_journal_replacement_is_cleared_before_planning() {
+    let scratch = Scratch::new("leftover-replacement");
+    let src = scratch.join("src");
+    std::fs::create_dir_all(&src).expect("a source directory");
+    let values = 4096usize;
+    write_shard(
+        &src.join("s.safetensors"),
+        &[Entry::new(
+            "model.norm.weight",
+            "BF16",
+            vec![values as u64],
+            bf16_bytes(1.0).repeat(values),
+        )],
+    );
+    let selection_path = scratch.join("selection.toml");
+    SelectionBuilder::new("leftover")
+        .bf16("model.norm.weight", "model.norm.weight", "s.safetensors")
+        .write(&selection_path);
+    let selection = moxie_repack::read_selection(&selection_path).expect("it parses");
+    let budgets = budgets(1 << 10);
+    let out = scratch.join("out");
+
+    let mut sources = moxie_repack::open_sources(&src, &budgets).expect("sources");
+    let mut ledger = moxie_repack::ledger_for(&budgets).expect("a ledger");
+    let units = std::cell::Cell::new(0usize);
+    let stop = || units.get() > 4;
+    moxie_repack::repack(
+        &selection,
+        &mut sources,
+        &out,
+        &budgets,
+        &Options::default(),
+        &Faults::none(),
+        &stop,
+        &mut ledger,
+        &mut |line: &str| {
+            if line.starts_with("unit ") {
+                units.set(units.get() + 1);
+            }
+        },
+    )
+    .expect("cancellation is not an error");
+
+    // What an interruption between the write and the rename leaves behind.
+    let leftover = out.join(".moxie-repack-journal-new");
+    std::fs::write(&leftover, vec![b'x'; 128 * 1024]).expect("the leftover writes");
+
+    let mut sources = moxie_repack::open_sources(&src, &budgets).expect("sources");
+    let mut ledger = moxie_repack::ledger_for(&budgets).expect("a ledger");
+    let report = moxie_repack::repack(
+        &selection,
+        &mut sources,
+        &out,
+        &budgets,
+        &Options {
+            take_over_interrupted_run: true,
+        },
+        &Faults::none(),
+        &|| false,
+        &mut ledger,
+        &mut |_| {},
+    )
+    .expect("a leftover replacement does not block a resume");
+    assert!(
+        matches!(report.outcome, Outcome::Published { .. }),
+        "{:?}",
+        report.outcome
+    );
+    assert!(!leftover.exists(), "the leftover replacement survived");
+    assert!(ledger.outstanding().is_empty());
+}
+
+/// A **refused** resume does not clear the leftover either.
+///
+/// Cleanup used to run before the journal's binding was checked, so a resume
+/// with a different plan was correctly refused **after** deleting a file that
+/// was not its to delete. Ownership first, mutation second -- the same rule the
+/// header pass and the tear repair already follow.
+#[test]
+fn a_refused_resume_leaves_the_leftover_replacement_alone() {
+    let scratch = Scratch::new("refused-leftover");
+    let src = scratch.join("src");
+    std::fs::create_dir_all(&src).expect("a source directory");
+    write_shard(
+        &src.join("s.safetensors"),
+        &[Entry::new(
+            "model.norm.weight",
+            "BF16",
+            vec![8192],
+            bf16_bytes(1.0).repeat(8192),
+        )],
+    );
+    let selection_path = scratch.join("selection.toml");
+    SelectionBuilder::new("refused-leftover")
+        .bf16("model.norm.weight", "model.norm.weight", "s.safetensors")
+        .write(&selection_path);
+    let selection = moxie_repack::read_selection(&selection_path).expect("it parses");
+    let budgets = budgets(1 << 10);
+    let out = scratch.join("out");
+
+    let mut sources = moxie_repack::open_sources(&src, &budgets).expect("sources");
+    let mut ledger = moxie_repack::ledger_for(&budgets).expect("a ledger");
+    let units = std::cell::Cell::new(0usize);
+    let stop = || units.get() > 2;
+    moxie_repack::repack(
+        &selection,
+        &mut sources,
+        &out,
+        &budgets,
+        &Options::default(),
+        &Faults::none(),
+        &stop,
+        &mut ledger,
+        &mut |line: &str| {
+            if line.starts_with("unit ") {
+                units.set(units.get() + 1);
+            }
+        },
+    )
+    .expect("cancellation is not an error");
+    assert!(
+        !out.join("manifest.toml").exists(),
+        "the first run published, so there is nothing to resume"
+    );
+
+    let leftover = out.join(".moxie-repack-journal-new");
+    std::fs::write(&leftover, b"not this run's").expect("the leftover writes");
+    let before: BTreeMap<String, Vec<u8>> = std::fs::read_dir(&out)
+        .expect("the destination reads")
+        .map(|e| {
+            let p = e.expect("an entry").path();
+            (
+                p.file_name()
+                    .expect("a name")
+                    .to_string_lossy()
+                    .into_owned(),
+                std::fs::read(&p).expect("a file"),
+            )
+        })
+        .collect();
+
+    // A different output plan, with the source still resolvable.
+    let other = scratch.join("other.toml");
+    let text = std::fs::read_to_string(&selection_path).expect("it reads");
+    let patched = text.replacen(
+        "role = \"model.norm.weight\"",
+        "role = \"model.norm.renamed\"",
+        1,
+    );
+    assert_ne!(patched, text, "the role line was not found");
+    std::fs::write(&other, patched).expect("written");
+    let other_selection = moxie_repack::read_selection(&other).expect("it parses");
+
+    let mut sources = moxie_repack::open_sources(&src, &budgets).expect("sources");
+    let mut ledger = moxie_repack::ledger_for(&budgets).expect("a ledger");
+    let e = moxie_repack::repack(
+        &other_selection,
+        &mut sources,
+        &out,
+        &budgets,
+        &Options {
+            take_over_interrupted_run: true,
+        },
+        &Faults::none(),
+        &|| false,
+        &mut ledger,
+        &mut |_| {},
+    )
+    .expect_err("a different plan is a refusal");
+    assert!(
+        e.to_string().contains("bound to a different plan"),
+        "the refusal is not the binding check: {e}"
+    );
+
+    let after: BTreeMap<String, Vec<u8>> = std::fs::read_dir(&out)
+        .expect("the destination reads")
+        .map(|e| {
+            let p = e.expect("an entry").path();
+            (
+                p.file_name()
+                    .expect("a name")
+                    .to_string_lossy()
+                    .into_owned(),
+                std::fs::read(&p).expect("a file"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "a refused resume changed which files the destination holds"
+    );
+    for (name, bytes) in &before {
+        assert_eq!(
+            bytes,
+            after.get(name).expect("the same file"),
+            "a refused resume rewrote '{name}'"
+        );
+    }
+    assert!(ledger.outstanding().is_empty());
+}
+
+/// A role whose escaped form is larger than the role is **refused at planning**.
+///
+/// Journal sizing used the decoded role length while the journal stores the
+/// escaped one. Independent review used a role of 1,000 escaped NULs to write a
+/// 17,517,998-byte journal inside an admitted run, which the next invocation
+/// could not read back.
+///
+/// The arithmetic itself is checked in `moxie-format`, against `unit_line`
+/// directly. This is the end-to-end half, and it requires a **specific**
+/// outcome: a refusal naming the journal, before any payload work. Accepting
+/// "refused or published" was how the targeted mutation survived -- with the
+/// sizing wrong the run publishes, and a test that tolerates both sees nothing.
+#[test]
+fn a_role_whose_escaped_form_overruns_the_journal_is_refused_at_planning() {
+    let scratch = Scratch::new("escaped-role");
+    let src = scratch.join("src");
+    std::fs::create_dir_all(&src).expect("a source directory");
+    // A backslash is one byte in a name and two in the journal. With enough
+    // units, that difference is the difference between a plan that fits under
+    // the journal's cap and one that does not.
+    let role: String = std::iter::repeat_n('\\', 900).collect();
+    assert_eq!(
+        moxie_format::journal::escaped_len(&role),
+        1_800,
+        "this role does not reproduce the finding"
+    );
+    // Sized so the **decoded** estimate fits under the journal's cap and the
+    // escaped one does not -- 13.5 MB against 22.1 MB, either side of 16.8 MB.
+    // Without that separation both spellings refuse and the test cannot tell
+    // which arithmetic produced the refusal.
+    let values = 2_426_112usize;
+    write_shard(
+        &src.join("s.safetensors"),
+        &[Entry::new(
+            "plain.weight",
+            "BF16",
+            vec![values as u64],
+            bf16_bytes(1.0).repeat(values),
+        )],
+    );
+    let selection_path = scratch.join("selection.toml");
+    let placeholder = "ROLE-PLACEHOLDER";
+    let text = SelectionBuilder::new("escaped-role")
+        .bf16(placeholder, "plain.weight", "s.safetensors")
+        .text()
+        .replace(placeholder, &"\\\\".repeat(900));
+    std::fs::write(&selection_path, &text).expect("the selection writes");
+    let selection = moxie_repack::read_selection(&selection_path).expect("it parses");
+
+    let budgets = moxie_repack::Budgets {
+        total_bytes: 512 << 20,
+        header_bytes: 4 << 20,
+        scratch_bytes: 1 << 10,
+        chunk_file_bytes: 256 << 20,
+        disk_bytes: 256 << 20,
+    };
+    let out = scratch.join("out");
+    let mut sources = moxie_repack::open_sources(&src, &budgets).expect("sources");
+    let mut ledger = moxie_repack::ledger_for(&budgets).expect("a ledger");
+    let e = moxie_repack::repack(
+        &selection,
+        &mut sources,
+        &out,
+        &budgets,
+        &Options::default(),
+        &Faults::none(),
+        &|| false,
+        &mut ledger,
+        &mut |_| {},
+    )
+    .expect_err("a journal nobody can read back is not a plan");
+    assert!(
+        e.to_string().contains("journal byte"),
+        "the refusal does not name the journal cap: {e}"
+    );
+    assert!(
+        !out.join("manifest.toml").exists(),
+        "it published despite a journal it could not read back"
+    );
+    assert!(ledger.outstanding().is_empty());
+}

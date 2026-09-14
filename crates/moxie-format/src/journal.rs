@@ -340,6 +340,23 @@ fn integer_field(value: &toml::Value, field: &str) -> Result<u64> {
 /// arbitrary text, which is why this exists at all. It is not a general
 /// serializer; `journal_lines_round_trip` is what keeps it honest, including
 /// for roles carrying quotes, backslashes and control characters.
+/// How many bytes `s` occupies **after** escaping.
+///
+/// A caller sizing a journal has to count what gets written, not what it was
+/// given: a control character becomes `\uXXXX`, six bytes for one. Independent
+/// review used a valid role of 1,000 escaped NULs to turn an estimated record
+/// into a 6,268-byte one and overran both the staging allowance and the
+/// reader's own cap.
+pub fn escaped_len(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' => 2,
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => 6,
+            c => c.len_utf8(),
+        })
+        .sum()
+}
+
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -356,6 +373,60 @@ fn escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod escaping_tests {
+    use super::*;
+
+    /// `escaped_len` bounds what a record actually costs.
+    ///
+    /// The journal's sizing is built on this. Independent review found the
+    /// bound using the **decoded** length while the file stores the escaped
+    /// one: a role of 1,000 control characters produced records roughly six
+    /// times their estimate, overran the staging allowance, and wrote a journal
+    /// the reader's own cap refused to reopen.
+    #[test]
+    fn escaped_len_is_what_a_record_costs() {
+        for role in [
+            "plain.role.weight",
+            "with\"quote",
+            "with\\backslash",
+            "with\nnewline",
+            "with\u{1}control",
+            &"\u{0}".repeat(1_000),
+            "unicode-\u{4e16}\u{754c}",
+        ] {
+            let escaped = escape(role);
+            assert_eq!(
+                escaped_len(role),
+                escaped.len(),
+                "escaped_len disagrees with escape for {role:?}"
+            );
+            // And the whole record is the names plus a bounded remainder.
+            let unit = CompletedUnit {
+                tensor: role.to_string(),
+                index: 0,
+                chunk: "model-00001-of-00001.safetensors".into(),
+                offset: 0,
+                len: 0,
+                sha256: "0".repeat(64),
+                source_sha256: "0".repeat(64),
+            };
+            let line = unit_line(&unit);
+            assert!(
+                line.len() >= escaped_len(role),
+                "a record is at least its escaped name"
+            );
+            assert!(
+                line.len() <= escaped_len(role) + escaped_len(&unit.chunk) + 384,
+                "a {}-byte record for a {}-byte escaped name is outside the fixed remainder \
+                 the sizing assumes",
+                line.len(),
+                escaped_len(role)
+            );
+        }
+    }
 }
 
 #[cfg(test)]

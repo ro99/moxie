@@ -44,6 +44,12 @@ pub enum Site {
     ChunkSync,
     /// Reading staged bytes back, on resume or for a rehash.
     ChunkReadBack,
+    /// Writing the compacted journal to its replacement file.
+    JournalCompactWrite,
+    /// Syncing that replacement before it is put in place.
+    JournalCompactSync,
+    /// The rename that makes the compacted journal the journal.
+    JournalCompactPublish,
     /// Writing the staged manifest.
     ManifestWrite,
     /// Syncing the staged manifest.
@@ -78,6 +84,9 @@ impl Site {
         Site::ChunkWrite,
         Site::ChunkSync,
         Site::ChunkReadBack,
+        Site::JournalCompactWrite,
+        Site::JournalCompactSync,
+        Site::JournalCompactPublish,
         Site::ManifestWrite,
         Site::ManifestSync,
         Site::Validate,
@@ -102,6 +111,9 @@ impl Site {
             Site::ChunkWrite => "chunk-write",
             Site::ChunkSync => "chunk-sync",
             Site::ChunkReadBack => "chunk-read-back",
+            Site::JournalCompactWrite => "journal-compact-write",
+            Site::JournalCompactSync => "journal-compact-sync",
+            Site::JournalCompactPublish => "journal-compact-publish",
             Site::ManifestWrite => "manifest-write",
             Site::ManifestSync => "manifest-sync",
             Site::Validate => "validate",
