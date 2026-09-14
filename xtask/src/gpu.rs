@@ -85,6 +85,7 @@ const CASES: &[&str] = &[
     "concurrent_handoff_is_exclusive",
     "measurement_is_live",
     "grouped_expert_mlp",
+    "affine_linear_w4a16_w8a16",
 ];
 
 /// Run every GPU case on every visible device.
@@ -216,6 +217,7 @@ pub fn run(profile: Option<&str>) -> i32 {
         ));
         results.push(case(&cap, "measurement_is_live", measurement_is_live(&cap)));
         results.push(case(&cap, "grouped_expert_mlp", grouped_expert_mlp(&cap)));
+        results.push(case(&cap, "affine_linear_w4a16_w8a16", affine_linear(&cap)));
     }
 
     println!("\n--- results ---");
@@ -2389,5 +2391,218 @@ mod task_0012_negative_fixtures {
             &residual_bounds,
             None,
         ));
+    }
+}
+
+/// Task 0028: the shared quantized linear, qualified per architecture.
+///
+/// One symbol, two widths, two group rules and both zero-point modes, against
+/// task 0024's decoder on the host. The weights and activations are written
+/// here: this qualifies a **kernel**, and is not model support or a quality
+/// claim of any kind.
+///
+/// The executor's own device test covers admission, residency and the memory
+/// bound. What this case adds is the thing document 07 asks this lane for --
+/// a per-architecture pass or a recorded absence, with no way for an SM86 run
+/// to stand in for SM120.
+fn affine_linear(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    use moxie_format::affine::{
+        AffineDescriptor, AffineTensor, Grouping, IntWidth, ZeroPoints, pack_row,
+    };
+    use moxie_format::scale::{ScaleDtype, ScaleValues};
+    use moxie_kernels::cpu_expert::{bf16_round, to_bf16_bits};
+
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let stream = Stream::new(&ctx)?;
+    let module = Module::load(
+        &ctx,
+        ModuleImage::Binary(smoke_image(moxie_kernels::AFFINE_LINEAR_FATBIN)?),
+    )?;
+    let kernel = module.function(moxie_kernels::AFFINE_LINEAR)?;
+
+    let mut state = 0x0028_0028u64;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 40) as f32) / ((1u32 << 24) as f32)
+    };
+
+    let mut compared = 0usize;
+    for (width, group, asymmetric, rows, out_features, in_features) in [
+        (IntWidth::Int4, 32u32, true, 5usize, 48usize, 100usize),
+        (IntWidth::Int8, 128, false, 3, 32, 300),
+    ] {
+        let descriptor = AffineDescriptor {
+            width,
+            out_features,
+            in_features,
+            grouping: Grouping::Contiguous { size: group },
+            group_index: None,
+            scale_dtype: ScaleDtype::Bf16,
+        };
+        let (lo, hi) = width.code_range();
+        let span = (hi - lo + 1) as usize;
+        let mut codes = Vec::new();
+        for o in 0..out_features {
+            let row: Vec<i32> = (0..in_features)
+                .map(|k| lo + ((o * in_features + k) % span) as i32)
+                .collect();
+            codes.extend_from_slice(&pack_row(width, &row).map_err(numerical)?);
+        }
+        let entries = descriptor.group_entries().map_err(numerical)?;
+        let scales: Vec<u16> = (0..entries)
+            .map(|_| to_bf16_bits(0.01 + next() * 0.05))
+            .collect();
+        let zero_points = if asymmetric {
+            ZeroPoints::PerGroup(
+                (0..entries)
+                    .map(|i| (lo + ((i * 5) % span) as i32) as i16)
+                    .collect(),
+            )
+        } else {
+            ZeroPoints::Symmetric
+        };
+        let tensor = AffineTensor::new(
+            descriptor,
+            codes,
+            ScaleValues::Bf16(scales.clone()),
+            zero_points.clone(),
+        )
+        .map_err(numerical)?;
+
+        let x: Vec<f32> = (0..rows * in_features)
+            .map(|_| bf16_round(next() - 0.5))
+            .collect();
+        let mut d_x = DeviceBuffer::alloc(&ctx, rows * in_features * 2)?;
+        d_x.copy_from_host(
+            &x.iter()
+                .flat_map(|v| to_bf16_bits(*v).to_le_bytes())
+                .collect::<Vec<_>>(),
+        )?;
+        let mut d_codes = DeviceBuffer::alloc(&ctx, tensor.codes().len())?;
+        d_codes.copy_from_host(tensor.codes())?;
+        let mut d_scales = DeviceBuffer::alloc(&ctx, scales.len() * 2)?;
+        d_scales.copy_from_host(
+            &scales
+                .iter()
+                .flat_map(|s| s.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )?;
+        let zero_bytes: Vec<u8> = match &zero_points {
+            ZeroPoints::Symmetric => Vec::new(),
+            ZeroPoints::PerGroup(z) => z.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        };
+        // A symmetric tensor has **no** zero-point component. The kernel gets a
+        // null pointer, not a buffer of zeros, so the absent section is absent
+        // on the device too.
+        let d_zero = if zero_bytes.is_empty() {
+            None
+        } else {
+            let mut buffer = DeviceBuffer::alloc(&ctx, zero_bytes.len())?;
+            buffer.copy_from_host(&zero_bytes)?;
+            Some(buffer)
+        };
+        let d_out = DeviceBuffer::alloc(&ctx, rows * out_features * 2)?;
+
+        let (mut x_ptr, mut code_ptr, mut scale_ptr) = (
+            d_x.device_ptr(),
+            d_codes.device_ptr(),
+            d_scales.device_ptr(),
+        );
+        let mut zero_ptr = d_zero.as_ref().map_or(0u64, DeviceBuffer::device_ptr);
+        let mut out_ptr = d_out.device_ptr();
+        let mut rows_u = rows as u64;
+        let mut in_u = in_features as u64;
+        let mut out_u = out_features as u64;
+        let mut stride = width.row_stride(in_features) as u64;
+        let mut groups = (entries / out_features) as u64;
+        let mut bits = width.bits();
+        let mut group_size = group;
+        let mut scale_kind = 1u32;
+        let mut params: [*mut c_void; 13] = [
+            (&raw mut x_ptr).cast(),
+            (&raw mut code_ptr).cast(),
+            (&raw mut scale_ptr).cast(),
+            (&raw mut zero_ptr).cast(),
+            (&raw mut out_ptr).cast(),
+            (&raw mut rows_u).cast(),
+            (&raw mut in_u).cast(),
+            (&raw mut out_u).cast(),
+            (&raw mut stride).cast(),
+            (&raw mut groups).cast(),
+            (&raw mut bits).cast(),
+            (&raw mut group_size).cast(),
+            (&raw mut scale_kind).cast(),
+        ];
+        let tile = moxie_kernels::AFFINE_LINEAR_TILE;
+        // SAFETY: the symbol's ABI is the one declared in `affine_linear.cu`;
+        // every pointer is a live buffer of the size the kernel indexes, and
+        // the grid covers exactly the output tiles.
+        unsafe {
+            kernel.launch_blocking(
+                (out_u.div_ceil(tile) as u32, rows_u.div_ceil(tile) as u32, 1),
+                (32, 1, 1),
+                0,
+                &mut params,
+            )?;
+        }
+        stream.synchronize()?;
+        let mut got = vec![0u8; rows * out_features * 2];
+        d_out.copy_to_host(&mut got)?;
+        let got = decode_u16(&got);
+
+        // The oracle: the whole weight reconstructed on the host through task
+        // 0024's decoder, rounded to BF16, then multiplied in ascending order
+        // with FP32 accumulation. It shares no code with the kernel.
+        let weight = tensor.reconstruct().map_err(numerical)?;
+        for m in 0..rows {
+            for n in 0..out_features {
+                let mut acc = 0f32;
+                let mut abs = 0f32;
+                for k in 0..in_features {
+                    let term = x[m * in_features + k] * bf16_round(weight[n * in_features + k]);
+                    acc += term;
+                    abs += term.abs();
+                }
+                let reference = bf16_round(acc);
+                let device = f32::from_bits(u32::from(got[m * out_features + n]) << 16);
+                let difference = (device - reference).abs();
+                let exponent = (reference.abs().to_bits() >> 23) & 0xFF;
+                let ulp = if exponent <= 7 {
+                    f32::from_bits(1)
+                } else {
+                    f32::from_bits((exponent - 7) << 23)
+                };
+                // The owner's two-clause gate of 2026-09-14: 2 ULP at the
+                // oracle's magnitude, or within the reduction's own resolution
+                // where the result has cancelled below what BF16 can express.
+                if difference > 2.0 * ulp && difference > abs / 256.0 {
+                    return Err(Error::Numerical {
+                        detail: format!(
+                            "{} ({m},{n}): device {device} against oracle {reference}, \
+                             {difference} apart; 2 ULP is {} and the reduction's \
+                             resolution is {}",
+                            width.profile(),
+                            2.0 * ulp,
+                            abs / 256.0
+                        ),
+                    });
+                }
+                compared += 1;
+            }
+        }
+    }
+    if compared != 5 * 48 + 3 * 32 {
+        return Err(Error::Numerical {
+            detail: format!("{compared} element(s) compared; the case checks 336"),
+        });
+    }
+    Ok(Outcome::Passed)
+}
+
+fn numerical(error: Error) -> Error {
+    Error::Numerical {
+        detail: format!("the canonical fixture is malformed: {error}"),
     }
 }

@@ -25,15 +25,19 @@ all accepted, and M2's formal closure statement remains the owner's to make.
 |---|---|
 | Accepted | [Task 0024](docs/tasks/0024-m3-asymmetric-int4-pack-quantized-import.md) — M3 item 2's asymmetric INT4 import (owner, 2026-09-13, after three review rounds). **Importer-only**: no execution, no quality claim. |
 | Implemented, unreviewed | [Task 0025](docs/tasks/0025-m3-offline-repack-publication.md) — M3 item 1's offline repack, and [task 0026](docs/tasks/0026-m3-canonical-safetensors-publication.md) — the same publication as **safetensors shards** under the owner's packaging ruling. Corrected after **two** independent reviews: ten findings, then fourteen, all fixed with a regression each. **Bytes only**, and neither closes M3 item 1. |
-| Next | M3 item 3 — shared W4A16/W8A16 paths. The largest gap in the milestone: nothing here executes a quantized weight. |
-| Continuation | [The task 0026 handover](docs/handovers/2026-09-14-task0026-safetensors-publication.md), which carries task 0025's forward |
+| Implemented, unreviewed | [Task 0028](docs/tasks/0028-m3-shared-w4a16-w8a16-execution.md) — M3 item 3's **dense** W4A16/W8A16 path. One shared kernel, four catalogue identities, no whole-tensor dequantization; the republished Laguna module executes on all three GPUs within the predeclared threshold. **Dense only, synthetic activations, no timing.** |
+| Next | M3 item 3's **expert** half — quantized MoE. Nothing routed executes a quantized weight, so no quantized checkpoint runs as a model. |
+| Continuation | [The task 0028 handover](docs/handovers/2026-09-14-task0028-shared-quantized-execution.md); [the task 0026 handover](docs/handovers/2026-09-14-task0026-safetensors-publication.md) carries task 0025's forward |
 
-**Nothing in this repository executes a checkpoint.** Tensors have been
-imported, expert bytes made resident, real expert weights computed with over
-**synthetic activations and routes written by their tests**, and one module
-repacked into a canonical artifact nothing runs. No output-quality claim follows
-from any of it, and none may be made without paired output against the released
-model. Say what ran; never call it model support.
+**Nothing in this repository generates a token from a checkpoint.** Tensors have
+been imported, expert bytes made resident, real expert weights computed with,
+one module repacked into a canonical artifact, and — since task 0028 — that
+module's canonical INT4 weight multiplied on all three GPUs. **Every one of
+those ran over synthetic activations and routes written by their tests.** One
+projection of one layer is not a model: nothing composes a block and nothing
+generates a token. No output-quality claim follows from any of it, and none may
+be made without paired output against the released model. Say what ran; never
+call it model support.
 
 ## Owner gates
 
@@ -46,7 +50,8 @@ work:
 - **v1 quality is a bit-identical repack** `W=(Q-Z)*S` ([ADR 0018](docs/decisions/adr/0018-v1-quality-is-bit-identical-repack.md)), publisher quality accepted as-is. A repack is not evidence about model output.
 - **Storage and conversion are user-managed** ([ADR 0020](docs/decisions/adr/0020-user-managed-storage-and-canonical-materialization.md)). **No agent-initiated bulk download, copy or conversion** may start without a task naming artifact, revision, expected size and retention. `/models` and `/fast/models` are read-only inputs.
 - **Repack is a Moxie program the user runs offline**, not an external script ([ADR 0021](docs/decisions/adr/0021-repack-is-a-moxie-program.md)); `moxie-repack` is its placement ([ADR 0022](docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md)), and the writer is a **module of that program** ([ADR 0024](docs/decisions/adr/0024-one-storage-crate-and-a-write-module.md)): nothing else can name it, so no rule is needed. A new crate needs several consumers and something distinct to own; one consumer plus a rule to maintain is a module.
-- **Offline repacking is provisional** ([ADR 0027](docs/decisions/adr/0027-repacking-is-provisional-pending-measured-inference-benefit.md)). The owner's requirement is **measured inference benefit**; none exists or is runnable yet. Never cite layout, packaging, plans or byte-exactness as evidence of speed. Retention is decided by [experiment 0007](docs/evidence/experiments/0007-offline-versus-load-time-preparation.md). Scope is bounded to task 0027; AutoRound, `actorder: static`, F16 passthrough and DeepSeek revisions are **named continuations**, not prerequisites.
+- **Offline repacking is provisional** ([ADR 0027](docs/decisions/adr/0027-repacking-is-provisional-pending-measured-inference-benefit.md)). The owner's requirement is **measured inference benefit**; none exists. Task 0028 makes experiment 0007 **runnable**, which is not the same as run. Never cite layout, packaging, plans or byte-exactness as evidence of speed. Retention is decided by [experiment 0007](docs/evidence/experiments/0007-offline-versus-load-time-preparation.md). Scope is bounded to task 0027; AutoRound, `actorder: static`, F16 passthrough and DeepSeek revisions are **named continuations**, not prerequisites.
+- **A quantized linear's numerical gate has two clauses** (owner, 2026-09-14). An output element passes at 2 ULP of BF16 at the oracle's magnitude **or** within `2^-8 · Σ|x·W|`, the reduction's own resolution, because no reordered FP32 reduction can meet the first clause on an output that has cancelled. Narrowing or widening it again is the owner's call, not a task's. [ADR 0028](docs/decisions/adr/0028-quantized-reduction-numerical-gate.md) records it and the measurement that prompted it.
 - **A published artifact is safetensors shards plus a TOML manifest** (owner, 2026-09-14; [ADR 0022](docs/decisions/adr/0022-user-programs-and-canonical-write-authority.md) amended, schema in [ADR 0025](docs/decisions/adr/0025-canonical-safetensors-schema.md)). No custom container. Each shard must open with the **reference implementation**; the manifest, not `__metadata__`, defines what the tensors mean. The affine mathematics of [ADR 0023](docs/decisions/adr/0023-canonical-affine-payload-and-repack-journal.md) is unchanged, and its journal stays private and out of the artifact.
 
 Ask about an open gate in a batch, before dependent conclusions or irreversible

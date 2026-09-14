@@ -225,12 +225,24 @@ include!("mutationtable.rs");
 /// rule -- so carrying an unrunnable battery would be carrying a number that
 /// cannot be reproduced. Its record keeps what it measured, and says when the
 /// driver was retired.
-const BATTERIES: &[Battery] = &[Battery {
-    tag: "0006",
-    lanes: LANES_T0006,
-    mutations: BATTERY_T0006,
-    builds: BUILDS_T0006,
-}];
+const BATTERIES: &[Battery] = &[
+    Battery {
+        tag: "0006",
+        lanes: LANES_T0006,
+        mutations: BATTERY_T0006,
+        builds: BUILDS_T0006,
+    },
+    // Task 0028's battery needs a GPU and the CUDA toolkit, because its
+    // mutations are wrong *answers* rather than wrong control flow. Running it
+    // on a machine with neither reports every lane as stably failing, which the
+    // baseline already refuses to build verdicts on.
+    Battery {
+        tag: "0028",
+        lanes: LANES_T0028,
+        mutations: BATTERY_T0028,
+        builds: BUILDS_T0028,
+    },
+];
 
 /// What every lane does on the **clean** tree, measured once.
 ///

@@ -42,8 +42,41 @@ Each links into the entries below.
 | A record contradicting a fact it already contains | task 0022's expert inventory, task 0022's VRAM figure, task 0024's sign claim |
 | A comparison whose two sides are not independent | task 0022's FP64 transcription, task 0024's FP32-versus-BF16 arithmetic |
 | A fix that is not guarded by the test written for it | task 0023's fake axis, task 0024's helper-only regression |
+| A numerical gate whose denominator can collapse | task 0028's 2-ULP-at-the-result threshold |
 
 ## Entries, newest first
+
+**A tolerance is only as meaningful as what it divides by (2026-09-14).** Task
+0028's contract predeclared, before any implementation existed, that each output
+element must land within **2 ULP of BF16 at the oracle's magnitude**. That is a
+good rule and it was written at the right time. It is also **unsatisfiable by
+any implementation** on an output that has cancelled: the kernel reduces in the
+tensor core's order and the oracle reduces in ascending order, and on one
+element in a few thousand the true result sits six orders of magnitude below the
+sum of the terms that produced it. At that point "one ULP of the result" is a
+quantity no reordered FP32 sum controls. Measured: 37 of 101,376 elements missed
+it at worst 6 ULP, while the same kernel's error against the reduction's own
+term sum was **1.6e-8** — below one FP32 epsilon. The kernel was fine; the
+denominator had collapsed.
+
+Three things are worth carrying:
+
+* **The threshold was still right to predeclare.** The failure mode this
+  repository keeps producing is a tolerance fitted to a result. Writing it first
+  is what made the conversation a ruling instead of an adjustment.
+* **Ask before writing the tests, not after.** The measurement existed and the
+  acceptance suite did not, so the owner's ruling ([ADR 0028](decisions/adr/0028-quantized-reduction-numerical-gate.md))
+  shaped what got asserted rather than being retrofitted onto it.
+* **The guard fires nowhere in the fixtures, and that had to be said.** Every
+  element of five synthetic cases and of the real module passes the first clause
+  alone. The temptation was to hunt for a seed that reached the second clause so
+  the suite would "exercise" it — which is fitting the evidence to the guard,
+  the same shape from the other end. It is driven directly instead, by a test
+  carrying the measured numbers, which also asserts the clause still refuses the
+  same difference on a well-conditioned reduction.
+
+**The lesson to carry:** when a gate is a ratio, write down what happens when the
+denominator goes to zero — before the first run, not after the first surprise.
 
 
 **An internal improvement is not a demonstrated user benefit (2026-09-14).**

@@ -37,6 +37,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cuda/smoke.cu");
     println!("cargo:rerun-if-changed=cuda/bf16_chain.cu");
     println!("cargo:rerun-if-changed=cuda/expert_mlp.cu");
+    println!("cargo:rerun-if-changed=cuda/affine_linear.cu");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=archs.rs");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -117,6 +118,15 @@ fn main() {
         ARCHS,
     );
 
+    let affine = build_source_fatbin(
+        &nvcc,
+        &host_cc,
+        &out,
+        "affine_linear.fatbin",
+        "cuda/affine_linear.cu",
+        ARCHS,
+    );
+
     println!(
         "cargo:rustc-env=MOXIE_SMOKE_FATBIN={}",
         out.join("smoke.fatbin").display()
@@ -138,6 +148,11 @@ fn main() {
         out.join("expert_mlp.fatbin").display()
     );
     println!("cargo:rustc-env=MOXIE_EXPERT_MLP_FATBIN_SHA256={experts}");
+    println!(
+        "cargo:rustc-env=MOXIE_AFFINE_LINEAR_FATBIN={}",
+        out.join("affine_linear.fatbin").display()
+    );
+    println!("cargo:rustc-env=MOXIE_AFFINE_LINEAR_FATBIN_SHA256={affine}");
     println!(
         "cargo:rustc-env=MOXIE_NVCC_VERSION={}",
         one_line(&nvcc_version)

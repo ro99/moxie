@@ -292,6 +292,17 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                     // `second-residency-owner` rule keeps the driver from
                     // becoming a cache of its own.
                     "moxie-storage",
+                    // Task 0028: the quantized linear's launch is derived from
+                    // the canonical affine descriptor -- width, group rule,
+                    // zero-point mode, scale dtype -- which is `moxie-format`'s
+                    // vocabulary and nobody else's. Restating those four things
+                    // here would be a second description of one format, which
+                    // is how the divergence ADR 0003 forbids starts. The edge
+                    // carries **descriptors only**: `moxie-format` is I/O-free
+                    // by rule, so this can never become a path to a file, and
+                    // it was already in this crate's graph beneath
+                    // `moxie-storage`.
+                    "moxie-format",
                 ],
                 third_party: NONE,
             },
@@ -3774,6 +3785,12 @@ mod tests {
 
         let executor = allow["moxie-executor"].workspace;
         assert!(executor.contains(&"moxie-kernels"));
+        // Task 0028's descriptor edge, and the direction that stays refused:
+        // the format crate may not reach back for the executor, and it may not
+        // acquire the filesystem by being depended on from one that has it.
+        assert!(executor.contains(&"moxie-format"));
+        assert!(!allow["moxie-plan"].workspace.contains(&"moxie-format"));
+        assert!(!allow["moxie-kernels"].workspace.contains(&"moxie-format"));
         let kernels = allow["moxie-kernels"].workspace;
         assert_eq!(kernels, ["moxie-types"]);
         for forbidden in ["moxie-plan", "moxie-executor", "moxie-model-api"] {

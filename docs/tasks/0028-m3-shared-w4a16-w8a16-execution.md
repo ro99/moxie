@@ -1,6 +1,7 @@
 # Task 0028 — M3 item 3: shared W4A16 / W8A16 execution
 
-Status: **proposed**; contract written before implementation.
+Status: **implemented, unreviewed**. Contract written before implementation; the
+result below is filled from the runs, not from the plan.
 
 ## Identity and authority
 
@@ -130,6 +131,183 @@ Status: **proposed**; contract written before implementation.
 
 ## Result, filled after work
 
-*(empty — no implementation has started)*
+**A canonical INT4 tensor executes.** One module of a published canonical
+artifact — 3,072 by 1,024, group-32 asymmetric INT4, the module task 0025
+published and nothing ran — was made resident as three components, multiplied by
+activations this repository wrote, and matched an independent host decoder on
+every one of the three GPUs. That is the first time anything here computes with
+a quantized checkpoint weight.
+
+**It is not model support and no quality claim follows.** The activations are
+synthetic, the module is one projection of one layer, nothing composes a block,
+and no token is generated. Output quality is **O2** and needs paired output
+against the released model. **No timing was taken and none may be quoted**:
+O6/O7 are open, both lanes are debug or release test builds, and there is no
+baseline on this machine.
+
+### What was built
+
+**One kernel, one symbol.** `crates/moxie-kernels/cuda/affine_linear.cu`
+defines `moxie_affine_linear_v1`, and W4A16 and W8A16 are two catalogue
+identities over it rather than two implementations. The code width is a
+parameter, and so are the group rule, the zero-point section and the scale
+encoding — the sharing is structural, and
+`the_two_quantized_profiles_are_one_symbol_and_four_identities` fails if a
+descriptor ever names a second symbol.
+
+**No whole-tensor dequantization anywhere.** One warp computes one 16x16 output
+tile. Per `k` tile it unpacks and dequantizes a 16x16 weight tile **into shared
+memory** and multiplies it with a `wmma` BF16 fragment pair accumulating in
+FP32. Nothing wider than that tile is ever 16-bit, the catalogue's workspace
+expression is `Zero`, and both device tests assert the launch's whole device
+footprint against what one BF16 copy of the weight would need — 1,990,656 B
+against 6,291,456 B for the real module. The shortcut the roadmap forbids by
+name was never needed and is not present.
+
+**The scale of a group is converted once per group.** Group sizes are 32 or 128
+and a `k` tile is 16 wide at a 16-aligned offset, so a lane's eight columns
+always lie inside one group. That coupling spans two crates that otherwise never
+meet, so `every_allowed_group_size_fits_the_tile` holds the host lane to it: if
+`moxie_format::affine::ALLOWED_GROUP_SIZES` widens without revisiting the
+kernel, the host lane breaks rather than a GPU returning a wrong number.
+
+**Two refusals rather than two approximations.** A tensor carrying an
+activation-order group map is refused by name — ADR 0027 makes `actorder:
+static` a continuation, and reading a permuted tensor as contiguous is a
+plausible wrong answer no tolerance catches. A group size the tile cannot honour
+is refused for the same reason.
+
+### Two deviations from this contract, both deliberate
+
+**The executor code is a new module, not `chain.rs`.** The contract listed
+`crates/moxie-executor/src/chain.rs` among the allowed files before either shape
+was known. `chain.rs` binds task 0012's selected three-node BF16 chain — a fixed
+graph with a fixed edge shape and a launch order written node by node — and a
+quantized dense linear has a different operand set, three device buffers for one
+logical weight. Folding them together would make that file two things whose only
+shared property is the word "linear". The work is in the same crate under the
+same ownership, in `crates/moxie-executor/src/affine_linear.rs`.
+
+**`moxie-executor` gained a dependency on `moxie-format`.** The launch is
+derived from the canonical affine descriptor — width, group rule, zero-point
+mode, scale dtype — which is `moxie-format`'s vocabulary and nobody else's.
+Restating those four things in the executor would be a second description of one
+format. The edge is declared in `arch-check`'s allowlist with that reason, it
+carries descriptors only (`moxie-format` is I/O-free by rule, so it can never
+become a path to a file), and the crate was already in this one's graph beneath
+`moxie-storage`. `every_spelling_of_a_forbidden_import_lands_on_one_rule` and
+the allowlist test both assert the directions that stay refused.
+
+### The owner ruling this task needed
+
+**The predeclared threshold could not be met in general, and the reason is the
+metric.** The contract fixed `|y_kernel − y_oracle|` ≤ 2 ULP of BF16 at the
+oracle's magnitude. Measured at 33 by 1,024 by 3,072 with uniformly drawn codes
+and zero points, 37 of 101,376 elements missed it, worst 6 ULP. The worst
+element's oracle result is **2.21729279e-5** against a term sum of
+**44.8413914** — six orders of magnitude of cancellation — and the kernel's
+error against that term sum is **1.6e-8**, below one FP32 epsilon. No reordered
+FP32 reduction can land within 2 ULP of a result that has cancelled that far;
+the denominator collapses, not the kernel.
+
+**Owner ruling, 2026-09-14: add a cancellation guard.** An element passes if the
+difference is within 2 ULP of the oracle's magnitude **or** within
+`2^-8 · Σ|x_k · W_k|`, the smallest difference a BF16 output of that reduction
+could express at all. Both bounds are computed and both are reported. This is a
+widened gate and it was the owner's to widen; it was put to him **before** the
+acceptance tests were written around either form.
+
+**Where the second clause actually fires: nowhere in this task's fixtures.**
+Every element of all five synthetic cases and of the real module passes the
+first clause alone, worst **2.000 ULP**. A guard nothing exercises is a shape
+this repository keeps producing, so the guard is driven directly instead, by
+`the_cancellation_clause_covers_a_cancelled_element_and_nothing_else` — with the
+measured numbers above, asserting that the clause covers the cancelled element,
+that it still refuses the same difference on a well-conditioned reduction, and
+that the fixture still misses the first clause. Fishing for a seed that happens
+to exceed would have been fitting the evidence to the guard.
+
+### Coverage, and why each case is there
+
+| Case | Width | Group | Zero points | Scales | Shape |
+|---|---|---|---|---|---|
+| a | INT4 | 32 | asymmetric | bf16 | 5 x 100 x 96 |
+| b | INT8 | 128 | symmetric | f32 | 3 x 300 x 64 |
+| c | INT4 | 128 | symmetric | f16 | 17 x 300 x 48 |
+| d | INT8 | per-channel | asymmetric | bf16 | 7 x 100 x 33 |
+| e | INT4 | 32 | asymmetric | bf16 | 33 x 1024 x 3072 |
+| real | INT4 | 32 | asymmetric | bf16 (source's own) | 3 x 1024 x 3072 |
+
+(a) and (b) are the contract's two. (c) and (d) **cross** the group rule and the
+zero-point section against the other width: if either were secretly tied to the
+code width, one of those two fails. (e) is the geometry that produced the
+measurement above. Every row count — 5, 3, 17, 7, 33, 3 — is a non-multiple of
+the 16-wide tile, and 100 and 300 input features leave a short final group.
+
+**Whole-integer-range coverage is asserted from the tensor, not from the
+generator.** Every third position of the flattened fixture walks the code range
+in order; three is coprime to both 16 and 256, so those positions cycle through
+every code of either width spread across rows and columns. The test then reads
+the codes back through the decoder and requires all sixteen INT4 codes, INT8's
+−128 and 127 with more than 200 distinct values, and zero points spanning both
+signs.
+
+### The oracle shares no code path with the kernel
+
+The host side reconstructs the **whole** weight through
+`AffineTensor::reconstruct` — task 0024's exhaustively tested decoder — rounds
+each value to BF16, and multiplies in ascending order with FP32 accumulation.
+The kernel never materializes a whole weight at all. For the real module the
+oracle's bytes arrive through `Artifact::stream_tensor`, which verifies each
+component against its own checksum, while the device's bytes arrive through the
+residency authority's chunk reads: the same published file, read by two code
+paths that meet nowhere.
+
+### Memory and lifetime
+
+The weight's three components are resident in the **one** production
+weight-residency owner (task 0020), acquired as three chunks of one logical
+tensor and reaching the launch as `device_address` of a lease's offset. Nothing
+in the new module copies a weight, keeps one, or maps chunk to bytes — the
+`a second weight-residency owner` rule still passes. Readiness is the authority's
+own event-gated upload, so no component is readable before its copy is observed.
+Each component's resident range is checked against the length the descriptor
+implies **before** it becomes a pointer: a short component is a refusal, not a
+read into the next tensor. The per-step activations and output are a separate
+admitted `DeviceArena`; a launch whose completion cannot be established
+quarantines the run, and `close` refuses while quarantined.
+
+### Gates
+
+Run on this tree, all three GPUs present:
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets` and the
+  same with `--features moxie-executor/driver`: clean.
+- `cargo xtask spec-check`: 10 documents present and unchanged.
+- `cargo xtask arch-check`: 79 rejected fixtures, 21 accepted, 13 rules, zero
+  failures — including the new `moxie-executor -> moxie-format` entry and the
+  assertions that the reverse edges stay refused.
+- `cargo xtask-cuda test-gpu`: **45 passed, 0 failed, 0 skipped**; `sm_86` and
+  `sm_120` both QUALIFIED, with the new `affine_linear_w4a16_w8a16` case passing
+  on all three devices.
+- `cargo test -p moxie-executor --features driver --test affine_linear_device`:
+  five cases on three UUIDs, worst 2.000 ULP, plus the cancellation-clause test.
+- `cargo test -p moxie-executor --features driver --test affine_linear_real_module`:
+  one module published in 59.5 s (nearly all of it hashing the 5.37 GB source
+  shard) and executed on all three UUIDs, 9,216 output elements per device,
+  worst 2.000 ULP.
+- Host and device-feature suites, and the mutation battery once on the final
+  tree: see the handover for the counts.
+
+### What this does not do
+
+- **No expert or MoE quantized path.** A following task; the grouped expert
+  kernel is still BF16-only.
+- **No FP16 activations, no W4A4/W8A8, no attention change, no tuning.**
+- **No performance claim, and no evidence for [experiment 0007](../evidence/experiments/0007-offline-versus-load-time-preparation.md).**
+  What this task changes is that the experiment is now *runnable* — a canonical
+  tensor can be executed, so the comparison ADR 0027 requires has a subject. It
+  was not run and repacking stays provisional.
+- **It does not close M3 item 3 by itself**, and it closes no owner gate.
 
 [adr23]: ../decisions/adr/0023-canonical-affine-payload-and-repack-journal.md

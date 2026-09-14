@@ -639,6 +639,95 @@ const BATTERY_T0006: &[Mutation] = &[
 ];
 
 /// What `T0006` rebuilds between substitutions.
+/// The `T0028` battery's lanes.
+///
+/// One host lane and two device lanes. The device lanes are what make this
+/// battery worth its runtime: a kernel's answer can only be wrong on a GPU, and
+/// a host lane cannot tell a correct tile from a transposed one.
+const LANES_T0028: &[Lane] = &[
+    Lane { name: "w4a16-host", argv: &[r#"test"#, r#"-p"#, r#"moxie-executor"#, r#"--lib"#, r#"--offline"#, r#"--locked"#, r#"affine_linear"#] },
+    Lane { name: "w4a16-kernels", argv: &[r#"test"#, r#"-p"#, r#"moxie-kernels"#, r#"--features"#, r#"fatbin"#, r#"--offline"#, r#"--locked"#] },
+    Lane { name: "w4a16-device", argv: &[r#"test"#, r#"-p"#, r#"moxie-executor"#, r#"--features"#, r#"driver"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"affine_linear_device"#] },
+];
+
+/// The `T0028` battery: can task 0028's gates actually fail?
+///
+/// Every substitution here is a way of getting a **plausible wrong answer**
+/// rather than a crash -- a transposed tile, a nibble pair read backwards, a
+/// zero point that is never subtracted, one group's scale applied to another's
+/// codes. Those are exactly the defects a tolerance cannot catch by being
+/// tight, which is why they are measured rather than asserted.
+const BATTERY_T0028: &[Mutation] = &[
+    Mutation {
+        name: "int4-nibble-pair-read-backwards",
+        file: "crates/moxie-kernels/cuda/affine_linear.cu",
+        from: r#"        (k & 1ULL) ? (byte >> 4) : (byte & 0x0FU));"#,
+        to: r#"        (k & 1ULL) ? (byte & 0x0FU) : (byte >> 4));"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "zero-point-never-subtracted",
+        file: "crates/moxie-kernels/cuda/affine_linear.cu",
+        from: r#"                value = __fmul_rn(static_cast<float>(code - zero), scale);"#,
+        to: r#"                value = __fmul_rn(static_cast<float>(code), scale);"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "every-group-uses-the-first-groups-scale",
+        file: "crates/moxie-kernels/cuda/affine_linear.cu",
+        from: r#"            const unsigned long long group =
+                (groups_per_row == 1ULL)
+                    ? 0ULL
+                    : ((k0 + half) / static_cast<unsigned long long>(group_size));"#,
+        to: r#"            const unsigned long long group = 0ULL;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "bf16-scales-decoded-as-f16",
+        file: "crates/moxie-kernels/cuda/affine_linear.cu",
+        from: r#"    if (kind == 1U) {"#,
+        to: r#"    if (kind == 9U) {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "weight-tile-loaded-untransposed",
+        file: "crates/moxie-kernels/cuda/affine_linear.cu",
+        from: r#"        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;"#,
+        to: r#"        wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "host-group-map-off-by-one",
+        file: "crates/moxie-executor/src/affine_linear.rs",
+        from: r#"            k / self.group_size"#,
+        to: r#"            (k + 1) / self.group_size"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "permuted-tensor-accepted-as-contiguous",
+        file: "crates/moxie-executor/src/affine_linear.rs",
+        from: r#"        if descriptor.group_index.is_some() {"#,
+        to: r#"        if false && descriptor.group_index.is_some() {"#,
+        expect: Expect::Caught,
+    },
+    // Independence control. No fixture supplies a component shorter than its
+    // descriptor implies, so removing this check must leave the battery green:
+    // if a numerical lane goes red here, the answer was depending on a bounds
+    // check rather than on the arithmetic, which is a different fact.
+    Mutation {
+        name: "resident-component-length-unchecked",
+        file: "crates/moxie-executor/src/affine_linear.rs",
+        from: r#"            if len < need {"#,
+        to: r#"            if false && len < need {"#,
+        expect: Expect::Survivor,
+    },
+];
+
+const BUILDS_T0028: &[&[&str]] = &[
+    &["-p", "moxie-kernels", "--features", "fatbin"],
+    &["-p", "moxie-executor", "--features", "driver", "--tests"],
+];
+
 const BUILDS_T0006: &[&[&str]] = &[
     &["-p", "moxie-format"],
     &["-p", "moxie-storage", "--tests"],

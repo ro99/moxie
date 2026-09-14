@@ -26,6 +26,11 @@ moxie-memory.workspace = true
 # `moxie-storage` may not know what a cache is, so the edge belongs here, where
 # the crate that already "schedules actual effects" performs them.
 moxie-storage.workspace = true
+# Task 0028: the canonical affine descriptor -- width, group rule, zero-point
+# mode and scale dtype -- is `moxie-format`'s vocabulary, and the quantized
+# launch is derived from it. Restating those four things as a second set of
+# enums here is how one format becomes two.
+moxie-format.workspace = true
 moxie-cuda.workspace = true
 moxie-plan.workspace = true
 moxie-kernels.workspace = true
@@ -48,6 +53,12 @@ moxie-host.workspace = true
 # integration tests -- and `arch-check` excludes dev-dependencies in every
 # table for that reason. A fixture proves the production edge is refused.
 moxie-models.workspace = true
+# Task 0028 acceptance 5: the real-module case publishes one module of one
+# inventoried checkpoint into a private temporary directory and then executes
+# it, so the two halves of M3 meet in one test. A dev dependency only -- the
+# executor's production code names no converter, and nothing here may write
+# under a checkpoint root.
+moxie-repack.workspace = true
 
 [lints]
 workspace = true

@@ -59,6 +59,23 @@ pub const BF16_EXPERT_PROJECT_SILU: &str = "moxie_bf16_expert_project_silu_v1";
 pub const BF16_EXPERT_DOWN: &str = "moxie_bf16_expert_down_v1";
 pub const BF16_EXPERT_ABI: u32 = 1;
 
+/// Task 0028's shared quantized dense linear. **One symbol for both widths.**
+///
+/// W4A16 and W8A16 are two catalogue identities over the same code, because the
+/// only thing that differs between them is how a code is read out of a packed
+/// row. The group rule, the zero-point section and the scale encoding are
+/// runtime parameters. Two symbols here would be two implementations one review
+/// cycle later, and ADR 0003 is explicit that "W4A16 is an execution profile,
+/// AWQ/AutoRound are methods": neither is a licence for a kernel per source.
+pub const AFFINE_LINEAR: &str = "moxie_affine_linear_v1";
+pub const AFFINE_LINEAR_ABI: u32 = 1;
+/// The output tile the kernel's warp computes, and the tensor-core `k` step.
+///
+/// Public because it is a *contract*, not an implementation detail: the host
+/// checks that a group boundary never falls inside a `k` tile before it
+/// launches, and that check needs this number.
+pub const AFFINE_LINEAR_TILE: u64 = 16;
+
 #[cfg(feature = "fatbin")]
 mod images {
     use moxie_types::{
@@ -84,6 +101,7 @@ mod images {
     pub const SMOKE_FATBIN_SM86_ONLY: &[u8] = include_bytes!(env!("MOXIE_SMOKE_FATBIN_SM86"));
     pub const BF16_CHAIN_FATBIN: &[u8] = include_bytes!(env!("MOXIE_BF16_CHAIN_FATBIN"));
     pub const EXPERT_MLP_FATBIN: &[u8] = include_bytes!(env!("MOXIE_EXPERT_MLP_FATBIN"));
+    pub const AFFINE_LINEAR_FATBIN: &[u8] = include_bytes!(env!("MOXIE_AFFINE_LINEAR_FATBIN"));
 
     /// Compute capabilities actually compiled into [`SMOKE_FATBIN`].
     pub const KERNEL_ARCHS: &str = env!("MOXIE_KERNEL_ARCHS");
@@ -93,6 +111,7 @@ mod images {
     pub const SMOKE_FATBIN_SM86_SHA256: &str = env!("MOXIE_SMOKE_FATBIN_SM86_SHA256");
     pub const BF16_CHAIN_FATBIN_SHA256: &str = env!("MOXIE_BF16_CHAIN_FATBIN_SHA256");
     pub const EXPERT_MLP_FATBIN_SHA256: &str = env!("MOXIE_EXPERT_MLP_FATBIN_SHA256");
+    pub const AFFINE_LINEAR_FATBIN_SHA256: &str = env!("MOXIE_AFFINE_LINEAR_FATBIN_SHA256");
     /// What `nvcc --version` reported, verified against the pin in `build.rs`.
     pub const NVCC_VERSION: &str = env!("MOXIE_NVCC_VERSION");
     /// The host compiler nvcc drove. Recorded, not pinned.
@@ -216,6 +235,56 @@ mod images {
         KernelCatalogue::new(descriptors).expect("built-in descriptors are unique")
     }
 
+    /// Task 0028's W4A16 / W8A16 dense linear, one descriptor per (width, SM).
+    ///
+    /// The **weight operand precision** is what separates a W4A16 entry from a
+    /// W8A16 one and from the BF16 linear in the chain package: selection is by
+    /// semantic capability and operand precision, never by which checkpoint the
+    /// tensor came from (document 02). All four name the same symbol, so a
+    /// catalogue split can never become an implementation split.
+    ///
+    /// Qualification does not leak between architectures: SM86 and SM120 are
+    /// separate identities, and a passing SM86 run says nothing about SM120.
+    pub fn affine_linear_catalogue() -> KernelCatalogue {
+        let hash = parse_sha256(AFFINE_LINEAR_FATBIN_SHA256);
+        let mut descriptors = Vec::new();
+        for sm in [SmVersion::SM86, SmVersion::SM120] {
+            for width in [Precision::Int4, Precision::Int8] {
+                descriptors.push(SemanticKernelDescriptor {
+                    id: KernelId(format!(
+                        "{}-linear-v1-{}",
+                        super::profile_name(width),
+                        sm.name()
+                    )),
+                    abi_version: super::AFFINE_LINEAR_ABI,
+                    operation: SemanticKernelOp::Linear,
+                    inputs: vec![
+                        KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                        KernelOperand::Weight(WeightPrecision::expect(width)),
+                    ],
+                    output: ActivationPrecision::expect(Precision::Bf16),
+                    accumulation: AccumulationPolicy::Bf16InF32Acc,
+                    rounding: RoundingProfile::FinalBf16Rne,
+                    layout: TensorLayout::ContiguousRowMajorV1,
+                    shape: KernelShapeBounds {
+                        max_rows: 65_536,
+                        max_input: 16_384,
+                        max_output: 65_536,
+                    },
+                    sm,
+                    // Zero, and that is the claim worth reading twice: the
+                    // dequantized weight lives in a 16x16 shared-memory tile
+                    // inside the launch, so there is no workspace for a BF16
+                    // copy of the weight because no such copy exists.
+                    workspace: WorkspaceExpression::Zero,
+                    image_sha256: hash,
+                    symbols: vec![KernelSymbol(super::AFFINE_LINEAR.to_string())],
+                });
+            }
+        }
+        KernelCatalogue::new(descriptors).expect("built-in descriptors are unique")
+    }
+
     fn descriptor(
         id: String,
         operation: SemanticKernelOp,
@@ -260,12 +329,24 @@ mod images {
     }
 }
 
+/// The execution profile an integer weight width names, as document 03 spells
+/// it. Kept beside the symbol rather than inside the image module so the host
+/// lane can name a profile without a CUDA toolkit.
+pub const fn profile_name(width: moxie_types::Precision) -> &'static str {
+    match width {
+        moxie_types::Precision::Int4 => "w4a16",
+        moxie_types::Precision::Int8 => "w8a16",
+        _ => "bf16",
+    }
+}
+
 #[cfg(feature = "fatbin")]
 pub use images::{
-    BF16_CHAIN_FATBIN, BF16_CHAIN_FATBIN_SHA256, EXPERT_MLP_FATBIN, EXPERT_MLP_FATBIN_SHA256,
-    HOST_COMPILER_VERSION, KERNEL_ARCHS, NVCC_VERSION, SMOKE_FATBIN, SMOKE_FATBIN_SHA256,
-    SMOKE_FATBIN_SM86_ONLY, SMOKE_FATBIN_SM86_SHA256, axpy_capability, bf16_chain_catalogue,
-    compiled_sm, expert_mlp_catalogue,
+    AFFINE_LINEAR_FATBIN, AFFINE_LINEAR_FATBIN_SHA256, BF16_CHAIN_FATBIN, BF16_CHAIN_FATBIN_SHA256,
+    EXPERT_MLP_FATBIN, EXPERT_MLP_FATBIN_SHA256, HOST_COMPILER_VERSION, KERNEL_ARCHS, NVCC_VERSION,
+    SMOKE_FATBIN, SMOKE_FATBIN_SHA256, SMOKE_FATBIN_SM86_ONLY, SMOKE_FATBIN_SM86_SHA256,
+    affine_linear_catalogue, axpy_capability, bf16_chain_catalogue, compiled_sm,
+    expert_mlp_catalogue,
 };
 
 #[cfg(test)]
@@ -317,6 +398,61 @@ mod tests {
         assert_eq!(BF16_CHAIN_FATBIN_SHA256.len(), 64);
         assert!(NVCC_VERSION.contains("13.0"), "{NVCC_VERSION}");
         assert!(!HOST_COMPILER_VERSION.is_empty());
+    }
+
+    #[test]
+    fn a_profile_name_follows_the_weight_width() {
+        // Document 03's names. `w4a16` is a weight/activation profile, so the
+        // activation half is fixed and only the weight width may move it.
+        assert_eq!(profile_name(moxie_types::Precision::Int4), "w4a16");
+        assert_eq!(profile_name(moxie_types::Precision::Int8), "w8a16");
+        assert_eq!(profile_name(moxie_types::Precision::Bf16), "bf16");
+    }
+
+    #[cfg(feature = "fatbin")]
+    #[test]
+    fn the_two_quantized_profiles_are_one_symbol_and_four_identities() {
+        // The shared-ness has to be structural. If these ever name different
+        // symbols, "shared W4A16/W8A16 path" has quietly become two kernels.
+        let catalogue = affine_linear_catalogue();
+        assert_eq!(catalogue.descriptors().len(), 4);
+        for descriptor in catalogue.descriptors() {
+            assert_eq!(descriptor.symbols.len(), 1);
+            assert_eq!(descriptor.symbols[0].0, AFFINE_LINEAR);
+            assert_eq!(
+                descriptor.workspace,
+                moxie_types::WorkspaceExpression::Zero,
+                "a workspace would be where a dequantized weight could hide"
+            );
+        }
+        let ids: Vec<&str> = catalogue
+            .descriptors()
+            .iter()
+            .map(|d| d.id.0.as_str())
+            .collect();
+        for want in [
+            "w4a16-linear-v1-sm_86",
+            "w8a16-linear-v1-sm_86",
+            "w4a16-linear-v1-sm_120",
+            "w8a16-linear-v1-sm_120",
+        ] {
+            assert!(ids.contains(&want), "{want} missing from {ids:?}");
+        }
+    }
+
+    #[cfg(feature = "fatbin")]
+    #[test]
+    fn the_quantized_package_is_a_separate_image_from_the_bf16_one() {
+        // Task 0012's chain and task 0028's linear are different fatbins, so a
+        // descriptor that cited the wrong image would fail its own load rather
+        // than silently running the other package's code.
+        assert_ne!(AFFINE_LINEAR_FATBIN_SHA256, BF16_CHAIN_FATBIN_SHA256);
+        assert_ne!(AFFINE_LINEAR_FATBIN_SHA256, EXPERT_MLP_FATBIN_SHA256);
+        assert!(AFFINE_LINEAR_FATBIN.len() > 1024);
+        assert_ne!(
+            affine_linear_catalogue().digest(),
+            bf16_chain_catalogue().digest()
+        );
     }
 
     #[cfg(feature = "fatbin")]

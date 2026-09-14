@@ -79,6 +79,7 @@ version = "0.0.0"
 dependencies = [
  "moxie-cuda",
  "moxie-engine",
+ "moxie-format",
  "moxie-graph",
  "moxie-host",
  "moxie-kernels",
@@ -86,6 +87,7 @@ dependencies = [
  "moxie-models",
  "moxie-oracles",
  "moxie-plan",
+ "moxie-repack",
  "moxie-storage",
  "moxie-types",
 ]
