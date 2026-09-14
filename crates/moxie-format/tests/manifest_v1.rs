@@ -945,3 +945,70 @@ fn a_version_1_manifest_keeps_its_published_identity() {
          must keep the identity it was published with"
     );
 }
+
+/// A version 1 manifest with no tensors is still a version 1 manifest.
+///
+/// The version used to be reconstructed from the first tensor's placement,
+/// defaulting to 2. Independent review pointed out that an empty v1 manifest
+/// therefore acquired v2 identity semantics and was re-encoded as v2 — and that
+/// an empty v1 and an empty v2 manifest, otherwise identical, hashed the same.
+#[test]
+fn an_empty_manifest_keeps_the_version_it_declared() {
+    let body = |v: u32| {
+        format!(
+            r#"schema_version = {v}
+required_features = []
+endianness = "little"
+excluded = []
+tensors = []
+
+[source]
+model = "empty"
+revision = "r0"
+license = "unlicensed-test-fixture"
+[[source.files]]
+path = "shard-a.safetensors"
+sha256 = "{HEX}"
+
+[tokenizer]
+name = "none"
+version = "not-selected"
+digest = "{HEX}"
+
+[template]
+name = "none"
+version = "not-selected"
+digest = "{HEX}"
+
+[architecture]
+name = "fixture"
+version = "1"
+[architecture.metadata]
+
+[provenance]
+scale_convention = "affine-v1"
+quantizer = "none"
+calibration = "none"
+
+[completeness]
+status = "partial"
+missing = ["everything"]
+"#
+        )
+    };
+    let v1 = manifest::parse(&body(1)).expect("an empty v1 manifest parses");
+    let v2 = manifest::parse(&body(2)).expect("an empty v2 manifest parses");
+    assert_eq!(manifest::schema_version_of(&v1), 1);
+    assert_eq!(manifest::schema_version_of(&v2), 2);
+    assert_ne!(
+        manifest::artifact_identity(&v1),
+        manifest::artifact_identity(&v2),
+        "two manifests declaring different schema versions must not share an identity"
+    );
+    assert!(
+        manifest::encode(&v1)
+            .expect("it encodes")
+            .contains("schema_version = 1"),
+        "a v1 manifest was re-encoded under another version"
+    );
+}

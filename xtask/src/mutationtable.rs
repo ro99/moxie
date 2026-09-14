@@ -414,27 +414,13 @@ const BATTERY_T0006: &[Mutation] = &[
         name: "resume-rewrites-before-it-checks",
         file: "crates/moxie-repack/src/write/run.rs",
         from: r#"        if resuming {
-            let report = match run.recover(&journal_path, faults, cancelled) {
-                Ok(report) => report,
-                Err(e) => {
-                    run.abandon(ledger)?;
-                    return Err(e);
-                }
-            };
-            if let Err(e) = run.write_shard_headers(faults) {"#,
+            let report = match run.recover(&journal_path, faults, cancelled) {"#,
         to: r#"        if resuming {
-            if let Err(e) = run.write_shard_headers(faults) {
+            if run.write_shard_headers(faults).is_err() {
                 run.abandon(ledger)?;
-                return Err(e);
+                return Err(invalid("header pass failed".into()));
             }
-            let report = match run.recover(&journal_path, faults, cancelled) {
-                Ok(report) => report,
-                Err(e) => {
-                    run.abandon(ledger)?;
-                    return Err(e);
-                }
-            };
-            if let Err(e) = run.write_shard_headers(faults) {"#,
+            let report = match run.recover(&journal_path, faults, cancelled) {"#,
         expect: Expect::Caught,
     },
     Mutation {
@@ -504,6 +490,96 @@ const BATTERY_T0006: &[Mutation] = &[
         file: "crates/moxie-format/src/manifest.rs",
         from: r#"    w.field_u64("schema", schema_version_of(manifest) as u64);"#,
         to: r#"    w.field_u64("schema", SCHEMA_VERSION as u64);"#,
+        expect: Expect::Caught,
+    },
+    // --- round 3 -------------------------------------------------------------
+    Mutation {
+        name: "source-length-not-rechecked",
+        file: "crates/moxie-storage/src/lib.rs",
+        from: r#"        if now != self.len {"#,
+        to: r#"        if false && now != self.len {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "source-header-not-bound",
+        file: "crates/moxie-repack/src/source.rs",
+        from: r#"            header_sha256: shard.header_sha256().to_string(),"#,
+        to: r#"            header_sha256: String::new(),"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "partial-admission-leaks",
+        file: "crates/moxie-repack/src/work.rs",
+        from: r#"            Err(e) => {
+                let _ = ledger.release(metadata_charge);
+                return Err(e);
+            }"#,
+        to: r#"            Err(e) => {
+                return Err(e);
+            }"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "recovery-cancellation-is-an-error-again",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"            if cancelled() {
+                return Ok(None);
+            }"#,
+        to: r#"            if cancelled() {
+                return Err(invalid("cancelled while rehashing".into()));
+            }"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "journal-history-not-compacted",
+        file: "crates/moxie-repack/src/write/run.rs",
+        from: r#"        let compacted = {
+            let mut text = journal::header_lines(&self.binding);
+            for unit in &kept {
+                text.push_str(&journal::unit_line(unit));
+            }
+            text
+        };"#,
+        to: r#"        let compacted = {
+            let mut text = moxie_storage::read_text_capped(journal_path, journal::MAX_JOURNAL_BYTES)
+                .unwrap_or_default();
+            let _ = &kept;
+            text.push_str("");
+            text
+        };"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "manifest-global-allowance-is-a-constant",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"        let mut manifest = Self::MANIFEST_FIXED_BOUND
+            + selection_bytes.saturating_mul(Self::MANIFEST_GLOBAL_EXPANSION);"#,
+        to: r#"        let _ = selection_bytes;
+        let mut manifest = Self::MANIFEST_FIXED_BOUND;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "recovery-is-not-admitted",
+        file: "crates/moxie-repack/src/lib.rs",
+        from: r#"    buffers.admit_recovery(
+        ledger,
+        Budgets::recovery_bound(journal_bytes, units, widest_role),
+    )?;"#,
+        to: r#"    let _ = (journal_bytes, units, widest_role);"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "schema-version-inferred-again",
+        file: "crates/moxie-format/src/manifest.rs",
+        from: r#"pub fn schema_version_of(manifest: &Manifest) -> u32 {
+    manifest.schema_version
+}"#,
+        to: r#"pub fn schema_version_of(manifest: &Manifest) -> u32 {
+    match manifest.tensors.first().map(|t| &t.placement) {
+        Some(Placement::Chunk { .. }) => 1,
+        _ => SCHEMA_VERSION,
+    }
+}"#,
         expect: Expect::Caught,
     },
 ];

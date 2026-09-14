@@ -232,6 +232,33 @@ const BATTERIES: &[Battery] = &[Battery {
     builds: BUILDS_T0006,
 }];
 
+/// What every lane does on the **clean** tree, measured once.
+///
+/// `Some(true)` stably passes, `Some(false)` stably fails, `None` disagrees with
+/// itself. This is the control side of every verdict below, and it is one fact
+/// about the tree rather than fifty: re-proving it after each substitution cost
+/// an extra rebuild and `REPEATS` more lane runs per mutation, which is most of
+/// why a full battery took four hours.
+///
+/// The trade is stated rather than hidden: a tree that breaks *during* the run
+/// is noticed at the end, when the baseline is taken again, instead of at the
+/// mutation that broke it.
+fn baseline(root: &Path, lanes: &[Lane]) -> Vec<(&'static str, Option<bool>)> {
+    lanes
+        .iter()
+        .map(|l| {
+            let first = lane_passes(root, l);
+            let mut stable = true;
+            for _ in 1..REPEATS {
+                if lane_passes(root, l) != first {
+                    stable = false;
+                }
+            }
+            (l.name, if stable { Some(first) } else { None })
+        })
+        .collect()
+}
+
 /// Split requested names into (chosen, unknown), keeping battery order.
 fn select<'a>(requested: &[String], battery: &'a [Mutation]) -> (Vec<&'a Mutation>, Vec<String>) {
     let unknown: Vec<String> = requested
@@ -427,6 +454,47 @@ pub fn run(args: &[String]) -> i32 {
         chosen
     };
 
+    // The control side of every verdict, measured once, before anything is
+    // edited. A lane that cannot pass on a clean tree cannot tell us anything
+    // about a mutant, and the battery says so rather than reporting fifty
+    // invalid controls one at a time.
+    println!(
+        "measuring the clean-tree baseline over {} lane(s)...",
+        battery.lanes.len()
+    );
+    if !builds(&root, battery.builds) {
+        eprintln!("mutation-check: the clean tree does not build; nothing was measured");
+        return 2;
+    }
+    let base = baseline(&root, battery.lanes);
+    let bad: Vec<&str> = base
+        .iter()
+        .filter(|(_, ok)| *ok != Some(true))
+        .map(|(n, _)| *n)
+        .collect();
+    if !bad.is_empty() {
+        for (name, ok) in &base {
+            if *ok != Some(true) {
+                let what = match ok {
+                    None => "disagrees with itself",
+                    Some(false) => "fails",
+                    Some(true) => unreachable!(),
+                };
+                println!("  BASELINE {name}: {what} on the clean tree");
+            }
+        }
+        eprintln!(
+            "mutation-check: {} lane(s) cannot pass on a clean tree, so no verdict below would \
+             mean anything. Nothing was measured.",
+            bad.len()
+        );
+        return 2;
+    }
+    println!(
+        "baseline: {} lane(s) stably pass, {REPEATS} repetition(s) each",
+        base.len()
+    );
+
     let mut outcomes: Vec<(&str, Verdict, Vec<&str>, Expect)> = Vec::new();
     let mut skipped: Vec<(&str, String)> = Vec::new();
 
@@ -444,7 +512,7 @@ pub fn run(args: &[String]) -> i32 {
             continue;
         }
 
-        let caught_by: Vec<&str>;
+        let mut caught_by: Vec<&str> = Vec::new();
         let mut mutant_ok = None;
         {
             let guard = match Restore::arm(&root, m.file, &original) {
@@ -465,39 +533,46 @@ pub fn run(args: &[String]) -> i32 {
                 println!("SKIP {}: does not compile", m.name);
                 continue;
             }
-            caught_by = battery
-                .lanes
-                .iter()
-                .filter(|l| !lane_passes(&root, l))
-                .map(|l| l.name)
-                .collect();
-            if !caught_by.is_empty() && m.expect == Expect::Caught {
-                let lane = battery
-                    .lanes
-                    .iter()
-                    .find(|l| l.name == caught_by[0])
-                    .expect("a lane that just ran");
-                mutant_ok = repeated(&root, lane, false);
+            match m.expect {
+                // A mutant needs **one** failing lane. Stopping there rather
+                // than running the other eleven to fill in a column is most of
+                // the remaining cost.
+                Expect::Caught => {
+                    for lane in battery.lanes {
+                        if !lane_passes(&root, lane) {
+                            caught_by.push(lane.name);
+                            mutant_ok = repeated(&root, lane, false);
+                            break;
+                        }
+                    }
+                }
+                // An independence control claims **no** lane fails, so every
+                // lane has to run, and the claim is repeated. The second review
+                // found controls certified from a single pass while the summary
+                // said three.
+                Expect::Survivor => {
+                    for lane in battery.lanes {
+                        let mut failed = false;
+                        for _ in 0..REPEATS {
+                            if !lane_passes(&root, lane) {
+                                failed = true;
+                            }
+                        }
+                        if failed {
+                            caught_by.push(lane.name);
+                        }
+                    }
+                }
             }
-            // `guard` drops here: the file is back before the control runs.
+            // `guard` drops here: the file is back.
         }
 
-        let mut control_ok = None;
-        if !caught_by.is_empty() && m.expect == Expect::Caught {
-            if !builds(&root, battery.builds) {
-                skipped.push((m.name, "the tree did not rebuild after restore".into()));
-                println!("SKIP {}: no rebuild after restore", m.name);
-                continue;
-            }
-            let lane = battery
-                .lanes
-                .iter()
-                .find(|l| l.name == caught_by[0])
-                .expect("a lane that just ran");
-            control_ok = repeated(&root, lane, true);
-        } else {
-            builds(&root, battery.builds);
-        }
+        // The control side is the baseline above, taken once on the clean tree.
+        let control_ok = caught_by
+            .first()
+            .and_then(|n| base.iter().find(|(name, _)| name == n))
+            .map(|(_, ok)| *ok)
+            .unwrap_or(Some(true));
 
         let verdict = classify(&caught_by, mutant_ok, control_ok, m.expect);
         let detail = if caught_by.is_empty() {
@@ -508,6 +583,19 @@ pub fn run(args: &[String]) -> i32 {
         println!("{:52} {:15} {detail}", m.name, verdict.name());
         outcomes.push((m.name, verdict, caught_by, m.expect));
     }
+
+    // Put the tree back the way a build expects it, and confirm the baseline
+    // still holds: the one thing the per-mutation control used to cover.
+    if !builds(&root, battery.builds) {
+        eprintln!("mutation-check: the tree does not build after the battery");
+        return 2;
+    }
+    let after = baseline(&root, battery.lanes);
+    let drifted: Vec<&str> = after
+        .iter()
+        .filter(|(_, ok)| *ok != Some(true))
+        .map(|(n, _)| *n)
+        .collect();
 
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for (_, v, _, _) in &outcomes {
@@ -523,14 +611,26 @@ pub fn run(args: &[String]) -> i32 {
     println!(
         "\n{caught} of {mutants} mutant(s) caught, {held} of {controls} expected survivor(s) held \
          (independence controls and equivalent mutants); {} survivor(s), {} unstable, {} invalid \
-         control(s), {} broken control(s), {} skipped; {REPEATS} repetition(s) of each verdict in \
-         both directions",
+         control(s), {} broken control(s), {} skipped",
         counts.get("survivor").unwrap_or(&0),
         counts.get("unstable").unwrap_or(&0),
         counts.get("invalid-control").unwrap_or(&0),
         counts.get("control-broken").unwrap_or(&0),
         skipped.len(),
     );
+    // What was actually measured, rather than a sentence about repetitions that
+    // some verdicts never received.
+    println!(
+        "measured: the clean-tree baseline over all {} lane(s), {REPEATS} repetition(s) each, \
+         before and after; each caught mutant's deciding lane repeated {REPEATS} time(s) under \
+         the mutation; each expected survivor's full lane set repeated {REPEATS} time(s)",
+        base.len()
+    );
+    if !drifted.is_empty() {
+        println!(
+            "  BASELINE DRIFT after the battery: {drifted:?} no longer pass on the restored tree"
+        );
+    }
     for (name, verdict, _, _) in &outcomes {
         if !matches!(verdict, Verdict::Caught | Verdict::ControlHeld) {
             println!("  {} {name}", verdict.name().to_uppercase());
@@ -540,7 +640,7 @@ pub fn run(args: &[String]) -> i32 {
         println!("  SKIPPED {name}: {why}");
     }
     // An incomplete or invalid battery is not a measurement.
-    let ok = caught == mutants && held == controls && skipped.is_empty();
+    let ok = caught == mutants && held == controls && skipped.is_empty() && drifted.is_empty();
     if ok { 0 } else { 1 }
 }
 

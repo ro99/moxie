@@ -100,6 +100,13 @@ pub enum Start {
     /// A destination that already holds a published manifest. Nothing was
     /// changed and nothing may be.
     AlreadyPublished { artifact: PathBuf },
+    /// The caller cancelled while the run was being recovered.
+    ///
+    /// Rehashing an interrupted run's staged units is a full re-read of
+    /// everything it had written, so it is a place a user asks to stop -- and a
+    /// stop they asked for is not a corrupt artifact. It used to be reported as
+    /// one.
+    Cancelled { destination: PathBuf },
 }
 
 /// What a resume recovered, measured rather than assumed.
@@ -115,6 +122,10 @@ pub struct ResumeReport {
     pub truncated_bytes: u64,
     /// A torn final journal line, in bytes.
     pub torn_journal_bytes: usize,
+    /// Bytes the journal occupies after recovery rewrote it to the units it
+    /// kept. Discarded records describe bytes about to be written again, and
+    /// keeping them made every resume cycle leave the destination larger.
+    pub journal_compacted_to: u64,
     /// The phase the journal was left in.
     pub phase: Phase,
 }
@@ -344,7 +355,15 @@ impl Run {
         // scratch on its behalf.
         if resuming {
             let report = match run.recover(&journal_path, faults, cancelled) {
-                Ok(report) => report,
+                Ok(Some(report)) => report,
+                // A cancellation, reported as one. The destination keeps its
+                // private state and resumes later; nothing was published and
+                // nothing admitted stays charged.
+                Ok(None) => {
+                    let destination = run.dest.clone();
+                    run.abandon(ledger)?;
+                    return Ok(Start::Cancelled { destination });
+                }
                 Err(e) => {
                     run.abandon(ledger)?;
                     return Err(e);
@@ -375,7 +394,7 @@ impl Run {
         journal_path: &Path,
         faults: &Faults,
         cancelled: &dyn Fn() -> bool,
-    ) -> Result<ResumeReport> {
+    ) -> Result<Option<ResumeReport>> {
         // Bytes, not text: a record torn inside a multi-byte character makes
         // the file invalid UTF-8 past its last committed newline, and that is
         // the state this recovery exists to repair.
@@ -440,18 +459,18 @@ impl Run {
             discarded: Vec::new(),
             truncated_bytes: 0,
             torn_journal_bytes: state.torn_tail_bytes,
+            journal_compacted_to: 0,
             phase: state.phase,
         };
         let mut stopped: BTreeMap<String, bool> = BTreeMap::new();
         let mut staged_bytes: u64 = 0;
+        let mut kept: Vec<CompletedUnit> = Vec::new();
         for unit in &state.units {
             // Recovery rehashes every byte it reuses, which for a large run is
             // minutes of reading. A cancellation only observed afterwards is a
             // cancellation nobody experiences.
             if cancelled() {
-                return Err(invalid(
-                    "cancelled while rehashing the staged units of an interrupted run".into(),
-                ));
+                return Ok(None);
             }
             let Some(planned) = self.plan.component(&unit.tensor).cloned() else {
                 return Err(invalid(format!(
@@ -471,6 +490,7 @@ impl Run {
                 Ok(()) => {
                     report.reused_units += 1;
                     report.reused_bytes += unit.len;
+                    kept.push(unit.clone());
                 }
                 Err(e) => {
                     stopped.insert(unit.tensor.clone(), true);
@@ -480,6 +500,44 @@ impl Run {
                 }
             }
         }
+        // **Compact the journal to what this recovery kept.** A discarded
+        // record describes bytes that are about to be written again, so keeping
+        // it means every resume cycle leaves the destination larger: independent
+        // review cancelled, corrupted, resumed and cancelled repeatedly and
+        // watched a 240,000-byte disk budget retain 166,026 bytes, then 326,698,
+        // then 487,370. Removing records is the safe direction -- a unit with no
+        // record is rewritten, which is the invariant the whole journal exists
+        // to keep -- so a crash during this rewrite costs work, never bytes.
+        let compacted = {
+            let mut text = journal::header_lines(&self.binding);
+            for unit in &kept {
+                text.push_str(&journal::unit_line(unit));
+            }
+            text
+        };
+        {
+            use std::io::{Seek, Write};
+            let mut file = open_confined(&self.dest, JOURNAL_FILE, false)?;
+            file.set_len(0)
+                .map_err(|e| invalid(format!("cannot compact the journal: {e}")))?;
+            file.write_all(compacted.as_bytes())
+                .map_err(|e| invalid(format!("cannot rewrite the journal: {e}")))?;
+            file.sync_all()
+                .map_err(|e| invalid(format!("cannot sync the compacted journal: {e}")))?;
+            // And this run's own handle to the new end, as the tear repair does.
+            self.journal
+                .seek(std::io::SeekFrom::Start(compacted.len() as u64))
+                .map_err(|e| invalid(format!("cannot reposition the journal: {e}")))?;
+        }
+        report.journal_compacted_to = compacted.len() as u64;
+        // The staging files this destination **already holds** are this run's to
+        // account for. Starting the count at zero let a resumed run spend the
+        // whole allowance again on top of what was there.
+        let staged_manifest = std::fs::metadata(self.dest.join(STAGED_MANIFEST_FILE))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        self.overhead_used = compacted.len() as u64 + staged_manifest;
+
         // Bytes past the last journaled unit are a crash between a payload
         // write and its journal line: the chunk file is truncated back to what
         // the journal accounts for, so the next unit writes where it expects.
@@ -515,7 +573,7 @@ impl Run {
             staged_bytes += accounted;
         }
         self.disk_used = staged_bytes;
-        Ok(report)
+        Ok(Some(report))
     }
 
     /// Re-read one journaled unit's staged bytes and fold them into the

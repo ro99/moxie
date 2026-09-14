@@ -236,6 +236,14 @@ struct RawCompleteness {
 /// A validated manifest: the owned value every later stage consumes.
 #[derive(Debug, Clone)]
 pub struct Manifest {
+    /// The version this manifest **is**, kept from the document it was parsed
+    /// from rather than reconstructed from its rows.
+    ///
+    /// Inferring it from the first tensor's placement made a valid v1 manifest
+    /// with no tensors indistinguishable from a v2 one: both defaulted to 2, so
+    /// an empty v1 artifact silently acquired v2 identity and was re-encoded
+    /// under the new version.
+    pub schema_version: u32,
     pub required_features: Vec<String>,
     pub endianness: Endianness,
     pub source: Source,
@@ -726,6 +734,7 @@ fn validate_raw(raw: RawManifest, version: u32) -> Result<Manifest> {
     };
 
     Ok(Manifest {
+        schema_version: version,
         required_features: raw.required_features,
         endianness,
         source,
@@ -1318,10 +1327,7 @@ fn check_arch_walk(value: &toml::Value, depth: usize, nodes: &mut usize) -> Resu
 /// relabel every artifact nobody converted -- and, through `artifact_identity`,
 /// would change their identities.
 pub fn schema_version_of(manifest: &Manifest) -> u32 {
-    match manifest.tensors.first().map(|t| &t.placement) {
-        Some(Placement::Chunk { .. }) => 1,
-        _ => SCHEMA_VERSION,
-    }
+    manifest.schema_version
 }
 
 pub fn artifact_identity(manifest: &Manifest) -> String {

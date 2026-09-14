@@ -655,6 +655,13 @@ pub struct Shard {
     path: PathBuf,
     file: File,
     header: SafeHeader,
+    /// SHA-256 of the header bytes this shard was parsed from.
+    ///
+    /// Every tensor offset in use came out of those bytes. A source rewritten
+    /// **in place** -- same inode, same length, different tensor locations --
+    /// changes nothing a stat can see, and independent review used exactly that
+    /// to make a repack read one tensor's bytes and publish them as another's.
+    header_sha256: String,
     len: u64,
     budget: ByteBudget,
     header_budget: HeaderBudget,
@@ -849,14 +856,30 @@ impl Shard {
                 detail: format!("cannot read the header of {}: {e}", path.display()).into(),
             })?;
         let header = SafeHeader::parse(&bytes, len)?;
+        // **After** the parse, and streamed rather than one-shot. `sha256_hex`
+        // copies its input, which for a header is the one allocation
+        // `HeaderBudget` exists to bound -- doing it here and eagerly doubled
+        // the admitted peak and spent it on headers that were about to be
+        // refused. The streaming hasher reads the buffer in place.
+        let header_sha256 = {
+            let mut h = moxie_format::StreamingSha256::new();
+            h.update(&bytes);
+            h.finalize_hex()
+        };
         Ok(Self {
             path: path.to_path_buf(),
             file,
             header,
+            header_sha256,
             len,
             budget,
             header_budget,
         })
+    }
+
+    /// SHA-256 of the header bytes this shard's offsets came from.
+    pub fn header_sha256(&self) -> &str {
+        &self.header_sha256
     }
 
     /// This open file's identity, as the kernel knows it.
@@ -905,6 +928,27 @@ impl Shard {
         if scratch.is_empty() {
             return Err(Error::InvalidArtifact {
                 detail: "a zero-byte scratch buffer cannot hash anything".into(),
+            });
+        }
+        // The length **now**, from this handle, not the one captured when the
+        // shard was opened. A file appended to after its first hash would
+        // otherwise be hashed twice to the same stale end, and the digest would
+        // describe a prefix while claiming to describe the file.
+        let now = self
+            .file
+            .metadata()
+            .map_err(|e| Error::InvalidArtifact {
+                detail: format!("cannot stat the open {}: {e}", self.path.display()).into(),
+            })?
+            .len();
+        if now != self.len {
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "{} was {} byte(s) when this run opened it and is {now} now: its header's offsets describe the file that was there, not the one that is",
+                    self.path.display(),
+                    self.len
+                )
+                .into(),
             });
         }
         let mut hasher = moxie_format::StreamingSha256::new();

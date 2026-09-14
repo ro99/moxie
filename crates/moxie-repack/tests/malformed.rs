@@ -345,14 +345,24 @@ fn a_refused_resume_leaves_the_destination_exactly_as_it_was() {
         })
         .collect();
 
-    // A different selection: same destination, different plan.
+    // A different selection: same destination, same **source**, different output
+    // plan. Only the role changes -- the second review found that replacing
+    // every occurrence renamed the source tensor too, so the run failed
+    // resolving its input and never reached the binding check this test is
+    // about. `role` and `name` are separate fields for exactly this reason.
     let other = f.scratch.join("other-selection.toml");
     let text = std::fs::read_to_string(&f.selection).expect("the selection reads");
-    std::fs::write(
-        &other,
-        text.replace("model.norm.weight", "model.norm.other"),
-    )
-    .expect("written");
+    let patched = text.replacen(
+        "role = \"model.norm.weight\"",
+        "role = \"model.norm.renamed\"",
+        1,
+    );
+    assert_ne!(patched, text, "the role line was not found");
+    assert!(
+        patched.contains("name = \"model.norm.weight\""),
+        "the source tensor name must stay resolvable, or the run fails before the binding check"
+    );
+    std::fs::write(&other, patched).expect("written");
     let mut args = vec![
         "repack".to_string(),
         "--selection".into(),
@@ -370,6 +380,16 @@ fn a_refused_resume_leaves_the_destination_exactly_as_it_was() {
         r.status, 0,
         "a different plan resumed: {}{}",
         r.stdout, r.stderr
+    );
+    // And refused for the **right** reason: the binding, not a source it could
+    // not resolve. Accepting any nonzero exit is how this test passed while
+    // testing nothing.
+    assert!(
+        r.stdout.contains("bound to a different plan")
+            || r.stderr.contains("bound to a different plan"),
+        "the refusal is not the binding check: {}{}",
+        r.stdout,
+        r.stderr
     );
 
     let after: BTreeMap<String, Vec<u8>> = std::fs::read_dir(&f.out)

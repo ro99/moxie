@@ -126,6 +126,9 @@ impl Budgets {
     const PER_TENSOR_METADATA_BYTES: u64 = 4096;
     /// How many times a role's own bytes are retained across those structures.
     const ROLE_RETENTIONS: u64 = 16;
+    /// One parsed journal record, without its names: two 64-character digests,
+    /// the numbers, the struct and its map node.
+    const PER_JOURNAL_RECORD_BYTES: u64 = 384;
 
     /// What this program may hold besides its payload tiles, for **this**
     /// selection.
@@ -142,6 +145,23 @@ impl Budgets {
             + moxie_format::manifest::MAX_MANIFEST_BYTES as u64
             + selection_bytes.saturating_mul(Self::ROLE_RETENTIONS)
             + tensors.saturating_mul(Self::PER_TENSOR_METADATA_BYTES)
+    }
+
+    /// What **recovery** holds, which the selection says nothing about.
+    ///
+    /// Reading an interrupted run's journal holds its bytes and the records
+    /// parsed out of them at the same time, and how many records there are is a
+    /// function of the payload and the work-unit size -- not of how many
+    /// tensors were selected or how long their names are. Independent review
+    /// resumed an 8 MiB source under a 9,438,720-byte total and measured
+    /// 12,942,600 bytes of peak live heap against a 5,257,792-byte reservation.
+    ///
+    /// Admitted separately, after the plan exists and before recovery runs,
+    /// because that is the first moment the unit count is known.
+    pub fn recovery_bound(journal_bytes: u64, units: u64, role_bytes: u64) -> u64 {
+        journal_bytes.saturating_add(
+            units.saturating_mul(role_bytes.saturating_add(Self::PER_JOURNAL_RECORD_BYTES)),
+        )
     }
 
     /// Refuse a budget that cannot hold what the run will hold.
@@ -250,11 +270,26 @@ impl StagingEstimate {
     const MANIFEST_TENSOR_FIXED: u64 = 1024;
     /// One component row: its checksum, its keys, and room for the file name.
     const MANIFEST_COMPONENT_FIXED: u64 = 256;
+    /// The keys and punctuation of a manifest's global sections, without the
+    /// values, which come from the selection and are counted separately.
     const MANIFEST_FIXED_BOUND: u64 = 16 * 1024;
+    /// How much larger the manifest's global half can be than the selection
+    /// text it is built from: TOML re-serialization repeats table keys, quotes
+    /// and escapes strings, and adds a 64-character digest per source file.
+    const MANIFEST_GLOBAL_EXPANSION: u64 = 4;
 
-    fn of(payload_bytes: u64, tensors: &[TensorStaging]) -> Self {
+    fn of(payload_bytes: u64, tensors: &[TensorStaging], selection_bytes: u64) -> Self {
         let mut journal = Self::JOURNAL_HEADER_BOUND;
-        let mut manifest = Self::MANIFEST_FIXED_BOUND;
+        // The **global** half of the manifest -- architecture metadata,
+        // provenance, the tokenizer and template identities, the excluded list,
+        // the source-file digests -- is not a constant. Every one of those
+        // values comes from the selection, so the selection's own length bounds
+        // them. Independent review put a 32 KiB architecture-metadata string in
+        // a valid selection and watched publication fail against a derived
+        // allowance of 22,435 bytes with a 64 MiB disk budget, which no budget
+        // could fix.
+        let mut manifest = Self::MANIFEST_FIXED_BOUND
+            + selection_bytes.saturating_mul(Self::MANIFEST_GLOBAL_EXPANSION);
         for t in tensors {
             // A unit names its component, which is the role plus the longest
             // suffix this schema has (`.zero_points`, 12 bytes).
@@ -659,8 +694,12 @@ pub fn separate_source_and_destination(source_root: &Path, destination: &Path) -
 /// tensors -- and both are removed at publication. The disk budget is checked
 /// against payload **plus** this, because a budget that covers only the part
 /// that is easy to count is not a budget.
-pub fn overhead_bound(resolved: &[Resolved], budgets: &Budgets) -> Result<u64> {
-    let estimate = StagingEstimate::of(0, &staging_shape(resolved, budgets)?);
+pub fn overhead_bound(
+    resolved: &[Resolved],
+    budgets: &Budgets,
+    selection_bytes: u64,
+) -> Result<u64> {
+    let estimate = StagingEstimate::of(0, &staging_shape(resolved, budgets)?, selection_bytes);
     let total = estimate.journal_bound_bytes + estimate.manifest_bound_bytes;
     // The journal has a cap of its own, and a plan whose journal cannot be read
     // back is a plan that cannot be resumed. Independent review produced a
@@ -762,7 +801,11 @@ fn inspect_inner(
 ) -> Result<InspectReport> {
     let write = write_budget(budgets)?;
     let resolved = resolve(selection, sources)?;
-    let plan = output_plan(&resolved, &write, overhead_bound(&resolved, budgets)?)?;
+    let plan = output_plan(
+        &resolved,
+        &write,
+        overhead_bound(&resolved, budgets, selection.source_bytes())?,
+    )?;
     let mut tensors = Vec::with_capacity(resolved.len());
     for r in resolved.iter() {
         tensors.push(TensorReport {
@@ -785,7 +828,11 @@ fn inspect_inner(
         });
     }
     Ok(InspectReport {
-        staging: StagingEstimate::of(plan.payload_bytes(), &staging_shape(&resolved, budgets)?),
+        staging: StagingEstimate::of(
+            plan.payload_bytes(),
+            &staging_shape(&resolved, budgets)?,
+            selection.source_bytes(),
+        ),
         model: selection.model.clone(),
         revision: selection.revision.clone(),
         source_root: sources.root().to_path_buf(),
@@ -966,7 +1013,11 @@ fn repack_inner(
     let destination = &separate_source_and_destination(sources.root(), destination)?;
     let write = write_budget(budgets)?;
     let resolved = resolve(selection, sources)?;
-    let plan = output_plan(&resolved, &write, overhead_bound(&resolved, budgets)?)?;
+    let plan = output_plan(
+        &resolved,
+        &write,
+        overhead_bound(&resolved, budgets, selection.source_bytes())?,
+    )?;
 
     // Source identity before anything is written: the whole-file digests the
     // manifest will record, which are also what binds a resume. Hashing a
@@ -1011,6 +1062,19 @@ fn repack_inner(
         schema_version: manifest::SCHEMA_VERSION,
     };
 
+    // **What recovery will hold, admitted before it holds it.** The unit count
+    // is the thing that drives it, and this is the first line at which it is
+    // known: the plan exists and nothing has been read back yet.
+    let shape = staging_shape(&resolved, budgets)?;
+    let units: u64 = shape.iter().map(|t| t.units).sum();
+    let widest_role = shape.iter().map(|t| t.role_bytes).max().unwrap_or(0);
+    let journal_bytes =
+        StagingEstimate::of(0, &shape, selection.source_bytes()).journal_bound_bytes;
+    buffers.admit_recovery(
+        ledger,
+        Budgets::recovery_bound(journal_bytes, units, widest_role),
+    )?;
+
     let start = Run::begin(
         destination,
         plan,
@@ -1028,6 +1092,22 @@ fn repack_inner(
                  artifact and never updates a model in place",
                 artifact.display()
             )));
+        }
+        Start::Cancelled { destination } => {
+            return Ok(RepackReport {
+                outcome: Outcome::Cancelled {
+                    destination,
+                    bytes_done: 0,
+                },
+                artifact_identity: String::new(),
+                units_written: 0,
+                units_reused: 0,
+                bytes_written: 0,
+                source_bytes_read: 0,
+                resumed: true,
+                resume_detail: vec!["cancelled while recovering the interrupted run".into()],
+                source_digests,
+            });
         }
         Start::Fresh(run) => {
             *run_slot = Some(run);
@@ -1211,6 +1291,9 @@ pub fn build_manifest(
         });
     }
     Ok(Manifest {
+        // This writer publishes version 2 and says so, rather than leaving the
+        // version to be guessed from a row.
+        schema_version: manifest::SCHEMA_VERSION,
         required_features: Vec::new(),
         endianness: Endianness::Little,
         source: Source {

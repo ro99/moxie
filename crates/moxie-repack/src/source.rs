@@ -49,7 +49,7 @@ pub struct Sources {
     /// and the repack that followed, and the artifact carried the old file's
     /// values under the new file's digest. This makes the second open a
     /// refusal.
-    identities: BTreeMap<String, (u64, u64)>,
+    identities: BTreeMap<String, FileIdentity>,
     /// Bytes read through this cache, for honest reporting.
     bytes_read: u64,
     headers_parsed: u64,
@@ -128,15 +128,10 @@ impl Sources {
             // reads one source under one identity or it stops: continuing over
             // a replacement would publish bytes from one file described by
             // another file's digest.
-            let key = shard.file_key()?;
+            let key = FileIdentity::of(&shard)?;
             match self.identities.get(file) {
                 Some(seen) if *seen != key => {
-                    return Err(invalid(format!(
-                        "source file '{file}' has been replaced since this run first opened it: \
-                         it was {seen:?} and is now {key:?}. A repack reads one set of bytes, and \
-                         continuing would describe the bytes it converted with a digest of bytes \
-                         it never saw"
-                    )));
+                    return Err(invalid(seen.disagreement(file, &key)));
                 }
                 Some(_) => {}
                 None => {
@@ -262,14 +257,15 @@ impl Sources {
         let files: Vec<String> = self.identities.keys().cloned().collect();
         for file in files {
             let path = self.path_of(&file)?;
-            let now = path_key(&path)?;
-            let seen = self.identities[&file];
+            // A **fresh** open, not the cached handle: the question is what is
+            // at that path now, and a retained handle cannot answer it. The
+            // header is parsed again too, because a source rewritten in place
+            // keeps its inode and its length and moves every tensor.
+            let fresh = Shard::open_with_limits(&path, self.read_budget, self.header_budget)?;
+            let now = FileIdentity::of(&fresh)?;
+            let seen = self.identities[&file].clone();
             if now != seen {
-                return Err(invalid(format!(
-                    "source file '{file}' has been replaced since this run first opened it: it \
-                     was {seen:?} and is now {now:?}. The digest this run would publish describes \
-                     bytes that are no longer at that path"
-                )));
+                return Err(invalid(seen.disagreement(&file, &now)));
             }
         }
         Ok(())
@@ -316,25 +312,61 @@ impl Sources {
     }
 }
 
-/// A path's identity, as the kernel knows it: the same pair `Shard::file_key`
-/// reports for an open handle.
-fn path_key(path: &Path) -> Result<(u64, u64)> {
-    let meta = std::fs::metadata(path)
-        .map_err(|e| invalid(format!("cannot stat {}: {e}", path.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok((meta.dev(), meta.ino()))
+/// What a run binds a source file to, for the length of the run.
+///
+/// The inode alone was not enough. Independent review found two ways past it:
+/// append to the file, and both hashes stopped at the length captured when it
+/// was opened; rewrite the header **in place**, keeping the inode and the
+/// length, and the run kept using offsets that no longer described anything.
+/// So identity here is what the offsets and the digest actually depend on --
+/// which file, how long it is, when it last changed, and the exact header bytes
+/// the tensor locations were read out of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileIdentity {
+    key: (u64, u64),
+    len: u64,
+    mtime_nanos: u128,
+    header_sha256: String,
+}
+
+impl FileIdentity {
+    fn of(shard: &Shard) -> Result<Self> {
+        let meta = std::fs::metadata(shard.path())
+            .map_err(|e| invalid(format!("cannot stat {}: {e}", shard.path().display())))?;
+        Ok(Self {
+            key: shard.file_key()?,
+            len: shard.len(),
+            mtime_nanos: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            header_sha256: shard.header_sha256().to_string(),
+        })
     }
-    #[cfg(not(unix))]
-    {
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        Ok((meta.len(), mtime))
+
+    /// Which field moved, said plainly: "it changed" is not a diagnosis.
+    fn disagreement(&self, file: &str, now: &Self) -> String {
+        let what = if self.key != now.key {
+            format!("a different file ({:?} became {:?})", self.key, now.key)
+        } else if self.len != now.len {
+            format!("{} byte(s) became {}", self.len, now.len)
+        } else if self.header_sha256 != now.header_sha256 {
+            "the same length and inode, with a rewritten header: every tensor offset this run \
+             resolved came out of the bytes that are gone"
+                .to_string()
+        } else {
+            format!(
+                "modified at {} rather than {}",
+                now.mtime_nanos, self.mtime_nanos
+            )
+        };
+        format!(
+            "source file '{file}' changed while this run was reading it: {what}. A repack \
+             converts one set of bytes and publishes a digest of those bytes; continuing would \
+             publish a description of something nobody has"
+        )
     }
 }
 

@@ -321,6 +321,10 @@ pub struct Buffers {
     columns_charge: Option<Reservation>,
     /// The whole-run metadata charge: headers, selection, manifest.
     metadata_charge: Option<Reservation>,
+    /// What recovery holds: the journal's bytes and the records parsed out of
+    /// them. Admitted once the plan exists, which is the first moment the
+    /// record count is known.
+    recovery_charge: Option<Reservation>,
 }
 
 impl Buffers {
@@ -342,17 +346,73 @@ impl Buffers {
             StageSpan::at(0),
         ))?;
         let metadata_charge = ledger.admit(&plan).map_err(moxie_types::Error::from)?;
-        let source =
-            HostBuffer::allocate_in(ledger, "repack source tile", HostTier::Pageable, tile, 0)?;
-        let canonical =
-            HostBuffer::allocate_in(ledger, "repack canonical tile", HostTier::Pageable, tile, 0)?;
+        // **Every admission before this point comes back if a later one fails.**
+        // `?` here used to abandon the metadata charge and the first tile with
+        // no `Buffers` in existence for the caller to release: independent
+        // review supplied a budget that admitted the metadata and refused the
+        // source tile, and 10,857,840 bytes stayed charged for the life of the
+        // process. A partly-admitted plan is not a plan.
+        let source = match HostBuffer::allocate_in(
+            ledger,
+            "repack source tile",
+            HostTier::Pageable,
+            tile,
+            0,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = ledger.release(metadata_charge);
+                return Err(e);
+            }
+        };
+        let canonical = match HostBuffer::allocate_in(
+            ledger,
+            "repack canonical tile",
+            HostTier::Pageable,
+            tile,
+            0,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                let mut source = source;
+                let _ = source.release(ledger);
+                let _ = ledger.release(metadata_charge);
+                return Err(e);
+            }
+        };
         Ok(Self {
             source,
             canonical,
             columns: Vec::new(),
             columns_charge: None,
             metadata_charge: Some(metadata_charge),
+            recovery_charge: None,
         })
+    }
+
+    /// Admit what recovery will hold, before it holds it.
+    pub fn admit_recovery(&mut self, ledger: &mut Ledger, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut plan = PlanRequest::new("repack recovery", ["live"])?;
+        plan.buffer(BufferRequest::new(
+            "journal bytes and parsed records",
+            Scope::Host,
+            Tier::Host(HostTier::Pageable),
+            bytes,
+            StageSpan::at(0),
+        ))?;
+        let charge = ledger.admit(&plan).map_err(moxie_types::Error::from)?;
+        if let Some(previous) = self.recovery_charge.take() {
+            ledger.release(previous).map_err(|e| {
+                invalid(format!(
+                    "cannot release the previous recovery charge: {e:?}"
+                ))
+            })?;
+        }
+        self.recovery_charge = Some(charge);
+        Ok(())
     }
 
     pub fn source_tile_mut(&mut self) -> &mut [u8] {
@@ -420,6 +480,11 @@ impl Buffers {
                 .release(charge)
                 .map_err(|e| invalid(format!("cannot release the column scratch charge: {e:?}")))?;
             self.columns = Vec::new();
+        }
+        if let Some(charge) = self.recovery_charge.take() {
+            ledger
+                .release(charge)
+                .map_err(|e| invalid(format!("cannot release the recovery charge: {e:?}")))?;
         }
         Ok(())
     }

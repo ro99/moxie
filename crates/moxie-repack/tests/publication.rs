@@ -184,6 +184,7 @@ fn manifest_for(sealed: &[moxie_repack::write::SealedTensor]) -> Manifest {
         });
     }
     Manifest {
+        schema_version: manifest::SCHEMA_VERSION,
         required_features: Vec::new(),
         endianness: Endianness::Little,
         source: Source {
@@ -254,6 +255,16 @@ fn run_to_end(
             return Err(moxie_types::Error::InvalidArtifact {
                 detail: format!("{} is already published", artifact.display()).into(),
             });
+        }
+        Start::Cancelled { destination } => {
+            return Ok((
+                Outcome::Cancelled {
+                    destination,
+                    bytes_done: 0,
+                },
+                String::new(),
+                0,
+            ));
         }
     };
     let mut written = 0usize;
@@ -954,84 +965,84 @@ fn cancellation_observed_after_validation_still_stops_before_the_rename() {
 /// Cancellation that arrives at the **last** gate, after everything has been
 /// validated and before the rename.
 ///
-/// The battery found this one: with a check before staging and a check inside
-/// the validation loop, a closure that cancels "from the second question
-/// onwards" stops inside the loop and never reaches the final gate, so deleting
-/// that gate changed nothing.
+/// Two earlier versions of this test were circular and the second review proved
+/// it by running the mutation: both learned *when* to cancel from the
+/// implementation under test, so deleting the final gate simply moved the
+/// boundary they cancelled at and they kept passing.
 ///
-/// Naming "the last question" cannot be done by counting the gates in the
-/// source -- that count changed the moment validation began asking between
-/// slices rather than between tensors, and a test that hard-codes it silently
-/// starts cancelling somewhere else. So it is **measured**: one run publishes
-/// with a closure that always answers no and counts, and a second, identical
-/// run answers yes only on the call with that number.
+/// The trigger here is **not** a count. The run appends `phase = "validated"`
+/// to its journal, durably, as the last thing before the final gate, so the
+/// journal on disk says "validation is over" from outside the process. This
+/// closure answers no until it sees that line. With the gate deleted there is
+/// nothing left to stop, and the run publishes -- which is the failure.
 #[test]
 fn cancellation_at_the_final_gate_still_stops_before_the_rename() {
-    fn run_with(dest: &Path, cancel_on: Option<usize>) -> (Option<Outcome>, usize) {
-        let mut ledger = ledger();
-        let start = Run::begin(
-            dest,
-            plan(),
-            binding(),
-            budget(),
-            &Options::default(),
-            &mut ledger,
-            &Faults::none(),
-            &|| false,
-        )
-        .expect("it starts");
-        let mut run = match start {
-            Start::Fresh(run) => run,
-            other => panic!("{other:?}"),
-        };
-        for request in requests() {
-            let bytes = payload(request_len(&request), request_len(&request) as usize);
-            for (at, len) in units(&request) {
-                run.write_unit(
-                    &component_of(&request),
-                    &bytes[at as usize..at as usize + len],
-                    HEX,
-                    &Faults::none(),
-                )
-                .expect("every unit writes");
-            }
-        }
-        let sealed = run.seal().expect("it seals");
-        let text = manifest::encode(&manifest_for(&sealed)).expect("it encodes");
-        let asked = std::cell::Cell::new(0usize);
-        let cancelled = || {
-            asked.set(asked.get() + 1);
-            Some(asked.get()) == cancel_on
-        };
-        let outcome = run
-            .publish(&text, &cancelled, &Faults::none(), &mut ledger)
-            .expect("publication is not an error");
-        assert!(ledger.outstanding().is_empty());
-        (Some(outcome), asked.get())
-    }
-
-    // How many times this publication asks, measured rather than assumed.
-    let measured_dir = Scratch::new("cancel-final-measure");
-    let (outcome, total) = run_with(&measured_dir.join("artifact"), None);
-    assert!(
-        matches!(outcome, Some(Outcome::Published { .. })),
-        "the measuring run must publish: {outcome:?}"
-    );
-    assert!(total >= 2, "only {total} cancellation boundary/boundaries");
-
-    // And now: no to every one of them but the last.
     let scratch = Scratch::new("cancel-final-gate");
     let dest = scratch.join("artifact");
-    let (outcome, asked) = run_with(&dest, Some(total));
-    assert_eq!(asked, total, "it asked a different number of times");
+    let mut ledger = ledger();
+    let start = Run::begin(
+        &dest,
+        plan(),
+        binding(),
+        budget(),
+        &Options::default(),
+        &mut ledger,
+        &Faults::none(),
+        &|| false,
+    )
+    .expect("it starts");
+    let mut run = match start {
+        Start::Fresh(run) => run,
+        other => panic!("{other:?}"),
+    };
+    for request in requests() {
+        let bytes = payload(request_len(&request), request_len(&request) as usize);
+        for (at, len) in units(&request) {
+            run.write_unit(
+                &component_of(&request),
+                &bytes[at as usize..at as usize + len],
+                HEX,
+                &Faults::none(),
+            )
+            .expect("every unit writes");
+        }
+    }
+    let sealed = run.seal().expect("it seals");
+    let text = manifest::encode(&manifest_for(&sealed)).expect("it encodes");
+
+    // The journal, read from disk at every boundary: an observer outside this
+    // run, watching for the record that says validation finished.
+    let journal = dest.join(".moxie-repack-journal");
+    let asked = std::cell::Cell::new(0usize);
+    let validated = std::cell::Cell::new(false);
+    let cancelled = || {
+        asked.set(asked.get() + 1);
+        let seen = std::fs::read_to_string(&journal)
+            .map(|t| t.contains("phase = \"validated\""))
+            .unwrap_or(false);
+        if seen {
+            validated.set(true);
+        }
+        seen
+    };
+    let outcome = run
+        .publish(&text, &cancelled, &Faults::none(), &mut ledger)
+        .expect("cancellation is not an error");
     assert!(
-        matches!(outcome, Some(Outcome::Cancelled { .. })),
+        validated.get(),
+        "the run never recorded that it had validated, so this test never reached the gate it \
+         is about: it asked {} time(s)",
+        asked.get()
+    );
+    assert!(
+        matches!(outcome, Outcome::Cancelled { .. }),
         "cancellation at the final gate gave {outcome:?}"
     );
     assert!(
         !dest.join(MANIFEST_FILE).exists(),
         "it published despite being cancelled at the last gate"
     );
+    assert!(ledger.outstanding().is_empty());
 }
 
 /// A private file replaced by a symbolic link is refused, and the link's target

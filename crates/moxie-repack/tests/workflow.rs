@@ -212,12 +212,29 @@ fn a_source_that_changes_after_it_is_hashed_is_refused() {
         &mut ledger,
         &mut |line: &str| {
             // The moment the digest is recorded, change a payload byte that no
-            // declared range's length depends on.
+            // declared range's length depends on -- and put the timestamps back
+            // afterwards.
+            //
+            // The restore is the point. Binding the source's inode, length and
+            // modification time catches most edits before this, so without it
+            // this test would be measuring the metadata check rather than the
+            // re-hash. With identical metadata and different bytes, only
+            // reading the file again can tell.
             if line.starts_with("hashed source") {
+                let before = std::fs::metadata(&shard).expect("the shard stats");
                 let mut bytes = original.clone();
                 let at = bytes.len() - 1;
                 bytes[at] ^= 0xFF;
                 std::fs::write(&shard, &bytes).expect("moving the source");
+                let times = std::fs::FileTimes::new()
+                    .set_accessed(before.accessed().expect("atime"))
+                    .set_modified(before.modified().expect("mtime"));
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&shard)
+                    .expect("the shard reopens")
+                    .set_times(times)
+                    .expect("the timestamps go back");
             }
         },
     )
