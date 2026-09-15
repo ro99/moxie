@@ -106,7 +106,7 @@ its reason, carries descriptors only, and was already in the graph beneath
 
 **Read the round below first.** The list that follows was measured at
 **`448c9a2`** — after the **first** review round's corrections landed in
-`9051f9a`, and before the second and third rounds changed the code again. An
+`9051f9a`, and before the four rounds after it changed the code again. An
 earlier version of this note said `cfc1061`, which is wrong: that commit carried
 8 of the battery's mutations and none of the first round's, so a 13-of-13 result
 could not have come from it. Review caught the misattribution.
@@ -119,15 +119,30 @@ re-measured is worse than an old number that says its own date.
 
 - fmt, both clippy lanes, spec-check (10 documents), arch-check (79 rejected
   fixtures, 21 accepted, 13 rules): clean.
-- `cargo xtask mutation-check --self-test`: **103 of 103** cases over 88
+- `cargo xtask mutation-check --self-test`: **105 of 105** cases over 90
   anchors.
-- `cargo test --workspace`: **1,100 passed**, 0 failed, 0 ignored.
-- `cargo test --workspace --features moxie-executor/driver`: **1,144 passed**
+- `cargo test --workspace`: **1,099 passed**, 0 failed, 0 ignored.
+- `cargo test --workspace --features moxie-executor/driver`: **1,143 passed**
   across 100 suites, 0 failed, 0 ignored, 0 filtered out.
-- The nine mutations the three review rounds added: each run individually,
-  **each caught**. The full `T0028` battery — now 22 mutations — has **not**
-  been re-run end to end on this tree, and `cargo xtask-cuda test-gpu` has not
-  been re-run either.
+- The eleven mutations the review rounds added: each run individually, **each
+  caught**. The full `T0028` battery — now **24** mutations — has **not** been
+  re-run end to end on this tree, and `cargo xtask-cuda test-gpu` has not been
+  re-run either.
+
+**One finding is open and failing.** Allocation failure on the admission path
+aborts the process in at least six places across three crates —
+`moxie-memory`'s request, ledger and arena modules, `moxie-executor`'s arena,
+and `moxie-cuda`'s symbol lookup. Two abort *after* something has already
+changed: `Rc::new(ArenaCore)` after the device allocation succeeded, and
+`Arena::allocate`'s record after the free list was mutated.
+[Task 0029](../tasks/0029-allocation-fallible-admission-vocabulary.md) carries
+the inventory, the sweeps that decide whether it is complete, and the three
+repairs this task made that stay **unmeasured** until those sweeps exist.
+
+This section was itself stale for a round — reporting 103/103, 1,100/1,144, 22
+mutations and the expert path as next, under a heading saying "current".
+AGENTS.md points here, so a stale handover is the record that misleads by being
+read exactly as intended.
 
 ### Measured at `448c9a2`, after the first review round only:
 
@@ -207,7 +222,14 @@ and do not run anything else on the machine while it goes.
 
 ## What is next, and what is not
 
-**Next in M3 item 3: the quantized expert path.** Nothing here touches MoE — the
+**Next: [task 0029](../tasks/0029-allocation-fallible-admission-vocabulary.md),
+the admission call graph.** It is this task's one open finding, it is measured
+failing, and it spans `moxie-memory`, `moxie-executor` and `moxie-cuda`. Three
+repairs made here stay unmeasured until its sweeps exist. An earlier version of
+this section named the expert path first, which read as though nothing was
+outstanding.
+
+**Then in M3 item 3: the quantized expert path.** Nothing here touches MoE — the
 grouped expert kernel is still BF16-only, so Laguna and every other quantized
 MoE still does not execute as a model. That is the largest remaining gap and it
 is a task of its own, not an extension of this one.

@@ -41,10 +41,10 @@ part of the contract rather than a note.
 | `moxie-memory::request` | `PlanRequest::new` | the stage `collect()`, the `BTreeSet` built to check distinctness, three `format!` refusals |
 | `moxie-memory::request` | `PlanRequest::buffer` / `reserve` | `Vec::push` on the request's lists, and the `format!` refusals around them |
 | `moxie-memory::request` | `BufferRequest::new` | `label.into()`. **The one that changes a signature**: it returns `Self`, it has 115 call sites, and a label that cannot be allocated has nowhere to go |
-| `moxie-memory::ledger` | `Ledger::admit` | `committed.entry().or_insert()`, `outstanding.insert(..)` and the `label().to_string()` inside it |
+| `moxie-memory::ledger` | `Ledger::admit` | `committed.entry().or_insert()`, then `outstanding.insert(..)` and the `label().to_string()` inside it — **in that order**. The counters are charged *before* the record that names them is allocated, so an abort or a refusal between the two leaves capacity charged against a reservation that does not exist |
 | `moxie-memory::arena` | `Arena::new` | `vec![FreeRange { .. }]` |
 | `moxie-memory::arena` | `Arena::allocate` | `owner.clone()` and `live.insert`, **after the free list has already been mutated** — so an abort there is not just a crash, it is a crash with the arena half-updated |
-| `moxie-memory::arena` | `Arena::outstanding` | `owner.clone()` per record. Reporting rather than admission, and on the path a refusal takes to describe itself |
+| `moxie-memory::ledger` | `Ledger::outstanding` | a label and two vectors cloned **per reservation**. Reached from admission, not only from reporting: `DeviceArena::create_partitioned` calls it to find the reservation it was handed. An earlier draft of this row named `Arena::outstanding`, which admission never calls; review corrected it. `Ledger::for_each_outstanding` already exists as the allocation-free form, so the repair may be a call-site change rather than a new one |
 | `moxie-executor::arena` | `create_partitioned` | `BTreeSet::insert` while validating the tier list |
 | `moxie-executor::arena` | `create_partitioned` | `Rc::new(ArenaCore)`, **after `DeviceBuffer::alloc` has succeeded** — an abort here leaves a live device allocation with no owner |
 | `moxie-cuda::driver` | `Module::function` | `CString::new(name)`, reached from `resolve_all` for every symbol |
@@ -79,19 +79,34 @@ whether anything remains.
    return a run equal to the unarmed one. Exhausting the loop bound is a
    failure. This is the shape task 0028's review required after a weaker sweep
    accepted a corrupted success.
-2. After a refusal at **any** position: the ledger has nothing outstanding, the
-   arena's free list is what it was, and no device allocation is live. The
-   `Rc::new` site is the reason this clause exists.
-3. The same sweep over `PlanRequest::new` plus `buffer` in the host lane, which
+2. After a refusal at **any** position of (1): the ledger has nothing
+   outstanding and no device allocation is live.
+3. **Two sweeps below `admit`, because (1) and (2) cannot see inside it.**
+   Review established both gaps:
+   - **`Arena::allocate`, with the arena retained.** `admit` owns its arena and
+     drops it on refusal, so a top-level sweep cannot tell a rolled-back free
+     list from a discarded one. This sweep keeps the arena and compares its
+     exact state — free list and live map — against what it was before the
+     armed call. Without it, a mutation that returns a refusal *without* undoing
+     the free-list mutation survives while (1) still passes.
+   - **`Ledger::admit`, comparing every counter.** It charges `committed` per
+     tier and `committed_scope` per scope **before** allocating the record that
+     names them, so "nothing outstanding" can pass while capacity stays charged.
+     This sweep compares every scope and tier counter before and after each
+     refusal, not just the outstanding list.
+4. The same sweep over `PlanRequest::new` plus `buffer` in the host lane, which
    needs no GPU and is where most of the inventory lives.
-4. Three mutations in the `T0029` battery: a `try_reserve` whose failure yields
-   a default value instead of a refusal, one infallible growth restored, and a
-   refusal that returns without undoing the free-list mutation.
-5. Every existing consumer still compiles and passes: the BF16 chain, the
+5. Four mutations in the `T0029` battery: a `try_reserve` whose failure yields a
+   default value instead of a refusal; one infallible growth restored; a refusal
+   that returns without undoing the free-list mutation; and a refusal that
+   returns without undoing the committed counters.
+6. Every existing consumer still compiles and passes: the BF16 chain, the
    expert plans, the residency authority and the whole device lane.
-6. Task 0028's two unmeasured repairs — its reserved range list and its
-   fallibly built symbol list — are covered by (1) and recorded as measured
-   there.
+7. Task 0028's **three** unmeasured repairs — its reserved range list, its
+   fallibly built symbol list, and `Module::resolve_all`'s fallible growth — are
+   covered by (1) and recorded as measured there. An earlier draft of this
+   clause said two and omitted `resolve_all`, which task 0028's own record has
+   right; review caught the disagreement.
 
 ## Exact condition requiring owner direction
 
