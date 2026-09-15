@@ -681,6 +681,43 @@ const LANES_T0028: &[Lane] = &[
 /// codes. Those are exactly the defects a tolerance cannot catch by being
 /// tight, which is why they are measured rather than asserted.
 const BATTERY_T0028: &[Mutation] = &[
+    // --- the third review -----------------------------------------------------
+    //
+    // Two of the second round's repairs were incomplete in the same way: each
+    // closed the path the reproduction used and left the path beside it open.
+    Mutation {
+        // The allocation finding again. The refusal formatters were fixed and
+        // the *successful* selection still collected two vectors and cloned the
+        // winner, all infallibly -- and a success has no refusal to fall back
+        // to. Review armed a valid sm_86 selection and got SIGABRT.
+        name: "selection-collects-a-temporary-vector",
+        file: "crates/moxie-executor/src/affine_linear.rs",
+        from: r#"    let mut chosen: Option<&SemanticKernelDescriptor> = None;"#,
+        to: r#"    let _unbounded: Vec<_> = catalogue.descriptors().iter().collect();
+    let mut chosen: Option<&SemanticKernelDescriptor> = None;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        // The same finding at the other end: the descriptor a successful
+        // selection returns is owned, and cloning it grows three heap values.
+        name: "the-selected-descriptor-is-cloned-infallibly",
+        file: "crates/moxie-executor/src/affine_linear.rs",
+        from: r#"    descriptor.try_clone()"#,
+        to: r#"    Ok(descriptor.clone())"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        // The edited-plan finding again. The exact-set comparison is measured
+        // against the binding, and the binding is optional in the parser
+        // because a hand-written selection has none -- so deleting the section
+        // skipped every check at once.
+        name: "a-plan-without-a-binding-is-left-unchecked",
+        file: "crates/moxie-repack/src/discover.rs",
+        from: r#"        if generated {"#,
+        to: r#"        if false && generated {"#,
+        expect: Expect::Caught,
+    },
+
     // --- the re-review of the first seven findings ----------------------------
     //
     // Three of the seven were reported as fixed and were not. Each substitution

@@ -400,35 +400,52 @@ pub fn select_affine_linear_kernel(
     weight: WeightPrecision,
     launch: &AffineLaunch,
 ) -> Result<SemanticKernelDescriptor> {
-    let on_this_device: Vec<_> = catalogue
-        .descriptors()
-        .iter()
-        .filter(|d| {
-            d.operation == SemanticKernelOp::Linear
-                && d.sm.major == capability.compute_major
-                && d.sm.minor == capability.compute_minor
-        })
-        .collect();
-    let matches: Vec<_> = on_this_device
-        .iter()
-        .filter(|d| descriptor_serves(d, weight, launch).is_ok())
-        .collect();
+    // **One pass, no temporaries.** This collected two `Vec`s and then cloned
+    // the winner, all infallibly, on the path that ends in a *successful*
+    // selection -- where the caller has no refusal to fall back to. Independent
+    // review failed one 32-byte allocation here and got `SIGABRT`. The scan
+    // holds a reference and two counters instead, and the one allocation left
+    // is the clone, which is now fallible.
+    let mut chosen: Option<&SemanticKernelDescriptor> = None;
+    let mut matched = 0usize;
     // A bare "found 0" is not actionable. When every device-local candidate was
     // rejected, the first rejection's reason *is* the answer, and the reasons
-    // are the same predicate admission will re-apply.
-    if matches.is_empty()
-        && let Some(reason) = on_this_device
-            .iter()
-            .find_map(|d| descriptor_serves(d, weight, launch).err())
+    // are the same predicate admission will re-apply. Only the first is kept:
+    // building one per rejected descriptor would allocate per candidate, and
+    // only one of them is ever read.
+    let mut first_rejection: Option<Error> = None;
+    for descriptor in catalogue.descriptors() {
+        if descriptor.operation != SemanticKernelOp::Linear
+            || descriptor.sm.major != capability.compute_major
+            || descriptor.sm.minor != capability.compute_minor
+        {
+            continue;
+        }
+        match descriptor_serves(descriptor, weight, launch) {
+            Ok(()) => {
+                matched += 1;
+                if chosen.is_none() {
+                    chosen = Some(descriptor);
+                }
+            }
+            Err(reason) => {
+                if first_rejection.is_none() {
+                    first_rejection = Some(reason);
+                }
+            }
+        }
+    }
+    if matched == 0
+        && let Some(reason) = first_rejection
     {
         return Err(reason);
     }
-    if matches.len() != 1 {
+    let Some(descriptor) = chosen.filter(|_| matched == 1) else {
         return Err(unsupported_kernel_fmt(
             "linear",
             format_args!(
                 "expected exactly one {} descriptor for a {} weight at {}x{}x{} on sm_{}{}; \
-                 found {}",
+                 found {matched}",
                 moxie_kernels::profile_name(weight.get()),
                 weight,
                 launch.rows,
@@ -436,11 +453,10 @@ pub fn select_affine_linear_kernel(
                 launch.out_features,
                 capability.compute_major,
                 capability.compute_minor,
-                matches.len()
             ),
         ));
-    }
-    Ok((*matches[0]).clone())
+    };
+    descriptor.try_clone()
 }
 
 /// Whether one descriptor serves this weight width at this geometry.

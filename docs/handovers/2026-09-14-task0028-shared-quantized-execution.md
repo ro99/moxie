@@ -104,7 +104,27 @@ its reason, carries descriptors only, and was already in the graph beneath
 
 ## Verification
 
-Measured on this tree with all three GPUs present:
+**Read the round below first.** The list that follows was measured at
+`cfc1061`, *before* three review rounds changed the code it describes. It is
+kept because it is the only end-to-end battery and `test-gpu` result there is,
+and it is labelled rather than refreshed, because a number relabelled without
+being re-measured is worse than an old number that says its own date.
+
+### Re-measured on the current tree (2026-09-15)
+
+- fmt, both clippy lanes, spec-check (10 documents), arch-check (79 rejected
+  fixtures, 21 accepted, 13 rules): clean.
+- `cargo xtask mutation-check --self-test`: **103 of 103** cases over 88
+  anchors.
+- `cargo test --workspace`: **1,100 passed**, 0 failed, 0 ignored.
+- `cargo test --workspace --features moxie-executor/driver`: **1,144 passed**
+  across 100 suites, 0 failed, 0 ignored, 0 filtered out.
+- The nine mutations the three review rounds added: each run individually,
+  **each caught**. The full `T0028` battery — now 22 mutations — has **not**
+  been re-run end to end on this tree, and `cargo xtask-cuda test-gpu` has not
+  been re-run either.
+
+### Measured at `cfc1061`, before any review round:
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`, and the
   same with `--features moxie-executor/driver`: clean.

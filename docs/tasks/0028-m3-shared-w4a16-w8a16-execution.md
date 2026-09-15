@@ -1,6 +1,6 @@
 # Task 0028 — M3 item 3: shared W4A16 / W8A16 execution
 
-Status: **implemented, reviewed twice, not accepted**. Contract written before
+Status: **implemented, reviewed three times, not accepted**. Contract written before
 implementation; the result below is filled from the runs, not from the plan.
 
 ## Identity and authority
@@ -249,13 +249,57 @@ expressed the defect it was named for. Both were rewritten and both are now
 caught. A mutation that cannot fail is the same mistake as a test that cannot
 fail, one level up.
 
-**Gates on the corrected tree.** fmt; both clippy lanes; spec-check (10
-documents); arch-check (79 rejected fixtures, 21 accepted, 13 rules); the
-mutation self-test at **100 of 100** cases over 85 anchors; **1,096** host tests
-and **1,140** device-feature tests across 100 suites, with nothing failed,
-ignored or skipped. The full `T0028` battery has **not** been re-run end to end
-on this tree; the six mutations this round added were each run and each caught,
-and that is the narrower claim.
+### The third review: two of those three were still open
+
+Both in the same shape as the round before — the repair closed the path the
+reproduction used and left the path beside it.
+
+| Finding | What the second repair missed | What closes it |
+|---|---|---|
+| **3 (P1)**, allocation failure | The refusal *formatters* were fixed and the **successful** selection was not: `select_affine_linear_kernel` collected two temporary `Vec`s and cloned the winner, all infallibly — on the one path where a caller has no refusal to fall back to. Review armed a valid sm_86 selection and got `memory allocation of 32 bytes failed`. The regression only exercised an unsupported sm_120, where both vectors stay empty and nothing is allocated before the formatter runs | Selection is one pass over the catalogue holding a reference and two counters, and the descriptor it returns is built by `SemanticKernelDescriptor::try_clone`. The regression **sweeps every allocation position** of a selection that succeeds, walking until the trap stops firing |
+| **5 (P1)**, edited plan | The exact `(tensor, shard)` comparison is measured **against the binding**, and `confirm_binding` returned success the moment `[binding]` was absent — which the parser allows, because a hand-written selection has none. Review deleted the block, deleted a tensor, and published a `complete` artifact missing it | `--plan` means this program generated the document, so it now requires a binding and says so by name. `--selection` remains the unbound hand-written route |
+
+Three more mutations, all caught on their first run, bringing the `T0028`
+battery to **22**:
+
+| Mutation | Deciding lane |
+|---|---|
+| `selection-collects-a-temporary-vector` | `allocation-refusal` |
+| `the-selected-descriptor-is-cloned-infallibly` | `allocation-refusal` |
+| `a-plan-without-a-binding-is-left-unchecked` | `two-command` |
+
+### One gap is named rather than closed
+
+Review asked the sweep to cover successful **admission** as well as selection.
+`AffineLinearRun::admit`'s own allocations are fallible, but the first thing it
+calls is `moxie_memory::PlanRequest::new`, and that **aborts**: armed at
+position 4, a plan request built exactly as `resource_request` builds one dies
+with `memory allocation of 5 bytes failed`.
+
+That is not this task's code. `PlanRequest` and `BufferRequest` are the shared
+admission vocabulary — the BF16 chain, the expert plans and the residency
+authority all build them, their labels are `impl Into<String>` evaluated at
+every call site, and their refusals use `format!`. Making that path fallible is
+a change to a shared owner with its own consumers, and doing it inside a
+correction round is the scope drift task contracts exist to stop.
+
+So the admission half of the sweep is **unmeasured, not passing**, it is stated
+as such in `tests/allocation_refusal.rs` beside the sweeps that do run, and it
+is the next bounded task. The measurement above is the reproduction that task
+starts from.
+
+**Gates on the corrected tree** (2026-09-15, after the third round): fmt; both
+clippy lanes; spec-check (10 documents); arch-check (79 rejected fixtures, 21
+accepted, 13 rules); the mutation self-test at **103 of 103** cases over 88
+anchors; **1,100** host tests and **1,144** device-feature tests across 100
+suites, with nothing failed, ignored or skipped.
+
+The full `T0028` battery has **not** been re-run end to end on this tree, and
+neither has `cargo xtask-cuda test-gpu`. What has been run is each of the
+**nine** mutations the three rounds added, individually, all caught. That is a
+narrower claim than a battery pass and it is the only one these corrections are
+entitled to; the 13-of-13 result in the support matrix and the handover
+describes `cfc1061`, and both now say so.
 
 **A new lane.** `allocation-refusal` runs a test binary with a per-thread
 one-shot failing allocator. A process that aborts cannot be observed from

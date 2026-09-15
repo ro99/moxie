@@ -181,6 +181,60 @@ pub struct SemanticKernelDescriptor {
     pub symbols: Vec<KernelSymbol>,
 }
 
+impl SemanticKernelDescriptor {
+    /// Clone without an allocation that can abort the process.
+    ///
+    /// `Clone` grows three heap values -- the identifier, the operand list and
+    /// the symbol list -- and every one of them aborts when the allocator
+    /// refuses. Selection returns an owned descriptor on its **success** path,
+    /// which is the path a caller has no refusal to fall back to, and an
+    /// independent review failed one 32-byte allocation there and got
+    /// `SIGABRT`. Each buffer is reserved before it is filled, so a refusal is
+    /// a typed capacity error.
+    pub fn try_clone(&self) -> crate::Result<Self> {
+        fn no_room() -> crate::Error {
+            crate::Error::CapacityExceeded {
+                tier: None,
+                requested_bytes: 0,
+                available_bytes: 0,
+            }
+        }
+        fn try_string(source: &str) -> crate::Result<String> {
+            let mut out = String::new();
+            out.try_reserve_exact(source.len()).map_err(|_| no_room())?;
+            out.push_str(source);
+            Ok(out)
+        }
+        let mut inputs = Vec::new();
+        inputs
+            .try_reserve_exact(self.inputs.len())
+            .map_err(|_| no_room())?;
+        inputs.extend_from_slice(&self.inputs);
+        let mut symbols = Vec::new();
+        symbols
+            .try_reserve_exact(self.symbols.len())
+            .map_err(|_| no_room())?;
+        for symbol in &self.symbols {
+            symbols.push(KernelSymbol(try_string(&symbol.0)?));
+        }
+        Ok(Self {
+            id: KernelId(try_string(&self.id.0)?),
+            abi_version: self.abi_version,
+            operation: self.operation,
+            inputs,
+            output: self.output,
+            accumulation: self.accumulation,
+            rounding: self.rounding,
+            layout: self.layout,
+            shape: self.shape,
+            sm: self.sm,
+            workspace: self.workspace,
+            image_sha256: self.image_sha256,
+            symbols,
+        })
+    }
+}
+
 /// Read-only, closed catalogue injected into planning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelCatalogue {

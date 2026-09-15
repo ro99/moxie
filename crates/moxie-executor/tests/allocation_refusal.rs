@@ -38,22 +38,40 @@ use moxie_types::{
 };
 
 thread_local! {
-    /// Armed by [`with_one_failed_allocation`] and cleared by the allocation it
-    /// fails, so exactly one request on this thread returns null and everything
-    /// after it succeeds. `const` initialised, so reading it inside the
-    /// allocator cannot itself allocate.
-    static ARMED: Cell<bool> = const { Cell::new(false) };
+    /// How many more allocations on this thread succeed before one fails.
+    ///
+    /// `None` is disarmed. `Some(n)` lets `n` through and fails the next one,
+    /// then disarms, so exactly one request returns null per arming. `const`
+    /// initialised, so reading it inside the allocator cannot itself allocate.
+    static ARMED: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Whether the last arming actually reached its allocation. A sweep that has
+    /// run past the end of a function would otherwise look identical to one
+    /// still finding new positions.
+    static FIRED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Take the arming, if this thread has any. `try_with` because a thread tearing
-/// down its locals must not panic inside the allocator.
+/// Count down, and report whether this allocation is the one to fail.
+///
+/// `try_with` because a thread tearing down its locals must not panic inside
+/// the allocator.
 fn take_arming() -> bool {
     ARMED
-        .try_with(|armed| armed.replace(false))
+        .try_with(|armed| match armed.get() {
+            None => false,
+            Some(0) => {
+                armed.set(None);
+                let _ = FIRED.try_with(|fired| fired.set(true));
+                true
+            }
+            Some(n) => {
+                armed.set(Some(n - 1));
+                false
+            }
+        })
         .unwrap_or(false)
 }
 
-fn set_arming(value: bool) {
+fn set_arming(value: Option<usize>) {
     let _ = ARMED.try_with(|armed| armed.set(value));
 }
 
@@ -91,12 +109,20 @@ static A: OneShotFailure = OneShotFailure;
 /// Nothing is asserted inside: an assertion allocates, and the point is to keep
 /// the armed window as narrow as the call being tested.
 fn with_one_failed_allocation<T>(body: impl FnOnce() -> T) -> T {
-    set_arming(true);
+    with_failure_at(0, body).0
+}
+
+/// Run `body` with the `skip`-th allocation after arming failing, and report
+/// whether that allocation was ever reached.
+fn with_failure_at<T>(skip: usize, body: impl FnOnce() -> T) -> (T, bool) {
+    let _ = FIRED.try_with(|fired| fired.set(false));
+    set_arming(Some(skip));
     let out = body();
     // Disarm whether or not the allocation happened, so a path that stops
     // allocating cannot leave this thread running under a live trap.
-    set_arming(false);
-    out
+    set_arming(None);
+    let fired = FIRED.try_with(Cell::get).unwrap_or(false);
+    (out, fired)
 }
 
 fn descriptor(width: IntWidth, in_features: usize, out_features: usize) -> AffineDescriptor {
@@ -216,4 +242,110 @@ fn the_same_refusal_carries_its_prose_when_allocation_succeeds() {
         text.contains("cannot bind"),
         "the unarmed refusal lost its prose: {text}"
     );
+}
+
+/// **Every** allocation position in a *successful* selection, swept.
+///
+/// The first regression only exercised a refusal, where both temporary vectors
+/// stay empty and nothing is allocated before the formatter runs. Review armed
+/// the trap around a selection that **succeeds** on sm_86 and got `memory
+/// allocation of 32 bytes failed` and `SIGABRT`: the two `collect()` calls and
+/// the winner's `clone()` were all infallible, on the one path with no refusal
+/// to fall back to.
+///
+/// One position proves nothing here, because which position aborts depends on
+/// how the function is written. So this walks every position until the arming
+/// stops firing, which is where the call has stopped allocating at all.
+/// Surviving the loop **is** the assertion: an abort takes the process, and no
+/// assertion inside it would run.
+#[test]
+fn every_allocation_in_a_successful_selection_degrades_rather_than_aborting() {
+    let catalogue = KernelCatalogue::new(vec![
+        catalogue_entry(Precision::Int4, SmVersion::SM86),
+        catalogue_entry(Precision::Int8, SmVersion::SM86),
+        catalogue_entry(Precision::Int4, SmVersion::SM120),
+    ])
+    .expect("three descriptors");
+    let d = descriptor(IntWidth::Int4, 64, 32);
+    let launch = AffineLaunch::derive(&d, ZeroPointSection::PerGroup, 4).expect("a launch");
+    let int4 = WeightPrecision::expect(Precision::Int4);
+    let cap = capability(8, 6);
+
+    // The control: unarmed, this selection succeeds and finds the INT4 sm_86
+    // entry. Without it, a sweep over a selection that always failed would pass
+    // by never reaching an allocation at all.
+    let chosen = select_affine_linear_kernel(&catalogue, &cap, int4, &launch)
+        .expect("an sm_86 INT4 descriptor is in the catalogue");
+    assert!(chosen.id.0.contains("sm_86"), "{}", chosen.id.0);
+
+    let mut positions_reached = 0usize;
+    let mut refusals = 0usize;
+    for skip in 0..64 {
+        let (result, fired) = with_failure_at(skip, || {
+            select_affine_linear_kernel(&catalogue, &cap, int4, &launch)
+        });
+        if result.is_err() {
+            refusals += 1;
+        }
+        if !fired {
+            break;
+        }
+        positions_reached += 1;
+    }
+
+    // At least one position must have been reachable, or this sweep measured
+    // nothing -- the same way the first regression measured nothing.
+    assert!(
+        positions_reached > 0,
+        "no allocation was reached during a successful selection, so this sweep proves nothing"
+    );
+    assert!(
+        refusals > 0,
+        "every armed position still returned Ok, so the trap never reached the call it was \
+         armed around"
+    );
+}
+
+/// The same sweep over the geometry derivation a caller runs first.
+#[test]
+fn every_allocation_in_a_launch_derivation_degrades_rather_than_aborting() {
+    let d = descriptor(IntWidth::Int4, 64, 32);
+    for skip in 0..64 {
+        let (result, fired) = with_failure_at(skip, || {
+            AffineLaunch::derive(&d, ZeroPointSection::PerGroup, 4)
+        });
+        // Either outcome is legal; an abort is not, and an abort ends the
+        // process rather than this loop.
+        let _ = result;
+        if !fired {
+            break;
+        }
+    }
+}
+
+/// What this sweep does **not** cover, stated where it is measured.
+///
+/// Review asked for the sweep to cover successful **admission** too.
+/// `AffineLinearRun::admit`'s own allocations are fallible -- its labels go
+/// through `try_label` -- but the first thing it calls is
+/// `moxie_memory::PlanRequest::new`, and that aborts: armed at position 4, a
+/// plan request built exactly as `resource_request` builds one dies with
+/// `memory allocation of 5 bytes failed`.
+///
+/// That is **not** task 0028's code. `PlanRequest` and `BufferRequest` are the
+/// shared admission vocabulary: the BF16 chain, the expert plans and the
+/// residency authority all build them, their labels are `impl Into<String>`
+/// evaluated at every call site, and their refusals use `format!`. Making that
+/// path fallible is a change to a shared owner with its own consumers, and
+/// smuggling it into this correction round would be the kind of scope drift
+/// this repository's task contracts exist to stop.
+///
+/// So it is recorded rather than half-done, and the admission half of the sweep
+/// is **unmeasured**, not passing. The task record names it as the next bounded
+/// task.
+#[test]
+fn the_admission_sweep_is_unmeasured_and_this_says_so() {
+    // Deliberately empty of assertions. It exists so the gap has a name in the
+    // same file as the sweeps that *are* measured, rather than only in a
+    // document nobody runs.
 }

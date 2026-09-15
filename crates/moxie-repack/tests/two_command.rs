@@ -1124,6 +1124,78 @@ fn a_plan_edited_to_swap_an_entry_cannot_publish_as_complete() {
     );
 }
 
+/// A `--plan` document with its `[binding]` block removed is refused.
+///
+/// The exact-set comparison, the config digest and the index digest are all
+/// measured **against the binding**, and `confirm_binding` returned success the
+/// moment the section was absent -- which the parser allows, because a
+/// hand-written selection has none. Review deleted the block, deleted a tensor,
+/// and published a `complete` artifact missing it. The optional section belongs
+/// to `--selection`; `--plan` says this program wrote the document.
+#[test]
+fn a_plan_without_its_binding_is_refused_rather_than_unchecked() {
+    let scratch = Scratch::new("unbound-plan");
+    let root = checkpoint(&scratch, false);
+    let plan = scratch.join("model.plan.toml");
+    let out = scratch.join("out");
+
+    let planned = common::run(&[
+        "plan",
+        "--source-root",
+        root.to_str().unwrap(),
+        "--out-plan",
+        plan.to_str().unwrap(),
+    ]);
+    assert_eq!(planned.outcome(), "planned", "{}", planned.stdout);
+    let text = std::fs::read_to_string(&plan).expect("the plan reads");
+
+    // Remove the whole `[binding]` block, and one tensor with it -- the exact
+    // sequence review reproduced.
+    let at = text.find("\n[binding]\n").expect("a binding section");
+    let after = text[at + 1..]
+        .find("\n[")
+        .map(|i| at + 1 + i)
+        .expect("a section after the binding");
+    let unbound = format!("{}{}", &text[..at], &text[after..]);
+    assert!(
+        !unbound.contains("[binding]") && unbound.contains("status = \"complete\""),
+        "the edit did not remove the binding, or removed the completeness line"
+    );
+    let victim = "model.norm.weight";
+    let at = unbound.find(victim).expect("the bf16 tensor is named");
+    let line_start = unbound[..at].rfind('\n').expect("a line start") + 1;
+    let line_end = unbound[at..].find('\n').expect("a line end") + at + 1;
+    let edited = format!("{}{}", &unbound[..line_start], &unbound[line_end..]);
+    assert!(
+        !edited.contains(victim),
+        "the tensor was not removed:\n{edited}"
+    );
+    std::fs::write(&plan, &edited).expect("the edited plan writes");
+
+    let refused = common::run(&[
+        "repack",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_ne!(
+        refused.status, 0,
+        "an unbound plan published a subset as complete:\n{}{}",
+        refused.stdout, refused.stderr
+    );
+    assert!(
+        refused.says("[binding]"),
+        "the refusal does not name what is missing:\n{}{}",
+        refused.stdout,
+        refused.stderr
+    );
+    assert!(
+        !out.join("manifest.toml").exists(),
+        "a manifest was published for a plan that was refused"
+    );
+}
+
 /// Task 0028's review, finding 7: a file this program did not create is not
 /// this program's to delete.
 ///

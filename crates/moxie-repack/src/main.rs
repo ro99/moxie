@@ -776,7 +776,7 @@ fn command_repack(flags: &mut Flags) -> i32 {
         // gained or lost tensors is refused rather than published as the old
         // subset -- and a plan that has *itself* been edited to cover less is
         // refused rather than published as complete.
-        moxie_repack::discover::confirm_binding(&root, &plan_text, &selection)?;
+        moxie_repack::discover::confirm_binding(&root, &plan_text, &selection, from_plan)?;
         // **A partial conversion is not a model.** The normal path refuses one,
         // because an artifact missing tensors that opens and verifies is the
         // most expensive kind of wrong. Converting a subset on purpose stays

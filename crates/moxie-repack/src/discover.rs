@@ -847,14 +847,34 @@ fn automatic_scratch_bytes(discovery: &Discovery) -> Result<usize> {
 ///
 /// So the plan binds what **defines** the model: its `config.json` and its
 /// index, by content, plus how many tensors that index named.
+/// `generated` says which route this document arrived by: `--plan` means the
+/// program wrote it and every guard below applies, `--selection` means a person
+/// did and the binding is optional.
 pub fn confirm_binding(
     root: &Path,
     plan_text: &str,
     selection: &moxie_format::selection::Selection,
+    generated: bool,
 ) -> Result<()> {
     let Some((config_sha, index_sha, index_tensors)) =
         moxie_format::plan::declared_binding(plan_text)?
     else {
+        // **A `--plan` document without a binding is not a plan.** The binding
+        // is what every check below is measured against, so a document missing
+        // it silently skipped all of them -- independent review deleted the
+        // `[binding]` block, deleted a tensor, and published a `complete`
+        // artifact with the tensor missing. The parser leaves the section
+        // optional because a hand-written selection has none, and that is the
+        // `--selection` route; it is not this one.
+        if generated {
+            return Err(invalid(
+                "this plan has no [binding] section. `--plan` means this program generated the \
+                 document, and the binding is what says which checkpoint it describes -- without \
+                 it nothing can be checked against anything. Generate a new plan, or pass a \
+                 hand-written document with --selection, which is the route that does not bind"
+                    .to_string(),
+            ));
+        }
         // A hand-written selection binds nothing of the kind; the advanced path
         // is the user saying what to convert.
         return Ok(());
