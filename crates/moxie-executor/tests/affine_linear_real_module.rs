@@ -415,19 +415,21 @@ fn a_published_canonical_int4_module_executes_and_matches_its_decoder() {
              would need {dequantized}"
         );
 
-        let got = run
+        let completed = run
             .run(
                 &stream,
                 &authority,
                 &residency,
                 ResidentAffineWeight {
-                    codes: &codes,
-                    scales: &scales,
-                    zero_points: Some(&zero_points),
+                    codes,
+                    scales,
+                    zero_points: Some(zero_points),
                 },
-                &x_bytes,
+                x_bytes.clone(),
             )
-            .expect("the module executes");
+            .unwrap_or_else(|refused| panic!("the module executes: {}", refused.error));
+        let got = completed.output;
+        let weight = completed.weight;
 
         let (mut worst_ulp, mut cancelled) = (0f64, 0usize);
         for (i, expected) in want.iter().enumerate() {
@@ -470,7 +472,10 @@ fn a_published_canonical_int4_module_executes_and_matches_its_decoder() {
         );
 
         run.close(&mut ledger).expect("the run closes");
-        for lease in [codes, scales, zero_points] {
+        for lease in [Some(weight.codes), Some(weight.scales), weight.zero_points]
+            .into_iter()
+            .flatten()
+        {
             authority.release(lease).expect("the lease retires");
         }
         authority.end_turn(TurnId::new(1));

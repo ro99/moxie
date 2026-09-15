@@ -34,6 +34,84 @@ fn invalid(field: &'static str, detail: impl Into<String>) -> Error {
     }
 }
 
+/// A `String` that grows only through `try_reserve`.
+///
+/// The same device `moxie-format` uses, for the same reason task 0024's review
+/// established: `format!` **aborts** when an allocation fails, and the context
+/// that produces a refusal is exactly the context most likely to coincide with
+/// memory pressure. A review failed one 32-byte allocation on this path and got
+/// `SIGABRT` instead of a typed capacity error.
+struct FallibleString(String);
+
+impl core::fmt::Write for FallibleString {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        // Reserve first, then push: `push_str` cannot reallocate once the
+        // capacity is there, so no infallible growth happens on this path.
+        self.0.try_reserve(s.len()).map_err(|_| core::fmt::Error)?;
+        self.0.push_str(s);
+        Ok(())
+    }
+}
+
+fn fallible(args: core::fmt::Arguments<'_>) -> String {
+    use core::fmt::Write;
+    let mut sink = FallibleString(String::new());
+    // An empty detail is a shorter true statement, not an abort. The variant
+    // and the `&'static str` field are what a caller branches on either way.
+    match sink.write_fmt(args) {
+        Ok(()) => sink.0,
+        Err(_) => String::new(),
+    }
+}
+
+/// [`Error::InvalidRequest`] whose prose is composed **fallibly**.
+fn invalid_fmt(field: &'static str, detail: core::fmt::Arguments<'_>) -> Error {
+    Error::InvalidRequest {
+        field,
+        detail: fallible(detail),
+    }
+}
+
+/// [`Error::Unsupported`] whose prose is composed **fallibly**.
+fn unsupported_fmt(capability: &'static str, reason: core::fmt::Arguments<'_>) -> Error {
+    Error::Unsupported {
+        capability,
+        reason: fallible(reason),
+    }
+}
+
+/// [`Error::UnsupportedKernel`] whose prose is composed **fallibly**.
+fn unsupported_kernel_fmt(operation: &'static str, detail: core::fmt::Arguments<'_>) -> Error {
+    Error::UnsupportedKernel {
+        operation,
+        detail: fallible(detail),
+    }
+}
+
+/// A zeroed buffer of `len` bytes, or a typed capacity refusal.
+///
+/// `vec![0u8; len]` aborts when the allocation fails. This is the readback
+/// destination for a whole output tensor, so it is the largest thing this path
+/// asks for and the one most likely to be refused.
+/// Used by the launch path, which is behind `driver`, and by the host test that
+/// proves it degrades rather than aborts. The host lane builds the library
+/// without either, so the attribute is the honest way to say "this has one
+/// consumer and one gate" -- the same note `moxie-format::invalid_static`
+/// carries for the same reason.
+#[cfg_attr(not(any(feature = "driver", test)), allow(dead_code))]
+fn try_zeroed(len: usize) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(len)
+        .map_err(|_| Error::CapacityExceeded {
+            tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::Pageable)),
+            requested_bytes: len as u64,
+            available_bytes: 0,
+        })?;
+    // Cannot reallocate: the capacity is already there.
+    out.resize(len, 0);
+    Ok(out)
+}
+
 fn unsupported(capability: &'static str, reason: impl Into<String>) -> Error {
     Error::Unsupported {
         capability,
@@ -49,21 +127,29 @@ fn unsupported(capability: &'static str, reason: impl Into<String>) -> Error {
 /// cannot fall inside a `k` tile — so that is checked here, against
 /// [`moxie_kernels::AFFINE_LINEAR_TILE`], rather than assumed in CUDA where it
 /// could only fail as a wrong number.
+/// **The fields are private and there is no way to build one except through
+/// [`AffineLaunch::derive`].** A value of this type *is* the evidence that the
+/// geometry was checked, the same way `moxie-types`' role precisions are. An
+/// independent review constructed a launch with `row_stride = 1` and
+/// `groups_per_row = 0` on a 64-column INT4 tensor and drove it through
+/// selection and admission: the component-size checks became vacuous and the
+/// kernel would have indexed outside its own buffers. Public fields on a
+/// checked struct mean the check happened once, to a value nobody has to keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AffineLaunch {
-    pub rows: u64,
-    pub in_features: u64,
-    pub out_features: u64,
+    rows: u64,
+    in_features: u64,
+    out_features: u64,
     /// Bytes one packed code row occupies. INT4 rows are byte-aligned, so an
     /// odd row carries one nibble that is never a logical value.
-    pub row_stride: u64,
-    pub groups_per_row: u64,
+    row_stride: u64,
+    groups_per_row: u64,
     /// Logical input columns per group. Equal to `in_features` for a
     /// per-output-channel tensor, which has exactly one group.
-    pub group_size: u64,
-    pub width: IntWidth,
-    pub scale_dtype: ScaleDtype,
-    pub symmetric: bool,
+    group_size: u64,
+    width: IntWidth,
+    scale_dtype: ScaleDtype,
+    symmetric: bool,
 }
 
 impl AffineLaunch {
@@ -106,9 +192,9 @@ impl AffineLaunch {
         // than a failure.
         let tile = moxie_kernels::AFFINE_LINEAR_TILE;
         if groups_per_row > 1 && !group_size.is_multiple_of(tile) {
-            return Err(unsupported(
+            return Err(unsupported_fmt(
                 "w4a16_group_size",
-                format!(
+                format_args!(
                     "group size {group_size} is not a multiple of the {tile}-wide tensor-core \
                      tile, so a group boundary would fall inside one tile and the kernel's \
                      one-scale-per-tile conversion would read the wrong group"
@@ -153,6 +239,43 @@ impl AffineLaunch {
         Self::derive(tensor.descriptor(), section, rows)
     }
 
+    pub const fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    pub const fn in_features(&self) -> u64 {
+        self.in_features
+    }
+
+    pub const fn out_features(&self) -> u64 {
+        self.out_features
+    }
+
+    pub const fn row_stride(&self) -> u64 {
+        self.row_stride
+    }
+
+    pub const fn groups_per_row(&self) -> u64 {
+        self.groups_per_row
+    }
+
+    pub const fn group_size(&self) -> u64 {
+        self.group_size
+    }
+
+    pub const fn width(&self) -> IntWidth {
+        self.width
+    }
+
+    pub const fn scale_dtype(&self) -> ScaleDtype {
+        self.scale_dtype
+    }
+
+    /// Whether this tensor has **no** zero-point component at all.
+    pub const fn symmetric(&self) -> bool {
+        self.symmetric
+    }
+
     /// The group a logical input column belongs to.
     ///
     /// The same arithmetic the kernel performs, expressed once on the host so a
@@ -160,9 +283,9 @@ impl AffineLaunch {
     /// decoder's own map — on shapes whose last group is short.
     pub fn group_of(&self, k: u64) -> Result<u64> {
         if k >= self.in_features {
-            return Err(invalid(
+            return Err(invalid_fmt(
                 "column",
-                format!("column {k} is outside {} input features", self.in_features),
+                format_args!("column {k} is outside {} input features", self.in_features),
             ));
         }
         Ok(if self.groups_per_row == 1 {
@@ -257,29 +380,29 @@ pub fn select_affine_linear_kernel(
     weight: WeightPrecision,
     launch: &AffineLaunch,
 ) -> Result<SemanticKernelDescriptor> {
-    let inputs = vec![
-        KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
-        KernelOperand::Weight(weight),
-    ];
-    let matches: Vec<_> = catalogue
+    let on_this_device: Vec<_> = catalogue
         .descriptors()
         .iter()
         .filter(|d| {
             d.operation == SemanticKernelOp::Linear
-                && d.abi_version == moxie_kernels::AFFINE_LINEAR_ABI
-                && d.inputs == inputs
-                && d.output == ActivationPrecision::expect(Precision::Bf16)
-                && d.accumulation == moxie_types::AccumulationPolicy::Bf16InF32Acc
-                && d.rounding == moxie_types::RoundingProfile::FinalBf16Rne
-                && d.layout == moxie_types::TensorLayout::ContiguousRowMajorV1
-                && d.workspace == moxie_types::WorkspaceExpression::Zero
                 && d.sm.major == capability.compute_major
                 && d.sm.minor == capability.compute_minor
-                && launch.rows <= d.shape.max_rows
-                && launch.in_features <= d.shape.max_input
-                && launch.out_features <= d.shape.max_output
         })
         .collect();
+    let matches: Vec<_> = on_this_device
+        .iter()
+        .filter(|d| descriptor_serves(d, weight, launch).is_ok())
+        .collect();
+    // A bare "found 0" is not actionable. When every device-local candidate was
+    // rejected, the first rejection's reason *is* the answer, and the reasons
+    // are the same predicate admission will re-apply.
+    if matches.is_empty()
+        && let Some(reason) = on_this_device
+            .iter()
+            .find_map(|d| descriptor_serves(d, weight, launch).err())
+    {
+        return Err(reason);
+    }
     if matches.len() != 1 {
         return Err(Error::UnsupportedKernel {
             operation: "linear",
@@ -297,17 +420,84 @@ pub fn select_affine_linear_kernel(
             ),
         });
     }
-    let descriptor = matches[0];
-    if descriptor.symbols.len() != 1 || descriptor.symbols[0].0 != moxie_kernels::AFFINE_LINEAR {
-        return Err(Error::UnsupportedKernel {
-            operation: "linear",
-            detail: format!(
-                "descriptor {} names {:?} rather than the shared quantized linear symbol",
-                descriptor.id.0, descriptor.symbols
-            ),
-        });
+    Ok((*matches[0]).clone())
+}
+
+/// Whether one descriptor serves this weight width at this geometry.
+///
+/// **Selection and admission apply the same predicate**, which is the point:
+/// `AffineLinearRun::admit` is a public entry point that takes a descriptor,
+/// and a review handed it one that selection would never have chosen. A
+/// descriptor checked at selection and trusted at admission is a check that
+/// happened to a value nobody kept.
+pub fn descriptor_serves(
+    descriptor: &SemanticKernelDescriptor,
+    weight: WeightPrecision,
+    launch: &AffineLaunch,
+) -> Result<()> {
+    let refuse = |detail: core::fmt::Arguments<'_>| Err(unsupported_kernel_fmt("linear", detail));
+    // The mismatch worth naming first, because it is the one that produces a
+    // wrong answer rather than a failed lookup: a descriptor whose weight
+    // operand is not the width this geometry packs. The requested width and the
+    // descriptor's declared width are checked against the geometry separately,
+    // so neither can stand in for the other.
+    let declared = descriptor.inputs.iter().find_map(|operand| match operand {
+        KernelOperand::Weight(precision) => Some(*precision),
+        _ => None,
+    });
+    if weight.get() != launch.width.precision()
+        || declared.map(WeightPrecision::get) != Some(launch.width.precision())
+    {
+        return refuse(format_args!(
+            "cannot bind: the request names {weight} weights, descriptor {} declares {}, \
+             and the geometry packs {}",
+            descriptor.id.0,
+            declared.map_or_else(|| "none".to_string(), |p| p.to_string()),
+            launch.width.precision()
+        ));
     }
-    Ok(descriptor.clone())
+    let inputs = [
+        KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+        KernelOperand::Weight(weight),
+    ];
+    if descriptor.operation != SemanticKernelOp::Linear
+        || descriptor.abi_version != moxie_kernels::AFFINE_LINEAR_ABI
+        || descriptor.inputs != inputs
+        || descriptor.output != ActivationPrecision::expect(Precision::Bf16)
+        || descriptor.accumulation != moxie_types::AccumulationPolicy::Bf16InF32Acc
+        || descriptor.rounding != moxie_types::RoundingProfile::FinalBf16Rne
+        || descriptor.layout != moxie_types::TensorLayout::ContiguousRowMajorV1
+        // Zero, and load-bearing: a workspace is where a dequantized copy of
+        // the weight could hide, and this path must not have one.
+        || descriptor.workspace != moxie_types::WorkspaceExpression::Zero
+    {
+        return refuse(format_args!(
+            "descriptor {} does not declare the shared quantized linear contract",
+            descriptor.id.0
+        ));
+    }
+    if descriptor.symbols.len() != 1 || descriptor.symbols[0].0 != moxie_kernels::AFFINE_LINEAR {
+        return refuse(format_args!(
+            "descriptor {} names {:?} rather than the shared quantized linear symbol",
+            descriptor.id.0, descriptor.symbols
+        ));
+    }
+    if launch.rows > descriptor.shape.max_rows
+        || launch.in_features > descriptor.shape.max_input
+        || launch.out_features > descriptor.shape.max_output
+    {
+        return refuse(format_args!(
+            "{}x{}x{} is outside descriptor {}'s declared domain of {}x{}x{}",
+            launch.rows,
+            launch.in_features,
+            launch.out_features,
+            descriptor.id.0,
+            descriptor.shape.max_rows,
+            descriptor.shape.max_input,
+            descriptor.shape.max_output
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "driver")]
@@ -323,12 +513,21 @@ mod device {
     };
     use moxie_types::{DeviceTier, Error, HostTier, Result, Scope, SemanticKernelDescriptor, Tier};
 
-    use super::{AffineLaunch, invalid};
+    use super::{AffineLaunch, fallible, invalid, invalid_fmt, try_zeroed, unsupported_kernel_fmt};
     use crate::arena::{DeviceArena, DeviceRange};
     use crate::residency::DeviceResidency;
 
     /// 256-byte alignment, as every other device range in this crate uses.
     const ALIGNMENT: u64 = 256;
+
+    /// The three device addresses one launch reads, each already checked
+    /// against the length the descriptor implies and the device it runs on.
+    #[derive(Debug, Clone, Copy)]
+    struct ComponentAddresses {
+        codes: u64,
+        scales: u64,
+        zero_points: Option<u64>,
+    }
 
     /// One logical weight, resident as three components.
     ///
@@ -337,10 +536,57 @@ mod device {
     /// tensor genuinely has no third one. `zero_points: None` is the absent
     /// section; the kernel receives a null pointer and adds nothing.
     #[derive(Debug)]
-    pub struct ResidentAffineWeight<'a> {
-        pub codes: &'a ResidencyLease,
-        pub scales: &'a ResidencyLease,
-        pub zero_points: Option<&'a ResidencyLease>,
+    pub struct ResidentAffineWeight {
+        pub codes: ResidencyLease,
+        pub scales: ResidencyLease,
+        pub zero_points: Option<ResidencyLease>,
+    }
+
+    impl ResidentAffineWeight {
+        fn leases(&self) -> impl Iterator<Item = &ResidencyLease> {
+            [
+                Some(&self.codes),
+                Some(&self.scales),
+                self.zero_points.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+        }
+    }
+
+    /// One completed launch: the output, and the operands handed back.
+    ///
+    /// The operands are **returned**, not borrowed, because a launch that could
+    /// not establish its own completion must keep them instead. Getting them
+    /// back is the caller's evidence that nothing is still reading them.
+    #[derive(Debug)]
+    pub struct AffineLinearOutput {
+        pub output: Vec<u8>,
+        pub weight: ResidentAffineWeight,
+        pub activations: Vec<u8>,
+    }
+
+    /// A refused launch.
+    ///
+    /// `weight` and `activations` are `Some` when the refusal happened
+    /// **before** anything was enqueued, and `None` when the run retained them:
+    /// submitted work whose completion is unknown may still be reading those
+    /// bytes, and handing a lease back would let the caller release it and let
+    /// the authority evict weights out from under a live copy. Withholding is
+    /// the whole point of the lease discipline (document 02).
+    #[derive(Debug)]
+    pub struct AffineRunRefused {
+        pub error: Error,
+        pub weight: Option<ResidentAffineWeight>,
+        pub activations: Option<Vec<u8>>,
+    }
+
+    impl AffineRunRefused {
+        /// Whether the run kept the operands because their completion is
+        /// unknown.
+        pub const fn retained_operands(&self) -> bool {
+            self.weight.is_none()
+        }
     }
 
     /// An admitted quantized linear: one arena for the per-step tensors, one
@@ -361,6 +607,10 @@ mod device {
         arena_bytes: u64,
         ledger: LedgerId,
         ctx: &'ctx RankContext,
+        /// Operands retained past a launch whose completion could not be
+        /// established. Never handed back and never dropped while quarantined.
+        held_weight: Option<ResidentAffineWeight>,
+        held_activations: Option<Vec<u8>>,
         /// Set when work was enqueued and its completion could not be
         /// established. The ranges it may still be reading are then never
         /// released: `close` refuses and dropping keeps the charge.
@@ -409,16 +659,26 @@ mod device {
             if descriptor.sm.major != ctx.capability().compute_major
                 || descriptor.sm.minor != ctx.capability().compute_minor
             {
-                return Err(fail(Error::UnsupportedKernel {
-                    operation: "linear",
-                    detail: format!(
+                return Err(fail(unsupported_kernel_fmt(
+                    "linear",
+                    format_args!(
                         "descriptor {} is qualified for {} and this device is sm_{}{}",
                         descriptor.id.0,
                         descriptor.sm.name(),
                         ctx.capability().compute_major,
                         ctx.capability().compute_minor
                     ),
-                }));
+                )));
+            }
+            // Admission re-applies selection's own predicate. This is a public
+            // entry point that accepts a descriptor, and a review handed it one
+            // selection would never have chosen.
+            if let Err(error) = super::descriptor_serves(
+                &descriptor,
+                moxie_types::WeightPrecision::expect(launch.width().precision()),
+                &launch,
+            ) {
+                return Err(fail(error));
             }
             let request = match resource_request(&launch, ctx) {
                 Ok(request) => request,
@@ -511,6 +771,8 @@ mod device {
                 arena_bytes: total,
                 ledger: ledger.id(),
                 ctx,
+                held_weight: None,
+                held_activations: None,
                 quarantined: false,
             })
         }
@@ -536,55 +798,284 @@ mod device {
         /// Upload one step's activations, launch against the resident weight,
         /// and return the output once the completion event says it exists.
         ///
-        /// `x` stays owned by the caller for the whole call and the call does
-        /// not return until the event is observed, so no source is reusable
-        /// before its copy completed.
+        /// **The operands are taken by value and returned by value.** Borrowing
+        /// them was wrong: after a failure between the first copy and an
+        /// observed completion, the caller could free the activation source or
+        /// release the weight leases while submitted work was still reading
+        /// them, and quarantining this run's own arena protected none of that.
+        /// Now a refusal either happened before anything was enqueued -- and
+        /// hands everything back -- or the run keeps them, forever, exactly as
+        /// it keeps its arena.
+        // The refusal is large because it carries the operands back, which is
+        // the whole point: boxing it would put the caller's only route to its
+        // own leases behind an allocation on the error path.
+        #[allow(clippy::result_large_err)]
         pub fn run(
             &mut self,
             stream: &Stream<'ctx>,
             authority: &ResidencyAuthority,
             residency: &DeviceResidency<'ctx>,
-            weight: ResidentAffineWeight<'_>,
-            x: &[u8],
-        ) -> Result<Vec<u8>> {
+            weight: ResidentAffineWeight,
+            x: Vec<u8>,
+        ) -> std::result::Result<AffineLinearOutput, AffineRunRefused> {
+            // Nothing below this point has been enqueued yet, so every refusal
+            // here returns the operands untouched.
+            let give_back = |error, weight, activations| AffineRunRefused {
+                error,
+                weight: Some(weight),
+                activations: Some(activations),
+            };
             if self.quarantined {
-                return Err(invalid(
-                    "run",
-                    "this run is quarantined: work was enqueued whose completion is unknown",
-                ));
-            }
-            if Some(stream.device_uuid()) != residency.scope().device() {
-                return Err(invalid(
-                    "stream",
-                    "the stream and the residency backing name different devices",
-                ));
-            }
-            if x.len() as u64 != self.launch.activation_bytes()? {
-                return Err(invalid(
-                    "activations",
-                    format!(
-                        "{} activation byte(s) for {} row(s) of {}",
-                        x.len(),
-                        self.launch.rows,
-                        self.launch.in_features
+                return Err(give_back(
+                    invalid(
+                        "run",
+                        "this run is quarantined: work was enqueued whose completion is unknown",
                     ),
+                    weight,
+                    x,
                 ));
+            }
+            let Some(device) = residency.scope().device() else {
+                return Err(give_back(
+                    invalid("residency", "this residency backing is not a device scope"),
+                    weight,
+                    x,
+                ));
+            };
+            if stream.device_uuid() != device || self.ctx.uuid() != device {
+                return Err(give_back(
+                    invalid(
+                        "stream",
+                        "the stream, the rank context and the residency backing do not all \
+                         name one device",
+                    ),
+                    weight,
+                    x,
+                ));
+            }
+            match self.launch.activation_bytes() {
+                Ok(need) if x.len() as u64 == need => {}
+                Ok(need) => {
+                    return Err(give_back(
+                        invalid_fmt(
+                            "activations",
+                            format_args!(
+                                "{} activation byte(s) for {} row(s) of {}, which needs {need}",
+                                x.len(),
+                                self.launch.rows,
+                                self.launch.in_features
+                            ),
+                        ),
+                        weight,
+                        x,
+                    ));
+                }
+                Err(error) => return Err(give_back(error, weight, x)),
+            }
+            let addresses = match self.resolve(authority, residency, &weight, device) {
+                Ok(addresses) => addresses,
+                Err(error) => return Err(give_back(error, weight, x)),
+            };
+            let output = match self.launch.output_bytes().and_then(|bytes| {
+                usize::try_from(bytes)
+                    .map_err(|_| invalid("output", "the output extent exceeds this host's usize"))
+                    .and_then(try_zeroed)
+            }) {
+                Ok(host) => host,
+                Err(error) => return Err(give_back(error, weight, x)),
+            };
+
+            // --- from here on, work is in flight -----------------------------
+            self.held_weight = Some(weight);
+            self.held_activations = Some(x);
+            match self.enqueue(stream, addresses) {
+                Ok(()) => {}
+                Err(error) => {
+                    // `enqueue` already quarantined, so the operands stay here.
+                    return Err(AffineRunRefused {
+                        error,
+                        weight: None,
+                        activations: None,
+                    });
+                }
+            }
+            let mut output = output;
+            if let Err(error) = self
+                .output
+                .as_ref()
+                .expect("live output range")
+                .copy_to_host(&mut output)
+            {
+                // A readback can surface an asynchronous fatal device status
+                // even after the event synchronized. The operands stay held.
+                self.quarantined = true;
+                return Err(AffineRunRefused {
+                    error: self.attribute(error),
+                    weight: None,
+                    activations: None,
+                });
+            }
+            if output
+                .chunks_exact(2)
+                .any(|word| !bf16_is_finite(u16::from_le_bytes([word[0], word[1]])))
+            {
+                let error = Error::Numerical {
+                    detail: fallible(format_args!(
+                        "{} produced a nonfinite BF16 output",
+                        self.descriptor.id.0
+                    )),
+                };
+                // Completion *was* observed, so the operands are safe to hand
+                // back: this is a numerical refusal, not a lifetime one.
+                return Err(AffineRunRefused {
+                    error,
+                    weight: self.held_weight.take(),
+                    activations: self.held_activations.take(),
+                });
+            }
+            Ok(AffineLinearOutput {
+                output,
+                weight: self.held_weight.take().expect("the run held its weight"),
+                activations: self
+                    .held_activations
+                    .take()
+                    .expect("the run held its activations"),
+            })
+        }
+
+        /// Copy the activations, launch, and wait for the completion event.
+        ///
+        /// Every failure path quarantines before returning, because from the
+        /// first `copy_from_host_async` onwards the answer to "is anything
+        /// still reading these bytes" is no longer known.
+        fn enqueue(&mut self, stream: &Stream<'ctx>, addresses: ComponentAddresses) -> Result<()> {
+            let x = self
+                .held_activations
+                .as_ref()
+                .expect("the run holds its activations");
+            let activations = self.activations.as_ref().expect("live activation range");
+            // SAFETY: the source is held by this run until completion is
+            // observed or the run is quarantined, and the destination is an
+            // admitted range of this run's own arena.
+            if let Err(error) = unsafe { activations.copy_from_host_async(x, stream) } {
+                self.quarantined = true;
+                return Err(self.attribute(error));
+            }
+            let mut x_address = match activations.device_address() {
+                Ok(address) => address,
+                Err(error) => {
+                    self.quarantined = true;
+                    return Err(self.attribute(error));
+                }
+            };
+            let mut output_address = match self
+                .output
+                .as_ref()
+                .expect("live output range")
+                .device_address()
+            {
+                Ok(address) => address,
+                Err(error) => {
+                    self.quarantined = true;
+                    return Err(self.attribute(error));
+                }
+            };
+            let mut codes_address = addresses.codes;
+            let mut scales_address = addresses.scales;
+            let mut zero_address = addresses.zero_points.unwrap_or(0);
+            let mut rows = self.launch.rows;
+            let mut in_features = self.launch.in_features;
+            let mut out_features = self.launch.out_features;
+            let mut row_stride = self.launch.row_stride;
+            let mut groups_per_row = self.launch.groups_per_row;
+            let mut code_bits = self.launch.code_bits();
+            let mut group_size = match u32::try_from(self.launch.group_size) {
+                Ok(size) => size,
+                Err(_) => {
+                    self.quarantined = true;
+                    return Err(invalid("group_size", "the group size exceeds a u32"));
+                }
+            };
+            let mut scale_kind = self.launch.scale_kind();
+            let mut params: [*mut c_void; 13] = [
+                (&raw mut x_address).cast(),
+                (&raw mut codes_address).cast(),
+                (&raw mut scales_address).cast(),
+                (&raw mut zero_address).cast(),
+                (&raw mut output_address).cast(),
+                (&raw mut rows).cast(),
+                (&raw mut in_features).cast(),
+                (&raw mut out_features).cast(),
+                (&raw mut row_stride).cast(),
+                (&raw mut groups_per_row).cast(),
+                (&raw mut code_bits).cast(),
+                (&raw mut group_size).cast(),
+                (&raw mut scale_kind).cast(),
+            ];
+            let tile = moxie_kernels::AFFINE_LINEAR_TILE;
+            let grid = match (
+                u32::try_from(out_features.div_ceil(tile)),
+                u32::try_from(rows.div_ceil(tile)),
+            ) {
+                (Ok(x), Ok(y)) => (x, y, 1),
+                _ => {
+                    self.quarantined = true;
+                    return Err(invalid("grid", "the launch grid exceeds a u32"));
+                }
+            };
+            // SAFETY: the symbol's ABI is the one declared in
+            // `affine_linear.cu`; every pointer names a live admitted or
+            // resident range whose length and device were checked above, and
+            // the grid covers exactly the output tiles.
+            let launched = unsafe {
+                self.module
+                    .launch_async(0, stream, grid, (32, 1, 1), 0, &mut params)
+            };
+            self.settle(launched, stream)
+        }
+
+        /// Resolve the three components to device addresses.
+        fn resolve(
+            &self,
+            authority: &ResidencyAuthority,
+            residency: &DeviceResidency<'ctx>,
+            weight: &ResidentAffineWeight,
+            device: moxie_types::DeviceUuid,
+        ) -> Result<ComponentAddresses> {
+            // One authority may hold a cache on **every** device, and an offset
+            // resolved inside another device's allocation names the wrong
+            // bytes. A review drove 3090 leases through a 5060 Ti backing and
+            // got a confident, different answer; task 0021's review found the
+            // same shape one layer down, which is why the check is here rather
+            // than assumed.
+            for lease in weight.leases() {
+                if lease.scope() != Scope::Device(device) {
+                    return Err(invalid_fmt(
+                        "lease",
+                        format_args!(
+                            "a component lease is resident in {} and this launch runs on \
+                             {}, so its offset names another allocation's bytes",
+                            lease.scope(),
+                            Scope::Device(device)
+                        ),
+                    ));
+                }
             }
             let codes = self.component(
                 authority,
                 residency,
-                weight.codes,
+                &weight.codes,
                 "codes",
                 self.launch.code_bytes()?,
             )?;
             let scales = self.component(
                 authority,
                 residency,
-                weight.scales,
+                &weight.scales,
                 "scales",
                 self.launch.scale_bytes()?,
             )?;
-            let zero_points = match (weight.zero_points, self.launch.zero_point_bytes()?) {
+            let zero_points = match (&weight.zero_points, self.launch.zero_point_bytes()?) {
                 (Some(lease), Some(bytes)) => {
                     Some(self.component(authority, residency, lease, "zero_points", bytes)?)
                 }
@@ -605,71 +1096,11 @@ mod device {
                     ));
                 }
             };
-
-            let activations = self.activations.as_ref().expect("live activation range");
-            let output = self.output.as_ref().expect("live output range");
-            // SAFETY: `x` outlives the synchronize below, and the destination
-            // is an admitted range of this run's own arena.
-            unsafe {
-                activations.copy_from_host_async(x, stream)?;
-            }
-            let mut x_address = activations.device_address()?;
-            let mut codes_address = codes;
-            let mut scales_address = scales;
-            let mut zero_address = zero_points.unwrap_or(0);
-            let mut output_address = output.device_address()?;
-            let mut rows = self.launch.rows;
-            let mut in_features = self.launch.in_features;
-            let mut out_features = self.launch.out_features;
-            let mut row_stride = self.launch.row_stride;
-            let mut groups_per_row = self.launch.groups_per_row;
-            let mut code_bits = self.launch.code_bits();
-            let mut group_size = u32::try_from(self.launch.group_size)
-                .map_err(|_| invalid("group_size", "the group size exceeds a u32"))?;
-            let mut scale_kind = self.launch.scale_kind();
-            let mut params: [*mut c_void; 13] = [
-                (&raw mut x_address).cast(),
-                (&raw mut codes_address).cast(),
-                (&raw mut scales_address).cast(),
-                (&raw mut zero_address).cast(),
-                (&raw mut output_address).cast(),
-                (&raw mut rows).cast(),
-                (&raw mut in_features).cast(),
-                (&raw mut out_features).cast(),
-                (&raw mut row_stride).cast(),
-                (&raw mut groups_per_row).cast(),
-                (&raw mut code_bits).cast(),
-                (&raw mut group_size).cast(),
-                (&raw mut scale_kind).cast(),
-            ];
-            let tile = moxie_kernels::AFFINE_LINEAR_TILE;
-            let grid_x = u32::try_from(out_features.div_ceil(tile))
-                .map_err(|_| invalid("grid", "the output grid exceeds a u32"))?;
-            let grid_y = u32::try_from(rows.div_ceil(tile))
-                .map_err(|_| invalid("grid", "the row grid exceeds a u32"))?;
-            // SAFETY: the symbol's ABI is the one declared in
-            // `affine_linear.cu`; every pointer names a live admitted or
-            // resident range whose length was checked above, and the grid
-            // covers exactly the output tiles.
-            let launched = unsafe {
-                self.module
-                    .launch_async(0, stream, (grid_x, grid_y, 1), (32, 1, 1), 0, &mut params)
-            };
-            self.settle(launched, stream)?;
-            let mut host = vec![0u8; self.launch.output_bytes()? as usize];
-            self.output
-                .as_ref()
-                .expect("live output range")
-                .copy_to_host(&mut host)?;
-            if host
-                .chunks_exact(2)
-                .any(|word| !bf16_is_finite(u16::from_le_bytes([word[0], word[1]])))
-            {
-                return Err(Error::Numerical {
-                    detail: format!("{} produced a nonfinite BF16 output", self.descriptor.id.0),
-                });
-            }
-            Ok(host)
+            Ok(ComponentAddresses {
+                codes,
+                scales,
+                zero_points,
+            })
         }
 
         /// Resolve one resident component to an address, after checking that
@@ -702,9 +1133,9 @@ mod device {
             }
             let (offset, len) = authority.device_range(lease)?;
             if len < need {
-                return Err(invalid(
+                return Err(invalid_fmt(
                     what,
-                    format!(
+                    format_args!(
                         "the resident {what} component is {len} byte(s); the launch reads {need}"
                     ),
                 ));
@@ -909,7 +1340,8 @@ mod device {
 
 #[cfg(feature = "driver")]
 pub use device::{
-    AffineAdmitRefused, AffineCloseRefused, AffineLinearRun, ResidentAffineWeight, resource_request,
+    AffineAdmitRefused, AffineCloseRefused, AffineLinearOutput, AffineLinearRun, AffineRunRefused,
+    ResidentAffineWeight, resource_request,
 };
 
 #[cfg(test)]
@@ -1111,14 +1543,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(chosen.id.0, "w4a16-linear-v1-sm_86");
+        // An INT8 descriptor for an INT8 geometry. Selecting it against the
+        // INT4 launch above is now itself a refusal, which is finding 4: a
+        // descriptor and a geometry that disagree must never bind.
+        let wide = descriptor(IntWidth::Int8, 64, 32, Grouping::Contiguous { size: 32 });
+        let wide = AffineLaunch::derive(&wide, zeros(&wide), 4).unwrap();
         let chosen = select_affine_linear_kernel(
             &catalogue,
             &cap,
             WeightPrecision::expect(Precision::Int8),
-            &launch,
+            &wide,
         )
         .unwrap();
         assert_eq!(chosen.id.0, "w8a16-linear-v1-sm_86");
+        assert!(
+            select_affine_linear_kernel(
+                &catalogue,
+                &cap,
+                WeightPrecision::expect(Precision::Int8),
+                &launch,
+            )
+            .is_err(),
+            "an INT8 descriptor must not serve an INT4 geometry"
+        );
 
         // A BF16 weight is not this kernel's operand. The refusal names the
         // profile it looked for, so the mismatch is readable rather than a bare
@@ -1133,7 +1580,8 @@ mod tests {
         assert_eq!(error.kind(), "unsupported_kernel");
         let text = error.to_string();
         assert!(text.contains("bf16"), "{text}");
-        assert!(text.contains("found 0"), "{text}");
+        assert!(text.contains("int4"), "{text}");
+        assert!(text.contains("cannot bind"), "{text}");
     }
 
     #[test]
@@ -1152,6 +1600,80 @@ mod tests {
         let wide = descriptor(IntWidth::Int4, 2048, 32, Grouping::Contiguous { size: 32 });
         let wide = AffineLaunch::derive(&wide, zeros(&wide), 4).unwrap();
         assert!(select_affine_linear_kernel(&catalogue, &capability(8, 6), int4, &wide).is_err());
+    }
+
+    #[test]
+    fn a_launch_cannot_be_edited_after_it_was_checked() {
+        // Finding 4. Every field was public, so a caller could build a checked
+        // launch and then set `row_stride = 1` and `groups_per_row = 0` on a
+        // 64-column INT4 tensor. Selection and admission both accepted it, the
+        // component-size checks became vacuous, and the kernel would have
+        // indexed outside its own buffers.
+        //
+        // The fields are private now, so that edit does not compile. What is
+        // checkable at run time is that the only constructor produces geometry
+        // consistent with the descriptor it came from.
+        let d = descriptor(IntWidth::Int4, 64, 32, Grouping::Contiguous { size: 32 });
+        let launch = AffineLaunch::derive(&d, zeros(&d), 4).unwrap();
+        assert_eq!(launch.row_stride(), 32, "two INT4 codes to the byte");
+        assert_eq!(launch.groups_per_row(), 2);
+        assert_eq!(
+            launch.code_bytes().unwrap(),
+            launch.row_stride() * launch.out_features()
+        );
+        assert!(launch.groups_per_row() > 0 && launch.row_stride() > 0);
+    }
+
+    #[test]
+    fn admission_re_applies_the_predicate_selection_used() {
+        // Finding 4, second half: `admit` is a public entry point that takes a
+        // descriptor, and it trusted whatever it was handed. These are the
+        // mismatches it must refuse, checked through the shared predicate that
+        // admission and selection now both call.
+        let d = descriptor(IntWidth::Int4, 64, 32, Grouping::Contiguous { size: 32 });
+        let launch = AffineLaunch::derive(&d, zeros(&d), 4).unwrap();
+        let int4 = WeightPrecision::expect(Precision::Int4);
+        let good = catalogue_entry(Precision::Int4, SmVersion::SM86);
+        assert!(descriptor_serves(&good, int4, &launch).is_ok());
+
+        // A descriptor for the other width.
+        let other = catalogue_entry(Precision::Int8, SmVersion::SM86);
+        assert!(descriptor_serves(&other, int4, &launch).is_err());
+
+        // A descriptor that declares a workspace: that is where a dequantized
+        // copy of the weight could hide, and this path must not have one.
+        let mut workspace = catalogue_entry(Precision::Int4, SmVersion::SM86);
+        workspace.workspace = WorkspaceExpression::RowsTimesF32;
+        let error = descriptor_serves(&workspace, int4, &launch).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("shared quantized linear contract")
+        );
+
+        // A geometry outside the descriptor's declared domain.
+        let wide = descriptor(IntWidth::Int4, 2048, 32, Grouping::Contiguous { size: 32 });
+        let wide = AffineLaunch::derive(&wide, zeros(&wide), 4).unwrap();
+        let error = descriptor_serves(&good, int4, &wide).unwrap_err();
+        assert!(error.to_string().contains("declared domain"), "{error}");
+    }
+
+    #[test]
+    fn a_refusal_is_still_a_refusal_when_its_prose_cannot_be_built() {
+        // Finding 3. `format!` aborts when an allocation fails, and the context
+        // that produces a refusal is the context most likely to be under memory
+        // pressure: a review failed one 32-byte allocation on this path and got
+        // SIGABRT instead of a typed error. What is checkable without an
+        // allocator fixture is that the composer degrades to a shorter true
+        // statement rather than panicking, and that the field survives it.
+        let error = invalid_fmt("field", format_args!("{} detail", 1));
+        assert_eq!(error.kind(), "invalid_request");
+        assert!(error.to_string().contains("1 detail"));
+
+        // The one payload-sized allocation on the run path is fallible.
+        let huge = try_zeroed(usize::MAX / 2).unwrap_err();
+        assert_eq!(huge.kind(), "capacity_exceeded");
+        assert_eq!(try_zeroed(4).unwrap(), vec![0u8; 4]);
     }
 
     #[test]

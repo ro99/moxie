@@ -22,6 +22,16 @@ use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
+/// A `RankContext` is exclusive per device and `cargo test` runs a binary's
+/// tests in parallel threads. Serialising them is not a workaround: the
+/// exclusivity is the property task 0007 established deliberately, and this
+/// executable's injected faults are process-wide besides.
+static DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    DEVICE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static COPIES: AtomicUsize = AtomicUsize::new(0);
 static FREES: AtomicUsize = AtomicUsize::new(0);
@@ -544,6 +554,7 @@ fn selected_bindings(
 
 #[test]
 fn real_driver_admission_submission_and_cleanup_are_fail_closed() {
+    let _serial = one_at_a_time();
     let count = moxie_cuda::device_count().unwrap();
     assert!(count > 0, "driver lane needs real hardware");
     for ordinal in 0..count {
@@ -1516,4 +1527,201 @@ fn real_driver_admission_submission_and_cleanup_are_fail_closed() {
         assert_eq!(ledger.outstanding().len(), 6);
         eprintln!("PASS driver boundary faults on {}", ctx.uuid());
     }
+}
+
+/// Task 0028's review, finding 2: a launch that cannot establish its own
+/// completion must keep **every** operand, not just its arena.
+///
+/// The first version took the weight leases and the activation source by
+/// reference. After a failure between the first copy and an observed
+/// completion, the caller still owned both: it could free the activation source
+/// or release the leases and let the authority evict the weights, while
+/// submitted work was still reading those bytes. Quarantining this run's own
+/// activation/output arena protected none of it.
+///
+/// `cuEventRecord` is failed here for real, on real hardware, after the copy
+/// and the launch have been submitted -- which is exactly the window.
+#[test]
+fn a_quantized_launch_that_cannot_prove_completion_keeps_its_operands() {
+    let _serial = one_at_a_time();
+    use moxie_executor::affine_linear::{AffineLaunch, AffineLinearRun, ResidentAffineWeight};
+    use moxie_executor::residency::DeviceResidency;
+    use moxie_executor::{ChunkSource, drain_reads, select_affine_linear_kernel};
+    use moxie_format::affine::{AffineDescriptor, Grouping, IntWidth};
+    use moxie_format::payload::ZeroPointSection;
+    use moxie_format::scale::ScaleDtype;
+    use moxie_memory::{
+        AcquireRequest, Acquired, ArtifactId, ChunkId, Content, LogicalRange, ResidencyAuthority,
+        ResidencyRequest, TensorSlot, TurnId, UseClass,
+    };
+
+    const OUT: usize = 32;
+    const IN: usize = 64;
+    const ROWS: u64 = 3;
+
+    /// A symmetric per-channel INT8 tensor: two components, no zero points, so
+    /// the fixture is as small as the contract allows.
+    struct Fixture {
+        artifact: ArtifactId,
+        codes: Vec<u8>,
+        scales: Vec<u8>,
+    }
+
+    impl ChunkSource for Fixture {
+        fn read_chunk(&mut self, chunk: &ChunkId, into: &mut [u8]) -> moxie_types::Result<()> {
+            assert_eq!(chunk.artifact(), &self.artifact);
+            let whole: &[u8] = match chunk.slot().role() {
+                "codes" => &self.codes,
+                "scales" => &self.scales,
+                other => panic!("no component is bound to role {other:?}"),
+            };
+            let start = chunk.range().offset_bytes() as usize;
+            into.copy_from_slice(&whole[start..start + into.len()]);
+            Ok(())
+        }
+    }
+
+    let ctx = RankContext::acquire(RankId(28_900), 0).unwrap();
+    let stream = Stream::new(&ctx).unwrap();
+    let capability = query_device(0).unwrap();
+    let scope = Scope::Device(ctx.uuid());
+
+    let descriptor = AffineDescriptor {
+        width: IntWidth::Int8,
+        out_features: OUT,
+        in_features: IN,
+        grouping: Grouping::PerOutputChannel,
+        group_index: None,
+        scale_dtype: ScaleDtype::F32,
+    };
+    let launch = AffineLaunch::derive(&descriptor, ZeroPointSection::Absent, ROWS).unwrap();
+    let kernel = select_affine_linear_kernel(
+        &moxie_kernels::affine_linear_catalogue(),
+        &capability,
+        WeightPrecision::expect(Precision::Int8),
+        &launch,
+    )
+    .unwrap();
+
+    let code_bytes = launch.code_bytes().unwrap();
+    let scale_bytes = launch.scale_bytes().unwrap();
+    let mut source = Fixture {
+        artifact: ArtifactId::new("sha256:task0028-fault-fixture").unwrap(),
+        codes: vec![1u8; code_bytes as usize],
+        scales: (0..OUT).flat_map(|_| 1.0f32.to_le_bytes()).collect(),
+    };
+    let align = |bytes: u64| bytes.div_ceil(256) * 256;
+    let cap = align(code_bytes) + align(scale_bytes);
+
+    let mut ledger = Ledger::new([
+        CapacitySnapshot::new(Scope::Host, 64 << 20, 1 << 20).unwrap(),
+        CapacitySnapshot::new(scope, 64 << 20, 1 << 20).unwrap(),
+    ])
+    .unwrap();
+    let mut authority = ResidencyAuthority::open(
+        &mut ledger,
+        &ResidencyRequest::new("fault fixture", cap).device(ctx.uuid(), cap),
+    )
+    .unwrap();
+    let mut residency = DeviceResidency::create(&ctx, &mut authority).unwrap();
+
+    fn resident<'ctx>(
+        authority: &mut ResidencyAuthority,
+        residency: &mut DeviceResidency<'ctx>,
+        stream: &Stream<'ctx>,
+        source: &mut Fixture,
+        scope: Scope,
+        role: &str,
+        len: u64,
+    ) -> moxie_memory::ResidencyLease {
+        let chunk = ChunkId::new(
+            source.artifact.clone(),
+            TensorSlot::tensor(role).unwrap(),
+            LogicalRange::new(0, len).unwrap(),
+            1,
+        );
+        match authority
+            .acquire(AcquireRequest {
+                chunk: &chunk,
+                destination: scope,
+                now: 0,
+                deadline: u64::MAX,
+                class: UseClass::demand(Content::DenseSpine),
+                turn: TurnId::new(1),
+            })
+            .unwrap_or_else(|e| panic!("acquiring {role}: {}", e.error))
+        {
+            Acquired::Ready(lease) => lease,
+            Acquired::Pending { lease, work, .. } => {
+                for order in &drain_reads(authority, source, work).unwrap() {
+                    residency.perform_upload(authority, stream, order).unwrap();
+                }
+                lease
+            }
+        }
+    }
+    let codes = resident(
+        &mut authority,
+        &mut residency,
+        &stream,
+        &mut source,
+        scope,
+        "codes",
+        code_bytes,
+    );
+    let scales = resident(
+        &mut authority,
+        &mut residency,
+        &stream,
+        &mut source,
+        scope,
+        "scales",
+        scale_bytes,
+    );
+
+    let mut run = AffineLinearRun::admit(&mut ledger, &ctx, kernel, launch)
+        .unwrap_or_else(|refused| panic!("admission: {}", refused.error));
+
+    // The window: the copy and the launch are submitted for real, and the
+    // event that would prove they finished is refused.
+    let records = RECORDS.load(SeqCst);
+    RECORD_ERROR.store(1, SeqCst);
+    let refused = run
+        .run(
+            &stream,
+            &authority,
+            &residency,
+            ResidentAffineWeight {
+                codes,
+                scales,
+                zero_points: None,
+            },
+            vec![0u8; launch.activation_bytes().unwrap() as usize],
+        )
+        .expect_err("a refused event record must refuse the run");
+    RECORD_ERROR.store(0, SeqCst);
+    assert!(RECORDS.load(SeqCst) > records, "the record was attempted");
+
+    // The operands are **not** handed back. Before this fix they were never
+    // taken in the first place, so the caller could release these leases while
+    // the launch was still reading them.
+    assert!(refused.retained_operands());
+    assert!(refused.weight.is_none() && refused.activations.is_none());
+
+    // And the consequences of holding them are real, not advisory: the run
+    // refuses to release its ranges, the ledger stays charged, and the
+    // authority cannot close because its leases are still live.
+    let held = run
+        .close(&mut ledger)
+        .expect_err("a quarantined run must not release ranges in flight");
+    assert!(!ledger.outstanding().is_empty());
+    assert!(
+        authority.close(&mut ledger).is_err(),
+        "the authority closed while a launch may still be reading its cache"
+    );
+    // Dropped, not released: a dropped quarantined run keeps its allocation and
+    // its charge, exactly as `DeviceArena` already does. Withholding is the
+    // point -- a context that cannot prove completion withholds forever rather
+    // than advertising memory nothing can recover.
+    drop(held);
 }

@@ -442,7 +442,26 @@ fn command_plan(flags: &mut Flags) -> i32 {
                     );
                     return 2;
                 }
-                // A leftover from an interrupted plan is ours to clear.
+                // **Something is already there, and this program did not put it
+                // there.** The first version assumed any regular file at this
+                // predictable path was its own leftover and deleted it; an
+                // independent review put unrelated data at
+                // `<plan>.toml.partial`, ran an ordinary `plan`, and had it
+                // deleted with a success exit. A path this program did not
+                // create is not this program's to remove, and `--force` --
+                // which already means "replace an existing plan" -- is where
+                // the user says otherwise.
+                Ok(_) if !flags.force => {
+                    println!("outcome: refused");
+                    eprintln!(
+                        "moxie-repack: {} already exists and this run did not create it. It may \
+                         be a leftover from an interrupted plan, or it may be something else \
+                         entirely; this program cannot tell, and deleting the wrong file is \
+                         worse than refusing. Remove it, or pass --force to replace it",
+                        staging.display()
+                    );
+                    return 2;
+                }
                 Ok(_) => {
                     if let Err(e) = std::fs::remove_file(&staging) {
                         println!("outcome: refused");
@@ -679,7 +698,16 @@ fn command_repack(flags: &mut Flags) -> i32 {
         eprintln!("moxie-repack: repack needs --out <dir>");
         return 1;
     };
-    let plan_text = match std::fs::read_to_string(&selection_path) {
+    // **Capped at the first read, not at the second.** This document was read
+    // with `read_to_string` and only the later `read_selection` applied the
+    // selection cap, so an arbitrarily large file was already resident by then
+    // -- an unbounded allocation in a program whose whole point is bounded
+    // memory, and before any of it was admitted. The same text is parsed
+    // throughout, so the cap applies to every use of it.
+    let plan_text = match moxie_storage::read_text_capped(
+        &selection_path,
+        moxie_format::selection::MAX_SELECTION_BYTES,
+    ) {
         Ok(t) => t,
         Err(e) => {
             eprintln!(
@@ -737,12 +765,18 @@ fn command_repack(flags: &mut Flags) -> i32 {
     let cancelled = move || CANCEL.load(Ordering::SeqCst);
 
     let result = (|| {
-        let selection = moxie_repack::read_selection(&selection_path)?;
-        // **Is this still the checkpoint the plan describes?** Asked before
-        // anything is created. A plan binds the config and index it was
-        // generated from, so a checkpoint that has gained or lost tensors is
-        // refused rather than published as the old subset.
-        moxie_repack::discover::confirm_binding(&root, &plan_text)?;
+        // Parsed from the text already in hand, not read again. A second read
+        // is a second moment: round two of task 0027's review found the binding
+        // digests read after discovery and bound a different moment than the
+        // one they described. One document, read once, parsed here.
+        let selection = moxie_format::selection::parse(&plan_text)?;
+        // **Is this still the checkpoint the plan describes, and does the plan
+        // still cover it?** Asked before anything is created. A plan binds the
+        // config and index it was generated from, so a checkpoint that has
+        // gained or lost tensors is refused rather than published as the old
+        // subset -- and a plan that has *itself* been edited to cover less is
+        // refused rather than published as complete.
+        moxie_repack::discover::confirm_binding(&root, &plan_text, &selection)?;
         // **A partial conversion is not a model.** The normal path refuses one,
         // because an artifact missing tensors that opens and verifies is the
         // most expensive kind of wrong. Converting a subset on purpose stays

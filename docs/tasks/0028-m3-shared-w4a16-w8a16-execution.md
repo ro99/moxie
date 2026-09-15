@@ -25,6 +25,10 @@ result below is filled from the runs, not from the plan.
   ([ADR 0027](../decisions/adr/0027-repacking-is-provisional-pending-measured-inference-benefit.md)).
   Running that experiment is **not** in this task's scope; making it possible is
   a consequence, not a deliverable.
+  **This bullet was wrong and is left as written** — a contract is a record of
+  what was promised, not a place to edit history. Experiment 0007's trigger
+  needs execution that can run a *model* and both sides loadable honestly; this
+  task delivers one dense projection and fires neither. See the result below.
 
 ## Bounded deliverable
 
@@ -130,6 +134,90 @@ result below is filled from the runs, not from the plan.
   task, not an expansion of this one.
 
 ## Result, filled after work
+
+### Corrections after the first independent review
+
+**Seven findings, five P1. All seven reproduced, all seven fixed, none
+disputed.** Four are in this task's code; three are in `moxie-repack`'s user
+surface, which the review reached while reading the same unpushed batch.
+
+Every one of the four is the **same mistake**: a check that was made once, to a
+value nobody had to keep.
+
+1. **(P1) A lease from another GPU was accepted.** `component()` checked the
+   authority that issued a lease and the byte length of its range, and never
+   the **device** it is resident on. One authority can hold a cache on every
+   GPU, each with its own offsets, so a 5060 Ti launch took 3090 leases,
+   resolved their offsets inside the 5060 Ti's allocation and returned a
+   confident answer over whatever lived there. Task 0021's review found this
+   shape one layer down and I did not carry it across. Every lease's scope is
+   checked before its address is resolved, and
+   `a_component_resident_on_another_device_is_refused` drives two real GPUs
+   under one authority.
+
+2. **(P1) A launch that could not prove completion did not keep what it was
+   reading.** `run` took the weight leases and the activation source by
+   reference. After a failure between the first copy and an observed
+   completion, the caller still owned both and could free the source or release
+   the leases while submitted work was in flight; quarantining this run's own
+   arena protected none of it. The operands are now taken **by value** and
+   either handed back — when the refusal happened before anything was enqueued
+   — or kept by the run forever, exactly as it keeps its arena.
+   `a_quantized_launch_that_cannot_prove_completion_keeps_its_operands` fails
+   `cuEventRecord` for real, on real hardware, and asserts that the refusal
+   returns no operands, that `close` refuses, that the charge stays outstanding
+   and that **the authority cannot close** because its leases are still live.
+
+3. **(P1) An allocation failure aborted the process.** The output readback used
+   `vec![0u8; n]`, and every refusal composed its prose with `format!`. The
+   review failed one 32-byte allocation and got `SIGABRT`. This is task 0024's
+   finding in a new crate: the readback is `try_zeroed`, and this module's
+   refusals compose through a `try_reserve`d sink that degrades to an empty
+   detail — the variant and the `&'static str` field are what a caller branches
+   on — rather than aborting.
+
+4. **(P1) Checked geometry could be edited after it was checked.** Every
+   `AffineLaunch` field was public. The review built a valid launch, set
+   `row_stride = 1` and `groups_per_row = 0` on a 64-column INT4 tensor, and
+   drove it through selection **and** admission: the component-size checks
+   became vacuous. The fields are private now, so that edit does not compile,
+   and `admit` — a public entry point that accepts a descriptor — re-applies
+   the same `descriptor_serves` predicate selection uses, instead of trusting
+   what it was handed.
+
+And three in `moxie-repack`, task 0027's deferred code:
+
+5. **(P1) An edited plan published a subset as `complete`.** The binding check
+   asks whether the **checkpoint** changed; an edit to the plan leaves that
+   answered "no", and the guard downstream read the plan's own `completeness`
+   field, which the same edit leaves untouched. `confirm_binding` now recomputes
+   coverage from the document in hand against the tensor count the binding
+   carries, the way `Discovery::accounted` counts it.
+
+6. **(P2) The plan's size cap applied to the second read, not the first.**
+   `read_to_string` had already made an arbitrarily large file resident before
+   `read_selection` checked anything. The first read is capped, and the same
+   text is now **parsed** rather than read a second time — a second read is a
+   second moment, which is round two of this converter's own review.
+
+7. **(P2) Planning deleted a file it had not created.** Any regular file at the
+   predictable staging path was treated as an interrupted plan's leftover and
+   removed; the review put unrelated data there and lost it to a successful
+   `plan`. A path this program did not create is not its to remove, so it
+   refuses and names `--force`, which already means "replace an existing plan".
+
+**Each fix has a regression, and each regression is measured by substitution
+rather than by assertion**: six new mutations in the `T0028` battery put the
+defect back, and every one of them is a plausible wrong answer or a freed
+buffer, never a crash.
+
+**One claim in this record was also wrong and is corrected.** It said task 0028
+makes experiment 0007 runnable. It does not: that trigger needs execution that
+can run a **model** and both sides loadable honestly, and one dense projection
+is neither. The contract bullet that first made the claim is left as written,
+with a note — a contract records what was promised.
+
+### The work itself
 
 **A canonical INT4 tensor executes.** One module of a published canonical
 artifact — 3,072 by 1,024, group-32 asymmetric INT4, the module task 0025
@@ -354,10 +442,13 @@ runnable without the serialisation workaround.
 - **No expert or MoE quantized path.** A following task; the grouped expert
   kernel is still BF16-only.
 - **No FP16 activations, no W4A4/W8A8, no attention change, no tuning.**
-- **No performance claim, and no evidence for [experiment 0007](../evidence/experiments/0007-offline-versus-load-time-preparation.md).**
-  What this task changes is that the experiment is now *runnable* — a canonical
-  tensor can be executed, so the comparison ADR 0027 requires has a subject. It
-  was not run and repacking stays provisional.
+- **No performance claim, and it does not make [experiment 0007](../evidence/experiments/0007-offline-versus-load-time-preparation.md)
+  runnable.** An earlier version of this record claimed it did; the review was
+  right that this contradicts the experiment's own trigger, which needs shared
+  execution that can run **a model** and enough checkpoint infrastructure to
+  load and run **both sides** honestly. One dense projection is neither. The
+  trigger has not fired, no partial number from it may be cited, and repacking
+  stays provisional.
 - **It does not close M3 item 3 by itself**, and it closes no owner gate.
 
 [adr23]: ../decisions/adr/0023-canonical-affine-payload-and-repack-journal.md

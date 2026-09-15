@@ -658,9 +658,18 @@ const LANES_T0028: &[Lane] = &[
     Lane { name: "w4a16-host", argv: &[r#"test"#, r#"-p"#, r#"moxie-executor"#, r#"--lib"#, r#"--offline"#, r#"--locked"#, r#"affine_linear"#] },
     Lane { name: "w4a16-kernels", argv: &[r#"test"#, r#"-p"#, r#"moxie-kernels"#, r#"--features"#, r#"fatbin"#, r#"--offline"#, r#"--locked"#] },
     Lane { name: "w4a16-device", argv: &[r#"test"#, r#"-p"#, r#"moxie-executor"#, r#"--features"#, r#"driver"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"affine_linear_device"#] },
+    // The injected-fault lane. Three of the review's findings are about what
+    // happens **after** something has been enqueued, and no unfaulted test can
+    // reach that window.
+    Lane { name: "w4a16-faults", argv: &[r#"test"#, r#"-p"#, r#"moxie-executor"#, r#"--features"#, r#"driver"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"driver_faults"#] },
+    // The review found three defects in `moxie-repack`'s user surface while
+    // reading this batch. They are task 0027's code and this is where their
+    // regressions are measured, because T0006 measures the publication path
+    // rather than the CLI.
+    Lane { name: "two-command", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"two_command"#] },
 ];
 
-/// The `T0028` battery: can task 0028's gates actually fail?
+/// The `T0028` battery: can task 0028's gates, and its review's, actually fail?
 ///
 /// Every substitution here is a way of getting a **plausible wrong answer**
 /// rather than a crash -- a transposed tile, a nibble pair read backwards, a
@@ -720,6 +729,69 @@ const BATTERY_T0028: &[Mutation] = &[
         to: r#"        if false && descriptor.group_index.is_some() {"#,
         expect: Expect::Caught,
     },
+    // The review's findings, each with the substitution that puts the defect
+    // back. Every one of them is a plausible wrong answer or a freed buffer
+    // that work may still be reading -- never a crash.
+    Mutation {
+        name: "another-devices-lease-accepted",
+        file: "crates/moxie-executor/src/affine_linear.rs",
+        from: r#"                if lease.scope() != Scope::Device(device) {"#,
+        to: r#"                if false && lease.scope() != Scope::Device(device) {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "admission-trusts-the-descriptor-it-is-handed",
+        file: "crates/moxie-executor/src/affine_linear.rs",
+        from: r#"            if let Err(error) = super::descriptor_serves(
+                &descriptor,
+                moxie_types::WeightPrecision::expect(launch.width().precision()),
+                &launch,
+            ) {
+                return Err(fail(error));
+            }"#,
+        to: r#"            let _ = &launch;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "an-unprovable-launch-hands-its-operands-back",
+        file: "crates/moxie-executor/src/affine_linear.rs",
+        from: r#"                    // `enqueue` already quarantined, so the operands stay here.
+                    return Err(AffineRunRefused {
+                        error,
+                        weight: None,
+                        activations: None,
+                    });"#,
+        to: r#"                    return Err(AffineRunRefused {
+                        error,
+                        weight: self.held_weight.take(),
+                        activations: self.held_activations.take(),
+                    });"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "an-edited-plan-publishes-as-complete",
+        file: "crates/moxie-repack/src/discover.rs",
+        from: r#"    ) && accounted != index_tensors"#,
+        to: r#"    ) && false && accounted != index_tensors"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "a-staging-path-is-deleted-without-ownership",
+        file: "crates/moxie-repack/src/main.rs",
+        from: r#"                Ok(_) if !flags.force => {"#,
+        to: r#"                Ok(_) if false => {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "the-plan-is-read-before-its-cap-applies",
+        file: "crates/moxie-repack/src/main.rs",
+        from: r#"    let plan_text = match moxie_storage::read_text_capped(
+        &selection_path,
+        moxie_format::selection::MAX_SELECTION_BYTES,
+    ) {"#,
+        to: r#"    let plan_text = match std::fs::read_to_string(&selection_path) {"#,
+        expect: Expect::Caught,
+    },
     // Independence control. No fixture supplies a component shorter than its
     // descriptor implies, so removing this check must leave the battery green:
     // if a numerical lane goes red here, the answer was depending on a bounds
@@ -736,6 +808,7 @@ const BATTERY_T0028: &[Mutation] = &[
 const BUILDS_T0028: &[&[&str]] = &[
     &["-p", "moxie-kernels", "--features", "fatbin"],
     &["-p", "moxie-executor", "--features", "driver", "--tests"],
+    &["-p", "moxie-repack", "--tests"],
 ];
 
 const BUILDS_T0006: &[&[&str]] = &[

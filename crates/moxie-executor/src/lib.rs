@@ -50,7 +50,7 @@ pub mod turn;
 pub use plan::{resource_request, validate_plan_binding};
 
 pub mod affine_linear;
-pub use affine_linear::{AffineLaunch, select_affine_linear_kernel};
+pub use affine_linear::{AffineLaunch, descriptor_serves, select_affine_linear_kernel};
 
 pub mod residency;
 pub use residency::{ChunkSource, ShardSource, drain_reads, perform_read};
@@ -92,7 +92,8 @@ pub use grouped_device::{AttachRefused, DeviceExperts, DeviceExtents, ExpertLane
 
 #[cfg(feature = "driver")]
 pub use affine_linear::{
-    AffineAdmitRefused, AffineCloseRefused, AffineLinearRun, ResidentAffineWeight,
+    AffineAdmitRefused, AffineCloseRefused, AffineLinearOutput, AffineLinearRun, AffineRunRefused,
+    ResidentAffineWeight,
 };
 
 #[cfg(feature = "driver")]

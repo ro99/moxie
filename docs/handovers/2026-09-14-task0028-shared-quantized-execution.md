@@ -9,10 +9,11 @@ repository has ever computed with.
 be quoted — O6 and O7 are open. The activations are synthetic, one projection of
 one layer ran, nothing composes a block, and no token was generated: output
 quality is O2 and needs paired output against the released model. And this does
-**not** justify offline repacking ([ADR 0027](../decisions/adr/0027-repacking-is-provisional-pending-measured-inference-benefit.md)).
-What it changes is that [experiment 0007](../evidence/experiments/0007-offline-versus-load-time-preparation.md)
-is now *runnable* — the comparison has a subject — and the experiment was not
-run.
+**not** justify offline repacking ([ADR 0027](../decisions/adr/0027-repacking-is-provisional-pending-measured-inference-benefit.md)),
+and it does **not** make [experiment 0007](../evidence/experiments/0007-offline-versus-load-time-preparation.md)
+runnable. That experiment's trigger needs shared execution that can run **a
+model** and enough checkpoint infrastructure to load and run **both sides**
+honestly; one dense projection is neither. The trigger has not fired.
 
 ## Workspace identity
 
@@ -156,4 +157,6 @@ is a task of its own, not an extension of this one.
 **Not next, and worth saying so:** performance. The temptation after a kernel
 lands is to tune it and quote a number. O6 and O7 are open, this kernel makes no
 occupancy or throughput claim, and the first performance artifact this
-milestone needs is experiment 0007's comparison, not a faster tile.
+milestone needs is experiment 0007's comparison, not a faster tile — and that
+experiment cannot start until a *model* runs, which is further away than one
+working kernel makes it feel.

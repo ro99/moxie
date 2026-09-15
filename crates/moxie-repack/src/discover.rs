@@ -847,7 +847,11 @@ fn automatic_scratch_bytes(discovery: &Discovery) -> Result<usize> {
 ///
 /// So the plan binds what **defines** the model: its `config.json` and its
 /// index, by content, plus how many tensors that index named.
-pub fn confirm_binding(root: &Path, plan_text: &str) -> Result<()> {
+pub fn confirm_binding(
+    root: &Path,
+    plan_text: &str,
+    selection: &moxie_format::selection::Selection,
+) -> Result<()> {
     let Some((config_sha, index_sha, index_tensors)) =
         moxie_format::plan::declared_binding(plan_text)?
     else {
@@ -880,6 +884,38 @@ pub fn confirm_binding(root: &Path, plan_text: &str) -> Result<()> {
              and publishing the old subset as complete would be describing a model nobody has. \
              Generate a new plan",
             now.len()
+        )));
+    }
+    // **And does this plan still cover that index?** The two questions are not
+    // the same one, and only the first was being asked. An independent review
+    // deleted one tensor entry from a generated plan and published a
+    // one-tensor artifact marked `complete`: the checkpoint had not changed, so
+    // the digests above matched, and the guard downstream read the plan's own
+    // `completeness` field -- which the same edit leaves untouched.
+    //
+    // The coverage is recomputed here from the document in hand, against the
+    // count the binding carries, exactly as `Discovery::accounted` counts it:
+    // a quantized module accounts for each of its source tensors and a BF16
+    // tensor for one.
+    let accounted: usize = selection
+        .tensors
+        .iter()
+        .map(|tensor| match &tensor.kind {
+            moxie_format::selection::SelectionKind::Bf16 { .. } => 1,
+            moxie_format::selection::SelectionKind::PackQuantized { files, .. } => files.len(),
+        })
+        .sum();
+    if matches!(
+        selection.completeness,
+        moxie_format::selection::Completeness::Complete
+    ) && accounted != index_tensors
+    {
+        return Err(invalid(format!(
+            "this plan says it is complete and covers {accounted} of the checkpoint's \
+             {index_tensors} index tensor(s). A plan that has been edited since it was \
+             generated is not a description of this model, and publishing the difference as \
+             complete would describe a model nobody has. Generate a new plan, or declare the \
+             subset deliberately with a partial plan and --allow-partial"
         )));
     }
     Ok(())

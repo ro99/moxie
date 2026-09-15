@@ -549,19 +549,21 @@ fn run_case<'ctx>(
         case.name
     );
 
-    let got = run
+    let completed = run
         .run(
             stream,
             &authority,
             &residency,
             ResidentAffineWeight {
-                codes: &codes,
-                scales: &scales,
-                zero_points: zero_points.as_ref(),
+                codes,
+                scales,
+                zero_points,
             },
-            &x_bytes,
+            x_bytes,
         )
-        .unwrap_or_else(|e| panic!("{}: {e}", case.name));
+        .unwrap_or_else(|refused| panic!("{}: {}", case.name, refused.error));
+    let got = completed.output;
+    let weight = completed.weight;
 
     let (want, terms) = oracle(&tensor, &x, case.rows);
     let measured =
@@ -580,7 +582,7 @@ fn run_case<'ctx>(
     );
 
     run.close(&mut ledger).expect("the run closes");
-    for lease in [Some(codes), Some(scales), zero_points]
+    for lease in [Some(weight.codes), Some(weight.scales), weight.zero_points]
         .into_iter()
         .flatten()
     {
@@ -640,6 +642,222 @@ fn assert_code_coverage(tensor: &AffineTensor, case: &Case) {
             case.name
         );
     }
+}
+
+/// Task 0028's review, finding 4: admission must re-apply selection's predicate.
+///
+/// `admit` is a public entry point that takes a descriptor, and it trusted
+/// whatever it was handed. A W8A16 descriptor bound to an INT4 geometry would
+/// have launched the shared kernel with `code_bits = 4` against component sizes
+/// computed for eight-bit codes.
+#[test]
+fn admission_refuses_a_descriptor_that_does_not_serve_the_geometry() {
+    let _serial = one_at_a_time();
+    assert!(device_count().expect("devices") > 0, "real hardware");
+    let capability = query_device(0).expect("a capability");
+    let ctx = RankContext::acquire(RankId(28_700), 0).expect("a rank context");
+    let case = &CASES[0];
+    let tensor = tensor(
+        case.width,
+        case.out_features,
+        case.in_features,
+        case.grouping,
+        case.asymmetric,
+        case.scale_dtype,
+        0x0028_2026,
+    );
+    let launch = AffineLaunch::for_tensor(&tensor, case.rows as u64).expect("the launch derives");
+    let catalogue = moxie_kernels::affine_linear_catalogue();
+    // The *other* width's descriptor, for this device. A real catalogue entry,
+    // correctly qualified, that simply does not serve this geometry.
+    let wrong = catalogue
+        .descriptors()
+        .iter()
+        .find(|d| d.id.0 == format!("w8a16-linear-v1-{}", capability.sm()))
+        .expect("the w8a16 entry")
+        .clone();
+    let mut ledger = Ledger::new([
+        CapacitySnapshot::new(Scope::Host, 8 << 20, 1 << 20).unwrap(),
+        CapacitySnapshot::new(Scope::Device(ctx.uuid()), 8 << 20, 1 << 20).unwrap(),
+    ])
+    .unwrap();
+    let refused = AffineLinearRun::admit(&mut ledger, &ctx, wrong, launch)
+        .expect_err("admission must refuse a descriptor that does not serve this geometry");
+    assert_eq!(refused.error.kind(), "unsupported_kernel");
+    assert!(
+        refused.error.to_string().contains("cannot bind"),
+        "{}",
+        refused.error
+    );
+    // Refused before anything was allocated, and nothing stayed charged.
+    assert!(refused.reservation.is_none());
+    assert!(
+        ledger.outstanding().is_empty(),
+        "{:?}",
+        ledger.outstanding()
+    );
+}
+
+/// Task 0028's review, finding 1: a lease resident on another GPU must refuse.
+///
+/// One authority can hold a cache on **every** device, and each cache has its
+/// own offsets. `component()` checked the authority and the byte length and
+/// never the device, so a 5060 Ti launch accepted 3090 leases, resolved their
+/// offsets inside the 5060 Ti's allocation and returned a confident wrong
+/// answer over whatever happened to live there. Task 0021's review found the
+/// same shape one layer down, which is why this one is a test rather than a
+/// comment.
+#[test]
+fn a_component_resident_on_another_device_is_refused() {
+    let _serial = one_at_a_time();
+    let count = device_count().expect("devices");
+    if count < 2 {
+        eprintln!(
+            "SKIP the cross-device refusal: this machine has {count} GPU(s) and the case \
+             needs two. A missing device is a blocked lane, never acceptance."
+        );
+        return;
+    }
+    let case = &CASES[0];
+    let tensor = tensor(
+        case.width,
+        case.out_features,
+        case.in_features,
+        case.grouping,
+        case.asymmetric,
+        case.scale_dtype,
+        0x0028_2026,
+    );
+    let launch = AffineLaunch::for_tensor(&tensor, case.rows as u64).expect("the launch derives");
+
+    // Two contexts, two residency backings, **one** authority -- which is the
+    // configuration the check exists for.
+    let host = RankContext::acquire(RankId(28_800), 0).expect("the first device");
+    let other = RankContext::acquire(RankId(28_801), 1).expect("the second device");
+    let host_stream = Stream::new(&host).expect("a stream");
+    let other_stream = Stream::new(&other).expect("a stream");
+
+    let code_bytes = launch.code_bytes().unwrap();
+    let scale_bytes_len = launch.scale_bytes().unwrap();
+    let zero_bytes = launch.zero_point_bytes().unwrap();
+    let align = |bytes: u64| bytes.div_ceil(256) * 256;
+    let cap = align(code_bytes) + align(scale_bytes_len) + align(zero_bytes.unwrap_or(0));
+    let mut ledger = Ledger::new([
+        CapacitySnapshot::new(Scope::Host, 64 << 20, 1 << 20).unwrap(),
+        CapacitySnapshot::new(Scope::Device(host.uuid()), 64 << 20, 1 << 20).unwrap(),
+        CapacitySnapshot::new(Scope::Device(other.uuid()), 64 << 20, 1 << 20).unwrap(),
+    ])
+    .unwrap();
+    let mut authority = ResidencyAuthority::open(
+        &mut ledger,
+        &ResidencyRequest::new("two device caches", cap)
+            .device(host.uuid(), cap)
+            .device(other.uuid(), cap),
+    )
+    .unwrap();
+    let host_residency = DeviceResidency::create(&host, &mut authority).unwrap();
+    let mut other_residency = DeviceResidency::create(&other, &mut authority).unwrap();
+    let mut source = Fixture {
+        artifact: ArtifactId::new("sha256:task0028-cross-device-fixture").unwrap(),
+        components: components(&tensor),
+    };
+
+    // Every component made resident on the **second** device.
+    let elsewhere = Scope::Device(other.uuid());
+    let codes = resident(
+        &mut authority,
+        &mut source,
+        &mut other_residency,
+        &other_stream,
+        elsewhere,
+        "codes",
+        code_bytes,
+    );
+    let scales = resident(
+        &mut authority,
+        &mut source,
+        &mut other_residency,
+        &other_stream,
+        elsewhere,
+        "scales",
+        scale_bytes_len,
+    );
+    let zero_points = zero_bytes.map(|bytes| {
+        resident(
+            &mut authority,
+            &mut source,
+            &mut other_residency,
+            &other_stream,
+            elsewhere,
+            "zero_points",
+            bytes,
+        )
+    });
+
+    let capability = query_device(0).expect("a capability");
+    let kernel = select_affine_linear_kernel(
+        &moxie_kernels::affine_linear_catalogue(),
+        &capability,
+        WeightPrecision::expect(case.width.precision()),
+        &launch,
+    )
+    .expect("a descriptor");
+    let mut run = AffineLinearRun::admit(&mut ledger, &host, kernel, launch)
+        .unwrap_or_else(|refused| panic!("admission: {}", refused.error));
+
+    let refused = run
+        .run(
+            &host_stream,
+            &authority,
+            &host_residency,
+            ResidentAffineWeight {
+                codes,
+                scales,
+                zero_points,
+            },
+            vec![0u8; launch.activation_bytes().unwrap() as usize],
+        )
+        .expect_err("a launch must not read another device's leases");
+    assert_eq!(refused.error.kind(), "invalid_request");
+    assert!(
+        refused
+            .error
+            .to_string()
+            .contains("another allocation's bytes"),
+        "{}",
+        refused.error
+    );
+    // Nothing was enqueued, so the operands come straight back and the caller
+    // can retry them where they actually live.
+    assert!(!refused.retained_operands());
+    let weight = refused.weight.expect("the operands are handed back");
+
+    run.close(&mut ledger).expect("the run closes");
+    for lease in [Some(weight.codes), Some(weight.scales), weight.zero_points]
+        .into_iter()
+        .flatten()
+    {
+        authority.release(lease).expect("the lease retires");
+    }
+    authority.end_turn(TurnId::new(1));
+    authority.retire_all(elsewhere);
+    other_residency
+        .close(&mut authority)
+        .expect("the second backing returns");
+    host_residency
+        .close(&mut authority)
+        .expect("the first backing returns");
+    authority.close(&mut ledger).expect("the authority closes");
+    assert!(
+        ledger.outstanding().is_empty(),
+        "{:?}",
+        ledger.outstanding()
+    );
+    eprintln!(
+        "task0028: a component resident on {} was refused by a launch on {}",
+        other.uuid(),
+        host.uuid()
+    );
 }
 
 /// The owner's second clause, tested in both directions and needing no device.

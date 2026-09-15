@@ -979,3 +979,168 @@ fn planning_refuses_to_write_inside_the_checkpoint() {
         after.difference(&before).collect::<Vec<_>>()
     );
 }
+
+/// Task 0028's review, finding 5: an edited plan cannot publish a subset as
+/// complete.
+///
+/// The guard downstream read the plan's own `completeness` field, and the
+/// binding check asked a different question -- has the *checkpoint* changed --
+/// which an edit to the plan leaves answered "no". The review deleted one
+/// tensor entry from a generated plan, ran the ordinary `repack --plan`, and
+/// got a one-tensor artifact marked `complete` with a success exit.
+#[test]
+fn a_plan_edited_to_cover_less_cannot_publish_as_complete() {
+    let scratch = Scratch::new("edited-plan");
+    let root = checkpoint(&scratch, false);
+    let plan = scratch.join("model.plan.toml");
+    let out = scratch.join("out");
+
+    let planned = common::run(&[
+        "plan",
+        "--source-root",
+        root.to_str().unwrap(),
+        "--out-plan",
+        plan.to_str().unwrap(),
+    ]);
+    assert_eq!(planned.outcome(), "planned", "{}", planned.stdout);
+    let text = std::fs::read_to_string(&plan).expect("the plan reads");
+    assert!(
+        text.contains("status = \"complete\""),
+        "the fixture plan is not complete to begin with:\n{text}"
+    );
+
+    // Delete one entry from the `[bf16]` tensor list, leaving `completeness`
+    // untouched -- which is exactly what an editor does. The plan is ADR 0026's
+    // compact form, so an entry is a line in a list rather than a table.
+    let at = text.find("\n[bf16]\ntensors = [\n").expect("a bf16 list");
+    let first = at + "\n[bf16]\ntensors = [\n".len();
+    let line_end = text[first..].find('\n').expect("an entry line") + first + 1;
+    let edited = format!("{}{}", &text[..first], &text[line_end..]);
+    assert!(
+        edited.len() < text.len() && edited.contains("status = \"complete\""),
+        "the edit did not remove an entry, or removed the completeness line"
+    );
+    std::fs::write(&plan, &edited).expect("the edited plan writes");
+
+    let refused = common::run(&[
+        "repack",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    // Non-zero and nothing readable, the same shape
+    // `a_plan_whose_checkpoint_changed_is_refused` asserts: which outcome word
+    // this lands on is the program's existing classification and not what the
+    // guard is for.
+    assert_ne!(
+        refused.status, 0,
+        "an edited plan published:\n{}{}",
+        refused.stdout, refused.stderr
+    );
+    assert!(
+        refused.says("says it is complete"),
+        "the refusal does not say what is wrong:\n{}{}",
+        refused.stdout,
+        refused.stderr
+    );
+    // Nothing readable was produced. A partial artifact that opens is the most
+    // expensive kind of wrong, and this one must not exist at all.
+    assert!(
+        !out.join("manifest.toml").exists(),
+        "a manifest was published for a plan that was refused"
+    );
+}
+
+/// Task 0028's review, finding 7: a file this program did not create is not
+/// this program's to delete.
+///
+/// Any regular file at the predictable staging path was treated as an
+/// interrupted plan's leftover and removed. The review put unrelated data
+/// there, ran an ordinary `plan`, and had it deleted with a success exit.
+#[test]
+fn planning_refuses_to_delete_a_staging_path_it_did_not_create() {
+    let scratch = Scratch::new("staging-ownership");
+    let root = checkpoint(&scratch, false);
+    let plan = scratch.join("result.toml");
+    let staging = plan.with_extension("toml.partial");
+    let precious = b"someone else's bytes";
+    std::fs::write(&staging, precious).expect("the other file writes");
+
+    let refused = common::run(&[
+        "plan",
+        "--source-root",
+        root.to_str().unwrap(),
+        "--out-plan",
+        plan.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        refused.outcome(),
+        "refused",
+        "planning proceeded over a file it did not create:\n{}{}",
+        refused.stdout,
+        refused.stderr
+    );
+    assert_eq!(
+        std::fs::read(&staging).expect("the other file survives"),
+        precious,
+        "planning deleted a file it did not create"
+    );
+    assert!(refused.says("--force"), "the refusal names the way out");
+
+    // `--force` already means "replace an existing plan", so it is where the
+    // user says the leftover is theirs to clear. Then it proceeds.
+    let forced = common::run(&[
+        "plan",
+        "--source-root",
+        root.to_str().unwrap(),
+        "--out-plan",
+        plan.to_str().unwrap(),
+        "--force",
+    ]);
+    assert_eq!(
+        forced.outcome(),
+        "planned",
+        "{}{}",
+        forced.stdout,
+        forced.stderr
+    );
+    assert!(plan.exists(), "the plan was not written");
+    assert!(!staging.exists(), "the staging file outlived the rename");
+}
+
+/// Task 0028's review, finding 6: the size cap applies to the first read.
+///
+/// `repack --plan` read the document with `read_to_string` and only the later
+/// `read_selection` applied the cap, so an arbitrarily large file was already
+/// resident by the time anything checked -- an unbounded allocation in a
+/// program whose whole point is bounded memory, before any of it was admitted.
+#[test]
+fn an_oversized_plan_is_refused_by_the_read_that_first_touches_it() {
+    let scratch = Scratch::new("oversized-plan");
+    let plan = scratch.join("huge.plan.toml");
+    let mut text = String::from("version = 1\n");
+    // One byte over the cap, built from a comment so the document would
+    // otherwise be parseable.
+    text.push_str("# ");
+    while text.len() <= moxie_format::selection::MAX_SELECTION_BYTES {
+        text.push('x');
+    }
+    text.push('\n');
+    std::fs::write(&plan, &text).expect("the oversized plan writes");
+
+    let refused = common::run(&[
+        "repack",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--out",
+        scratch.join("out").to_str().unwrap(),
+    ]);
+    assert_ne!(refused.status, 0, "an oversized plan was accepted");
+    assert!(
+        refused.says("cannot read") || refused.says("byte"),
+        "the refusal does not name the size:\n{}{}",
+        refused.stdout,
+        refused.stderr
+    );
+}
