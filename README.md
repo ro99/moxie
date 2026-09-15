@@ -40,8 +40,14 @@ mean that Moxie has imported or supports them.
 | `docs/spec/01-09`, `docs/spec/strata-arch-diagnosis.md` | Reference documents: the normative specification | **no — kept local** |
 | `docs/spec/templates/` | Forms used to author living records | yes |
 | `docs/decisions/`, `docs/tasks/`, `docs/handovers/`, `docs/models/`, `docs/evidence/` | Living records: owner-gate register, ADRs, task contracts, handovers, bring-up contracts, support matrix, benchmark manifests, experiment conclusions | yes |
-| `crates/` | Shared engine crates. `moxie-types`, `moxie-graph`, `moxie-model-api`, `moxie-format`, `moxie-oracles`, `moxie-state`, `moxie-cuda`, `moxie-kernels` | yes |
-| `crates/moxie-storage` | The one crate that touches the filesystem for checkpoints: bounded reads, chunk validation, and the bounded-read primitives the repacker writes through | yes |
+| `crates/moxie-types`, `moxie-graph`, `moxie-model-api` | Foundation: identifiers/errors, typed semantic graph, model-definition interface | yes |
+| `crates/moxie-format`, `moxie-oracles`, `moxie-interp` | Mathematics and reference: canonical codec/schema, independent operation oracles, host graph interpreter | yes |
+| `crates/moxie-memory`, `moxie-state`, `moxie-sampling` | Resources and sequence: ledger/admission, paged transactions, pure distributions | yes |
+| `crates/moxie-host`, `moxie-storage` | Sensors: machine telemetry (sole `/proc`+cgroup reader), bounded checkpoint reads | yes |
+| `crates/moxie-cuda`, `moxie-kernels` | Device boundary: typed CUDA wrapper, audited kernels behind the C ABI | yes |
+| `crates/moxie-plan`, `moxie-executor`, `moxie-engine` | Plan and run: pure lowering, rank-local execution, single-sequence generation | yes |
+| `crates/moxie-models` | Concrete families, one module each; only composition roots may import it | yes |
+| `crates/moxie-cli/` | `moxie` diagnostic client of the generation service; synthetic inputs, no checkpoint | yes |
 | `crates/moxie-repack/` | `moxie-repack`: the offline inspector, repacker and verifier (ADR 0021/0022), whose `write` module owns canonical publication (ADR 0024) | yes |
 | `xtask/` | Command index and its architecture-check fixtures | yes |
 

@@ -24,5 +24,5 @@ SHA-256 of the raw file bytes:
 | `docs/spec/06-implementation-roadmap.md` | `07a4ba125616be6587e5d69068b7ffb79bcc1307de9ea64daa1aef3dd06e3252` |
 | `docs/spec/07-validation-and-performance.md` | `1838291d4b53baeefd98353ef383986ce922669ecab396eb99e97c123517442a` |
 | `docs/spec/08-strata-reference-map.md` | `a21e754a2d1aebcc215b9a5a50b4ebccdbd5761325cea2918f9f5ec8cd6774a6` |
-| `docs/spec/09-agent-playbooks.md` | `96efdaa3d9297d5214c223b49c4101db827e6ba46c79578d88ba6f75ab47d631` |
+| `docs/spec/09-agent-playbooks.md` | `64abd07bd37a78c83120ea7ae38406b5b5d78f7a53b2b93b6c2a949f8780288b` |
 | `docs/spec/strata-arch-diagnosis.md` | `3983f5177a5b2d480caaf09d6aa11b18a3e7360693475bbe176ea0ae868408ca` |
