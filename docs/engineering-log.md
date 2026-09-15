@@ -43,8 +43,49 @@ Each links into the entries below.
 | A comparison whose two sides are not independent | task 0022's FP64 transcription, task 0024's FP32-versus-BF16 arithmetic |
 | A fix that is not guarded by the test written for it | task 0023's fake axis, task 0024's helper-only regression |
 | A numerical gate whose denominator can collapse | task 0028's 2-ULP-at-the-result threshold |
+| A check attached to a value nobody has to keep | task 0028's public launch fields, trusted descriptor, unchecked lease scope and borrowed operands |
 
 ## Entries, newest first
+
+**A check is only as good as the value it is attached to (2026-09-14).** Task
+0028's first review returned seven findings, five P1. Four were in the new
+executor code and, listed separately, they look like four different bugs:
+
+* a lease's **device** was never checked, only the authority that issued it and
+  the length of its range;
+* a launch that could not prove completion kept its arena and **not** the
+  operands it was reading;
+* the output readback aborted instead of returning a typed capacity error;
+* every field of the checked geometry was `pub`, and the public admission entry
+  point trusted whatever descriptor it was handed.
+
+Together they are one shape. Each check happened at one moment, to a value that
+anyone could change afterwards or that nobody had to hold. `AffineLaunch::derive`
+validated geometry and then handed out a struct whose fields could be rewritten;
+`select_affine_linear_kernel` matched a descriptor and `admit` accepted a
+different one; `component()` validated a lease and the *device* it belonged to
+was never part of the validation; `run` checked its operands and then borrowed
+them across an asynchronous boundary, where "checked" stops meaning anything.
+
+The repairs are all the same repair: make the value carry its own evidence.
+Private fields, so a checked launch cannot be edited. One predicate, applied by
+both selection and admission, so a descriptor cannot be checked by one and
+trusted by the other. The lease's scope in the check that resolves its address.
+And operands taken **by value**, returned on success and kept forever when
+completion is unknown — because borrowing an operand across an asynchronous
+boundary is not a lifetime, it is a hope.
+
+Three more findings were in `moxie-repack`'s user surface, reached while reading
+the same batch: an edited plan publishing a subset as `complete` because the
+guard read the plan's own field rather than recomputing coverage; a size cap
+applied to the second read of a document instead of the first; and planning
+deleting any file at a predictable staging path, including one it had not
+created. That last one is worth its own sentence: **a path this program did not
+create is not this program's to remove.**
+
+**The lesson to carry:** when you write a check, ask what holds the result of
+it. If the answer is "the caller, until it decides otherwise", the check is
+documentation.
 
 **A tolerance is only as meaningful as what it divides by (2026-09-14).** Task
 0028's contract predeclared, before any implementation existed, that each output

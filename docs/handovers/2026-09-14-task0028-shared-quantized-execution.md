@@ -110,19 +110,44 @@ Measured on this tree with all three GPUs present:
 - `cargo test -p moxie-executor --features driver --test affine_linear_real_module`:
   the real module published in 59.5 s and executed on three UUIDs, 9,216 output
   elements per device, worst 2.000 ULP.
-- `cargo xtask mutation-check --battery 0028`: **7 of 7 mutants caught, 1 of 1
-  expected survivor held**, 0 unstable, 0 broken controls, `git status` clean
+- `cargo xtask mutation-check --battery 0028`: **13 of 13 mutants caught, 1 of
+  1 expected survivor held**, 0 unstable, 0 broken controls, `git status` clean
   afterwards. The substitutions are plausible wrong *answers* — a nibble pair
   read backwards, a zero point never subtracted, one group's scale used for
   every group, BF16 scales decoded as F16, the weight tile loaded untransposed
   — which is why the battery needs device lanes and why a tolerance alone could
-  not have caught any of them.
-- `cargo test --workspace --locked --offline`: **1,085 passed, 0 failed, 0
+  not have caught any of them. Six of the thirteen put the first review's
+  findings back, including the one that needs an injected CUDA fault to reach.
+- `cargo test --workspace --locked --offline`: **1,091 passed, 0 failed, 0
   ignored**.
 - `cargo test --workspace --features moxie-executor/driver --locked --offline`:
-  **1,125 passed, 0 failed, 0 ignored**.
+  **1,134 passed, 0 failed, 0 ignored**.
 - `cargo xtask mutation-check --battery 0006`: **UNMEASURED, not passed.** See
   below.
+
+## What the first independent review found
+
+**Seven findings, five P1, all reproduced and fixed, none disputed.** Four were
+in this task's code and all four were the same mistake: a check made once, to a
+value nobody had to keep. A lease's *device* was never checked, only its
+authority and length. A launch that could not prove completion kept nothing it
+was reading. The readback aborted instead of returning a typed error. And the
+checked geometry had public fields, so it could be edited after it was checked
+and admission trusted whatever descriptor it was handed.
+
+The other three are `moxie-repack`'s user surface — task 0027's deferred code,
+reached while reading the same batch: an edited plan publishing a subset as
+complete, a size cap applied to the second read rather than the first, and
+planning deleting a file it had not created. All three are fixed here with
+regressions, because a P1 does not become someone else's problem by being in
+someone else's crate.
+
+The task record carries each finding and its fix. Two are worth carrying
+forward as shapes rather than as fixes: **a check is only as good as the value
+it is attached to**, which is why `AffineLaunch`'s fields are private and why
+`admit` re-applies selection's predicate; and **borrowing an operand across an
+asynchronous boundary is not a lifetime**, which is why `run` takes its weight
+and activations by value and keeps them when it cannot prove they are idle.
 
 ## One thing to fix that is not this task's
 

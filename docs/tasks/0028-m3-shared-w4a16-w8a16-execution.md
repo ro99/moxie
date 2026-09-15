@@ -384,21 +384,25 @@ Run on this tree, all three GPUs present:
   one module published in 59.5 s (nearly all of it hashing the 5.37 GB source
   shard) and executed on all three UUIDs, 9,216 output elements per device,
   worst 2.000 ULP.
-- `cargo test --workspace --locked --offline`: **1,085 passed, 0 failed, 0
+- `cargo test --workspace --locked --offline`: **1,091 passed, 0 failed, 0
   ignored**.
 - `cargo test --workspace --features moxie-executor/driver --locked --offline`:
-  **1,125 passed, 0 failed, 0 ignored**.
-- `cargo xtask mutation-check --battery 0028`, once on the final tree:
-  **7 of 7 mutants caught, 1 of 1 expected survivor held**, 0 unstable, 0
-  broken controls, and `git status` clean afterwards. Every device mutation was
-  caught by the device lane and every host mutation by the host lane. The
-  substitutions are ways of getting a **plausible wrong answer** rather than a
-  crash — an INT4 nibble pair read backwards, a zero point never subtracted,
-  every group using the first group's scale, BF16 scales decoded as F16, and
-  the weight tile loaded untransposed — because those are exactly the defects a
-  tolerance cannot catch by being tight. The independence control removes the
-  resident-component length check, which no fixture violates, and it held: the
-  numerical lanes are not depending on a bounds check for their answer.
+  **1,134 passed, 0 failed, 0 ignored**.
+- `cargo xtask mutation-check --battery 0028`, on the corrected tree:
+  **13 of 13 mutants caught, 1 of 1 expected survivor held**, 0 unstable, 0
+  broken controls, and `git status` clean afterwards. Seven substitutions are
+  ways of getting a **plausible wrong answer** rather than a crash — an INT4
+  nibble pair read backwards, a zero point never subtracted, every group using
+  the first group's scale, BF16 scales decoded as F16, the weight tile loaded
+  untransposed, a group map off by one, a permuted tensor read as contiguous —
+  because those are exactly the defects a tolerance cannot catch by being
+  tight. Six more put the review's findings back: another device's lease
+  accepted, admission trusting the descriptor it is handed, an unprovable
+  launch handing its operands back, an edited plan publishing as complete, a
+  staging path deleted without ownership, and the plan read before its cap
+  applies. The independence control removes the resident-component length
+  check, which no fixture violates, and it held: the numerical lanes are not
+  depending on a bounds check for their answer.
 
 ### One gate unmeasured, and one finding handed back
 
