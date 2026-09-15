@@ -44,8 +44,36 @@ Each links into the entries below.
 | A fix that is not guarded by the test written for it | task 0023's fake axis, task 0024's helper-only regression |
 | A numerical gate whose denominator can collapse | task 0028's 2-ULP-at-the-result threshold |
 | A check attached to a value nobody has to keep | task 0028's public launch fields, trusted descriptor, unchecked lease scope and borrowed operands |
+| Work that exists on one disk and nowhere else | 24 commits, four tasks and five review rounds, unpushed for thirty hours |
 
 ## Entries, newest first
+
+**A branch nobody else can see is not a record (2026-09-15).** `origin/main` sat
+at `44a94c4` from 2026-09-13 20:43 while local `main` ran twenty-four commits
+ahead — 09-13 20:46 through 09-14 22:21, about thirty hours, 86 files, 29,747
+insertions. Tasks 0025, 0026, 0027 and 0028 were completed, reviewed five times
+and corrected in that window, and none of it existed anywhere but one disk.
+
+The backlog was not a decision. No commit was held back for a reason; pushing
+simply never became a step, because every session ended on the same two
+sentences — the gates passed, here is what changed — and neither of them is
+`git push`. Each session then inherited a repository that was already behind and
+treated that as the normal state.
+
+What it costs is not the risk of losing the disk, which is real but obvious. It
+is that the whole apparatus this repository runs on — task contracts, ADRs,
+handovers, independent review — is built for other people to read, and for
+thirty hours the only way to read any of it was to sit at this machine. An
+independent reviewer working from `origin/main` would have been reviewing task
+0024. A handover written "so the next agent can pick this up" pointed at commits
+that were not anywhere the next agent could fetch.
+
+The rule, and it is a small one: **a task is not handed over until its commits
+are on the remote.** A handover names a base commit; if that commit is not
+fetchable, the handover names nothing. Check `git status -sb` for an `ahead`
+count at the end of a session the same way the gates are checked, and push
+before writing the summary rather than after — a summary is a claim about a
+state other people can reach.
 
 **A check is only as good as the value it is attached to (2026-09-14).** Task
 0028's first review returned seven findings, five P1. Four were in the new
