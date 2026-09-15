@@ -702,12 +702,22 @@ const BATTERY_T0028: &[Mutation] = &[
         // rejected on the way to a match, so a *successful* selection allocated
         // prose nobody would read -- and a failure there was ignored rather
         // than returned.
+        //
+        // **This substitution changes nothing but the allocation.** The first
+        // version replaced the predicate with `descriptor_serves(..).err()`
+        // mapped to one fixed `Mismatch`, which also changed *which reason* a
+        // refusal reports -- so the host lane caught it on refusal text, and the
+        // deciding lane recorded described the wrong half of the mutation.
+        // Review caught that. Building the error and discarding it puts the
+        // allocation back and leaves every observable value identical, so only
+        // an allocation failure can see it.
         name: "selection-composes-prose-for-candidates-it-rejects",
         file: "crates/moxie-executor/src/affine_linear.rs",
-        from: r#"        match descriptor_mismatch(descriptor, weight, launch) {
-            None => {"#,
-        to: r#"        match descriptor_serves(descriptor, weight, launch).err().map(|_| Mismatch::Contract) {
-            None => {"#,
+        from: r#"            Some(mismatch) => {
+                // The **reason**, not the prose:"#,
+        to: r#"            Some(mismatch) => {
+                let _ = mismatch.into_error(descriptor, weight, launch);
+                // The **reason**, not the prose:"#,
         expect: Expect::Caught,
     },
     // Admission's own two repairs -- the reserved range list and the fallibly

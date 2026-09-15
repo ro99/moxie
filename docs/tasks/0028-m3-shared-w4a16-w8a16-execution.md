@@ -273,7 +273,7 @@ battery to **22**:
 
 | Finding | What the third repair missed | What closes it |
 |---|---|---|
-| **3 (P1)**, allocation failure, *again* | The claim that `admit`'s own allocations were fallible was **false**. Two remained in this task's code: `hold.push` grew an unreserved `Vec` after the arena exists, and the symbol list was an infallible `clone().collect()`. `Module::resolve_all` underneath them used `with_capacity` and `to_vec` | Both are reserved and built fallibly, and `resolve_all` grows through `try_reserve` — its signature already returned `Result` |
+| **3 (P1)**, allocation failure, *again* | The claim that `admit`'s own allocations were fallible was **false**. Two remained in this task's code: `hold.push` grew an unreserved `Vec` after the arena exists, and the symbol list was an infallible `clone().collect()`. `Module::resolve_all` underneath them used `with_capacity` and `to_vec` | Those three are fixed. **The path as a whole is not** — see below |
 | **(P2)**, the sweep itself | It counted refusals **globally** and required only `refusals > 0`. Review mutated the fallible clone to return `Ok("")` on a failed reservation — a corrupted descriptor, not a refusal — and it still passed, because other positions supplied the refusals it counted | Every firing position must return `capacity_exceeded`; the first non-firing position must return a descriptor **equal** to the catalogue's; exhausting the loop bound is a failure |
 
 **Running that stronger sweep immediately found a real defect**, which is the
@@ -292,13 +292,41 @@ Two mutations added, both caught, bringing the battery to **24**:
 | Mutation | Deciding lane |
 |---|---|
 | `a-failed-reservation-yields-a-value-instead-of-a-refusal` | `allocation-refusal` |
-| `selection-composes-prose-for-candidates-it-rejects` | `w4a16-host` |
+| `selection-composes-prose-for-candidates-it-rejects` | `allocation-refusal` |
+
+### The fifth review: the admission path aborts in more places than were named
+
+Two records were wrong and one mutation measured the wrong thing.
+
+**The claim that "`admit`'s own allocations are fallible apart from
+`PlanRequest`" was itself incomplete**, and this record made it twice. Review
+walked the call graph and found infallible allocation in five more places
+across three crates — including `Rc::new(ArenaCore)` **after**
+`DeviceBuffer::alloc` has succeeded, where an abort leaves a live device
+allocation with no owner, and `Arena::allocate`'s `owner.clone()` **after** the
+free list has been mutated, where an abort leaves the arena half-updated.
+Repairing `PlanRequest` alone would only have moved the first abort further
+down the same graph.
+
+The inventory now lives in [task 0029](0029-allocation-fallible-admission-vocabulary.md),
+whose scope was also wrong: it named `moxie-memory`'s `request` module as sole
+owner and then required a sweep of all of `admit`, which that scope cannot
+satisfy. It is rewritten around the whole call graph.
+
+**`selection-composes-prose-for-candidates-it-rejects` was attributed to the
+`w4a16-host` lane**, and the battery did report that — because the substitution
+changed *which reason* a refusal names as well as putting the allocation back,
+so the host lane caught it on refusal text. It was measuring the wrong half of
+its own name. The substitution now builds the error and discards it: every
+observable value is identical and only an allocation failure can see it. The
+deciding lane is `allocation-refusal`, re-run and confirmed.
 
 ### The open finding, and two fixes that are unmeasured
 
-**Allocation failure in the shared admission vocabulary still aborts.** Armed at
-position 4, a plan request built exactly as `resource_request` builds one dies
-with `memory allocation of 5 bytes failed`. This is **failing**, not
+**Allocation failure on the admission path still aborts, in at least six places
+across three crates.** Armed at position 4, a plan request built exactly as
+`resource_request` builds one dies with `memory allocation of 5 bytes failed`;
+the rest of the inventory is in task 0029. This is **failing**, not
 unmeasured — it has been measured, and it fails.
 
 An earlier version of this record called it "a named gap" and put an empty
@@ -308,9 +336,10 @@ was right to reject both. It is now a comment where a test cannot pass, and
 [task 0029](0029-allocation-fallible-admission-vocabulary.md) is the bounded
 task that fixes it — written, with the reproduction it starts from.
 
-**The two admission repairs above are fixed but unmeasured.** No mutation
-covers them and none is in the battery, because an admission sweep has to get
-past `PlanRequest::new` first. They are not recorded as expected survivors:
+**The three admission repairs above are fixed but unmeasured** — the reserved
+range list, the fallibly built symbol list, and `resolve_all`'s growth. No
+mutation covers them and none is in the battery, because an admission sweep has
+to get past `PlanRequest::new` first, and then past five further aborts. They are not recorded as expected survivors:
 this battery's `Expect::Survivor` means *independence control* — "nothing should
 catch this, and something catching it is a finding" — and using it for "nothing
 can reach this yet" would encode an untested fix as an expected one. Task
