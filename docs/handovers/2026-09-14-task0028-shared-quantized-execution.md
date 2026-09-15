@@ -105,10 +105,15 @@ its reason, carries descriptors only, and was already in the graph beneath
 ## Verification
 
 **Read the round below first.** The list that follows was measured at
-`cfc1061`, *before* three review rounds changed the code it describes. It is
-kept because it is the only end-to-end battery and `test-gpu` result there is,
-and it is labelled rather than refreshed, because a number relabelled without
-being re-measured is worse than an old number that says its own date.
+**`448c9a2`** — after the **first** review round's corrections landed in
+`9051f9a`, and before the second and third rounds changed the code again. An
+earlier version of this note said `cfc1061`, which is wrong: that commit carried
+8 of the battery's mutations and none of the first round's, so a 13-of-13 result
+could not have come from it. Review caught the misattribution.
+
+The list is kept rather than refreshed because it is the only end-to-end battery
+and `test-gpu` result there is, and a number relabelled without being
+re-measured is worse than an old number that says its own date.
 
 ### Re-measured on the current tree (2026-09-15)
 
@@ -124,7 +129,7 @@ being re-measured is worse than an old number that says its own date.
   been re-run end to end on this tree, and `cargo xtask-cuda test-gpu` has not
   been re-run either.
 
-### Measured at `cfc1061`, before any review round:
+### Measured at `448c9a2`, after the first review round only:
 
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`, and the
   same with `--features moxie-executor/driver`: clean.

@@ -1053,6 +1053,12 @@ impl<'ctx> Module<'ctx> {
     /// Resolve a complete ordered symbol set before any launch and retain the
     /// module beside the raw function handles. This avoids per-node lookup and
     /// keeps the image loaded until the caller's completion lease retires.
+    /// Resolve every symbol, growing **fallibly**.
+    ///
+    /// `with_capacity` and `to_vec` abort when the allocator refuses, and this
+    /// runs inside admission, where a caller has a typed refusal to return and
+    /// a reservation to hand back. Independent review found the callers being
+    /// made fallible while this stayed infallible underneath them.
     pub fn resolve_all(self, names: &[String]) -> Result<ResolvedModule<'ctx>> {
         if names.is_empty() {
             return Err(Error::InvalidRequest {
@@ -1060,14 +1066,30 @@ impl<'ctx> Module<'ctx> {
                 detail: "a kernel package must resolve at least one symbol".into(),
             });
         }
-        let mut functions = Vec::with_capacity(names.len());
+        let no_room = || Error::CapacityExceeded {
+            tier: None,
+            requested_bytes: 0,
+            available_bytes: 0,
+        };
+        let mut functions = Vec::new();
+        functions
+            .try_reserve_exact(names.len())
+            .map_err(|_| no_room())?;
+        let mut owned: Vec<String> = Vec::new();
+        owned
+            .try_reserve_exact(names.len())
+            .map_err(|_| no_room())?;
         for name in names {
             let function = self.function(name)?;
             functions.push(function.func);
+            let mut copy = String::new();
+            copy.try_reserve_exact(name.len()).map_err(|_| no_room())?;
+            copy.push_str(name);
+            owned.push(copy);
         }
         Ok(ResolvedModule {
             module: self,
-            names: names.to_vec(),
+            names: owned,
             functions,
         })
     }

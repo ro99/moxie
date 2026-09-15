@@ -1,6 +1,7 @@
 # Task 0028 — M3 item 3: shared W4A16 / W8A16 execution
 
-Status: **implemented, reviewed three times, not accepted**. Contract written before
+Status: **implemented, reviewed four times, not accepted, one finding open**
+(the shared admission vocabulary aborts; [task 0029](0029-allocation-fallible-admission-vocabulary.md)). Contract written before
 implementation; the result below is filled from the runs, not from the plan.
 
 ## Identity and authority
@@ -268,38 +269,70 @@ battery to **22**:
 | `the-selected-descriptor-is-cloned-infallibly` | `allocation-refusal` |
 | `a-plan-without-a-binding-is-left-unchecked` | `two-command` |
 
-### One gap is named rather than closed
+### The fourth review: the sweep accepted a corrupted success, and admission was still wrong
 
-Review asked the sweep to cover successful **admission** as well as selection.
-`AffineLinearRun::admit`'s own allocations are fallible, but the first thing it
-calls is `moxie_memory::PlanRequest::new`, and that **aborts**: armed at
+| Finding | What the third repair missed | What closes it |
+|---|---|---|
+| **3 (P1)**, allocation failure, *again* | The claim that `admit`'s own allocations were fallible was **false**. Two remained in this task's code: `hold.push` grew an unreserved `Vec` after the arena exists, and the symbol list was an infallible `clone().collect()`. `Module::resolve_all` underneath them used `with_capacity` and `to_vec` | Both are reserved and built fallibly, and `resolve_all` grows through `try_reserve` — its signature already returned `Result` |
+| **(P2)**, the sweep itself | It counted refusals **globally** and required only `refusals > 0`. Review mutated the fallible clone to return `Ok("")` on a failed reservation — a corrupted descriptor, not a refusal — and it still passed, because other positions supplied the refusals it counted | Every firing position must return `capacity_exceeded`; the first non-firing position must return a descriptor **equal** to the catalogue's; exhausting the loop bound is a failure |
+
+**Running that stronger sweep immediately found a real defect**, which is the
+argument for it. `descriptor_serves` composed its refusal prose for every
+candidate it rejected — including candidates rejected on the way to a match — so
+a *successful* selection allocated prose nobody would read, and a failure there
+was discarded. The predicate is now a `Mismatch` value that allocates nothing,
+and the prose is built from it only at the point a refusal is returned. One
+predicate still, read by both the selection scan and the public
+`descriptor_serves`: splitting a check into a fast boolean and a separate
+explanation is how the two drift, which is a defect an earlier round already
+found here.
+
+Two mutations added, both caught, bringing the battery to **24**:
+
+| Mutation | Deciding lane |
+|---|---|
+| `a-failed-reservation-yields-a-value-instead-of-a-refusal` | `allocation-refusal` |
+| `selection-composes-prose-for-candidates-it-rejects` | `w4a16-host` |
+
+### The open finding, and two fixes that are unmeasured
+
+**Allocation failure in the shared admission vocabulary still aborts.** Armed at
 position 4, a plan request built exactly as `resource_request` builds one dies
-with `memory allocation of 5 bytes failed`.
+with `memory allocation of 5 bytes failed`. This is **failing**, not
+unmeasured — it has been measured, and it fails.
 
-That is not this task's code. `PlanRequest` and `BufferRequest` are the shared
-admission vocabulary — the BF16 chain, the expert plans and the residency
-authority all build them, their labels are `impl Into<String>` evaluated at
-every call site, and their refusals use `format!`. Making that path fallible is
-a change to a shared owner with its own consumers, and doing it inside a
-correction round is the scope drift task contracts exist to stop.
+An earlier version of this record called it "a named gap" and put an empty
+`#[test]` in `allocation_refusal.rs` to say so. That test reported `ok` and
+counted toward the passing total, which is worse than saying nothing; review
+was right to reject both. It is now a comment where a test cannot pass, and
+[task 0029](0029-allocation-fallible-admission-vocabulary.md) is the bounded
+task that fixes it — written, with the reproduction it starts from.
 
-So the admission half of the sweep is **unmeasured, not passing**, it is stated
-as such in `tests/allocation_refusal.rs` beside the sweeps that do run, and it
-is the next bounded task. The measurement above is the reproduction that task
-starts from.
+**The two admission repairs above are fixed but unmeasured.** No mutation
+covers them and none is in the battery, because an admission sweep has to get
+past `PlanRequest::new` first. They are not recorded as expected survivors:
+this battery's `Expect::Survivor` means *independence control* — "nothing should
+catch this, and something catching it is a finding" — and using it for "nothing
+can reach this yet" would encode an untested fix as an expected one. Task
+0029's acceptance includes the sweep that measures them.
 
-**Gates on the corrected tree** (2026-09-15, after the third round): fmt; both
+**Gates on the corrected tree** (2026-09-15, after the fourth round): fmt; both
 clippy lanes; spec-check (10 documents); arch-check (79 rejected fixtures, 21
-accepted, 13 rules); the mutation self-test at **103 of 103** cases over 88
-anchors; **1,100** host tests and **1,144** device-feature tests across 100
-suites, with nothing failed, ignored or skipped.
+accepted, 13 rules); the mutation self-test at **105 of 105** cases over 90
+anchors; **1,099** host tests and **1,143** device-feature tests across 100
+suites, with nothing failed, ignored or skipped. The host total is one lower
+than the round before because the empty test that claimed the admission gap was
+deleted; a passing test that asserts nothing is not a test.
 
 The full `T0028` battery has **not** been re-run end to end on this tree, and
 neither has `cargo xtask-cuda test-gpu`. What has been run is each of the
-**nine** mutations the three rounds added, individually, all caught. That is a
+**eleven** mutations the four rounds added, individually, all caught. That is a
 narrower claim than a battery pass and it is the only one these corrections are
 entitled to; the 13-of-13 result in the support matrix and the handover
-describes `cfc1061`, and both now say so.
+describes **`448c9a2`** — after the first round's corrections in `9051f9a`, not
+before any of them — and both now say so. An earlier version of this paragraph
+attributed it to `cfc1061`, which carried 8 mutations and none of the first
+round's; review corrected it.
 
 **A new lane.** `allocation-refusal` runs a test binary with a per-thread
 one-shot failing allocator. A process that aborts cannot be observed from

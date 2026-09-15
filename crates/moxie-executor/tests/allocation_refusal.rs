@@ -253,11 +253,19 @@ fn the_same_refusal_carries_its_prose_when_allocation_succeeds() {
 /// the winner's `clone()` were all infallible, on the one path with no refusal
 /// to fall back to.
 ///
-/// One position proves nothing here, because which position aborts depends on
-/// how the function is written. So this walks every position until the arming
-/// stops firing, which is where the call has stopped allocating at all.
-/// Surviving the loop **is** the assertion: an abort takes the process, and no
-/// assertion inside it would run.
+/// Three things are required of each position, and the first version required
+/// only the weakest of them. Review mutated `try_string` to return `Ok("")` on
+/// a failed reservation -- which yields a **corrupted descriptor**, not a
+/// refusal -- and the sweep still passed, because it counted refusals globally
+/// and two positions elsewhere supplied them. So:
+///
+/// 1. every position that actually fires must return the typed refusal, not a
+///    value built from a reservation that failed;
+/// 2. the first position that does **not** fire -- the sweep has run past the
+///    end of the call -- must return a descriptor equal to the catalogue's,
+///    which is what catches a silently truncated one;
+/// 3. exhausting the loop bound is a failure, because a sweep that never
+///    reached the end never established (2).
 #[test]
 fn every_allocation_in_a_successful_selection_degrades_rather_than_aborting() {
     let catalogue = KernelCatalogue::new(vec![
@@ -274,35 +282,55 @@ fn every_allocation_in_a_successful_selection_degrades_rather_than_aborting() {
     // The control: unarmed, this selection succeeds and finds the INT4 sm_86
     // entry. Without it, a sweep over a selection that always failed would pass
     // by never reaching an allocation at all.
-    let chosen = select_affine_linear_kernel(&catalogue, &cap, int4, &launch)
+    let expected = select_affine_linear_kernel(&catalogue, &cap, int4, &launch)
         .expect("an sm_86 INT4 descriptor is in the catalogue");
-    assert!(chosen.id.0.contains("sm_86"), "{}", chosen.id.0);
+    assert!(expected.id.0.contains("sm_86"), "{}", expected.id.0);
 
-    let mut positions_reached = 0usize;
-    let mut refusals = 0usize;
-    for skip in 0..64 {
+    const LIMIT: usize = 64;
+    let mut fired_positions = 0usize;
+    let mut ran_past_the_end = false;
+    for skip in 0..LIMIT {
         let (result, fired) = with_failure_at(skip, || {
             select_affine_linear_kernel(&catalogue, &cap, int4, &launch)
         });
-        if result.is_err() {
-            refusals += 1;
+        if fired {
+            fired_positions += 1;
+            // (1) A failed reservation is a refusal. A descriptor returned here
+            // was built from an allocation that did not happen.
+            match result {
+                Err(error) => assert_eq!(
+                    error.kind(),
+                    "capacity_exceeded",
+                    "position {skip} failed an allocation and refused with the wrong kind: {error}"
+                ),
+                Ok(chosen) => panic!(
+                    "position {skip} failed an allocation and still returned a descriptor: {:?}",
+                    chosen.id
+                ),
+            }
+            continue;
         }
-        if !fired {
-            break;
-        }
-        positions_reached += 1;
+        // (2) Past the end of the call: nothing was failed, so this must be the
+        // whole descriptor, field for field.
+        let chosen = result
+            .unwrap_or_else(|e| panic!("position {skip} failed nothing and still refused: {e}"));
+        assert_eq!(
+            chosen, expected,
+            "position {skip} failed nothing and returned a descriptor unequal to the catalogue's"
+        );
+        ran_past_the_end = true;
+        break;
     }
 
-    // At least one position must have been reachable, or this sweep measured
-    // nothing -- the same way the first regression measured nothing.
+    // (3) The sweep has to have reached the end, or (2) was never established.
     assert!(
-        positions_reached > 0,
-        "no allocation was reached during a successful selection, so this sweep proves nothing"
+        ran_past_the_end,
+        "the sweep exhausted its {LIMIT}-position bound without running past the end of the \
+         call, so it never checked a complete result"
     );
     assert!(
-        refusals > 0,
-        "every armed position still returned Ok, so the trap never reached the call it was \
-         armed around"
+        fired_positions > 0,
+        "no allocation was reached during a successful selection, so this sweep proves nothing"
     );
 }
 
@@ -323,29 +351,16 @@ fn every_allocation_in_a_launch_derivation_degrades_rather_than_aborting() {
     }
 }
 
-/// What this sweep does **not** cover, stated where it is measured.
-///
-/// Review asked for the sweep to cover successful **admission** too.
-/// `AffineLinearRun::admit`'s own allocations are fallible -- its labels go
-/// through `try_label` -- but the first thing it calls is
-/// `moxie_memory::PlanRequest::new`, and that aborts: armed at position 4, a
-/// plan request built exactly as `resource_request` builds one dies with
-/// `memory allocation of 5 bytes failed`.
-///
-/// That is **not** task 0028's code. `PlanRequest` and `BufferRequest` are the
-/// shared admission vocabulary: the BF16 chain, the expert plans and the
-/// residency authority all build them, their labels are `impl Into<String>`
-/// evaluated at every call site, and their refusals use `format!`. Making that
-/// path fallible is a change to a shared owner with its own consumers, and
-/// smuggling it into this correction round would be the kind of scope drift
-/// this repository's task contracts exist to stop.
-///
-/// So it is recorded rather than half-done, and the admission half of the sweep
-/// is **unmeasured**, not passing. The task record names it as the next bounded
-/// task.
-#[test]
-fn the_admission_sweep_is_unmeasured_and_this_says_so() {
-    // Deliberately empty of assertions. It exists so the gap has a name in the
-    // same file as the sweeps that *are* measured, rather than only in a
-    // document nobody runs.
-}
+// What this file does **not** cover, and why there is no test here for it.
+//
+// Review asked the sweep to cover successful **admission** too. It is not
+// covered, and the first attempt to say so was an empty `#[test]` that reported
+// `ok` — which is worse than silence: it counted as a passing test, and the
+// behaviour it named is not unmeasured but **measured to abort**. Armed at
+// position 4, a plan request built exactly as `resource_request` builds one
+// dies with `memory allocation of 5 bytes failed`.
+//
+// The status is therefore **failing**, and it is recorded where failures are
+// recorded — the task record, the support matrix, and
+// `docs/tasks/0029-allocation-fallible-admission-vocabulary.md`, which is the
+// bounded task that fixes it. A comment cannot pass, which is the point.

@@ -681,6 +681,45 @@ const LANES_T0028: &[Lane] = &[
 /// codes. Those are exactly the defects a tolerance cannot catch by being
 /// tight, which is why they are measured rather than asserted.
 const BATTERY_T0028: &[Mutation] = &[
+    // --- the fourth review ----------------------------------------------------
+    //
+    // The sweep the third round added counted refusals globally and required
+    // only that one of them happened. Review mutated the fallible clone to
+    // return an empty string on a failed reservation -- a **corrupted
+    // descriptor**, not a refusal -- and the sweep still passed, because other
+    // positions supplied the refusals it counted.
+    Mutation {
+        name: "a-failed-reservation-yields-a-value-instead-of-a-refusal",
+        file: "crates/moxie-types/src/capability.rs",
+        from: r#"            out.try_reserve_exact(source.len()).map_err(|_| no_room())?;"#,
+        to: r#"            if out.try_reserve_exact(source.len()).is_err() {
+                return Ok(String::new());
+            }"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        // The same round: selection composed a refusal for every candidate it
+        // rejected on the way to a match, so a *successful* selection allocated
+        // prose nobody would read -- and a failure there was ignored rather
+        // than returned.
+        name: "selection-composes-prose-for-candidates-it-rejects",
+        file: "crates/moxie-executor/src/affine_linear.rs",
+        from: r#"        match descriptor_mismatch(descriptor, weight, launch) {
+            None => {"#,
+        to: r#"        match descriptor_serves(descriptor, weight, launch).err().map(|_| Mismatch::Contract) {
+            None => {"#,
+        expect: Expect::Caught,
+    },
+    // Admission's own two repairs -- the reserved range list and the fallibly
+    // built symbol list -- have **no mutation here on purpose**. Nothing can
+    // catch them: an admission sweep has to get past
+    // `moxie_memory::PlanRequest::new`, which aborts, and that is task 0029.
+    // `Expect::Survivor` is this battery's word for an *independence control* --
+    // "nothing should catch this, and something catching it is a finding" --
+    // and using it for "nothing can reach this yet" would encode an untested
+    // fix as an expected one. The task record carries them as fixed and
+    // unmeasured instead.
+
     // --- the third review -----------------------------------------------------
     //
     // Two of the second round's repairs were incomplete in the same way: each

@@ -413,7 +413,7 @@ pub fn select_affine_linear_kernel(
     // are the same predicate admission will re-apply. Only the first is kept:
     // building one per rejected descriptor would allocate per candidate, and
     // only one of them is ever read.
-    let mut first_rejection: Option<Error> = None;
+    let mut first_rejection: Option<(Mismatch, &SemanticKernelDescriptor)> = None;
     for descriptor in catalogue.descriptors() {
         if descriptor.operation != SemanticKernelOp::Linear
             || descriptor.sm.major != capability.compute_major
@@ -421,24 +421,28 @@ pub fn select_affine_linear_kernel(
         {
             continue;
         }
-        match descriptor_serves(descriptor, weight, launch) {
-            Ok(()) => {
+        match descriptor_mismatch(descriptor, weight, launch) {
+            None => {
                 matched += 1;
                 if chosen.is_none() {
                     chosen = Some(descriptor);
                 }
             }
-            Err(reason) => {
+            Some(mismatch) => {
+                // The **reason**, not the prose: composing a refusal for a
+                // candidate rejected on the way to a match is an allocation on
+                // the success path, and review's sweep caught one of them
+                // failing and being ignored.
                 if first_rejection.is_none() {
-                    first_rejection = Some(reason);
+                    first_rejection = Some((mismatch, descriptor));
                 }
             }
         }
     }
     if matched == 0
-        && let Some(reason) = first_rejection
+        && let Some((mismatch, descriptor)) = first_rejection
     {
-        return Err(reason);
+        return Err(mismatch.into_error(descriptor, weight, launch));
     }
     let Some(descriptor) = chosen.filter(|_| matched == 1) else {
         return Err(unsupported_kernel_fmt(
@@ -471,30 +475,106 @@ pub fn descriptor_serves(
     weight: WeightPrecision,
     launch: &AffineLaunch,
 ) -> Result<()> {
-    let refuse = |detail: core::fmt::Arguments<'_>| Err(unsupported_kernel_fmt("linear", detail));
-    // The mismatch worth naming first, because it is the one that produces a
-    // wrong answer rather than a failed lookup: a descriptor whose weight
-    // operand is not the width this geometry packs. The requested width and the
-    // descriptor's declared width are checked against the geometry separately,
-    // so neither can stand in for the other.
-    let declared = descriptor.inputs.iter().find_map(|operand| match operand {
+    match descriptor_mismatch(descriptor, weight, launch) {
+        None => Ok(()),
+        Some(mismatch) => Err(mismatch.into_error(descriptor, weight, launch)),
+    }
+}
+
+/// Why a descriptor does not serve, as a value rather than as prose.
+///
+/// **Separating these two is what makes a successful selection allocation-free.**
+/// `descriptor_serves` built its refusal — and so allocated — for every
+/// candidate it rejected, including the ones rejected on the way to a match.
+/// Review's sweep then found a failed allocation returning a descriptor rather
+/// than a refusal, because the allocation that failed was prose nobody was
+/// going to read.
+///
+/// The predicate stays **one** predicate: this enum is the only thing that
+/// decides, and both the selection scan and the public `descriptor_serves` read
+/// it. Splitting a check into a fast boolean and a separate explanation is how
+/// the two drift apart, which is the defect an earlier round already found here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mismatch {
+    /// The weight width the request names, the descriptor declares and the
+    /// geometry packs are not all the same width.
+    Width,
+    /// Some part of the shared quantized linear contract is not declared.
+    Contract,
+    /// The descriptor names something other than the one shared symbol.
+    Symbol,
+    /// The geometry is outside the descriptor's declared domain.
+    Domain,
+}
+
+impl Mismatch {
+    fn into_error(
+        self,
+        descriptor: &SemanticKernelDescriptor,
+        weight: WeightPrecision,
+        launch: &AffineLaunch,
+    ) -> Error {
+        let refuse = |detail: core::fmt::Arguments<'_>| unsupported_kernel_fmt("linear", detail);
+        match self {
+            // The mismatch worth naming first, because it is the one that
+            // produces a wrong answer rather than a failed lookup.
+            Mismatch::Width => {
+                let declared = declared_weight(descriptor);
+                refuse(format_args!(
+                    "cannot bind: the request names {weight} weights, descriptor {} declares {}, \
+                     and the geometry packs {}",
+                    descriptor.id.0,
+                    // **Allocation-free.** This was `to_string()`, evaluated
+                    // before the fallible sink ever saw the arguments, so one
+                    // failed allocation here aborted the process through the
+                    // very path built to avoid that. A precision's name is a
+                    // `&'static str`.
+                    declared.map_or("none", |p| p.get().name()),
+                    launch.width.precision()
+                ))
+            }
+            Mismatch::Contract => refuse(format_args!(
+                "descriptor {} does not declare the shared quantized linear contract",
+                descriptor.id.0
+            )),
+            Mismatch::Symbol => refuse(format_args!(
+                "descriptor {} names {:?} rather than the shared quantized linear symbol",
+                descriptor.id.0, descriptor.symbols
+            )),
+            Mismatch::Domain => refuse(format_args!(
+                "{}x{}x{} is outside descriptor {}'s declared domain of {}x{}x{}",
+                launch.rows,
+                launch.in_features,
+                launch.out_features,
+                descriptor.id.0,
+                descriptor.shape.max_rows,
+                descriptor.shape.max_input,
+                descriptor.shape.max_output
+            )),
+        }
+    }
+}
+
+fn declared_weight(descriptor: &SemanticKernelDescriptor) -> Option<WeightPrecision> {
+    descriptor.inputs.iter().find_map(|operand| match operand {
         KernelOperand::Weight(precision) => Some(*precision),
         _ => None,
-    });
+    })
+}
+
+/// The predicate itself. Allocates nothing, whatever it decides.
+fn descriptor_mismatch(
+    descriptor: &SemanticKernelDescriptor,
+    weight: WeightPrecision,
+    launch: &AffineLaunch,
+) -> Option<Mismatch> {
+    // The requested width and the descriptor's declared width are checked
+    // against the geometry separately, so neither can stand in for the other.
+    let declared = declared_weight(descriptor);
     if weight.get() != launch.width.precision()
         || declared.map(WeightPrecision::get) != Some(launch.width.precision())
     {
-        return refuse(format_args!(
-            "cannot bind: the request names {weight} weights, descriptor {} declares {}, \
-             and the geometry packs {}",
-            descriptor.id.0,
-            // **Allocation-free.** This was `to_string()`, evaluated before
-            // the fallible sink ever saw the arguments, so one failed
-            // allocation here aborted the process through the very path built
-            // to avoid that. A precision's name is a `&'static str`.
-            declared.map_or("none", |p| p.get().name()),
-            launch.width.precision()
-        ));
+        return Some(Mismatch::Width);
     }
     let inputs = [
         KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
@@ -511,33 +591,18 @@ pub fn descriptor_serves(
         // the weight could hide, and this path must not have one.
         || descriptor.workspace != moxie_types::WorkspaceExpression::Zero
     {
-        return refuse(format_args!(
-            "descriptor {} does not declare the shared quantized linear contract",
-            descriptor.id.0
-        ));
+        return Some(Mismatch::Contract);
     }
     if descriptor.symbols.len() != 1 || descriptor.symbols[0].0 != moxie_kernels::AFFINE_LINEAR {
-        return refuse(format_args!(
-            "descriptor {} names {:?} rather than the shared quantized linear symbol",
-            descriptor.id.0, descriptor.symbols
-        ));
+        return Some(Mismatch::Symbol);
     }
     if launch.rows > descriptor.shape.max_rows
         || launch.in_features > descriptor.shape.max_input
         || launch.out_features > descriptor.shape.max_output
     {
-        return refuse(format_args!(
-            "{}x{}x{} is outside descriptor {}'s declared domain of {}x{}x{}",
-            launch.rows,
-            launch.in_features,
-            launch.out_features,
-            descriptor.id.0,
-            descriptor.shape.max_rows,
-            descriptor.shape.max_input,
-            descriptor.shape.max_output
-        ));
+        return Some(Mismatch::Domain);
     }
-    Ok(())
+    None
 }
 
 #[cfg(feature = "driver")]
@@ -776,7 +841,23 @@ mod device {
                     return Err(give_back(ledger, refused.reservation, refused.error));
                 }
             };
-            let mut hold = Vec::new();
+            // **Reserved once, for exactly what it holds.** Two `push` calls
+            // on an empty `Vec` grow it infallibly, and independent review
+            // named them: this runs after the arena exists, so an abort here
+            // would take the process with a device allocation live.
+            let mut hold: Vec<DeviceRange<'ctx>> = Vec::new();
+            if hold.try_reserve_exact(2).is_err() {
+                return Err(unwind(
+                    arena,
+                    Vec::new(),
+                    ledger,
+                    Error::CapacityExceeded {
+                        tier: None,
+                        requested_bytes: 0,
+                        available_bytes: 0,
+                    },
+                ));
+            }
             let allocate = |arena: &mut DeviceArena<'ctx>, bytes, label: &str| {
                 // `to_string()` aborts on a failed allocation, on the path that
                 // exists to report one.
@@ -804,7 +885,37 @@ mod device {
                 Ok(image) => image,
                 Err(error) => return Err(unwind(arena, hold, ledger, error)),
             };
-            let symbols: Vec<String> = descriptor.symbols.iter().map(|s| s.0.clone()).collect();
+            // The symbol list, built fallibly: `collect()` over `clone()` is
+            // one infallible growth per symbol plus one for the vector, on the
+            // path that has a refusal to return.
+            let symbols = {
+                let mut symbols: Vec<String> = Vec::new();
+                let mut room = symbols.try_reserve_exact(descriptor.symbols.len()).is_ok();
+                if room {
+                    for symbol in &descriptor.symbols {
+                        match try_label(format_args!("{}", symbol.0)) {
+                            Ok(name) => symbols.push(name),
+                            Err(_) => {
+                                room = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !room {
+                    return Err(unwind(
+                        arena,
+                        hold,
+                        ledger,
+                        Error::CapacityExceeded {
+                            tier: None,
+                            requested_bytes: 0,
+                            available_bytes: 0,
+                        },
+                    ));
+                }
+                symbols
+            };
             let module = match Module::load(ctx, ModuleImage::Binary(image))
                 .and_then(|module| module.resolve_all(&symbols))
             {
