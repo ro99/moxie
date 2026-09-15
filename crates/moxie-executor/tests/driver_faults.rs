@@ -54,6 +54,45 @@ static LAUNCH_FAIL_COUNTDOWN: AtomicUsize = AtomicUsize::new(0);
 static EVENT_SYNC_ERROR: AtomicI32 = AtomicI32::new(0);
 static EVENT_QUERY_ERROR: AtomicI32 = AtomicI32::new(0);
 static READBACK_ERROR: AtomicI32 = AtomicI32::new(0);
+static CTX_SYNC_ERROR: AtomicI32 = AtomicI32::new(0);
+
+/// One host allocation watched by address, and whether it was ever freed.
+///
+/// A byte counter cannot answer this question: the claim is about **these**
+/// bytes, the activations an asynchronous `cuMemcpyHtoDAsync` reads, and a
+/// total that happens to stay level proves nothing about one buffer. A pointer
+/// comparison is exact and needs no serialisation beyond what this executable
+/// already has.
+static WATCHED_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
+static WATCHED_HOST_FREED: AtomicBool = AtomicBool::new(false);
+
+struct WatchingAllocator;
+
+// SAFETY: every method forwards the caller's unmodified pointer and layout to
+// the system allocator. The only addition is one address comparison.
+unsafe impl std::alloc::GlobalAlloc for WatchingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: forwards the caller's unmodified layout.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        if ptr as usize == WATCHED_HOST_PTR.load(SeqCst) && ptr as usize != 0 {
+            WATCHED_HOST_FREED.store(true, SeqCst);
+        }
+        // SAFETY: pointer and layout describe the original live allocation.
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        if ptr as usize == WATCHED_HOST_PTR.load(SeqCst) && ptr as usize != 0 {
+            WATCHED_HOST_FREED.store(true, SeqCst);
+        }
+        // SAFETY: forwards the caller's own pointer, layout and size.
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static HOST_ALLOCATOR: WatchingAllocator = WatchingAllocator;
 
 #[link(name = "dl")]
 unsafe extern "C" {
@@ -296,6 +335,10 @@ unsafe extern "C" fn cuMemFree_v2(ptr: u64) -> c_int {
 #[unsafe(no_mangle)]
 unsafe extern "C" fn cuCtxSynchronize() -> c_int {
     SYNCS.fetch_add(1, SeqCst);
+    let error = CTX_SYNC_ERROR.load(SeqCst);
+    if error != 0 {
+        return error;
+    }
     forward!("cuCtxSynchronize", unsafe extern "C" fn() -> c_int,)
 }
 
@@ -1682,6 +1725,15 @@ fn a_quantized_launch_that_cannot_prove_completion_keeps_its_operands() {
     let mut run = AffineLinearRun::admit(&mut ledger, &ctx, kernel, launch)
         .unwrap_or_else(|refused| panic!("admission: {}", refused.error));
 
+    // **The activations are watched by address.** These are the host bytes a
+    // `cuMemcpyHtoDAsync` reads, and the original finding was that dropping the
+    // quarantined run ran `Vec::drop` on them while the copy might still be in
+    // flight. Nothing observed that; the first regression checked the ledger and
+    // the leases and then dropped the run.
+    let activations = vec![0u8; launch.activation_bytes().unwrap() as usize];
+    WATCHED_HOST_FREED.store(false, SeqCst);
+    WATCHED_HOST_PTR.store(activations.as_ptr() as usize, SeqCst);
+
     // The window: the copy and the launch are submitted for real, and the
     // event that would prove they finished is refused.
     let records = RECORDS.load(SeqCst);
@@ -1696,7 +1748,7 @@ fn a_quantized_launch_that_cannot_prove_completion_keeps_its_operands() {
                 scales,
                 zero_points: None,
             },
-            vec![0u8; launch.activation_bytes().unwrap() as usize],
+            activations,
         )
         .expect_err("a refused event record must refuse the run");
     RECORD_ERROR.store(0, SeqCst);
@@ -1723,5 +1775,64 @@ fn a_quantized_launch_that_cannot_prove_completion_keeps_its_operands() {
     // its charge, exactly as `DeviceArena` already does. Withholding is the
     // point -- a context that cannot prove completion withholds forever rather
     // than advertising memory nothing can recover.
+    assert!(
+        !WATCHED_HOST_FREED.load(SeqCst),
+        "the activations were freed before the run was even dropped"
+    );
     drop(held);
+    // **The claim, observed.** Dropping a quarantined run must not return the
+    // host bytes an in-flight copy may be reading.
+    assert!(
+        !WATCHED_HOST_FREED.load(SeqCst),
+        "dropping the quarantined run deallocated the activations the copy may \
+         still be reading"
+    );
+    WATCHED_HOST_PTR.store(0, SeqCst);
+}
+
+/// A device allocation whose completion cannot be established is **not** freed.
+///
+/// `DeviceBuffer::drop` synchronised the context and then called
+/// `cuMemFree_v2` whatever the synchronise returned. A failed
+/// `cuCtxSynchronize` is the one answer that means "whether anything is still
+/// reading this allocation is unknown", and freeing on it hands live pages back
+/// to the driver -- the physical half of the same lifetime finding. The
+/// allocation is permanently withheld instead.
+#[test]
+fn a_backing_whose_synchronize_fails_is_withheld_rather_than_freed() {
+    let _guard = one_at_a_time();
+    let ctx = RankContext::acquire(RankId(28_901), 0).expect("a rank context");
+
+    // A real device allocation, dropped with the context synchronise made to
+    // fail -- which is how a device in a bad state answers, and the state in
+    // which "is anything still reading this?" has no answer.
+    let buffer = moxie_cuda::DeviceBuffer::alloc(&ctx, 4096).expect("a device allocation");
+    let frees = FREES.load(SeqCst);
+    let syncs = SYNCS.load(SeqCst);
+    CTX_SYNC_ERROR.store(4, SeqCst);
+    drop(buffer);
+    CTX_SYNC_ERROR.store(0, SeqCst);
+    assert!(
+        SYNCS.load(SeqCst) > syncs,
+        "the drop did not synchronise the context at all, so it never asked"
+    );
+    assert_eq!(
+        FREES.load(SeqCst),
+        frees,
+        "the allocation was freed even though the synchronise that would prove \
+         nothing is reading it failed"
+    );
+
+    // The control, and it is load-bearing: the same drop with a working
+    // synchronise **does** free. Without it, a drop that had stopped freeing
+    // altogether would pass the assertion above.
+    let buffer = moxie_cuda::DeviceBuffer::alloc(&ctx, 4096).expect("a device allocation");
+    let frees = FREES.load(SeqCst);
+    drop(buffer);
+    assert_eq!(
+        FREES.load(SeqCst),
+        frees + 1,
+        "a buffer whose synchronise succeeded was not freed, so the withholding \
+         above proves nothing"
+    );
 }

@@ -814,10 +814,25 @@ impl Drop for DeviceBuffer<'_> {
         // free into the wrong context. Synchronising before the free is then
         // what makes this sound: an asynchronous copy or kernel may still be
         // reading this allocation, and the driver would happily hand the pages
-        // to the next allocation. R07. Teardown errors are not actionable.
+        // to the next allocation. R07.
+        //
+        // **A failed synchronize is not a teardown error to ignore.** It is the
+        // one answer that means "whether anything is still reading this is
+        // unknown", and the previous version freed anyway -- independent review
+        // named this as the physical half of the quarantine hole. When the
+        // context cannot be made current, or cannot be synchronized, the
+        // allocation is **permanently withheld**: leaking device memory at
+        // teardown is a bounded, visible cost, and freeing pages a live copy is
+        // reading is a silent wrong answer somewhere else.
         unsafe {
-            let _ = ffi::cuCtxSetCurrent(self.ctx.raw());
-            let _ = ffi::cuCtxSynchronize();
+            if ffi::cuCtxSetCurrent(self.ctx.raw()) != ffi::CUDA_SUCCESS {
+                self.ptr = 0;
+                return;
+            }
+            if ffi::cuCtxSynchronize() != ffi::CUDA_SUCCESS {
+                self.ptr = 0;
+                return;
+            }
             let _ = ffi::cuMemFree_v2(self.ptr);
         }
     }

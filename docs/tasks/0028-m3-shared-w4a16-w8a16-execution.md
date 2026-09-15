@@ -1,7 +1,7 @@
 # Task 0028 — M3 item 3: shared W4A16 / W8A16 execution
 
-Status: **implemented, unreviewed**. Contract written before implementation; the
-result below is filled from the runs, not from the plan.
+Status: **implemented, reviewed twice, not accepted**. Contract written before
+implementation; the result below is filled from the runs, not from the plan.
 
 ## Identity and authority
 
@@ -210,6 +210,59 @@ And three in `moxie-repack`, task 0027's deferred code:
 rather than by assertion**: six new mutations in the `T0028` battery put the
 defect back, and every one of them is a plausible wrong answer or a freed
 buffer, never a crash.
+
+**That sentence was wrong when it was written, and the re-review said so.** Six
+mutations for seven findings is not one each, and the finding with none was the
+allocation-failure one — the finding whose failure mode is a `SIGABRT`, which no
+mutation in the table could have caught because no lane failed an allocation.
+Three of the seven were also still open. Both are corrected below; the paragraph
+above is left as written because a record that quietly repairs its own claims is
+worth less than one that shows them being repaired.
+
+### The re-review: three of the seven were not fixed
+
+| Finding | What the first repair missed | What closes it |
+|---|---|---|
+| **2 (P1)**, operand lifetime | `AffineLinearRun` retained the operands and `close` refused while quarantined — but the type had **no `Drop`**, so dropping the refused run ran `Vec::drop` on the activations an asynchronous `cuMemcpyHtoDAsync` may still be reading. The physical half was worse: `DeviceBuffer::drop` called `cuMemFree_v2` even when the `cuCtxSynchronize` that would prove nothing is reading it **failed**. | A quarantined run's `Drop` forgets its activations and its leases. A buffer whose context cannot be synchronized is **permanently withheld** rather than freed. Leaking device memory at teardown is bounded and visible; freeing pages a live copy is reading is a silent wrong answer somewhere else |
+| **3 (P1)**, allocation failure | The fallible sink was real, but `descriptor_serves` evaluated `to_string()` on its arguments **before** the sink ever saw them, and other paths — `attribute`, the selection count refusal, three arena labels — still used `format!`. The test that claimed to prove it used an allocation so large that `Vec` rejects it on layout, which never reaches the allocator at all | Every one of those paths composes through `try_reserve`, and a label that cannot be built is a typed refusal rather than an empty string. A new test binary owns a **per-thread one-shot failing allocator** and arms it around the call |
+| **5 (P1)**, edited plan | The repair compared the **count** of planned tensors with the bound `index_tensors`. Review swapped one entry for a different tensor the index already named: same count, same digests, and a `complete` artifact carrying one tensor twice and another not at all | The exact `(tensor name, shard)` pairs are compared against the bound index — missing, extra, duplicated and wrongly-bound are each named separately. A total is a shadow of a set, and two different sets cast the same one |
+
+**Measured by substitution, this time including the abort.** Six mutations were
+added to the `T0028` battery for this round, bringing it to **19**. Every one
+was run and every one is caught:
+
+| Mutation | Deciding lane |
+|---|---|
+| `refusal-prose-allocated-before-the-fallible-sink` | `allocation-refusal` |
+| `the-fallible-sink-grows-infallibly` | `allocation-refusal` |
+| `quarantined-run-releases-its-operands-on-drop` | `w4a16-faults` |
+| `device-buffer-freed-under-a-failed-synchronize` | `w4a16-faults` |
+| `completeness-compares-a-count-not-a-set` | `two-command` |
+| `an-edited-plan-publishes-as-complete` (re-anchored) | `two-command` |
+
+**Two of those six survived on the first run**, and finding out was the whole
+point of running the battery rather than asserting. `the-fallible-sink-grows-infallibly`
+consumed the test's own one-shot allocation trap before reaching the infallible
+path, and `completeness-compares-a-count-not-a-set` left the duplicate guard
+standing in front of the code it was mutating — so neither substitution
+expressed the defect it was named for. Both were rewritten and both are now
+caught. A mutation that cannot fail is the same mistake as a test that cannot
+fail, one level up.
+
+**Gates on the corrected tree.** fmt; both clippy lanes; spec-check (10
+documents); arch-check (79 rejected fixtures, 21 accepted, 13 rules); the
+mutation self-test at **100 of 100** cases over 85 anchors; **1,096** host tests
+and **1,140** device-feature tests across 100 suites, with nothing failed,
+ignored or skipped. The full `T0028` battery has **not** been re-run end to end
+on this tree; the six mutations this round added were each run and each caught,
+and that is the narrower claim.
+
+**A new lane.** `allocation-refusal` runs a test binary with a per-thread
+one-shot failing allocator. A process that aborts cannot be observed from
+inside itself, so the regression for an abort is a binary that dies — which is
+a lane result, not an assertion. The trap is per **thread**: a process-wide flag
+was the first attempt and it landed in an unrelated test's `format!`, which is
+`budget.rs`'s concurrency bug in a new place.
 
 **One claim in this record was also wrong and is corrected.** It said task 0028
 makes experiment 0007 runnable. It does not: that trigger needs execution that

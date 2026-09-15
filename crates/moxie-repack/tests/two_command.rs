@@ -1052,6 +1052,78 @@ fn a_plan_edited_to_cover_less_cannot_publish_as_complete() {
     );
 }
 
+/// The re-review of the same finding: a substitution that keeps the **count**.
+///
+/// The first repair counted what the plan accounted for and compared the total
+/// with the bound `index_tensors`. Review then replaced one entry with a
+/// different tensor the index already named -- same total, same digests -- and
+/// published a `complete` artifact carrying one tensor twice and the other not
+/// at all. A total is a shadow of a set, and two different sets cast the same
+/// one, so the exact `(tensor name, shard)` pairs are what is compared now.
+#[test]
+fn a_plan_edited_to_swap_an_entry_cannot_publish_as_complete() {
+    let scratch = Scratch::new("swapped-plan");
+    let root = checkpoint(&scratch, false);
+    let plan = scratch.join("model.plan.toml");
+    let out = scratch.join("out");
+
+    let planned = common::run(&[
+        "plan",
+        "--source-root",
+        root.to_str().unwrap(),
+        "--out-plan",
+        plan.to_str().unwrap(),
+    ]);
+    assert_eq!(planned.outcome(), "planned", "{}", planned.stdout);
+    let text = std::fs::read_to_string(&plan).expect("the plan reads");
+
+    // Replace the standalone BF16 tensor with a tensor the index **already**
+    // names -- one of the quantized module's own companions. The entry count
+    // does not move, the completeness line does not move, and the checkpoint is
+    // untouched, so every digest still matches.
+    let victim = "model.norm.weight";
+    let duplicate = "model.layers.0.mlp.down_proj.weight_scale";
+    assert!(
+        text.contains(victim),
+        "the fixture plan does not name {victim}:\n{text}"
+    );
+    let edited = text.replace(victim, duplicate);
+    assert_ne!(edited, text, "the substitution changed nothing");
+    assert_eq!(
+        edited.matches('\n').count(),
+        text.matches('\n').count(),
+        "the substitution changed the line count, so it is not a same-count edit"
+    );
+    assert!(
+        edited.contains("status = \"complete\""),
+        "the substitution removed the completeness line"
+    );
+    std::fs::write(&plan, &edited).expect("the edited plan writes");
+
+    let refused = common::run(&[
+        "repack",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_ne!(
+        refused.status, 0,
+        "a same-count substitution published:\n{}{}",
+        refused.stdout, refused.stderr
+    );
+    assert!(
+        refused.says("more than once") || refused.says("does not describe this checkpoint"),
+        "the refusal does not name the substitution:\n{}{}",
+        refused.stdout,
+        refused.stderr
+    );
+    assert!(
+        !out.join("manifest.toml").exists(),
+        "a manifest was published for a plan that was refused"
+    );
+}
+
 /// Task 0028's review, finding 7: a file this program did not create is not
 /// this program's to delete.
 ///

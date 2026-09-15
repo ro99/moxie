@@ -667,6 +667,10 @@ const LANES_T0028: &[Lane] = &[
     // regressions are measured, because T0006 measures the publication path
     // rather than the CLI.
     Lane { name: "two-command", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"two_command"#] },
+    // The allocation-failure lane. A refusal that aborts cannot be caught by a
+    // test that never fails an allocation, and the re-review's reproduction was
+    // a `SIGABRT`, which no assertion inside the process can observe.
+    Lane { name: "allocation-refusal", argv: &[r#"test"#, r#"-p"#, r#"moxie-executor"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"allocation_refusal"#] },
 ];
 
 /// The `T0028` battery: can task 0028's gates, and its review's, actually fail?
@@ -677,6 +681,84 @@ const LANES_T0028: &[Lane] = &[
 /// codes. Those are exactly the defects a tolerance cannot catch by being
 /// tight, which is why they are measured rather than asserted.
 const BATTERY_T0028: &[Mutation] = &[
+    // --- the re-review of the first seven findings ----------------------------
+    //
+    // Three of the seven were reported as fixed and were not. Each substitution
+    // below is the state the re-review actually reproduced, not a paraphrase of
+    // it: a process that aborts, a buffer freed under an unknown completion, and
+    // a plan that publishes the wrong tensors as complete.
+    Mutation {
+        // Finding 3, re-reviewed: the arguments were allocated **before** the
+        // fallible sink received them, so one failed allocation aborted the
+        // process through the path built to prevent that.
+        name: "refusal-prose-allocated-before-the-fallible-sink",
+        file: "crates/moxie-executor/src/affine_linear.rs",
+        from: r#"            declared.map_or("none", |p| p.get().name()),"#,
+        to: r#"            declared.map_or_else(|| "none".to_string(), |p| p.to_string()),"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        // The same finding at its root: a "fallible" sink that is not fallible.
+        // Every refusal in this module composes its prose through it, so this
+        // is the one substitution that puts the abort back everywhere at once.
+        name: "the-fallible-sink-grows-infallibly",
+        file: "crates/moxie-executor/src/affine_linear.rs",
+        from: r#"    match sink.write_fmt(args) {
+        Ok(()) => sink.0,
+        Err(_) => String::new(),
+    }"#,
+        to: r#"    let _ = &sink;
+    args.to_string()"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        // Finding 2, re-reviewed: `close` refused while quarantined but nothing
+        // stopped the value being dropped, and dropping it freed the host bytes
+        // an asynchronous copy may still be reading.
+        name: "quarantined-run-releases-its-operands-on-drop",
+        file: "crates/moxie-executor/src/affine_linear.rs",
+        from: r#"            if !self.quarantined {
+                return;
+            }"#,
+        to: r#"            if true {
+                return;
+            }"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        // The physical half of the same finding: a failed context synchronise is
+        // the one answer meaning "completion unknown", and the free proceeded.
+        name: "device-buffer-freed-under-a-failed-synchronize",
+        file: "crates/moxie-cuda/src/driver.rs",
+        from: r#"            if ffi::cuCtxSynchronize() != ffi::CUDA_SUCCESS {
+                self.ptr = 0;
+                return;
+            }"#,
+        to: r#"            let _ = ffi::cuCtxSynchronize();"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        // Finding 5, re-reviewed: the first repair compared the **count** of
+        // planned tensors with the bound index. Two different sets satisfy one
+        // count equally, and review found the pair -- a tensor duplicated and
+        // another dropped. This substitution is that repair, verbatim.
+        name: "completeness-compares-a-count-not-a-set",
+        file: "crates/moxie-repack/src/discover.rs",
+        from: r#"    if !duplicated.is_empty() {"#,
+        to: r#"    let accounted: usize = selection
+        .tensors
+        .iter()
+        .map(|t| match &t.kind {
+            moxie_format::selection::SelectionKind::Bf16 { .. } => 1,
+            moxie_format::selection::SelectionKind::PackQuantized { files, .. } => files.len(),
+        })
+        .sum();
+    if accounted == index_tensors {
+        return Ok(());
+    }
+    if !duplicated.is_empty() {"#,
+        expect: Expect::Caught,
+    },
     Mutation {
         name: "int4-nibble-pair-read-backwards",
         file: "crates/moxie-kernels/cuda/affine_linear.cu",
@@ -771,8 +853,15 @@ const BATTERY_T0028: &[Mutation] = &[
     Mutation {
         name: "an-edited-plan-publishes-as-complete",
         file: "crates/moxie-repack/src/discover.rs",
-        from: r#"    ) && accounted != index_tensors"#,
-        to: r#"    ) && false && accounted != index_tensors"#,
+        from: r#"    if !matches!(
+        selection.completeness,
+        moxie_format::selection::Completeness::Complete
+    ) {
+        return Ok(());
+    }"#,
+        to: r#"    if true {
+        return Ok(());
+    }"#,
         expect: Expect::Caught,
     },
     Mutation {

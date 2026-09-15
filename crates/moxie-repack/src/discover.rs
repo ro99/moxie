@@ -886,6 +886,7 @@ pub fn confirm_binding(
             now.len()
         )));
     }
+    let index = moxie_format::checkpoint_config::parse_index(&index_text)?;
     // **And does this plan still cover that index?** The two questions are not
     // the same one, and only the first was being asked. An independent review
     // deleted one tensor entry from a generated plan and published a
@@ -893,30 +894,100 @@ pub fn confirm_binding(
     // the digests above matched, and the guard downstream read the plan's own
     // `completeness` field -- which the same edit leaves untouched.
     //
-    // The coverage is recomputed here from the document in hand, against the
-    // count the binding carries, exactly as `Discovery::accounted` counts it:
-    // a quantized module accounts for each of its source tensors and a BF16
-    // tensor for one.
-    let accounted: usize = selection
-        .tensors
-        .iter()
-        .map(|tensor| match &tensor.kind {
-            moxie_format::selection::SelectionKind::Bf16 { .. } => 1,
-            moxie_format::selection::SelectionKind::PackQuantized { files, .. } => files.len(),
-        })
-        .sum();
-    if matches!(
+    // **Counting is not comparing.** The first repair counted what the plan
+    // accounted for and checked the total against `index_tensors`. Review then
+    // replaced one entry with a *different* tensor the index already named,
+    // left the total alone, and published an artifact carrying one tensor twice
+    // and another not at all -- still marked `complete`. A total is a shadow of
+    // a set; two different sets cast the same one.
+    //
+    // So the exact `(tensor name, shard)` pairs are compared. The index is
+    // bound by content above, so it is the index the plan was generated from,
+    // and a complete plan has to name every pair in it and no pair outside it.
+    let mut named: BTreeMap<String, &str> = BTreeMap::new();
+    let mut duplicated: Vec<String> = Vec::new();
+    for tensor in &selection.tensors {
+        let pairs: Vec<(String, &str)> = match &tensor.kind {
+            moxie_format::selection::SelectionKind::Bf16 { name, file } => {
+                vec![(name.clone(), file.as_str())]
+            }
+            moxie_format::selection::SelectionKind::PackQuantized { module, files, .. } => files
+                .iter()
+                .map(|(suffix, file)| (format!("{module}.{suffix}"), file.as_str()))
+                .collect(),
+        };
+        for (name, file) in pairs {
+            if let Some(first) = named.insert(name.clone(), file) {
+                duplicated.push(format!("{name} (in '{first}' and again in '{file}')"));
+            }
+        }
+    }
+    if !duplicated.is_empty() {
+        return Err(invalid(format!(
+            "this plan names {} tensor(s) more than once: {:?}. One source tensor converted twice \
+             is not a description of this checkpoint, whatever the total comes to. Generate a new \
+             plan",
+            duplicated.len(),
+            &duplicated[..duplicated.len().min(5)]
+        )));
+    }
+    if !matches!(
         selection.completeness,
         moxie_format::selection::Completeness::Complete
-    ) && accounted != index_tensors
-    {
+    ) {
+        return Ok(());
+    }
+    let mut missing: Vec<&str> = Vec::new();
+    let mut moved: Vec<String> = Vec::new();
+    for (name, file) in &index {
+        match named.get(name) {
+            None => missing.push(name.as_str()),
+            Some(planned) if *planned != file.as_str() => {
+                moved.push(format!(
+                    "{name} (plan says '{planned}', index says '{file}')"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    let mut extra: Vec<&str> = named
+        .keys()
+        .filter(|name| !index.contains_key(name.as_str()))
+        .map(String::as_str)
+        .collect();
+    missing.sort_unstable();
+    extra.sort_unstable();
+    if !missing.is_empty() || !extra.is_empty() || !moved.is_empty() {
         return Err(invalid(format!(
-            "this plan says it is complete and covers {accounted} of the checkpoint's \
-             {index_tensors} index tensor(s). A plan that has been edited since it was \
-             generated is not a description of this model, and publishing the difference as \
+            "this plan says it is complete and does not describe this checkpoint's index: {} \
+             indexed tensor(s) it never names{}, {} tensor(s) the index does not have{}, and {} \
+             bound to the wrong shard{}. It covers {} of {index_tensors}. A plan edited since it \
+             was generated is not a description of this model, and publishing the difference as \
              complete would describe a model nobody has. Generate a new plan, or declare the \
-             subset deliberately with a partial plan and --allow-partial"
+             subset deliberately with a partial plan and --allow-partial",
+            missing.len(),
+            sample(&missing),
+            extra.len(),
+            sample(&extra),
+            moved.len(),
+            sample_owned(&moved),
+            named.len()
         )));
     }
     Ok(())
+}
+
+/// The first few of a list, for a refusal that has to stay readable.
+fn sample(names: &[&str]) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    format!(" (starting with {:?})", &names[..names.len().min(3)])
+}
+
+fn sample_owned(names: &[String]) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    format!(" (starting with {:?})", &names[..names.len().min(3)])
 }

@@ -1,6 +1,14 @@
 # Handover — task 0028: a canonical INT4 tensor executes
 
-**Implemented, not reviewed, not accepted.** M3 item 3's dense half: one shared
+**Implemented, reviewed twice, not accepted.** The first review found seven
+issues, five P1. The re-review found that **three of those seven were still
+open** — the operand-lifetime fix had no `Drop`, the allocation-failure fix
+still allocated infallibly on the paths that matter, and the edited-plan fix
+compared a count where a set was needed. All three are now closed, each with a
+mutation in the `T0028` battery; the [task record](../tasks/0028-m3-shared-w4a16-w8a16-execution.md)
+carries the detail, including the two mutations that survived their first run.
+
+**Original summary, unchanged:** M3 item 3's dense half: one shared
 kernel multiplies a canonical affine INT4 or INT8 weight on both architectures,
 and the module task 0025 published is the first checkpoint weight this
 repository has ever computed with.
