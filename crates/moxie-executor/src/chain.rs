@@ -579,9 +579,21 @@ impl<'ctx> OperationLease<SelectedCompletion<'ctx>, ChainOperation<'ctx>> {
 /// This is public so validation and diagnostics can inspect the tier charges,
 /// real stage spans, and host-source retention without allocating a device.
 pub fn selected_resource_request(candidate: &SelectedPlanCandidate) -> Result<PlanRequest> {
+    // Both the label and the stage names are copied **fallibly**: the stages
+    // borrow the candidate, which does not outlive the request, and `format!`
+    // aborts where this has a refusal to return.
+    let mut stages = moxie_memory::fallible::with_capacity(candidate.stages().len())?;
+    for stage in candidate.stages() {
+        stages.push(moxie_memory::request::Label::from(
+            moxie_memory::fallible::string(stage)?,
+        ));
+    }
     let mut request = PlanRequest::new(
-        format!("selected-bf16-chain-{}", candidate.base().id().get()),
-        candidate.stages().iter().map(String::as_str),
+        moxie_memory::fallible::text(format_args!(
+            "selected-bf16-chain-{}",
+            candidate.base().id().get()
+        ))?,
+        stages,
     )?;
     let scope = Scope::Device(candidate.workload().device);
     for (label, tier, bytes, span) in [

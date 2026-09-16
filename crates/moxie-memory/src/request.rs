@@ -7,9 +7,43 @@
 //! a prefill-to-decode barrier cost both, which document 03 calls the temporary
 //! coexistence admission must reflect.
 
-use std::collections::BTreeSet;
+use std::borrow::Cow;
 
 use moxie_types::{Error, Result, Scope, Tier};
+
+use crate::fallible;
+
+/// A label that costs nothing to carry.
+///
+/// Every label in this module used to be a `String`, and `impl Into<String>`
+/// meant the **constructor** allocated: `BufferRequest::new("activations", ..)`
+/// copied four­teen bytes onto the heap through `handle_alloc_error`, on the
+/// admission path, where an allocation failure has to be a refusal. A
+/// `Cow<'static, str>` borrows a literal and moves a `String`, so neither form
+/// allocates here and no call site changes.
+pub type Label = Cow<'static, str>;
+
+/// [`Error::InvalidRequest`] whose prose is composed fallibly — **or, when
+/// there is no room to compose it, `CapacityExceeded` instead**.
+///
+/// An earlier version of this comment said the detail was allowed to be empty.
+/// It is not: task 0029's contract says an allocation failure is
+/// `CapacityExceeded`, and an `InvalidRequest` with nothing in it tells a
+/// caller the request was malformed when what happened is that there was no
+/// memory. Two different claims, and the wrong one is the more misleading.
+fn invalid(field: &'static str, detail: core::fmt::Arguments<'_>) -> Error {
+    match fallible::text(detail) {
+        Ok(detail) => Error::InvalidRequest { field, detail },
+        // **The allocation failure wins.** An earlier version degraded to an
+        // `InvalidRequest` with an empty detail, which tells a caller the
+        // request was malformed when what happened is that there was no memory
+        // -- two different claims. Task 0029's contract already says an
+        // allocation failure is `CapacityExceeded`; review pointed out that
+        // treating it as an open question contradicted the contract rather
+        // than interpreting it.
+        Err(no_room) => no_room,
+    }
+}
 
 /// An inclusive span of stage indices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +88,7 @@ pub enum Scaling {
 /// One buffer a plan needs, in one scope and tier, live over one span.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferRequest {
-    pub label: String,
+    pub label: Label,
     pub scope: Scope,
     pub tier: Tier,
     /// Physical bytes. For a mapping this is its **resident** set, which is
@@ -70,7 +104,7 @@ pub struct BufferRequest {
 
 impl BufferRequest {
     pub fn new(
-        label: impl Into<String>,
+        label: impl Into<Label>,
         scope: Scope,
         tier: Tier,
         bytes: u64,
@@ -120,7 +154,7 @@ pub enum ReserveRule {
 /// A reserve whose bytes the ledger computes, charged like any other bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedReserve {
-    pub label: String,
+    pub label: Label,
     pub scope: Scope,
     pub tier: Tier,
     pub rule: ReserveRule,
@@ -129,7 +163,7 @@ pub struct DerivedReserve {
 
 impl DerivedReserve {
     pub fn new(
-        label: impl Into<String>,
+        label: impl Into<Label>,
         scope: Scope,
         tier: Tier,
         rule: ReserveRule,
@@ -148,8 +182,8 @@ impl DerivedReserve {
 /// A complete resource envelope, admitted or refused as one thing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanRequest {
-    label: String,
-    stages: Vec<String>,
+    label: Label,
+    stages: Vec<Label>,
     buffers: Vec<BufferRequest>,
     reserves: Vec<DerivedReserve>,
 }
@@ -157,12 +191,18 @@ pub struct PlanRequest {
 impl PlanRequest {
     /// A request over the given ordered stages. Stage labels must be distinct:
     /// a report that names a peak stage is useless if two stages print the same.
-    pub fn new<I, S>(label: impl Into<String>, stages: I) -> Result<Self>
+    pub fn new<I, S>(label: impl Into<Label>, stages: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
-        S: Into<String>,
+        S: Into<Label>,
     {
-        let stages: Vec<String> = stages.into_iter().map(Into::into).collect();
+        // **Grown one element at a time, each reserved first.** `collect()`
+        // reallocates infallibly, which is an abort on the admission path.
+        let mut labels: Vec<Label> = Vec::new();
+        for stage in stages {
+            fallible::push(&mut labels, stage.into())?;
+        }
+        let stages = labels;
         if stages.is_empty() {
             return Err(Error::InvalidRequest {
                 field: "stages",
@@ -170,23 +210,27 @@ impl PlanRequest {
             });
         }
         if u32::try_from(stages.len()).is_err() {
-            return Err(Error::InvalidRequest {
-                field: "stages",
-                detail: format!("{} stages does not fit a stage index", stages.len()),
-            });
+            return Err(invalid(
+                "stages",
+                format_args!("{} stages does not fit a stage index", stages.len()),
+            ));
         }
-        let distinct: BTreeSet<&String> = stages.iter().collect();
-        if distinct.len() != stages.len() {
-            return Err(Error::InvalidRequest {
-                field: "stages",
-                detail: "stage labels must be distinct".into(),
-            });
+        // **No `BTreeSet`.** Building one to check distinctness allocates a node
+        // per stage, and a plan has a handful of stages: the quadratic scan is
+        // free at this size and cannot fail.
+        for (index, stage) in stages.iter().enumerate() {
+            if stages[..index].iter().any(|earlier| earlier == stage) {
+                return Err(Error::InvalidRequest {
+                    field: "stages",
+                    detail: "stage labels must be distinct".into(),
+                });
+            }
         }
         if let Some(empty) = stages.iter().position(|s| s.is_empty()) {
-            return Err(Error::InvalidRequest {
-                field: "stages",
-                detail: format!("stage {empty} has an empty label"),
-            });
+            return Err(invalid(
+                "stages",
+                format_args!("stage {empty} has an empty label"),
+            ));
         }
         Ok(PlanRequest {
             label: label.into(),
@@ -200,41 +244,41 @@ impl PlanRequest {
         self.check(buffer.scope, buffer.tier, buffer.live, &buffer.label)?;
         if let Some(virtual_bytes) = buffer.virtual_bytes {
             if !buffer.tier.has_virtual_extent() {
-                return Err(Error::InvalidRequest {
-                    field: "virtual_bytes",
-                    detail: format!(
+                return Err(invalid(
+                    "virtual_bytes",
+                    format_args!(
                         "{}: {} has no virtual extent distinct from its bytes",
                         buffer.label,
                         buffer.tier.name()
                     ),
-                });
+                ));
             }
             if virtual_bytes < buffer.bytes {
-                return Err(Error::InvalidRequest {
-                    field: "virtual_bytes",
-                    detail: format!(
+                return Err(invalid(
+                    "virtual_bytes",
+                    format_args!(
                         "{}: {virtual_bytes} B of address space cannot hold {} B resident",
                         buffer.label, buffer.bytes
                     ),
-                });
+                ));
             }
         }
-        self.buffers.push(buffer);
+        fallible::push(&mut self.buffers, buffer)?;
         Ok(self)
     }
 
     pub fn reserve(&mut self, reserve: DerivedReserve) -> Result<&mut Self> {
         self.check(reserve.scope, reserve.tier, reserve.live, &reserve.label)?;
         if let ReserveRule::NLargestBuffersOfTier(0) = reserve.rule {
-            return Err(Error::InvalidRequest {
-                field: "rule",
-                detail: format!(
+            return Err(invalid(
+                "rule",
+                format_args!(
                     "{}: a reserve of the 0 largest buffers is not a reserve",
                     reserve.label
                 ),
-            });
+            ));
         }
-        self.reserves.push(reserve);
+        fallible::push(&mut self.reserves, reserve)?;
         Ok(self)
     }
 
@@ -246,31 +290,31 @@ impl PlanRequest {
             });
         }
         if tier.scope_kind() != scope.kind() {
-            return Err(Error::InvalidRequest {
-                field: "tier",
-                detail: format!("{label}: {} is not a tier of {scope}", tier.name()),
-            });
+            return Err(invalid(
+                "tier",
+                format_args!("{label}: {} is not a tier of {scope}", tier.name()),
+            ));
         }
         let last_stage = (self.stages.len() - 1) as u32;
         if live.first > live.last {
-            return Err(Error::InvalidRequest {
-                field: "live",
-                detail: format!(
+            return Err(invalid(
+                "live",
+                format_args!(
                     "{label}: span {}..={} ends before it starts",
                     live.first, live.last
                 ),
-            });
+            ));
         }
         if live.last > last_stage {
-            return Err(Error::InvalidRequest {
-                field: "live",
-                detail: format!(
+            return Err(invalid(
+                "live",
+                format_args!(
                     "{label}: span {}..={} leaves the plan's {} stage(s)",
                     live.first,
                     live.last,
                     self.stages.len()
                 ),
-            });
+            ));
         }
         Ok(())
     }
@@ -279,7 +323,7 @@ impl PlanRequest {
         &self.label
     }
 
-    pub fn stages(&self) -> &[String] {
+    pub fn stages(&self) -> &[Label] {
         &self.stages
     }
 
@@ -292,12 +336,26 @@ impl PlanRequest {
     }
 
     /// Every scope the request touches, in identity order.
-    pub fn scopes(&self) -> BTreeSet<Scope> {
-        self.buffers
+    ///
+    /// A `Vec` rather than a `BTreeSet`, and reserved rather than collected: a
+    /// set allocates a node per scope and `collect` reallocates, both through
+    /// `handle_alloc_error`. A request touches a handful of scopes, so the
+    /// linear membership test costs nothing and cannot fail.
+    pub fn scopes(&self) -> Result<Vec<Scope>> {
+        let mut out: Vec<Scope> =
+            fallible::with_capacity(self.buffers.len() + self.reserves.len())?;
+        for scope in self
+            .buffers
             .iter()
             .map(|b| b.scope)
             .chain(self.reserves.iter().map(|r| r.scope))
-            .collect()
+        {
+            if !out.contains(&scope) {
+                out.push(scope);
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
     }
 }
 
@@ -415,7 +473,7 @@ mod tests {
             .scaling(Scaling::Context),
         )
         .unwrap();
-        assert_eq!(p.scopes().len(), 2);
+        assert_eq!(p.scopes().unwrap().len(), 2);
         assert!(p.buffers()[0].live.covers(1));
         assert!(!p.buffers()[1].live.covers(2));
         assert_eq!(p.buffers()[1].scales_with, Some(Scaling::Context));

@@ -1029,7 +1029,20 @@ impl<'ctx> Module<'ctx> {
     /// Look up a kernel. The returned `Function` borrows this module, so it
     /// cannot outlive the image it was resolved from.
     pub fn function(&self, name: &str) -> Result<Function<'_>> {
-        let cname = CString::new(name).map_err(|_| Error::InvalidRequest {
+        // **`CString::new` allocates infallibly**, and this is reached from
+        // `resolve_all` once per symbol, inside admission, after a device
+        // allocation already exists. The bytes are reserved first and the NUL
+        // appended, which is what `CString::new` does -- fallibly.
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(name.len() + 1)
+            .map_err(|_| Error::CapacityExceeded {
+                tier: None,
+                requested_bytes: 0,
+                available_bytes: 0,
+            })?;
+        bytes.extend_from_slice(name.as_bytes());
+        let cname = CString::new(bytes).map_err(|_| Error::InvalidRequest {
             field: "kernel_name",
             detail: "interior NUL".into(),
         })?;

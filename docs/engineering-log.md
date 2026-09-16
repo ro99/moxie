@@ -45,8 +45,52 @@ Each links into the entries below.
 | A numerical gate whose denominator can collapse | task 0028's 2-ULP-at-the-result threshold |
 | A check attached to a value nobody has to keep | task 0028's public launch fields, trusted descriptor, unchecked lease scope and borrowed operands |
 | Work that exists on one disk and nowhere else | 24 commits, four tasks and five review rounds, unpushed for thirty hours |
+| A repair that satisfies the test rather than the property | task 0029, four rounds: an owned label the fixture never used, a prefix measured on a warmed ledger, a mutant that panicked before it mutated, an aggregate standing in for a state |
+| A harness with no tests of its own | the mutation guard, after three rounds of guard bugs: the self-test covers verdicts, selectors and anchors, and never touched restoration |
 
 ## Entries, newest first
+
+**A repair that satisfies the test rather than the property (2026-09-15).**
+Task 0029 made an admission path refuse instead of aborting. Its contract was
+one sentence — an allocation failure is a typed error — and it took **four**
+review rounds, none of which found the property unmet by accident. Each round
+found a repair that made the test pass without making the statement true:
+
+* labels became `Cow<'static, str>` so the constructor stopped allocating, and
+  the *clone* still did — on the path where the label is owned, after the free
+  list had moved. The sweep missed it because its fixture passed a literal,
+  which is the borrowed half;
+* the device sweep's prefix was measured on a warmed, reused ledger while every
+  armed iteration used a fresh one, so it swept fewer positions than the call
+  made and could not say so;
+* the rollback mutants *deleted* a reservation, so a later insert panicked on
+  zero capacity: they tested a crash, not a refusal returned after a mutation,
+  and one of them wedged the battery for twenty-five minutes with the mutant
+  still in the source file;
+* the arena's "exact state" comparison compared `ArenaOccupancy` — byte and
+  range counts, which cannot see offsets, order, owners or generations.
+
+The common shape is not carelessness, it is **the test being the thing that was
+repaired**. A property is a statement about every input; a test is one input. If
+the fixture only ever passes a borrowed label, "labels are copied fallibly" is
+never under test, and a green run says nothing about it. The question that would
+have caught all four is the same one: *what would have to be true for this to
+pass while the statement is false?*
+
+**A harness with no tests of its own (2026-09-15).** The mutation guard — the
+thing that puts a source file back after a substitution — produced three
+separate defects in three rounds: it deleted its own backup after a failed
+restore, it could leave a marker with no parked original, and it could not
+express "marker cleared, copy pending" at all. It had **no tests**. The
+`mutation-check --self-test` runs 109 cases and none of them touched
+restoration, because the self-test was built to check verdicts, selectors and
+anchors — which is exactly the tooling equivalent of a valid-only sweep.
+
+It has five now, injecting failure at each step by putting a directory where a
+file must be written or removed. The lesson is narrower than "test everything":
+**the code that runs when something has already gone wrong is the code least
+likely to have been exercised**, and a recovery path is entirely made of that
+code.
 
 **A branch nobody else can see is not a record (2026-09-15).** `origin/main` sat
 at `44a94c4` from 2026-09-13 20:43 while local `main` ran twenty-four commits

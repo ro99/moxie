@@ -57,7 +57,7 @@ pub struct ScopeReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionReport {
     /// The request's stage labels, so a `peak_stage` index reads as a name.
-    pub stages: Vec<String>,
+    pub stages: Vec<crate::request::Label>,
     pub scopes: Vec<ScopeReport>,
 }
 
@@ -69,7 +69,7 @@ impl AdmissionReport {
     fn stage_name(&self, index: u32) -> &str {
         self.stages
             .get(index as usize)
-            .map(String::as_str)
+            .map(crate::request::Label::as_ref)
             .unwrap_or("?")
     }
 }

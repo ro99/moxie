@@ -64,26 +64,6 @@ fn fallible(args: core::fmt::Arguments<'_>) -> String {
     }
 }
 
-/// A `String` built from `format_args!` without ever growing infallibly, or a
-/// typed capacity refusal.
-///
-/// `fallible` degrades to an empty detail, which is right for prose nobody
-/// branches on. A **label** is different: it names an arena and a buffer, it
-/// ends up in refusals and traces, and silently substituting an empty one would
-/// make two arenas indistinguishable. So this reports the failure instead.
-#[cfg_attr(not(any(feature = "driver", test)), allow(dead_code))]
-fn try_label(args: core::fmt::Arguments<'_>) -> Result<String> {
-    use core::fmt::Write;
-    let mut sink = FallibleString(String::new());
-    sink.write_fmt(args)
-        .map(|()| sink.0)
-        .map_err(|_| Error::CapacityExceeded {
-            tier: None,
-            requested_bytes: 0,
-            available_bytes: 0,
-        })
-}
-
 /// [`Error::InvalidRequest`] whose prose is composed **fallibly**.
 fn invalid_fmt(field: &'static str, detail: core::fmt::Arguments<'_>) -> Error {
     Error::InvalidRequest {
@@ -618,9 +598,7 @@ mod device {
     };
     use moxie_types::{DeviceTier, Error, HostTier, Result, Scope, SemanticKernelDescriptor, Tier};
 
-    use super::{
-        AffineLaunch, fallible, invalid, invalid_fmt, try_label, try_zeroed, unsupported_kernel_fmt,
-    };
+    use super::{AffineLaunch, fallible, invalid, invalid_fmt, try_zeroed, unsupported_kernel_fmt};
     use crate::arena::{DeviceArena, DeviceRange};
     use crate::residency::DeviceResidency;
 
@@ -824,7 +802,10 @@ mod device {
             // Built **before** the arena call: a label that cannot be
             // allocated is a refusal that has to hand the reservation back, and
             // it cannot do that from inside the call that consumes it.
-            let label = match try_label(format_args!("affine-linear-{}", descriptor.id.0)) {
+            let label = match moxie_memory::fallible::text(format_args!(
+                "affine-linear-{}",
+                descriptor.id.0
+            )) {
                 Ok(label) => label,
                 Err(error) => return Err(give_back(ledger, reservation, error)),
             };
@@ -861,7 +842,7 @@ mod device {
             let allocate = |arena: &mut DeviceArena<'ctx>, bytes, label: &str| {
                 // `to_string()` aborts on a failed allocation, on the path that
                 // exists to report one.
-                let owned = try_label(format_args!("{label}"))?;
+                let owned = moxie_memory::fallible::text(format_args!("{label}"))?;
                 arena
                     .allocate(bytes, ALIGNMENT, owned)
                     .map_err(|refused| refused.error)
@@ -893,7 +874,7 @@ mod device {
                 let mut room = symbols.try_reserve_exact(descriptor.symbols.len()).is_ok();
                 if room {
                     for symbol in &descriptor.symbols {
-                        match try_label(format_args!("{}", symbol.0)) {
+                        match moxie_memory::fallible::text(format_args!("{}", symbol.0)) {
                             Ok(name) => symbols.push(name),
                             Err(_) => {
                                 room = false;
@@ -1456,7 +1437,7 @@ mod device {
     /// same way `selected_resource_request` does for the BF16 chain.
     pub fn resource_request(launch: &AffineLaunch, ctx: &RankContext) -> Result<PlanRequest> {
         let mut request = PlanRequest::new(
-            try_label(format_args!("affine-linear-{}", launch.profile()))?,
+            moxie_memory::fallible::text(format_args!("affine-linear-{}", launch.profile()))?,
             ["bind", "launch", "read"],
         )?;
         let scope = Scope::Device(ctx.uuid());
@@ -1837,19 +1818,6 @@ mod tests {
             launch.row_stride() * launch.out_features()
         );
         assert!(launch.groups_per_row() > 0 && launch.row_stride() > 0);
-    }
-
-    #[test]
-    fn a_label_that_cannot_be_allocated_is_a_refusal_and_not_an_empty_name() {
-        // Prose may degrade to nothing -- nobody branches on it. A **label**
-        // names an arena and a buffer and ends up in refusals and traces, so an
-        // empty one would make two arenas indistinguishable. This is the one
-        // fallible composition that reports failure instead of shortening.
-        let long = "x".repeat(64);
-        assert_eq!(try_label(format_args!("{long}")).unwrap(), long);
-        // The failing half is measured in `tests/allocation_refusal.rs`, which
-        // owns an allocator that can return null; nothing inside this process
-        // can make `try_reserve` fail on demand.
     }
 
     #[test]

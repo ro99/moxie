@@ -20,7 +20,7 @@ pub struct OperationAcquireRefused<R> {
 #[must_use = "an operation lease must retire before its resource is reusable"]
 pub struct OperationLease<C, R> {
     id: LeaseId,
-    label: String,
+    label: moxie_memory::request::Label,
     lifecycle: Lifecycle<C>,
     resource: Option<R>,
 }
@@ -37,7 +37,7 @@ impl<C, R> Drop for OperationLease<C, R> {
 
 impl<C: Completion, R> OperationLease<C, R> {
     pub fn new(
-        label: impl Into<String>,
+        label: impl Into<moxie_memory::request::Label>,
         resource: R,
     ) -> std::result::Result<Self, OperationAcquireRefused<R>> {
         let label = label.into();
@@ -186,12 +186,12 @@ impl<C, R> OperationTurnReport<C, R> {
 /// Turn-boundary owner for suballocated operation leases.
 #[derive(Debug, Default)]
 pub struct OperationTurn<C, R> {
-    label: String,
+    label: moxie_memory::request::Label,
     leases: Vec<OperationLease<C, R>>,
 }
 
 impl<C: Completion, R> OperationTurn<C, R> {
-    pub fn new(label: impl Into<String>) -> Result<Self> {
+    pub fn new(label: impl Into<moxie_memory::request::Label>) -> Result<Self> {
         let label = label.into();
         if label.is_empty() {
             return Err(invalid("label", "an operation turn must be named"));
@@ -407,7 +407,7 @@ mod driver_binding {
         pub fn prepare_upload(
             self,
             source: Vec<u8>,
-            label: impl Into<String>,
+            label: impl Into<moxie_memory::request::Label>,
         ) -> std::result::Result<
             OperationLease<Event<'ctx>, ArenaUpload<'ctx>>,
             PrepareArenaUploadRefused<'ctx>,
@@ -514,7 +514,7 @@ mod driver_binding {
             ctx: &'ctx RankContext,
             regions: &[(DeviceTier, u64)],
             capacity: u64,
-            label: impl Into<String>,
+            label: impl Into<moxie_memory::request::Label>,
         ) -> std::result::Result<Self, ArenaCreateRefused> {
             let fail = |reservation, error| ArenaCreateRefused { reservation, error };
             let scope = Scope::Device(ctx.uuid());
@@ -531,10 +531,26 @@ mod driver_binding {
                 ));
             }
             let mut total = 0u64;
-            let mut seen = std::collections::BTreeSet::new();
+            // **No `BTreeSet`.** Building one allocates a node per tier, on a
+            // path whose whole job is to refuse rather than abort, and a
+            // partitioned arena has a handful of regions: the linear scan is
+            // free at this size and cannot fail.
+            let mut seen: [Option<DeviceTier>; 8] = [None; 8];
+            let mut seen_len = 0usize;
             for (tier, bytes) in regions {
+                let duplicate = seen[..seen_len].contains(&Some(*tier));
+                if !duplicate {
+                    if seen_len == seen.len() {
+                        return Err(fail(
+                            reservation,
+                            invalid("regions", "more partitioned regions than tiers exist"),
+                        ));
+                    }
+                    seen[seen_len] = Some(*tier);
+                    seen_len += 1;
+                }
                 if *bytes == 0
-                    || !seen.insert(*tier)
+                    || duplicate
                     || matches!(
                         tier,
                         DeviceTier::SafetyHeadroom | DeviceTier::AllocatorFragmentation
@@ -568,17 +584,23 @@ mod driver_binding {
                     ),
                 ));
             }
-            let Some(record) = ledger
-                .outstanding()
-                .into_iter()
-                .find(|record| record.id == reservation.id())
-            else {
+            // **By reference.** This called `ledger.outstanding()`, which
+            // clones a label and two vectors per reservation, to find the one
+            // reservation it already had the id of -- an allocation on the
+            // admission path, which independent review named.
+            let Some(charges) = ledger.charges_of(reservation.id()) else {
                 return Err(fail(
                     reservation,
                     invalid("reservation", "reservation is not outstanding"),
                 ));
             };
-            if record.scope_charges.iter().any(|(candidate, bytes)| {
+            let Some(scope_charges) = ledger.scope_charges_of(reservation.id()) else {
+                return Err(fail(
+                    reservation,
+                    invalid("reservation", "reservation is not outstanding"),
+                ));
+            };
+            if scope_charges.iter().any(|(candidate, bytes)| {
                 matches!(candidate, Scope::Device(_)) && *candidate != scope && *bytes != 0
             }) {
                 return Err(fail(
@@ -589,8 +611,7 @@ mod driver_binding {
                     ),
                 ));
             }
-            let scope_budget = record
-                .scope_charges
+            let scope_budget = scope_charges
                 .iter()
                 .find(|(candidate, _)| *candidate == scope)
                 .map(|(_, bytes)| *bytes)
@@ -606,8 +627,7 @@ mod driver_binding {
                 ));
             }
             for (tier, bytes) in regions {
-                let tier_budget = record
-                    .charges
+                let tier_budget = charges
                     .iter()
                     .find(|(candidate, candidate_tier, _)| {
                         *candidate == scope && *candidate_tier == Tier::Device(*tier)
@@ -629,26 +649,48 @@ mod driver_binding {
                 Ok(arena) => arena,
                 Err(error) => return Err(fail(reservation, error)),
             };
-            let host_pageable_budget = record
-                .charges
+            let host_pageable_budget = charges
                 .iter()
                 .find(|(candidate, candidate_tier, _)| {
                     *candidate == Scope::Host && *candidate_tier == Tier::Host(HostTier::Pageable)
                 })
                 .map(|(_, _, bytes)| *bytes)
                 .unwrap_or(0);
+            // **The `Rc` is allocated before the device memory is.**
+            //
+            // `Rc::new` grows through `handle_alloc_error` and has no stable
+            // fallible form. That is survivable when nothing has happened yet
+            // and unacceptable once a device allocation exists: the previous
+            // order took `capacity` bytes on the card and *then* asked the host
+            // allocator for the block that would own them, so a failure left
+            // live device memory with no owner and no path to a free.
+            // Independent review named it.
+            //
+            // A zero-length `DeviceBuffer` is inert -- `alloc` returns a null
+            // pointer without touching the driver, and `Drop` returns early on
+            // one -- so the owning block is taken first with a placeholder and
+            // the real allocation moved in through `Rc::get_mut`, which is
+            // available precisely because this reference is still unique.
+            let placeholder = match DeviceBuffer::alloc(ctx, 0) {
+                Ok(buffer) => buffer,
+                Err(error) => return Err(fail(reservation, error)),
+            };
+            let mut core = Rc::new(ArenaCore {
+                buffer: placeholder,
+                device_ordinal: ctx.ordinal(),
+                active_upload: Cell::new(false),
+                host_pageable_budget,
+            });
             let buffer = match DeviceBuffer::alloc(ctx, capacity as usize) {
                 Ok(buffer) => buffer,
                 Err(error) => return Err(fail(reservation, error)),
             };
+            Rc::get_mut(&mut core)
+                .expect("the arena's core is unique until it is handed out")
+                .buffer = buffer;
             Ok(Self {
                 metadata,
-                core: Some(Rc::new(ArenaCore {
-                    buffer,
-                    device_ordinal: ctx.ordinal(),
-                    active_upload: Cell::new(false),
-                    host_pageable_budget,
-                })),
+                core: Some(core),
                 reservation: Some(reservation),
                 ledger: ledger.id(),
                 scope,
@@ -663,7 +705,7 @@ mod driver_binding {
             ctx: &'ctx RankContext,
             tier: DeviceTier,
             capacity: u64,
-            label: impl Into<String>,
+            label: impl Into<moxie_memory::request::Label>,
         ) -> std::result::Result<Self, ArenaCreateRefused> {
             let fail = |reservation, error| ArenaCreateRefused { reservation, error };
             let scope = Scope::Device(ctx.uuid());
@@ -682,17 +724,23 @@ mod driver_binding {
                     invalid("tier", "headroom and fragmentation are not payload arenas"),
                 ));
             }
-            let Some(record) = ledger
-                .outstanding()
-                .into_iter()
-                .find(|record| record.id == reservation.id())
-            else {
+            // **By reference.** This called `ledger.outstanding()`, which
+            // clones a label and two vectors per reservation, to find the one
+            // reservation it already had the id of -- an allocation on the
+            // admission path, which independent review named.
+            let Some(charges) = ledger.charges_of(reservation.id()) else {
                 return Err(fail(
                     reservation,
                     invalid("reservation", "reservation is not outstanding"),
                 ));
             };
-            if record.scope_charges.iter().any(|(candidate, bytes)| {
+            let Some(scope_charges) = ledger.scope_charges_of(reservation.id()) else {
+                return Err(fail(
+                    reservation,
+                    invalid("reservation", "reservation is not outstanding"),
+                ));
+            };
+            if scope_charges.iter().any(|(candidate, bytes)| {
                 matches!(candidate, Scope::Device(_)) && *candidate != scope && *bytes != 0
             }) {
                 return Err(fail(
@@ -703,14 +751,12 @@ mod driver_binding {
                     ),
                 ));
             }
-            let scope_budget = record
-                .scope_charges
+            let scope_budget = scope_charges
                 .iter()
                 .find(|(candidate, _)| *candidate == scope)
                 .map(|(_, bytes)| *bytes)
                 .unwrap_or(0);
-            let tier_budget = record
-                .charges
+            let tier_budget = charges
                 .iter()
                 .find(|(candidate, candidate_tier, _)| {
                     *candidate == scope && *candidate_tier == Tier::Device(tier)
@@ -743,26 +789,48 @@ mod driver_binding {
                 Ok(arena) => arena,
                 Err(error) => return Err(fail(reservation, error)),
             };
-            let host_pageable_budget = record
-                .charges
+            let host_pageable_budget = charges
                 .iter()
                 .find(|(candidate, candidate_tier, _)| {
                     *candidate == Scope::Host && *candidate_tier == Tier::Host(HostTier::Pageable)
                 })
                 .map(|(_, _, bytes)| *bytes)
                 .unwrap_or(0);
+            // **The `Rc` is allocated before the device memory is.**
+            //
+            // `Rc::new` grows through `handle_alloc_error` and has no stable
+            // fallible form. That is survivable when nothing has happened yet
+            // and unacceptable once a device allocation exists: the previous
+            // order took `capacity` bytes on the card and *then* asked the host
+            // allocator for the block that would own them, so a failure left
+            // live device memory with no owner and no path to a free.
+            // Independent review named it.
+            //
+            // A zero-length `DeviceBuffer` is inert -- `alloc` returns a null
+            // pointer without touching the driver, and `Drop` returns early on
+            // one -- so the owning block is taken first with a placeholder and
+            // the real allocation moved in through `Rc::get_mut`, which is
+            // available precisely because this reference is still unique.
+            let placeholder = match DeviceBuffer::alloc(ctx, 0) {
+                Ok(buffer) => buffer,
+                Err(error) => return Err(fail(reservation, error)),
+            };
+            let mut core = Rc::new(ArenaCore {
+                buffer: placeholder,
+                device_ordinal: ctx.ordinal(),
+                active_upload: Cell::new(false),
+                host_pageable_budget,
+            });
             let buffer = match DeviceBuffer::alloc(ctx, capacity as usize) {
                 Ok(buffer) => buffer,
                 Err(error) => return Err(fail(reservation, error)),
             };
+            Rc::get_mut(&mut core)
+                .expect("the arena's core is unique until it is handed out")
+                .buffer = buffer;
             Ok(Self {
                 metadata,
-                core: Some(Rc::new(ArenaCore {
-                    buffer,
-                    device_ordinal: ctx.ordinal(),
-                    active_upload: Cell::new(false),
-                    host_pageable_budget,
-                })),
+                core: Some(core),
                 reservation: Some(reservation),
                 ledger: ledger.id(),
                 scope,
@@ -791,7 +859,7 @@ mod driver_binding {
             &mut self,
             bytes: u64,
             alignment: u64,
-            owner: impl Into<String>,
+            owner: impl Into<moxie_memory::request::Label>,
         ) -> std::result::Result<DeviceRange<'ctx>, AllocateRefused> {
             if let Some(error) = &self.quarantined {
                 return Err(AllocateRefused {
@@ -837,7 +905,7 @@ mod driver_binding {
         pub fn transfer(
             &mut self,
             mut range: DeviceRange<'ctx>,
-            owner: impl Into<String>,
+            owner: impl Into<moxie_memory::request::Label>,
         ) -> std::result::Result<DeviceRange<'ctx>, RangeTransferRefused<'ctx>> {
             if !Rc::ptr_eq(
                 self.core.as_ref().expect("open arena has a core"),

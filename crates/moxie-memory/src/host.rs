@@ -74,7 +74,9 @@ impl HostBuffer {
         let data_bytes = state_bytes
             .checked_add(workspace_bytes)
             .ok_or(moxie_types::DimError::Overflow)?;
-        let mut plan = PlanRequest::new(label, ["live"])?;
+        // `Label` is `Cow<'static, str>`, and this label borrows the
+        // caller's frame, so it is copied -- fallibly, which is the point.
+        let mut plan = PlanRequest::new(crate::fallible::string(label)?, ["live"])?;
         // `Scaling::Context` is what licenses a refusal to suggest
         // `LowerContext`, so it is declared per row rather than per tier: a
         // vocabulary workspace does not shrink with requested context, and

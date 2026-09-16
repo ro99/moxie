@@ -11,13 +11,22 @@ use moxie_types::{DeviceTier, Error, Result, Scope, Tier};
 /// Logical activation intervals are diagnostics used to assign physical slots.
 /// The one physical arena is charged once for the complete plan lifetime.
 pub fn resource_request(candidate: &PlanCandidate) -> Result<PlanRequest> {
-    let stages = candidate.stages().iter().map(String::as_str);
+    // The candidate's stage names borrow it, and a request's labels outlive
+    // the call, so each is copied -- **fallibly**, like the label itself. Both
+    // were infallible: `String::as_str` fed an `Into<String>` that allocated
+    // per stage, and `format!` aborted outright.
+    let mut stages = moxie_memory::fallible::with_capacity(candidate.stages().len())?;
+    for stage in candidate.stages() {
+        stages.push(moxie_memory::request::Label::from(
+            moxie_memory::fallible::string(stage)?,
+        ));
+    }
     let mut request = PlanRequest::new(
-        format!(
+        moxie_memory::fallible::text(format_args!(
             "graph-resource-plan-{}-{}",
             candidate.id().get(),
             candidate.workload().phase.name()
-        ),
+        ))?,
         stages,
     )?;
     let last = u32::try_from(candidate.stages().len() - 1).map_err(|_| {
@@ -37,7 +46,7 @@ pub fn resource_request(candidate: &PlanCandidate) -> Result<PlanRequest> {
     for binding in candidate.bindings() {
         if let ValueBinding::ExternalWeight(weight) = binding {
             request.buffer(BufferRequest::new(
-                format!("weight-value-{}", weight.value.0),
+                moxie_memory::fallible::text(format_args!("weight-value-{}", weight.value.0))?,
                 scope,
                 Tier::Device(DeviceTier::PackedResidentWeights),
                 weight.required_bytes,

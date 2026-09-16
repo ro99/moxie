@@ -167,7 +167,7 @@ impl From<AdmitError> for Error {
 struct ScopeState {
     snapshot: CapacitySnapshot,
     /// Per-tier commitments, against the per-tier caps.
-    committed: BTreeMap<Tier, u64>,
+    committed: crate::fallible::Map<Tier, u64>,
     /// The scope's committed total: the sum of each admitted plan's **scope
     /// peak**, not the sum of its tier commitments.
     ///
@@ -201,7 +201,7 @@ pub struct Outstanding {
 pub struct Ledger {
     id: LedgerId,
     scopes: BTreeMap<Scope, ScopeState>,
-    outstanding: BTreeMap<ReservationId, OutstandingRecord>,
+    outstanding: crate::fallible::Map<ReservationId, OutstandingRecord>,
 }
 
 /// The intermediate result of evaluating a request against the ledger.
@@ -235,7 +235,7 @@ impl Ledger {
                 scope,
                 ScopeState {
                     snapshot,
-                    committed: BTreeMap::new(),
+                    committed: crate::fallible::Map::new(),
                     committed_scope: 0,
                 },
             );
@@ -243,7 +243,7 @@ impl Ledger {
         Ok(Ledger {
             id: LedgerId::next(),
             scopes,
-            outstanding: BTreeMap::new(),
+            outstanding: crate::fallible::Map::new(),
         })
     }
 
@@ -311,6 +311,25 @@ impl Ledger {
         }
     }
 
+    /// One reservation's scope charges, by reference, allocating **nothing**.
+    ///
+    /// `outstanding()` clones a label and two vectors per reservation, and an
+    /// arena calls it only to find the one reservation it was handed -- on the
+    /// admission path, where an allocation failure has to be a refusal.
+    /// Independent review found that call; this is what it should have been.
+    pub fn scope_charges_of(&self, id: ReservationId) -> Option<&[(Scope, u64)]> {
+        self.outstanding
+            .get(&id)
+            .map(|record| record.scope_charges.as_slice())
+    }
+
+    /// One reservation's tier charges, by reference, allocating **nothing**.
+    pub fn charges_of(&self, id: ReservationId) -> Option<&[(Scope, Tier, u64)]> {
+        self.outstanding
+            .get(&id)
+            .map(|record| record.charges.as_slice())
+    }
+
     /// How many reservations are outstanding, without building them.
     pub fn outstanding_count(&self) -> usize {
         self.outstanding.len()
@@ -353,14 +372,93 @@ impl Ledger {
             })));
         }
 
-        // Nothing below can fail: every sum was checked during evaluation, and
-        // adding a peak that already fits under a ceiling cannot overflow it.
+        // **Everything that can fail happens before anything is charged.**
+        //
+        // This used to add every committed counter first and then allocate the
+        // record that names them. An allocation failure between the two left
+        // capacity charged against a reservation that did not exist, which
+        // `outstanding()` cannot see and no release can undo -- independent
+        // review named the ordering. So the label, the record's slot and the
+        // per-tier map entries are all obtained first; the additions come last
+        // and cannot fail.
+        let no_room = || AdmitError::Invalid(crate::fallible::no_room());
+        let label = crate::fallible::string(request.label()).map_err(AdmitError::Invalid)?;
+        let id = ReservationId::next();
+        // **Every allocation happens before anything is charged**, and the
+        // charging then cannot fail. This used to add the committed counters
+        // first and allocate the record that names them second: a failure
+        // between the two left capacity charged against a reservation nobody
+        // could see and no release could undo. Independent review named the
+        // ordering.
+        //
+        // A tier's entry is created here, zeroed, so the additions below only
+        // ever touch an entry that already exists.
+        // **The reservation's slot first, then the tier entries.** The entries
+        // are a change to the ledger's own map, and taking them before the slot
+        // meant a failure to reserve the slot returned a refusal with the map
+        // already carrying zeroed rows it did not have before. The logical
+        // counters were right and the structure was not, which is the same
+        // shape one level down. Independent review found the ordering.
+        self.outstanding.try_reserve_one().map_err(|_| no_room())?;
+        // **Room for every missing entry, in every scope, before any of them is
+        // installed.** Reserving one at a time and inserting as it goes leaves
+        // the earlier rows behind when a later reservation fails -- the affine
+        // request touches a Host scope and a Device scope, so that is two maps
+        // and directly reachable. Independent review found it. Counting first
+        // and reserving per scope makes the whole preparation atomic: after the
+        // loop below, no insertion can fail.
+        {
+            // One pass to count what each scope is missing, one to take the
+            // room, and only then the insertions.
+            let mut wanted: Vec<(Scope, usize)> =
+                crate::fallible::with_capacity(evaluation.charges.len())
+                    .map_err(AdmitError::Invalid)?;
+            for (scope, tier, _) in &evaluation.charges {
+                let state = self
+                    .scopes
+                    .get(scope)
+                    .expect("evaluation rejected unknown scopes");
+                if state.committed.contains_key(tier) {
+                    continue;
+                }
+                match wanted.iter_mut().find(|(s, _)| s == scope) {
+                    Some((_, n)) => *n += 1,
+                    None => wanted.push((*scope, 1)),
+                }
+            }
+            for (scope, additional) in &wanted {
+                let state = self
+                    .scopes
+                    .get_mut(scope)
+                    .expect("evaluation rejected unknown scopes");
+                state
+                    .committed
+                    .try_reserve(*additional)
+                    .map_err(|_| no_room())?;
+            }
+            for (scope, tier, _) in &evaluation.charges {
+                let state = self
+                    .scopes
+                    .get_mut(scope)
+                    .expect("evaluation rejected unknown scopes");
+                if !state.committed.contains_key(tier) {
+                    state.committed.insert(*tier, 0);
+                }
+            }
+        }
+
+        // From here nothing allocates and nothing can fail: every sum was
+        // checked during evaluation, and adding a peak that already fits under
+        // a ceiling cannot overflow it.
         for (scope, tier, bytes) in &evaluation.charges {
             let state = self
                 .scopes
                 .get_mut(scope)
                 .expect("evaluation rejected unknown scopes");
-            *state.committed.entry(*tier).or_insert(0) += *bytes;
+            *state
+                .committed
+                .get_mut(tier)
+                .expect("the entry was created above") += *bytes;
         }
         for (scope, bytes) in &evaluation.scope_charges {
             let state = self
@@ -369,11 +467,10 @@ impl Ledger {
                 .expect("evaluation rejected unknown scopes");
             state.committed_scope += *bytes;
         }
-        let id = ReservationId::next();
         self.outstanding.insert(
             id,
             OutstandingRecord {
-                label: request.label().to_string(),
+                label,
                 charges: evaluation.charges,
                 scope_charges: evaluation.scope_charges,
             },
@@ -432,23 +529,30 @@ impl Ledger {
     // --- evaluation ----------------------------------------------------------
 
     fn evaluate(&self, request: &PlanRequest) -> Result<Evaluation> {
-        for scope in request.scopes() {
+        for scope in request.scopes()? {
             if !self.scopes.contains_key(&scope) {
                 return Err(Error::InvalidRequest {
                     field: "scope",
-                    detail: format!("{scope} has no capacity snapshot in this ledger"),
+                    // Task 0029's contract: an allocation failure is
+                    // `CapacityExceeded`, not a different error missing its
+                    // data, so a failed `text` propagates rather than degrades.
+                    detail: crate::fallible::text(format_args!(
+                        "{scope} has no capacity snapshot in this ledger"
+                    ))?,
                 });
             }
         }
 
         let base = peaks(request, &|_| false)?;
 
-        let mut charges: Vec<(Scope, Tier, u64)> = base
-            .tier
-            .iter()
-            .filter(|(_, (bytes, _))| *bytes > 0)
-            .map(|((scope, tier), (bytes, _))| (*scope, *tier, *bytes))
-            .collect();
+        // Reserved, then filled. `collect()` reallocates infallibly, and
+        // admission may not abort to say a plan does not fit.
+        let mut charges: Vec<(Scope, Tier, u64)> = crate::fallible::with_capacity(base.tier.len())?;
+        for ((scope, tier), (bytes, _)) in base.tier.iter() {
+            if *bytes > 0 {
+                charges.push((*scope, *tier, *bytes));
+            }
+        }
         charges.sort_unstable_by_key(|(scope, tier, _)| (*scope, *tier));
 
         let mut binding: Vec<BindingConstraint> = Vec::new();
@@ -474,28 +578,34 @@ impl Ledger {
                 if let Some(cap) = cap
                     && tier_needed > cap
                 {
-                    binding.push(BindingConstraint {
-                        scope: *scope,
-                        tier,
-                        kind: BindingKind::TierCap,
-                        needed_bytes: tier_needed,
-                        available_bytes: cap,
-                        peak_stage,
-                    });
+                    crate::fallible::push(
+                        &mut binding,
+                        BindingConstraint {
+                            scope: *scope,
+                            tier,
+                            kind: BindingKind::TierCap,
+                            needed_bytes: tier_needed,
+                            available_bytes: cap,
+                            peak_stage,
+                        },
+                    )?;
                 }
-                tiers.push(TierReport {
-                    tier,
-                    cap_bytes: cap,
-                    committed_bytes: committed,
-                    request_peak_bytes: peak,
-                    peak_stage,
-                    remaining_headroom_bytes: cap.map(|c| c.saturating_sub(tier_needed)),
-                    virtual_extent_bytes: base
-                        .virtual_live
-                        .get(&(*scope, tier))
-                        .and_then(|row| row.iter().copied().max())
-                        .unwrap_or(0),
-                });
+                crate::fallible::push(
+                    &mut tiers,
+                    TierReport {
+                        tier,
+                        cap_bytes: cap,
+                        committed_bytes: committed,
+                        request_peak_bytes: peak,
+                        peak_stage,
+                        remaining_headroom_bytes: cap.map(|c| c.saturating_sub(tier_needed)),
+                        virtual_extent_bytes: base
+                            .virtual_live
+                            .get(&(*scope, tier))
+                            .and_then(|row| row.iter().copied().max())
+                            .unwrap_or(0),
+                    },
+                )?;
             }
 
             if needed > admissible {
@@ -515,38 +625,55 @@ impl Ledger {
                     })
                     .map(|(_, tier)| tier)
                     .unwrap_or(Tier::Device(DeviceTier::SafetyHeadroom));
-                binding.push(BindingConstraint {
-                    scope: *scope,
-                    tier: largest,
-                    kind: BindingKind::ScopeBudget,
-                    needed_bytes: needed,
-                    available_bytes: admissible,
-                    peak_stage: scope_peak_stage,
-                });
+                crate::fallible::push(
+                    &mut binding,
+                    BindingConstraint {
+                        scope: *scope,
+                        tier: largest,
+                        kind: BindingKind::ScopeBudget,
+                        needed_bytes: needed,
+                        available_bytes: admissible,
+                        peak_stage: scope_peak_stage,
+                    },
+                )?;
             }
 
             if scope_peak > 0 {
-                scope_charges.push((*scope, scope_peak));
+                crate::fallible::push(&mut scope_charges, (*scope, scope_peak))?;
             }
 
-            scope_reports.push(ScopeReport {
-                scope: *scope,
-                physical_bytes: state.snapshot.physical_bytes(),
-                system_headroom_bytes: state.snapshot.system_headroom_bytes(),
-                admissible_bytes: admissible,
-                committed_bytes: committed_charged,
-                request_peak_bytes: scope_peak,
-                peak_stage: scope_peak_stage,
-                remaining_headroom_bytes: admissible.saturating_sub(needed),
-                tiers,
-            });
+            crate::fallible::push(
+                &mut scope_reports,
+                ScopeReport {
+                    scope: *scope,
+                    physical_bytes: state.snapshot.physical_bytes(),
+                    system_headroom_bytes: state.snapshot.system_headroom_bytes(),
+                    admissible_bytes: admissible,
+                    committed_bytes: committed_charged,
+                    request_peak_bytes: scope_peak,
+                    peak_stage: scope_peak_stage,
+                    remaining_headroom_bytes: admissible.saturating_sub(needed),
+                    tiers,
+                },
+            )?;
         }
 
         let alternatives = self.alternatives(request, &binding, &base)?;
 
         Ok(Evaluation {
             report: AdmissionReport {
-                stages: request.stages().to_vec(),
+                // Cloning a `Cow` clones a pointer for a literal stage and
+                // the bytes for an owned one; the reserve is what makes the
+                // vector's own growth fallible.
+                stages: {
+                    // `Cow::clone` copies an owned label's bytes infallibly,
+                    // and the BF16 plan and chain builders make owned stages.
+                    let mut stages = crate::fallible::with_capacity(request.stages().len())?;
+                    for stage in request.stages() {
+                        stages.push(crate::fallible::clone_label(stage)?);
+                    }
+                    stages
+                },
                 scopes: scope_reports,
             },
             charges,
@@ -624,7 +751,7 @@ impl Ledger {
         }
 
         if request
-            .scopes()
+            .scopes()?
             .iter()
             .filter(|s| s.kind() == ScopeKind::Device)
             .count()
@@ -748,7 +875,16 @@ impl Ledger {
 
         let mut free_in: BTreeMap<Tier, Vec<u64>> = BTreeMap::new();
         let mut free_scope = vec![scope_room; stage_count];
-        let mut relocated = PlanRequest::new(request.label(), request.stages().to_vec())?;
+        // The label borrows `request`, which does not live as long as the
+        // plan being built, so it is copied fallibly. The stages are `Cow`s
+        // already: cloning one is a pointer for a literal.
+        let mut relocated = {
+            let mut stages = crate::fallible::with_capacity(request.stages().len())?;
+            for stage in request.stages() {
+                stages.push(crate::fallible::clone_label(stage)?);
+            }
+            PlanRequest::new(crate::fallible::string(request.label())?, stages)?
+        };
         let mut any = false;
 
         for b in request.buffers() {
@@ -785,7 +921,7 @@ impl Ledger {
                 relocated.buffer(stays)?;
             }
             let mut goes = b.clone();
-            goes.label = format!("{} (host)", b.label);
+            goes.label = crate::fallible::text(format_args!("{} (host)", b.label))?.into();
             goes.scope = Scope::Host;
             goes.tier = destination;
             goes.bytes = take;
@@ -837,11 +973,11 @@ fn host_destination(tier: Tier) -> Option<Tier> {
 #[derive(Debug)]
 struct Peaks {
     /// Bytes live per stage, per scope and tier.
-    live: BTreeMap<(Scope, Tier), Vec<u64>>,
+    live: crate::fallible::Map<(Scope, Tier), Vec<u64>>,
     /// Declared virtual extent per stage. Reported, charged to nothing.
-    virtual_live: BTreeMap<(Scope, Tier), Vec<u64>>,
-    tier: BTreeMap<(Scope, Tier), (u64, u32)>,
-    scope: BTreeMap<Scope, (u64, u32)>,
+    virtual_live: crate::fallible::Map<(Scope, Tier), Vec<u64>>,
+    tier: crate::fallible::Map<(Scope, Tier), (u64, u32)>,
+    scope: crate::fallible::Map<Scope, (u64, u32)>,
 }
 
 impl Peaks {
@@ -867,20 +1003,34 @@ fn peaks(request: &PlanRequest, zero: &dyn Fn(&BufferRequest) -> bool) -> Result
     let overflow = || Error::Dim(moxie_types::DimError::Overflow);
     let bytes_of = |b: &BufferRequest| if zero(b) { 0 } else { b.bytes };
 
-    let mut live: BTreeMap<(Scope, Tier), Vec<u64>> = BTreeMap::new();
-    let mut virtual_live: BTreeMap<(Scope, Tier), Vec<u64>> = BTreeMap::new();
+    // **Every row and every entry is reserved before it exists.** `vec!` and
+    // `BTreeMap::insert` both abort when the allocator refuses, and this runs
+    // inside admission, whose whole job is to answer "does this fit" without
+    // dying.
+    let zero_row = |count: usize| -> Result<Vec<u64>> {
+        let mut row: Vec<u64> = crate::fallible::with_capacity(count)?;
+        row.resize(count, 0);
+        Ok(row)
+    };
+    let mut live: crate::fallible::Map<(Scope, Tier), Vec<u64>> = crate::fallible::Map::new();
+    let mut virtual_live: crate::fallible::Map<(Scope, Tier), Vec<u64>> =
+        crate::fallible::Map::new();
     for b in request.buffers() {
-        let row = live
-            .entry((b.scope, b.tier))
-            .or_insert_with(|| vec![0; stage_count]);
+        if !live.contains_key(&(b.scope, b.tier)) {
+            live.try_insert((b.scope, b.tier), zero_row(stage_count)?)?;
+        }
+        let row = live.get_mut(&(b.scope, b.tier)).expect("just inserted");
         for stage in b.live.first..=b.live.last {
             let slot = &mut row[stage as usize];
             *slot = slot.checked_add(bytes_of(b)).ok_or_else(overflow)?;
         }
         if let Some(extent) = b.virtual_bytes {
+            if !virtual_live.contains_key(&(b.scope, b.tier)) {
+                virtual_live.try_insert((b.scope, b.tier), zero_row(stage_count)?)?;
+            }
             let row = virtual_live
-                .entry((b.scope, b.tier))
-                .or_insert_with(|| vec![0; stage_count]);
+                .get_mut(&(b.scope, b.tier))
+                .expect("just inserted");
             for stage in b.live.first..=b.live.last {
                 let slot = &mut row[stage as usize];
                 *slot = slot.checked_add(extent).ok_or_else(overflow)?;
@@ -889,12 +1039,12 @@ fn peaks(request: &PlanRequest, zero: &dyn Fn(&BufferRequest) -> bool) -> Result
     }
 
     for r in request.reserves() {
-        let mut sizes: Vec<u64> = request
-            .buffers()
-            .iter()
-            .filter(|b| b.scope == r.scope && b.tier == r.tier)
-            .map(bytes_of)
-            .collect();
+        let mut sizes: Vec<u64> = crate::fallible::with_capacity(request.buffers().len())?;
+        for b in request.buffers() {
+            if b.scope == r.scope && b.tier == r.tier {
+                sizes.push(bytes_of(b));
+            }
+        }
         sizes.sort_unstable_by(|a, b| b.cmp(a));
         let wanted = match r.rule {
             ReserveRule::LargestBufferOfTier => 1,
@@ -903,30 +1053,31 @@ fn peaks(request: &PlanRequest, zero: &dyn Fn(&BufferRequest) -> bool) -> Result
         if sizes.len() < wanted {
             return Err(Error::InvalidRequest {
                 field: "rule",
-                detail: format!(
+                detail: crate::fallible::text(format_args!(
                     "{}: {:?} needs {wanted} buffer(s) in {} of {}, and the request declares {}",
                     r.label,
                     r.rule,
                     r.tier.name(),
                     r.scope,
                     sizes.len()
-                ),
+                ))?,
             });
         }
         let mut bytes: u64 = 0;
         for size in &sizes[..wanted] {
             bytes = bytes.checked_add(*size).ok_or_else(overflow)?;
         }
-        let row = live
-            .entry((r.scope, r.tier))
-            .or_insert_with(|| vec![0; stage_count]);
+        if !live.contains_key(&(r.scope, r.tier)) {
+            live.try_insert((r.scope, r.tier), zero_row(stage_count)?)?;
+        }
+        let row = live.get_mut(&(r.scope, r.tier)).expect("just inserted");
         for stage in r.live.first..=r.live.last {
             let slot = &mut row[stage as usize];
             *slot = slot.checked_add(bytes).ok_or_else(overflow)?;
         }
     }
 
-    let mut tier: BTreeMap<(Scope, Tier), (u64, u32)> = BTreeMap::new();
+    let mut tier: crate::fallible::Map<(Scope, Tier), (u64, u32)> = crate::fallible::Map::new();
     for (key, row) in &live {
         let (mut peak, mut at) = (0u64, 0u32);
         for (stage, bytes) in row.iter().enumerate() {
@@ -935,13 +1086,18 @@ fn peaks(request: &PlanRequest, zero: &dyn Fn(&BufferRequest) -> bool) -> Result
                 at = stage as u32;
             }
         }
-        tier.insert(*key, (peak, at));
+        tier.try_insert(*key, (peak, at))?;
     }
 
     // The scope figure is the stage-wise total, not the sum of the per-tier
     // peaks, which would reserve buffers that are never live together.
-    let mut scope: BTreeMap<Scope, (u64, u32)> = BTreeMap::new();
-    let present: BTreeSet<Scope> = live.keys().map(|(s, _)| *s).collect();
+    let mut scope: crate::fallible::Map<Scope, (u64, u32)> = crate::fallible::Map::new();
+    let mut present: Vec<Scope> = crate::fallible::with_capacity(live.len())?;
+    for ((s, _), _) in &live {
+        if !present.contains(s) {
+            present.push(*s);
+        }
+    }
     for s in present {
         let (mut peak, mut at) = (0u64, 0u32);
         for stage in 0..stage_count {
@@ -956,7 +1112,7 @@ fn peaks(request: &PlanRequest, zero: &dyn Fn(&BufferRequest) -> bool) -> Result
                 at = stage as u32;
             }
         }
-        scope.insert(s, (peak, at));
+        scope.try_insert(s, (peak, at))?;
     }
 
     Ok(Peaks {

@@ -30,6 +30,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 /// How many times each verdict is taken, in both directions.
 ///
@@ -88,11 +89,34 @@ impl Verdict {
 ///
 /// Covers a normal return, an early `?` and a panic. It does **not** cover a
 /// signal, which is what the restore marker beside it is for.
+/// How far a guard has got through putting the tree back.
+///
+/// **Three steps, not two booleans.** Each one can fail on its own and each
+/// failure means something different, so a pair of flags kept losing one of the
+/// combinations: with `armed`/`restored`, a marker removal that succeeded and a
+/// parked-original removal that failed left the guard claiming both files were
+/// still there, retrying the removed marker and never retrying the copy.
+/// Independent review found that, after finding the previous ordering bug in
+/// the same place. A state a step cannot half-leave is the fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// The source file still carries the mutant.
+    Mutated,
+    /// The source is back. The marker and the parked original are both on disk,
+    /// which is the recoverable pair.
+    Restored,
+    /// The marker is gone. Only the parked original is left, and it is now
+    /// inert: nothing looks for it without a marker.
+    MarkerCleared,
+    /// Nothing left.
+    Clean,
+}
+
 struct Restore {
     path: PathBuf,
     original: String,
     marker: PathBuf,
-    armed: bool,
+    stage: Stage,
 }
 
 impl Restore {
@@ -110,18 +134,90 @@ impl Restore {
             path: root.join(file),
             original: original.to_string(),
             marker,
-            armed: true,
+            stage: Stage::Mutated,
         })
+    }
+
+    fn parked(&self) -> PathBuf {
+        self.marker.with_file_name("original")
+    }
+
+    /// Advance one step, or report why it could not.
+    ///
+    /// The order is the whole point: **source, then marker, then the parked
+    /// copy.** The marker is what tells the next run there is something to
+    /// recover and the copy is what it recovers *from*, so a marker outliving
+    /// its copy is the one combination nothing can recover from -- which is why
+    /// the copy goes last and only after the marker is confirmed gone.
+    fn step(&mut self) -> Result<(), String> {
+        match self.stage {
+            Stage::Mutated => {
+                std::fs::write(&self.path, &self.original).map_err(|e| {
+                    format!(
+                        "cannot restore {}: {e}. The mutant is still installed; the original is \
+                         parked at {} and the marker names the file, so the next run recovers it",
+                        self.path.display(),
+                        self.parked().display()
+                    )
+                })?;
+                self.stage = Stage::Restored;
+            }
+            Stage::Restored => {
+                std::fs::remove_file(&self.marker).map_err(|e| {
+                    format!(
+                        "{} was restored but its marker could not be cleared: {e}. The marker and \
+                         its parked original are both left in place, so the next run sees a \
+                         recoverable pair rather than a marker with nothing behind it",
+                        self.path.display()
+                    )
+                })?;
+                self.stage = Stage::MarkerCleared;
+            }
+            Stage::MarkerCleared => {
+                std::fs::remove_file(self.parked()).map_err(|e| {
+                    format!(
+                        "{} was restored and its marker cleared, but the parked original at {} \
+                         could not be removed: {e}. Nothing looks for it without a marker, so \
+                         this is untidy rather than unsafe",
+                        self.path.display(),
+                        self.parked().display()
+                    )
+                })?;
+                self.stage = Stage::Clean;
+            }
+            Stage::Clean => {}
+        }
+        Ok(())
+    }
+
+    /// Put the file back and clear the evidence, one confirmed step at a time.
+    ///
+    /// The ordinary path. `Drop` is the emergency one, for a panic or a `?` on
+    /// the way out, and it cannot report anything -- which is exactly why the
+    /// cleanup must not live only there: an early version ignored the result of
+    /// the rewrite and then deleted the marker and the parked copy
+    /// unconditionally, so a filesystem error left the mutant installed with
+    /// its only backup gone.
+    fn disarm(&mut self) -> Result<(), String> {
+        while self.stage != Stage::Clean {
+            self.step()?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for Restore {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
+        // The emergency path: something is unwinding, so nothing here can be
+        // returned. It runs the same steps and stops at the first that fails,
+        // leaving whatever that step was protecting -- a recovery that deletes
+        // its own backup is worse than one that leaves a marker behind.
+        while self.stage != Stage::Clean {
+            if let Err(e) = self.step() {
+                eprintln!("mutation-check: {e}");
+                return;
+            }
         }
-        let _ = std::fs::write(&self.path, &self.original);
-        let _ = std::fs::remove_file(&self.marker);
     }
 }
 
@@ -140,6 +236,7 @@ fn recover_interrupted(root: &Path) -> Result<(), String> {
     std::fs::write(&path, &original)
         .map_err(|e| format!("cannot restore {}: {e}", path.display()))?;
     std::fs::remove_file(&marker).map_err(|e| format!("cannot clear the marker: {e}"))?;
+    let _ = std::fs::remove_file(dir.join("original"));
     println!(
         "restored {} from an interrupted run before measuring anything",
         file.trim()
@@ -147,10 +244,29 @@ fn recover_interrupted(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The longest any single lane run may take.
+///
+/// **A mutation can hang rather than fail.** A substitution that removes a
+/// reservation can leave a later `insert` panicking inside a thread the harness
+/// then waits on forever, and the tree stays mutated for as long as that lasts:
+/// an independent review found `T0029` stuck for over twenty-five minutes on a
+/// futex, with the source file still carrying the mutant. A lane that does not
+/// finish is a lane that failed, and saying so is what lets the run move on and
+/// put the file back.
+const LANE_TIMEOUT: Duration = Duration::from_secs(600);
+
 fn lane_passes(root: &Path, lane: &Lane) -> bool {
-    Command::new("cargo")
+    // `timeout --kill-after` rather than a wait loop: the child is a `cargo`
+    // that spawns a test binary, and killing the group is what actually stops
+    // a wedged test process.
+    let mut command = Command::new("timeout");
+    command
+        .arg("--kill-after=30s")
+        .arg(format!("{}s", LANE_TIMEOUT.as_secs()))
+        .arg("cargo")
         .args(lane.argv)
-        .current_dir(root)
+        .current_dir(root);
+    command
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -241,6 +357,15 @@ const BATTERIES: &[Battery] = &[
         lanes: LANES_T0028,
         mutations: BATTERY_T0028,
         builds: BUILDS_T0028,
+    },
+    // Task 0029's battery needs a GPU for its device lane, and both of its
+    // shapes are wrong *answers* rather than crashes: a failed reservation that
+    // yields a value, and a refusal returned after something has moved.
+    Battery {
+        tag: "0029",
+        lanes: LANES_T0029,
+        mutations: BATTERY_T0029,
+        builds: BUILDS_T0029,
     },
 ];
 
@@ -527,20 +652,31 @@ pub fn run(args: &[String]) -> i32 {
         let mut caught_by: Vec<&str> = Vec::new();
         let mut mutant_ok = None;
         {
-            let guard = match Restore::arm(&root, m.file, &original) {
+            let mut guard = match Restore::arm(&root, m.file, &original) {
                 Ok(g) => g,
                 Err(e) => {
                     eprintln!("mutation-check: {e}");
                     return 2;
                 }
             };
-            let _ = &guard;
+            // **Every `continue` below leaves through `Drop`.** That is the
+            // emergency path, which cannot report a failed restore, so each one
+            // disarms explicitly first and stops the whole run if the file did
+            // not go back.
             if std::fs::write(&path, original.replacen(m.from, m.to, 1)).is_err() {
+                if let Err(e) = guard.disarm() {
+                    eprintln!("mutation-check: {e}");
+                    return 2;
+                }
                 skipped.push((m.name, "cannot apply".into()));
                 println!("SKIP {}: cannot apply", m.name);
                 continue;
             }
             if !builds(&root, battery.builds) {
+                if let Err(e) = guard.disarm() {
+                    eprintln!("mutation-check: {e}");
+                    return 2;
+                }
                 skipped.push((m.name, "does not compile".into()));
                 println!("SKIP {}: does not compile", m.name);
                 continue;
@@ -576,7 +712,13 @@ pub fn run(args: &[String]) -> i32 {
                     }
                 }
             }
-            // `guard` drops here: the file is back.
+            // **Restored here, not by `Drop`.** A failure to put the file back
+            // is the one thing this run must not swallow: it stops, with the
+            // marker and the parked copy still on disk for the next run.
+            if let Err(e) = guard.disarm() {
+                eprintln!("mutation-check: {e}");
+                return 2;
+            }
         }
 
         // The control side is the baseline above, taken once on the clean tree.
@@ -698,5 +840,151 @@ pub fn reference_check(args: &[String]) -> i32 {
             );
             2
         }
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::{Restore, Stage};
+
+    /// A scratch directory that removes itself.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "moxie-restore-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir_all(&dir).expect("a scratch directory");
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An armed guard over a real file, plus the root it lives in.
+    fn armed(scratch: &Scratch, body: &str) -> Restore {
+        std::fs::write(scratch.0.join("subject.rs"), body).expect("the subject writes");
+        Restore::arm(&scratch.0, "subject.rs", body).expect("an armed guard")
+    }
+
+    #[test]
+    fn the_ordinary_path_restores_and_clears_both_artifacts() {
+        let scratch = Scratch::new("ordinary");
+        let mut guard = armed(&scratch, "original\n");
+        std::fs::write(scratch.0.join("subject.rs"), "mutant\n").expect("the mutant writes");
+
+        guard.disarm().expect("disarm");
+
+        assert_eq!(guard.stage, Stage::Clean);
+        assert_eq!(
+            std::fs::read_to_string(scratch.0.join("subject.rs")).expect("the subject reads"),
+            "original\n"
+        );
+        assert!(!guard.marker.exists(), "the marker survived a clean disarm");
+        assert!(
+            !guard.parked().exists(),
+            "the parked original survived a clean disarm"
+        );
+    }
+
+    /// **The rewrite fails.** Both artifacts must survive: the mutant is still
+    /// installed and the parked copy is the only way back.
+    #[test]
+    fn a_failed_rewrite_keeps_the_marker_and_the_parked_original() {
+        let scratch = Scratch::new("rewrite");
+        let mut guard = armed(&scratch, "original\n");
+        // A directory cannot be overwritten by a file write.
+        std::fs::remove_file(scratch.0.join("subject.rs")).expect("remove the file");
+        std::fs::create_dir(scratch.0.join("subject.rs")).expect("a directory in its place");
+
+        let error = guard
+            .disarm()
+            .expect_err("a rewrite over a directory fails");
+
+        assert!(error.contains("cannot restore"), "{error}");
+        assert_eq!(guard.stage, Stage::Mutated);
+        assert!(guard.marker.exists(), "the marker was cleared anyway");
+        assert!(
+            guard.parked().exists(),
+            "the parked original was removed while the mutant was still installed"
+        );
+        guard.stage = Stage::Clean;
+    }
+
+    /// **The marker removal fails.** Both artifacts must survive, because a
+    /// marker without its copy is the one unrecoverable pair.
+    #[test]
+    fn a_failed_marker_removal_keeps_the_parked_original() {
+        let scratch = Scratch::new("marker");
+        let mut guard = armed(&scratch, "original\n");
+        std::fs::remove_file(&guard.marker).expect("remove the marker");
+        // A directory at the marker's path: `remove_file` refuses it.
+        std::fs::create_dir(&guard.marker).expect("a directory in its place");
+
+        let error = guard
+            .disarm()
+            .expect_err("removing a directory as a file fails");
+
+        assert!(error.contains("marker could not be cleared"), "{error}");
+        assert_eq!(guard.stage, Stage::Restored);
+        assert!(
+            guard.parked().exists(),
+            "the parked original was removed while its marker survived -- the one \
+             combination nothing can recover from"
+        );
+        guard.stage = Stage::Clean;
+    }
+
+    /// **The parked-original removal fails.** The marker is already gone, so
+    /// nothing looks for the copy: untidy, not unsafe, and the state says so.
+    #[test]
+    fn a_failed_parked_removal_stops_at_the_last_step() {
+        let scratch = Scratch::new("parked");
+        let mut guard = armed(&scratch, "original\n");
+        std::fs::remove_file(guard.parked()).expect("remove the parked original");
+        std::fs::create_dir(guard.parked()).expect("a directory in its place");
+
+        let error = guard
+            .disarm()
+            .expect_err("removing a directory as a file fails");
+
+        assert!(error.contains("parked original"), "{error}");
+        assert_eq!(
+            guard.stage,
+            Stage::MarkerCleared,
+            "the guard did not record that the marker was already cleared, so a retry \
+             would attempt a removal that has already happened"
+        );
+        assert!(!guard.marker.exists(), "the marker was not cleared");
+        guard.stage = Stage::Clean;
+    }
+
+    /// A retry after a failed cleanup resumes where it stopped rather than
+    /// repeating a step that already succeeded.
+    #[test]
+    fn a_retry_resumes_from_the_step_that_failed() {
+        let scratch = Scratch::new("retry");
+        let mut guard = armed(&scratch, "original\n");
+        std::fs::remove_file(guard.parked()).expect("remove the parked original");
+        std::fs::create_dir(guard.parked()).expect("a directory in its place");
+        guard.disarm().expect_err("the last step fails");
+        assert_eq!(guard.stage, Stage::MarkerCleared);
+
+        // Clear the obstruction and retry: it must not try the marker again.
+        std::fs::remove_dir(guard.parked()).expect("clear the obstruction");
+        std::fs::write(guard.parked(), "original\n").expect("a real parked copy");
+
+        guard.disarm().expect("the retry completes");
+        assert_eq!(guard.stage, Stage::Clean);
     }
 }

@@ -4,7 +4,6 @@
 //! generation authority paired with a physical allocation by `moxie-executor`.
 //! Allocation is deterministic address-ordered first fit; release is explicit.
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use moxie_types::{Error, Result};
@@ -63,7 +62,7 @@ pub struct Allocation {
     reserved_offset: u64,
     reserved_bytes: u64,
     alignment: u64,
-    owner: String,
+    owner: crate::request::Label,
 }
 
 impl Allocation {
@@ -106,7 +105,7 @@ struct LiveRecord {
     reserved_offset: u64,
     reserved_bytes: u64,
     alignment: u64,
-    owner: String,
+    owner: crate::request::Label,
 }
 
 /// Exact current occupancy, including fragmentation.
@@ -124,7 +123,7 @@ pub struct ArenaOccupancy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutstandingAllocation {
     pub key: AllocationKey,
-    pub owner: String,
+    pub owner: crate::request::Label,
     pub offset: u64,
     pub bytes: u64,
     pub reserved_bytes: u64,
@@ -166,16 +165,20 @@ pub struct TransferRefused {
 #[derive(Debug)]
 pub struct Arena {
     id: ArenaId,
-    label: String,
+    label: crate::request::Label,
     capacity: u64,
     base_alignment: u64,
     free: Vec<FreeRange>,
-    live: BTreeMap<AllocationId, LiveRecord>,
+    live: crate::fallible::Map<AllocationId, LiveRecord>,
     next_allocation: u64,
 }
 
 impl Arena {
-    pub fn new(label: impl Into<String>, capacity: u64, base_alignment: u64) -> Result<Self> {
+    pub fn new(
+        label: impl Into<crate::request::Label>,
+        capacity: u64,
+        base_alignment: u64,
+    ) -> Result<Self> {
         let label = label.into();
         if label.is_empty() {
             return Err(invalid("label", "an arena must be named"));
@@ -194,11 +197,17 @@ impl Arena {
             label,
             capacity,
             base_alignment,
-            free: vec![FreeRange {
-                offset: 0,
-                bytes: capacity,
-            }],
-            live: BTreeMap::new(),
+            // **Not `vec!`.** One element, grown fallibly: an arena that
+            // cannot be created is a refusal, and `vec!` makes it an abort.
+            free: {
+                let mut free = crate::fallible::with_capacity(1)?;
+                free.push(FreeRange {
+                    offset: 0,
+                    bytes: capacity,
+                });
+                free
+            },
+            live: crate::fallible::Map::new(),
             next_allocation: 1,
         })
     }
@@ -261,7 +270,7 @@ impl Arena {
         &mut self,
         bytes: u64,
         alignment: u64,
-        owner: impl Into<String>,
+        owner: impl Into<crate::request::Label>,
     ) -> std::result::Result<Allocation, AllocateRefused> {
         let owner = owner.into();
         if bytes == 0 {
@@ -313,6 +322,26 @@ impl Arena {
             .checked_add(1)
             .ok_or_else(|| self.refusal(invalid("allocation", "allocation identity overflowed")))?;
 
+        // **The room for the record is taken before the free list moves.**
+        // This mutated the free list and then allocated the record describing
+        // it: a failure in between left the arena believing bytes were handed
+        // out that nothing owned, and an abort left it that way permanently.
+        // Independent review named the ordering. Reserving first makes the
+        // two-step change atomic -- everything after this point is arithmetic
+        // and a move.
+        if let Err(error) = self.live.try_reserve_one() {
+            return Err(self.refusal(error));
+        }
+        // **And the record's own label, copied before the mutation too.** An
+        // owned label -- which is what `AffineLinearRun::admit` builds -- copies
+        // its bytes on `clone`, infallibly, and this used to do that *after*
+        // the free list had moved. Independent review found it; a `Cow` removes
+        // the allocation from the constructor, not from the clone.
+        let record_owner = match crate::fallible::clone_label(&owner) {
+            Ok(label) => label,
+            Err(error) => return Err(self.refusal(error)),
+        };
+
         let remaining = range.bytes - reserved_bytes;
         if remaining == 0 {
             self.free.remove(index);
@@ -331,7 +360,7 @@ impl Arena {
             reserved_offset: range.offset,
             reserved_bytes,
             alignment,
-            owner: owner.clone(),
+            owner: record_owner,
         };
         self.live.insert(id, record);
         Ok(Allocation {
@@ -360,7 +389,7 @@ impl Arena {
     pub fn transfer(
         &mut self,
         mut allocation: Allocation,
-        owner: impl Into<String>,
+        owner: impl Into<crate::request::Label>,
     ) -> std::result::Result<Allocation, TransferRefused> {
         let owner = owner.into();
         let error = if owner.is_empty() {

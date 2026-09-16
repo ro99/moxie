@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 pub mod arena;
+pub mod fallible;
 pub mod host;
 pub mod ledger;
 pub mod report;

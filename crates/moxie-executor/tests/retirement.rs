@@ -19,7 +19,7 @@ fn host_ledger() -> Ledger {
 }
 
 fn admit(ledger: &mut Ledger, label: &str, bytes: u64) -> Reservation {
-    let mut req = PlanRequest::new(label, ["run"]).unwrap();
+    let mut req = PlanRequest::new(label.to_string(), ["run"]).unwrap();
     req.buffer(BufferRequest::new(
         format!("{label}-buf"),
         Scope::Host,

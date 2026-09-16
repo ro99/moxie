@@ -66,12 +66,80 @@ static CTX_SYNC_ERROR: AtomicI32 = AtomicI32::new(0);
 static WATCHED_HOST_PTR: AtomicUsize = AtomicUsize::new(0);
 static WATCHED_HOST_FREED: AtomicBool = AtomicBool::new(false);
 
+thread_local! {
+    /// Task 0029's trap: how many more allocations on this thread succeed
+    /// before one fails. `None` is disarmed. Per **thread**, because this
+    /// executable's tests share a process and a global flag lands in an
+    /// unrelated test's `format!`.
+    static ARMED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Whether the last arming reached its allocation.
+    static FIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Counting mode: how many allocations this thread has made since it was zeroed.
+static COUNTING: AtomicUsize = AtomicUsize::new(0);
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Count the allocations `body` makes, failing none of them.
+fn count_allocations<T>(body: impl FnOnce() -> T) -> (T, usize) {
+    COUNT.store(0, SeqCst);
+    COUNTING.fetch_add(1, SeqCst);
+    let out = body();
+    COUNTING.fetch_sub(1, SeqCst);
+    (out, COUNT.load(SeqCst))
+}
+
+fn take_arming() -> bool {
+    if COUNTING.load(SeqCst) > 0 {
+        COUNT.fetch_add(1, SeqCst);
+    }
+    ARMED
+        .try_with(|armed| match armed.get() {
+            None => false,
+            Some(0) => {
+                armed.set(None);
+                let _ = FIRED.try_with(|fired| fired.set(true));
+                true
+            }
+            Some(n) => {
+                armed.set(Some(n - 1));
+                false
+            }
+        })
+        .unwrap_or(false)
+}
+
+/// Run `body` with the `skip`-th allocation after arming failing, and report
+/// whether that allocation was reached.
+fn with_failure_at<T>(skip: usize, body: impl FnOnce() -> T) -> (T, bool) {
+    /// Disarms however the scope ends. A panic past a plain assignment leaks
+    /// the trap onto the next test on this thread; the host harness got this
+    /// guard and this one did not, which review pointed out.
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            let _ = ARMED.try_with(|armed| armed.set(None));
+        }
+    }
+
+    let _ = FIRED.try_with(|fired| fired.set(false));
+    let guard = Disarm;
+    let _ = ARMED.try_with(|armed| armed.set(Some(skip)));
+    let out = body();
+    drop(guard);
+    let fired = FIRED.try_with(std::cell::Cell::get).unwrap_or(false);
+    (out, fired)
+}
+
 struct WatchingAllocator;
 
 // SAFETY: every method forwards the caller's unmodified pointer and layout to
 // the system allocator. The only addition is one address comparison.
 unsafe impl std::alloc::GlobalAlloc for WatchingAllocator {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if take_arming() {
+            return core::ptr::null_mut();
+        }
         // SAFETY: forwards the caller's unmodified layout.
         unsafe { std::alloc::System.alloc(layout) }
     }
@@ -85,6 +153,9 @@ unsafe impl std::alloc::GlobalAlloc for WatchingAllocator {
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
         if ptr as usize == WATCHED_HOST_PTR.load(SeqCst) && ptr as usize != 0 {
             WATCHED_HOST_FREED.store(true, SeqCst);
+        }
+        if take_arming() {
+            return core::ptr::null_mut();
         }
         // SAFETY: forwards the caller's own pointer, layout and size.
         unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
@@ -1310,7 +1381,7 @@ fn real_driver_admission_submission_and_cleanup_are_fail_closed() {
         for (actual, expected) in request.buffers().iter().zip(expected_request) {
             assert_eq!(
                 (
-                    actual.label.as_str(),
+                    actual.label.as_ref(),
                     actual.scope,
                     actual.tier,
                     actual.bytes,
@@ -1834,5 +1905,204 @@ fn a_backing_whose_synchronize_fails_is_withheld_rather_than_freed() {
         frees + 1,
         "a buffer whose synchronise succeeded was not freed, so the withholding \
          above proves nothing"
+    );
+}
+
+/// Task 0029: allocation positions of a real admission, on hardware.
+///
+/// **Not every position, and this says so.** `Rc::new` has no fallible form in
+/// stable Rust, so the arena's shared core aborts rather than refusing, and an
+/// abort cannot be swept past. What runs here is the positions before it.
+///
+/// Each armed position must return `CapacityExceeded` -- not merely some error,
+/// which is how an earlier version passed while the kind drifted -- and must
+/// leave the ledger with nothing outstanding.
+///
+/// **What this does *not* establish**, because independent review was right to
+/// press on it: that position `prefix` is the last one before `Rc::new`. The
+/// count is a **reconstruction** of admission's pre-`Rc` preparation, built from
+/// the same calls in the same order with the same primitives, and a
+/// reconstruction is evidence about the reconstruction. Two things would make
+/// it exact and neither is built: a production boundary hook immediately before
+/// `Rc::new` that a counting pass can read, or a subprocess-per-position sweep,
+/// where an abort is observable from outside because the child dies. Until one
+/// exists this is a **lower bound** on the positions that refuse, and the task
+/// record says the same.
+///
+/// It is still what task 0028 could not write at all: its sweep stopped at
+/// `admit` entirely, so the repairs inside it were fixed and unmeasured.
+#[test]
+fn every_allocation_in_a_quantized_admission_refuses_rather_than_aborting() {
+    let _serial = one_at_a_time();
+    use moxie_executor::affine_linear::{AffineLaunch, AffineLinearRun};
+    use moxie_executor::select_affine_linear_kernel;
+    use moxie_format::affine::{AffineDescriptor, Grouping, IntWidth};
+    use moxie_format::payload::ZeroPointSection;
+    use moxie_format::scale::ScaleDtype;
+
+    let ctx = RankContext::acquire(RankId(28_902), 0).expect("a rank context");
+    let descriptor = AffineDescriptor {
+        width: IntWidth::Int4,
+        out_features: 32,
+        in_features: 64,
+        grouping: Grouping::Contiguous { size: 32 },
+        group_index: None,
+        scale_dtype: ScaleDtype::Bf16,
+    };
+    let launch =
+        AffineLaunch::derive(&descriptor, ZeroPointSection::PerGroup, 4).expect("a launch");
+    let capability = query_device(0).expect("a device capability");
+    let catalogue = moxie_kernels::affine_linear_catalogue();
+    let weight = moxie_types::WeightPrecision::expect(moxie_types::Precision::Int4);
+    let kernel = select_affine_linear_kernel(&catalogue, &capability, weight, &launch)
+        .expect("a descriptor for this device");
+
+    // **How far this sweep can go, measured rather than assumed.**
+    //
+    // `DeviceArena::create_partitioned` allocates the arena's shared core with
+    // `Rc::new`, and stable Rust has no fallible `Rc`. Task 0029 moved that
+    // call ahead of the device allocation, so a failure there can no longer
+    // strand live device memory with no owner -- but it is still an abort, and
+    // an abort cannot be swept past.
+    //
+    // **A reconstruction of what `admit` does before `Rc::new`, in its own
+    // order.** Not a proof of where that line falls -- see this test's doc
+    // comment. Everything at or after it is unswept and named as such here and
+    // in the task record, rather than quietly omitted by a loop bound that
+    // happens to stop early.
+    //
+    // Measured on a **fresh** ledger, because every armed iteration uses one: an
+    // earlier version warmed one and reused it, and its retained map capacity
+    // made the count smaller than the calls the sweep would make.
+    //
+    // It also counted only `resource_request` and `Ledger::admit` and stopped
+    // there, which skipped two more reachable positions -- the arena label and
+    // the metadata arena's own free-list storage -- both of which run before
+    // `Rc::new`. Independent review found both. The composition below mirrors
+    // `admit`'s order; `full` below is what checks that it has not drifted.
+    let prefix = {
+        let mut ledger = test_ledger(&ctx);
+        let (reservation, allocations) = count_allocations(|| {
+            let request =
+                moxie_executor::affine_linear::resource_request(&launch, &ctx).expect("a request");
+            let reservation = ledger.admit(&request).expect("an admitted reservation");
+            // **`admit`'s order, and its primitives.** The label is built
+            // before the reservation is released, through the same
+            // `moxie_memory::fallible::text` production uses rather than
+            // `format!` -- a reconstruction with different primitives in a
+            // different order measures the reconstruction. Independent review
+            // found both, and then pointed out that exposing a second copy of
+            // this helper as public API just to be callable here was the wrong
+            // way to fix it: production now uses the shared vocabulary too.
+            let label: moxie_memory::request::Label =
+                moxie_memory::fallible::text(format_args!("affine-linear-{}", kernel.id.0))
+                    .expect("a label")
+                    .into();
+            // The metadata arena, whose `new` grows a one-element free list.
+            let metadata =
+                moxie_memory::arena::Arena::new(label, 1 << 20, 256).expect("a metadata arena");
+            drop(metadata);
+            reservation
+        });
+        // **Cleanup outside the window.** `release` allocates nothing today,
+        // and counting it anyway would make the reconstruction stop being
+        // attributable to admission's preparation the moment that changed.
+        ledger.release(reservation).expect("release");
+        allocations
+    };
+
+    // The whole call's allocation count, for contrast: what the sweep does not
+    // reach is the difference, and it is reported rather than left implicit.
+    // **Admission alone.** An earlier version counted `close()` inside the
+    // window too, which reaches `Arena::release`'s own infallible insertion, so
+    // the total could not be attributed to `admit`. The run is closed after the
+    // count.
+    let full = {
+        let mut ledger = test_ledger(&ctx);
+        let kernel = kernel.try_clone().expect("a descriptor copy");
+        let (run, allocations) = count_allocations(|| {
+            AffineLinearRun::admit(&mut ledger, &ctx, kernel, launch)
+                .unwrap_or_else(|refused| panic!("admission: {}", refused.error))
+        });
+        run.close(&mut ledger).expect("close");
+        allocations
+    };
+    assert!(
+        prefix < full,
+        "the reconstructed prefix ({prefix}) is not shorter than admission's own count \
+         ({full}), so it is not a prefix of it"
+    );
+    assert!(
+        prefix > 0,
+        "admission's request and ledger prefix allocates nothing, so this sweep proves nothing"
+    );
+
+    let mut fired_positions = 0usize;
+    let mut admitted = false;
+    for skip in 0..prefix {
+        let mut ledger = test_ledger(&ctx);
+        let kernel = kernel.try_clone().expect("a descriptor copy");
+        let (result, fired) = with_failure_at(skip, || {
+            AffineLinearRun::admit(&mut ledger, &ctx, kernel, launch)
+        });
+
+        if fired {
+            fired_positions += 1;
+            match result {
+                Err(refused) => {
+                    // The contract: a failed allocation is `CapacityExceeded`,
+                    // not merely some error. Accepting any `Err` was how an
+                    // earlier version of this passed while the kind drifted.
+                    assert_eq!(
+                        refused.error.kind(),
+                        "capacity_exceeded",
+                        "position {skip} failed an allocation and refused with the wrong kind: {}",
+                        refused.error
+                    );
+                    // A refusal hands the reservation back or never took one;
+                    // either way nothing may stay charged.
+                    drop(refused);
+                    assert!(
+                        ledger.outstanding().is_empty(),
+                        "position {skip} refused and left {} reservation(s) charged",
+                        ledger.outstanding().len()
+                    );
+                }
+                Ok(run) => panic!(
+                    "position {skip} failed an allocation and still admitted a run of {} byte(s)",
+                    run.arena_bytes()
+                ),
+            }
+            continue;
+        }
+
+        let run = match result {
+            Ok(run) => run,
+            Err(refused) => panic!(
+                "position {skip} failed nothing and still refused: {}",
+                refused.error
+            ),
+        };
+        run.close(&mut ledger).expect("an admitted run closes");
+        assert!(ledger.outstanding().is_empty());
+        admitted = true;
+        break;
+    }
+
+    // Every armed position in the prefix must have fired: the prefix count is
+    // exactly how many allocations happen there, so a position that fires
+    // nothing means the count and the call have diverged.
+    assert_eq!(
+        fired_positions, prefix,
+        "the sweep armed {prefix} position(s) and only {fired_positions} fired, so the measured \
+         prefix does not describe the call"
+    );
+    let _ = admitted;
+    eprintln!(
+        "PASS task 0029 admission sweep on {}: at least {fired_positions} of admission's {full} \
+         allocation position(s) refuse; the remaining {} include `Rc::new`, which aborts, and are \
+         unswept. The boundary is a reconstruction, not a proof -- see this test's comment",
+        ctx.uuid(),
+        full - fired_positions
     );
 }

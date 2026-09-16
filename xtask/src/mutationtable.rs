@@ -993,3 +993,132 @@ const BUILDS_T0006: &[&[&str]] = &[
     &["-p", "xtask"],
 ];
 
+
+/// The `T0029` battery's lanes.
+///
+/// One host lane and one device lane. The host lane carries the plan-request,
+/// ledger-counter and arena free-list sweeps; the device lane carries the
+/// admission sweep, which needs a real context to admit against.
+const LANES_T0029: &[Lane] = &[
+    Lane { name: "admission-host", argv: &[r#"test"#, r#"-p"#, r#"moxie-memory"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"allocation_refusal"#] },
+    Lane { name: "admission-device", argv: &[r#"test"#, r#"-p"#, r#"moxie-executor"#, r#"--features"#, r#"driver"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"driver_faults"#] },
+];
+
+/// The `T0029` battery: can an allocation failure still be mistaken for
+/// success, or leave something half-changed?
+///
+/// Every substitution here is one of the two shapes this task exists to
+/// remove -- a failed reservation that yields a value instead of a refusal, and
+/// a refusal that returns after something has already been mutated. Neither is
+/// a crash, which is the point: both leave a running program with a wrong
+/// answer in it.
+const BATTERY_T0029: &[Mutation] = &[
+    Mutation {
+        // A failed reservation that produces a value. Review found this exact
+        // shape in task 0028's fallible clone, where it returned `Ok("")`.
+        name: "a-failed-reservation-yields-an-empty-vector",
+        file: "crates/moxie-memory/src/fallible.rs",
+        from: r#"    out.try_reserve_exact(capacity).map_err(|_| no_room())?;
+    Ok(out)"#,
+        to: r#"    let _ = out.try_reserve_exact(capacity);
+    Ok(out)"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        // One infallible growth restored, in the request builder.
+        name: "the-request-grows-its-buffer-list-infallibly",
+        file: "crates/moxie-memory/src/request.rs",
+        from: r#"        fallible::push(&mut self.buffers, buffer)?;"#,
+        to: r#"        self.buffers.push(buffer);"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        // A refusal that returns **after** the arena's free list has moved.
+        // The top-level admission sweep cannot see this -- `admit` drops its
+        // arena on refusal -- which is why the arena is swept directly.
+        // **The order is swapped, not the reservation removed.** Deleting it
+        // makes the later `insert` panic on zero capacity, which tests a crash
+        // rather than the property: a refusal *returned* after the free list has
+        // already moved. Independent review caught the first version doing
+        // exactly that, and the run wedged on the panic with the tree still
+        // mutated.
+        name: "an-arena-refusal-leaves-the-free-list-mutated",
+        file: "crates/moxie-memory/src/arena.rs",
+        from: r#"        if let Err(error) = self.live.try_reserve_one() {
+            return Err(self.refusal(error));
+        }"#,
+        to: r#"        let remaining_first = range.bytes - reserved_bytes;
+        if remaining_first == 0 {
+            self.free.remove(index);
+        } else {
+            self.free[index] = FreeRange {
+                offset: range.offset + reserved_bytes,
+                bytes: remaining_first,
+            };
+        }
+        if let Err(error) = self.live.try_reserve_one() {
+            return Err(self.refusal(error));
+        }
+        self.free.insert(
+            index,
+            FreeRange {
+                offset: range.offset,
+                bytes: range.bytes,
+            },
+        );"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        // A refusal that returns **after** the ledger's counters have moved:
+        // "nothing outstanding" still passes, and capacity stays charged.
+        // Swapped, for the same reason: the counters move **first** and the
+        // fallible reservation follows, so a failure returns a refusal with
+        // capacity already charged -- which "nothing outstanding" cannot see.
+        //
+        // **The entries are created inside the substitution.** A first version
+        // charged through `get_mut(..).expect(..)` before the production loop
+        // had installed the rows, so on a fresh ledger it panicked before
+        // mutating anything -- a crash again, not a refusal after a mutation.
+        // Independent review caught it. On success the charge is undone, so the
+        // production code below behaves exactly as it does unmutated.
+        name: "an-admission-refusal-leaves-the-counters-charged",
+        file: "crates/moxie-memory/src/ledger.rs",
+        from: r#"        self.outstanding.try_reserve_one().map_err(|_| no_room())?;"#,
+        to: r#"        for (scope, tier, _) in &evaluation.charges {
+            let state = self
+                .scopes
+                .get_mut(scope)
+                .expect("evaluation rejected unknown scopes");
+            if !state.committed.contains_key(tier) {
+                state.committed.try_insert(*tier, 0).map_err(|_| no_room())?;
+            }
+        }
+        for (scope, tier, bytes) in &evaluation.charges {
+            let state = self
+                .scopes
+                .get_mut(scope)
+                .expect("evaluation rejected unknown scopes");
+            *state
+                .committed
+                .get_mut(tier)
+                .expect("installed just above") += *bytes;
+        }
+        self.outstanding.try_reserve_one().map_err(|_| no_room())?;
+        for (scope, tier, bytes) in &evaluation.charges {
+            let state = self
+                .scopes
+                .get_mut(scope)
+                .expect("evaluation rejected unknown scopes");
+            *state
+                .committed
+                .get_mut(tier)
+                .expect("installed just above") -= *bytes;
+        }"#,
+        expect: Expect::Caught,
+    },
+];
+
+const BUILDS_T0029: &[&[&str]] = &[
+    &["-p", "moxie-memory", "--tests"],
+    &["-p", "moxie-executor", "--features", "driver", "--tests"],
+];
