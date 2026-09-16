@@ -12,17 +12,22 @@ const LANES_T0006: &[Lane] = &[
     Lane { name: "workflow", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"workflow"#] },
     Lane { name: "roundtrip", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"round_trip"#] },
     Lane { name: "cli", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"cli"#] },
-    // `--test-threads=1` because this lane measures peak **live** heap through
-    // a global allocator. Its own lock stops one test resetting the other's
-    // peak, but not the other test's live bytes being counted into it, so the
-    // lane is load-dependent: two baseline runs on an identical clean tree
+    // Ran with `--test-threads=1` until task 0030. This lane measures peak
+    // **live** heap through a global allocator, and the executable's own lock
+    // used to cover the measured call only: every fixture built, source opened
+    // and scratch directory destroyed outside it was counted into whichever
+    // window happened to be open. Two baseline runs on an identical clean tree
     // reported "fails" and "disagrees with itself", and the battery correctly
-    // refused to build verdicts on either. Serialising the executable is not a
-    // weakened assertion -- it is the isolation the measurement already
-    // assumes. The **fix** belongs in `crates/moxie-repack/tests/budget.rs`,
-    // whose two tests should not share a process-wide counter at all; until
-    // then this keeps the battery runnable, which an unrunnable battery is not.
-    Lane { name: "budget", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"budget"#, r#"--"#, r#"--test-threads=1"#] },
+    // refused to build verdicts on either. Serialising the lane kept the
+    // battery runnable but measured the wrong thing quietly.
+    //
+    // The fix is where it belonged: `crates/moxie-repack/tests/budget.rs` now
+    // holds its lock from before the fixture exists to after it is destroyed,
+    // so the lane needs no help from the battery. Measured on this tree, with
+    // the executable's own 32 MiB negative control running against it: 20 of 20
+    // parallel runs pass, and 12 of 12 under 56-way CPU load plus a concurrent
+    // workspace build, every one reporting the same 209,256 B peak.
+    Lane { name: "budget", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"budget"#] },
     Lane { name: "malformed", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"malformed"#] },
     Lane { name: "round2", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"round2"#] },
     Lane { name: "admission", argv: &[r#"test"#, r#"-p"#, r#"moxie-repack"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"admission"#] },

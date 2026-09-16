@@ -1,8 +1,13 @@
 # 0006 — Can the repacker's gates fail? Measured by mutation, with an independence control
 
-Date: 2026-09-13. Milestone: M3 item 1,
-[task 0025](../../tasks/0025-m3-offline-repack-publication.md).
-Status: **measured; the task is implemented and not reviewed.**
+Date opened: 2026-09-13. Milestone: M3 item 1,
+[task 0025](../../tasks/0025-m3-offline-repack-publication.md), then
+[task 0026](../../tasks/0026-m3-canonical-safetensors-publication.md), then
+[task 0030](../../tasks/0030-m3-repack-correctness-package.md).
+Status: **measured three times; last re-run 2026-09-16 on task 0030's tree.**
+The run that describes the current tree is the last section, not the first:
+the `ccfd7fa` figures below are kept because the differences between the
+runs are the evidence, and **none of them describes this tree**.
 
 ## Why this exists
 
@@ -72,6 +77,9 @@ survivors, because it is a different fact.
 
 ## Lanes
 
+Twelve, as the battery runs them. The table drifted from the driver twice; it is
+now written from `LANES_T0006` rather than from memory.
+
 | Lane | Command |
 |---|---|
 | `format` | `cargo test -p moxie-format --lib` |
@@ -81,7 +89,15 @@ survivors, because it is a different fact.
 | `roundtrip` | `cargo test -p moxie-repack --test round_trip` |
 | `cli` | `cargo test -p moxie-repack --test cli` |
 | `budget` | `cargo test -p moxie-repack --test budget` |
+| `malformed` | `cargo test -p moxie-repack --test malformed` |
+| `round2` | `cargo test -p moxie-repack --test round2` |
+| `admission` | `cargo test -p moxie-repack --test admission` |
+| `storage` | `cargo test -p moxie-storage --test artifact` |
 | `arch` | `cargo xtask arch-check` |
+
+The `budget` lane ran with `--test-threads=1` from 2026-09-14 until task 0030
+took it off again. Why it was there, and why taking it off is a repair rather
+than a relaxation, is the [task 0030 section](#re-run-for-task-0030-on-the-repaired-budget-lane-2026-09-16).
 
 The real-artifact lane is deliberately **not** in the battery: it needs a
 checkpoint this machine happens to have, and thirty seconds of SHA-256 per

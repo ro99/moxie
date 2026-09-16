@@ -1,6 +1,9 @@
 # Task 0026 — M3 item 1: publish canonical artifacts as safetensors shards
 
-Status: **active**; contract written before implementation.
+Status: **implemented; fourteen review findings fixed; not accepted.** Its
+`ccfd7fa` 30-of-30 mutation figure does not describe the current tree —
+[experiment 0006](../evidence/experiments/0006-repack-publication-mutations.md)'s
+task 0030 section does.
 
 ## Identity and authority
 

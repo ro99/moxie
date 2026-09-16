@@ -1,6 +1,9 @@
 # Task 0025 — M3 item 1: bounded offline repack and canonical publication
 
-Status: **proposed, contract only; no implementation or acceptance claimed**.
+Status: **implemented, corrected through two independent reviews (ten
+findings, then fourteen with task 0026), not accepted.** The body below is
+the record of what was built; the publication container it describes is
+superseded by [task 0026](0026-m3-canonical-safetensors-publication.md).
 
 ## Identity and authority
 

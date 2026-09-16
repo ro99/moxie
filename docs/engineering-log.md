@@ -47,8 +47,70 @@ Each links into the entries below.
 | Work that exists on one disk and nowhere else | 24 commits, four tasks and five review rounds, unpushed for thirty hours |
 | A repair that satisfies the test rather than the property | task 0029, four rounds: an owned label the fixture never used, a prefix measured on a warmed ledger, a mutant that panicked before it mutated, an aggregate standing in for a state |
 | A harness with no tests of its own | the mutation guard, after three rounds of guard bugs: the self-test covers verdicts, selectors and anchors, and never touched restoration |
+| A measurement that shares its instrument with whatever runs beside it | task 0025's budget lane, whose global allocator counted the other test's fixtures for two tasks, and was serialised rather than fixed |
 
 ## Entries, newest first
+
+**A measurement that shares its instrument with whatever runs beside it
+(2026-09-16).** Task 0025's budget lane is the only gate in this repository that
+measures memory rather than asserting about it: a counting global allocator,
+peak live heap across a whole repack, against the bytes the ledger admitted.
+The instrument is **process-wide**, and the file had two tests in it.
+
+The first version let the two tests reset each other's peak, and that was found
+and fixed with a lock. The lock covered the measured call. It did not cover
+building a two-mebibyte fixture, opening the sources, reading `LIVE` after the
+run, or destroying the scratch directory -- all of which allocate, all of which
+ran in parallel with the other test's open window, and every byte of which a
+process-wide counter attributes to whichever window is open. So the lane stayed
+load-dependent: two baseline runs on an identical clean tree reported "fails"
+and "disagrees with itself", and `cargo xtask mutation-check` -- correctly --
+refused to build verdicts on either.
+
+What happened next is the part worth keeping. The battery was made to pass
+`--test-threads=1` to the lane, with a comment saying whose bug it was and that
+the fix belonged in the test file. That is a **workaround recorded honestly and
+still a workaround**: it kept the battery runnable, which matters, and it also
+meant that for two tasks the only memory gate here was measured under a
+condition nothing else in the suite runs under, and nobody had to look at it
+again. A gate that needs the harness held a particular way is a gate whose
+number nobody can reproduce from the command in the record.
+
+The repair is scope, not locking: a measurement is now a session, taken before
+the fixture exists and released after it is destroyed, with every counter read
+inside it. The peak window opens after the fixture is built, because what is
+being measured is a repack and not the bytes a test wrote to give it something
+to repack. `--test-threads=1` is gone from the lane.
+
+Three things came out of measuring the repair rather than asserting it:
+
+* **The negative control is what the gate is worth.** A bound that cannot fail
+  is not a measurement. The lane now allocates 32 MiB against a bound of 8, and
+  checks the meter sees it. Written first as a buffer *held* for a quarter of a
+  second, it proved nothing: a window reports the peak above the live bytes it
+  opened with, so a buffer already live when the window opens is part of the
+  baseline and moves nothing. Only a burst **inside** a window moves a peak.
+* **The counterfactual is a rate, not a yes or no.** With the burst outside a
+  session -- exactly where the fixtures used to be built -- the lane failed 5
+  of 20 runs, the failure landing in whichever window the burst happened to
+  overlap. That is the "disagrees with itself" the battery reported, reproduced
+  on demand. With sessions: 20 of 20, and 12 of 12 under 56-way CPU load with a
+  concurrent workspace build, every one reporting the same 209,256 B peak.
+* **The instrument has a resolution, and it is now named.** Under load the
+  control read 33,554,044 B of a 33,554,432 B burst -- 388 B short, because the
+  harness freed its own bookkeeping on another thread while the window was
+  open. A window is conservative by whatever is freed elsewhere during it. The
+  tile bound sits **4.33 orders of magnitude** above that 388 B and the admitted
+  total **5.54** -- 8,388,608 / 388 and 134,217,728 / 388, divided rather than
+  guessed. The first draft of this entry said "six orders" of both, which is the
+  smaller version of the same habit the entry is about: a number written to feel
+  like headroom instead of measured.
+
+The control also had to be taught that a loaded machine can lose it two seconds
+between reading the clock and checking it: its first version checked the
+deadline before the body and failed under load having measured nothing,
+reporting a broken meter. A control that can report zero work as a failed
+instrument is a control that will be disabled by the next person who sees it.
 
 **A repair that satisfies the test rather than the property (2026-09-15).**
 Task 0029 made an admission path refuse instead of aborting. Its contract was
