@@ -359,6 +359,115 @@ fn an_uninterrupted_run_publishes_and_verifies() {
     }
 }
 
+/// Task 0031: the validation pass is the only thing standing between sealed
+/// bytes and a published artifact, and until now nothing made it prove that.
+///
+/// `published-validation-skipped` -- the substitution that drops the
+/// `Site::Validate` check and empties the role list, so not one payload byte is
+/// read back -- **survived the battery** on task 0030's tree. It could, because
+/// every other test in this file publishes bytes the writer itself just wrote
+/// and hashed: skipping a read-back changes nothing when nothing on disk has
+/// changed since it was written. The gate can only mean something against bytes
+/// that went wrong **after** the writer was finished with them.
+///
+/// So this corrupts the staged payload in the one window the validation pass
+/// owns: after `seal`, before `publish`. The unit checksums were taken as the
+/// bytes streamed past, the read-back boundary is only reached on a resume or a
+/// rehash, and nothing else looks at the payload again. A run that publishes
+/// this artifact has published bytes nobody checked.
+///
+/// **One bit, in a mantissa's low byte.** Not a byte, and not the high byte:
+/// flipping an exponent would also trip the BF16 finiteness check, and then
+/// this test would pass for a reason that has nothing to do with checksums --
+/// the "two rules that can both fire need a case each" shape experiment 0006
+/// already recorded once. The value stays finite, and the only thing wrong with
+/// it is that it is not the value that was hashed.
+#[test]
+fn a_staged_payload_corrupted_after_sealing_is_refused_before_publication() {
+    let scratch = Scratch::new("corrupt-after-seal");
+    let dest = scratch.join("artifact");
+    let mut ledger = ledger();
+    let faults = Faults::none();
+    let options = Options {
+        take_over_interrupted_run: false,
+    };
+    let start = Run::begin(
+        &dest,
+        plan(),
+        binding(),
+        budget(),
+        &options,
+        &mut ledger,
+        &faults,
+        &|| false,
+    )
+    .expect("a fresh run");
+    let mut run = match start {
+        Start::Fresh(run) => run,
+        _ => panic!("an empty destination gives a fresh run"),
+    };
+    for request in requests() {
+        let bytes = payload(request_len(&request), request_len(&request) as usize);
+        for (at, len) in units(&request) {
+            run.write_unit(
+                &component_of(&request),
+                &bytes[at as usize..at as usize + len],
+                HEX,
+                &faults,
+            )
+            .expect("every unit is written");
+        }
+    }
+    let sealed = run.seal().expect("it seals");
+
+    // The shard is staged under its final name -- only the manifest is
+    // private -- so the bytes a reader would get are already on disk here.
+    let shard = dest.join("model-00001-of-00001.safetensors");
+    let mut raw = std::fs::read(&shard).expect("the staged shard");
+    let header_len = u64::from_le_bytes(raw[..8].try_into().expect("a length prefix")) as usize;
+    let payload_start = 8 + header_len;
+    assert!(
+        payload_start < raw.len(),
+        "the staged shard has {} byte(s) and a payload starting at {payload_start}",
+        raw.len()
+    );
+    let before = raw[payload_start];
+    // Little-endian BF16: the low byte is mantissa, so no exponent moves and
+    // nothing becomes non-finite.
+    raw[payload_start] = before ^ 0x01;
+    std::fs::write(&shard, &raw).expect("the corruption lands");
+
+    let manifest = manifest_for(&sealed);
+    let text = manifest::encode(&manifest).expect("it encodes");
+    let error = run
+        .publish(&text, &|| false, &faults, &mut ledger)
+        .expect_err(
+            "one wrong bit in the staged payload must stop publication: the validation pass \
+             exists to read those bytes back",
+        );
+    let detail = error.to_string();
+    assert!(
+        detail.contains("checksum mismatch"),
+        "the refusal does not name a checksum mismatch: {detail}"
+    );
+
+    // And nothing is exposed. A reader sees no artifact, not a corrupt one.
+    assert!(
+        !dest.join(MANIFEST_FILE).exists(),
+        "a refused publication left a readable manifest behind"
+    );
+    assert!(
+        moxie_storage::Artifact::open(&dest).is_err(),
+        "a destination whose payload failed validation opened as an artifact"
+    );
+    // The failed path still gives back every admitted byte.
+    assert!(
+        ledger.outstanding().is_empty(),
+        "a refused publication kept a charge: {:?}",
+        ledger.outstanding()
+    );
+}
+
 /// The enumeration. Every visit to every named boundary, failed in turn.
 #[test]
 fn every_failure_point_leaves_a_resumable_destination_that_publishes_the_same_artifact() {
@@ -484,6 +593,27 @@ fn every_failure_point_leaves_a_resumable_destination_that_publishes_the_same_ar
     );
     // A boundary nothing ever reached is a boundary this enumeration did not
     // test, and saying which is the point of measuring coverage.
+    //
+    // **Every** boundary, with no allowance. This read `unvisited.len() <= 1`
+    // until task 0031, from when one boundary was genuinely unreachable by this
+    // scenario: a staged unit is only rehashed on a resume, so `chunk-read-back`
+    // was never visited. The scenario then grew a resume -- independent review
+    // asked for it, so that journal compaction would be covered -- and that
+    // boundary started being reached. The coverage table above says so: it
+    // reports `chunk-read-back` with **2 visits** and nothing unreached at all.
+    // The allowance stayed behind, and nobody re-measured it.
+    //
+    // What it cost: with zero unreached and one allowed, deleting any single
+    // `faults.check(Site::X)` for a once-visited boundary moves the count from
+    // 0 to 1 and still passes. That is half of `published-validation-skipped`,
+    // the mutation that survived the battery on task 0030's tree -- its other
+    // half is caught by the corruption regression above. Slack sized for a gap
+    // that has closed is slack sized to hide the next removed check.
+    //
+    // Tightening this is a strengthening, not a tolerance weakening: the table
+    // beside it measures zero unreached boundaries, so nothing legitimate is
+    // being excluded, and a boundary that becomes genuinely unreachable again
+    // must be argued for in writing rather than absorbed by a spare slot.
     let unvisited: Vec<&str> = Site::ALL
         .iter()
         .filter(|s| !visited.contains(s))
@@ -491,8 +621,8 @@ fn every_failure_point_leaves_a_resumable_destination_that_publishes_the_same_ar
         .collect();
     eprintln!("  boundaries not reached by this scenario: {unvisited:?}");
     assert!(
-        unvisited.len() <= 1,
-        "more boundaries than expected are unreached: {unvisited:?}"
+        unvisited.is_empty(),
+        "these boundaries are never reached, so nothing here tests them: {unvisited:?}"
     );
 }
 
