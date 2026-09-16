@@ -144,7 +144,7 @@ Refusals name what was found and what to do. The common ones:
 | Message contains | What it means |
 |---|---|
 | `quant_method 'auto-round'` | This packing is not implemented yet. The plan is refused rather than partially guessed |
-| `actorder "static"` | An activation-order permutation changes which input column each code belongs to; ignoring one is forbidden |
+| `actorder "group"` / `"dynamic"`, or `weight_g_idx` | This source needs a column-to-group map that the contiguous importer cannot discard. `static` / `weight` ordering is supported because it preserves the saved contiguous grouping |
 | `this plan is partial` | Some tensors are not covered. `--allow-partial` converts the covered subset **deliberately**; without it, a partial conversion is refused because it is not a model |
 | `already exists` | A plan is not silently replaced. `--force`, or name another path |
 | `bound to a different plan` | The destination belongs to a different run. Use a fresh `--out` |

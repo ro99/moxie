@@ -274,6 +274,14 @@ pub fn source_entries<'a>(
     module: &str,
     zero_points: ZeroPointSource,
 ) -> Result<SourceEntries<'a>> {
+    if header
+        .tensors()
+        .contains_key(&crate::join_name(module, "weight_g_idx")?)
+    {
+        return Err(invalid_static(
+            "weight_g_idx requires mapped grouping; the contiguous importer cannot discard it",
+        ));
+    }
     // Every name is built fallibly: `format!` aborts, and this helper resolves
     // four of them before it reaches a refusal.
     let packed = header.get(&crate::join_name(module, "weight_packed")?)?;
@@ -1910,6 +1918,18 @@ mod tests {
             ("m.weight_zero_point", "I8", &[1, 1]),
         ]);
         assert!(source_entries(&wrong, "m", ZeroPointSource::PackedAlongOutput).is_err());
+    }
+
+    #[test]
+    fn a_contiguous_import_cannot_drop_a_serialized_group_map() {
+        let header = header_with(&[
+            ("m.weight_packed", "I32", &[2, 32]),
+            ("m.weight_scale", "BF16", &[2, 2]),
+            ("m.weight_shape", "I64", &[2]),
+            ("m.weight_g_idx", "I32", &[256]),
+        ]);
+        let error = source_entries(&header, "m", ZeroPointSource::Symmetric).unwrap_err();
+        assert!(error.to_string().contains("weight_g_idx"));
     }
 
     /// A minimal safetensors header over tensors whose payloads are all zero.

@@ -15,16 +15,20 @@ use common::{Entry, Module, Scratch, bf16_bytes, binary, run, write_shard};
 
 /// A checkpoint: `config.json`, an index, and shards.
 fn checkpoint(scratch: &Scratch, symmetric: bool) -> std::path::PathBuf {
+    checkpoint_with_group(scratch, symmetric, 32)
+}
+
+fn checkpoint_with_group(scratch: &Scratch, symmetric: bool, group: usize) -> std::path::PathBuf {
     let root = scratch.join("checkpoint");
     std::fs::create_dir_all(&root).expect("a checkpoint directory");
 
     let rows = 4usize;
-    let columns = 64usize;
-    let groups = columns / 32;
+    let columns = group * 2;
+    let groups = columns / group;
     let m = Module {
         rows,
         columns,
-        group: 32,
+        group,
         bits: 4,
         codes: (0..rows)
             .map(|o| {
@@ -110,7 +114,7 @@ fn checkpoint(scratch: &Scratch, symmetric: bool) -> std::path::PathBuf {
     "config_groups": {{
       "group_0": {{
         "weights": {{
-          "num_bits": 4, "group_size": 32, "symmetric": {sym},
+          "num_bits": 4, "group_size": {group}, "symmetric": {sym},
           "strategy": "group", "type": "int", "actorder": null
         }}
       }}
@@ -1287,4 +1291,93 @@ fn an_oversized_plan_is_refused_by_the_read_that_first_touches_it() {
         refused.stdout,
         refused.stderr
     );
+}
+
+#[test]
+fn static_group128_repack_preserves_all_codes_and_group_scales() {
+    use moxie_format::affine::{AffineDescriptor, Grouping, IntWidth};
+    use moxie_format::payload::{self, ZeroPointSection};
+    use moxie_format::scale::ScaleDtype;
+    let scratch = Scratch::new("static-group128");
+    let root = checkpoint_with_group(&scratch, true, 128);
+    let config = root.join("config.json");
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("\"actorder\": null", "\"actorder\": \"static\"");
+    std::fs::write(&config, text).unwrap();
+    let plan = scratch.join("plan.toml");
+    let out = scratch.join("artifact");
+    let r = run(&[
+        "plan",
+        "--source-root",
+        root.to_str().unwrap(),
+        "--out-plan",
+        plan.to_str().unwrap(),
+    ]);
+    assert_eq!(r.status, 0, "{}{}", r.stdout, r.stderr);
+    let r = run(&[
+        "repack",
+        "--plan",
+        plan.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(r.status, 0, "{}{}", r.stdout, r.stderr);
+    let descriptor = AffineDescriptor {
+        width: IntWidth::Int4,
+        out_features: 4,
+        in_features: 256,
+        grouping: Grouping::Contiguous { size: 128 },
+        group_index: None,
+        scale_dtype: ScaleDtype::Bf16,
+    };
+    let expected_len = payload::length_of(&descriptor, ZeroPointSection::Absent).unwrap() as usize;
+    let mut bytes = Vec::with_capacity(expected_len);
+    let artifact = moxie_storage::Artifact::open(&out).unwrap();
+    artifact
+        .stream_tensor(
+            "model.layers.0.mlp.down_proj.weight",
+            &mut [0; 512],
+            &mut |slice| {
+                bytes.extend_from_slice(slice);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(bytes.len(), expected_len);
+    let tensor = payload::decode(descriptor, ZeroPointSection::Absent, &bytes).unwrap();
+    for o in 0..4 {
+        for (k, value) in tensor.reconstruct_row(o).unwrap().iter().enumerate() {
+            let signed = ((o * 7 + k * 3) % 16) as i32 - 8;
+            let scale = 0.5 + ((o + k / 128) % 3) as f32;
+            assert_eq!(value.to_bits(), (signed as f32 * scale).to_bits());
+        }
+    }
+}
+
+#[test]
+fn planning_cannot_treat_a_group_map_as_an_unrelated_skipped_tensor() {
+    let scratch = Scratch::new("static-map-contradiction");
+    let root = checkpoint(&scratch, true);
+    let index_path = root.join("model.safetensors.index.json");
+    let index = std::fs::read_to_string(&index_path).unwrap();
+    let name = "model.layers.0.mlp.down_proj.weight_g_idx";
+    write_shard(
+        &root.join("map.safetensors"),
+        &[Entry::new(name, "I32", vec![64], vec![0; 256])],
+    );
+    let index = index.replace(
+        "\"weight_map\": {",
+        &format!("\"weight_map\": {{\n \"{name}\": \"map.safetensors\","),
+    );
+    std::fs::write(index_path, index).unwrap();
+    let r = run(&[
+        "plan",
+        "--source-root",
+        root.to_str().unwrap(),
+        "--out-plan",
+        scratch.join("plan.toml").to_str().unwrap(),
+    ]);
+    assert_ne!(r.status, 0);
+    assert!(format!("{}{}", r.stdout, r.stderr).contains("weight_g_idx"));
 }

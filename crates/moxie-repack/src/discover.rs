@@ -137,6 +137,11 @@ pub fn discover(root: &Path, sources: &mut Sources) -> Result<Discovery> {
         ))
     })?;
     let index = checkpoint_config::parse_index(&index_text)?;
+    if let Some(name) = index.keys().find(|name| name.ends_with(".weight_g_idx")) {
+        return Err(invalid(format!(
+            "{name} requires mapped grouping; a contiguous plan cannot discard its column-to-group map"
+        )));
+    }
     if index.is_empty() {
         return Err(invalid(format!(
             "{} names no tensors",

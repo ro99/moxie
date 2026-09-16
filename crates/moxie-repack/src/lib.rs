@@ -422,6 +422,20 @@ impl Resolved {
 /// Resolve a selection against its shards, reading headers only.
 pub fn resolve(selection: &Selection, sources: &mut Sources) -> Result<Vec<Resolved>> {
     let mut out = Vec::with_capacity(selection.tensors.len());
+    let contiguous_modules: std::collections::BTreeSet<&str> = selection
+        .tensors
+        .iter()
+        .filter_map(|t| match &t.kind {
+            SelectionKind::PackQuantized { module, .. } => Some(module.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !contiguous_modules.is_empty() {
+        // One pass over each source header, not a reopen per selected module.
+        for file in selection.files() {
+            sources.refuse_group_maps(&file, &contiguous_modules)?;
+        }
+    }
     for t in &selection.tensors {
         let resolved = match &t.kind {
             SelectionKind::Bf16 { name, file } => {

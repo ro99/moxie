@@ -149,6 +149,27 @@ impl Sources {
     /// The cross-shard resolver needs this to see a companion the selection did
     /// **not** declare: a symmetric selection over a module that carries zero
     /// points is a disagreement, and the only way to notice is to look.
+    /// Reject a map for any selected contiguous module, even when stored
+    /// beside another selected tensor. Borrow header names; do not materialize
+    /// another header-sized list or reopen a shard for every module.
+    pub(crate) fn refuse_group_maps(
+        &mut self,
+        file: &str,
+        modules: &std::collections::BTreeSet<&str>,
+    ) -> Result<()> {
+        let shard = self.shard(file)?;
+        for name in shard.header().tensors().keys() {
+            if let Some(module) = name.strip_suffix(".weight_g_idx")
+                && modules.contains(module)
+            {
+                return Err(invalid(format!(
+                    "{name} in {file} requires mapped grouping; the contiguous importer cannot discard it"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn declares(&mut self, file: &str, name: &str) -> Result<bool> {
         let shard = self.shard(file)?;
         Ok(shard.header().tensors().contains_key(name))

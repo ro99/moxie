@@ -159,8 +159,12 @@ pub fn parse(text: &str) -> Result<CheckpointDeclaration> {
         invalid_static("this checkpoint's quantization group declares no weights")
     })?;
 
+    // compressed-tensors 0.17.0 ActivationOrdering: static aliases weight,
+    // which changes calibration but preserves the saved column/group order.
+    // group/dynamic instead needs weight_g_idx; it is not an alias of this lane.
     if let Some(order) = &w.actorder
         && !order.is_null()
+        && !matches!(order.as_str(), Some("static" | "weight"))
     {
         return Err(invalid(format_args!(
             "this checkpoint declares actorder {order}: an activation-order permutation changes \
@@ -249,4 +253,45 @@ pub fn parse_index(text: &str) -> Result<std::collections::BTreeMap<String, Stri
     let parsed: Index = serde_json::from_str(text)
         .map_err(|e| invalid(format_args!("the safetensors index does not parse: {e}")))?;
     Ok(parsed.weight_map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(order: serde_json::Value) -> String {
+        serde_json::json!({"model_type":"fixture","quantization_config":{
+            "format":"pack-quantized", "config_groups":{"group_0":{"weights":{
+                "num_bits":4,"group_size":128,"symmetric":true,"strategy":"group",
+                "type":"int","actorder":order
+            }}}
+        }})
+        .to_string()
+    }
+
+    #[test]
+    fn static_and_weight_are_contiguous_serialization_aliases() {
+        let baseline = parse(&config(serde_json::Value::Null)).unwrap();
+        for order in ["static", "weight"] {
+            assert_eq!(parse(&config(order.into())).unwrap(), baseline);
+        }
+    }
+
+    #[test]
+    fn mapped_unknown_and_malformed_ordering_is_not_discarded() {
+        for order in [
+            serde_json::json!("group"),
+            serde_json::json!("dynamic"),
+            serde_json::json!("unknown"),
+            serde_json::json!(true),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                parse(&config(order))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("actorder")
+            );
+        }
+    }
 }

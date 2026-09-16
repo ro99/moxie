@@ -1238,3 +1238,19 @@ the working tree. Driver recovery restored its parked original before any
 implementation or measurement. Long mutation campaigns need a stable snapshot
 and their own restoration record; a dirty working tree can contain a deliberately
 broken experiment, not a builder's proposed change.
+
+
+## 2026-09-16 — static ordering and the source-set boundary (task 0033)
+
+Pinned compressed-tensors static/weight ordering preserves the saved column
+order; group/dynamic ordering requires a map. Treating both as permutations had
+unnecessarily refused the static sources. The new static lane matches11,264
+sampled canonical values across two pinned HY3 projections.
+
+The first map guard searched only a selected module's companion shards.
+Independent review placed its map beside a different selected BF16 tensor and
+escaped that guard. The corrected scan checks all declared source shards once,
+borrowing names from each header; a nested per-module scan would have reparsed
+large headers tens of thousands of times. Indexed discovery checks its index;
+a manual partial selection has only its declared source set. A claim about all
+checkpoint files needs the index and its admitted parse memory.

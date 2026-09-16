@@ -384,3 +384,82 @@ fn a_total_budget_below_the_working_set_is_refused() {
         );
     }
 }
+
+#[test]
+fn a_manual_contiguous_selection_cannot_drop_a_map_in_the_scale_shard() {
+    let scratch = Scratch::new("split-group-map");
+    let m = module(8, 64, true);
+    let source = shard_with(&scratch, &m, "I32", "I64", false);
+    let name = "model.layers.0.mlp.down_proj";
+    write_shard(
+        &source.join("scales.safetensors"),
+        &[
+            Entry::new(
+                &format!("{name}.weight_scale"),
+                "BF16",
+                m.scale_shape(),
+                m.scale_payload("BF16"),
+            ),
+            Entry::new(
+                &format!("{name}.weight_g_idx"),
+                "I32",
+                vec![64],
+                (0..64i32)
+                    .flat_map(|k| ((k + 32) / 32 % 2).to_le_bytes())
+                    .collect(),
+            ),
+        ],
+    );
+    let selection = selection_for(&scratch, true);
+    let text = std::fs::read_to_string(&selection).unwrap().replace(
+        "weight_scale = \"shard-a.safetensors\"",
+        "weight_scale = \"scales.safetensors\"",
+    );
+    std::fs::write(&selection, text).unwrap();
+    let selection = moxie_repack::read_selection(&selection).unwrap();
+    let budgets = budgets();
+    let mut sources = moxie_repack::open_sources(&source, &budgets).unwrap();
+    let error = moxie_repack::inspect(
+        &selection,
+        &mut sources,
+        &budgets,
+        &mut moxie_repack::ledger_for(&budgets).unwrap(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("weight_g_idx"), "{error}");
+}
+
+#[test]
+fn a_map_beside_a_different_selected_tensor_is_not_discarded() {
+    let scratch = Scratch::new("map-beside-bf16");
+    let m = module(8, 64, true);
+    let source = shard_with(&scratch, &m, "I32", "I64", false);
+    let name = "model.layers.0.mlp.down_proj";
+    write_shard(
+        &source.join("other.safetensors"),
+        &[
+            Entry::new("norm.weight", "BF16", vec![1], vec![0, 0]),
+            Entry::new(
+                &format!("{name}.weight_g_idx"),
+                "I32",
+                vec![64],
+                vec![0; 256],
+            ),
+        ],
+    );
+    let selection = selection_for(&scratch, true);
+    let mut text = std::fs::read_to_string(&selection).unwrap();
+    text.push_str("\n[[tensor]]\nrole = \"norm.weight\"\nkind = \"bf16\"\nname = \"norm.weight\"\nfile = \"other.safetensors\"\n");
+    std::fs::write(&selection, text).unwrap();
+    let selection = moxie_repack::read_selection(&selection).unwrap();
+    let budgets = budgets();
+    let mut sources = moxie_repack::open_sources(&source, &budgets).unwrap();
+    let error = moxie_repack::inspect(
+        &selection,
+        &mut sources,
+        &budgets,
+        &mut moxie_repack::ledger_for(&budgets).unwrap(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("weight_g_idx"), "{error}");
+}
