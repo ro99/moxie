@@ -21,13 +21,12 @@ use moxie_types::{Error, Result};
 
 /// The refusal every function here returns.
 ///
-/// Zero bytes, because the request that failed is an allocator's business and
-/// not a tier's: a ledger refusal carries the tier and the shortfall, and
-/// borrowing those fields to describe a heap failure would make two different
-/// facts look like one.
+/// This vocabulary allocates host metadata, attributed to pageable host memory.
+/// Zero sizes mean the host allocator did not report its available capacity;
+/// `tier: None` remains reserved for unattributed driver allocation failures.
 pub fn no_room() -> Error {
     Error::CapacityExceeded {
-        tier: None,
+        tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::Pageable)),
         requested_bytes: 0,
         available_bytes: 0,
     }

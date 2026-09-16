@@ -23,6 +23,14 @@ use crate::fallible;
 /// allocates here and no call site changes.
 pub type Label = Cow<'static, str>;
 
+/// Preserve a caller's non-static borrow by copying it through fallible growth.
+fn own_label(label: Cow<'_, str>) -> Result<Label> {
+    Ok(Cow::Owned(match label {
+        Cow::Owned(label) => label,
+        Cow::Borrowed(label) => fallible::string(label)?,
+    }))
+}
+
 /// [`Error::InvalidRequest`] whose prose is composed fallibly — **or, when
 /// there is no room to compose it, `CapacityExceeded` instead**.
 ///
@@ -103,6 +111,35 @@ pub struct BufferRequest {
 }
 
 impl BufferRequest {
+    /// Fallible constructor for a label borrowed from caller-owned storage.
+    pub fn try_new(
+        label: &str,
+        scope: Scope,
+        tier: Tier,
+        bytes: u64,
+        live: StageSpan,
+    ) -> Result<Self> {
+        Ok(Self::new(
+            fallible::string(label)?,
+            scope,
+            tier,
+            bytes,
+            live,
+        ))
+    }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            label: fallible::clone_label(&self.label)?,
+            scope: self.scope,
+            tier: self.tier,
+            bytes: self.bytes,
+            live: self.live,
+            scales_with: self.scales_with,
+            virtual_bytes: self.virtual_bytes,
+        })
+    }
+
     pub fn new(
         label: impl Into<Label>,
         scope: Scope,
@@ -162,6 +199,26 @@ pub struct DerivedReserve {
 }
 
 impl DerivedReserve {
+    pub fn try_new(
+        label: &str,
+        scope: Scope,
+        tier: Tier,
+        rule: ReserveRule,
+        live: StageSpan,
+    ) -> Result<Self> {
+        Ok(Self::new(fallible::string(label)?, scope, tier, rule, live))
+    }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            label: fallible::clone_label(&self.label)?,
+            scope: self.scope,
+            tier: self.tier,
+            rule: self.rule,
+            live: self.live,
+        })
+    }
+
     pub fn new(
         label: impl Into<Label>,
         scope: Scope,
@@ -191,22 +248,22 @@ pub struct PlanRequest {
 impl PlanRequest {
     /// A request over the given ordered stages. Stage labels must be distinct:
     /// a report that names a peak stage is useless if two stages print the same.
-    pub fn new<I, S>(label: impl Into<Label>, stages: I) -> Result<Self>
+    pub fn new<'a, I, S>(label: impl Into<Cow<'a, str>>, stages: I) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
-        S: Into<Label>,
+        S: Into<Cow<'a, str>>,
     {
         // **Grown one element at a time, each reserved first.** `collect()`
         // reallocates infallibly, which is an abort on the admission path.
         let mut labels: Vec<Label> = Vec::new();
         for stage in stages {
-            fallible::push(&mut labels, stage.into())?;
+            fallible::push(&mut labels, own_label(stage.into())?)?;
         }
         let stages = labels;
         if stages.is_empty() {
             return Err(Error::InvalidRequest {
                 field: "stages",
-                detail: "a plan has at least one stage".into(),
+                detail: fallible::string("a plan has at least one stage")?,
             });
         }
         if u32::try_from(stages.len()).is_err() {
@@ -222,7 +279,7 @@ impl PlanRequest {
             if stages[..index].iter().any(|earlier| earlier == stage) {
                 return Err(Error::InvalidRequest {
                     field: "stages",
-                    detail: "stage labels must be distinct".into(),
+                    detail: fallible::string("stage labels must be distinct")?,
                 });
             }
         }
@@ -233,7 +290,7 @@ impl PlanRequest {
             ));
         }
         Ok(PlanRequest {
-            label: label.into(),
+            label: own_label(label.into())?,
             stages,
             buffers: Vec::new(),
             reserves: Vec::new(),
@@ -286,7 +343,9 @@ impl PlanRequest {
         if label.is_empty() {
             return Err(Error::InvalidRequest {
                 field: "label",
-                detail: "every buffer and reserve is labelled, so a report can name it".into(),
+                detail: fallible::string(
+                    "every buffer and reserve is labelled, so a report can name it",
+                )?,
             });
         }
         if tier.scope_kind() != scope.kind() {

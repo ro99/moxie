@@ -6,7 +6,7 @@
 //! it. Here there is one ledger, admission is atomic, and a reservation is
 //! released by name rather than by scope exit.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use moxie_types::{DeviceTier, Error, HostTier, Result, Scope, ScopeKind, Tier};
@@ -61,7 +61,7 @@ impl ReservationId {
 /// # use moxie_types::Scope;
 /// let mut l = Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 20, 1 << 10).unwrap()]).unwrap();
 /// let r = l.admit(&PlanRequest::new("p", ["decode"]).unwrap()).unwrap();
-/// let second = r.clone(); // a second authority over the same bytes
+/// let second = r.try_clone()?; // a second authority over the same bytes
 /// drop(second);
 /// ```
 ///
@@ -125,7 +125,7 @@ pub enum AdmitError {
     /// The request could not be evaluated at all.
     Invalid(Error),
     /// The request was evaluated and does not fit.
-    Rejected(Box<Rejection>),
+    Rejected(Rejection),
 }
 
 impl AdmitError {
@@ -158,7 +158,7 @@ impl From<AdmitError> for Error {
     fn from(e: AdmitError) -> Error {
         match e {
             AdmitError::Invalid(e) => e,
-            AdmitError::Rejected(r) => (*r).into(),
+            AdmitError::Rejected(r) => r.into(),
         }
     }
 }
@@ -364,12 +364,12 @@ impl Ledger {
                 .map(BindingConstraint::shortfall_bytes)
                 .max()
                 .unwrap_or(0);
-            return Err(AdmitError::Rejected(Box::new(Rejection {
+            return Err(AdmitError::Rejected(Rejection {
                 report: evaluation.report,
                 binding: evaluation.binding,
                 shortfall_bytes: shortfall,
                 alternatives: evaluation.alternatives,
-            })));
+            }));
         }
 
         // **Everything that can fail happens before anything is charged.**
@@ -485,14 +485,17 @@ impl Ledger {
     /// happens once; hands it back on refusal, so nothing is stranded.
     pub fn release(&mut self, reservation: Reservation) -> std::result::Result<(), ReleaseRefused> {
         if reservation.ledger != self.id {
-            let error = Error::InvalidRequest {
-                field: "reservation",
-                detail: format!(
-                    "reservation {} belongs to ledger {}, not {}",
-                    reservation.id.get(),
-                    reservation.ledger.get(),
-                    self.id.get()
-                ),
+            let error = match crate::fallible::text(format_args!(
+                "reservation {} belongs to ledger {}, not {}",
+                reservation.id.get(),
+                reservation.ledger.get(),
+                self.id.get()
+            )) {
+                Ok(detail) => Error::InvalidRequest {
+                    field: "reservation",
+                    detail,
+                },
+                Err(error) => error,
             };
             return Err(ReleaseRefused { reservation, error });
         }
@@ -710,7 +713,7 @@ impl Ledger {
         binding: &[BindingConstraint],
         base: &Peaks,
     ) -> Result<Vec<LegalAlternative>> {
-        let mut out: BTreeSet<LegalAlternative> = BTreeSet::new();
+        let mut out = Vec::new();
         if binding.is_empty() {
             return Ok(Vec::new());
         }
@@ -736,7 +739,7 @@ impl Ledger {
                 }
             });
             if helps {
-                out.insert(alternative);
+                crate::fallible::push(&mut out, alternative)?;
             }
         }
 
@@ -747,7 +750,7 @@ impl Ledger {
                     | Tier::Device(DeviceTier::ExpertCache)
             )
         }) {
-            out.insert(LegalAlternative::OtherWeightPrecisionOrArtifact);
+            crate::fallible::push(&mut out, LegalAlternative::OtherWeightPrecisionOrArtifact)?;
         }
 
         if request
@@ -757,7 +760,7 @@ impl Ledger {
             .count()
             > 1
         {
-            out.insert(LegalAlternative::DifferentTopology);
+            crate::fallible::push(&mut out, LegalAlternative::DifferentTopology)?;
         }
 
         // Moving work to the host is offered only when one **concrete**
@@ -768,15 +771,17 @@ impl Ledger {
         if let Some(host) = self.scopes.get(&Scope::Host)
             && !binding.iter().any(|c| c.scope == Scope::Host)
         {
-            let mut moved: BTreeMap<Scope, Peaks> = BTreeMap::new();
-            for scope in binding
-                .iter()
-                .filter(|c| c.scope.kind() == ScopeKind::Device)
-                .map(|c| c.scope)
-                .collect::<BTreeSet<Scope>>()
+            let mut moved = crate::fallible::Map::new();
+            for scope in request
+                .scopes()?
+                .into_iter()
+                .filter(|s| s.kind() == ScopeKind::Device)
             {
+                if !binding.iter().any(|c| c.scope == scope) {
+                    continue;
+                }
                 if let Some(peaks) = self.relocate_to_host(request, base, host, scope)? {
-                    moved.insert(scope, peaks);
+                    moved.try_insert(scope, peaks)?;
                 }
             }
 
@@ -818,11 +823,13 @@ impl Ledger {
                 .iter()
                 .any(|c| c.scope.kind() == ScopeKind::Device && clears(c))
             {
-                out.insert(LegalAlternative::HostBackedExecution);
+                crate::fallible::push(&mut out, LegalAlternative::HostBackedExecution)?;
             }
         }
 
-        Ok(out.into_iter().collect())
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
     }
 
     /// Build one concrete relocation of `scope`'s movable bytes onto the host,
@@ -853,11 +860,6 @@ impl Ledger {
         scope: Scope,
     ) -> Result<Option<Peaks>> {
         let stage_count = request.stages().len();
-        let reserved: BTreeSet<(Scope, Tier)> = request
-            .reserves()
-            .iter()
-            .map(|r| (r.scope, r.tier))
-            .collect();
 
         // What the host has spare, before anything moves.
         let scope_room = host
@@ -873,8 +875,9 @@ impl Ledger {
                 .min(scope_room),
         };
 
-        let mut free_in: BTreeMap<Tier, Vec<u64>> = BTreeMap::new();
-        let mut free_scope = vec![scope_room; stage_count];
+        let mut free_in = crate::fallible::Map::new();
+        let mut free_scope = crate::fallible::with_capacity(stage_count)?;
+        free_scope.resize(stage_count, scope_room);
         // The label borrows `request`, which does not live as long as the
         // plan being built, so it is copied fallibly. The stages are `Cow`s
         // already: cloning one is a pointer for a literal.
@@ -888,18 +891,26 @@ impl Ledger {
         let mut any = false;
 
         for b in request.buffers() {
-            let destination = if b.scope == scope && !reserved.contains(&(b.scope, b.tier)) {
+            let destination = if b.scope == scope
+                && !request
+                    .reserves()
+                    .iter()
+                    .any(|r| r.scope == b.scope && r.tier == b.tier)
+            {
                 host_destination(b.tier)
             } else {
                 None
             };
             let Some(destination) = destination else {
-                relocated.buffer(b.clone())?;
+                relocated.buffer(b.try_clone()?)?;
                 continue;
             };
-            let free = free_in
-                .entry(destination)
-                .or_insert_with(|| vec![room_of(destination); stage_count]);
+            if !free_in.contains_key(&destination) {
+                let mut row = crate::fallible::with_capacity(stage_count)?;
+                row.resize(stage_count, room_of(destination));
+                free_in.try_insert(destination, row)?;
+            }
+            let free = free_in.get_mut(&destination).expect("inserted destination");
             let mut take = b.bytes;
             for stage in b.live.first..=b.live.last {
                 take = take
@@ -907,7 +918,7 @@ impl Ledger {
                     .min(free_scope[stage as usize]);
             }
             if take == 0 {
-                relocated.buffer(b.clone())?;
+                relocated.buffer(b.try_clone()?)?;
                 continue;
             }
             for stage in b.live.first..=b.live.last {
@@ -916,11 +927,11 @@ impl Ledger {
             }
             any = true;
             if take < b.bytes {
-                let mut stays = b.clone();
+                let mut stays = b.try_clone()?;
                 stays.bytes -= take;
                 relocated.buffer(stays)?;
             }
-            let mut goes = b.clone();
+            let mut goes = b.try_clone()?;
             goes.label = crate::fallible::text(format_args!("{} (host)", b.label))?.into();
             goes.scope = Scope::Host;
             goes.tier = destination;
@@ -930,7 +941,7 @@ impl Ledger {
         }
 
         for r in request.reserves() {
-            relocated.reserve(r.clone())?;
+            relocated.reserve(r.try_clone()?)?;
         }
 
         if !any {

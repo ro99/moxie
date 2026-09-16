@@ -1214,3 +1214,27 @@ forbidden. Its `dflash` draft model is not on this machine and is M9's. None of
 the three artifacts is approved for quality, conversion or requantization: O1's
 catalog and O5's storage questions stay open.
 
+
+
+## 2026-09-16 — M3 admission recovery (task 0032)
+
+The actual affine admission call now has an allocation-position sweep through
+its end, instead of a reconstruction that stopped before Rc allocation. A
+private fallibly allocated shared core (explicitly approved by the owner)
+preserves range retention; all 48 positions refused cleanly on each of the
+three GPUs. Rejection/relocation collections and label copies are fallible;
+reserving return capacity during allocation makes fragmented release allocate
+nothing. Borrowed dynamic plan labels work again, restoring the CUDA gate.
+
+Independent review found the new rejection sweep accepted the wrong refusal:
+ordinary admission rejection and metadata allocation failure both flattened to
+`capacity_exceeded`. Checking the exact admission variant and allocator fields
+now separates them. The swallowed-error substitution is caught; full, partial
+and zero-room relocation cases reach their first non-firing result. Error kinds
+are useful API categories, but do not prove which failure path ran.
+
+An interrupted publication mutation had left checksum validation disabled in
+the working tree. Driver recovery restored its parked original before any
+implementation or measurement. Long mutation campaigns need a stable snapshot
+and their own restoration record; a dirty working tree can contain a deliberately
+broken experiment, not a builder's proposed change.

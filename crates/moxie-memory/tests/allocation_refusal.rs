@@ -352,3 +352,228 @@ fn a_refused_arena_allocation_leaves_the_free_list_where_it_was() {
         "no allocation was reached inside the arena, so this sweep proves nothing"
     );
 }
+
+#[test]
+fn rejected_admission_and_host_relocation_refuse_every_allocation() {
+    use moxie_memory::{DerivedReserve, ReserveRule, Scaling};
+    use moxie_types::{DeviceTier, DeviceUuid};
+    let device =
+        Scope::Device(DeviceUuid::parse("GPU-00000000-0000-0000-0000-000000000032").unwrap());
+    let mut request = PlanRequest::new(
+        String::from("owned relocation request"),
+        [String::from("prefill"), String::from("decode")],
+    )
+    .unwrap();
+    request
+        .buffer(BufferRequest::new(
+            String::from("owned weights"),
+            device,
+            Tier::Device(DeviceTier::PackedResidentWeights),
+            1024,
+            StageSpan::inclusive(0, 1),
+        ))
+        .unwrap();
+    request
+        .buffer(
+            BufferRequest::new(
+                String::from("owned state"),
+                device,
+                Tier::Device(DeviceTier::KvStatePages),
+                512,
+                StageSpan::at(1),
+            )
+            .scaling(Scaling::Context),
+        )
+        .unwrap();
+    request
+        .buffer(BufferRequest::new(
+            String::from("host workspace"),
+            Scope::Host,
+            Tier::Host(HostTier::CpuWorkspace),
+            64,
+            StageSpan::at(0),
+        ))
+        .unwrap();
+    request
+        .reserve(DerivedReserve::new(
+            String::from("owned reserve"),
+            Scope::Host,
+            Tier::Host(HostTier::CpuWorkspace),
+            ReserveRule::LargestBufferOfTier,
+            StageSpan::at(0),
+        ))
+        .unwrap();
+    // Enough room for all moves, room for a split, and no room after the
+    // existing host peak. Each runs the actual rejection and relocation call.
+    for (host_bytes, expected_host_alternative) in [(1 << 20, true), (512, false), (129, false)] {
+        let ledger = || {
+            Ledger::new([
+                CapacitySnapshot::new(Scope::Host, host_bytes, 1).unwrap(),
+                CapacitySnapshot::new(device, 256, 0).unwrap(),
+            ])
+            .unwrap()
+        };
+        let baseline = ledger().admit(&request).unwrap_err();
+        assert_eq!(
+            baseline
+                .as_rejection()
+                .unwrap()
+                .alternatives
+                .contains(&moxie_memory::LegalAlternative::HostBackedExecution),
+            expected_host_alternative,
+        );
+        let mut reached_end = false;
+        let mut failures = 0;
+        for skip in 0..1024 {
+            let mut ledger = ledger();
+            let before = format!("{ledger:?}");
+            let (outcome, fired) = with_failure_at(skip, || ledger.admit(&request));
+            let error = outcome.expect_err("an oversized request cannot succeed");
+            assert_eq!(format!("{ledger:?}"), before, "ledger changed at {skip}");
+            if fired {
+                failures += 1;
+                // A normal rejection also converts to CapacityExceeded. Check
+                // the admission variant and exact allocator attribution so a
+                // swallowed failure cannot masquerade as an ordinary rejection.
+                assert_eq!(
+                    error,
+                    moxie_memory::AdmitError::Invalid(moxie_memory::fallible::no_room()),
+                    "host {host_bytes}, position {skip}",
+                );
+            } else {
+                assert_eq!(error, baseline);
+                reached_end = true;
+                break;
+            }
+        }
+        assert!(
+            reached_end && failures > 0,
+            "sweep must reach a non-firing complete rejection"
+        );
+        eprintln!(
+            "task0032: host {host_bytes}: {failures} rejected-admission/relocation allocation positions refused"
+        );
+    }
+}
+
+#[test]
+fn invalid_request_diagnostics_refuse_every_allocation() {
+    for case in 0..4 {
+        let attempt = || -> moxie_types::Result<()> {
+            match case {
+                0 => {
+                    PlanRequest::new("p", std::iter::empty::<&str>())?;
+                }
+                1 => {
+                    PlanRequest::new("p", ["duplicate", "duplicate"])?;
+                }
+                2 => {
+                    PlanRequest::new("p", [""])?;
+                }
+                _ => {
+                    let mut request = PlanRequest::new("p", ["run"])?;
+                    request.buffer(BufferRequest::new(
+                        "",
+                        Scope::Host,
+                        Tier::Host(HostTier::Pageable),
+                        1,
+                        StageSpan::at(0),
+                    ))?;
+                }
+            }
+            Ok(())
+        };
+        let baseline = attempt().unwrap_err();
+        let mut end = false;
+        for skip in 0..LIMIT {
+            let (result, fired) = with_failure_at(skip, attempt);
+            let error = result.unwrap_err();
+            if fired {
+                assert_eq!(
+                    error.kind(),
+                    "capacity_exceeded",
+                    "case {case}, position {skip}"
+                );
+            } else {
+                assert_eq!(error, baseline);
+                end = true;
+                break;
+            }
+        }
+        assert!(end, "case {case} exhausted sweep");
+    }
+}
+
+// The refusal retains its handle inline: boxing would allocate under failure.
+#[allow(clippy::result_large_err)]
+#[test]
+fn releasing_fragmented_ranges_never_allocates() {
+    let mut arena = Arena::new("fragmented", 65536, 256).unwrap();
+    let mut allocations: Vec<_> = (0..100)
+        .map(|_| Some(arena.allocate(256, 256, "range").unwrap()))
+        .collect();
+    // Releasing alternating allocations maximizes free-list fragmentation.
+    for parity in 0..2 {
+        for index in (parity..allocations.len()).step_by(2) {
+            let allocation = allocations[index].take().unwrap();
+            let (result, fired) = with_failure_at(0, || arena.release(allocation));
+            result.unwrap();
+            assert!(!fired, "release allocated at range {index}");
+        }
+    }
+    assert_eq!(arena.occupancy().live_allocations, 0);
+    assert_eq!(arena.occupancy().largest_free_bytes, 65536);
+}
+
+// The refusal retains its handle inline: boxing would allocate under failure.
+#[allow(clippy::result_large_err)]
+#[test]
+fn failed_transfer_preserves_handle_and_exact_arena_state() {
+    let mut end = false;
+    for skip in 0..LIMIT {
+        let mut arena = Arena::new("transfer", 4096, 256).unwrap();
+        let allocation = arena.allocate(256, 256, "before").unwrap();
+        let owner = String::from("owned destination");
+        let before = format!("{arena:?}");
+        let (result, fired) = with_failure_at(skip, || arena.transfer(allocation, owner));
+        if fired {
+            let refused = result.unwrap_err();
+            assert_eq!(refused.error.kind(), "capacity_exceeded");
+            assert_eq!(refused.allocation.owner(), "before");
+            assert_eq!(format!("{arena:?}"), before);
+            arena.release(refused.allocation).unwrap();
+        } else {
+            let allocation = result.unwrap();
+            assert_eq!(allocation.owner(), "owned destination");
+            arena.release(allocation).unwrap();
+            end = true;
+            break;
+        }
+    }
+    assert!(end);
+}
+
+#[test]
+fn dynamically_borrowed_labels_outlive_their_callers() {
+    let request = {
+        let label = String::from("dynamic");
+        let stage = String::from("run");
+        let mut request = PlanRequest::new(label.as_str(), [stage.as_str()]).unwrap();
+        request
+            .buffer(
+                BufferRequest::try_new(
+                    label.as_str(),
+                    Scope::Host,
+                    Tier::Host(HostTier::Pageable),
+                    1,
+                    StageSpan::at(0),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        request
+    };
+    assert_eq!(request.label(), "dynamic");
+    assert_eq!(request.stages()[0], "run");
+    assert_eq!(request.buffers()[0].label, "dynamic");
+}

@@ -250,8 +250,8 @@ fn invalid(field: &'static str, detail: impl Into<String>) -> Error {
 
 #[cfg(feature = "driver")]
 mod driver_binding {
+    use crate::shared::Shared as Rc;
     use std::cell::Cell;
-    use std::rc::Rc;
 
     use moxie_cuda::{DeviceBuffer, Event, RankContext, Stream};
     use moxie_memory::{
@@ -656,31 +656,21 @@ mod driver_binding {
                 })
                 .map(|(_, _, bytes)| *bytes)
                 .unwrap_or(0);
-            // **The `Rc` is allocated before the device memory is.**
-            //
-            // `Rc::new` grows through `handle_alloc_error` and has no stable
-            // fallible form. That is survivable when nothing has happened yet
-            // and unacceptable once a device allocation exists: the previous
-            // order took `capacity` bytes on the card and *then* asked the host
-            // allocator for the block that would own them, so a failure left
-            // live device memory with no owner and no path to a free.
-            // Independent review named it.
-            //
-            // A zero-length `DeviceBuffer` is inert -- `alloc` returns a null
-            // pointer without touching the driver, and `Drop` returns early on
-            // one -- so the owning block is taken first with a placeholder and
-            // the real allocation moved in through `Rc::get_mut`, which is
-            // available precisely because this reference is still unique.
+            // Obtain fallible shared ownership before creating device memory.
+            // Every range retains this core; failed close keeps the same block.
             let placeholder = match DeviceBuffer::alloc(ctx, 0) {
                 Ok(buffer) => buffer,
                 Err(error) => return Err(fail(reservation, error)),
             };
-            let mut core = Rc::new(ArenaCore {
+            let mut core = match Rc::try_new(ArenaCore {
                 buffer: placeholder,
                 device_ordinal: ctx.ordinal(),
                 active_upload: Cell::new(false),
                 host_pageable_budget,
-            });
+            }) {
+                Ok(core) => core,
+                Err(error) => return Err(fail(reservation, error)),
+            };
             let buffer = match DeviceBuffer::alloc(ctx, capacity as usize) {
                 Ok(buffer) => buffer,
                 Err(error) => return Err(fail(reservation, error)),
@@ -796,31 +786,21 @@ mod driver_binding {
                 })
                 .map(|(_, _, bytes)| *bytes)
                 .unwrap_or(0);
-            // **The `Rc` is allocated before the device memory is.**
-            //
-            // `Rc::new` grows through `handle_alloc_error` and has no stable
-            // fallible form. That is survivable when nothing has happened yet
-            // and unacceptable once a device allocation exists: the previous
-            // order took `capacity` bytes on the card and *then* asked the host
-            // allocator for the block that would own them, so a failure left
-            // live device memory with no owner and no path to a free.
-            // Independent review named it.
-            //
-            // A zero-length `DeviceBuffer` is inert -- `alloc` returns a null
-            // pointer without touching the driver, and `Drop` returns early on
-            // one -- so the owning block is taken first with a placeholder and
-            // the real allocation moved in through `Rc::get_mut`, which is
-            // available precisely because this reference is still unique.
+            // Obtain fallible shared ownership before creating device memory.
+            // Every range retains this core; failed close keeps the same block.
             let placeholder = match DeviceBuffer::alloc(ctx, 0) {
                 Ok(buffer) => buffer,
                 Err(error) => return Err(fail(reservation, error)),
             };
-            let mut core = Rc::new(ArenaCore {
+            let mut core = match Rc::try_new(ArenaCore {
                 buffer: placeholder,
                 device_ordinal: ctx.ordinal(),
                 active_upload: Cell::new(false),
                 host_pageable_budget,
-            });
+            }) {
+                Ok(core) => core,
+                Err(error) => return Err(fail(reservation, error)),
+            };
             let buffer = match DeviceBuffer::alloc(ctx, capacity as usize) {
                 Ok(buffer) => buffer,
                 Err(error) => return Err(fail(reservation, error)),
@@ -958,22 +938,21 @@ mod driver_binding {
                     invalid("arena", format!("{live} allocation(s) remain live")),
                 ));
             }
-            let core = self.core.take().expect("open arena has a core");
-            let mut core = match Rc::try_unwrap(core) {
-                Ok(core) => core,
-                Err(core) => {
-                    self.core = Some(core);
-                    return Err(refuse(
-                        self,
-                        invalid("arena", "a device range still retains the physical arena"),
-                    ));
-                }
+            // Do not unwrap and reallocate on a failed free. Unique access
+            // retains the same ownership block in quarantine; physical free is not retried.
+            let Some(core) = Rc::get_mut(self.core.as_mut().expect("open arena has a core")) else {
+                return Err(refuse(
+                    self,
+                    invalid("arena", "a device range still retains the physical arena"),
+                ));
             };
-            // SAFETY: no range remains live, so no operation can still name or
-            // use a subrange. Close is the sole owner of the physical buffer.
+            // SAFETY: there are no live metadata ranges or other core owners;
+            // no operation can still name a subrange of this buffer.
             if let Err(error) = unsafe { core.buffer.try_free() } {
-                self.quarantined = Some(error.clone());
-                self.core = Some(Rc::new(core));
+                self.quarantined = Some(Error::DeviceLost {
+                    device: core.device_ordinal,
+                    detail: String::new(),
+                });
                 return Err(refuse(self, error));
             }
             ledger

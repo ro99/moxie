@@ -68,6 +68,9 @@ pub use trace::{
     TRACE_SCHEMA_VERSION,
 };
 
+#[cfg(feature = "driver")]
+mod shared;
+
 pub mod arena;
 pub use arena::{
     OperationAcquireRefused, OperationHeld, OperationLease, OperationRetireRefused,

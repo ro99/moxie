@@ -1019,6 +1019,15 @@ const LANES_T0029: &[Lane] = &[
 /// answer in it.
 const BATTERY_T0029: &[Mutation] = &[
     Mutation {
+        // A normal capacity rejection must not conceal failed host metadata
+        // allocation while computing its alternatives.
+        name: "rejection-swallows-an-alternative-allocation-failure",
+        file: "crates/moxie-memory/src/ledger.rs",
+        from: r#"        let alternatives = self.alternatives(request, &binding, &base)?;"#,
+        to: r#"        let alternatives = self.alternatives(request, &binding, &base).unwrap_or_default();"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
         // A failed reservation that produces a value. Review found this exact
         // shape in task 0028's fallible clone, where it returned `Ok("")`.
         name: "a-failed-reservation-yields-an-empty-vector",

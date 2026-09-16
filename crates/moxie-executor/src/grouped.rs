@@ -2362,7 +2362,7 @@ pub enum GroupedAdmitRefused {
     /// rejection to carry.
     Rejected {
         plan: Box<ExpertPlan>,
-        rejection: Box<moxie_memory::Rejection>,
+        rejection: moxie_memory::Rejection,
     },
 }
 

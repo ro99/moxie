@@ -190,7 +190,7 @@ mod driver_binding {
         },
         Rejected {
             candidate: Box<PlanCandidate>,
-            rejection: Box<Rejection>,
+            rejection: Rejection,
         },
         Held {
             candidate: Box<PlanCandidate>,

@@ -342,6 +342,13 @@ impl Arena {
             Err(error) => return Err(self.refusal(error)),
         };
 
+        // Each live allocation may return one disjoint range. Reserve all
+        // outstanding returns before handing out another handle; release is
+        // allocation-free, even under persistent host pressure.
+        if self.free.try_reserve(self.live.len() + 1).is_err() {
+            return Err(self.refusal(crate::fallible::no_room()));
+        }
+
         let remaining = range.bytes - reserved_bytes;
         if remaining == 0 {
             self.free.remove(index);
@@ -400,11 +407,14 @@ impl Arena {
         if let Some(error) = error {
             return Err(TransferRefused { allocation, error });
         }
+        let record_owner = match crate::fallible::clone_label(&owner) {
+            Ok(owner) => owner,
+            Err(error) => return Err(TransferRefused { allocation, error }),
+        };
         self.live
             .get_mut(&allocation.key.allocation)
             .expect("validated allocation is live")
-            .owner
-            .clone_from(&owner);
+            .owner = record_owner;
         allocation.owner = owner;
         Ok(allocation)
     }
@@ -480,10 +490,10 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
         .map(|v| v & !(alignment - 1))
 }
 
-fn invalid(field: &'static str, detail: impl Into<String>) -> Error {
-    Error::InvalidRequest {
-        field,
-        detail: detail.into(),
+fn invalid(field: &'static str, detail: &str) -> Error {
+    match crate::fallible::string(detail) {
+        Ok(detail) => Error::InvalidRequest { field, detail },
+        Err(error) => error,
     }
 }
 

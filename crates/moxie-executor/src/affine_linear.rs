@@ -713,7 +713,7 @@ mod device {
         /// The ledger's own breakdown, when the refusal was a capacity
         /// rejection. Summarising it into a byte count would throw away the
         /// explanation a caller needs to act.
-        pub rejection: Option<Box<Rejection>>,
+        pub rejection: Option<Rejection>,
     }
 
     #[derive(Debug)]
@@ -730,6 +730,8 @@ mod device {
         /// weight fits is the residency authority's question and it answered it
         /// before this is called; charging the same bytes twice would make the
         /// ledger's total a number about nothing.
+        // Keep the rejection inline: reporting exhausted memory must not allocate a Box.
+        #[allow(clippy::result_large_err)]
         pub fn admit(
             ledger: &mut Ledger,
             ctx: &'ctx RankContext,

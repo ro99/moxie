@@ -40,7 +40,7 @@ pub enum SelectedAdmitRefused<'ctx> {
     },
     Rejected {
         candidate: Box<SelectedPlanCandidate>,
-        rejection: Box<moxie_memory::Rejection>,
+        rejection: moxie_memory::Rejection,
     },
     Held {
         candidate: Box<SelectedPlanCandidate>,
