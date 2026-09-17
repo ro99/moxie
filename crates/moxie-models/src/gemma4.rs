@@ -497,6 +497,17 @@ impl Gemma4Text {
     /// on anything but the layer type, and no arithmetic that is not an
     /// `OpParams` field.
     pub fn compose(&self, oracles: &OracleRegistry, rows: SymbolId) -> Result<Composition> {
+        self.compose_with_weight_precisions(oracles, rows, std::collections::BTreeMap::new())
+    }
+
+    /// Compose the same semantics with explicit source-declared weight precisions.
+    /// This adds no checkpoint importer or model-owned execution path.
+    pub fn compose_with_weight_precisions(
+        &self,
+        oracles: &OracleRegistry,
+        rows: SymbolId,
+        precisions: std::collections::BTreeMap<String, WeightPrecision>,
+    ) -> Result<Composition> {
         let c = &self.config;
         // Checked, and checked *here*: these products become tensor extents and
         // shape arguments, and `GraphBuilder` never sees them as a
@@ -515,7 +526,8 @@ impl Gemma4Text {
             width("heads * head_dim", c.heads, dim)?;
             width("kv_heads * head_dim", kv, dim)?;
         }
-        let mut g = GraphBuilder::new(moxie_graph::OracleId("moxie_oracles::host_reference"), rows);
+        let mut g = GraphBuilder::new(moxie_graph::OracleId("moxie_oracles::host_reference"), rows)
+            .with_weight_precisions(precisions);
         let index = TensorSpec::new(
             ValueRole::Index(IndexEncoding::U64),
             vec![Dim::symbol(rows)],
@@ -1317,6 +1329,83 @@ mod tests {
     /// the oracle crate even in a test would be the edge `arch-check` exists to
     /// refuse. The names are the ones `moxie-oracles` registers, so a graph
     /// that finishes here finishes there.
+    #[test]
+    fn both_graph_definitions_consume_integer_experts_through_shared_contracts() {
+        use crate::laguna::{BlockConfig, RoutedBlocks};
+        let gemma = Gemma4Text::reduced(routed_config(), "synthetic-quantized").unwrap();
+        let laguna = RoutedBlocks::reduced(BlockConfig::reduced(), "synthetic-quantized").unwrap();
+        let mut registry = oracles_registry();
+        registry
+            .register(
+                Op::SwiGlu,
+                moxie_graph::OracleId("moxie_oracles::host_reference"),
+                moxie_graph::OracleEvidence {
+                    implementation: "test",
+                    test_module: "test",
+                },
+            )
+            .unwrap();
+        let originals = [
+            gemma.compose(&registry, SymbolId(0)).unwrap().graph,
+            laguna.compose(&registry, SymbolId(0)).unwrap().graph,
+        ];
+        for (family, graph) in originals.iter().enumerate() {
+            let mut precisions = std::collections::BTreeMap::new();
+            for node in graph
+                .nodes()
+                .iter()
+                .filter(|n| n.params.op() == Op::ExpertMlp)
+            {
+                for (value, precision) in node.inputs[2..4]
+                    .iter()
+                    .zip([Precision::Int4, Precision::Int8])
+                {
+                    precisions.insert(
+                        graph.name(*value).unwrap().to_owned(),
+                        WeightPrecision::expect(precision),
+                    );
+                }
+            }
+            assert!(!precisions.is_empty());
+            let composed = if family == 0 {
+                gemma
+                    .compose_with_weight_precisions(&registry, SymbolId(0), precisions.clone())
+                    .unwrap()
+                    .graph
+            } else {
+                laguna
+                    .compose_with_weight_precisions(&registry, SymbolId(0), precisions.clone())
+                    .unwrap()
+                    .graph
+            };
+            assert_eq!(composed.nodes().len(), graph.nodes().len());
+            for node in composed.nodes() {
+                if node.params.op() == Op::ExpertMlp {
+                    assert!(
+                        matches!(composed.spec(node.inputs[2]).unwrap().role, ValueRole::Weight(w) if w.get() == Precision::Int4)
+                    );
+                    assert!(
+                        matches!(composed.spec(node.inputs[3]).unwrap().role, ValueRole::Weight(w) if w.get() == Precision::Int8)
+                    );
+                }
+            }
+            precisions.insert(
+                "absent.weight".into(),
+                WeightPrecision::expect(Precision::Int4),
+            );
+            let refused = if family == 0 {
+                gemma
+                    .compose_with_weight_precisions(&registry, SymbolId(0), precisions)
+                    .is_err()
+            } else {
+                laguna
+                    .compose_with_weight_precisions(&registry, SymbolId(0), precisions)
+                    .is_err()
+            };
+            assert!(refused, "unknown source roles must not be silently ignored");
+        }
+    }
+
     fn oracles_registry() -> OracleRegistry {
         let mut o = OracleRegistry::new();
         for op in [

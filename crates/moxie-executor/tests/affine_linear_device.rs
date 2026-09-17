@@ -164,7 +164,9 @@ fn tensor(
         codes.extend_from_slice(&pack_row(width, &row).unwrap());
     }
     let entries = descriptor.group_entries().unwrap();
-    let raw: Vec<f32> = (0..entries).map(|_| 0.01 + rng.next() * 0.05).collect();
+    let raw: Vec<f32> = (0..entries)
+        .map(|i| (0.01 + rng.next() * 0.05) * if i.is_multiple_of(2) { 1.0 } else { -1.0 })
+        .collect();
     let scales = match scale_dtype {
         ScaleDtype::F32 => ScaleValues::F32(raw),
         ScaleDtype::Bf16 => ScaleValues::Bf16(raw.iter().map(|s| to_bf16_bits(*s)).collect()),
@@ -183,7 +185,7 @@ fn tensor(
 }
 
 /// Round to IEEE binary16, for the F16 scale lane. Only ever used on the small
-/// positive values this fixture generates, and the result is checked by
+/// finite values of either sign this fixture generates, and the result is checked by
 /// `ScaleValues::validate` before it can reach a device.
 fn half_bits(value: f32) -> u16 {
     let bits = value.to_bits();

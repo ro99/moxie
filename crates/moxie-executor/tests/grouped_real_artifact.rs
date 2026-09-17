@@ -73,6 +73,7 @@ fn artifact_id() -> ArtifactId {
 
 fn roles() -> ExpertRoles {
     ExpertRoles {
+        per_expert: None,
         artifact: artifact_id(),
         gate_up_role: "experts_gate_up".into(),
         down_role: "experts_down".into(),

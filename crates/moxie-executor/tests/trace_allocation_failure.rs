@@ -263,6 +263,7 @@ fn a_trace_that_cannot_allocate_returns_an_error_instead_of_aborting() {
         &mut ledger,
         plan,
         ExpertRoles {
+            per_expert: None,
             artifact: artifact(),
             gate_up_role: "experts_gate_up".into(),
             down_role: "experts_down".into(),

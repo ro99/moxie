@@ -152,6 +152,7 @@ fn artifact() -> ArtifactId {
 
 fn roles() -> ExpertRoles {
     ExpertRoles {
+        per_expert: None,
         artifact: artifact(),
         gate_up_role: "experts_gate_up".into(),
         down_role: "experts_down".into(),
@@ -1212,5 +1213,278 @@ fn the_default_amortisation_threshold_sends_every_laguna_expert_to_the_cpu() {
             .map(|g| g.decision().bytes_per_row)
             .min()
             .unwrap()
+    );
+}
+
+struct IntegerSource(std::collections::BTreeMap<String, Vec<u8>>);
+impl moxie_executor::residency::ChunkSource for IntegerSource {
+    fn read_chunk(
+        &mut self,
+        chunk: &moxie_memory::ChunkId,
+        into: &mut [u8],
+    ) -> moxie_types::Result<()> {
+        assert_eq!(chunk.artifact(), &artifact());
+        assert_eq!(chunk.range().offset_bytes(), 0);
+        let bytes = &self.0[chunk.slot().role()];
+        assert_eq!(bytes.len(), into.len());
+        into.copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+fn integer_cases() -> Vec<([moxie_plan::expert::ExpertWeightFormat; 2], bool)> {
+    use moxie_plan::expert::ExpertWeightFormat::{Affine, Bf16};
+    use moxie_types::Precision;
+    let a = Affine {
+        width: Precision::Int4,
+        group: 32,
+        scale: Precision::F16,
+        zeros: true,
+    };
+    let b = Affine {
+        width: Precision::Int8,
+        group: 128,
+        scale: Precision::F32,
+        zeros: true,
+    };
+    let c = Affine {
+        width: Precision::Int8,
+        group: 32,
+        scale: Precision::Bf16,
+        zeros: false,
+    };
+    [[a, b], [b, a], [Bf16, c], [c, Bf16]]
+        .into_iter()
+        .flat_map(|formats| [false, true].map(|device| (formats, device)))
+        .collect()
+}
+
+fn integer_weights(
+    formats: [moxie_plan::expert::ExpertWeightFormat; 2],
+) -> (Weights, IntegerSource, Vec<(String, String)>) {
+    use moxie_plan::expert::ExpertWeightFormat;
+    use moxie_types::Precision;
+    let mut w = weights(0x0035);
+    w.gate_up.clear();
+    w.down.clear();
+    let mut sources = std::collections::BTreeMap::new();
+    let mut pairs = Vec::new();
+    for e in 0..EXPERTS {
+        let names = (format!("expert.{e}.gate_up"), format!("expert.{e}.down"));
+        for (projection, (outputs, inputs, name)) in [
+            (2 * INTERMEDIATE, HIDDEN, &names.0),
+            (HIDDEN, INTERMEDIATE, &names.1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (outputs, inputs) = (outputs as usize, inputs as usize);
+            let (bits, group, scale, zeros) = match formats[projection] {
+                ExpertWeightFormat::Bf16 => (16, 32, Precision::Bf16, false),
+                ExpertWeightFormat::Affine {
+                    width,
+                    group,
+                    scale,
+                    zeros,
+                } => (width.bits() as usize, group as usize, scale, zeros),
+            };
+            let groups = inputs.div_ceil(group);
+            let stride = if bits == 16 {
+                inputs * 2
+            } else {
+                inputs.div_ceil(8 / bits)
+            };
+            let mut bytes = vec![0; outputs * stride];
+            let values = if projection == 0 {
+                &mut w.gate_up
+            } else {
+                &mut w.down
+            };
+            for o in 0..outputs {
+                for k in 0..inputs {
+                    let g = k / group;
+                    let zero = if zeros { ((o + g) % 3) as i32 - 1 } else { 0 };
+                    let sign = if (o + g).is_multiple_of(2) { 1.0 } else { -1.0 };
+                    let width = bits.min(8);
+                    let q =
+                        ((o * 11 + k * 7 + e as usize) % (1 << width)) as i32 - (1 << (width - 1));
+                    let value = (q - zero) as f32 / 64.0 * sign;
+                    values.push(value);
+                    match bits {
+                        4 => bytes[o * stride + k / 2] |= (q as u8 & 15) << ((k % 2) * 4),
+                        8 => bytes[o * stride + k] = q as u8,
+                        _ => bytes[o * stride + k * 2..o * stride + k * 2 + 2]
+                            .copy_from_slice(&to_bf16_bits(value).to_le_bytes()),
+                    }
+                }
+            }
+            if bits != 16 {
+                for o in 0..outputs {
+                    for g in 0..groups {
+                        let negative = !(o + g).is_multiple_of(2);
+                        match scale {
+                            Precision::F16 => bytes.extend_from_slice(
+                                &(if negative { 0xa400u16 } else { 0x2400 }).to_le_bytes(),
+                            ),
+                            Precision::Bf16 => bytes.extend_from_slice(
+                                &to_bf16_bits(if negative { -1.0 / 64.0 } else { 1.0 / 64.0 })
+                                    .to_le_bytes(),
+                            ),
+                            _ => bytes.extend_from_slice(
+                                &(if negative { -1.0f32 / 64.0 } else { 1.0 / 64.0 }).to_le_bytes(),
+                            ),
+                        }
+                    }
+                }
+                if zeros {
+                    for o in 0..outputs {
+                        for g in 0..groups {
+                            bytes.extend_from_slice(&(((o + g) % 3) as i16 - 1).to_le_bytes());
+                        }
+                    }
+                }
+            }
+            sources.insert(name.clone(), bytes);
+        }
+        pairs.push(names);
+    }
+    (w, IntegerSource(sources), pairs)
+}
+
+#[test]
+fn canonical_integer_experts_use_the_shared_residency_and_reduction_on_every_device() {
+    let _serial = one_at_a_time();
+    let count = moxie_cuda::device_count().unwrap();
+    assert!(count > 0, "the device lane requires real hardware");
+    let mut compared = 0usize;
+
+    for ordinal in 0..count {
+        let ctx = RankContext::acquire(RankId(ordinal), ordinal).unwrap();
+        let scope = Scope::Device(ctx.uuid());
+        let catalogue = moxie_kernels::expert_mlp_catalogue();
+
+        for activation in [ExpertActivation::GeGlu, ExpertActivation::SwiGlu] {
+            for (formats, on_device) in integer_cases() {
+                let (w, mut src, role_pairs) = integer_weights(formats);
+
+                let mut ledger = Ledger::new([
+                    CapacitySnapshot::new(Scope::Host, 64 * MIB, MIB).unwrap(),
+                    CapacitySnapshot::new(scope, 64 * MIB, MIB).unwrap(),
+                ])
+                .unwrap();
+                let mut authority = ResidencyAuthority::open(
+                    &mut ledger,
+                    &ResidencyRequest::new("device experts", 64 * CHUNK)
+                        .device(ctx.uuid(), 8 * CHUNK),
+                )
+                .unwrap();
+                let mut residency = DeviceResidency::create(&ctx, &mut authority).unwrap();
+
+                let budget = ExpertBudget {
+                    device: ctx.uuid(),
+                    device_pci_bus_id: ctx.capability().pci_bus_id.clone(),
+                    device_cache_cap_bytes: 8 * CHUNK,
+                    device_cache_leased_bytes: 0,
+                    device_cache_largest_free_bytes: u64::MAX,
+                    device_arena_free_bytes: 16 * MIB,
+                    host_workspace_bytes: MIB,
+                    host_buffer_bytes: MIB,
+                    host_cache_cap_bytes: 1 << 30,
+                    host_cache_leased_bytes: 0,
+                    host_cache_largest_free_bytes: u64::MAX,
+                    cache_alignment_bytes: 256,
+                    chunks_per_expert: 2,
+                    resident: ResidentChunks::none(),
+                };
+                let policy = ExpertPolicy {
+                    device: if on_device {
+                        StrategyControl::Required
+                    } else {
+                        StrategyControl::Off
+                    },
+                    host: if on_device {
+                        StrategyControl::Auto
+                    } else {
+                        StrategyControl::Required
+                    },
+                    host_placement: StrategyControl::Off,
+                    ..ExpertPolicy::default()
+                };
+                let plan = moxie_plan::expert::compile_experts_with_weights(
+                    &mlp(activation),
+                    &combine(),
+                    &route(),
+                    &budget,
+                    &policy,
+                    None,
+                    Some(ExpertKernels {
+                        capability: ctx.capability(),
+                        catalogue: &catalogue,
+                    }),
+                    formats,
+                )
+                .unwrap_or_else(|e| panic!("device {ordinal}: {e}"));
+                assert!(
+                    plan.groups().iter().all(|g| g.placement().candidate()
+                        == if on_device {
+                            Candidate::Device
+                        } else {
+                            Candidate::Host
+                        }),
+                    "`required` must put every group on the device"
+                );
+                assert_eq!(plan.kernel().is_some(), on_device);
+
+                let mut expert_roles = roles();
+                expert_roles.per_expert = Some(role_pairs);
+                let mut run = GroupedRun::admit(&mut ledger, plan, expert_roles, None)
+                    .unwrap_or_else(|e| panic!("device {ordinal}: {e}"));
+                if on_device {
+                    run.attach_device(&mut ledger, &ctx, &mut residency)
+                        .unwrap_or_else(|e| panic!("device {ordinal}: {e}"));
+                }
+
+                let x = to_bytes(&w.x);
+                run.load_activations(&x).unwrap();
+                run.run_to_completion(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
+                    .unwrap_or_else(|e| panic!("device {ordinal}: {e}"));
+
+                // Slots first: a wrong reduction over right slots and a right
+                // reduction over wrong slots are different defects.
+                let want_slots = oracle_slots(&w, activation);
+                assert_eq!(
+                    as_u16(run.buffers().slots()),
+                    want_slots,
+                    "device {ordinal} {activation:?}: slots"
+                );
+                let got = as_u16(run.reduce(&w.coefficients).unwrap());
+                assert_eq!(
+                    got,
+                    oracle_rows(&w, activation),
+                    "device {ordinal} {activation:?}: rows"
+                );
+                compared += want_slots.len() + got.len();
+                assert_eq!(run.stats().device_groups, if on_device { 5 } else { 0 });
+                assert_eq!(run.stats().host_groups, if on_device { 0 } else { 5 });
+
+                run.close(&mut ledger).unwrap();
+                // Every lease is back, but the chunks are still resident. Retiring
+                // them is what frees the ranges that live in the one real device
+                // allocation, and the residency refuses to close until they are.
+                authority.end_turn(TurnId::new(1));
+                authority.retire_all(scope);
+                residency.close(&mut authority).unwrap();
+                authority.close(&mut ledger).unwrap();
+                assert!(ledger.outstanding().is_empty());
+                eprintln!(
+                    "quantized expert UUID={} gate={activation:?} device={on_device} formats={formats:?} passed",
+                    ctx.uuid()
+                );
+            }
+        }
+    }
+    println!(
+        "grouped expert device gate: {compared} BF16 components bit-identical to the oracle \
+         across {count} device(s) and both gate transforms"
     );
 }

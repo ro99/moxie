@@ -235,6 +235,7 @@ fn measure(name: &str, leak_bytes: usize) -> Measurement {
             resident: ResidentChunks::none(),
         };
         let roles = ExpertRoles {
+            per_expert: None,
             artifact: artifact(),
             gate_up_role: format!("experts_gate_up.{layer}"),
             down_role: format!("experts_down.{layer}"),

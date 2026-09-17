@@ -170,6 +170,24 @@ impl Sources {
         Ok(())
     }
 
+    pub(crate) fn selected_gptq_maps(
+        &mut self,
+        file: &str,
+        modules: &std::collections::BTreeSet<&str>,
+    ) -> Result<Vec<(String, String)>> {
+        let shard = self.shard(file)?;
+        Ok(shard
+            .header()
+            .tensors()
+            .keys()
+            .filter_map(|name| {
+                name.strip_suffix(".g_idx")
+                    .filter(|module| modules.contains(module))
+                    .map(|module| (module.to_string(), file.to_string()))
+            })
+            .collect())
+    }
+
     pub fn declares(&mut self, file: &str, name: &str) -> Result<bool> {
         let shard = self.shard(file)?;
         Ok(shard.header().tensors().contains_key(name))

@@ -139,18 +139,14 @@ impl ScaleValues {
 
     /// Reject anything a kernel must never see.
     ///
-    /// Document 03: "Positive finite scales; reject nonfinite/zero/negative
-    /// values unless an explicit source zero-block convention is normalized
-    /// losslessly to valid canonical values." No such convention is pinned for
-    /// an integer source, so zero is rejected here: an all-zero group is
-    /// expressible with zero *codes*, and a zero scale would instead erase a
-    /// group silently while looking like a valid tensor.
+    /// ADR0030: preserve finite, nonzero scales of either sign exactly.
+    /// Signed zero and nonfinite encodings remain invalid.
     pub fn validate(&self) -> Result<()> {
         for i in 0..self.len() {
             let v = self.get(i).expect("index below len");
-            if !v.is_finite() || v <= 0.0 {
+            if !v.is_finite() || v == 0.0 {
                 return Err(invalid(format_args!(
-                    "scale[{i}] is {v} ({}); scales must be positive and finite",
+                    "scale[{i}] is {v} ({}); scales must be finite and nonzero",
                     self.dtype().name()
                 )));
             }
@@ -236,9 +232,9 @@ mod tests {
     }
 
     #[test]
-    fn nonfinite_zero_and_negative_scales_are_rejected() {
+    fn signed_scales_are_preserved_and_nonfinite_or_zero_scales_are_rejected() {
         assert!(ScaleValues::F32(vec![1.0, 2.0]).validate().is_ok());
-        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        for bad in [0.0f32, -0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(
                 ScaleValues::F32(vec![1.0, bad]).validate().is_err(),
                 "{bad} should be rejected"
@@ -246,8 +242,11 @@ mod tests {
         }
         assert!(ScaleValues::F16(vec![0x0000]).validate().is_err()); // +0
         assert!(ScaleValues::F16(vec![0x7C00]).validate().is_err()); // inf
-        assert!(ScaleValues::F16(vec![0xBC00]).validate().is_err()); // -1
+        assert!(ScaleValues::F16(vec![0xBC00]).validate().is_ok()); // -1
         assert!(ScaleValues::Bf16(vec![0x0000]).validate().is_err());
+        assert!(ScaleValues::Bf16(vec![0xBF80]).validate().is_ok());
+        assert!(ScaleValues::F32(vec![-1.0]).validate().is_ok());
+        assert!(ScaleValues::F16(vec![0x8000]).validate().is_err());
         assert!(ScaleValues::Bf16(vec![0x3F80]).validate().is_ok()); // 1.0
     }
 

@@ -188,6 +188,10 @@ struct RawTensor {
     zero_points: Option<String>,
     #[serde(default)]
     files: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    shape: Option<[usize; 2]>,
+    #[serde(default)]
+    requires_group_index: Option<bool>,
 }
 
 /// One selected tensor.
@@ -209,6 +213,14 @@ pub enum SelectionKind {
         name: String,
         /// The shard file, relative to the source root.
         file: String,
+    },
+    /// GPTQ-v1 zero-minus-one serialization. Logical shape is explicit so
+    /// packed-word padding never silently becomes a logical input channel.
+    Gptq {
+        module: String,
+        spec: crate::gptq::GptqSpec,
+        logical: (usize, usize),
+        files: BTreeMap<String, String>,
     },
     /// A compressed-tensors `pack-quantized` module.
     PackQuantized {
@@ -285,7 +297,7 @@ impl Selection {
                 SelectionKind::Bf16 { file, .. } => {
                     set.insert(file.clone());
                 }
-                SelectionKind::PackQuantized { files, .. } => {
+                SelectionKind::PackQuantized { files, .. } | SelectionKind::Gptq { files, .. } => {
                     for f in files.values() {
                         set.insert(f.clone());
                     }
@@ -365,6 +377,11 @@ pub fn parse(text: &str) -> Result<Selection> {
                 a
             }
         };
+        if t.kind != "gptq-v1" && (t.shape.is_some() || t.requires_group_index.is_some()) {
+            return Err(invalid_static(
+                "shape/requires_group_index are gptq-v1 selection fields",
+            ));
+        }
         let kind = match t.kind.as_str() {
             "bf16" => {
                 let name = nonempty(
@@ -397,6 +414,65 @@ pub fn parse(text: &str) -> Result<Selection> {
                     }
                 }
                 SelectionKind::Bf16 { name, file }
+            }
+            "gptq-v1" => {
+                if t.name.is_some() || t.file.is_some() || t.zero_points.is_some() {
+                    return Err(invalid_static(
+                        "gptq-v1 uses module/files and fixed zero-minus-one semantics",
+                    ));
+                }
+                let module = nonempty(
+                    t.module
+                        .ok_or_else(|| invalid_static("gptq-v1 requires module"))?,
+                    "tensor.module",
+                )?;
+                let width = match t.width.as_deref() {
+                    Some("int4") => IntWidth::Int4,
+                    Some("int8") => IntWidth::Int8,
+                    _ => return Err(invalid_static("gptq-v1 width must be int4 or int8")),
+                };
+                let group_size = match t.group {
+                    Some(toml::Value::Integer(32)) => 32,
+                    Some(toml::Value::Integer(128)) => 128,
+                    _ => return Err(invalid_static("gptq-v1 group must be 32 or 128")),
+                };
+                let [outputs, inputs] = t.shape.ok_or_else(|| {
+                    invalid_static("gptq-v1 requires logical shape [outputs,inputs]")
+                })?;
+                if outputs == 0 || inputs == 0 {
+                    return Err(invalid_static(
+                        "gptq-v1 logical dimensions must be positive",
+                    ));
+                }
+                let requires_group_index = t.requires_group_index.unwrap_or(false);
+                let declared = t
+                    .files
+                    .ok_or_else(|| invalid_static("gptq-v1 requires tensor.files"))?;
+                for required in ["qweight", "qzeros", "scales"] {
+                    if !declared.contains_key(required) {
+                        return Err(invalid_static("gptq-v1 needs qweight, qzeros and scales"));
+                    }
+                }
+                if requires_group_index && !declared.contains_key("g_idx") {
+                    return Err(invalid_static("gptq-v1 activation ordering requires g_idx"));
+                }
+                let mut files = BTreeMap::new();
+                for (suffix, file) in declared {
+                    if !["qweight", "qzeros", "scales", "g_idx"].contains(&suffix.as_str()) {
+                        return Err(invalid_static("unknown gptq-v1 companion"));
+                    }
+                    files.insert(suffix, source_file(file, &role)?);
+                }
+                SelectionKind::Gptq {
+                    module,
+                    spec: crate::gptq::GptqSpec {
+                        width,
+                        group_size,
+                        requires_group_index,
+                    },
+                    logical: (outputs, inputs),
+                    files,
+                }
             }
             "pack-quantized" => {
                 let module = nonempty(
@@ -497,9 +573,7 @@ pub fn parse(text: &str) -> Result<Selection> {
             }
             other => {
                 return Err(invalid(format_args!(
-                    "tensor '{role}': kind '{other}' is outside {{bf16, pack-quantized}}. \
-                     AutoGPTQ/AutoRound packing and activation-order maps are M3 item 2's \
-                     remainder and are refused by name rather than guessed at"
+                    "tensor '{role}': kind '{other}' is outside {{bf16, pack-quantized, gptq-v1}}"
                 )));
             }
         };
@@ -738,7 +812,7 @@ weight_zero_point = "s1.safetensors"
             ),
             (
                 with(&PQ.replace("kind = \"pack-quantized\"", "kind = \"auto-gptq\"")),
-                "refused by name rather than guessed at",
+                "outside {bf16, pack-quantized, gptq-v1}",
             ),
             (
                 with(&PQ.replace("weight_scale = \"s2.safetensors\"\n", "")),

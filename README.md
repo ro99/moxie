@@ -157,13 +157,17 @@ safetensors implementation** (owner ruling, 2026-09-14; schema in
 tensor becomes one, two or three physical ones — `U8` packed INT4 codes, `I8`
 INT8 codes, scales in the source's own dtype, `I16` zero points — and the
 manifest says what they mean. It is **not** a model Transformers can load: no
-`config.json`, tokenizer or index is written, and nothing here executes a
-canonical tensor.
+`config.json`, tokenizer or index is written. Shared dense and grouped-expert
+operators execute canonical weights over synthetic activations; no complete model runs.
 
 Measured capabilities, and nothing else: BF16 passthrough, and compressed-tensors `pack-quantized`
 INT4/INT8 at group 32, group 128 and per-channel, symmetric or with zero points packed along the
-output axis. AutoGPTQ/AutoRound packing, activation-order maps, tokenizers, fused expert role
-mapping and whole-catalog conversion are **refused by name**. Exit status distinguishes the
+output axis. Task0034 adds GPTQ-v1 integer selection and pinned AutoRound0.15.0
+`auto_round:auto_gptq` discovery, including explicit group maps and source scale bits
+of either sign ([ADR0030](docs/decisions/adr/0030-preserve-signed-affine-scales.md)).
+Bounded samples of two catalog revisions pass; this is not whole-catalog conversion.
+Unsupported per-module overrides, unquantized F16 weights, tokenizer publication
+and inferred fused expert role mapping are refused. Exit status distinguishes the
 outcomes: 0 published or verified, 1 a command-line error, 2 refused or failed (leaving a resumable
 destination), 3 cancelled, and 4 **published, durability unconfirmed** — the artifact exists and the
 confirming `fsync` did not report success, which is neither a failure nor a success.

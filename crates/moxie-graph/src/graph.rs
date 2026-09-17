@@ -1199,6 +1199,7 @@ pub struct GraphSignature {
 /// Builds and validates a graph.
 #[derive(Debug)]
 pub struct GraphBuilder {
+    weight_precisions: BTreeMap<String, WeightPrecision>,
     values: Vec<TensorSpec>,
     names: BTreeMap<ValueId, String>,
     nodes: Vec<Node>,
@@ -1215,6 +1216,7 @@ impl GraphBuilder {
     /// symbol standing for the row count, which is not known until a step runs.
     pub fn new(oracle: OracleId, rows: SymbolId) -> Self {
         Self {
+            weight_precisions: BTreeMap::new(),
             values: Vec::new(),
             names: BTreeMap::new(),
             nodes: Vec::new(),
@@ -1224,6 +1226,13 @@ impl GraphBuilder {
             rows,
             positions: None,
         }
+    }
+
+    /// Bind source-declared weight precisions by semantic role. Unknown roles
+    /// are rejected at finish and consumers still enforce their own contracts.
+    pub fn with_weight_precisions(mut self, precisions: BTreeMap<String, WeightPrecision>) -> Self {
+        self.weight_precisions = precisions;
+        self
     }
 
     fn add_value(&mut self, name: &str, spec: TensorSpec) -> ValueId {
@@ -1246,7 +1255,7 @@ impl GraphBuilder {
     }
 
     /// A model parameter, supplied once.
-    pub fn weight(&mut self, name: &str, spec: TensorSpec) -> Result<ValueId> {
+    pub fn weight(&mut self, name: &str, mut spec: TensorSpec) -> Result<ValueId> {
         if !matches!(spec.role, ValueRole::Weight(_)) {
             return Err(Error::InvalidArtifact {
                 detail: format!(
@@ -1255,6 +1264,9 @@ impl GraphBuilder {
                 )
                 .into(),
             });
+        }
+        if let Some(precision) = self.weight_precisions.remove(name) {
+            spec.role = ValueRole::Weight(precision);
         }
         let id = self.add_value(name, spec);
         self.weights.push(id);
@@ -1333,7 +1345,14 @@ impl GraphBuilder {
         let output = self.add_value(&format!("{}#{}", params.op().name(), id.0), out_spec);
         let contract = OpContract {
             op: params.op(),
-            weights: vec![WeightPrecision::expect(Precision::Bf16)],
+            weights: if matches!(params.op(), Op::Linear | Op::ExpertMlp) {
+                [Precision::Int4, Precision::Int8, Precision::Bf16]
+                    .into_iter()
+                    .map(WeightPrecision::expect)
+                    .collect()
+            } else {
+                vec![WeightPrecision::expect(Precision::Bf16)]
+            },
             activations: vec![ActivationPrecision::expect(Precision::Bf16)],
             output: params.output_precision(),
             accumulation: AccumulationPolicy::Bf16InF32Acc,
@@ -1690,6 +1709,15 @@ impl GraphBuilder {
         oracles: &OracleRegistry,
         ids: &GraphIdAllocator,
     ) -> Result<Graph> {
+        if !self.weight_precisions.is_empty() {
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "weight precision declarations name absent roles: {:?}",
+                    self.weight_precisions.keys()
+                )
+                .into(),
+            });
+        }
         if output.0 as usize >= self.values.len() {
             return Err(Error::InvalidRequest {
                 field: "output",

@@ -71,7 +71,7 @@ pub enum UnitSource {
 pub fn minimum_tile_bytes(tensor: &Resolved) -> Result<usize> {
     Ok(match &tensor.kind {
         ResolvedKind::Bf16 { .. } => 1,
-        ResolvedKind::PackQuantized { plan, section, .. } => {
+        ResolvedKind::Integer { plan, section, .. } => {
             let codes = plan
                 .source_code_row_bytes()
                 .max(plan.canonical_code_row_bytes());
@@ -108,7 +108,7 @@ pub fn unit_count(tensor: &Resolved, tile: usize) -> Result<usize> {
     }
     Ok(match &tensor.kind {
         ResolvedKind::Bf16 { len, .. } => (*len as usize).div_ceil(tile.max(1)),
-        ResolvedKind::PackQuantized { plan, section, .. } => {
+        ResolvedKind::Integer { plan, section, .. } => {
             let rows = plan.out_features();
             let codes = rows.div_ceil(block_rows(
                 tile,
@@ -171,7 +171,7 @@ impl<'a> Units<'a> {
     fn new(tensor: &'a Resolved, tile: usize) -> Result<Self> {
         let (rows, scales_start, zeros_start) = match &tensor.kind {
             ResolvedKind::Bf16 { len, .. } => (*len as usize, 0, None),
-            ResolvedKind::PackQuantized { plan, section, .. } => {
+            ResolvedKind::Integer { plan, section, .. } => {
                 let ext = payload::extents(plan.descriptor(), *section)?;
                 (
                     plan.out_features(),
@@ -216,7 +216,7 @@ impl Iterator for Units<'_> {
                 self.at += take as u64;
                 Some(unit)
             }
-            ResolvedKind::PackQuantized { plan, .. } => loop {
+            ResolvedKind::Integer { plan, .. } => loop {
                 if self.section > 2 {
                     return None;
                 }
@@ -514,7 +514,7 @@ pub fn convert_unit(
             payload::write_code_block(&source.bytes()[..*len], &mut canonical.bytes_mut()[..*len])?;
             Ok(digest)
         }
-        (ResolvedKind::PackQuantized { plan, .. }, UnitSource::Codes { start, end }) => {
+        (ResolvedKind::Integer { plan, .. }, UnitSource::Codes { start, end }) => {
             let stride = plan.source_code_row_bytes();
             let src_len = (end - start) * stride;
             read_module_range(
@@ -527,7 +527,6 @@ pub fn convert_unit(
             )?;
             let digest = sha256_of(&buffers.source.bytes()[..src_len]);
             let width = plan.descriptor().in_features;
-            let plan = plan.clone();
             let columns_len = width;
             // The three borrows are taken apart explicitly: the column scratch
             // has to be admitted (which needs the ledger) before the tiles are
@@ -547,7 +546,7 @@ pub fn convert_unit(
             )?;
             Ok(digest)
         }
-        (ResolvedKind::PackQuantized { plan, .. }, UnitSource::Scales { start, end }) => {
+        (ResolvedKind::Integer { plan, .. }, UnitSource::Scales { start, end }) => {
             let stride = plan.scale_row_bytes();
             let src_len = (end - start) * stride;
             read_module_range(
@@ -569,7 +568,7 @@ pub fn convert_unit(
             )?;
             Ok(digest)
         }
-        (ResolvedKind::PackQuantized { plan, .. }, UnitSource::Zeros { start, end }) => {
+        (ResolvedKind::Integer { plan, .. }, UnitSource::Zeros { start, end }) => {
             let words = plan.zero_point_word_rows(*start..*end)?;
             let stride = plan.source_zero_point_word_row_bytes();
             let src_len = (words.end - words.start) * stride;
@@ -597,7 +596,7 @@ pub fn convert_unit(
             tensor.role,
             match kind {
                 ResolvedKind::Bf16 { .. } => "bf16",
-                ResolvedKind::PackQuantized { .. } => "pack-quantized",
+                ResolvedKind::Integer { .. } => "pack-quantized",
             }
         ))),
     }
@@ -612,12 +611,70 @@ fn read_module_range(
     offset: u64,
     len: usize,
 ) -> Result<()> {
-    let ResolvedKind::PackQuantized { module, files, .. } = &tensor.kind else {
+    let ResolvedKind::Integer {
+        module,
+        files,
+        plan,
+        ..
+    } = &tensor.kind
+    else {
         return Err(invalid(format!(
             "tensor '{}' is not a pack-quantized module",
             tensor.role
         )));
     };
+    if let crate::integer::IntegerPlan::Gptq(plan) = plan {
+        let (suffix, matrix_rows, matrix_columns, scalar, first, count) = match suffix {
+            "weight_packed" => (
+                "qweight",
+                plan.input_word_rows(),
+                plan.out_features(),
+                4,
+                offset as usize / plan.source_code_row_bytes(),
+                len / plan.source_code_row_bytes(),
+            ),
+            "weight_scale" => (
+                "scales",
+                plan.groups_per_row(),
+                plan.out_features(),
+                plan.descriptor().scale_dtype.bytes(),
+                offset as usize / plan.scale_row_bytes(),
+                len / plan.scale_row_bytes(),
+            ),
+            "weight_zero_point" => (
+                "qzeros",
+                plan.groups_per_row(),
+                plan.output_word_columns(),
+                4,
+                offset as usize / plan.source_zero_point_word_row_bytes(),
+                len / plan.source_zero_point_word_row_bytes(),
+            ),
+            _ => return Err(invalid("unknown GPTQ source component".into())),
+        };
+        if len > buffers.source.bytes().len()
+            || first
+                .checked_add(count)
+                .is_none_or(|end| end > matrix_columns)
+        {
+            return Err(invalid(
+                "GPTQ gathered tile exceeds its admitted bounds".into(),
+            ));
+        }
+        let file = files
+            .get(suffix)
+            .ok_or_else(|| invalid(format!("missing GPTQ {suffix}")))?;
+        let name = format!("{module}.{suffix}");
+        let stripe = count * scalar;
+        for row in 0..matrix_rows {
+            sources.read_range(
+                file,
+                &name,
+                ((row * matrix_columns + first) * scalar) as u64,
+                &mut buffers.source.bytes_mut()[row * stripe..(row + 1) * stripe],
+            )?;
+        }
+        return Ok(());
+    }
     let file = files.get(suffix).ok_or_else(|| {
         invalid(format!(
             "tensor '{}': no shard named for {suffix}",

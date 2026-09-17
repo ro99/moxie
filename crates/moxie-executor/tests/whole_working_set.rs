@@ -99,6 +99,7 @@ fn tensor_names(layer: u32) -> (String, String) {
 
 fn roles(layer: u32) -> ExpertRoles {
     ExpertRoles {
+        per_expert: None,
         artifact: artifact_id(),
         gate_up_role: format!("experts_gate_up.{layer}"),
         down_role: format!("experts_down.{layer}"),

@@ -186,7 +186,9 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                     "moxie-memory",
                     "moxie-host",
                 ],
-                third_party: NONE,
+                // Task0034: bounded matching of pinned AutoRound extra_config
+                // expressions during offline discovery; no engine dependency.
+                third_party: &["regex"],
             },
         ),
         (

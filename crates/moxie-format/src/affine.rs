@@ -270,7 +270,8 @@ impl AffineDescriptor {
                     self.in_features
                 )));
             }
-            let mut used = vec![0usize; groups];
+            let mut used = crate::try_vec::<usize>(groups)?;
+            used.resize(groups, 0);
             for (k, g) in map.iter().enumerate() {
                 let g = *g as usize;
                 if g >= groups {
@@ -1205,7 +1206,7 @@ mod tests {
     #[test]
     fn a_nonfinite_or_zero_scale_never_reaches_a_kernel() {
         let d = desc(IntWidth::Int8, 1, 2, Grouping::PerOutputChannel);
-        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
+        for bad in [0.0f32, -0.0, f32::NAN, f32::INFINITY] {
             assert!(
                 AffineTensor::new(
                     d.clone(),

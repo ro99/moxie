@@ -16,6 +16,7 @@ moxie-format.workspace = true
 moxie-storage.workspace = true
 moxie-memory.workspace = true
 moxie-host.workspace = true
+regex = "1"
 
 [lints]
 workspace = true

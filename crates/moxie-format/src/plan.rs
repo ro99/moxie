@@ -74,6 +74,7 @@ struct RawPlan {
     #[serde(default)]
     excluded: Vec<toml::Value>,
     weights: Option<RawWeights>,
+    gptq: Option<RawGptq>,
     bf16: Option<RawBf16>,
     /// Present in a generated plan, absent in a hand-written selection. Read
     /// through `resolved_options`; accepted here so the document parses.
@@ -84,6 +85,26 @@ struct RawPlan {
     #[serde(default)]
     #[allow(dead_code)]
     binding: Option<toml::Value>,
+}
+
+#[derive(Deserialize)]
+struct RawGptq {
+    width: String,
+    group: usize,
+    #[serde(default)]
+    requires_group_index: bool,
+    #[serde(default)]
+    modules: Vec<RawGptqModule>,
+}
+
+#[derive(Deserialize)]
+struct RawGptqModule {
+    module: String,
+    shape: [usize; 2],
+    qweight: usize,
+    qzeros: usize,
+    scales: usize,
+    g_idx: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -133,7 +154,7 @@ pub fn declared_entries(text: &str) -> Result<usize> {
         })
         .unwrap_or(0);
     let bf16 = raw.bf16.as_ref().map(|b| b.tensors.len()).unwrap_or(0);
-    Ok(modules + bf16)
+    Ok(modules + bf16 + raw.gptq.as_ref().map_or(0, |g| g.modules.len()))
 }
 
 /// Expand a plan into the selection it describes.
@@ -155,7 +176,7 @@ pub fn expand(text: &str) -> Result<Selection> {
         })
         .unwrap_or(0);
     let bf16 = raw.bf16.as_ref().map(|b| b.tensors.len()).unwrap_or(0);
-    let entries = modules + bf16;
+    let entries = modules + bf16 + raw.gptq.as_ref().map_or(0, |g| g.modules.len());
     if entries == 0 {
         return Err(invalid(format_args!(
             "this plan selects nothing: it names no modules and no bf16 tensors"
@@ -286,6 +307,25 @@ pub fn expand(text: &str) -> Result<Selection> {
             out.push_str("kind = \"bf16\"\n");
             out.push_str(&format!("name = {}\n", string(name)));
             out.push_str(&format!("file = {}\n", string(&shard(*index, name)?)));
+        }
+    }
+    if let Some(g) = &raw.gptq {
+        for m in &g.modules {
+            out.push_str(&format!("\n[[tensor]]\nrole = {}\nkind = \"gptq-v1\"\nmodule = {}\nwidth = {}\ngroup = {}\nshape = [{},{}]\nrequires_group_index = {}\n[tensor.files]\n",
+                string(&format!("{}.weight",m.module)),string(&m.module),string(&g.width),g.group,m.shape[0],m.shape[1],g.requires_group_index));
+            for (suffix, index) in [
+                ("qweight", m.qweight),
+                ("qzeros", m.qzeros),
+                ("scales", m.scales),
+            ] {
+                out.push_str(&format!(
+                    "{suffix} = {}\n",
+                    string(&shard(index, &m.module)?)
+                ));
+            }
+            if let Some(index) = m.g_idx {
+                out.push_str(&format!("g_idx = {}\n", string(&shard(index, &m.module)?)));
+            }
         }
     }
     let mut selection = crate::selection::parse(&out)?;

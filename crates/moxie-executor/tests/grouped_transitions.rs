@@ -182,6 +182,7 @@ fn uuid() -> DeviceUuid {
 
 fn roles(g: Geometry) -> ExpertRoles {
     ExpertRoles {
+        per_expert: None,
         // A distinct artifact per profile: two profiles sharing one identity
         // would let one profile's chunk satisfy the other's demand, which is a
         // residency answer no route asked for.

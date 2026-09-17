@@ -128,3 +128,94 @@ extern "C" __global__ void moxie_bf16_expert_down_v1(
     slots[static_cast<unsigned long long>(slot_index[slot]) * hidden + component] =
         __float2bfloat16_rn(acc);
 }
+
+// Canonical integer operands share the decoder with dense affine execution.
+// The payload is codes/scales/i16 zeros; map is an optional admitted operand.
+// Packed sections may be unaligned, so metadata loads are byte-addressed.
+#include "affine_decode.cuh"
+
+static __device__ __forceinline__ float moxie_expert_affine_v1(
+    const unsigned char* weight, const unsigned int* map,
+    unsigned long long output, unsigned long long input,
+    unsigned long long outputs, unsigned long long inputs,
+    unsigned int bits, unsigned int group, unsigned int scale_kind,
+    unsigned int has_zeros) {
+    if (bits == 16U) {
+        const unsigned char* p = weight + (output * inputs + input) * 2;
+        return __uint_as_float((static_cast<unsigned int>(p[0]) | (static_cast<unsigned int>(p[1]) << 8)) << 16);
+    }
+    const unsigned long long stride = (inputs + (8 / bits) - 1) / (8 / bits);
+    const unsigned long long groups = (inputs + group - 1) / group;
+    const unsigned long long entry = output * groups + (map ? map[input] : input / group);
+    const unsigned long long scale_offset = outputs * stride;
+    const unsigned long long zero_offset = scale_offset + outputs * groups * (scale_kind == 2 ? 4 : 2);
+    int zero = 0;
+    if (has_zeros) {
+        const unsigned char* p = weight + zero_offset + entry * 2;
+        zero = static_cast<short>(static_cast<unsigned short>(p[0]) | (static_cast<unsigned short>(p[1]) << 8));
+    }
+    const int code = moxie_affine_code_v1(weight, output * stride, input, bits);
+    const float scale = moxie_affine_scale_v1(weight + scale_offset, entry, scale_kind);
+    return __bfloat162float(__float2bfloat16_rn(__fmul_rn(static_cast<float>(code - zero), scale)));
+}
+
+static __device__ __forceinline__ void moxie_affine_expert_lanes_v1(
+    const __nv_bfloat16* x_row, const unsigned char* gate_up, const unsigned int* map,
+    unsigned long long hidden, unsigned long long intermediate, unsigned long long lane,
+    unsigned int bits, unsigned int group, unsigned int scale_kind, unsigned int has_zeros,
+    float* gate_out, float* up_out) {
+    float gate = 0.0F, up = 0.0F;
+    for (unsigned long long k = 0; k < hidden; ++k) {
+        const float xk = __bfloat162float(x_row[k]);
+        gate = __fadd_rn(gate, __fmul_rn(xk, moxie_expert_affine_v1(gate_up, map, lane, k, 2 * intermediate, hidden, bits, group, scale_kind, has_zeros)));
+        up = __fadd_rn(up, __fmul_rn(xk, moxie_expert_affine_v1(gate_up, map, intermediate + lane, k, 2 * intermediate, hidden, bits, group, scale_kind, has_zeros)));
+    }
+    *gate_out = __bfloat162float(__float2bfloat16_rn(gate));
+    *up_out = __bfloat162float(__float2bfloat16_rn(up));
+}
+
+extern "C" __global__ void moxie_affine_expert_project_gelu_v1(
+    const __nv_bfloat16* x, const unsigned int* row_index,
+    const unsigned char* gate_up, const unsigned int* map, float* activated,
+    unsigned long long assignments, unsigned long long hidden, unsigned long long intermediate,
+    unsigned int bits, unsigned int group, unsigned int scale_kind, unsigned int has_zeros) {
+    const unsigned long long index = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= assignments * intermediate) return;
+    float gate, up;
+    moxie_affine_expert_lanes_v1(x + static_cast<unsigned long long>(row_index[index / intermediate]) * hidden,
+        gate_up, map, hidden, intermediate, index % intermediate, bits, group, scale_kind, has_zeros, &gate, &up);
+    const double gated = static_cast<double>(__bfloat162float(__float2bfloat16_rn(moxie_gelu_tanh_v1(gate))));
+    const float h = static_cast<float>(__dmul_rn(gated, static_cast<double>(up)));
+    activated[index] = __bfloat162float(__float2bfloat16_rn(h));
+}
+
+extern "C" __global__ void moxie_affine_expert_project_silu_v1(
+    const __nv_bfloat16* x, const unsigned int* row_index,
+    const unsigned char* gate_up, const unsigned int* map, float* activated,
+    unsigned long long assignments, unsigned long long hidden, unsigned long long intermediate,
+    unsigned int bits, unsigned int group, unsigned int scale_kind, unsigned int has_zeros) {
+    const unsigned long long index = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= assignments * intermediate) return;
+    float gate, up;
+    moxie_affine_expert_lanes_v1(x + static_cast<unsigned long long>(row_index[index / intermediate]) * hidden,
+        gate_up, map, hidden, intermediate, index % intermediate, bits, group, scale_kind, has_zeros, &gate, &up);
+    const double g = static_cast<double>(gate);
+    const float h = static_cast<float>(__dmul_rn(__dmul_rn(g, moxie_sigmoid_v1(g)), static_cast<double>(up)));
+    activated[index] = __bfloat162float(__float2bfloat16_rn(h));
+}
+
+extern "C" __global__ void moxie_affine_expert_down_v1(
+    const float* activated, const unsigned char* down, const unsigned int* map,
+    const unsigned int* slot_index, __nv_bfloat16* slots,
+    unsigned long long assignments, unsigned long long hidden, unsigned long long intermediate,
+    unsigned int bits, unsigned int group, unsigned int scale_kind, unsigned int has_zeros) {
+    const unsigned long long index = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= assignments * hidden) return;
+    const unsigned long long slot = index / hidden;
+    const unsigned long long component = index % hidden;
+    float acc = 0.0F;
+    for (unsigned long long k = 0; k < intermediate; ++k) {
+        acc = __fadd_rn(acc, __fmul_rn(activated[slot * intermediate + k], moxie_expert_affine_v1(down, map, component, k, hidden, intermediate, bits, group, scale_kind, has_zeros)));
+    }
+    slots[static_cast<unsigned long long>(slot_index[slot]) * hidden + component] = __float2bfloat16_rn(acc);
+}

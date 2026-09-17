@@ -586,6 +586,17 @@ impl RoutedBlocks {
 
     /// Compose the graph.
     pub fn compose(&self, oracles: &OracleRegistry, rows: SymbolId) -> Result<Composition> {
+        self.compose_with_weight_precisions(oracles, rows, std::collections::BTreeMap::new())
+    }
+
+    /// Compose the same semantics with explicit source-declared weight precisions.
+    /// This adds no checkpoint importer or model-owned execution path.
+    pub fn compose_with_weight_precisions(
+        &self,
+        oracles: &OracleRegistry,
+        rows: SymbolId,
+        precisions: std::collections::BTreeMap<String, WeightPrecision>,
+    ) -> Result<Composition> {
         let c = &self.config;
         width("vocab * hidden", c.vocab, c.hidden)?;
         // The doubling is checked **first**. `2 * moe_intermediate` used to be
@@ -605,7 +616,8 @@ impl RoutedBlocks {
             c.hidden,
         )?;
 
-        let mut g = GraphBuilder::new(moxie_graph::OracleId("moxie_oracles::host_reference"), rows);
+        let mut g = GraphBuilder::new(moxie_graph::OracleId("moxie_oracles::host_reference"), rows)
+            .with_weight_precisions(precisions);
         let tokens = g.input(
             "tokens",
             TensorSpec::new(

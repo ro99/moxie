@@ -159,6 +159,88 @@ pub fn expert_group_bf16(
     workspace: &mut [f32],
     out: &mut [u8],
 ) -> Result<()> {
+    expert_group_weights(
+        x,
+        assignment,
+        ExpertWeight::Bf16(gate_up),
+        ExpertWeight::Bf16(down),
+        transform,
+        shape,
+        tiling,
+        workspace,
+        out,
+    )
+}
+
+/// The same grouped operation and rounding boundaries over canonical integer
+/// weights. Decodes scalars in place; workspace does not depend on weight size.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_group_affine(
+    x: &[u8],
+    assignment: ExpertAssignment<'_>,
+    gate_up: crate::affine::AffineWeight<'_>,
+    down: crate::affine::AffineWeight<'_>,
+    transform: GateTransform,
+    shape: ExpertShape,
+    tiling: ExpertTiling,
+    workspace: &mut [f32],
+    out: &mut [u8],
+) -> Result<()> {
+    expert_group_weights(
+        x,
+        assignment,
+        ExpertWeight::Affine(gate_up),
+        ExpertWeight::Affine(down),
+        transform,
+        shape,
+        tiling,
+        workspace,
+        out,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ExpertWeight<'a> {
+    Bf16(&'a [u8]),
+    Affine(crate::affine::AffineWeight<'a>),
+}
+impl ExpertWeight<'_> {
+    fn check(self, rows: usize, columns: usize) -> Result<()> {
+        let valid = match self {
+            Self::Bf16(bytes) => {
+                rows.checked_mul(columns).and_then(|n| n.checked_mul(2)) == Some(bytes.len())
+            }
+            Self::Affine(view) => view.shape() == (rows, columns),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(invalid(
+                "weight",
+                "expert weight shape/length mismatch".into(),
+            ))
+        }
+    }
+    fn value(self, row: usize, column: usize, columns: usize) -> f32 {
+        match self {
+            Self::Bf16(bytes) => load_bf16(bytes, row * columns + column),
+            Self::Affine(view) => bf16_round(view.value(row, column)),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn expert_group_weights(
+    x: &[u8],
+    assignment: ExpertAssignment<'_>,
+    gate_up: ExpertWeight<'_>,
+    down: ExpertWeight<'_>,
+    transform: GateTransform,
+    shape: ExpertShape,
+    tiling: ExpertTiling,
+    workspace: &mut [f32],
+    out: &mut [u8],
+) -> Result<()> {
     let hidden = shape.hidden as usize;
     let intermediate = shape.intermediate as usize;
     if hidden == 0 || intermediate == 0 {
@@ -174,27 +256,8 @@ pub fn expert_group_bf16(
         ));
     }
     let lanes = (tiling.lanes as usize).min(intermediate);
-    if gate_up.len() != 2 * intermediate * hidden * 2 {
-        return Err(Error::InvalidArtifact {
-            detail: format!(
-                "gate/up slice is {} B, expected {} for [{}, {hidden}] BF16",
-                gate_up.len(),
-                2 * intermediate * hidden * 2,
-                2 * intermediate
-            )
-            .into(),
-        });
-    }
-    if down.len() != hidden * intermediate * 2 {
-        return Err(Error::InvalidArtifact {
-            detail: format!(
-                "down slice is {} B, expected {} for [{hidden}, {intermediate}] BF16",
-                down.len(),
-                hidden * intermediate * 2
-            )
-            .into(),
-        });
-    }
+    gate_up.check(2 * intermediate, hidden)?;
+    down.check(hidden, intermediate)?;
     if assignment.rows.len() != assignment.slots.len() {
         return Err(invalid(
             "assignment",
@@ -218,7 +281,6 @@ pub fn expert_group_bf16(
     let (activated, lane_tile) = workspace.split_at_mut(intermediate);
     let (gate_tile, up_tile) = lane_tile.split_at_mut(lanes);
 
-    let up_base = intermediate * hidden;
     for (assigned, (&row, &slot)) in assignment
         .rows
         .iter()
@@ -230,7 +292,11 @@ pub fn expert_group_bf16(
         let x_start = row.checked_mul(hidden).and_then(|v| v.checked_mul(2));
         let out_start = slot.checked_mul(hidden).and_then(|v| v.checked_mul(2));
         match (x_start, out_start) {
-            (Some(xs), Some(os)) if xs + hidden * 2 <= x.len() && os + hidden * 2 <= out.len() => {}
+            (Some(xs), Some(os))
+                if xs.checked_add(hidden * 2).is_some_and(|end| end <= x.len())
+                    && os
+                        .checked_add(hidden * 2)
+                        .is_some_and(|end| end <= out.len()) => {}
             _ => {
                 return Err(invalid(
                     "assignment",
@@ -243,6 +309,10 @@ pub fn expert_group_bf16(
                 ));
             }
         }
+    }
+    for (&row, &slot) in assignment.rows.iter().zip(assignment.slots.iter()) {
+        let row = row as usize;
+        let slot = slot as usize;
         let x_row = &x[row * hidden * 2..(row + 1) * hidden * 2];
 
         // The gate/up projection, one bounded tile of lanes at a time. Each
@@ -255,12 +325,10 @@ pub fn expert_group_bf16(
                 let lane = lane0 + t;
                 let mut gate = 0f32;
                 let mut up = 0f32;
-                let gate_row = lane * hidden;
-                let up_row = up_base + lane * hidden;
                 for k in 0..hidden {
                     let xk = load_bf16(x_row, k);
-                    gate += xk * load_bf16(gate_up, gate_row + k);
-                    up += xk * load_bf16(gate_up, up_row + k);
+                    gate += xk * gate_up.value(lane, k, hidden);
+                    up += xk * gate_up.value(intermediate + lane, k, hidden);
                 }
                 gate_tile[t] = bf16_round(gate);
                 up_tile[t] = bf16_round(up);
@@ -278,9 +346,8 @@ pub fn expert_group_bf16(
         let out_row = &mut out[slot * hidden * 2..(slot + 1) * hidden * 2];
         for o in 0..hidden {
             let mut acc = 0f32;
-            let base = o * intermediate;
             for (i, h) in activated.iter().enumerate() {
-                acc += *h * load_bf16(down, base + i);
+                acc += *h * down.value(o, i, intermediate);
             }
             store_bf16(out_row, o, acc);
         }

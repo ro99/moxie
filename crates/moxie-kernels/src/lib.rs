@@ -22,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod affine;
 pub mod cpu_expert;
 
 /// Compute capabilities this build *targets*, as `["86", "120"]`.
@@ -230,6 +231,58 @@ mod images {
                         KernelSymbol(super::BF16_EXPERT_DOWN.to_string()),
                     ],
                 });
+            }
+        }
+        for sm in [SmVersion::SM86, SmVersion::SM120] {
+            for gate_width in [Precision::Bf16, Precision::Int4, Precision::Int8] {
+                for down_width in [Precision::Bf16, Precision::Int4, Precision::Int8] {
+                    if gate_width == Precision::Bf16 && down_width == Precision::Bf16 {
+                        continue;
+                    }
+                    for (gate, project) in [
+                        (
+                            GateTransform::GeluTanh,
+                            "moxie_affine_expert_project_gelu_v1",
+                        ),
+                        (GateTransform::Silu, "moxie_affine_expert_project_silu_v1"),
+                    ] {
+                        descriptors.push(SemanticKernelDescriptor {
+                            id: KernelId(format!(
+                                "affine-expert-{}-{}-{}-{}",
+                                gate_width.name(),
+                                down_width.name(),
+                                gate.name(),
+                                sm.name()
+                            )),
+                            abi_version: super::BF16_EXPERT_ABI,
+                            operation: SemanticKernelOp::ExpertMlp(gate),
+                            inputs: vec![
+                                KernelOperand::Activation(ActivationPrecision::expect(
+                                    Precision::Bf16,
+                                )),
+                                KernelOperand::RouteIndex,
+                                KernelOperand::Weight(WeightPrecision::expect(gate_width)),
+                                KernelOperand::Weight(WeightPrecision::expect(down_width)),
+                            ],
+                            output: ActivationPrecision::expect(Precision::Bf16),
+                            accumulation: AccumulationPolicy::Bf16InF32Acc,
+                            rounding: RoundingProfile::FinalBf16Rne,
+                            layout: TensorLayout::ContiguousRowMajorV1,
+                            shape: KernelShapeBounds {
+                                max_rows: 65_536,
+                                max_input: 16_384,
+                                max_output: 16_384,
+                            },
+                            sm,
+                            workspace: WorkspaceExpression::RowsTimesIntermediateF32,
+                            image_sha256: hash,
+                            symbols: vec![
+                                KernelSymbol(project.to_string()),
+                                KernelSymbol("moxie_affine_expert_down_v1".to_string()),
+                            ],
+                        });
+                    }
+                }
             }
         }
         KernelCatalogue::new(descriptors).expect("built-in descriptors are unique")

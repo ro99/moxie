@@ -38,6 +38,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cuda/bf16_chain.cu");
     println!("cargo:rerun-if-changed=cuda/expert_mlp.cu");
     println!("cargo:rerun-if-changed=cuda/affine_linear.cu");
+    println!("cargo:rerun-if-changed=cuda/affine_decode.cuh");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=archs.rs");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");

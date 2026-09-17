@@ -165,7 +165,7 @@ pub fn write_code_block(codes: &[u8], out: &mut [u8]) -> Result<()> {
 /// its scale table row-major in its own dtype, which is the canonical order and
 /// the canonical dtype, so the bytes are preserved exactly -- ADR 0018's
 /// bit-identical repack, at the level of the individual scalar. What is *not*
-/// preserved is a scalar a kernel must never see: a non-finite or non-positive
+/// preserved is a scalar a kernel must never see: a non-finite or zero
 /// scale is refused here rather than copied.
 pub fn write_scale_block(dtype: ScaleDtype, source_le: &[u8], out: &mut [u8]) -> Result<()> {
     let width = dtype.bytes();
@@ -185,9 +185,9 @@ pub fn write_scale_block(dtype: ScaleDtype, source_le: &[u8], out: &mut [u8]) ->
     }
     for (i, raw) in source_le.chunks_exact(width).enumerate() {
         let v = decode_scalar(dtype, raw);
-        if !v.is_finite() || v <= 0.0 {
+        if !v.is_finite() || v == 0.0 {
             return Err(invalid(format_args!(
-                "scale[{i}] of this block is {v} ({}); scales must be positive and finite",
+                "scale[{i}] of this block is {v} ({}); scales must be finite and nonzero",
                 dtype.name()
             )));
         }
@@ -481,8 +481,39 @@ mod tests {
     }
 
     #[test]
+    fn signed_scales_preserve_every_source_bit_in_each_encoding() {
+        for (dtype, raw) in [
+            (
+                ScaleDtype::F16,
+                [0xbc00u16, 0x8001, 0x3c00]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                ScaleDtype::Bf16,
+                [0xbf80u16, 0x8001, 0x3f80]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+            ),
+            (
+                ScaleDtype::F32,
+                [-1.0f32, -f32::from_bits(1), 1.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            ),
+        ] {
+            let mut out = vec![0; raw.len()];
+            write_scale_block(dtype, &raw, &mut out).unwrap();
+            assert_eq!(out, raw);
+        }
+    }
+
+    #[test]
     fn a_nonfinite_or_zero_scale_is_refused_by_both_writers() {
-        for bad in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.0] {
             let values = ScaleValues::F32(vec![1.0, bad]);
             let mut out = vec![0u8; 8];
             assert!(write_scale_values(&values, &mut out).is_err(), "{bad}");

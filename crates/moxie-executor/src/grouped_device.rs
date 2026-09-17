@@ -27,7 +27,7 @@ use core::ffi::c_void;
 
 use moxie_cuda::{Event, Module, ModuleImage, RankContext, ResolvedModule, Stream, TrustedImage};
 use moxie_memory::{Ledger, Reservation, ResidencyAuthority, ResidencyLease};
-use moxie_plan::expert::{ExpertGroup, ExpertPlan};
+use moxie_plan::expert::{ExpertGroup, ExpertPlan, ExpertWeightFormat};
 use moxie_types::{DeviceTier, Error, Result, Scope, SemanticKernelDescriptor};
 
 use crate::arena::{DeviceArena, DeviceRange};
@@ -49,6 +49,7 @@ fn invalid(field: &'static str, detail: String) -> Error {
 #[derive(Debug)]
 #[must_use = "an unclosed device attachment keeps its arena and its reservation"]
 pub struct DeviceExperts<'ctx> {
+    weight_formats: [ExpertWeightFormat; 2],
     ctx: &'ctx RankContext,
     stream: Stream<'ctx>,
     module: ResolvedModule<'ctx>,
@@ -299,6 +300,7 @@ impl<'ctx> DeviceExperts<'ctx> {
 
         let mut taken = taken.into_iter();
         Ok(DeviceExperts {
+            weight_formats: plan.weight_formats(),
             ctx,
             stream,
             module,
@@ -576,8 +578,12 @@ impl<'ctx> DeviceExperts<'ctx> {
 
         let (gate_up_offset, gate_up_len) = authority.device_range(gate_up).map_err(plain)?;
         let (down_offset, down_len) = authority.device_range(down).map_err(plain)?;
-        let expected_gate_up = 2 * self.intermediate * self.hidden * 2;
-        let expected_down = self.hidden * self.intermediate * 2;
+        let expected_gate_up = self.weight_formats[0]
+            .bytes(2 * self.intermediate, self.hidden)
+            .expect("validated plan format");
+        let expected_down = self.weight_formats[1]
+            .bytes(self.hidden, self.intermediate)
+            .expect("validated plan format");
         if gate_up_len != expected_gate_up || down_len != expected_down {
             return Err(plain(Error::InvalidArtifact {
                 detail: format!(
@@ -674,6 +680,42 @@ impl<'ctx> DeviceExperts<'ctx> {
             (&raw mut hidden).cast(),
             (&raw mut intermediate).cast(),
         ];
+        let integer = self.weight_formats != [ExpertWeightFormat::Bf16; 2];
+        let metadata = |format| match format {
+            ExpertWeightFormat::Bf16 => (16u32, 32u32, 1u32, 0u32),
+            ExpertWeightFormat::Affine {
+                width,
+                group,
+                scale,
+                zeros,
+            } => (
+                width.bits(),
+                group,
+                match scale {
+                    moxie_types::Precision::F16 => 0,
+                    moxie_types::Precision::Bf16 => 1,
+                    _ => 2,
+                },
+                u32::from(zeros),
+            ),
+        };
+        let (mut bits, mut group_size, mut scale_kind, mut has_zeros) =
+            metadata(self.weight_formats[0]);
+        let mut map_ptr = 0u64; // Contiguous canonical groups; mapped views require a separately admitted map.
+        let mut affine_project: [*mut c_void; 12] = [
+            (&raw mut x_ptr).cast(),
+            (&raw mut row_ptr).cast(),
+            (&raw mut gate_up_ptr).cast(),
+            (&raw mut map_ptr).cast(),
+            (&raw mut workspace_ptr).cast(),
+            (&raw mut count).cast(),
+            (&raw mut hidden).cast(),
+            (&raw mut intermediate).cast(),
+            (&raw mut bits).cast(),
+            (&raw mut group_size).cast(),
+            (&raw mut scale_kind).cast(),
+            (&raw mut has_zeros).cast(),
+        ];
         // SAFETY: the selected descriptor fixes this symbol's ABI; every
         // pointer names a checked admitted range or a live residency lease
         // resolved through this attachment's own backing, and every index was
@@ -687,7 +729,11 @@ impl<'ctx> DeviceExperts<'ctx> {
                     (grid(lanes).map_err(unknown)?, 1, 1),
                     (BLOCK, 1, 1),
                     0,
-                    &mut project,
+                    if integer {
+                        &mut affine_project
+                    } else {
+                        &mut project
+                    },
                 )
                 .map_err(unknown)?;
         }
@@ -707,6 +753,22 @@ impl<'ctx> DeviceExperts<'ctx> {
             (&raw mut hidden).cast(),
             (&raw mut intermediate).cast(),
         ];
+        let (mut down_bits, mut down_group, mut down_scale, mut down_zeros) =
+            metadata(self.weight_formats[1]);
+        let mut affine_down: [*mut c_void; 12] = [
+            (&raw mut workspace_ptr).cast(),
+            (&raw mut down_ptr).cast(),
+            (&raw mut map_ptr).cast(),
+            (&raw mut slot_ptr).cast(),
+            (&raw mut slots_ptr).cast(),
+            (&raw mut count).cast(),
+            (&raw mut hidden).cast(),
+            (&raw mut intermediate).cast(),
+            (&raw mut down_bits).cast(),
+            (&raw mut down_group).cast(),
+            (&raw mut down_scale).cast(),
+            (&raw mut down_zeros).cast(),
+        ];
         // SAFETY: as above, for the second symbol of the same descriptor.
         unsafe {
             self.module
@@ -720,7 +782,11 @@ impl<'ctx> DeviceExperts<'ctx> {
                     ),
                     (BLOCK, 1, 1),
                     0,
-                    &mut down_params,
+                    if integer {
+                        &mut affine_down
+                    } else {
+                        &mut down_params
+                    },
                 )
                 .map_err(|e| unknown_after(e, submitted))?;
         }
@@ -1162,6 +1228,7 @@ mod tests {
 
     fn roles() -> ExpertRoles {
         ExpertRoles {
+            per_expert: None,
             artifact: ArtifactId::new("grouped-unit-fixture-v1").unwrap(),
             gate_up_role: "experts_gate_up".into(),
             down_role: "experts_down".into(),

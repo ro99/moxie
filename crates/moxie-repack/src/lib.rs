@@ -39,6 +39,7 @@
 #![forbid(unsafe_code)]
 
 pub mod discover;
+pub mod integer;
 pub mod source;
 pub mod work;
 pub mod write;
@@ -46,6 +47,7 @@ pub mod write;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::integer::IntegerPlan;
 use crate::write::{Faults, Outcome, OutputPlan, Run, Start, TensorRequest, WriteBudget};
 use moxie_format::affine::Grouping;
 use moxie_format::compressed_tensors::{
@@ -387,9 +389,9 @@ pub enum ResolvedKind {
         len: u64,
     },
     /// Converted from a `pack-quantized` module.
-    PackQuantized {
+    Integer {
         module: String,
-        plan: PackQuantizedPlan,
+        plan: IntegerPlan,
         files: BTreeMap<String, String>,
         section: ZeroPointSection,
     },
@@ -399,10 +401,14 @@ impl Resolved {
     pub fn profile(&self) -> String {
         match &self.kind {
             ResolvedKind::Bf16 { .. } => "bf16 passthrough".into(),
-            ResolvedKind::PackQuantized { plan, section, .. } => {
+            ResolvedKind::Integer { plan, section, .. } => {
                 let d = plan.descriptor();
                 format!(
-                    "pack-quantized {} {} {} scales, {}",
+                    "{} {} {} {} scales, {}",
+                    match plan {
+                        IntegerPlan::CompressedTensors(_) => "pack-quantized",
+                        IntegerPlan::Gptq(_) => "gptq-v1",
+                    },
                     d.width.profile(),
                     match d.grouping {
                         Grouping::PerOutputChannel => "per-channel".to_string(),
@@ -430,10 +436,25 @@ pub fn resolve(selection: &Selection, sources: &mut Sources) -> Result<Vec<Resol
             _ => None,
         })
         .collect();
-    if !contiguous_modules.is_empty() {
-        // One pass over each source header, not a reopen per selected module.
-        for file in selection.files() {
+    let gptq_modules: std::collections::BTreeSet<&str> = selection
+        .tensors
+        .iter()
+        .filter_map(|t| match &t.kind {
+            SelectionKind::Gptq { module, .. } => Some(module.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut gptq_maps = BTreeMap::new();
+    for file in selection.files() {
+        if !contiguous_modules.is_empty() {
             sources.refuse_group_maps(&file, &contiguous_modules)?;
+        }
+        if !gptq_modules.is_empty() {
+            for (module, file) in sources.selected_gptq_maps(&file, &gptq_modules)? {
+                if gptq_maps.insert(module.clone(), file).is_some() {
+                    return Err(invalid(format!("{module}: duplicate g_idx source")));
+                }
+            }
         }
     }
     for t in &selection.tensors {
@@ -469,6 +490,91 @@ pub fn resolve(selection: &Selection, sources: &mut Sources) -> Result<Vec<Resol
                         len: entry.len,
                     },
                 }
+            }
+            SelectionKind::Gptq {
+                module,
+                spec,
+                logical,
+                files,
+            } => {
+                let named = |suffix: &str| -> Result<(&str, String)> {
+                    let file = files
+                        .get(suffix)
+                        .ok_or_else(|| invalid(format!("{module}: missing {suffix}")))?;
+                    Ok((file.as_str(), format!("{module}.{suffix}")))
+                };
+                let (wf, wn) = named("qweight")?;
+                let (zf, zn) = named("qzeros")?;
+                let (sf, sn) = named("scales")?;
+                let w = sources.entry(wf, &wn)?;
+                let z = sources.entry(zf, &zn)?;
+                let scales = sources.entry(sf, &sn)?;
+                if w.dtype != Dtype::I32 || z.dtype != Dtype::I32 {
+                    return Err(invalid(format!(
+                        "{module}: GPTQ qweight and qzeros must be I32"
+                    )));
+                }
+                let map_file = gptq_maps.get(module).cloned();
+                if map_file.as_ref() != files.get("g_idx") {
+                    return Err(invalid(format!(
+                        "{module}: g_idx must be explicitly named by the selection and match its source file"
+                    )));
+                }
+                let map_name = format!("{module}.g_idx");
+                let map = match &map_file {
+                    Some(file) => {
+                        let entry = sources.entry(file, &map_name)?;
+                        if entry.dtype != Dtype::I32 || entry.shape != [logical.1 as u64] {
+                            return Err(invalid(format!(
+                                "{module}: g_idx must be I32[input channels]"
+                            )));
+                        }
+                        let cap = (logical.1 as u64)
+                            .checked_mul(4)
+                            .ok_or_else(|| invalid("g_idx size overflow".into()))?;
+                        Some(sources.read_small(file, &map_name, cap)?)
+                    }
+                    None => None,
+                };
+                let map_shape = [logical.1 as u64];
+                let plan = moxie_format::gptq::GptqPlan::new(
+                    spec,
+                    moxie_format::gptq::DeclaredSource {
+                        logical: *logical,
+                        qweight_shape: &w.shape,
+                        qzeros_shape: &z.shape,
+                        scales_shape: &scales.shape,
+                        scale_dtype: scale_dtype_of(scales.dtype)?,
+                        group_index: map.as_deref(),
+                        group_index_shape: map.as_ref().map(|_| map_shape.as_slice()),
+                    },
+                )?;
+                let expected = plan.source_lengths()?;
+                if (w.len, z.len, scales.len)
+                    != (expected.0 as u64, expected.1 as u64, expected.2 as u64)
+                {
+                    return Err(invalid(format!(
+                        "{module}: GPTQ source byte length mismatch"
+                    )));
+                }
+                let source_bytes = w
+                    .len
+                    .checked_add(z.len)
+                    .and_then(|v| v.checked_add(scales.len))
+                    .and_then(|v| v.checked_add(map.as_ref().map_or(0, |m| m.len() as u64)))
+                    .ok_or_else(|| invalid("GPTQ source bytes overflow".into()))?;
+                let mut bound_files = files.clone();
+                if let Some(file) = map_file {
+                    bound_files.insert("g_idx".into(), file);
+                }
+                resolved_integer(
+                    t,
+                    module,
+                    &bound_files,
+                    IntegerPlan::Gptq(plan),
+                    ZeroPointSection::PerGroup,
+                    source_bytes,
+                )?
             }
             SelectionKind::PackQuantized {
                 module,
@@ -590,65 +696,83 @@ pub fn resolve(selection: &Selection, sources: &mut Sources) -> Result<Vec<Resol
                     ZeroPointSource::Symmetric => ZeroPointSection::Absent,
                     ZeroPointSource::PackedAlongOutput => ZeroPointSection::PerGroup,
                 };
-                let canonical_bytes = payload::length_of(plan.descriptor(), section)?;
                 let source_bytes =
                     packed.len + scale.len + zero_point.as_ref().map(|z| z.len).unwrap_or(0);
-                let d = plan.descriptor();
-                Resolved {
-                    role: t.role.clone(),
-                    alignment: t.alignment,
-                    components: moxie_format::canonical::affine_components(
-                        &t.role,
-                        plan.descriptor(),
-                        section,
-                    )?,
-                    shape: vec![d.out_features as u64, d.in_features as u64],
-                    precision: match d.width {
-                        moxie_format::affine::IntWidth::Int4 => TensorPrecision::AffineInt4V1,
-                        moxie_format::affine::IntWidth::Int8 => TensorPrecision::AffineInt8V1,
-                    },
-                    affine: Some(AffineFields {
-                        group_rule: match d.grouping {
-                            Grouping::PerOutputChannel => GroupRule::PerChannel,
-                            Grouping::Contiguous { size: 32 } => GroupRule::Contiguous32,
-                            Grouping::Contiguous { size: 128 } => GroupRule::Contiguous128,
-                            Grouping::Contiguous { size } => {
-                                return Err(invalid(format!(
-                                    "tensor '{}': group size {size} has no manifest group_rule",
-                                    t.role
-                                )));
-                            }
-                        },
-                        scale_dtype: match d.scale_dtype {
-                            ScaleDtype::F16 => ManifestScaleDtype::F16,
-                            ScaleDtype::Bf16 => ManifestScaleDtype::Bf16,
-                            ScaleDtype::F32 => ManifestScaleDtype::F32,
-                        },
-                        zero_point: match section {
-                            ZeroPointSection::Absent => ZeroPointMode::Symmetric,
-                            ZeroPointSection::PerGroup => ZeroPointMode::PerGroup,
-                        },
-                        // Preserved rather than invented: the importer refuses
-                        // a source that carries an activation-order map, so a
-                        // canonical group index can only be absent here. When
-                        // that lane exists it arrives through the descriptor,
-                        // never by being defaulted away.
-                        group_index: d.group_index.clone(),
-                    }),
-                    canonical_bytes,
+                resolved_integer(
+                    t,
+                    module,
+                    files,
+                    IntegerPlan::CompressedTensors(plan),
+                    section,
                     source_bytes,
-                    kind: ResolvedKind::PackQuantized {
-                        module: module.clone(),
-                        plan,
-                        files: files.clone(),
-                        section,
-                    },
-                }
+                )?
             }
         };
         out.push(resolved);
     }
     Ok(out)
+}
+
+fn resolved_integer(
+    t: &moxie_format::selection::SelectedTensor,
+    module: &str,
+    files: &BTreeMap<String, String>,
+    plan: IntegerPlan,
+    section: ZeroPointSection,
+    source_bytes: u64,
+) -> Result<Resolved> {
+    let canonical_bytes = payload::length_of(plan.descriptor(), section)?;
+    let d = plan.descriptor();
+    Ok(Resolved {
+        role: t.role.clone(),
+        alignment: t.alignment,
+        components: moxie_format::canonical::affine_components(
+            &t.role,
+            plan.descriptor(),
+            section,
+        )?,
+        shape: vec![d.out_features as u64, d.in_features as u64],
+        precision: match d.width {
+            moxie_format::affine::IntWidth::Int4 => TensorPrecision::AffineInt4V1,
+            moxie_format::affine::IntWidth::Int8 => TensorPrecision::AffineInt8V1,
+        },
+        affine: Some(AffineFields {
+            group_rule: match d.grouping {
+                Grouping::PerOutputChannel => GroupRule::PerChannel,
+                Grouping::Contiguous { size: 32 } => GroupRule::Contiguous32,
+                Grouping::Contiguous { size: 128 } => GroupRule::Contiguous128,
+                Grouping::Contiguous { size } => {
+                    return Err(invalid(format!(
+                        "tensor '{}': group size {size} has no manifest group_rule",
+                        t.role
+                    )));
+                }
+            },
+            scale_dtype: match d.scale_dtype {
+                ScaleDtype::F16 => ManifestScaleDtype::F16,
+                ScaleDtype::Bf16 => ManifestScaleDtype::Bf16,
+                ScaleDtype::F32 => ManifestScaleDtype::F32,
+            },
+            zero_point: match section {
+                ZeroPointSection::Absent => ZeroPointMode::Symmetric,
+                ZeroPointSection::PerGroup => ZeroPointMode::PerGroup,
+            },
+            // Preserved rather than invented: the importer refuses
+            // a source that carries an activation-order map, so a
+            // canonical group index can only be absent here. When
+            // that lane exists it arrives through the descriptor,
+            // never by being defaulted away.
+            group_index: d.group_index.clone(),
+        }),
+        canonical_bytes,
+        source_bytes,
+        kind: ResolvedKind::Integer {
+            module: module.to_string(),
+            plan,
+            files: files.clone(),
+            section,
+        },
+    })
 }
 
 /// Build the output plan from resolved tensors.
@@ -828,12 +952,36 @@ pub fn inspect(
 }
 
 /// Admit what this selection's parsed form will occupy.
+/// In addition to ordinary per-tensor metadata, mapped integer inputs retain
+/// raw map bytes, decoded maps in the resolved/output/manifest representations,
+/// validation counts, and serialized decimal entries. Reserve 64 bytes per
+/// logical input column before resolving a declared GPTQ map. An undeclared
+/// map is refused before allocation. Oversized sums refuse first.
+fn selection_metadata_bound(budgets: &Budgets, selection: &Selection) -> Result<u64> {
+    let mut bound =
+        budgets.metadata_bound(selection.source_bytes(), selection.tensors.len() as u64);
+    for tensor in &selection.tensors {
+        if let SelectionKind::Gptq { logical, files, .. } = &tensor.kind
+            && files.contains_key("g_idx")
+        {
+            bound = bound
+                .checked_add(
+                    (logical.1 as u64)
+                        .checked_mul(64)
+                        .ok_or_else(|| invalid("GPTQ map memory bound overflows".into()))?,
+                )
+                .ok_or_else(|| invalid("metadata memory bound overflows".into()))?;
+        }
+    }
+    Ok(bound)
+}
+
 fn admit_metadata(
     ledger: &mut Ledger,
     selection: &Selection,
     budgets: &Budgets,
 ) -> Result<Reservation> {
-    let bound = budgets.metadata_bound(selection.source_bytes(), selection.tensors.len() as u64);
+    let bound = selection_metadata_bound(budgets, selection)?;
     let mut plan = PlanRequest::new("repack metadata", ["live"])?;
     plan.buffer(BufferRequest::new(
         "parsed selection, plan, headers and report",
@@ -959,6 +1107,22 @@ pub fn selection_digest(selection: &Selection) -> String {
                 field(name.as_bytes());
                 field(file.as_bytes());
             }
+            SelectionKind::Gptq {
+                module,
+                spec,
+                logical,
+                files,
+            } => {
+                field(b"gptq-v1");
+                field(module.as_bytes());
+                field(format!("{spec:?}").as_bytes());
+                field(&(logical.0 as u64).to_le_bytes());
+                field(&(logical.1 as u64).to_le_bytes());
+                for (suffix, file) in files {
+                    field(suffix.as_bytes());
+                    field(file.as_bytes());
+                }
+            }
             SelectionKind::PackQuantized {
                 module,
                 spec,
@@ -1014,7 +1178,7 @@ pub fn repack(
     // What the parsed selection, the plan, the shard headers and the manifest
     // will hold -- admitted before any of them is built, and proportional to
     // this selection rather than to a constant.
-    let metadata = budgets.metadata_bound(selection.source_bytes(), selection.tensors.len() as u64);
+    let metadata = selection_metadata_bound(budgets, selection)?;
     let mut buffers = work::Buffers::admit(ledger, budgets, metadata)?;
     let mut run_slot: Option<Run> = None;
     let result = repack_inner(

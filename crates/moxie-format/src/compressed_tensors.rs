@@ -654,7 +654,7 @@ impl PackQuantizedPlan {
     ///
     /// The source's table is already row-major `(output channel, group)` in the
     /// canonical dtype, so the bytes are preserved exactly -- and validated:
-    /// a non-finite or non-positive scale is refused rather than copied.
+    /// a non-finite or zero scale is refused rather than copied.
     pub fn convert_scale_rows(
         &self,
         rows: core::ops::Range<usize>,
@@ -1199,9 +1199,9 @@ mod tests {
             )
             .is_err()
         );
-        // Nonfinite, zero and negative scales each rejected by the canonical
+        // Nonfinite and either signed zero scale rejected by the canonical
         // validator, reached through the importer.
-        for bits in [0x7F80u16, 0x0000, 0xBF80] {
+        for bits in [0x7F80u16, 0x0000, 0x8000] {
             let bad: Vec<u8> = (0..4).flat_map(|_| bits.to_le_bytes()).collect();
             assert!(
                 import(

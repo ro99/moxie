@@ -338,8 +338,8 @@ const BATTERY_T0006: &[Mutation] = &[
     Mutation {
         name: "scale-block-not-validated",
         file: "crates/moxie-format/src/payload.rs",
-        from: r#"        if !v.is_finite() || v <= 0.0 {"#,
-        to: r#"        if false && (!v.is_finite() || v <= 0.0) {"#,
+        from: r#"        if !v.is_finite() || v == 0.0 {"#,
+        to: r#"        if false && (!v.is_finite() || v == 0.0) {"#,
         expect: Expect::Caught,
     },
     Mutation {
@@ -841,7 +841,8 @@ const BATTERY_T0028: &[Mutation] = &[
         .iter()
         .map(|t| match &t.kind {
             moxie_format::selection::SelectionKind::Bf16 { .. } => 1,
-            moxie_format::selection::SelectionKind::PackQuantized { files, .. } => files.len(),
+            moxie_format::selection::SelectionKind::PackQuantized { files, .. }
+            | moxie_format::selection::SelectionKind::Gptq { files, .. } => files.len(),
         })
         .sum();
     if accounted == index_tensors {
@@ -852,7 +853,7 @@ const BATTERY_T0028: &[Mutation] = &[
     },
     Mutation {
         name: "int4-nibble-pair-read-backwards",
-        file: "crates/moxie-kernels/cuda/affine_linear.cu",
+        file: "crates/moxie-kernels/cuda/affine_decode.cuh",
         from: r#"        (k & 1ULL) ? (byte >> 4) : (byte & 0x0FU));"#,
         to: r#"        (k & 1ULL) ? (byte & 0x0FU) : (byte >> 4));"#,
         expect: Expect::Caught,
@@ -876,7 +877,7 @@ const BATTERY_T0028: &[Mutation] = &[
     },
     Mutation {
         name: "bf16-scales-decoded-as-f16",
-        file: "crates/moxie-kernels/cuda/affine_linear.cu",
+        file: "crates/moxie-kernels/cuda/affine_decode.cuh",
         from: r#"    if (kind == 1U) {"#,
         to: r#"    if (kind == 9U) {"#,
         expect: Expect::Caught,

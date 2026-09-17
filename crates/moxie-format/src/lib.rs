@@ -25,6 +25,7 @@ pub mod bf16;
 pub mod canonical;
 pub mod checkpoint_config;
 pub mod compressed_tensors;
+pub mod gptq;
 pub mod journal;
 pub mod manifest;
 pub mod payload;

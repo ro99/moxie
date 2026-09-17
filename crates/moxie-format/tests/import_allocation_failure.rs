@@ -471,3 +471,52 @@ fn every_allocation_position_in_source_entries_is_a_typed_error() {
     eprintln!("task0024 source_entries sweep: {swept} allocation position(s) refused");
     assert!(swept >= 5, "every case must have had positions refused");
 }
+
+#[test]
+fn gptq_import_recovers_every_allocation_including_group_map_validation() {
+    use moxie_format::gptq::{DeclaredSource, GptqSpec, SourceTensors};
+    let weights = [0x76u8; 32 * 8 * 4];
+    let zeros = [0x77u8; 2 * 4];
+    let scales = 0x3c00u16.to_le_bytes().repeat(16);
+    let map: Vec<u8> = (0..256i32)
+        .flat_map(|k| (1 - k / 128).to_le_bytes())
+        .collect();
+    let spec = GptqSpec {
+        width: IntWidth::Int4,
+        group_size: 128,
+        requires_group_index: true,
+    };
+    let source = SourceTensors {
+        declaration: DeclaredSource {
+            logical: (8, 256),
+            qweight_shape: &[32, 8],
+            qzeros_shape: &[2, 1],
+            scales_shape: &[2, 8],
+            scale_dtype: ScaleDtype::F16,
+            group_index: Some(&map),
+            group_index_shape: Some(&[256]),
+        },
+        qweight: &weights,
+        qzeros: &zeros,
+        scales: &scales,
+    };
+    let positions = allocations_of(|| moxie_format::gptq::import(&spec, source).unwrap());
+    assert!(positions > 0);
+    for at in 0..positions {
+        let result = while_failing_at(at, 1, || moxie_format::gptq::import(&spec, source));
+        assert!(
+            matches!(result, Err(Error::CapacityExceeded { .. })),
+            "GPTQ allocation {at}: {result:?}"
+        );
+    }
+    assert!(while_failing_at(positions, 1, || moxie_format::gptq::import(&spec, source)).is_ok());
+    let mut invalid = source;
+    invalid.declaration.qzeros_shape = &[2, 2];
+    let positions = allocations_of(|| moxie_format::gptq::import(&spec, invalid).unwrap_err());
+    for at in 0..=positions {
+        assert!(while_failing_at(at, 1, || moxie_format::gptq::import(&spec, invalid)).is_err());
+    }
+    eprintln!(
+        "GPTQ valid import: all allocation positions refused; malformed header remains an error"
+    );
+}

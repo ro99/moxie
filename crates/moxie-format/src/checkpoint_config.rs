@@ -30,9 +30,18 @@ fn invalid(detail: core::fmt::Arguments<'_>) -> Error {
 /// The largest `config.json` this will read, before reading it.
 pub const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegerSerialization {
+    CompressedTensors,
+    GptqV1 { requires_group_index: bool },
+}
+
 /// What a checkpoint says about how its weights are packed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuantizationDeclaration {
+    pub serialization: IntegerSerialization,
+    /// AutoRound regex overrides requiring unquantized source tensors.
+    pub passthrough_patterns: Vec<String>,
     /// `int4` or `int8`, from `num_bits`.
     pub bits: u32,
     /// How scales are shared, from `strategy` and `group_size`.
@@ -76,6 +85,24 @@ struct RawQuantization {
     config_groups: std::collections::BTreeMap<String, RawGroup>,
     #[serde(default)]
     ignore: Vec<String>,
+    #[serde(default)]
+    packing_format: String,
+    #[serde(default)]
+    autoround_version: String,
+    bits: Option<u32>,
+    group_size: Option<i64>,
+    sym: Option<bool>,
+    desc_act: Option<bool>,
+    data_type: Option<String>,
+    #[serde(default)]
+    extra_config: std::collections::BTreeMap<String, RawOverride>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOverride {
+    bits: u32,
+    data_type: String,
 }
 
 #[derive(Deserialize)]
@@ -125,6 +152,56 @@ pub fn parse(text: &str) -> Result<CheckpointDeclaration> {
             quantization: None,
         });
     };
+    if q.quant_method == "auto-round" && q.packing_format == "auto_round:auto_gptq" {
+        if !q.format.is_empty() || !q.config_groups.is_empty() {
+            return Err(invalid_static(
+                "AutoRound GPTQ declaration conflicts with compressed-tensors fields",
+            ));
+        }
+        if q.autoround_version != "0.15.0"
+            || q.data_type.as_deref() != Some("int")
+            || q.sym.is_none()
+        {
+            return Err(invalid_static(
+                "AutoRound GPTQ import requires the pinned 0.15.0 integer declaration and explicit symmetry",
+            ));
+        }
+        let bits = q
+            .bits
+            .ok_or_else(|| invalid_static("AutoRound declares no bits"))?;
+        if !matches!(bits, 4 | 8) {
+            return Err(invalid_static("AutoRound importer supports INT4/INT8 only"));
+        }
+        let size = match q.group_size {
+            Some(32) => 32,
+            Some(128) => 128,
+            _ => return Err(invalid_static("AutoRound importer requires group32/128")),
+        };
+        let mut passthrough_patterns = Vec::new();
+        for (pattern, over) in q.extra_config {
+            if over.bits != 16 || !matches!(over.data_type.as_str(), "fp" | "float") {
+                return Err(invalid_static(
+                    "AutoRound per-module quantized overrides need their own packing specification; only declared 16-bit passthrough overrides are supported",
+                ));
+            }
+            passthrough_patterns.push(pattern);
+        }
+        return Ok(CheckpointDeclaration {
+            model_type: raw.model_type,
+            architecture,
+            quantization: Some(QuantizationDeclaration {
+                serialization: IntegerSerialization::GptqV1 {
+                    requires_group_index: q.desc_act.unwrap_or(false),
+                },
+                passthrough_patterns,
+                bits,
+                granularity: Granularity::Group { size },
+                // GPTQ carries explicit qzeros even for symmetric sources.
+                zero_points: ZeroPointSource::PackedAlongOutput,
+                ignored: q.ignore,
+            }),
+        });
+    }
     if q.format != "pack-quantized" {
         let declared = if q.format.is_empty() {
             if q.quant_method.is_empty() {
@@ -135,16 +212,10 @@ pub fn parse(text: &str) -> Result<CheckpointDeclaration> {
         } else {
             format!("format '{}'", q.format)
         };
-        let known = match q.quant_method.as_str() {
-            "auto-round" => {
-                " auto-round stores GPTQ-style `qweight`, `qzeros` and `scales`, which is a                  different packing rather than a different spelling of this one: reading it needs                  a shared importer this repository does not have yet."
-            }
-            _ => "",
-        };
         return Err(invalid(format_args!(
-            "this checkpoint declares {declared}; only compressed-tensors 'pack-quantized' has \
-             been measured here.{known} Guessing at a packing is how a conversion produces wrong \
-             values that no checksum can see, so it is refused"
+            "this checkpoint declares {declared}; supported declarations are compressed-tensors \
+             pack-quantized and pinned AutoRound 0.15.0 auto_round:auto_gptq. \
+             Unsupported packing is refused rather than inferred"
         )));
     }
     if q.config_groups.len() != 1 {
@@ -221,6 +292,8 @@ pub fn parse(text: &str) -> Result<CheckpointDeclaration> {
         model_type: raw.model_type,
         architecture,
         quantization: Some(QuantizationDeclaration {
+            serialization: IntegerSerialization::CompressedTensors,
+            passthrough_patterns: Vec::new(),
             bits,
             granularity,
             zero_points,

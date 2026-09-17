@@ -666,11 +666,56 @@ pub struct ExpertKernels<'a> {
     pub catalogue: &'a KernelCatalogue,
 }
 
+/// Byte interpretation of one expert projection, independent of checkpoint method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertWeightFormat {
+    Bf16,
+    Affine {
+        width: Precision,
+        group: u32,
+        scale: Precision,
+        zeros: bool,
+    },
+}
+
+impl ExpertWeightFormat {
+    pub const fn precision(self) -> Precision {
+        match self {
+            Self::Bf16 => Precision::Bf16,
+            Self::Affine { width, .. } => width,
+        }
+    }
+    pub fn bytes(self, outputs: u64, inputs: u64) -> Option<u64> {
+        match self {
+            Self::Bf16 => outputs.checked_mul(inputs)?.checked_mul(2),
+            Self::Affine {
+                width,
+                group,
+                scale,
+                zeros,
+            } => {
+                if !matches!(width, Precision::Int4 | Precision::Int8)
+                    || !matches!(group, 32 | 128)
+                    || !matches!(scale, Precision::F16 | Precision::Bf16 | Precision::F32)
+                {
+                    return None;
+                }
+                let codes = outputs.checked_mul(inputs.div_ceil(u64::from(8 / width.bits())))?;
+                let metadata = outputs
+                    .checked_mul(inputs.div_ceil(u64::from(group)))?
+                    .checked_mul(u64::from(scale.bits() / 8) + if zeros { 2 } else { 0 })?;
+                codes.checked_add(metadata)
+            }
+        }
+    }
+}
+
 /// A routed layer's expert work, decided.
 // Not `Eq`: the combine's output scale is an `f32`, and a plan carries the
 // checkpoint's value rather than a canonicalised one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpertPlan {
+    weight_formats: [ExpertWeightFormat; 2],
     kernel: Option<SemanticKernelDescriptor>,
     shape: ExpertShape,
     rows: u64,
@@ -686,6 +731,9 @@ pub struct ExpertPlan {
 }
 
 impl ExpertPlan {
+    pub const fn weight_formats(&self) -> [ExpertWeightFormat; 2] {
+        self.weight_formats
+    }
     pub const fn shape(&self) -> ExpertShape {
         self.shape
     }
@@ -1033,6 +1081,30 @@ pub fn compile_experts(
     topology: Option<&NumaTopology>,
     kernels: Option<ExpertKernels<'_>>,
 ) -> std::result::Result<ExpertPlan, ExpertPlanRefused> {
+    compile_experts_with_weights(
+        mlp,
+        combine,
+        route_experts,
+        budget,
+        policy,
+        topology,
+        kernels,
+        [ExpertWeightFormat::Bf16; 2],
+    )
+}
+
+/// Compile the same shared grouped operation with explicit canonical operands.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_experts_with_weights(
+    mlp: &OpParams,
+    combine: &OpParams,
+    route_experts: &[u32],
+    budget: &ExpertBudget,
+    policy: &ExpertPolicy,
+    topology: Option<&NumaTopology>,
+    kernels: Option<ExpertKernels<'_>>,
+    weight_formats: [ExpertWeightFormat; 2],
+) -> std::result::Result<ExpertPlan, ExpertPlanRefused> {
     let refuse = |error: Error| ExpertPlanRefused {
         error,
         device: None,
@@ -1103,8 +1175,15 @@ pub fn compile_experts(
     let group_count = grouped.len();
 
     let chunk_bytes = shape
-        .chunk_bytes()
-        .ok_or_else(|| refuse(overflow("one expert's chunk extent")))?;
+        .intermediate
+        .checked_mul(2)
+        .and_then(|rows| weight_formats[0].bytes(rows, shape.hidden))
+        .and_then(|gate_up| {
+            weight_formats[1]
+                .bytes(shape.hidden, shape.intermediate)
+                .and_then(|down| gate_up.checked_add(down))
+        })
+        .ok_or_else(|| refuse(overflow("one expert's canonical chunk extent or format")))?;
     let queue_capacity = policy
         .max_inflight_orders
         .min(u32::try_from(group_count).unwrap_or(u32::MAX))
@@ -1236,7 +1315,9 @@ pub fn compile_experts(
     // says so, rather than being discovered at the launch site where writing a
     // fallback would be the easy thing to do.
     let selected = match kernels {
-        Some(kernels) => select_expert_kernel(shape, rows, kernels).ok(),
+        Some(kernels) => {
+            select_expert_kernel_with_weights(shape, rows, kernels, weight_formats).ok()
+        }
         None => None,
     };
     let device_unavailable = if policy.host == StrategyControl::Required {
@@ -1597,6 +1678,7 @@ pub fn compile_experts(
     };
 
     let plan = ExpertPlan {
+        weight_formats,
         kernel: if any_device { selected } else { None },
         shape,
         rows,
@@ -1687,6 +1769,32 @@ pub fn select_expert_kernel(
     rows: u64,
     kernels: ExpertKernels<'_>,
 ) -> Result<SemanticKernelDescriptor> {
+    select_expert_kernel_with_weights(shape, rows, kernels, [ExpertWeightFormat::Bf16; 2])
+}
+
+pub fn select_expert_kernel_with_weights(
+    shape: ExpertShape,
+    rows: u64,
+    kernels: ExpertKernels<'_>,
+    weights: [ExpertWeightFormat; 2],
+) -> Result<SemanticKernelDescriptor> {
+    if shape.hidden == 0
+        || shape.intermediate == 0
+        || shape
+            .intermediate
+            .checked_mul(2)
+            .and_then(|rows| weights[0].bytes(rows, shape.hidden))
+            .is_none()
+        || weights[1].bytes(shape.hidden, shape.intermediate).is_none()
+    {
+        return Err(invalid(
+            "weights",
+            "invalid canonical expert geometry or format".into(),
+        ));
+    }
+    let mut operands = operand_roles();
+    operands[2] = KernelOperand::Weight(WeightPrecision::expect(weights[0].precision()));
+    operands[3] = KernelOperand::Weight(WeightPrecision::expect(weights[1].precision()));
     let operation = SemanticKernelOp::ExpertMlp(shape.gate_transform());
     let assignments = rows
         .checked_mul(shape.top_k)
@@ -1698,7 +1806,7 @@ pub fn select_expert_kernel(
         .filter(|d| {
             d.operation == operation
                 && d.abi_version == EXPERT_ABI_VERSION
-                && d.inputs == operand_roles()
+                && d.inputs == operands
                 && d.output == ActivationPrecision::expect(Precision::Bf16)
                 && d.accumulation == AccumulationPolicy::Bf16InF32Acc
                 && d.rounding == RoundingProfile::FinalBf16Rne

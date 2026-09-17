@@ -259,3 +259,22 @@ runs would be a figure about a tree whose battery is unmeasured, which is the
 mistake task 0030 spent a round correcting. Until the batteries run, acceptance
 1's verdict stands on the single-mutation run above and nothing else, and **a
 single-mutation run is not the battery**.
+
+
+## Recovery battery, 2026-09-17
+
+The original /tmp run was interrupted by a reboot and is not completion evidence.
+The test operator monitored the restarted full T0006 run in the persistent
+`/home/rodrigo/Developer/moxie-m3-publication-battery` worktree at
+`356f9655a8f7ca1add336a04a8dbf72b9b3f1ad1`, detached and clean after the driver.
+Logs: `results/m3-recovery/t0006.log`, exit status file `t0006.exit` (exit 1).
+
+Twelve baseline lanes, three repetitions, stable before and after. All 66
+substitutions ran: 58/63 caught, 3/3 expected controls held, **five unexpected
+survivors**, zero unstable/invalid/broken/skipped. Acceptance2 remains open.
+Survivors: journal-recorded-before-the-bytes-are-durable-tail,
+source-identity-not-rebound, cancelled-hashing-is-an-error-again,
+compaction-peak-not-budgeted, plan-budgets-for-one-journal.
+The operator is investigating regression tests on that isolated snapshot;
+expectations remain unchanged. This result does not qualify subsequent builder
+changes. Targeted checks of the five survivors come before any repeat full run.

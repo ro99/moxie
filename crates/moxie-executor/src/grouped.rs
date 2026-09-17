@@ -37,7 +37,9 @@ use moxie_memory::{
     LedgerId, LogicalRange, PlanRequest, Reservation, ReservationId, ResidencyAuthority,
     ResidencyLease, StageSpan, TensorSlot, TurnId, UseClass, WorkOrder,
 };
-use moxie_plan::expert::{Candidate, ExpertGroup, ExpertPlan, ExpertShape, Placement};
+use moxie_plan::expert::{
+    Candidate, ExpertGroup, ExpertPlan, ExpertShape, ExpertWeightFormat, Placement,
+};
 use moxie_types::{
     DeviceTier, Error, HostPlacement, HostTier, NumaTopology, Result, Scope, StrategyControl, Tier,
 };
@@ -288,6 +290,8 @@ impl core::fmt::Display for QueueFull {
 /// the same rule `ShardSource` already follows.
 #[derive(Debug, Clone)]
 pub struct ExpertRoles {
+    /// Explicit canonical role pairs, one per expert. None retains fused BF16 roles.
+    pub per_expert: Option<Vec<(String, String)>>,
     pub artifact: ArtifactId,
     pub gate_up_role: String,
     pub down_role: String,
@@ -302,6 +306,15 @@ impl ExpertRoles {
     /// the plan because a `ChunkId` is `moxie-memory`'s vocabulary and
     /// `moxie-plan` may not name it.
     pub fn chunks(&self, expert: u32, shape: ExpertShape) -> Result<(ChunkId, ChunkId)> {
+        self.chunks_with_formats(expert, shape, [ExpertWeightFormat::Bf16; 2])
+    }
+
+    pub fn chunks_with_formats(
+        &self,
+        expert: u32,
+        shape: ExpertShape,
+        formats: [ExpertWeightFormat; 2],
+    ) -> Result<(ChunkId, ChunkId)> {
         if u64::from(expert) >= shape.experts {
             return Err(invalid(
                 "expert",
@@ -311,14 +324,40 @@ impl ExpertRoles {
         let gate_up_stride = shape
             .intermediate
             .checked_mul(2)
-            .and_then(|v| v.checked_mul(shape.hidden))
-            .and_then(|v| v.checked_mul(BF16))
-            .ok_or_else(|| invalid("shape", "the gate/up stride overflows".into()))?;
-        let down_stride = shape
-            .hidden
-            .checked_mul(shape.intermediate)
-            .and_then(|v| v.checked_mul(BF16))
-            .ok_or_else(|| invalid("shape", "the down stride overflows".into()))?;
+            .and_then(|rows| formats[0].bytes(rows, shape.hidden))
+            .ok_or_else(|| invalid("shape", "the gate/up extent or format is invalid".into()))?;
+        let down_stride = formats[1]
+            .bytes(shape.hidden, shape.intermediate)
+            .ok_or_else(|| invalid("shape", "the down extent or format is invalid".into()))?;
+        if let Some(roles) = &self.per_expert {
+            if roles.len() as u64 != shape.experts {
+                return Err(invalid(
+                    "roles",
+                    "one explicit role pair is required per expert".into(),
+                ));
+            }
+            let (gate_up, down) = &roles[expert as usize];
+            return Ok((
+                ChunkId::new(
+                    self.artifact.clone(),
+                    TensorSlot::expert(gate_up.clone(), expert)?,
+                    LogicalRange::new(0, gate_up_stride)?,
+                    self.format_version,
+                ),
+                ChunkId::new(
+                    self.artifact.clone(),
+                    TensorSlot::expert(down.clone(), expert)?,
+                    LogicalRange::new(0, down_stride)?,
+                    self.format_version,
+                ),
+            ));
+        }
+        if formats != [ExpertWeightFormat::Bf16; 2] {
+            return Err(invalid(
+                "roles",
+                "affine experts require explicit canonical role pairs".into(),
+            ));
+        }
         let e = u64::from(expert);
         let gate_up = ChunkId::new(
             self.artifact.clone(),
@@ -1165,6 +1204,21 @@ impl<'lane> GroupedRun<'lane> {
         roles: ExpertRoles,
         topology: Option<&NumaTopology>,
     ) -> std::result::Result<Self, GroupedAdmitRefused> {
+        if roles
+            .per_expert
+            .as_ref()
+            .is_some_and(|pairs| pairs.len() as u64 != plan.shape().experts)
+            || (roles.per_expert.is_none()
+                && plan.weight_formats() != [ExpertWeightFormat::Bf16; 2])
+        {
+            return Err(GroupedAdmitRefused::Invalid {
+                plan: Box::new(plan),
+                error: invalid(
+                    "roles",
+                    "canonical integer experts require one explicit role pair per expert".into(),
+                ),
+            });
+        }
         let request = match Self::request_for(&plan) {
             Ok(request) => request,
             Err(error) => {
@@ -1566,6 +1620,7 @@ fn too_large(what: &'static str) -> Error {
 /// One group's acquire, as a single argument.
 #[derive(Debug, Clone, Copy)]
 struct GroupAcquire {
+    formats: [ExpertWeightFormat; 2],
     shape: ExpertShape,
     expert: u32,
     scope: Scope,
@@ -1608,16 +1663,17 @@ fn acquire_pair<S: ChunkSource>(
     what: GroupAcquire,
     mut lane: Option<&mut (dyn ExpertDeviceLane + '_)>,
 ) -> std::result::Result<(ResidencyLease, ResidencyLease, [u64; 2]), AcquireFailed> {
-    let (gate_up_chunk, down_chunk) = match roles.chunks(what.expert, what.shape) {
-        Ok(pair) => pair,
-        Err(error) => {
-            return Err(AcquireFailed {
-                error,
-                held: Vec::new(),
-                attempts: [0, 0],
-            });
-        }
-    };
+    let (gate_up_chunk, down_chunk) =
+        match roles.chunks_with_formats(what.expert, what.shape, what.formats) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return Err(AcquireFailed {
+                    error,
+                    held: Vec::new(),
+                    attempts: [0, 0],
+                });
+            }
+        };
     let class = UseClass::demand(Content::Expert);
     let mut held: Vec<ResidencyLease> = Vec::with_capacity(2);
     let mut attempts = [0u64; 2];
@@ -1754,6 +1810,7 @@ impl<'lane> GroupedRun<'lane> {
                 source,
                 &self.roles,
                 GroupAcquire {
+                    formats: self.plan.weight_formats(),
                     shape: self.plan.shape(),
                     expert,
                     scope,
@@ -1896,7 +1953,46 @@ impl<'lane> GroupedRun<'lane> {
                     ..
                 } = &mut self.buffers;
                 let (_, tile) = workspace.as_mut_slice().split_at_mut(reduction);
-                moxie_kernels::cpu_expert::expert_group_bf16(
+                let operand =
+                    |bytes,
+                     rows,
+                     cols,
+                     format|
+                     -> Result<moxie_kernels::cpu_expert::ExpertWeight<'_>> {
+                        Ok(match format {
+                            ExpertWeightFormat::Bf16 => {
+                                moxie_kernels::cpu_expert::ExpertWeight::Bf16(bytes)
+                            }
+                            ExpertWeightFormat::Affine {
+                                width,
+                                group,
+                                scale,
+                                zeros,
+                            } => moxie_kernels::cpu_expert::ExpertWeight::Affine(
+                                moxie_kernels::affine::AffineWeight::new(
+                                    bytes,
+                                    rows,
+                                    cols,
+                                    width,
+                                    group as usize,
+                                    scale,
+                                    zeros,
+                                    None,
+                                )?,
+                            ),
+                        })
+                    };
+                let formats = self.plan.weight_formats();
+                let gate_up = operand(
+                    gate_up,
+                    2 * intermediate as usize,
+                    hidden as usize,
+                    formats[0],
+                )
+                .map_err(plain)?;
+                let down = operand(down, hidden as usize, intermediate as usize, formats[1])
+                    .map_err(plain)?;
+                moxie_kernels::cpu_expert::expert_group_weights(
                     x.as_slice(),
                     moxie_kernels::cpu_expert::ExpertAssignment {
                         rows: group.rows(),

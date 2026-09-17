@@ -1254,3 +1254,20 @@ borrowing names from each header; a nested per-module scan would have reparsed
 large headers tens of thousands of times. Indexed discovery checks its index;
 a manual partial selection has only its declared source set. A claim about all
 checkpoint files needs the index and its admitted parse memory.
+
+
+## 2026-09-17 — source scales and quantized expert continuation
+
+Task0034's first bounded real AutoRound sample failed the positive-scale rule:
+the pinned GLM source stores negative F16 scales. Synthetic positive-only fixtures
+could never have shown it. The owner chose exact signed-scale preservation in
+ADR0030; 43,008 sampled source values then matched the canonical equation bitwise.
+Read actual source values before calling a format integration validated.
+
+Task0035 extends the existing grouped planner, host kernel, device attachment and
+residency authority. Packed codes and metadata replace BF16 byte extents; they do
+not introduce a second cache or a full dequantized weight copy. Both gate
+transforms and mixed projection precisions passed synthetic oracle checks on all
+three GPUs. Composition of two graphs is separate from execution of a complete
+graph; neither yields a checkpoint token. Mapped GPU operands and artifact binding
+remain explicit work, not an implied capability of a successful decoder test.

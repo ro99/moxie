@@ -41,6 +41,8 @@ pub struct Discovery {
     pub checkpoint: CheckpointDeclaration,
     /// Quantized modules, by module prefix, with the shard each tensor is in.
     pub modules: Vec<(String, BTreeMap<String, String>)>,
+    /// GPTQ logical shapes derived from the declared packed input extent.
+    pub gptq_shapes: BTreeMap<String, [usize; 2]>,
     /// BF16 tensors, as `(name, file)`.
     pub bf16: Vec<(String, String)>,
     /// What was found and left out, each with the reason.
@@ -203,6 +205,13 @@ pub fn discover(root: &Path, sources: &mut Sources) -> Result<Discovery> {
         )));
     }
 
+    let gptq = checkpoint.quantization.as_ref().is_some_and(|q| {
+        matches!(
+            q.serialization,
+            checkpoint_config::IntegerSerialization::GptqV1 { .. }
+        )
+    });
+    let mut gptq_shapes = BTreeMap::new();
     let symmetric = checkpoint
         .quantization
         .as_ref()
@@ -211,7 +220,9 @@ pub fn discover(root: &Path, sources: &mut Sources) -> Result<Discovery> {
     // A module carries three tensors when it is symmetric and four when it is
     // not: assuming four made the accounting go negative on every symmetric
     // checkpoint measured.
-    let suffixes: &[&str] = if symmetric {
+    let suffixes: &[&str] = if gptq {
+        &["qweight", "qzeros", "scales"]
+    } else if symmetric {
         &MODULE_SUFFIXES[..3]
     } else {
         &MODULE_SUFFIXES
@@ -228,14 +239,42 @@ pub fn discover(root: &Path, sources: &mut Sources) -> Result<Discovery> {
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut claimed: BTreeSet<String> = BTreeSet::new();
 
+    let anchor_suffix = if gptq { ".qweight" } else { ".weight_packed" };
     let mut anchors: Vec<&String> = index
         .keys()
-        .filter(|n| n.ends_with(".weight_packed"))
+        .filter(|n| n.ends_with(anchor_suffix))
         .collect();
     anchors.sort();
+    // Pinned AutoRound matches_any_regex uses re.search over the stored
+    // pattern. Compile one bounded matcher at a time; unsupported Python-only
+    // syntax refuses instead of silently dropping an override.
+    if let Some(q) = &checkpoint.quantization {
+        for pattern in &q.passthrough_patterns {
+            let raw_pattern = pattern
+                .strip_prefix("+:")
+                .or_else(|| pattern.strip_prefix("-:"))
+                .unwrap_or(pattern);
+            let matcher = regex::RegexBuilder::new(raw_pattern)
+                .size_limit(1 << 20)
+                .build()
+                .map_err(|e| {
+                    invalid(format!(
+                        "invalid or unsupported passthrough override {pattern:?}: {e}"
+                    ))
+                })?;
+            if let Some(name) = anchors
+                .iter()
+                .find(|n| matcher.is_match(n.strip_suffix(anchor_suffix).expect("anchor")))
+            {
+                return Err(invalid(format!(
+                    "{name} is quantized but matches 16-bit passthrough override {pattern:?}"
+                )));
+            }
+        }
+    }
     for anchor in anchors {
         let module = anchor
-            .strip_suffix(".weight_packed")
+            .strip_suffix(anchor_suffix)
             .expect("filtered on the suffix");
         if ignored.contains(module) {
             skipped.push((
@@ -262,7 +301,40 @@ pub fn discover(root: &Path, sources: &mut Sources) -> Result<Discovery> {
             ));
             continue;
         }
-        for suffix in suffixes {
+        if gptq {
+            let q = checkpoint.quantization.as_ref().expect("GPTQ declaration");
+            let (file, _) = declared.get(anchor).expect("declared anchor");
+            let weight = sources.entry(file, anchor)?;
+            if weight.dtype != Dtype::I32 || weight.shape.len() != 2 {
+                return Err(invalid(format!(
+                    "{anchor}: GPTQ qweight must be rank-two I32"
+                )));
+            }
+            let inputs = weight.shape[0]
+                .checked_mul(u64::from(32 / q.bits))
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| invalid("GPTQ input extent overflows".into()))?;
+            let outputs = usize::try_from(weight.shape[1])
+                .map_err(|_| invalid("GPTQ output extent overflows".into()))?;
+            gptq_shapes.insert(module.to_string(), [outputs, inputs]);
+            let map_name = format!("{module}.g_idx");
+            if let Some((file, dtype)) = declared.get(&map_name) {
+                if *dtype != Dtype::I32 {
+                    return Err(invalid(format!("{map_name} must be I32")));
+                }
+                found.insert("g_idx".into(), file.clone());
+            } else if matches!(
+                q.serialization,
+                checkpoint_config::IntegerSerialization::GptqV1 {
+                    requires_group_index: true
+                }
+            ) {
+                return Err(invalid(format!(
+                    "{module}: activation ordering requires g_idx"
+                )));
+            }
+        }
+        for suffix in found.keys() {
             claimed.insert(format!("{module}.{suffix}"));
         }
         modules.push((module.to_string(), found));
@@ -311,23 +383,27 @@ pub fn discover(root: &Path, sources: &mut Sources) -> Result<Discovery> {
     // inside one component, so raising the tile cannot merge two of them and
     // the unit count has a floor the total cannot see.
     //
-    // A module's components are its codes, its scales and, when it has them,
-    // its zero points -- `weight_shape` is two integers of metadata, not a
-    // component. Their source lengths stand in for their canonical ones: codes
-    // and scales are the same length either way, and i16 zero points are half
-    // their i32 source, so the count this produces is an upper bound.
+    // Bound each canonical component separately. Packed zero points expand
+    // to i16: one entry per scale, regardless of their source packing width.
     let mut component_bytes: Vec<u64> = Vec::with_capacity(modules.len() * 3 + bf16.len());
     for (module, module_files) in &modules {
         for suffix in module_files.keys() {
-            if suffix == "weight_shape" {
+            if matches!(suffix.as_str(), "weight_shape" | "g_idx") {
                 continue;
             }
-            component_bytes.push(
-                sizes
-                    .get(&format!("{module}.{suffix}"))
-                    .copied()
-                    .unwrap_or(0),
-            );
+            let name = format!("{module}.{suffix}");
+            let bytes = if matches!(suffix.as_str(), "qzeros" | "weight_zero_point") {
+                let scale_name =
+                    format!("{module}.{}", if gptq { "scales" } else { "weight_scale" });
+                let (_, dtype) = declared.get(&scale_name).expect("selected scale");
+                sizes[&scale_name]
+                    .checked_div(dtype.bytes() as u64)
+                    .and_then(|n| n.checked_mul(2))
+                    .ok_or_else(|| invalid("canonical zero point extent overflows".into()))?
+            } else {
+                sizes[&name]
+            };
+            component_bytes.push(bytes);
         }
     }
     for (name, _) in &bf16 {
@@ -338,6 +414,7 @@ pub fn discover(root: &Path, sources: &mut Sources) -> Result<Discovery> {
     Ok(Discovery {
         checkpoint,
         modules,
+        gptq_shapes,
         bf16,
         skipped,
         files,
@@ -497,7 +574,33 @@ pub fn to_plan_toml(discovery: &Discovery, source: &SourceBinding) -> Result<Str
         out.push_str("]\n");
     }
 
-    if !discovery.modules.is_empty() {
+    if let Some(checkpoint_config::QuantizationDeclaration {
+        serialization:
+            checkpoint_config::IntegerSerialization::GptqV1 {
+                requires_group_index,
+            },
+        ..
+    }) = q
+    {
+        if !discovery.modules.is_empty() {
+            out.push_str(&format!("\n[gptq]\nwidth = \"{width}\"\ngroup = {group}\nrequires_group_index = {requires_group_index}\n"));
+            for (module, files) in &discovery.modules {
+                let shape = discovery
+                    .gptq_shapes
+                    .get(module)
+                    .ok_or_else(|| invalid(format!("missing GPTQ shape for {module}")))?;
+                out.push_str(&format!(
+                    "\n[[gptq.modules]]\nmodule = {}\nshape = [{},{}]\n",
+                    string(module),
+                    shape[0],
+                    shape[1]
+                ));
+                for (suffix, file) in files {
+                    out.push_str(&format!("{suffix} = {}\n", shard_index[file.as_str()]));
+                }
+            }
+        }
+    } else if !discovery.modules.is_empty() {
         out.push_str("\n[weights]\n");
         out.push_str(&format!("width = \"{width}\"\n"));
         out.push_str(&format!("group = {group}\n"));
@@ -687,9 +790,12 @@ pub fn automatic_budgets(discovery: &Discovery) -> Result<crate::Budgets> {
     // bit-identical repack neither grows nor shrinks materially. The margin
     // covers shard headers, the journal, the staged manifest and the
     // replacement a compaction writes beside it.
-    let disk_bytes = discovery
-        .source_payload_bytes
-        .saturating_add(discovery.source_payload_bytes / 8)
+    let canonical_bytes = discovery
+        .component_bytes
+        .iter()
+        .fold(0u64, |sum, &n| sum.saturating_add(n));
+    let disk_bytes = canonical_bytes
+        .saturating_add(canonical_bytes / 8)
         .saturating_add(1 << 30);
 
     // A shard the ecosystem's tools are comfortable with -- but never larger
@@ -703,7 +809,15 @@ pub fn automatic_budgets(discovery: &Discovery) -> Result<crate::Budgets> {
     // the journal records.
     let entries = discovery.selected() as u64;
     let tiles = 3 * scratch_bytes as u64 / 2;
+    let map_metadata = discovery
+        .modules
+        .iter()
+        .filter(|(_, files)| files.contains_key("g_idx"))
+        .fold(0u64, |sum, (module, _)| {
+            sum.saturating_add((discovery.gptq_shapes[module][1] as u64).saturating_mul(64))
+        });
     let metadata = header_bytes
+        .saturating_add(map_metadata)
         .saturating_add(moxie_format::manifest::MAX_MANIFEST_BYTES as u64)
         .saturating_add(entries.saturating_mul(8 * 1024));
     let total_bytes = tiles
@@ -936,7 +1050,8 @@ pub fn confirm_binding(
             moxie_format::selection::SelectionKind::Bf16 { name, file } => {
                 vec![(name.clone(), file.as_str())]
             }
-            moxie_format::selection::SelectionKind::PackQuantized { module, files, .. } => files
+            moxie_format::selection::SelectionKind::PackQuantized { module, files, .. }
+            | moxie_format::selection::SelectionKind::Gptq { module, files, .. } => files
                 .iter()
                 .map(|(suffix, file)| (format!("{module}.{suffix}"), file.as_str()))
                 .collect(),
