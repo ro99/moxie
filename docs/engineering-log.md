@@ -1286,3 +1286,9 @@ baseline/mutant/restored repetitions. The tail-write mutant was initially
 misdescribed: it adds duplicate I/O after the journal, rather than removing the
 original write. Reading the exact substitution changed the claim and regression.
 The full battery remains a separate gate; targeted success cannot close it.
+
+The enlarged expert catalogue exposed a test that chose descriptor zero to
+inject a wrong image hash. Descriptor order is not a capability-selection API.
+Keep all descriptors and change only image identity when testing attachment
+failure, so the test reaches the intended resource-release boundary on either
+GPU architecture. The original failure and successful targeted rerun are kept.

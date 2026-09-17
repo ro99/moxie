@@ -655,9 +655,20 @@ fn a_refused_attachment_leaves_nothing_charged() {
         // A catalogue whose descriptor names a package this build does not
         // have. It is the review's own counterexample: an all-zero image hash
         // used to load the real fatbin anyway.
-        let mut stranger = catalogue.descriptors()[0].clone();
-        stranger.image_sha256 = [0; 32];
-        let stranger = moxie_types::KernelCatalogue::new(vec![stranger]).unwrap();
+        // Preserve capability/precision selection on this GPU; catalogue
+        // ordering is not a promise about which descriptor matches BF16 GeGLU.
+        let stranger = moxie_types::KernelCatalogue::new(
+            catalogue
+                .descriptors()
+                .iter()
+                .cloned()
+                .map(|mut descriptor| {
+                    descriptor.image_sha256 = [0; 32];
+                    descriptor
+                })
+                .collect(),
+        )
+        .unwrap();
         let plan = compile_experts(
             &mlp(ExpertActivation::GeGlu),
             &combine(),

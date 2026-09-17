@@ -93,3 +93,13 @@ Still required: independent review and closure report.
 Per-channel grouped formats and heterogeneous formats within one projection
 remain explicitly unsupported. No milestone closure, checkpoint token,
 model-output or performance claim.
+
+The complete grouped-device suite then ran all 11 tests: 10 passed, while the
+kernel-image refusal fixture failed before attachment because it selected the
+first catalogue entry instead of preserving capability selection. The fixture
+now corrupts image identities across the otherwise unchanged catalogue; its
+exact rerun passes and still verifies that attachment refuses the foreign image
+and returns every reservation. Evidence: `current-grouped-device-full.log`
+(retained failed run) and `grouped-attachment-refusal.log` under
+`results/m3-recovery/`. All 11 tests have passing results; this is not a claim
+that the original full invocation passed.
