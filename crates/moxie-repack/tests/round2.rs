@@ -1413,3 +1413,187 @@ fn a_role_whose_escaped_form_overruns_the_journal_is_refused_at_planning() {
     );
     assert!(ledger.outstanding().is_empty());
 }
+
+/// Reopening a source through the shard cache after its header changed while
+/// it was not the open shard is refused, at the moment of the reopen.
+///
+/// `Sources::shard`'s own rebind guard is a **different** net from
+/// `confirm_identities`, which `verify_unchanged` runs once, late, before
+/// anything is exposed: that later pass would eventually catch the same
+/// rewrite too, so a test that goes through the whole publication path cannot
+/// tell whether this guard fired or only the later one did. Calling
+/// `declares` directly, with no `repack`/`inspect` in between, is what
+/// isolates it.
+#[test]
+fn reopening_a_source_whose_header_changed_between_reads_is_refused() {
+    let scratch = Scratch::new("reopen-identity");
+    let src = scratch.join("src");
+    std::fs::create_dir_all(&src).expect("a source directory");
+    let path_a = src.join("a.safetensors");
+    write_shard(
+        &path_a,
+        &[
+            Entry::new("a.weight", "BF16", vec![8], bf16_bytes(1.0).repeat(8)),
+            Entry::new("b.weight", "BF16", vec![8], bf16_bytes(0.0).repeat(8)),
+        ],
+    );
+    write_shard(
+        &src.join("b.safetensors"),
+        &[Entry::new(
+            "other.weight",
+            "BF16",
+            vec![8],
+            bf16_bytes(2.0).repeat(8),
+        )],
+    );
+
+    let budgets = budgets(64 << 10);
+    let mut sources = moxie_repack::open_sources(&src, &budgets).expect("sources");
+
+    // First open of A, which records its identity.
+    assert!(
+        sources
+            .declares("a.safetensors", "a.weight")
+            .expect("a opens")
+    );
+    // Evict A from the one-shard-at-a-time cache by opening B.
+    assert!(
+        sources
+            .declares("b.safetensors", "other.weight")
+            .expect("b opens")
+    );
+
+    // Rewrite A's header in place: same inode, same length, different bytes --
+    // the same swap `a_source_whose_header_was_rewritten_in_place_is_refused`
+    // above uses, so the identity change is deterministic rather than resting
+    // on filesystem mtime granularity.
+    let mut bytes = std::fs::read(&path_a).expect("a reads");
+    let header_len = u64::from_le_bytes(bytes[..8].try_into().expect("eight bytes")) as usize;
+    let header = String::from_utf8(bytes[8..8 + header_len].to_vec()).expect("utf-8");
+    let swapped = header
+        .replacen("\"a.weight\"", "\"TEMP\"", 1)
+        .replacen("\"b.weight\"", "\"a.weight\"", 1)
+        .replacen("\"TEMP\"", "\"b.weight\"", 1);
+    assert_eq!(swapped.len(), header.len(), "the swap changes no length");
+    assert_ne!(swapped, header, "the swap matched nothing");
+    bytes[8..8 + header_len].copy_from_slice(swapped.as_bytes());
+    std::fs::write(&path_a, &bytes).expect("the rewrite lands");
+
+    let e = sources.declares("a.safetensors", "a.weight").expect_err(
+        "a source rewritten between two reads through the same cache is not the source \
+             that was first opened",
+    );
+    assert!(
+        e.to_string().contains("rewritten header"),
+        "the refusal does not name the rewrite: {e}"
+    );
+}
+
+/// Whole-file hashing honors cancellation raised partway through, not only
+/// before it starts.
+///
+/// `cancellation_while_hashing_is_reported_as_cancellation` above cancels from
+/// the first question asked, which a caller upstream of `Sources` can also
+/// intercept before `digest_whole_file`'s own loop is ever reached. Calling
+/// `file_digest_cancellable` directly and cancelling only after several
+/// chunks is what actually exercises the closure `digest_whole_file` checks
+/// between reads.
+#[test]
+fn whole_file_hashing_honors_cancellation_raised_mid_hash() {
+    let scratch = Scratch::new("cancel-mid-hash");
+    let src = scratch.join("src");
+    std::fs::create_dir_all(&src).expect("a source directory");
+    // Large enough, against a small scratch buffer, that the hash takes many
+    // chunks -- so cancelling after a few is distinguishable from cancelling
+    // before the hash starts at all.
+    let values = 4096usize;
+    write_shard(
+        &src.join("s.safetensors"),
+        &[Entry::new(
+            "model.norm.weight",
+            "BF16",
+            vec![values as u64],
+            bf16_bytes(1.0).repeat(values),
+        )],
+    );
+    let budgets = budgets(64 << 10);
+    let mut sources = moxie_repack::open_sources(&src, &budgets).expect("sources");
+
+    let calls = std::cell::Cell::new(0usize);
+    let cancel_after_a_few_chunks = || {
+        let seen = calls.get() + 1;
+        calls.set(seen);
+        seen > 2
+    };
+    let mut hash_scratch = vec![0u8; 64];
+    let out = sources
+        .file_digest_cancellable(
+            "s.safetensors",
+            &mut hash_scratch,
+            &cancel_after_a_few_chunks,
+        )
+        .expect("cancellation is not an error");
+    assert!(
+        out.is_none(),
+        "a cancellation raised partway through the whole-file hash was ignored: {out:?}"
+    );
+    assert!(
+        calls.get() > 2,
+        "the cancellation closure was consulted too few times to have reached the hashing \
+         loop's own check: {}",
+        calls.get()
+    );
+}
+
+/// The overhead bound reserves **two** journals' worth of headroom, not one.
+///
+/// `overhead_bound`'s own doc comment says why: compaction writes its
+/// replacement beside the original and renames over it, so for that instant
+/// the destination holds both. `InspectReport.staging` exposes the same
+/// `journal_bound_bytes`/`manifest_bound_bytes` the bound is built from, so
+/// the execution overhead allowance must agree with the independently exposed
+/// peak staging estimate, rather than relying on slack in a roomy fixture.
+#[test]
+fn overhead_bound_reserves_two_journals_not_one() {
+    let scratch = Scratch::new("overhead-bound-factor");
+    let src = scratch.join("src");
+    std::fs::create_dir_all(&src).expect("a source directory");
+    let values = 65_536usize;
+    write_shard(
+        &src.join("s.safetensors"),
+        &[Entry::new(
+            "model.norm.weight",
+            "BF16",
+            vec![values as u64],
+            bf16_bytes(1.0).repeat(values),
+        )],
+    );
+    let selection_path = scratch.join("selection.toml");
+    SelectionBuilder::new("overhead-bound-factor")
+        .bf16("model.norm.weight", "model.norm.weight", "s.safetensors")
+        .write(&selection_path);
+    let selection = moxie_repack::read_selection(&selection_path).expect("it parses");
+    // A small scratch, so the selection's one tensor becomes many units and
+    // the journal term this test targets is not dwarfed by the manifest's
+    // constant bound.
+    let budgets = budgets(1 << 10);
+    let mut sources = moxie_repack::open_sources(&src, &budgets).expect("sources");
+
+    let resolved = moxie_repack::resolve(&selection, &mut sources).expect("it resolves");
+    let bound = moxie_repack::overhead_bound(&resolved, &budgets, selection.source_bytes())
+        .expect("a bound");
+
+    let mut ledger = moxie_repack::ledger_for(&budgets).expect("a ledger");
+    let report = moxie_repack::inspect(&selection, &mut sources, &budgets, &mut ledger)
+        .expect("it inspects");
+    assert!(
+        report.staging.journal_bound_bytes > 0,
+        "this fixture produces no journal contribution to test the coefficient against"
+    );
+    assert_eq!(
+        bound,
+        report.staging.total() - report.staging.payload_bytes,
+        "the overhead bound does not reserve two journals' worth of headroom for compaction's \
+         peak -- see `StagingEstimate::total` and `recover`'s own peak check"
+    );
+}

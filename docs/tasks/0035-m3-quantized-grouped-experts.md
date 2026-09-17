@@ -47,7 +47,7 @@ replacement tests pass. Temporary fixtures are test-owned and deleted.
 
 ## Result
 
-Implemented first contiguous-group execution; integration/review gates remain.
+Implemented canonical artifact binding and mapped grouped execution; review and closure gates remain.
 Shared host packed views, CUDA scalar decoders, grouped planner byte extents,
 lease-based executor and catalogue now accept INT4/INT8 and mixed BF16 integer
 projection pairs. The CUDA affine decoder is shared with dense execution and
@@ -69,7 +69,27 @@ through one shared GraphBuilder contract; both compose INT4 gate/up and INT8 dow
 expert operands. Unknown roles refuse. This is graph composition plus separate
 shared operation execution, not execution of either complete model graph.
 
-Still required: canonical artifact-to-expert binding, GPU map admission/execution,
-second graph-derived execution shape, explicit quantized cancellation/admission
-regressions, independent review and affected full checks. No milestone closure,
-checkpoint token, model-output or performance claim.
+CanonicalSource now binds complete canonical artifacts to explicit expert role
+pairs, verifies projection shapes and formats, and streams checked payloads into
+the residency authority's destination. ADR0031 charges optional group maps in
+the same weight lease; no separate allocation or map cache exists.
+
+Published synthetic GPTQ fixtures execute the expert and combine operations
+extracted from reduced Gemma and Laguna graphs: H128/I67 GeGLU and H35/I65 SwiGLU,
+INT4/F16 gate-up and INT8/F32 down, signed scales and mapped group32 columns.
+Both host and device placements pass on all three GPUs: 46,944 BF16 components
+match the independent oracle bitwise. Cancellation after a group releases all
+leases and refuses reduction in every placement/device case. Insufficient host/device
+admission refuses with a typed ledger rejection and leaves no reservations.
+Evidence: `results/m3-recovery/mapped-expert-admission-cancellation.log`. Wrong shapes,
+foreign identities, legacy cache versions, nonzero offsets and omitted map
+budgets refuse before touching destination bytes. Complete graph execution is
+not implemented by this test.
+
+Affected host suites, driver clippy, architecture and specification checks pass.
+The broad host run first found an obsolete CLI diagnostic assertion; it now
+checks the exact unsupported auto-gptq format, and repack/storage suites pass.
+Still required: independent review and closure report.
+Per-channel grouped formats and heterogeneous formats within one projection
+remain explicitly unsupported. No milestone closure, checkpoint token,
+model-output or performance claim.

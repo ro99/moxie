@@ -1968,8 +1968,9 @@ impl<'lane> GroupedRun<'lane> {
                                 group,
                                 scale,
                                 zeros,
+                                mapped,
                             } => moxie_kernels::cpu_expert::ExpertWeight::Affine(
-                                moxie_kernels::affine::AffineWeight::new(
+                                moxie_kernels::affine::AffineWeight::new_packed(
                                     bytes,
                                     rows,
                                     cols,
@@ -1977,7 +1978,7 @@ impl<'lane> GroupedRun<'lane> {
                                     group as usize,
                                     scale,
                                     zeros,
-                                    None,
+                                    mapped,
                                 )?,
                             ),
                         })

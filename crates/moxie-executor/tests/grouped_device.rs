@@ -195,10 +195,19 @@ fn combine() -> OpParams {
 
 /// What every slot must be, bit for bit.
 fn oracle_slots(w: &Weights, activation: ExpertActivation) -> Vec<u16> {
+    oracle_slots_dims(w, activation, HIDDEN, INTERMEDIATE)
+}
+
+fn oracle_slots_dims(
+    w: &Weights,
+    activation: ExpertActivation,
+    hidden: u64,
+    intermediate: u64,
+) -> Vec<u16> {
     let spec = route::ExpertSpec {
         experts: EXPERTS as usize,
-        hidden: HIDDEN as usize,
-        intermediate: INTERMEDIATE as usize,
+        hidden: hidden as usize,
+        intermediate: intermediate as usize,
         activation,
     };
     let mut out = Vec::new();
@@ -206,7 +215,7 @@ fn oracle_slots(w: &Weights, activation: ExpertActivation) -> Vec<u16> {
     for (index, expert) in route.iter().enumerate() {
         let row = index / TOP_K as usize;
         let y = route::expert_row(
-            &w.x[row * HIDDEN as usize..(row + 1) * HIDDEN as usize],
+            &w.x[row * hidden as usize..(row + 1) * hidden as usize],
             &w.gate_up,
             &w.down,
             *expert,
@@ -219,13 +228,23 @@ fn oracle_slots(w: &Weights, activation: ExpertActivation) -> Vec<u16> {
 }
 
 fn oracle_rows(w: &Weights, activation: ExpertActivation) -> Vec<u16> {
-    let slots = oracle_slots(w, activation);
+    oracle_rows_dims(w, activation, HIDDEN, INTERMEDIATE, 1.0)
+}
+
+fn oracle_rows_dims(
+    w: &Weights,
+    activation: ExpertActivation,
+    hidden: u64,
+    intermediate: u64,
+    output_scale: f32,
+) -> Vec<u16> {
+    let slots = oracle_slots_dims(w, activation, hidden, intermediate);
     let mut out = Vec::new();
     for r in 0..ROWS as usize {
         let route = route();
         let experts = &route[r * TOP_K as usize..(r + 1) * TOP_K as usize];
         let values: Vec<f32> = slots
-            [r * TOP_K as usize * HIDDEN as usize..(r + 1) * TOP_K as usize * HIDDEN as usize]
+            [r * TOP_K as usize * hidden as usize..(r + 1) * TOP_K as usize * hidden as usize]
             .iter()
             .map(|bits| f32::from_bits((*bits as u32) << 16))
             .collect();
@@ -233,9 +252,9 @@ fn oracle_rows(w: &Weights, activation: ExpertActivation) -> Vec<u16> {
             experts,
             &w.coefficients[r * TOP_K as usize..(r + 1) * TOP_K as usize],
             &values,
-            HIDDEN as usize,
+            hidden as usize,
             CombineOrder::AscendingExpertId,
-            1.0,
+            output_scale,
         )
         .unwrap();
         out.extend(row.iter().map(|v| to_bf16_bits(*v)));
@@ -1240,18 +1259,21 @@ fn integer_cases() -> Vec<([moxie_plan::expert::ExpertWeightFormat; 2], bool)> {
         group: 32,
         scale: Precision::F16,
         zeros: true,
+        mapped: false,
     };
     let b = Affine {
         width: Precision::Int8,
         group: 128,
         scale: Precision::F32,
         zeros: true,
+        mapped: false,
     };
     let c = Affine {
         width: Precision::Int8,
         group: 32,
         scale: Precision::Bf16,
         zeros: false,
+        mapped: false,
     };
     [[a, b], [b, a], [Bf16, c], [c, Bf16]]
         .into_iter()
@@ -1262,9 +1284,18 @@ fn integer_cases() -> Vec<([moxie_plan::expert::ExpertWeightFormat; 2], bool)> {
 fn integer_weights(
     formats: [moxie_plan::expert::ExpertWeightFormat; 2],
 ) -> (Weights, IntegerSource, Vec<(String, String)>) {
+    integer_weights_dims(formats, HIDDEN, INTERMEDIATE)
+}
+
+fn integer_weights_dims(
+    formats: [moxie_plan::expert::ExpertWeightFormat; 2],
+    hidden: u64,
+    intermediate: u64,
+) -> (Weights, IntegerSource, Vec<(String, String)>) {
     use moxie_plan::expert::ExpertWeightFormat;
     use moxie_types::Precision;
     let mut w = weights(0x0035);
+    w.x = Values::new(0x0035).block((ROWS * hidden) as usize);
     w.gate_up.clear();
     w.down.clear();
     let mut sources = std::collections::BTreeMap::new();
@@ -1272,21 +1303,22 @@ fn integer_weights(
     for e in 0..EXPERTS {
         let names = (format!("expert.{e}.gate_up"), format!("expert.{e}.down"));
         for (projection, (outputs, inputs, name)) in [
-            (2 * INTERMEDIATE, HIDDEN, &names.0),
-            (HIDDEN, INTERMEDIATE, &names.1),
+            (2 * intermediate, hidden, &names.0),
+            (hidden, intermediate, &names.1),
         ]
         .into_iter()
         .enumerate()
         {
             let (outputs, inputs) = (outputs as usize, inputs as usize);
-            let (bits, group, scale, zeros) = match formats[projection] {
-                ExpertWeightFormat::Bf16 => (16, 32, Precision::Bf16, false),
+            let (bits, group, scale, zeros, mapped) = match formats[projection] {
+                ExpertWeightFormat::Bf16 => (16, 32, Precision::Bf16, false, false),
                 ExpertWeightFormat::Affine {
                     width,
                     group,
                     scale,
                     zeros,
-                } => (width.bits() as usize, group as usize, scale, zeros),
+                    mapped,
+                } => (width.bits() as usize, group as usize, scale, zeros, mapped),
             };
             let groups = inputs.div_ceil(group);
             let stride = if bits == 16 {
@@ -1302,7 +1334,11 @@ fn integer_weights(
             };
             for o in 0..outputs {
                 for k in 0..inputs {
-                    let g = k / group;
+                    let g = if mapped {
+                        groups - 1 - k / group
+                    } else {
+                        k / group
+                    };
                     let zero = if zeros { ((o + g) % 3) as i32 - 1 } else { 0 };
                     let sign = if (o + g).is_multiple_of(2) { 1.0 } else { -1.0 };
                     let width = bits.min(8);
@@ -1342,6 +1378,11 @@ fn integer_weights(
                             bytes.extend_from_slice(&(((o + g) % 3) as i16 - 1).to_le_bytes());
                         }
                     }
+                }
+            }
+            if mapped {
+                for k in 0..inputs {
+                    bytes.extend_from_slice(&((groups - 1 - k / group) as u32).to_le_bytes());
                 }
             }
             sources.insert(name.clone(), bytes);
@@ -1487,4 +1528,543 @@ fn canonical_integer_experts_use_the_shared_residency_and_reduction_on_every_dev
         "grouped expert device gate: {compared} BF16 components bit-identical to the oracle \
          across {count} device(s) and both gate transforms"
     );
+}
+
+/// Publish small synthetic GPTQ matrices through the real bounded converter.
+/// This is fixture serialization, not quantization of floating-point weights.
+fn publish_integer_weights(
+    dir: &Path,
+    formats: [moxie_plan::expert::ExpertWeightFormat; 2],
+    hidden: u64,
+    intermediate: u64,
+) -> (
+    Weights,
+    moxie_executor::residency::CanonicalSource,
+    Vec<(String, String)>,
+) {
+    use moxie_plan::expert::ExpertWeightFormat;
+    use moxie_types::Precision;
+    let (weights, raw, pairs) = integer_weights_dims(formats, hidden, intermediate);
+    let source_dir = dir.join("source");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    let digest = "0".repeat(64);
+    let mut selection = format!(
+        "version = 1\n[source]\nmodel = \"synthetic-experts\"\nrevision = \"fixture-v1\"\nlicense = \"test\"\n[tokenizer]\nname = \"none\"\nversion = \"none\"\ndigest = \"{digest}\"\n[template]\nname = \"none\"\nversion = \"none\"\ndigest = \"{digest}\"\n[architecture]\nname = \"fixture\"\nversion = \"1\"\n[architecture.metadata]\nnote = \"synthetic matrices only\"\n[provenance]\nscale_convention = \"affine-v1\"\nquantizer = \"fixture\"\ncalibration = \"none\"\n[completeness]\nstatus = \"complete\"\n"
+    );
+    let mut entries: Vec<(String, &str, Vec<usize>, Vec<u8>)> = Vec::new();
+    for pair in &pairs {
+        for (projection, (name, outputs, inputs)) in [
+            (&pair.0, 2 * intermediate, hidden),
+            (&pair.1, hidden, intermediate),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (outputs, inputs) = (outputs as usize, inputs as usize);
+            let bytes = &raw.0[name];
+            let ExpertWeightFormat::Affine {
+                width,
+                group,
+                scale,
+                zeros,
+                mapped,
+            } = formats[projection]
+            else {
+                panic!("integer fixture")
+            };
+            let bits = width.bits() as usize;
+            let pack = 32 / bits;
+            let group = group as usize;
+            let groups = inputs.div_ceil(group);
+            let stride = inputs.div_ceil(8 / bits);
+            let mut qweight = vec![0u32; inputs.div_ceil(pack) * outputs];
+            let mut qzeros = vec![0u32; groups * outputs.div_ceil(pack)];
+            let mut scales = Vec::new();
+            let scale_bytes = scale.bits() as usize / 8;
+            let scale_start = outputs * stride;
+            let zero_start = scale_start + outputs * groups * scale_bytes;
+            for o in 0..outputs {
+                for k in 0..inputs {
+                    let signed = if bits == 4 {
+                        let n = (bytes[o * stride + k / 2] >> ((k % 2) * 4)) & 15;
+                        ((n as i8) << 4 >> 4) as i32
+                    } else {
+                        bytes[o * stride + k] as i8 as i32
+                    };
+                    let unsigned = (signed + (1 << (bits - 1))) as u32;
+                    qweight[k / pack * outputs + o] |= unsigned << ((k % pack) * bits);
+                }
+            }
+            for g in 0..groups {
+                for o in 0..outputs {
+                    let entry = o * groups + g;
+                    let zero = if zeros {
+                        i16::from_le_bytes(
+                            bytes[zero_start + entry * 2..zero_start + entry * 2 + 2]
+                                .try_into()
+                                .unwrap(),
+                        ) as i32
+                    } else {
+                        0
+                    };
+                    let stored = (zero + (1 << (bits - 1)) - 1) as u32;
+                    qzeros[g * outputs.div_ceil(pack) + o / pack] |= stored << ((o % pack) * bits);
+                    scales.extend_from_slice(
+                        &bytes[scale_start + entry * scale_bytes
+                            ..scale_start + (entry + 1) * scale_bytes],
+                    );
+                }
+            }
+            if mapped {
+                entries.push((
+                    format!("{name}.g_idx"),
+                    "I32",
+                    vec![inputs],
+                    (0..inputs)
+                        .flat_map(|k| ((groups - 1 - k / group) as u32).to_le_bytes())
+                        .collect(),
+                ));
+            }
+            entries.push((
+                format!("{name}.qweight"),
+                "I32",
+                vec![inputs.div_ceil(pack), outputs],
+                qweight.into_iter().flat_map(u32::to_le_bytes).collect(),
+            ));
+            entries.push((
+                format!("{name}.qzeros"),
+                "I32",
+                vec![groups, outputs.div_ceil(pack)],
+                qzeros.into_iter().flat_map(u32::to_le_bytes).collect(),
+            ));
+            entries.push((
+                format!("{name}.scales"),
+                match scale {
+                    Precision::F16 => "F16",
+                    Precision::Bf16 => "BF16",
+                    _ => "F32",
+                },
+                vec![groups, outputs],
+                scales,
+            ));
+            selection.push_str(&format!("\n[[tensor]]\nrole = \"{name}\"\nkind = \"gptq-v1\"\nmodule = \"{name}\"\nwidth = \"int{bits}\"\ngroup = {group}\nshape = [{outputs},{inputs}]\n[tensor.files]\nqweight = \"source.safetensors\"\nqzeros = \"source.safetensors\"\nscales = \"source.safetensors\"\n"));
+            if mapped {
+                selection.push_str("g_idx = \"source.safetensors\"\n");
+            }
+        }
+    }
+    let mut header = String::from("{");
+    let mut payload = Vec::new();
+    for (index, (name, dtype, shape, bytes)) in entries.into_iter().enumerate() {
+        if index != 0 {
+            header.push(',');
+        }
+        header.push_str(&format!(
+            "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":{shape:?},\"data_offsets\":[{},{}]}}",
+            payload.len(),
+            payload.len() + bytes.len()
+        ));
+        payload.extend_from_slice(&bytes);
+    }
+    header.push('}');
+    while !header.len().is_multiple_of(8) {
+        header.push(' ');
+    }
+    let mut file = std::fs::File::create(source_dir.join("source.safetensors")).unwrap();
+    file.write_all(&(header.len() as u64).to_le_bytes())
+        .unwrap();
+    file.write_all(header.as_bytes()).unwrap();
+    file.write_all(&payload).unwrap();
+    drop(file);
+    let selection = moxie_format::selection::parse(&selection).unwrap();
+    let budgets = moxie_repack::Budgets {
+        total_bytes: 128 << 20,
+        header_bytes: 16 << 20,
+        scratch_bytes: 4096,
+        chunk_file_bytes: 4 << 20,
+        disk_bytes: 32 << 20,
+    };
+    let mut sources = moxie_repack::open_sources(&source_dir, &budgets).unwrap();
+    let mut ledger = moxie_repack::ledger_for(&budgets).unwrap();
+    let artifact_dir = dir.join("published");
+    moxie_repack::repack(
+        &selection,
+        &mut sources,
+        &artifact_dir,
+        &budgets,
+        &Default::default(),
+        &Default::default(),
+        &|| false,
+        &mut ledger,
+        &mut |_| {},
+    )
+    .unwrap();
+    assert!(ledger.outstanding().is_empty());
+    let artifact = moxie_storage::Artifact::open(&artifact_dir).unwrap();
+    (
+        weights,
+        moxie_executor::residency::CanonicalSource::new(artifact).unwrap(),
+        pairs,
+    )
+}
+
+#[test]
+fn published_gptq_experts_bind_and_execute_through_canonical_source() {
+    let _serial = one_at_a_time();
+    let count = moxie_cuda::device_count().unwrap();
+    assert!(count > 0, "the device lane requires real hardware");
+    let mut compared = 0usize;
+
+    for ordinal in 0..count {
+        let ctx = RankContext::acquire(RankId(ordinal), ordinal).unwrap();
+        let scope = Scope::Device(ctx.uuid());
+        let catalogue = moxie_kernels::expert_mlp_catalogue();
+
+        for (mlp_params, combine_params) in graph_expert_cases() {
+            let OpParams::ExpertMlp {
+                hidden,
+                intermediate,
+                activation,
+                ..
+            } = mlp_params
+            else {
+                unreachable!()
+            };
+            let OpParams::Combine { output_scale, .. } = combine_params else {
+                unreachable!()
+            };
+            for (mut formats, on_device) in integer_cases().into_iter().take(2) {
+                for format in &mut formats {
+                    if let moxie_plan::expert::ExpertWeightFormat::Affine {
+                        mapped, group, ..
+                    } = format
+                    {
+                        *mapped = true;
+                        *group = 32;
+                    }
+                }
+                let dir = scratch("published-gptq-experts");
+                let (w, mut src, role_pairs) =
+                    publish_integer_weights(&dir, formats, hidden, intermediate);
+                let shape = moxie_plan::expert::shape_of(&mlp_params, &combine_params)
+                    .unwrap()
+                    .0;
+                let (expert_roles, bound_formats) = src.bind_experts(shape, role_pairs).unwrap();
+                assert_eq!(bound_formats, formats);
+
+                let mut ledger = Ledger::new([
+                    CapacitySnapshot::new(Scope::Host, 64 * MIB, MIB).unwrap(),
+                    CapacitySnapshot::new(scope, 64 * MIB, MIB).unwrap(),
+                ])
+                .unwrap();
+                let mut authority = ResidencyAuthority::open(
+                    &mut ledger,
+                    &ResidencyRequest::new("device experts", 64 * CHUNK)
+                        .device(ctx.uuid(), 8 * CHUNK),
+                )
+                .unwrap();
+                let mut residency = DeviceResidency::create(&ctx, &mut authority).unwrap();
+
+                let budget = ExpertBudget {
+                    device: ctx.uuid(),
+                    device_pci_bus_id: ctx.capability().pci_bus_id.clone(),
+                    device_cache_cap_bytes: 8 * CHUNK,
+                    device_cache_leased_bytes: 0,
+                    device_cache_largest_free_bytes: u64::MAX,
+                    device_arena_free_bytes: 16 * MIB,
+                    host_workspace_bytes: MIB,
+                    host_buffer_bytes: MIB,
+                    host_cache_cap_bytes: 1 << 30,
+                    host_cache_leased_bytes: 0,
+                    host_cache_largest_free_bytes: u64::MAX,
+                    cache_alignment_bytes: 256,
+                    chunks_per_expert: 2,
+                    resident: ResidentChunks::none(),
+                };
+                let policy = ExpertPolicy {
+                    device: if on_device {
+                        StrategyControl::Required
+                    } else {
+                        StrategyControl::Off
+                    },
+                    host: if on_device {
+                        StrategyControl::Auto
+                    } else {
+                        StrategyControl::Required
+                    },
+                    host_placement: StrategyControl::Off,
+                    ..ExpertPolicy::default()
+                };
+                let plan = moxie_plan::expert::compile_experts_with_weights(
+                    &mlp_params,
+                    &combine_params,
+                    &route(),
+                    &budget,
+                    &policy,
+                    None,
+                    Some(ExpertKernels {
+                        capability: ctx.capability(),
+                        catalogue: &catalogue,
+                    }),
+                    formats,
+                )
+                .unwrap_or_else(|e| panic!("device {ordinal}: {e}"));
+                assert!(
+                    plan.groups().iter().all(|g| g.placement().candidate()
+                        == if on_device {
+                            Candidate::Device
+                        } else {
+                            Candidate::Host
+                        }),
+                    "`required` must put every group on the device"
+                );
+                assert_eq!(plan.kernel().is_some(), on_device);
+
+                let mut insufficient = Ledger::new([
+                    CapacitySnapshot::new(Scope::Host, 640, 128).unwrap(),
+                    CapacitySnapshot::new(scope, 640, 128).unwrap(),
+                ])
+                .unwrap();
+                let refused =
+                    GroupedRun::admit(&mut insufficient, plan.clone(), expert_roles.clone(), None)
+                        .unwrap_err();
+                assert!(matches!(
+                    refused,
+                    moxie_executor::grouped::GroupedAdmitRefused::Rejected { .. }
+                ));
+                assert!(insufficient.outstanding().is_empty());
+                let cancellation_plan = plan.clone();
+                let cancellation_roles = expert_roles.clone();
+                let mut run = GroupedRun::admit(&mut ledger, plan, expert_roles, None)
+                    .unwrap_or_else(|e| panic!("device {ordinal}: {e}"));
+                if on_device {
+                    run.attach_device(&mut ledger, &ctx, &mut residency)
+                        .unwrap_or_else(|e| panic!("device {ordinal}: {e}"));
+                }
+
+                let x = to_bytes(&w.x);
+                run.load_activations(&x).unwrap();
+                run.run_to_completion(&mut authority, &mut src, TurnId::new(1), 0, u64::MAX)
+                    .unwrap_or_else(|e| panic!("device {ordinal}: {e}"));
+
+                // Slots first: a wrong reduction over right slots and a right
+                // reduction over wrong slots are different defects.
+                let want_slots = oracle_slots_dims(&w, activation, hidden, intermediate);
+                assert_eq!(
+                    as_u16(run.buffers().slots()),
+                    want_slots,
+                    "device {ordinal} {activation:?}: slots"
+                );
+                let got = as_u16(run.reduce(&w.coefficients).unwrap());
+                assert_eq!(
+                    got,
+                    oracle_rows_dims(&w, activation, hidden, intermediate, output_scale),
+                    "device {ordinal} {activation:?}: rows"
+                );
+                compared += want_slots.len() + got.len();
+                assert_eq!(run.stats().device_groups, if on_device { 5 } else { 0 });
+                assert_eq!(run.stats().host_groups, if on_device { 0 } else { 5 });
+
+                run.close(&mut ledger).unwrap();
+                // A second turn cancels after one group with subsequent mapped
+                // operands queued. Map bytes share exactly the weight leases.
+                let mut cancelled =
+                    GroupedRun::admit(&mut ledger, cancellation_plan, cancellation_roles, None)
+                        .unwrap();
+                if on_device {
+                    cancelled
+                        .attach_device(&mut ledger, &ctx, &mut residency)
+                        .unwrap();
+                }
+                cancelled.load_activations(&x).unwrap();
+                cancelled
+                    .step(&mut authority, &mut src, TurnId::new(2), 0, u64::MAX)
+                    .unwrap();
+                cancelled.cancel(&mut authority);
+                assert!(cancelled.is_cancelled());
+                assert_eq!(authority.live_lease_count(), 0);
+                assert!(cancelled.reduce(&w.coefficients).is_err());
+                cancelled.close(&mut ledger).unwrap();
+                authority.end_turn(TurnId::new(2));
+                // Every lease is back, but the chunks are still resident. Retiring
+                // them is what frees the ranges that live in the one real device
+                // allocation, and the residency refuses to close until they are.
+                authority.end_turn(TurnId::new(1));
+                authority.retire_all(scope);
+                residency.close(&mut authority).unwrap();
+                authority.close(&mut ledger).unwrap();
+                assert!(ledger.outstanding().is_empty());
+                drop(src);
+                std::fs::remove_dir_all(&dir).unwrap();
+                eprintln!(
+                    "quantized expert UUID={} gate={activation:?} device={on_device} formats={formats:?} passed",
+                    ctx.uuid()
+                );
+            }
+        }
+    }
+    println!(
+        "grouped expert device gate: {compared} BF16 components bit-identical to the oracle \
+         across {count} device(s) and both gate transforms"
+    );
+}
+
+fn graph_expert_cases() -> Vec<(OpParams, OpParams)> {
+    use moxie_models::{gemma4, laguna};
+    let mut registry = moxie_graph::OracleRegistry::new();
+    moxie_oracles::register(&mut registry).unwrap();
+    let gemma = gemma4::Gemma4Text::reduced(
+        gemma4::TextConfig {
+            hidden: 128,
+            layers: 1,
+            heads: 4,
+            local_kv_heads: 2,
+            local_head_dim: 16,
+            global_kv_heads: 1,
+            global_head_dim: 32,
+            intermediate: 16,
+            vocab: 11,
+            global_stride: 6,
+            sliding_window: 3,
+            rms_eps: 1e-6,
+            sliding_rope_theta: 10_000.0,
+            global_rope_theta: 1_000_000.0,
+            global_partial_rotary: gemma4::Fraction::QUARTER,
+            final_logit_softcap: 30.0,
+            layer_scalars: vec![1.0],
+            embedding_scale: gemma4::embedding_scale(128),
+            max_trained_position: 256,
+            moe: Some(gemma4::MoeGeometry {
+                experts: EXPERTS,
+                top_k: TOP_K,
+                moe_intermediate: 67,
+                router_input_scale: gemma4::router_input_scale(128),
+            }),
+        },
+        "synthetic-expert-shape",
+    )
+    .unwrap();
+    let mut config = laguna::BlockConfig::reduced();
+    config.hidden = 35;
+    config.blocks = 1;
+    config.moe.experts = EXPERTS;
+    config.moe.top_k = TOP_K;
+    config.moe.moe_intermediate = 65;
+    let laguna = laguna::RoutedBlocks::reduced(config, "synthetic-expert-shape").unwrap();
+    let mut cases = Vec::new();
+    for (family, baseline) in [
+        gemma
+            .compose(&registry, moxie_types::SymbolId(0))
+            .unwrap()
+            .graph,
+        laguna
+            .compose(&registry, moxie_types::SymbolId(0))
+            .unwrap()
+            .graph,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expert = baseline
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.params, OpParams::ExpertMlp { .. }))
+            .unwrap();
+        let mut precisions = std::collections::BTreeMap::new();
+        for (value, width) in expert.inputs[2..4]
+            .iter()
+            .zip([moxie_types::Precision::Int4, moxie_types::Precision::Int8])
+        {
+            precisions.insert(
+                baseline.name(*value).unwrap().to_owned(),
+                moxie_types::WeightPrecision::expect(width),
+            );
+        }
+        let graph = if family == 0 {
+            gemma
+                .compose_with_weight_precisions(&registry, moxie_types::SymbolId(0), precisions)
+                .unwrap()
+                .graph
+        } else {
+            laguna
+                .compose_with_weight_precisions(&registry, moxie_types::SymbolId(0), precisions)
+                .unwrap()
+                .graph
+        };
+        let expert = graph
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.params, OpParams::ExpertMlp { .. }))
+            .unwrap();
+        let combine = graph
+            .nodes()
+            .iter()
+            .find(|node| {
+                matches!(node.params, OpParams::Combine { .. })
+                    && node.inputs.contains(&expert.output)
+            })
+            .unwrap();
+        cases.push((expert.params.clone(), combine.params.clone()));
+    }
+    cases
+}
+
+#[test]
+fn canonical_expert_binding_refuses_wrong_shapes_identities_and_unbudgeted_maps() {
+    use moxie_executor::residency::ChunkSource;
+    use moxie_memory::{ChunkId, LogicalRange, TensorSlot};
+    let (mlp, combine) = graph_expert_cases().remove(1);
+    let shape = moxie_plan::expert::shape_of(&mlp, &combine).unwrap().0;
+    let mut formats = integer_cases().remove(0).0;
+    for format in &mut formats {
+        if let moxie_plan::expert::ExpertWeightFormat::Affine { mapped, group, .. } = format {
+            *mapped = true;
+            *group = 32;
+        }
+    }
+    let dir = scratch("canonical-binding-refusals");
+    let (_, mut source, pairs) =
+        publish_integer_weights(&dir, formats, shape.hidden, shape.intermediate);
+    let mut wrong_shape = shape;
+    wrong_shape.hidden += 1;
+    assert!(matches!(
+        source.bind_experts(wrong_shape, pairs.clone()),
+        Err(moxie_types::Error::InvalidArtifact { .. })
+    ));
+    assert!(matches!(
+        source.bind_experts(shape, pairs[..1].to_vec()),
+        Err(moxie_types::Error::InvalidArtifact { .. })
+    ));
+    let role = pairs[0].0.clone();
+    let (_, bound) = source.bind_experts(shape, pairs).unwrap();
+    let payload = bound[0]
+        .payload_bytes(2 * shape.intermediate, shape.hidden)
+        .unwrap();
+    let resident = bound[0]
+        .bytes(2 * shape.intermediate, shape.hidden)
+        .unwrap();
+    assert_eq!(resident - payload, 4 * shape.hidden);
+    // Reject a legacy identity, a foreign artifact, an offset, or a buffer
+    // budgeted without the map before touching caller-owned destination bytes.
+    for (identity, version, offset, len) in [
+        (source.identity().clone(), 1, 0, resident),
+        (ArtifactId::new("foreign-artifact").unwrap(), 2, 0, resident),
+        (source.identity().clone(), 2, 1, resident),
+        (source.identity().clone(), 2, 0, payload),
+    ] {
+        let chunk = ChunkId::new(
+            identity,
+            TensorSlot::expert(&role, 0).unwrap(),
+            LogicalRange::new(offset, len).unwrap(),
+            version,
+        );
+        let mut bytes = vec![0xa5; len as usize];
+        assert!(matches!(
+            source.read_chunk(&chunk, &mut bytes),
+            Err(moxie_types::Error::InvalidArtifact { .. })
+        ));
+        assert!(bytes.iter().all(|&byte| byte == 0xa5));
+    }
+    drop(source);
+    std::fs::remove_dir_all(dir).unwrap();
 }

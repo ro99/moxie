@@ -564,6 +564,106 @@ impl Artifact {
         }
     }
 
+    /// Fill an admitted buffer with canonical bytes, without dequantizing or
+    /// allocating a second payload buffer. Every component checksum is checked.
+    /// Partial artifacts remain inspection-only. On error no byte is trusted.
+    pub fn read_canonical_payload(&self, role: &str, into: &mut [u8]) -> Result<()> {
+        if matches!(
+            self.manifest.completeness,
+            manifest::Completeness::Partial { .. }
+        ) {
+            return Err(Error::InvalidArtifact {
+                detail: "partial artifact cannot supply execution weights".into(),
+            });
+        }
+        let tensor = self
+            .manifest
+            .tensors
+            .iter()
+            .find(|t| t.role == role)
+            .ok_or_else(|| Error::InvalidArtifact {
+                detail: format!("no tensor named '{role}'").into(),
+            })?;
+        match (&self.payloads, &tensor.placement) {
+            (
+                Payloads::Chunks(chunks),
+                manifest::Placement::Chunk {
+                    chunk,
+                    offset,
+                    length,
+                    sha256,
+                    ..
+                },
+            ) => {
+                if into.len() as u64 != *length {
+                    return Err(Error::InvalidArtifact {
+                        detail: "canonical destination length mismatch".into(),
+                    });
+                }
+                let file = chunks.get(chunk.as_str()).expect("validated placement");
+                self.pump_into(
+                    role,
+                    &mut OpenChunk { file: &file.file },
+                    *offset,
+                    *length,
+                    sha256,
+                    tensor.precision,
+                    into,
+                    &mut |_| Ok(()),
+                )?;
+            }
+            (Payloads::Shards(shards), manifest::Placement::Components(components)) => {
+                let mut length = 0u64;
+                for component in components {
+                    let shard = shards
+                        .get(component.file.as_str())
+                        .expect("validated placement");
+                    length = length
+                        .checked_add(shard.header().get(&component.name)?.len())
+                        .ok_or_else(|| Error::InvalidArtifact {
+                            detail: "canonical payload length overflows".into(),
+                        })?;
+                }
+                if into.len() as u64 != length {
+                    return Err(Error::InvalidArtifact {
+                        detail: "canonical destination length mismatch".into(),
+                    });
+                }
+                let mut at = 0usize;
+                for component in components {
+                    let shard = shards
+                        .get(component.file.as_str())
+                        .expect("validated placement");
+                    let entry = shard.header().get(&component.name)?;
+                    let len = usize::try_from(entry.len()).map_err(|_| Error::InvalidArtifact {
+                        detail: "component does not fit address space".into(),
+                    })?;
+                    self.pump_into(
+                        &component.name,
+                        &mut OpenChunk { file: &shard.file },
+                        entry.file_offset(shard.header()),
+                        entry.len(),
+                        &component.sha256,
+                        if component.kind == moxie_format::canonical::ComponentKind::Weights {
+                            tensor.precision
+                        } else {
+                            TensorPrecision::AffineInt8V1
+                        },
+                        &mut into[at..at + len],
+                        &mut |_| Ok(()),
+                    )?;
+                    at += len;
+                }
+            }
+            _ => {
+                return Err(Error::InvalidArtifact {
+                    detail: "canonical placement does not match opened artifact".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Read one tensor into a caller-supplied buffer.
     ///
     /// Returns the tensor's byte length. If the buffer is smaller than the

@@ -675,6 +675,7 @@ pub enum ExpertWeightFormat {
         group: u32,
         scale: Precision,
         zeros: bool,
+        mapped: bool,
     },
 }
 
@@ -686,6 +687,15 @@ impl ExpertWeightFormat {
         }
     }
     pub fn bytes(self, outputs: u64, inputs: u64) -> Option<u64> {
+        let payload = self.payload_bytes(outputs, inputs)?;
+        if matches!(self, Self::Affine { mapped: true, .. }) {
+            payload.checked_add(inputs.checked_mul(4)?)
+        } else {
+            Some(payload)
+        }
+    }
+
+    pub fn payload_bytes(self, outputs: u64, inputs: u64) -> Option<u64> {
         match self {
             Self::Bf16 => outputs.checked_mul(inputs)?.checked_mul(2),
             Self::Affine {
@@ -693,6 +703,7 @@ impl ExpertWeightFormat {
                 group,
                 scale,
                 zeros,
+                ..
             } => {
                 if !matches!(width, Precision::Int4 | Precision::Int8)
                     || !matches!(group, 32 | 128)

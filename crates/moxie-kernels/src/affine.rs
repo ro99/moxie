@@ -14,7 +14,31 @@ pub struct AffineWeight<'a> {
     scale_offset: usize,
     zero_offset: usize,
     per_group_zeros: bool,
-    map: Option<&'a [u32]>,
+    map: Option<GroupMap<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GroupMap<'a> {
+    Native(&'a [u32]),
+    LittleEndian(&'a [u8]),
+}
+impl GroupMap<'_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Native(m) => m.len(),
+            Self::LittleEndian(m) => m.len() / 4,
+        }
+    }
+    fn group(self, index: usize) -> u32 {
+        match self {
+            Self::Native(m) => m[index],
+            Self::LittleEndian(m) => u32::from_le_bytes(
+                m[index * 4..index * 4 + 4]
+                    .try_into()
+                    .expect("validated map"),
+            ),
+        }
+    }
 }
 
 fn invalid() -> Error {
@@ -36,6 +60,61 @@ impl<'a> AffineWeight<'a> {
         scale_dtype: Precision,
         per_group_zeros: bool,
         map: Option<&'a [u32]>,
+    ) -> Result<Self> {
+        Self::with_map(
+            payload,
+            outputs,
+            inputs,
+            width,
+            group,
+            scale_dtype,
+            per_group_zeros,
+            map.map(GroupMap::Native),
+        )
+    }
+
+    /// Resident representation: canonical payload followed by an optional
+    /// little-endian map in the same admitted weight lease (ADR0031).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_packed(
+        resident: &'a [u8],
+        outputs: usize,
+        inputs: usize,
+        width: Precision,
+        group: usize,
+        scale_dtype: Precision,
+        per_group_zeros: bool,
+        mapped: bool,
+    ) -> Result<Self> {
+        let map_len = if mapped {
+            inputs.checked_mul(4).ok_or_else(invalid)?
+        } else {
+            0
+        };
+        let split = resident.len().checked_sub(map_len).ok_or_else(invalid)?;
+        let (payload, map) = resident.split_at(split);
+        Self::with_map(
+            payload,
+            outputs,
+            inputs,
+            width,
+            group,
+            scale_dtype,
+            per_group_zeros,
+            mapped.then_some(GroupMap::LittleEndian(map)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_map(
+        payload: &'a [u8],
+        outputs: usize,
+        inputs: usize,
+        width: Precision,
+        group: usize,
+        scale_dtype: Precision,
+        per_group_zeros: bool,
+        map: Option<GroupMap<'a>>,
     ) -> Result<Self> {
         if outputs == 0
             || inputs == 0
@@ -67,11 +146,14 @@ impl<'a> AffineWeight<'a> {
             zero_offset
         };
         if payload.len() != len
-            || map.is_some_and(|m| m.len() != inputs || m.iter().any(|&g| g as usize >= groups))
+            || map.is_some_and(|m| {
+                m.len() != inputs || (0..m.len()).any(|k| m.group(k) as usize >= groups)
+            })
         {
             return Err(invalid());
         }
-        if map.is_some_and(|m| (0..groups).any(|g| !m.contains(&(g as u32)))) {
+        if map.is_some_and(|m| (0..groups).any(|g| !(0..m.len()).any(|k| m.group(k) as usize == g)))
+        {
             return Err(invalid());
         }
         let view = Self {
@@ -141,7 +223,9 @@ impl<'a> AffineWeight<'a> {
         } else {
             self.payload[row * stride + column] as i8 as i32
         };
-        let group = self.map.map_or(column / self.group, |m| m[column] as usize);
+        let group = self
+            .map
+            .map_or(column / self.group, |m| m.group(column) as usize);
         let entry = row * self.groups + group;
         let zero = if self.per_group_zeros {
             let at = self.zero_offset + entry * 2;

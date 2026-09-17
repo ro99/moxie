@@ -146,7 +146,12 @@ static __device__ __forceinline__ float moxie_expert_affine_v1(
     }
     const unsigned long long stride = (inputs + (8 / bits) - 1) / (8 / bits);
     const unsigned long long groups = (inputs + group - 1) / group;
-    const unsigned long long entry = output * groups + (map ? map[input] : input / group);
+    unsigned long long logical_group = input / group;
+    if (map) {
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(map) + input * 4;
+        logical_group = static_cast<unsigned int>(p[0]) | (static_cast<unsigned int>(p[1]) << 8) | (static_cast<unsigned int>(p[2]) << 16) | (static_cast<unsigned int>(p[3]) << 24);
+    }
+    const unsigned long long entry = output * groups + logical_group;
     const unsigned long long scale_offset = outputs * stride;
     const unsigned long long zero_offset = scale_offset + outputs * groups * (scale_kind == 2 ? 4 : 2);
     int zero = 0;

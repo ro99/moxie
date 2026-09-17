@@ -1271,3 +1271,18 @@ transforms and mixed projection precisions passed synthetic oracle checks on all
 three GPUs. Composition of two graphs is separate from execution of a complete
 graph; neither yields a checkpoint token. Mapped GPU operands and artifact binding
 remain explicit work, not an implied capability of a successful decoder test.
+
+
+## 2026-09-17 — mapped artifact execution and survivor regressions
+
+Canonical expert group maps now occupy the tail of the already admitted weight
+lease. Both reduced graph consumers execute published synthetic GPTQ operands
+on all three GPUs, including odd projection tails and cancellation. Artifact
+binding rejects an unbudgeted map before writing the destination. This exercises
+shared expert/combine operations, not complete model graphs.
+
+All five T0006 survivors are caught by new targeted regressions with three
+baseline/mutant/restored repetitions. The tail-write mutant was initially
+misdescribed: it adds duplicate I/O after the journal, rather than removing the
+original write. Reading the exact substitution changed the claim and regression.
+The full battery remains a separate gate; targeted success cannot close it.

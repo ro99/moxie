@@ -111,6 +111,220 @@ impl ChunkSource for ShardSource {
     }
 }
 
+/// A canonical published artifact feeding the existing residency authority.
+/// Holds readers and metadata only; the authority supplies every payload buffer.
+#[derive(Debug)]
+pub struct CanonicalSource {
+    artifact: moxie_storage::Artifact,
+    identity: ArtifactId,
+}
+
+impl CanonicalSource {
+    pub fn new(artifact: moxie_storage::Artifact) -> Result<Self> {
+        if matches!(
+            artifact.manifest().completeness,
+            moxie_format::manifest::Completeness::Partial { .. }
+        ) {
+            return Err(Error::InvalidArtifact {
+                detail: "partial artifacts cannot bind execution weights".into(),
+            });
+        }
+        let identity = ArtifactId::new(artifact.identity())?;
+        Ok(Self { artifact, identity })
+    }
+
+    pub fn identity(&self) -> &ArtifactId {
+        &self.identity
+    }
+
+    /// Bind explicit semantic role pairs. All experts must agree on each
+    /// projection's format; heterogeneous layers use separate shared plans.
+    pub fn bind_experts(
+        &self,
+        shape: moxie_plan::expert::ExpertShape,
+        pairs: Vec<(String, String)>,
+    ) -> Result<(
+        crate::grouped::ExpertRoles,
+        [moxie_plan::expert::ExpertWeightFormat; 2],
+    )> {
+        use moxie_plan::expert::ExpertWeightFormat;
+        if pairs.len() as u64 != shape.experts || pairs.is_empty() {
+            return Err(Error::InvalidArtifact {
+                detail: "one canonical role pair is required per expert".into(),
+            });
+        }
+        let gate_rows =
+            shape
+                .intermediate
+                .checked_mul(2)
+                .ok_or_else(|| Error::InvalidArtifact {
+                    detail: "expert gate shape overflows".into(),
+                })?;
+        let mut formats = [ExpertWeightFormat::Bf16; 2];
+        for (expert, pair) in pairs.iter().enumerate() {
+            for (index, (role, rows, columns)) in [
+                (&pair.0, gate_rows, shape.hidden),
+                (&pair.1, shape.hidden, shape.intermediate),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let tensor = self.tensor(role)?;
+                if tensor.shape != [rows, columns] {
+                    return Err(Error::InvalidArtifact {
+                        detail: format!(
+                            "{role}: expected one expert projection [{rows},{columns}], got {:?}",
+                            tensor.shape
+                        )
+                        .into(),
+                    });
+                }
+                let format = canonical_expert_format(tensor)?;
+                if expert != 0 && format != formats[index] {
+                    return Err(Error::Unsupported { capability: "heterogeneous expert formats", reason: "one grouped plan requires uniform projection formats across its experts".into() });
+                }
+                formats[index] = format;
+            }
+        }
+        Ok((
+            crate::grouped::ExpertRoles {
+                per_expert: Some(pairs),
+                artifact: self.identity.clone(),
+                gate_up_role: String::new(),
+                down_role: String::new(),
+                format_version: 2,
+            },
+            formats,
+        ))
+    }
+
+    fn tensor(&self, role: &str) -> Result<&moxie_format::manifest::Tensor> {
+        self.artifact
+            .manifest()
+            .tensors
+            .iter()
+            .find(|tensor| tensor.role == role)
+            .ok_or_else(|| Error::InvalidArtifact {
+                detail: format!("canonical artifact has no role {role:?}").into(),
+            })
+    }
+}
+
+fn canonical_expert_format(
+    tensor: &moxie_format::manifest::Tensor,
+) -> Result<moxie_plan::expert::ExpertWeightFormat> {
+    use moxie_format::manifest::{GroupRule, ScaleDtype, TensorPrecision, ZeroPointMode};
+    use moxie_plan::expert::ExpertWeightFormat;
+    use moxie_types::Precision;
+    if tensor.precision == TensorPrecision::Bf16V1 {
+        return Ok(ExpertWeightFormat::Bf16);
+    }
+    let fields = tensor
+        .affine
+        .as_ref()
+        .ok_or_else(|| Error::InvalidArtifact {
+            detail: "affine tensor has no fields".into(),
+        })?;
+    let group = match fields.group_rule {
+        GroupRule::Contiguous32 => 32,
+        GroupRule::Contiguous128 => 128,
+        GroupRule::PerChannel => {
+            return Err(Error::Unsupported {
+                capability: "per-channel grouped weights",
+                reason: "grouped execution currently qualifies group32/128".into(),
+            });
+        }
+    };
+    Ok(ExpertWeightFormat::Affine {
+        width: if tensor.precision == TensorPrecision::AffineInt4V1 {
+            Precision::Int4
+        } else {
+            Precision::Int8
+        },
+        group,
+        scale: match fields.scale_dtype {
+            ScaleDtype::F16 => Precision::F16,
+            ScaleDtype::Bf16 => Precision::Bf16,
+            ScaleDtype::F32 => Precision::F32,
+        },
+        zeros: fields.zero_point == ZeroPointMode::PerGroup,
+        mapped: fields.group_index.is_some(),
+    })
+}
+
+impl ChunkSource for CanonicalSource {
+    fn read_chunk(&mut self, chunk: &ChunkId, into: &mut [u8]) -> Result<()> {
+        if chunk.artifact() != &self.identity
+            || chunk.format_version() != 2
+            || chunk.range().offset_bytes() != 0
+            || chunk.range().len_bytes() != into.len() as u64
+        {
+            return Err(Error::InvalidArtifact {
+                detail: "canonical source identity or whole-tensor range mismatch".into(),
+            });
+        }
+        let tensor = self.tensor(chunk.slot().role())?;
+        let format = canonical_expert_format(tensor)?;
+        let columns = *tensor.shape.last().expect("validated tensor");
+        let rows = tensor.shape[..tensor.shape.len() - 1]
+            .iter()
+            .try_fold(1u64, |n, &d| n.checked_mul(d))
+            .ok_or_else(|| Error::InvalidArtifact {
+                detail: "canonical shape overflows".into(),
+            })?;
+        let resident_bytes = format
+            .bytes(rows, columns)
+            .ok_or_else(|| Error::InvalidArtifact {
+                detail: "resident expert extent overflows".into(),
+            })?;
+        if resident_bytes != into.len() as u64 {
+            return Err(Error::InvalidArtifact {
+                detail: "resident expert extent does not match source metadata".into(),
+            });
+        }
+        let payload_bytes = usize::try_from(
+            format
+                .payload_bytes(rows, columns)
+                .expect("validated format"),
+        )
+        .map_err(|_| Error::InvalidArtifact {
+            detail: "payload does not fit address space".into(),
+        })?;
+        self.artifact
+            .read_canonical_payload(&tensor.role, &mut into[..payload_bytes])?;
+        if let Some(map) = tensor
+            .affine
+            .as_ref()
+            .and_then(|fields| fields.group_index.as_ref())
+        {
+            for (word, group) in into[payload_bytes..].chunks_exact_mut(4).zip(map) {
+                word.copy_from_slice(&group.to_le_bytes());
+            }
+        }
+        if let moxie_plan::expert::ExpertWeightFormat::Affine {
+            width,
+            group,
+            scale,
+            zeros,
+            mapped,
+        } = format
+        {
+            // Validate scalar metadata and map before the authority can publish an upload.
+            moxie_kernels::affine::AffineWeight::new_packed(
+                into,
+                rows as usize,
+                columns as usize,
+                width,
+                group as usize,
+                scale,
+                zeros,
+                mapped,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Perform one read order and report its outcome.
 ///
 /// Returns the follow-on orders the completion released -- this ticket's own

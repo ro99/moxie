@@ -1418,3 +1418,189 @@ fn the_journal_cap_refuses_a_record_the_plan_allowed() {
     eprintln!("task0026 journal cap: refused after {records} record(s)");
     run.abandon(&mut ledger).expect("it abandons");
 }
+
+/// A logical publication unit must not write and sync its payload twice.
+/// The tail mutant adds a duplicate durable write after the journal append;
+/// it does not remove the original pre-journal write. The defect measured here
+/// is duplicate payload I/O and an unnecessary failure boundary, not proof of
+/// a corrupt journal or lost durability.
+#[test]
+fn write_unit_touches_chunk_write_and_sync_exactly_once() {
+    let scratch = Scratch::new("write-once");
+    let dest = scratch.join("artifact");
+    let mut ledger = ledger();
+    let faults = Faults::none();
+    let start = Run::begin(
+        &dest,
+        plan(),
+        binding(),
+        budget(),
+        &Options::default(),
+        &mut ledger,
+        &faults,
+        &|| false,
+    )
+    .expect("a fresh start");
+    let mut run = match start {
+        Start::Fresh(run) => run,
+        other => panic!("expected a fresh start: {other:?}"),
+    };
+    let request = &requests()[0];
+    let (at, len) = units(request)[0];
+    let bytes = payload(request_len(request), request_len(request) as usize);
+    run.write_unit(
+        &component_of(request),
+        &bytes[at as usize..at as usize + len],
+        HEX,
+        &faults,
+    )
+    .expect("the unit writes");
+    assert_eq!(
+        faults.visits(Site::ChunkWrite),
+        1,
+        "one payload write per unit"
+    );
+    assert_eq!(
+        faults.visits(Site::ChunkSync),
+        1,
+        "one payload sync per unit; duplicate syncs add redundant I/O and failure boundaries"
+    );
+    run.abandon(&mut ledger).expect("it abandons");
+}
+
+/// A resume whose compaction would hold both journals above the plan's
+/// overhead allowance is refused, not silently allowed to exceed its own disk
+/// budget.
+///
+/// Compaction writes a replacement journal beside the original and renames
+/// over it, so for the length of that write the destination holds both at
+/// once -- `peak = overhead_used + journal_used` in `recover`. Nothing the
+/// incremental charging in `write_unit` does during ordinary writing ever
+/// reaches that peak; only a resume that has to compact does, which is why
+/// this drives a real cancel-then-resume rather than asserting on the charge
+/// functions directly.
+#[test]
+fn a_resume_whose_compaction_peak_exceeds_the_overhead_budget_is_refused() {
+    // First pass: measure how large the journal actually is after two units,
+    // under a budget roomy enough to get there uninterrupted.
+    let probe_dir = Scratch::new("compaction-peak-probe");
+    let probe_dest = probe_dir.join("artifact");
+    let mut probe_ledger = ledger();
+    let probe_plan = OutputPlan::build(requests(), &budget(), 8 * 1024).expect("a plan");
+    let start = Run::begin(
+        &probe_dest,
+        probe_plan,
+        binding(),
+        budget(),
+        &Options::default(),
+        &mut probe_ledger,
+        &Faults::none(),
+        &|| false,
+    )
+    .expect("a fresh start");
+    let mut run = match start {
+        Start::Fresh(run) => run,
+        other => panic!("expected a fresh start: {other:?}"),
+    };
+    let mut written = 0usize;
+    'probe: for request in requests() {
+        let bytes = payload(request_len(&request), request_len(&request) as usize);
+        for (at, len) in units(&request) {
+            run.write_unit(
+                &component_of(&request),
+                &bytes[at as usize..at as usize + len],
+                HEX,
+                &Faults::none(),
+            )
+            .expect("the unit writes");
+            written += 1;
+            if written == 2 {
+                break 'probe;
+            }
+        }
+    }
+    let outcome = run.cancel(&mut probe_ledger).expect("it cancels");
+    assert!(matches!(outcome, Outcome::Cancelled { .. }), "{outcome:?}");
+    let journal_len = std::fs::metadata(probe_dest.join(".moxie-repack-journal"))
+        .expect("a journal")
+        .len();
+    assert!(journal_len > 0, "the probe wrote no journal");
+
+    // Second pass, in a fresh destination, with the plan's overhead sized to
+    // hold one journal comfortably and the peak of two nowhere near.
+    let tight_overhead = journal_len + 16;
+    assert!(
+        tight_overhead < 2 * journal_len,
+        "the calibration does not leave room to distinguish one journal from the compaction peak"
+    );
+    let scratch = Scratch::new("compaction-peak");
+    let dest = scratch.join("artifact");
+    let mut tight_ledger = ledger();
+    let tight_plan = OutputPlan::build(requests(), &budget(), tight_overhead).expect("a plan");
+    let start = Run::begin(
+        &dest,
+        tight_plan,
+        binding(),
+        budget(),
+        &Options::default(),
+        &mut tight_ledger,
+        &Faults::none(),
+        &|| false,
+    )
+    .expect("a fresh start under the tight budget");
+    let mut run = match start {
+        Start::Fresh(run) => run,
+        other => panic!("expected a fresh start: {other:?}"),
+    };
+    let mut written = 0usize;
+    'tight: for request in requests() {
+        let bytes = payload(request_len(&request), request_len(&request) as usize);
+        for (at, len) in units(&request) {
+            run.write_unit(
+                &component_of(&request),
+                &bytes[at as usize..at as usize + len],
+                HEX,
+                &Faults::none(),
+            )
+            .expect("the unit writes under the tight budget");
+            written += 1;
+            if written == 2 {
+                break 'tight;
+            }
+        }
+    }
+    let outcome = run.cancel(&mut tight_ledger).expect("it cancels");
+    assert!(matches!(outcome, Outcome::Cancelled { .. }), "{outcome:?}");
+    let confirm_len = std::fs::metadata(dest.join(".moxie-repack-journal"))
+        .expect("a journal")
+        .len();
+    assert_eq!(
+        confirm_len, journal_len,
+        "the tight-budget run produced a differently sized journal than the probe: the \
+         calibration above does not apply here"
+    );
+
+    // Resume: recovery reads this journal back and compacts it, and the peak
+    // of holding both copies at once is double what the tight overhead
+    // reserved.
+    let mut resume_ledger = ledger();
+    let resume_plan = OutputPlan::build(requests(), &budget(), tight_overhead).expect("a plan");
+    let e = Run::begin(
+        &dest,
+        resume_plan,
+        binding(),
+        budget(),
+        &Options {
+            take_over_interrupted_run: true,
+        },
+        &mut resume_ledger,
+        &Faults::none(),
+        &|| false,
+    )
+    .expect_err("a compaction peak above the overhead budget is a refusal, not a silent overrun");
+    assert!(
+        e.to_string().contains("compacting this journal would hold"),
+        "the refusal does not name the compaction peak: {e}"
+    );
+    assert!(resume_ledger.outstanding().is_empty());
+}

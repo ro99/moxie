@@ -688,6 +688,7 @@ impl<'ctx> DeviceExperts<'ctx> {
                 group,
                 scale,
                 zeros,
+                ..
             } => (
                 width.bits(),
                 group,
@@ -701,7 +702,16 @@ impl<'ctx> DeviceExperts<'ctx> {
         };
         let (mut bits, mut group_size, mut scale_kind, mut has_zeros) =
             metadata(self.weight_formats[0]);
-        let mut map_ptr = 0u64; // Contiguous canonical groups; mapped views require a separately admitted map.
+        let mut map_ptr = if matches!(
+            self.weight_formats[0],
+            ExpertWeightFormat::Affine { mapped: true, .. }
+        ) {
+            gate_up_ptr
+                .checked_add(expected_gate_up - self.hidden * 4)
+                .expect("validated device range")
+        } else {
+            0u64
+        };
         let mut affine_project: [*mut c_void; 12] = [
             (&raw mut x_ptr).cast(),
             (&raw mut row_ptr).cast(),
@@ -755,10 +765,20 @@ impl<'ctx> DeviceExperts<'ctx> {
         ];
         let (mut down_bits, mut down_group, mut down_scale, mut down_zeros) =
             metadata(self.weight_formats[1]);
+        let mut down_map_ptr = if matches!(
+            self.weight_formats[1],
+            ExpertWeightFormat::Affine { mapped: true, .. }
+        ) {
+            down_ptr
+                .checked_add(expected_down - self.intermediate * 4)
+                .expect("validated device range")
+        } else {
+            0u64
+        };
         let mut affine_down: [*mut c_void; 12] = [
             (&raw mut workspace_ptr).cast(),
             (&raw mut down_ptr).cast(),
-            (&raw mut map_ptr).cast(),
+            (&raw mut down_map_ptr).cast(),
             (&raw mut slot_ptr).cast(),
             (&raw mut slots_ptr).cast(),
             (&raw mut count).cast(),

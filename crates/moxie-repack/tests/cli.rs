@@ -471,7 +471,7 @@ fn a_missing_or_unsupported_source_is_refused_by_name() {
     ]);
     assert_eq!(r.status, 2);
     assert!(
-        r.says("refused by name rather than guessed at"),
+        r.says("kind 'auto-gptq' is outside {bf16, pack-quantized, gptq-v1}"),
         "{}",
         r.stdout
     );

@@ -278,3 +278,20 @@ compaction-peak-not-budgeted, plan-budgets-for-one-journal.
 The operator is investigating regression tests on that isolated snapshot;
 expectations remain unchanged. This result does not qualify subsequent builder
 changes. Targeted checks of the five survivors come before any repeat full run.
+
+
+## Targeted survivor repairs, 2026-09-17
+
+Five added regressions catch all five survivors in an isolated source snapshot
+of 783f91a plus the test patch. Each test passed three baseline repetitions,
+failed three repetitions with its exact declared mutant, then passed three
+restored repetitions. No expectation changed. Evidence:
+`results/m3-recovery/survivor-targeted-summary.log` and `survivor-targeted/`.
+This is targeted evidence, not the full 66-substitution battery; acceptance2
+remains open until the final-tree battery passes.
+
+The durable-tail mutant adds a duplicate write/sync after journal recording;
+it does not delete the original preceding write. Its regression checks duplicate
+I/O/failure boundaries, not a demonstrated loss of durability. Other regressions
+exercise source reopening after identity change, cancellation during hashing,
+actual compaction peak rejection and consistency of public staging estimates.
