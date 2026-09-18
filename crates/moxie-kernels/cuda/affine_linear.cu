@@ -38,7 +38,7 @@ static __device__ __forceinline__ float moxie_affine_failure_v1() {
 //
 // One warp per 16x16 output tile. `zero_points` is null for a symmetric tensor,
 // which is the absent section rather than a buffer of zeros.
-extern "C" __global__ void moxie_affine_linear_v1(
+extern "C" __global__ void moxie_affine_linear_v2(
     const __nv_bfloat16* __restrict__ x,
     const unsigned char* __restrict__ codes,
     const unsigned char* __restrict__ scales,
@@ -69,8 +69,8 @@ extern "C" __global__ void moxie_affine_linear_v1(
     wmma::fill_fragment(acc, 0.0F);
 
     // Lane `t` owns half a tile row: eight consecutive columns of row `t / 2`.
-    // That assignment, not a strided one, is what makes the group constant
-    // across a lane's eight columns.
+    // Contiguous grouping can hoist their metadata lookup; a logical-column
+    // map may select a different group for every element below.
     const unsigned lane = threadIdx.x;
     const unsigned slot = lane >> 1;
     const unsigned half = (lane & 1U) * 8U;

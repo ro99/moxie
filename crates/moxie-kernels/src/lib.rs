@@ -68,8 +68,8 @@ pub const BF16_EXPERT_ABI: u32 = 1;
 /// runtime parameters. Two symbols here would be two implementations one review
 /// cycle later, and ADR 0003 is explicit that "W4A16 is an execution profile,
 /// AWQ/AutoRound are methods": neither is a licence for a kernel per source.
-pub const AFFINE_LINEAR: &str = "moxie_affine_linear_v1";
-pub const AFFINE_LINEAR_ABI: u32 = 1;
+pub const AFFINE_LINEAR: &str = "moxie_affine_linear_v2";
+pub const AFFINE_LINEAR_ABI: u32 = 2;
 /// The output tile the kernel's warp computes, and the tensor-core `k` step.
 ///
 /// Public because it is a *contract*, not an implementation detail: the host

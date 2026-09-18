@@ -757,11 +757,9 @@ fn resolved_integer(
                 ZeroPointSection::Absent => ZeroPointMode::Symmetric,
                 ZeroPointSection::PerGroup => ZeroPointMode::PerGroup,
             },
-            // Preserved rather than invented: the importer refuses
-            // a source that carries an activation-order map, so a
-            // canonical group index can only be absent here. When
-            // that lane exists it arrives through the descriptor,
-            // never by being defaulted away.
+            // Preserved rather than invented. Importers either refuse a map
+            // they cannot interpret or carry its logical-column grouping in
+            // the descriptor; this path never defaults one away.
             group_index: d.group_index.clone(),
         }),
         canonical_bytes,
