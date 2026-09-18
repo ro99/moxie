@@ -1,6 +1,6 @@
 # Task 0034 — shared GPTQ integer serialization import
 
-Status: active; contract before implementation, 2026-09-16.
+Status: implemented and measured; owner review pending, 2026-09-18.
 
 ## Identity and authority
 
@@ -65,7 +65,7 @@ material until evidence pins hashes; no new runtime dependency on Python.
 
 ## Result
 
-Implemented, validation in progress; independent review pending.
+Implemented and measured; owner review pending.
 
 Shared GPTQ-v1 decoder and bounded publisher preserve I32 packed inputs,
 zero-minus-one semantics, source scale bits, tails and explicit g_idx. Generated
@@ -95,3 +95,20 @@ GLM dc338195ea26db754f308f54a6d05e9490c01a03c6972fa74e531b133f887ffb;
 Qwen c8a3adef4e064142c043ac15eb5684bbca6aa8d382ac92f13e060160add2ca16.
 This is bounded affine-value evidence, not whole-artifact, model-output or
 performance qualification.
+
+The generated-plan regression now combines a noncontiguous `g_idx` map with
+multiple 16-bit passthrough patterns, including an MTP role and both `float`
+and `fp` spellings. It publishes the mapped affine tensor and preserves both
+BF16 overrides. Read-only parsing of the two pinned real configurations checks
+their group128 declaration and their model-specific 16-bit override families;
+the Qwen revision includes its `.*mtp.*` rule. A fused leading expert axis is
+refused by name: the pinned sources expose explicit rank-two expert modules,
+and this importer does not guess an exporter-specific interleave.
+
+The shared dense kernel now consumes the admitted u32 map per logical column.
+An INT4/group32/F16 mapped case passed the unchanged ADR0028 numerical gate on
+SM120 and both SM86 GPUs, and a missing map refuses before enqueue while
+returning every operand. Evidence:
+`results/m3-recovery/mapped-dense-device.log`. The grouped expert path carries
+the same metadata in its weight leases under ADR0031. No expanded weight copy
+or serialization-specific runtime was added.

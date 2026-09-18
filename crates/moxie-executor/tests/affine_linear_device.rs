@@ -56,6 +56,7 @@ struct Components {
     codes: Vec<u8>,
     scales: Vec<u8>,
     zero_points: Option<Vec<u8>>,
+    group_index: Option<Vec<u8>>,
 }
 
 /// Serves the three components out of memory, in the authority's own chunk
@@ -77,6 +78,11 @@ impl ChunkSource for Fixture {
                 .zero_points
                 .as_deref()
                 .expect("a symmetric tensor has no zero-point component"),
+            "group_index" => self
+                .components
+                .group_index
+                .as_deref()
+                .expect("a contiguous tensor has no group-index component"),
             other => panic!("no component is bound to role {other:?}"),
         };
         let start = chunk.range().offset_bytes() as usize;
@@ -103,6 +109,11 @@ fn components(tensor: &AffineTensor) -> Components {
             ZeroPoints::Symmetric => None,
             ZeroPoints::PerGroup(z) => Some(z.iter().flat_map(|v| v.to_le_bytes()).collect()),
         },
+        group_index: tensor
+            .descriptor()
+            .group_index
+            .as_ref()
+            .map(|map| map.iter().flat_map(|group| group.to_le_bytes()).collect()),
     }
 }
 
@@ -129,6 +140,7 @@ impl Sequence {
 /// cycle through every code of either width, spread across rows and columns
 /// rather than bunched at the start of row zero. The rest are drawn. The
 /// coverage is then *asserted* from the tensor, never from this comment.
+#[allow(clippy::too_many_arguments)]
 fn tensor(
     width: IntWidth,
     out_features: usize,
@@ -136,9 +148,10 @@ fn tensor(
     grouping: Grouping,
     asymmetric: bool,
     scale_dtype: ScaleDtype,
+    mapped: bool,
     seed: u64,
 ) -> AffineTensor {
-    let descriptor = AffineDescriptor {
+    let mut descriptor = AffineDescriptor {
         width,
         out_features,
         in_features,
@@ -146,6 +159,17 @@ fn tensor(
         group_index: None,
         scale_dtype,
     };
+    if mapped {
+        let Grouping::Contiguous { size } = grouping else {
+            panic!("mapped fixture requires grouped scales");
+        };
+        let groups = in_features.div_ceil(size as usize);
+        descriptor.group_index = Some(
+            (0..in_features)
+                .map(|k| (groups - 1 - k / size as usize) as u32)
+                .collect(),
+        );
+    }
     let (lo, hi) = width.code_range();
     let span = (hi - lo + 1) as usize;
     let mut rng = Sequence(seed);
@@ -336,6 +360,7 @@ struct Case {
     grouping: Grouping,
     asymmetric: bool,
     scale_dtype: ScaleDtype,
+    mapped: bool,
     out_features: usize,
     in_features: usize,
     rows: usize,
@@ -356,6 +381,7 @@ const CASES: &[Case] = &[
         grouping: Grouping::Contiguous { size: 32 },
         asymmetric: true,
         scale_dtype: ScaleDtype::Bf16,
+        mapped: false,
         out_features: 96,
         in_features: 100,
         rows: 5,
@@ -366,6 +392,7 @@ const CASES: &[Case] = &[
         grouping: Grouping::Contiguous { size: 128 },
         asymmetric: false,
         scale_dtype: ScaleDtype::F32,
+        mapped: false,
         out_features: 64,
         in_features: 300,
         rows: 3,
@@ -376,6 +403,7 @@ const CASES: &[Case] = &[
         grouping: Grouping::Contiguous { size: 128 },
         asymmetric: false,
         scale_dtype: ScaleDtype::F16,
+        mapped: false,
         out_features: 48,
         in_features: 300,
         rows: 17,
@@ -394,6 +422,7 @@ const CASES: &[Case] = &[
         grouping: Grouping::Contiguous { size: 32 },
         asymmetric: true,
         scale_dtype: ScaleDtype::Bf16,
+        mapped: false,
         out_features: 3072,
         in_features: 1024,
         rows: 33,
@@ -404,9 +433,21 @@ const CASES: &[Case] = &[
         grouping: Grouping::PerOutputChannel,
         asymmetric: true,
         scale_dtype: ScaleDtype::Bf16,
+        mapped: false,
         out_features: 33,
         in_features: 100,
         rows: 7,
+    },
+    Case {
+        name: "f: int4 group-32 asymmetric with activation-order map",
+        width: IntWidth::Int4,
+        grouping: Grouping::Contiguous { size: 32 },
+        asymmetric: true,
+        scale_dtype: ScaleDtype::F16,
+        mapped: true,
+        out_features: 48,
+        in_features: 100,
+        rows: 5,
     },
 ];
 
@@ -448,6 +489,7 @@ fn run_case<'ctx>(
         case.grouping,
         case.asymmetric,
         case.scale_dtype,
+        case.mapped,
         0x0028_2026,
     );
     assert_code_coverage(&tensor, case);
@@ -483,11 +525,15 @@ fn run_case<'ctx>(
     let code_bytes = launch.code_bytes().unwrap();
     let scale_bytes_len = launch.scale_bytes().unwrap();
     let zero_bytes = launch.zero_point_bytes().unwrap();
+    let group_index_bytes = launch.group_index_bytes().unwrap();
     // The cache is capped at the three components, each rounded up to the
     // cache's own 256-byte alignment and nothing more, so `capacity()` is a
     // measured bound rather than a generous one.
     let align = |bytes: u64| bytes.div_ceil(256) * 256;
-    let weight_bytes = align(code_bytes) + align(scale_bytes_len) + align(zero_bytes.unwrap_or(0));
+    let weight_bytes = align(code_bytes)
+        + align(scale_bytes_len)
+        + align(zero_bytes.unwrap_or(0))
+        + align(group_index_bytes.unwrap_or(0));
     let mut ledger = Ledger::new([
         CapacitySnapshot::new(Scope::Host, 64 << 20, 1 << 20).unwrap(),
         CapacitySnapshot::new(scope, 64 << 20, 1 << 20).unwrap(),
@@ -534,6 +580,17 @@ fn run_case<'ctx>(
             bytes,
         )
     });
+    let group_index = group_index_bytes.map(|bytes| {
+        resident(
+            &mut authority,
+            &mut source,
+            &mut residency,
+            stream,
+            scope,
+            "group_index",
+            bytes,
+        )
+    });
 
     let mut run = AffineLinearRun::admit(&mut ledger, ctx, descriptor, launch)
         .unwrap_or_else(|refused| panic!("{}: {}", case.name, refused.error));
@@ -551,18 +608,50 @@ fn run_case<'ctx>(
         case.name
     );
 
-    let completed = run
-        .run(
-            stream,
-            &authority,
-            &residency,
+    let (weight, x_bytes) = if launch.mapped() {
+        let refused = run
+            .run(
+                stream,
+                &authority,
+                &residency,
+                ResidentAffineWeight {
+                    codes,
+                    scales,
+                    zero_points,
+                    group_index: None,
+                },
+                x_bytes,
+            )
+            .expect_err("a mapped launch must not run without its admitted map");
+        assert!(!refused.retained_operands());
+        assert!(refused.error.to_string().contains("group-index component"));
+        let returned = refused
+            .weight
+            .expect("the pre-launch refusal returns weight");
+        (
+            ResidentAffineWeight {
+                codes: returned.codes,
+                scales: returned.scales,
+                zero_points: returned.zero_points,
+                group_index,
+            },
+            refused
+                .activations
+                .expect("the pre-launch refusal returns activations"),
+        )
+    } else {
+        (
             ResidentAffineWeight {
                 codes,
                 scales,
                 zero_points,
+                group_index,
             },
             x_bytes,
         )
+    };
+    let completed = run
+        .run(stream, &authority, &residency, weight, x_bytes)
         .unwrap_or_else(|refused| panic!("{}: {}", case.name, refused.error));
     let got = completed.output;
     let weight = completed.weight;
@@ -584,9 +673,14 @@ fn run_case<'ctx>(
     );
 
     run.close(&mut ledger).expect("the run closes");
-    for lease in [Some(weight.codes), Some(weight.scales), weight.zero_points]
-        .into_iter()
-        .flatten()
+    for lease in [
+        Some(weight.codes),
+        Some(weight.scales),
+        weight.zero_points,
+        weight.group_index,
+    ]
+    .into_iter()
+    .flatten()
     {
         authority
             .release(lease)
@@ -666,6 +760,7 @@ fn admission_refuses_a_descriptor_that_does_not_serve_the_geometry() {
         case.grouping,
         case.asymmetric,
         case.scale_dtype,
+        case.mapped,
         0x0028_2026,
     );
     let launch = AffineLaunch::for_tensor(&tensor, case.rows as u64).expect("the launch derives");
@@ -728,6 +823,7 @@ fn a_component_resident_on_another_device_is_refused() {
         case.grouping,
         case.asymmetric,
         case.scale_dtype,
+        case.mapped,
         0x0028_2026,
     );
     let launch = AffineLaunch::for_tensor(&tensor, case.rows as u64).expect("the launch derives");
@@ -816,6 +912,7 @@ fn a_component_resident_on_another_device_is_refused() {
                 codes,
                 scales,
                 zero_points,
+                group_index: None,
             },
             vec![0u8; launch.activation_bytes().unwrap() as usize],
         )

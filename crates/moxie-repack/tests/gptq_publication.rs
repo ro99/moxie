@@ -159,16 +159,31 @@ fn autoround_generated_plan_keeps_passthrough_and_checks_overrides() {
                 0x3c00u16.to_le_bytes().repeat(16),
             ),
             Entry::new(
+                "m.g_idx",
+                "I32",
+                vec![64],
+                (0..64u32)
+                    .map(|k| 1 - k / 32)
+                    .flat_map(u32::to_le_bytes)
+                    .collect(),
+            ),
+            Entry::new(
                 "norm.weight",
                 "BF16",
                 vec![1],
                 0x3f80u16.to_le_bytes().to_vec(),
             ),
+            Entry::new(
+                "mtp.head.weight",
+                "BF16",
+                vec![1],
+                0x4000u16.to_le_bytes().to_vec(),
+            ),
         ],
     );
-    let config = r#"{"model_type":"fixture","quantization_config":{"quant_method":"auto-round","packing_format":"auto_round:auto_gptq","autoround_version":"0.15.0","bits":4,"group_size":32,"sym":true,"data_type":"int","extra_config":{".*norm.*":{"bits":16,"data_type":"float"}}}}"#;
+    let config = r#"{"model_type":"fixture","quantization_config":{"quant_method":"auto-round","packing_format":"auto_round:auto_gptq","autoround_version":"0.15.0","bits":4,"group_size":32,"sym":true,"desc_act":true,"data_type":"int","extra_config":{".*norm.*":{"bits":16,"data_type":"float"},".*mtp.*":{"bits":16,"data_type":"fp"}}}}"#;
     std::fs::write(source.join("config.json"), config).unwrap();
-    std::fs::write(source.join("model.safetensors.index.json"),r#"{"weight_map":{"m.qweight":"model.safetensors","m.qzeros":"model.safetensors","m.scales":"model.safetensors","norm.weight":"model.safetensors"}}"#).unwrap();
+    std::fs::write(source.join("model.safetensors.index.json"),r#"{"weight_map":{"m.qweight":"model.safetensors","m.qzeros":"model.safetensors","m.scales":"model.safetensors","m.g_idx":"model.safetensors","norm.weight":"model.safetensors","mtp.head.weight":"model.safetensors"}}"#).unwrap();
     let plan = scratch.join("plan.toml");
     let output = scratch.join("artifact");
     let planned = run(&[
@@ -182,6 +197,8 @@ fn autoround_generated_plan_keeps_passthrough_and_checks_overrides() {
     let text = std::fs::read_to_string(&plan).unwrap();
     assert!(text.contains("[gptq]"));
     assert!(text.contains("norm.weight"));
+    assert!(text.contains("mtp.head.weight"));
+    assert!(text.contains("g_idx"));
     let published = run(&[
         "repack",
         "--plan",
@@ -198,6 +215,9 @@ fn autoround_generated_plan_keeps_passthrough_and_checks_overrides() {
     let mut norm = [0u8; 2];
     artifact.read_tensor("norm.weight", &mut norm).unwrap();
     assert_eq!(norm, 0x3f80u16.to_le_bytes());
+    let mut mtp = [0u8; 2];
+    artifact.read_tensor("mtp.head.weight", &mut mtp).unwrap();
+    assert_eq!(mtp, 0x4000u16.to_le_bytes());
     let mut raw = Vec::new();
     artifact
         .stream_tensor("m.weight", &mut [0; 128], &mut |part| {
@@ -210,7 +230,7 @@ fn autoround_generated_plan_keeps_passthrough_and_checks_overrides() {
         out_features: 8,
         in_features: 64,
         grouping: moxie_format::affine::Grouping::Contiguous { size: 32 },
-        group_index: None,
+        group_index: Some((0..64u32).map(|k| 1 - k / 32).collect()),
         scale_dtype: moxie_format::scale::ScaleDtype::F16,
     };
     let tensor = moxie_format::payload::decode(

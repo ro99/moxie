@@ -210,6 +210,13 @@ pub struct SourceTensors<'a> {
 
 /// Decode a `weight_shape` payload: exactly two little-endian `I64` values.
 pub fn decode_weight_shape(payload: &[u8]) -> Result<(usize, usize)> {
+    if payload.len() == 24 {
+        return Err(invalid_static(
+            "weight_shape declares a leading expert axis; this importer requires one explicit \
+             rank-two expert module per role and refuses fused/interleaved expert storage rather \
+             than guessing its exporter-specific order",
+        ));
+    }
     if payload.len() != 16 {
         return Err(invalid(format_args!(
             "weight_shape must hold exactly two I64 values, got {} byte(s)",
@@ -1304,6 +1311,13 @@ mod tests {
         let mut negative = (-1i64).to_le_bytes().to_vec();
         negative.extend_from_slice(&5376i64.to_le_bytes());
         assert!(decode_weight_shape(&negative).is_err());
+        let fused = [2i64, 8192, 5376]
+            .into_iter()
+            .flat_map(i64::to_le_bytes)
+            .collect::<Vec<_>>();
+        let error = decode_weight_shape(&fused).unwrap_err();
+        assert!(error.to_string().contains("leading expert axis"), "{error}");
+        assert!(error.to_string().contains("interleaved"), "{error}");
     }
 
     /// The scale dtype comes from the tensor header, never from the config.

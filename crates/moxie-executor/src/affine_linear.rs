@@ -122,11 +122,9 @@ fn unsupported(capability: &'static str, reason: impl Into<String>) -> Error {
 /// Everything the kernel needs that is not an address, derived once from the
 /// canonical descriptor and checked before any device work starts.
 ///
-/// This type is the group map. The kernel reads a group index per `(row, k
-/// tile)` and never per element, which is only correct while a group boundary
-/// cannot fall inside a `k` tile — so that is checked here, against
-/// [`moxie_kernels::AFFINE_LINEAR_TILE`], rather than assumed in CUDA where it
-/// could only fail as a wrong number.
+/// This type is the checked launch geometry. Contiguous groups use one scale
+/// rule derived here; mapped weights carry a separately admitted u32 index for
+/// every logical input column and the kernel consults it per element.
 /// **The fields are private and there is no way to build one except through
 /// [`AffineLaunch::derive`].** A value of this type *is* the evidence that the
 /// geometry was checked, the same way `moxie-types`' role precisions are. An
@@ -150,16 +148,16 @@ pub struct AffineLaunch {
     width: IntWidth,
     scale_dtype: ScaleDtype,
     symmetric: bool,
+    mapped: bool,
 }
 
 impl AffineLaunch {
     /// Derive the launch from a canonical descriptor, or refuse.
     ///
-    /// Refusals here are the kernel's declared domain, not a convenience:
-    /// an activation-order map and a group size the tile cannot honour are both
-    /// things this kernel does not implement, and ADR 0027 names `actorder:
-    /// static` a continuation rather than a prerequisite. Silently treating a
-    /// permuted tensor as contiguous would produce a plausible wrong answer.
+    /// Refusals here are the kernel's declared domain, not a convenience. A
+    /// mapped descriptor is accepted only after the format contract validates
+    /// its exact length, range and coverage; silently treating it as contiguous
+    /// would produce a plausible wrong answer.
     pub fn derive(
         descriptor: &AffineDescriptor,
         zero_points: ZeroPointSection,
@@ -168,14 +166,6 @@ impl AffineLaunch {
         descriptor.validate()?;
         if rows == 0 {
             return Err(invalid("rows", "a launch needs at least one row"));
-        }
-        if descriptor.group_index.is_some() {
-            return Err(unsupported(
-                "w4a16_group_index",
-                "this tensor carries an activation-order group map; the shared linear \
-                 implements the contiguous and per-channel rules only, and a permuted \
-                 tensor is a named continuation rather than a case to approximate",
-            ));
         }
         let groups_per_row = descriptor.groups_per_row()? as u64;
         let in_features = descriptor.in_features as u64;
@@ -215,6 +205,7 @@ impl AffineLaunch {
             width: descriptor.width,
             scale_dtype: descriptor.scale_dtype,
             symmetric,
+            mapped: descriptor.group_index.is_some(),
         };
         // Every extent the kernel indexes, checked for overflow before it is a
         // pointer. A `u64` product that wraps here is a read past the end of a
@@ -276,9 +267,13 @@ impl AffineLaunch {
         self.symmetric
     }
 
+    pub const fn mapped(&self) -> bool {
+        self.mapped
+    }
+
     /// The group a logical input column belongs to.
     ///
-    /// The same arithmetic the kernel performs, expressed once on the host so a
+    /// The contiguous arithmetic the kernel performs, expressed once on the host so a
     /// test can check it against [`AffineDescriptor::group_of`] — which is the
     /// decoder's own map — on shapes whose last group is short.
     pub fn group_of(&self, k: u64) -> Result<u64> {
@@ -286,6 +281,12 @@ impl AffineLaunch {
             return Err(invalid_fmt(
                 "column",
                 format_args!("column {k} is outside {} input features", self.in_features),
+            ));
+        }
+        if self.mapped {
+            return Err(unsupported(
+                "mapped_group_lookup",
+                "a mapped launch needs its admitted group-index component",
             ));
         }
         Ok(if self.groups_per_row == 1 {
@@ -318,6 +319,17 @@ impl AffineLaunch {
             .and_then(|entries| entries.checked_mul(2))
             .map(Some)
             .ok_or_else(|| invalid("zero_points", "the zero-point extent overflows"))
+    }
+
+    /// Bytes in the optional logical-column to scale-group map.
+    pub fn group_index_bytes(&self) -> Result<Option<u64>> {
+        if !self.mapped {
+            return Ok(None);
+        }
+        self.in_features
+            .checked_mul(4)
+            .map(Some)
+            .ok_or_else(|| invalid("group_index", "the group-index extent overflows"))
     }
 
     pub fn activation_bytes(&self) -> Result<u64> {
@@ -605,26 +617,28 @@ mod device {
     /// 256-byte alignment, as every other device range in this crate uses.
     const ALIGNMENT: u64 = 256;
 
-    /// The three device addresses one launch reads, each already checked
+    /// The component addresses one launch reads, each already checked
     /// against the length the descriptor implies and the device it runs on.
     #[derive(Debug, Clone, Copy)]
     struct ComponentAddresses {
         codes: u64,
         scales: u64,
         zero_points: Option<u64>,
+        group_index: Option<u64>,
     }
 
-    /// One logical weight, resident as three components.
+    /// One logical weight, resident as its canonical components plus an
+    /// optional activation-order map.
     ///
-    /// Three leases rather than one because they are three separately sized
-    /// sections whose bytes the source stores apart, and because a symmetric
-    /// tensor genuinely has no third one. `zero_points: None` is the absent
-    /// section; the kernel receives a null pointer and adds nothing.
+    /// Separate leases preserve the source sections and let the one residency
+    /// authority account for each. `None` means that section is absent; the
+    /// kernel receives a null pointer and must not infer replacement bytes.
     #[derive(Debug)]
     pub struct ResidentAffineWeight {
         pub codes: ResidencyLease,
         pub scales: ResidencyLease,
         pub zero_points: Option<ResidencyLease>,
+        pub group_index: Option<ResidencyLease>,
     }
 
     impl ResidentAffineWeight {
@@ -633,6 +647,7 @@ mod device {
                 Some(&self.codes),
                 Some(&self.scales),
                 self.zero_points.as_ref(),
+                self.group_index.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -1129,6 +1144,7 @@ mod device {
             let mut codes_address = addresses.codes;
             let mut scales_address = addresses.scales;
             let mut zero_address = addresses.zero_points.unwrap_or(0);
+            let mut group_index_address = addresses.group_index.unwrap_or(0);
             let mut rows = self.launch.rows;
             let mut in_features = self.launch.in_features;
             let mut out_features = self.launch.out_features;
@@ -1143,11 +1159,12 @@ mod device {
                 }
             };
             let mut scale_kind = self.launch.scale_kind();
-            let mut params: [*mut c_void; 13] = [
+            let mut params: [*mut c_void; 14] = [
                 (&raw mut x_address).cast(),
                 (&raw mut codes_address).cast(),
                 (&raw mut scales_address).cast(),
                 (&raw mut zero_address).cast(),
+                (&raw mut group_index_address).cast(),
                 (&raw mut output_address).cast(),
                 (&raw mut rows).cast(),
                 (&raw mut in_features).cast(),
@@ -1180,7 +1197,7 @@ mod device {
             self.settle(launched, stream)
         }
 
-        /// Resolve the three components to device addresses.
+        /// Resolve every present component to a device address.
         fn resolve(
             &self,
             authority: &ResidencyAuthority,
@@ -1242,10 +1259,29 @@ mod device {
                     ));
                 }
             };
+            let group_index = match (&weight.group_index, self.launch.group_index_bytes()?) {
+                (Some(lease), Some(bytes)) => {
+                    Some(self.component(authority, residency, lease, "group_index", bytes)?)
+                }
+                (None, None) => None,
+                (Some(_), None) => {
+                    return Err(invalid(
+                        "group_index",
+                        "a contiguous tensor was given a group-index component",
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(invalid(
+                        "group_index",
+                        "a mapped tensor was given no group-index component",
+                    ));
+                }
+            };
             Ok(ComponentAddresses {
                 codes,
                 scales,
                 zero_points,
+                group_index,
             })
         }
 
@@ -1642,18 +1678,13 @@ mod tests {
     }
 
     #[test]
-    fn a_permuted_tensor_is_refused_rather_than_read_as_contiguous() {
-        // ADR 0027 names `actorder: static` a continuation. Treating a permuted
-        // tensor as contiguous produces a plausible wrong answer no accuracy
-        // threshold would catch, so the kernel's domain is stated instead.
+    fn a_permuted_tensor_requires_its_exact_group_index_component() {
         let mut d = descriptor(IntWidth::Int4, 64, 4, Grouping::Contiguous { size: 32 });
         d.group_index = Some((0..64).map(|k| (k as u32) % 2).collect());
-        let error = AffineLaunch::derive(&d, zeros(&d), 1).unwrap_err();
-        assert_eq!(error.kind(), "unsupported");
-        assert!(
-            error.to_string().contains("activation-order"),
-            "{error} does not say what it refused"
-        );
+        let launch = AffineLaunch::derive(&d, zeros(&d), 1).unwrap();
+        assert!(launch.mapped());
+        assert_eq!(launch.group_index_bytes().unwrap(), Some(64 * 4));
+        assert!(launch.group_of(0).is_err());
     }
 
     #[test]

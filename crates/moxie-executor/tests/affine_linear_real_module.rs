@@ -424,6 +424,7 @@ fn a_published_canonical_int4_module_executes_and_matches_its_decoder() {
                     codes,
                     scales,
                     zero_points: Some(zero_points),
+                    group_index: None,
                 },
                 x_bytes.clone(),
             )

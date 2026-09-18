@@ -615,3 +615,22 @@ runnable without the serialisation workaround.
 - **It does not close M3 item 3 by itself**, and it closes no owner gate.
 
 [adr23]: ../decisions/adr/0023-canonical-affine-payload-and-repack-journal.md
+
+## M3 closure continuation — mapped dense weights, 2026-09-18
+
+Task0034 made activation-order maps a real canonical input and task0035 first
+qualified them in grouped experts. The dense path's earlier refusal was then a
+gap against roadmap M3 items 3/5 and the milestone exit clause. `AffineLaunch`
+now records whether the validated descriptor is mapped; an optional u32 map is
+charged and held as another residency lease, length-checked on the launch
+device, and passed to the same shared kernel. Contiguous operands retain their
+half-tile scale path. Mapped operands select scale/zero metadata per logical
+column and never materialize an expanded weight.
+
+The new mapped INT4/group32/F16/asymmetric case, with a short final group,
+passed on SM120 and both SM86 GPUs: 240 output elements per GPU, worst 0 ULP
+against the independent reconstruction oracle. The full six-case dense gate
+also passed on all three devices under ADR0028. Omitting the map refuses before
+enqueue and returns the leases and activations. Evidence:
+`results/m3-recovery/mapped-dense-device.log`. This continuation changes no
+quality tolerance and makes no timing, model-output, or model-support claim.

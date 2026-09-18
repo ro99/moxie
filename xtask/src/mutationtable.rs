@@ -897,10 +897,17 @@ const BATTERY_T0028: &[Mutation] = &[
         expect: Expect::Caught,
     },
     Mutation {
-        name: "permuted-tensor-accepted-as-contiguous",
+        name: "mapped-launch-forgets-that-it-needs-a-map",
         file: "crates/moxie-executor/src/affine_linear.rs",
-        from: r#"        if descriptor.group_index.is_some() {"#,
-        to: r#"        if false && descriptor.group_index.is_some() {"#,
+        from: r#"            mapped: descriptor.group_index.is_some(),"#,
+        to: r#"            mapped: false,"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "mapped-columns-use-contiguous-groups",
+        file: "crates/moxie-kernels/cuda/affine_linear.cu",
+        from: r#"                if (group_index != nullptr) {"#,
+        to: r#"                if (false && group_index != nullptr) {"#,
         expect: Expect::Caught,
     },
     // The review's findings, each with the substitution that puts the defect

@@ -2,6 +2,8 @@
 //! is converted or written. These prove affine values, not model output.
 use moxie_format::{
     affine::IntWidth,
+    checkpoint_config::IntegerSerialization,
+    compressed_tensors::Granularity,
     gptq::{DeclaredSource, GptqPlan, GptqSpec},
     scale::ScaleDtype,
 };
@@ -28,7 +30,27 @@ fn pinned_autoround_samples_preserve_source_values() {
             continue;
         }
         let config = std::fs::read_to_string(root.join("config.json")).unwrap();
-        moxie_format::checkpoint_config::parse(&config).unwrap();
+        let declaration = moxie_format::checkpoint_config::parse(&config).unwrap();
+        let quantization = declaration.quantization.as_ref().unwrap();
+        assert_eq!(quantization.bits, 4);
+        assert_eq!(quantization.granularity, Granularity::Group { size: 128 });
+        assert!(matches!(
+            quantization.serialization,
+            IntegerSerialization::GptqV1 { .. }
+        ));
+        assert!(!quantization.passthrough_patterns.is_empty());
+        let required_override = if model.starts_with("Qwen") {
+            ".*mtp.*"
+        } else {
+            ".*shared_head.*"
+        };
+        assert!(
+            quantization
+                .passthrough_patterns
+                .iter()
+                .any(|pattern| pattern == required_override),
+            "{model} lost its {required_override:?} 16-bit override"
+        );
         let index = moxie_format::checkpoint_config::parse_index(
             &std::fs::read_to_string(root.join("model.safetensors.index.json")).unwrap(),
         )

@@ -1292,3 +1292,20 @@ inject a wrong image hash. Descriptor order is not a capability-selection API.
 Keep all descriptors and change only image identity when testing attachment
 failure, so the test reaches the intended resource-release boundary on either
 GPU architecture. The original failure and successful targeted rerun are kept.
+
+## 2026-09-18 — close the activation-order execution gap
+
+Importing a GPTQ group map while the dense shared kernel refused it left one
+serialization feature without the dense consumer promised by M3's common
+matrix. The map is now a separately admitted weight component whose lease has
+the same device and completion lifetime checks as codes, scales and zeros.
+Mapped columns choose metadata per element; contiguous columns retain the
+existing half-tile path. A missing map refuses before enqueue and returns its
+operands. The mapped dense case passes on SM120 and both SM86 devices.
+
+The closure audit also found that “expert interleaving” existed only in a
+format comment. The inspected pinned integer artifacts store rank-two modules,
+so a leading expert axis now receives a specific refusal instead of being
+flattened or guessed. AutoRound coverage now combines a real group map with
+multiple 16-bit overrides, including MTP, and checks the override families in
+both pinned real configurations.

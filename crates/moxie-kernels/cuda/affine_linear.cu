@@ -13,10 +13,10 @@
 // codes are unpacked and dequantized **into a 16x16 tensor-core tile in shared
 // memory**, one k-tile at a time. Nothing wider than that tile is ever 16-bit.
 //
-// The scale of a group is converted **once per group**, not once per element:
-// group sizes are 32 or 128 and the k-tile is 16 wide at a 16-aligned offset,
-// so the eight columns a lane dequantizes always lie inside one group. The host
-// checks that invariant before launching; this kernel assumes it.
+// Contiguous scales are converted once per half-tile. A mapped tensor may send
+// adjacent logical columns to different groups, so that lane reads its admitted
+// u32 map and converts the selected scale per element. No map is approximated
+// as contiguous and no expanded weight is materialized.
 //
 // Accumulation is FP32 inside the tensor core (`AccumulationPolicy::Bf16InF32Acc`)
 // and the output boundary is one `RoundingProfile::FinalBf16Rne`. The products
@@ -43,6 +43,7 @@ extern "C" __global__ void moxie_affine_linear_v1(
     const unsigned char* __restrict__ codes,
     const unsigned char* __restrict__ scales,
     const short* __restrict__ zero_points,
+    const unsigned int* __restrict__ group_index,
     __nv_bfloat16* __restrict__ output,
     unsigned long long rows,
     unsigned long long in_features,
@@ -88,24 +89,35 @@ extern "C" __global__ void moxie_affine_linear_v1(
 
         const unsigned long long n = n0 + slot;
         const bool row_live = n < out_features;
-        float scale = 0.0F;
-        int zero = 0;
-        if (row_live) {
+        float contiguous_scale = 0.0F;
+        int contiguous_zero = 0;
+        if (row_live && group_index == nullptr) {
             const unsigned long long group =
                 (groups_per_row == 1ULL)
                     ? 0ULL
                     : ((k0 + half) / static_cast<unsigned long long>(group_size));
             const unsigned long long entry = n * groups_per_row + group;
-            scale = moxie_affine_scale_v1(scales, entry, scale_kind);
-            zero = (zero_points == nullptr)
-                       ? 0
-                       : static_cast<int>(zero_points[entry]);
+            contiguous_scale = moxie_affine_scale_v1(scales, entry, scale_kind);
+            contiguous_zero = (zero_points == nullptr)
+                                  ? 0
+                                  : static_cast<int>(zero_points[entry]);
         }
         for (unsigned j = 0; j < 8; ++j) {
             const unsigned column = half + j;
             const unsigned long long k = k0 + column;
             float value = 0.0F;
             if (row_live && k < in_features) {
+                float scale = contiguous_scale;
+                int zero = contiguous_zero;
+                if (group_index != nullptr) {
+                    const unsigned long long group =
+                        static_cast<unsigned long long>(group_index[k]);
+                    const unsigned long long entry = n * groups_per_row + group;
+                    scale = moxie_affine_scale_v1(scales, entry, scale_kind);
+                    zero = (zero_points == nullptr)
+                               ? 0
+                               : static_cast<int>(zero_points[entry]);
+                }
                 const int code =
                     moxie_affine_code_v1(codes, n * row_stride, k, code_bits);
                 value = __fmul_rn(static_cast<float>(code - zero), scale);

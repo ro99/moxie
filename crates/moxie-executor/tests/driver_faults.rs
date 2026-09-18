@@ -1802,6 +1802,7 @@ fn a_quantized_launch_that_cannot_prove_completion_keeps_its_operands() {
                 codes,
                 scales,
                 zero_points: None,
+                group_index: None,
             },
             activations,
         )

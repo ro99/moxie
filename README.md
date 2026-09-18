@@ -210,12 +210,16 @@ formal closure statement remains the owner's to make. The list below is the hist
 how the earlier milestones closed and is not the current assignment — [AGENTS.md](AGENTS.md) holds
 that, and is the only file that does.
 
-The most recent completed work is [task 0024](docs/tasks/0024-m3-asymmetric-int4-pack-quantized-import.md),
-M3 item 2's asymmetric INT4 importer, accepted on 2026-09-13 after three rounds of independent
-review, and [task 0025](docs/tasks/0025-m3-offline-repack-publication.md), M3 item 1's offline
-repack and canonical publication — the `moxie-repack` program documented above. Neither establishes
-model execution or output quality: **nothing in this repository executes a quantized weight**, which
-is M3 item 3 and the largest remaining gap in the milestone.
+M3 now has bounded canonical publication, compressed-tensors and GPTQ/AutoRound
+import, and shared dense and grouped-expert W4A16/W8A16 execution. Synthetic
+canonical integer weights, including activation-order maps, execute on both
+SM86 GPUs and the SM120 GPU through the shared residency authority. One
+published real module has also executed with synthetic activations. These are
+operation-level gates: **nothing in this repository generates a token from a
+checkpoint**, and no model-output, quality, or performance claim follows from
+them. The remaining M3 work is the final mutation batteries, record
+reconciliation, review, and owner acceptance; [AGENTS.md](AGENTS.md) is the
+live assignment ledger.
 
 **M1.4 complete; M1.5 active.** The owner accepted
 [task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md) on 2026-09-10 after independent
