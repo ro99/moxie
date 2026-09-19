@@ -231,7 +231,26 @@ required architectures qualified on real devices — GPU-3032cfa3 and GPU-81fe45
   (33,024), committed rows (32,769) and visible rows (32,769, or 4,096 under a
   window) are reported separately, and the windowed answer is required to differ
   from the full-history one.
-- Host: `cargo test --workspace` all suites passed, 0 failed, 0 skipped.
+- `cargo test -p moxie-executor --features driver --test paged_attention_device`:
+  6 cases, all passed. Admission that cannot fit refuses **before allocating**,
+  carries the ledger's own rejection and strands nothing; a descriptor selection
+  would never have chosen — narrowed shape bounds, another package's symbol, an
+  INT4 cache operand, an indivisible head ratio — is refused at admission; a page
+  mapping that names a physical page twice, names one that does not exist, is
+  empty, is longer than the admitted pages, or changes under committed rows is
+  refused; four kinds of malformed append each hand the rows back, leave the
+  frontier at 20 and leave every committed byte identical; a stream from another
+  device is refused for both append and attend; and 32 append-and-decode steps
+  grow neither the arena nor the ledger while producing a different answer every
+  step.
+- `cargo test -p moxie-executor --features driver --test driver_faults`: 5 cases,
+  all passed, including the new
+  `a_paged_attention_failure_keeps_its_query_and_its_frontier`. With the event
+  record made to fail after a real copy, the append refuses, **retains** the
+  rows, leaves the frontier at four and quarantines the run — which then refuses
+  to close or to read its own pages. With `cuLaunchKernel` made to fail, the
+  attend refuses, retains the query, leaves the frontier unmoved and quarantines.
+- Host: `cargo test --workspace` 105 suites passed, 0 failed, 0 skipped.
   `cargo test -p moxie-executor --features driver` all suites passed.
   `cargo fmt --all --check`, `cargo clippy` on the host and driver lanes with zero
   warnings, `cargo xtask arch-check` (79 rejected fixtures, 21 accepted, 13 rules)
@@ -267,19 +286,23 @@ specification and the affected suites. **Not done, and not claimed:**
   committed frontier `PagedAttentionRun` reports is a fact about copied bytes
   rather than a journal entry. This is the next bounded task and the largest
   remaining piece of acceptance 1 and 4.
-- **Injected failure sweeps.** Cancellation and refusal before enqueue are
-  covered (the frontier and every prior byte are checked unchanged after a
-  refused append); *injected* launch and synchronization faults, in the style of
-  `driver_faults`, are not.
 - **A reclaimed base is host-checked only.** Every device case runs with
   `history_base = 0`. The kernel takes the base and masks on absolute positions,
   and the launch contract refuses a base that is not a whole number of pages, but
   no device gate has actually attended over a history whose first logical row is
   above zero. That is the shape a sliding layer reaches once it reclaims, so it
   belongs in the state-binding task's gates rather than in prose.
-- **The task mutation battery** (acceptance 5) has not been run.
-- Admission-failure sweeps over every allocation, and the no-hidden-growth
-  check across decode steps, are not yet written.
+- **The task mutation battery** (acceptance 5) is not written and not run, and
+  deliberately so: a battery measures whether a task's gates can fail, and this
+  task's gates are not finished. Writing T0037 against a state binding that does
+  not exist would measure substitutions in code the next task replaces. It
+  belongs at the closure candidate, as T0006 and T0028 did.
+- **Host-side growth** is checked only as "admission does not grow": 32 append
+  and decode steps leave the arena bytes and the ledger's charged buffers
+  unchanged, and each step's answer differs from the last so the appends are
+  demonstrably read. What is *not* measured is host allocator behaviour across
+  decode steps, which needs the measured-allocator lane rather than an
+  assertion.
 - MLA, host-backed streaming, COW forks, prefix reuse, FP16 cache, tensor cores
   and any performance claim remain out of scope and unsupported by name.
 

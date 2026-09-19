@@ -28,15 +28,17 @@ all accepted, and M2's formal closure statement remains the owner's to make.
 | Accepted M3.1 | Tasks [0025](docs/tasks/0025-m3-offline-repack-publication.md), [0026](docs/tasks/0026-m3-canonical-safetensors-publication.md), [0030](docs/tasks/0030-m3-repack-correctness-package.md) and [0031](docs/tasks/0031-m3-battery-closure.md): bounded canonical safetensors publication and final T0006, 63/63 defects caught plus three controls held. Repacking remains provisional under ADR0027. |
 | Accepted M3.2 | Tasks [0024](docs/tasks/0024-m3-asymmetric-int4-pack-quantized-import.md), [0033](docs/tasks/0033-m3-static-activation-order-import.md) and [0034](docs/tasks/0034-m3-gptq-integer-import.md): compressed-tensors and GPTQ/AutoRound integer import, signed scales, maps, overrides/MTP and named refusals. |
 | Accepted M3.3 | Tasks [0028](docs/tasks/0028-m3-shared-w4a16-w8a16-execution.md), [0032](docs/tasks/0032-m3-admission-closure.md) and [0035](docs/tasks/0035-m3-quantized-grouped-experts.md): shared dense and grouped W4A16/W8A16 on both SM86 GPUs and SM120; final T0028 caught 24/24 defects and held its control. Synthetic activations and routes; no timing. |
-| Active M4 | [Task 0037](docs/tasks/0037-m4-paged-device-attention.md): first bounded M4 slice, common BF16 paged device attention with actual 32,768-row state, prefill/append/decode and full/sliding GQA semantics. [M3→M4 handover](docs/handovers/2026-09-19-m3-closure-to-m4.md) carries the exact boundary. |
+| Active M4 | [Task 0037](docs/tasks/0037-m4-paged-device-attention.md): first bounded M4 slice, common BF16 paged device attention with actual 32,768-row state, prefill/append/decode and full/sliding GQA semantics. **Partially implemented**: the kernel, its binding and the 32,768-actual-row gate pass on both SM86 GPUs and SM120 ([ADR0032](docs/decisions/adr/0032-first-paged-attention-kernel-is-written-here.md) records why no upstream source was adopted); `moxie-state` does not own the device pages yet, and the mutation battery is deferred to the closure candidate. The [state-binding handover](docs/handovers/2026-09-19-paged-attention-to-state-binding.md) is the next bounded task; the [M3→M4 handover](docs/handovers/2026-09-19-m3-closure-to-m4.md) carries the milestone boundary. |
 
 **Nothing in this repository generates a token from a checkpoint.** Tensors have
 been imported, expert bytes made resident, real expert weights computed with,
 one module repacked into a canonical artifact, and — since task 0028 — that
 module's canonical INT4 weight multiplied on all three GPUs. Task0035 also runs
-synthetic canonical integer expert weights through shared residency and reduction. **Every one of
-those ran over synthetic activations and routes written by their tests.** One
-projection of one layer is not a model: nothing composes a block and nothing
+synthetic canonical integer expert weights through shared residency and reduction.
+Task0037 attends over 32,768 actual paged rows on all three GPUs. **Every one of
+those ran over synthetic activations, routes, keys, values and queries written by
+their tests.** One projection of one layer is not a model, and neither is one
+attention operation over invented state: nothing composes a block and nothing
 generates a token. No output-quality claim follows from any of it, and none may
 be made without paired output against the released model. Say what ran; never
 call it model support.

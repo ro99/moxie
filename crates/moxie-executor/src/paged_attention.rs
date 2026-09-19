@@ -1118,6 +1118,9 @@ pub mod device {
             if self.quarantined {
                 return Err(give_back(invalid("run", "this run is quarantined"), table));
             }
+            if let Err(error) = self.same_device(stream) {
+                return Err(give_back(error, table));
+            }
             if self.committed_rows != 0 {
                 return Err(give_back(
                     invalid(
@@ -1217,6 +1220,23 @@ pub mod device {
             Ok(())
         }
 
+        /// Whether this stream belongs to the device this run was admitted on.
+        ///
+        /// An offset resolved inside another device's allocation names the
+        /// wrong bytes, and enqueuing on a foreign stream would order the copy
+        /// against work this run never sees. The affine linear binding learned
+        /// this from a review that drove 3090 leases through a 5060 Ti backing
+        /// and got a confident, different answer.
+        fn same_device(&self, stream: &Stream<'ctx>) -> Result<()> {
+            if stream.device_uuid() != self.ctx.uuid() {
+                return Err(invalid(
+                    "stream",
+                    "this stream and this run do not name one device",
+                ));
+            }
+            Ok(())
+        }
+
         /// Append `rows` dense rows of keys and values at the committed
         /// frontier.
         ///
@@ -1248,6 +1268,9 @@ pub mod device {
                     keys,
                     values,
                 ));
+            }
+            if let Err(error) = self.same_device(stream) {
+                return Err(give_back(error, keys, values));
             }
             if self.page_table.is_empty() {
                 return Err(give_back(
@@ -1462,6 +1485,9 @@ pub mod device {
             };
             if self.quarantined {
                 return Err(give_back(invalid("run", "this run is quarantined"), query));
+            }
+            if let Err(error) = self.same_device(stream) {
+                return Err(give_back(error, query));
             }
             if let Err(error) = super::descriptor_serves(&self.descriptor, launch) {
                 return Err(give_back(error, query));

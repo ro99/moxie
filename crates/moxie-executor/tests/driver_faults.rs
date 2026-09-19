@@ -2008,3 +2008,136 @@ fn every_allocation_in_a_quantized_admission_refuses_rather_than_aborting() {
         );
     }
 }
+
+/// A paged attention launch whose completion cannot be established keeps its
+/// query, its pages and its frontier.
+///
+/// Task 0037. The same lifetime rule the quantized launch above proves, at the
+/// one place where it also has to protect *history*: the committed frontier is
+/// what later launches attend over, so a launch or an event record that fails
+/// must leave it exactly where it was. A frontier advanced on an unproven copy
+/// would make every later decode attend over bytes nothing wrote.
+#[test]
+fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
+    let _serial = one_at_a_time();
+    use moxie_executor::{PageGeometry, PagedAttentionLaunch, PagedAttentionRun};
+    use moxie_plan::Visibility;
+
+    const HEADS: u64 = 2;
+    let geometry = PageGeometry {
+        kv_heads: 1,
+        head_dim: 64,
+        page_tokens: 8,
+        pages: 2,
+    };
+    let row_elements = (geometry.kv_heads * geometry.head_dim) as usize;
+    let rows_bytes = |rows: usize, seed: u8| vec![seed; rows * row_elements * 2];
+
+    let ctx = RankContext::acquire(RankId(37_001), 0).expect("a rank context");
+    let stream = Stream::new(&ctx).expect("a stream");
+    let capability = query_device(0).expect("query device 0");
+    let launch = |rows: u64, first_position: u64, history_rows: u64| PagedAttentionLaunch {
+        geometry,
+        heads: HEADS,
+        scale: moxie_plan::reciprocal_sqrt_scale(64),
+        visibility: Visibility::Causal,
+        rows,
+        first_position,
+        history_base: 0,
+        history_rows,
+    };
+    let descriptor = moxie_executor::select_paged_attention_kernel(
+        &moxie_kernels::paged_attention_catalogue(),
+        &capability,
+        &launch(1, 0, 1),
+    )
+    .expect("this build declares a paged attention descriptor for this device");
+
+    let mut ledger = test_ledger(&ctx);
+    let mut run = PagedAttentionRun::admit(&mut ledger, &ctx, descriptor, geometry, HEADS, 1)
+        .map_err(|r| r.error)
+        .expect("admission fits this ledger");
+    run.publish_page_table(&stream, vec![1, 0])
+        .map_err(|r| r.error)
+        .expect("a reversed mapping is a mapping");
+    run.append(&stream, 4, rows_bytes(4, 0x21), rows_bytes(4, 0x22))
+        .map_err(|r| r.error)
+        .expect("four rows fit");
+    assert_eq!(run.committed_rows(), 4);
+    let committed = run.read_rows(0, 4).expect("read the committed rows back");
+
+    // An append whose event record fails. The copies were submitted for real,
+    // so their completion is unknown and the rows cannot be published.
+    let records = RECORDS.load(SeqCst);
+    RECORD_ERROR.store(1, SeqCst);
+    let refused = run
+        .append(&stream, 1, rows_bytes(1, 0x31), rows_bytes(1, 0x32))
+        .expect_err("an append whose record failed must refuse");
+    RECORD_ERROR.store(0, SeqCst);
+    assert!(RECORDS.load(SeqCst) > records, "the record was attempted");
+    assert!(
+        refused.retained_source(),
+        "a refusal after enqueue must keep the rows the copy may be reading"
+    );
+    assert_eq!(
+        run.committed_rows(),
+        4,
+        "the frontier advanced on a copy nothing proved"
+    );
+    // The run is quarantined, so it will not release ranges that may be in
+    // flight, will not read its own pages back, and stays charged.
+    assert!(run.read_rows(0, 4).is_err(), "a quarantined run read back");
+    let held = run
+        .close(&mut ledger)
+        .expect_err("a quarantined run must not release ranges in flight");
+    assert!(!ledger.outstanding().is_empty());
+    drop(held);
+
+    // The same window on the launch itself, on a fresh run: the copy is real,
+    // the launch is refused, and the query is retained rather than handed back.
+    let mut ledger = test_ledger(&ctx);
+    let descriptor = moxie_executor::select_paged_attention_kernel(
+        &moxie_kernels::paged_attention_catalogue(),
+        &capability,
+        &launch(1, 0, 1),
+    )
+    .expect("a descriptor");
+    let mut run = PagedAttentionRun::admit(&mut ledger, &ctx, descriptor, geometry, HEADS, 1)
+        .map_err(|r| r.error)
+        .expect("admission fits this ledger");
+    run.publish_page_table(&stream, vec![1, 0])
+        .map_err(|r| r.error)
+        .expect("a mapping");
+    run.append(&stream, 4, rows_bytes(4, 0x21), rows_bytes(4, 0x22))
+        .map_err(|r| r.error)
+        .expect("four rows fit");
+    assert_eq!(
+        run.read_rows(0, 4).expect("read back"),
+        committed,
+        "the same rows through the same mapping are the same bytes"
+    );
+
+    let launches = LAUNCHES.load(SeqCst);
+    LAUNCH_ERROR.store(1, SeqCst);
+    LAUNCH_FAIL_COUNTDOWN.store(1, SeqCst);
+    let query = vec![0x3Cu8; (HEADS * geometry.head_dim) as usize * 2];
+    let refused = run
+        .attend(&stream, &launch(1, 3, 4), query)
+        .expect_err("a refused launch must refuse the attend");
+    LAUNCH_FAIL_COUNTDOWN.store(0, SeqCst);
+    LAUNCH_ERROR.store(0, SeqCst);
+    assert!(LAUNCHES.load(SeqCst) > launches, "the launch was attempted");
+    assert!(
+        refused.retained_source(),
+        "the query copy was submitted, so the query must be retained"
+    );
+    assert_eq!(
+        run.committed_rows(),
+        4,
+        "a failed launch moved the frontier"
+    );
+    assert!(
+        run.close(&mut ledger).is_err(),
+        "a quarantined run released its ranges"
+    );
+}
