@@ -1460,3 +1460,23 @@ And a test comment claimed 96 was not a multiple of the warp width. 96 is 3x32.
 The case tested a non-power-of-two width and nothing else for a week, because
 the comment was read as the coverage. Numbers in test prose are claims, and
 review checked this one by dividing.
+
+## 2026-09-19 — "no `format!`" is not "cannot abort"
+
+The third review round on the same module. Every refusal had been routed through
+a `try_reserve` sink and `format!` was gone — and the shortest refusals could
+still abort, because `invalid(field, "a launch with no query row")` ends in
+`detail.into()`, and converting a `&str` into a `String` allocates infallibly.
+The repair had been checked by grepping for `format!`, which is a proxy for the
+property rather than the property.
+
+Two things follow. The helper that takes `impl Into<String>` is the hazard, not
+the interpolation: a fixed message is not free just because it is constant, and
+the only way to be sure is for every path to end in the same fallible sink.
+And a sweep that exercises the interpolated refusals is not a sweep of the
+module — the literal ones are a different code path and were the ones failing.
+
+The control is what settles it, and it is worth stating that it was run rather
+than reasoned about: restoring `detail.into()` kills the test binary at
+`memory allocation of 26 bytes failed`, `signal: 6, SIGABRT`. A regression for an
+abort that has never been seen to abort is a test of nothing.

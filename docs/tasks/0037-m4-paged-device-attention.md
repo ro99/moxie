@@ -346,13 +346,27 @@ the first, which is scope rather than a defect and is now stated as such.
    dimensions, admission refuses a geometry this device cannot launch before
    charging anything, `attend` re-applies it, and the device fixture proves both
    the refusal and that one head fewer admits.
-8. **Fallible diagnostics throughout.** Every refusal in this module composed its
-   prose with `format!`, which aborts rather than refusing when an allocation
-   fails. The module now uses the same fallible sink the affine binding does, and
-   two host sweeps in `allocation_refusal.rs` arm a one-shot allocator failure
-   across every position of a launch refusal and a selection refusal. Admission
-   itself still inherits the `PlanRequest` abort that task 0029 is the bounded fix
-   for; that is pre-existing and is not claimed to be repaired here.
+8. **Fallible diagnostics throughout, in two rounds.** Every refusal in this
+   module composed its prose with `format!`, which aborts rather than refusing
+   when an allocation fails. Removing `format!` was not enough and the third
+   review caught it: `invalid(field, "a literal")` still called `detail.into()`,
+   and converting a `&str` to a `String` allocates infallibly, so the shortest
+   refusals — no query row, an empty history, a zero-row append — were the ones
+   still able to abort. Every refusal in the module now goes through the fallible
+   sink whether or not its prose interpolates anything.
+
+   The sweeps were strengthened with it. They now cover the fixed-literal paths
+   as well as the interpolated ones, and they assert what the affine sweeps
+   assert: that at least one position actually failed an allocation, and that the
+   sweep ran **past the end** of the call rather than exhausting its bound. The
+   control is measured rather than assumed — with `invalid` restored to
+   `detail.into()`, the test binary dies at `memory allocation of 26 bytes
+   failed`, `signal: 6, SIGABRT`, which is what a regression for an abort has to
+   be able to do.
+
+   Admission itself still inherits the `PlanRequest` abort that task 0029 is the
+   bounded fix for; that is pre-existing, outside this module, and is not claimed
+   to be repaired here.
 
 Record gaps repaired: ADR 0032 said "no kernel exists yet" and now records the
 implementation and, as document 07 requires, **the legacy negative result** —

@@ -74,11 +74,15 @@ fn fallible(args: core::fmt::Arguments<'_>) -> String {
     }
 }
 
-fn invalid(field: &'static str, detail: impl Into<String>) -> Error {
-    Error::InvalidRequest {
-        field,
-        detail: detail.into(),
-    }
+/// [`Error::InvalidRequest`] with a fixed message, still composed **fallibly**.
+///
+/// `detail.into()` on a `&str` allocates, and it allocates infallibly: a literal
+/// message is not free just because it is constant. Every refusal in this module
+/// goes through the sink above, whether or not its prose has anything to
+/// interpolate — which is the difference between "no `format!` calls" and "no
+/// allocation that can abort".
+fn invalid(field: &'static str, detail: &str) -> Error {
+    invalid_fmt(field, format_args!("{detail}"))
 }
 
 /// [`Error::InvalidRequest`] whose prose is composed **fallibly**.

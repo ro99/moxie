@@ -355,13 +355,24 @@ fn every_allocation_in_a_launch_derivation_degrades_rather_than_aborting() {
 
 /// Task 0037: a paged attention launch refuses under a failed allocation.
 ///
-/// The same requirement, for the newer binding. Its checks compose prose for
-/// every refusal — head ratios, scales, positions, page alignment, ABI widths —
-/// and every one of them runs on the path a caller takes when it is short of
-/// memory. Sweeping the positions is what proves the sink is fallible
-/// everywhere rather than at the first refusal somebody happened to test.
+/// The same requirement as the affine sweeps above, for the newer binding, and
+/// with their termination assertions: a sweep that never fires an allocation,
+/// or that stops before running past the end of the call, proves nothing about
+/// the positions it did not reach.
+///
+/// **Both message shapes are here on purpose.** A refusal that interpolates
+/// values and one that carries a fixed literal look different and allocate the
+/// same: `detail.into()` on a `&str` is an infallible `String` allocation, so
+/// "no `format!` calls" was not the same claim as "nothing here can abort". The
+/// literal cases below are the ones that were still aborting after the first
+/// repair.
+///
+/// The control was **measured**, not assumed: with `invalid` restored to
+/// `detail.into()`, this binary dies at `memory allocation of 26 bytes failed`,
+/// `signal: 6, SIGABRT`. That is what a regression for an abort has to be able
+/// to do, and it is why the literal paths are swept rather than reasoned about.
 #[test]
-fn a_paged_attention_launch_refuses_when_its_prose_cannot_be_allocated() {
+fn every_allocation_in_a_paged_launch_refusal_degrades_rather_than_aborting() {
     use moxie_executor::{AttentionLayer, PageGeometry, PagedAttentionLaunch};
     use moxie_plan::Visibility;
 
@@ -376,10 +387,31 @@ fn a_paged_attention_launch_refuses_when_its_prose_cannot_be_allocated() {
         scale: 1.0,
         visibility: Visibility::Causal,
     };
-    // Four refusals, each from a different check, each composing its own prose.
+    // The control: this layer builds a legal launch, so a sweep that refused
+    // everything for the wrong reason would be visible here.
+    PagedAttentionLaunch::new(layer, 1, 0, 0, 1).expect("the fixture is a legal launch");
+
     /// One named way to build a launch that must be refused.
     type Refusal = Box<dyn Fn() -> moxie_types::Result<PagedAttentionLaunch>>;
     let refusals: Vec<(&str, Refusal)> = vec![
+        // Fixed-literal prose: the paths `detail.into()` used to allocate.
+        (
+            "a launch with no query row",
+            Box::new(move || PagedAttentionLaunch::new(layer, 0, 0, 0, 1)),
+        ),
+        (
+            "attending over an empty history",
+            Box::new(move || PagedAttentionLaunch::new(layer, 1, 0, 0, 0)),
+        ),
+        (
+            "a sliding window of zero",
+            Box::new(move || {
+                let mut bad = layer;
+                bad.visibility = Visibility::SlidingWindow { window: 0 };
+                PagedAttentionLaunch::new(bad, 1, 0, 0, 1)
+            }),
+        ),
+        // Interpolated prose.
         (
             "an indivisible head ratio",
             Box::new(move || {
@@ -415,23 +447,47 @@ fn a_paged_attention_launch_refuses_when_its_prose_cannot_be_allocated() {
             }),
         ),
     ];
+
+    const LIMIT: usize = 64;
     for (what, refuse) in refusals {
-        // Position zero is the first allocation the refusal makes; the sweep
-        // walks forward until nothing allocates any more. Any position that
-        // aborts takes the whole binary with it, which is the regression.
-        for skip in 0..8 {
+        let mut fired_positions = 0usize;
+        let mut ran_past_the_end = false;
+        for skip in 0..LIMIT {
             let (result, fired) = with_failure_at(skip, &refuse);
-            assert!(result.is_err(), "{what} was accepted at position {skip}");
-            if !fired {
-                break;
+            // The refusal itself never depends on an allocation succeeding: a
+            // launch that is illegal is illegal whether or not its prose could
+            // be written. A value returned here would mean the check was
+            // skipped, not that the message was short.
+            assert!(
+                result.is_err(),
+                "{what} was accepted at position {skip}, so a failed allocation \
+                 changed the answer rather than the prose"
+            );
+            if fired {
+                fired_positions += 1;
+                continue;
             }
+            ran_past_the_end = true;
+            break;
         }
+        // Every one of these refusals composes prose, so at least one position
+        // must have failed an allocation. Zero would mean the sweep measured a
+        // path that allocates nothing — a true statement about some other code.
+        assert!(
+            fired_positions > 0,
+            "{what} never reached an allocation, so this sweep proved nothing"
+        );
+        assert!(
+            ran_past_the_end,
+            "{what} exhausted the {LIMIT}-position bound without running past the end \
+             of the call, so the later positions are unmeasured"
+        );
     }
 }
 
 /// Task 0037: selecting a paged attention kernel refuses the same way.
 #[test]
-fn paged_attention_selection_refuses_when_its_prose_cannot_be_allocated() {
+fn every_allocation_in_a_paged_selection_refusal_degrades_rather_than_aborting() {
     use moxie_executor::{AttentionLayer, PageGeometry, PagedAttentionLaunch};
     use moxie_plan::Visibility;
 
@@ -447,21 +503,43 @@ fn paged_attention_selection_refuses_when_its_prose_cannot_be_allocated() {
         visibility: Visibility::Causal,
     };
     let launch = PagedAttentionLaunch::new(layer, 1, 0, 0, 1).expect("a legal launch");
-    // An empty catalogue: the "found none" refusal, which is the one that
-    // composes the longest prose.
-    let empty = KernelCatalogue::new(Vec::new()).expect("an empty catalogue");
     let capability = capability(8, 6);
-    for skip in 0..8 {
-        let (result, fired) = with_failure_at(skip, || {
-            moxie_executor::select_paged_attention_kernel(&empty, &capability, &launch)
-        });
-        assert!(
-            result.is_err(),
-            "an empty catalogue selected something at position {skip}"
-        );
-        if !fired {
+    // Two refusals with different prose: nothing matched at all, and one
+    // candidate that matched the architecture but not the launch.
+    let empty = KernelCatalogue::new(Vec::new()).expect("an empty catalogue");
+    let wrong = KernelCatalogue::new(vec![catalogue_entry(Precision::Int4, SmVersion::SM86)])
+        .expect("one affine descriptor");
+
+    const LIMIT: usize = 64;
+    for (what, catalogue) in [
+        ("an empty catalogue", &empty),
+        ("another operation", &wrong),
+    ] {
+        let mut fired_positions = 0usize;
+        let mut ran_past_the_end = false;
+        for skip in 0..LIMIT {
+            let (result, fired) = with_failure_at(skip, || {
+                moxie_executor::select_paged_attention_kernel(catalogue, &capability, &launch)
+            });
+            assert!(
+                result.is_err(),
+                "{what} selected a descriptor at position {skip}"
+            );
+            if fired {
+                fired_positions += 1;
+                continue;
+            }
+            ran_past_the_end = true;
             break;
         }
+        assert!(
+            fired_positions > 0,
+            "{what} never reached an allocation, so this sweep proved nothing"
+        );
+        assert!(
+            ran_past_the_end,
+            "{what} exhausted the {LIMIT}-position bound without running past the end"
+        );
     }
 }
 
