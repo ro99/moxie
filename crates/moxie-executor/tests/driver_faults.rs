@@ -2022,6 +2022,32 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     let _serial = one_at_a_time();
     use moxie_executor::{PageGeometry, PagedAttentionLaunch, PagedAttentionRun};
     use moxie_plan::Visibility;
+    use moxie_types::PagePlacement;
+
+    /// The placements a state authority would give for `rows` rows from
+    /// `first`, in this fixture's geometry.
+    ///
+    /// Written out rather than driven through `moxie_state` because this file
+    /// interposes the CUDA driver process-wide and its fixtures stay as small
+    /// as the fault window allows; `paged_attention_device.rs` is where the two
+    /// authorities meet for real.
+    fn placements(first: u64, rows: u64, page_tokens: u64, pages: u64) -> Vec<PagePlacement> {
+        let mut out = Vec::new();
+        let mut done = 0;
+        while done < rows {
+            let position = first + done;
+            let slot = position % page_tokens;
+            let run = (page_tokens - slot).min(rows - done);
+            out.push(PagePlacement {
+                position,
+                physical_page: (position / page_tokens) % pages,
+                slot,
+                rows: run,
+            });
+            done += run;
+        }
+        out
+    }
 
     const HEADS: u64 = 2;
     let geometry = PageGeometry {
@@ -2060,19 +2086,26 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     run.publish_page_table(&stream, vec![1, 0])
         .map_err(|r| r.error)
         .expect("a reversed mapping is a mapping");
-    run.append(&stream, 4, rows_bytes(4, 0x21), rows_bytes(4, 0x22))
-        .map_err(|r| r.error)
-        .expect("four rows fit");
-    assert_eq!(run.committed_rows(), 4);
-    let committed = run.read_rows(0, 4).expect("read the committed rows back");
+    let first_four = placements(0, 4, geometry.page_tokens, geometry.pages);
+    run.write_rows(
+        &stream,
+        &first_four,
+        rows_bytes(4, 0x21),
+        rows_bytes(4, 0x22),
+    )
+    .map_err(|r| r.error)
+    .expect("four rows fit");
+    assert_eq!(run.written_rows(), 4);
+    let committed = run.read_rows(&first_four).expect("read the rows back");
 
     // An append whose event record fails. The copies were submitted for real,
     // so their completion is unknown and the rows cannot be published.
     let records = RECORDS.load(SeqCst);
     RECORD_ERROR.store(1, SeqCst);
+    let fifth = placements(4, 1, geometry.page_tokens, geometry.pages);
     let refused = run
-        .append(&stream, 1, rows_bytes(1, 0x31), rows_bytes(1, 0x32))
-        .expect_err("an append whose record failed must refuse");
+        .write_rows(&stream, &fifth, rows_bytes(1, 0x31), rows_bytes(1, 0x32))
+        .expect_err("a write whose record failed must refuse");
     RECORD_ERROR.store(0, SeqCst);
     assert!(RECORDS.load(SeqCst) > records, "the record was attempted");
     assert!(
@@ -2080,13 +2113,16 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
         "a refusal after enqueue must keep the rows the copy may be reading"
     );
     assert_eq!(
-        run.committed_rows(),
+        run.written_rows(),
         4,
-        "the frontier advanced on a copy nothing proved"
+        "the high-water mark advanced on a copy nothing proved"
     );
     // The run is quarantined, so it will not release ranges that may be in
     // flight, will not read its own pages back, and stays charged.
-    assert!(run.read_rows(0, 4).is_err(), "a quarantined run read back");
+    assert!(
+        run.read_rows(&first_four).is_err(),
+        "a quarantined run read back"
+    );
     let held = run
         .close(&mut ledger)
         .expect_err("a quarantined run must not release ranges in flight");
@@ -2108,11 +2144,16 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     run.publish_page_table(&stream, vec![1, 0])
         .map_err(|r| r.error)
         .expect("a mapping");
-    run.append(&stream, 4, rows_bytes(4, 0x21), rows_bytes(4, 0x22))
-        .map_err(|r| r.error)
-        .expect("four rows fit");
+    run.write_rows(
+        &stream,
+        &first_four,
+        rows_bytes(4, 0x21),
+        rows_bytes(4, 0x22),
+    )
+    .map_err(|r| r.error)
+    .expect("four rows fit");
     assert_eq!(
-        run.read_rows(0, 4).expect("read back"),
+        run.read_rows(&first_four).expect("read back"),
         committed,
         "the same rows through the same mapping are the same bytes"
     );
@@ -2131,11 +2172,7 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
         refused.retained_source(),
         "the query copy was submitted, so the query must be retained"
     );
-    assert_eq!(
-        run.committed_rows(),
-        4,
-        "a failed launch moved the frontier"
-    );
+    assert_eq!(run.written_rows(), 4, "a failed launch moved the frontier");
     assert!(
         run.close(&mut ledger).is_err(),
         "a quarantined run released its ranges"

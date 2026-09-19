@@ -1480,3 +1480,33 @@ The control is what settles it, and it is worth stating that it was run rather
 than reasoned about: restoring `detail.into()` kills the test binary at
 `memory allocation of 26 bytes failed`, `signal: 6, SIGABRT`. A regression for an
 abort that has never been seen to abort is a test of nothing.
+
+## 2026-09-19 — the ring was already a page table
+
+Task 0038's handover called it an open design question: the host KV store
+reclaims a windowed layer by ring overwrite, the device path reclaims by whole
+pages through a page table, and something had to reconcile them. Reading
+`PagedSequence::ranges` settled it in one line — it places row `r` at
+`page = (r / page_tokens) % pages`, which *is* a page table, `L → L % pages`.
+There was never a second scheme to reconcile, only the same one at two
+granularities, and the device path now writes it down rather than inventing it.
+
+What the reading did surface is a real mismatch the handover had not seen. The
+ring's eviction boundary is row-granular: at capacity 64 and high water 100,
+physical page 2 holds rows 96..99 in its first four slots and rows 36..47 in its
+last twelve. No `history_base` describes a page like that, because a page table
+addresses whole pages. So a device page has to leave the retained range as soon
+as *any* of its rows would be overwritten — which costs up to a page of capacity
+and is why the admitted rows round up by one page. That rounding is not slack,
+and the sweep that proves it (six windows against three page widths, 300 appends
+each, asserting the base never passes the oldest row the window admits) is what
+turns "should be enough" into a checked property.
+
+The lesson for the boundary itself: the crate that owns retention cannot own
+device bytes, and the crate that owns device bytes must not own retention. What
+passes between them is neither — it is a *placement*, so it lives in the
+vocabulary crate both already depend on, and the executor gained no new edge at
+all. The check the performer keeps is the one about bytes it wrote; the check
+the authority keeps is the one about rows it committed. Neither subsumes the
+other, and a launch that passes both is reading rows that are both history and
+present.

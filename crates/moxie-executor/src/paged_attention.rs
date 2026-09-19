@@ -976,7 +976,9 @@ pub mod device {
     use moxie_memory::{
         BufferRequest, Ledger, LedgerId, PlanRequest, Rejection, Reservation, StageSpan,
     };
-    use moxie_types::{DeviceTier, Error, HostTier, Result, Scope, SemanticKernelDescriptor, Tier};
+    use moxie_types::{
+        DeviceTier, Error, HostTier, PagePlacement, Result, Scope, SemanticKernelDescriptor, Tier,
+    };
 
     use super::{PageGeometry, PagedAttentionLaunch, invalid, invalid_fmt, unsupported_kernel_fmt};
     use crate::arena::{DeviceArena, DeviceRange};
@@ -1055,8 +1057,15 @@ pub mod device {
         /// page to an offset when rows are written. One table, read by the host
         /// for addresses and by the kernel for the same addresses.
         page_table: Vec<u32>,
-        /// Rows whose copy into the pages has been **observed** to complete.
-        committed_rows: u64,
+        /// Rows whose copy into the pages this run has **observed** complete.
+        ///
+        /// A physical high-water mark, not a frontier. What is history is the
+        /// state authority's to say, and it says it by publishing rows this run
+        /// has already returned successfully for. The two are checked against
+        /// each other rather than one standing in for the other: this refuses a
+        /// launch reading bytes it never wrote, and the authority refuses one
+        /// reading rows it never committed.
+        written: u64,
         arena_bytes: u64,
         ledger: LedgerId,
         ctx: &'ctx RankContext,
@@ -1333,7 +1342,7 @@ pub mod device {
                 query: Some(query),
                 output: Some(output),
                 page_table,
-                committed_rows: 0,
+                written: 0,
                 arena_bytes: extents.total,
                 ledger: ledger.id(),
                 ctx,
@@ -1350,13 +1359,15 @@ pub mod device {
             self.arena_bytes
         }
 
-        /// Rows whose copy into the pages has been observed to complete.
+        /// Rows this run has observed copied into its pages.
         ///
-        /// Reported separately from the admitted capacity and from what a
-        /// launch declares visible, because the three are different numbers and
-        /// conflating them is how a cache claims a context it does not hold.
-        pub const fn committed_rows(&self) -> u64 {
-            self.committed_rows
+        /// Reported separately from the admitted capacity and from what a launch
+        /// declares visible, because the three are different numbers and
+        /// conflating them is how a cache claims a context it does not hold. It
+        /// is **not** the committed frontier: `moxie_state::DeviceKvSequence`
+        /// owns that, and this number only bounds what the bytes can support.
+        pub const fn written_rows(&self) -> u64 {
+            self.written
         }
 
         /// Rows the admitted pages can physically hold.
@@ -1398,15 +1409,13 @@ pub mod device {
             if let Err(error) = self.same_device(stream) {
                 return Err(give_back(error, table));
             }
-            if self.committed_rows != 0 {
-                return Err(give_back(
-                    invalid(
-                        "page_table",
-                        "the mapping cannot change once rows are committed",
-                    ),
-                    table,
-                ));
-            }
+            // Republishing is legal and necessary. The authority's retained
+            // range slides as its ring wraps, so the logical-to-physical table
+            // for that range changes with it — an earlier version of this
+            // refused any change after the first write, which is a rule that
+            // can only be kept by a cache that never reclaims. What must stay
+            // true is the mapping's shape, and that is checked below every
+            // time.
             let pages = self.geometry.pages;
             if table.is_empty() || table.len() as u64 > pages {
                 return Err(give_back(
@@ -1514,20 +1523,27 @@ pub mod device {
             Ok(())
         }
 
-        /// Append `rows` dense rows of keys and values at the committed
-        /// frontier.
+        /// Write `rows` dense rows of keys and values where the **state
+        /// authority** says they go.
         ///
-        /// The frontier advances **only** after the copy's completion event is
-        /// observed. A refusal before anything is enqueued leaves it and every
-        /// prior byte untouched and hands the source back; a failure after
-        /// enqueue quarantines the run, keeps the source, and still does not
-        /// advance the frontier. There is no state in between: a partially
-        /// copied append is never published as history.
+        /// `placements` comes from `moxie_state::DeviceKvSequence`, which owns
+        /// retention, the frontier and the ring. This run performs them: it
+        /// does not compute `position / page_tokens`, does not decide which
+        /// page may be overwritten, and does not publish anything as history.
+        /// Two implementations of one mapping is the failure that split is for.
+        ///
+        /// What it *does* own is a physical fact: which rows it has observed
+        /// copied. A refusal before anything is enqueued leaves that and every
+        /// prior byte untouched and hands the sources back; a failure after
+        /// enqueue quarantines the run, keeps the sources, and still does not
+        /// advance it. There is no state in between: a partially copied write
+        /// is never reported as written, and the authority only publishes rows
+        /// this call has returned successfully for.
         #[allow(clippy::result_large_err)]
-        pub fn append(
+        pub fn write_rows(
             &mut self,
             stream: &Stream<'ctx>,
-            rows: u64,
+            placements: &[PagePlacement],
             keys: Vec<u8>,
             values: Vec<u8>,
         ) -> std::result::Result<(), PagedRunRefused> {
@@ -1545,16 +1561,9 @@ pub mod device {
             if let Err(error) = self.same_device(stream) {
                 return Err(give_back(error, keys, values));
             }
-            if self.page_table.is_empty() {
+            if placements.is_empty() {
                 return Err(give_back(
-                    invalid("page_table", "no page mapping has been published"),
-                    keys,
-                    values,
-                ));
-            }
-            if rows == 0 {
-                return Err(give_back(
-                    invalid("rows", "an append of no rows"),
+                    invalid("placements", "a write with no placement"),
                     keys,
                     values,
                 ));
@@ -1566,6 +1575,67 @@ pub mod device {
                 Ok(bytes) => bytes,
                 Err(error) => return Err(give_back(error, keys, values)),
             };
+
+            // The placements are checked, not trusted: the authority owns the
+            // mapping, and this run owns the extents. A page identity outside
+            // the admitted pages, a slot outside a page, a gap or a step
+            // backwards would each write somewhere nothing asked for.
+            let mut rows = 0u64;
+            let mut position = placements[0].position;
+            for placement in placements {
+                if placement.position != position {
+                    return Err(give_back(
+                        invalid(
+                            "placements",
+                            "the runs are not contiguous and ascending from the first",
+                        ),
+                        keys,
+                        values,
+                    ));
+                }
+                if placement.rows == 0 {
+                    return Err(give_back(
+                        invalid("placements", "a run of no rows"),
+                        keys,
+                        values,
+                    ));
+                }
+                if placement.physical_page >= self.geometry.pages {
+                    return Err(give_back(
+                        invalid_fmt(
+                            "placements",
+                            format_args!(
+                                "physical page {} of {} admitted",
+                                placement.physical_page, self.geometry.pages
+                            ),
+                        ),
+                        keys,
+                        values,
+                    ));
+                }
+                let slot_end = placement.slot.checked_add(placement.rows);
+                if slot_end.is_none_or(|end| end > self.geometry.page_tokens) {
+                    return Err(give_back(
+                        invalid(
+                            "placements",
+                            "a run crosses the end of the page it is placed on",
+                        ),
+                        keys,
+                        values,
+                    ));
+                }
+                match placement.end() {
+                    Some(end) => position = end,
+                    None => {
+                        return Err(give_back(
+                            Error::Dim(moxie_types::DimError::Overflow),
+                            keys,
+                            values,
+                        ));
+                    }
+                }
+                rows += placement.rows;
+            }
             let want = match rows.checked_mul(row_bytes) {
                 Some(want) => want,
                 None => {
@@ -1579,7 +1649,7 @@ pub mod device {
             if keys.len() as u64 != want || values.len() as u64 != want {
                 return Err(give_back(
                     invalid_fmt(
-                        "append",
+                        "rows",
                         format_args!(
                             "{} key byte(s) and {} value byte(s) for {rows} row(s) of \
                              {row_bytes}",
@@ -1591,38 +1661,12 @@ pub mod device {
                     values,
                 ));
             }
-            let end = match self.committed_rows.checked_add(rows) {
-                Some(end) => end,
-                None => {
-                    return Err(give_back(
-                        Error::Dim(moxie_types::DimError::Overflow),
-                        keys,
-                        values,
-                    ));
-                }
-            };
-            let capacity = match self.geometry.capacity_rows() {
-                Ok(capacity) => capacity,
-                Err(error) => return Err(give_back(error, keys, values)),
-            };
-            let mapped = self.page_table.len() as u64 * self.geometry.page_tokens;
-            if end > capacity || end > mapped {
-                return Err(give_back(
-                    Error::CapacityExceeded {
-                        tier: Some(Tier::Device(DeviceTier::KvStatePages)),
-                        requested_bytes: end,
-                        available_bytes: capacity.min(mapped),
-                    },
-                    keys,
-                    values,
-                ));
-            }
 
             // Everything above refuses without touching the device. From here
             // on the run holds both sources, unmoved and unjoined, until
             // completion is observed.
             self.held = Some(RefusedSource::Rows { keys, values });
-            match self.enqueue_append(stream, rows, row_bytes) {
+            match self.enqueue_writes(stream, placements, row_bytes) {
                 Ok(()) => {}
                 Err(error) => {
                     return Err(PagedRunRefused {
@@ -1632,37 +1676,30 @@ pub mod device {
                 }
             }
             self.held = None;
-            // The frontier moves last, after the event said the bytes are there.
-            self.committed_rows = end;
+            // Last, after the event said the bytes are there. This is the
+            // physical high-water mark, not a frontier: the authority publishes
+            // history, and it does so only for a call that returned `Ok`.
+            self.written = self.written.max(position);
             Ok(())
         }
 
-        fn enqueue_append(
+        fn enqueue_writes(
             &mut self,
             stream: &Stream<'ctx>,
-            rows: u64,
+            placements: &[PagePlacement],
             row_bytes: u64,
         ) -> Result<()> {
-            let page_tokens = self.geometry.page_tokens;
             let page_bytes = self.geometry.page_bytes()?;
             let Some(RefusedSource::Rows { keys, values }) = self.held.as_ref() else {
-                return Err(invalid("append", "the append is not holding its rows"));
+                return Err(invalid("write", "the write is not holding its rows"));
             };
-            let first_row = self.committed_rows;
-            // One copy per page-aligned run: a dense append crosses page
-            // boundaries, and the physical pages it lands on need not be
-            // adjacent. The loop is over *storage discontinuities*, not over
-            // rows.
+            // One copy per placement, per payload. The loop is over the
+            // authority's runs, which is where the storage discontinuities are.
             let mut done = 0u64;
-            while done < rows {
-                let row = first_row + done;
-                let logical_page = row / page_tokens;
-                let slot = row % page_tokens;
-                let run = (page_tokens - slot).min(rows - done);
-                let physical = u64::from(self.page_table[logical_page as usize]);
-                let within = physical * page_bytes + slot * row_bytes;
+            for placement in placements {
+                let within = placement.physical_page * page_bytes + placement.slot * row_bytes;
                 let start = (done * row_bytes) as usize;
-                let len = (run * row_bytes) as usize;
+                let len = (placement.rows * row_bytes) as usize;
                 for (range, source) in [
                     (self.keys.as_ref().expect("live key range"), keys),
                     (self.values.as_ref().expect("live value range"), values),
@@ -1677,52 +1714,65 @@ pub mod device {
                         return Err(self.attribute(error));
                     }
                 }
-                done += run;
+                done += placement.rows;
             }
             self.settle(Ok(()), stream)
         }
 
-        /// Read committed rows back out of the pages.
+        /// Read rows back out of the pages, at placements the authority gave.
         ///
         /// Evidence, not a data path: it is how a gate checks that an aborted
-        /// append left every prior byte exactly as it was.
-        pub fn read_rows(&self, first_row: u64, rows: u64) -> Result<Vec<u8>> {
+        /// write left every prior byte exactly as it was. It takes placements
+        /// for the same reason the write does — the mapping is not this run's
+        /// to reconstruct, and a readback that computed its own would be able
+        /// to agree with a write that was wrong.
+        pub fn read_rows(&self, placements: &[PagePlacement]) -> Result<Vec<u8>> {
             if self.quarantined {
                 return Err(invalid("run", "this run is quarantined"));
             }
-            let end = first_row
-                .checked_add(rows)
-                .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
-            if end > self.committed_rows {
-                return Err(invalid_fmt(
-                    "read_rows",
-                    format_args!(
-                        "rows {first_row}..{end} are not committed; the frontier is {}",
-                        self.committed_rows
-                    ),
-                ));
+            if placements.is_empty() {
+                return Err(invalid("placements", "a readback of no rows"));
             }
             let row_bytes = self
                 .geometry
                 .row_elements()?
                 .checked_mul(2)
                 .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
-            let page_tokens = self.geometry.page_tokens;
             let page_bytes = self.geometry.page_bytes()?;
+            let mut rows = 0u64;
+            for placement in placements {
+                if placement.physical_page >= self.geometry.pages
+                    || placement
+                        .slot
+                        .checked_add(placement.rows)
+                        .is_none_or(|end| end > self.geometry.page_tokens)
+                {
+                    return Err(invalid("placements", "a run outside its admitted page"));
+                }
+                let end = placement
+                    .end()
+                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+                if end > self.written {
+                    return Err(invalid_fmt(
+                        "placements",
+                        format_args!(
+                            "row {} was never written; {} row(s) have been",
+                            end - 1,
+                            self.written
+                        ),
+                    ));
+                }
+                rows += placement.rows;
+            }
             let len = usize::try_from(rows * row_bytes * 2)
                 .map_err(|_| invalid("read_rows", "the readback exceeds this host's usize"))?;
             let mut out = super::try_zeroed(len)?;
             let half = (rows * row_bytes) as usize;
             let mut done = 0u64;
-            while done < rows {
-                let row = first_row + done;
-                let logical_page = row / page_tokens;
-                let slot = row % page_tokens;
-                let run = (page_tokens - slot).min(rows - done);
-                let physical = u64::from(self.page_table[logical_page as usize]);
-                let within = physical * page_bytes + slot * row_bytes;
+            for placement in placements {
+                let within = placement.physical_page * page_bytes + placement.slot * row_bytes;
                 let start = (done * row_bytes) as usize;
-                let take = (run * row_bytes) as usize;
+                let take = (placement.rows * row_bytes) as usize;
                 self.keys
                     .as_ref()
                     .expect("live key range")
@@ -1731,7 +1781,7 @@ pub mod device {
                     .as_ref()
                     .expect("live value range")
                     .copy_to_host_at(within, &mut out[half + start..half + start + take])?;
-                done += run;
+                done += placement.rows;
             }
             Ok(out)
         }
@@ -1776,15 +1826,20 @@ pub mod device {
                     query,
                 ));
             }
-            if launch.history_base + launch.history_rows > self.committed_rows {
+            // The physical half of the check. The authority refuses a launch
+            // reading rows it never committed; this refuses one reading bytes
+            // this run never wrote. Neither subsumes the other, and a launch
+            // that passes both is reading rows that are both history and
+            // present.
+            if launch.history_base() + launch.history_rows() > self.written {
                 return Err(give_back(
                     invalid_fmt(
                         "history_rows",
                         format_args!(
-                            "a launch declaring [{}, {}) against a frontier of {}",
-                            launch.history_base,
-                            launch.history_base + launch.history_rows,
-                            self.committed_rows
+                            "a launch declaring [{}, {}) against {} written row(s)",
+                            launch.history_base(),
+                            launch.history_base() + launch.history_rows(),
+                            self.written
                         ),
                     ),
                     query,

@@ -40,6 +40,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod device;
+pub use device::{DeviceKvSequence, DeviceLayerLayout, Placement};
+
 pub mod paged;
 pub use paged::{
     KvGeometry, KvRow, LayerKv, PagedCloseRefused, PagedExecutionBinding, PagedSequence,

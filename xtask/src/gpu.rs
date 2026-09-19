@@ -30,8 +30,8 @@ use moxie_interp::{HostTensor, Interpreter, Value};
 use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSpan};
 use moxie_plan::{Phase, ResourceWorkload, Visibility, lower_selected};
 use moxie_types::{
-    ActivationPrecision, DeviceCapability, DeviceTier, Dim, Error, HostTier, Precision, RankId,
-    Scope, SymbolId, TensorLayout, Tier, WeightPrecision,
+    ActivationPrecision, DeviceCapability, DeviceTier, Dim, Error, HostTier, PagePlacement,
+    Precision, RankId, Scope, SymbolId, TensorLayout, Tier, WeightPrecision,
 };
 
 /// Wrap the build's own fatbin as a trusted image.
@@ -2594,6 +2594,42 @@ fn shuffled_pages(pages: u64) -> Vec<u32> {
     (0..pages).rev().map(|p| p as u32).collect()
 }
 
+/// The placements a mapping implies for `rows` rows from `first`.
+///
+/// These cases hand the run a **reversed** table and then place rows through
+/// it, which is the property they exist to check: the run performs whatever
+/// mapping it is given and assumes nothing about it. The authority-driven path
+/// — where `moxie_state::DeviceKvSequence` produces both the table and the
+/// placements — is what `paged_attention_32k` and the executor's own device
+/// tests cover.
+fn placements_through(
+    table: &[u32],
+    page_tokens: u64,
+    first: u64,
+    rows: u64,
+) -> Result<Vec<PagePlacement>, Error> {
+    let mut out = Vec::new();
+    let mut done = 0;
+    while done < rows {
+        let position = first + done;
+        let slot = position % page_tokens;
+        let run = (page_tokens - slot).min(rows - done);
+        let logical = (position / page_tokens) as usize;
+        let physical = *table.get(logical).ok_or(Error::InvalidRequest {
+            field: "page_table",
+            detail: "the mapping does not cover this row".into(),
+        })?;
+        out.push(PagePlacement {
+            position,
+            physical_page: u64::from(physical),
+            slot,
+            rows: run,
+        });
+        done += run;
+    }
+    Ok(out)
+}
+
 /// Compare one launch's device output against the independent FP64 equation.
 ///
 /// The expected value comes from `moxie_oracles::online_softmax`, cut into
@@ -2931,42 +2967,52 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
             case.rows,
         )
         .map_err(|r| r.error)?;
-        run.publish_page_table(&stream, shuffled_pages(case.geometry.pages))
+        let table = shuffled_pages(case.geometry.pages);
+        run.publish_page_table(&stream, table.clone())
             .map_err(|r| r.error)?;
 
         let mut written = 0u64;
         for rows in case.appends {
             let (keys, values) = fixture.payload(written, *rows);
-            run.append(&stream, *rows, keys, values)
+            let placements = placements_through(&table, case.geometry.page_tokens, written, *rows)?;
+            run.write_rows(&stream, &placements, keys, values)
                 .map_err(|r| r.error)?;
             written += rows;
         }
-        if run.committed_rows() != case.history {
+        if run.written_rows() != case.history {
             return Ok(Outcome::Failed(format!(
-                "{}: committed {} row(s) after appending {}",
+                "{}: wrote {} row(s) of {}",
                 case.label,
-                run.committed_rows(),
+                run.written_rows(),
                 case.history
             )));
         }
 
         // An append that cannot fit is refused *before* the device is touched:
         // the frontier does not move and every prior byte is unchanged.
-        let before = run.read_rows(0, case.history)?;
-        let overflow = run.capacity_rows()? + 1;
+        let whole_history = placements_through(&table, case.geometry.page_tokens, 0, case.history)?;
+        let before = run.read_rows(&whole_history)?;
+        // A placement naming a page this run was never admitted for. Refused
+        // before the device is touched, with the rows handed back.
+        let outside = vec![PagePlacement {
+            position: case.history,
+            physical_page: case.geometry.pages,
+            slot: 0,
+            rows: 1,
+        }];
         let (keys, values) = fixture.payload(0, 1);
         let refused = run
-            .append(&stream, overflow, keys, values)
-            .expect_err("an append past capacity must be refused");
+            .write_rows(&stream, &outside, keys, values)
+            .expect_err("a placement outside the admitted pages must be refused");
         if refused.retained_source() {
             return Ok(Outcome::Failed(format!(
                 "{}: a refusal before enqueue kept the caller's rows",
                 case.label
             )));
         }
-        if run.committed_rows() != case.history || run.read_rows(0, case.history)? != before {
+        if run.written_rows() != case.history || run.read_rows(&whole_history)? != before {
             return Ok(Outcome::Failed(format!(
-                "{}: a refused append moved the frontier or changed committed bytes",
+                "{}: a refused write moved the high-water mark or changed written bytes",
                 case.label
             )));
         }
@@ -3100,6 +3146,57 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let catalogue = moxie_kernels::paged_attention_catalogue();
     let fixture = AttentionFixture::build(geometry, heads, CONTEXT + 1, 0x0037_8000);
 
+    // Task 0038: the state authority owns this history. It places every row,
+    // publishes the mapping for its own retained range, and is the only thing
+    // that says what is committed; the run performs and launches. A gate that
+    // drove the run directly would be testing a path nothing uses.
+    let authority = || -> Result<moxie_state::DeviceKvSequence, Error> {
+        let sequence = moxie_state::DeviceKvSequence::new(moxie_state::KvGeometry {
+            layers: vec![moxie_state::LayerKv {
+                kv_heads: geometry.kv_heads as usize,
+                key_dim: geometry.head_dim as usize,
+                value_dim: geometry.head_dim as usize,
+                retention: moxie_state::Retention::All,
+            }],
+            precision: Precision::Bf16,
+            page_tokens: geometry.page_tokens as usize,
+            max_tokens: (geometry.pages * geometry.page_tokens) as usize,
+            tentative_rows: (geometry.pages * geometry.page_tokens) as usize,
+        })?;
+        if sequence.layout(0)?.pages != geometry.pages {
+            return Err(Error::InvalidRequest {
+                field: "geometry",
+                detail: "the authority and the run describe different page counts".into(),
+            });
+        }
+        Ok(sequence)
+    };
+
+    /// Append `rows` rows from the frontier: place, write, publish, republish.
+    ///
+    /// The order is the contract. Publication happens only after the write
+    /// returned, so a failed copy can never leave the authority claiming
+    /// history the device does not hold.
+    fn append_rows<'ctx>(
+        sequence: &mut moxie_state::DeviceKvSequence,
+        run: &mut PagedAttentionRun<'ctx>,
+        stream: &Stream<'ctx>,
+        fixture: &AttentionFixture,
+        rows: u64,
+    ) -> Result<(), Error> {
+        let first = sequence.committed_rows();
+        let placements = sequence.placements(0, first, rows)?;
+        let (keys, values) = fixture.payload(first, rows);
+        run.write_rows(stream, &placements, keys, values)
+            .map_err(|r| r.error)?;
+        let txn = sequence.begin()?;
+        sequence.publish(txn, rows)?;
+        sequence.commit(txn, rows)?;
+        run.publish_page_table(stream, sequence.page_table(0)?)
+            .map_err(|r| r.error)?;
+        Ok(())
+    }
+
     let decode = |first_position: u64, history_rows: u64, visibility: Visibility| {
         PagedAttentionLaunch::new(
             AttentionLayer {
@@ -3128,17 +3225,13 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         chunk_rows,
     )
     .map_err(|r| r.error)?;
-    whole
-        .publish_page_table(&stream, shuffled_pages(geometry.pages))
-        .map_err(|r| r.error)?;
-    let (keys, values) = fixture.payload(0, CONTEXT);
-    whole
-        .append(&stream, CONTEXT, keys, values)
-        .map_err(|r| r.error)?;
-    if whole.committed_rows() != CONTEXT {
+    let mut whole_state = authority()?;
+    append_rows(&mut whole_state, &mut whole, &stream, &fixture, CONTEXT)?;
+    if whole_state.committed_rows() != CONTEXT || whole.written_rows() != CONTEXT {
         return Ok(Outcome::Failed(format!(
-            "committed {} row(s), not {CONTEXT}",
-            whole.committed_rows()
+            "the authority committed {} row(s) and the run wrote {}, not {CONTEXT}",
+            whole_state.committed_rows(),
+            whole.written_rows()
         )));
     }
 
@@ -3153,21 +3246,16 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         chunk_rows,
     )
     .map_err(|r| r.error)?;
-    chunked
-        .publish_page_table(&stream, shuffled_pages(geometry.pages))
-        .map_err(|r| r.error)?;
+    let mut chunked_state = authority()?;
     let mut written = 0u64;
     for rows in [1u64, 255, 256, 7_000, 25_256] {
-        let (keys, values) = fixture.payload(written, rows);
-        chunked
-            .append(&stream, rows, keys, values)
-            .map_err(|r| r.error)?;
+        append_rows(&mut chunked_state, &mut chunked, &stream, &fixture, rows)?;
         written += rows;
     }
-    if written != CONTEXT || chunked.committed_rows() != CONTEXT {
+    if written != CONTEXT || chunked_state.committed_rows() != CONTEXT {
         return Ok(Outcome::Failed(format!(
             "chunked construction committed {} row(s) after {written}",
-            chunked.committed_rows()
+            chunked_state.committed_rows()
         )));
     }
 
@@ -3189,7 +3277,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         "    {} 32k-decode visible={} committed={} capacity={} state={} B {summary}",
         cap.sm(),
         last.history_rows(),
-        whole.committed_rows(),
+        whole_state.committed_rows(),
         whole.capacity_rows()?,
         whole.arena_bytes()
     );
@@ -3223,14 +3311,11 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     }
 
     // Append row 32,768 -- the row after the context -- and decode it.
-    let (keys, values) = fixture.payload(CONTEXT, 1);
-    whole
-        .append(&stream, 1, keys, values)
-        .map_err(|r| r.error)?;
-    if whole.committed_rows() != CONTEXT + 1 {
+    append_rows(&mut whole_state, &mut whole, &stream, &fixture, 1)?;
+    if whole_state.committed_rows() != CONTEXT + 1 {
         return Ok(Outcome::Failed(format!(
             "the frontier is {} after appending row {CONTEXT}",
-            whole.committed_rows()
+            whole_state.committed_rows()
         )));
     }
     let next = decode(CONTEXT, CONTEXT + 1, Visibility::Causal)?;
@@ -3242,7 +3327,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         "    {} 32k-append-decode visible={} committed={} capacity={} {summary}",
         cap.sm(),
         next.history_rows(),
-        whole.committed_rows(),
+        whole_state.committed_rows(),
         whole.capacity_rows()?
     );
 
@@ -3258,10 +3343,10 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         .map_err(|r| r.error)?;
     let summary = check_attention(&fixture, &windowed, &slid, "32k-sliding")?;
     let visible = (0..=CONTEXT).filter(|k| windowed.allows(0, *k)).count();
-    if visible != 4_096 || whole.committed_rows() != CONTEXT + 1 {
+    if visible != 4_096 || whole_state.committed_rows() != CONTEXT + 1 {
         return Ok(Outcome::Failed(format!(
             "{visible} visible row(s) against {} committed",
-            whole.committed_rows()
+            whole_state.committed_rows()
         )));
     }
     if slid == after {
@@ -3272,7 +3357,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     println!(
         "    {} 32k-sliding visible={visible} committed={} capacity={} {summary}",
         cap.sm(),
-        whole.committed_rows(),
+        whole_state.committed_rows(),
         whole.capacity_rows()?
     );
 

@@ -97,6 +97,7 @@ dependencies = [
  "moxie-oracles",
  "moxie-plan",
  "moxie-repack",
+ "moxie-state",
  "moxie-storage",
  "moxie-types",
 ]
@@ -410,6 +411,7 @@ dependencies = [
  "moxie-memory",
  "moxie-oracles",
  "moxie-plan",
+ "moxie-state",
  "moxie-types",
  "proc-macro2",
  "quote",

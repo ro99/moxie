@@ -22,7 +22,8 @@ use moxie_executor::{AttentionLayer, PageGeometry, PagedAttentionLaunch, PagedAt
 use moxie_kernels::cpu_expert::to_bf16_bits;
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_plan::Visibility;
-use moxie_types::{Error, RankId, Scope};
+use moxie_state::{DeviceKvSequence, KvGeometry, LayerKv, Retention};
+use moxie_types::{Error, PagePlacement, Precision, RankId, Scope};
 
 /// A `RankContext` is exclusive per device and `cargo test` runs a binary's
 /// tests in parallel threads. Serialising them is the property task 0007
@@ -40,6 +41,69 @@ fn geometry() -> PageGeometry {
         page_tokens: 16,
         pages: 4,
     }
+}
+
+/// The same layer, described to the state authority.
+///
+/// One geometry, two vocabularies: the authority speaks rows, retention and
+/// transactions, the run speaks bytes and pages. `authority()` below asserts
+/// they resolve to the same page count, which is what keeps them one layer.
+fn kv_geometry() -> KvGeometry {
+    KvGeometry {
+        layers: vec![LayerKv {
+            kv_heads: geometry().kv_heads as usize,
+            key_dim: geometry().head_dim as usize,
+            value_dim: geometry().head_dim as usize,
+            retention: Retention::All,
+        }],
+        precision: Precision::Bf16,
+        page_tokens: geometry().page_tokens as usize,
+        max_tokens: (geometry().pages * geometry().page_tokens) as usize,
+        tentative_rows: (geometry().pages * geometry().page_tokens) as usize,
+    }
+}
+
+fn authority() -> DeviceKvSequence {
+    let sequence = DeviceKvSequence::new(kv_geometry()).expect("a device sequence");
+    assert_eq!(
+        sequence.layout(0).expect("one layer").pages,
+        geometry().pages,
+        "the authority and the run must describe the same pages"
+    );
+    sequence
+}
+
+/// Publish `rows` rows through the authority and write them through the run.
+///
+/// The order is the contract: placements first, bytes second, publication last
+/// and only when the write returned. A run that wrote nothing must never leave
+/// the authority claiming history.
+fn append_through_authority<'ctx>(
+    sequence: &mut DeviceKvSequence,
+    run: &mut PagedAttentionRun<'ctx>,
+    stream: &Stream<'ctx>,
+    rows: u64,
+    seed: u64,
+) -> Vec<PagePlacement> {
+    let first = sequence.committed_rows();
+    let placements = sequence
+        .placements(0, first, rows)
+        .expect("the authority places the rows");
+    let keys = bf16_bytes(rows as usize * row_bytes(), seed);
+    let values = bf16_bytes(rows as usize * row_bytes(), seed + 1);
+    run.write_rows(stream, &placements, keys, values)
+        .map_err(|r| r.error)
+        .expect("the write fits");
+    let txn = sequence.begin().expect("a transaction");
+    sequence.publish(txn, rows).expect("publish");
+    sequence.commit(txn, rows).expect("commit");
+    // The mapping follows the history. It grows as pages are filled and slides
+    // as the ring reclaims, and republishing it is how the run learns both --
+    // which is why the run no longer refuses a second publication.
+    run.publish_page_table(stream, sequence.page_table(0).expect("a table"))
+        .map_err(|r| r.error)
+        .expect("the authority's mapping");
+    placements
 }
 
 const HEADS: u64 = 4;
@@ -101,7 +165,7 @@ fn prepared<'ctx>(
     ctx: &'ctx RankContext,
     stream: &Stream<'ctx>,
     rows: u64,
-) -> PagedAttentionRun<'ctx> {
+) -> (PagedAttentionRun<'ctx>, DeviceKvSequence) {
     let mut run = PagedAttentionRun::admit(
         ledger,
         ctx,
@@ -112,20 +176,29 @@ fn prepared<'ctx>(
     )
     .map_err(|r| r.error)
     .expect("admission fits a measured device");
-    run.publish_page_table(
-        stream,
-        (0..geometry().pages).rev().map(|p| p as u32).collect(),
-    )
-    .map_err(|r| r.error)
-    .expect("a reversed mapping is a mapping");
+    let mut sequence = authority();
+    // The mapping the authority publishes for its own retained range, not one
+    // this test invented. With a retain-all layer it is the identity until the
+    // ring wraps, and the wrap is what `a_reclaimed_base` exercises.
     if rows > 0 {
+        let placements = sequence.placements(0, 0, rows).expect("placements");
+        let txn = sequence.begin().expect("a transaction");
+        sequence.publish(txn, rows).expect("publish");
+        sequence.commit(txn, rows).expect("commit");
+        run.publish_page_table(stream, sequence.page_table(0).expect("a table"))
+            .map_err(|r| r.error)
+            .expect("the authority's mapping");
         let keys = bf16_bytes(rows as usize * row_bytes(), 0x37_0001);
         let values = bf16_bytes(rows as usize * row_bytes(), 0x37_0002);
-        run.append(stream, rows, keys, values)
+        run.write_rows(stream, &placements, keys, values)
             .map_err(|r| r.error)
-            .expect("the append fits");
+            .expect("the write fits");
+    } else {
+        run.publish_page_table(stream, vec![0, 1, 2, 3])
+            .map_err(|r| r.error)
+            .expect("an identity mapping");
     }
-    run
+    (run, sequence)
 }
 
 #[test]
@@ -408,31 +481,80 @@ fn a_mapping_that_is_not_a_mapping_is_refused() {
             .is_err(),
         "a mapping longer than the admitted pages was accepted"
     );
-    // An append before any mapping exists has nowhere to write.
-    let keys = bf16_bytes(row_bytes(), 1);
-    let values = bf16_bytes(row_bytes(), 2);
-    let refused = run
-        .append(&stream, 1, keys, values)
-        .expect_err("an append with no mapping was accepted");
-    assert!(
-        !refused.retained_source(),
-        "a pre-enqueue refusal kept bytes"
-    );
-    assert_eq!(run.committed_rows(), 0);
-
     run.publish_page_table(&stream, vec![3, 2, 1, 0])
         .map_err(|r| r.error)
         .expect("a reversed mapping is a mapping");
+    let placement = PagePlacement {
+        position: 0,
+        physical_page: 3,
+        slot: 0,
+        rows: 1,
+    };
     let keys = bf16_bytes(row_bytes(), 1);
     let values = bf16_bytes(row_bytes(), 2);
-    run.append(&stream, 1, keys, values)
+    run.write_rows(&stream, &[placement], keys, values)
         .map_err(|r| r.error)
-        .expect("the append fits");
-    // Remapping under a live history would move rows something has attended to.
-    assert!(
-        run.publish_page_table(&stream, vec![0, 1, 2, 3]).is_err(),
-        "the mapping changed under committed rows"
-    );
+        .expect("the write fits");
+    // **Republishing is legal**, and it has to be: the authority's retained
+    // range slides as its ring wraps, so the table for that range changes with
+    // it. An earlier version refused any change after the first write, which is
+    // a rule only a cache that never reclaims can keep.
+    run.publish_page_table(&stream, vec![0, 1, 2, 3])
+        .map_err(|r| r.error)
+        .expect("the mapping may follow the retained range");
+    // A placement outside the admitted pages, one that runs off the end of its
+    // page, and a set that is not contiguous are each refused before any copy.
+    for (what, placements) in [
+        (
+            "a page that does not exist",
+            vec![PagePlacement {
+                position: 1,
+                physical_page: 9,
+                slot: 0,
+                rows: 1,
+            }],
+        ),
+        (
+            "a run off the end of its page",
+            vec![PagePlacement {
+                position: 1,
+                physical_page: 0,
+                slot: 15,
+                rows: 2,
+            }],
+        ),
+        (
+            "a gap between runs",
+            vec![
+                PagePlacement {
+                    position: 1,
+                    physical_page: 0,
+                    slot: 1,
+                    rows: 1,
+                },
+                PagePlacement {
+                    position: 3,
+                    physical_page: 0,
+                    slot: 3,
+                    rows: 1,
+                },
+            ],
+        ),
+    ] {
+        let rows: u64 = placements.iter().map(|p| p.rows).sum();
+        let refused = run
+            .write_rows(
+                &stream,
+                &placements,
+                bf16_bytes(rows as usize * row_bytes(), 3),
+                bf16_bytes(rows as usize * row_bytes(), 4),
+            )
+            .expect_err(what);
+        assert!(
+            !refused.retained_source(),
+            "{what}: a pre-enqueue refusal kept bytes"
+        );
+    }
     run.close(&mut ledger).map_err(|r| r.error).expect("close");
     assert!(ledger.outstanding().is_empty());
 }
@@ -447,52 +569,65 @@ fn a_refused_append_moves_nothing_and_hands_the_rows_back() {
     let ctx = RankContext::acquire(RankId(0), 0).expect("acquire device 0");
     let stream = Stream::new(&ctx).expect("a stream");
     let mut ledger = measured_ledger(&ctx);
-    let mut run = prepared(&mut ledger, &ctx, &stream, 20);
-    let before = run.read_rows(0, 20).expect("committed rows read back");
+    let (mut run, sequence) = prepared(&mut ledger, &ctx, &stream, 20);
+    let written = sequence.placements(0, 0, 20).expect("placements");
+    let before = run.read_rows(&written).expect("written rows read back");
     let capacity = run.capacity_rows().expect("capacity");
     assert_eq!(capacity, 64, "four pages of sixteen rows");
+    let good = sequence.placements(0, 20, 2).expect("two more rows");
 
-    let cases: Vec<(&str, u64, usize, usize)> = vec![
-        // label, rows, key element count, value element count
-        ("no rows at all", 0, 0, 0),
-        ("more rows than the pages hold", capacity + 1, 0, 0),
+    let cases: Vec<(&str, Vec<PagePlacement>, usize, usize)> = vec![
+        ("no placement at all", Vec::new(), 0, 0),
         (
             "keys short of their row count",
-            2,
+            good.clone(),
             row_bytes(),
             2 * row_bytes(),
         ),
         (
             "values short of their row count",
-            2,
+            good.clone(),
             2 * row_bytes(),
             row_bytes(),
         ),
     ];
-    for (label, rows, keys, values) in cases {
+    for (label, placements, keys, values) in cases {
         let refused = run
-            .append(&stream, rows, bf16_bytes(keys, 7), bf16_bytes(values, 8))
+            .write_rows(
+                &stream,
+                &placements,
+                bf16_bytes(keys, 7),
+                bf16_bytes(values, 8),
+            )
             .err()
             .unwrap_or_else(|| panic!("{label} was accepted"));
         assert!(
             !refused.retained_source(),
             "{label}: a refusal before enqueue must hand the rows back"
         );
-        assert_eq!(run.committed_rows(), 20, "{label}: the frontier moved");
+        assert_eq!(run.written_rows(), 20, "{label}: the high-water mark moved");
         assert_eq!(
-            run.read_rows(0, 20).expect("read back"),
+            run.read_rows(&written).expect("read back"),
             before,
-            "{label}: committed bytes changed"
+            "{label}: written bytes changed"
+        );
+        assert_eq!(
+            sequence.committed_rows(),
+            20,
+            "{label}: the authority published rows the run refused"
         );
     }
+    // The authority refuses to place rows past its own admitted context, which
+    // is the other half: the run bounds bytes, the authority bounds history.
+    assert!(sequence.placements(0, 0, capacity + 1).is_err());
 
-    // And a launch that claims history the frontier does not have.
+    // And a launch that claims history nothing wrote.
     let query = bf16_bytes((HEADS * geometry().head_dim) as usize, 9);
     let refused = run
         .attend(&stream, &launch(1, 19, 21), query)
-        .expect_err("a launch past the frontier was accepted");
+        .expect_err("a launch past the written rows was accepted");
     assert!(!refused.retained_source());
-    assert_eq!(run.committed_rows(), 20);
+    assert_eq!(run.written_rows(), 20);
     run.close(&mut ledger).map_err(|r| r.error).expect("close");
     assert!(ledger.outstanding().is_empty());
 }
@@ -510,15 +645,16 @@ fn a_stream_from_another_device_is_refused() {
     let stream = Stream::new(&ctx).expect("a stream");
     let foreign = Stream::new(&other).expect("a stream on the other device");
     let mut ledger = measured_ledger(&ctx);
-    let mut run = prepared(&mut ledger, &ctx, &stream, 4);
+    let (mut run, sequence) = prepared(&mut ledger, &ctx, &stream, 4);
 
+    let placements = sequence.placements(0, 4, 1).expect("one more row");
     let keys = bf16_bytes(row_bytes(), 3);
     let values = bf16_bytes(row_bytes(), 4);
     let refused = run
-        .append(&foreign, 1, keys, values)
-        .expect_err("an append on a foreign stream was accepted");
+        .write_rows(&foreign, &placements, keys, values)
+        .expect_err("a write on a foreign stream was accepted");
     assert!(!refused.retained_source());
-    assert_eq!(run.committed_rows(), 4, "the frontier moved");
+    assert_eq!(run.written_rows(), 4, "the high-water mark moved");
 
     let query = bf16_bytes((HEADS * geometry().head_dim) as usize, 5);
     assert!(
@@ -539,7 +675,7 @@ fn repeated_decode_admits_nothing_further() {
     let ctx = RankContext::acquire(RankId(0), 0).expect("acquire device 0");
     let stream = Stream::new(&ctx).expect("a stream");
     let mut ledger = measured_ledger(&ctx);
-    let mut run = prepared(&mut ledger, &ctx, &stream, 1);
+    let (mut run, mut sequence) = prepared(&mut ledger, &ctx, &stream, 1);
 
     // The claim is narrow and exact: decoding does not grow what was admitted.
     // The pages, the table, the query and the output are charged once at
@@ -549,11 +685,7 @@ fn repeated_decode_admits_nothing_further() {
     let bytes = run.arena_bytes();
     let mut previous: Option<Vec<u8>> = None;
     for step in 1..=32u64 {
-        let keys = bf16_bytes(row_bytes(), 0x1000 + step);
-        let values = bf16_bytes(row_bytes(), 0x2000 + step);
-        run.append(&stream, 1, keys, values)
-            .map_err(|r| r.error)
-            .expect("one row per step");
+        append_through_authority(&mut sequence, &mut run, &stream, 1, 0x1000 + step);
         let query = bf16_bytes((HEADS * geometry().head_dim) as usize, 0x3000 + step);
         let out = run
             .attend(&stream, &launch(1, step, step + 1), query)
@@ -569,7 +701,12 @@ fn repeated_decode_admits_nothing_further() {
         if let Some(earlier) = previous.replace(out.clone()) {
             assert_ne!(earlier, out, "step {step} repeated the previous answer");
         }
-        assert_eq!(run.committed_rows(), step + 1);
+        assert_eq!(run.written_rows(), step + 1);
+        assert_eq!(
+            sequence.committed_rows(),
+            step + 1,
+            "the authority and the run disagree about step {step}"
+        );
         assert_eq!(run.arena_bytes(), bytes, "step {step} grew the arena");
         assert_eq!(
             ledger.outstanding().len(),
@@ -578,5 +715,163 @@ fn repeated_decode_admits_nothing_further() {
         );
     }
     run.close(&mut ledger).map_err(|r| r.error).expect("close");
+    assert!(ledger.outstanding().is_empty());
+}
+
+/// Task 0038 acceptance 2: **the wrap is invisible to the answer.**
+///
+/// The case task 0037 could not reach. A windowed layer's ring wraps, the
+/// authority's retained base leaves zero, and the launch attends over
+/// `history_base > 0` — physical pages in a different order than the logical
+/// rows, with the oldest pages holding the newest rows.
+///
+/// The check is an equality rather than a tolerance: a second run with enough
+/// pages that nothing is ever overwritten holds the same rows at the same
+/// absolute positions, and a query at the same position with the same window
+/// sees the same keys and values. Two different physical layouts, one logical
+/// history, and the device must not be able to tell the difference. A tolerance
+/// would have accepted a kernel that read the wrong page and happened to be
+/// close.
+#[test]
+fn a_wrapped_ring_answers_exactly_as_an_unwrapped_one() {
+    let _guard = one_at_a_time();
+    if device_count().expect("enumerate") == 0 {
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    }
+    const ROWS: u64 = 100;
+    const WINDOW: u64 = 40;
+    let ctx = RankContext::acquire(RankId(0), 0).expect("acquire device 0");
+    let stream = Stream::new(&ctx).expect("a stream");
+
+    // Two geometries over one layer. The first wraps: four 16-row pages hold 64
+    // rows and the history is 100 long. The second cannot: eight pages hold
+    // 128, so every row stays where it was written.
+    let run_case = |pages: u64, ledger: &mut Ledger| -> (Vec<u8>, u64, u64) {
+        let geometry = PageGeometry {
+            kv_heads: 2,
+            head_dim: 64,
+            page_tokens: 16,
+            pages,
+        };
+        let kv = KvGeometry {
+            layers: vec![LayerKv {
+                kv_heads: 2,
+                key_dim: 64,
+                value_dim: 64,
+                retention: if pages == 4 {
+                    // 40 + 8 is three pages, plus the eviction page: four.
+                    Retention::Window {
+                        window: WINDOW as usize,
+                    }
+                } else {
+                    Retention::All
+                },
+            }],
+            precision: Precision::Bf16,
+            page_tokens: 16,
+            // Context, not capacity. A windowed layer's whole purpose is a
+            // context longer than the rows it keeps, so the four-page case
+            // admits a 4,096-position context over 64 physical rows; the
+            // retain-all case must physically hold everything it admits.
+            max_tokens: if pages == 4 {
+                4096
+            } else {
+                (pages * 16) as usize
+            },
+            tentative_rows: 8,
+        };
+        let mut sequence = DeviceKvSequence::new(kv).expect("a device sequence");
+        assert_eq!(
+            sequence.layout(0).expect("one layer").pages,
+            pages,
+            "the authority and the run must describe the same pages"
+        );
+        let capability = query_device(ctx.ordinal()).expect("query the device");
+        let layer = AttentionLayer {
+            geometry,
+            heads: HEADS,
+            scale: moxie_plan::reciprocal_sqrt_scale(64),
+            visibility: Visibility::SlidingWindow { window: WINDOW },
+        };
+        let descriptor = moxie_executor::select_paged_attention_kernel(
+            &moxie_kernels::paged_attention_catalogue(),
+            &capability,
+            &PagedAttentionLaunch::new(layer, 1, 0, 0, 1).expect("a launch"),
+        )
+        .expect("a descriptor");
+        let mut run = PagedAttentionRun::admit(ledger, &ctx, descriptor, geometry, HEADS, 1)
+            .map_err(|r| r.error)
+            .expect("admission fits");
+
+        // The same bytes at the same positions in both cases: the row's seed is
+        // its absolute position, so nothing about the physical layout can
+        // change what a row contains.
+        let mut written = 0u64;
+        while written < ROWS {
+            let step = 8.min(ROWS - written);
+            let placements = sequence
+                .placements(0, written, step)
+                .expect("the authority places the rows");
+            let row = (2 * 64) as usize;
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for offset in 0..step {
+                keys.extend_from_slice(&bf16_bytes(row, 0x5000 + written + offset));
+                values.extend_from_slice(&bf16_bytes(row, 0x9000 + written + offset));
+            }
+            run.write_rows(&stream, &placements, keys, values)
+                .map_err(|r| r.error)
+                .expect("the write fits");
+            let txn = sequence.begin().expect("a transaction");
+            sequence.publish(txn, step).expect("publish");
+            sequence.commit(txn, step).expect("commit");
+            run.publish_page_table(&stream, sequence.page_table(0).expect("a table"))
+                .map_err(|r| r.error)
+                .expect("the authority's mapping");
+            written += step;
+        }
+
+        let retained = sequence.retained(0).expect("a range");
+        let launch = PagedAttentionLaunch::new(
+            layer,
+            1,
+            ROWS - 1,
+            retained.start,
+            retained.end - retained.start,
+        )
+        .expect("a launch over the retained range");
+        let query = bf16_bytes((HEADS * 64) as usize, 0x7777);
+        let out = run
+            .attend(&stream, &launch, query)
+            .map_err(|r| r.error)
+            .expect("the decode runs");
+        run.close(ledger).map_err(|r| r.error).expect("close");
+        (out, retained.start, sequence.committed_rows())
+    };
+
+    let mut ledger = measured_ledger(&ctx);
+    let (wrapped, wrapped_base, wrapped_rows) = run_case(4, &mut ledger);
+    let (flat, flat_base, flat_rows) = run_case(8, &mut ledger);
+
+    // The premise: one of these really did wrap and the other really did not.
+    assert_eq!(
+        (wrapped_base, wrapped_rows),
+        (48, ROWS),
+        "the four-page case was supposed to reclaim"
+    );
+    assert_eq!(
+        (flat_base, flat_rows),
+        (0, ROWS),
+        "the eight-page case was not supposed to reclaim"
+    );
+    assert!(
+        wrapped.iter().any(|b| *b != 0),
+        "the wrapped decode produced nothing"
+    );
+    assert_eq!(
+        wrapped, flat,
+        "the same logical history gave different answers on two physical layouts"
+    );
     assert!(ledger.outstanding().is_empty());
 }

@@ -393,8 +393,18 @@ specification and the affected suites. **Not done, and not claimed:**
 - **The semantic path.** Finding 1 above: planner lowering from
   `OpParams::Attention`, device query/output handles rather than host staging,
   and execution through the admitted graph plan. Until then this is a qualified
-  kernel and binding, not the engine's attention.
-- **A reclaimed base is host-checked only.** Every device case runs with
+  kernel and binding, not the engine's attention. Carried into
+  [task 0038](0038-m4-device-kv-state-authority.md) as its second deliverable,
+  which is not started.
+- **The state binding** is **closed by task 0038's first half**:
+  `moxie_state::DeviceKvSequence` owns placement, retention, the frontier,
+  transactions, abort and truncation, and the 32,768-row gate is driven through
+  it.
+- ~~**A reclaimed base is host-checked only.**~~ **Closed by task 0038**:
+  `a_wrapped_ring_answers_exactly_as_an_unwrapped_one` attends after the ring
+  has wrapped, at a retained base of 48, and gets byte-identical results to a
+  store that never reclaimed. The paragraph below is kept for the record of what
+  was open at this task's own close. Every device case *in this task* ran with
   `history_base = 0`. The kernel takes the base and masks on absolute positions,
   and the launch contract refuses a base that is not a whole number of pages, but
   no device gate has actually attended over a history whose first logical row is

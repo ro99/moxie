@@ -36,6 +36,12 @@ moxie-plan.workspace = true
 moxie-kernels.workspace = true
 
 [dev-dependencies]
+# Task 0038: the device tests drive the state authority and this crate's
+# performer together, which is the only place the two meet. A dev dependency
+# only -- production code here names no state type, `arch-check` excludes
+# dev-dependencies from every table, and a fixture proves the production edge is
+# refused.
+moxie-state.workspace = true
 moxie-graph.workspace = true
 # Task 0020's real-artifact test builds its demand set the way a routed step
 # does, through the engine's route-to-chunk arithmetic. A dev dependency only:

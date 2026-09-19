@@ -1267,6 +1267,87 @@ mod tests {
         }
     }
 
+    /// Task 0038: the device authority places a row where this store does.
+    ///
+    /// The device path claims that its page table **is** this ring, written
+    /// down. That claim is checked against this store's own table bytes rather
+    /// than against a restatement of its formula: the placement's physical page
+    /// is used to read this sequence's page-table entry, and the byte offset
+    /// that produces must be the one `ranges` returns. Two implementations of
+    /// one mapping is the failure this asserts away.
+    #[test]
+    fn the_device_authority_places_rows_where_this_store_does() {
+        use crate::device::DeviceKvSequence;
+
+        // Retain-all, so both sides admit the same page count: a windowed layer
+        // deliberately differs, and that difference is asserted below.
+        let geometry = KvGeometry::uniform(2, 1, 2, 2, Precision::Bf16, 4, 32);
+        let mut ledger =
+            Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 20, 1024).unwrap()]).unwrap();
+        let mut host = PagedSequence::new(&mut ledger, geometry.clone()).unwrap();
+        let mut device = DeviceKvSequence::new(geometry.clone()).unwrap();
+
+        let rows = [KvRow {
+            key: &[1, 2, 3, 4],
+            value: &[5, 6, 7, 8],
+        }; 2];
+        // Twenty-four rows of an admitted thirty-two: six whole pages and a
+        // wrap of neither, which is what makes the comparison about placement
+        // rather than about the boundary.
+        let txn = host.begin().unwrap();
+        host.append_prompt(24).unwrap();
+        let device_txn = device.begin().unwrap();
+        for position in 0..24u64 {
+            host.append(txn, position, &rows, &AtomicBool::new(false))
+                .unwrap();
+        }
+        device.publish(device_txn, 24).unwrap();
+        // Zero, because prompt tokens are accepted when they are appended:
+        // accepting them again would count the same context twice.
+        host.commit_prefix(txn, 0).unwrap();
+        device.commit(device_txn, 24).unwrap();
+
+        for layer in 0..geometry.layers.len() {
+            let l = &host.layout.layers[layer];
+            for position in 0..24u64 {
+                let (key, value) = host.ranges(layer, position as usize);
+                let placement = device.placement_of(layer, position).unwrap();
+                // Through this store's *own* page table, not through a second
+                // copy of its arithmetic.
+                let entry = (l.table_base + placement.physical_page as usize) * 8;
+                let table = &host.backing.bytes()[entry..entry + 8];
+                let base = u64::from_le_bytes(table.try_into().unwrap()) as usize;
+                assert_eq!(
+                    key.start,
+                    base + placement.slot as usize * l.key_bytes,
+                    "layer {layer} row {position}: the two mappings disagree on the key"
+                );
+                assert_eq!(
+                    value.start,
+                    base + geometry.page_tokens * l.key_bytes
+                        + placement.slot as usize * l.value_bytes,
+                    "layer {layer} row {position}: the two mappings disagree on the value"
+                );
+            }
+        }
+
+        // The one place they differ, on purpose: a windowed layer's device
+        // capacity carries an extra page, because a device page is evicted
+        // whole and the oldest row the window admits must survive that.
+        let mut windowed = geometry.clone();
+        windowed.layers[0].retention = Retention::Window { window: 8 };
+        windowed.tentative_rows = 4;
+        let device = DeviceKvSequence::new(windowed.clone()).unwrap();
+        let mut ledger =
+            Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 20, 1024).unwrap()]).unwrap();
+        let host = PagedSequence::new(&mut ledger, windowed).unwrap();
+        assert_eq!(
+            device.layout(0).unwrap().pages,
+            host.layout.layers[0].pages as u64 + 1,
+            "the device layer must admit exactly one page more than the host ring"
+        );
+    }
+
     #[test]
     fn cancellation_at_every_publication_boundary_restores_physical_and_logical_state() {
         let geometry = KvGeometry::uniform(3, 1, 2, 1, Precision::Bf16, 2, 8);
