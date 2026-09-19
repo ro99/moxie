@@ -1786,6 +1786,106 @@ pub mod device {
             Ok(out)
         }
 
+        /// Attend from a device query range into a device output range.
+        ///
+        /// **This is the contract document 04 states**: "attention consumes
+        /// device tensor handles and page-table/state handles", and host
+        /// reference paths are "explicit separate implementations, not
+        /// compulsory staging interfaces". Nothing crosses the host boundary
+        /// here — the query is already on the device, the answer stays there,
+        /// and a graph whose activation arena holds both never pays for a round
+        /// trip per step.
+        ///
+        /// The ranges must belong to this run's device and be at least the
+        /// launch's extents. They are **not** this run's own: a caller passes
+        /// the arena slots its plan bound, which is what makes this the path a
+        /// lowered graph can use.
+        ///
+        /// Nothing is retained on refusal because nothing of the caller's was
+        /// taken: the query is already device-resident and this call copies no
+        /// host bytes. A failure after the launch still quarantines the run,
+        /// because the ranges may still be read.
+        pub fn attend_into(
+            &mut self,
+            stream: &Stream<'ctx>,
+            launch: &PagedAttentionLaunch,
+            query: &DeviceRange<'ctx>,
+            output: &DeviceRange<'ctx>,
+        ) -> Result<()> {
+            self.check_attend(stream, launch)?;
+            let want = launch.query_bytes()?;
+            for (range, what) in [(query, "query"), (output, "output")] {
+                if range.device_uuid() != self.ctx.uuid() {
+                    return Err(invalid(what, "this range belongs to another device"));
+                }
+                if range.bytes() < want {
+                    return Err(invalid_fmt(
+                        what,
+                        format_args!("{} byte(s) for a launch needing {want}", range.bytes()),
+                    ));
+                }
+            }
+            let scalars = Self::abi_scalars(launch)?;
+            let addresses = [
+                query.device_address()?,
+                self.keys
+                    .as_ref()
+                    .expect("live key range")
+                    .device_address()?,
+                self.values
+                    .as_ref()
+                    .expect("live value range")
+                    .device_address()?,
+                self.table
+                    .as_ref()
+                    .expect("live page table range")
+                    .device_address()?,
+                output.device_address()?,
+            ];
+            self.launch_with(stream, scalars, addresses)
+        }
+
+        /// Everything both entry points check before either touches the device.
+        fn check_attend(
+            &mut self,
+            stream: &Stream<'ctx>,
+            launch: &PagedAttentionLaunch,
+        ) -> Result<()> {
+            if self.quarantined {
+                return Err(invalid("run", "this run is quarantined"));
+            }
+            self.same_device(stream)?;
+            super::descriptor_serves(&self.descriptor, launch)?;
+            check_grid(launch, self.ctx)?;
+            if *launch.geometry() != self.geometry
+                || launch.heads() != self.heads
+                || launch.rows() > self.max_rows
+            {
+                return Err(invalid(
+                    "launch",
+                    "this launch's geometry is not the one this run was admitted for",
+                ));
+            }
+            if launch.history_base() + launch.history_rows() > self.written {
+                return Err(invalid_fmt(
+                    "history_rows",
+                    format_args!(
+                        "a launch declaring [{}, {}) against {} written row(s)",
+                        launch.history_base(),
+                        launch.history_base() + launch.history_rows(),
+                        self.written
+                    ),
+                ));
+            }
+            if launch.logical_pages().unwrap_or(u64::MAX) > self.page_table.len() as u64 {
+                return Err(invalid(
+                    "page_table",
+                    "the published mapping is shorter than the history",
+                ));
+            }
+            Ok(())
+        }
+
         /// Attend `launch.rows` query rows against the committed history.
         ///
         /// The launch's declared history must be one this run actually holds:
@@ -1802,57 +1902,15 @@ pub mod device {
                 error,
                 source: Some(RefusedSource::Query(query)),
             };
-            if self.quarantined {
-                return Err(give_back(invalid("run", "this run is quarantined"), query));
-            }
-            if let Err(error) = self.same_device(stream) {
+            // The same preconditions `attend_into` applies, because there is
+            // one operation: the difference between the two entry points is
+            // where the query already is, not what makes a launch legal. The
+            // physical half of the history check lives in there — the authority
+            // refuses a launch reading rows it never committed, this refuses one
+            // reading bytes this run never wrote, and neither subsumes the
+            // other.
+            if let Err(error) = self.check_attend(stream, launch) {
                 return Err(give_back(error, query));
-            }
-            if let Err(error) = super::descriptor_serves(&self.descriptor, launch) {
-                return Err(give_back(error, query));
-            }
-            if let Err(error) = check_grid(launch, self.ctx) {
-                return Err(give_back(error, query));
-            }
-            if *launch.geometry() != self.geometry
-                || launch.heads() != self.heads
-                || launch.rows() > self.max_rows
-            {
-                return Err(give_back(
-                    invalid(
-                        "launch",
-                        "this launch's geometry is not the one this run was admitted for",
-                    ),
-                    query,
-                ));
-            }
-            // The physical half of the check. The authority refuses a launch
-            // reading rows it never committed; this refuses one reading bytes
-            // this run never wrote. Neither subsumes the other, and a launch
-            // that passes both is reading rows that are both history and
-            // present.
-            if launch.history_base() + launch.history_rows() > self.written {
-                return Err(give_back(
-                    invalid_fmt(
-                        "history_rows",
-                        format_args!(
-                            "a launch declaring [{}, {}) against {} written row(s)",
-                            launch.history_base(),
-                            launch.history_base() + launch.history_rows(),
-                            self.written
-                        ),
-                    ),
-                    query,
-                ));
-            }
-            if launch.logical_pages().unwrap_or(u64::MAX) > self.page_table.len() as u64 {
-                return Err(give_back(
-                    invalid(
-                        "page_table",
-                        "the published mapping is shorter than the history",
-                    ),
-                    query,
-                ));
             }
             match launch.query_bytes() {
                 Ok(want) if query.len() as u64 == want => {}
@@ -1971,6 +2029,20 @@ pub mod device {
                     }
                 }
             }
+            self.launch_with(stream, scalars, addresses)
+        }
+
+        /// The launch itself: five addresses, the ABI's scalars, one grid.
+        ///
+        /// Shared by both entry points, because there is one kernel and one ABI
+        /// and the only difference between staging through this run's ranges
+        /// and attending into a caller's is which addresses arrive here.
+        fn launch_with(
+            &mut self,
+            stream: &Stream<'ctx>,
+            scalars: AbiScalars,
+            addresses: [u64; 5],
+        ) -> Result<()> {
             let [
                 mut query_address,
                 mut key_address,
@@ -2320,5 +2392,209 @@ pub mod device {
                 rejection: None,
             },
         }
+    }
+}
+
+#[cfg(all(test, feature = "driver"))]
+mod device_tests {
+    //! The device-handle entry point, which has no external caller yet.
+    //!
+    //! `attend_into` takes `DeviceRange`s and reads their addresses, and both
+    //! of those are crate-internal — deliberately, because a range's address is
+    //! only meaningful inside the crate that owns its arena. So the test that
+    //! proves the two entry points compute the same answer lives here, beside
+    //! them, and it needs real hardware.
+
+    use moxie_cuda::{RankContext, Stream};
+    use moxie_memory::{CapacitySnapshot, Ledger};
+    use moxie_plan::Visibility;
+    use moxie_types::{PagePlacement, RankId};
+
+    use super::device::PagedAttentionRun;
+    use super::{AttentionLayer, PageGeometry, PagedAttentionLaunch};
+    use crate::arena::DeviceArena;
+
+    const HEADS: u64 = 4;
+    const HEAD_DIM: u64 = 64;
+
+    fn geometry() -> PageGeometry {
+        PageGeometry {
+            kv_heads: 2,
+            head_dim: HEAD_DIM,
+            page_tokens: 8,
+            pages: 2,
+        }
+    }
+
+    fn bytes(count: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        let mut out = Vec::with_capacity(count * 2);
+        for _ in 0..count {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let value = ((state >> 41) as f32) / ((1u32 << 22) as f32) - 1.0;
+            out.extend_from_slice(&moxie_kernels::cpu_expert::to_bf16_bits(value).to_le_bytes());
+        }
+        out
+    }
+
+    /// The two entry points are one operation.
+    ///
+    /// Document 04 requires attention to consume device handles, with host
+    /// paths as "explicit separate implementations, not compulsory staging
+    /// interfaces". That is only true if the separate implementation computes
+    /// the same thing, so this asserts **byte equality** between a launch whose
+    /// query was staged through the run's own ranges and one that read a
+    /// caller's device range and wrote a caller's device range.
+    #[test]
+    fn device_handles_and_host_staging_give_the_same_bytes() {
+        let _guard = crate::DRIVER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if moxie_cuda::device_count().expect("enumerate") == 0 {
+            eprintln!("SKIPPED: no CUDA device");
+            return;
+        }
+        let ctx = RankContext::acquire(RankId(38_001), 0).expect("a rank context");
+        let stream = Stream::new(&ctx).expect("a stream");
+        let capability = moxie_cuda::query_device(0).expect("query device 0");
+        let layer = AttentionLayer {
+            geometry: geometry(),
+            heads: HEADS,
+            scale: moxie_plan::reciprocal_sqrt_scale(HEAD_DIM),
+            visibility: Visibility::Causal,
+        };
+        let descriptor = super::select_paged_attention_kernel(
+            &moxie_kernels::paged_attention_catalogue(),
+            &capability,
+            &PagedAttentionLaunch::new(layer, 1, 0, 0, 1).expect("a launch"),
+        )
+        .expect("a descriptor");
+
+        let measurement = ctx.measure().expect("measure");
+        let mut ledger = Ledger::new([
+            CapacitySnapshot::measured(&measurement, 1 << 20).expect("device capacity"),
+            CapacitySnapshot::new(moxie_types::Scope::Host, 1 << 28, 1 << 20).expect("host"),
+        ])
+        .expect("one ledger");
+        let mut run = PagedAttentionRun::admit(&mut ledger, &ctx, descriptor, geometry(), HEADS, 1)
+            .map_err(|r| r.error)
+            .expect("admission fits");
+        run.publish_page_table(&stream, vec![1, 0])
+            .map_err(|r| r.error)
+            .expect("a reversed mapping");
+
+        let rows = 6u64;
+        let row = (geometry().kv_heads * HEAD_DIM) as usize;
+        let placements = vec![PagePlacement {
+            position: 0,
+            physical_page: 1,
+            slot: 0,
+            rows,
+        }];
+        run.write_rows(
+            &stream,
+            &placements,
+            bytes(rows as usize * row, 0x3801),
+            bytes(rows as usize * row, 0x3802),
+        )
+        .map_err(|r| r.error)
+        .expect("the write fits");
+
+        let launch = PagedAttentionLaunch::new(layer, 1, rows - 1, 0, rows).expect("a launch");
+        let query = bytes((HEADS * HEAD_DIM) as usize, 0x3803);
+        let staged = run
+            .attend(&stream, &launch, query.clone())
+            .map_err(|r| r.error)
+            .expect("the staged decode runs");
+
+        // The caller's own ranges, from the caller's own arena -- which is what
+        // a lowered graph's activation slots are.
+        let want = launch.query_bytes().expect("extent");
+        let mut request =
+            moxie_memory::PlanRequest::new("attention handles", ["bind"]).expect("a request");
+        request
+            .buffer(moxie_memory::BufferRequest::new(
+                "caller activations",
+                moxie_types::Scope::Device(ctx.uuid()),
+                moxie_types::Tier::Device(moxie_types::DeviceTier::Activations),
+                3 * want,
+                moxie_memory::StageSpan { first: 0, last: 0 },
+            ))
+            .expect("one buffer");
+        let reservation = ledger.admit(&request).expect("admission fits");
+        let mut arena = DeviceArena::create(
+            &ledger,
+            reservation,
+            &ctx,
+            moxie_types::DeviceTier::Activations,
+            3 * want,
+            "caller arena",
+        )
+        .map_err(|r| r.error)
+        .expect("an arena");
+        let query_range = arena
+            .allocate(want, 256, "query")
+            .map_err(|r| r.error)
+            .expect("a query range");
+        let output_range = arena
+            .allocate(want, 256, "output")
+            .map_err(|r| r.error)
+            .expect("an output range");
+        // SAFETY: `query` outlives the synchronize below, and the destination
+        // is a live range of this test's own arena on this device.
+        unsafe { query_range.copy_from_host_async(&query, &stream) }.expect("upload the query");
+        stream.synchronize().expect("the upload completes");
+
+        run.attend_into(&stream, &launch, &query_range, &output_range)
+            .expect("the device-handle decode runs");
+        let mut direct = vec![0u8; want as usize];
+        output_range
+            .copy_to_host(&mut direct)
+            .expect("read the caller's output back");
+
+        assert_eq!(
+            staged, direct,
+            "staging the query through the run and reading it from a device handle \
+             gave different answers"
+        );
+        assert!(
+            direct.iter().any(|b| *b != 0),
+            "the decode produced nothing"
+        );
+
+        // A range from another device, and one too small for the launch, are
+        // refused rather than read.
+        assert!(
+            run.attend_into(&stream, &launch, &query_range, &query_range)
+                .is_ok(),
+            "a caller may aim the output at any range of the right size"
+        );
+        let short = arena
+            .allocate(256, 256, "short")
+            .map_err(|r| r.error)
+            .expect("a short range");
+        assert!(
+            run.attend_into(&stream, &launch, &short, &output_range)
+                .is_err(),
+            "a query range too small for the launch was accepted"
+        );
+
+        arena.release(short).map_err(|r| r.error).expect("release");
+        arena
+            .release(output_range)
+            .map_err(|r| r.error)
+            .expect("release");
+        arena
+            .release(query_range)
+            .map_err(|r| r.error)
+            .expect("release");
+        arena
+            .close(&mut ledger)
+            .map_err(|r| r.error)
+            .expect("close");
+        run.close(&mut ledger).map_err(|r| r.error).expect("close");
+        assert!(ledger.outstanding().is_empty());
     }
 }

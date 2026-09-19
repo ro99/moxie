@@ -33,9 +33,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // which must mask on the layer's *declared* rule and not on a second enum that
 // drifts from it.
 pub use moxie_graph::{
-    Graph, GraphId, IndexEncoding, OpParams, ValueId, ValueRole, Visibility, reciprocal_sqrt_scale,
+    Graph, GraphId, IndexEncoding, OpParams, StateEffect, ValueId, ValueRole, Visibility,
+    reciprocal_sqrt_scale,
 };
-use moxie_graph::{GraphSignature, StateEffect, TensorSpec};
+use moxie_graph::{GraphSignature, TensorSpec};
 use moxie_types::{DeviceUuid, Error, Precision, Result, SymbolTable, TensorLayout};
 
 const DEVICE_ALIGNMENT: u64 = 256;
@@ -123,6 +124,40 @@ pub struct ResourceWorkload {
     pub device: DeviceUuid,
 }
 
+/// What one lowered attention node needs from the state authority.
+///
+/// A resource plan admits the per-step tensors. It does **not** admit KV pages:
+/// those are persistent, they outlive every step, and `moxie-state` admits them
+/// against its own geometry and retention. So the plan reports them rather than
+/// requesting them — a caller checks that the authority holds a layer of this
+/// shape before it binds the plan, and a plan that silently omitted its state
+/// would be a plan whose arena is the whole truth about its memory, which for
+/// attention it never is.
+///
+/// This is the shape the graph declares, not a placement: how many key/value
+/// heads of what width one row carries, and how much history the workload says
+/// is visible. Where those rows physically go is the authority's answer, and
+/// the executor asks it per append.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StateRequirement {
+    /// The stage index of the node that appends to this state.
+    pub stage: u32,
+    /// Which KV store the node reads and appends to, from `OpParams::Attention`.
+    pub layer: u32,
+    /// The state kind the node affects, as the graph declares it.
+    pub effect: StateEffect,
+    pub heads: u64,
+    pub kv_heads: u64,
+    pub head_dim: u64,
+    pub scale: f32,
+    pub visibility: Visibility,
+    /// Rows this step appends, and the history it attends over. Both from the
+    /// workload: one is `rows`, the other is `visible_tokens`, and a plan that
+    /// conflated them would describe a decode as a prefill.
+    pub appended_rows: u64,
+    pub visible_tokens: u64,
+}
+
 /// Inclusive node-stage lifetime. The terminal-output stage is `node_count`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveRange {
@@ -201,6 +236,7 @@ pub struct PlanCandidate {
     slots: Vec<ArenaSlot>,
     activation_arena_bytes: u64,
     weight_bytes: u64,
+    state: Vec<StateRequirement>,
 }
 
 impl PlanCandidate {
@@ -222,6 +258,14 @@ impl PlanCandidate {
 
     pub fn bindings(&self) -> &[ValueBinding] {
         &self.bindings
+    }
+
+    /// What this plan needs from the state authority, in stage order.
+    ///
+    /// Empty for a stateless graph, which is every graph this planner lowered
+    /// before task 0038.
+    pub fn state(&self) -> &[StateRequirement] {
+        &self.state
     }
 
     pub fn binding(&self, value: ValueId) -> Option<&ValueBinding> {
@@ -293,6 +337,7 @@ fn lower_with_ids(
     })?;
     let mut producers = BTreeMap::<ValueId, u32>::new();
     let mut consumers = BTreeMap::<ValueId, u32>::new();
+    let mut state: Vec<StateRequirement> = Vec::new();
     for (stage, node) in graph.nodes().iter().enumerate() {
         let stage = stage as u32;
         producers.insert(node.output, stage);
@@ -301,6 +346,31 @@ fn lower_with_ids(
                 .entry(*input)
                 .and_modify(|last| *last = (*last).max(stage))
                 .or_insert(stage);
+        }
+        if let OpParams::Attention {
+            heads,
+            kv_heads,
+            head_dim,
+            scale,
+            visibility,
+            layer,
+        } = node.params
+        {
+            state.try_reserve(1).map_err(|_| {
+                invalid("state", "the state requirement list could not be reserved")
+            })?;
+            state.push(StateRequirement {
+                stage,
+                layer,
+                effect: node.params.state_effect(),
+                heads,
+                kv_heads,
+                head_dim,
+                scale,
+                visibility,
+                appended_rows: workload.rows,
+                visible_tokens: workload.visible_tokens,
+            });
         }
         let workspace = node.contract.workspace_upper_bound.eval(&symbols)?;
         if workspace != 0 {
@@ -448,6 +518,7 @@ fn lower_with_ids(
         slots: planned_slots,
         activation_arena_bytes,
         weight_bytes,
+        state,
     })
 }
 
@@ -499,15 +570,33 @@ fn validate_workload(graph: &Graph, workload: ResourceWorkload) -> Result<()> {
             "prefill/decode resource plans require branch_rows == rows",
         ));
     }
-    if let Some((node, effect)) = graph
-        .state_effects()
-        .into_iter()
-        .find(|(_, effect)| *effect != StateEffect::None)
-    {
-        return Err(Error::Unsupported {
-            capability: "stateful_resource_plan",
-            reason: format!("node {} has state effect {effect:?}", node.0),
-        });
+    // **The refusal is narrowed, not removed.** Appending to paged KV is the one
+    // state effect this planner can express, and only for the operation whose
+    // pages the state authority knows how to admit. Every other effect — a
+    // recurrent accumulator, a sparse index, anything that is not truncatable by
+    // dropping a suffix — still has no admission story here and still says so.
+    for (node, effect) in graph.state_effects() {
+        if effect == StateEffect::None {
+            continue;
+        }
+        let params = graph
+            .nodes()
+            .get(node.0 as usize)
+            .map(|n| &n.params)
+            .ok_or_else(|| invalid("graph", "a state effect on a node that is not there"))?;
+        let servable =
+            matches!(params, OpParams::Attention { .. }) && effect == StateEffect::Appends;
+        if !servable {
+            return Err(Error::Unsupported {
+                capability: "stateful_resource_plan",
+                reason: format!(
+                    "node {} is {} with state effect {effect:?}, and only a paged attention \
+                     append has an admission contract in this planner",
+                    node.0,
+                    params.op().name()
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -917,10 +1006,50 @@ mod tests {
             )
             .unwrap();
         let stateful = builder.finish(output, &registry()).unwrap();
+
+        // Task 0038: an attention append is the one state effect this planner
+        // can express, so this graph now lowers -- and it must **report** what
+        // it needs from the state authority rather than silently omitting it.
+        // KV pages are not in the activation arena: they are persistent, they
+        // outlive every step, and a plan whose arena was the whole truth about
+        // its memory would be wrong for every attention graph.
+        let plan = lower(&stateful, workload(&stateful, 2)).expect("an attention graph lowers");
+        assert_eq!(plan.state().len(), 1);
+        let need = plan.state()[0];
         assert_eq!(
-            lower(&stateful, workload(&stateful, 2)).unwrap_err().kind(),
-            "unsupported"
+            (
+                need.stage,
+                need.layer,
+                need.heads,
+                need.kv_heads,
+                need.head_dim
+            ),
+            (0, 0, 1, 1, 4)
         );
+        assert_eq!(need.effect, StateEffect::Appends);
+        assert_eq!(need.visibility, Visibility::Causal);
+        assert_eq!(need.scale, reciprocal_sqrt_scale(4));
+        // The two row counts are different facts and stay separate: one is what
+        // this step appends, the other is what it attends over.
+        assert_eq!((need.appended_rows, need.visible_tokens), (2, 17));
+        // A stateless graph reports nothing, which is every graph lowered
+        // before this task.
+        assert!(
+            lower(&graph, workload(&graph, 2))
+                .unwrap()
+                .state()
+                .is_empty()
+        );
+
+        // The refusal survives for what still has no admission contract. Every
+        // phase that needs branch state is refused before any of this runs, and
+        // the non-attention branch of the state check is fail-closed by
+        // construction: `OpParams::state_effect` returns `Appends` for
+        // `Attention` and `None` for everything else today, so an operation that
+        // gains an effect is refused until someone writes its contract.
+        let mut branch = workload(&stateful, 2);
+        branch.phase = Phase::Verify;
+        assert_eq!(lower(&stateful, branch).unwrap_err().kind(), "unsupported");
     }
 
     #[test]

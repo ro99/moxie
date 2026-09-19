@@ -1,8 +1,10 @@
 # Task 0038 — M4.1b the state authority owns the device pages, and the graph reaches them
 
-Status: active, half implemented. Opened 2026-09-19 after task 0037's kernel and
-binding were qualified and twice reviewed. The state authority owns the device
-pages; the graph does not yet reach them. See "Progress" below.
+Status: active, mostly implemented. Opened 2026-09-19 after task 0037's kernel
+and binding were qualified and twice reviewed. The state authority owns the
+device pages, the planner lowers attention and reports what it needs, and the
+binding consumes device handles. What is missing is the last wiring: no lowered
+plan yet executes its attention node. See "Progress" below.
 
 ## Identity and authority
 
@@ -193,13 +195,58 @@ below claims otherwise.
   the change: max 3.037e-5 at 32,768 visible rows, 2.953e-5 after the append,
   identical on all three GPUs.
 
+## Progress — 2026-09-19, half two: the graph lowers, the handles exist
+
+Two of the three pieces deliverable 2 needs. **The third — executing a lowered
+attention node through its own plan's arena slots — is not done**, and
+acceptance 4 is therefore not met.
+
+### The planner no longer refuses attention
+
+`moxie-plan`'s `stateful_resource_plan` refusal is **narrowed, not removed**.
+Appending to paged KV on an `Op::Attention` node lowers; every other state
+effect still has no admission contract here and still says so, and the branch is
+fail-closed — `OpParams::state_effect` returns `Appends` for `Attention` and
+`None` for everything else today, so an operation that gains an effect is
+refused until someone writes its contract.
+
+What lowering now produces is `StateRequirement`, one per attention node: the
+layer, the head geometry, the declared scale, the visibility rule, and the two
+row counts kept separate — what this step appends and what it attends over. KV
+pages are **not** in the activation arena: they are persistent, they outlive
+every step, and `moxie-state` admits them against its own retention. So the plan
+*reports* them and a caller checks the authority holds a layer of that shape.
+A plan whose arena was the whole truth about its memory would be wrong for every
+attention graph, which is why this is a field rather than an omission.
+
+### Attention consumes device handles
+
+`PagedAttentionRun::attend_into` takes a device query range and a device output
+range and copies no host bytes. That is document 04's contract — "attention
+consumes device tensor handles and page-table/state handles", with host paths as
+"explicit separate implementations, not compulsory staging interfaces" — and the
+host-staged `attend` is now explicitly that separate implementation, sharing one
+precondition check and one launch with it.
+
+`device_handles_and_host_staging_give_the_same_bytes` asserts they are one
+operation: the same launch, staged through the run's own ranges and read from a
+caller's arena ranges, produces **byte-identical** output. A separate
+implementation that computed something else would satisfy the words and not the
+contract.
+
 ### Still open
 
-Deliverable 2 in full: `moxie-plan` still refuses every stateful graph, no
-`OpParams::Attention` node lowers to this binding, and query and output still
-cross the host boundary. Acceptance 4 is untouched; 1, 2, 3 and 5 are met for
-the half that landed. Task 0037's remaining items are unchanged except its
-reclaimed-base gap, which this closes.
+- **End-to-end execution through a lowered plan.** `lower_selected` does not
+  select attention nodes, and `chain.rs` binds the task 0012 chain rather than a
+  state-touching graph, so nothing yet walks a lowered attention node into
+  `attend_into` with the plan's own arena slots. That is acceptance 4 and it is
+  what remains of this task.
+- Everything named out of scope above: MLA, streaming, COW, prefix reuse, FP16
+  cache, tensor cores, timing.
+
+## Result, filled after work
+
+No completion is claimed: acceptance 4 is open, and with it the task.
 
 ## Result, filled after work
 

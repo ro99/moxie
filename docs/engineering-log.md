@@ -1510,3 +1510,28 @@ all. The check the performer keeps is the one about bytes it wrote; the check
 the authority keeps is the one about rows it committed. Neither subsumes the
 other, and a launch that passes both is reading rows that are both history and
 present.
+
+## 2026-09-19 — a plan whose arena is the whole truth about its memory
+
+Lowering attention meant deciding what a resource plan says about KV pages, and
+the first instinct — put them in the arena like everything else — is wrong in a
+way worth writing down. Activation slots are per-step and reused across nodes by
+liveness; KV pages are persistent, they outlive every step, and their size comes
+from retention and context rather than from the graph's shapes. Charging them to
+the step arena would make every decode appear to allocate a cache it inherited.
+
+So the plan *reports* them. `StateRequirement` is what one attention node needs
+from the state authority, and a caller checks the authority holds a layer of
+that shape before binding. The property that makes this honest is that the plan
+no longer claims its arena is the whole truth about its memory — for an
+attention graph it never was, and a plan that silently omitted the pages would
+have been read as saying otherwise.
+
+The other half of the day: `attend_into` takes device ranges, which is what
+document 04 asked for all along — "host reference paths are explicit separate
+implementations, not compulsory staging interfaces". The word that carries the
+weight there is *separate*, and the only way to keep two implementations honest
+is to assert they compute the same thing. They share one precondition check and
+one launch, and a fixture asserts byte equality between them. A separate
+implementation that computed something else would satisfy the sentence and break
+the contract.
