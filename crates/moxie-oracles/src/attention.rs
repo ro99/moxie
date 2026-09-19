@@ -366,16 +366,32 @@ pub fn attend_multi_head(
 /// attention. A kernel qualified against this must be qualified on data whose
 /// conditioning is stated, and document 07's requirement to "stress cancellation
 /// and near-zero outputs" is exactly the case where this term dominates.
+///
+/// **`scale` is the layer's declared score scale, not a derived one.** It is the
+/// value the operation carries -- `OpParams::Attention::scale`, which is
+/// [`Heads::scale`] here -- because `Δs` bounds the error of the *scaled* score
+/// and nothing about the head dimension determines that factor. Deriving
+/// `1/sqrt(head_dim)` internally, as this helper did before task 0037,
+/// understates `Δs` by `scale · sqrt(head_dim)` on every layer that declares
+/// something else, and that understatement then passes through the exponential.
+/// A Gemma-style layer normalizes its queries and keys per head and attends with
+/// a scale of exactly 1.0, so at `head_dim` 128 the derived value was eleven
+/// times too small; `the_derived_scale_was_not_a_bound_for_a_layer_that_declares_its_own`
+/// holds a fixture where it is smaller than the error it claims to bound. The
+/// magnitude is taken, so no caller can drive the bound negative. Only the input
+/// changes here: the formula above is the one task 0003 revised and ADR 0028
+/// pins.
 pub fn attention_error_bound(
     query_head: &[f32],
     visible_keys: &[&[f32]],
     visible_values: &[&[f32]],
     weights: &[f64],
     component: usize,
+    scale: f32,
 ) -> f64 {
     use crate::metric::gamma;
     let head_dim = query_head.len();
-    let scale = 1.0 / (head_dim as f64).sqrt();
+    let scale = (scale as f64).abs();
 
     let delta_s = visible_keys
         .iter()
@@ -430,6 +446,11 @@ mod tests {
         )
     }
 
+    /// The conventional scale, named at each fixture that assumes it.
+    fn mha_scale(head_dim: usize) -> f32 {
+        moxie_graph::reciprocal_sqrt_scale(head_dim as u64)
+    }
+
     fn history_of(rows: &[Vec<f32>]) -> KvHistory {
         let mut h = KvHistory::new();
         for (i, r) in rows.iter().enumerate() {
@@ -446,11 +467,15 @@ mod tests {
         history: &KvHistory,
         pos: u64,
         vis: Visibility,
+        scale: f32,
     ) -> (Vec<f64>, Vec<f64>, Vec<usize>) {
         let visible: Vec<usize> = (0..history.len())
             .filter(|k| vis.allows(pos, *k as u64))
             .collect();
-        let scale = 1.0 / (q.len() as f64).sqrt();
+        // The declared scale, widened -- not an idealized `1/sqrt(head_dim)`.
+        // The operation carries an exact f32 value and that is the number the
+        // reference must use, or the two differ by a factor nobody declared.
+        let scale = scale as f64;
         let scores: Vec<f64> = visible
             .iter()
             .map(|i| {
@@ -487,8 +512,26 @@ mod tests {
         vis: Visibility,
         label: &str,
     ) -> f64 {
-        let got = attend_mha(q, history, pos, 1, q.len(), vis).unwrap();
-        let (want, weights, visible) = reference(q, history, pos, vis);
+        assert_within_bound_at(q, history, pos, vis, mha_scale(q.len()), label)
+    }
+
+    /// The same check for a layer that declares its own score scale.
+    fn assert_within_bound_at(
+        q: &[f32],
+        history: &KvHistory,
+        pos: u64,
+        vis: Visibility,
+        scale: f32,
+        label: &str,
+    ) -> f64 {
+        let heads = Heads {
+            query: 1,
+            key_value: 1,
+            head_dim: q.len(),
+            scale,
+        };
+        let got = attend_multi_head(q, history, pos, heads, vis).unwrap();
+        let (want, weights, visible) = reference(q, history, pos, vis, scale);
         let keys: Vec<&[f32]> = visible
             .iter()
             .map(|i| history.keys[*i].as_slice())
@@ -500,7 +543,7 @@ mod tests {
 
         let mut worst = 0f64;
         for d in 0..q.len() {
-            let bound = attention_error_bound(q, &keys, &values, &weights, d);
+            let bound = attention_error_bound(q, &keys, &values, &weights, d, scale);
             let err = (got[d] as f64 - want[d]).abs();
             assert!(
                 err <= bound,
@@ -533,7 +576,13 @@ mod tests {
 
         // On well-conditioned data the bound really is tight -- a few ulps, not
         // a licence. If this ever loosens, the bound has stopped saying anything.
-        let (want, weights, visible) = reference(&q, &history, (n - 1) as u64, Visibility::Causal);
+        let (want, weights, visible) = reference(
+            &q,
+            &history,
+            (n - 1) as u64,
+            Visibility::Causal,
+            mha_scale(head_dim),
+        );
         let keys: Vec<&[f32]> = visible
             .iter()
             .map(|i| history.keys[*i].as_slice())
@@ -542,7 +591,7 @@ mod tests {
             .iter()
             .map(|i| history.values[*i].as_slice())
             .collect();
-        let bound = attention_error_bound(&q, &keys, &values, &weights, 0);
+        let bound = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(head_dim));
         assert!(
             bound < 1e-4,
             "on benign data the bound should be tiny, got {bound:.3e}"
@@ -584,7 +633,8 @@ mod tests {
         let q = vec![1.0f32; hd];
 
         let got = attend_mha(&q, &history, 1, 1, hd, Visibility::Causal).unwrap();
-        let (want, weights, visible) = reference(&q, &history, 1, Visibility::Causal);
+        let (want, weights, visible) =
+            reference(&q, &history, 1, Visibility::Causal, mha_scale(hd));
 
         // The disagreement is large and real: FP32 genuinely computes a
         // different distribution here.
@@ -607,16 +657,160 @@ mod tests {
             .map(|i| history.values[*i].as_slice())
             .collect();
         for d in 0..2 {
-            let bound = attention_error_bound(&q, &keys, &values, &weights, d);
+            let bound = attention_error_bound(&q, &keys, &values, &weights, d, mha_scale(hd));
             let err = (got[d] as f64 - want[d]).abs();
             assert!(err <= bound, "component {d}: {err:.4e} > {bound:.4e}");
         }
 
         // And it is honest about being weak here rather than pretending.
-        let bound = attention_error_bound(&q, &keys, &values, &weights, 0);
+        let bound = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd));
         assert!(
             bound > 0.1,
             "on data this ill-conditioned the bound must say so, got {bound:.3e}"
+        );
+    }
+
+    #[test]
+    fn the_derived_scale_was_not_a_bound_for_a_layer_that_declares_its_own() {
+        // Task 0037's repair, as a counterexample rather than an assertion about
+        // taste. Before it, this helper derived `1/sqrt(head_dim)` internally.
+        // A Gemma-style layer normalizes queries and keys per head and then
+        // declares a score scale of exactly 1.0, so at head dimension 128 the
+        // derived value is 11.3 times too small -- and `Δs` passes through an
+        // exponential, so "too small" means "not a bound".
+        //
+        // The fixture drives the score error to its worst case instead of a
+        // typical one, which is what makes the two numbers straddle the error.
+        // Every lane after the first holds exactly half an ulp of 1024, so each
+        // FP32 addition is a tie that rounds back to 1024 and loses the whole
+        // term: the computed dot product is 1024 while the exact one is
+        // 1024 + 127 * 2^-14.
+        let hd = 128usize;
+        let big = 1024.0f32;
+        let half_ulp = 1.0f32 / 16384.0; // 2^-14, exactly half of ulp(1024)
+        let declared = 1.0f32;
+
+        let mut key0 = vec![half_ulp; hd];
+        key0[0] = big;
+        let mut key1 = vec![0.0f32; hd];
+        key1[0] = big;
+        let mut v0 = vec![0.0f32; hd];
+        v0[0] = 1.0;
+        let mut v1 = vec![0.0f32; hd];
+        v1[1] = 1.0;
+
+        let mut history = KvHistory::new();
+        history.append(0, key0, v0).unwrap();
+        history.append(1, key1, v1).unwrap();
+        let q = vec![1.0f32; hd];
+
+        let heads = Heads {
+            query: 1,
+            key_value: 1,
+            head_dim: hd,
+            scale: declared,
+        };
+        let got = attend_multi_head(&q, &history, 1, heads, Visibility::Causal).unwrap();
+        let (want, weights, visible) = reference(&q, &history, 1, Visibility::Causal, declared);
+
+        // FP32 loses the entire second key lane set and sees two equal scores.
+        assert!(
+            (got[0] - 0.5).abs() < 1e-9,
+            "the fixture must actually cancel: {}",
+            got[0]
+        );
+        let err = (got[0] as f64 - want[0]).abs();
+        assert!(err > 1e-3, "and the error must be real: {err:.4e}");
+
+        let keys: Vec<&[f32]> = visible
+            .iter()
+            .map(|i| history.keys[*i].as_slice())
+            .collect();
+        let values: Vec<&[f32]> = visible
+            .iter()
+            .map(|i| history.values[*i].as_slice())
+            .collect();
+
+        let declared_bound = attention_error_bound(&q, &keys, &values, &weights, 0, declared);
+        let derived_bound = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd));
+        println!(
+            "scale 1.0: error {err:.4e} declared bound {declared_bound:.4e} \
+             derived bound {derived_bound:.4e}"
+        );
+
+        // The declared scale bounds it. The derived one does not, and not by a
+        // hair: it is below the measured error by a clear margin, so a kernel
+        // qualified against the old helper would have been accepted while
+        // computing something the bound forbade.
+        assert!(
+            err <= declared_bound,
+            "the declared scale must bound it: {err:.4e} > {declared_bound:.4e}"
+        );
+        assert!(
+            derived_bound * 1.2 < err,
+            "the derived scale must visibly fail to: bound {derived_bound:.4e} vs \
+             error {err:.4e}"
+        );
+    }
+
+    #[test]
+    fn the_bound_tracks_the_declared_scale_on_ordinary_data() {
+        // The other half of the repair: on well-conditioned data a declared
+        // scale of 1.0 is an ordinary case, not a pathology. The bound stays
+        // tight, it covers the measured error at every position, and it is
+        // strictly larger than the same data's bound at the conventional scale,
+        // because the scores it bounds are `sqrt(head_dim)` times larger.
+        let hd = 16usize;
+        let n = 12usize;
+        let rows: Vec<Vec<f32>> = (0..n)
+            .map(|i| {
+                (0..hd)
+                    .map(|d| (((i * 5 + d * 3) % 17) as f32 - 8.0) / 32.0)
+                    .collect()
+            })
+            .collect();
+        let history = history_of(&rows);
+        let q: Vec<f32> = (0..hd).map(|d| (d as f32 - 8.0) / 24.0).collect();
+
+        for scale in [1.0f32, mha_scale(hd)] {
+            for pos in [0u64, 1, 7, (n - 1) as u64] {
+                assert_within_bound_at(
+                    &q,
+                    &history,
+                    pos,
+                    Visibility::Causal,
+                    scale,
+                    &format!("scale {scale} pos {pos}"),
+                );
+            }
+        }
+
+        let (_, weights, visible) = reference(&q, &history, 7, Visibility::Causal, 1.0);
+        let keys: Vec<&[f32]> = visible
+            .iter()
+            .map(|i| history.keys[*i].as_slice())
+            .collect();
+        let values: Vec<&[f32]> = visible
+            .iter()
+            .map(|i| history.values[*i].as_slice())
+            .collect();
+        let at_one = attention_error_bound(&q, &keys, &values, &weights, 0, 1.0);
+        let at_conventional = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd));
+        assert!(
+            at_one < 1e-5,
+            "a scale of 1.0 is not a licence to be loose: {at_one:.3e}"
+        );
+        assert!(
+            at_one > at_conventional,
+            "a larger declared scale must give a larger score-error term: \
+             {at_one:.3e} vs {at_conventional:.3e}"
+        );
+        // A negative scale cannot exist on a validated operation, but this
+        // helper is public: the magnitude is what enters the bound.
+        assert_eq!(
+            at_one,
+            attention_error_bound(&q, &keys, &values, &weights, 0, -1.0),
+            "the bound must use the magnitude of the declared scale"
         );
     }
 
@@ -641,7 +835,8 @@ mod tests {
         let q = vec![0.0f32; hd];
 
         let got = attend_mha(&q, &history, 2, 1, hd, Visibility::Causal).unwrap();
-        let (want, weights, visible) = reference(&q, &history, 2, Visibility::Causal);
+        let (want, weights, visible) =
+            reference(&q, &history, 2, Visibility::Causal, mha_scale(hd));
         let keys: Vec<&[f32]> = visible
             .iter()
             .map(|i| history.keys[*i].as_slice())
@@ -653,7 +848,7 @@ mod tests {
 
         let err = (got[0] as f64 - want[0]).abs();
         assert!(err > 0.0, "the fixture must actually lose something");
-        let bound = attention_error_bound(&q, &keys, &values, &weights, 0);
+        let bound = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd));
         assert!(err <= bound, "error {err:e} exceeded bound {bound:e}");
 
         // The underflow term is what is carrying it: the relative terms alone
@@ -676,7 +871,7 @@ mod tests {
             .collect();
         let history = history_of(&rows);
         let q: Vec<f32> = (0..hd).map(|d| (d % 3) as f32 * 0.5 - 0.5).collect();
-        let (_, weights, visible) = reference(&q, &history, 5, Visibility::Causal);
+        let (_, weights, visible) = reference(&q, &history, 5, Visibility::Causal, mha_scale(hd));
         let keys: Vec<&[f32]> = visible
             .iter()
             .map(|i| history.keys[*i].as_slice())
@@ -686,7 +881,7 @@ mod tests {
             .map(|i| history.values[*i].as_slice())
             .collect();
         for d in 0..hd {
-            let bound = attention_error_bound(&q, &keys, &values, &weights, d);
+            let bound = attention_error_bound(&q, &keys, &values, &weights, d, mha_scale(hd));
             assert!(bound < 1e-5, "component {d} bound {bound:.3e} is not tight");
         }
         assert_within_bound(&q, &history, 5, Visibility::Causal, "benign");

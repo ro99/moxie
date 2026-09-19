@@ -35,6 +35,7 @@ pub mod linear;
 pub mod mask;
 pub mod metric;
 pub mod norm;
+pub mod online_softmax;
 pub mod protocol;
 pub mod recurrent;
 pub mod residual;

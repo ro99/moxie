@@ -115,6 +115,54 @@ canonical state ownership, importing code with unresolved license/provenance,
 starting a bulk checkpoint operation, or claiming performance. A hardware/shape
 that cannot pass is a named refusal, not permission to narrow the 32K exit gate.
 
+## Progress — 2026-09-19, host mathematics before device code
+
+Two contract prerequisites, both host-only. **No device code, no kernel, no
+state or admission change, and no part of acceptance 2–6 is claimed.**
+
+- `moxie_oracles::attention::attention_error_bound` now takes the layer's
+  **declared** score scale instead of deriving `1/sqrt(head_dim)`, as the
+  contract requires before device code. The formula is untouched; only its input
+  changed, and the magnitude is taken so no caller can drive the bound negative.
+  The repair is not cosmetic:
+  `the_derived_scale_was_not_a_bound_for_a_layer_that_declares_its_own` holds a
+  128-dimension fixture with a declared scale of 1.0 where the measured error is
+  1.94e-3, the declared-scale bound is 1.57e-2 and the **derived** value is
+  1.38e-3 — smaller than the error it claimed to bound. A Gemma-style layer
+  normalizes queries and keys per head and attends with a scale of exactly 1.0,
+  so that was the realistic case, not a constructed one.
+  `the_bound_tracks_the_declared_scale_on_ordinary_data` covers scale 1.0 and
+  reciprocal-square-root scale on well-conditioned data, where the bound stays
+  under 1e-5. The FP64 reference in these fixtures now uses the declared f32
+  value widened, not an idealized `1/sqrt(head_dim)` no operation declared.
+- New `moxie_oracles::online_softmax`: the partial/merge algebra a Flash-style
+  paged kernel runs on, which `mask.rs` had listed as owed mathematics. FP64
+  throughout, so it states the algebra a kernel may reorder into; the distance
+  to an FP32 kernel stays bounded by `attention_error_bound` under ADR 0028 and
+  nothing here widens it. Eight fixtures pin: every block width from one row to
+  wider than the history reproduces the whole-history softmax (causal and
+  sliding); a fully masked block contributes nothing and produces no `NaN`
+  (`−∞ − (−∞)`, the merge's sharpest edge, reached whenever a window has moved
+  past a page); block order and tree reduction do not change the answer; the
+  running maximum is what keeps scores that overflow `exp` finite; a query with
+  no visible key anywhere is a typed refusal, not a uniform draw; and every
+  score is checked for finiteness rather than the maximum alone, because
+  `f64::max` ignores a `NaN` operand and would have let one reach the
+  denominator unexplained.
+
+Commands, all on the host lane at `01da0de` plus these changes: `cargo fmt --all
+--check` clean; `cargo clippy -p moxie-oracles --all-targets` zero warnings;
+`cargo test -p moxie-oracles` 195 passed, 0 failed, 0 skipped; `cargo test
+--workspace` all suites passed, 0 failed, 0 skipped (5m26s); `cargo xtask
+arch-check` 79 rejected fixtures, 21 accepted, 13 rules; `cargo xtask spec-check`
+10 documents unchanged. No GPU lane was run, because nothing device-side changed:
+that is unmeasured, not passing.
+
+Still open, in the order the contract sets: the pinned-source audit and its
+adoption decision, the paged device state and its admission, the kernel and its
+executor binding, both SM86 UUIDs and SM120, the 32,768-actual-row gate, the
+admission/cancellation sweeps, and the support matrix.
+
 ## Result, filled after work
 
 No implementation or result is claimed by this contract.
