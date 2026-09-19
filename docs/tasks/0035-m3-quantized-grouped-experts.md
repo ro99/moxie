@@ -1,6 +1,6 @@
 # Task 0035 — canonical integer weights in shared grouped experts
 
-Status: active, contract before implementation, 2026-09-17.
+Status: implemented and measured; owner review pending, 2026-09-19.
 
 ## Identity and authority
 
@@ -47,7 +47,8 @@ replacement tests pass. Temporary fixtures are test-owned and deleted.
 
 ## Result
 
-Implemented canonical artifact binding and mapped grouped execution; review and closure gates remain.
+Implemented canonical artifact binding and mapped grouped execution; owner review
+remains.
 Shared host packed views, CUDA scalar decoders, grouped planner byte extents,
 lease-based executor and catalogue now accept INT4/INT8 and mixed BF16 integer
 projection pairs. The CUDA affine decoder is shared with dense execution and
@@ -89,10 +90,12 @@ not implemented by this test.
 Affected host suites, driver clippy, architecture and specification checks pass.
 The broad host run first found an obsolete CLI diagnostic assertion; it now
 checks the exact unsupported auto-gptq format, and repack/storage suites pass.
-Still required: independent review and closure report.
+Still required: owner review and the task0036 closure report.
 Per-channel grouped formats and heterogeneous formats within one projection
-remain explicitly unsupported. No milestone closure, checkpoint token,
-model-output or performance claim.
+remain explicitly unsupported: `CanonicalSource` returns the typed capability
+names `per-channel grouped weights` and `heterogeneous expert formats` before
+residency or launch. No milestone closure, checkpoint token, model-output or
+performance claim.
 
 The complete grouped-device suite then ran all 11 tests: 10 passed, while the
 kernel-image refusal fixture failed before attachment because it selected the
@@ -103,3 +106,10 @@ and returns every reservation. Evidence: `current-grouped-device-full.log`
 (retained failed run) and `grouped-attachment-refusal.log` under
 `results/m3-recovery/`. All 11 tests have passing results; this is not a claim
 that the original full invocation passed.
+
+The complete suite was run again after final review on candidate `0672d24`:
+**11 passed, zero failed/ignored/filtered**. It includes the repaired attachment
+fixture, the 294,912-component quantized matrix, the 46,944-component mapped
+published fixtures, both consumers, all three GPUs, cancellation, admission and
+artifact-binding refusals. Evidence:
+`results/m3-recovery/m3-final-grouped-device.log`.

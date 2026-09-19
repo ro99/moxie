@@ -1,7 +1,9 @@
 # Task 0028 — M3 item 3: shared W4A16 / W8A16 execution
 
-Status: **implemented, reviewed four times, not accepted, one finding open**
-(the shared admission vocabulary aborts; [task 0029](0029-allocation-fallible-admission-vocabulary.md)). Contract written before
+Status: **implemented and measured; admission finding repaired; owner
+acceptance pending.** [Task 0032](0032-m3-admission-closure.md) closes the
+task0029 allocation work and the final continuation below closes mapped dense
+execution. Contract written before
 implementation; the result below is filled from the runs, not from the plan.
 
 ## Identity and authority
@@ -634,3 +636,13 @@ also passed on all three devices under ADR0028. Omitting the map refuses before
 enqueue and returns the leases and activations. Evidence:
 `results/m3-recovery/mapped-dense-device.log`. This continuation changes no
 quality tolerance and makes no timing, model-output, or model-support claim.
+
+The frozen candidate `0672d24` then ran the complete T0028 battery from a clean
+detached worktree: **24/24 declared mutants caught, 1/1 expected control held,
+zero survivors, unstable verdicts, invalid controls, broken controls or
+skips**. All six clean lanes were stable for three repetitions before and
+after; exit status was zero, HEAD was unchanged and no parked original
+remained. This includes both mapped regressions: forgetting the required map
+and using contiguous groups inside the CUDA decoder. Evidence:
+`results/m3-recovery/t0028-final-0672d24.log`, SHA-256
+`adb5a19f543026d9197b446419e0f28b8e8cd427fcd06e25ddb4d73596a3ce9b`.

@@ -1,6 +1,7 @@
 # Task 0036 — reconcile and close M3.1 / M3.2 / M3.3
 
-Status: active; closure contract, 2026-09-18.
+Status: closure candidate complete; owner review and M3 decision pending,
+2026-09-19.
 
 ## Identity and authority
 
@@ -69,6 +70,61 @@ unmet clause. Ordinary defects and missing regressions are engineering work.
 
 ## Result, filled after work
 
-Implementation candidate and focused gates are in progress. Final source
-identity, battery totals, complete gate table, review disposition, and owner
-decision will be recorded here without converting partial runs into evidence.
+The implementation candidate is `0672d24`, comprising `85daa05` (`Execute
+mapped dense weights and close importer coverage gaps`) plus the review repair
+`0672d24` (`Version the mapped affine launch ABI`). It adds the last known
+execution/importer coverage without changing the affine equation or ADR0028
+gate:
+
+- dense CUDA execution consumes an admitted `u32` group map per logical input
+  column; map bytes participate in residency, extent, device and completion
+  lifetime checks, and a missing map refuses before enqueue;
+- the mapped INT4/group32/F16 dense tail case passes on both SM86 GPUs and SM120
+  with all 240 outputs per GPU inside ADR0028 (worst zero ULP in this case);
+- generated GPTQ plans combine a noncontiguous map with multiple passthrough
+  override patterns, including MTP, and preserve both BF16 overrides;
+- both pinned read-only AutoRound configurations have their group declaration
+  and model-specific override families checked; and
+- a fused leading expert axis refuses by name instead of being flattened or
+  interpreted as an exporter-specific interleave.
+
+Focused evidence at that identity:
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Dense affine unit tests | 11 passed | `cargo test -p moxie-executor affine_linear --lib` |
+| Mapped dense device case | SM120 and both SM86 passed | `results/m3-recovery/mapped-dense-device.log` |
+| Complete grouped-device suite | 11 passed on `0672d24` | `results/m3-recovery/m3-final-grouped-device.log` |
+| Compressed-tensors interleave refusal | passed | affected `moxie-format` suite |
+| GPTQ map x override publication | passed | affected `moxie-repack` suite |
+| Pinned AutoRound samples/configs | 43,008 values bitwise plus config checks | `results/m3-recovery/autoround-samples.log` |
+| Affected host suites | passed | `results/m3-recovery/m3-final-affected-host.log` |
+| Driver clippy | passed on `85daa05`; repeated after ABI repair | `results/m3-recovery/m3-final-driver-clippy.log`, direct `cargo clippy` run |
+| Architecture/specification checks | 79 rejected, 21 accepted, 13 rules; 10 documents | `results/m3-recovery/m3-final-arch.log`, `m3-final-spec.log` |
+| Mutation driver self-test | 111/111 | direct `cargo xtask mutation-check --self-test` run |
+| Final T0006 | 63/63 caught, 3/3 controls held, zero other verdicts | `results/m3-recovery/t0006-final-0672d24.log` |
+| Final T0028 | 24/24 caught, 1/1 control held, zero other verdicts | `results/m3-recovery/t0028-final-0672d24.log` |
+
+Read-only review of `85daa05` found no P0 or P1 code defect and judged the M3
+candidate sound. It identified the stale support rows, two comments and the
+unchanged ABI version after the CUDA signature gained its map parameter. The
+support rows are reconciled here; `0672d24` scopes the comments and moves both
+the symbol and declared ABI from v1 to v2. The six-case dense device suite then
+passed again on SM120 and both SM86 GPUs, and driver clippy remained clean.
+
+The decisive batteries passed from a clean detached worktree at exactly
+`0672d24`. T0006 caught all 63 mutants and held all three controls, with all 12
+lanes stable three times before and after. T0028 caught all 24 mutants and held
+its one control, with all six lanes stable three times before and after. Both
+reported zero survivor, unstable, invalid, broken or skipped verdicts, exited
+zero, restored a clean tree and left HEAD unchanged. Their log hashes are
+`b5e61d449ad87661f230b6b3147b5d4045a3d584d3f86a680722dde3e719fc1c` and
+`adb5a19f543026d9197b446419e0f28b8e8cd427fcd06e25ddb4d73596a3ce9b`,
+respectively. The five earlier publication survivors are caught in the final
+T0006, and both mapped-execution mutations are caught in the final T0028.
+
+Acceptance clauses 1 through 4 now have committed implementation and measured
+evidence, and the records named by clause 5 agree with that evidence. The
+candidate makes no model-output, quality, token-generation or performance
+claim, and experiment0007 remains pending. Clause 5's repository-owner review
+and the owner's M3 decision remain.

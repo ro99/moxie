@@ -1,6 +1,7 @@
 # Task 0034 — shared GPTQ integer serialization import
 
-Status: implemented and measured; owner review pending, 2026-09-18.
+Status: implemented and measured; independent review found no blocking code
+defect; owner acceptance pending, 2026-09-19.
 
 ## Identity and authority
 
@@ -81,7 +82,8 @@ Two synthetic publication cases pass, including tiny gathers, both widths,
 noncontiguous group maps and source-to-canonical byte equality. The importer
 allocation sweep refuses each measured allocation, including map validation,
 without aborting. Full format/repack host suites passed before signed-scale
-integration; affected tests are being rerun after that integration.
+integration; the affected suites pass after signed-scale and mapped dense
+integration.
 
 Read-only pinned samples exposed negative F16 scales in GLM. The owner approved
 preserving them exactly; ADR0030 changes only the affine scale sign restriction.
@@ -112,3 +114,10 @@ returning every operand. Evidence:
 `results/m3-recovery/mapped-dense-device.log`. The grouped expert path carries
 the same metadata in its weight leases under ADR0031. No expanded weight copy
 or serialization-specific runtime was added.
+
+An independent read-only review of commit85daa05 verified group-map validation,
+residency and lifetime handling, CUDA indexing, the fused-axis refusal, and the
+override/map/MTP configuration coverage. It found no P0 or P1 code defect. Its
+P2 record and comment findings are reconciled in task0036, and the launch ABI
+version finding is repaired by commit0672d24. Owner acceptance remains a
+separate gate.

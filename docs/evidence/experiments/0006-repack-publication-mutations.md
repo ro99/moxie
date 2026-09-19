@@ -4,10 +4,9 @@ Date opened: 2026-09-13. Milestone: M3 item 1,
 [task 0025](../../tasks/0025-m3-offline-repack-publication.md), then
 [task 0026](../../tasks/0026-m3-canonical-safetensors-publication.md), then
 [task 0030](../../tasks/0030-m3-repack-correctness-package.md).
-Status: **measured three times; last re-run 2026-09-16 on task 0030's tree.**
-The run that describes the current tree is the last section, not the first:
-the `ccfd7fa` figures below are kept because the differences between the
-runs are the evidence, and **none of them describes this tree**.
+Status: **final-tree battery passed 2026-09-19 at `0672d24`.** Historical runs
+remain below because the differences between them are evidence; the final
+section is the result that describes the M3 closure candidate.
 
 ## Why this exists
 
@@ -246,3 +245,27 @@ rule, and no substitution in the driver can weaken it.
   `publication.rs` is the systematic half; this is the adversarial one.
 - **No quality, execution or performance claim follows.** Nothing here runs a
   model, a kernel or a benchmark.
+
+## Final M3 closure run (2026-09-19, `0672d24`)
+
+Task0031's recovery run at `356f965` exposed five unexpected survivors. A
+targeted baseline/mutant/restored campaign first proved that the five added
+regressions catch their exact substitutions; that did not count as this full
+run. The reviewed closure candidate then ran all of T0006 end to end in a clean
+detached worktree at
+`0672d24f716a9293ec77de68b31e26e39fa64159`.
+
+**Final result: 63 of 63 mutants caught, 3 of 3 expected survivors held; zero
+unexpected survivors, unstable verdicts, invalid controls, broken controls or
+skips.** All 12 clean lanes passed three repetitions before and after, and each
+deciding lane or survivor lane set repeated three times under substitution.
+Exit status was zero; HEAD stayed unchanged and the driver left no parked
+original or dirty file.
+
+The previously surviving durable-tail, source-rebinding, cancelled-hashing,
+compaction-peak and two-journal-budget substitutions are all caught in this
+result. Expectations were unchanged. Local full log:
+`results/m3-recovery/t0006-final-0672d24.log`, SHA-256
+`b5e61d449ad87661f230b6b3147b5d4045a3d584d3f86a680722dde3e719fc1c`.
+This closes the publication test-strength gate; the limitations immediately
+above still apply.

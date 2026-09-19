@@ -86,8 +86,9 @@ Architecture79negative/21positive/13rules and ten unchanged spec documents pass.
 Initial new tests failed because the generic BF16 weight reader correctly refused
 an affine tensor and because the header needed a larger explicit budget; they
 now use the checksummed canonical stream and the declared header budget.
-Independent review requested, acceptance pending. AutoRound/mapped execution
-remain unimplemented.
+Independent review requested, acceptance pending. The later task0034 implements
+AutoRound/GPTQ maps and task0035 carries them through shared grouped execution;
+those continuations do not change this task's contiguous static-order result.
 
 
 ### Review correction

@@ -1309,3 +1309,28 @@ so a leading expert axis now receives a specific refusal instead of being
 flattened or guessed. AutoRound coverage now combines a real group map with
 multiple 16-bit overrides, including MTP, and checks the override families in
 both pinned real configurations.
+
+Read-only review found no mapped-path soundness defect, but caught the other
+half of changing a kernel call: adding the group-map pointer changed the launch
+ABI while its version and versioned symbol still said v1. The catalogue and
+fatbin are built together today, so this could not cross-wire the measured
+binary, but an ABI field is a compatibility claim rather than an ornament.
+Both advance to v2, and the three-GPU dense suite passes after the rebuild.
+Review also caught two comments that still described the old unmapped-only
+path. When a restriction is removed, search prose and capability records for
+the old refusal alongside the production branch.
+
+## 2026-09-19 — freeze M3 evidence on one source identity
+
+The final publication and dense-execution mutation batteries ran from clean
+detached worktrees at the same candidate, `0672d24`. T0006 caught all 63
+declared defects and held three controls; T0028 caught all 24 defects and held
+one control. Both repeated every clean lane three times before and after,
+reported no survivor, unstable, invalid, broken or skipped verdict, and restored
+clean trees. Targeted survivor runs helped locate missing tests, but only these
+complete final-tree batteries close their gates.
+
+The closure pass also reconciled the living capability records. Early README
+and task prose still said the repacker, W8 execution, map consumer and override
+paths were missing after those paths existed. A final gate is incomplete while
+the entry point sends the next builder toward already-finished work.

@@ -1,6 +1,7 @@
 # Task 0031 — M3.1 battery closure: validation survivor, full T0006, T0028 regression
 
-Status: **active recovery**; regression implemented, full batteries outstanding.
+Status: **implemented and measured**; final T0006 and T0028 passed on the same
+candidate; owner M3 decision pending.
 The 2026-09-16 correction below supersedes the inherited acceptance premise and
 blocked CUDA status; the historical Result remains as provenance.
 
@@ -57,10 +58,10 @@ and SM120. That replaces the blocked alternative in acceptance 4. It does not
 replace either mutation battery. Tasks 0031/0032 are now being executed directly
 by the owner-assigned recovery agent; no coordinator order is pending.
 
-## Result, filled after work
+## Historical result before the final recovery runs
 
-Status: **implemented and self-measured; batteries not run, by the
-coordinator's instruction.** The survivor is closed and the mutation that
+Status at that checkpoint: **implemented and self-measured; batteries not run,
+by the coordinator's instruction.** The survivor is closed and the mutation that
 survived task 0030's battery is caught. Acceptance 1 is **partially met** with
 its literal before/after clause open; 4 is satisfied via its blocked
 alternative; **2, 3, 5 and 6 are outstanding**.
@@ -192,7 +193,7 @@ writing rather than absorbed by a spare slot. That is the intended cost.
 This is the same shape as the survivor itself: **a gate whose slack nobody
 re-measured after the thing it allowed for went away.**
 
-### The outstanding ledger: acceptances 2, 3, 5, 6 open; 4 satisfied
+### Historical outstanding ledger before the final recovery runs
 
 | # | Acceptance | State | What is missing |
 |---|---|---|---|
@@ -295,3 +296,32 @@ it does not delete the original preceding write. Its regression checks duplicate
 I/O/failure boundaries, not a demonstrated loss of durability. Other regressions
 exercise source reopening after identity change, cancellation during hashing,
 actual compaction peak rejection and consistency of public staging estimates.
+
+
+## Final-tree T0006, 2026-09-19
+
+Acceptance 2 is met on the reviewed candidate
+`0672d24f716a9293ec77de68b31e26e39fa64159`. A clean detached worktree ran the
+full `cargo xtask mutation-check --battery 0006` end to end:
+
+- all 12 clean lanes passed stably, three repetitions each, before and after;
+- **63/63 declared mutants caught**;
+- **3/3 expected survivors held** (the two independence controls and the
+  equivalent runtime disk-budget check);
+- **zero** unexpected survivors, unstable verdicts, invalid controls, broken
+  controls or skipped substitutions; and
+- exit status 0, unchanged detached HEAD and a clean tree with no parked
+  original afterward.
+
+The five survivors from the `356f965` recovery run are among the 63 caught
+mutants. This is the complete battery that the targeted repairs did not claim
+to replace. Durable local evidence:
+`results/m3-recovery/t0006-final-0672d24.log`, SHA-256
+`b5e61d449ad87661f230b6b3147b5d4045a3d584d3f86a680722dde3e719fc1c`.
+Acceptance 3 is also met on the same identity. The full T0028 battery caught
+**24/24 declared mutants**, held **1/1 expected control**, and reported zero
+survivors, unstable verdicts, invalid controls, broken controls or skips. All
+six clean lanes were stable for three repetitions before and after. The run
+exited zero with unchanged detached HEAD, a clean tree and no parked original.
+Evidence: `results/m3-recovery/t0028-final-0672d24.log`, SHA-256
+`adb5a19f543026d9197b446419e0f28b8e8cd427fcd06e25ddb4d73596a3ce9b`.

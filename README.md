@@ -14,12 +14,12 @@ model.** The diagnostic CLI emits synthetic token IDs. **Nothing here executes a
 released model**, and no model-throughput or model-quality claim has been
 established.
 
-[Task 0018](docs/tasks/0018-m3-compressed-tensors-int8-importer.md) imports
-compressed-tensors `pack-quantized` INT8 weights -- including real tensors from a
-local Gemma 4 artifact -- into canonical affine form. **An import is not
-support**: nothing runs those weights, because the W8A16 execution path, the
-repacker and the canonical manifest write are all still M3's, and the reduced
-Gemma graph remains a synthetic fixture over invented weights.
+[Task 0018](docs/tasks/0018-m3-compressed-tensors-int8-importer.md) began the
+shared affine import path. The current M3 candidate imports compressed-tensors
+and GPTQ/AutoRound integer weights, publishes canonical safetensors artifacts,
+and executes shared dense and grouped-expert W4A16/W8A16 operations. **An
+operation is not model support**: the executed activations and routes are test
+fixtures, no complete checkpoint-backed graph runs, and no token is generated.
 
 The
 [M0 review and correction task](docs/tasks/0002-m0-review-and-integer-transition.md) records what
@@ -113,6 +113,7 @@ through the device build would leave that independence untested.
 | `cargo xtask-cuda test-gpu [--profile sm_NN]` | CUDA 13.0 + the cards | Real launches on every visible device; **fails** when a required architecture has no passing device |
 | `cargo xtask-cuda test-bf16-chain` | CUDA 13.0 + one card | Reduced H8/H17 selected semantic chain used by Compute Sanitizer |
 | `cargo xtask-cuda probe [--out <path>]` | CUDA 13.0 + the cards | Bounded hardware and topology inventory |
+| `moxie-repack plan --source-root <checkpoint> [--out-plan <file>]` | a source checkpoint | Reads bounded configuration/index/header metadata and emits an explicit selection; writes nothing inside the checkpoint |
 | `moxie-repack inspect --selection <file> --source-root <dir> <budgets>` | a source checkpoint | Headers only: what a selection is, what it would cost, and what is refused. Writes nothing |
 | `moxie-repack repack --selection <file> --source-root <dir> --out <dir> <budgets>` | a source checkpoint | Converts a selection in bounded units, resumes an interrupted run, validates through the production reader, publishes with one rename |
 | `moxie-repack verify --artifact <dir> --scratch-bytes <n>` | a published artifact | Re-reads every payload through the production reader and checks it against its recorded checksum |
@@ -130,9 +131,10 @@ run is unmeasured, never passing.
 **→ [Using `moxie-repack`](docs/repack-guide.md)** is the user guide.
 
 **This step is experimental and provisional.** Moxie cannot execute a checkpoint
-yet, so there is **no evidence that repacking makes inference faster**, and the
-artifacts it produces are not runnable by Moxie today. It exists to develop and
-evaluate shared execution. Whether it is kept is decided by a measurement that
+yet, so there is **no evidence that repacking makes inference faster**, and its
+artifacts are not runnable as checkpoint-backed models today. Shared operators
+can consume their canonical components over test inputs. Whether repacking is
+kept is decided by a measurement that
 is not yet runnable ([ADR 0027](docs/decisions/adr/0027-repacking-is-provisional-pending-measured-inference-benefit.md),
 [experiment 0007](docs/evidence/experiments/0007-offline-versus-load-time-preparation.md)).
 Byte-exactness, conformant packaging and compact plans are facts about bytes,
@@ -145,10 +147,12 @@ write authority in, and task 0025 is what built it. Five budgets are required on
 there is no default for any of them: how much of a user's machine a tool may spend is not a question
 a tool should answer on the user's behalf.
 
-What it converts is a **selection**: a small TOML document naming each tensor, its role, its source
-shard and, for a quantized module, its packing parameters. Nothing is discovered, expanded from a
-pattern, or inferred from a name, which is what keeps ADR 0020's "no agent-initiated bulk
-conversion" a property of the tool rather than a promise about how it is invoked.
+What it converts is a **selection**: a small TOML document naming each tensor,
+its role, source shard and, for a quantized module, its packing parameters. The
+separate `plan` command can derive that explicit selection from bounded
+checkpoint configuration, index and header metadata. Planning never publishes
+an artifact or writes inside the checkpoint; conversion still requires the
+user to invoke `repack` with the resulting selection and explicit budgets.
 
 A published artifact is a directory: a TOML manifest plus one or more
 `model-NNNNN-of-NNNNN.safetensors` shards that open with the **reference
@@ -166,8 +170,9 @@ output axis. Task0034 adds GPTQ-v1 integer selection and pinned AutoRound0.15.0
 `auto_round:auto_gptq` discovery, including explicit group maps and source scale bits
 of either sign ([ADR0030](docs/decisions/adr/0030-preserve-signed-affine-scales.md)).
 Bounded samples of two catalog revisions pass; this is not whole-catalog conversion.
-Unsupported per-module overrides, unquantized F16 weights, tokenizer publication
-and inferred fused expert role mapping are refused. Exit status distinguishes the
+Named unquantized BF16 passthrough overrides, including MTP patterns, are
+preserved. Unsupported override modes, tokenizer publication and inferred fused
+expert role mapping are refused. Exit status distinguishes the
 outcomes: 0 published or verified, 1 a command-line error, 2 refused or failed (leaving a resumable
 destination), 3 cancelled, and 4 **published, durability unconfirmed** — the artifact exists and the
 confirming `fsync` did not report success, which is neither a failure nor a success.
@@ -217,9 +222,9 @@ SM86 GPUs and the SM120 GPU through the shared residency authority. One
 published real module has also executed with synthetic activations. These are
 operation-level gates: **nothing in this repository generates a token from a
 checkpoint**, and no model-output, quality, or performance claim follows from
-them. The remaining M3 work is the final mutation batteries, record
-reconciliation, review, and owner acceptance; [AGENTS.md](AGENTS.md) is the
-live assignment ledger.
+them. The final mutation batteries and record reconciliation pass on the frozen
+M3 candidate. Repository-owner review and the milestone decision remain;
+[AGENTS.md](AGENTS.md) is the live assignment ledger.
 
 **M1.4 complete; M1.5 active.** The owner accepted
 [task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md) on 2026-09-10 after independent
