@@ -363,6 +363,42 @@ mod driver_binding {
             }
         }
 
+        /// Enqueue a checked copy into one slice of this range.
+        ///
+        /// The mirror of [`DeviceRange::copy_to_host_at`], and task 0037 is why
+        /// it exists: appending rows to paged key/value state writes *part* of
+        /// one admitted payload, at the offset the page table resolves to, and
+        /// a whole-range copy cannot express that without either restaging the
+        /// whole cache or allocating a range per page. The extent is checked
+        /// against this range, so a page identity that resolved wrongly is a
+        /// typed refusal rather than a write into a neighbouring layer.
+        pub(crate) unsafe fn copy_from_host_async_at(
+            &self,
+            within: u64,
+            source: &[u8],
+            stream: &Stream<'ctx>,
+        ) -> moxie_types::Result<()> {
+            let end = within
+                .checked_add(source.len() as u64)
+                .ok_or_else(|| invalid("source", "write extent overflowed"))?;
+            if end > self.bytes() {
+                return Err(invalid("source", "write exceeds its admitted range"));
+            }
+            let offset = self
+                .offset()
+                .checked_add(within)
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| invalid("range", "range offset is not addressable"))?;
+            // SAFETY: forwarded to the caller, exactly as `copy_from_host_async`
+            // forwards it: the operation lease owns `source` and this range
+            // until its recorded event completes.
+            unsafe {
+                self.core
+                    .buffer
+                    .copy_from_host_async_at(offset, source, stream)
+            }
+        }
+
         /// Read one slice of this range back, at an offset inside it.
         ///
         /// Task 0021 reads a grouped launch's slots back one at a time: the

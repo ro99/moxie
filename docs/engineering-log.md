@@ -1342,3 +1342,67 @@ partial artifact into checkpoint model support, convert correctness evidence
 into a performance claim, or fire experiment0007's model-execution trigger.
 Task0037 starts M4 with common paged device attention and actual 32,768-row
 state rather than a model-local attention loop or a nominal width setting.
+
+## 2026-09-19 — a bound is an input away from not being a bound
+
+Task 0037's first change was supposed to be a tidy-up: `attention_error_bound`
+derived `1/sqrt(head_dim)` internally while the operation has carried an
+explicit score scale since task 0003. It is not a tidy-up. `Δs` bounds the error
+of the **scaled** score, the term passes through an exponential, and a
+Gemma-style layer normalizes its queries and keys per head and then declares a
+scale of exactly 1.0 — so at head dimension 128 the derived value was 11.3 times
+too small. The fixture that now holds the case measures an error of 1.94e-3
+against a derived "bound" of 1.38e-3. A kernel qualified against the old helper
+could have been accepted while computing something the bound forbade.
+
+The shape worth carrying: a bound is a statement about a computation, and every
+parameter of that computation it derives instead of receiving is an assumption
+about a caller it has never met. Two earlier reviews disproved this same
+function's *formula*; this one was its *input*, and no amount of care about the
+formula would have found it.
+
+## 2026-09-19 — the gate that was not being run against the ABI it launched
+
+The GPU lane was failing at HEAD, before M4 touched anything, and had been since
+task 0035. `cargo xtask-cuda test-gpu`'s hand-written `affine_linear` case
+builds its launch parameter array by hand. When task 0035 versioned the affine
+ABI to v2 and added the `group_index` operand, the executor's binding was
+updated and this one was not: the array stayed at thirteen entries, so the
+**output pointer was bound to the kernel's map parameter**, the kernel read group
+identities out of its own output buffer, and the resulting illegal access
+poisoned the process context. Every later case, on every later device, failed
+with an inherited "illegal memory access" — 34 failures from one wrong index.
+
+Two things hid it. `moxie-executor`'s own device tests use the production
+binding, so they passed throughout and the failure looked like a hardware or
+environment problem. And the second bug found the same day has the same shape:
+`grouped_device`'s negative fixture selected its descriptor by operation and SM
+alone, and task 0035 also added `affine-expert-*` descriptors for the same
+operation and SM that sort **before** the BF16 one, so the fixture had been
+handing the planner a quantized descriptor for a BF16 plan and failing before it
+mutated anything.
+
+Both are the same lesson, and it is not "write more tests". A hand-written
+duplicate of a production binding is a second implementation of an ABI, and
+`find(operation, sm)` is a second implementation of kernel selection. Neither
+was updated when the thing it duplicated changed, because nothing links them.
+When a task versions an ABI or adds catalogue entries, grep for every place that
+builds a parameter array or picks a descriptor by hand — the compiler will not,
+and a green executor suite will not tell you either.
+
+## 2026-09-19 — pages are storage, tiles are scheduling
+
+The first paged attention kernel keeps its online-softmax tile (128 keys)
+deliberately independent of the page width (16, 32, 256 in the gates). A tile
+that matched the page would never cross a page boundary and never leave a tail
+partly masked, which are the two cases a paged kernel exists to get right. The
+same reasoning put a **reversed** page table in every device case: an identity
+mapping produces the right answer even when the table is ignored, so it proves
+nothing about the indirection it is there to exercise.
+
+The merge's sharp edge is the empty partial. A fully masked tile has a maximum
+of `-inf`, and `exp(-inf - (-inf))` is `NaN`, so the identity of the merge has to
+be handled *around* the arithmetic rather than through it. A sliding window
+reaches that case as soon as the window has moved past a whole tile — which is
+to say, always, in production — and the host fixture and the kernel now pin it
+from both sides.

@@ -1691,6 +1691,15 @@ mod tests {
         let ctx = RankContext::acquire(RankId(0), 0).unwrap();
         let scope = Scope::Device(ctx.uuid());
         let builtin = moxie_kernels::expert_mlp_catalogue();
+        // Operation and architecture do not identify a descriptor on their own.
+        // A catalogue is sorted by id, and since task 0035 the package also
+        // declares `affine-expert-*` entries for the same operation and the
+        // same SM with **integer** weight operands -- which sort before
+        // `bf16-expert-mlp-*`. Finding by operation and SM alone therefore
+        // picked a quantized descriptor for a BF16 plan, the planner correctly
+        // refused it as unqualified, and the fixture failed before it had
+        // mutated anything. The projection symbol is what says which package
+        // this is.
         let gelu = builtin
             .descriptors()
             .iter()
@@ -1701,8 +1710,9 @@ mod tests {
                     )
                     && d.sm.major == ctx.capability().compute_major
                     && d.sm.minor == ctx.capability().compute_minor
+                    && d.symbols[0].0 == moxie_kernels::BF16_EXPERT_PROJECT_GELU
             })
-            .expect("this build declares a GeGLU descriptor for this device")
+            .expect("this build declares a BF16 GeGLU descriptor for this device")
             .clone();
 
         // The unmodified descriptor attaches, so the refusals below are the

@@ -18,7 +18,8 @@ use moxie_cuda::{
     query_device,
 };
 use moxie_executor::{
-    DeviceArena, Lease, OwnedBinding, SelectedAdmitRefused, SelectedReservedPlan, Turn, Upload,
+    DeviceArena, Lease, OwnedBinding, PageGeometry, PagedAttentionLaunch, PagedAttentionRun,
+    SelectedAdmitRefused, SelectedReservedPlan, Turn, Upload, select_paged_attention_kernel,
 };
 use moxie_graph::{
     Bindings, Graph, GraphBuilder, Op, OpParams, OracleEvidence, OracleId, OracleRegistry,
@@ -26,7 +27,7 @@ use moxie_graph::{
 };
 use moxie_interp::{HostTensor, Interpreter, Value};
 use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSpan};
-use moxie_plan::{Phase, ResourceWorkload, lower_selected};
+use moxie_plan::{Phase, ResourceWorkload, Visibility, lower_selected};
 use moxie_types::{
     ActivationPrecision, DeviceCapability, DeviceTier, Dim, Error, HostTier, Precision, RankId,
     Scope, SymbolId, TensorLayout, Tier, WeightPrecision,
@@ -86,6 +87,8 @@ const CASES: &[&str] = &[
     "measurement_is_live",
     "grouped_expert_mlp",
     "affine_linear_w4a16_w8a16",
+    "paged_attention",
+    "paged_attention_32k",
 ];
 
 /// Run every GPU case on every visible device.
@@ -218,6 +221,8 @@ pub fn run(profile: Option<&str>) -> i32 {
         results.push(case(&cap, "measurement_is_live", measurement_is_live(&cap)));
         results.push(case(&cap, "grouped_expert_mlp", grouped_expert_mlp(&cap)));
         results.push(case(&cap, "affine_linear_w4a16_w8a16", affine_linear(&cap)));
+        results.push(case(&cap, "paged_attention", paged_attention(&cap)));
+        results.push(case(&cap, "paged_attention_32k", paged_attention_32k(&cap)));
     }
 
     println!("\n--- results ---");
@@ -2393,6 +2398,16 @@ fn affine_linear(cap: &DeviceCapability) -> Result<Outcome, Error> {
             d_scales.device_ptr(),
         );
         let mut zero_ptr = d_zero.as_ref().map_or(0u64, DeviceBuffer::device_ptr);
+        // The activation-order map, absent here: these fixtures are contiguous
+        // tensors. A **null pointer is the operand**, not a missing argument —
+        // this case lost the parameter when task 0035 versioned the ABI to v2,
+        // which bound the output buffer to `group_index` and made the kernel
+        // read group identities out of its own output. The result was an
+        // illegal access that poisoned the process context, so every later case
+        // on every later device failed with it. `moxie-executor`'s own device
+        // tests passed throughout, because the executor's binding was updated
+        // and this hand-written one was not.
+        let mut map_ptr = 0u64;
         let mut out_ptr = d_out.device_ptr();
         let mut rows_u = rows as u64;
         let mut in_u = in_features as u64;
@@ -2402,11 +2417,12 @@ fn affine_linear(cap: &DeviceCapability) -> Result<Outcome, Error> {
         let mut bits = width.bits();
         let mut group_size = group;
         let mut scale_kind = 1u32;
-        let mut params: [*mut c_void; 13] = [
+        let mut params: [*mut c_void; 14] = [
             (&raw mut x_ptr).cast(),
             (&raw mut code_ptr).cast(),
             (&raw mut scale_ptr).cast(),
             (&raw mut zero_ptr).cast(),
+            (&raw mut map_ptr).cast(),
             (&raw mut out_ptr).cast(),
             (&raw mut rows_u).cast(),
             (&raw mut in_u).cast(),
@@ -2479,6 +2495,715 @@ fn affine_linear(cap: &DeviceCapability) -> Result<Outcome, Error> {
         return Err(Error::Numerical {
             detail: format!("{compared} element(s) compared; the case checks 336"),
         });
+    }
+    Ok(Outcome::Passed)
+}
+
+/// One attention fixture: BF16 keys, values and queries for a paged layer.
+///
+/// Synthetic, and that is stated rather than implied: no checkpoint is read
+/// here and no output-quality claim follows from any of it. What these cases
+/// prove is that the kernel computes the attention equation the host oracle
+/// defines, over paged state whose physical pages are deliberately not in
+/// logical order.
+struct AttentionFixture {
+    geometry: PageGeometry,
+    heads: u64,
+    keys: Vec<u16>,
+    values: Vec<u16>,
+}
+
+impl AttentionFixture {
+    fn build(geometry: PageGeometry, heads: u64, rows: u64, seed: u64) -> Self {
+        use moxie_kernels::cpu_expert::to_bf16_bits;
+        let mut state = seed;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 41) as f32) / ((1u32 << 22) as f32) - 1.0
+        };
+        let width = (rows * geometry.kv_heads * geometry.head_dim) as usize;
+        let mut keys = Vec::with_capacity(width);
+        let mut values = Vec::with_capacity(width);
+        for _ in 0..width {
+            keys.push(to_bf16_bits(next()));
+            values.push(to_bf16_bits(next()));
+        }
+        Self {
+            geometry,
+            heads,
+            keys,
+            values,
+        }
+    }
+
+    /// The BF16 bytes for `rows` rows starting at absolute position `first`.
+    fn payload(&self, first: u64, rows: u64) -> (Vec<u8>, Vec<u8>) {
+        let per_row = (self.geometry.kv_heads * self.geometry.head_dim) as usize;
+        let start = first as usize * per_row;
+        let end = start + rows as usize * per_row;
+        let to_bytes = |v: &[u16]| v.iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>();
+        (
+            to_bytes(&self.keys[start..end]),
+            to_bytes(&self.values[start..end]),
+        )
+    }
+
+    /// A query block, a fixed function of the **absolute** position, so a
+    /// chunked launch and a whole one are given exactly the same numbers.
+    fn query(&self, first: u64, rows: u64) -> Vec<u16> {
+        use moxie_kernels::cpu_expert::to_bf16_bits;
+        let mut out = Vec::with_capacity((rows * self.heads * self.geometry.head_dim) as usize);
+        for row in 0..rows {
+            let position = first + row;
+            for head in 0..self.heads {
+                for d in 0..self.geometry.head_dim {
+                    let mix = (position.wrapping_mul(31) ^ head.wrapping_mul(7) ^ (d * 13)) % 61;
+                    out.push(to_bf16_bits((mix as f32 - 30.0) / 24.0));
+                }
+            }
+        }
+        out
+    }
+
+    fn query_bytes(&self, first: u64, rows: u64) -> Vec<u8> {
+        self.query(first, rows)
+            .iter()
+            .flat_map(|b| b.to_le_bytes())
+            .collect()
+    }
+
+    fn head_slice(&self, source: &[u16], row: u64, kv_head: u64) -> Vec<f32> {
+        let per_row = (self.geometry.kv_heads * self.geometry.head_dim) as usize;
+        let start = row as usize * per_row + (kv_head * self.geometry.head_dim) as usize;
+        source[start..start + self.geometry.head_dim as usize]
+            .iter()
+            .map(|b| bf16_value(*b))
+            .collect()
+    }
+}
+
+/// A page table whose physical pages are deliberately not in logical order.
+///
+/// An identity mapping proves nothing: every offset would be right even if the
+/// table were ignored. This one reverses the order and is validated by
+/// `publish_page_table`, so a kernel that quietly assumed contiguity fails.
+fn shuffled_pages(pages: u64) -> Vec<u32> {
+    (0..pages).rev().map(|p| p as u32).collect()
+}
+
+/// Compare one launch's device output against the independent FP64 equation.
+///
+/// The expected value comes from `moxie_oracles::online_softmax`, cut into
+/// blocks of a width the kernel does not use, so the two agree on the *answer*
+/// rather than on a schedule. The tolerance is the predeclared
+/// `attention_error_bound` at the layer's declared scale, plus half a BF16 ulp
+/// for the one output narrowing the descriptor already declares. That addition
+/// is the rounding boundary, not a widening of the bound: ADR 0028's clauses
+/// are untouched.
+fn check_attention(
+    fixture: &AttentionFixture,
+    launch: &PagedAttentionLaunch,
+    output: &[u8],
+    label: &str,
+) -> Result<moxie_oracles::metric::ErrorSummary, Error> {
+    use moxie_oracles::attention::attention_error_bounds_at;
+    use moxie_oracles::online_softmax::attend_row_blocked;
+
+    let head_dim = fixture.geometry.head_dim as usize;
+    let group = fixture.heads / fixture.geometry.kv_heads;
+    let got = decode_u16(output);
+    let block = fixture.query(launch.first_position, launch.rows);
+    let mut device_values: Vec<f32> = Vec::new();
+    let mut oracle_values: Vec<f64> = Vec::new();
+    for row in 0..launch.rows {
+        let visible: Vec<u64> = (launch.history_base..launch.history_base + launch.history_rows)
+            .filter(|key| launch.allows(row, *key))
+            .collect();
+        if visible.is_empty() {
+            return Err(Error::Numerical {
+                detail: format!("{label}: row {row} sees nothing, which this gate cannot check"),
+            });
+        }
+        for head in 0..fixture.heads {
+            let kv_head = head / group;
+            let start = ((row * fixture.heads + head) * fixture.geometry.head_dim) as usize;
+            let query_row: Vec<f32> = block[start..start + head_dim]
+                .iter()
+                .map(|b| bf16_value(*b))
+                .collect();
+            let keys: Vec<Vec<f32>> = visible
+                .iter()
+                .map(|k| fixture.head_slice(&fixture.keys, *k, kv_head))
+                .collect();
+            let values: Vec<Vec<f32>> = visible
+                .iter()
+                .map(|k| fixture.head_slice(&fixture.values, *k, kv_head))
+                .collect();
+            let key_views: Vec<&[f32]> = keys.iter().map(|k| k.as_slice()).collect();
+            let value_views: Vec<&[f32]> = values.iter().map(|v| v.as_slice()).collect();
+            let allowed = vec![true; visible.len()];
+            let want = attend_row_blocked(
+                &query_row,
+                &key_views,
+                &value_views,
+                &allowed,
+                launch.scale,
+                // Neither the kernel's tile nor the page width.
+                37,
+            )
+            .map_err(|e| Error::Numerical {
+                detail: format!("{label}: the oracle refused: {e}"),
+            })?;
+            let weights = softmax_weights(&query_row, &key_views, launch.scale);
+            // Every component's bound in one pass. The per-component entry
+            // point recomputes the score-error term for each lane, which at
+            // the 32,768-row gate is four billion operations per head; the two
+            // are asserted bitwise equal in the oracle's own fixtures.
+            let bounds = attention_error_bounds_at(
+                &query_row,
+                &key_views,
+                &value_views,
+                &weights,
+                launch.scale,
+            )
+            .map_err(|e| Error::Numerical {
+                detail: format!("{label}: the bound refused: {e}"),
+            })?;
+            for d in 0..head_dim {
+                let device = bf16_value(got[start + d]);
+                if !device.is_finite() {
+                    return Err(Error::Numerical {
+                        detail: format!("{label}: row {row} head {head} lane {d} is {device}"),
+                    });
+                }
+                let bound = bounds[d];
+                let difference = (f64::from(device) - want[d]).abs();
+                let half_ulp = 0.5 * f64::from(bf16_ulp(want[d] as f32));
+                if difference > bound + half_ulp {
+                    return Err(Error::Numerical {
+                        detail: format!(
+                            "{label}: row {row} head {head} lane {d}: device {device} against \
+                             oracle {}, {difference:.3e} apart; the bound is {bound:.3e} and \
+                             the BF16 boundary is {half_ulp:.3e}",
+                            want[d]
+                        ),
+                    });
+                }
+                device_values.push(device);
+                oracle_values.push(want[d]);
+            }
+        }
+    }
+    Ok(moxie_oracles::metric::ErrorSummary::absolute(
+        &device_values,
+        &oracle_values,
+    ))
+}
+
+/// The exact FP64 softmax weights the bound needs.
+fn softmax_weights(query: &[f32], keys: &[&[f32]], scale: f32) -> Vec<f64> {
+    let scores: Vec<f64> = keys
+        .iter()
+        .map(|k| {
+            let dot: f64 = query
+                .iter()
+                .zip(k.iter())
+                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                .sum();
+            dot * f64::from(scale)
+        })
+        .collect();
+    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let exps: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+    let denom: f64 = exps.iter().sum();
+    exps.iter().map(|e| e / denom).collect()
+}
+
+/// One BF16 ulp at this magnitude.
+fn bf16_ulp(value: f32) -> f32 {
+    let exponent = (value.abs().to_bits() >> 23) & 0xFF;
+    if exponent <= 7 {
+        f32::from_bits(1)
+    } else {
+        f32::from_bits((exponent - 7) << 23)
+    }
+}
+
+/// Admit a ledger with this device's measured capacity and the host's.
+fn measured_ledger(ctx: &RankContext) -> Result<Ledger, Error> {
+    let measurement = ctx.measure()?;
+    let snapshot = CapacitySnapshot::measured(&measurement, 1 << 20)?;
+    let host = moxie_host::read()?;
+    let host_snapshot = CapacitySnapshot::measured_host(&host, 1 << 20)?;
+    Ledger::new([snapshot, host_snapshot])
+}
+
+/// Task 0037: paged attention over persistent admitted device state.
+///
+/// Head dimensions 64 and 128, multi-head and a 4:1 grouped ratio, full causal
+/// and sliding visibility, whole and chunked prefill, single-row decode, page
+/// tails and a page table that is not the identity. Every component is checked
+/// against the FP64 oracle under the predeclared bound.
+fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let stream = Stream::new(&ctx)?;
+    let catalogue = moxie_kernels::paged_attention_catalogue();
+
+    struct Case {
+        label: &'static str,
+        geometry: PageGeometry,
+        heads: u64,
+        scale: f32,
+        visibility: Visibility,
+        rows: u64,
+        history: u64,
+        first_position: u64,
+        /// Appends to build the history with, in order. They must sum to it.
+        appends: &'static [u64],
+    }
+
+    let cases = [
+        // Multi-head, head dimension 64, a history that ends mid-page, and a
+        // whole-prefill launch from position zero.
+        Case {
+            label: "mha-64-whole-prefill",
+            geometry: PageGeometry {
+                kv_heads: 4,
+                head_dim: 64,
+                page_tokens: 16,
+                pages: 4,
+            },
+            heads: 4,
+            scale: moxie_plan::reciprocal_sqrt_scale(64),
+            visibility: Visibility::Causal,
+            rows: 40,
+            history: 40,
+            first_position: 0,
+            appends: &[16, 9, 15],
+        },
+        // Grouped 4:1, head dimension 128, a single decode row at the end of a
+        // history whose last page holds four rows.
+        Case {
+            label: "gqa-128-decode",
+            geometry: PageGeometry {
+                kv_heads: 2,
+                head_dim: 128,
+                page_tokens: 32,
+                pages: 4,
+            },
+            heads: 8,
+            scale: moxie_plan::reciprocal_sqrt_scale(128),
+            visibility: Visibility::Causal,
+            rows: 1,
+            history: 100,
+            first_position: 99,
+            appends: &[1, 63, 36],
+        },
+        // A sliding window with a declared scale of exactly 1.0 -- the
+        // Gemma-shaped layer the bound repair was about -- over a history whose
+        // early pages are entirely outside the window.
+        Case {
+            label: "sliding-20-scale-one",
+            geometry: PageGeometry {
+                kv_heads: 1,
+                head_dim: 64,
+                page_tokens: 8,
+                pages: 9,
+            },
+            heads: 4,
+            scale: 1.0,
+            visibility: Visibility::SlidingWindow { window: 20 },
+            rows: 5,
+            history: 71,
+            first_position: 66,
+            appends: &[8, 40, 23],
+        },
+    ];
+
+    let mut checked = 0usize;
+    for case in &cases {
+        let fixture = AttentionFixture::build(case.geometry, case.heads, case.history, 0x0037_0001);
+        let launch = PagedAttentionLaunch {
+            geometry: case.geometry,
+            heads: case.heads,
+            scale: case.scale,
+            visibility: case.visibility,
+            rows: case.rows,
+            first_position: case.first_position,
+            history_base: 0,
+            history_rows: case.history,
+        };
+        let descriptor = select_paged_attention_kernel(&catalogue, cap, &launch)?;
+        let mut ledger = measured_ledger(&ctx)?;
+        let mut run = PagedAttentionRun::admit(
+            &mut ledger,
+            &ctx,
+            descriptor,
+            case.geometry,
+            case.heads,
+            case.rows,
+        )
+        .map_err(|r| r.error)?;
+        run.publish_page_table(&stream, shuffled_pages(case.geometry.pages))
+            .map_err(|r| r.error)?;
+
+        let mut written = 0u64;
+        for rows in case.appends {
+            let (keys, values) = fixture.payload(written, *rows);
+            run.append(&stream, *rows, keys, values)
+                .map_err(|r| r.error)?;
+            written += rows;
+        }
+        if run.committed_rows() != case.history {
+            return Ok(Outcome::Failed(format!(
+                "{}: committed {} row(s) after appending {}",
+                case.label,
+                run.committed_rows(),
+                case.history
+            )));
+        }
+
+        // An append that cannot fit is refused *before* the device is touched:
+        // the frontier does not move and every prior byte is unchanged.
+        let before = run.read_rows(0, case.history)?;
+        let overflow = run.capacity_rows()? + 1;
+        let (keys, values) = fixture.payload(0, 1);
+        let refused = run
+            .append(&stream, overflow, keys, values)
+            .expect_err("an append past capacity must be refused");
+        if refused.retained_source() {
+            return Ok(Outcome::Failed(format!(
+                "{}: a refusal before enqueue kept the caller's rows",
+                case.label
+            )));
+        }
+        if run.committed_rows() != case.history || run.read_rows(0, case.history)? != before {
+            return Ok(Outcome::Failed(format!(
+                "{}: a refused append moved the frontier or changed committed bytes",
+                case.label
+            )));
+        }
+
+        let whole = run
+            .attend(
+                &stream,
+                &launch,
+                fixture.query_bytes(case.first_position, case.rows),
+            )
+            .map_err(|r| r.error)?;
+        let summary = check_attention(&fixture, &launch, &whole, case.label)?;
+        println!(
+            "    {} {} heads={} kv={} d={} pages={}x{} state={} B {summary}",
+            cap.sm(),
+            case.label,
+            case.heads,
+            case.geometry.kv_heads,
+            case.geometry.head_dim,
+            case.geometry.pages,
+            case.geometry.page_tokens,
+            run.arena_bytes()
+        );
+        checked += summary.count;
+
+        // The same rows, cut into uneven chunks. Every query row is
+        // independent of how the launch was cut, so the bytes must be
+        // identical -- not merely close.
+        if case.rows > 1 {
+            let mut chunked: Vec<u8> = Vec::new();
+            let mut done = 0u64;
+            for width in [1u64, 2, 3] {
+                if done >= case.rows {
+                    break;
+                }
+                let rows = width.min(case.rows - done);
+                let chunk_launch = PagedAttentionLaunch {
+                    rows,
+                    first_position: case.first_position + done,
+                    ..launch
+                };
+                let out = run
+                    .attend(
+                        &stream,
+                        &chunk_launch,
+                        fixture.query_bytes(chunk_launch.first_position, rows),
+                    )
+                    .map_err(|r| r.error)?;
+                check_attention(&fixture, &chunk_launch, &out, case.label)?;
+                chunked.extend_from_slice(&out);
+                done += rows;
+            }
+            let remaining = case.rows - done;
+            if remaining > 0 {
+                let chunk_launch = PagedAttentionLaunch {
+                    rows: remaining,
+                    first_position: case.first_position + done,
+                    ..launch
+                };
+                let out = run
+                    .attend(
+                        &stream,
+                        &chunk_launch,
+                        fixture.query_bytes(chunk_launch.first_position, remaining),
+                    )
+                    .map_err(|r| r.error)?;
+                chunked.extend_from_slice(&out);
+            }
+            if chunked != whole {
+                return Ok(Outcome::Failed(format!(
+                    "{}: chunked prefill differs from whole prefill",
+                    case.label
+                )));
+            }
+        }
+
+        // A launch declaring more history than was committed is refused rather
+        // than attending over pages nothing wrote.
+        let beyond = PagedAttentionLaunch {
+            history_rows: case.history + 1,
+            ..launch
+        };
+        if run
+            .attend(
+                &stream,
+                &beyond,
+                fixture.query_bytes(case.first_position, case.rows),
+            )
+            .is_ok()
+        {
+            return Ok(Outcome::Failed(format!(
+                "{}: a launch past the frontier was accepted",
+                case.label
+            )));
+        }
+        run.close(&mut ledger).map_err(|r| r.error)?;
+        if !ledger.outstanding().is_empty() {
+            return Ok(Outcome::Failed(format!(
+                "{}: a closed run left bytes charged",
+                case.label
+            )));
+        }
+    }
+    if checked == 0 {
+        return Ok(Outcome::Failed("no component was compared".into()));
+    }
+    Ok(Outcome::Passed)
+}
+
+/// Task 0037 acceptance 3: **32,768 actual BF16 key/value rows**.
+///
+/// Not an admitted capacity, not a declared maximum and not a short history
+/// with a long label: 32,768 rows are materialized, appended and attended over,
+/// and then row 32,768 is appended and the next decode produced. Whole and
+/// chunked construction are compared, and the three numbers a cache can confuse
+/// -- admitted capacity, committed rows and visible rows -- are reported
+/// separately because they are different facts.
+///
+/// No timing appears here. O6 and O7 are open; this gate is about correctness
+/// and bounded state.
+fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    const CONTEXT: u64 = 32_768;
+    let geometry = PageGeometry {
+        kv_heads: 2,
+        head_dim: 128,
+        page_tokens: 256,
+        // One page beyond the context, for the row that is appended after it.
+        pages: CONTEXT / 256 + 1,
+    };
+    let heads = 8;
+    let scale = moxie_plan::reciprocal_sqrt_scale(128);
+    // The widest launch this gate makes: a prefill chunk at the far end of the
+    // history, which is also what proves a multi-row launch and a one-row
+    // decode agree at 32K.
+    let chunk_rows = 24u64;
+
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let stream = Stream::new(&ctx)?;
+    let catalogue = moxie_kernels::paged_attention_catalogue();
+    let fixture = AttentionFixture::build(geometry, heads, CONTEXT + 1, 0x0037_8000);
+
+    let decode =
+        |first_position: u64, history_rows: u64, visibility: Visibility| PagedAttentionLaunch {
+            geometry,
+            heads,
+            scale,
+            visibility,
+            rows: 1,
+            first_position,
+            history_base: 0,
+            history_rows,
+        };
+    let descriptor =
+        select_paged_attention_kernel(&catalogue, cap, &decode(0, 1, Visibility::Causal))?;
+
+    // Build A: the whole history in one append.
+    let mut ledger = measured_ledger(&ctx)?;
+    let mut whole = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor.try_clone()?,
+        geometry,
+        heads,
+        chunk_rows,
+    )
+    .map_err(|r| r.error)?;
+    whole
+        .publish_page_table(&stream, shuffled_pages(geometry.pages))
+        .map_err(|r| r.error)?;
+    let (keys, values) = fixture.payload(0, CONTEXT);
+    whole
+        .append(&stream, CONTEXT, keys, values)
+        .map_err(|r| r.error)?;
+    if whole.committed_rows() != CONTEXT {
+        return Ok(Outcome::Failed(format!(
+            "committed {} row(s), not {CONTEXT}",
+            whole.committed_rows()
+        )));
+    }
+
+    // Build B: the same rows, appended in uneven chunks that cross pages and
+    // leave a partial page open in the middle.
+    let mut chunked = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor.try_clone()?,
+        geometry,
+        heads,
+        chunk_rows,
+    )
+    .map_err(|r| r.error)?;
+    chunked
+        .publish_page_table(&stream, shuffled_pages(geometry.pages))
+        .map_err(|r| r.error)?;
+    let mut written = 0u64;
+    for rows in [1u64, 255, 256, 7_000, 25_256] {
+        let (keys, values) = fixture.payload(written, rows);
+        chunked
+            .append(&stream, rows, keys, values)
+            .map_err(|r| r.error)?;
+        written += rows;
+    }
+    if written != CONTEXT || chunked.committed_rows() != CONTEXT {
+        return Ok(Outcome::Failed(format!(
+            "chunked construction committed {} row(s) after {written}",
+            chunked.committed_rows()
+        )));
+    }
+
+    // The last row of the 32,768 attends over the whole history. Whole and
+    // chunked construction must produce the same bytes, not merely close ones.
+    let last = decode(CONTEXT - 1, CONTEXT, Visibility::Causal);
+    let query = fixture.query_bytes(CONTEXT - 1, 1);
+    let from_whole = whole
+        .attend(&stream, &last, query.clone())
+        .map_err(|r| r.error)?;
+    let from_chunked = chunked.attend(&stream, &last, query).map_err(|r| r.error)?;
+    if from_whole != from_chunked {
+        return Ok(Outcome::Failed(
+            "whole and chunked construction disagree at 32,768 rows".into(),
+        ));
+    }
+    let summary = check_attention(&fixture, &last, &from_whole, "32k-decode")?;
+    println!(
+        "    {} 32k-decode visible={} committed={} capacity={} state={} B {summary}",
+        cap.sm(),
+        last.history_rows,
+        whole.committed_rows(),
+        whole.capacity_rows()?,
+        whole.arena_bytes()
+    );
+
+    // A multi-row prefill chunk at the far end, against the same rows decoded
+    // one at a time. Same operation, different row counts, identical bytes.
+    let chunk = PagedAttentionLaunch {
+        rows: chunk_rows,
+        first_position: CONTEXT - chunk_rows,
+        ..last
+    };
+    let block = whole
+        .attend(
+            &stream,
+            &chunk,
+            fixture.query_bytes(chunk.first_position, chunk_rows),
+        )
+        .map_err(|r| r.error)?;
+    let lane_bytes = (heads * geometry.head_dim * 2) as usize;
+    for row in 0..chunk_rows {
+        let position = chunk.first_position + row;
+        let one = whole
+            .attend(
+                &stream,
+                &decode(position, CONTEXT, Visibility::Causal),
+                fixture.query_bytes(position, 1),
+            )
+            .map_err(|r| r.error)?;
+        let start = row as usize * lane_bytes;
+        if one != block[start..start + lane_bytes] {
+            return Ok(Outcome::Failed(format!(
+                "row {position} differs between a {chunk_rows}-row chunk and a single decode"
+            )));
+        }
+    }
+
+    // Append row 32,768 -- the row after the context -- and decode it.
+    let (keys, values) = fixture.payload(CONTEXT, 1);
+    whole
+        .append(&stream, 1, keys, values)
+        .map_err(|r| r.error)?;
+    if whole.committed_rows() != CONTEXT + 1 {
+        return Ok(Outcome::Failed(format!(
+            "the frontier is {} after appending row {CONTEXT}",
+            whole.committed_rows()
+        )));
+    }
+    let next = decode(CONTEXT, CONTEXT + 1, Visibility::Causal);
+    let after = whole
+        .attend(&stream, &next, fixture.query_bytes(CONTEXT, 1))
+        .map_err(|r| r.error)?;
+    let summary = check_attention(&fixture, &next, &after, "32k-append-decode")?;
+    println!(
+        "    {} 32k-append-decode visible={} committed={} capacity={} {summary}",
+        cap.sm(),
+        next.history_rows,
+        whole.committed_rows(),
+        whole.capacity_rows()?
+    );
+
+    // The three numbers are different, and a sliding launch is where that
+    // becomes visible: the same committed history, a fraction of it visible.
+    let windowed = decode(
+        CONTEXT,
+        CONTEXT + 1,
+        Visibility::SlidingWindow { window: 4_096 },
+    );
+    let slid = whole
+        .attend(&stream, &windowed, fixture.query_bytes(CONTEXT, 1))
+        .map_err(|r| r.error)?;
+    let summary = check_attention(&fixture, &windowed, &slid, "32k-sliding")?;
+    let visible = (0..=CONTEXT).filter(|k| windowed.allows(0, *k)).count();
+    if visible != 4_096 || whole.committed_rows() != CONTEXT + 1 {
+        return Ok(Outcome::Failed(format!(
+            "{visible} visible row(s) against {} committed",
+            whole.committed_rows()
+        )));
+    }
+    if slid == after {
+        return Ok(Outcome::Failed(
+            "a 4,096-row window produced the same answer as the whole history".into(),
+        ));
+    }
+    println!(
+        "    {} 32k-sliding visible={visible} committed={} capacity={} {summary}",
+        cap.sm(),
+        whole.committed_rows(),
+        whole.capacity_rows()?
+    );
+
+    whole.close(&mut ledger).map_err(|r| r.error)?;
+    chunked.close(&mut ledger).map_err(|r| r.error)?;
+    if !ledger.outstanding().is_empty() {
+        return Ok(Outcome::Failed("a closed run left bytes charged".into()));
     }
     Ok(Outcome::Passed)
 }

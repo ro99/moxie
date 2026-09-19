@@ -1,7 +1,10 @@
 # Task 0037 — M4.1 common paged device attention at actual 32K context
 
-Status: active contract before implementation, authorized by the owner on
-2026-09-19.
+Status: active, partially implemented. Authorized by the owner on 2026-09-19.
+The kernel, its binding and the 32,768-row gate run on all three GPUs; the
+`moxie-state` binding, the injected-failure sweeps and the mutation battery are
+open. See "Still open" below — no acceptance item is claimed that is not
+evidenced there.
 
 ## Identity and authority
 
@@ -158,11 +161,129 @@ arch-check` 79 rejected fixtures, 21 accepted, 13 rules; `cargo xtask spec-check
 10 documents unchanged. No GPU lane was run, because nothing device-side changed:
 that is unmeasured, not passing.
 
-Still open, in the order the contract sets: the pinned-source audit and its
-adoption decision, the paged device state and its admission, the kernel and its
-executor binding, both SM86 UUIDs and SM120, the 32,768-actual-row gate, the
-admission/cancellation sweeps, and the support matrix.
+## Progress — 2026-09-19, the audit, the kernel and the 32,768-row gate
+
+### Pinned-source audit and its decision
+
+[ADR 0032](../decisions/adr/0032-first-paged-attention-kernel-is-written-here.md)
+records it. FlashAttention at `ce088ab9` is BSD-3, admits `cc_major >= 8` at
+runtime and gencodes `sm_120` on CUDA ≥ 12.8, but its FA2 sources are the
+`*_sm80.cu` generation whose own unsupported-arch message declares **sm80–sm90**,
+its host API is a PyTorch extension (`torch/python.h`, `at::Tensor`,
+`TORCH_CHECK`) rather than a C ABI, and its paged path requires
+`page_block_size % 256 == 0`. FlashInfer at `91bda04c` is Apache-2.0, lists SM 8.6
+and SM 12.0, and has a genuinely torch-free core, but its `paged_kv_t` fixes a
+page-table layout that task 0037 assigns to `moxie-state`, and its scheduling and
+workspace ownership live in the Python/JIT layer. **No upstream source was
+copied.** The kernel is written here, against the common ABI, and FlashInfer is
+named as the candidate to revisit when a slice is authorized to make a
+performance claim.
+
+### What now runs
+
+- `moxie_bf16_paged_attention_v1` (`crates/moxie-kernels/cuda/paged_attention.cu`):
+  one symbol for whole prefill, a prefill chunk and a single decode row, and one
+  path for MHA and GQA. Absolute positions throughout, masked keys excluded
+  rather than biased, FP32 scores/maximum/exponentials/partials with one BF16
+  output boundary, `expf` rather than `__expf`, and a 128-key online-softmax tile
+  deliberately independent of the page width. Compiled SASS-only for sm_86 and
+  sm_120, in its own fatbin with its own digest.
+- `SemanticKernelOp::PagedAttention` and `KernelOperand::PageIndex` in
+  `moxie-types`; two catalogue identities, one per SM, naming one symbol and
+  `WorkspaceExpression::Zero` — there is no materialized score matrix, which is
+  what lets a 32,768-row history be attended over without a buffer that grows
+  with it.
+- `moxie_executor::paged_attention`: the checked launch contract (geometry, page
+  mapping, absolute-position visibility, the append-before-attend rule, typed
+  capacity and overflow refusals) and, behind `driver`, `PagedAttentionRun` —
+  admission of the pages, table, query and output through `moxie-memory`, a
+  validated page table published once, dense appends that advance the committed
+  frontier **only** after a completion event, launch, and refusals that either
+  hand the source back or retain it under quarantine. `DeviceRange` gained a
+  checked partial write, which is what an append to one page needs.
+- `moxie_oracles::online_softmax` and the score-scale repair to
+  `attention_error_bound`, from the earlier progress entry, plus
+  `attention_error_bounds_at`: the same bound for a whole row, asserted bitwise
+  equal to the per-component entry point, because the per-component one
+  recomputes `Δs` per lane and costs four billion operations per head at 32K.
+
+### Evidence
+
+`cargo xtask-cuda test-gpu`: **51 cases, 51 passed, 0 failed, 0 skipped**; both
+required architectures qualified on real devices — GPU-3032cfa3 and GPU-81fe4578
+(RTX 3090, sm_86) and GPU-97fe4889 (RTX 5060 Ti, sm_120).
+
+- `paged_attention`: head dimensions 64 and 128, MHA and 4:1 GQA, full causal and
+  sliding (window 20) visibility, a declared scale of exactly 1.0 as well as the
+  conventional one, whole and chunked prefill compared **bit for bit**, one-row
+  decode, page widths 8/16/32 with tails, and a **reversed** page table. Every
+  component checked against `online_softmax` in FP64, cut into 37-key blocks the
+  kernel never uses, under `attention_error_bound` at the declared scale plus the
+  one declared BF16 boundary. Worst case measured: max 1.953e-3, RMS 7.524e-4,
+  p99 1.913e-3 over 1,280 components (sliding, scale 1.0); the grouped 128-wide
+  decode is max 4.875e-4 over 1,024.
+- `paged_attention_32k`: **32,768 actual BF16 rows materialized**, in 33,915,648 B
+  of admitted state. Whole-append and five-chunk construction produce
+  **bit-identical** decode results at row 32,767; a 24-row prefill chunk and 24
+  single-row decodes agree bit for bit; row 32,768 is appended and decoded. Against
+  FP64 at 32,768 visible rows: max 3.037e-5, RMS 5.625e-6, p99 1.519e-5, and after
+  the append max 2.953e-5 — **identical on all three GPUs**. Admitted capacity
+  (33,024), committed rows (32,769) and visible rows (32,769, or 4,096 under a
+  window) are reported separately, and the windowed answer is required to differ
+  from the full-history one.
+- Host: `cargo test --workspace` all suites passed, 0 failed, 0 skipped.
+  `cargo test -p moxie-executor --features driver` all suites passed.
+  `cargo fmt --all --check`, `cargo clippy` on the host and driver lanes with zero
+  warnings, `cargo xtask arch-check` (79 rejected fixtures, 21 accepted, 13 rules)
+  and `cargo xtask spec-check` (10 documents) all pass.
+
+### Two pre-existing failures found and repaired
+
+Neither is task 0037's code, both blocked its gates, and both are recorded in
+[the engineering log](../engineering-log.md).
+
+1. **The GPU lane was red at HEAD.** `xtask`'s hand-written `affine_linear` case
+   never gained the `group_index` operand when task 0035 versioned that ABI to v2,
+   so the output pointer was bound to the kernel's map parameter; the kernel read
+   group identities out of its own output and the illegal access poisoned the
+   process context, failing 34 cases across all three devices. `moxie-executor`'s
+   own device tests use the production binding and passed throughout, which is how
+   it survived M3 closure. Fixed by passing the absent map as the null operand it
+   is.
+2. **`grouped_device`'s negative fixture selected the wrong descriptor.** It found
+   its GeGLU descriptor by operation and SM alone; task 0035's `affine-expert-*`
+   entries share both and sort first in an id-sorted catalogue, so the planner was
+   handed a quantized descriptor for a BF16 plan and correctly refused it — before
+   the fixture had mutated anything. Fixed by selecting on the projection symbol.
+
+### Still open
+
+Acceptance 1 is met for the launch contract and the oracles; acceptance 2 and 3
+are met as described above; acceptance 5 is met for fmt, clippy, architecture,
+specification and the affected suites. **Not done, and not claimed:**
+
+- **The state authority binding.** `moxie-state` does not own these pages yet.
+  There is no transaction, branch, retention or truncation behind them, and the
+  committed frontier `PagedAttentionRun` reports is a fact about copied bytes
+  rather than a journal entry. This is the next bounded task and the largest
+  remaining piece of acceptance 1 and 4.
+- **Injected failure sweeps.** Cancellation and refusal before enqueue are
+  covered (the frontier and every prior byte are checked unchanged after a
+  refused append); *injected* launch and synchronization faults, in the style of
+  `driver_faults`, are not.
+- **A reclaimed base is host-checked only.** Every device case runs with
+  `history_base = 0`. The kernel takes the base and masks on absolute positions,
+  and the launch contract refuses a base that is not a whole number of pages, but
+  no device gate has actually attended over a history whose first logical row is
+  above zero. That is the shape a sliding layer reaches once it reclaims, so it
+  belongs in the state-binding task's gates rather than in prose.
+- **The task mutation battery** (acceptance 5) has not been run.
+- Admission-failure sweeps over every allocation, and the no-hidden-growth
+  check across decode steps, are not yet written.
+- MLA, host-backed streaming, COW forks, prefix reuse, FP16 cache, tensor cores
+  and any performance claim remain out of scope and unsupported by name.
 
 ## Result, filled after work
 
-No implementation or result is claimed by this contract.
+No completion is claimed. The task's own acceptance list is the gate, and four
+of its items are open above.

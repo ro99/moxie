@@ -52,6 +52,14 @@ pub use plan::{resource_request, validate_plan_binding};
 pub mod affine_linear;
 pub use affine_linear::{AffineLaunch, descriptor_serves, select_affine_linear_kernel};
 
+pub mod paged_attention;
+pub use paged_attention::{PageGeometry, PagedAttentionLaunch, select_paged_attention_kernel};
+
+#[cfg(feature = "driver")]
+pub use paged_attention::device::{
+    PagedAdmitRefused, PagedAttentionRun, PagedCloseRefused, PagedRunRefused,
+};
+
 pub mod residency;
 pub use residency::{ChunkSource, ShardSource, drain_reads, perform_read};
 

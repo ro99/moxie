@@ -77,6 +77,32 @@ pub const AFFINE_LINEAR_ABI: u32 = 2;
 /// launches, and that check needs this number.
 pub const AFFINE_LINEAR_TILE: u64 = 16;
 
+/// Task 0037's common paged attention. **One symbol for every calling pattern.**
+///
+/// Whole prefill, a prefill chunk and a single decode row are the same
+/// operation over different row counts, and multi-head attention is grouped
+/// attention with one query head per group. Splitting any of those into its own
+/// symbol would make the shapes that share a kernel today diverge tomorrow,
+/// which is the failure document 02 names. Visibility, head counts, head
+/// dimension, page width and the score scale are runtime parameters.
+pub const PAGED_ATTENTION: &str = "moxie_bf16_paged_attention_v1";
+pub const PAGED_ATTENTION_ABI: u32 = 1;
+/// Keys the kernel scores, maximizes and folds into its running partial before
+/// it looks at the next ones.
+///
+/// Public because it is a *contract* rather than an implementation detail: it
+/// is the block width of the online softmax the host oracle pins, and a host
+/// checking that a tile spans a page boundary needs the number. It is
+/// deliberately not the page width — pages are storage, tiles are scheduling,
+/// and a tile that matched the page would never exercise a tail.
+pub const PAGED_ATTENTION_TILE: u64 = 128;
+/// Threads per attention block, which is also the number of output components
+/// one block writes per pass.
+pub const PAGED_ATTENTION_THREADS: u32 = 128;
+/// The widest head dimension the image serves. The host refuses more rather
+/// than letting the kernel read past a row.
+pub const PAGED_ATTENTION_MAX_HEAD_DIM: u64 = 256;
+
 #[cfg(feature = "fatbin")]
 mod images {
     use moxie_types::{
@@ -103,6 +129,7 @@ mod images {
     pub const BF16_CHAIN_FATBIN: &[u8] = include_bytes!(env!("MOXIE_BF16_CHAIN_FATBIN"));
     pub const EXPERT_MLP_FATBIN: &[u8] = include_bytes!(env!("MOXIE_EXPERT_MLP_FATBIN"));
     pub const AFFINE_LINEAR_FATBIN: &[u8] = include_bytes!(env!("MOXIE_AFFINE_LINEAR_FATBIN"));
+    pub const PAGED_ATTENTION_FATBIN: &[u8] = include_bytes!(env!("MOXIE_PAGED_ATTENTION_FATBIN"));
 
     /// Compute capabilities actually compiled into [`SMOKE_FATBIN`].
     pub const KERNEL_ARCHS: &str = env!("MOXIE_KERNEL_ARCHS");
@@ -113,6 +140,7 @@ mod images {
     pub const BF16_CHAIN_FATBIN_SHA256: &str = env!("MOXIE_BF16_CHAIN_FATBIN_SHA256");
     pub const EXPERT_MLP_FATBIN_SHA256: &str = env!("MOXIE_EXPERT_MLP_FATBIN_SHA256");
     pub const AFFINE_LINEAR_FATBIN_SHA256: &str = env!("MOXIE_AFFINE_LINEAR_FATBIN_SHA256");
+    pub const PAGED_ATTENTION_FATBIN_SHA256: &str = env!("MOXIE_PAGED_ATTENTION_FATBIN_SHA256");
     /// What `nvcc --version` reported, verified against the pin in `build.rs`.
     pub const NVCC_VERSION: &str = env!("MOXIE_NVCC_VERSION");
     /// The host compiler nvcc drove. Recorded, not pinned.
@@ -338,6 +366,59 @@ mod images {
         KernelCatalogue::new(descriptors).expect("built-in descriptors are unique")
     }
 
+    /// Task 0037's paged attention, one descriptor per SM.
+    ///
+    /// Per architecture and not per shape: head dimension, head counts, page
+    /// width and visibility are runtime parameters of the one symbol, so a
+    /// descriptor per mask or per head geometry would be a catalogue that grows
+    /// with every checkpoint rather than with every kernel. Qualification does
+    /// not leak between architectures — SM86 and SM120 are separate identities,
+    /// and a passing Ampere run says nothing about Blackwell.
+    ///
+    /// The shape bounds are this operation's: `max_input` is the head
+    /// dimension the image serves, and `max_rows` is the query rows one launch
+    /// may carry. Neither is the history length, which is bounded by what the
+    /// state authority admitted rather than by the kernel.
+    pub fn paged_attention_catalogue() -> KernelCatalogue {
+        let hash = parse_sha256(PAGED_ATTENTION_FATBIN_SHA256);
+        let mut descriptors = Vec::new();
+        for sm in [SmVersion::SM86, SmVersion::SM120] {
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("bf16-paged-attention-v1-{}", sm.name())),
+                abi_version: super::PAGED_ATTENTION_ABI,
+                operation: SemanticKernelOp::PagedAttention,
+                inputs: vec![
+                    // Query rows, then the two paged payloads, then the table
+                    // that says where a logical page physically is.
+                    KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                    KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                    KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                    KernelOperand::PageIndex,
+                ],
+                output: ActivationPrecision::expect(Precision::Bf16),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::FinalBf16Rne,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape: KernelShapeBounds {
+                    max_rows: 65_536,
+                    max_input: super::PAGED_ATTENTION_MAX_HEAD_DIM,
+                    max_output: super::PAGED_ATTENTION_MAX_HEAD_DIM,
+                },
+                sm,
+                // Zero, and it is worth reading twice: the running maximum, the
+                // running denominator and the running value sum live in
+                // registers and shared memory for the whole launch. There is no
+                // workspace because there is no materialized score matrix —
+                // which is the property that lets a 32,768-row history be
+                // attended over without a buffer that grows with it.
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(super::PAGED_ATTENTION.to_string())],
+            });
+        }
+        KernelCatalogue::new(descriptors).expect("built-in descriptors are unique")
+    }
+
     fn descriptor(
         id: String,
         operation: SemanticKernelOp,
@@ -397,9 +478,9 @@ pub const fn profile_name(width: moxie_types::Precision) -> &'static str {
 pub use images::{
     AFFINE_LINEAR_FATBIN, AFFINE_LINEAR_FATBIN_SHA256, BF16_CHAIN_FATBIN, BF16_CHAIN_FATBIN_SHA256,
     EXPERT_MLP_FATBIN, EXPERT_MLP_FATBIN_SHA256, HOST_COMPILER_VERSION, KERNEL_ARCHS, NVCC_VERSION,
-    SMOKE_FATBIN, SMOKE_FATBIN_SHA256, SMOKE_FATBIN_SM86_ONLY, SMOKE_FATBIN_SM86_SHA256,
-    affine_linear_catalogue, axpy_capability, bf16_chain_catalogue, compiled_sm,
-    expert_mlp_catalogue,
+    PAGED_ATTENTION_FATBIN, PAGED_ATTENTION_FATBIN_SHA256, SMOKE_FATBIN, SMOKE_FATBIN_SHA256,
+    SMOKE_FATBIN_SM86_ONLY, SMOKE_FATBIN_SM86_SHA256, affine_linear_catalogue, axpy_capability,
+    bf16_chain_catalogue, compiled_sm, expert_mlp_catalogue, paged_attention_catalogue,
 };
 
 #[cfg(test)]

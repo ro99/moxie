@@ -389,11 +389,74 @@ pub fn attention_error_bound(
     component: usize,
     scale: f32,
 ) -> f64 {
+    let delta_s = score_error(query_head, visible_keys, scale);
+    component_bound(
+        delta_s,
+        query_head.len(),
+        visible_keys.len(),
+        visible_values,
+        weights,
+        component,
+    )
+}
+
+/// Every component's bound at once, for a caller checking a whole output row.
+///
+/// The same number [`attention_error_bound`] returns, component by component,
+/// and `the_two_bound_entry_points_agree_bit_for_bit` asserts exactly that:
+/// both call the same two functions with the same arguments, so there is one
+/// formula and not two. What changes is only that `Δs`, which does not depend
+/// on the component, is computed once instead of once per component.
+///
+/// This is not a micro-optimization. `Δs` costs `keys × head_dim`, so the
+/// per-component entry point costs `head_dim` times that for a full row: at the
+/// 32,768-row gate with a head dimension of 128 that is four billion operations
+/// per head, which is the difference between a gate that runs and one nobody
+/// runs.
+pub fn attention_error_bounds(
+    query_head: &[f32],
+    visible_keys: &[&[f32]],
+    visible_values: &[&[f32]],
+    weights: &[f64],
+) -> Result<Vec<f64>> {
+    attention_error_bounds_at(query_head, visible_keys, visible_values, weights, 1.0)
+}
+
+/// [`attention_error_bounds`] at the layer's declared score scale.
+pub fn attention_error_bounds_at(
+    query_head: &[f32],
+    visible_keys: &[&[f32]],
+    visible_values: &[&[f32]],
+    weights: &[f64],
+    scale: f32,
+) -> Result<Vec<f64>> {
+    let Some(first) = visible_values.first() else {
+        return Err(Error::InvalidRequest {
+            field: "visible_values",
+            detail: "no visible value to bound".into(),
+        });
+    };
+    let delta_s = score_error(query_head, visible_keys, scale);
+    let mut out = crate::try_vec(first.len())?;
+    for component in 0..first.len() {
+        out.push(component_bound(
+            delta_s,
+            query_head.len(),
+            visible_keys.len(),
+            visible_values,
+            weights,
+            component,
+        ));
+    }
+    Ok(out)
+}
+
+/// `Δs`, the worst scaled-score error over the visible keys.
+fn score_error(query_head: &[f32], visible_keys: &[&[f32]], scale: f32) -> f64 {
     use crate::metric::gamma;
     let head_dim = query_head.len();
     let scale = (scale as f64).abs();
-
-    let delta_s = visible_keys
+    visible_keys
         .iter()
         .map(|k| {
             let abs_sum: f64 = query_head
@@ -403,8 +466,18 @@ pub fn attention_error_bound(
                 .sum();
             gamma(head_dim as u64) * abs_sum * scale
         })
-        .fold(0f64, f64::max);
+        .fold(0f64, f64::max)
+}
 
+/// The three terms, for one output component, given `Δs`.
+fn component_bound(
+    delta_s: f64,
+    head_dim: usize,
+    keys: usize,
+    visible_values: &[&[f32]],
+    weights: &[f64],
+    component: usize,
+) -> f64 {
     let max_v = visible_values
         .iter()
         .map(|v| (v[component] as f64).abs())
@@ -415,7 +488,7 @@ pub fn attention_error_bound(
         .map(|(p, v)| (p * v[component] as f64).abs())
         .sum();
 
-    let k = visible_keys.len() as u64;
+    let k = keys as u64;
     let softmax_term = (2.0 * delta_s).exp_m1() * max_v;
     let steps = 2 * k + head_dim as u64 + 3;
     softmax_term + crate::metric::bound(k + 2, weighted) + steps as f64 * crate::metric::FP32_ETA
@@ -812,6 +885,62 @@ mod tests {
             attention_error_bound(&q, &keys, &values, &weights, 0, -1.0),
             "the bound must use the magnitude of the declared scale"
         );
+    }
+
+    #[test]
+    fn the_two_bound_entry_points_agree_bit_for_bit() {
+        // The row-at-a-time entry point exists because the per-component one
+        // recomputes `Δs` for every component, which is unaffordable at the
+        // 32,768-key gate. "The same bound, computed once" has to be a fact
+        // rather than an intention, so it is asserted as bitwise equality --
+        // not approximate agreement -- across scales and conditioning.
+        let hd = 6usize;
+        let n = 9usize;
+        let rows = (0..n)
+            .map(|i| {
+                (0..hd)
+                    .map(|d| (((i * 11 + d * 5) % 19) as f32 - 9.0) / 7.0)
+                    .collect::<Vec<f32>>()
+            })
+            .collect::<Vec<_>>();
+        let history = history_of(&rows);
+        let q: Vec<f32> = (0..hd).map(|d| (d as f32 - 3.0) / 4.0).collect();
+        for scale in [1.0f32, mha_scale(hd), 0.125] {
+            let (_, weights, visible) = reference(&q, &history, 8, Visibility::Causal, scale);
+            let keys: Vec<&[f32]> = visible
+                .iter()
+                .map(|i| history.keys[*i].as_slice())
+                .collect();
+            let values: Vec<&[f32]> = visible
+                .iter()
+                .map(|i| history.values[*i].as_slice())
+                .collect();
+            let row = attention_error_bounds_at(&q, &keys, &values, &weights, scale).unwrap();
+            assert_eq!(row.len(), hd);
+            for (d, bound) in row.iter().enumerate() {
+                assert_eq!(
+                    *bound,
+                    attention_error_bound(&q, &keys, &values, &weights, d, scale),
+                    "component {d} at scale {scale}"
+                );
+            }
+        }
+        // The default-scale entry point is the conventional one, and an empty
+        // visible set is a typed refusal rather than an empty vector.
+        let (_, weights, visible) = reference(&q, &history, 8, Visibility::Causal, 1.0);
+        let keys: Vec<&[f32]> = visible
+            .iter()
+            .map(|i| history.keys[*i].as_slice())
+            .collect();
+        let values: Vec<&[f32]> = visible
+            .iter()
+            .map(|i| history.values[*i].as_slice())
+            .collect();
+        assert_eq!(
+            attention_error_bounds(&q, &keys, &values, &weights).unwrap(),
+            attention_error_bounds_at(&q, &keys, &values, &weights, 1.0).unwrap()
+        );
+        assert!(attention_error_bounds(&q, &[], &[], &[]).is_err());
     }
 
     #[test]

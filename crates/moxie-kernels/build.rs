@@ -38,6 +38,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cuda/bf16_chain.cu");
     println!("cargo:rerun-if-changed=cuda/expert_mlp.cu");
     println!("cargo:rerun-if-changed=cuda/affine_linear.cu");
+    println!("cargo:rerun-if-changed=cuda/paged_attention.cu");
     println!("cargo:rerun-if-changed=cuda/affine_decode.cuh");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=archs.rs");
@@ -128,6 +129,15 @@ fn main() {
         ARCHS,
     );
 
+    let attention = build_source_fatbin(
+        &nvcc,
+        &host_cc,
+        &out,
+        "paged_attention.fatbin",
+        "cuda/paged_attention.cu",
+        ARCHS,
+    );
+
     println!(
         "cargo:rustc-env=MOXIE_SMOKE_FATBIN={}",
         out.join("smoke.fatbin").display()
@@ -154,6 +164,11 @@ fn main() {
         out.join("affine_linear.fatbin").display()
     );
     println!("cargo:rustc-env=MOXIE_AFFINE_LINEAR_FATBIN_SHA256={affine}");
+    println!(
+        "cargo:rustc-env=MOXIE_PAGED_ATTENTION_FATBIN={}",
+        out.join("paged_attention.fatbin").display()
+    );
+    println!("cargo:rustc-env=MOXIE_PAGED_ATTENTION_FATBIN_SHA256={attention}");
     println!(
         "cargo:rustc-env=MOXIE_NVCC_VERSION={}",
         one_line(&nvcc_version)

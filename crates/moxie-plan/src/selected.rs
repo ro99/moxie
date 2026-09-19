@@ -681,6 +681,15 @@ mod tests {
                 KernelOperand::Weight(WeightPrecision::expect(Precision::Bf16)),
                 KernelOperand::Weight(WeightPrecision::expect(Precision::Bf16)),
             ],
+            // Task 0037's operand list, built where that launch is built for
+            // the same reason: query activations, the two paged payloads, and
+            // the page table that says where a logical page physically is.
+            SemanticKernelOp::PagedAttention => vec![
+                KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                KernelOperand::PageIndex,
+            ],
         };
         SemanticKernelDescriptor {
             id: KernelId(format!("{}-{}", op.name(), sm.name())),

@@ -27,7 +27,14 @@ pub use selected::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use moxie_graph::{Graph, GraphId, IndexEncoding, OpParams, ValueId, ValueRole};
+// Re-exported rather than re-declared, for the reason chain.rs already relies
+// on: a consumer that binds a lowered node needs the vocabulary the node was
+// written in. `Visibility` joins the list with task 0037's attention launch,
+// which must mask on the layer's *declared* rule and not on a second enum that
+// drifts from it.
+pub use moxie_graph::{
+    Graph, GraphId, IndexEncoding, OpParams, ValueId, ValueRole, Visibility, reciprocal_sqrt_scale,
+};
 use moxie_graph::{GraphSignature, StateEffect, TensorSpec};
 use moxie_types::{DeviceUuid, Error, Precision, Result, SymbolTable, TensorLayout};
 

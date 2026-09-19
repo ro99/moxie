@@ -52,6 +52,15 @@ pub enum SemanticKernelOp {
     /// The gated expert feed-forward, evaluated per selected slot. The gate
     /// transform is part of the operation's identity, not a parameter of it.
     ExpertMlp(GateTransform),
+    /// Attention over paged key/value state: prefill, append and decode.
+    ///
+    /// One operation rather than three, because whole prefill, a prefill chunk
+    /// and a single decode row differ only in how many query rows a launch
+    /// serves. Visibility, head grouping and the score scale are semantic
+    /// *parameters* of the graph node, not separate operations: a descriptor
+    /// per mask would make the catalogue grow with every model that windows
+    /// differently, which is the shape document 02 forbids.
+    PagedAttention,
 }
 
 impl SemanticKernelOp {
@@ -62,6 +71,7 @@ impl SemanticKernelOp {
             Self::Residual => "residual",
             Self::ExpertMlp(GateTransform::GeluTanh) => "expert_mlp_gelu_tanh",
             Self::ExpertMlp(GateTransform::Silu) => "expert_mlp_silu",
+            Self::PagedAttention => "paged_attention",
         }
     }
 }
@@ -81,6 +91,14 @@ pub enum KernelOperand {
     /// it as an activation precision would invite a precision predicate to be
     /// applied to a row number.
     RouteIndex,
+    /// A `u32` physical page identity per logical page of one layer's history.
+    ///
+    /// The other half of document 02's integer roles, and distinct from
+    /// [`KernelOperand::RouteIndex`] because it indexes *storage* rather than
+    /// selection: a route index says which expert a row goes to, a page index
+    /// says where a row already is. Reading one as the other is a wrong answer
+    /// with the right shape, so they are separate roles.
+    PageIndex,
 }
 
 /// The one output-rounding boundary qualified by task 0012.
