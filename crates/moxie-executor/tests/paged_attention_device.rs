@@ -262,6 +262,22 @@ fn a_descriptor_that_does_not_serve_the_geometry_is_refused_at_admission() {
             }),
         ),
         (
+            "a rounding profile or layout this package does not declare",
+            // Nothing to write: `RoundingProfile` and `TensorLayout` each have
+            // exactly one variant today, so neither field can be given a wrong
+            // value. Membership compares them regardless, and
+            // `moxie-kernels`' own fixture asserts that. When either enum gains
+            // a second variant this case stops being a no-op and this comment
+            // stops being true.
+            Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                assert_eq!(d.rounding, moxie_types::RoundingProfile::FinalBf16Rne);
+                assert_eq!(d.layout, moxie_types::TensorLayout::ContiguousRowMajorV1);
+                // Change something that *is* variable, so this case still
+                // asserts a refusal rather than passing vacuously.
+                d.output = moxie_types::ActivationPrecision::expect(moxie_types::Precision::F32);
+            }),
+        ),
+        (
             "widened shape bounds",
             Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
                 d.shape.max_rows = u64::MAX;
@@ -291,6 +307,47 @@ fn a_descriptor_that_does_not_serve_the_geometry_is_refused_at_admission() {
     .map_err(|r| r.error)
     .expect("the package's own descriptor admits");
     run.close(&mut ledger).map_err(|r| r.error).expect("close");
+
+    // A head count that fits a `u32` but not the device's grid. CUDA's `y` and
+    // `z` limits are 65,535 while `x` reaches `2^31 - 1`, so this launch is
+    // legal as a value and unlaunchable on this hardware. It must be refused at
+    // **admission**, with nothing charged — not discovered by `cuLaunchKernel`
+    // after a query has already been copied, which is what happened before the
+    // limits were queried and checked.
+    let mut one_kv = geometry();
+    one_kv.kv_heads = 1;
+    let too_many_heads = u64::from(query_device(0).expect("query").max_grid.1) + 1;
+    let refused = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor_for(&ctx),
+        one_kv,
+        too_many_heads,
+        1,
+    )
+    .err()
+    .map(|r| r.error)
+    .expect("a grid of 65,536 blocks in y was accepted");
+    assert!(
+        matches!(refused, Error::UnsupportedKernel { .. }),
+        "{refused:?}"
+    );
+    assert!(ledger.outstanding().is_empty(), "a refusal stranded bytes");
+    // One below the limit is admissible, so the refusal is the limit biting
+    // rather than the head count being large.
+    PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor_for(&ctx),
+        one_kv,
+        too_many_heads - 1,
+        1,
+    )
+    .map_err(|r| r.error)
+    .expect("the largest launchable head count admits")
+    .close(&mut ledger)
+    .map_err(|r| r.error)
+    .expect("close");
 
     // A head ratio that does not divide is refused before any of that.
     let mut odd = geometry();

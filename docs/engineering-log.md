@@ -1435,3 +1435,28 @@ on the path whose entire purpose is to report that something could not be done.
 Worth carrying: when a new module sits beside an older one that solved the same
 problem, the older one's *strongest* check is the specification, not its shape.
 Read what it refuses, not what it computes.
+
+## 2026-09-19 — the second review, and what "checked before enqueue" has to mean
+
+The ABI-width repair moved every `u32` conversion into the launch constructor,
+and it was still incomplete: CUDA's grid `y` and `z` stop at **65,535** while
+`x` reaches `2^31 - 1`, so a head count that fits a `u32` can still be
+unlaunchable. A launch with 65,536 heads admitted, copied its query, and would
+have learned the truth from `cuLaunchKernel` — the exact shape the repair was
+written to eliminate, one field over.
+
+The fix is not a bigger constant. A launch is a host value and cannot know a
+device's limits; a run is bound to one device and can, so `DeviceCapability` now
+carries the **queried** maximum grid dimensions beside the peer-access flags it
+already discovers rather than assumes, and admission refuses a geometry the
+device cannot launch before charging anything for it.
+
+Two smaller lessons from the same round. A membership test that rebuilds a
+catalogue allocates a `Vec`, two `String`s per descriptor and a `format!` per id
+— on the path that exists to refuse under memory pressure; the identity question
+now has an allocation-free predicate pinned to the catalogue by a fixture, which
+is the same "two statements of one fact, asserted equal" shape `bf16_round` uses.
+And a test comment claimed 96 was not a multiple of the warp width. 96 is 3x32.
+The case tested a non-power-of-two width and nothing else for a week, because
+the comment was read as the coverage. Numbers in test prose are claims, and
+review checked this one by dividing.

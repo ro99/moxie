@@ -3,9 +3,10 @@
 ## Workspace identity
 
 - Writable root `/home/rodrigo/Developer/moxie`, branch `main`. This work is
-  `92a1ea4` (the oracle preparation) and `a15d0af` (the kernel, the binding and
-  the 32,768-row gate), plus the refusal gates committed after them. Fetch and
-  recheck `HEAD` before implementing.
+  four commits: `92a1ea4` (the oracle preparation), `a15d0af` (the kernel, the
+  binding and the 32,768-row gate), `11ae103` (the refusal gates) and `7164175`
+  (the first review's findings), plus the second review's corrective commit on
+  top. Fetch and recheck `HEAD` before implementing.
 - `coordinator.md` is unrelated carried work, still dirty, still outside every
   commit here. Preserve it.
 - Legacy `/home/rodrigo/Developer/strata` remains read-only at
@@ -22,8 +23,9 @@ table. In short:
 
 **Passed.** `cargo xtask-cuda test-gpu`: 51 cases, 51 passed, 0 failed, 0
 skipped, both architectures qualified. `paged_attention` covers head dimensions
-64, 96, 128 and 256 — the widest the catalogue declares, so its shape domain is
-qualified at the boundary rather than inside it — MHA and grouped 4:1 and 3:1, causal and sliding visibility, a declared scale of
+64, 100, 128, 200 and 256 — the widest the catalogue declares, so its shape
+domain is qualified at the boundary rather than inside it, with 100 and 200 the
+widths the 32-lane loop cannot divide — MHA and grouped 4:1 and 3:1, causal and sliding visibility, a declared scale of
 1.0 and the conventional one, whole versus chunked prefill compared bit for bit,
 one-row decode, page tails and a reversed page table, all against the FP64 oracle
 under `attention_error_bound`. `paged_attention_32k` materializes **32,768 actual
@@ -31,7 +33,8 @@ BF16 rows** in 33,915,648 B of admitted state, decodes at row 32,767 with whole
 and chunked construction bit-identical, appends row 32,768 and decodes again
 (max error 3.0e-5 against FP64, identical on all three GPUs), and reports
 admitted capacity, committed rows and visible rows separately. Host:
-`cargo test --workspace` 105 suites, 0 failed; `cargo test -p moxie-executor
+`cargo test --workspace` 106 suites, 0 failed (105 before this task added a
+driver-only test binary, which builds and reports zero tests on the host lane); `cargo test -p moxie-executor
 --features driver` every suite passed, including six new refusal cases and one
 new injected-fault case; both clippy lanes, `arch-check` and `spec-check` clean.
 
@@ -47,13 +50,19 @@ entry for a BF16 plan.
 **Skipped / unmeasured.** The task mutation battery was not written or run, on
 purpose (see below). No timing was taken anywhere.
 
-**Reviewed.** An independent review after those commits found four
+**Reviewed twice.** The first independent review found four
 closure-blocking defects — partial descriptor identity at the binding boundary,
 infallible allocations on refusal paths, ABI widths discovered after enqueue, and
 a declared shape envelope wider than the qualified one — plus a wrong BF16
 spacing in the gate and three stale records. All are repaired, and task 0037's
 record carries them one by one. The review's first finding is scope rather than a
-defect and became the next task below.
+defect and became the next task below. The second review found three more —
+diagnostics that could abort instead of refusing, a CUDA grid-`y` limit still
+discovered after the query copy, and a head dimension whose "unaligned" claim
+was false — plus two overstated records. All are repaired in the corrective
+commit; `DeviceCapability` now carries the device's queried maximum grid
+dimensions, and `moxie-kernels` exposes an allocation-free package-identity
+predicate so admission need not rebuild a catalogue to check membership.
 
 ## Decisions
 

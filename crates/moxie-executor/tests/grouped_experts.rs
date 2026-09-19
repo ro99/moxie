@@ -1270,6 +1270,8 @@ fn an_unknown_submission_state_withholds_the_weight_leases() {
         multiprocessor_count: 82,
         pci_bus_id: BUS.into(),
         peer_access: Vec::new(),
+        // The real limits on every NVIDIA architecture to date.
+        max_grid: (2_147_483_647, 65_535, 65_535),
     };
     let catalogue =
         moxie_types::KernelCatalogue::new(vec![moxie_types::SemanticKernelDescriptor {

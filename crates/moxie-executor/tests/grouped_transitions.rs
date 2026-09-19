@@ -429,6 +429,8 @@ fn plan_for(case: Case) -> ExpertPlan {
         multiprocessor_count: 82,
         pci_bus_id: BUS.into(),
         peer_access: Vec::new(),
+        // The real limits on every NVIDIA architecture to date.
+        max_grid: (2_147_483_647, 65_535, 65_535),
     };
     let on_device = case.candidate == Candidate::Device;
     let budget = ExpertBudget {

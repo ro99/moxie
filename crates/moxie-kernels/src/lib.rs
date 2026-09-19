@@ -103,6 +103,61 @@ pub const PAGED_ATTENTION_THREADS: u32 = 128;
 /// than letting the kernel read past a row.
 pub const PAGED_ATTENTION_MAX_HEAD_DIM: u64 = 256;
 
+/// The catalogue identity this build publishes for one architecture.
+///
+/// A `&'static str` per SM rather than a formatted name, because
+/// [`paged_attention_declares`] must answer without allocating. Gated with the
+/// images it identifies: without them there is no package to be a member of.
+#[cfg(feature = "fatbin")]
+const fn paged_attention_id(sm: moxie_types::SmVersion) -> Option<&'static str> {
+    match (sm.major, sm.minor) {
+        (8, 6) => Some("bf16-paged-attention-v1-sm_86"),
+        (12, 0) => Some("bf16-paged-attention-v1-sm_120"),
+        _ => None,
+    }
+}
+
+/// Whether this descriptor is one this build's paged attention package declares.
+///
+/// **Allocation-free, and that is the point.** The binding asks this question at
+/// admission, on the path that must produce a typed refusal under memory
+/// pressure; building a catalogue to answer it would allocate a `Vec`, two
+/// `String`s per descriptor and a `format!` for each id, any of which can abort
+/// instead of refusing (task 0019's rule). Every field the catalogue sets is
+/// compared here — including the ones nothing else checks, which is the whole
+/// reason the question is asked: a descriptor declaring another layout,
+/// accumulation policy, rounding profile, workspace or image would otherwise be
+/// executed by this build's own code with its declaration ignored.
+///
+/// `the_package_predicate_and_the_catalogue_agree` pins the two together, so
+/// this cannot drift from what [`images::paged_attention_catalogue`] builds.
+#[cfg(feature = "fatbin")]
+pub fn paged_attention_declares(descriptor: &moxie_types::SemanticKernelDescriptor) -> bool {
+    use moxie_types::{
+        AccumulationPolicy, ActivationPrecision, KernelOperand, Precision, RoundingProfile,
+        SemanticKernelOp, TensorLayout, WorkspaceExpression,
+    };
+    let Some(id) = paged_attention_id(descriptor.sm) else {
+        return false;
+    };
+    let bf16 = KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16));
+    descriptor.id.0 == id
+        && descriptor.abi_version == PAGED_ATTENTION_ABI
+        && descriptor.operation == SemanticKernelOp::PagedAttention
+        && descriptor.inputs.as_slice() == [bf16, bf16, bf16, KernelOperand::PageIndex]
+        && descriptor.output == ActivationPrecision::expect(Precision::Bf16)
+        && descriptor.accumulation == AccumulationPolicy::Bf16InF32Acc
+        && descriptor.rounding == RoundingProfile::FinalBf16Rne
+        && descriptor.layout == TensorLayout::ContiguousRowMajorV1
+        && descriptor.shape.max_rows == 65_536
+        && descriptor.shape.max_input == PAGED_ATTENTION_MAX_HEAD_DIM
+        && descriptor.shape.max_output == PAGED_ATTENTION_MAX_HEAD_DIM
+        && descriptor.workspace == WorkspaceExpression::Zero
+        && descriptor.image_sha256 == images::paged_attention_sha256()
+        && descriptor.symbols.len() == 1
+        && descriptor.symbols[0].0 == PAGED_ATTENTION
+}
+
 #[cfg(feature = "fatbin")]
 mod images {
     use moxie_types::{
@@ -384,7 +439,11 @@ mod images {
         let mut descriptors = Vec::new();
         for sm in [SmVersion::SM86, SmVersion::SM120] {
             descriptors.push(SemanticKernelDescriptor {
-                id: KernelId(format!("bf16-paged-attention-v1-{}", sm.name())),
+                id: KernelId(
+                    super::paged_attention_id(sm)
+                        .expect("this build declares an id for every targeted architecture")
+                        .to_string(),
+                ),
                 abi_version: super::PAGED_ATTENTION_ABI,
                 operation: SemanticKernelOp::PagedAttention,
                 inputs: vec![
@@ -450,6 +509,11 @@ mod images {
                 .map(|name| KernelSymbol((*name).to_string()))
                 .collect(),
         }
+    }
+
+    /// This build's paged attention image digest, parsed without allocating.
+    pub fn paged_attention_sha256() -> [u8; 32] {
+        parse_sha256(PAGED_ATTENTION_FATBIN_SHA256)
     }
 
     fn parse_sha256(value: &str) -> [u8; 32] {
@@ -532,6 +596,101 @@ mod tests {
         assert_eq!(BF16_CHAIN_FATBIN_SHA256.len(), 64);
         assert!(NVCC_VERSION.contains("13.0"), "{NVCC_VERSION}");
         assert!(!HOST_COMPILER_VERSION.is_empty());
+    }
+
+    #[cfg(feature = "fatbin")]
+    #[test]
+    fn the_package_predicate_and_the_catalogue_agree() {
+        // Two statements of one package's identity, pinned to each other. The
+        // predicate exists because admission cannot afford to build the
+        // catalogue; it is only worth having if it says the same thing.
+        let catalogue = paged_attention_catalogue();
+        assert_eq!(catalogue.descriptors().len(), 2);
+        for descriptor in catalogue.descriptors() {
+            assert!(
+                paged_attention_declares(descriptor),
+                "the predicate rejected {}, which this build declares",
+                descriptor.id.0
+            );
+        }
+
+        // And every field it compares actually changes the answer. A predicate
+        // that returned `true` for everything would pass the loop above.
+        let base = catalogue.descriptors()[0].try_clone().expect("clone");
+        /// One named change to a descriptor, applied alone.
+        type Change = Box<dyn Fn(&mut moxie_types::SemanticKernelDescriptor)>;
+        let mutations: Vec<(&str, Change)> = vec![
+            (
+                "id",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                    d.id = moxie_types::KernelId("invented".into());
+                }),
+            ),
+            (
+                "abi",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| d.abi_version += 1),
+            ),
+            (
+                "operation",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                    d.operation = moxie_types::SemanticKernelOp::Linear;
+                }),
+            ),
+            (
+                "operands",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                    d.inputs.pop();
+                }),
+            ),
+            (
+                "accumulation",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                    d.accumulation = moxie_types::AccumulationPolicy::F32;
+                }),
+            ),
+            (
+                "workspace",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                    d.workspace = moxie_types::WorkspaceExpression::RowsTimesF32;
+                }),
+            ),
+            (
+                "shape bounds",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                    d.shape.max_rows = u64::MAX;
+                }),
+            ),
+            (
+                "image digest",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| d.image_sha256 = [0; 32]),
+            ),
+            (
+                "symbol",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                    d.symbols[0] = moxie_types::KernelSymbol(AFFINE_LINEAR.to_string());
+                }),
+            ),
+            (
+                "architecture",
+                Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                    d.sm = moxie_types::SmVersion { major: 9, minor: 0 };
+                }),
+            ),
+        ];
+        for (what, change) in mutations {
+            let mut descriptor = base.try_clone().expect("clone");
+            change(&mut descriptor);
+            assert!(
+                !paged_attention_declares(&descriptor),
+                "a descriptor with a changed {what} was accepted as this package's"
+            );
+        }
+
+        // `layout` and `rounding` are compared too, and cannot be mutated here:
+        // `TensorLayout` and `RoundingProfile` each have exactly one variant
+        // today. When either gains a second, this list gains a case.
+        assert_eq!(base.layout, moxie_types::TensorLayout::ContiguousRowMajorV1);
+        assert_eq!(base.rounding, moxie_types::RoundingProfile::FinalBf16Rne);
     }
 
     #[test]

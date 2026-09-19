@@ -259,11 +259,18 @@ fn oracle(tensor: &AffineTensor, x: &[f32], rows: usize) -> (Vec<f32>, Vec<f32>)
 /// One ULP of BF16 at `value`'s magnitude.
 fn bf16_ulp(value: f32) -> f32 {
     let exponent = (value.abs().to_bits() >> 23) & 0xFF;
-    if exponent <= 7 {
-        // Subnormal territory for the 8-bit significand: the smallest step.
-        return f32::from_bits(1);
+    match exponent {
+        // The expected value is itself an F32 subnormal. BF16's own smallest
+        // subnormal is `2^-133`, and no BF16 spacing is finer than that.
+        0 => f32::from_bits(1 << 16),
+        // `2^(e-134)`, written as the F32 subnormal it is. This returned
+        // `f32::from_bits(1)` — `2^-149`, sixteen binades too small — until task
+        // 0037 found the same arithmetic wrong in its own copy. The correction
+        // only ever *relaxes* the gate, and only where the oracle's value is
+        // subnormal, so no verdict this lane has produced changes.
+        1..=7 => f32::from_bits(1 << (15 + exponent)),
+        _ => f32::from_bits((exponent - 7) << 23),
     }
-    f32::from_bits((exponent - 7) << 23)
 }
 
 #[derive(Debug)]

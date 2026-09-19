@@ -375,6 +375,16 @@ pub struct DeviceCapability {
     /// it depends on a patched kernel module that a driver upgrade can remove.
     /// See docs/evidence/topology-p2p.md.
     pub peer_access: Vec<(u32, bool)>,
+    /// The largest grid this device will launch, per dimension.
+    ///
+    /// Discovered for the same reason peer access is. The `y` and `z` limits are
+    /// **65,535** on every NVIDIA architecture to date while `x` is `2^31 - 1`,
+    /// and a binding that assumed a `u32` fits all three would submit its
+    /// operands and only then learn otherwise from `cuLaunchKernel` — turning a
+    /// refusal that was knowable before any device work into an unknown
+    /// submission. A launch geometry is checked against these before it is
+    /// admitted.
+    pub max_grid: (u32, u32, u32),
 }
 
 impl DeviceCapability {
@@ -526,6 +536,8 @@ mod tests {
             multiprocessor_count: 0,
             pci_bus_id: "0000:00:00.0".into(),
             peer_access: vec![(1, true), (2, false)],
+            // The real limits on every NVIDIA architecture to date.
+            max_grid: (2_147_483_647, 65_535, 65_535),
         }
     }
 

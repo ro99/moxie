@@ -741,6 +741,8 @@ mod tests {
             multiprocessor_count: 1,
             pci_bus_id: "synthetic".into(),
             peer_access: Vec::new(),
+            // The real limits on every NVIDIA architecture to date.
+            max_grid: (2_147_483_647, 65_535, 65_535),
         }
     }
 

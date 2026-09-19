@@ -176,6 +176,8 @@ fn capability(major: u32, minor: u32) -> DeviceCapability {
         multiprocessor_count: 1,
         pci_bus_id: "0000:00:00.0".into(),
         peer_access: Vec::new(),
+        // The real limits on every NVIDIA architecture to date.
+        max_grid: (2_147_483_647, 65_535, 65_535),
     }
 }
 
@@ -345,6 +347,118 @@ fn every_allocation_in_a_launch_derivation_degrades_rather_than_aborting() {
         // Either outcome is legal; an abort is not, and an abort ends the
         // process rather than this loop.
         let _ = result;
+        if !fired {
+            break;
+        }
+    }
+}
+
+/// Task 0037: a paged attention launch refuses under a failed allocation.
+///
+/// The same requirement, for the newer binding. Its checks compose prose for
+/// every refusal — head ratios, scales, positions, page alignment, ABI widths —
+/// and every one of them runs on the path a caller takes when it is short of
+/// memory. Sweeping the positions is what proves the sink is fallible
+/// everywhere rather than at the first refusal somebody happened to test.
+#[test]
+fn a_paged_attention_launch_refuses_when_its_prose_cannot_be_allocated() {
+    use moxie_executor::{AttentionLayer, PageGeometry, PagedAttentionLaunch};
+    use moxie_plan::Visibility;
+
+    let layer = AttentionLayer {
+        geometry: PageGeometry {
+            kv_heads: 2,
+            head_dim: 64,
+            page_tokens: 16,
+            pages: 4,
+        },
+        heads: 8,
+        scale: 1.0,
+        visibility: Visibility::Causal,
+    };
+    // Four refusals, each from a different check, each composing its own prose.
+    /// One named way to build a launch that must be refused.
+    type Refusal = Box<dyn Fn() -> moxie_types::Result<PagedAttentionLaunch>>;
+    let refusals: Vec<(&str, Refusal)> = vec![
+        (
+            "an indivisible head ratio",
+            Box::new(move || {
+                let mut bad = layer;
+                bad.heads = 3;
+                PagedAttentionLaunch::new(bad, 1, 0, 0, 1)
+            }),
+        ),
+        (
+            "a nonpositive declared scale",
+            Box::new(move || {
+                let mut bad = layer;
+                bad.scale = 0.0;
+                PagedAttentionLaunch::new(bad, 1, 0, 0, 1)
+            }),
+        ),
+        (
+            "a query past the frontier",
+            Box::new(move || PagedAttentionLaunch::new(layer, 1, 64, 0, 64)),
+        ),
+        (
+            "a history base inside a page",
+            Box::new(move || PagedAttentionLaunch::new(layer, 1, 40, 8, 40)),
+        ),
+        (
+            "a window wider than the ABI",
+            Box::new(move || {
+                let mut bad = layer;
+                bad.visibility = Visibility::SlidingWindow {
+                    window: u64::from(u32::MAX) + 1,
+                };
+                PagedAttentionLaunch::new(bad, 1, 0, 0, 1)
+            }),
+        ),
+    ];
+    for (what, refuse) in refusals {
+        // Position zero is the first allocation the refusal makes; the sweep
+        // walks forward until nothing allocates any more. Any position that
+        // aborts takes the whole binary with it, which is the regression.
+        for skip in 0..8 {
+            let (result, fired) = with_failure_at(skip, &refuse);
+            assert!(result.is_err(), "{what} was accepted at position {skip}");
+            if !fired {
+                break;
+            }
+        }
+    }
+}
+
+/// Task 0037: selecting a paged attention kernel refuses the same way.
+#[test]
+fn paged_attention_selection_refuses_when_its_prose_cannot_be_allocated() {
+    use moxie_executor::{AttentionLayer, PageGeometry, PagedAttentionLaunch};
+    use moxie_plan::Visibility;
+
+    let layer = AttentionLayer {
+        geometry: PageGeometry {
+            kv_heads: 2,
+            head_dim: 64,
+            page_tokens: 16,
+            pages: 4,
+        },
+        heads: 8,
+        scale: 1.0,
+        visibility: Visibility::Causal,
+    };
+    let launch = PagedAttentionLaunch::new(layer, 1, 0, 0, 1).expect("a legal launch");
+    // An empty catalogue: the "found none" refusal, which is the one that
+    // composes the longest prose.
+    let empty = KernelCatalogue::new(Vec::new()).expect("an empty catalogue");
+    let capability = capability(8, 6);
+    for skip in 0..8 {
+        let (result, fired) = with_failure_at(skip, || {
+            moxie_executor::select_paged_attention_kernel(&empty, &capability, &launch)
+        });
+        assert!(
+            result.is_err(),
+            "an empty catalogue selected something at position {skip}"
+        );
         if !fired {
             break;
         }

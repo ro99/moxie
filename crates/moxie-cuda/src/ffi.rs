@@ -34,6 +34,9 @@ pub struct CUuuid {
 }
 
 // Device attribute ordinals, from cuda.h. These are ABI-stable.
+pub const CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X: c_int = 5;
+pub const CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y: c_int = 6;
+pub const CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z: c_int = 7;
 pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;

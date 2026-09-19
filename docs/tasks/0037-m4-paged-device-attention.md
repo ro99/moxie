@@ -250,7 +250,10 @@ required architectures qualified on real devices — GPU-3032cfa3 and GPU-81fe45
   rows, leaves the frontier at four and quarantines the run — which then refuses
   to close or to read its own pages. With `cuLaunchKernel` made to fail, the
   attend refuses, retains the query, leaves the frontier unmoved and quarantines.
-- Host: `cargo test --workspace` 105 suites passed, 0 failed, 0 skipped.
+- Host: `cargo test --workspace` **106** suites passed, 0 failed, 0 skipped. The
+  count was 105 before this task's `paged_attention_device.rs` added a test
+  binary; it is `#![cfg(feature = "driver")]`, so on the host lane it builds and
+  reports zero tests.
   `cargo test -p moxie-executor --features driver` all suites passed.
   `cargo fmt --all --check`, `cargo clippy` on the host and driver lanes with zero
   warnings, `cargo xtask arch-check` (79 rejected fixtures, 21 accepted, 13 rules)
@@ -297,9 +300,16 @@ the first, which is scope rather than a defect and is now stated as such.
    loaded this build's fatbin unconditionally, so a descriptor declaring a
    different layout, accumulation policy, rounding profile, workspace or image
    would have been executed by code declaring something else. That is exactly
-   the defect task 0021's review found one package over. Admission now requires
-   the descriptor to **be** a member of `paged_attention_catalogue()`, as
-   `grouped_device` does, with seven mutation cases and a passing control.
+   the defect task 0021's review found one package over. Admission now asks
+   `moxie_kernels::paged_attention_declares`, an **allocation-free** predicate
+   that compares every field the catalogue sets — rebuilding the catalogue to
+   answer would allocate a `Vec`, two `String`s and a `format!` on the path that
+   must refuse under memory pressure. `the_package_predicate_and_the_catalogue_agree`
+   pins the predicate to the catalogue over ten mutations, and the binding's own
+   fixture covers seven more with a passing control. `layout` and `rounding` are
+   compared and **cannot be mutated**: `TensorLayout` and `RoundingProfile` each
+   have one variant today, which is recorded in both fixtures rather than
+   claimed as coverage.
 3. **Infallible allocations on refusal paths, repaired.** The refusal joined the
    key and value vectors with `Vec::append` to hand them back — a reallocation on
    the path whose purpose is to report a refusal — and the page-table refusal
@@ -317,13 +327,32 @@ the first, which is scope rather than a defect and is now stated as such.
    positions that could overflow.
 5. **A declared envelope wider than the qualified one, closed.** The catalogue
    advertises head dimensions through 256 while only 64 and 128 had run. The
-   device gate now covers **256**, the widest declared, and **96**, which is
-   neither a power of two nor a multiple of the warp width, on all three GPUs.
+   device gate now covers **256**, the widest declared, **100**, which the
+   32-lane loop cannot divide, and **200**, which cannot be divided *and* leaves
+   the second accumulator slot partly used — on all three GPUs. A first attempt
+   used 96 and called it unaligned; 96 is 3x32, so it tested a non-power-of-two
+   width and nothing else. The number is now spelled out in the case comment.
 6. **A wrong BF16 spacing in the gate, repaired.** `bf16_ulp` returned `2^-149`
    for every exponent field at or below seven instead of BF16's own `2^-133`
    floor — sixteen binades too small. It could only reject a correct kernel at
-   subnormal magnitudes, never accept a wrong one, and the affine lane carried
-   the same inline copy; one repaired helper now serves both.
+   subnormal magnitudes, never accept a wrong one. There were **three** copies of
+   the arithmetic: this lane's helper, the affine case's inline version and
+   `affine_linear_device.rs`. All three are corrected.
+7. **The grid limit, after the second review.** `check` proved the head count
+   fits a `u32`; CUDA's grid `y` stops at 65,535. A launch with 65,536 heads
+   therefore admitted and would have failed inside `cuLaunchKernel` *after* the
+   query copy — the same predictable-after-enqueue shape the ABI repair was
+   for. `DeviceCapability` now carries the device's **queried** maximum grid
+   dimensions, admission refuses a geometry this device cannot launch before
+   charging anything, `attend` re-applies it, and the device fixture proves both
+   the refusal and that one head fewer admits.
+8. **Fallible diagnostics throughout.** Every refusal in this module composed its
+   prose with `format!`, which aborts rather than refusing when an allocation
+   fails. The module now uses the same fallible sink the affine binding does, and
+   two host sweeps in `allocation_refusal.rs` arm a one-shot allocator failure
+   across every position of a launch refusal and a selection refusal. Admission
+   itself still inherits the `PlanRequest` abort that task 0029 is the bounded fix
+   for; that is pre-existing and is not claimed to be repaired here.
 
 Record gaps repaired: ADR 0032 said "no kernel exists yet" and now records the
 implementation and, as document 07 requires, **the legacy negative result** —

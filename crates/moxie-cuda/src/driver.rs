@@ -160,6 +160,11 @@ pub fn query_device(ordinal: u32) -> Result<DeviceCapability> {
         multiprocessor_count: attribute(dev, ffi::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32,
         pci_bus_id,
         peer_access,
+        max_grid: (
+            attribute(dev, ffi::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X)? as u32,
+            attribute(dev, ffi::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)? as u32,
+            attribute(dev, ffi::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z)? as u32,
+        ),
     })
 }
 

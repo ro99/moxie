@@ -46,10 +46,62 @@ const PAYLOAD_BYTES: u64 = 2;
 /// A page-table entry is one `u32`.
 const PAGE_ENTRY_BYTES: u64 = 4;
 
+/// A `String` that grows only through `try_reserve`.
+///
+/// The same device `moxie-format` and the affine binding use, for the reason
+/// task 0024's review established: `format!` **aborts** when an allocation
+/// fails, and the context that produces a refusal is exactly the context most
+/// likely to coincide with memory pressure.
+struct FallibleString(String);
+
+impl core::fmt::Write for FallibleString {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.0.try_reserve(s.len()).map_err(|_| core::fmt::Error)?;
+        self.0.push_str(s);
+        Ok(())
+    }
+}
+
+/// Compose prose fallibly. An empty detail is a shorter true statement, not an
+/// abort: the variant and the `&'static str` field are what a caller branches
+/// on either way.
+fn fallible(args: core::fmt::Arguments<'_>) -> String {
+    use core::fmt::Write;
+    let mut sink = FallibleString(String::new());
+    match sink.write_fmt(args) {
+        Ok(()) => sink.0,
+        Err(_) => String::new(),
+    }
+}
+
 fn invalid(field: &'static str, detail: impl Into<String>) -> Error {
     Error::InvalidRequest {
         field,
         detail: detail.into(),
+    }
+}
+
+/// [`Error::InvalidRequest`] whose prose is composed **fallibly**.
+fn invalid_fmt(field: &'static str, detail: core::fmt::Arguments<'_>) -> Error {
+    Error::InvalidRequest {
+        field,
+        detail: fallible(detail),
+    }
+}
+
+/// [`Error::Unsupported`] whose prose is composed **fallibly**.
+fn unsupported_fmt(capability: &'static str, reason: core::fmt::Arguments<'_>) -> Error {
+    Error::Unsupported {
+        capability,
+        reason: fallible(reason),
+    }
+}
+
+/// [`Error::UnsupportedKernel`] whose prose is composed **fallibly**.
+fn unsupported_kernel_fmt(operation: &'static str, detail: core::fmt::Arguments<'_>) -> Error {
+    Error::UnsupportedKernel {
+        operation,
+        detail: fallible(detail),
     }
 }
 
@@ -65,13 +117,6 @@ fn try_zeroed(len: usize) -> Result<Vec<u8>> {
         })?;
     out.resize(len, 0);
     Ok(out)
-}
-
-fn unsupported_kernel(operation: &'static str, detail: impl Into<String>) -> Error {
-    Error::UnsupportedKernel {
-        operation,
-        detail: detail.into(),
-    }
 }
 
 /// One layer's paged key/value geometry, as a launch sees it.
@@ -101,23 +146,23 @@ pub struct PageGeometry {
 impl PageGeometry {
     pub fn check(&self) -> Result<()> {
         if self.kv_heads == 0 || self.head_dim == 0 || self.page_tokens == 0 || self.pages == 0 {
-            return Err(invalid(
+            return Err(invalid_fmt(
                 "page_geometry",
-                format!(
+                format_args!(
                     "{} kv head(s) of {} in pages of {} row(s), {} page(s): none may be zero",
                     self.kv_heads, self.head_dim, self.page_tokens, self.pages
                 ),
             ));
         }
         if self.head_dim > moxie_kernels::PAGED_ATTENTION_MAX_HEAD_DIM {
-            return Err(Error::Unsupported {
-                capability: "attention_head_dim",
-                reason: format!(
+            return Err(unsupported_fmt(
+                "attention_head_dim",
+                format_args!(
                     "head dimension {} exceeds the {} this image serves",
                     self.head_dim,
                     moxie_kernels::PAGED_ATTENTION_MAX_HEAD_DIM
                 ),
-            });
+            ));
         }
         Ok(())
     }
@@ -164,15 +209,15 @@ impl PageGeometry {
     /// second page table.
     pub fn row_offset(&self, physical_page: u64, slot: u64) -> Result<u64> {
         if slot >= self.page_tokens {
-            return Err(invalid(
+            return Err(invalid_fmt(
                 "slot",
-                format!("slot {slot} in a page of {} row(s)", self.page_tokens),
+                format_args!("slot {slot} in a page of {} row(s)", self.page_tokens),
             ));
         }
         if physical_page >= self.pages {
-            return Err(invalid(
+            return Err(invalid_fmt(
                 "physical_page",
-                format!(
+                format_args!(
                     "physical page {physical_page} of {} admitted page(s)",
                     self.pages
                 ),
@@ -327,18 +372,18 @@ impl PagedAttentionLaunch {
             // enforces. A ratio that does not divide gives one group more query
             // heads than another, which is not a layout any released checkpoint
             // uses and not one this launch will invent.
-            return Err(invalid(
+            return Err(invalid_fmt(
                 "heads",
-                format!(
+                format_args!(
                     "{} query head(s) must be a nonzero multiple of {} key/value head(s)",
                     self.layer.heads, self.layer.geometry.kv_heads
                 ),
             ));
         }
         if !(self.layer.scale.is_finite() && self.layer.scale > 0.0) {
-            return Err(invalid(
+            return Err(invalid_fmt(
                 "attention_scale",
-                format!(
+                format_args!(
                     "score scale must be finite and positive, got {}",
                     self.layer.scale
                 ),
@@ -359,10 +404,10 @@ impl PagedAttentionLaunch {
             // withheld source. Every conversion this ABI performs is checked
             // where the value is constructed.
             if u32::try_from(window).is_err() {
-                return Err(Error::Unsupported {
-                    capability: "attention_window",
-                    reason: format!("a window of {window} rows exceeds this ABI's u32"),
-                });
+                return Err(unsupported_fmt(
+                    "attention_window",
+                    format_args!("a window of {window} rows exceeds this ABI's u32"),
+                ));
             }
         }
         if self.rows == 0 {
@@ -372,9 +417,9 @@ impl PagedAttentionLaunch {
             .history_base
             .is_multiple_of(self.layer.geometry.page_tokens)
         {
-            return Err(invalid(
+            return Err(invalid_fmt(
                 "history_base",
-                format!(
+                format_args!(
                     "history base {} is not a whole number of {}-row pages; a partially \
                      reclaimed page has no stable slot for its rows",
                     self.history_base, self.layer.geometry.page_tokens
@@ -398,9 +443,9 @@ impl PagedAttentionLaunch {
         // Every other scalar the launch hands the kernel, at the same width the
         // ABI declares. `grid` and `window` cannot fail after this.
         u32::try_from(self.rows).map_err(|_| {
-            invalid(
+            invalid_fmt(
                 "rows",
-                format!("{} query rows exceed a u32 launch grid", self.rows),
+                format_args!("{} query rows exceed a u32 launch grid", self.rows),
             )
         })?;
         for (value, field) in [
@@ -409,8 +454,12 @@ impl PagedAttentionLaunch {
             (self.layer.geometry.head_dim, "head_dim"),
             (self.layer.geometry.page_tokens, "page_tokens"),
         ] {
-            u32::try_from(value)
-                .map_err(|_| invalid(field, format!("{value} exceeds this ABI's u32 {field}")))?;
+            u32::try_from(value).map_err(|_| {
+                invalid_fmt(
+                    field,
+                    format_args!("{value} exceeds this ABI's u32 {field}"),
+                )
+            })?;
         }
         let history_end = self
             .history_base
@@ -423,9 +472,9 @@ impl PagedAttentionLaunch {
             .checked_sub(1)
             .expect("rows is nonzero");
         if self.first_position < self.history_base {
-            return Err(invalid(
+            return Err(invalid_fmt(
                 "first_position",
-                format!(
+                format_args!(
                     "query position {} precedes the retained history, which starts at {}",
                     self.first_position, self.history_base
                 ),
@@ -436,9 +485,9 @@ impl PagedAttentionLaunch {
             // causal query attends to itself, so its own key must already be
             // stored. A query beyond the frontier would silently attend to a
             // shorter history rather than to nothing.
-            return Err(invalid(
+            return Err(invalid_fmt(
                 "first_position",
-                format!(
+                format_args!(
                     "query positions {}..={last_query} run past a history holding [{}, \
                      {history_end}); append before attending",
                     self.first_position, self.history_base
@@ -482,12 +531,12 @@ impl PagedAttentionLaunch {
     pub fn window(&self) -> Result<u32> {
         match self.layer.visibility {
             Visibility::Causal => Ok(0),
-            Visibility::SlidingWindow { window } => {
-                u32::try_from(window).map_err(|_| Error::Unsupported {
-                    capability: "attention_window",
-                    reason: format!("a window of {window} rows exceeds this ABI's u32"),
-                })
-            }
+            Visibility::SlidingWindow { window } => u32::try_from(window).map_err(|_| {
+                unsupported_fmt(
+                    "attention_window",
+                    format_args!("a window of {window} rows exceeds this ABI's u32"),
+                )
+            }),
         }
     }
 
@@ -515,15 +564,15 @@ impl PagedAttentionLaunch {
     /// The launch grid: one block per query row and head.
     pub fn grid(&self) -> Result<(u32, u32, u32)> {
         let x = u32::try_from(self.rows).map_err(|_| {
-            invalid(
+            invalid_fmt(
                 "rows",
-                format!("{} query rows exceed a u32 launch grid", self.rows),
+                format_args!("{} query rows exceed a u32 launch grid", self.rows),
             )
         })?;
         let y = u32::try_from(self.layer.heads).map_err(|_| {
-            invalid(
+            invalid_fmt(
                 "heads",
-                format!("{} heads exceed a u32 launch grid", self.layer.heads),
+                format_args!("{} heads exceed a u32 launch grid", self.layer.heads),
             )
         })?;
         Ok((x, y, 1))
@@ -569,18 +618,18 @@ pub fn select_paged_attention_kernel(
     if matched == 0
         && let Some((reason, descriptor)) = first_rejection
     {
-        return Err(unsupported_kernel(
+        return Err(unsupported_kernel_fmt(
             "paged_attention",
-            format!(
+            format_args!(
                 "{} does not serve this launch: {reason}",
                 descriptor.id.0.as_str()
             ),
         ));
     }
     let Some(descriptor) = chosen.filter(|_| matched == 1) else {
-        return Err(unsupported_kernel(
+        return Err(unsupported_kernel_fmt(
             "paged_attention",
-            format!(
+            format_args!(
                 "expected exactly one paged attention descriptor for {} row(s) of {} head(s) \
                  by {} on sm_{}{}; found {matched}",
                 launch.rows,
@@ -603,9 +652,9 @@ pub fn descriptor_serves(
     launch.check()?;
     match descriptor_mismatch(descriptor, launch) {
         None => Ok(()),
-        Some(reason) => Err(unsupported_kernel(
+        Some(reason) => Err(unsupported_kernel_fmt(
             "paged_attention",
-            format!("{} does not serve this launch: {reason}", descriptor.id.0),
+            format_args!("{} does not serve this launch: {reason}", descriptor.id.0),
         )),
     }
 }
@@ -925,7 +974,7 @@ pub mod device {
     };
     use moxie_types::{DeviceTier, Error, HostTier, Result, Scope, SemanticKernelDescriptor, Tier};
 
-    use super::{PageGeometry, PagedAttentionLaunch, invalid};
+    use super::{PageGeometry, PagedAttentionLaunch, invalid, invalid_fmt, unsupported_kernel_fmt};
     use crate::arena::{DeviceArena, DeviceRange};
 
     /// 256-byte alignment, as every other device range in this crate uses.
@@ -1033,9 +1082,9 @@ pub mod device {
             if descriptor.sm.major != ctx.capability().compute_major
                 || descriptor.sm.minor != ctx.capability().compute_minor
             {
-                return Err(fail(super::unsupported_kernel(
+                return Err(fail(super::unsupported_kernel_fmt(
                     "paged_attention",
-                    format!(
+                    format_args!(
                         "descriptor {} is qualified for {} and this device is sm_{}{}",
                         descriptor.id.0,
                         descriptor.sm.name(),
@@ -1048,9 +1097,9 @@ pub mod device {
                 return Err(fail(error));
             }
             if max_rows == 0 || heads == 0 || !heads.is_multiple_of(geometry.kv_heads) {
-                return Err(fail(invalid(
+                return Err(fail(invalid_fmt(
                     "admission",
-                    format!(
+                    format_args!(
                         "{heads} query head(s) over {} key/value head(s) and {max_rows} row(s) \
                          per launch",
                         geometry.kv_heads
@@ -1096,20 +1145,35 @@ pub mod device {
             // still runs against whatever catalogue it is given — that is task
             // 0012's design — and this is the boundary where a selected
             // descriptor becomes a launch.
-            let package = moxie_kernels::paged_attention_catalogue();
-            if !package.descriptors().contains(&descriptor) {
-                return Err(fail(super::unsupported_kernel(
+            //
+            // Asked of a predicate rather than of a rebuilt catalogue:
+            // `paged_attention_catalogue()` allocates a `Vec`, two `String`s per
+            // descriptor and a `format!` for each id, and this runs on the path
+            // that must produce a typed refusal under memory pressure. The
+            // predicate compares every field the catalogue sets, allocates
+            // nothing, and is pinned to the catalogue by
+            // `the_package_predicate_and_the_catalogue_agree`.
+            if !moxie_kernels::paged_attention_declares(&descriptor) {
+                return Err(fail(unsupported_kernel_fmt(
                     "paged_attention",
-                    format!(
-                        "descriptor {} is not one of the {} this build's paged attention \
-                         package declares, so its declared layout, accumulation, rounding, \
-                         workspace and image are not bound to the code that would run",
-                        descriptor.id.0,
-                        package.descriptors().len()
+                    format_args!(
+                        "descriptor {} is not one this build's paged attention package \
+                         declares, so its layout, accumulation, rounding, workspace and \
+                         image are not bound to the code that would run",
+                        descriptor.id.0
                     ),
                 )));
             }
 
+            // The device's own grid limits, and this is why they are queried
+            // rather than assumed: `y` and `z` stop at 65,535 while `x` reaches
+            // `2^31 - 1`, so a head count that fits a `u32` can still be
+            // unlaunchable. Refusing here means a geometry this device cannot
+            // launch never gets pages admitted for it; `attend` re-applies the
+            // same check for the same reason it re-applies `descriptor_serves`.
+            if let Err(error) = check_grid(&widest, ctx) {
+                return Err(fail(error));
+            }
             let extents = match Extents::derive(&geometry, heads, max_rows) {
                 Ok(extents) => extents,
                 Err(error) => return Err(fail(error)),
@@ -1342,9 +1406,9 @@ pub mod device {
             let pages = self.geometry.pages;
             if table.is_empty() || table.len() as u64 > pages {
                 return Err(give_back(
-                    invalid(
+                    invalid_fmt(
                         "page_table",
-                        format!(
+                        format_args!(
                             "{} logical page(s) over {pages} admitted page(s)",
                             table.len()
                         ),
@@ -1371,9 +1435,9 @@ pub mod device {
                 let physical = u64::from(*physical);
                 if physical >= pages {
                     return Err(give_back(
-                        invalid(
+                        invalid_fmt(
                             "page_table",
-                            format!(
+                            format_args!(
                                 "logical page {logical} names physical page {physical} of \
                                  {pages} admitted"
                             ),
@@ -1383,9 +1447,9 @@ pub mod device {
                 }
                 if seen[physical as usize] {
                     return Err(give_back(
-                        invalid(
+                        invalid_fmt(
                             "page_table",
-                            format!("physical page {physical} is named twice"),
+                            format_args!("physical page {physical} is named twice"),
                         ),
                         table,
                     ));
@@ -1510,9 +1574,9 @@ pub mod device {
             };
             if keys.len() as u64 != want || values.len() as u64 != want {
                 return Err(give_back(
-                    invalid(
+                    invalid_fmt(
                         "append",
-                        format!(
+                        format_args!(
                             "{} key byte(s) and {} value byte(s) for {rows} row(s) of \
                              {row_bytes}",
                             keys.len(),
@@ -1626,9 +1690,9 @@ pub mod device {
                 .checked_add(rows)
                 .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
             if end > self.committed_rows {
-                return Err(invalid(
+                return Err(invalid_fmt(
                     "read_rows",
-                    format!(
+                    format_args!(
                         "rows {first_row}..{end} are not committed; the frontier is {}",
                         self.committed_rows
                     ),
@@ -1693,6 +1757,9 @@ pub mod device {
             if let Err(error) = super::descriptor_serves(&self.descriptor, launch) {
                 return Err(give_back(error, query));
             }
+            if let Err(error) = check_grid(launch, self.ctx) {
+                return Err(give_back(error, query));
+            }
             if *launch.geometry() != self.geometry
                 || launch.heads() != self.heads
                 || launch.rows() > self.max_rows
@@ -1707,9 +1774,9 @@ pub mod device {
             }
             if launch.history_base + launch.history_rows > self.committed_rows {
                 return Err(give_back(
-                    invalid(
+                    invalid_fmt(
                         "history_rows",
-                        format!(
+                        format_args!(
                             "a launch declaring [{}, {}) against a frontier of {}",
                             launch.history_base,
                             launch.history_base + launch.history_rows,
@@ -1732,9 +1799,9 @@ pub mod device {
                 Ok(want) if query.len() as u64 == want => {}
                 Ok(want) => {
                     return Err(give_back(
-                        invalid(
+                        invalid_fmt(
                             "query",
-                            format!(
+                            format_args!(
                                 "{} query byte(s) where the launch needs {want}",
                                 query.len()
                             ),
@@ -1924,9 +1991,15 @@ pub mod device {
 
         fn attribute(&self, error: Error) -> Error {
             match error {
+                // Fallible: this runs where a launch has already failed, which
+                // is where memory pressure is most likely, and `format!` there
+                // turns a typed device error into `SIGABRT`.
                 Error::DeviceLost { detail, .. } => Error::DeviceLost {
                     device: self.ctx.ordinal(),
-                    detail: format!("kernel {}: {detail}", self.descriptor.id.0),
+                    detail: super::fallible(format_args!(
+                        "kernel {}: {detail}",
+                        self.descriptor.id.0
+                    )),
                 },
                 other => other,
             }
@@ -1977,6 +2050,30 @@ pub mod device {
                 }
             }
         }
+    }
+
+    /// Whether this device will launch this launch's grid.
+    ///
+    /// A launch is a host value and cannot know a device's limits; a run is
+    /// bound to one device and can. One block per query row and head means the
+    /// head count lands on grid `y`, whose limit is 65,535 and not `u32::MAX` —
+    /// the distinction that would otherwise be discovered by `cuLaunchKernel`
+    /// after the query had already been copied.
+    fn check_grid(launch: &PagedAttentionLaunch, ctx: &RankContext) -> Result<()> {
+        let (x, y, z) = launch.grid()?;
+        let (max_x, max_y, max_z) = ctx.capability().max_grid;
+        if x > max_x || y > max_y || z > max_z {
+            return Err(unsupported_kernel_fmt(
+                "paged_attention",
+                format_args!(
+                    "a grid of {x}x{y}x{z} blocks exceeds this device's {max_x}x{max_y}x{max_z}: \
+                     {} query row(s) of {} head(s) cannot be launched here",
+                    launch.rows(),
+                    launch.heads()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Everything the kernel's ABI takes that is not an address.

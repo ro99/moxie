@@ -2848,15 +2848,16 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
             first_position: 26,
             appends: &[8, 12, 9],
         },
-        // A head dimension that is neither a power of two nor a multiple of the
-        // warp width, so the lane loop that splits a dot product across 32
-        // lanes has a genuine remainder and the accumulator loop leaves threads
-        // idle. Every earlier case divides evenly and would not notice.
+        // A head dimension the 32-lane loop genuinely cannot divide: 100 is
+        // three components for most lanes and four for the first four, so the
+        // remainder path is exercised rather than described. (96 is 3x32 and
+        // would not have been: an earlier version of this case claimed
+        // otherwise, which is why the number is spelled out here.)
         Case {
-            label: "gqa-96-unaligned",
+            label: "gqa-100-remainder",
             geometry: PageGeometry {
                 kv_heads: 2,
-                head_dim: 96,
+                head_dim: 100,
                 page_tokens: 16,
                 pages: 3,
             },
@@ -2867,6 +2868,26 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
             history: 33,
             first_position: 31,
             appends: &[16, 1, 16],
+        },
+        // A remainder **and** a partially used second accumulator slot: 200 is
+        // 6x32+8 across the lane loop, and 72 of the block's 128 threads own a
+        // second output component while the rest own one. Neither the 100-wide
+        // case (one slot) nor the 256-wide one (two full slots) reaches that.
+        Case {
+            label: "mha-200-partial-slot",
+            geometry: PageGeometry {
+                kv_heads: 1,
+                head_dim: 200,
+                page_tokens: 8,
+                pages: 3,
+            },
+            heads: 2,
+            scale: moxie_plan::reciprocal_sqrt_scale(200),
+            visibility: Visibility::SlidingWindow { window: 12 },
+            rows: 2,
+            history: 21,
+            first_position: 19,
+            appends: &[8, 13],
         },
         // A sliding window with a declared scale of exactly 1.0 -- the
         // Gemma-shaped layer the bound repair was about -- over a history whose
