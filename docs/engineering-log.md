@@ -1334,3 +1334,11 @@ The closure pass also reconciled the living capability records. Early README
 and task prose still said the repacker, W8 execution, map consumer and override
 paths were missing after those paths existed. A final gate is incomplete while
 the entry point sends the next builder toward already-finished work.
+
+The repository owner accepted the complete M3 packet on 2026-09-19 and directed
+the project to M4. The accepted boundary remains operation-level integer import,
+publication and dense/grouped execution over test inputs. It does not promote a
+partial artifact into checkpoint model support, convert correctness evidence
+into a performance claim, or fire experiment0007's model-execution trigger.
+Task0037 starts M4 with common paged device attention and actual 32,768-row
+state rather than a model-local attention loop or a nominal width setting.

@@ -2,37 +2,25 @@
 
 ## Current assignment and milestone handoff
 
-**[Task 0025](0025-m3-offline-repack-publication.md) is the next contract:
-M3 item 1's bounded offline repacker and canonical publication**, placed by
-[ADR 0022](../decisions/adr/0022-user-programs-and-canonical-write-authority.md)
-under [ADR 0021](../decisions/adr/0021-repack-is-a-moxie-program.md). It is
-**proposed, contract only — no implementation and no acceptance** — and it
-authorizes no bulk materialization.
+**[Task 0037](0037-m4-paged-device-attention.md) is the active contract:** the
+first bounded M4 slice, common BF16 paged device attention with persistent
+admitted KV, prefill/append/decode, full/sliding MHA/GQA and an actual 32,768-row
+gate on SM86 and SM120. It is a contract before implementation and claims no
+device-attention result yet.
 
-**It comes before M3 item 3, and the reason is not only roadmap order.** Repack
-is item 1 and the importers are item 2, which tasks 0018 and 0024 delivered
-ahead of it; ADR 0021 assigns repack to item 1 explicitly and states that M3's
-exit clause — "lossless (repack) claims have source-oracle evidence" — cannot
-close without the program that publishes what the evidence is about. And nothing
-persists what the importers produce: they build canonical tensors in memory that
-no manifest holds and no reader round-trips, so a kernel built first would have
-nothing to execute from but a test fixture. **M3 item 3 — the W4A16/W8A16 paths
-— is what follows**, and remains the largest gap in the milestone.
+**M3 is accepted and complete** (owner, 2026-09-19) through [task
+0036](0036-m3-final-closure.md). The [M3→M4
+handover](../handovers/2026-09-19-m3-closure-to-m4.md) records the frozen
+implementation, final mutation totals and the exact boundary that remains.
+M4 is authorized. M1 is complete; M2's five items are accepted and its formal
+milestone closure statement remains the owner's to make.
 
-**M1 complete (M1.5 closed 2026-09-12); M2's five items are all accepted — items
-1 and 2 on 2026-09-12, items 3, 4 and 5 on 2026-09-13 — the owner authorized
-M3 on 2026-09-13, and M3's first contract
-([task 0024](0024-m3-asymmetric-int4-pack-quantized-import.md)) is **accepted**
-by the owner the same day after three rounds of independent review.** M2's formal closure
-statement is still the owner's to make and is not claimed here. M3's own gates
-are already ruled on: O2 repack-only (ADR 0018) and O5 user-managed storage and
-conversion (ADRs 0020-0021), so no bulk download, copy or conversion may be started by
-an agent without a task naming artifact, revision, expected size and retention.
-See
-[the closure handover](../handovers/2026-09-12-m1-closure-to-m2.md) for M1's
-exit evidence gate by gate, and
-[the owner-gate register](../decisions/owner-gates.md) for the partial O1 ruling
-that designated `/fast/models/google/gemma-4-26B-A4B-it` as M2's BF16 MoE.
+O6/O7 remain open, so task0037 cannot turn correctness into a performance
+claim. Checkpoint roots and the legacy repository remain read-only. Any bulk
+artifact operation still needs a task naming artifact, revision, size and
+retention.
+
+## Historical accepted-task register
 
 Accepted through M1: tasks 0003–0015 (shared tensors and interpreter, sequence
 transactions, manifest and bounded reads, resource ledger and admission,

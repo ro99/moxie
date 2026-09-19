@@ -1,7 +1,7 @@
 # Task 0028 — M3 item 3: shared W4A16 / W8A16 execution
 
-Status: **implemented and measured; admission finding repaired; owner
-acceptance pending.** [Task 0032](0032-m3-admission-closure.md) closes the
+Status: **accepted by the owner as part of M3 closure, 2026-09-19.** Admission
+finding repaired. [Task 0032](0032-m3-admission-closure.md) closes the
 task0029 allocation work and the final continuation below closes mapped dense
 execution. Contract written before
 implementation; the result below is filled from the runs, not from the plan.

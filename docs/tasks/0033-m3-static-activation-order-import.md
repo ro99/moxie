@@ -1,6 +1,7 @@
 # Task 0033 — pinned static activation-order import
 
-Status: implemented and measured; independent review finding repaired, owner acceptance pending, 2026-09-16.
+Status: accepted by the owner as part of M3 closure, 2026-09-19; independent
+review finding repaired.
 
 ## Identity and authority
 
@@ -86,9 +87,10 @@ Architecture79negative/21positive/13rules and ten unchanged spec documents pass.
 Initial new tests failed because the generic BF16 weight reader correctly refused
 an affine tensor and because the header needed a larger explicit budget; they
 now use the checksummed canonical stream and the declared header budget.
-Independent review requested, acceptance pending. The later task0034 implements
-AutoRound/GPTQ maps and task0035 carries them through shared grouped execution;
-those continuations do not change this task's contiguous static-order result.
+Independent review's source-set finding is repaired, and the owner accepted the
+task through M3 closure. The later task0034 implements AutoRound/GPTQ maps and
+task0035 carries them through shared grouped execution; those continuations do
+not change this task's contiguous static-order result.
 
 
 ### Review correction

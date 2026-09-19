@@ -1,7 +1,7 @@
 # Task 0034 — shared GPTQ integer serialization import
 
-Status: implemented and measured; independent review found no blocking code
-defect; owner acceptance pending, 2026-09-19.
+Status: accepted by the owner as part of M3 closure, 2026-09-19; independent
+review found no blocking code defect.
 
 ## Identity and authority
 
@@ -66,7 +66,7 @@ material until evidence pins hashes; no new runtime dependency on Python.
 
 ## Result
 
-Implemented and measured; owner review pending.
+Implemented, measured and accepted through task0036.
 
 Shared GPTQ-v1 decoder and bounded publisher preserve I32 packed inputs,
 zero-minus-one semantics, source scale bits, tails and explicit g_idx. Generated
@@ -119,5 +119,5 @@ An independent read-only review of commit85daa05 verified group-map validation,
 residency and lifetime handling, CUDA indexing, the fused-axis refusal, and the
 override/map/MTP configuration coverage. It found no P0 or P1 code defect. Its
 P2 record and comment findings are reconciled in task0036, and the launch ABI
-version finding is repaired by commit0672d24. Owner acceptance remains a
-separate gate.
+version finding is repaired by commit0672d24. The owner accepted this scope
+through task0036 on 2026-09-19.

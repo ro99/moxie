@@ -1,7 +1,7 @@
 # Task 0031 — M3.1 battery closure: validation survivor, full T0006, T0028 regression
 
-Status: **implemented and measured**; final T0006 and T0028 passed on the same
-candidate; owner M3 decision pending.
+Status: **accepted by the owner as part of M3 closure, 2026-09-19**; final T0006
+and T0028 passed on the same candidate.
 The 2026-09-16 correction below supersedes the inherited acceptance premise and
 blocked CUDA status; the historical Result remains as provenance.
 

@@ -1,6 +1,6 @@
 # Task 0035 — canonical integer weights in shared grouped experts
 
-Status: implemented and measured; owner review pending, 2026-09-19.
+Status: accepted by the owner as part of M3 closure, 2026-09-19.
 
 ## Identity and authority
 
@@ -47,8 +47,8 @@ replacement tests pass. Temporary fixtures are test-owned and deleted.
 
 ## Result
 
-Implemented canonical artifact binding and mapped grouped execution; owner review
-remains.
+Implemented canonical artifact binding and mapped grouped execution; accepted
+through task0036.
 Shared host packed views, CUDA scalar decoders, grouped planner byte extents,
 lease-based executor and catalogue now accept INT4/INT8 and mixed BF16 integer
 projection pairs. The CUDA affine decoder is shared with dense execution and
@@ -90,7 +90,7 @@ not implemented by this test.
 Affected host suites, driver clippy, architecture and specification checks pass.
 The broad host run first found an obsolete CLI diagnostic assertion; it now
 checks the exact unsupported auto-gptq format, and repack/storage suites pass.
-Still required: owner review and the task0036 closure report.
+Task0036 records the final review and owner acceptance.
 Per-channel grouped formats and heterogeneous formats within one projection
 remain explicitly unsupported: `CanonicalSource` returns the typed capability
 names `per-channel grouped weights` and `heterogeneous expert formats` before

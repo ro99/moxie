@@ -18,16 +18,17 @@ reads as instructions.
 
 ## Active assignment
 
-**M3 is authorized** (owner, 2026-09-13). M1 is complete, M2's five items are
+**M3 is accepted and complete** (owner, 2026-09-19; [task
+0036](docs/tasks/0036-m3-final-closure.md)). M1 is complete, M2's five items are
 all accepted, and M2's formal closure statement remains the owner's to make.
+**M4 is authorized** as the next milestone.
 
 | | |
 |---|---|
-| Accepted | [Task 0024](docs/tasks/0024-m3-asymmetric-int4-pack-quantized-import.md) — M3 item 2's asymmetric INT4 import (owner, 2026-09-13, after three review rounds). **Importer-only**: no execution, no quality claim. |
-| Implemented and independently reviewed; owner acceptance pending | [Task 0025](docs/tasks/0025-m3-offline-repack-publication.md) — M3 item 1's offline repack, and [task 0026](docs/tasks/0026-m3-canonical-safetensors-publication.md) — the same publication as **safetensors shards** under the owner's packaging ruling. Corrected after **two** independent reviews: ten findings, then fourteen, all fixed with a regression each. **Bytes only**; final publication closure evidence is in tasks0031/0036. |
-| Implemented, measured; owner acceptance pending | [Task 0028](docs/tasks/0028-m3-shared-w4a16-w8a16-execution.md) — shared dense W4A16/W8A16. [Task 0032](docs/tasks/0032-m3-admission-closure.md) repairs task 0029's allocation closure: full actual admission sweeps at all 48 positions on all three GPUs; rejection/relocation sweeps at 59/59/47 positions; allocation-free fragmented release. Owner approved the private fallible shared handle on 2026-09-16. Final T0028 on the closure candidate caught 24/24 defects and held its expected control. Synthetic activations, no timing. |
-| Closure candidate | [Task 0031](docs/tasks/0031-m3-battery-closure.md): final T0006 caught 63/63 defects and held all three controls; final T0028 also passes on the same source identity. [Task 0034](docs/tasks/0034-m3-gptq-integer-import.md): GPTQ/AutoRound import, mapped dense execution and override/MTP coverage implemented; independent review found no blocking code defect. [Task 0035](docs/tasks/0035-m3-quantized-grouped-experts.md): quantized grouped experts, artifact binding, mapped GPU execution and cancellation pass on all three GPUs. |
-| Owner decision | [Task 0036](docs/tasks/0036-m3-final-closure.md) reconciles the final evidence and is ready for the owner's review and M3 decision. [M3 recovery direction](docs/handovers/2026-09-16-m3-recovery-direction.md) remains the sequencing authority; earlier handovers remain historical evidence. |
+| Accepted M3.1 | Tasks [0025](docs/tasks/0025-m3-offline-repack-publication.md), [0026](docs/tasks/0026-m3-canonical-safetensors-publication.md), [0030](docs/tasks/0030-m3-repack-correctness-package.md) and [0031](docs/tasks/0031-m3-battery-closure.md): bounded canonical safetensors publication and final T0006, 63/63 defects caught plus three controls held. Repacking remains provisional under ADR0027. |
+| Accepted M3.2 | Tasks [0024](docs/tasks/0024-m3-asymmetric-int4-pack-quantized-import.md), [0033](docs/tasks/0033-m3-static-activation-order-import.md) and [0034](docs/tasks/0034-m3-gptq-integer-import.md): compressed-tensors and GPTQ/AutoRound integer import, signed scales, maps, overrides/MTP and named refusals. |
+| Accepted M3.3 | Tasks [0028](docs/tasks/0028-m3-shared-w4a16-w8a16-execution.md), [0032](docs/tasks/0032-m3-admission-closure.md) and [0035](docs/tasks/0035-m3-quantized-grouped-experts.md): shared dense and grouped W4A16/W8A16 on both SM86 GPUs and SM120; final T0028 caught 24/24 defects and held its control. Synthetic activations and routes; no timing. |
+| Active M4 | [Task 0037](docs/tasks/0037-m4-paged-device-attention.md): first bounded M4 slice, common BF16 paged device attention with actual 32,768-row state, prefill/append/decode and full/sliding GQA semantics. [M3→M4 handover](docs/handovers/2026-09-19-m3-closure-to-m4.md) carries the exact boundary. |
 
 **Nothing in this repository generates a token from a checkpoint.** Tensors have
 been imported, expert bytes made resident, real expert weights computed with,

@@ -15,7 +15,7 @@ released model**, and no model-throughput or model-quality claim has been
 established.
 
 [Task 0018](docs/tasks/0018-m3-compressed-tensors-int8-importer.md) began the
-shared affine import path. The current M3 candidate imports compressed-tensors
+shared affine import path. The accepted M3 scope imports compressed-tensors
 and GPTQ/AutoRound integer weights, publishes canonical safetensors artifacts,
 and executes shared dense and grouped-expert W4A16/W8A16 operations. **An
 operation is not model support**: the executed activations and routes are test
@@ -210,7 +210,8 @@ link widths and simultaneous-transfer behavior to be measured rather than assume
 
 ## Current state and the next assignment
 
-**M3 is authorized** (owner, 2026-09-13). M1 is complete and M2's five items are all accepted; M2's
+**M3 is accepted and complete** (owner, 2026-09-19). M4 is authorized as the
+next milestone. M1 is complete and M2's five items are all accepted; M2's
 formal closure statement remains the owner's to make. The list below is the historical record of
 how the earlier milestones closed and is not the current assignment — [AGENTS.md](AGENTS.md) holds
 that, and is the only file that does.
@@ -222,11 +223,12 @@ SM86 GPUs and the SM120 GPU through the shared residency authority. One
 published real module has also executed with synthetic activations. These are
 operation-level gates: **nothing in this repository generates a token from a
 checkpoint**, and no model-output, quality, or performance claim follows from
-them. The final mutation batteries and record reconciliation pass on the frozen
-M3 candidate. Repository-owner review and the milestone decision remain;
-[AGENTS.md](AGENTS.md) is the live assignment ledger.
+them. The final mutation batteries and record reconciliation passed on the
+accepted M3 candidate. [Task 0037](docs/tasks/0037-m4-paged-device-attention.md)
+is the first bounded M4 slice; [AGENTS.md](AGENTS.md) is the live assignment
+ledger.
 
-**M1.4 complete; M1.5 active.** The owner accepted
+**Historical M1 transition: M1.4 complete; M1.5 was next.** The owner accepted
 [task 0012](docs/tasks/0012-m1-selected-bf16-device-chain.md) on 2026-09-10 after independent
 verification of the selected BF16 device chain and all five review corrections through `1138a2a`.
 The accepted scope includes explicit refusal of unqualified RMS underflow; it establishes no
@@ -258,10 +260,10 @@ limited to 256 requested context tokens, with bounded graph/scratch sizes.
 It has no tokenizer, text stop/EOS, HTTP or checkpoint support. Use `--help` for the
 diagnostic CLI and `--cancel-after N` for deterministic cancellation testing.
 Final independent review through `3f13784` found no remaining blocker, and the owner
-accepted task 0015 on 2026-09-11. This closes M1.4 within the explicit synthetic
-host-reference scope; **M1.5 is active**. Model/checkpoint integration and M4 device
+accepted task 0015 on 2026-09-11. This closed M1.4 within the explicit synthetic
+host-reference scope; **M1.5 was active at that point**. Model/checkpoint integration and M4 device
 attention remain separate work. The
-[active handover](docs/handovers/2026-09-11-m1.4-closure-to-m1.5.md) records the
+[contemporaneous handover](docs/handovers/2026-09-11-m1.4-closure-to-m1.5.md) records the
 accepted boundary and next contract.
 
 Assignments use [TASK.md](docs/spec/templates/TASK.md), never "do everything necessary to make model

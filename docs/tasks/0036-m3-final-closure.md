@@ -1,7 +1,6 @@
 # Task 0036 — reconcile and close M3.1 / M3.2 / M3.3
 
-Status: closure candidate complete; owner review and M3 decision pending,
-2026-09-19.
+Status: **accepted by the repository owner; M3 complete, 2026-09-19.**
 
 ## Identity and authority
 
@@ -123,8 +122,16 @@ zero, restored a clean tree and left HEAD unchanged. Their log hashes are
 respectively. The five earlier publication survivors are caught in the final
 T0006, and both mapped-execution mutations are caught in the final T0028.
 
-Acceptance clauses 1 through 4 now have committed implementation and measured
+Acceptance clauses 1 through 4 have committed implementation and measured
 evidence, and the records named by clause 5 agree with that evidence. The
 candidate makes no model-output, quality, token-generation or performance
-claim, and experiment0007 remains pending. Clause 5's repository-owner review
-and the owner's M3 decision remain.
+claim, and experiment0007 remains pending.
+
+## Owner decision
+
+On 2026-09-19 the repository owner reviewed the closure packet and instructed:
+“document and push. we are ready to m4”. This accepts M3.1, M3.2 and M3.3 at
+implementation commits `85daa05` and `0672d24`, with closure record `54b52e3`,
+within the limits stated above. M3 is complete. M4 is authorized as the next
+milestone; this decision does not resolve O6/O7, retain offline repacking on
+performance grounds, or claim checkpoint token generation.
