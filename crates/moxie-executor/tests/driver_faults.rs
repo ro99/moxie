@@ -2036,15 +2036,15 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     let ctx = RankContext::acquire(RankId(37_001), 0).expect("a rank context");
     let stream = Stream::new(&ctx).expect("a stream");
     let capability = query_device(0).expect("query device 0");
-    let launch = |rows: u64, first_position: u64, history_rows: u64| PagedAttentionLaunch {
+    let layer = moxie_executor::AttentionLayer {
         geometry,
         heads: HEADS,
         scale: moxie_plan::reciprocal_sqrt_scale(64),
         visibility: Visibility::Causal,
-        rows,
-        first_position,
-        history_base: 0,
-        history_rows,
+    };
+    let launch = |rows: u64, first_position: u64, history_rows: u64| {
+        PagedAttentionLaunch::new(layer, rows, first_position, 0, history_rows)
+            .expect("the fixture's launches are legal")
     };
     let descriptor = moxie_executor::select_paged_attention_kernel(
         &moxie_kernels::paged_attention_catalogue(),

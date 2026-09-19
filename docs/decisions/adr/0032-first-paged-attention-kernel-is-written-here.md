@@ -1,6 +1,8 @@
 # ADR 0032 — write the first paged attention kernel here, adopt no upstream source yet
 
-- **Date / status:** 2026-09-19 / decided before device code; no kernel exists yet.
+- **Date / status:** 2026-09-19 / decided before device code and **implemented**:
+  `moxie_bf16_paged_attention_v1` is qualified on both SM86 GPUs and SM120 under
+  task 0037.
 - **Classification:** implementation choice under the authorized task0037, from a
   **source audit**. Nothing here is measured: O6 and O7 are open and this ADR
   makes no speed claim in either direction.
@@ -54,6 +56,37 @@ JIT-packaged layer rather than in those headers. Task0037 assigns page identity
 and admission to `moxie-state` and `moxie-memory`; importing that type now would
 settle a contract this repository has not written yet, in the first slice, to
 get code whose benefit cannot be measured until O6/O7 are resolved.
+
+## The legacy result, preserved
+
+Document 07 requires a rejected result to be kept with its mechanism and exact
+scope, and task 0037 names legacy attention as evidence rather than architecture.
+Read at the frozen `2dc566eb`:
+
+- `kernels/cuda/detail/backend_flash_attention.inc.cuh` is qualified for exactly
+  this hardware — it refuses anything but SM86 and SM120 in its own words — and
+  is still not the path. Its upload layout appends the **packed keys and values**
+  to the query on every call, in FP32 (`sizeof(float)`), so the visible history
+  crosses the bus per invocation; that is R04's failure written as an allocation
+  plan. Its `f64_dot_f32_score_f32_accum` numerics additionally size a score
+  scratch at `query_rows × query_heads × logical_rows` floats — a materialized
+  score matrix that grows with the history, which is what an online softmax
+  exists not to need.
+- `kernels/cuda/detail/backend_dense_page.inc.cuh`'s `bf16_kv_attention` does
+  keep a persistent BF16 cache, and it is single-row decode only: it requires
+  `queries.size() == query_heads × head_dim`, takes the next key and value row as
+  host spans and returns FP32 output. It cannot serve prefill or a chunk, so it
+  is not one operation over different row counts.
+- The genuinely paged and absorbed paths sit under the DeepSeek model directory
+  and in `backend_absorbed_attention.inc.cuh`, tied to that family's geometry and
+  latent state.
+
+So the legacy tree contains a kernel for our two architectures **and** the
+architecture this repository is required not to have: per-call history upload, a
+score buffer that scales with context, FP32 host staging per step, and paged
+support that belongs to one model family. Copying it was never the option; the
+useful part is the negative result above, which is why it is recorded rather
+than summarized as "legacy is not the architecture to copy".
 
 ## Decision
 

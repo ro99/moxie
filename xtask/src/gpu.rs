@@ -18,8 +18,9 @@ use moxie_cuda::{
     query_device,
 };
 use moxie_executor::{
-    DeviceArena, Lease, OwnedBinding, PageGeometry, PagedAttentionLaunch, PagedAttentionRun,
-    SelectedAdmitRefused, SelectedReservedPlan, Turn, Upload, select_paged_attention_kernel,
+    AttentionLayer, DeviceArena, Lease, OwnedBinding, PageGeometry, PagedAttentionLaunch,
+    PagedAttentionRun, SelectedAdmitRefused, SelectedReservedPlan, Turn, Upload,
+    select_paged_attention_kernel,
 };
 use moxie_graph::{
     Bindings, Graph, GraphBuilder, Op, OpParams, OracleEvidence, OracleId, OracleRegistry,
@@ -2466,12 +2467,12 @@ fn affine_linear(cap: &DeviceCapability) -> Result<Outcome, Error> {
                 let reference = bf16_round(acc);
                 let device = f32::from_bits(u32::from(got[m * out_features + n]) << 16);
                 let difference = (device - reference).abs();
-                let exponent = (reference.abs().to_bits() >> 23) & 0xFF;
-                let ulp = if exponent <= 7 {
-                    f32::from_bits(1)
-                } else {
-                    f32::from_bits((exponent - 7) << 23)
-                };
+                // The same spacing function the attention gate uses. It was
+                // duplicated here and wrong below `2^-126` in both copies; see
+                // `bf16_ulp`. The correction only ever *relaxes* the bound, and
+                // only for subnormal expected values, so no verdict this lane
+                // has ever produced changes.
+                let ulp = bf16_ulp(reference);
                 // The owner's two-clause gate of 2026-09-14: 2 ULP at the
                 // oracle's magnitude, or within the reduction's own resolution
                 // where the result has cancelled below what BF16 can express.
@@ -2614,11 +2615,12 @@ fn check_attention(
     let head_dim = fixture.geometry.head_dim as usize;
     let group = fixture.heads / fixture.geometry.kv_heads;
     let got = decode_u16(output);
-    let block = fixture.query(launch.first_position, launch.rows);
+    let block = fixture.query(launch.first_position(), launch.rows());
     let mut device_values: Vec<f32> = Vec::new();
     let mut oracle_values: Vec<f64> = Vec::new();
-    for row in 0..launch.rows {
-        let visible: Vec<u64> = (launch.history_base..launch.history_base + launch.history_rows)
+    for row in 0..launch.rows() {
+        let visible: Vec<u64> = (launch.history_base()
+            ..launch.history_base() + launch.history_rows())
             .filter(|key| launch.allows(row, *key))
             .collect();
         if visible.is_empty() {
@@ -2649,14 +2651,14 @@ fn check_attention(
                 &key_views,
                 &value_views,
                 &allowed,
-                launch.scale,
+                launch.scale(),
                 // Neither the kernel's tile nor the page width.
                 37,
             )
             .map_err(|e| Error::Numerical {
                 detail: format!("{label}: the oracle refused: {e}"),
             })?;
-            let weights = softmax_weights(&query_row, &key_views, launch.scale);
+            let weights = softmax_weights(&query_row, &key_views, launch.scale());
             // Every component's bound in one pass. The per-component entry
             // point recomputes the score-error term for each lane, which at
             // the 32,768-row gate is four billion operations per head; the two
@@ -2666,7 +2668,7 @@ fn check_attention(
                 &key_views,
                 &value_views,
                 &weights,
-                launch.scale,
+                launch.scale(),
             )
             .map_err(|e| Error::Numerical {
                 detail: format!("{label}: the bound refused: {e}"),
@@ -2722,12 +2724,26 @@ fn softmax_weights(query: &[f32], keys: &[&[f32]], scale: f32) -> Vec<f64> {
 }
 
 /// One BF16 ulp at this magnitude.
+///
+/// BF16 carries eight significand bits, so at a value whose F32 exponent field
+/// is `e` the spacing is `2^(e-134)` — `f32::from_bits((e - 7) << 23)` while
+/// that is a normal F32, and an F32 **subnormal** below it. The floor is BF16's
+/// own smallest subnormal, `2^-133`, which is `f32::from_bits(1 << 16)`.
+///
+/// The earlier version returned `f32::from_bits(1)`, `2^-149`, for every
+/// exponent field at or below seven: sixteen binades too small, and wrong in the
+/// strict direction. It cannot make a gate accept a wrong answer, but it can
+/// make one reject a correct kernel whose expected value is subnormal — which
+/// is exactly the region document 07 asks to be stressed rather than avoided.
 fn bf16_ulp(value: f32) -> f32 {
     let exponent = (value.abs().to_bits() >> 23) & 0xFF;
-    if exponent <= 7 {
-        f32::from_bits(1)
-    } else {
-        f32::from_bits((exponent - 7) << 23)
+    match exponent {
+        // The expected value is itself an F32 subnormal: no BF16 spacing is
+        // finer than BF16's own smallest subnormal.
+        0 => f32::from_bits(1 << 16),
+        // `2^(e-134)`, written as the F32 subnormal it is.
+        1..=7 => f32::from_bits(1 << (15 + exponent)),
+        _ => f32::from_bits((exponent - 7) << 23),
     }
 }
 
@@ -2762,6 +2778,17 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
         first_position: u64,
         /// Appends to build the history with, in order. They must sum to it.
         appends: &'static [u64],
+    }
+
+    impl Case {
+        fn layer(&self) -> AttentionLayer {
+            AttentionLayer {
+                geometry: self.geometry,
+                heads: self.heads,
+                scale: self.scale,
+                visibility: self.visibility,
+            }
+        }
     }
 
     let cases = [
@@ -2801,6 +2828,46 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
             first_position: 99,
             appends: &[1, 63, 36],
         },
+        // The widest head dimension the catalogue advertises. Declaring a
+        // shape domain and qualifying a subset of it is the gap document 07
+        // calls out by name, so the boundary of the claim is measured rather
+        // than assumed.
+        Case {
+            label: "mha-256-widest-declared",
+            geometry: PageGeometry {
+                kv_heads: 1,
+                head_dim: moxie_kernels::PAGED_ATTENTION_MAX_HEAD_DIM,
+                page_tokens: 8,
+                pages: 4,
+            },
+            heads: 2,
+            scale: moxie_plan::reciprocal_sqrt_scale(moxie_kernels::PAGED_ATTENTION_MAX_HEAD_DIM),
+            visibility: Visibility::Causal,
+            rows: 3,
+            history: 29,
+            first_position: 26,
+            appends: &[8, 12, 9],
+        },
+        // A head dimension that is neither a power of two nor a multiple of the
+        // warp width, so the lane loop that splits a dot product across 32
+        // lanes has a genuine remainder and the accumulator loop leaves threads
+        // idle. Every earlier case divides evenly and would not notice.
+        Case {
+            label: "gqa-96-unaligned",
+            geometry: PageGeometry {
+                kv_heads: 2,
+                head_dim: 96,
+                page_tokens: 16,
+                pages: 3,
+            },
+            heads: 6,
+            scale: 1.0,
+            visibility: Visibility::Causal,
+            rows: 2,
+            history: 33,
+            first_position: 31,
+            appends: &[16, 1, 16],
+        },
         // A sliding window with a declared scale of exactly 1.0 -- the
         // Gemma-shaped layer the bound repair was about -- over a history whose
         // early pages are entirely outside the window.
@@ -2825,16 +2892,13 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let mut checked = 0usize;
     for case in &cases {
         let fixture = AttentionFixture::build(case.geometry, case.heads, case.history, 0x0037_0001);
-        let launch = PagedAttentionLaunch {
-            geometry: case.geometry,
-            heads: case.heads,
-            scale: case.scale,
-            visibility: case.visibility,
-            rows: case.rows,
-            first_position: case.first_position,
-            history_base: 0,
-            history_rows: case.history,
-        };
+        let launch = PagedAttentionLaunch::new(
+            case.layer(),
+            case.rows,
+            case.first_position,
+            0,
+            case.history,
+        )?;
         let descriptor = select_paged_attention_kernel(&catalogue, cap, &launch)?;
         let mut ledger = measured_ledger(&ctx)?;
         let mut run = PagedAttentionRun::admit(
@@ -2918,16 +2982,12 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
                     break;
                 }
                 let rows = width.min(case.rows - done);
-                let chunk_launch = PagedAttentionLaunch {
-                    rows,
-                    first_position: case.first_position + done,
-                    ..launch
-                };
+                let chunk_launch = launch.at(rows, case.first_position + done)?;
                 let out = run
                     .attend(
                         &stream,
                         &chunk_launch,
-                        fixture.query_bytes(chunk_launch.first_position, rows),
+                        fixture.query_bytes(chunk_launch.first_position(), rows),
                     )
                     .map_err(|r| r.error)?;
                 check_attention(&fixture, &chunk_launch, &out, case.label)?;
@@ -2936,16 +2996,12 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
             }
             let remaining = case.rows - done;
             if remaining > 0 {
-                let chunk_launch = PagedAttentionLaunch {
-                    rows: remaining,
-                    first_position: case.first_position + done,
-                    ..launch
-                };
+                let chunk_launch = launch.at(remaining, case.first_position + done)?;
                 let out = run
                     .attend(
                         &stream,
                         &chunk_launch,
-                        fixture.query_bytes(chunk_launch.first_position, remaining),
+                        fixture.query_bytes(chunk_launch.first_position(), remaining),
                     )
                     .map_err(|r| r.error)?;
                 chunked.extend_from_slice(&out);
@@ -2960,10 +3016,10 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
 
         // A launch declaring more history than was committed is refused rather
         // than attending over pages nothing wrote.
-        let beyond = PagedAttentionLaunch {
-            history_rows: case.history + 1,
-            ..launch
-        };
+        // One row past the frontier. The launch itself is legal -- the
+        // geometry admits it -- and the run must refuse it because those rows
+        // were never committed.
+        let beyond = launch.over(0, case.history + 1)?;
         if run
             .attend(
                 &stream,
@@ -3023,19 +3079,22 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let catalogue = moxie_kernels::paged_attention_catalogue();
     let fixture = AttentionFixture::build(geometry, heads, CONTEXT + 1, 0x0037_8000);
 
-    let decode =
-        |first_position: u64, history_rows: u64, visibility: Visibility| PagedAttentionLaunch {
-            geometry,
-            heads,
-            scale,
-            visibility,
-            rows: 1,
+    let decode = |first_position: u64, history_rows: u64, visibility: Visibility| {
+        PagedAttentionLaunch::new(
+            AttentionLayer {
+                geometry,
+                heads,
+                scale,
+                visibility,
+            },
+            1,
             first_position,
-            history_base: 0,
+            0,
             history_rows,
-        };
+        )
+    };
     let descriptor =
-        select_paged_attention_kernel(&catalogue, cap, &decode(0, 1, Visibility::Causal))?;
+        select_paged_attention_kernel(&catalogue, cap, &decode(0, 1, Visibility::Causal)?)?;
 
     // Build A: the whole history in one append.
     let mut ledger = measured_ledger(&ctx)?;
@@ -3093,7 +3152,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
 
     // The last row of the 32,768 attends over the whole history. Whole and
     // chunked construction must produce the same bytes, not merely close ones.
-    let last = decode(CONTEXT - 1, CONTEXT, Visibility::Causal);
+    let last = decode(CONTEXT - 1, CONTEXT, Visibility::Causal)?;
     let query = fixture.query_bytes(CONTEXT - 1, 1);
     let from_whole = whole
         .attend(&stream, &last, query.clone())
@@ -3108,7 +3167,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     println!(
         "    {} 32k-decode visible={} committed={} capacity={} state={} B {summary}",
         cap.sm(),
-        last.history_rows,
+        last.history_rows(),
         whole.committed_rows(),
         whole.capacity_rows()?,
         whole.arena_bytes()
@@ -3116,25 +3175,21 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
 
     // A multi-row prefill chunk at the far end, against the same rows decoded
     // one at a time. Same operation, different row counts, identical bytes.
-    let chunk = PagedAttentionLaunch {
-        rows: chunk_rows,
-        first_position: CONTEXT - chunk_rows,
-        ..last
-    };
+    let chunk = last.at(chunk_rows, CONTEXT - chunk_rows)?;
     let block = whole
         .attend(
             &stream,
             &chunk,
-            fixture.query_bytes(chunk.first_position, chunk_rows),
+            fixture.query_bytes(chunk.first_position(), chunk_rows),
         )
         .map_err(|r| r.error)?;
     let lane_bytes = (heads * geometry.head_dim * 2) as usize;
     for row in 0..chunk_rows {
-        let position = chunk.first_position + row;
+        let position = chunk.first_position() + row;
         let one = whole
             .attend(
                 &stream,
-                &decode(position, CONTEXT, Visibility::Causal),
+                &decode(position, CONTEXT, Visibility::Causal)?,
                 fixture.query_bytes(position, 1),
             )
             .map_err(|r| r.error)?;
@@ -3157,7 +3212,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
             whole.committed_rows()
         )));
     }
-    let next = decode(CONTEXT, CONTEXT + 1, Visibility::Causal);
+    let next = decode(CONTEXT, CONTEXT + 1, Visibility::Causal)?;
     let after = whole
         .attend(&stream, &next, fixture.query_bytes(CONTEXT, 1))
         .map_err(|r| r.error)?;
@@ -3165,7 +3220,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     println!(
         "    {} 32k-append-decode visible={} committed={} capacity={} {summary}",
         cap.sm(),
-        next.history_rows,
+        next.history_rows(),
         whole.committed_rows(),
         whole.capacity_rows()?
     );
@@ -3176,7 +3231,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         CONTEXT,
         CONTEXT + 1,
         Visibility::SlidingWindow { window: 4_096 },
-    );
+    )?;
     let slid = whole
         .attend(&stream, &windowed, fixture.query_bytes(CONTEXT, 1))
         .map_err(|r| r.error)?;

@@ -1406,3 +1406,32 @@ be handled *around* the arithmetic rather than through it. A sliding window
 reaches that case as soon as the window has moved past a whole tile — which is
 to say, always, in production — and the host fixture and the kernel now pin it
 from both sides.
+
+## 2026-09-19 — a checked value has to be one nobody can edit afterwards
+
+Review of the first paged attention slice found four defects that share one
+sentence: a check is worth nothing if the thing it checked can change, or if
+something else is trusted in its place.
+
+`PagedAttentionLaunch` had public fields and a public `check`. Every caller did
+call it, so every test passed — and an instance edited after the check, or built
+by a caller that skipped it, would have carried positions the kernel indexes
+with. `AffineLaunch` learned this in task 0028 and the lesson did not travel.
+The fields are private now, with `new`, `at` and `over` as the only ways in.
+
+The same shape, twice more. The binding checked a descriptor field by field and
+then loaded **this build's** fatbin regardless, so a descriptor declaring another
+layout, accumulation policy, rounding profile or image would have run on code
+that declares something else; `grouped_device` already required whole-catalogue
+membership for exactly that reason, and the new module reimplemented the weaker
+check instead of the stronger one. And the ABI's `u32` window conversion sat
+*after* the query copy, so a refusal that was knowable before any device work
+became an unknown submission and a quarantined run.
+
+The fourth was the oldest rule in this workspace: a refusal path that allocates.
+Handing an append's rows back joined them with `Vec::append`, which reallocates,
+on the path whose entire purpose is to report that something could not be done.
+
+Worth carrying: when a new module sits beside an older one that solved the same
+problem, the older one's *strongest* check is the specification, not its shape.
+Read what it refuses, not what it computes.

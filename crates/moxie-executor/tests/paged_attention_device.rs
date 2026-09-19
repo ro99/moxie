@@ -18,7 +18,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use moxie_cuda::{RankContext, Stream, device_count, query_device};
-use moxie_executor::{PageGeometry, PagedAttentionLaunch, PagedAttentionRun};
+use moxie_executor::{AttentionLayer, PageGeometry, PagedAttentionLaunch, PagedAttentionRun};
 use moxie_kernels::cpu_expert::to_bf16_bits;
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_plan::Visibility;
@@ -45,17 +45,18 @@ fn geometry() -> PageGeometry {
 const HEADS: u64 = 4;
 const MAX_ROWS: u64 = 2;
 
-fn launch(rows: u64, first_position: u64, history_rows: u64) -> PagedAttentionLaunch {
-    PagedAttentionLaunch {
+fn layer() -> AttentionLayer {
+    AttentionLayer {
         geometry: geometry(),
         heads: HEADS,
         scale: moxie_plan::reciprocal_sqrt_scale(64),
         visibility: Visibility::Causal,
-        rows,
-        first_position,
-        history_base: 0,
-        history_rows,
     }
+}
+
+fn launch(rows: u64, first_position: u64, history_rows: u64) -> PagedAttentionLaunch {
+    PagedAttentionLaunch::new(layer(), rows, first_position, 0, history_rows)
+        .expect("the fixture's launches are legal")
 }
 
 /// Deterministic BF16 bytes: `rows` stored rows, or one query block.
@@ -219,6 +220,78 @@ fn a_descriptor_that_does_not_serve_the_geometry_is_refused_at_admission() {
         .is_err(),
         "a non-BF16 cache operand was accepted; unsupported must fail to match"
     );
+    // **Whole identity, not field by field.** Each of these keeps operation,
+    // ABI, operands, output, symbol and shape bounds intact and changes one
+    // field that admission would otherwise never look at -- and admission loads
+    // this build's image regardless, so a descriptor declaring a different
+    // layout, accumulation, rounding, workspace or image would have been
+    // executed by code that declares something else. The binding requires the
+    // descriptor to *be* one the built-in package declares, which is the only
+    // form of the check that cannot be half-satisfied.
+    /// One named change to a descriptor, applied alone.
+    type Change = Box<dyn Fn(&mut moxie_types::SemanticKernelDescriptor)>;
+    let identity: Vec<(&str, Change)> = vec![
+        (
+            "a different accumulation policy",
+            Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                d.accumulation = moxie_types::AccumulationPolicy::F32;
+            }),
+        ),
+        (
+            "a workspace this kernel does not take",
+            Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                d.workspace = moxie_types::WorkspaceExpression::RowsTimesF32;
+            }),
+        ),
+        (
+            "a zeroed image digest",
+            Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                d.image_sha256 = [0; 32];
+            }),
+        ),
+        (
+            "an ABI version this binding does not speak",
+            Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                d.abi_version += 1;
+            }),
+        ),
+        (
+            "an identity that is not in the package",
+            Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                d.id = moxie_types::KernelId("bf16-paged-attention-v1-invented".to_string());
+            }),
+        ),
+        (
+            "widened shape bounds",
+            Box::new(|d: &mut moxie_types::SemanticKernelDescriptor| {
+                d.shape.max_rows = u64::MAX;
+            }),
+        ),
+    ];
+    for (what, change) in identity {
+        let mut descriptor = descriptor_for(&ctx);
+        change(&mut descriptor);
+        assert!(
+            PagedAttentionRun::admit(&mut ledger, &ctx, descriptor, geometry(), HEADS, MAX_ROWS)
+                .is_err(),
+            "a descriptor with {what} was accepted for a launch"
+        );
+    }
+    // The control, and it is load-bearing: the package's own descriptor still
+    // admits, so the refusals above are the check biting rather than the
+    // fixture failing.
+    let run = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor_for(&ctx),
+        geometry(),
+        HEADS,
+        MAX_ROWS,
+    )
+    .map_err(|r| r.error)
+    .expect("the package's own descriptor admits");
+    run.close(&mut ledger).map_err(|r| r.error).expect("close");
+
     // A head ratio that does not divide is refused before any of that.
     let mut odd = geometry();
     odd.kv_heads = 3;

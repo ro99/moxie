@@ -6,13 +6,26 @@
 //! serves, turn admitted ranges into addresses, and wait on the event that says
 //! the answer exists.
 //!
-//! **What this module is not.** It is not a state owner. It holds no pages
-//! between launches, publishes no frontier and decides no retention: those are
-//! `moxie-state`'s, and a second copy of them here is the "second state
-//! authority" task 0037 forbids by name. A launch is handed ranges that were
-//! already admitted and already filled, and it reads them. It is not an
-//! admission authority either — every byte it names was charged by
-//! `moxie-memory` before this module saw it.
+//! **What this module is and is not.** `PagedAttentionRun` does hold pages
+//! between launches and does track how many rows it has observed committed —
+//! that is what "persistent device state" means physically. What it does not do
+//! is *decide* anything about them: no retention rule, no transaction, no
+//! branch, no truncation, no lineage. Those are `moxie-state`'s, and the
+//! frontier here is a fact about copied bytes rather than a journal entry.
+//! Until that binding exists, these mechanics are provisional and belong to the
+//! task that will replace them; a second copy of the state authority's
+//! decisions here is the thing task 0037 forbids by name. Admission is
+//! `moxie-memory`'s throughout: every byte this module names was charged before
+//! it was allocated.
+//!
+//! **This is not yet the common execution path.** Document 04 requires attention
+//! to consume device tensor and page-table handles, with host reference paths as
+//! explicit separate implementations rather than compulsory staging. The
+//! `attend` below takes host query bytes and returns host output bytes, which is
+//! a bring-up interface: it is how a gate drives the kernel, not how a graph
+//! will. `moxie-plan` still refuses every stateful graph, and no
+//! `OpParams::Attention` node lowers to this yet. Both are named work in task
+//! 0037's record, not properties of the design.
 //!
 //! **Why a separate module from `affine_linear.rs`.** Different operation,
 //! different operand set — a paged payload plus a page table rather than a
@@ -173,12 +186,15 @@ impl PageGeometry {
     }
 }
 
-/// One launch of the attention kernel: query rows against a visible history.
+/// One layer's attention semantics: what does not change between launches.
 ///
-/// Whole prefill, one prefill chunk and a single decode row are the same value
-/// with a different `rows`, which is the point of having one kernel.
+/// Head geometry, the declared score scale and the visibility rule belong to
+/// the layer; how many query rows a launch carries and where they sit belong to
+/// the launch. Separating them is what lets a decode row and a prefill chunk be
+/// built from one description without restating the parameters that must not
+/// differ between them.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PagedAttentionLaunch {
+pub struct AttentionLayer {
     pub geometry: PageGeometry,
     /// Query heads. Equal to `geometry.kv_heads` for multi-head attention, a
     /// multiple of it for grouped-query attention.
@@ -187,31 +203,126 @@ pub struct PagedAttentionLaunch {
     /// layers normalize queries and keys per head and declare exactly 1.0.
     pub scale: f32,
     pub visibility: Visibility,
-    /// Query rows in this launch.
-    pub rows: u64,
-    /// The absolute position of query row zero.
-    pub first_position: u64,
-    /// The absolute position of logical row zero of the history.
-    ///
-    /// Above zero for a layer that has reclaimed what its window can no longer
-    /// see. It must be a whole number of pages: a partially reclaimed page
-    /// would put a row at a slot that depends on the eviction history, which is
-    /// the state a page table exists to avoid.
-    pub history_base: u64,
-    /// Rows the history holds, from `history_base`.
-    pub history_rows: u64,
+}
+
+/// One launch of the attention kernel: query rows against a visible history.
+///
+/// Whole prefill, one prefill chunk and a single decode row are the same value
+/// with a different row count, which is the point of having one kernel.
+///
+/// **The fields are private and there is no way to build one except through
+/// [`PagedAttentionLaunch::new`] or [`PagedAttentionLaunch::at`].** A value of
+/// this type *is* the evidence that its geometry, positions and ABI widths were
+/// checked, exactly as `AffineLaunch` is for the quantized linear. Public
+/// fields on a checked struct mean the check happened once, to a value nobody
+/// has to keep: an instance edited after `check` — or built by a caller who
+/// never called it — would carry positions that `allows` adds without
+/// overflowing and that the kernel indexes with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PagedAttentionLaunch {
+    layer: AttentionLayer,
+    rows: u64,
+    first_position: u64,
+    history_base: u64,
+    history_rows: u64,
 }
 
 impl PagedAttentionLaunch {
-    /// Check every geometric and positional precondition this launch has.
+    /// One launch, checked. Every other constructor goes through this.
+    pub fn new(
+        layer: AttentionLayer,
+        rows: u64,
+        first_position: u64,
+        history_base: u64,
+        history_rows: u64,
+    ) -> Result<Self> {
+        let launch = Self {
+            layer,
+            rows,
+            first_position,
+            history_base,
+            history_rows,
+        };
+        launch.check()?;
+        Ok(launch)
+    }
+
+    /// The same layer and the same history, a different query block.
     ///
-    /// Called by construction *and* re-applied at admission, for the reason
-    /// `affine_linear::descriptor_serves` exists: a public entry point that
-    /// takes a checked value and trusts it is a check that happened to
-    /// something nobody kept.
-    pub fn check(&self) -> Result<()> {
-        self.geometry.check()?;
-        if self.heads == 0 || !self.heads.is_multiple_of(self.geometry.kv_heads) {
+    /// What a chunked prefill needs, and the reason it cannot be a field
+    /// assignment: moving the query block changes which keys are visible, so it
+    /// is re-checked rather than edited in place.
+    pub fn at(&self, rows: u64, first_position: u64) -> Result<Self> {
+        Self::new(
+            self.layer,
+            rows,
+            first_position,
+            self.history_base,
+            self.history_rows,
+        )
+    }
+
+    /// The same launch over a different committed history.
+    pub fn over(&self, history_base: u64, history_rows: u64) -> Result<Self> {
+        Self::new(
+            self.layer,
+            self.rows,
+            self.first_position,
+            history_base,
+            history_rows,
+        )
+    }
+
+    pub const fn layer(&self) -> &AttentionLayer {
+        &self.layer
+    }
+
+    pub const fn geometry(&self) -> &PageGeometry {
+        &self.layer.geometry
+    }
+
+    pub const fn heads(&self) -> u64 {
+        self.layer.heads
+    }
+
+    pub const fn scale(&self) -> f32 {
+        self.layer.scale
+    }
+
+    pub const fn visibility(&self) -> Visibility {
+        self.layer.visibility
+    }
+
+    pub const fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    pub const fn first_position(&self) -> u64 {
+        self.first_position
+    }
+
+    pub const fn history_base(&self) -> u64 {
+        self.history_base
+    }
+
+    pub const fn history_rows(&self) -> u64 {
+        self.history_rows
+    }
+
+    /// Check every geometric, positional and ABI precondition this launch has.
+    ///
+    /// Private, because the only values of this type are ones that passed it.
+    /// Admission re-derives the scalars it needs rather than re-checking, for
+    /// the reason `affine_linear::descriptor_serves` exists: a check applied to
+    /// a value nobody keeps is a check that happened to something else.
+    fn check(&self) -> Result<()> {
+        self.layer.geometry.check()?;
+        if self.layer.heads == 0
+            || !self
+                .layer
+                .heads
+                .is_multiple_of(self.layer.geometry.kv_heads)
+        {
             // The same grouping rule the graph validates and the oracle
             // enforces. A ratio that does not divide gives one group more query
             // heads than another, which is not a layout any released checkpoint
@@ -220,37 +331,53 @@ impl PagedAttentionLaunch {
                 "heads",
                 format!(
                     "{} query head(s) must be a nonzero multiple of {} key/value head(s)",
-                    self.heads, self.geometry.kv_heads
+                    self.layer.heads, self.layer.geometry.kv_heads
                 ),
             ));
         }
-        if !(self.scale.is_finite() && self.scale > 0.0) {
+        if !(self.layer.scale.is_finite() && self.layer.scale > 0.0) {
             return Err(invalid(
                 "attention_scale",
                 format!(
                     "score scale must be finite and positive, got {}",
-                    self.scale
+                    self.layer.scale
                 ),
             ));
         }
-        if let Visibility::SlidingWindow { window } = self.visibility
-            && window == 0
-        {
-            return Err(invalid(
-                "visibility",
-                "a sliding window of zero sees nothing, including the query's own position",
-            ));
+        if let Visibility::SlidingWindow { window } = self.layer.visibility {
+            if window == 0 {
+                return Err(invalid(
+                    "visibility",
+                    "a sliding window of zero sees nothing, including the query's own position",
+                ));
+            }
+            // The ABI width, refused **here** rather than at the launch. A
+            // window wider than the kernel's `u32` used to be discovered by
+            // `window()` inside `enqueue_attend`, which runs after the query
+            // copy has been submitted: a refusal that was knowable before any
+            // device work became an unknown submission, a quarantined run and a
+            // withheld source. Every conversion this ABI performs is checked
+            // where the value is constructed.
+            if u32::try_from(window).is_err() {
+                return Err(Error::Unsupported {
+                    capability: "attention_window",
+                    reason: format!("a window of {window} rows exceeds this ABI's u32"),
+                });
+            }
         }
         if self.rows == 0 {
             return Err(invalid("rows", "a launch with no query row"));
         }
-        if !self.history_base.is_multiple_of(self.geometry.page_tokens) {
+        if !self
+            .history_base
+            .is_multiple_of(self.layer.geometry.page_tokens)
+        {
             return Err(invalid(
                 "history_base",
                 format!(
                     "history base {} is not a whole number of {}-row pages; a partially \
                      reclaimed page has no stable slot for its rows",
-                    self.history_base, self.geometry.page_tokens
+                    self.history_base, self.layer.geometry.page_tokens
                 ),
             ));
         }
@@ -261,12 +388,29 @@ impl PagedAttentionLaunch {
                  value before attending, because a causal query attends to itself",
             ));
         }
-        if self.history_rows > self.geometry.capacity_rows()? {
+        if self.history_rows > self.layer.geometry.capacity_rows()? {
             return Err(Error::CapacityExceeded {
                 tier: None,
                 requested_bytes: self.history_rows,
-                available_bytes: self.geometry.capacity_rows()?,
+                available_bytes: self.layer.geometry.capacity_rows()?,
             });
+        }
+        // Every other scalar the launch hands the kernel, at the same width the
+        // ABI declares. `grid` and `window` cannot fail after this.
+        u32::try_from(self.rows).map_err(|_| {
+            invalid(
+                "rows",
+                format!("{} query rows exceed a u32 launch grid", self.rows),
+            )
+        })?;
+        for (value, field) in [
+            (self.layer.heads, "heads"),
+            (self.layer.geometry.kv_heads, "kv_heads"),
+            (self.layer.geometry.head_dim, "head_dim"),
+            (self.layer.geometry.page_tokens, "page_tokens"),
+        ] {
+            u32::try_from(value)
+                .map_err(|_| invalid(field, format!("{value} exceeds this ABI's u32 {field}")))?;
         }
         let history_end = self
             .history_base
@@ -306,7 +450,7 @@ impl PagedAttentionLaunch {
 
     /// Logical pages the page table must describe.
     pub fn logical_pages(&self) -> Result<u64> {
-        Ok(self.history_rows.div_ceil(self.geometry.page_tokens))
+        Ok(self.history_rows.div_ceil(self.layer.geometry.page_tokens))
     }
 
     /// Bytes of page table this launch reads.
@@ -319,8 +463,8 @@ impl PagedAttentionLaunch {
     /// Bytes of query, which is also the byte count of the output.
     pub fn query_bytes(&self) -> Result<u64> {
         self.rows
-            .checked_mul(self.heads)
-            .and_then(|r| r.checked_mul(self.geometry.head_dim))
+            .checked_mul(self.layer.heads)
+            .and_then(|r| r.checked_mul(self.layer.geometry.head_dim))
             .and_then(|r| r.checked_mul(PAYLOAD_BYTES))
             .ok_or(Error::Dim(DimError::Overflow))
     }
@@ -336,7 +480,7 @@ impl PagedAttentionLaunch {
     /// Zero is not "no window" by convention alone — a window of zero is
     /// refused at construction precisely so the value can carry this meaning.
     pub fn window(&self) -> Result<u32> {
-        match self.visibility {
+        match self.layer.visibility {
             Visibility::Causal => Ok(0),
             Visibility::SlidingWindow { window } => {
                 u32::try_from(window).map_err(|_| Error::Unsupported {
@@ -355,10 +499,17 @@ impl PagedAttentionLaunch {
     /// `Visibility::allows` instead of re-deriving the rule: R21 is what
     /// happens when two implementations of the same mask exist.
     pub fn allows(&self, row: u64, key: u64) -> bool {
+        // A row outside this launch has no position, and saturating is not an
+        // answer: `check` has already proved that `first_position + rows` and
+        // `history_base + history_rows` are representable, so the only way to
+        // reach an overflow here is to ask about a row this launch does not
+        // have. That question has one true answer and it is `false`.
+        if row >= self.rows {
+            return false;
+        }
         let position = self.first_position + row;
-        key >= self.history_base
-            && key < self.history_base + self.history_rows
-            && self.visibility.allows(position, key)
+        let end = self.history_base + self.history_rows;
+        key >= self.history_base && key < end && self.layer.visibility.allows(position, key)
     }
 
     /// The launch grid: one block per query row and head.
@@ -369,10 +520,10 @@ impl PagedAttentionLaunch {
                 format!("{} query rows exceed a u32 launch grid", self.rows),
             )
         })?;
-        let y = u32::try_from(self.heads).map_err(|_| {
+        let y = u32::try_from(self.layer.heads).map_err(|_| {
             invalid(
                 "heads",
-                format!("{} heads exceed a u32 launch grid", self.heads),
+                format!("{} heads exceed a u32 launch grid", self.layer.heads),
             )
         })?;
         Ok((x, y, 1))
@@ -433,8 +584,8 @@ pub fn select_paged_attention_kernel(
                 "expected exactly one paged attention descriptor for {} row(s) of {} head(s) \
                  by {} on sm_{}{}; found {matched}",
                 launch.rows,
-                launch.heads,
-                launch.geometry.head_dim,
+                launch.heads(),
+                launch.geometry().head_dim,
                 capability.compute_major,
                 capability.compute_minor,
             ),
@@ -481,12 +632,12 @@ fn descriptor_mismatch(
     if descriptor.output != ActivationPrecision::expect(Precision::Bf16) {
         return Some("its output precision is not BF16");
     }
-    if descriptor.shape.max_input < launch.geometry.head_dim
-        || descriptor.shape.max_output < launch.geometry.head_dim
+    if descriptor.shape.max_input < launch.geometry().head_dim
+        || descriptor.shape.max_output < launch.geometry().head_dim
     {
         return Some("the head dimension exceeds the shape bounds it declares");
     }
-    if descriptor.shape.max_rows < launch.rows {
+    if descriptor.shape.max_rows < launch.rows() {
         return Some("the query row count exceeds the shape bounds it declares");
     }
     if descriptor.symbols.len() != 1 || descriptor.symbols[0].0 != moxie_kernels::PAGED_ATTENTION {
@@ -508,27 +659,28 @@ mod tests {
         }
     }
 
-    fn launch() -> PagedAttentionLaunch {
-        PagedAttentionLaunch {
+    fn layer() -> AttentionLayer {
+        AttentionLayer {
             geometry: geometry(),
             heads: 8,
             scale: moxie_plan::reciprocal_sqrt_scale(64),
             visibility: Visibility::Causal,
-            rows: 4,
-            first_position: 60,
-            history_base: 0,
-            history_rows: 64,
         }
+    }
+
+    /// Four query rows ending at position 63 of a 64-row history.
+    fn launch() -> PagedAttentionLaunch {
+        PagedAttentionLaunch::new(layer(), 4, 60, 0, 64).expect("a legal launch")
     }
 
     #[test]
     fn a_launch_reports_the_bytes_its_operands_occupy() {
         let l = launch();
         // 2 kv heads of 64, 32 rows to a page, two bytes each.
-        assert_eq!(l.geometry.row_elements().unwrap(), 128);
-        assert_eq!(l.geometry.page_bytes().unwrap(), 128 * 32 * 2);
-        assert_eq!(l.geometry.payload_bytes().unwrap(), 128 * 32 * 2 * 8);
-        assert_eq!(l.geometry.capacity_rows().unwrap(), 256);
+        assert_eq!(l.geometry().row_elements().unwrap(), 128);
+        assert_eq!(l.geometry().page_bytes().unwrap(), 128 * 32 * 2);
+        assert_eq!(l.geometry().payload_bytes().unwrap(), 128 * 32 * 2 * 8);
+        assert_eq!(l.geometry().capacity_rows().unwrap(), 256);
         // 64 rows of history is exactly two 32-row pages.
         assert_eq!(l.logical_pages().unwrap(), 2);
         assert_eq!(l.page_table_bytes().unwrap(), 8);
@@ -544,13 +696,9 @@ mod tests {
         // page table sized by division rather than ceiling would leave the
         // final row unaddressable, which is the classic off-by-one a paged
         // cache has.
-        let mut l = launch();
-        l.history_rows = 65;
-        l.first_position = 64;
-        l.rows = 1;
+        let l = PagedAttentionLaunch::new(layer(), 1, 64, 0, 65).expect("a legal launch");
         assert_eq!(l.logical_pages().unwrap(), 3);
         assert_eq!(l.page_table_bytes().unwrap(), 12);
-        l.check().unwrap();
     }
 
     #[test]
@@ -566,36 +714,42 @@ mod tests {
     }
 
     #[test]
-    fn grouped_and_multi_head_ratios_are_checked_the_way_the_graph_checks_them() {
-        let mut l = launch();
-        // 8 query heads over 2 key/value heads: four queries per group.
-        l.check().unwrap();
+    fn a_launch_cannot_exist_without_having_been_checked() {
+        // The point of the private fields. Every refusal below is a value that
+        // simply does not come into being, so no later code can be handed one
+        // and trust a check that happened to something else.
+        let mut illegal = layer();
+        illegal.heads = 1; // fewer query heads than key/value heads
+        assert!(PagedAttentionLaunch::new(illegal, 4, 60, 0, 64).is_err());
+        let mut illegal = layer();
+        illegal.heads = 6;
+        illegal.geometry.kv_heads = 4; // a ratio that does not divide
+        assert!(PagedAttentionLaunch::new(illegal, 4, 60, 0, 64).is_err());
+        let mut illegal = layer();
+        illegal.heads = 0;
+        assert!(PagedAttentionLaunch::new(illegal, 4, 60, 0, 64).is_err());
+
         // Multi-head is the same value with the ratio at one.
-        l.heads = 2;
-        l.check().unwrap();
-        // Fewer query heads than key/value heads, and a ratio that does not
-        // divide, are both refused.
-        l.heads = 1;
-        assert!(l.check().is_err());
-        l.heads = 6;
-        l.geometry.kv_heads = 4;
-        assert!(l.check().is_err());
-        l.heads = 0;
-        assert!(l.check().is_err());
+        let mut mha = layer();
+        mha.heads = 2;
+        PagedAttentionLaunch::new(mha, 4, 60, 0, 64).expect("multi-head is grouped with one");
     }
 
     #[test]
     fn the_declared_scale_must_be_finite_and_positive() {
         for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
-            let mut l = launch();
-            l.scale = bad;
-            assert!(l.check().is_err(), "scale {bad} was accepted");
+            let mut illegal = layer();
+            illegal.scale = bad;
+            assert!(
+                PagedAttentionLaunch::new(illegal, 4, 60, 0, 64).is_err(),
+                "scale {bad} was accepted"
+            );
         }
         // 1.0 is an ordinary declared scale, not a suspicious one: a
         // Gemma-style layer normalizes its queries and keys and declares it.
-        let mut l = launch();
-        l.scale = 1.0;
-        l.check().unwrap();
+        let mut gemma = layer();
+        gemma.scale = 1.0;
+        PagedAttentionLaunch::new(gemma, 4, 60, 0, 64).expect("a declared scale of one");
     }
 
     #[test]
@@ -604,17 +758,12 @@ mod tests {
         // 64-row history means the query's own key was never written, and the
         // kernel would then attend over 64 keys and return a confident wrong
         // answer instead of nothing.
-        let mut l = launch();
-        l.first_position = 64;
-        l.rows = 1;
-        assert!(l.check().is_err());
+        assert!(PagedAttentionLaunch::new(layer(), 1, 64, 0, 64).is_err());
         // The last legal position is the frontier's last row.
-        l.first_position = 63;
-        l.check().unwrap();
+        let last = PagedAttentionLaunch::new(layer(), 1, 63, 0, 64).expect("the last row");
         // A chunk that starts legally and runs past the end is refused too.
-        l.first_position = 62;
-        l.rows = 4;
-        assert!(l.check().is_err());
+        assert!(last.at(4, 62).is_err());
+        assert!(last.at(2, 62).is_ok());
     }
 
     #[test]
@@ -622,31 +771,21 @@ mod tests {
         // A sliding layer has reclaimed everything below `history_base`. A
         // query there cannot see its own key, and the answer is a refusal
         // rather than attention over whatever the pages now hold.
-        let mut l = launch();
-        l.history_base = 32;
-        l.first_position = 31;
-        l.rows = 1;
-        l.history_rows = 32;
-        assert!(l.check().is_err());
-        l.first_position = 32;
-        l.check().unwrap();
+        assert!(PagedAttentionLaunch::new(layer(), 1, 31, 32, 32).is_err());
+        PagedAttentionLaunch::new(layer(), 1, 32, 32, 32).expect("the first retained row");
     }
 
     #[test]
     fn a_history_base_inside_a_page_is_refused() {
-        let mut l = launch();
-        l.history_base = 16;
-        l.first_position = 70;
         assert!(matches!(
-            l.check().unwrap_err(),
+            PagedAttentionLaunch::new(layer(), 1, 70, 16, 64).unwrap_err(),
             Error::InvalidRequest {
                 field: "history_base",
                 ..
             }
         ));
         // A whole page of reclamation is fine.
-        l.history_base = 32;
-        l.check().unwrap();
+        PagedAttentionLaunch::new(layer(), 4, 60, 32, 32).expect("whole-page reclamation");
     }
 
     #[test]
@@ -654,30 +793,22 @@ mod tests {
         // Not an invalid request: the geometry is legal and the bytes are not
         // there. The distinction is what lets a caller admit more pages and
         // retry rather than rewrite its request.
-        let mut l = launch();
-        l.history_rows = 257;
-        l.first_position = 256;
-        l.rows = 1;
         assert!(matches!(
-            l.check().unwrap_err(),
+            PagedAttentionLaunch::new(layer(), 1, 256, 0, 257).unwrap_err(),
             Error::CapacityExceeded { .. }
         ));
     }
 
     #[test]
     fn an_empty_history_and_an_empty_launch_are_typed_errors() {
-        let mut l = launch();
-        l.history_rows = 0;
-        assert!(l.check().is_err());
-        let mut l = launch();
-        l.rows = 0;
-        assert!(l.check().is_err());
-        let mut l = launch();
-        l.geometry.page_tokens = 0;
-        assert!(l.check().is_err());
-        let mut l = launch();
-        l.geometry.pages = 0;
-        assert!(l.check().is_err());
+        assert!(PagedAttentionLaunch::new(layer(), 4, 60, 0, 0).is_err());
+        assert!(PagedAttentionLaunch::new(layer(), 0, 60, 0, 64).is_err());
+        let mut no_page = layer();
+        no_page.geometry.page_tokens = 0;
+        assert!(PagedAttentionLaunch::new(no_page, 4, 60, 0, 64).is_err());
+        let mut no_pages = layer();
+        no_pages.geometry.pages = 0;
+        assert!(PagedAttentionLaunch::new(no_pages, 4, 60, 0, 64).is_err());
     }
 
     #[test]
@@ -685,10 +816,10 @@ mod tests {
         // Unsupported, not invalid: the request is coherent and this build
         // cannot serve it. A named refusal is the contract; silently reading
         // past the end of a row is what it prevents.
-        let mut l = launch();
-        l.geometry.head_dim = moxie_kernels::PAGED_ATTENTION_MAX_HEAD_DIM + 1;
+        let mut wide = geometry();
+        wide.head_dim = moxie_kernels::PAGED_ATTENTION_MAX_HEAD_DIM + 1;
         assert!(matches!(
-            l.geometry.check().unwrap_err(),
+            wide.check().unwrap_err(),
             Error::Unsupported {
                 capability: "attention_head_dim",
                 ..
@@ -704,52 +835,71 @@ mod tests {
         let mut g = geometry();
         g.pages = u64::MAX;
         assert!(matches!(g.payload_bytes(), Err(Error::Dim(_))));
-        let mut l = launch();
-        l.first_position = u64::MAX;
-        assert!(l.check().is_err());
-        let mut l = launch();
-        l.history_base = 0;
-        l.history_rows = u64::MAX - 1;
-        assert!(l.check().is_err());
+        assert!(PagedAttentionLaunch::new(layer(), 4, u64::MAX, 0, 64).is_err());
+        assert!(PagedAttentionLaunch::new(layer(), 4, 60, 0, u64::MAX - 1).is_err());
     }
 
     #[test]
-    fn the_window_parameter_says_causal_with_zero_and_nothing_else_does() {
-        let mut l = launch();
-        assert_eq!(l.window().unwrap(), 0);
-        l.visibility = Visibility::SlidingWindow { window: 16 };
-        assert_eq!(l.window().unwrap(), 16);
-        // A window of zero would be indistinguishable from causal in the ABI,
-        // so it is refused at construction rather than encoded.
-        l.visibility = Visibility::SlidingWindow { window: 0 };
-        assert!(l.check().is_err());
-        l.visibility = Visibility::SlidingWindow {
+    fn every_abi_width_is_refused_at_construction_not_at_the_launch() {
+        // The finding this closes: a window wider than the kernel's `u32` used
+        // to be discovered inside the launch, **after** the query copy had been
+        // submitted, turning a knowable refusal into an unknown submission and
+        // a quarantined run. Nothing that reaches a launch can fail a width
+        // conversion any more, so `window` and `grid` are total on a value of
+        // this type.
+        let mut wide = layer();
+        wide.visibility = Visibility::SlidingWindow {
             window: u64::from(u32::MAX) + 1,
         };
-        assert!(matches!(l.window(), Err(Error::Unsupported { .. })));
+        assert!(matches!(
+            PagedAttentionLaunch::new(wide, 4, 60, 0, 64).unwrap_err(),
+            Error::Unsupported {
+                capability: "attention_window",
+                ..
+            }
+        ));
+        // A window of zero would be indistinguishable from causal in the ABI,
+        // so it is refused at construction rather than encoded.
+        let mut zero = layer();
+        zero.visibility = Visibility::SlidingWindow { window: 0 };
+        assert!(PagedAttentionLaunch::new(zero, 4, 60, 0, 64).is_err());
+
+        let mut narrow = layer();
+        narrow.visibility = Visibility::SlidingWindow { window: 16 };
+        let l = PagedAttentionLaunch::new(narrow, 4, 60, 0, 64).expect("a legal window");
+        assert_eq!(l.window().unwrap(), 16);
+        assert_eq!(
+            launch().window().unwrap(),
+            0,
+            "causal is zero and only that"
+        );
+        assert_eq!(l.grid().unwrap(), (4, 8, 1));
     }
 
     #[test]
     fn visibility_is_decided_on_absolute_positions() {
-        // R21: the same launch, one chunk starting at zero and one starting
+        // R21: the same layer, one chunk starting at zero and one starting
         // later, must mask on the true position rather than on the row index.
-        let mut l = launch();
-        l.first_position = 0;
-        l.rows = 4;
-        assert!(l.allows(0, 0));
-        assert!(!l.allows(0, 1), "row zero must not see the future");
-        assert!(l.allows(3, 3) && l.allows(3, 0));
+        let first = PagedAttentionLaunch::new(layer(), 4, 0, 0, 64).expect("the first chunk");
+        assert!(first.allows(0, 0));
+        assert!(!first.allows(0, 1), "row zero must not see the future");
+        assert!(first.allows(3, 3) && first.allows(3, 0));
 
-        l.first_position = 60;
-        assert!(l.allows(0, 60) && l.allows(0, 59));
-        assert!(!l.allows(0, 61), "position 60 must not see 61");
+        let later = launch();
+        assert!(later.allows(0, 60) && later.allows(0, 59));
+        assert!(!later.allows(0, 61), "position 60 must not see 61");
 
-        l.visibility = Visibility::SlidingWindow { window: 4 };
-        assert!(l.allows(0, 57) && !l.allows(0, 56));
+        let mut windowed = layer();
+        windowed.visibility = Visibility::SlidingWindow { window: 4 };
+        let w = PagedAttentionLaunch::new(windowed, 4, 60, 0, 64).expect("a windowed launch");
+        assert!(w.allows(0, 57) && !w.allows(0, 56));
         // Reclaimed rows are invisible whatever the window says.
-        l.history_base = 32;
-        l.history_rows = 32;
-        assert!(!l.allows(0, 31));
+        let w = PagedAttentionLaunch::new(windowed, 4, 60, 32, 32).expect("after reclamation");
+        assert!(!w.allows(0, 31));
+        // A row this launch does not have has no position, and asking is false
+        // rather than an addition that overflows.
+        assert!(!w.allows(4, 60));
+        assert!(!w.allows(u64::MAX, 60));
     }
 }
 
@@ -790,7 +940,25 @@ pub mod device {
         pub rejection: Option<Rejection>,
     }
 
-    /// A refused append or attend.
+    /// What a refusal hands back, **in the allocations the caller gave it**.
+    ///
+    /// Not one concatenated buffer. Joining an append's key and value rows to
+    /// return them reallocates — `Vec::append` on an exact-capacity vector
+    /// always does — and that allocation is infallible, on the path whose whole
+    /// purpose is to report a refusal. Task 0019's rule again: a refusal that
+    /// allocates can abort instead of refusing, and a review found this shape
+    /// one crate over by failing a 32-byte allocation and getting `SIGABRT`.
+    #[derive(Debug)]
+    pub enum RefusedSource {
+        /// An append's rows, each still in the vector it arrived in.
+        Rows { keys: Vec<u8>, values: Vec<u8> },
+        /// A page mapping, still the `u32` entries it arrived as.
+        PageTable(Vec<u32>),
+        /// One launch's query rows, or the encoded table bytes in flight.
+        Query(Vec<u8>),
+    }
+
+    /// A refused append, mapping or attend.
     ///
     /// `source` is `Some` when the refusal happened **before** anything was
     /// enqueued, and `None` when the run retained it: submitted work whose
@@ -798,7 +966,7 @@ pub mod device {
     #[derive(Debug)]
     pub struct PagedRunRefused {
         pub error: Error,
-        pub source: Option<Vec<u8>>,
+        pub source: Option<RefusedSource>,
     }
 
     impl PagedRunRefused {
@@ -839,7 +1007,9 @@ pub mod device {
         arena_bytes: u64,
         ledger: LedgerId,
         ctx: &'ctx RankContext,
-        held: Option<Vec<u8>>,
+        /// What this run is holding across work whose completion it has not
+        /// observed. An append holds two vectors and hands both back unjoined.
+        held: Option<RefusedSource>,
         quarantined: bool,
     }
 
@@ -890,18 +1060,54 @@ pub mod device {
             // Admission re-applies selection's predicate, on the widest launch
             // this run can serve. A descriptor that cannot serve that launch
             // must be refused now rather than at the first attend.
-            let widest = PagedAttentionLaunch {
-                geometry,
-                heads,
-                scale: 1.0,
-                visibility: moxie_plan::Visibility::Causal,
-                rows: max_rows,
-                first_position: 0,
-                history_base: 0,
-                history_rows: max_rows,
+            let widest = match PagedAttentionLaunch::new(
+                super::AttentionLayer {
+                    geometry,
+                    heads,
+                    scale: 1.0,
+                    visibility: moxie_plan::Visibility::Causal,
+                },
+                max_rows,
+                0,
+                0,
+                max_rows,
+            ) {
+                Ok(launch) => launch,
+                Err(error) => return Err(fail(error)),
             };
             if let Err(error) = super::descriptor_serves(&descriptor, &widest) {
                 return Err(fail(error));
+            }
+            // **Identity before loading, and whole identity.** Everything above
+            // checks fields one at a time, and admission then loads *this
+            // build's* fatbin unconditionally — so a descriptor declaring a
+            // different layout, accumulation policy, rounding profile,
+            // workspace expression or image would be executed by the local
+            // image anyway, with its own declaration silently ignored. Task
+            // 0021's review produced exactly that shape one package over:
+            // operation, ABI and hash matched, the symbol did not, and every
+            // GPU computed the wrong activation for a valid-looking plan.
+            //
+            // The descriptor must therefore **be** one the built-in package
+            // declares. That binds operation, ABI, operand roles and
+            // precisions, output, accumulation, rounding, layout, shape bounds,
+            // SM, workspace, image digest and symbols together, which is the
+            // only form of this check that cannot be half-satisfied. Selection
+            // still runs against whatever catalogue it is given — that is task
+            // 0012's design — and this is the boundary where a selected
+            // descriptor becomes a launch.
+            let package = moxie_kernels::paged_attention_catalogue();
+            if !package.descriptors().contains(&descriptor) {
+                return Err(fail(super::unsupported_kernel(
+                    "paged_attention",
+                    format!(
+                        "descriptor {} is not one of the {} this build's paged attention \
+                         package declares, so its declared layout, accumulation, rounding, \
+                         workspace and image are not bound to the code that would run",
+                        descriptor.id.0,
+                        package.descriptors().len()
+                    ),
+                )));
             }
 
             let extents = match Extents::derive(&geometry, heads, max_rows) {
@@ -1111,9 +1317,12 @@ pub mod device {
             stream: &Stream<'ctx>,
             table: Vec<u32>,
         ) -> std::result::Result<(), PagedRunRefused> {
+            // The table goes back as the entries it arrived as. Re-encoding it
+            // into bytes to report a refusal is an allocation on the refusal
+            // path, which is where allocations fail.
             let give_back = |error, table: Vec<u32>| PagedRunRefused {
                 error,
-                source: Some(table.iter().flat_map(|v| v.to_le_bytes()).collect()),
+                source: Some(RefusedSource::PageTable(table)),
             };
             if self.quarantined {
                 return Err(give_back(invalid("run", "this run is quarantined"), table));
@@ -1208,7 +1417,7 @@ pub mod device {
                     source: None,
                 });
             }
-            self.held = Some(bytes);
+            self.held = Some(RefusedSource::Query(bytes));
             if let Err(error) = self.settle(Ok(()), stream) {
                 return Err(PagedRunRefused {
                     error,
@@ -1254,13 +1463,9 @@ pub mod device {
             keys: Vec<u8>,
             values: Vec<u8>,
         ) -> std::result::Result<(), PagedRunRefused> {
-            let give_back = |error, keys: Vec<u8>, mut values: Vec<u8>| {
-                let mut source = keys;
-                source.append(&mut values);
-                PagedRunRefused {
-                    error,
-                    source: Some(source),
-                }
+            let give_back = |error, keys: Vec<u8>, values: Vec<u8>| PagedRunRefused {
+                error,
+                source: Some(RefusedSource::Rows { keys, values }),
             };
             if self.quarantined {
                 return Err(give_back(
@@ -1346,12 +1551,10 @@ pub mod device {
             }
 
             // Everything above refuses without touching the device. From here
-            // on the run holds both sources until completion is observed.
-            let mut source = keys;
-            let mut values = values;
-            source.append(&mut values);
-            self.held = Some(source);
-            match self.enqueue_append(stream, rows, row_bytes, want) {
+            // on the run holds both sources, unmoved and unjoined, until
+            // completion is observed.
+            self.held = Some(RefusedSource::Rows { keys, values });
+            match self.enqueue_append(stream, rows, row_bytes) {
                 Ok(()) => {}
                 Err(error) => {
                     return Err(PagedRunRefused {
@@ -1371,11 +1574,12 @@ pub mod device {
             stream: &Stream<'ctx>,
             rows: u64,
             row_bytes: u64,
-            half: u64,
         ) -> Result<()> {
             let page_tokens = self.geometry.page_tokens;
             let page_bytes = self.geometry.page_bytes()?;
-            let source = self.held.as_ref().expect("the append holds its source");
+            let Some(RefusedSource::Rows { keys, values }) = self.held.as_ref() else {
+                return Err(invalid("append", "the append is not holding its rows"));
+            };
             let first_row = self.committed_rows;
             // One copy per page-aligned run: a dense append crosses page
             // boundaries, and the physical pages it lands on need not be
@@ -1391,14 +1595,11 @@ pub mod device {
                 let within = physical * page_bytes + slot * row_bytes;
                 let start = (done * row_bytes) as usize;
                 let len = (run * row_bytes) as usize;
-                for (range, offset) in [
-                    (self.keys.as_ref().expect("live key range"), 0usize),
-                    (
-                        self.values.as_ref().expect("live value range"),
-                        half as usize,
-                    ),
+                for (range, source) in [
+                    (self.keys.as_ref().expect("live key range"), keys),
+                    (self.values.as_ref().expect("live value range"), values),
                 ] {
-                    let slice = &source[offset + start..offset + start + len];
+                    let slice = &source[start..start + len];
                     // SAFETY: the source is held by this run until completion is
                     // observed, and the destination extent is checked against
                     // this run's own admitted range.
@@ -1481,7 +1682,7 @@ pub mod device {
         ) -> std::result::Result<Vec<u8>, PagedRunRefused> {
             let give_back = |error, query| PagedRunRefused {
                 error,
-                source: Some(query),
+                source: Some(RefusedSource::Query(query)),
             };
             if self.quarantined {
                 return Err(give_back(invalid("run", "this run is quarantined"), query));
@@ -1492,9 +1693,9 @@ pub mod device {
             if let Err(error) = super::descriptor_serves(&self.descriptor, launch) {
                 return Err(give_back(error, query));
             }
-            if launch.geometry != self.geometry
-                || launch.heads != self.heads
-                || launch.rows > self.max_rows
+            if *launch.geometry() != self.geometry
+                || launch.heads() != self.heads
+                || launch.rows() > self.max_rows
             {
                 return Err(give_back(
                     invalid(
@@ -1552,9 +1753,17 @@ pub mod device {
                 Err(error) => return Err(give_back(error, query)),
             };
 
+            // The last thing that can be known without the device: every ABI
+            // width this launch needs. A failure here is an ordinary refusal
+            // with the query handed back.
+            let scalars = match Self::abi_scalars(launch) {
+                Ok(scalars) => scalars,
+                Err(error) => return Err(give_back(error, query)),
+            };
+
             // --- from here on, work is in flight -------------------------
-            self.held = Some(query);
-            if let Err(error) = self.enqueue_attend(stream, launch) {
+            self.held = Some(RefusedSource::Query(query));
+            if let Err(error) = self.enqueue_attend(stream, scalars) {
                 return Err(PagedRunRefused {
                     error,
                     source: None,
@@ -1577,12 +1786,39 @@ pub mod device {
             Ok(out)
         }
 
-        fn enqueue_attend(
-            &mut self,
-            stream: &Stream<'ctx>,
-            launch: &PagedAttentionLaunch,
-        ) -> Result<()> {
-            let query_source = self.held.as_ref().expect("the attend holds its query");
+        /// Every scalar this ABI needs, derived **before** anything is
+        /// enqueued.
+        ///
+        /// `PagedAttentionLaunch::new` has already refused any value that does
+        /// not fit, so none of these conversions can fail on a launch that
+        /// exists. They are still fallible and they still happen here, because
+        /// the alternative is what this code did before: discover an unfitting
+        /// window *after* submitting the query copy, and turn a refusal that was
+        /// knowable up front into an unknown submission and a quarantined run.
+        fn abi_scalars(launch: &PagedAttentionLaunch) -> Result<AbiScalars> {
+            Ok(AbiScalars {
+                rows: launch.rows(),
+                first_position: launch.first_position(),
+                history_base: launch.history_base(),
+                history_rows: launch.history_rows(),
+                heads: u32::try_from(launch.heads())
+                    .map_err(|_| invalid("heads", "the head count exceeds a u32"))?,
+                kv_heads: u32::try_from(launch.geometry().kv_heads)
+                    .map_err(|_| invalid("kv_heads", "the key/value head count exceeds a u32"))?,
+                head_dim: u32::try_from(launch.geometry().head_dim)
+                    .map_err(|_| invalid("head_dim", "the head dimension exceeds a u32"))?,
+                page_tokens: u32::try_from(launch.geometry().page_tokens)
+                    .map_err(|_| invalid("page_tokens", "the page width exceeds a u32"))?,
+                window: launch.window()?,
+                scale: launch.scale(),
+                grid: launch.grid()?,
+            })
+        }
+
+        fn enqueue_attend(&mut self, stream: &Stream<'ctx>, scalars: AbiScalars) -> Result<()> {
+            let Some(RefusedSource::Query(query_source)) = self.held.as_ref() else {
+                return Err(invalid("attend", "the attend is not holding its query"));
+            };
             let query_range = self.query.as_ref().expect("live query range");
             // SAFETY: the source is held until completion is observed and the
             // destination is this run's own admitted range.
@@ -1590,100 +1826,45 @@ pub mod device {
                 self.quarantined = true;
                 return Err(self.attribute(error));
             }
-            let mut query_address = match query_range.device_address() {
-                Ok(address) => address,
-                Err(error) => {
-                    self.quarantined = true;
-                    return Err(self.attribute(error));
-                }
-            };
-            let mut key_address = match self.keys.as_ref().expect("live key range").device_address()
+            let mut addresses = [0u64; 5];
+            for (slot, range) in [
+                query_range,
+                self.keys.as_ref().expect("live key range"),
+                self.values.as_ref().expect("live value range"),
+                self.table.as_ref().expect("live page table range"),
+                self.output.as_ref().expect("live output range"),
+            ]
+            .into_iter()
+            .enumerate()
             {
-                Ok(address) => address,
-                Err(error) => {
-                    self.quarantined = true;
-                    return Err(self.attribute(error));
+                match range.device_address() {
+                    Ok(address) => addresses[slot] = address,
+                    Err(error) => {
+                        self.quarantined = true;
+                        return Err(self.attribute(error));
+                    }
                 }
-            };
-            let mut value_address = match self
-                .values
-                .as_ref()
-                .expect("live value range")
-                .device_address()
-            {
-                Ok(address) => address,
-                Err(error) => {
-                    self.quarantined = true;
-                    return Err(self.attribute(error));
-                }
-            };
-            let mut table_address = match self
-                .table
-                .as_ref()
-                .expect("live page table range")
-                .device_address()
-            {
-                Ok(address) => address,
-                Err(error) => {
-                    self.quarantined = true;
-                    return Err(self.attribute(error));
-                }
-            };
-            let mut output_address = match self
-                .output
-                .as_ref()
-                .expect("live output range")
-                .device_address()
-            {
-                Ok(address) => address,
-                Err(error) => {
-                    self.quarantined = true;
-                    return Err(self.attribute(error));
-                }
-            };
-            let mut rows = launch.rows;
-            let mut first_position = launch.first_position;
-            let mut history_base = launch.history_base;
-            let mut history_rows = launch.history_rows;
-            let mut heads = match u32::try_from(launch.heads) {
-                Ok(heads) => heads,
-                Err(_) => {
-                    self.quarantined = true;
-                    return Err(invalid("heads", "the head count exceeds a u32"));
-                }
-            };
-            let mut kv_heads = match u32::try_from(launch.geometry.kv_heads) {
-                Ok(kv) => kv,
-                Err(_) => {
-                    self.quarantined = true;
-                    return Err(invalid(
-                        "kv_heads",
-                        "the key/value head count exceeds a u32",
-                    ));
-                }
-            };
-            let mut head_dim = match u32::try_from(launch.geometry.head_dim) {
-                Ok(dim) => dim,
-                Err(_) => {
-                    self.quarantined = true;
-                    return Err(invalid("head_dim", "the head dimension exceeds a u32"));
-                }
-            };
-            let mut page_tokens = match u32::try_from(launch.geometry.page_tokens) {
-                Ok(tokens) => tokens,
-                Err(_) => {
-                    self.quarantined = true;
-                    return Err(invalid("page_tokens", "the page width exceeds a u32"));
-                }
-            };
-            let mut window = match launch.window() {
-                Ok(window) => window,
-                Err(error) => {
-                    self.quarantined = true;
-                    return Err(error);
-                }
-            };
-            let mut scale = launch.scale;
+            }
+            let [
+                mut query_address,
+                mut key_address,
+                mut value_address,
+                mut table_address,
+                mut output_address,
+            ] = addresses;
+            let AbiScalars {
+                mut rows,
+                mut first_position,
+                mut history_base,
+                mut history_rows,
+                mut heads,
+                mut kv_heads,
+                mut head_dim,
+                mut page_tokens,
+                mut window,
+                mut scale,
+                grid,
+            } = scalars;
             let mut params: [*mut c_void; 15] = [
                 (&raw mut query_address).cast(),
                 (&raw mut key_address).cast(),
@@ -1701,13 +1882,6 @@ pub mod device {
                 (&raw mut window).cast(),
                 (&raw mut scale).cast(),
             ];
-            let grid = match launch.grid() {
-                Ok(grid) => grid,
-                Err(error) => {
-                    self.quarantined = true;
-                    return Err(error);
-                }
-            };
             // SAFETY: the symbol's ABI is the one declared in
             // `paged_attention.cu`; every pointer names a live admitted range
             // whose extent was checked above, and the grid is one block per
@@ -1803,6 +1977,25 @@ pub mod device {
                 }
             }
         }
+    }
+
+    /// Everything the kernel's ABI takes that is not an address.
+    ///
+    /// Derived from a checked launch before any device work starts, so a
+    /// launch that cannot be expressed in this ABI is refused with nothing
+    /// enqueued and nothing withheld.
+    struct AbiScalars {
+        rows: u64,
+        first_position: u64,
+        history_base: u64,
+        history_rows: u64,
+        heads: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        page_tokens: u32,
+        window: u32,
+        scale: f32,
+        grid: (u32, u32, u32),
     }
 
     /// The aligned extents one run admits.

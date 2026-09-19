@@ -22,7 +22,8 @@ table. In short:
 
 **Passed.** `cargo xtask-cuda test-gpu`: 51 cases, 51 passed, 0 failed, 0
 skipped, both architectures qualified. `paged_attention` covers head dimensions
-64 and 128, MHA and 4:1 GQA, causal and sliding visibility, a declared scale of
+64, 96, 128 and 256 — the widest the catalogue declares, so its shape domain is
+qualified at the boundary rather than inside it — MHA and grouped 4:1 and 3:1, causal and sliding visibility, a declared scale of
 1.0 and the conventional one, whole versus chunked prefill compared bit for bit,
 one-row decode, page tails and a reversed page table, all against the FP64 oracle
 under `attention_error_bound`. `paged_attention_32k` materializes **32,768 actual
@@ -45,6 +46,14 @@ entry for a BF16 plan.
 
 **Skipped / unmeasured.** The task mutation battery was not written or run, on
 purpose (see below). No timing was taken anywhere.
+
+**Reviewed.** An independent review after those commits found four
+closure-blocking defects — partial descriptor identity at the binding boundary,
+infallible allocations on refusal paths, ABI widths discovered after enqueue, and
+a declared shape envelope wider than the qualified one — plus a wrong BF16
+spacing in the gate and three stale records. All are repaired, and task 0037's
+record carries them one by one. The review's first finding is scope rather than a
+defect and became the next task below.
 
 ## Decisions
 
@@ -102,7 +111,14 @@ purpose (see below). No timing was taken anywhere.
 
 ## Next task
 
-**Bind the device paged key/value state to `moxie-state`'s transaction journal.**
+**Make paged attention the engine's attention: bind its state to `moxie-state`
+and reach it from the graph.**
+
+A review of this work established that the binding is not yet on the execution
+path at all — `moxie-plan` refuses every stateful graph, no `OpParams::Attention`
+node lowers to it, and `attend` stages the query and output through the host
+where document 04 requires device tensor and page-table handles. The state
+binding below is necessary and not sufficient; both halves are this task.
 
 - **Owning component:** `moxie-state` for the schema, frontier, retention and
   transaction; `moxie-memory` for admission; `moxie-executor` keeps the
@@ -112,6 +128,11 @@ purpose (see below). No timing was taken anywhere.
   `Retention`, ring reclamation, tentative headroom), ADR 0014, tasks 0013 and
   0017, `crates/moxie-executor/src/paged_attention.rs` in full, and this
   handover's uncertainty above.
+- **Second deliverable, equal in weight:** `OpParams::Attention` lowers through
+  `moxie-plan` to this binding, the stateful-graph refusal is replaced by an
+  admitted plan rather than removed, and query and output are device handles the
+  executor already owns. The host-staging entry point stays only as what document
+  04 calls an explicit separate reference path, if it stays at all.
 - **Deliverable:** one sequence transaction that appends rows to *device* pages
   and publishes them, so that the committed frontier a launch attends over is the
   journal's and not the run's own counter; aborting leaves the committed frontier

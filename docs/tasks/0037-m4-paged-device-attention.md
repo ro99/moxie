@@ -275,6 +275,67 @@ Neither is task 0037's code, both blocked its gates, and both are recorded in
    handed a quantized descriptor for a BF16 plan and correctly refused it — before
    the fixture had mutated anything. Fixed by selecting on the projection symbol.
 
+### Review of 2026-09-19 and what it changed
+
+An independent review of the three commits above found four closure-blocking
+implementation defects and several record gaps. All are repaired here except
+the first, which is scope rather than a defect and is now stated as such.
+
+1. **Not the common semantic path.** The binding is driven by tests and `xtask`
+   and nothing else: `moxie-plan` refuses every stateful graph
+   (`stateful_resource_plan`), no `OpParams::Attention` node lowers to this, and
+   `attend` takes host query bytes and returns host output bytes where document
+   04 requires attention to consume device tensor and page-table handles with
+   host paths as "explicit separate implementations, not compulsory staging
+   interfaces". R04 itself is respected — the history is **not** re-uploaded per
+   step — but the query and output cross the bus every launch. This is now named
+   in the module header, the support matrix and the next task, which was too
+   narrow: planner lowering and device handles belong in it beside the state
+   binding.
+2. **Partial descriptor identity, repaired.** `descriptor_mismatch` checked
+   operation, ABI, operands, output, shape bounds and symbol; admission then
+   loaded this build's fatbin unconditionally, so a descriptor declaring a
+   different layout, accumulation policy, rounding profile, workspace or image
+   would have been executed by code declaring something else. That is exactly
+   the defect task 0021's review found one package over. Admission now requires
+   the descriptor to **be** a member of `paged_attention_catalogue()`, as
+   `grouped_device` does, with seven mutation cases and a passing control.
+3. **Infallible allocations on refusal paths, repaired.** The refusal joined the
+   key and value vectors with `Vec::append` to hand them back — a reallocation on
+   the path whose purpose is to report a refusal — and the page-table refusal
+   re-encoded its entries with `collect()`. Both are gone: `RefusedSource` hands
+   each source back in the allocation it arrived in, and the run holds the two
+   append vectors unjoined.
+4. **ABI widths discovered after enqueue, repaired.** A sliding window wider than
+   the kernel's `u32` passed `check`, and `window()` only failed inside
+   `enqueue_attend` — after the query copy had been submitted — turning a
+   knowable refusal into an unknown submission, a quarantined run and a withheld
+   source. Every width this ABI takes is now refused by `PagedAttentionLaunch`'s
+   constructor, and the remaining conversions happen in `abi_scalars` before any
+   copy. The launch's fields are private with `new`/`at`/`over` constructors, so
+   a checked launch cannot be edited afterwards, and `allows` no longer adds
+   positions that could overflow.
+5. **A declared envelope wider than the qualified one, closed.** The catalogue
+   advertises head dimensions through 256 while only 64 and 128 had run. The
+   device gate now covers **256**, the widest declared, and **96**, which is
+   neither a power of two nor a multiple of the warp width, on all three GPUs.
+6. **A wrong BF16 spacing in the gate, repaired.** `bf16_ulp` returned `2^-149`
+   for every exponent field at or below seven instead of BF16's own `2^-133`
+   floor — sixteen binades too small. It could only reject a correct kernel at
+   subnormal magnitudes, never accept a wrong one, and the affine lane carried
+   the same inline copy; one repaired helper now serves both.
+
+Record gaps repaired: ADR 0032 said "no kernel exists yet" and now records the
+implementation and, as document 07 requires, **the legacy negative result** —
+the frozen `backend_flash_attention` is qualified for exactly SM86 and SM120 yet
+appends the packed keys and values to every upload in FP32 and can size a score
+scratch at `rows × heads × history`, while `bf16_kv_attention` keeps a persistent
+BF16 cache but serves one query row with FP32 host staging. The support matrix
+said common paged attention was implemented two rows above saying paged
+attention was not; the second row is now the streaming and tensor-core work it
+meant. The module header claimed to hold no pages or frontier while doing both;
+it now says they are provisional executor mechanics pending the state binding.
+
 ### Still open
 
 Acceptance 1 is met for the launch contract and the oracles; acceptance 2 and 3
@@ -286,6 +347,10 @@ specification and the affected suites. **Not done, and not claimed:**
   committed frontier `PagedAttentionRun` reports is a fact about copied bytes
   rather than a journal entry. This is the next bounded task and the largest
   remaining piece of acceptance 1 and 4.
+- **The semantic path.** Finding 1 above: planner lowering from
+  `OpParams::Attention`, device query/output handles rather than host staging,
+  and execution through the admitted graph plan. Until then this is a qualified
+  kernel and binding, not the engine's attention.
 - **A reclaimed base is host-checked only.** Every device case runs with
   `history_base = 0`. The kernel takes the base and masks on absolute positions,
   and the launch contract refuses a base that is not a whole number of pages, but
