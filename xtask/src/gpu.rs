@@ -19,7 +19,7 @@ use moxie_cuda::{
 };
 use moxie_executor::{
     AttentionLayer, DeviceArena, Lease, OwnedBinding, PageGeometry, PagedAttentionLaunch,
-    PagedAttentionRun, SelectedAdmitRefused, SelectedReservedPlan, Turn, Upload,
+    PagedAttentionRun, SelectedAdmitRefused, SelectedReservedPlan, Staging, Turn, Upload,
     select_paged_attention_kernel,
 };
 use moxie_graph::{
@@ -2965,10 +2965,11 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
             case.geometry,
             case.heads,
             case.rows,
+            Staging::Host,
         )
         .map_err(|r| r.error)?;
         let table = shuffled_pages(case.geometry.pages);
-        run.publish_page_table(&stream, table.clone())
+        run.publish_page_table(&stream, 0, table.clone())
             .map_err(|r| r.error)?;
 
         let mut written = 0u64;
@@ -3184,16 +3185,17 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         fixture: &AttentionFixture,
         rows: u64,
     ) -> Result<(), Error> {
-        let first = sequence.committed_rows();
-        let placements = sequence.placements(0, first, rows)?;
-        let (keys, values) = fixture.payload(first, rows);
+        let txn = sequence.begin()?;
+        let staged = sequence.stage(txn, rows)?;
+        let placements = sequence.placements(&staged, 0)?;
+        let view = sequence.page_view(0)?;
+        run.publish_page_table(stream, view.base, view.table)
+            .map_err(|r| r.error)?;
+        let (keys, values) = fixture.payload(staged.first(), rows);
         run.write_rows(stream, &placements, keys, values)
             .map_err(|r| r.error)?;
-        let txn = sequence.begin()?;
-        sequence.publish(txn, rows)?;
+        sequence.publish(txn, staged)?;
         sequence.commit(txn, rows)?;
-        run.publish_page_table(stream, sequence.page_table(0)?)
-            .map_err(|r| r.error)?;
         Ok(())
     }
 
@@ -3223,6 +3225,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         geometry,
         heads,
         chunk_rows,
+        Staging::Host,
     )
     .map_err(|r| r.error)?;
     let mut whole_state = authority()?;
@@ -3244,6 +3247,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         geometry,
         heads,
         chunk_rows,
+        Staging::Host,
     )
     .map_err(|r| r.error)?;
     let mut chunked_state = authority()?;
