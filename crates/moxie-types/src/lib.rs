@@ -26,7 +26,7 @@ pub use ids::{
     ArtifactId, BranchId, ChunkId, DeviceId, DeviceUuid, LayoutId, RankId, StateTransactionId,
     TensorId,
 };
-pub use layout::{PagePlacement, TensorLayout};
+pub use layout::{BatchId, PagePlacement, PageView, PagedKvWriter, TensorLayout};
 pub use numa::{HostPlacement, NumaNode, NumaNodeId, NumaTopology};
 pub use precision::{
     AccumulationPolicy, ActivationPrecision, CachePrecision, ExecutionProfile, Precision,

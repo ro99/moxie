@@ -1122,7 +1122,28 @@ impl PagedSequence {
 mod tests {
     use super::*;
     use moxie_memory::CapacitySnapshot;
-    use moxie_types::Scope;
+    use moxie_types::{BatchId, PagePlacement, PageView, PagedKvWriter, Scope};
+
+    /// A writer that records the placements it was handed instead of copying
+    /// anything: these cross-check tests compare the device authority's
+    /// placement mapping against the host ring's, they do not drive a device.
+    #[derive(Default)]
+    struct RecordingWriter {
+        placements: Vec<PagePlacement>,
+    }
+
+    impl PagedKvWriter for RecordingWriter {
+        fn write_layer(
+            &mut self,
+            _layer: usize,
+            _batch: BatchId,
+            _view: &PageView,
+            placements: &[PagePlacement],
+        ) -> Result<()> {
+            self.placements = placements.to_vec();
+            Ok(())
+        }
+    }
 
     #[test]
     fn cancelled_commit_restores_frontiers_counts_and_rows_at_every_boundary() {
@@ -1301,17 +1322,22 @@ mod tests {
             host.append(txn, position, &rows, &AtomicBool::new(false))
                 .unwrap();
         }
-        let staged = device.stage(device_txn, 24).unwrap();
-        // A performer would write these placements; this test only needs the
-        // mapping they carry.
-        let device_placements: Vec<_> = (0..geometry.layers.len())
-            .map(|layer| device.placements(&staged, layer).unwrap())
+        // A performer would copy through `write_layer`; this test only needs
+        // the mapping each layer's writer was handed.
+        let mut writers: Vec<RecordingWriter> = (0..geometry.layers.len())
+            .map(|_| RecordingWriter::default())
             .collect();
-        device.publish(device_txn, staged).unwrap();
+        let mut writer_refs: Vec<&mut dyn PagedKvWriter> = writers
+            .iter_mut()
+            .map(|w| w as &mut dyn PagedKvWriter)
+            .collect();
+        device.append(device_txn, 24, &mut writer_refs).unwrap();
         // Zero, because prompt tokens are accepted when they are appended:
         // accepting them again would count the same context twice.
         host.commit_prefix(txn, 0).unwrap();
         device.commit(device_txn, 24).unwrap();
+        let device_placements: Vec<Vec<PagePlacement>> =
+            writers.into_iter().map(|w| w.placements).collect();
 
         for (layer, placements) in device_placements.iter().enumerate() {
             let l = &host.layout.layers[layer];
@@ -1415,12 +1441,18 @@ mod tests {
             }
             host.commit_prefix(txn, 0).unwrap();
             let device_txn = device.begin().unwrap();
-            let staged = device.stage(device_txn, step).unwrap();
-            device.publish(device_txn, staged).unwrap();
+            let mut writer = RecordingWriter::default();
+            device
+                .append(
+                    device_txn,
+                    step,
+                    &mut [&mut writer as &mut dyn PagedKvWriter],
+                )
+                .unwrap();
             device.commit(device_txn, step).unwrap();
             written += step;
         }
-        assert_eq!(device.committed_rows(), ROWS);
+        assert_eq!(device.committed_rows().unwrap(), ROWS);
 
         // Every row, including the ones whose page has been reused twelve
         // times. The comparison is against this store's own table bytes, so a
@@ -1597,11 +1629,11 @@ mod tests {
         //   Commit: entry, after the accepted frontier moves, and after the
         //           committed sampler history is published.
         //
-        // Independent review found the third missing: the earlier version of
-        // this test reached `append_checked` and `stage_checked` but never
-        // `commit_checked`, so the one operation that advances the *accepted*
-        // frontier and publishes sampler history was only ever fault-injected
-        // against full-retention geometry, where no row is overwritten.
+        // Commit is exercised here against a windowed geometry, not only a
+        // full-retention one: it is the only operation that advances the
+        // *accepted* frontier and publishes sampler history, and a
+        // full-retention geometry never overwrites a row, so it alone cannot
+        // show a fault there unwinding correctly.
         for fault in [Fault::Append, Fault::Sample, Fault::Commit] {
             let boundaries = match fault {
                 Fault::Append => 4,

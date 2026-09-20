@@ -7,25 +7,26 @@
 //! the answer exists.
 //!
 //! **What this module is and is not.** `PagedAttentionRun` does hold pages
-//! between launches and does track how many rows it has observed committed —
-//! that is what "persistent device state" means physically. What it does not do
-//! is *decide* anything about them: no retention rule, no transaction, no
-//! branch, no truncation, no lineage. Those are `moxie-state`'s, and the
-//! frontier here is a fact about copied bytes rather than a journal entry.
-//! Until that binding exists, these mechanics are provisional and belong to the
-//! task that will replace them; a second copy of the state authority's
-//! decisions here is the thing task 0037 forbids by name. Admission is
-//! `moxie-memory`'s throughout: every byte this module names was charged before
-//! it was allocated.
+//! between launches and does track how many rows it has observed **written** —
+//! that is what "persistent device state" means physically, and it is a fact
+//! about copied bytes, not a claim about history. What it does not do is
+//! *decide* anything: no retention rule, no transaction, no branch, no
+//! truncation, no lineage, no publication. Those are `moxie-state`'s: it calls
+//! through [`moxie_types::PagedKvWriter`], handing a writer the batch and the
+//! placements it chose for one layer, and treats that layer published only
+//! when the writer's `write_layer` returns `Ok` — which this module's writer
+//! implementation may say only once the copy it drives has been observed
+//! complete. There is no value this module hands back that would let a caller
+//! make publication happen some other way. Admission is `moxie-memory`'s
+//! throughout: every byte this module names was charged before it was
+//! allocated.
 //!
-//! **This is not yet the common execution path.** Document 04 requires attention
-//! to consume device tensor and page-table handles, with host reference paths as
-//! explicit separate implementations rather than compulsory staging. The
-//! `attend` below takes host query bytes and returns host output bytes, which is
-//! a bring-up interface: it is how a gate drives the kernel, not how a graph
-//! will. `moxie-plan` still refuses every stateful graph, and no
-//! `OpParams::Attention` node lowers to this yet. Both are named work in task
-//! 0037's record, not properties of the design.
+//! **The device-handle path document 04 requires.** `attend_into` takes device
+//! query and output ranges and launches directly, with no host round trip;
+//! `attend` is the explicit separate host-staged implementation built on top of
+//! it, for a caller with host bytes rather than a plan's own activation arena.
+//! There is one launch, in `attend_into`; the two entry points differ in what
+//! happens before and after it, not in how the kernel is invoked.
 //!
 //! **Why a separate module from `affine_linear.rs`.** Different operation,
 //! different operand set — a paged payload plus a page table rather than a
@@ -46,32 +47,15 @@ const PAYLOAD_BYTES: u64 = 2;
 /// A page-table entry is one `u32`.
 const PAGE_ENTRY_BYTES: u64 = 4;
 
-/// A `String` that grows only through `try_reserve`.
-///
-/// The same device `moxie-format` and the affine binding use, for the reason
-/// task 0024's review established: `format!` **aborts** when an allocation
-/// fails, and the context that produces a refusal is exactly the context most
-/// likely to coincide with memory pressure.
-struct FallibleString(String);
-
-impl core::fmt::Write for FallibleString {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.0.try_reserve(s.len()).map_err(|_| core::fmt::Error)?;
-        self.0.push_str(s);
-        Ok(())
-    }
-}
-
 /// Compose prose fallibly. An empty detail is a shorter true statement, not an
 /// abort: the variant and the `&'static str` field are what a caller branches
-/// on either way.
+/// on either way. `format!` **aborts** when an allocation fails, and the
+/// context that produces a refusal is exactly the context most likely to
+/// coincide with memory pressure, so growth goes through
+/// [`moxie_memory::fallible::text`] -- the crate's one fallible formatter --
+/// rather than a second copy of it.
 fn fallible(args: core::fmt::Arguments<'_>) -> String {
-    use core::fmt::Write;
-    let mut sink = FallibleString(String::new());
-    match sink.write_fmt(args) {
-        Ok(()) => sink.0,
-        Err(_) => String::new(),
-    }
+    moxie_memory::fallible::text(args).unwrap_or_default()
 }
 
 /// [`Error::InvalidRequest`] with a fixed message, still composed **fallibly**.
@@ -889,12 +873,12 @@ mod tests {
 
     #[test]
     fn every_abi_width_is_refused_at_construction_not_at_the_launch() {
-        // The finding this closes: a window wider than the kernel's `u32` used
-        // to be discovered inside the launch, **after** the query copy had been
-        // submitted, turning a knowable refusal into an unknown submission and
-        // a quarantined run. Nothing that reaches a launch can fail a width
-        // conversion any more, so `window` and `grid` are total on a value of
-        // this type.
+        // A window wider than the kernel's `u32` must be refused here, at
+        // construction -- discovering it only inside the launch, after the
+        // query copy had already been submitted, would turn a knowable refusal
+        // into an unknown submission and a quarantined run. Nothing that
+        // reaches a launch can fail a width conversion, so `window` and `grid`
+        // are total on a value of this type.
         let mut wide = layer();
         wide.visibility = Visibility::SlidingWindow {
             window: u64::from(u32::MAX) + 1,
@@ -956,11 +940,13 @@ mod tests {
 /// The bytes a launch reads are admitted here and stay admitted across appends
 /// and decodes, because that is what "persistent device state" means
 /// physically: the pages are not restaged per step. What this module does *not*
-/// do is decide what those pages mean. The committed frontier it tracks is the
-/// count of rows whose copy has been observed to complete — a fact about bytes,
-/// not a retention policy, a transaction or a branch. `moxie-state` owns those,
-/// and binding this run to its journal is the next task rather than a second
-/// authority grown here.
+/// do is decide what those pages mean. The **written** high-water mark it
+/// tracks is the count of rows whose copy has been observed to complete — a
+/// fact about bytes, not a retention policy, a transaction or a branch.
+/// `moxie-state` owns those, and it drives this module through
+/// [`moxie_types::PagedKvWriter`] rather than through a second authority grown
+/// here: `PagedKvWriterAdapter` is the bridge, `write_rows` the mechanism it
+/// calls.
 #[cfg(feature = "driver")]
 pub mod device {
     use core::ffi::c_void;
@@ -972,7 +958,8 @@ pub mod device {
         BufferRequest, Ledger, LedgerId, PlanRequest, Rejection, Reservation, StageSpan,
     };
     use moxie_types::{
-        DeviceTier, Error, HostTier, PagePlacement, Result, Scope, SemanticKernelDescriptor, Tier,
+        BatchId, DeviceTier, Error, HostTier, PagePlacement, PagedKvWriter, PageView, Result,
+        Scope, SemanticKernelDescriptor, Tier,
     };
 
     use super::{PageGeometry, PagedAttentionLaunch, invalid, invalid_fmt, unsupported_kernel_fmt};
@@ -1002,13 +989,31 @@ pub mod device {
         DeviceHandles,
     }
 
-    /// A refusal that happened before anything was allocated.
+    /// A refusal from admission, or from the unwind it runs on a partial
+    /// failure.
+    ///
+    /// Not only "before anything was allocated": `unwind` builds one after
+    /// pages, a table and query/output ranges already exist, when a later
+    /// step -- the image load, module resolution, the page-table vector --
+    /// fails. `error` is always admission's *own* reason for refusing, never
+    /// overwritten by a failure while unwinding; that failure goes in
+    /// `cleanup` instead. Whatever cleanup could not give back travels with
+    /// the refusal rather than being dropped: the arena in `arena`, and every
+    /// range a failed `release` did not reach -- including the one its own
+    /// failure was holding -- in `ranges`.
     #[derive(Debug)]
-    pub struct PagedAdmitRefused {
+    pub struct PagedAdmitRefused<'ctx> {
         pub error: Error,
         /// Returned held only when giving it back *also* failed.
         pub reservation: Option<Reservation>,
         pub rejection: Option<Rejection>,
+        /// The arena, when a failed `close` could not hand it back to the
+        /// ledger.
+        pub arena: Option<DeviceArena<'ctx>>,
+        /// Ranges a failed `release` could not return.
+        pub ranges: Vec<DeviceRange<'ctx>>,
+        /// A cleanup failure, distinct from `error`.
+        pub cleanup: Option<Error>,
     }
 
     /// What a refusal hands back, **in the allocations the caller gave it**.
@@ -1049,6 +1054,29 @@ pub mod device {
     pub struct PagedCloseRefused<'ctx> {
         pub run: PagedAttentionRun<'ctx>,
         pub error: Error,
+    }
+
+    /// A refused `attend_into`, **in the ranges the caller gave it**.
+    ///
+    /// `ranges` is `Some` when the refusal happened before anything was
+    /// enqueued -- the caller's query and output are handed straight back --
+    /// and `None` when the launch was enqueued with its completion
+    /// unobserved: the run keeps them, because the caller releasing or
+    /// reusing them while the kernel may still be reading or writing them
+    /// would be a use-after-free the type system cannot see. The run is
+    /// quarantined exactly when this is `None`.
+    #[derive(Debug)]
+    pub struct PagedAttendRefused<'ctx> {
+        pub error: Error,
+        pub ranges: Option<(DeviceRange<'ctx>, DeviceRange<'ctx>)>,
+    }
+
+    impl PagedAttendRefused<'_> {
+        /// Whether the run kept the ranges because their completion is
+        /// unknown.
+        pub const fn retained_ranges(&self) -> bool {
+            self.ranges.is_none()
+        }
     }
 
     /// One layer's admitted paged key/value state, plus the per-launch query and
@@ -1092,6 +1120,18 @@ pub mod device {
         /// What this run is holding across work whose completion it has not
         /// observed. An append holds two vectors and hands both back unjoined.
         held: Option<RefusedSource>,
+        /// The query and output ranges of an `attend`/`attend_into` whose
+        /// completion is unobserved.
+        ///
+        /// Fixed two-slot storage, not a `Vec`: exactly one launch is ever in
+        /// flight, so there is nothing to reserve and nothing to allocate on
+        /// this path. Populated only alongside `quarantined`, and **never**
+        /// read back out again -- not by `close`, which refuses outright while
+        /// quarantined, and not by anything else. An ordinary drop is what
+        /// disposes of it; a caller reusing a range the kernel may still be
+        /// reading or writing is exactly the bug this field exists to
+        /// prevent, and never handing the pair back is what prevents it.
+        held_ranges: Option<(DeviceRange<'ctx>, DeviceRange<'ctx>)>,
         quarantined: bool,
     }
 
@@ -1107,11 +1147,14 @@ pub mod device {
             heads: u64,
             max_rows: u64,
             staging: Staging,
-        ) -> std::result::Result<Self, PagedAdmitRefused> {
+        ) -> std::result::Result<Self, PagedAdmitRefused<'ctx>> {
             let fail = |error| PagedAdmitRefused {
                 error,
                 reservation: None,
                 rejection: None,
+                arena: None,
+                ranges: Vec::new(),
+                cleanup: None,
             };
             if descriptor.sm.major != ctx.capability().compute_major
                 || descriptor.sm.minor != ctx.capability().compute_minor
@@ -1166,19 +1209,19 @@ pub mod device {
             // build's* fatbin unconditionally — so a descriptor declaring a
             // different layout, accumulation policy, rounding profile,
             // workspace expression or image would be executed by the local
-            // image anyway, with its own declaration silently ignored. Task
-            // 0021's review produced exactly that shape one package over:
-            // operation, ABI and hash matched, the symbol did not, and every
-            // GPU computed the wrong activation for a valid-looking plan.
+            // image anyway, with its own declaration silently ignored. A
+            // descriptor whose operation, ABI and image hash match but whose
+            // symbol names a different kernel body is exactly that shape: every
+            // field-by-field check above passes while every GPU computes the
+            // wrong activation for a plan that looks valid.
             //
             // The descriptor must therefore **be** one the built-in package
             // declares. That binds operation, ABI, operand roles and
             // precisions, output, accumulation, rounding, layout, shape bounds,
             // SM, workspace, image digest and symbols together, which is the
             // only form of this check that cannot be half-satisfied. Selection
-            // still runs against whatever catalogue it is given — that is task
-            // 0012's design — and this is the boundary where a selected
-            // descriptor becomes a launch.
+            // still runs against whatever catalogue it is given, and this is
+            // the boundary where a selected descriptor becomes a launch.
             //
             // Asked of a predicate rather than of a rebuilt catalogue:
             // `paged_attention_catalogue()` allocates a `Vec`, two `String`s per
@@ -1228,6 +1271,9 @@ pub mod device {
                         },
                         reservation: None,
                         rejection: Some(rejection),
+                        arena: None,
+                        ranges: Vec::new(),
+                        cleanup: None,
                     });
                 }
             };
@@ -1394,6 +1440,7 @@ pub mod device {
                 ledger: ledger.id(),
                 ctx,
                 held: None,
+                held_ranges: None,
                 quarantined: false,
             })
         }
@@ -1432,13 +1479,23 @@ pub mod device {
 
         /// Publish the logical-to-physical page mapping this run will use.
         ///
-        /// One table, uploaded once and then read by the kernel and by this
-        /// host code for exactly the same addresses. A second host-side mapping
+        /// Republishing is legal -- the state authority's retained range slides
+        /// as its ring wraps, and a mapping that starts later is how this run
+        /// learns that -- but a new table must agree with the one it replaces
+        /// wherever both describe a page holding rows this run has written:
+        /// those rows already live at the addresses the old table resolved, and
+        /// sending one elsewhere would leave it unreadable while every other
+        /// check still passed. The table is then read by the kernel and by this
+        /// host code for exactly the same addresses; a second host-side mapping
         /// would be the page table that disagrees with the page table.
         ///
-        /// Refused once rows are committed: remapping pages under a live
-        /// history would move rows that something has already attended to.
-        pub fn publish_page_table(
+        /// `pub(crate)`, not `pub`: publishing a table is one half of the one
+        /// authorized operation [`PagedKvWriterAdapter::write_layer`] performs
+        /// from the state authority's own [`PageView`], and a caller reaching
+        /// this directly could publish a mapping the authority never decided.
+        /// `RawPagedFixture` is the one named exception, for a gate that has no
+        /// authority to begin with.
+        pub(crate) fn publish_page_table(
             &mut self,
             stream: &Stream<'ctx>,
             base: u64,
@@ -1587,16 +1644,24 @@ pub mod device {
                 bytes.extend_from_slice(&entry.to_le_bytes());
             }
             let range = self.table.as_ref().expect("live page table range");
-            // SAFETY: the source is held by this run until completion is
+            // Owned by `self.held` before the first enqueue, exactly as
+            // `attend` owns its query: a copy call that itself refuses may
+            // still have submitted work the driver has not unwound, so the
+            // encoded bytes must already be something other than this local
+            // variable before that call runs, not after.
+            self.held = Some(RefusedSource::Query(bytes));
+            let Some(RefusedSource::Query(bytes)) = self.held.as_ref() else {
+                unreachable!("just assigned")
+            };
+            // SAFETY: the source is owned by `self.held` until completion is
             // observed, and the destination is this run's own admitted range.
-            if let Err(error) = unsafe { range.copy_from_host_async(&bytes, stream) } {
+            if let Err(error) = unsafe { range.copy_from_host_async(bytes, stream) } {
                 self.quarantined = true;
                 return Err(PagedRunRefused {
                     error: self.attribute(error),
                     source: None,
                 });
             }
-            self.held = Some(RefusedSource::Query(bytes));
             if let Err(error) = self.settle(Ok(()), stream) {
                 return Err(PagedRunRefused {
                     error,
@@ -1613,9 +1678,8 @@ pub mod device {
         ///
         /// An offset resolved inside another device's allocation names the
         /// wrong bytes, and enqueuing on a foreign stream would order the copy
-        /// against work this run never sees. The affine linear binding learned
-        /// this from a review that drove 3090 leases through a 5060 Ti backing
-        /// and got a confident, different answer.
+        /// against work this run never sees -- silently, since a stream from a
+        /// different GPU is otherwise a value of the right type.
         fn same_device(&self, stream: &Stream<'ctx>) -> Result<()> {
             if stream.device_uuid() != self.ctx.uuid() {
                 return Err(invalid(
@@ -1674,10 +1738,19 @@ pub mod device {
         /// prior byte untouched and hands the sources back; a failure after
         /// enqueue quarantines the run, keeps the sources, and still does not
         /// advance it. There is no state in between: a partially copied write
-        /// is never reported as written, and the authority only publishes rows
-        /// this call has returned successfully for.
+        /// is never reported as written. This is the mechanism a
+        /// [`PagedKvWriter`] drives, not a value a caller can hold and use
+        /// later to assert that a write happened: an `Ok` here is only ever
+        /// true at the moment it is returned.
+        ///
+        /// `pub(crate)`, not `pub`: `placements` and `keys`/`values` are
+        /// publicly constructible values with nothing behind them, so a
+        /// caller reaching this directly could overwrite a live published row
+        /// without the state authority ever being involved. `RawPagedFixture`
+        /// is the one named exception, for a gate that has no authority to
+        /// begin with.
         #[allow(clippy::result_large_err)]
-        pub fn write_rows(
+        pub(crate) fn write_rows(
             &mut self,
             stream: &Stream<'ctx>,
             placements: &[PagePlacement],
@@ -1842,8 +1915,9 @@ pub mod device {
             }
             self.held = None;
             // Last, after the event said the bytes are there. This is the
-            // physical high-water mark, not a frontier: the authority publishes
-            // history, and it does so only for a call that returned `Ok`.
+            // physical high-water mark, not a frontier: a `PagedKvWriter`
+            // publishes history through the authority, and only for a layer
+            // whose write returned `Ok`.
             self.written = self.written.max(position);
             Ok(())
         }
@@ -1970,48 +2044,106 @@ pub mod device {
         /// the arena slots its plan bound, which is what makes this the path a
         /// lowered graph can use.
         ///
-        /// Nothing is retained on refusal because nothing of the caller's was
-        /// taken: the query is already device-resident and this call copies no
-        /// host bytes. A failure after the launch still quarantines the run,
-        /// because the ranges may still be read.
+        /// **Taken and returned by value, never borrowed.** Launch is
+        /// asynchronous, and completion is only known once `settle` returns —
+        /// if event creation, recording or synchronization fails after the
+        /// kernel was enqueued, whether it is still reading these ranges is
+        /// unknowable. A borrowed `&DeviceRange` cannot stop the caller from
+        /// releasing or reusing them while that is true; owning them can. A
+        /// refusal before anything is enqueued hands them straight back
+        /// (`PagedAttendRefused::ranges` is `Some`); a refusal after enqueue
+        /// with completion unobserved keeps them here instead, and the run is
+        /// quarantined exactly then.
+        #[allow(clippy::result_large_err)]
         pub fn attend_into(
             &mut self,
             stream: &Stream<'ctx>,
             launch: &PagedAttentionLaunch,
-            query: &DeviceRange<'ctx>,
-            output: &DeviceRange<'ctx>,
-        ) -> Result<()> {
-            self.check_attend(stream, launch)?;
-            let want = launch.query_bytes()?;
-            for (range, what) in [(query, "query"), (output, "output")] {
-                if range.device_uuid() != self.ctx.uuid() {
-                    return Err(invalid(what, "this range belongs to another device"));
+            query: DeviceRange<'ctx>,
+            output: DeviceRange<'ctx>,
+        ) -> std::result::Result<(DeviceRange<'ctx>, DeviceRange<'ctx>), PagedAttendRefused<'ctx>>
+        {
+            macro_rules! refuse {
+                ($error:expr) => {
+                    return Err(PagedAttendRefused {
+                        error: $error,
+                        ranges: Some((query, output)),
+                    })
+                };
+            }
+            if let Err(error) = self.check_attend(stream, launch) {
+                refuse!(error);
+            }
+            let want = match launch.query_bytes() {
+                Ok(want) => want,
+                Err(error) => refuse!(error),
+            };
+            // Extents and identity, read into owned values before any check can
+            // move `query`/`output` into a refusal: a loop over `&query`/
+            // `&output` would hold them borrowed for the loop's own lifetime,
+            // which conflicts with handing them back on the first line refused.
+            for (uuid, bytes, what) in [
+                (query.device_uuid(), query.bytes(), "query"),
+                (output.device_uuid(), output.bytes(), "output"),
+            ] {
+                if uuid != self.ctx.uuid() {
+                    refuse!(invalid(what, "this range belongs to another device"));
                 }
-                if range.bytes() < want {
-                    return Err(invalid_fmt(
+                if bytes < want {
+                    refuse!(invalid_fmt(
                         what,
-                        format_args!("{} byte(s) for a launch needing {want}", range.bytes()),
+                        format_args!("{bytes} byte(s) for a launch needing {want}"),
                     ));
                 }
             }
-            let scalars = Self::abi_scalars(launch)?;
-            let addresses = [
-                query.device_address()?,
-                self.keys
-                    .as_ref()
-                    .expect("live key range")
-                    .device_address()?,
-                self.values
-                    .as_ref()
-                    .expect("live value range")
-                    .device_address()?,
-                self.table
-                    .as_ref()
-                    .expect("live page table range")
-                    .device_address()?,
-                output.device_address()?,
-            ];
-            self.launch_with(stream, scalars, addresses)
+            let addresses = match (|| -> Result<[u64; 5]> {
+                Ok([
+                    query.device_address()?,
+                    self.keys
+                        .as_ref()
+                        .expect("live key range")
+                        .device_address()?,
+                    self.values
+                        .as_ref()
+                        .expect("live value range")
+                        .device_address()?,
+                    self.table
+                        .as_ref()
+                        .expect("live page table range")
+                        .device_address()?,
+                    output.device_address()?,
+                ])
+            })() {
+                Ok(addresses) => addresses,
+                Err(error) => refuse!(error),
+            };
+            // The kernel declares query and output `__restrict__`
+            // (`paged_attention.cu`): the compiler is trusted to assume a store
+            // through one is never observable through the other. An in-place
+            // launch -- the same range for both -- would violate that, so it is
+            // refused here rather than left to whatever the alias happens to
+            // produce.
+            if ranges_overlap(addresses[0], query.bytes(), addresses[4], output.bytes()) {
+                refuse!(invalid(
+                    "output",
+                    "the query and output ranges overlap, which this kernel's __restrict__ \
+                     query and output pointers forbid"
+                ));
+            }
+            let scalars = match Self::abi_scalars(launch) {
+                Ok(scalars) => scalars,
+                Err(error) => refuse!(error),
+            };
+            match self.launch_with(stream, scalars, addresses) {
+                Ok(()) => Ok((query, output)),
+                Err(error) => {
+                    self.held_ranges = Some((query, output));
+                    Err(PagedAttendRefused {
+                        error,
+                        ranges: None,
+                    })
+                }
+            }
         }
 
         /// Everything both entry points check before either touches the device.
@@ -2070,11 +2202,15 @@ pub mod device {
             Ok(())
         }
 
-        /// Attend `launch.rows` query rows against the committed history.
+        /// Attend `launch.rows` query rows against the rows this run has
+        /// physically written.
         ///
         /// The launch's declared history must be one this run actually holds:
-        /// a launch that claimed more rows than were committed would attend
-        /// over uninitialized pages and return a confident wrong answer.
+        /// a launch that claimed more rows than were written would attend over
+        /// uninitialized pages and return a confident wrong answer. This is a
+        /// fact about copied bytes, not the state authority's committed
+        /// frontier -- `self.written` and `moxie_state`'s frontier are checked
+        /// against each other elsewhere, not conflated here.
         #[allow(clippy::result_large_err)]
         pub fn attend(
             &mut self,
@@ -2134,36 +2270,72 @@ pub mod device {
                 Err(error) => return Err(give_back(error, query)),
             };
 
-            // The last thing that can be known without the device: every ABI
-            // width this launch needs. A failure here is an ordinary refusal
-            // with the query handed back.
-            let scalars = match Self::abi_scalars(launch) {
-                Ok(scalars) => scalars,
-                Err(error) => return Err(give_back(error, query)),
-            };
-
             // --- from here on, work is in flight -------------------------
+            // The host source is owned by `self.held`, not by this frame, from
+            // before the first enqueue: a `Drop` while quarantined forgets it
+            // rather than freeing bytes a DMA transfer may still be reading,
+            // and nothing below clears it until completion is observed.
             self.held = Some(RefusedSource::Query(query));
-            if let Err(error) = self.enqueue_attend(stream, scalars) {
-                return Err(PagedRunRefused {
-                    error,
-                    source: None,
-                });
-            }
-            let mut out = out_len;
-            if let Err(error) = self
+            let Some(RefusedSource::Query(query_bytes)) = self.held.as_ref() else {
+                unreachable!("just assigned")
+            };
+            // The run's own ranges, taken out of their slots so the shared
+            // path below owns them exactly as a caller's own ranges would.
+            // There is one launch operation, in `attend_into`; staging a host
+            // query differs only in what happens before and after it.
+            let query_range = self
+                .query
+                .take()
+                .expect("a host-staged run has a query range");
+            let output_range = self
                 .output
-                .as_ref()
-                .expect("live output range")
-                .copy_to_host_at(0, &mut out)
-            {
+                .take()
+                .expect("a host-staged run has an output range");
+            // SAFETY: the source is owned by `self.held` until completion is
+            // observed below, and the destination is this run's own admitted
+            // range.
+            if let Err(error) = unsafe { query_range.copy_from_host_async(query_bytes, stream) } {
                 self.quarantined = true;
+                self.held_ranges = Some((query_range, output_range));
                 return Err(PagedRunRefused {
                     error: self.attribute(error),
                     source: None,
                 });
             }
+            // The copy above is already enqueued on `stream`, so from here on
+            // this run's completion is unknown regardless of what
+            // `attend_into` enqueued for its own kernel launch: a "before
+            // anything was enqueued" refusal from its perspective is not one
+            // from this call's, and its ranges must not be handed back.
+            let (query_range, output_range) =
+                match self.attend_into(stream, launch, query_range, output_range) {
+                    Ok(ranges) => ranges,
+                    Err(refused) => {
+                        self.quarantined = true;
+                        if let Some(ranges) = refused.ranges {
+                            self.held_ranges = Some(ranges);
+                        }
+                        // else: `attend_into` already moved them into `held_ranges`.
+                        return Err(PagedRunRefused {
+                            error: refused.error,
+                            source: None,
+                        });
+                    }
+                };
+            let mut out = out_len;
+            if let Err(error) = output_range.copy_to_host_at(0, &mut out) {
+                self.quarantined = true;
+                self.held_ranges = Some((query_range, output_range));
+                return Err(PagedRunRefused {
+                    error: self.attribute(error),
+                    source: None,
+                });
+            }
+            // Completion is observed: the host source and the device ranges
+            // may be reclaimed and reused.
             self.held = None;
+            self.query = Some(query_range);
+            self.output = Some(output_range);
             Ok(out)
         }
 
@@ -2194,39 +2366,6 @@ pub mod device {
                 scale: launch.scale(),
                 grid: launch.grid()?,
             })
-        }
-
-        fn enqueue_attend(&mut self, stream: &Stream<'ctx>, scalars: AbiScalars) -> Result<()> {
-            let Some(RefusedSource::Query(query_source)) = self.held.as_ref() else {
-                return Err(invalid("attend", "the attend is not holding its query"));
-            };
-            let query_range = self.query.as_ref().expect("live query range");
-            // SAFETY: the source is held until completion is observed and the
-            // destination is this run's own admitted range.
-            if let Err(error) = unsafe { query_range.copy_from_host_async(query_source, stream) } {
-                self.quarantined = true;
-                return Err(self.attribute(error));
-            }
-            let mut addresses = [0u64; 5];
-            for (slot, range) in [
-                query_range,
-                self.keys.as_ref().expect("live key range"),
-                self.values.as_ref().expect("live value range"),
-                self.table.as_ref().expect("live page table range"),
-                self.output.as_ref().expect("live output range"),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                match range.device_address() {
-                    Ok(address) => addresses[slot] = address,
-                    Err(error) => {
-                        self.quarantined = true;
-                        return Err(self.attribute(error));
-                    }
-                }
-            }
-            self.launch_with(stream, scalars, addresses)
         }
 
         /// The launch itself: five addresses, the ABI's scalars, one grid.
@@ -2336,7 +2475,11 @@ pub mod device {
         /// Release the pages, the per-step ranges and their charge.
         ///
         /// Refuses while quarantined: work whose completion is unknown may
-        /// still be reading these ranges.
+        /// still be reading these ranges, including whatever `held_ranges`
+        /// holds -- which stays inside the returned run rather than being
+        /// exposed, because handing it back would let a caller reuse exactly
+        /// the ranges this refusal says may still be in flight. `Drop` is what
+        /// disposes of it if the caller gives up on retrying.
         #[allow(clippy::result_large_err)]
         pub fn close(
             mut self,
@@ -2364,6 +2507,17 @@ pub mod device {
                 let Some(range) = taken else { continue };
                 let arena = self.arena.as_mut().expect("an open run has its arena");
                 if let Err(refused) = arena.release(range) {
+                    // Put the range back in the slot it came from. The arena
+                    // still records this allocation as live either way; losing
+                    // the handle here would make that permanent, because
+                    // nothing else names this allocation to retry it with.
+                    match slot {
+                        0 => self.output = Some(refused.range),
+                        1 => self.query = Some(refused.range),
+                        2 => self.table = Some(refused.range),
+                        3 => self.values = Some(refused.range),
+                        _ => self.keys = Some(refused.range),
+                    }
                     let error = refused.error;
                     return Err(PagedCloseRefused { run: self, error });
                 }
@@ -2377,6 +2531,197 @@ pub mod device {
                     Err(PagedCloseRefused { run: self, error })
                 }
             }
+        }
+    }
+
+    impl Drop for PagedAttentionRun<'_> {
+        fn drop(&mut self) {
+            if !self.quarantined {
+                return;
+            }
+            // Host bytes a still-enqueued copy may be reading. Forgetting --
+            // not dropping -- is the point: freeing this allocation while a
+            // DMA transfer is in flight would let the allocator hand the same
+            // bytes to something else while the device is still reading them.
+            if let Some(held) = self.held.take() {
+                match held {
+                    RefusedSource::Rows { keys, values } => {
+                        core::mem::forget(keys);
+                        core::mem::forget(values);
+                    }
+                    RefusedSource::PageTable(table) => core::mem::forget(table),
+                    RefusedSource::Query(bytes) => core::mem::forget(bytes),
+                }
+            }
+            // `held_ranges` needs no such rescue: a `DeviceRange` has no
+            // `Drop` of its own, so an ordinary drop here does not release its
+            // suballocation back to the arena's free list -- no later
+            // allocation can be handed the same bytes. That is a narrower
+            // claim than permanent withholding: it says nothing about the
+            // arena's own physical buffer, which is a fact about
+            // `DeviceArena`'s lifetime, not this run's.
+        }
+    }
+
+    /// A [`PagedKvWriter`] over one run, for the one layer it serves.
+    ///
+    /// `moxie_state::DeviceKvSequence` calls through this trait instead of
+    /// validating a token it was handed: it stages a batch, hands each
+    /// layer's writer the view and the placements it chose, and treats a
+    /// layer published only when that call returns `Ok`. This is the small
+    /// bridge back to the run's own (now crate-private) `publish_page_table`
+    /// and `write_rows`, which stay the actual mechanism -- the copy and the
+    /// completion observation are unchanged, only who is allowed to call them
+    /// is different: publishing the authority's view and writing the rows it
+    /// placed happen together, as one authorized operation, so nothing
+    /// outside this bridge can perform either alone.
+    ///
+    /// One run serves one layer; a sequence with more layers is driven with
+    /// one writer per layer, each holding its own run and its own share of
+    /// the rows.
+    #[derive(Debug)]
+    pub struct PagedKvWriterAdapter<'run, 'ctx> {
+        layer: usize,
+        run: &'run mut PagedAttentionRun<'ctx>,
+        stream: &'run Stream<'ctx>,
+        keys: Vec<u8>,
+        values: Vec<u8>,
+    }
+
+    impl<'run, 'ctx> PagedKvWriterAdapter<'run, 'ctx> {
+        /// Bind a run to the layer it serves, with the rows `write_layer` will
+        /// copy when the authority drives it.
+        pub fn new(
+            layer: usize,
+            run: &'run mut PagedAttentionRun<'ctx>,
+            stream: &'run Stream<'ctx>,
+            keys: Vec<u8>,
+            values: Vec<u8>,
+        ) -> Self {
+            Self {
+                layer,
+                run,
+                stream,
+                keys,
+                values,
+            }
+        }
+
+        /// Take back whatever rows this writer still holds.
+        ///
+        /// Empty once `write_layer` has enqueued them (they are the run's
+        /// problem from there) or while a quarantined run retains them
+        /// internally; otherwise -- before the first call, or after a
+        /// pre-enqueue refusal restored them -- these are the same
+        /// `keys`/`values` this writer was constructed with, for a caller
+        /// that aborts rather than retries.
+        pub fn into_rows(self) -> (Vec<u8>, Vec<u8>) {
+            (self.keys, self.values)
+        }
+    }
+
+    impl PagedKvWriter for PagedKvWriterAdapter<'_, '_> {
+        fn write_layer(
+            &mut self,
+            layer: usize,
+            _batch: BatchId,
+            view: &PageView,
+            placements: &[PagePlacement],
+        ) -> moxie_types::Result<()> {
+            if layer != self.layer {
+                return Err(invalid_fmt(
+                    "layer",
+                    format_args!("this writer serves layer {}, not {layer}", self.layer),
+                ));
+            }
+            // One authorized operation: publish the authority's own view --
+            // never one this adapter derives -- and only then write the rows
+            // it placed. Always republished rather than compared against the
+            // last one: correctness first, and an unconditional idempotent
+            // publish is cheaper to reason about than a cache that could be
+            // wrong about what the run currently holds.
+            self.run
+                .publish_page_table(self.stream, view.base, view.table.clone())
+                .map_err(|refused| refused.error)?;
+            let keys = core::mem::take(&mut self.keys);
+            let values = core::mem::take(&mut self.values);
+            match self.run.write_rows(self.stream, placements, keys, values) {
+                Ok(()) => Ok(()),
+                Err(refused) => {
+                    // A pre-enqueue refusal hands the rows straight back, and
+                    // they belong in this writer again -- not on the floor --
+                    // so `into_rows` or a retry can still reach them. `None`
+                    // means the run already retained them internally because
+                    // completion is unknown; there is nothing to recover.
+                    if let Some(RefusedSource::Rows { keys, values }) = refused.source {
+                        self.keys = keys;
+                        self.values = values;
+                    }
+                    Err(refused.error)
+                }
+            }
+        }
+    }
+
+    /// A run driven with no state authority at all.
+    ///
+    /// Exists for the kernel-numerics gate (`cargo xtask-cuda test-gpu`),
+    /// which stresses the kernel against the FP64 oracle with shuffled and
+    /// arbitrary page tables -- values no authority's retention policy would
+    /// ever produce, because that is not a state decision to begin with.
+    /// Taking the run **by value** is the point: a run the authority is
+    /// driving through a [`PagedKvWriterAdapter`] cannot also be driven this
+    /// way, because reaching this path means surrendering the managed one,
+    /// and the type's name then marks every place that happened. Nothing
+    /// holding published history may construct one.
+    #[derive(Debug)]
+    #[must_use = "an unclosed run keeps its arena and its reservation"]
+    pub struct RawPagedFixture<'ctx> {
+        run: PagedAttentionRun<'ctx>,
+    }
+
+    impl<'ctx> RawPagedFixture<'ctx> {
+        /// Surrender the managed path for `run`.
+        pub fn new(run: PagedAttentionRun<'ctx>) -> Self {
+            Self { run }
+        }
+
+        /// Publish an arbitrary mapping -- shuffled, reversed, whatever the
+        /// gate is stressing -- with no authority behind it.
+        #[allow(clippy::result_large_err)]
+        pub fn publish_page_table(
+            &mut self,
+            stream: &Stream<'ctx>,
+            base: u64,
+            table: Vec<u32>,
+        ) -> std::result::Result<(), PagedRunRefused> {
+            self.run.publish_page_table(stream, base, table)
+        }
+
+        /// Write rows at placements this fixture chose, with no authority
+        /// behind them either.
+        #[allow(clippy::result_large_err)]
+        pub fn write_rows(
+            &mut self,
+            stream: &Stream<'ctx>,
+            placements: &[PagePlacement],
+            keys: Vec<u8>,
+            values: Vec<u8>,
+        ) -> std::result::Result<(), PagedRunRefused> {
+            self.run.write_rows(stream, placements, keys, values)
+        }
+
+        /// The run's own public surface -- `attend`, `read_rows`,
+        /// `written_rows`, `arena_bytes` and the rest -- none of which needed
+        /// narrowing.
+        pub fn run(&self) -> &PagedAttentionRun<'ctx> {
+            &self.run
+        }
+
+        /// Hand the run back once this fixture is done driving it directly,
+        /// so it can `attend`, `read_rows` or `close` through its own API.
+        pub fn into_inner(self) -> PagedAttentionRun<'ctx> {
+            self.run
         }
     }
 
@@ -2488,10 +2833,15 @@ pub mod device {
 
     /// The admission request one paged attention run makes.
     ///
-    /// Four device buffers and one host readback, each named for what it is.
-    /// The pages are `PersistentState` and the query and output are
-    /// `Activations`, because the ledger's report is about what memory is *for*
-    /// and a cache charged as scratch is a cache nobody can see growing.
+    /// Three device buffers always: keys, values and the page table, each
+    /// named for what it is and charged as `KvStatePages`. `Staging::Host`
+    /// adds two more device buffers (query and output, charged as
+    /// `Activations`) and one host readback; `Staging::DeviceHandles` adds
+    /// none of those three, because the caller's own arena slots are the
+    /// query and output, and charging this ledger a second time for bytes it
+    /// will never hold is what lets an admissible direct-device plan be
+    /// refused. The ledger's report is about what memory is *for*, and a
+    /// cache charged as scratch is a cache nobody can see growing.
     pub fn resource_request(
         geometry: &PageGeometry,
         heads: u64,
@@ -2529,27 +2879,34 @@ pub mod device {
             extents.table,
             StageSpan::inclusive(0, 2),
         ))?;
-        request.buffer(BufferRequest::new(
-            "attention-query",
-            scope,
-            Tier::Device(DeviceTier::Activations),
-            extents.query,
-            StageSpan::inclusive(1, 2),
-        ))?;
-        request.buffer(BufferRequest::new(
-            "attention-output",
-            scope,
-            Tier::Device(DeviceTier::Activations),
-            extents.query,
-            StageSpan::inclusive(1, 2),
-        ))?;
-        request.buffer(BufferRequest::new(
-            "attention-output-readback",
-            Scope::Host,
-            Tier::Host(HostTier::Pageable),
-            extents.query,
-            StageSpan::at(2),
-        ))?;
+        // Host staging only: a direct-device run's query and output are the
+        // caller's own arena slots, and charging this ledger for a device
+        // activation pair and a host readback it will never hold is what lets
+        // an admissible direct-device plan be refused for bytes it does not
+        // use.
+        if staging == Staging::Host {
+            request.buffer(BufferRequest::new(
+                "attention-query",
+                scope,
+                Tier::Device(DeviceTier::Activations),
+                extents.query,
+                StageSpan::inclusive(1, 2),
+            ))?;
+            request.buffer(BufferRequest::new(
+                "attention-output",
+                scope,
+                Tier::Device(DeviceTier::Activations),
+                extents.query,
+                StageSpan::inclusive(1, 2),
+            ))?;
+            request.buffer(BufferRequest::new(
+                "attention-output-readback",
+                Scope::Host,
+                Tier::Host(HostTier::Pageable),
+                extents.query,
+                StageSpan::at(2),
+            ))?;
+        }
         Ok(request)
     }
 
@@ -2560,33 +2917,61 @@ pub mod device {
             .ok_or_else(|| invalid("align", "the aligned extent overflows"))
     }
 
-    fn give_back(ledger: &mut Ledger, reservation: Reservation, error: Error) -> PagedAdmitRefused {
+    /// Whether `[a, a + a_len)` and `[b, b + b_len)` share a byte.
+    fn ranges_overlap(a: u64, a_len: u64, b: u64, b_len: u64) -> bool {
+        a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    fn give_back<'ctx>(
+        ledger: &mut Ledger,
+        reservation: Reservation,
+        error: Error,
+    ) -> PagedAdmitRefused<'ctx> {
         match ledger.release(reservation) {
             Ok(()) => PagedAdmitRefused {
                 error,
                 reservation: None,
                 rejection: None,
+                arena: None,
+                ranges: Vec::new(),
+                cleanup: None,
             },
             Err(refused) => PagedAdmitRefused {
                 error,
                 reservation: Some(refused.reservation),
                 rejection: None,
+                arena: None,
+                ranges: Vec::new(),
+                cleanup: Some(refused.error),
             },
         }
     }
 
+    /// Release everything admission had built when a later step refused.
+    ///
+    /// Stops at the first failed `release` or `close` rather than trying the
+    /// rest: `error` stays admission's own reason for refusing throughout,
+    /// and whatever cleanup could not give back -- the arena, and every range
+    /// `hold` still names, including the one the failed `release` handed back
+    /// -- travels with the refusal in `arena`/`ranges` instead of being
+    /// dropped. `ranges` is `hold` itself, reused rather than reallocated on
+    /// this refusal path.
     fn unwind<'ctx>(
         mut arena: DeviceArena<'ctx>,
         mut ranges: Vec<DeviceRange<'ctx>>,
         ledger: &mut Ledger,
         error: Error,
-    ) -> PagedAdmitRefused {
+    ) -> PagedAdmitRefused<'ctx> {
         while let Some(range) = ranges.pop() {
             if let Err(refused) = arena.release(range) {
+                ranges.push(refused.range);
                 return PagedAdmitRefused {
-                    error: refused.error,
+                    error,
                     reservation: None,
                     rejection: None,
+                    arena: Some(arena),
+                    ranges,
+                    cleanup: Some(refused.error),
                 };
             }
         }
@@ -2595,12 +2980,41 @@ pub mod device {
                 error,
                 reservation: None,
                 rejection: None,
+                arena: None,
+                ranges,
+                cleanup: None,
             },
             Err(refused) => PagedAdmitRefused {
-                error: refused.error,
+                error,
                 reservation: None,
                 rejection: None,
+                arena: Some(refused.arena),
+                ranges,
+                cleanup: Some(refused.error),
             },
+        }
+    }
+
+    #[cfg(test)]
+    mod overlap_tests {
+        use super::ranges_overlap;
+
+        /// No hardware needed: this is the arithmetic `attend_into` refuses an
+        /// aliased query/output on, checked directly rather than only through
+        /// two live `DeviceRange`s -- which, once `attend_into` takes them by
+        /// value, cannot be made to alias through the safe API at all.
+        #[test]
+        fn identical_and_nested_ranges_overlap_disjoint_ones_do_not() {
+            assert!(ranges_overlap(0, 16, 0, 16), "identical ranges");
+            assert!(ranges_overlap(0, 16, 8, 16), "overlapping tails");
+            assert!(ranges_overlap(8, 16, 0, 16), "overlapping tails, swapped");
+            assert!(ranges_overlap(4, 4, 0, 16), "nested inside a wider range");
+            assert!(!ranges_overlap(0, 16, 16, 16), "adjacent, not overlapping");
+            assert!(!ranges_overlap(0, 8, 100, 8), "far apart");
+            assert!(
+                !ranges_overlap(u64::MAX - 4, 8, 0, 4),
+                "a saturating length must not wrap into a false overlap"
+            );
         }
     }
 }
@@ -2650,8 +3064,16 @@ mod device_tests {
     }
 
     /// A direct-device run is not charged for staging it never uses.
+    ///
+    /// Proved through the ledger's own admission, not the physical arena's
+    /// byte counter: a ledger with **no host capacity snapshot at all** must
+    /// still admit `Staging::DeviceHandles` -- its request names no host
+    /// buffer -- and must refuse `Staging::Host` on the missing scope, which
+    /// is only possible if that request actually names one. A byte-count
+    /// comparison of two admitted arenas cannot tell "the ledger was never
+    /// asked" from "it was asked and happened to fit."
     #[test]
-    fn a_direct_device_run_admits_no_staging_buffers() {
+    fn a_direct_device_run_is_not_charged_for_staging_it_never_uses() {
         let _guard = crate::DRIVER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -2677,29 +3099,11 @@ mod device_tests {
             .expect("a descriptor")
         };
 
-        // The same geometry, admitted both ways, against the same ledger.
         let measurement = ctx.measure().expect("measure");
         let mut ledger = Ledger::new([
-            CapacitySnapshot::measured(&measurement, 1 << 20).expect("device capacity"),
-            CapacitySnapshot::new(moxie_types::Scope::Host, 1 << 28, 1 << 20).expect("host"),
+            CapacitySnapshot::measured(&measurement, 1 << 20).expect("device capacity")
         ])
-        .expect("one ledger");
-        let staged = PagedAttentionRun::admit(
-            &mut ledger,
-            &ctx,
-            descriptor(),
-            geometry(),
-            HEADS,
-            4,
-            Staging::Host,
-        )
-        .map_err(|r| r.error)
-        .expect("admission fits");
-        let staged_bytes = staged.arena_bytes();
-        staged
-            .close(&mut ledger)
-            .map_err(|r| r.error)
-            .expect("close");
+        .expect("a ledger with device capacity and no host scope at all");
 
         let mut direct = PagedAttentionRun::admit(
             &mut ledger,
@@ -2711,19 +3115,39 @@ mod device_tests {
             Staging::DeviceHandles,
         )
         .map_err(|r| r.error)
-        .expect("admission fits");
-        let direct_bytes = direct.arena_bytes();
+        .expect("a direct-device run needs no host capacity to admit");
+        // `direct` itself is outstanding from here on -- the assertion below
+        // is about whether the *failed* admission changes that count, not
+        // about the ledger being empty, which it never is while `direct`
+        // lives.
+        let outstanding_before = ledger.outstanding_count();
 
-        // Four query rows of four heads by 64 in BF16, twice over: the query
-        // and the output the direct run does not hold.
-        let per_step = 2 * 4 * HEADS * HEAD_DIM * 2;
-        assert_eq!(
-            staged_bytes - direct_bytes,
-            per_step,
-            "a direct-device run was charged for staging buffers"
+        let staged_error = PagedAttentionRun::admit(
+            &mut ledger,
+            &ctx,
+            descriptor(),
+            geometry(),
+            HEADS,
+            4,
+            Staging::Host,
+        )
+        .expect_err("a host-staged run without host capacity was admitted")
+        .error;
+        assert!(
+            matches!(
+                staged_error,
+                moxie_types::Error::InvalidRequest { field: "scope", .. }
+            ),
+            "{staged_error:?}"
         );
-        // And the host-staged entry point is refused rather than silently
-        // reaching for ranges that are not there.
+        assert_eq!(
+            ledger.outstanding_count(),
+            outstanding_before,
+            "the failed admission changed what the ledger holds outstanding"
+        );
+
+        // And the host-staged entry point is refused on the direct run rather
+        // than silently reaching for ranges that are not there.
         direct
             .publish_page_table(&stream, 0, vec![0, 1])
             .map_err(|r| r.error)
@@ -2859,7 +3283,9 @@ mod device_tests {
         unsafe { query_range.copy_from_host_async(&query, &stream) }.expect("upload the query");
         stream.synchronize().expect("the upload completes");
 
-        run.attend_into(&stream, &launch, &query_range, &output_range)
+        let (query_range, output_range) = run
+            .attend_into(&stream, &launch, query_range, output_range)
+            .map_err(|r| r.error)
             .expect("the device-handle decode runs");
         let mut direct = vec![0u8; want as usize];
         output_range
@@ -2876,22 +3302,24 @@ mod device_tests {
             "the decode produced nothing"
         );
 
-        // A range from another device, and one too small for the launch, are
-        // refused rather than read.
-        assert!(
-            run.attend_into(&stream, &launch, &query_range, &query_range)
-                .is_ok(),
-            "a caller may aim the output at any range of the right size"
-        );
+        // Ownership by value already makes aliasing `f(&r, &r)` inexpressible
+        // here: a caller cannot hand the same `DeviceRange` to both parameters
+        // without a double move. `ranges_overlap` (unit tested below) is the
+        // runtime guard for the case ownership cannot rule out on its own --
+        // two distinct ranges whose bytes happen to coincide -- which this
+        // kernel's `__restrict__` query and output pointers forbid either way.
+        //
+        // A query range too small for the launch is refused rather than read,
+        // and it is handed straight back: nothing was enqueued.
         let short = arena
             .allocate(256, 256, "short")
             .map_err(|r| r.error)
             .expect("a short range");
-        assert!(
-            run.attend_into(&stream, &launch, &short, &output_range)
-                .is_err(),
-            "a query range too small for the launch was accepted"
-        );
+        let refused = run
+            .attend_into(&stream, &launch, short, output_range)
+            .expect_err("a query range too small for the launch was accepted");
+        assert!(!refused.retained_ranges());
+        let (short, output_range) = refused.ranges.expect("a pre-launch refusal keeps nothing");
 
         arena.release(short).map_err(|r| r.error).expect("release");
         arena

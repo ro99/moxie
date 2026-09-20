@@ -18,6 +18,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use moxie_cuda::{RankContext, Stream, device_count, query_device};
+use moxie_executor::paged_attention::device::{PagedKvWriterAdapter, RawPagedFixture};
 use moxie_executor::{
     AttentionLayer, PageGeometry, PagedAttentionLaunch, PagedAttentionRun, Staging,
 };
@@ -25,7 +26,10 @@ use moxie_kernels::cpu_expert::to_bf16_bits;
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_plan::Visibility;
 use moxie_state::{DeviceKvSequence, KvGeometry, LayerKv, Retention};
-use moxie_types::{Error, PagePlacement, Precision, RankId, Scope};
+use moxie_types::{
+    BatchId, Error, PagePlacement, PagedKvWriter, PageView, Precision, RankId, Scope,
+    StateTransactionId,
+};
 
 /// A `RankContext` is exclusive per device and `cargo test` runs a binary's
 /// tests in parallel threads. Serialising them is the property task 0007
@@ -100,40 +104,43 @@ fn decode_at<'ctx>(
     .expect("the decode runs")
 }
 
-/// Publish `rows` rows through the authority and write them through the run.
+/// The full admitted mapping for a retain-all layer: physical page equals
+/// logical page for every row this run can ever hold, from page zero.
+/// Retain-all never evicts, so this is valid once and forever -- a fact about
+/// the run's own admitted page count, not a decision about which rows
+/// survive, and not something [`append_through_authority`] needs since the
+/// writer publishes the authority's own view instead. Used only where there
+/// is no authority to ask: a fresh run with nothing committed yet, and the
+/// handful of tests below that drive [`PagedKvWriterAdapter`] directly with a
+/// hand-built (but still accurate) view.
+fn identity_table(pages: u64) -> Vec<u32> {
+    (0..u32::try_from(pages).expect("this fixture's page count fits a u32")).collect()
+}
+
+/// Append `rows` rows through the authority and write them through the run.
 ///
-/// The order is the contract: placements first, bytes second, publication last
-/// and only when the write returned. A run that wrote nothing must never leave
-/// the authority claiming history.
+/// `DeviceKvSequence::append` is the only public way to move the frontier: it
+/// stages, hands the writer the view and placements it chose, and publishes
+/// only on success. `PagedKvWriterAdapter::write_layer` publishes that view
+/// and writes the rows as one authorized operation, so this fixture no longer
+/// touches a page table at all -- computing one, even the trivial identity
+/// this retain-all layer would produce, is exactly the authority arithmetic
+/// this binding exists to keep out of callers.
 fn append_through_authority<'ctx>(
     sequence: &mut DeviceKvSequence,
     run: &mut PagedAttentionRun<'ctx>,
     stream: &Stream<'ctx>,
     rows: u64,
     seed: u64,
-) -> Vec<PagePlacement> {
+) {
     let txn = sequence.begin().expect("a transaction");
-    let staged = sequence.stage(txn, rows).expect("stage");
-    let placements = sequence
-        .placements(&staged, 0)
-        .expect("the authority places the rows");
-    // The mapping **before** the write, covering the rows about to land. A
-    // write is checked against the published view, so a view that stopped at
-    // the retained range would refuse the very rows it is about to gain. It
-    // grows as pages are filled and slides as the ring reclaims; republishing
-    // it is how the run learns both.
-    let view = sequence.page_view(0).expect("a view");
-    run.publish_page_table(stream, view.base, view.table)
-        .map_err(|r| r.error)
-        .expect("the authority's mapping");
     let keys = bf16_bytes(rows as usize * row_bytes(), seed);
     let values = bf16_bytes(rows as usize * row_bytes(), seed + 1);
-    run.write_rows(stream, &placements, keys, values)
-        .map_err(|r| r.error)
-        .expect("the write fits");
-    sequence.publish(txn, staged).expect("publish");
+    let mut writer = PagedKvWriterAdapter::new(0, run, stream, keys, values);
+    sequence
+        .append(txn, rows, &mut [&mut writer])
+        .expect("append");
     sequence.commit(txn, rows).expect("commit");
-    placements
 }
 
 const HEADS: u64 = 4;
@@ -214,9 +221,14 @@ fn prepared<'ctx>(
     if rows > 0 {
         append_through_authority(&mut sequence, &mut run, stream, rows, 0x37_0001);
     } else {
-        run.publish_page_table(stream, 0, vec![0, 1, 2, 3])
+        // No authority has published anything yet -- there is nothing for it
+        // to have decided -- so this is `RawPagedFixture`'s case rather than
+        // the adapter's.
+        let mut raw = RawPagedFixture::new(run);
+        raw.publish_page_table(stream, 0, identity_table(geometry().pages))
             .map_err(|r| r.error)
             .expect("an identity mapping");
+        run = raw.into_inner();
     }
     (run, sequence)
 }
@@ -502,7 +514,7 @@ fn a_mapping_that_is_not_a_mapping_is_refused() {
     let ctx = RankContext::acquire(RankId(0), 0).expect("acquire device 0");
     let stream = Stream::new(&ctx).expect("a stream");
     let mut ledger = measured_ledger(&ctx);
-    let mut run = PagedAttentionRun::admit(
+    let run = PagedAttentionRun::admit(
         &mut ledger,
         &ctx,
         descriptor_for(&ctx),
@@ -513,6 +525,10 @@ fn a_mapping_that_is_not_a_mapping_is_refused() {
     )
     .map_err(|r| r.error)
     .expect("admission fits");
+    // No state authority anywhere in this test: every mapping and placement
+    // below is deliberately malformed, which no authority would ever
+    // produce, so this drives the run directly through `RawPagedFixture`.
+    let mut run = RawPagedFixture::new(run);
 
     // A physical page that does not exist, and one named twice. The second is
     // the dangerous one: aliased pages make an append overwrite history that is
@@ -601,6 +617,7 @@ fn a_mapping_that_is_not_a_mapping_is_refused() {
     // A placement outside the admitted pages, one that runs off the end of its
     // page, and a set that is not contiguous are each refused before any copy.
     for (what, placements) in [
+        ("no placement at all", Vec::new()),
         (
             "a page that does not exist",
             vec![PagePlacement {
@@ -651,7 +668,10 @@ fn a_mapping_that_is_not_a_mapping_is_refused() {
             "{what}: a pre-enqueue refusal kept bytes"
         );
     }
-    run.close(&mut ledger).map_err(|r| r.error).expect("close");
+    run.into_inner()
+        .close(&mut ledger)
+        .map_err(|r| r.error)
+        .expect("close");
     assert!(ledger.outstanding().is_empty());
 }
 
@@ -674,39 +694,40 @@ fn a_refused_append_moves_nothing_and_hands_the_rows_back() {
     let before = run.read_rows(&written).expect("written rows read back");
     let capacity = run.capacity_rows().expect("capacity");
     assert_eq!(capacity, 64, "four pages of sixteen rows");
-    let txn = sequence.begin().expect("a transaction");
-    let staged = sequence.stage(txn, 2).expect("stage");
-    let good = sequence.placements(&staged, 0).expect("two more rows");
 
-    let cases: Vec<(&str, Vec<PagePlacement>, usize, usize)> = vec![
-        ("no placement at all", Vec::new(), 0, 0),
-        (
-            "keys short of their row count",
-            good.clone(),
-            row_bytes(),
-            2 * row_bytes(),
-        ),
+    // Two more rows, with keys or values short of what they claim. The
+    // authority stages and places them for real; only the byte lengths this
+    // writer was built with are wrong, so `write_rows` refuses before
+    // anything is enqueued and the adapter must still have the caller's
+    // original bytes afterward -- the same property `retained_source()` used
+    // to stand in for, checked on the path a real caller drives.
+    let cases: Vec<(&str, usize, usize)> = vec![
+        ("keys short of their row count", row_bytes(), 2 * row_bytes()),
         (
             "values short of their row count",
-            good.clone(),
             2 * row_bytes(),
             row_bytes(),
         ),
     ];
-    for (label, placements, keys, values) in cases {
-        let refused = run
-            .write_rows(
-                &stream,
-                &placements,
-                bf16_bytes(keys, 7),
-                bf16_bytes(values, 8),
-            )
+    for (label, keys_len, values_len) in cases {
+        let keys = bf16_bytes(keys_len, 7);
+        let values = bf16_bytes(values_len, 8);
+        let txn = sequence.begin().expect("a transaction");
+        let mut writer = PagedKvWriterAdapter::new(0, &mut run, &stream, keys.clone(), values.clone());
+        sequence
+            .append(txn, 2, &mut [&mut writer])
             .err()
             .unwrap_or_else(|| panic!("{label} was accepted"));
-        assert!(
-            !refused.retained_source(),
-            "{label}: a refusal before enqueue must hand the rows back"
+        let (recovered_keys, recovered_values) = writer.into_rows();
+        assert_eq!(
+            recovered_keys, keys,
+            "{label}: a refusal before enqueue must hand the keys back"
         );
+        assert_eq!(
+            recovered_values, values,
+            "{label}: a refusal before enqueue must hand the values back"
+        );
+        sequence.abort(txn).expect("abort");
         assert_eq!(run.written_rows(), 20, "{label}: the high-water mark moved");
         assert_eq!(
             run.read_rows(&written).expect("read back"),
@@ -714,16 +735,22 @@ fn a_refused_append_moves_nothing_and_hands_the_rows_back() {
             "{label}: written bytes changed"
         );
         assert_eq!(
-            sequence.committed_rows(),
+            sequence.committed_rows().expect("committed rows"),
             20,
             "{label}: the authority published rows the run refused"
         );
     }
     // The authority refuses to stage rows past its own admitted context, which
     // is the other half: the run bounds bytes, the authority bounds history.
-    sequence.abort(txn).expect("abort");
+    // `append` refuses inside its own staging step, before the writer -- an
+    // empty one here -- is ever driven.
     let txn = sequence.begin().expect("a transaction");
-    assert!(sequence.stage(txn, capacity + 1).is_err());
+    let mut writer = PagedKvWriterAdapter::new(0, &mut run, &stream, Vec::new(), Vec::new());
+    assert!(
+        sequence
+            .append(txn, capacity + 1, &mut [&mut writer])
+            .is_err()
+    );
     sequence.abort(txn).expect("abort");
 
     // And a launch that claims history nothing wrote.
@@ -733,6 +760,59 @@ fn a_refused_append_moves_nothing_and_hands_the_rows_back() {
         .expect_err("a launch past the written rows was accepted");
     assert!(!refused.retained_source());
     assert_eq!(run.written_rows(), 20);
+    run.close(&mut ledger).map_err(|r| r.error).expect("close");
+    assert!(ledger.outstanding().is_empty());
+}
+
+/// A pre-enqueue refusal through the writer must not destroy the caller's
+/// rows.
+///
+/// `write_rows` hands `RefusedSource::Rows` straight back when nothing was
+/// enqueued, and `PagedKvWriterAdapter::write_layer` must put it back into the
+/// adapter rather than dropping it on the way to a `moxie_types::Error` --
+/// otherwise a caller that aborts and retries loses the allocations it
+/// arrived with.
+#[test]
+fn a_pre_enqueue_writer_refusal_returns_the_original_rows() {
+    let _guard = one_at_a_time();
+    if device_count().expect("enumerate") == 0 {
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    }
+    let ctx = RankContext::acquire(RankId(0), 0).expect("acquire device 0");
+    let stream = Stream::new(&ctx).expect("a stream");
+    let mut ledger = measured_ledger(&ctx);
+    let (mut run, _sequence) = prepared(&mut ledger, &ctx, &stream, 4);
+
+    let keys = bf16_bytes(row_bytes(), 11);
+    let values = bf16_bytes(row_bytes(), 12);
+    let mut writer = PagedKvWriterAdapter::new(0, &mut run, &stream, keys.clone(), values.clone());
+    let batch = BatchId {
+        transaction: StateTransactionId(0),
+        first: 0,
+        rows: 0,
+    };
+    // The identity mapping `prepared` already published -- still accurate,
+    // since a retain-all layer's mapping never changes -- and an empty
+    // placement set: `write_rows` refuses before touching the device, well
+    // before this writer's own layer check would matter.
+    let view = PageView {
+        base: 0,
+        table: identity_table(geometry().pages),
+    };
+    writer
+        .write_layer(0, batch, &view, &[])
+        .expect_err("a write with no placement was accepted");
+    let (recovered_keys, recovered_values) = writer.into_rows();
+    assert_eq!(
+        recovered_keys, keys,
+        "the adapter destroyed the caller's keys on a pre-enqueue refusal"
+    );
+    assert_eq!(
+        recovered_values, values,
+        "the adapter destroyed the caller's values on a pre-enqueue refusal"
+    );
+
     run.close(&mut ledger).map_err(|r| r.error).expect("close");
     assert!(ledger.outstanding().is_empty());
 }
@@ -750,18 +830,29 @@ fn a_stream_from_another_device_is_refused() {
     let stream = Stream::new(&ctx).expect("a stream");
     let foreign = Stream::new(&other).expect("a stream on the other device");
     let mut ledger = measured_ledger(&ctx);
-    let (mut run, sequence) = prepared(&mut ledger, &ctx, &stream, 4);
+    let (mut run, mut sequence) = prepared(&mut ledger, &ctx, &stream, 4);
 
-    let mut sequence = sequence;
-    let txn = sequence.begin().expect("a transaction");
-    let staged = sequence.stage(txn, 1).expect("stage");
-    let placements = sequence.placements(&staged, 0).expect("one more row");
+    // One more row, through the writer adapter built on the foreign stream:
+    // `write_layer` publishes the authority's view before writing, and that
+    // publish already refuses a stream naming another device, so `append`
+    // never reaches the copy itself.
     let keys = bf16_bytes(row_bytes(), 3);
     let values = bf16_bytes(row_bytes(), 4);
-    let refused = run
-        .write_rows(&foreign, &placements, keys, values)
+    let txn = sequence.begin().expect("a transaction");
+    let mut writer = PagedKvWriterAdapter::new(0, &mut run, &foreign, keys.clone(), values.clone());
+    sequence
+        .append(txn, 1, &mut [&mut writer])
         .expect_err("a write on a foreign stream was accepted");
-    assert!(!refused.retained_source());
+    let (recovered_keys, recovered_values) = writer.into_rows();
+    assert_eq!(
+        recovered_keys, keys,
+        "a refusal before enqueue must hand the keys back"
+    );
+    assert_eq!(
+        recovered_values, values,
+        "a refusal before enqueue must hand the values back"
+    );
+    sequence.abort(txn).expect("abort");
     assert_eq!(run.written_rows(), 4, "the high-water mark moved");
 
     let query = bf16_bytes((HEADS * geometry().head_dim) as usize, 5);
@@ -811,7 +902,7 @@ fn repeated_decode_admits_nothing_further() {
         }
         assert_eq!(run.written_rows(), step + 1);
         assert_eq!(
-            sequence.committed_rows(),
+            sequence.committed_rows().expect("committed rows"),
             step + 1,
             "the authority and the run disagree about step {step}"
         );
@@ -920,16 +1011,6 @@ fn a_wrapped_ring_answers_exactly_as_an_unwrapped_one() {
         while written < ROWS {
             let step = 8.min(ROWS - written);
             let txn = sequence.begin().expect("a transaction");
-            let staged = sequence.stage(txn, step).expect("stage");
-            let placements = sequence
-                .placements(&staged, 0)
-                .expect("the authority places the rows");
-            // The mapping before the write: a write is checked against the
-            // published view, and the view has to cover the rows about to land.
-            let view = sequence.page_view(0).expect("a view");
-            run.publish_page_table(&stream, view.base, view.table)
-                .map_err(|r| r.error)
-                .expect("the authority's mapping");
             let row = (2 * 64) as usize;
             let mut keys = Vec::new();
             let mut values = Vec::new();
@@ -937,19 +1018,30 @@ fn a_wrapped_ring_answers_exactly_as_an_unwrapped_one() {
                 keys.extend_from_slice(&bf16_bytes(row, 0x5000 + written + offset));
                 values.extend_from_slice(&bf16_bytes(row, 0x9000 + written + offset));
             }
-            run.write_rows(&stream, &placements, keys, values)
-                .map_err(|r| r.error)
-                .expect("the write fits");
-            sequence.publish(txn, staged).expect("publish");
+            let mut writer = PagedKvWriterAdapter::new(0, &mut run, &stream, keys, values);
+            sequence
+                .append(txn, step, &mut [&mut writer])
+                .expect("append");
             sequence.commit(txn, step).expect("commit");
             written += step;
         }
 
+        // A pure resync, with no write attached: the final `commit` above can
+        // advance the retained base further than the view published during
+        // that same append already reflected (`retained` depends on
+        // `committed_high_water`, which only moves at `commit`, itself called
+        // after that append's `write_layer` already ran). There is no
+        // "authorized operation" shape for a republish with nothing to write,
+        // so this is `RawPagedFixture`, applied to the authority's own
+        // current view rather than an invented one -- not an adversarial
+        // value, just the one case the adapter has no method for.
         let retained = sequence.retained(0).expect("a range");
         let view = sequence.page_view(0).expect("a view");
-        run.publish_page_table(&stream, view.base, view.table)
+        let mut raw = RawPagedFixture::new(run);
+        raw.publish_page_table(&stream, view.base, view.table)
             .map_err(|r| r.error)
             .expect("the authority's mapping for the retained range");
+        let mut run = raw.into_inner();
         let launch = PagedAttentionLaunch::new(
             layer,
             1,
@@ -982,7 +1074,11 @@ fn a_wrapped_ring_answers_exactly_as_an_unwrapped_one() {
             .map_err(|r| r.error)
             .expect("the decode runs");
         run.close(ledger).map_err(|r| r.error).expect("close");
-        (out, retained.start, sequence.committed_rows())
+        (
+            out,
+            retained.start,
+            sequence.committed_rows().expect("committed rows"),
+        )
     };
 
     let mut ledger = measured_ledger(&ctx);
@@ -1038,25 +1134,43 @@ fn abort_truncate_and_reappend_hold_on_device() {
 
     let at_twelve = decode_at(&mut run, &stream, &sequence, 11);
 
-    // (1) An aborted transaction changes nothing a decode can see.
+    // (1) An aborted transaction changes nothing a decode can see. The write
+    // goes through the writer adapter directly rather than through
+    // `sequence.append`, which would publish on success -- the identity
+    // mapping `prepared` already published covers rows 12..16, so this
+    // reuses it rather than asking the authority for a fresh view -- and the
+    // authority is never staged for these rows at all, which is the harder
+    // version of "never published": there is no staged batch for the abort
+    // below to discard.
     let txn = sequence.begin().expect("a transaction");
-    let staged = sequence.stage(txn, 4).expect("stage");
-    let placements = sequence.placements(&staged, 0).expect("placements");
-    let view = sequence.page_view(0).expect("a view");
-    run.publish_page_table(&stream, view.base, view.table)
-        .map_err(|r| r.error)
-        .expect("a mapping covering the staged rows");
-    run.write_rows(
+    let placements = vec![PagePlacement {
+        position: 12,
+        physical_page: 12 / geometry().page_tokens,
+        slot: 12 % geometry().page_tokens,
+        rows: 4,
+    }];
+    let view = PageView {
+        base: 0,
+        table: identity_table(geometry().pages),
+    };
+    let batch = BatchId {
+        transaction: txn,
+        first: 12,
+        rows: 4,
+    };
+    let mut writer = PagedKvWriterAdapter::new(
+        0,
+        &mut run,
         &stream,
-        &placements,
         bf16_bytes(4 * row_bytes(), 0x9001),
         bf16_bytes(4 * row_bytes(), 0x9002),
-    )
-    .map_err(|r| r.error)
-    .expect("the write fits");
+    );
+    writer
+        .write_layer(0, batch, &view, &placements)
+        .expect("the write fits");
     sequence.abort(txn).expect("abort");
     assert_eq!(
-        sequence.committed_rows(),
+        sequence.committed_rows().expect("committed rows"),
         12,
         "the abort moved the frontier"
     );
@@ -1073,7 +1187,7 @@ fn abort_truncate_and_reappend_hold_on_device() {
     // (2) A truncation drops exactly its suffix.
     let at_eight = decode_at(&mut run, &stream, &sequence, 7);
     sequence.truncate(8).expect("truncate to eight rows");
-    assert_eq!(sequence.committed_rows(), 8);
+    assert_eq!(sequence.committed_rows().expect("committed rows"), 8);
     assert_eq!(
         decode_at(&mut run, &stream, &sequence, 7),
         at_eight,
@@ -1087,7 +1201,7 @@ fn abort_truncate_and_reappend_hold_on_device() {
     // follows the new bytes. Different seed, so an answer that had not changed
     // would mean the old rows were still being read.
     append_through_authority(&mut sequence, &mut run, &stream, 4, 0x9101);
-    assert_eq!(sequence.committed_rows(), 12);
+    assert_eq!(sequence.committed_rows().expect("committed rows"), 12);
     let after = decode_at(&mut run, &stream, &sequence, 11);
     assert_ne!(
         after, at_twelve,

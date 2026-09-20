@@ -6,9 +6,10 @@
 //! returns non-zero when any *attempted* case failed, **and** returns non-zero
 //! when a required architecture produced no passing case at all.
 //!
-//! That last rule is the one the M0 review found missing: the previous version
-//! printed a NOTE for a missing architecture and exited 0, so a CI wrapper could
-//! read an all-skipped run as qualification.
+//! That last rule matters because an all-skipped run must not look like a
+//! qualification: a CI wrapper reading exit 0 cannot otherwise distinguish
+//! "every required architecture passed" from "every required architecture was
+//! missing."
 
 use core::ffi::c_void;
 use std::ffi::CString;
@@ -2766,11 +2767,11 @@ fn softmax_weights(query: &[f32], keys: &[&[f32]], scale: f32) -> Vec<f64> {
 /// that is a normal F32, and an F32 **subnormal** below it. The floor is BF16's
 /// own smallest subnormal, `2^-133`, which is `f32::from_bits(1 << 16)`.
 ///
-/// The earlier version returned `f32::from_bits(1)`, `2^-149`, for every
-/// exponent field at or below seven: sixteen binades too small, and wrong in the
-/// strict direction. It cannot make a gate accept a wrong answer, but it can
-/// make one reject a correct kernel whose expected value is subnormal — which
-/// is exactly the region document 07 asks to be stressed rather than avoided.
+/// Returning the F32 subnormal floor (`f32::from_bits(1)`, `2^-149`) for every
+/// exponent field at or below seven would be sixteen binades too small — wrong
+/// in the strict direction. That cannot make a gate accept a wrong answer, but
+/// it can make one reject a correct kernel whose expected value is subnormal —
+/// exactly the region document 07 asks to be stressed rather than avoided.
 fn bf16_ulp(value: f32) -> f32 {
     let exponent = (value.abs().to_bits() >> 23) & 0xFF;
     match exponent {
@@ -2886,9 +2887,8 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
         },
         // A head dimension the 32-lane loop genuinely cannot divide: 100 is
         // three components for most lanes and four for the first four, so the
-        // remainder path is exercised rather than described. (96 is 3x32 and
-        // would not have been: an earlier version of this case claimed
-        // otherwise, which is why the number is spelled out here.)
+        // remainder path is exercised rather than described. 96 is 3x32 and
+        // would not exercise it, which is why 100 is the number here.
         Case {
             label: "gqa-100-remainder",
             geometry: PageGeometry {
@@ -2958,7 +2958,7 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
         )?;
         let descriptor = select_paged_attention_kernel(&catalogue, cap, &launch)?;
         let mut ledger = measured_ledger(&ctx)?;
-        let mut run = PagedAttentionRun::admit(
+        let run = PagedAttentionRun::admit(
             &mut ledger,
             &ctx,
             descriptor,
@@ -2968,6 +2968,13 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
             Staging::Host,
         )
         .map_err(|r| r.error)?;
+        // No state authority anywhere in this gate: the shuffled table below
+        // is deliberately not one any retention policy would ever produce --
+        // stressing the kernel against the FP64 oracle is not a state
+        // decision -- so this drives the run directly through
+        // `RawPagedFixture` rather than the authority's writer.
+        let mut run =
+            moxie_executor::paged_attention::device::RawPagedFixture::new(run);
         let table = shuffled_pages(case.geometry.pages);
         run.publish_page_table(&stream, 0, table.clone())
             .map_err(|r| r.error)?;
@@ -2980,11 +2987,11 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
                 .map_err(|r| r.error)?;
             written += rows;
         }
-        if run.written_rows() != case.history {
+        if run.run().written_rows() != case.history {
             return Ok(Outcome::Failed(format!(
                 "{}: wrote {} row(s) of {}",
                 case.label,
-                run.written_rows(),
+                run.run().written_rows(),
                 case.history
             )));
         }
@@ -2992,7 +2999,7 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
         // An append that cannot fit is refused *before* the device is touched:
         // the frontier does not move and every prior byte is unchanged.
         let whole_history = placements_through(&table, case.geometry.page_tokens, 0, case.history)?;
-        let before = run.read_rows(&whole_history)?;
+        let before = run.run().read_rows(&whole_history)?;
         // A placement naming a page this run was never admitted for. Refused
         // before the device is touched, with the rows handed back.
         let outside = vec![PagePlacement {
@@ -3011,13 +3018,17 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
                 case.label
             )));
         }
-        if run.written_rows() != case.history || run.read_rows(&whole_history)? != before {
+        if run.run().written_rows() != case.history || run.run().read_rows(&whole_history)? != before
+        {
             return Ok(Outcome::Failed(format!(
                 "{}: a refused write moved the high-water mark or changed written bytes",
                 case.label
             )));
         }
 
+        // Done writing directly: hand the run back to attend and close
+        // through its own public API, which never needed narrowing.
+        let mut run = run.into_inner();
         let whole = run
             .attend(
                 &stream,
@@ -3173,11 +3184,12 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         Ok(sequence)
     };
 
-    /// Append `rows` rows from the frontier: place, write, publish, republish.
-    ///
-    /// The order is the contract. Publication happens only after the write
-    /// returned, so a failed copy can never leave the authority claiming
-    /// history the device does not hold.
+    /// Append `rows` rows from the frontier through `DeviceKvSequence::append`,
+    /// the only public way to move it: it stages, hands the writer the view
+    /// and placements it chose, and publishes only on success.
+    /// `PagedKvWriterAdapter::write_layer` publishes that view and writes the
+    /// rows as one authorized operation, so this gate no longer touches a
+    /// page table at all.
     fn append_rows<'ctx>(
         sequence: &mut moxie_state::DeviceKvSequence,
         run: &mut PagedAttentionRun<'ctx>,
@@ -3186,15 +3198,12 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         rows: u64,
     ) -> Result<(), Error> {
         let txn = sequence.begin()?;
-        let staged = sequence.stage(txn, rows)?;
-        let placements = sequence.placements(&staged, 0)?;
-        let view = sequence.page_view(0)?;
-        run.publish_page_table(stream, view.base, view.table)
-            .map_err(|r| r.error)?;
-        let (keys, values) = fixture.payload(staged.first(), rows);
-        run.write_rows(stream, &placements, keys, values)
-            .map_err(|r| r.error)?;
-        sequence.publish(txn, staged)?;
+        let first = sequence.published_rows();
+        let (keys, values) = fixture.payload(first, rows);
+        let mut writer = moxie_executor::paged_attention::device::PagedKvWriterAdapter::new(
+            0, run, stream, keys, values,
+        );
+        sequence.append(txn, rows, &mut [&mut writer])?;
         sequence.commit(txn, rows)?;
         Ok(())
     }
@@ -3230,10 +3239,10 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     .map_err(|r| r.error)?;
     let mut whole_state = authority()?;
     append_rows(&mut whole_state, &mut whole, &stream, &fixture, CONTEXT)?;
-    if whole_state.committed_rows() != CONTEXT || whole.written_rows() != CONTEXT {
+    if whole_state.committed_rows()? != CONTEXT || whole.written_rows() != CONTEXT {
         return Ok(Outcome::Failed(format!(
             "the authority committed {} row(s) and the run wrote {}, not {CONTEXT}",
-            whole_state.committed_rows(),
+            whole_state.committed_rows()?,
             whole.written_rows()
         )));
     }
@@ -3256,10 +3265,10 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         append_rows(&mut chunked_state, &mut chunked, &stream, &fixture, rows)?;
         written += rows;
     }
-    if written != CONTEXT || chunked_state.committed_rows() != CONTEXT {
+    if written != CONTEXT || chunked_state.committed_rows()? != CONTEXT {
         return Ok(Outcome::Failed(format!(
             "chunked construction committed {} row(s) after {written}",
-            chunked_state.committed_rows()
+            chunked_state.committed_rows()?
         )));
     }
 
@@ -3281,7 +3290,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         "    {} 32k-decode visible={} committed={} capacity={} state={} B {summary}",
         cap.sm(),
         last.history_rows(),
-        whole_state.committed_rows(),
+        whole_state.committed_rows()?,
         whole.capacity_rows()?,
         whole.arena_bytes()
     );
@@ -3316,10 +3325,10 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
 
     // Append row 32,768 -- the row after the context -- and decode it.
     append_rows(&mut whole_state, &mut whole, &stream, &fixture, 1)?;
-    if whole_state.committed_rows() != CONTEXT + 1 {
+    if whole_state.committed_rows()? != CONTEXT + 1 {
         return Ok(Outcome::Failed(format!(
             "the frontier is {} after appending row {CONTEXT}",
-            whole_state.committed_rows()
+            whole_state.committed_rows()?
         )));
     }
     let next = decode(CONTEXT, CONTEXT + 1, Visibility::Causal)?;
@@ -3331,7 +3340,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         "    {} 32k-append-decode visible={} committed={} capacity={} {summary}",
         cap.sm(),
         next.history_rows(),
-        whole_state.committed_rows(),
+        whole_state.committed_rows()?,
         whole.capacity_rows()?
     );
 
@@ -3347,10 +3356,10 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         .map_err(|r| r.error)?;
     let summary = check_attention(&fixture, &windowed, &slid, "32k-sliding")?;
     let visible = (0..=CONTEXT).filter(|k| windowed.allows(0, *k)).count();
-    if visible != 4_096 || whole_state.committed_rows() != CONTEXT + 1 {
+    if visible != 4_096 || whole_state.committed_rows()? != CONTEXT + 1 {
         return Ok(Outcome::Failed(format!(
             "{visible} visible row(s) against {} committed",
-            whole_state.committed_rows()
+            whole_state.committed_rows()?
         )));
     }
     if slid == after {
@@ -3361,7 +3370,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     println!(
         "    {} 32k-sliding visible={visible} committed={} capacity={} {summary}",
         cap.sm(),
-        whole_state.committed_rows(),
+        whole_state.committed_rows()?,
         whole.capacity_rows()?
     );
 

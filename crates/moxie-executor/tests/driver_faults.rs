@@ -97,8 +97,7 @@ fn take_arming() -> bool {
 /// whether that allocation was reached.
 fn with_failure_at<T>(skip: usize, body: impl FnOnce() -> T) -> (T, bool) {
     /// Disarms however the scope ends. A panic past a plain assignment leaks
-    /// the trap onto the next test on this thread; the host harness got this
-    /// guard and this one did not, which review pointed out.
+    /// the trap onto the next test on this thread.
     struct Disarm;
     impl Drop for Disarm {
         fn drop(&mut self) {
@@ -2020,6 +2019,7 @@ fn every_allocation_in_a_quantized_admission_refuses_rather_than_aborting() {
 #[test]
 fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     let _serial = one_at_a_time();
+    use moxie_executor::paged_attention::device::RawPagedFixture;
     use moxie_executor::{PageGeometry, PagedAttentionLaunch, PagedAttentionRun, Staging};
     use moxie_plan::Visibility;
     use moxie_types::PagePlacement;
@@ -2084,7 +2084,7 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     .expect("this build declares a paged attention descriptor for this device");
 
     let mut ledger = test_ledger(&ctx);
-    let mut run = PagedAttentionRun::admit(
+    let run = PagedAttentionRun::admit(
         &mut ledger,
         &ctx,
         descriptor,
@@ -2095,6 +2095,11 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     )
     .map_err(|r| r.error)
     .expect("admission fits this ledger");
+    // No `moxie_state` authority anywhere in this file (it interposes the
+    // CUDA driver process-wide, so its fixtures stay as small as the fault
+    // window allows): every run here is driven directly through
+    // `RawPagedFixture`.
+    let mut run = RawPagedFixture::new(run);
     let table = vec![1u32, 0];
     run.publish_page_table(&stream, 0, table.clone())
         .map_err(|r| r.error)
@@ -2108,16 +2113,22 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     )
     .map_err(|r| r.error)
     .expect("four rows fit");
-    assert_eq!(run.written_rows(), 4);
-    let committed = run.read_rows(&first_four).expect("read the rows back");
+    assert_eq!(run.run().written_rows(), 4);
+    let committed = run.run().read_rows(&first_four).expect("read the rows back");
 
     // An append whose event record fails. The copies were submitted for real,
     // so their completion is unknown and the rows cannot be published.
+    let fifth = placements(4, 1, geometry.page_tokens, &table);
+    let fifth_keys = rows_bytes(1, 0x31);
+    let fifth_values = rows_bytes(1, 0x32);
+    // Watched by address, not by a byte total: the claim is about **this**
+    // allocation, the one an in-flight `cuMemcpyHtoDAsync` may still read.
+    WATCHED_HOST_FREED.store(false, SeqCst);
+    WATCHED_HOST_PTR.store(fifth_keys.as_ptr() as usize, SeqCst);
     let records = RECORDS.load(SeqCst);
     RECORD_ERROR.store(1, SeqCst);
-    let fifth = placements(4, 1, geometry.page_tokens, &table);
     let refused = run
-        .write_rows(&stream, &fifth, rows_bytes(1, 0x31), rows_bytes(1, 0x32))
+        .write_rows(&stream, &fifth, fifth_keys, fifth_values)
         .expect_err("a write whose record failed must refuse");
     RECORD_ERROR.store(0, SeqCst);
     assert!(RECORDS.load(SeqCst) > records, "the record was attempted");
@@ -2126,21 +2137,32 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
         "a refusal after enqueue must keep the rows the copy may be reading"
     );
     assert_eq!(
-        run.written_rows(),
+        run.run().written_rows(),
         4,
         "the high-water mark advanced on a copy nothing proved"
     );
     // The run is quarantined, so it will not release ranges that may be in
     // flight, will not read its own pages back, and stays charged.
     assert!(
-        run.read_rows(&first_four).is_err(),
+        run.run().read_rows(&first_four).is_err(),
         "a quarantined run read back"
     );
     let held = run
+        .into_inner()
         .close(&mut ledger)
         .expect_err("a quarantined run must not release ranges in flight");
     assert!(!ledger.outstanding().is_empty());
+    assert!(
+        !WATCHED_HOST_FREED.load(SeqCst),
+        "the row source was freed before the quarantined run was even dropped"
+    );
     drop(held);
+    assert!(
+        !WATCHED_HOST_FREED.load(SeqCst),
+        "dropping the quarantined run deallocated the row source the copy may \
+         still be reading"
+    );
+    WATCHED_HOST_PTR.store(0, SeqCst);
 
     // The same window on the launch itself, on a fresh run: the copy is real,
     // the launch is refused, and the query is retained rather than handed back.
@@ -2151,7 +2173,7 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
         &launch(1, 0, 1),
     )
     .expect("a descriptor");
-    let mut run = PagedAttentionRun::admit(
+    let run = PagedAttentionRun::admit(
         &mut ledger,
         &ctx,
         descriptor,
@@ -2162,6 +2184,7 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     )
     .map_err(|r| r.error)
     .expect("admission fits this ledger");
+    let mut run = RawPagedFixture::new(run);
     run.publish_page_table(&stream, 0, table.clone())
         .map_err(|r| r.error)
         .expect("a mapping");
@@ -2174,15 +2197,20 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     .map_err(|r| r.error)
     .expect("four rows fit");
     assert_eq!(
-        run.read_rows(&first_four).expect("read back"),
+        run.run().read_rows(&first_four).expect("read back"),
         committed,
         "the same rows through the same mapping are the same bytes"
     );
+    // Done writing directly: hand the run back to attend through its own
+    // public API, which never needed narrowing.
+    let mut run = run.into_inner();
 
+    let query = vec![0x3Cu8; (HEADS * geometry.head_dim) as usize * 2];
+    WATCHED_HOST_FREED.store(false, SeqCst);
+    WATCHED_HOST_PTR.store(query.as_ptr() as usize, SeqCst);
     let launches = LAUNCHES.load(SeqCst);
     LAUNCH_ERROR.store(1, SeqCst);
     LAUNCH_FAIL_COUNTDOWN.store(1, SeqCst);
-    let query = vec![0x3Cu8; (HEADS * geometry.head_dim) as usize * 2];
     let refused = run
         .attend(&stream, &launch(1, 3, 4), query)
         .expect_err("a refused launch must refuse the attend");
@@ -2194,8 +2222,62 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
         "the query copy was submitted, so the query must be retained"
     );
     assert_eq!(run.written_rows(), 4, "a failed launch moved the frontier");
+    let held = run
+        .close(&mut ledger)
+        .expect_err("a quarantined run released its ranges");
     assert!(
-        run.close(&mut ledger).is_err(),
+        !WATCHED_HOST_FREED.load(SeqCst),
+        "the query was freed before the quarantined run was even dropped"
+    );
+    drop(held);
+    assert!(
+        !WATCHED_HOST_FREED.load(SeqCst),
+        "dropping the quarantined run deallocated the query the copy may still \
+         be reading"
+    );
+    WATCHED_HOST_PTR.store(0, SeqCst);
+
+    // The page-table upload has the same ordering requirement: the encoded
+    // bytes must be owned by `self.held` before the copy call, not after, so
+    // a copy that refuses synchronously still leaves them retained rather
+    // than dropping a local the function never reached. `publish_page_table`
+    // builds that buffer from `table` internally, so unlike the two windows
+    // above there is no host pointer this test ever held to watch -- this is
+    // the same `None`-convention behavior the earlier windows also check, not
+    // a second proof of the deallocation property.
+    let mut ledger = test_ledger(&ctx);
+    let descriptor = moxie_executor::select_paged_attention_kernel(
+        &moxie_kernels::paged_attention_catalogue(),
+        &capability,
+        &launch(1, 0, 1),
+    )
+    .expect("a descriptor");
+    let run = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor,
+        geometry,
+        HEADS,
+        1,
+        Staging::Host,
+    )
+    .map_err(|r| r.error)
+    .expect("admission fits this ledger");
+    let mut run = RawPagedFixture::new(run);
+    let copies = COPIES.load(SeqCst);
+    COPY_ERROR.store(1, SeqCst);
+    let refused = run
+        .publish_page_table(&stream, 0, table.clone())
+        .expect_err("a page-table upload whose copy call failed must refuse");
+    COPY_ERROR.store(0, SeqCst);
+    assert!(COPIES.load(SeqCst) > copies, "the copy was attempted");
+    assert!(
+        refused.retained_source(),
+        "a refusal after the copy call must keep the encoded table the driver \
+         may still be reading"
+    );
+    assert!(
+        run.into_inner().close(&mut ledger).is_err(),
         "a quarantined run released its ranges"
     );
 }
