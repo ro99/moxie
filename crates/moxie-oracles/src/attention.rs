@@ -181,12 +181,15 @@ impl KvHistory {
 
     /// One head's lanes, checked rather than sliced blind.
     ///
-    /// The fourth review appended a one-element key and attended with head
-    /// dimension two: the slice ran off the end and panicked. A stored row that
-    /// does not match the attention geometry is an artifact error, and a panic
-    /// is not one -- document 02 requires typed errors at this boundary.
+    /// A stored row whose width does not match the attention geometry, or a
+    /// geometry whose element count does not fit a `usize`, is an artifact
+    /// error rather than a panic -- document 02 requires typed errors at this
+    /// boundary.
     fn head_slice(row: &[f32], head: usize, head_dim: usize, heads: usize) -> Result<&[f32]> {
-        if row.len() != heads * head_dim {
+        let expected = heads
+            .checked_mul(head_dim)
+            .ok_or(moxie_types::DimError::Overflow)?;
+        if row.len() != expected {
             return Err(Error::InvalidArtifact {
                 detail: format!(
                     "a stored row of {} element(s) does not match {heads} head(s) of \
@@ -196,7 +199,15 @@ impl KvHistory {
                 .into(),
             });
         }
-        Ok(&row[head * head_dim..(head + 1) * head_dim])
+        let start = head
+            .checked_mul(head_dim)
+            .ok_or(moxie_types::DimError::Overflow)?;
+        let end = start
+            .checked_add(head_dim)
+            .ok_or(moxie_types::DimError::Overflow)?;
+        row.get(start..end).ok_or(Error::InvalidArtifact {
+            detail: std::borrow::Cow::Borrowed("head slice bounds exceed the stored row"),
+        })
     }
 }
 
@@ -258,7 +269,10 @@ pub fn attend_multi_head(
         head_dim,
         scale,
     } = heads;
-    if query.len() != heads * head_dim {
+    let expected_query_len = heads
+        .checked_mul(head_dim)
+        .ok_or(moxie_types::DimError::Overflow)?;
+    if query.len() != expected_query_len {
         return Err(Error::InvalidArtifact {
             detail: format!(
                 "query has {} elements, expected {heads}x{head_dim}",
@@ -325,15 +339,14 @@ pub fn attend_multi_head(
     Ok(out)
 }
 
-/// The error bound for one attention output, per task 0003's **revised**
-/// analysis.
+/// The error bound for one attention output. ADR 0028 pins the formula below.
 ///
-/// The first version of this contract counted rounding steps and multiplied by
-/// `Σ|p·V|`, which is wrong, and the fourth review disproved it: with keys
-/// containing `2^24` and `1` the score dot product cancels catastrophically, two
-/// scores that differ by 0.5 in FP64 both evaluate to 0 in FP32, the softmax
-/// returns a uniform distribution instead of `[0.62, 0.38]`, and the normalized
-/// error is 0.32 against a declared bound of 6.6e-7.
+/// Counting rounding steps and multiplying by `Σ|p·V|` is not a sound bound:
+/// with keys containing `2^24` and `1` the score dot product cancels
+/// catastrophically, two scores that differ by 0.5 in FP64 both evaluate to 0
+/// in FP32, the softmax returns a uniform distribution instead of `[0.62,
+/// 0.38]`, and the normalized error is 0.32 against what that step-counting
+/// approach would declare, 6.6e-7.
 ///
 /// Counting operations cannot bound this, because the error does not pass
 /// through the softmax additively -- it passes through an **exponential**. The
@@ -352,12 +365,12 @@ pub fn attend_multi_head(
 /// sequential-sum bound over the `K` visible keys plus the max subtraction and
 /// the divide.
 ///
-/// The third is gradual underflow, and the fifth review is why it is here: with
-/// values at `2^-133` the products are subnormal, the two relative terms both
-/// shrink toward zero with the data, and the measured absolute error was 51
-/// times the bound. A relative model says nothing once results leave the normal
-/// range, so the additive `η` term carries the bound there. It costs about
-/// `1e-44` when the data is ordinary, which is to say nothing at all.
+/// The third is gradual underflow: with values at `2^-133` the products are
+/// subnormal, the two relative terms both shrink toward zero with the data,
+/// and a purely relative bound understates the true error there by 51x. A
+/// relative model says nothing once results leave the normal range, so the
+/// additive `η` term carries the bound there. It costs about `1e-44` when the
+/// data is ordinary, which is to say nothing at all.
 ///
 /// **This bound is data-dependent and it does not shrink to a constant.** When
 /// `Q·K` is well conditioned, `Δs` is tiny and the bound is a few ulps; when it
@@ -371,16 +384,14 @@ pub fn attend_multi_head(
 /// value the operation carries -- `OpParams::Attention::scale`, which is
 /// [`Heads::scale`] here -- because `Δs` bounds the error of the *scaled* score
 /// and nothing about the head dimension determines that factor. Deriving
-/// `1/sqrt(head_dim)` internally, as this helper did before task 0037,
-/// understates `Δs` by `scale · sqrt(head_dim)` on every layer that declares
-/// something else, and that understatement then passes through the exponential.
-/// A Gemma-style layer normalizes its queries and keys per head and attends with
-/// a scale of exactly 1.0, so at `head_dim` 128 the derived value was eleven
-/// times too small; `the_derived_scale_was_not_a_bound_for_a_layer_that_declares_its_own`
-/// holds a fixture where it is smaller than the error it claims to bound. The
-/// magnitude is taken, so no caller can drive the bound negative. Only the input
-/// changes here: the formula above is the one task 0003 revised and ADR 0028
-/// pins.
+/// `1/sqrt(head_dim)` internally understates `Δs` by `scale · sqrt(head_dim)`
+/// on every layer that declares something else, and that understatement then
+/// passes through the exponential. A Gemma-style layer normalizes its queries
+/// and keys per head and attends with a scale of exactly 1.0, so at
+/// `head_dim` 128 the derived value is eleven times too small;
+/// `the_derived_scale_was_not_a_bound_for_a_layer_that_declares_its_own` holds
+/// a fixture where it is smaller than the error it claims to bound. The
+/// magnitude is taken, so no caller can drive the bound negative.
 pub fn attention_error_bound(
     query_head: &[f32],
     visible_keys: &[&[f32]],
@@ -388,16 +399,96 @@ pub fn attention_error_bound(
     weights: &[f64],
     component: usize,
     scale: f32,
-) -> f64 {
+) -> Result<f64> {
+    let value_dim = validate_bound_inputs(query_head, visible_keys, visible_values, weights)?;
+    if !scale.is_finite() {
+        return Err(Error::InvalidRequest {
+            field: "scale",
+            detail: format!("score scale must be finite, got {scale}"),
+        });
+    }
+    if component >= value_dim {
+        return Err(Error::InvalidRequest {
+            field: "component",
+            detail: format!("component {component} is out of range for value width {value_dim}"),
+        });
+    }
     let delta_s = score_error(query_head, visible_keys, scale);
-    component_bound(
+    Ok(component_bound(
         delta_s,
         query_head.len(),
         visible_keys.len(),
         visible_values,
         weights,
         component,
-    )
+    ))
+}
+
+/// The preconditions both bound entry points share, checked explicitly instead
+/// of left to `zip` truncation or an out-of-bounds index: a nonzero head
+/// dimension, equal counts of keys, values and weights, every key as wide as
+/// the query, and every value row the same nonzero width. Returns that shared
+/// value width.
+fn validate_bound_inputs(
+    query_head: &[f32],
+    visible_keys: &[&[f32]],
+    visible_values: &[&[f32]],
+    weights: &[f64],
+) -> Result<usize> {
+    if query_head.is_empty() {
+        return Err(Error::InvalidRequest {
+            field: "head_dim",
+            detail: "zero head dimension".into(),
+        });
+    }
+    if visible_keys.len() != visible_values.len() || visible_keys.len() != weights.len() {
+        return Err(Error::InvalidRequest {
+            field: "attention_error_bound",
+            detail: format!(
+                "{} key(s), {} value(s), {} weight(s)",
+                visible_keys.len(),
+                visible_values.len(),
+                weights.len()
+            ),
+        });
+    }
+    let Some(first) = visible_values.first() else {
+        return Err(Error::InvalidRequest {
+            field: "visible_values",
+            detail: "no visible value to bound".into(),
+        });
+    };
+    let value_dim = first.len();
+    if value_dim == 0 {
+        return Err(Error::InvalidRequest {
+            field: "visible_values",
+            detail: "zero-width value row".into(),
+        });
+    }
+    for (i, key) in visible_keys.iter().enumerate() {
+        if key.len() != query_head.len() {
+            return Err(Error::InvalidRequest {
+                field: "key",
+                detail: format!(
+                    "key {i} has dimension {}, query has {}",
+                    key.len(),
+                    query_head.len()
+                ),
+            });
+        }
+    }
+    for (i, value) in visible_values.iter().enumerate() {
+        if value.len() != value_dim {
+            return Err(Error::InvalidRequest {
+                field: "value",
+                detail: format!(
+                    "value {i} has dimension {}, expected {value_dim}",
+                    value.len()
+                ),
+            });
+        }
+    }
+    Ok(value_dim)
 }
 
 /// Every component's bound at once, for a caller checking a whole output row.
@@ -430,15 +521,16 @@ pub fn attention_error_bounds_at(
     weights: &[f64],
     scale: f32,
 ) -> Result<Vec<f64>> {
-    let Some(first) = visible_values.first() else {
+    let value_dim = validate_bound_inputs(query_head, visible_keys, visible_values, weights)?;
+    if !scale.is_finite() {
         return Err(Error::InvalidRequest {
-            field: "visible_values",
-            detail: "no visible value to bound".into(),
+            field: "scale",
+            detail: format!("score scale must be finite, got {scale}"),
         });
-    };
+    }
     let delta_s = score_error(query_head, visible_keys, scale);
-    let mut out = crate::try_vec(first.len())?;
-    for component in 0..first.len() {
+    let mut out = crate::try_vec(value_dim)?;
+    for component in 0..value_dim {
         out.push(component_bound(
             delta_s,
             query_head.len(),
@@ -616,7 +708,7 @@ mod tests {
 
         let mut worst = 0f64;
         for d in 0..q.len() {
-            let bound = attention_error_bound(q, &keys, &values, &weights, d, scale);
+            let bound = attention_error_bound(q, &keys, &values, &weights, d, scale).unwrap();
             let err = (got[d] as f64 - want[d]).abs();
             assert!(
                 err <= bound,
@@ -664,7 +756,8 @@ mod tests {
             .iter()
             .map(|i| history.values[*i].as_slice())
             .collect();
-        let bound = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(head_dim));
+        let bound =
+            attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(head_dim)).unwrap();
         assert!(
             bound < 1e-4,
             "on benign data the bound should be tiny, got {bound:.3e}"
@@ -684,16 +777,16 @@ mod tests {
 
     #[test]
     fn a_cancelling_score_widens_the_bound_because_the_error_is_real() {
-        // The fourth review's counterexample, preserved. Keys holding 2^24 and 1
-        // make the score dot product cancel catastrophically: two scores that
-        // differ by 0.5 in FP64 both evaluate to exactly 0 in FP32, so the
-        // softmax returns a uniform distribution instead of [0.62, 0.38].
+        // Keys holding 2^24 and 1 make the score dot product cancel
+        // catastrophically: two scores that differ by 0.5 in FP64 both
+        // evaluate to exactly 0 in FP32, so the softmax returns a uniform
+        // distribution instead of [0.62, 0.38].
         //
-        // The old contract counted rounding steps and declared gamma(2K+Hd+3),
-        // about 6.6e-7. The actual normalized error is ~0.32. That is not a
-        // tolerance that needed enlarging; it is a bound of the wrong *form*,
-        // because the score error passes through an exponential rather than
-        // being added to the result.
+        // Counting rounding steps declares gamma(2K+Hd+3), about 6.6e-7. The
+        // actual normalized error is ~0.32. That is not a tolerance that needs
+        // enlarging; it is a bound of the wrong *form*, because the score
+        // error passes through an exponential rather than being added to the
+        // result.
         let hd = 4usize;
         let big = 16_777_216.0f32; // 2^24; f32 cannot represent 2^24 + 1
         let mut history = KvHistory::new();
@@ -730,13 +823,14 @@ mod tests {
             .map(|i| history.values[*i].as_slice())
             .collect();
         for d in 0..2 {
-            let bound = attention_error_bound(&q, &keys, &values, &weights, d, mha_scale(hd));
+            let bound =
+                attention_error_bound(&q, &keys, &values, &weights, d, mha_scale(hd)).unwrap();
             let err = (got[d] as f64 - want[d]).abs();
             assert!(err <= bound, "component {d}: {err:.4e} > {bound:.4e}");
         }
 
         // And it is honest about being weak here rather than pretending.
-        let bound = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd));
+        let bound = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd)).unwrap();
         assert!(
             bound > 0.1,
             "on data this ill-conditioned the bound must say so, got {bound:.3e}"
@@ -745,11 +839,11 @@ mod tests {
 
     #[test]
     fn the_derived_scale_was_not_a_bound_for_a_layer_that_declares_its_own() {
-        // Task 0037's repair, as a counterexample rather than an assertion about
-        // taste. Before it, this helper derived `1/sqrt(head_dim)` internally.
-        // A Gemma-style layer normalizes queries and keys per head and then
-        // declares a score scale of exactly 1.0, so at head dimension 128 the
-        // derived value is 11.3 times too small -- and `Δs` passes through an
+        // Deriving `1/sqrt(head_dim)` internally rather than taking the
+        // declared scale is a counterexample, not a taste call: a Gemma-style
+        // layer normalizes queries and keys per head and then declares a
+        // score scale of exactly 1.0, so at head dimension 128 the derived
+        // value is 11.3 times too small -- and `Δs` passes through an
         // exponential, so "too small" means "not a bound".
         //
         // The fixture drives the score error to its worst case instead of a
@@ -804,8 +898,10 @@ mod tests {
             .map(|i| history.values[*i].as_slice())
             .collect();
 
-        let declared_bound = attention_error_bound(&q, &keys, &values, &weights, 0, declared);
-        let derived_bound = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd));
+        let declared_bound =
+            attention_error_bound(&q, &keys, &values, &weights, 0, declared).unwrap();
+        let derived_bound =
+            attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd)).unwrap();
         println!(
             "scale 1.0: error {err:.4e} declared bound {declared_bound:.4e} \
              derived bound {derived_bound:.4e}"
@@ -828,7 +924,7 @@ mod tests {
 
     #[test]
     fn the_bound_tracks_the_declared_scale_on_ordinary_data() {
-        // The other half of the repair: on well-conditioned data a declared
+        // The other half of the invariant: on well-conditioned data a declared
         // scale of 1.0 is an ordinary case, not a pathology. The bound stays
         // tight, it covers the measured error at every position, and it is
         // strictly larger than the same data's bound at the conventional scale,
@@ -867,8 +963,9 @@ mod tests {
             .iter()
             .map(|i| history.values[*i].as_slice())
             .collect();
-        let at_one = attention_error_bound(&q, &keys, &values, &weights, 0, 1.0);
-        let at_conventional = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd));
+        let at_one = attention_error_bound(&q, &keys, &values, &weights, 0, 1.0).unwrap();
+        let at_conventional =
+            attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd)).unwrap();
         assert!(
             at_one < 1e-5,
             "a scale of 1.0 is not a licence to be loose: {at_one:.3e}"
@@ -882,7 +979,7 @@ mod tests {
         // helper is public: the magnitude is what enters the bound.
         assert_eq!(
             at_one,
-            attention_error_bound(&q, &keys, &values, &weights, 0, -1.0),
+            attention_error_bound(&q, &keys, &values, &weights, 0, -1.0).unwrap(),
             "the bound must use the magnitude of the declared scale"
         );
     }
@@ -920,7 +1017,7 @@ mod tests {
             for (d, bound) in row.iter().enumerate() {
                 assert_eq!(
                     *bound,
-                    attention_error_bound(&q, &keys, &values, &weights, d, scale),
+                    attention_error_bound(&q, &keys, &values, &weights, d, scale).unwrap(),
                     "component {d} at scale {scale}"
                 );
             }
@@ -944,11 +1041,74 @@ mod tests {
     }
 
     #[test]
+    fn the_bound_functions_refuse_malformed_input_instead_of_truncating_or_panicking() {
+        // Keys, values and weights of matching width and count, so each case
+        // below is broken in exactly one way.
+        let key0 = [1.0f32, 0.0];
+        let key1 = [0.0f32, 1.0];
+        let keys: [&[f32]; 2] = [&key0, &key1];
+        let value0 = [1.0f32, 2.0];
+        let value1 = [3.0f32, 4.0];
+        let values: [&[f32]; 2] = [&value0, &value1];
+        let weights = [0.5f64, 0.5];
+        let q = [1.0f32, 1.0];
+
+        // A weight count that does not match the key/value count is refused
+        // rather than `zip`-truncated into a partial, silently weaker bound.
+        assert!(attention_error_bound(&q, &keys, &values, &weights[..1], 0, 1.0).is_err());
+        assert!(attention_error_bounds_at(&q, &keys, &values, &weights[..1], 1.0).is_err());
+
+        // A key narrower than the query is refused rather than `zip`-truncated
+        // into a dot product over the wrong lanes.
+        let short_key = [1.0f32];
+        let mixed_keys: [&[f32]; 2] = [&short_key, &key1];
+        assert!(attention_error_bound(&q, &mixed_keys, &values, &weights, 0, 1.0).is_err());
+
+        // A value row narrower than the others is refused rather than indexed
+        // out of bounds by a later component.
+        let short_value = [1.0f32];
+        let mixed_values: [&[f32]; 2] = [&value0, &short_value];
+        assert!(attention_error_bound(&q, &keys, &mixed_values, &weights, 1, 1.0).is_err());
+        assert!(attention_error_bounds_at(&q, &keys, &mixed_values, &weights, 1.0).is_err());
+
+        // A component past the value width is refused rather than indexed out
+        // of bounds.
+        assert!(attention_error_bound(&q, &keys, &values, &weights, 2, 1.0).is_err());
+
+        // A non-finite scale is refused: this entry point takes the magnitude
+        // of a negative scale (asserted above), but not of an infinite one.
+        for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                attention_error_bound(&q, &keys, &values, &weights, 0, scale).is_err(),
+                "scale {scale} was accepted"
+            );
+            assert!(
+                attention_error_bounds_at(&q, &keys, &values, &weights, scale).is_err(),
+                "scale {scale} was accepted"
+            );
+        }
+
+        // Zero-width attention -- an empty query and equally empty value rows
+        // -- is refused rather than handed back as an apparently valid empty
+        // bound.
+        let empty_key: [f32; 0] = [];
+        let empty_value: [f32; 0] = [];
+        let empty_keys: [&[f32]; 1] = [&empty_key];
+        let empty_values: [&[f32]; 1] = [&empty_value];
+        let one_weight = [1.0f64];
+        assert!(
+            attention_error_bound(&[], &empty_keys, &empty_values, &one_weight, 0, 1.0).is_err()
+        );
+        assert!(
+            attention_error_bounds_at(&[], &empty_keys, &empty_values, &one_weight, 1.0).is_err()
+        );
+    }
+
+    #[test]
     fn subnormal_values_are_covered_by_the_underflow_term() {
-        // Fifth review, reproduced: zero queries and keys, three visible
-        // positions, and one value at 2^-133. Every product is subnormal, both
-        // relative terms shrink with the data, and the purely relative bound was
-        // 51 times too small.
+        // Zero queries and keys, three visible positions, and one value at
+        // 2^-133. Every product is subnormal, both relative terms shrink with
+        // the data, and a purely relative bound is 51 times too small.
         let hd = 3usize;
         let tiny = f32::from_bits(1 << 16); // 2^-133; `powi(-133)` overflows first
         assert!(
@@ -977,7 +1137,7 @@ mod tests {
 
         let err = (got[0] as f64 - want[0]).abs();
         assert!(err > 0.0, "the fixture must actually lose something");
-        let bound = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd));
+        let bound = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd)).unwrap();
         assert!(err <= bound, "error {err:e} exceeded bound {bound:e}");
 
         // The underflow term is what is carrying it: the relative terms alone
@@ -1010,7 +1170,8 @@ mod tests {
             .map(|i| history.values[*i].as_slice())
             .collect();
         for d in 0..hd {
-            let bound = attention_error_bound(&q, &keys, &values, &weights, d, mha_scale(hd));
+            let bound =
+                attention_error_bound(&q, &keys, &values, &weights, d, mha_scale(hd)).unwrap();
             assert!(bound < 1e-5, "component {d} bound {bound:.3e} is not tight");
         }
         assert_within_bound(&q, &history, 5, Visibility::Causal, "benign");
@@ -1087,10 +1248,10 @@ mod tests {
 
     #[test]
     fn a_stored_row_that_does_not_match_the_head_geometry_is_a_typed_error() {
-        // Fourth review, reproduced: a one-element key attended with head
-        // dimension two ran the slice off the end and panicked. `KvHistory`
-        // checks key and value widths agree with each other, which is not the
-        // same as agreeing with the geometry they are read under.
+        // A one-element key attended with head dimension two runs the slice
+        // off the end. `KvHistory` checks key and value widths agree with
+        // each other, which is not the same as agreeing with the geometry
+        // they are read under.
         let mut h = KvHistory::new();
         h.append(0, vec![1.0], vec![1.0]).unwrap();
         let e = attend_mha(&[1.0, 2.0], &h, 0, 1, 2, Visibility::Causal).unwrap_err();
@@ -1267,6 +1428,23 @@ mod tests {
                 "scale {scale} was accepted"
             );
         }
+        // A geometry whose head count times head dimension overflows `usize`
+        // is refused rather than wrapping into an accidental small number.
+        assert!(
+            attend_multi_head(
+                &q,
+                &history,
+                0,
+                Heads {
+                    query: usize::MAX,
+                    key_value: 1,
+                    head_dim: 2,
+                    scale: 1.0,
+                },
+                Visibility::Causal
+            )
+            .is_err()
+        );
     }
 
     #[test]

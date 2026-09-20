@@ -95,13 +95,14 @@ impl Partial {
                 ),
             });
         }
-        if !(scale.is_finite() && scale != 0.0) {
+        if !(scale.is_finite() && scale > 0.0) {
             return Err(Error::InvalidRequest {
                 field: "scale",
-                detail: format!("score scale must be finite and nonzero, got {scale}"),
+                detail: format!("score scale must be finite and positive, got {scale}"),
             });
         }
-        let visible: Vec<usize> = (0..keys.len()).filter(|i| allowed[*i]).collect();
+        let mut visible = crate::try_vec(keys.len())?;
+        visible.extend((0..keys.len()).filter(|i| allowed[*i]));
         let Some(&first) = visible.first() else {
             // The width is still knowable from a masked row, and a caller that
             // merges this partial gets a dimension check rather than silence.
@@ -253,8 +254,7 @@ impl Partial {
 /// The whole point of the module in one function: the caller supplies the same
 /// keys, values and mask [`crate::mask::attend_row`] would get, and gets the
 /// same answer computed the way a paged kernel computes it. `block` is the page
-/// or tile width; the final block may be short, which is the page tail every
-/// review asks about.
+/// or tile width; the final block may be short, which is the page tail.
 pub fn attend_row_blocked(
     query: &[f32],
     keys: &[&[f32]],
@@ -600,10 +600,18 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            Partial::block(&query, &k, &v, &allowed, f32::NAN).unwrap_err(),
-            Error::InvalidRequest { field: "scale", .. }
-        ));
+        // The graph and kernel contract require a strictly positive scale, not
+        // merely a nonzero one: zero, a negative value, and non-finite values
+        // are all refused.
+        for scale in [f32::NAN, 0.0, -1.0, f32::INFINITY] {
+            assert!(
+                matches!(
+                    Partial::block(&query, &k, &v, &allowed, scale).unwrap_err(),
+                    Error::InvalidRequest { field: "scale", .. }
+                ),
+                "scale {scale} was accepted"
+            );
+        }
         // A key of the wrong width is caught rather than silently truncated.
         let short = vec![1.0f32, 2.0];
         let mixed: Vec<&[f32]> = vec![short.as_slice(), k[1], k[2], k[3]];
