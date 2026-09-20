@@ -1301,17 +1301,33 @@ mod tests {
             host.append(txn, position, &rows, &AtomicBool::new(false))
                 .unwrap();
         }
-        device.publish(device_txn, 24).unwrap();
+        let staged = device.stage(device_txn, 24).unwrap();
+        // A performer would write these placements; this test only needs the
+        // mapping they carry.
+        let device_placements: Vec<_> = (0..geometry.layers.len())
+            .map(|layer| device.placements(&staged, layer).unwrap())
+            .collect();
+        device.publish(device_txn, staged).unwrap();
         // Zero, because prompt tokens are accepted when they are appended:
         // accepting them again would count the same context twice.
         host.commit_prefix(txn, 0).unwrap();
         device.commit(device_txn, 24).unwrap();
 
-        for layer in 0..geometry.layers.len() {
+        for (layer, placements) in device_placements.iter().enumerate() {
             let l = &host.layout.layers[layer];
             for position in 0..24u64 {
                 let (key, value) = host.ranges(layer, position as usize);
                 let placement = device.placement_of(layer, position).unwrap();
+                // The same row through the staged batch's own placements: one
+                // mapping, asked two ways.
+                let staged_run = placements
+                    .iter()
+                    .find(|p| p.position <= position && position < p.position + p.rows)
+                    .expect("every staged row is in a run");
+                assert_eq!(
+                    placement.physical_page, staged_run.physical_page,
+                    "layer {layer} row {position}: placement and staged run disagree"
+                );
                 // Through this store's *own* page table, not through a second
                 // copy of its arithmetic.
                 let entry = (l.table_base + placement.physical_page as usize) * 8;
@@ -1346,6 +1362,110 @@ mod tests {
             host.layout.layers[0].pages as u64 + 1,
             "the device layer must admit exactly one page more than the host ring"
         );
+    }
+
+    /// The same comparison **across a wrap**, which is where a ring can differ.
+    ///
+    /// The retain-all case above cannot wrap: its capacity is its context. So
+    /// this one gives both stores four pages — the host by windowing 24 rows
+    /// with 8 of headroom, the device by windowing 16 with the same 8 and the
+    /// eviction page it adds — and appends a hundred rows through a 32-row
+    /// ring. Equal page counts mean one modulus, and every row after the first
+    /// wrap is a row whose physical page is *not* its logical one.
+    #[test]
+    fn the_two_mappings_still_agree_after_the_ring_has_wrapped() {
+        use crate::device::DeviceKvSequence;
+
+        const ROWS: u64 = 100;
+        let layer = |window: usize| LayerKv {
+            kv_heads: 1,
+            key_dim: 2,
+            value_dim: 2,
+            retention: Retention::Window { window },
+        };
+        let make = |window: usize| KvGeometry {
+            layers: vec![layer(window)],
+            precision: Precision::Bf16,
+            page_tokens: 8,
+            max_tokens: 4096,
+            tentative_rows: 8,
+        };
+        // 24 + 8 is four pages for the host; 16 + 8 is three plus the eviction
+        // page for the device. Both admit 32 rows in four 8-row pages.
+        let mut ledger =
+            Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 20, 1024).unwrap()]).unwrap();
+        let mut host = PagedSequence::new(&mut ledger, make(24)).unwrap();
+        let mut device = DeviceKvSequence::new(make(16)).unwrap();
+        assert_eq!(host.layout.layers[0].pages, 4);
+        assert_eq!(device.layout(0).unwrap().pages, 4);
+        assert_eq!(host.layout.layers[0].capacity, 32);
+
+        let rows = [KvRow {
+            key: &[1, 2, 3, 4],
+            value: &[5, 6, 7, 8],
+        }];
+        let mut written = 0u64;
+        while written < ROWS {
+            let step = 8.min(ROWS - written);
+            let txn = host.begin().unwrap();
+            host.append_prompt(step).unwrap();
+            for offset in 0..step {
+                host.append(txn, written + offset, &rows, &AtomicBool::new(false))
+                    .unwrap();
+            }
+            host.commit_prefix(txn, 0).unwrap();
+            let device_txn = device.begin().unwrap();
+            let staged = device.stage(device_txn, step).unwrap();
+            device.publish(device_txn, staged).unwrap();
+            device.commit(device_txn, step).unwrap();
+            written += step;
+        }
+        assert_eq!(device.committed_rows(), ROWS);
+
+        // Every row, including the ones whose page has been reused twelve
+        // times. The comparison is against this store's own table bytes, so a
+        // device mapping that had drifted would land on different bytes here.
+        let l = &host.layout.layers[0];
+        let mut wrapped = 0usize;
+        for position in 0..ROWS {
+            let (key, value) = host.ranges(0, position as usize);
+            let logical_page = position / 8;
+            let physical = (position / 8) % 4;
+            if logical_page != physical {
+                wrapped += 1;
+            }
+            let entry = (l.table_base + physical as usize) * 8;
+            let table = &host.backing.bytes()[entry..entry + 8];
+            let base = u64::from_le_bytes(table.try_into().unwrap()) as usize;
+            let slot = (position % 8) as usize;
+            assert_eq!(
+                key.start,
+                base + slot * l.key_bytes,
+                "row {position}: the two mappings disagree on the key after a wrap"
+            );
+            assert_eq!(
+                value.start,
+                base + 8 * l.key_bytes + slot * l.value_bytes,
+                "row {position}: the two mappings disagree on the value after a wrap"
+            );
+        }
+        assert!(
+            wrapped > 60,
+            "only {wrapped} rows were on a reused page; this fixture is not wrapping"
+        );
+
+        // And the device's own placements agree with that, for every row it
+        // still retains.
+        let retained = device.retained(0).unwrap();
+        assert!(
+            retained.start > 0,
+            "the device ring was supposed to reclaim"
+        );
+        for position in retained {
+            let placement = device.placement_of(0, position).unwrap();
+            assert_eq!(placement.physical_page, (position / 8) % 4);
+            assert_eq!(placement.slot, position % 8);
+        }
     }
 
     #[test]

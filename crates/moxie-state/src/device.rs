@@ -67,6 +67,14 @@ pub struct DeviceLayerLayout {
     pub row_elements: u64,
 }
 
+/// One layer's logical-to-physical mapping, and the absolute row its first
+/// logical page names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageView {
+    pub base: u64,
+    pub table: Vec<u32>,
+}
+
 /// Where one run of rows physically lands.
 ///
 /// [`moxie_types::PagePlacement`], because it is the vocabulary that passes
@@ -79,18 +87,62 @@ pub type Placement = PagePlacement;
 /// It holds no bytes. Every method answers a question about placement,
 /// retention or the frontier, and the answers are the only thing a performer is
 /// permitted to act on.
+/// Rows a transaction has reserved and not yet published.
+///
+/// Returned by [`DeviceKvSequence::stage`] and consumed by
+/// [`DeviceKvSequence::publish`]. The positions and the count are one value, so
+/// a caller cannot write one range and publish another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "staged rows must be published or the transaction aborted"]
+pub struct StagedRows {
+    transaction: StateTransactionId,
+    first: u64,
+    rows: u64,
+}
+
+impl StagedRows {
+    /// The absolute position of the first staged row.
+    pub const fn first(&self) -> u64 {
+        self.first
+    }
+
+    /// How many rows are staged.
+    pub const fn rows(&self) -> u64 {
+        self.rows
+    }
+}
+
+/// One open transaction's bookkeeping.
+#[derive(Debug, Clone, Copy)]
+struct OpenTransaction {
+    id: StateTransactionId,
+    /// The frontier when it began, which is what an abort restores.
+    base: u64,
+    /// Rows staged and not yet published. At most one batch at a time: two
+    /// outstanding batches would let a caller publish them out of order and
+    /// move the frontier over rows nothing wrote.
+    pending: Option<(u64, u64)>,
+}
+
 #[derive(Debug)]
 pub struct DeviceKvSequence {
     geometry: KvGeometry,
     layout: Vec<DeviceLayerLayout>,
     state: SequenceState,
-    /// The committed frontier: rows whose write this authority has published.
+    /// The published frontier, including rows a transaction has published but
+    /// not yet committed. Tentative rows are legal state (document 04), and
+    /// they are readable and attendable before the commit that accepts them.
     rows: u64,
-    /// The highest frontier ever reached, which is what the ring overwrites
-    /// against. An aborted transaction lowers `rows` and not this.
-    high_water: u64,
-    /// The frontier when the open transaction began, so an abort restores it.
-    tentative_base: Option<u64>,
+    /// The frontier as of the last **commit**.
+    ///
+    /// Not updated by `publish`, and that is the fix for a defect worth naming:
+    /// the retained base is derived from this plus the admitted undo headroom,
+    /// so it cannot move while a transaction is open. When it was derived from
+    /// the published frontier instead, a tentative append advanced the base and
+    /// an abort left it advanced — rows the window still admitted became
+    /// permanently unreadable because of a transaction that was rolled back.
+    committed_high_water: u64,
+    open: Option<OpenTransaction>,
 }
 
 impl DeviceKvSequence {
@@ -112,6 +164,20 @@ impl DeviceKvSequence {
         if geometry.max_tokens == 0 {
             return Err(invalid("max_tokens", "a sequence admitting no row"));
         }
+        // **The cache precision is a contract, not a byte width.** Every path
+        // below this one reads two bytes per element as BF16, and an FP16 cache
+        // has the same width and a different meaning, so accepting one here
+        // would be the silent reinterpretation task 0037 refused by name and
+        // this task inherited. It is `Unsupported` rather than invalid: the
+        // request is coherent and this slice does not serve it.
+        if geometry.precision != moxie_types::Precision::Bf16 {
+            return Err(Error::Unsupported {
+                capability: "device_kv_precision",
+                reason: "device paged state is BF16 in this slice; an FP16 or integer \
+                         cache is unsupported rather than reinterpreted"
+                    .into(),
+            });
+        }
         let page_tokens = geometry.page_tokens as u64;
         let mut layout = Vec::new();
         layout
@@ -132,6 +198,22 @@ impl DeviceKvSequence {
                              and unsupported by this path"
                         .into(),
                 });
+            }
+            if let Retention::Window { window } = layer.retention {
+                // A window of zero sees nothing, including the query's own
+                // position, and a reclaiming sequence with no undo headroom has
+                // a transaction it can never abort. The host geometry refuses
+                // both; so does this.
+                if window == 0 {
+                    return Err(invalid("window", "a sliding window retaining no row"));
+                }
+                if geometry.tentative_rows == 0 {
+                    return Err(invalid(
+                        "tentative_rows",
+                        "a reclaiming sequence with no undo headroom cannot abort a \
+                         transaction it has written",
+                    ));
+                }
             }
             let rows = match layer.retention {
                 Retention::All => geometry.max_tokens as u64,
@@ -161,8 +243,8 @@ impl DeviceKvSequence {
             layout,
             state: SequenceState::new([StateKind::KvPages, StateKind::PositionCounter]),
             rows: 0,
-            high_water: 0,
-            tentative_base: None,
+            committed_high_water: 0,
+            open: None,
         })
     }
 
@@ -200,12 +282,33 @@ impl DeviceKvSequence {
     pub fn retained(&self, layer: usize) -> Result<Range<u64>> {
         let layout = self.layout(layer)?;
         let page_tokens = self.geometry.page_tokens as u64;
-        // The ring overwrites row `r` with row `r + capacity`. A page is gone
-        // once any of its rows has been: the first row still addressable is
-        // `high_water - capacity` rounded **up** to a page boundary.
-        let overwritten = self.high_water.saturating_sub(layout.capacity_rows);
+        // The ring overwrites row `r` with row `r + capacity`, and a page is
+        // gone once any of its rows has been. Two things make this the *stable*
+        // base rather than the tightest one.
+        //
+        // It is computed from the **committed** frontier, not the published
+        // one, and it adds the admitted undo headroom. So the highest row a
+        // transaction could legally write — `committed + tentative_rows` — is
+        // already accounted for before the transaction starts, the base cannot
+        // move while it is open, and an abort cannot leave it advanced over
+        // rows the window still admits. It costs the headroom in retained rows,
+        // which is exactly what the headroom was admitted for.
+        let reach = self
+            .committed_high_water
+            .saturating_add(self.headroom())
+            .max(self.rows);
+        let overwritten = reach.saturating_sub(layout.capacity_rows);
         let base = overwritten.div_ceil(page_tokens) * page_tokens;
         Ok(base.min(self.rows)..self.rows)
+    }
+
+    /// The undo headroom a transaction may use, zero when nothing reclaims.
+    fn headroom(&self) -> u64 {
+        if self.reclaims() {
+            self.geometry.tentative_rows as u64
+        } else {
+            0
+        }
     }
 
     /// Where row `position` of one layer physically sits.
@@ -225,39 +328,35 @@ impl DeviceKvSequence {
         Ok(self.place(layout, position, 1))
     }
 
-    /// The page-aligned runs covering `rows` rows from `first`.
+    /// The page-aligned runs covering one staged batch, for one layer.
     ///
     /// What a performer copies: one call per stretch of rows that shares a
     /// page. The performer does not compute `position / page_tokens` itself,
     /// which is the whole point — two implementations of one mapping is what
     /// this module exists to prevent.
     ///
-    /// Positions **at or beyond** the committed frontier are legal here and
-    /// nowhere else: this is what a transaction asks before it writes.
-    pub fn placements(&self, layer: usize, first: u64, rows: u64) -> Result<Vec<Placement>> {
+    /// The positions come from [`StagedRows`], not from an argument: they are
+    /// the authority's to choose and they are always the frontier.
+    pub fn placements(&self, staged: &StagedRows, layer: usize) -> Result<Vec<Placement>> {
         let layout = self.layout(layer)?;
-        if rows == 0 {
-            return Err(invalid("rows", "a placement of no rows"));
-        }
-        let end = first
-            .checked_add(rows)
-            .ok_or(Error::Dim(DimError::Overflow))?;
-        if end > self.geometry.max_tokens as u64 {
-            return Err(Error::CapacityExceeded {
-                tier: None,
-                requested_bytes: end,
-                available_bytes: self.geometry.max_tokens as u64,
-            });
+        let open = self
+            .open
+            .ok_or_else(|| invalid("transaction", "no transaction is open"))?;
+        if open.id != staged.transaction || open.pending != Some((staged.first, staged.rows)) {
+            return Err(invalid(
+                "staged",
+                "these rows are not the batch this transaction staged",
+            ));
         }
         let page_tokens = self.geometry.page_tokens as u64;
         let mut out = Vec::new();
-        out.try_reserve_exact((rows.div_ceil(page_tokens) + 1) as usize)
+        out.try_reserve_exact((staged.rows.div_ceil(page_tokens) + 1) as usize)
             .map_err(|_| Error::Dim(DimError::Overflow))?;
         let mut done = 0u64;
-        while done < rows {
-            let position = first + done;
+        while done < staged.rows {
+            let position = staged.first + done;
             let slot = position % page_tokens;
-            let run = (page_tokens - slot).min(rows - done);
+            let run = (page_tokens - slot).min(staged.rows - done);
             out.push(self.place(layout, position, run));
             done += run;
         }
@@ -275,52 +374,72 @@ impl DeviceKvSequence {
         }
     }
 
-    /// The logical-to-physical page table a launch reads, for the retained
-    /// range of one layer.
+    /// The mapping a launch reads: logical page zero is `base`.
     ///
-    /// Logical page zero is the first retained page, which is what the kernel's
-    /// `history_base` names. An empty history has no table and says so.
-    pub fn page_table(&self, layer: usize) -> Result<Vec<u32>> {
+    /// It covers the retained range and any rows this transaction has staged,
+    /// because a performer must be able to write where it is about to write.
+    pub fn page_view(&self, layer: usize) -> Result<PageView> {
         let layout = self.layout(layer)?;
         let retained = self.retained(layer)?;
-        if retained.is_empty() {
-            return Err(invalid("retained", "this layer retains no row"));
+        let staged_end = self.open.and_then(|o| o.pending).map_or(0, |(f, n)| f + n);
+        let end = self.rows.max(staged_end);
+        if end == 0 || retained.start >= end {
+            return Err(invalid("retained", "this layer holds no row"));
         }
         let page_tokens = self.geometry.page_tokens as u64;
         let first = retained.start / page_tokens;
-        let last = (retained.end - 1) / page_tokens;
-        let mut out = Vec::new();
-        out.try_reserve_exact((last - first + 1) as usize)
+        let last = (end - 1) / page_tokens;
+        let mut table = Vec::new();
+        table
+            .try_reserve_exact((last - first + 1) as usize)
             .map_err(|_| Error::Dim(DimError::Overflow))?;
         for absolute in first..=last {
-            let physical = absolute % layout.pages;
-            out.push(u32::try_from(physical).map_err(|_| {
+            table.push(u32::try_from(absolute % layout.pages).map_err(|_| {
                 invalid(
                     "page_table",
                     "a physical page identity exceeds this ABI's u32",
                 )
             })?);
         }
-        Ok(out)
+        Ok(PageView {
+            base: retained.start,
+            table,
+        })
     }
 
     /// Open a transaction. The frontier it starts at is what an abort restores.
     pub fn begin(&mut self) -> Result<StateTransactionId> {
-        let txn = self.state.begin(ROOT)?;
-        self.tentative_base = Some(self.rows);
-        Ok(txn)
+        if self.open.is_some() {
+            return Err(invalid("transaction", "a transaction is already open here"));
+        }
+        let id = self.state.begin(ROOT)?;
+        self.open = Some(OpenTransaction {
+            id,
+            base: self.rows,
+            pending: None,
+        });
+        Ok(id)
     }
 
-    /// Publish `rows` rows appended from the current frontier.
+    /// Reserve the next `rows` positions for this transaction to write.
     ///
-    /// Called **after** a performer has observed its copies complete. Before
-    /// that the rows are staged bytes with no reader; after it they are
-    /// history. There is no state in between, which is why this is a separate
-    /// call from [`Self::placements`] rather than a return value of it.
-    pub fn publish(&mut self, txn: StateTransactionId, rows: u64) -> Result<()> {
-        self.check_transaction(txn)?;
+    /// The positions are the authority's to choose, and they are always the
+    /// frontier: a dense, ordered append is the only shape paged state has.
+    /// What comes back is the only thing [`Self::placements`] will place and
+    /// the only thing [`Self::publish`] will publish.
+    ///
+    /// One batch at a time. Two outstanding batches could be published out of
+    /// order, which would move the frontier over rows nothing had written.
+    pub fn stage(&mut self, txn: StateTransactionId, rows: u64) -> Result<StagedRows> {
+        let open = self.open_transaction(txn)?;
+        if open.pending.is_some() {
+            return Err(invalid(
+                "staged",
+                "this transaction already has a staged batch; publish it first",
+            ));
+        }
         if rows == 0 {
-            return Err(invalid("rows", "publishing no row"));
+            return Err(invalid("rows", "staging no row"));
         }
         let end = self
             .rows
@@ -333,41 +452,90 @@ impl DeviceKvSequence {
                 available_bytes: self.geometry.max_tokens as u64,
             });
         }
-        // ADR 0014's headroom: a transaction that appends more than the
-        // admitted undo headroom would overwrite rows its own abort has to put
-        // back. Refused before publishing, so abort never has to fail.
-        let base = self.tentative_base.expect("a validated open transaction");
-        if self.reclaims() && end - base > self.geometry.tentative_rows as u64 {
+        // ADR 0014's headroom, checked before anything is written rather than
+        // after: a transaction that appended more than the admitted undo
+        // headroom would overwrite rows its own abort has to put back.
+        if self.reclaims() && end - open.base > self.geometry.tentative_rows as u64 {
             return Err(invalid(
                 "tentative_rows",
-                "this transaction has appended more rows than the admitted undo headroom",
+                "this transaction would append more rows than the admitted undo headroom",
             ));
         }
-        self.state.execute(ROOT, rows)?;
-        self.rows = end;
-        self.high_water = self.high_water.max(self.rows);
+        let staged = StagedRows {
+            transaction: txn,
+            first: self.rows,
+            rows,
+        };
+        self.open
+            .as_mut()
+            .expect("a validated open transaction")
+            .pending = Some((staged.first, staged.rows));
+        Ok(staged)
+    }
+
+    /// Publish a staged batch as history.
+    ///
+    /// Called **after** a performer has observed its copies complete. Before
+    /// that the rows are staged bytes with no reader; after it they are state.
+    /// There is no moment in between, which is why this is a separate call from
+    /// [`Self::stage`] rather than something that call does for you.
+    pub fn publish(&mut self, txn: StateTransactionId, staged: StagedRows) -> Result<()> {
+        let open = self.open_transaction(txn)?;
+        if staged.transaction != txn || open.pending != Some((staged.first, staged.rows)) {
+            return Err(invalid(
+                "staged",
+                "these rows are not the batch this transaction staged",
+            ));
+        }
+        if staged.first != self.rows {
+            return Err(invalid(
+                "staged",
+                "the staged batch no longer starts at the frontier",
+            ));
+        }
+        self.state.execute(ROOT, staged.rows)?;
+        self.rows = staged.first + staged.rows;
+        self.open
+            .as_mut()
+            .expect("a validated open transaction")
+            .pending = None;
         Ok(())
     }
 
     /// Accept `accept` of the transaction's rows and close it.
+    ///
+    /// An unpublished staged batch is refused: its bytes may or may not have
+    /// been written, and committing over that question is how a frontier ends
+    /// up ahead of the rows behind it.
     pub fn commit(&mut self, txn: StateTransactionId, accept: u64) -> Result<()> {
-        self.check_transaction(txn)?;
+        let open = self.open_transaction(txn)?;
+        if open.pending.is_some() {
+            return Err(invalid(
+                "staged",
+                "a staged batch is unpublished; publish it or abort the transaction",
+            ));
+        }
         self.state.commit_prefix(txn, accept)?;
-        self.tentative_base = None;
+        self.open = None;
+        // The ring's reach only moves at a commit. Everything the retained base
+        // is derived from is therefore stable for the whole of a transaction.
+        self.committed_high_water = self.committed_high_water.max(self.rows);
         Ok(())
     }
 
     /// Discard the open transaction's rows.
     ///
-    /// The frontier returns to where the transaction began and the retained
-    /// range with it. `high_water` does **not** move: the ring has already
-    /// overwritten what it overwrote, and pretending otherwise would hand back
-    /// rows whose bytes are gone.
+    /// The frontier returns to where the transaction began **and so does the
+    /// retained range**, because the base was never derived from anything a
+    /// transaction can move. The bytes those rows overwrote are gone, which is
+    /// why the admitted capacity carries the undo headroom: the rows the window
+    /// still admits were never in the pages the transaction could reach.
     pub fn abort(&mut self, txn: StateTransactionId) -> Result<()> {
-        self.check_transaction(txn)?;
-        let base = self.tentative_base.take().expect("an open transaction");
+        let open = self.open_transaction(txn)?;
+        let base = open.base;
         self.state.abort(txn)?;
         self.rows = base;
+        self.open = None;
         Ok(())
     }
 
@@ -378,8 +546,14 @@ impl DeviceKvSequence {
     /// what remains is exactly what was there before those positions were
     /// written. Refused while a transaction is open — a truncation underneath
     /// one would move the frontier its abort is holding.
+    ///
+    /// Refused **below any layer's retained base**, for the reason the host
+    /// store refuses the same rollback: those rows are not there. Accepting it
+    /// would leave a frontier pointing at bytes the ring overwrote, and a
+    /// re-append from that prefix would report rows reclaimed the moment they
+    /// were written.
     pub fn truncate(&mut self, prefix: u64) -> Result<()> {
-        if self.tentative_base.is_some() {
+        if self.open.is_some() {
             return Err(invalid(
                 "truncate",
                 "a transaction is open; commit or abort before truncating",
@@ -387,6 +561,16 @@ impl DeviceKvSequence {
         }
         if prefix > self.rows {
             return Err(invalid("prefix", "truncating past the committed frontier"));
+        }
+        for layer in 0..self.layout.len() {
+            let retained = self.retained(layer)?;
+            if prefix < retained.start {
+                return Err(Error::Reclaimed {
+                    layer: layer as u32,
+                    position: prefix,
+                    retained_from: retained.start,
+                });
+            }
         }
         self.state.rollback_to(ROOT, prefix, &[])?;
         self.rows = prefix;
@@ -400,15 +584,21 @@ impl DeviceKvSequence {
             .any(|l| matches!(l.retention, Retention::Window { .. }))
     }
 
-    fn check_transaction(&self, txn: StateTransactionId) -> Result<()> {
-        if self.tentative_base.is_none() {
-            return Err(invalid("transaction", "no transaction is open"));
-        }
-        let open = self.state.open_transactions();
-        if !open.iter().any(|(id, _)| *id == txn) {
+    /// The open transaction, if it is this one.
+    fn open_transaction(&self, txn: StateTransactionId) -> Result<OpenTransaction> {
+        let open = self
+            .open
+            .ok_or_else(|| invalid("transaction", "no transaction is open"))?;
+        if open.id != txn
+            || !self
+                .state
+                .open_transactions()
+                .iter()
+                .any(|(id, _)| *id == txn)
+        {
             return Err(invalid("transaction", "this transaction is not open here"));
         }
-        Ok(())
+        Ok(open)
     }
 }
 
@@ -464,7 +654,10 @@ mod tests {
         while done < rows {
             let step = headroom.min(rows - done);
             let txn = sequence.begin().expect("a transaction");
-            sequence.publish(txn, step).expect("publish");
+            let staged = sequence.stage(txn, step).expect("stage");
+            // A performer would write these placements here.
+            let _ = sequence.placements(&staged, 0).expect("placements");
+            sequence.publish(txn, staged).expect("publish");
             sequence.commit(txn, step).expect("commit");
             done += step;
         }
@@ -499,30 +692,35 @@ mod tests {
 
     #[test]
     fn a_page_leaves_the_retained_range_whole() {
-        // Capacity 40 rows in five 8-row pages. At frontier 100 the ring has
-        // overwritten rows 0..=59, so row 60 is the first whose bytes survive
-        // — and 60 is a page boundary here, so nothing is lost to rounding.
+        // Capacity is 40 rows in five 8-row pages, and the base is derived
+        // from the committed frontier **plus the admitted undo headroom** —
+        // 108 — so the ring's reach is 68 and the first whole page at or above
+        // it is 72. Pricing the headroom in is what keeps the base from moving
+        // while a transaction is open, and it costs exactly the headroom.
         let mut sequence = DeviceKvSequence::new(windowed(24, 8, 8)).expect("a sequence");
         fill(&mut sequence, 100);
         let retained = sequence.retained(0).expect("a range");
-        assert_eq!(retained, 64..100, "{retained:?}");
+        assert_eq!(retained, 72..100, "{retained:?}");
         assert_eq!(retained.start % 8, 0, "the base must be a whole page");
+        assert!(
+            retained.start <= 100 - 24,
+            "the window admits row 76 and the base must be at or below it"
+        );
 
-        // One more row does **not** move the base: the ring has overwritten
-        // through row 60, and the first whole page at or above 61 is still the
-        // one starting at 64. A base that moved per row would be describing a
-        // partially overwritten page.
+        // One more row does **not** move the base: the reach is 109, the
+        // ring has overwritten through row 68, and the first whole page at or
+        // above that is still 72. A base that moved per row would be
+        // describing a partially overwritten page.
         fill(&mut sequence, 1);
-        assert_eq!(sequence.retained(0).expect("a range"), 64..101);
+        assert_eq!(sequence.retained(0).expect("a range"), 72..101);
 
-        // It moves when the page starting at 64 is itself reached: row 104
-        // overwrites row 64's slot, so at frontier 109 the base is 72.
+        // It moves when the page starting at 72 is itself reached.
         fill(&mut sequence, 8);
-        assert_eq!(sequence.retained(0).expect("a range"), 72..109);
+        assert_eq!(sequence.retained(0).expect("a range"), 80..109);
         // And the row just below a base is gone rather than wrong.
-        assert!(sequence.placement_of(0, 71).is_err());
+        assert!(sequence.placement_of(0, 79).is_err());
         sequence
-            .placement_of(0, 72)
+            .placement_of(0, 80)
             .expect("the first retained row");
     }
 
@@ -571,15 +769,14 @@ mod tests {
         let mut sequence = DeviceKvSequence::new(windowed(24, 8, 8)).expect("a sequence");
         fill(&mut sequence, 100);
         let retained = sequence.retained(0).expect("a range");
-        assert_eq!(retained, 64..100);
-        // Rows 64..99 are absolute pages 8..12, and page 8 is physical 8 % 5.
-        let table = sequence.page_table(0).expect("a table");
-        assert_eq!(table, vec![3, 4, 0, 1, 2]);
-        // The kernel's arithmetic, checked against the authority's own: logical
-        // page zero is the retained base.
+        assert_eq!(retained, 72..100);
+        // Rows 72..99 are absolute pages 9..12, and page 9 is physical 9 % 5.
+        let view = sequence.page_view(0).expect("a view");
+        assert_eq!(view.base, retained.start);
+        assert_eq!(view.table, vec![4, 0, 1, 2]);
         for position in retained.clone() {
-            let logical = (position - retained.start) / 8;
-            let physical = u64::from(table[logical as usize]);
+            let logical = (position - view.base) / 8;
+            let physical = u64::from(view.table[logical as usize]);
             assert_eq!(
                 physical,
                 sequence
@@ -594,9 +791,12 @@ mod tests {
     #[test]
     fn placements_break_at_page_boundaries_and_nowhere_else() {
         let mut sequence = DeviceKvSequence::new(full(8, 64)).expect("a sequence");
-        fill(&mut sequence, 8);
-        // Six rows from position 5: 5..7 in one page, 8..10 in the next.
-        let runs = sequence.placements(0, 5, 6).expect("placements");
+        fill(&mut sequence, 5);
+        // Six rows from the frontier at 5: 5..7 in one page, 8..10 in the next.
+        let txn = sequence.begin().expect("a transaction");
+        let staged = sequence.stage(txn, 6).expect("stage");
+        assert_eq!((staged.first(), staged.rows()), (5, 6));
+        let runs = sequence.placements(&staged, 0).expect("placements");
         assert_eq!(runs.len(), 2);
         assert_eq!(
             runs[0],
@@ -616,14 +816,73 @@ mod tests {
                 rows: 3
             }
         );
+        // A second batch before the first is published is refused: two
+        // outstanding batches could be published out of order, moving the
+        // frontier over rows nothing wrote.
+        assert!(sequence.stage(txn, 1).is_err());
+        // So is committing over an unpublished batch.
+        assert!(sequence.commit(txn, 6).is_err());
+        sequence.publish(txn, staged).expect("publish");
+        // And publishing the same batch twice.
+        assert!(sequence.publish(txn, staged).is_err());
+        sequence.commit(txn, 6).expect("commit");
+
         // A run that starts on a boundary and covers exactly one page is one
         // placement, not two.
-        let runs = sequence.placements(0, 8, 8).expect("placements");
+        let txn = sequence.begin().expect("a transaction");
+        let staged = sequence.stage(txn, 5).expect("stage");
+        let runs = sequence.placements(&staged, 0).expect("placements");
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].rows, 8);
-        assert!(sequence.placements(0, 0, 0).is_err());
-        assert!(sequence.placements(1, 0, 1).is_err());
-        assert!(sequence.placements(0, 0, 65).is_err());
+        assert_eq!(runs[0].rows, 5);
+        assert!(sequence.placements(&staged, 1).is_err(), "no such layer");
+        sequence.abort(txn).expect("abort");
+        // Staged rows from an aborted transaction place nothing.
+        assert!(sequence.placements(&staged, 0).is_err());
+        assert!(sequence.stage(txn, 1).is_err(), "the transaction is closed");
+    }
+
+    #[test]
+    fn the_page_view_covers_rows_a_transaction_has_staged() {
+        let mut sequence = DeviceKvSequence::new(full(8, 64)).expect("a sequence");
+        fill(&mut sequence, 8);
+        assert_eq!(sequence.page_view(0).expect("a view").table.len(), 1);
+        let txn = sequence.begin().expect("a transaction");
+        let staged = sequence.stage(txn, 8).expect("stage");
+        let view = sequence.page_view(0).expect("a view");
+        assert_eq!(view.base, 0);
+        assert_eq!(view.table.len(), 2, "the staged page is not in the view");
+        for placement in sequence.placements(&staged, 0).expect("placements") {
+            let logical = (placement.position - view.base) / 8;
+            assert_eq!(
+                u64::from(view.table[logical as usize]),
+                placement.physical_page
+            );
+        }
+        sequence.abort(txn).expect("abort");
+        assert_eq!(sequence.page_view(0).expect("a view").table.len(), 1);
+    }
+
+    #[test]
+    fn a_staged_batch_cannot_name_positions_the_authority_did_not_choose() {
+        // Staging starts at the frontier, and only a batch this transaction
+        // staged can be placed or published.
+        let mut sequence = DeviceKvSequence::new(full(8, 128)).expect("a sequence");
+        fill(&mut sequence, 3);
+        let txn = sequence.begin().expect("a transaction");
+        let staged = sequence.stage(txn, 2).expect("stage");
+        assert_eq!(staged.first(), 3, "staging starts at the frontier");
+
+        // A batch from another sequence's transaction, and one this transaction
+        // did not stage, are both refused.
+        let mut other = DeviceKvSequence::new(full(8, 128)).expect("another sequence");
+        let other_txn = other.begin().expect("a transaction");
+        let foreign = other.stage(other_txn, 2).expect("stage");
+        assert!(sequence.placements(&foreign, 0).is_err());
+        assert!(sequence.publish(txn, foreign).is_err());
+        sequence.publish(txn, staged).expect("publish");
+        sequence.commit(txn, 2).expect("commit");
+        assert_eq!(sequence.committed_rows(), 5);
+        other.abort(other_txn).expect("abort");
     }
 
     #[test]
@@ -632,13 +891,51 @@ mod tests {
         fill(&mut sequence, 10);
         let before = sequence.retained(0).expect("a range");
         let txn = sequence.begin().expect("a transaction");
-        sequence.publish(txn, 6).expect("publish");
+        let staged = sequence.stage(txn, 6).expect("stage");
+        sequence.publish(txn, staged).expect("publish");
         assert_eq!(sequence.committed_rows(), 16);
+        // Tentative rows are legal state and are addressable before the commit
+        // that accepts them: document 04 forbids publishing candidates before
+        // verification, so they have to be readable without it.
+        sequence
+            .placement_of(0, 15)
+            .expect("a tentative row is placed");
         sequence.abort(txn).expect("abort");
         assert_eq!(sequence.committed_rows(), 10);
         assert_eq!(sequence.retained(0).expect("a range"), before);
         // And the rows it published are not addressable any more.
         assert!(sequence.placement_of(0, 10).is_err());
+    }
+
+    #[test]
+    fn a_windowed_abort_leaves_the_retained_base_where_it_found_it() {
+        // The retained base is derived from the committed frontier plus the
+        // admitted headroom, so no transaction can move it.
+        let mut sequence = DeviceKvSequence::new(windowed(24, 8, 8)).expect("a sequence");
+        fill(&mut sequence, 100);
+        let before = sequence.retained(0).expect("a range");
+        assert_eq!(before, 72..100, "the headroom is priced into the base");
+
+        let txn = sequence.begin().expect("a transaction");
+        let staged = sequence.stage(txn, 8).expect("stage the whole headroom");
+        sequence.publish(txn, staged).expect("publish");
+        assert_eq!(
+            sequence.retained(0).expect("a range").start,
+            before.start,
+            "a tentative append moved the retained base"
+        );
+        sequence.abort(txn).expect("abort");
+        assert_eq!(
+            sequence.retained(0).expect("a range"),
+            before,
+            "an abort left the retained base advanced"
+        );
+        // And the oldest row the window admits is still placeable, which is the
+        // property the whole arrangement exists for.
+        let oldest = sequence.committed_rows() - 24;
+        sequence
+            .placement_of(0, oldest)
+            .expect("the oldest row the window admits");
     }
 
     #[test]
@@ -679,18 +976,70 @@ mod tests {
     }
 
     #[test]
+    fn truncating_below_the_retained_base_is_refused() {
+        // The host store refuses a rollback whose target has been reclaimed,
+        // and for the same reason: those rows are not there. Accepting it would
+        // leave a frontier pointing at bytes the ring overwrote, and a
+        // re-append from that prefix would report rows reclaimed the moment
+        // they were written.
+        let mut sequence = DeviceKvSequence::new(windowed(24, 8, 8)).expect("a sequence");
+        fill(&mut sequence, 100);
+        let retained = sequence.retained(0).expect("a range");
+        assert_eq!(retained.start, 72);
+
+        let refused = sequence
+            .truncate(retained.start - 1)
+            .expect_err("a truncation below the retained base was accepted");
+        assert!(matches!(refused, Error::Reclaimed { .. }), "{refused:?}");
+        assert_eq!(
+            sequence.committed_rows(),
+            100,
+            "a refusal moved the frontier"
+        );
+
+        // The base itself is a legal target, and what remains after it is
+        // exactly what was there.
+        let at_base = sequence
+            .placement_of(0, retained.start)
+            .expect("the first retained row");
+        sequence
+            .truncate(retained.start)
+            .expect("truncate to the base");
+        assert_eq!(sequence.committed_rows(), retained.start);
+        assert_eq!(
+            sequence
+                .placement_of(0, retained.start - 1)
+                .expect_err("below the base is still gone")
+                .kind(),
+            "reclaimed"
+        );
+        // Re-appending from there lands where those rows were.
+        let txn = sequence.begin().expect("a transaction");
+        let staged = sequence.stage(txn, 1).expect("stage");
+        sequence.publish(txn, staged).expect("publish");
+        sequence.commit(txn, 1).expect("commit");
+        assert_eq!(
+            sequence
+                .placement_of(0, retained.start)
+                .expect("the re-appended row"),
+            at_base,
+            "a re-append landed somewhere else"
+        );
+    }
+
+    #[test]
     fn the_undo_headroom_is_refused_before_it_is_overwritten() {
         // ADR 0014: a transaction longer than the admitted headroom would
-        // overwrite rows its own abort has to restore. Refused at publication,
-        // so abort never has to fail.
+        // overwrite rows its own abort has to restore. Refused at **staging**,
+        // before a performer is given anywhere to write, so nothing is
+        // overwritten and abort never has to fail.
         let mut sequence = DeviceKvSequence::new(windowed(16, 8, 4)).expect("a sequence");
         fill(&mut sequence, 40);
         let txn = sequence.begin().expect("a transaction");
-        sequence
-            .publish(txn, 4)
-            .expect("four rows fit the headroom");
+        let staged = sequence.stage(txn, 4).expect("four rows fit the headroom");
+        sequence.publish(txn, staged).expect("publish");
         let refused = sequence
-            .publish(txn, 1)
+            .stage(txn, 1)
             .expect_err("a fifth row exceeds the headroom");
         assert!(
             matches!(
@@ -742,6 +1091,36 @@ mod tests {
         let mut empty = full(8, 64);
         empty.layers[0].kv_heads = 0;
         assert!(DeviceKvSequence::new(empty).is_err());
+
+        // The cache precision is a contract. Everything below reads two bytes
+        // per element as BF16, and an FP16 cache has the same width and a
+        // different meaning, so it is refused rather than reinterpreted.
+        for precision in [
+            moxie_types::Precision::F16,
+            moxie_types::Precision::F32,
+            moxie_types::Precision::Int8,
+        ] {
+            let mut other = full(8, 64);
+            other.precision = precision;
+            assert!(
+                matches!(
+                    DeviceKvSequence::new(other).unwrap_err(),
+                    Error::Unsupported {
+                        capability: "device_kv_precision",
+                        ..
+                    }
+                ),
+                "{precision:?} was accepted as a device cache precision"
+            );
+        }
+
+        // A window retaining nothing, and a reclaiming sequence with no undo
+        // headroom, are both refused: the first sees nothing at all, the second
+        // has a transaction it can never abort.
+        let mut no_window = windowed(0, 8, 4);
+        no_window.layers[0].retention = Retention::Window { window: 0 };
+        assert!(DeviceKvSequence::new(no_window).is_err());
+        assert!(DeviceKvSequence::new(windowed(8, 8, 0)).is_err());
     }
 
     #[test]
@@ -749,17 +1128,25 @@ mod tests {
         let mut sequence = DeviceKvSequence::new(full(8, 64)).expect("a sequence");
         let mut other = DeviceKvSequence::new(full(8, 64)).expect("another sequence");
         let txn = sequence.begin().expect("a transaction");
-        let foreign = other.begin().expect("another transaction");
+        let foreign_txn = other.begin().expect("another transaction");
         assert!(
-            sequence.publish(foreign, 1).is_err(),
+            sequence.stage(foreign_txn, 1).is_err(),
             "another sequence's transaction was accepted"
         );
-        sequence.publish(txn, 1).expect("publish");
-        sequence.commit(txn, 1).expect("commit");
         assert!(
-            sequence.publish(txn, 1).is_err(),
+            sequence.begin().is_err(),
+            "a second transaction opened over an open one"
+        );
+        let staged = sequence.stage(txn, 1).expect("stage");
+        sequence.publish(txn, staged).expect("publish");
+        sequence.commit(txn, 1).expect("commit");
+        other.abort(foreign_txn).expect("abort");
+        assert!(
+            sequence.stage(txn, 1).is_err(),
             "a committed transaction was reused"
         );
-        assert!(sequence.publish(txn, 0).is_err());
+        let txn = sequence.begin().expect("a transaction");
+        assert!(sequence.stage(txn, 0).is_err(), "a batch of no rows");
+        sequence.abort(txn).expect("abort");
     }
 }
