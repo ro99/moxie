@@ -2020,7 +2020,7 @@ fn every_allocation_in_a_quantized_admission_refuses_rather_than_aborting() {
 #[test]
 fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     let _serial = one_at_a_time();
-    use moxie_executor::{PageGeometry, PagedAttentionLaunch, PagedAttentionRun};
+    use moxie_executor::{PageGeometry, PagedAttentionLaunch, PagedAttentionRun, Staging};
     use moxie_plan::Visibility;
     use moxie_types::PagePlacement;
 
@@ -2031,7 +2031,7 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     /// interposes the CUDA driver process-wide and its fixtures stay as small
     /// as the fault window allows; `paged_attention_device.rs` is where the two
     /// authorities meet for real.
-    fn placements(first: u64, rows: u64, page_tokens: u64, pages: u64) -> Vec<PagePlacement> {
+    fn placements(first: u64, rows: u64, page_tokens: u64, table: &[u32]) -> Vec<PagePlacement> {
         let mut out = Vec::new();
         let mut done = 0;
         while done < rows {
@@ -2040,7 +2040,11 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
             let run = (page_tokens - slot).min(rows - done);
             out.push(PagePlacement {
                 position,
-                physical_page: (position / page_tokens) % pages,
+                // Through the published mapping, because that is what the run
+                // checks a write against: a placement computed from a formula
+                // that disagreed with the table would be refused, which is the
+                // binding working.
+                physical_page: u64::from(table[(position / page_tokens) as usize]),
                 slot,
                 rows: run,
             });
@@ -2080,13 +2084,22 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     .expect("this build declares a paged attention descriptor for this device");
 
     let mut ledger = test_ledger(&ctx);
-    let mut run = PagedAttentionRun::admit(&mut ledger, &ctx, descriptor, geometry, HEADS, 1)
-        .map_err(|r| r.error)
-        .expect("admission fits this ledger");
-    run.publish_page_table(&stream, vec![1, 0])
+    let mut run = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor,
+        geometry,
+        HEADS,
+        1,
+        Staging::Host,
+    )
+    .map_err(|r| r.error)
+    .expect("admission fits this ledger");
+    let table = vec![1u32, 0];
+    run.publish_page_table(&stream, 0, table.clone())
         .map_err(|r| r.error)
         .expect("a reversed mapping is a mapping");
-    let first_four = placements(0, 4, geometry.page_tokens, geometry.pages);
+    let first_four = placements(0, 4, geometry.page_tokens, &table);
     run.write_rows(
         &stream,
         &first_four,
@@ -2102,7 +2115,7 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     // so their completion is unknown and the rows cannot be published.
     let records = RECORDS.load(SeqCst);
     RECORD_ERROR.store(1, SeqCst);
-    let fifth = placements(4, 1, geometry.page_tokens, geometry.pages);
+    let fifth = placements(4, 1, geometry.page_tokens, &table);
     let refused = run
         .write_rows(&stream, &fifth, rows_bytes(1, 0x31), rows_bytes(1, 0x32))
         .expect_err("a write whose record failed must refuse");
@@ -2138,10 +2151,18 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
         &launch(1, 0, 1),
     )
     .expect("a descriptor");
-    let mut run = PagedAttentionRun::admit(&mut ledger, &ctx, descriptor, geometry, HEADS, 1)
-        .map_err(|r| r.error)
-        .expect("admission fits this ledger");
-    run.publish_page_table(&stream, vec![1, 0])
+    let mut run = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor,
+        geometry,
+        HEADS,
+        1,
+        Staging::Host,
+    )
+    .map_err(|r| r.error)
+    .expect("admission fits this ledger");
+    run.publish_page_table(&stream, 0, table.clone())
         .map_err(|r| r.error)
         .expect("a mapping");
     run.write_rows(

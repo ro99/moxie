@@ -60,6 +60,7 @@ pub use paged_attention::{
 #[cfg(feature = "driver")]
 pub use paged_attention::device::{
     PagedAdmitRefused, PagedAttentionRun, PagedCloseRefused, PagedRunRefused, RefusedSource,
+    Staging,
 };
 
 pub mod residency;

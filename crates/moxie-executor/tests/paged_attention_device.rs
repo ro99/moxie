@@ -18,7 +18,9 @@
 use std::sync::{Mutex, MutexGuard};
 
 use moxie_cuda::{RankContext, Stream, device_count, query_device};
-use moxie_executor::{AttentionLayer, PageGeometry, PagedAttentionLaunch, PagedAttentionRun};
+use moxie_executor::{
+    AttentionLayer, PageGeometry, PagedAttentionLaunch, PagedAttentionRun, Staging,
+};
 use moxie_kernels::cpu_expert::to_bf16_bits;
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_plan::Visibility;
@@ -73,6 +75,31 @@ fn authority() -> DeviceKvSequence {
     sequence
 }
 
+/// One decode over whatever the authority currently retains.
+fn decode_at<'ctx>(
+    run: &mut PagedAttentionRun<'ctx>,
+    stream: &Stream<'ctx>,
+    sequence: &DeviceKvSequence,
+    position: u64,
+) -> Vec<u8> {
+    let retained = sequence.retained(0).expect("a range");
+    let launch = PagedAttentionLaunch::new(
+        layer(),
+        1,
+        position,
+        retained.start,
+        retained.end - retained.start,
+    )
+    .expect("a launch over the retained range");
+    run.attend(
+        stream,
+        &launch,
+        bf16_bytes((HEADS * geometry().head_dim) as usize, 0x4242),
+    )
+    .map_err(|r| r.error)
+    .expect("the decode runs")
+}
+
 /// Publish `rows` rows through the authority and write them through the run.
 ///
 /// The order is the contract: placements first, bytes second, publication last
@@ -85,24 +112,27 @@ fn append_through_authority<'ctx>(
     rows: u64,
     seed: u64,
 ) -> Vec<PagePlacement> {
-    let first = sequence.committed_rows();
+    let txn = sequence.begin().expect("a transaction");
+    let staged = sequence.stage(txn, rows).expect("stage");
     let placements = sequence
-        .placements(0, first, rows)
+        .placements(&staged, 0)
         .expect("the authority places the rows");
+    // The mapping **before** the write, covering the rows about to land. A
+    // write is checked against the published view, so a view that stopped at
+    // the retained range would refuse the very rows it is about to gain. It
+    // grows as pages are filled and slides as the ring reclaims; republishing
+    // it is how the run learns both.
+    let view = sequence.page_view(0).expect("a view");
+    run.publish_page_table(stream, view.base, view.table)
+        .map_err(|r| r.error)
+        .expect("the authority's mapping");
     let keys = bf16_bytes(rows as usize * row_bytes(), seed);
     let values = bf16_bytes(rows as usize * row_bytes(), seed + 1);
     run.write_rows(stream, &placements, keys, values)
         .map_err(|r| r.error)
         .expect("the write fits");
-    let txn = sequence.begin().expect("a transaction");
-    sequence.publish(txn, rows).expect("publish");
+    sequence.publish(txn, staged).expect("publish");
     sequence.commit(txn, rows).expect("commit");
-    // The mapping follows the history. It grows as pages are filled and slides
-    // as the ring reclaims, and republishing it is how the run learns both --
-    // which is why the run no longer refuses a second publication.
-    run.publish_page_table(stream, sequence.page_table(0).expect("a table"))
-        .map_err(|r| r.error)
-        .expect("the authority's mapping");
     placements
 }
 
@@ -173,6 +203,7 @@ fn prepared<'ctx>(
         geometry(),
         HEADS,
         MAX_ROWS,
+        Staging::Host,
     )
     .map_err(|r| r.error)
     .expect("admission fits a measured device");
@@ -181,20 +212,9 @@ fn prepared<'ctx>(
     // this test invented. With a retain-all layer it is the identity until the
     // ring wraps, and the wrap is what `a_reclaimed_base` exercises.
     if rows > 0 {
-        let placements = sequence.placements(0, 0, rows).expect("placements");
-        let txn = sequence.begin().expect("a transaction");
-        sequence.publish(txn, rows).expect("publish");
-        sequence.commit(txn, rows).expect("commit");
-        run.publish_page_table(stream, sequence.page_table(0).expect("a table"))
-            .map_err(|r| r.error)
-            .expect("the authority's mapping");
-        let keys = bf16_bytes(rows as usize * row_bytes(), 0x37_0001);
-        let values = bf16_bytes(rows as usize * row_bytes(), 0x37_0002);
-        run.write_rows(stream, &placements, keys, values)
-            .map_err(|r| r.error)
-            .expect("the write fits");
+        append_through_authority(&mut sequence, &mut run, stream, rows, 0x37_0001);
     } else {
-        run.publish_page_table(stream, vec![0, 1, 2, 3])
+        run.publish_page_table(stream, 0, vec![0, 1, 2, 3])
             .map_err(|r| r.error)
             .expect("an identity mapping");
     }
@@ -226,6 +246,7 @@ fn admission_refuses_before_it_allocates_and_strands_nothing() {
         geometry(),
         HEADS,
         MAX_ROWS,
+        Staging::Host,
     )
     .expect_err("32 KiB of pages do not fit in 4 KiB");
     assert!(
@@ -262,7 +283,16 @@ fn a_descriptor_that_does_not_serve_the_geometry_is_refused_at_admission() {
         d
     };
     assert!(
-        PagedAttentionRun::admit(&mut ledger, &ctx, narrowed, geometry(), HEADS, MAX_ROWS).is_err(),
+        PagedAttentionRun::admit(
+            &mut ledger,
+            &ctx,
+            narrowed,
+            geometry(),
+            HEADS,
+            MAX_ROWS,
+            Staging::Host
+        )
+        .is_err(),
         "a descriptor whose shape bounds exclude this head dimension was accepted"
     );
     let renamed = {
@@ -271,7 +301,16 @@ fn a_descriptor_that_does_not_serve_the_geometry_is_refused_at_admission() {
         d
     };
     assert!(
-        PagedAttentionRun::admit(&mut ledger, &ctx, renamed, geometry(), HEADS, MAX_ROWS).is_err(),
+        PagedAttentionRun::admit(
+            &mut ledger,
+            &ctx,
+            renamed,
+            geometry(),
+            HEADS,
+            MAX_ROWS,
+            Staging::Host
+        )
+        .is_err(),
         "a descriptor naming another package's symbol was accepted"
     );
     let integer_cache = {
@@ -288,7 +327,8 @@ fn a_descriptor_that_does_not_serve_the_geometry_is_refused_at_admission() {
             integer_cache,
             geometry(),
             HEADS,
-            MAX_ROWS
+            MAX_ROWS,
+            Staging::Host,
         )
         .is_err(),
         "a non-BF16 cache operand was accepted; unsupported must fail to match"
@@ -361,8 +401,16 @@ fn a_descriptor_that_does_not_serve_the_geometry_is_refused_at_admission() {
         let mut descriptor = descriptor_for(&ctx);
         change(&mut descriptor);
         assert!(
-            PagedAttentionRun::admit(&mut ledger, &ctx, descriptor, geometry(), HEADS, MAX_ROWS)
-                .is_err(),
+            PagedAttentionRun::admit(
+                &mut ledger,
+                &ctx,
+                descriptor,
+                geometry(),
+                HEADS,
+                MAX_ROWS,
+                Staging::Host
+            )
+            .is_err(),
             "a descriptor with {what} was accepted for a launch"
         );
     }
@@ -376,6 +424,7 @@ fn a_descriptor_that_does_not_serve_the_geometry_is_refused_at_admission() {
         geometry(),
         HEADS,
         MAX_ROWS,
+        Staging::Host,
     )
     .map_err(|r| r.error)
     .expect("the package's own descriptor admits");
@@ -397,6 +446,7 @@ fn a_descriptor_that_does_not_serve_the_geometry_is_refused_at_admission() {
         one_kv,
         too_many_heads,
         1,
+        Staging::Host,
     )
     .err()
     .map(|r| r.error)
@@ -415,6 +465,7 @@ fn a_descriptor_that_does_not_serve_the_geometry_is_refused_at_admission() {
         one_kv,
         too_many_heads - 1,
         1,
+        Staging::Host,
     )
     .map_err(|r| r.error)
     .expect("the largest launchable head count admits")
@@ -432,7 +483,8 @@ fn a_descriptor_that_does_not_serve_the_geometry_is_refused_at_admission() {
             descriptor_for(&ctx),
             odd,
             HEADS,
-            MAX_ROWS
+            MAX_ROWS,
+            Staging::Host,
         )
         .is_err(),
         "four query heads over three key/value heads was accepted"
@@ -457,6 +509,7 @@ fn a_mapping_that_is_not_a_mapping_is_refused() {
         geometry(),
         HEADS,
         MAX_ROWS,
+        Staging::Host,
     )
     .map_err(|r| r.error)
     .expect("admission fits");
@@ -465,23 +518,35 @@ fn a_mapping_that_is_not_a_mapping_is_refused() {
     // the dangerous one: aliased pages make an append overwrite history that is
     // still visible, and no later check could tell.
     assert!(
-        run.publish_page_table(&stream, vec![0, 1, 99, 3]).is_err(),
+        run.publish_page_table(&stream, 0, vec![0, 1, 99, 3])
+            .is_err(),
         "a physical page outside the admitted set was accepted"
     );
     assert!(
-        run.publish_page_table(&stream, vec![0, 1, 1, 3]).is_err(),
+        run.publish_page_table(&stream, 0, vec![0, 1, 1, 3])
+            .is_err(),
         "an aliased physical page was accepted"
     );
     assert!(
-        run.publish_page_table(&stream, Vec::new()).is_err(),
+        run.publish_page_table(&stream, 0, Vec::new()).is_err(),
         "an empty mapping was accepted"
     );
     assert!(
-        run.publish_page_table(&stream, vec![0, 1, 2, 3, 0])
+        run.publish_page_table(&stream, 0, vec![0, 1, 2, 3, 0])
             .is_err(),
         "a mapping longer than the admitted pages was accepted"
     );
-    run.publish_page_table(&stream, vec![3, 2, 1, 0])
+    assert!(
+        run.publish_page_table(&stream, 4, vec![0, 1, 2, 3])
+            .is_err(),
+        "a mapping starting beyond the written rows was accepted"
+    );
+    assert!(
+        run.publish_page_table(&stream, 1, vec![0, 1, 2, 3])
+            .is_err(),
+        "a mapping starting inside a page was accepted"
+    );
+    run.publish_page_table(&stream, 0, vec![3, 2, 1, 0])
         .map_err(|r| r.error)
         .expect("a reversed mapping is a mapping");
     let placement = PagePlacement {
@@ -495,13 +560,44 @@ fn a_mapping_that_is_not_a_mapping_is_refused() {
     run.write_rows(&stream, &[placement], keys, values)
         .map_err(|r| r.error)
         .expect("the write fits");
-    // **Republishing is legal**, and it has to be: the authority's retained
-    // range slides as its ring wraps, so the table for that range changes with
-    // it. An earlier version refused any change after the first write, which is
-    // a rule only a cache that never reclaims can keep.
-    run.publish_page_table(&stream, vec![0, 1, 2, 3])
+
+    // A write must agree with the published mapping: row 0 lives on physical
+    // page 3 under this table.
+    let disagreeing = PagePlacement {
+        position: 1,
+        physical_page: 0,
+        slot: 1,
+        rows: 1,
+    };
+    let refused = run
+        .write_rows(
+            &stream,
+            &[disagreeing],
+            bf16_bytes(row_bytes(), 5),
+            bf16_bytes(row_bytes(), 6),
+        )
+        .expect_err("a placement contradicting the mapping was accepted");
+    assert!(!refused.retained_source());
+
+    // Republishing is legal — the retained range slides — but it may not
+    // contradict the mapping rows were written through.
+    let refused = run
+        .publish_page_table(&stream, 0, vec![0, 1, 2, 3])
+        .expect_err("a mapping contradicting written rows was accepted");
+    assert!(!refused.retained_source());
+    // A mapping that agrees where it overlaps is accepted, including one that
+    // starts later: the rows below the new base are simply not described.
+    run.publish_page_table(&stream, 0, vec![3, 2, 1, 0])
         .map_err(|r| r.error)
-        .expect("the mapping may follow the retained range");
+        .expect("the same mapping republishes");
+    // A base past the written rows is refused: there is nothing there. A base
+    // that has really moved is exercised by the wrapped-ring case below.
+    assert!(
+        run.publish_page_table(&stream, 16, vec![2, 1, 0]).is_err(),
+        "a mapping starting past the written rows was accepted"
+    );
+    // A launch naming the wrong base is checked in the wrapped-ring case,
+    // where a base other than zero exists.
     // A placement outside the admitted pages, one that runs off the end of its
     // page, and a set that is not contiguous are each refused before any copy.
     for (what, placements) in [
@@ -569,12 +665,18 @@ fn a_refused_append_moves_nothing_and_hands_the_rows_back() {
     let ctx = RankContext::acquire(RankId(0), 0).expect("acquire device 0");
     let stream = Stream::new(&ctx).expect("a stream");
     let mut ledger = measured_ledger(&ctx);
-    let (mut run, sequence) = prepared(&mut ledger, &ctx, &stream, 20);
-    let written = sequence.placements(0, 0, 20).expect("placements");
+    let (mut run, mut sequence) = prepared(&mut ledger, &ctx, &stream, 20);
+    // The rows already written, placed again: the authority's mapping is a
+    // function of the position, so asking twice gives the same answer.
+    let written: Vec<PagePlacement> = (0..20)
+        .map(|row| sequence.placement_of(0, row).expect("a placement"))
+        .collect();
     let before = run.read_rows(&written).expect("written rows read back");
     let capacity = run.capacity_rows().expect("capacity");
     assert_eq!(capacity, 64, "four pages of sixteen rows");
-    let good = sequence.placements(0, 20, 2).expect("two more rows");
+    let txn = sequence.begin().expect("a transaction");
+    let staged = sequence.stage(txn, 2).expect("stage");
+    let good = sequence.placements(&staged, 0).expect("two more rows");
 
     let cases: Vec<(&str, Vec<PagePlacement>, usize, usize)> = vec![
         ("no placement at all", Vec::new(), 0, 0),
@@ -617,9 +719,12 @@ fn a_refused_append_moves_nothing_and_hands_the_rows_back() {
             "{label}: the authority published rows the run refused"
         );
     }
-    // The authority refuses to place rows past its own admitted context, which
+    // The authority refuses to stage rows past its own admitted context, which
     // is the other half: the run bounds bytes, the authority bounds history.
-    assert!(sequence.placements(0, 0, capacity + 1).is_err());
+    sequence.abort(txn).expect("abort");
+    let txn = sequence.begin().expect("a transaction");
+    assert!(sequence.stage(txn, capacity + 1).is_err());
+    sequence.abort(txn).expect("abort");
 
     // And a launch that claims history nothing wrote.
     let query = bf16_bytes((HEADS * geometry().head_dim) as usize, 9);
@@ -647,7 +752,10 @@ fn a_stream_from_another_device_is_refused() {
     let mut ledger = measured_ledger(&ctx);
     let (mut run, sequence) = prepared(&mut ledger, &ctx, &stream, 4);
 
-    let placements = sequence.placements(0, 4, 1).expect("one more row");
+    let mut sequence = sequence;
+    let txn = sequence.begin().expect("a transaction");
+    let staged = sequence.stage(txn, 1).expect("stage");
+    let placements = sequence.placements(&staged, 0).expect("one more row");
     let keys = bf16_bytes(row_bytes(), 3);
     let values = bf16_bytes(row_bytes(), 4);
     let refused = run
@@ -800,9 +908,10 @@ fn a_wrapped_ring_answers_exactly_as_an_unwrapped_one() {
             &PagedAttentionLaunch::new(layer, 1, 0, 0, 1).expect("a launch"),
         )
         .expect("a descriptor");
-        let mut run = PagedAttentionRun::admit(ledger, &ctx, descriptor, geometry, HEADS, 1)
-            .map_err(|r| r.error)
-            .expect("admission fits");
+        let mut run =
+            PagedAttentionRun::admit(ledger, &ctx, descriptor, geometry, HEADS, 1, Staging::Host)
+                .map_err(|r| r.error)
+                .expect("admission fits");
 
         // The same bytes at the same positions in both cases: the row's seed is
         // its absolute position, so nothing about the physical layout can
@@ -810,9 +919,17 @@ fn a_wrapped_ring_answers_exactly_as_an_unwrapped_one() {
         let mut written = 0u64;
         while written < ROWS {
             let step = 8.min(ROWS - written);
+            let txn = sequence.begin().expect("a transaction");
+            let staged = sequence.stage(txn, step).expect("stage");
             let placements = sequence
-                .placements(0, written, step)
+                .placements(&staged, 0)
                 .expect("the authority places the rows");
+            // The mapping before the write: a write is checked against the
+            // published view, and the view has to cover the rows about to land.
+            let view = sequence.page_view(0).expect("a view");
+            run.publish_page_table(&stream, view.base, view.table)
+                .map_err(|r| r.error)
+                .expect("the authority's mapping");
             let row = (2 * 64) as usize;
             let mut keys = Vec::new();
             let mut values = Vec::new();
@@ -823,16 +940,16 @@ fn a_wrapped_ring_answers_exactly_as_an_unwrapped_one() {
             run.write_rows(&stream, &placements, keys, values)
                 .map_err(|r| r.error)
                 .expect("the write fits");
-            let txn = sequence.begin().expect("a transaction");
-            sequence.publish(txn, step).expect("publish");
+            sequence.publish(txn, staged).expect("publish");
             sequence.commit(txn, step).expect("commit");
-            run.publish_page_table(&stream, sequence.page_table(0).expect("a table"))
-                .map_err(|r| r.error)
-                .expect("the authority's mapping");
             written += step;
         }
 
         let retained = sequence.retained(0).expect("a range");
+        let view = sequence.page_view(0).expect("a view");
+        run.publish_page_table(&stream, view.base, view.table)
+            .map_err(|r| r.error)
+            .expect("the authority's mapping for the retained range");
         let launch = PagedAttentionLaunch::new(
             layer,
             1,
@@ -841,6 +958,24 @@ fn a_wrapped_ring_answers_exactly_as_an_unwrapped_one() {
             retained.end - retained.start,
         )
         .expect("a launch over the retained range");
+        // **A launch must name the base the mapping describes.** The kernel
+        // treats `history_base` as logical page zero, so a launch declaring a
+        // different base would read the published table through an offset
+        // nothing wrote against. With a wrapped ring the two differ, which is
+        // why this is checked here.
+        if retained.start > 0 {
+            // A narrower history than the published one, page-aligned and
+            // legal on its own terms: base 64 over 36 rows still covers
+            // position 99. It is refused because it is not the base the
+            // mapping describes, not because it is out of range.
+            let mismatched =
+                PagedAttentionLaunch::new(layer, 1, ROWS - 1, 64, ROWS - 64).expect("a launch");
+            let query = bf16_bytes((HEADS * 64) as usize, 0x7778);
+            assert!(
+                run.attend(&stream, &mismatched, query).is_err(),
+                "a launch whose history base is not the published one was accepted"
+            );
+        }
         let query = bf16_bytes((HEADS * 64) as usize, 0x7777);
         let out = run
             .attend(&stream, &launch, query)
@@ -873,5 +1008,96 @@ fn a_wrapped_ring_answers_exactly_as_an_unwrapped_one() {
         wrapped, flat,
         "the same logical history gave different answers on two physical layouts"
     );
+    assert!(ledger.outstanding().is_empty());
+}
+
+/// Task 0038 acceptance 2: abort, truncate and re-append, on hardware.
+///
+/// The transaction shapes the authority owns, exercised where the bytes really
+/// are. Three properties, each checked by what attention *answers* rather than
+/// by what a counter says:
+///
+/// 1. An aborted transaction leaves the committed history untouched — the same
+///    decode gives the same bytes before and after, and the rows it staged are
+///    not addressable.
+/// 2. A truncation drops exactly its suffix: a decode over the truncated prefix
+///    equals the decode that prefix gave before the suffix ever existed.
+/// 3. A re-append after truncation lands where the truncated rows were, and the
+///    answer follows the new rows rather than the old ones.
+#[test]
+fn abort_truncate_and_reappend_hold_on_device() {
+    let _guard = one_at_a_time();
+    if device_count().expect("enumerate") == 0 {
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    }
+    let ctx = RankContext::acquire(RankId(0), 0).expect("acquire device 0");
+    let stream = Stream::new(&ctx).expect("a stream");
+    let mut ledger = measured_ledger(&ctx);
+    let (mut run, mut sequence) = prepared(&mut ledger, &ctx, &stream, 12);
+
+    let at_twelve = decode_at(&mut run, &stream, &sequence, 11);
+
+    // (1) An aborted transaction changes nothing a decode can see.
+    let txn = sequence.begin().expect("a transaction");
+    let staged = sequence.stage(txn, 4).expect("stage");
+    let placements = sequence.placements(&staged, 0).expect("placements");
+    let view = sequence.page_view(0).expect("a view");
+    run.publish_page_table(&stream, view.base, view.table)
+        .map_err(|r| r.error)
+        .expect("a mapping covering the staged rows");
+    run.write_rows(
+        &stream,
+        &placements,
+        bf16_bytes(4 * row_bytes(), 0x9001),
+        bf16_bytes(4 * row_bytes(), 0x9002),
+    )
+    .map_err(|r| r.error)
+    .expect("the write fits");
+    sequence.abort(txn).expect("abort");
+    assert_eq!(
+        sequence.committed_rows(),
+        12,
+        "the abort moved the frontier"
+    );
+    assert!(
+        sequence.placement_of(0, 12).is_err(),
+        "a row the abort discarded is still addressable"
+    );
+    assert_eq!(
+        decode_at(&mut run, &stream, &sequence, 11),
+        at_twelve,
+        "an aborted transaction changed what the committed history answers"
+    );
+
+    // (2) A truncation drops exactly its suffix.
+    let at_eight = decode_at(&mut run, &stream, &sequence, 7);
+    sequence.truncate(8).expect("truncate to eight rows");
+    assert_eq!(sequence.committed_rows(), 8);
+    assert_eq!(
+        decode_at(&mut run, &stream, &sequence, 7),
+        at_eight,
+        "a truncation changed the prefix it was supposed to keep"
+    );
+    // The rows above the prefix are gone as far as the authority is concerned,
+    // and a launch that reached for them would be refused by the run as well.
+    assert!(sequence.placement_of(0, 8).is_err());
+
+    // (3) Re-appending lands where the truncated rows were, and the answer
+    // follows the new bytes. Different seed, so an answer that had not changed
+    // would mean the old rows were still being read.
+    append_through_authority(&mut sequence, &mut run, &stream, 4, 0x9101);
+    assert_eq!(sequence.committed_rows(), 12);
+    let after = decode_at(&mut run, &stream, &sequence, 11);
+    assert_ne!(
+        after, at_twelve,
+        "the decode still answers with the rows the truncation dropped"
+    );
+    assert!(
+        after.iter().any(|b| *b != 0),
+        "the re-appended decode produced nothing"
+    );
+
+    run.close(&mut ledger).map_err(|r| r.error).expect("close");
     assert!(ledger.outstanding().is_empty());
 }

@@ -400,13 +400,8 @@ impl PagedAttentionLaunch {
                     "a sliding window of zero sees nothing, including the query's own position",
                 ));
             }
-            // The ABI width, refused **here** rather than at the launch. A
-            // window wider than the kernel's `u32` used to be discovered by
-            // `window()` inside `enqueue_attend`, which runs after the query
-            // copy has been submitted: a refusal that was knowable before any
-            // device work became an unknown submission, a quarantined run and a
-            // withheld source. Every conversion this ABI performs is checked
-            // where the value is constructed.
+            // Every ABI width is checked where the value is constructed, so a
+            // launch that exists can always be expressed to the kernel.
             if u32::try_from(window).is_err() {
                 return Err(unsupported_fmt(
                     "attention_window",
@@ -986,6 +981,27 @@ pub mod device {
     /// 256-byte alignment, as every other device range in this crate uses.
     const ALIGNMENT: u64 = 256;
 
+    /// Whether this run admits the buffers the host-staged path needs.
+    ///
+    /// The pages and the page table are persistent state and are always
+    /// admitted. The query and output ranges, and the host readback that goes
+    /// with them, exist **only** for [`PagedAttentionRun::attend`] — and a
+    /// caller using [`PagedAttentionRun::attend_into`] brings its own, from its
+    /// plan's activation arena.
+    ///
+    /// Admitting them unconditionally charged a direct-device caller three
+    /// times: once in its own arena, once again here, and once more for a host
+    /// readback nothing would read. On a device whose memory is nearly spoken
+    /// for, that difference is an admissible plan being refused.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Staging {
+        /// Admit query, output and readback buffers. `attend` works.
+        Host,
+        /// Admit only the persistent pages and table. `attend` refuses and
+        /// names `attend_into`, which is the path.
+        DeviceHandles,
+    }
+
     /// A refusal that happened before anything was allocated.
     #[derive(Debug)]
     pub struct PagedAdmitRefused {
@@ -1000,9 +1016,7 @@ pub mod device {
     /// Not one concatenated buffer. Joining an append's key and value rows to
     /// return them reallocates — `Vec::append` on an exact-capacity vector
     /// always does — and that allocation is infallible, on the path whose whole
-    /// purpose is to report a refusal. Task 0019's rule again: a refusal that
-    /// allocates can abort instead of refusing, and a review found this shape
-    /// one crate over by failing a 32-byte allocation and getting `SIGABRT`.
+    /// purpose is to report a refusal.
     #[derive(Debug)]
     pub enum RefusedSource {
         /// An append's rows, each still in the vector it arrived in.
@@ -1053,10 +1067,16 @@ pub mod device {
         table: Option<DeviceRange<'ctx>>,
         query: Option<DeviceRange<'ctx>>,
         output: Option<DeviceRange<'ctx>>,
-        /// The host's copy of the page table, which is what resolves a logical
-        /// page to an offset when rows are written. One table, read by the host
-        /// for addresses and by the kernel for the same addresses.
+        /// The published mapping, and the absolute row its logical page zero
+        /// names.
+        ///
+        /// **A table without its base is not a mapping.** The base makes it a
+        /// view of *absolute* rows: every write is checked against it, every
+        /// launch must name it, and a republication must agree with it wherever
+        /// both describe a page that holds written rows.
         page_table: Vec<u32>,
+        page_table_base: u64,
+        staging: Staging,
         /// Rows whose copy into the pages this run has **observed** complete.
         ///
         /// A physical high-water mark, not a frontier. What is history is the
@@ -1086,6 +1106,7 @@ pub mod device {
             geometry: PageGeometry,
             heads: u64,
             max_rows: u64,
+            staging: Staging,
         ) -> std::result::Result<Self, PagedAdmitRefused> {
             let fail = |error| PagedAdmitRefused {
                 error,
@@ -1187,11 +1208,11 @@ pub mod device {
             if let Err(error) = check_grid(&widest, ctx) {
                 return Err(fail(error));
             }
-            let extents = match Extents::derive(&geometry, heads, max_rows) {
+            let extents = match Extents::derive(&geometry, heads, max_rows, staging) {
                 Ok(extents) => extents,
                 Err(error) => return Err(fail(error)),
             };
-            let request = match resource_request(&geometry, heads, max_rows, ctx) {
+            let request = match resource_request(&geometry, heads, max_rows, staging, ctx) {
                 Ok(request) => request,
                 Err(error) => return Err(fail(error)),
             };
@@ -1217,6 +1238,25 @@ pub mod device {
                 Ok(label) => label,
                 Err(error) => return Err(give_back(ledger, reservation, error)),
             };
+            // Only the regions that carry bytes. A direct-device run holds no
+            // per-step buffers at all, and a zero-byte region is not a
+            // partition of anything.
+            let mut regions: Vec<(DeviceTier, u64)> = Vec::new();
+            if regions.try_reserve_exact(2).is_err() {
+                return Err(give_back(
+                    ledger,
+                    reservation,
+                    Error::CapacityExceeded {
+                        tier: None,
+                        requested_bytes: 0,
+                        available_bytes: 0,
+                    },
+                ));
+            }
+            regions.push((DeviceTier::KvStatePages, extents.persistent));
+            if extents.per_step != 0 {
+                regions.push((DeviceTier::Activations, extents.per_step));
+            }
             let mut arena = match DeviceArena::create_partitioned(
                 ledger,
                 reservation,
@@ -1225,10 +1265,7 @@ pub mod device {
                 // per-step activations. One physical allocation, two declared
                 // tiers, because the ledger's totals are about what the bytes
                 // are for and not only about how many there are.
-                &[
-                    (DeviceTier::KvStatePages, extents.persistent),
-                    (DeviceTier::Activations, extents.per_step),
-                ],
+                &regions,
                 extents.total,
                 label,
             ) {
@@ -1256,13 +1293,16 @@ pub mod device {
                     .allocate(bytes, ALIGNMENT, owned)
                     .map_err(|refused| refused.error)
             };
-            for (bytes, name) in [
+            let mut wanted: Vec<(u64, &str)> = vec![
                 (extents.payload, "attention-keys"),
                 (extents.payload, "attention-values"),
                 (extents.table, "attention-page-table"),
-                (extents.query, "attention-query"),
-                (extents.query, "attention-output"),
-            ] {
+            ];
+            if staging == Staging::Host {
+                wanted.push((extents.query, "attention-query"));
+                wanted.push((extents.query, "attention-output"));
+            }
+            for (bytes, name) in wanted {
                 match allocate(&mut arena, bytes, name) {
                     Ok(range) => hold.push(range),
                     Err(error) => return Err(unwind(arena, hold, ledger, error)),
@@ -1324,8 +1364,13 @@ pub mod device {
                     },
                 ));
             }
-            let output = hold.pop().expect("output range");
-            let query = hold.pop().expect("query range");
+            let (query, output) = if staging == Staging::Host {
+                let output = hold.pop().expect("output range");
+                let query = hold.pop().expect("query range");
+                (Some(query), Some(output))
+            } else {
+                (None, None)
+            };
             let table = hold.pop().expect("page table range");
             let values = hold.pop().expect("value range");
             let keys = hold.pop().expect("key range");
@@ -1339,9 +1384,11 @@ pub mod device {
                 keys: Some(keys),
                 values: Some(values),
                 table: Some(table),
-                query: Some(query),
-                output: Some(output),
+                query,
+                output,
+                staging,
                 page_table,
+                page_table_base: 0,
                 written: 0,
                 arena_bytes: extents.total,
                 ledger: ledger.id(),
@@ -1394,6 +1441,7 @@ pub mod device {
         pub fn publish_page_table(
             &mut self,
             stream: &Stream<'ctx>,
+            base: u64,
             table: Vec<u32>,
         ) -> std::result::Result<(), PagedRunRefused> {
             // The table goes back as the entries it arrived as. Re-encoding it
@@ -1409,14 +1457,28 @@ pub mod device {
             if let Err(error) = self.same_device(stream) {
                 return Err(give_back(error, table));
             }
-            // Republishing is legal and necessary. The authority's retained
-            // range slides as its ring wraps, so the logical-to-physical table
-            // for that range changes with it — an earlier version of this
-            // refused any change after the first write, which is a rule that
-            // can only be kept by a cache that never reclaims. What must stay
-            // true is the mapping's shape, and that is checked below every
-            // time.
+            // Republishing is legal: the authority's retained range slides as
+            // its ring wraps. What must hold is the mapping's shape and its
+            // agreement with the one it replaces, both checked below.
             let pages = self.geometry.pages;
+            if !base.is_multiple_of(self.geometry.page_tokens) {
+                return Err(give_back(
+                    invalid(
+                        "base",
+                        "a mapping's first logical page must start on a page boundary",
+                    ),
+                    table,
+                ));
+            }
+            if base > self.written {
+                return Err(give_back(
+                    invalid(
+                        "base",
+                        "a mapping cannot start beyond the rows this run has written",
+                    ),
+                    table,
+                ));
+            }
             if table.is_empty() || table.len() as u64 > pages {
                 return Err(give_back(
                     invalid_fmt(
@@ -1470,6 +1532,46 @@ pub mod device {
                 seen[physical as usize] = true;
             }
 
+            // **Agreement with the mapping it replaces**, wherever both describe
+            // the same absolute page. Rows already written live at addresses the
+            // old table resolved; a new table that sent one of them somewhere
+            // else would leave every one of those rows unreadable while every
+            // individual check still passed. This is the other half of what
+            // makes a write, a table and a launch one coherent view.
+            if !self.page_table.is_empty() {
+                let page_tokens = self.geometry.page_tokens;
+                let old_first = self.page_table_base / page_tokens;
+                let new_first = base / page_tokens;
+                for (index, physical) in table.iter().enumerate() {
+                    let absolute = new_first + index as u64;
+                    let Some(old_index) = absolute.checked_sub(old_first) else {
+                        continue;
+                    };
+                    let Some(previous) = self.page_table.get(old_index as usize) else {
+                        continue;
+                    };
+                    // Only pages that actually hold written rows are bound: a
+                    // page beyond the frontier has nothing to be inconsistent
+                    // with.
+                    if absolute * page_tokens >= self.written {
+                        continue;
+                    }
+                    if previous != physical {
+                        return Err(give_back(
+                            invalid_fmt(
+                                "page_table",
+                                format_args!(
+                                    "absolute page {absolute} holds written rows at physical \
+                                     page {previous} and the new mapping sends it to \
+                                     {physical}"
+                                ),
+                            ),
+                            table,
+                        ));
+                    }
+                }
+            }
+
             let mut bytes: Vec<u8> = Vec::new();
             if bytes.try_reserve_exact(table.len() * 4).is_err() {
                 return Err(give_back(
@@ -1503,6 +1605,7 @@ pub mod device {
             }
             self.held = None;
             self.page_table = table;
+            self.page_table_base = base;
             Ok(())
         }
 
@@ -1521,6 +1624,40 @@ pub mod device {
                 ));
             }
             Ok(())
+        }
+
+        /// Where the published mapping puts the page holding absolute `row`.
+        ///
+        /// The one place this run turns a row into a physical page, used by
+        /// both the write path and the readback so neither can drift from the
+        /// table the kernel reads.
+        fn resolves_to(&self, row: u64) -> Result<u64> {
+            if self.page_table.is_empty() {
+                return Err(invalid("page_table", "no page mapping has been published"));
+            }
+            let page_tokens = self.geometry.page_tokens;
+            let Some(offset) = row.checked_sub(self.page_table_base) else {
+                return Err(invalid_fmt(
+                    "placements",
+                    format_args!(
+                        "row {row} is below the published mapping, which starts at {}",
+                        self.page_table_base
+                    ),
+                ));
+            };
+            let logical = offset / page_tokens;
+            self.page_table
+                .get(logical as usize)
+                .map(|physical| u64::from(*physical))
+                .ok_or_else(|| {
+                    invalid_fmt(
+                        "placements",
+                        format_args!(
+                            "row {row} is beyond the published mapping's {} page(s)",
+                            self.page_table.len()
+                        ),
+                    )
+                })
         }
 
         /// Write `rows` dense rows of keys and values where the **state
@@ -1600,13 +1737,41 @@ pub mod device {
                         values,
                     ));
                 }
-                if placement.physical_page >= self.geometry.pages {
+                // **Against the published mapping, not merely in range.** A
+                // placement names an absolute row, the table says where that
+                // row's page is, and a write that disagreed with it would put
+                // bytes somewhere no launch will ever look — while every
+                // bounds check passed. This is what binds the three operations
+                // into one view: writes go where the table says, launches read
+                // what the table says, and a republication may not contradict
+                // either.
+                match self.resolves_to(placement.position) {
+                    Ok(physical) if physical == placement.physical_page => {}
+                    Ok(physical) => {
+                        return Err(give_back(
+                            invalid_fmt(
+                                "placements",
+                                format_args!(
+                                    "row {} is placed on physical page {} and the published \
+                                     mapping sends it to {physical}",
+                                    placement.position, placement.physical_page
+                                ),
+                            ),
+                            keys,
+                            values,
+                        ));
+                    }
+                    Err(error) => return Err(give_back(error, keys, values)),
+                }
+                if placement.slot != placement.position % self.geometry.page_tokens {
                     return Err(give_back(
                         invalid_fmt(
                             "placements",
                             format_args!(
-                                "physical page {} of {} admitted",
-                                placement.physical_page, self.geometry.pages
+                                "row {} is placed at slot {} and its page holds it at {}",
+                                placement.position,
+                                placement.slot,
+                                placement.position % self.geometry.page_tokens
                             ),
                         ),
                         keys,
@@ -1741,13 +1906,17 @@ pub mod device {
             let page_bytes = self.geometry.page_bytes()?;
             let mut rows = 0u64;
             for placement in placements {
-                if placement.physical_page >= self.geometry.pages
+                if self.resolves_to(placement.position)? != placement.physical_page
+                    || placement.slot != placement.position % self.geometry.page_tokens
                     || placement
                         .slot
                         .checked_add(placement.rows)
                         .is_none_or(|end| end > self.geometry.page_tokens)
                 {
-                    return Err(invalid("placements", "a run outside its admitted page"));
+                    return Err(invalid(
+                        "placements",
+                        "a run that the published mapping does not put there",
+                    ));
                 }
                 let end = placement
                     .end()
@@ -1877,6 +2046,21 @@ pub mod device {
                     ),
                 ));
             }
+            // The launch's own view of the history must be the published one:
+            // its `history_base` is what the kernel treats as logical page
+            // zero, so a launch naming a different base would read the table
+            // through an offset nothing wrote against.
+            if launch.history_base() != self.page_table_base {
+                return Err(invalid_fmt(
+                    "history_base",
+                    format_args!(
+                        "this launch starts its history at {} and the published mapping \
+                         starts at {}",
+                        launch.history_base(),
+                        self.page_table_base
+                    ),
+                ));
+            }
             if launch.logical_pages().unwrap_or(u64::MAX) > self.page_table.len() as u64 {
                 return Err(invalid(
                     "page_table",
@@ -1902,6 +2086,19 @@ pub mod device {
                 error,
                 source: Some(RefusedSource::Query(query)),
             };
+            // A run that admitted no staging buffers has nowhere to put a host
+            // query, and that is the point of admitting none: a direct-device
+            // caller is not charged for a path it does not use.
+            if self.staging != Staging::Host {
+                return Err(give_back(
+                    invalid(
+                        "staging",
+                        "this run admitted no staging buffers; attend_into takes the \
+                         caller's own device ranges",
+                    ),
+                    query,
+                ));
+            }
             // The same preconditions `attend_into` applies, because there is
             // one operation: the difference between the two entry points is
             // where the query already is, not what makes a launch legal. The
@@ -2238,7 +2435,12 @@ pub mod device {
     }
 
     impl Extents {
-        fn derive(geometry: &PageGeometry, heads: u64, max_rows: u64) -> Result<Self> {
+        fn derive(
+            geometry: &PageGeometry,
+            heads: u64,
+            max_rows: u64,
+            staging: Staging,
+        ) -> Result<Self> {
             let payload = align_up(geometry.payload_bytes()?)?;
             let table = align_up(
                 geometry
@@ -2257,9 +2459,16 @@ pub mod device {
                 .checked_mul(2)
                 .and_then(|v| v.checked_add(table))
                 .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
-            let per_step = query
-                .checked_mul(2)
-                .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+            // Zero for a direct-device run: the caller's ranges are the query
+            // and the output, and charging for a second pair here is what makes
+            // an admissible plan refusable.
+            let per_step = if staging == Staging::Host {
+                query
+                    .checked_mul(2)
+                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))?
+            } else {
+                0
+            };
             let total = persistent
                 .checked_add(per_step)
                 .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
@@ -2287,9 +2496,10 @@ pub mod device {
         geometry: &PageGeometry,
         heads: u64,
         max_rows: u64,
+        staging: Staging,
         ctx: &RankContext,
     ) -> Result<PlanRequest> {
-        let extents = Extents::derive(geometry, heads, max_rows)?;
+        let extents = Extents::derive(geometry, heads, max_rows, staging)?;
         let mut request = PlanRequest::new(
             moxie_memory::fallible::text(format_args!(
                 "paged-attention-{}x{}",
@@ -2410,7 +2620,7 @@ mod device_tests {
     use moxie_plan::Visibility;
     use moxie_types::{PagePlacement, RankId};
 
-    use super::device::PagedAttentionRun;
+    use super::device::{PagedAttentionRun, Staging};
     use super::{AttentionLayer, PageGeometry, PagedAttentionLaunch};
     use crate::arena::DeviceArena;
 
@@ -2437,6 +2647,100 @@ mod device_tests {
             out.extend_from_slice(&moxie_kernels::cpu_expert::to_bf16_bits(value).to_le_bytes());
         }
         out
+    }
+
+    /// A direct-device run is not charged for staging it never uses.
+    #[test]
+    fn a_direct_device_run_admits_no_staging_buffers() {
+        let _guard = crate::DRIVER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if moxie_cuda::device_count().expect("enumerate") == 0 {
+            eprintln!("SKIPPED: no CUDA device");
+            return;
+        }
+        let ctx = RankContext::acquire(RankId(38_002), 0).expect("a rank context");
+        let stream = Stream::new(&ctx).expect("a stream");
+        let capability = moxie_cuda::query_device(0).expect("query device 0");
+        let layer = AttentionLayer {
+            geometry: geometry(),
+            heads: HEADS,
+            scale: moxie_plan::reciprocal_sqrt_scale(HEAD_DIM),
+            visibility: Visibility::Causal,
+        };
+        let descriptor = || {
+            super::select_paged_attention_kernel(
+                &moxie_kernels::paged_attention_catalogue(),
+                &capability,
+                &PagedAttentionLaunch::new(layer, 1, 0, 0, 1).expect("a launch"),
+            )
+            .expect("a descriptor")
+        };
+
+        // The same geometry, admitted both ways, against the same ledger.
+        let measurement = ctx.measure().expect("measure");
+        let mut ledger = Ledger::new([
+            CapacitySnapshot::measured(&measurement, 1 << 20).expect("device capacity"),
+            CapacitySnapshot::new(moxie_types::Scope::Host, 1 << 28, 1 << 20).expect("host"),
+        ])
+        .expect("one ledger");
+        let staged = PagedAttentionRun::admit(
+            &mut ledger,
+            &ctx,
+            descriptor(),
+            geometry(),
+            HEADS,
+            4,
+            Staging::Host,
+        )
+        .map_err(|r| r.error)
+        .expect("admission fits");
+        let staged_bytes = staged.arena_bytes();
+        staged
+            .close(&mut ledger)
+            .map_err(|r| r.error)
+            .expect("close");
+
+        let mut direct = PagedAttentionRun::admit(
+            &mut ledger,
+            &ctx,
+            descriptor(),
+            geometry(),
+            HEADS,
+            4,
+            Staging::DeviceHandles,
+        )
+        .map_err(|r| r.error)
+        .expect("admission fits");
+        let direct_bytes = direct.arena_bytes();
+
+        // Four query rows of four heads by 64 in BF16, twice over: the query
+        // and the output the direct run does not hold.
+        let per_step = 2 * 4 * HEADS * HEAD_DIM * 2;
+        assert_eq!(
+            staged_bytes - direct_bytes,
+            per_step,
+            "a direct-device run was charged for staging buffers"
+        );
+        // And the host-staged entry point is refused rather than silently
+        // reaching for ranges that are not there.
+        direct
+            .publish_page_table(&stream, 0, vec![0, 1])
+            .map_err(|r| r.error)
+            .expect("a mapping");
+        let refused = direct
+            .attend(
+                &stream,
+                &PagedAttentionLaunch::new(layer, 1, 0, 0, 1).expect("a launch"),
+                bytes((HEADS * HEAD_DIM) as usize, 1),
+            )
+            .expect_err("a direct-device run staged a host query");
+        assert!(!refused.retained_source());
+        direct
+            .close(&mut ledger)
+            .map_err(|r| r.error)
+            .expect("close");
+        assert!(ledger.outstanding().is_empty());
     }
 
     /// The two entry points are one operation.
@@ -2478,10 +2782,18 @@ mod device_tests {
             CapacitySnapshot::new(moxie_types::Scope::Host, 1 << 28, 1 << 20).expect("host"),
         ])
         .expect("one ledger");
-        let mut run = PagedAttentionRun::admit(&mut ledger, &ctx, descriptor, geometry(), HEADS, 1)
-            .map_err(|r| r.error)
-            .expect("admission fits");
-        run.publish_page_table(&stream, vec![1, 0])
+        let mut run = PagedAttentionRun::admit(
+            &mut ledger,
+            &ctx,
+            descriptor,
+            geometry(),
+            HEADS,
+            1,
+            Staging::Host,
+        )
+        .map_err(|r| r.error)
+        .expect("admission fits");
+        run.publish_page_table(&stream, 0, vec![1, 0])
             .map_err(|r| r.error)
             .expect("a reversed mapping");
 
