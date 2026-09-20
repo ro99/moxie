@@ -95,6 +95,14 @@ Use [TASK.md](docs/spec/templates/TASK.md) for a bounded assignment; use the mod
 
 Every task names the mechanism fixed, shared owner, consumers, source/oracle, resource and cancellation contract, acceptance tests and deletion/expiry plan. Run architecture/host tests plus relevant real GPU, topology, state, quality and paired performance gates. Report failed/skipped/unmeasured separately. No required feature is complete because it has a stub or flag.
 
+**A test earns its place or it does not exist.** One test per invariant, at the
+layer that owns it. Do not write a test per method, per refusal message, per
+field, or a second test that re-checks what an existing one already fails on.
+Do not change production code to make a test convenient, and do not add sleeps,
+retries, skips or environment accommodations to make one pass — fix the test or
+delete it. The owner's standing instruction (2026-09-19): agents here
+over-produce tests, and the cost is real work not done.
+
 Preserve negative experiments and remove superseded rewrite paths after replacement gates pass. Do not delete the legacy checkout. No bulk checkpoint conversion/download, system-driver change, network exposure or other material operational expansion without scoped authorization.
 
 Open owner decisions O1–O7 are in document 01. Ask in a batch before dependent conclusions or work. Resolve normal technical choices through source, tests and measured ADRs; do not ask the owner to design kernels. A task cannot override an owner requirement through local inference.
