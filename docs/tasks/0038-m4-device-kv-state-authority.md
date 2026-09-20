@@ -2,17 +2,14 @@
 
 Status: active, not accepted. Opened 2026-09-19 after task 0037's kernel and
 binding were qualified and twice reviewed. Deliverable 1 (the state authority
-owns the device pages) and deliverable 2 (the graph lowers attention and the
-binding consumes device handles) are both **partially** landed; see "Progress"
-for what is current — this record does not retell the review history, which is
-in [the engineering log](../engineering-log.md). The write-callback shape is
-now settled: the owner amended the "no trait object, no callback into the
-executor" line below, 2026-09-20 (see "Bounded deliverable"), so the disagreement
-between that line and the implementation is no longer open. Three things are
-open instead: the graph wiring, acceptance criterion 2's device evidence, and
-the two defects the amendment left inside the callback — the authority still
-does not hand it a page view, and the raw write/publish methods are still
-public (see "The writer callback" below).
+owns the device pages) is landed as of the 2026-09-20 regression evidence,
+including the write-callback shape (the owner amended "no trait object, no
+callback into the executor" below, 2026-09-20; see "Bounded deliverable") and
+the two defects that amendment left open (see "The writer callback"). Two
+things remain open: deliverable 2's graph wiring, and acceptance criterion 2's
+device evidence — tonight's regression run does not add it. This record does
+not retell the review history, which is in
+[the engineering log](../engineering-log.md).
 
 ## Identity and authority
 
@@ -160,15 +157,13 @@ expressed as one contract.
 
 ## Progress — 2026-09-19, half one: the authority owns the pages
 
-Deliverable 1 is **partially** landed. Placement, retention, the frontier,
-transactions, abort and truncation are decided by the state authority, as
-below. What is **not** landed is the rest of the same sentence in "Bounded
-deliverable" above — "no trait object, no callback into the executor" — and
-the authority does not hand its performer a page view, so a caller still
-reimplements that arithmetic; see "The writer callback" further below for
-both. **Deliverable 2 — lowering `OpParams::Attention` and binding
-device handles — is likewise partial**, so this task stays open and nothing
-below claims otherwise.
+Deliverable 1 is **landed** as of the 2026-09-20 regression evidence further
+below. Placement, retention, the frontier, transactions, abort and truncation
+are decided by the state authority, as below; the write-callback shape the
+owner amended "Bounded deliverable" above to permit, and the defects a review
+found inside it, are covered under "The writer callback" further below.
+**Deliverable 2 — lowering `OpParams::Attention` and binding device handles —
+remains partial**, so this task stays open and nothing below claims otherwise.
 
 ### What moved
 
@@ -354,53 +349,74 @@ and missing: one device case combining all five operations with
 `history_base > 0`, run against both SM86 GPUs and SM120.
 
 Separately, `abort_truncate_and_reappend_hold_on_device`'s truncation assertion
-`sequence.committed_rows() == 8` (after truncating from 12) does not hold
-under the current implementation: `committed_rows` reports the physical write
-high-water mark, which a truncate does not move, not the accepted/committed
-frontier the method's own documentation promises. The test as written asserts
-a value the code cannot currently produce. Splitting the accepted frontier
-from the physical watermark is open work, not a passing case.
+`sequence.committed_rows() == 8` (after truncating from 12) did not hold under
+the implementation this was written against: `committed_rows` reported the
+physical write high-water mark, which a truncate does not move, not the
+accepted/committed frontier the method's own documentation promised. **Closed**
+as of the 2026-09-20 regression run below: the facts are now split three ways —
+`published_rows()` (materialized including tentative), `committed_rows()` (from
+`SequenceState`'s own accepted count, moved only by `commit`'s `accept`
+argument and bounded to what the transaction published), and a private
+`committed_high_water` used only by `retained()`. `commit` also now refuses an
+`accept` past what the transaction published, closing the separate overflow
+this record had not previously named.
 
 **The writer callback.** `moxie_types::WriteReceipt` — a per-layer digest a
 caller could construct and hand back, with a public constructor and no
 sequence/layer/device/run identity in it — is **deleted**.
-`moxie_types::PagedKvWriter` replaces it: `write_layer(&mut self, layer,
-batch, placements) -> Result<()>`, implemented by `PagedKvWriterAdapter` and
-called from `DeviceKvSequence::append`. That closes less than it looks like
-it does:
+`moxie_types::PagedKvWriter` replaces it, implemented by `PagedKvWriterAdapter`
+and called from `DeviceKvSequence::append`. `&mut dyn PagedKvWriter` called by
+`moxie-state` **is** the trait object and the callback into the executor that
+"Bounded deliverable" above originally ruled out by name — see the owner's
+amendment there, 2026-09-20: the callback stays, the contract line is amended.
+The three defects a review found inside it are **closed** as of the 2026-09-20
+regression run below:
 
-- The callback carries placements only. The authority does not hand the
-  writer its page view, so a caller — including this task's own device test —
-  must reimplement the retained-base/logical-page/modulo arithmetic that
-  decides where the table sits, rather than reading it from the one place
-  that owns the decision.
-- `PagedAttentionRun::publish_page_table` and `write_rows` are public, and
-  `PagePlacement`/`BatchId` are publicly constructible. A caller can still
-  write or republish device pages with no state transaction behind it at all,
-  bypassing the authority entirely.
-- `PagedKvWriterAdapter` drops the caller's rows on an ordinary pre-enqueue
-  refusal instead of returning them, so a retry or an abort after a refusal
-  cannot recover what it arrived with.
-- `&mut dyn PagedKvWriter` called by `moxie-state` **is** the trait object and
-  the callback into the executor that "Bounded deliverable" above ruled out by
-  name — see the owner's amendment there, 2026-09-20: the callback stays, the
-  contract line is amended, and that disagreement is now settled. The two
-  defects above are not: they are what the amendment leaves open, and the
-  specified fix — `PageView` moves to `moxie-types` beside `PagePlacement`,
-  `write_layer` gains a `view: &PageView` parameter so `append` hands over the
-  view it already computes, and `publish_page_table`/`write_rows` stop being
-  `pub` — is **not** in this tree. `moxie-types` declares the four-argument
-  trait; `moxie-state`'s `DeviceKvSequence::append` still calls the
-  three-argument one it replaces, and `publish_page_table`/`write_rows` are
-  still `pub`. Record this as specified and started, not landed.
+- `moxie_types::PageView` (moved from `moxie-state`, beside `PagePlacement`)
+  is now a fourth argument to `write_layer`; `append` hands over the view it
+  already computes, and `view_covering` — this task's own device test
+  reimplementing the retained-base/logical-page/modulo arithmetic — is
+  deleted from the test file rather than kept beside the authority that now
+  supplies it.
+- `PagedAttentionRun::publish_page_table` and `write_rows` are `pub(crate)`,
+  not `pub`. The one remaining public path, `RawPagedFixture`, takes the run
+  **by value** — surrendering it, so a run driven through
+  `PagedKvWriterAdapter` cannot also be driven this way — and exists by name
+  only for the kernel-numerics gate that must stress arbitrary page tables
+  with no authority behind them.
+- `PagedKvWriterAdapter` restores a pre-enqueue refusal's rows into itself
+  (via `RefusedSource::Rows`) instead of dropping them, so a retry or an abort
+  after a refusal can recover what it arrived with.
+
+## Progress — 2026-09-20, regression evidence
+
+Measured fact, dated 2026-09-20, against commits `b1e9381..6984c17`. This is
+**regression evidence**: it says the 51 existing GPU cases and the host/driver
+suites still pass through the rewritten `append`/`PagedKvWriter` path — page
+table published from the authority's own `PageView`, not a caller's copy of
+its arithmetic. It does **not** satisfy acceptance criterion 2, which stays
+open exactly as described above, and it carries no timing or performance claim
+(O6/O7 remain open; nothing here was timed).
+
+- Host: `cargo test --workspace`, 1185 passed, 0 failed.
+- Driver: `cargo test -p moxie-executor --lib --tests --features driver`, 160
+  passed, 0 failed.
+- GPU: `CUDA_DEVICE_ORDER=PCI_BUS_ID cargo run -p xtask --features cuda --
+  test-gpu`, 51 passed, 0 failed, 0 skipped/unmeasured, on all three devices.
+  QUALIFIED sm_86 (both 3090s, devices 1 and 2) and sm_120 (5060 Ti, device 0).
+  `paged_attention` and `paged_attention_32k` pass on every device. 32k-decode
+  on sm_86: max 3.037e-5, rms 5.625e-6, p99 1.519e-5 — identical to the figure
+  recorded before the state binding was rewritten; 32k-append-decode max
+  2.953e-5; 32k-sliding max 1.092e-4.
 
 ## Result, filled after work
 
 No completion is claimed. Acceptance 4 is open (the graph wiring) and
-acceptance 2 is open (see above). The callback-versus-contract disagreement
-that was open here is settled — the owner amended "Bounded deliverable"'s
-"no trait object, no callback into the executor" line, 2026-09-20, and kept
-the callback — but that settles the shape only. The two defects it left open
-("The writer callback" above: no page view handed to the writer, and
-`publish_page_table`/`write_rows` still public) are unresolved and are this
-task's to close, not the owner's.
+acceptance 2 is open (see above) — the 2026-09-20 regression evidence confirms
+the existing 51 GPU cases and the host/driver suites still pass through the
+rewritten path; it does not add the combined append/attend/abort/truncate/
+reappend, reclaimed-base, both-architectures case criterion 2 requires. The
+callback-versus-contract disagreement is settled (the owner's amendment,
+2026-09-20), and the defects it left open — no page view handed to the writer,
+`publish_page_table`/`write_rows` public — are closed as of the same date. No
+timing or performance claim is made anywhere in this record (O6/O7 open).

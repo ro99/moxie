@@ -397,18 +397,16 @@ specification and the affected suites. **Not done, and not claimed:**
   kernel and binding, not the engine's attention. Carried into
   [task 0038](0038-m4-device-kv-state-authority.md) as its second deliverable,
   which is not started.
-- **The state binding** is **partially closed by task 0038's first half, still
-  open**: `moxie_state::DeviceKvSequence` decides placement, retention, the
-  frontier, transactions, abort and truncation, and the 32,768-row gate is
-  driven through it — but the authority does not hand its performer a page
-  view (a caller still reimplements that arithmetic), and the public
-  `publish_page_table`/`write_rows` can write device pages outside any
-  authority transaction. The callback that carries placements to the executor
-  was named out of scope by task 0038's original contract; the owner amended
-  that line 2026-09-20 and kept the callback, so the shape is settled and only
-  the two defects above are open. See
-  [task 0038](0038-m4-device-kv-state-authority.md) for the current state; do
-  not read this bullet as closed.
+- **The state binding** is **closed by task 0038's first half**, as of the
+  2026-09-20 regression evidence: `moxie_state::DeviceKvSequence` decides
+  placement, retention, the frontier, transactions, abort and truncation, the
+  32,768-row gate is driven through it, the authority hands its performer a
+  page view rather than the performer reimplementing that arithmetic, and the
+  raw `publish_page_table`/`write_rows` are no longer a public bypass. The
+  callback that carries this was named out of scope by task 0038's original
+  contract; the owner amended that line 2026-09-20 and kept the callback. See
+  [task 0038](0038-m4-device-kv-state-authority.md) for detail — task 0038
+  itself remains open on its second half and its acceptance criterion 2.
 - ~~**A reclaimed base is host-checked only.**~~ **Closed by task 0038**:
   `a_wrapped_ring_answers_exactly_as_an_unwrapped_one` attends after the ring
   has wrapped, at a retained base of 48, and gets byte-identical results to a

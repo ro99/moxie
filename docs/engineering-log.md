@@ -1660,3 +1660,24 @@ default that ages gracefully — it goes stale exactly as fast as "implemented"
 does, and this round is the proof, since both were wrong in the same file at
 the same time. The fix is not to hedge harder; it is to check the current
 tree before every claim, in both directions, every round.
+
+## 2026-09-20 — task 0038 regression evidence, commits `b1e9381..6984c17`
+
+Host: `cargo test --workspace`, 1185 passed, 0 failed. Driver:
+`cargo test -p moxie-executor --lib --tests --features driver`, 160 passed, 0
+failed. GPU: `CUDA_DEVICE_ORDER=PCI_BUS_ID cargo run -p xtask --features cuda
+-- test-gpu`, 51 passed, 0 failed, 0 skipped/unmeasured, on all three
+devices — sm_86 (both 3090s, devices 1 and 2) and sm_120 (5060 Ti, device 0)
+QUALIFIED. `paged_attention` and `paged_attention_32k` pass on every device.
+32k-decode on sm_86: max 3.037e-5, rms 5.625e-6, p99 1.519e-5, identical to
+the figure recorded before the state binding was rewritten; 32k-append-decode
+max 2.953e-5; 32k-sliding max 1.092e-4.
+
+This is regression evidence for the existing 51 GPU cases and the host/driver
+suites now running through the rewritten `append`/`PagedKvWriter` path, with
+the page table published from the authority's own `PageView` rather than a
+caller-reimplemented one. It does not satisfy task 0038 acceptance criterion
+2, which needs a combined append/attend/abort/truncate/reappend case with a
+reclaimed `history_base > 0` on both SM86 GPUs and SM120; that case does not
+exist yet and criterion 2 stays open. No timing or performance claim is made
+anywhere in this evidence: O6 and O7 are open, and nothing was timed.
