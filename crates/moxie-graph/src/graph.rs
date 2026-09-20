@@ -1440,6 +1440,19 @@ impl GraphBuilder {
             }
             Ok(())
         };
+        // Stricter than `want_float`: a weight passes that check too (Linear's
+        // second operand, RmsNorm's gain and Embedding's table are legitimately
+        // weights in a "float" slot), but query/key/value feed a per-step state
+        // append, not a stored parameter, so only an activation belongs there.
+        let want_activation = |i: usize| -> Result<()> {
+            if !matches!(s(i).role, ValueRole::Activation(_)) {
+                return Err(bad(format!(
+                    "input {i} must be an activation role, got {:?}",
+                    s(i).role
+                )));
+            }
+            Ok(())
+        };
         let want_route = |i: usize| -> Result<()> {
             if !s(i).role.is_route() {
                 return Err(bad(format!(
@@ -1555,7 +1568,7 @@ impl GraphBuilder {
                 let kv_width =
                     (Dim::constant(kv_heads) * Dim::constant(head_dim)).eval(&SymbolTable::new())?;
                 for (i, want) in [query_width, kv_width, kv_width].into_iter().enumerate() {
-                    want_float(i)?;
+                    want_activation(i)?;
                     rank(i, 2)?;
                     dim_is(i, 1, want)?;
                 }
@@ -1891,6 +1904,52 @@ mod identity_tests {
         let error = build(IndexEncoding::U32).unwrap_err();
         assert_eq!(error.kind(), "invalid_artifact", "{error}");
         assert!(format!("{error}").contains("narrower"), "{error}");
+    }
+
+    #[test]
+    fn attention_refuses_a_weight_in_a_query_key_or_value_slot() {
+        // `want_float` alone would accept this: Linear's second operand,
+        // RmsNorm's gain and Embedding's table are legitimately weights in a
+        // "float" slot. But query/key/value feed a per-step state append, not
+        // a stored parameter, and a BF16 weight there passes the node's own
+        // precision contract too -- so nothing downstream of `want_float`
+        // would have refused it either.
+        let rows = SymbolId(0);
+        let activation = |rows: SymbolId| {
+            TensorSpec::new(
+                ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                vec![Dim::symbol(rows), Dim::constant(4)],
+            )
+        };
+        let disguised_weight = TensorSpec::new(
+            ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
+            vec![Dim::symbol(rows), Dim::constant(4)],
+        );
+        let build = |query: TensorSpec| {
+            let mut g = GraphBuilder::new(OracleId("test"), rows);
+            let q = g.input("q", query);
+            let k = g.input("k", activation(rows));
+            let v = g.input("v", activation(rows));
+            let positions = g.input(
+                "positions",
+                TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![Dim::symbol(rows)]),
+            );
+            g.node(
+                OpParams::Attention {
+                    heads: 1,
+                    kv_heads: 1,
+                    head_dim: 4,
+                    scale: 1.0,
+                    visibility: Visibility::Causal,
+                    layer: 0,
+                },
+                &[q, k, v, positions],
+            )
+        };
+        assert!(build(activation(rows)).is_ok());
+        let error = build(disguised_weight).unwrap_err();
+        assert_eq!(error.kind(), "invalid_artifact", "{error}");
+        assert!(format!("{error}").contains("activation role"), "{error}");
     }
 
     #[test]
