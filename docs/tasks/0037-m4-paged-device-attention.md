@@ -385,21 +385,30 @@ Acceptance 1 is met for the launch contract and the oracles; acceptance 2 and 3
 are met as described above; acceptance 5 is met for fmt, clippy, architecture,
 specification and the affected suites. **Not done, and not claimed:**
 
-- **The state authority binding.** `moxie-state` does not own these pages yet.
+- ~~**The state authority binding.** `moxie-state` does not own these pages yet.
   There is no transaction, branch, retention or truncation behind them, and the
   committed frontier `PagedAttentionRun` reports is a fact about copied bytes
-  rather than a journal entry. This is the next bounded task and the largest
-  remaining piece of acceptance 1 and 4.
+  rather than a journal entry.~~ This was the largest remaining piece of
+  acceptance 1 and 4, and the record below is what was open at this task's own
+  close. See the next bullet for what closed it.
 - **The semantic path.** Finding 1 above: planner lowering from
   `OpParams::Attention`, device query/output handles rather than host staging,
   and execution through the admitted graph plan. Until then this is a qualified
   kernel and binding, not the engine's attention. Carried into
   [task 0038](0038-m4-device-kv-state-authority.md) as its second deliverable,
   which is not started.
-- **The state binding** is **closed by task 0038's first half**:
-  `moxie_state::DeviceKvSequence` owns placement, retention, the frontier,
-  transactions, abort and truncation, and the 32,768-row gate is driven through
-  it.
+- **The state binding** is **partially closed by task 0038's first half, still
+  open**: `moxie_state::DeviceKvSequence` decides placement, retention, the
+  frontier, transactions, abort and truncation, and the 32,768-row gate is
+  driven through it — but the authority does not hand its performer a page
+  view (a caller still reimplements that arithmetic), and the public
+  `publish_page_table`/`write_rows` can write device pages outside any
+  authority transaction. The callback that carries placements to the executor
+  was named out of scope by task 0038's original contract; the owner amended
+  that line 2026-09-20 and kept the callback, so the shape is settled and only
+  the two defects above are open. See
+  [task 0038](0038-m4-device-kv-state-authority.md) for the current state; do
+  not read this bullet as closed.
 - ~~**A reclaimed base is host-checked only.**~~ **Closed by task 0038**:
   `a_wrapped_ring_answers_exactly_as_an_unwrapped_one` attends after the ring
   has wrapped, at a retained base of 48, and gets byte-identical results to a

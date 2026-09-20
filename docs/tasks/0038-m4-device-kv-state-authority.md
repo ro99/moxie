@@ -1,10 +1,18 @@
 # Task 0038 — M4.1b the state authority owns the device pages, and the graph reaches them
 
-Status: active, mostly implemented. Opened 2026-09-19 after task 0037's kernel
-and binding were qualified and twice reviewed. The state authority owns the
-device pages, the planner lowers attention and reports what it needs, and the
-binding consumes device handles. What is missing is the last wiring: no lowered
-plan yet executes its attention node. See "Progress" below.
+Status: active, not accepted. Opened 2026-09-19 after task 0037's kernel and
+binding were qualified and twice reviewed. Deliverable 1 (the state authority
+owns the device pages) and deliverable 2 (the graph lowers attention and the
+binding consumes device handles) are both **partially** landed; see "Progress"
+for what is current — this record does not retell the review history, which is
+in [the engineering log](../engineering-log.md). The write-callback shape is
+now settled: the owner amended the "no trait object, no callback into the
+executor" line below, 2026-09-20 (see "Bounded deliverable"), so the disagreement
+between that line and the implementation is no longer open. Three things are
+open instead: the graph wiring, acceptance criterion 2's device evidence, and
+the two defects the amendment left inside the callback — the authority still
+does not hand it a page view, and the raw write/publish methods are still
+public (see "The writer callback" below).
 
 ## Identity and authority
 
@@ -64,6 +72,25 @@ retained, what a page table contains and when a page leaves the retained range.
 launch. No trait object, no callback into the executor, no second frontier:
 `PagedAttentionRun::committed_rows` stops being its own counter and starts being
 what the authority says.
+
+> **Amended by the owner, 2026-09-20.** The line above — "no trait object, no
+> callback into the executor" — required a data-only boundary: the authority
+> publishes decisions as data, and the executor reads them. The implemented
+> design is a callback, `&mut dyn PagedKvWriter`, called by `moxie-state`. The
+> owner's ruling: **the callback stays; this line is amended, not the code.**
+> A data-only boundary cannot enforce that publication follows an observed
+> write — nothing in "the authority writes a decision, the executor later
+> reads it" requires the executor to have performed the write before the
+> authority publishes, which is the one thing this whole mechanism exists to
+> guarantee. What the callback buys instead: `append` is the only public way
+> to move the frontier, `stage` and the publish step are private, and there is
+> no value a caller can hold that makes publication happen — the only way to
+> reach it is to be one of `writers` and return `Ok`. What it does **not**
+> buy, unchanged from a data-only boundary: a writer that returns `Ok` before
+> its copy has completed is lying, and the authority has no way to check that
+> from outside. This was the owner's decision, not an agent's, and it settles
+> the shape only — the two defects the reviewer found inside it (below) are
+> still open work.
 
 **2. `OpParams::Attention` reaches it from the graph.** `moxie-plan` refuses
 every stateful graph today (`stateful_resource_plan`). That refusal is replaced
@@ -133,8 +160,14 @@ expressed as one contract.
 
 ## Progress — 2026-09-19, half one: the authority owns the pages
 
-Deliverable 1 landed. **Deliverable 2 — lowering `OpParams::Attention` and
-binding device handles — is not started**, so this task stays open and nothing
+Deliverable 1 is **partially** landed. Placement, retention, the frontier,
+transactions, abort and truncation are decided by the state authority, as
+below. What is **not** landed is the rest of the same sentence in "Bounded
+deliverable" above — "no trait object, no callback into the executor" — and
+the authority does not hand its performer a page view, so a caller still
+reimplements that arithmetic; see "The writer callback" further below for
+both. **Deliverable 2 — lowering `OpParams::Attention` and binding
+device handles — is likewise partial**, so this task stays open and nothing
 below claims otherwise.
 
 ### What moved
@@ -246,9 +279,9 @@ contract.
 
 ## Progress — 2026-09-19, the second review's four blockers
 
-Review found four correctness blockers in the first two commits, two resource
-and precision gaps, and two pieces of evidence that had not been produced. All
-are closed; none of them was a matter of degree.
+Four correctness fixes, a precision gap, a resource gap and two pieces of
+evidence, numbered below. All are closed, including the resource gap: it took
+a second attempt (item 6).
 
 1. **Placements, the page table and the launch were not bound to each other.**
    A caller could write rows through one permutation, publish another valid
@@ -280,16 +313,19 @@ are closed; none of them was a matter of degree.
    accepted any precision while everything below read two bytes as BF16 — and
    FP16 has the same width and a different meaning. Non-BF16 is now
    `Unsupported`, a zero window and zero headroom are refused as the host
-   geometry refuses them, and `StateRequirement` carries the key operand's
-   precision so a binder can reconcile graph, kernel and authority on one
-   encoding.
-6. **The direct-device path was charged for staging it never uses.** Every run
-   admitted query and output ranges plus a host readback, so a graph executing
-   on its own arena slots would have paid three times — and on a device whose
-   memory is nearly spoken for, that is an admissible plan being refused.
-   `Staging::DeviceHandles` admits the pages and the table and nothing else;
-   `attend` then refuses and names `attend_into`. The difference is asserted
-   exactly, at `2 · rows · heads · head_dim · 2` bytes.
+   geometry refuses them, and lowering now validates all three attention
+   operand roles: query must be an activation and BF16 — the only precision
+   the selected kernel serves — and key and value precision must match each
+   other. `StateRequirement` carries that shared key/value cache precision so
+   a binder can reconcile graph, kernel and authority on one encoding.
+6. **The direct-device path was charged for staging it never uses.** The first
+   attempt only shrank the arena byte counter (`Extents::per_step`) while
+   `resource_request` still unconditionally requested query, output and
+   host-readback buffers for both staging modes, so the ledger could still
+   refuse a direct-device plan for capacity it never touches; a review caught
+   that the passing test proved the byte count, not the charge. `resource_request`
+   now requests those three buffers only for `Staging::Host`, and the ledger
+   test checks the missing-host-scope distinction rather than the arena bytes.
 
 **Evidence that was missing and now exists.** The host comparison had run over
 24 of 32 rows and wrapped neither store, so it compared two mappings where
@@ -304,6 +340,67 @@ an abort leaves the committed decode byte-identical, a truncation leaves the
 prefix's decode byte-identical, and a re-append changes the answer rather than
 replaying the dropped rows.
 
+**Acceptance criterion 2 is not met.** The evidence above covers three of its
+five pieces and reads as satisfying it; it does not. Criterion 2 requires
+append/attend/abort/truncate/reappend together, with a reclaimed
+`history_base > 0`, on both SM86 GPUs and SM120. No test does that.
+`abort_truncate_and_reappend_hold_on_device` runs the three transaction shapes,
+but only on `RankId(0)` and only against a `Retention::All` layer — it never
+sets a reclaimed base. `a_wrapped_ring_answers_exactly_as_an_unwrapped_one`
+reaches a reclaimed base, but only exercises append and attend, and also runs
+on one ordinal only. Neither test selects an SM86 device versus SM120, so the
+"both architectures" half of the criterion is unaddressed by either. Required
+and missing: one device case combining all five operations with
+`history_base > 0`, run against both SM86 GPUs and SM120.
+
+Separately, `abort_truncate_and_reappend_hold_on_device`'s truncation assertion
+`sequence.committed_rows() == 8` (after truncating from 12) does not hold
+under the current implementation: `committed_rows` reports the physical write
+high-water mark, which a truncate does not move, not the accepted/committed
+frontier the method's own documentation promises. The test as written asserts
+a value the code cannot currently produce. Splitting the accepted frontier
+from the physical watermark is open work, not a passing case.
+
+**The writer callback.** `moxie_types::WriteReceipt` — a per-layer digest a
+caller could construct and hand back, with a public constructor and no
+sequence/layer/device/run identity in it — is **deleted**.
+`moxie_types::PagedKvWriter` replaces it: `write_layer(&mut self, layer,
+batch, placements) -> Result<()>`, implemented by `PagedKvWriterAdapter` and
+called from `DeviceKvSequence::append`. That closes less than it looks like
+it does:
+
+- The callback carries placements only. The authority does not hand the
+  writer its page view, so a caller — including this task's own device test —
+  must reimplement the retained-base/logical-page/modulo arithmetic that
+  decides where the table sits, rather than reading it from the one place
+  that owns the decision.
+- `PagedAttentionRun::publish_page_table` and `write_rows` are public, and
+  `PagePlacement`/`BatchId` are publicly constructible. A caller can still
+  write or republish device pages with no state transaction behind it at all,
+  bypassing the authority entirely.
+- `PagedKvWriterAdapter` drops the caller's rows on an ordinary pre-enqueue
+  refusal instead of returning them, so a retry or an abort after a refusal
+  cannot recover what it arrived with.
+- `&mut dyn PagedKvWriter` called by `moxie-state` **is** the trait object and
+  the callback into the executor that "Bounded deliverable" above ruled out by
+  name — see the owner's amendment there, 2026-09-20: the callback stays, the
+  contract line is amended, and that disagreement is now settled. The two
+  defects above are not: they are what the amendment leaves open, and the
+  specified fix — `PageView` moves to `moxie-types` beside `PagePlacement`,
+  `write_layer` gains a `view: &PageView` parameter so `append` hands over the
+  view it already computes, and `publish_page_table`/`write_rows` stop being
+  `pub` — is **not** in this tree. `moxie-types` declares the four-argument
+  trait; `moxie-state`'s `DeviceKvSequence::append` still calls the
+  three-argument one it replaces, and `publish_page_table`/`write_rows` are
+  still `pub`. Record this as specified and started, not landed.
+
 ## Result, filled after work
 
-No completion is claimed: acceptance 4 is open, and with it the task.
+No completion is claimed. Acceptance 4 is open (the graph wiring) and
+acceptance 2 is open (see above). The callback-versus-contract disagreement
+that was open here is settled — the owner amended "Bounded deliverable"'s
+"no trait object, no callback into the executor" line, 2026-09-20, and kept
+the callback — but that settles the shape only. The two defects it left open
+("The writer callback" above: no page view handed to the writer, and
+`publish_page_table`/`write_rows` still public) are unresolved and are this
+task's to close, not the owner's.

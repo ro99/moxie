@@ -35,15 +35,15 @@ Each links into the entries below.
 | A boundary invented before it had two sides | task 0025's `moxie-storage-write`, which forced a second copy of the reader's `pread` |
 | A format assumption nobody asked the format about | task 0026's eight-byte alignment, refused by the reference reader |
 | A new boundary that hides the boundary beside it | task 0026's shard-header pass, which absorbed every payload fault |
-| A claim checked against a copy of itself | task 0026's component validation, shape check, source digest and memory bound |
+| A claim checked against a copy of itself | task 0026's component validation, shape check, source digest and memory bound; task 0038's device test reimplementing the authority's page-table arithmetic instead of reading it from the authority |
 | Optimizing the architecture, and calling it a user benefit | offline repacking, built and packaged before its performance hypothesis was tested |
 | A tool that measures the tree it is editing | the mutation battery, twice: killed mid-substitution, and left unrunnable for two tasks |
 | A test measured by assertion rather than by mutation | tasks 0020, 0021, 0022, 0023, 0024 |
-| A record contradicting a fact it already contains | task 0022's expert inventory, task 0022's VRAM figure, task 0024's sign claim |
+| A record contradicting a fact it already contains | task 0022's expert inventory, task 0022's VRAM figure, task 0024's sign claim, task 0038's page-ownership claim in `AGENTS.md` and the support matrix, task 0038's writer-trait claim going stale in the opposite direction one round later |
 | A comparison whose two sides are not independent | task 0022's FP64 transcription, task 0024's FP32-versus-BF16 arithmetic |
 | A fix that is not guarded by the test written for it | task 0023's fake axis, task 0024's helper-only regression |
 | A numerical gate whose denominator can collapse | task 0028's 2-ULP-at-the-result threshold |
-| A check attached to a value nobody has to keep | task 0028's public launch fields, trusted descriptor, unchecked lease scope and borrowed operands |
+| A check attached to a value nobody has to keep | task 0028's public launch fields, trusted descriptor, unchecked lease scope and borrowed operands; task 0038's `WriteReceipt` and the quarantined range `PagedCloseRefused` handed back on the refusing path |
 | Work that exists on one disk and nowhere else | 24 commits, four tasks and five review rounds, unpushed for thirty hours |
 | A repair that satisfies the test rather than the property | task 0029, four rounds: an owned label the fixture never used, a prefix measured on a warmed ledger, a mutant that panicked before it mutated, an aggregate standing in for a state |
 | A harness with no tests of its own | the mutation guard, after three rounds of guard bugs: the self-test covers verdicts, selectors and anchors, and never touched restoration |
@@ -1571,3 +1571,92 @@ that spans several operations cannot be enforced by validating each one against
 its own arguments. It has to be expressed as a value they all have to speak
 about — a staged batch, a published view — so that the states that violate it
 cannot be constructed.
+
+## 2026-09-19 — a record that agreed with itself in one sentence and not the next
+
+A third review of task 0038 found `AGENTS.md` and the support matrix each
+asserting, within one entry, both that `moxie-state` now owns the device pages
+and that it does not: the M4 status line said the binding was missing, one
+sentence of the support matrix row said the state authority already places
+every row, and a later sentence in that same row said `moxie-state` does not
+yet own these pages. Both halves had been true at different points in the same
+day and nobody deleted the half that stopped being true when the other landed.
+
+The task record had a second, sharper version of the same shape. It described
+`abort_truncate_and_reappend_hold_on_device` and
+`a_wrapped_ring_answers_exactly_as_an_unwrapped_one` under a heading reading
+"evidence that was missing and now exists," which is true of each test's own
+claim and false of acceptance criterion 2's conjunction: append, attend,
+abort, truncate and re-append together, with a reclaimed `history_base > 0`,
+on both SM86 GPUs and SM120. One test has the transaction shapes at full
+retention on one ordinal; the other has a reclaimed base at append/attend only,
+also on one ordinal. Two tests each satisfying part of a conjunction is not the
+conjunction, and "the evidence now exists" read as if it were. The disposition
+this review reached — the record's claim that task 0038 was "one wiring step
+from done" is not supported by the current code — was really this same error
+one level up: two open items summarized as the smaller of the two.
+
+The standing lesson is the same one three checks each looking at one third of
+the thing taught a few entries up, applied to prose instead of code: a
+conjunction of conditions cannot be reported as satisfied by citing evidence
+for each condition separately, and a claim that was true before a later change
+landed has to be deleted, not left beside the sentence that supersedes it.
+
+## 2026-09-19 — a fix that moves ownership into a new return type and hands it straight back out
+
+A second-round review rejected the tree the round above tried to close.
+`PagedCloseRefused` was supposed to be the fix for the original
+external-range lifetime bug: quarantine an ambiguous query or output range
+instead of releasing it, and return the run so the caller cannot reuse
+memory that may still be in flight. But `close` `take`s that same range out
+of `held_ranges` and puts it on `PagedCloseRefused` even when the run is
+quarantined, so a caller holding the refusal can release or reuse exactly
+the bytes the refusal exists to withhold. The type changed; the range still
+left the building.
+
+`WriteReceipt` was the same shape one layer up. It replaced an unchecked
+write with a value a caller had to produce before publication — except the
+constructor was public, the digest named no sequence, layer, device or run,
+and one honest receipt could be replayed for every layer. A caller never had
+to observe anything to hold a valid-looking one. Ownership had moved into a
+type; the type did not require having earned it.
+
+The standing lesson: introducing a return type, a token or a quarantine flag
+is not a fix by itself. The question to ask of any such type is not "does a
+caller have to produce this to proceed" but "can a caller produce this
+without doing the thing the type is supposed to prove happened." If the
+answer is yes — a public constructor, a value handed back on every path
+including the refusing one, a digest with no identity in it — the type is
+decoration on the same hole, not a wall across it.
+
+## 2026-09-20 — a record can be stale in both directions on the same page
+
+A third review rejected task 0038's tree again, and this time the docs were
+wrong on both sides of the same question at once. The record said the
+`PagedKvWriter` trait had no implementor and nothing called it — true when
+written, false two commits later, because `PagedKvWriterAdapter` now exists
+and `DeviceKvSequence::append` calls it. Two paragraphs over, `AGENTS.md`, the
+support matrix and task 0037 all said the state binding was landed —
+`moxie-state` "owns" the device pages — which was never quite true and had
+gotten less true since: the authority still does not hand its callback a page
+view, so the integration test reimplements the retained-base/page/modulo
+arithmetic the authority exists to own, and the public `write_rows`/
+`publish_page_table` can write a device page with no transaction behind it at
+all. One claim hadn't caught up to code that shipped; the other had run ahead
+of code that never fully landed. Both are a record answering "is this true"
+from memory of an earlier tree instead of from the tree in front of it.
+
+The reimplemented arithmetic is its own instance of an older shape, "a claim
+checked against a copy of itself" (see the recurring-shapes table above),
+worth naming here because it is also a documentation habit, not only a
+test-fixture one: a description that restates what a component should do,
+written by someone who did not go back and check what it now does, is the
+same mistake in prose.
+
+The standing lesson, stated flat: a status claim has an expiry date the
+moment the code it describes can change, and neither direction is safer than
+the other. Writing "not yet implemented" into a record is not a conservative
+default that ages gracefully — it goes stale exactly as fast as "implemented"
+does, and this round is the proof, since both were wrong in the same file at
+the same time. The fix is not to hedge harder; it is to check the current
+tree before every claim, in both directions, every round.
