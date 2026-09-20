@@ -151,6 +151,14 @@ pub struct StateRequirement {
     pub head_dim: u64,
     pub scale: f32,
     pub visibility: Visibility,
+    /// The precision of the key and value operands this node appends.
+    ///
+    /// Carried because the binder has three things to reconcile — the graph's
+    /// operands, the kernel the catalogue selected, and what the state
+    /// authority admitted — and without it the one encoding they must agree on
+    /// is the one nobody states. Two bytes is not a contract: FP16 and BF16 are
+    /// the same width and different meanings.
+    pub cache_precision: Precision,
     /// Rows this step appends, and the history it attends over. Both from the
     /// workload: one is `rows`, the other is `visible_tokens`, and a plan that
     /// conflated them would describe a decode as a prefill.
@@ -356,6 +364,22 @@ fn lower_with_ids(
             layer,
         } = node.params
         {
+            // The key operand's own precision, from the graph rather than from
+            // an assumption about what a cache holds. A node whose keys are not
+            // an activation at all is malformed here rather than later.
+            let key =
+                node.inputs.get(1).copied().ok_or_else(|| {
+                    invalid("attention", "an attention node without a key operand")
+                })?;
+            let cache_precision = match graph.values()[key.0 as usize].role {
+                ValueRole::Activation(precision) => precision.get(),
+                other => {
+                    return Err(invalid(
+                        "attention",
+                        format!("the key operand is {other:?}, which is not an activation"),
+                    ));
+                }
+            };
             state.try_reserve(1).map_err(|_| {
                 invalid("state", "the state requirement list could not be reserved")
             })?;
@@ -368,6 +392,7 @@ fn lower_with_ids(
                 head_dim,
                 scale,
                 visibility,
+                cache_precision,
                 appended_rows: workload.rows,
                 visible_tokens: workload.visible_tokens,
             });
@@ -1027,6 +1052,9 @@ mod tests {
             (0, 0, 1, 1, 4)
         );
         assert_eq!(need.effect, StateEffect::Appends);
+        // The encoding the binder has to reconcile, from the graph's own
+        // operand rather than from an assumption about what a cache holds.
+        assert_eq!(need.cache_precision, Precision::Bf16);
         assert_eq!(need.visibility, Visibility::Causal);
         assert_eq!(need.scale, reciprocal_sqrt_scale(4));
         // The two row counts are different facts and stay separate: one is what
