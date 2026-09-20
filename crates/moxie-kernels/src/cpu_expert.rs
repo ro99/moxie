@@ -104,9 +104,10 @@ fn store_bf16(bytes: &mut [u8], index: usize, value: f32) {
 /// They differ in more than their curve: GeGLU rounds its gate term to BF16
 /// before multiplying because the pinned Gemma 4 source does, and SwiGLU
 /// evaluates the whole product in FP64 and rounds once because task 0003's
-/// contract says so after a review found an intermediate underflow producing a
-/// 100% error. Collapsing them into one function with a flag would erase a
-/// declared boundary, which is what document 02 keeps them apart to prevent.
+/// contract requires it: rounding the intermediate gate term to BF16 first
+/// underflows and can produce 100% error. Collapsing them into one function
+/// with a flag would erase a declared boundary, which is what document 02
+/// keeps them apart to prevent.
 #[inline]
 fn gate_times_up(gate: f32, up: f32, transform: GateTransform) -> f32 {
     match transform {
@@ -473,11 +474,10 @@ pub fn combine_rows_bf16(
         let out_row = &mut out[r * hidden * 2..(r + 1) * hidden * 2];
         for (o, value) in acc.iter().enumerate() {
             // Checked at the store, because a finite scale and a finite sum can
-            // still leave BF16's range: a review reached BF16 infinity from a
-            // slot of 2.0 and a scale of `f32::MAX` while this returned
-            // `Ok(())` and `GroupedRun::reduce` reported success. The FFI
-            // boundary owes a typed error, not a quiet infinity that the next
-            // layer consumes.
+            // still leave BF16's range: a slot of 2.0 and a scale of
+            // `f32::MAX` are both finite yet their FP32 product is not
+            // representable in BF16. The FFI boundary owes a typed error, not
+            // a quiet infinity that the next layer consumes.
             let scaled = value * output_scale;
             let narrowed = bf16_round(scaled);
             if !narrowed.is_finite() {

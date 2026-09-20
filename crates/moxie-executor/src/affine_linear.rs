@@ -34,34 +34,15 @@ fn invalid(field: &'static str, detail: impl Into<String>) -> Error {
     }
 }
 
-/// A `String` that grows only through `try_reserve`.
+/// `format!` for refusal prose that degrades instead of aborting.
 ///
-/// The same device `moxie-format` uses, for the same reason task 0024's review
-/// established: `format!` **aborts** when an allocation fails, and the context
-/// that produces a refusal is exactly the context most likely to coincide with
-/// memory pressure. A review failed one 32-byte allocation on this path and got
-/// `SIGABRT` instead of a typed capacity error.
-struct FallibleString(String);
-
-impl core::fmt::Write for FallibleString {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        // Reserve first, then push: `push_str` cannot reallocate once the
-        // capacity is there, so no infallible growth happens on this path.
-        self.0.try_reserve(s.len()).map_err(|_| core::fmt::Error)?;
-        self.0.push_str(s);
-        Ok(())
-    }
-}
-
+/// `format!` **aborts** when an allocation fails, and a refusal path is
+/// exactly where that failure is most likely to coincide with memory
+/// pressure. An empty detail is a shorter true statement, not an abort: the
+/// variant and the `&'static str` field are what a caller branches on either
+/// way.
 fn fallible(args: core::fmt::Arguments<'_>) -> String {
-    use core::fmt::Write;
-    let mut sink = FallibleString(String::new());
-    // An empty detail is a shorter true statement, not an abort. The variant
-    // and the `&'static str` field are what a caller branches on either way.
-    match sink.write_fmt(args) {
-        Ok(()) => sink.0,
-        Err(_) => String::new(),
-    }
+    moxie_memory::fallible::text(args).unwrap_or_default()
 }
 
 /// [`Error::InvalidRequest`] whose prose is composed **fallibly**.
@@ -90,26 +71,16 @@ fn unsupported_kernel_fmt(operation: &'static str, detail: core::fmt::Arguments<
 
 /// A zeroed buffer of `len` bytes, or a typed capacity refusal.
 ///
-/// `vec![0u8; len]` aborts when the allocation fails. This is the readback
-/// destination for a whole output tensor, so it is the largest thing this path
-/// asks for and the one most likely to be refused.
-/// Used by the launch path, which is behind `driver`, and by the host test that
+/// This is the readback destination for a whole output tensor, the largest
+/// thing this path asks for and the one most likely to be refused. Used by
+/// the launch path, which is behind `driver`, and by the host test that
 /// proves it degrades rather than aborts. The host lane builds the library
 /// without either, so the attribute is the honest way to say "this has one
 /// consumer and one gate" -- the same note `moxie-format::invalid_static`
 /// carries for the same reason.
 #[cfg_attr(not(any(feature = "driver", test)), allow(dead_code))]
 fn try_zeroed(len: usize) -> Result<Vec<u8>> {
-    let mut out: Vec<u8> = Vec::new();
-    out.try_reserve_exact(len)
-        .map_err(|_| Error::CapacityExceeded {
-            tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::Pageable)),
-            requested_bytes: len as u64,
-            available_bytes: 0,
-        })?;
-    // Cannot reallocate: the capacity is already there.
-    out.resize(len, 0);
-    Ok(out)
+    moxie_memory::fallible::zeroed(len)
 }
 
 fn unsupported(capability: &'static str, reason: impl Into<String>) -> Error {
@@ -127,12 +98,12 @@ fn unsupported(capability: &'static str, reason: impl Into<String>) -> Error {
 /// every logical input column and the kernel consults it per element.
 /// **The fields are private and there is no way to build one except through
 /// [`AffineLaunch::derive`].** A value of this type *is* the evidence that the
-/// geometry was checked, the same way `moxie-types`' role precisions are. An
-/// independent review constructed a launch with `row_stride = 1` and
-/// `groups_per_row = 0` on a 64-column INT4 tensor and drove it through
-/// selection and admission: the component-size checks became vacuous and the
-/// kernel would have indexed outside its own buffers. Public fields on a
-/// checked struct mean the check happened once, to a value nobody has to keep.
+/// geometry was checked, the same way `moxie-types`' role precisions are.
+/// Public fields would let a caller construct a launch with `row_stride = 1`
+/// and `groups_per_row = 0` on a 64-column INT4 tensor and drive it through
+/// selection and admission with the component-size checks vacuous, indexing
+/// the kernel outside its own buffers. Private fields mean the check happens
+/// once, to a value nobody has to keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AffineLaunch {
     rows: u64,
@@ -392,12 +363,10 @@ pub fn select_affine_linear_kernel(
     weight: WeightPrecision,
     launch: &AffineLaunch,
 ) -> Result<SemanticKernelDescriptor> {
-    // **One pass, no temporaries.** This collected two `Vec`s and then cloned
-    // the winner, all infallibly, on the path that ends in a *successful*
-    // selection -- where the caller has no refusal to fall back to. Independent
-    // review failed one 32-byte allocation here and got `SIGABRT`. The scan
-    // holds a reference and two counters instead, and the one allocation left
-    // is the clone, which is now fallible.
+    // **One pass, no temporaries.** A successful selection has no refusal to
+    // fall back to, so every allocation on that path must be fallible. The
+    // scan holds a reference and two counters instead of collecting `Vec`s;
+    // the one allocation left is the winning clone.
     let mut chosen: Option<&SemanticKernelDescriptor> = None;
     let mut matched = 0usize;
     // A bare "found 0" is not actionable. When every device-local candidate was
@@ -422,9 +391,9 @@ pub fn select_affine_linear_kernel(
             }
             Some(mismatch) => {
                 // The **reason**, not the prose: composing a refusal for a
-                // candidate rejected on the way to a match is an allocation on
-                // the success path, and review's sweep caught one of them
-                // failing and being ignored.
+                // candidate rejected on the way to a match would allocate on
+                // the success path, and a failed allocation there must not be
+                // silently ignored.
                 if first_rejection.is_none() {
                     first_rejection = Some((mismatch, descriptor));
                 }
@@ -458,9 +427,9 @@ pub fn select_affine_linear_kernel(
 /// Whether one descriptor serves this weight width at this geometry.
 ///
 /// **Selection and admission apply the same predicate**, which is the point:
-/// `AffineLinearRun::admit` is a public entry point that takes a descriptor,
-/// and a review handed it one that selection would never have chosen. A
-/// descriptor checked at selection and trusted at admission is a check that
+/// `AffineLinearRun::admit` is a public entry point that accepts an arbitrary
+/// descriptor, not only ones selection would have chosen. Trusting it at
+/// admission because it was checked at selection would be a check that
 /// happened to a value nobody kept.
 pub fn descriptor_serves(
     descriptor: &SemanticKernelDescriptor,
@@ -476,16 +445,14 @@ pub fn descriptor_serves(
 /// Why a descriptor does not serve, as a value rather than as prose.
 ///
 /// **Separating these two is what makes a successful selection allocation-free.**
-/// `descriptor_serves` built its refusal — and so allocated — for every
-/// candidate it rejected, including the ones rejected on the way to a match.
-/// Review's sweep then found a failed allocation returning a descriptor rather
-/// than a refusal, because the allocation that failed was prose nobody was
-/// going to read.
+/// Building a refusal's prose for every candidate rejected on the way to a
+/// match -- including the ones a caller never reads because the scan went on
+/// to match -- would allocate on a path that must stay allocation-free.
 ///
 /// The predicate stays **one** predicate: this enum is the only thing that
 /// decides, and both the selection scan and the public `descriptor_serves` read
 /// it. Splitting a check into a fast boolean and a separate explanation is how
-/// the two drift apart, which is the defect an earlier round already found here.
+/// the two drift apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mismatch {
     /// The weight width the request names, the descriptor declares and the
@@ -772,9 +739,9 @@ mod device {
                     ),
                 )));
             }
-            // Admission re-applies selection's own predicate. This is a public
-            // entry point that accepts a descriptor, and a review handed it one
-            // selection would never have chosen.
+            // Admission re-applies selection's own predicate: this is a public
+            // entry point that accepts an arbitrary descriptor, and nothing
+            // upstream guarantees it is one selection would have chosen.
             if let Err(error) = super::descriptor_serves(
                 &descriptor,
                 moxie_types::WeightPrecision::expect(launch.width().precision()),
@@ -839,10 +806,9 @@ mod device {
                     return Err(give_back(ledger, refused.reservation, refused.error));
                 }
             };
-            // **Reserved once, for exactly what it holds.** Two `push` calls
-            // on an empty `Vec` grow it infallibly, and independent review
-            // named them: this runs after the arena exists, so an abort here
-            // would take the process with a device allocation live.
+            // **Reserved once, for exactly what it holds.** This runs after
+            // the arena exists, so an infallible `push` that aborts here would
+            // take the process down with a device allocation live.
             let mut hold: Vec<DeviceRange<'ctx>> = Vec::new();
             if hold.try_reserve_exact(2).is_err() {
                 return Err(unwind(
@@ -1207,10 +1173,7 @@ mod device {
         ) -> Result<ComponentAddresses> {
             // One authority may hold a cache on **every** device, and an offset
             // resolved inside another device's allocation names the wrong
-            // bytes. A review drove 3090 leases through a 5060 Ti backing and
-            // got a confident, different answer; task 0021's review found the
-            // same shape one layer down, which is why the check is here rather
-            // than assumed.
+            // bytes silently. The check is required here rather than assumed.
             for lease in weight.leases() {
                 if lease.scope() != Scope::Device(device) {
                     return Err(invalid_fmt(
@@ -1437,14 +1400,13 @@ mod device {
 
     /// Dropping a quarantined run **withholds** what it is holding.
     ///
-    /// The type carried the operands past a launch whose completion could not
-    /// be established, and `close` refuses while quarantined -- but nothing
-    /// stopped the value itself being dropped, and dropping it ran
-    /// `Vec::drop` on the activations. Those are the host bytes an
-    /// asynchronous `cuMemcpyHtoDAsync` reads; freeing them while the copy may
-    /// still be in flight is the same class of bug as freeing the device
-    /// allocation, one end of the wire further along. Independent review
-    /// pointed at exactly this gap.
+    /// The type carries the operands past a launch whose completion could not
+    /// be established, and `close` refuses while quarantined. Without this
+    /// impl, dropping the value would still run `Vec::drop` on the
+    /// activations -- the host bytes an asynchronous `cuMemcpyHtoDAsync`
+    /// reads -- freeing them while the copy may still be in flight, the same
+    /// class of bug as freeing the device allocation one end of the wire
+    /// further along.
     ///
     /// So a quarantined run leaks, deliberately and permanently. The arena
     /// already does this (`DeviceArena::drop` forgets its core while a
@@ -1775,8 +1737,8 @@ mod tests {
         .unwrap();
         assert_eq!(chosen.id.0, "w4a16-linear-v1-sm_86");
         // An INT8 descriptor for an INT8 geometry. Selecting it against the
-        // INT4 launch above is now itself a refusal, which is finding 4: a
-        // descriptor and a geometry that disagree must never bind.
+        // INT4 launch above is itself a refusal: a descriptor and a geometry
+        // that disagree must never bind.
         let wide = descriptor(IntWidth::Int8, 64, 32, Grouping::Contiguous { size: 32 });
         let wide = AffineLaunch::derive(&wide, zeros(&wide), 4).unwrap();
         let chosen = select_affine_linear_kernel(
@@ -1835,13 +1797,13 @@ mod tests {
 
     #[test]
     fn a_launch_cannot_be_edited_after_it_was_checked() {
-        // Finding 4. Every field was public, so a caller could build a checked
-        // launch and then set `row_stride = 1` and `groups_per_row = 0` on a
-        // 64-column INT4 tensor. Selection and admission both accepted it, the
-        // component-size checks became vacuous, and the kernel would have
-        // indexed outside its own buffers.
+        // Public fields would let a caller build a checked launch and then set
+        // `row_stride = 1` and `groups_per_row = 0` on a 64-column INT4
+        // tensor, so selection and admission would accept it with the
+        // component-size checks vacuous and the kernel indexing outside its
+        // own buffers.
         //
-        // The fields are private now, so that edit does not compile. What is
+        // The fields are private, so that edit does not compile. What is
         // checkable at run time is that the only constructor produces geometry
         // consistent with the descriptor it came from.
         let d = descriptor(IntWidth::Int4, 64, 32, Grouping::Contiguous { size: 32 });
@@ -1857,10 +1819,10 @@ mod tests {
 
     #[test]
     fn admission_re_applies_the_predicate_selection_used() {
-        // Finding 4, second half: `admit` is a public entry point that takes a
-        // descriptor, and it trusted whatever it was handed. These are the
-        // mismatches it must refuse, checked through the shared predicate that
-        // admission and selection now both call.
+        // `admit` is a public entry point that accepts an arbitrary
+        // descriptor. These are the mismatches it must refuse, checked
+        // through the shared predicate that admission and selection both
+        // call.
         let d = descriptor(IntWidth::Int4, 64, 32, Grouping::Contiguous { size: 32 });
         let launch = AffineLaunch::derive(&d, zeros(&d), 4).unwrap();
         let int4 = WeightPrecision::expect(Precision::Int4);
@@ -1891,12 +1853,11 @@ mod tests {
 
     #[test]
     fn a_refusal_is_still_a_refusal_when_its_prose_cannot_be_built() {
-        // Finding 3. `format!` aborts when an allocation fails, and the context
-        // that produces a refusal is the context most likely to be under memory
-        // pressure: a review failed one 32-byte allocation on this path and got
-        // SIGABRT instead of a typed error. What is checkable without an
-        // allocator fixture is that the composer degrades to a shorter true
-        // statement rather than panicking, and that the field survives it.
+        // `format!` aborts when an allocation fails, and the context that
+        // produces a refusal is the context most likely to be under memory
+        // pressure. What is checkable without an allocator fixture is that
+        // the composer degrades to a shorter true statement rather than
+        // panicking, and that the field survives it.
         let error = invalid_fmt("field", format_args!("{} detail", 1));
         assert_eq!(error.kind(), "invalid_request");
         assert!(error.to_string().contains("1 detail"));

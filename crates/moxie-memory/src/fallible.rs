@@ -5,11 +5,11 @@
 //! process**. Admission is exactly the wrong place for it: a ledger exists to
 //! say "this does not fit", and it may not answer that question by dying.
 //!
-//! Independent review reached the abort through `AffineLinearRun::admit` and
-//! then walked the call graph: `PlanRequest::new`, `Ledger::admit`,
-//! `Arena::new`, `Arena::allocate` and `Module::function` all grew infallibly,
-//! two of them **after** a device allocation had succeeded or a free list had
-//! been mutated ([task 0029](../../../docs/tasks/0029-allocation-fallible-admission-vocabulary.md)).
+//! The abort reachable through `AffineLinearRun::admit` runs this call graph:
+//! `PlanRequest::new`, `Ledger::admit`, `Arena::new`, `Arena::allocate` and
+//! `Module::function` all grew infallibly, two of them **after** a device
+//! allocation had succeeded or a free list had been mutated
+//! ([task 0029](../../../docs/tasks/0029-allocation-fallible-admission-vocabulary.md)).
 //!
 //! What this module provides is the small vocabulary that path needs. It is
 //! deliberately not a general-purpose allocator wrapper: every function here
@@ -65,6 +65,24 @@ pub fn push<T>(vec: &mut Vec<T>, value: T) -> Result<()> {
     Ok(())
 }
 
+/// A zeroed `Vec<u8>` of `len` bytes, or a typed capacity refusal.
+///
+/// `vec![0u8; len]` aborts when the allocation fails. Reserving first and
+/// naming `len` as the requested extent makes the refusal a payload-sized
+/// number a caller can act on, not just "no room".
+pub fn zeroed(len: usize) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(len)
+        .map_err(|_| Error::CapacityExceeded {
+            tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::Pageable)),
+            requested_bytes: len as u64,
+            available_bytes: 0,
+        })?;
+    // Cannot reallocate: the capacity is already there.
+    out.resize(len, 0);
+    Ok(out)
+}
+
 /// `Vec::with_capacity` that refuses.
 pub fn with_capacity<T>(capacity: usize) -> Result<Vec<T>> {
     let mut out = Vec::new();
@@ -77,9 +95,9 @@ pub fn with_capacity<T>(capacity: usize) -> Result<Vec<T>> {
 /// **`Cow::clone` is not free.** A borrowed label clones a pointer, but an
 /// owned one copies its bytes through `handle_alloc_error` -- and the labels
 /// that reach an arena from `AffineLinearRun::admit` are owned, built by its
-/// own fallible formatter. Independent review found `Arena::allocate` cloning
-/// one *after* the free list had moved, which is the abort this task exists to
-/// remove wearing the type that was supposed to remove it.
+/// own fallible formatter. `Arena::allocate` clones one *after* the free list
+/// has moved, which is the abort this module exists to remove wearing the
+/// type that was supposed to remove it.
 pub fn clone_label(source: &crate::request::Label) -> Result<crate::request::Label> {
     Ok(match source {
         std::borrow::Cow::Borrowed(s) => std::borrow::Cow::Borrowed(s),

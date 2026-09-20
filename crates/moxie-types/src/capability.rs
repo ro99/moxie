@@ -205,10 +205,13 @@ impl SemanticKernelDescriptor {
     /// `Clone` grows three heap values -- the identifier, the operand list and
     /// the symbol list -- and every one of them aborts when the allocator
     /// refuses. Selection returns an owned descriptor on its **success** path,
-    /// which is the path a caller has no refusal to fall back to, and an
-    /// independent review failed one 32-byte allocation there and got
-    /// `SIGABRT`. Each buffer is reserved before it is filled, so a refusal is
-    /// a typed capacity error.
+    /// which is the path a caller has no refusal to fall back to. Each buffer
+    /// is reserved before it is filled, so a refusal is a typed capacity
+    /// error rather than an abort.
+    ///
+    /// `moxie-types` cannot depend on `moxie-memory` (the dependency runs the
+    /// other way), so this repeats its fallible-string vocabulary rather than
+    /// sharing it.
     pub fn try_clone(&self) -> crate::Result<Self> {
         fn no_room() -> crate::Error {
             crate::Error::CapacityExceeded {

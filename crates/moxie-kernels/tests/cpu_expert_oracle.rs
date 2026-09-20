@@ -331,11 +331,10 @@ fn the_reduction_matches_the_oracle_in_whichever_order_it_is_given() {
 /// A scaled reduction that leaves BF16's range is a typed error, not a quiet
 /// infinity.
 ///
-/// A review reached BF16 infinity from a single slot of 2.0, a unit
-/// coefficient and a **finite** scale, while this kernel returned `Ok(())` and
-/// `GroupedRun::reduce` reported success. Both operands were finite, so no
-/// earlier check could have caught it; the store is where it becomes
-/// unrepresentable, and the store is where it is refused.
+/// A single slot of 2.0, a unit coefficient and a **finite** scale are all
+/// individually representable, yet their FP32 product overflows BF16. Both
+/// operands are finite, so no earlier check can catch it; the store is where
+/// it becomes unrepresentable, and the store is where it is refused.
 #[test]
 fn a_scaled_reduction_that_overflows_bf16_is_a_typed_error() {
     let slots: Vec<u8> = to_bf16_bits(2.0f32).to_le_bytes().to_vec();

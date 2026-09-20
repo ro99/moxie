@@ -823,12 +823,10 @@ impl Drop for DeviceBuffer<'_> {
         //
         // **A failed synchronize is not a teardown error to ignore.** It is the
         // one answer that means "whether anything is still reading this is
-        // unknown", and the previous version freed anyway -- independent review
-        // named this as the physical half of the quarantine hole. When the
-        // context cannot be made current, or cannot be synchronized, the
-        // allocation is **permanently withheld**: leaking device memory at
-        // teardown is a bounded, visible cost, and freeing pages a live copy is
-        // reading is a silent wrong answer somewhere else.
+        // unknown". When the context cannot be made current, or cannot be
+        // synchronized, the allocation is **permanently withheld**: leaking
+        // device memory at teardown is a bounded, visible cost, and freeing
+        // pages a live copy is reading is a silent wrong answer somewhere else.
         unsafe {
             if ffi::cuCtxSetCurrent(self.ctx.raw()) != ffi::CUDA_SUCCESS {
                 self.ptr = 0;
@@ -910,7 +908,7 @@ impl<'a> TrustedImage<'a> {
 /// Rust enum label is never passed to the driver. So a `&CStr` that happens to
 /// begin with ELF or fatbin magic would be handed to the binary-image parser
 /// through what looks like the text path -- exactly the boundary the trusted-
-/// image type exists to keep closed. The second M0 review found that hole.
+/// image type exists to keep closed.
 ///
 /// This type closes it by construction: the bytes must be UTF-8 text, must not
 /// begin with any image magic the driver recognises, and must carry the
@@ -1075,8 +1073,8 @@ impl<'ctx> Module<'ctx> {
     ///
     /// `with_capacity` and `to_vec` abort when the allocator refuses, and this
     /// runs inside admission, where a caller has a typed refusal to return and
-    /// a reservation to hand back. Independent review found the callers being
-    /// made fallible while this stayed infallible underneath them.
+    /// a reservation to hand back: an infallible allocation here would abort
+    /// underneath a caller its own callers were made fallible for.
     pub fn resolve_all(self, names: &[String]) -> Result<ResolvedModule<'ctx>> {
         if names.is_empty() {
             return Err(Error::InvalidRequest {
@@ -1262,10 +1260,11 @@ mod tests {
 
     #[test]
     fn ptx_text_cannot_be_mistaken_for_a_binary_image() {
-        // Second review: `ModuleImage::Ptx(&CStr)` passed its pointer to the
-        // same auto-detecting entry point, so a short NUL-terminated buffer
-        // beginning with ELF magic reached the binary-image parser through the
-        // text path. The Rust label is not passed to CUDA.
+        // `ModuleImage::Ptx(&CStr)` must not pass its pointer to the same
+        // auto-detecting entry point a binary image uses, or a short
+        // NUL-terminated buffer beginning with ELF magic would reach the
+        // binary-image parser through the text path. The Rust label is not
+        // passed to CUDA.
         let elf = CString::new([0x7Fu8, b'E', b'L', b'F', b'x'].as_slice()).unwrap();
         assert!(PtxSource::new(&elf).is_err());
         let fatbin = CString::new([0x50u8, 0xED, 0x55, 0xBA, b'x'].as_slice()).unwrap();

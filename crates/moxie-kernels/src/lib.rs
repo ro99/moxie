@@ -65,9 +65,9 @@ pub const BF16_EXPERT_ABI: u32 = 1;
 /// W4A16 and W8A16 are two catalogue identities over the same code, because the
 /// only thing that differs between them is how a code is read out of a packed
 /// row. The group rule, the zero-point section and the scale encoding are
-/// runtime parameters. Two symbols here would be two implementations one review
-/// cycle later, and ADR 0003 is explicit that "W4A16 is an execution profile,
-/// AWQ/AutoRound are methods": neither is a licence for a kernel per source.
+/// runtime parameters. Two symbols here would drift into two implementations,
+/// and ADR 0003 is explicit that "W4A16 is an execution profile, AWQ/AutoRound
+/// are methods": neither is a licence for a kernel per source.
 pub const AFFINE_LINEAR: &str = "moxie_affine_linear_v2";
 pub const AFFINE_LINEAR_ABI: u32 = 2;
 /// The output tile the kernel's warp computes, and the tensor-core `k` step.
