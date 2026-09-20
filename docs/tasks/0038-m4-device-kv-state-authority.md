@@ -244,10 +244,66 @@ contract.
 - Everything named out of scope above: MLA, streaming, COW, prefix reuse, FP16
   cache, tensor cores, timing.
 
+## Progress — 2026-09-19, the second review's four blockers
+
+Review found four correctness blockers in the first two commits, two resource
+and precision gaps, and two pieces of evidence that had not been produced. All
+are closed; none of them was a matter of degree.
+
+1. **Placements, the page table and the launch were not bound to each other.**
+   A caller could write rows through one permutation, publish another valid
+   permutation, and launch against rows that were never written there — each
+   check passed because each looked at one of the three alone. A table now
+   carries the `history_base` its logical page zero names, so it is a view of
+   absolute rows; a write is checked against that view; a republication must
+   agree with the view it replaces wherever both describe a page that holds
+   written rows; and a launch must name the base the view describes.
+2. **Placement was not tied to a transaction or the frontier.** `placements`
+   took any position up to the admitted context, so an empty sequence could
+   place row 100, write it, publish one row, and leave the authority reporting
+   one row committed while the performer's high-water mark sat at 101 — with
+   both checks passing and row zero never written. Positions are the
+   authority's now: `stage(txn, rows)` reserves them at the frontier, one batch
+   at a time, and placements and publication both speak only of that batch.
+3. **A windowed abort left the retained base advanced.** The base was derived
+   from the published frontier, so a tentative append moved it and an abort left
+   it moved: at window 24 and headroom 8, a sequence at row 100 retained
+   64..100, staged eight rows, aborted, and retained 72..100 for ever after —
+   eight rows the window still admitted, lost to a transaction that was rolled
+   back. The base is now derived from the **committed** frontier plus the
+   admitted headroom, so the worst a transaction could do is priced in before it
+   starts and nothing it does can move it.
+4. **Truncation below a retained base was accepted.** The host store refuses the
+   equivalent rollback because those rows are not there; so does this now, with
+   `Error::Reclaimed` naming the layer and the base.
+5. **Cache precision was unvalidated, and unreported.** `DeviceKvSequence::new`
+   accepted any precision while everything below read two bytes as BF16 — and
+   FP16 has the same width and a different meaning. Non-BF16 is now
+   `Unsupported`, a zero window and zero headroom are refused as the host
+   geometry refuses them, and `StateRequirement` carries the key operand's
+   precision so a binder can reconcile graph, kernel and authority on one
+   encoding.
+6. **The direct-device path was charged for staging it never uses.** Every run
+   admitted query and output ranges plus a host readback, so a graph executing
+   on its own arena slots would have paid three times — and on a device whose
+   memory is nearly spoken for, that is an admissible plan being refused.
+   `Staging::DeviceHandles` admits the pages and the table and nothing else;
+   `attend` then refuses and names `attend_into`. The difference is asserted
+   exactly, at `2 · rows · heads · head_dim · 2` bytes.
+
+**Evidence that was missing and now exists.** The host comparison had run over
+24 of 32 rows and wrapped neither store, so it compared two mappings where
+neither modulus had bitten. `the_two_mappings_still_agree_after_the_ring_has_
+wrapped` gives both stores four pages — the host by windowing 24 rows with 8 of
+headroom, the device by windowing 16 with the eviction page it adds — appends a
+hundred rows through a 32-row ring, and checks every row against the host
+store's **own table bytes**, asserting that more than sixty of them sit on a
+reused page. And `abort_truncate_and_reappend_hold_on_device` exercises the
+three transaction shapes on hardware, checking each by what attention *answers*:
+an abort leaves the committed decode byte-identical, a truncation leaves the
+prefix's decode byte-identical, and a re-append changes the answer rather than
+replaying the dropped rows.
+
 ## Result, filled after work
 
 No completion is claimed: acceptance 4 is open, and with it the task.
-
-## Result, filled after work
-
-No completion is claimed: half of the bounded deliverable is not started.

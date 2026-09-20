@@ -1535,3 +1535,39 @@ is to assert they compute the same thing. They share one precondition check and
 one launch, and a fixture asserts byte equality between them. A separate
 implementation that computed something else would satisfy the sentence and break
 the contract.
+
+## 2026-09-19 — three checks that each looked at one third of the thing
+
+The review of the device KV binding found the same shape three times, and it is
+worth naming because every individual check was correct.
+
+Writes took placements, the page table took any non-aliasing permutation, and a
+launch checked the table's *length*. So a caller could write rows through one
+mapping, publish another, and attend against rows that were never written there
+— and nothing was wrong with any of the three checks. What was missing was that
+they were checks of three separate facts that only mean something together. The
+repair is one view: a table carries the base its logical page zero names, a
+write is checked against that view, a republication must agree with the view it
+replaces where both describe written rows, and a launch must name the base the
+view describes.
+
+The same shape in the authority: `placements` took a position, `publish` took a
+count, and neither knew about the other, so an empty sequence could place row
+100, write it, publish one row, and leave the frontier at 1 with a high-water
+mark at 101. Positions are the authority's to choose now, and a staged batch is
+one value carrying both the positions and the count.
+
+And the subtlest: the retained base was derived from the published frontier, so
+a *tentative* append moved it and an abort left it moved. Eight rows the window
+still admitted became permanently unreadable because of a transaction that was
+rolled back. The base now comes from the committed frontier plus the admitted
+undo headroom — the worst a transaction could do, priced in before it starts, so
+nothing it does can move it. That is what the headroom was admitted for, and it
+took a review reproducing it at window 24 to notice that the code was spending
+it twice.
+
+The lesson is not "add a check". All three were the same mistake: an invariant
+that spans several operations cannot be enforced by validating each one against
+its own arguments. It has to be expressed as a value they all have to speak
+about — a staged batch, a published view — so that the states that violate it
+cannot be constructed.
