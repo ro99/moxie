@@ -33,8 +33,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // which must mask on the layer's *declared* rule and not on a second enum that
 // drifts from it.
 pub use moxie_graph::{
-    Graph, GraphId, IndexEncoding, OpParams, StateEffect, ValueId, ValueRole, Visibility,
-    reciprocal_sqrt_scale,
+    Graph, GraphId, IndexEncoding, MlaAttentionDescriptor, OpParams, StateEffect, ValueId,
+    ValueRole, Visibility, reciprocal_sqrt_scale,
 };
 use moxie_graph::{GraphSignature, TensorSpec};
 use moxie_types::{DeviceUuid, Error, Precision, Result, SymbolTable, TensorLayout};
@@ -138,10 +138,20 @@ pub struct ResourceWorkload {
 /// heads of what width one row carries, and how much history the workload says
 /// is visible. Where those rows physically go is the authority's answer, and
 /// the executor asks it per append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateRequirementKind {
+    /// Conventional per-head key/value rows.
+    KvPages,
+    /// MLA's latent plus shared positional-rope row.
+    MlaLatent,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StateRequirement {
     /// The stage index of the node that appends to this state.
     pub stage: u32,
+    /// Which persistent state schema the requirement describes.
+    pub kind: StateRequirementKind,
     /// Which KV store the node reads and appends to, from `OpParams::Attention`.
     pub layer: u32,
     /// The state kind the node affects, as the graph declares it.
@@ -164,6 +174,10 @@ pub struct StateRequirement {
     /// conflated them would describe a decode as a prefill.
     pub appended_rows: u64,
     pub visible_tokens: u64,
+    /// The closed MLA descriptor when `kind` is [`StateRequirementKind::MlaLatent`].
+    /// Conventional KV requirements leave it unset rather than duplicating a
+    /// partial MLA shape in the plan.
+    pub mla: Option<MlaAttentionDescriptor>,
 }
 
 /// Inclusive node-stage lifetime. The terminal-output stage is `node_count`.
@@ -358,27 +372,65 @@ fn lower_with_ids(
                 .and_modify(|last| *last = (*last).max(stage))
                 .or_insert(stage);
         }
-        if let OpParams::Attention {
+        let requirement = match node.params {
+            OpParams::Attention {
+                heads,
+                kv_heads,
+                head_dim,
+                scale,
+                visibility,
+                layer,
+            } => {
+                // Graph construction already validates all three data operands
+                // as BF16 activations. The key carries the cache precision.
+                let ValueRole::Activation(precision) =
+                    graph.values()[node.inputs[1].0 as usize].role
+                else {
+                    unreachable!("GraphBuilder requires an activation role for the key operand")
+                };
+                Some((
+                    StateRequirementKind::KvPages,
+                    layer,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    scale,
+                    visibility,
+                    precision.get(),
+                    None,
+                ))
+            }
+            OpParams::MlaAttention { descriptor } => Some((
+                StateRequirementKind::MlaLatent,
+                descriptor.layer,
+                descriptor.heads,
+                descriptor.heads,
+                descriptor.query_head_dim()?,
+                1.0 / (descriptor.query_head_dim()? as f32).sqrt(),
+                descriptor.visibility,
+                descriptor.cache_precision.get(),
+                Some(descriptor),
+            )),
+            _ => None,
+        };
+        if let Some((
+            kind,
+            layer,
             heads,
             kv_heads,
             head_dim,
             scale,
             visibility,
-            layer,
-        } = node.params
+            cache_precision,
+            mla,
+        )) = requirement
         {
-            // Graph construction already validates all three data operands as
-            // BF16 activations. The key carries the cache precision.
-            let ValueRole::Activation(precision) = graph.values()[node.inputs[1].0 as usize].role
-            else {
-                unreachable!("GraphBuilder requires an activation role for the key operand")
-            };
-            let cache_precision = precision.get();
             state.try_reserve(1).map_err(|_| {
                 invalid("state", "the state requirement list could not be reserved")
             })?;
             state.push(StateRequirement {
                 stage,
+                kind,
                 layer,
                 effect: node.params.state_effect(),
                 heads,
@@ -389,6 +441,7 @@ fn lower_with_ids(
                 cache_precision,
                 appended_rows: workload.rows,
                 visible_tokens: workload.visible_tokens,
+                mla,
             });
         }
         let workspace = node.contract.workspace_upper_bound.eval(&symbols)?;
@@ -603,14 +656,16 @@ fn validate_workload(graph: &Graph, workload: ResourceWorkload) -> Result<()> {
             .get(node.0 as usize)
             .map(|n| &n.params)
             .ok_or_else(|| invalid("graph", "a state effect on a node that is not there"))?;
-        let servable =
-            matches!(params, OpParams::Attention { .. }) && effect == StateEffect::Appends;
+        let servable = matches!(
+            params,
+            OpParams::Attention { .. } | OpParams::MlaAttention { .. }
+        ) && effect == StateEffect::Appends;
         if !servable {
             return Err(Error::Unsupported {
                 capability: "stateful_resource_plan",
                 reason: format!(
-                    "node {} is {} with state effect {effect:?}, and only a paged attention \
-                     append has an admission contract in this planner",
+                    "node {} is {} with state effect {effect:?}, and only a paged or MLA \
+                     attention append has an admission contract in this planner",
                     node.0,
                     params.op().name()
                 ),
@@ -734,10 +789,12 @@ fn invalid(field: &'static str, detail: impl Into<String>) -> Error {
 mod tests {
     use super::*;
     use moxie_graph::{
-        GraphBuilder, Op, OpParams, OracleEvidence, OracleId, OracleRegistry, TensorSpec,
-        Visibility, reciprocal_sqrt_scale,
+        GraphBuilder, MlaAttentionDescriptor, Op, OpParams, OracleEvidence, OracleId,
+        OracleRegistry, RopeLayout, TensorSpec, Visibility, reciprocal_sqrt_scale,
     };
-    use moxie_types::{ActivationPrecision, Dim, Precision, SymbolId, WeightPrecision};
+    use moxie_types::{
+        ActivationPrecision, CachePrecision, Dim, Precision, SymbolId, WeightPrecision,
+    };
 
     const ORACLE: OracleId = OracleId("plan-test");
     const ROWS: SymbolId = SymbolId(44);
@@ -775,6 +832,7 @@ mod tests {
             Op::Residual,
             Op::VocabProjection,
             Op::Attention,
+            Op::MlaAttention,
         ] {
             registry
                 .register(
@@ -1072,6 +1130,69 @@ mod tests {
         let mut branch = workload(&stateful, 2);
         branch.phase = Phase::Verify;
         assert_eq!(lower(&stateful, branch).unwrap_err().kind(), "unsupported");
+    }
+
+    #[test]
+    fn mla_stateful_plan_reports_the_latent_descriptor() {
+        let descriptor = MlaAttentionDescriptor {
+            hidden: 4,
+            q_lora_rank: 2,
+            kv_lora_rank: 2,
+            qk_nope_head_dim: 2,
+            qk_rope_head_dim: 2,
+            v_head_dim: 2,
+            heads: 2,
+            rms_norm_eps: 1e-5,
+            rope_base: 10_000.0,
+            rope_layout: RopeLayout::Interleaved,
+            visibility: Visibility::Causal,
+            layer: 0,
+            cache_precision: CachePrecision::expect(Precision::Bf16),
+        };
+        let rows = Dim::symbol(ROWS);
+        let mut builder = GraphBuilder::new(ORACLE, ROWS);
+        let hidden = builder.input("hidden", activation(rows.clone(), 4));
+        let positions = builder.input(
+            "positions",
+            TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows]),
+        );
+        let mla_weight = |builder: &mut GraphBuilder, name: &str, shape: &[u64]| {
+            builder
+                .weight(
+                    name,
+                    TensorSpec::new(
+                        ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
+                        shape.iter().map(|d| Dim::constant(*d)).collect(),
+                    ),
+                )
+                .unwrap()
+        };
+        let q_a = mla_weight(&mut builder, "q_a", &[2, 4]);
+        let q_norm = mla_weight(&mut builder, "q_norm", &[2]);
+        let q_b = mla_weight(&mut builder, "q_b", &[8, 2]);
+        let kv_a = mla_weight(&mut builder, "kv_a", &[4, 4]);
+        let kv_norm = mla_weight(&mut builder, "kv_norm", &[2]);
+        let kv_b = mla_weight(&mut builder, "kv_b", &[8, 2]);
+        let output = mla_weight(&mut builder, "output", &[4, 4]);
+        let result = builder
+            .node(
+                OpParams::MlaAttention { descriptor },
+                &[
+                    hidden, positions, q_a, q_norm, q_b, kv_a, kv_norm, kv_b, output,
+                ],
+            )
+            .unwrap();
+        let graph = builder.finish(result, &registry()).unwrap();
+        let plan = lower(&graph, workload(&graph, 2)).unwrap();
+        assert_eq!(plan.state().len(), 1);
+        let requirement = plan.state()[0];
+        assert_eq!(requirement.kind, StateRequirementKind::MlaLatent);
+        assert_eq!(requirement.mla, Some(descriptor));
+        assert_eq!(requirement.head_dim, 4);
+        assert_eq!(requirement.scale, 0.5);
+        assert_ne!(requirement.scale, reciprocal_sqrt_scale(2));
+        assert_eq!(requirement.cache_precision, Precision::Bf16);
+        assert_eq!(requirement.visible_tokens, 17);
     }
 
     #[test]

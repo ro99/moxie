@@ -236,6 +236,15 @@ finish the handoff or continue independent assigned work. If delivery fails,
 preserve the report, inspect the target and retry only after resolving the
 failure; do not send an unbounded stream of duplicate prompts.
 
+An `agent_not_found` error on a name that was working earlier this session
+(observed 2026-09-21, mid-assignment, no process exit) does not by itself mean
+the worker died: Herdr can drop a name binding on a reconnect while the pane
+and its process survive untouched, with everything else — revision counters,
+terminal IDs — reset in the same event. Check with `herdr agent get <name>`
+or `herdr pane list`; if the pane is still there with its transcript intact,
+`herdr agent rename <pane-id> <name>` restores the binding and the retry
+succeeds. Only treat it as a dead worker if the pane itself is gone.
+
 The coordinator consumes each notification by assignment/job ID, checks its
 evidence, records the transition and sends the next assignment or needed answer.
 That response is the acknowledgment; no acknowledgment-of-acknowledgment loop.

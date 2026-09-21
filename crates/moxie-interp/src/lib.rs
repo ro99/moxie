@@ -38,13 +38,13 @@ pub mod kv;
 pub mod paged;
 pub mod tensor;
 
-use moxie_graph::{Bindings, Graph, Node, OpParams, ValueId};
-use moxie_oracles::{activation, attention, linear, norm, residual, rope, route};
-use moxie_state::{LogitsHandle, SequenceState};
+use moxie_graph::{Bindings, Graph, MlaAttentionDescriptor, Node, OpParams, ValueId};
+use moxie_oracles::{activation, attention, linear, mla, norm, residual, rope, route};
+use moxie_state::{LogitsHandle, MlaLatentDescriptor, SequenceState};
 use moxie_types::BranchId;
 use moxie_types::{Error, Result};
 
-pub use kv::{CacheId, CacheJournal, KvCache};
+pub use kv::{CacheId, CacheJournal, KvCache, MlaCacheRow};
 pub use tensor::{HostTensor, RouteTable, Value};
 
 pub(crate) fn try_vec<T>(capacity: usize) -> Result<Vec<T>> {
@@ -347,6 +347,37 @@ impl Interpreter {
         // it is a property of the graph and the cache, so it is checked here,
         // before anything is written.
         let graph_layers = graph.attention_layers().len();
+        let mut mla_descriptor = None;
+        let mut has_kv_attention = false;
+        for node in graph.nodes() {
+            match node.params {
+                OpParams::Attention { .. } => has_kv_attention = true,
+                OpParams::MlaAttention { descriptor } => {
+                    let descriptor = mla_state_descriptor(descriptor)?;
+                    if let Some(previous) = mla_descriptor
+                        && previous != descriptor
+                    {
+                        return Err(Error::InvalidArtifact {
+                            detail: "all MLA layers in one host cache must use the same latent \
+                                     descriptor"
+                                .into(),
+                        });
+                    }
+                    mla_descriptor = Some(descriptor);
+                }
+                _ => {}
+            }
+        }
+        if has_kv_attention && mla_descriptor.is_some() {
+            return Err(Error::InvalidArtifact {
+                detail: "a graph cannot mix conventional KV attention and MLA latent state".into(),
+            });
+        }
+        if let Some(descriptor) = mla_descriptor {
+            kv.check_mla_descriptor(descriptor)?;
+        } else {
+            kv.require_kv_pages()?;
+        }
         // A step publishes sequence state, and a graph that touches no state has
         // none to publish. The sixth review's second pass reached the same
         // atomicity defect through a `RoPE -> VocabProjection` graph with a
@@ -595,7 +626,27 @@ impl Interpreter {
         cancel: &Cancel,
     ) -> Result<(u64, LogitsHandle)> {
         for a in staged.drain(..) {
-            kv.append(a.layer, a.position, a.key, a.value)?;
+            match a {
+                StagedAppend::Kv {
+                    layer,
+                    position,
+                    key,
+                    value,
+                } => kv.append(layer, position, key, value)?,
+                StagedAppend::Mla {
+                    layer,
+                    position,
+                    latent,
+                    rope,
+                } => kv.append_mla(
+                    layer,
+                    MlaCacheRow {
+                        position,
+                        latent,
+                        rope,
+                    },
+                )?,
+            }
         }
         cancel.check("publish/append")?;
         state.execute(branch, rows as u64)?;
@@ -618,6 +669,15 @@ impl Interpreter {
                     Error::InvalidRequest {
                         field: "positions",
                         detail: "attention positions are not bound".into(),
+                    }
+                })?;
+                return try_clone_slice(v.as_index()?);
+            }
+            if let OpParams::MlaAttention { .. } = node.params {
+                let v = values[node.inputs[1].0 as usize].as_ref().ok_or_else(|| {
+                    Error::InvalidRequest {
+                        field: "positions",
+                        detail: "MLA positions are not bound".into(),
                     }
                 })?;
                 return try_clone_slice(v.as_index()?);
@@ -798,12 +858,20 @@ impl Interpreter {
                 // is what lets a multi-row prefill attend to its own earlier
                 // rows without those rows having been committed yet.
                 let mut history = kv.read_history(layer)?;
-                for a in staged.iter().filter(|a| a.layer == layer) {
-                    history.append(
-                        a.position,
-                        try_clone_slice(&a.key)?,
-                        try_clone_slice(&a.value)?,
-                    )?;
+                for a in staged.iter() {
+                    let StagedAppend::Kv {
+                        layer: staged_layer,
+                        position,
+                        key,
+                        value,
+                    } = a
+                    else {
+                        continue;
+                    };
+                    if *staged_layer != layer {
+                        continue;
+                    }
+                    history.append(*position, try_clone_slice(key)?, try_clone_slice(value)?)?;
                 }
                 let mut out = try_vec(q.data().len())?;
                 for (r, position) in positions.iter().enumerate().take(q.rows()) {
@@ -819,7 +887,7 @@ impl Interpreter {
                         requested_bytes: std::mem::size_of::<StagedAppend>() as u64,
                         available_bytes: 0,
                     })?;
-                    staged.push(StagedAppend {
+                    staged.push(StagedAppend::Kv {
                         layer,
                         position,
                         key,
@@ -839,6 +907,67 @@ impl Interpreter {
                     )?);
                 }
                 Value::Float(HostTensor::round_to_bf16(out, try_clone_slice(q.shape())?)?)
+            }
+            OpParams::MlaAttention { descriptor } => {
+                let hidden = input(0)?.as_float()?;
+                let q_a_proj = widen(input(2)?.as_float()?.data())?;
+                let q_a_layernorm = widen(input(3)?.as_float()?.data())?;
+                let q_b_proj = widen(input(4)?.as_float()?.data())?;
+                let kv_a_proj_with_mqa = widen(input(5)?.as_float()?.data())?;
+                let kv_a_layernorm = widen(input(6)?.as_float()?.data())?;
+                let kv_b_proj = widen(input(7)?.as_float()?.data())?;
+                let o_proj = widen(input(8)?.as_float()?.data())?;
+                let weights = mla::MlaWeights {
+                    q_a_proj: &q_a_proj,
+                    q_a_layernorm: &q_a_layernorm,
+                    q_b_proj: &q_b_proj,
+                    kv_a_proj_with_mqa: &kv_a_proj_with_mqa,
+                    kv_a_layernorm: &kv_a_layernorm,
+                    kv_b_proj: &kv_b_proj,
+                    o_proj: &o_proj,
+                };
+                let mut history = kv.read_mla_history(descriptor.layer)?;
+                for staged_row in staged.iter() {
+                    let StagedAppend::Mla {
+                        layer,
+                        position,
+                        latent,
+                        rope,
+                    } = staged_row
+                    else {
+                        continue;
+                    };
+                    if *layer == descriptor.layer {
+                        push_mla_history(&mut history, *position, latent, rope)?;
+                    }
+                }
+                let mut out = try_vec(hidden.rows() * descriptor.hidden as usize)?;
+                for (row, position) in positions.iter().enumerate().take(hidden.rows()) {
+                    let input = widen(hidden.row(row)?)?;
+                    let projection = mla::project(descriptor, &input, weights, *position)?;
+                    let token = projection.cached_token()?;
+                    let latent = round_bf16(&token.latent)?;
+                    let rope = round_bf16(&token.rope)?;
+                    push_mla_history(&mut history, *position, &latent, &rope)?;
+                    staged.try_reserve(1).map_err(|_| Error::CapacityExceeded {
+                        tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::CpuWorkspace)),
+                        requested_bytes: std::mem::size_of::<StagedAppend>() as u64,
+                        available_bytes: 0,
+                    })?;
+                    staged.push(StagedAppend::Mla {
+                        layer: descriptor.layer,
+                        position: *position,
+                        latent,
+                        rope,
+                    });
+                    let result =
+                        mla::attend(descriptor, &projection, &history, &kv_b_proj, &o_proj)?;
+                    out.extend(result.output.iter().map(|value| *value as f32));
+                }
+                Value::Float(HostTensor::round_to_bf16(
+                    out,
+                    try_shape2(hidden.rows(), descriptor.hidden as usize)?,
+                )?)
             }
             OpParams::Residual { scale } => {
                 let a = input(0)?.as_float()?;
@@ -1038,11 +1167,60 @@ impl Default for Interpreter {
     }
 }
 
-/// A KV append held until the whole step succeeds.
-#[derive(Debug, Clone)]
-struct StagedAppend {
-    layer: u32,
+fn mla_state_descriptor(descriptor: MlaAttentionDescriptor) -> Result<MlaLatentDescriptor> {
+    let kv_lora_rank =
+        usize::try_from(descriptor.kv_lora_rank).map_err(|_| moxie_types::DimError::Overflow)?;
+    let qk_rope_head_dim = usize::try_from(descriptor.qk_rope_head_dim)
+        .map_err(|_| moxie_types::DimError::Overflow)?;
+    MlaLatentDescriptor::new(kv_lora_rank, qk_rope_head_dim, descriptor.cache_precision)
+}
+
+fn widen(values: &[f32]) -> Result<Vec<f64>> {
+    let mut output = try_vec(values.len())?;
+    output.extend(values.iter().map(|value| *value as f64));
+    Ok(output)
+}
+
+fn round_bf16(values: &[f64]) -> Result<Vec<f32>> {
+    let mut output = try_vec(values.len())?;
+    output.extend(values.iter().map(|value| tensor::to_bf16(*value as f32)));
+    Ok(output)
+}
+
+fn push_mla_history(
+    history: &mut Vec<mla::MlaCachedToken>,
     position: u64,
-    key: Vec<f32>,
-    value: Vec<f32>,
+    latent: &[f32],
+    rope: &[f32],
+) -> Result<()> {
+    history
+        .try_reserve(1)
+        .map_err(|_| Error::CapacityExceeded {
+            tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::CpuWorkspace)),
+            requested_bytes: std::mem::size_of::<mla::MlaCachedToken>() as u64,
+            available_bytes: 0,
+        })?;
+    history.push(mla::MlaCachedToken {
+        position,
+        latent: widen(latent)?,
+        rope: widen(rope)?,
+    });
+    Ok(())
+}
+
+/// A state append held until the whole step succeeds.
+#[derive(Debug, Clone)]
+enum StagedAppend {
+    Kv {
+        layer: u32,
+        position: u64,
+        key: Vec<f32>,
+        value: Vec<f32>,
+    },
+    Mla {
+        layer: u32,
+        position: u64,
+        latent: Vec<f32>,
+        rope: Vec<f32>,
+    },
 }

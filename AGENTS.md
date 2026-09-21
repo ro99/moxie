@@ -21,19 +21,20 @@ reads as instructions.
 **M3 is accepted and complete** (owner, 2026-09-19; [task
 0036](docs/tasks/0036-m3-final-closure.md)). M1 is complete, M2's five items are
 all accepted, and M2's formal closure statement remains the owner's to make.
-**M4 is authorized**, and **M4.1 is accepted and complete** (owner, 2026-09-20;
-task 0038). **M4.2 is active**: [task
-0039](docs/tasks/0039-m4-mla-state-descriptors-and-glm52-fixtures.md)
-**accepted** (owner, 2026-09-21) — a shared MLA/state descriptor and a
-source-linked GLM-5.2 FP64 oracle, reviewed twice (two blocking RoPE-rotation
-defects found and repaired). [Task
-0040](docs/tasks/0040-m4-mla-reference-plan-admission.md) (proposed
-2026-09-21) is M4.2's second half — a reference (unabsorbed) MLA graph
-admitted and executed on the host interpreter, validated against task 0039's
-oracle. Absorbed/layout-specific paths and device execution remain deferred
-by the roadmap's own text until that lands. The
-[M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md) tracks
-this milestone's obligations.
+**M4 is authorized**. **M4.1 is accepted and complete** (owner, 2026-09-20;
+task 0038). **M4.2 is accepted and complete** (owner, 2026-09-21): [task
+0039](docs/tasks/0039-m4-mla-state-descriptors-and-glm52-fixtures.md) — a
+shared MLA/state descriptor and a source-linked GLM-5.2 FP64 oracle — and
+[task 0040](docs/tasks/0040-m4-mla-reference-plan-admission.md) — a reference
+(unabsorbed) MLA graph admitted through `moxie-plan` and executed on the host
+interpreter, validated against task 0039's oracle. Both tasks were reviewed
+twice; each round 1 found a real blocking defect (a RoPE-rotation output-
+placement bug in task 0039, an untested attention-score-scale formula in task
+0040) that round 2 repaired and re-review confirmed. **M4.3 through M4.5
+remain unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
+path are explicitly out of M4.2's scope and are not opened by its acceptance.
+The [M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md)
+tracks this milestone's obligations.
 
 | | |
 |---|---|

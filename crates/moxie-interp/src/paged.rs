@@ -2,7 +2,7 @@
 //! below are ephemeral oracle scratch, never another persistent cache or journal.
 use moxie_format::bf16::{bf16_bits_to_f32, f32_to_bf16_bits};
 use moxie_graph::{Bindings, Graph, OpParams, ValueId, Visibility};
-use moxie_oracles::attention::KvHistory;
+use moxie_oracles::{attention::KvHistory, mla::MlaCachedToken};
 use moxie_state::{KvRow, LogitsHandle, PagedExecutionBinding, PagedSequence, ROOT, Retention};
 use moxie_types::{Error, Precision, Result, StateTransactionId, SymbolTable};
 
@@ -96,10 +96,21 @@ impl<'a> PagedExecution<'a> {
 
 pub(crate) trait HistorySource {
     fn read_history(&self, layer: u32) -> Result<KvHistory>;
+
+    fn read_mla_history(&self, _layer: u32) -> Result<Vec<MlaCachedToken>> {
+        Err(Error::Unsupported {
+            capability: "mla_host_reference",
+            reason: "this execution source exposes conventional KV history only".into(),
+        })
+    }
 }
 impl HistorySource for KvCache {
     fn read_history(&self, layer: u32) -> Result<KvHistory> {
         Ok(self.history(layer)?.clone())
+    }
+
+    fn read_mla_history(&self, layer: u32) -> Result<Vec<MlaCachedToken>> {
+        self.mla_history(layer)
     }
 }
 impl HistorySource for PagedSequence {
@@ -362,7 +373,17 @@ impl Interpreter {
             for layer in 0..layer_count {
                 let row = staged
                     .iter()
-                    .find(|a| a.layer == layer as u32 && a.position == position)
+                    .find_map(|a| match a {
+                        super::StagedAppend::Kv {
+                            layer: row_layer,
+                            position: row_position,
+                            key,
+                            value,
+                        } if *row_layer == layer as u32 && *row_position == position => {
+                            Some((key.as_slice(), value.as_slice()))
+                        }
+                        _ => None,
+                    })
                     .ok_or_else(|| invalid("graph", "missing layer row"))?;
                 let encode = |data: &[f32]| -> Result<Vec<u8>> {
                     let mut out = try_vec(
@@ -373,7 +394,7 @@ impl Interpreter {
                     out.extend(data.iter().flat_map(|x| f32_to_bf16_bits(*x).to_le_bytes()));
                     Ok(out)
                 };
-                encoded.push((encode(&row.key)?, encode(&row.value)?));
+                encoded.push((encode(row.0)?, encode(row.1)?));
             }
             let mut views = try_vec(encoded.len())?;
             views.extend(encoded.iter().map(|(k, v)| KvRow { key: k, value: v }));

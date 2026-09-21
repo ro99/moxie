@@ -157,12 +157,10 @@ impl Op {
 
 /// The checked shape, positional and cache contract for [`Op::MlaAttention`].
 ///
-/// This is deliberately a descriptor rather than an `OpParams` variant for
-/// now. The current planner and interpreter intentionally refuse MLA; putting
-/// a variant in the executable graph would make that refusal look like an
-/// admitted execution path and would require a model/executor consumer before
-/// the reference algebra has been reviewed. The next MLA task can attach this
-/// closed descriptor to a node without inventing the geometry again.
+/// This is deliberately a closed descriptor carried by the executable
+/// `OpParams::MlaAttention` variant. The host reference planner/interpreter
+/// admit that unabsorbed path without inventing the geometry again; absorbed
+/// and device paths remain separate, unsupported capabilities.
 ///
 /// The weight shapes use the same row-major `[out, in]` convention as
 /// [`OpParams::Linear`]. The descriptor states the unfused path from the

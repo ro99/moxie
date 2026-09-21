@@ -1,6 +1,13 @@
 # Task 0040 — M4.2b a reference MLA graph executes on the host interpreter
 
-Status: proposed
+Status: **accepted** (owner, 2026-09-21). Built by Codex `luna`, independently
+reviewed and re-reviewed by Codex `sol`; two rounds — round 1 found a
+blocking (P1) test-coverage gap (the MLA attention score scale formula was
+correct but nothing pinned it against the wrong-dimension substitution, and
+the fixture's own tolerance was too loose to catch it through the shared
+oracle path) and a ponytail finding; round 2's repair was re-reviewed and
+accepted with no remaining finding. This closes M4.2's second half and
+roadmap deliverable M4.2 as a whole.
 
 ## Identity and authority
 
@@ -148,13 +155,54 @@ Status: proposed
 
 ## Result, filled after work
 
-- Changed shared owners and consumers; source commit:
-- Commands and result IDs; passed / failed / skipped separately:
-- Measured effect and uncertainty:
-- Deleted/replaced paths:
-- Remaining blockers and next bounded task:
+- **Changed shared owners and consumers; source commit:** uncommitted at
+  writeup, base `9a0f482` (task 0039's acceptance commit), branch `main`.
+  `crates/moxie-graph/src/graph.rs` and `lib.rs` (+`OpParams::MlaAttention`
+  variant carrying `MlaAttentionDescriptor`, closing the gap task 0039 left
+  open by name), `crates/moxie-plan/src/lib.rs` (+`StateRequirementKind`
+  distinguishing `KvPages`/`MlaLatent`, `stateful_resource_plan` narrowed for
+  `OpParams::MlaAttention` the same way it already was for `Op::Attention`,
+  score scale derived as `1/sqrt(query_head_dim)` matching the legacy
+  source's dot-then-scale ordering), `crates/moxie-interp/src/kv.rs` (+MLA
+  payload variant inside the existing `KvCache`, same `CacheOwner`/
+  `SequenceState` provenance, explicit typed refusal on
+  conventional/MLA cache cross-use in either direction — no second cache
+  authority), `crates/moxie-interp/src/lib.rs` and `paged.rs` (interpreter
+  plumbing for the new cache shape), `crates/moxie-interp/tests/mla_reference.rs`
+  (new), `docs/evidence/support-matrix.md` (MLA moves from "no admission
+  contract" to "host reference execution only").
+- **Commands and result IDs; passed / failed / skipped separately:**
+  **Passed** (round 2, final): `cargo test -p moxie-plan --lib --locked`
+  20/20; `cargo test -p moxie-interp --test mla_reference --locked` 2/2;
+  `cargo test -p moxie-oracles --lib mla::tests --locked` 4/4; `cargo test --workspace --locked`
+  full pass; both clippy lanes `-D warnings`; CUDA-feature workspace clippy;
+  `arch-check` (79 rejected, 21 accepted, 13 rules); `spec-check` (10 docs);
+  `cargo fmt --all -- --check`; `git diff --check`. **Failed:** none
+  surviving — round 1's coverage gap (score-scale formula correct but
+  untested against the wrong-dimension substitution) is repaired: the plan
+  test now asserts `requirement.head_dim == 4`, `requirement.scale == 0.5`,
+  and explicitly `requirement.scale != reciprocal_sqrt_scale(2)` (the
+  wrong-dimension value, ≈0.7071, for this fixture's `v_head_dim = 2`) —
+  independently confirmed meaningful, not vacuous, by the reviewer. **Skipped:**
+  GPU, driver-feature and checkpoint-weight lanes — out of scope by the task
+  contract.
+- **Measured effect and uncertainty:** no timing, no performance claim
+  (O6/O7 open). Correctness evidence: a 3-token prefill plus one decode step
+  reads the committed latent cache back and matches `moxie_oracles::mla`'s
+  FP64 oracle within a predeclared 0.015625 bound; the reviewer independently
+  confirmed this bound is load-bearing (a self-only decode, skipping the
+  cache read, misses by 0.140 — well outside the gate). Cancellation and
+  truncation each leave prior latent rows byte-for-value unchanged, checked
+  against saved prefill rows after a distinct decode suffix, not merely
+  asserted.
+- **Deleted/replaced paths:** two redundant no-op norm-gain fills in
+  `mla_reference.rs`, removed per the reviewer's round-1 ponytail finding.
+- **Remaining blockers and next bounded task:** device (GPU) execution of
+  the reference MLA path and the absorbed/layout-specific fast path both
+  remain unopened tasks — the roadmap's own ordering keeps them behind this
+  task's acceptance, not automatically unblocked by it. The DSA/sparse
+  indexer half of the GLM-5.2 checkpoint remains completely untouched.
 
-Do not fill acceptance with "MLA works" or "GLM-5.2 supported." Missing
-oracle, shape or ownership evidence is not an accepted task. Device execution
-and absorbed/fused attention remain separate, later tasks even after this one
-is accepted.
+Owner acceptance is requested for this scope only: reference (unabsorbed) MLA
+plan admission and host execution, not device execution, not the absorbed
+path, not GLM-5.2 model support.

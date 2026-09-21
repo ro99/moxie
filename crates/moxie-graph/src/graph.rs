@@ -33,7 +33,10 @@ use moxie_types::{
     WeightPrecision,
 };
 
-use crate::{Op, OpContract, OracleId, OracleRegistry, PartitionRule, StateEffect, Visibility};
+use crate::{
+    MlaAttentionDescriptor, Op, OpContract, OracleId, OracleRegistry, PartitionRule, StateEffect,
+    Visibility,
+};
 
 /// Process-unique identity of one immutable validated graph.
 ///
@@ -318,6 +321,16 @@ pub enum OpParams {
         visibility: Visibility,
         /// Which KV store this node reads and appends to.
         layer: u32,
+    },
+    /// The unabsorbed MLA reference composition.
+    ///
+    /// The operands are `(hidden, positions, q_a_proj, q_a_layernorm,
+    /// q_b_proj, kv_a_proj_with_mqa, kv_a_layernorm, kv_b_proj, o_proj)`.
+    /// The descriptor keeps the projection, RoPE and latent-cache geometry on
+    /// the node; the host interpreter dispatches each stage to the shared MLA
+    /// oracle rather than inventing a second algebra or an absorbed path.
+    MlaAttention {
+        descriptor: MlaAttentionDescriptor,
     },
     Residual {
         /// The factor applied after the sum, at the BF16 boundary:
@@ -648,6 +661,7 @@ impl OpParams {
             OpParams::GeGlu { .. } => Op::GeGlu,
             OpParams::Rope { .. } => Op::Rope,
             OpParams::Attention { .. } => Op::Attention,
+            OpParams::MlaAttention { .. } => Op::MlaAttention,
             OpParams::Residual { .. } => Op::Residual,
             OpParams::VocabProjection { .. } => Op::VocabProjection,
             OpParams::Route { .. } => Op::Route,
@@ -676,7 +690,9 @@ impl OpParams {
             }
             // Head ownership, GQA KV replication and the output reduction are
             // document 04's M5 work. Undetermined until then, deliberately.
-            OpParams::Attention { .. } => PartitionRule::NotDetermined,
+            OpParams::Attention { .. } | OpParams::MlaAttention { .. } => {
+                PartitionRule::NotDetermined
+            }
             // Replicated, and that is a correctness requirement rather than a
             // cost choice. Every rank must reach the same selection from the
             // same row: a router sharded over its expert axis would reduce
@@ -695,7 +711,7 @@ impl OpParams {
     /// What this operation does to sequence state.
     pub fn state_effect(&self) -> StateEffect {
         match self {
-            OpParams::Attention { .. } => StateEffect::Appends,
+            OpParams::Attention { .. } | OpParams::MlaAttention { .. } => StateEffect::Appends,
             _ => StateEffect::None,
         }
     }
@@ -775,11 +791,12 @@ impl OpParams {
         match self {
             OpParams::Embedding { .. } => 2, // tokens, table
             OpParams::Linear { bias, .. } => 2 + usize::from(*bias),
-            OpParams::RmsNorm { .. } => 2,   // x, gain
-            OpParams::SwiGlu { .. } => 2,    // gate, up
-            OpParams::GeGlu { .. } => 2,     // gate, up
-            OpParams::Rope { .. } => 2,      // x, positions
-            OpParams::Attention { .. } => 4, // q, k, v, positions
+            OpParams::RmsNorm { .. } => 2,      // x, gain
+            OpParams::SwiGlu { .. } => 2,       // gate, up
+            OpParams::GeGlu { .. } => 2,        // gate, up
+            OpParams::Rope { .. } => 2,         // x, positions
+            OpParams::Attention { .. } => 4,    // q, k, v, positions
+            OpParams::MlaAttention { .. } => 9, // hidden, positions, seven MLA weights
             OpParams::Residual { .. } => 2,
             OpParams::VocabProjection { .. } => 2, // hidden, table
             // `route_operands` is the one statement of which operands a
@@ -882,6 +899,7 @@ impl OpParams {
                 }
                 Ok(())
             }
+            OpParams::MlaAttention { descriptor } => descriptor.validate(),
             OpParams::Embedding { scale, .. } => {
                 if !(scale.is_finite() && scale > 0.0) {
                     return Err(Error::InvalidRequest {
@@ -1053,6 +1071,7 @@ fn position_operand(params: &OpParams) -> Option<usize> {
     match params {
         OpParams::Rope { .. } => Some(1),
         OpParams::Attention { .. } => Some(3),
+        OpParams::MlaAttention { .. } => Some(1),
         _ => None,
     }
 }
@@ -1165,6 +1184,7 @@ impl Graph {
             .iter()
             .filter_map(|n| match n.params {
                 OpParams::Attention { layer, .. } => Some(layer),
+                OpParams::MlaAttention { descriptor } => Some(descriptor.layer),
                 _ => None,
             })
             .collect();
@@ -1300,11 +1320,21 @@ impl GraphBuilder {
         // One attention node per KV layer. Two nodes sharing a layer index would
         // both append this step's keys to the same history, so the second would
         // attend over a history containing the first's rows twice.
-        if let OpParams::Attention { layer, .. } = params
-            && let Some(clash) = self
-                .nodes
-                .iter()
-                .find(|n| matches!(n.params, OpParams::Attention { layer: l, .. } if l == layer))
+        let state_layer = match params {
+            OpParams::Attention { layer, .. } => Some(layer),
+            OpParams::MlaAttention { descriptor } => Some(descriptor.layer),
+            _ => None,
+        };
+        if let Some(layer) = state_layer
+            && let Some(clash) = self.nodes.iter().find(|n| {
+                matches!(
+                    n.params,
+                    OpParams::Attention { layer: l, .. } if l == layer
+                ) || matches!(
+                    n.params,
+                    OpParams::MlaAttention { descriptor } if descriptor.layer == layer
+                )
+            })
         {
             return Err(Error::InvalidArtifact {
                 detail: format!(
@@ -1435,6 +1465,15 @@ impl GraphBuilder {
             if s(i).role.is_index() || s(i).role.is_route() {
                 return Err(bad(format!(
                     "input {i} must be a float role, got {:?}",
+                    s(i).role
+                )));
+            }
+            Ok(())
+        };
+        let want_weight = |i: usize| -> Result<()> {
+            if !matches!(s(i).role, ValueRole::Weight(_)) {
+                return Err(bad(format!(
+                    "input {i} must be a weight role, got {:?}",
                     s(i).role
                 )));
             }
@@ -1581,6 +1620,53 @@ impl GraphBuilder {
                     return Err(bad("one position per row is required".into()));
                 }
                 s(0).shape.clone()
+            }
+            OpParams::MlaAttention { descriptor } => {
+                descriptor.validate()?;
+                want_activation(0)?;
+                rank(0, 2)?;
+                dim_is(0, 1, descriptor.hidden)?;
+                want_index(1)?;
+                rank(1, 1)?;
+                if s(1).shape[0] != s(0).shape[0] {
+                    return Err(bad("one position per row is required".into()));
+                }
+
+                let (q_a_rows, q_a_cols) = descriptor.q_a_proj_shape()?;
+                let (q_b_rows, q_b_cols) = descriptor.q_b_proj_shape()?;
+                let (kv_a_rows, kv_a_cols) = descriptor.kv_a_proj_shape()?;
+                let (kv_b_rows, kv_b_cols) = descriptor.kv_b_proj_shape()?;
+                let (o_rows, o_cols) = descriptor.o_proj_shape()?;
+                for (i, (rows, cols)) in [
+                    (q_a_rows, q_a_cols),
+                    (q_b_rows, q_b_cols),
+                    (kv_a_rows, kv_a_cols),
+                    (kv_b_rows, kv_b_cols),
+                    (o_rows, o_cols),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let input = [2, 4, 5, 7, 8][i];
+                    want_weight(input)?;
+                    rank(input, 2)?;
+                    dim_is(input, 0, rows)?;
+                    dim_is(input, 1, cols)?;
+                }
+                for input in [3, 6] {
+                    want_weight(input)?;
+                    rank(input, 1)?;
+                    dim_is(
+                        input,
+                        0,
+                        if input == 3 {
+                            descriptor.q_lora_rank
+                        } else {
+                            descriptor.kv_lora_rank
+                        },
+                    )?;
+                }
+                vec![s(0).shape[0].clone(), Dim::constant(descriptor.hidden)]
             }
             OpParams::Residual { .. } => {
                 want_float(0)?;
@@ -1781,6 +1867,7 @@ impl GraphBuilder {
             .iter()
             .filter_map(|n| match n.params {
                 OpParams::Attention { layer, .. } => Some(layer),
+                OpParams::MlaAttention { descriptor } => Some(descriptor.layer),
                 _ => None,
             })
             .collect();

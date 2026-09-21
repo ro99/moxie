@@ -10,9 +10,30 @@
 //! `StateKind::KvPages` is `RestoreCapability::Truncate`, and [`KvCache::rollback_to`]
 //! is what that means physically.
 
-use moxie_oracles::attention::KvHistory;
-use moxie_state::{PrefixLineage, SequenceId, SequenceState};
+use moxie_oracles::{attention::KvHistory, mla::MlaCachedToken};
+use moxie_state::{MlaLatentDescriptor, PrefixLineage, SequenceId, SequenceState, StateKind};
 use moxie_types::{BranchId, Error, Result};
+
+use crate::tensor::is_bf16_valued;
+
+/// One BF16-valued row in the latent MLA cache.
+///
+/// The cache keeps the physical host representation as `f32`, just like
+/// [`KvHistory`]'s rows. Every element is checked to already be a BF16 value at
+/// append time; the oracle-facing conversion widens those values to `f64` only
+/// while evaluating a step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MlaCacheRow {
+    pub position: u64,
+    pub latent: Vec<f32>,
+    pub rope: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct MlaPayload {
+    descriptor: MlaLatentDescriptor,
+    layers: Vec<Vec<MlaCacheRow>>,
+}
 
 /// Which sequence, branch and version of the prefix a cache holds.
 ///
@@ -140,6 +161,10 @@ impl CacheId {
 #[derive(Debug)]
 pub struct KvCache {
     layers: Vec<KvHistory>,
+    /// The same cache authority can carry either conventional KV rows or MLA
+    /// latent rows. Keeping the owner, journal and lineage fields on this one
+    /// type is deliberate: MLA does not get a second cache-ownership scheme.
+    mla: Option<MlaPayload>,
     owner: CacheOwner,
     id: CacheId,
     /// The transaction open on this cache, if any.
@@ -182,6 +207,60 @@ impl KvCache {
         })?;
         Ok(Self {
             layers: vec![KvHistory::new(); layers],
+            mla: None,
+            owner: CacheOwner {
+                sequence: state.id(),
+                branch,
+                stamps: vec![lineage],
+            },
+            id: CacheId::next(),
+            open_txn: None,
+            next_txn: 1,
+        })
+    }
+
+    /// An MLA latent cache for `layers` state layers, bound to `branch`.
+    ///
+    /// It uses the same owner, lineage and append-only journal as the dense KV
+    /// cache. The sequence schema must name `MlaLatent`; the descriptor is the
+    /// physical row contract and is checked again when a graph executes.
+    pub fn for_mla_branch(
+        layers: usize,
+        descriptor: MlaLatentDescriptor,
+        state: &SequenceState,
+        branch: BranchId,
+    ) -> Result<Self> {
+        let descriptor = MlaLatentDescriptor::new(
+            descriptor.kv_lora_rank,
+            descriptor.qk_rope_head_dim,
+            descriptor.precision,
+        )?;
+        if !state.schema().contains(&StateKind::MlaLatent) {
+            return Err(Error::InvalidRequest {
+                field: "state",
+                detail: "an MLA cache requires StateKind::MlaLatent in the sequence schema".into(),
+            });
+        }
+        let at = state.frontiers(branch)?.executed;
+        if at != 0 {
+            return Err(Error::InvalidRequest {
+                field: "branch",
+                detail: format!(
+                    "{branch} has already executed {at} token(s); an empty MLA cache cannot \
+                     stand in for that history"
+                ),
+            });
+        }
+        let lineage = state.lineage_at(branch, 0)?.ok_or(Error::InvalidRequest {
+            field: "branch",
+            detail: format!("prefix 0 is not occupied on {branch}"),
+        })?;
+        Ok(Self {
+            layers: Vec::new(),
+            mla: Some(MlaPayload {
+                descriptor,
+                layers: vec![Vec::new(); layers],
+            }),
             owner: CacheOwner {
                 sequence: state.id(),
                 branch,
@@ -219,6 +298,7 @@ impl KvCache {
         }
         Ok(Self {
             layers: self.layers.clone(),
+            mla: self.mla.clone(),
             owner: self.owner.clone(),
             id: CacheId::next(),
             open_txn: None,
@@ -261,6 +341,37 @@ impl KvCache {
             });
         }
         self.check_stamp(state, branch, executed)
+    }
+
+    /// Require the cache schema selected by an MLA graph.
+    pub(crate) fn check_mla_descriptor(&self, expected: MlaLatentDescriptor) -> Result<()> {
+        let Some(mla) = &self.mla else {
+            return Err(Error::InvalidRequest {
+                field: "mla_cache",
+                detail: "an MLA graph cannot execute against conventional KV pages".into(),
+            });
+        };
+        if mla.descriptor != expected {
+            return Err(Error::InvalidRequest {
+                field: "mla_descriptor",
+                detail: format!(
+                    "cache descriptor {:?} does not match graph descriptor {:?}",
+                    mla.descriptor, expected
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuse a conventional attention graph from using an MLA latent cache.
+    pub(crate) fn require_kv_pages(&self) -> Result<()> {
+        if self.mla.is_some() {
+            return Err(Error::InvalidRequest {
+                field: "kv_cache",
+                detail: "a conventional attention graph cannot execute against an MLA cache".into(),
+            });
+        }
+        Ok(())
     }
 
     /// Compare what the cache remembers about `prefix` with what the state says.
@@ -310,7 +421,7 @@ impl KvCache {
         // that was already ragged. Inside a transaction that is simply an
         // error; it does not have to be unreachable to be safe.
         if self.len() as u64 != executed || !self.is_coherent() {
-            let lens: Vec<usize> = self.layers.iter().map(KvHistory::len).collect();
+            let lens = self.layer_lengths();
             return Err(Error::InvalidArtifact {
                 detail: format!(
                     "the cache layers hold {lens:?} position(s), not {executed} each,                      which is what the branch has executed"
@@ -334,7 +445,9 @@ impl KvCache {
     }
 
     pub fn layers(&self) -> usize {
-        self.layers.len()
+        self.mla
+            .as_ref()
+            .map_or(self.layers.len(), |mla| mla.layers.len())
     }
 
     /// Open a transaction: record what an abort would have to put back.
@@ -358,7 +471,7 @@ impl KvCache {
         Ok(CacheJournal {
             cache: self.id,
             txn,
-            lengths: self.layers.iter().map(KvHistory::len).collect(),
+            lengths: self.layer_lengths(),
             stamps: self.owner.stamps.len(),
         })
     }
@@ -416,8 +529,14 @@ impl KvCache {
     /// past that check the restoration itself cannot fail: it is truncation.
     pub fn abort(&mut self, journal: CacheJournal) -> Result<()> {
         self.check_journal(&journal)?;
-        for (l, n) in self.layers.iter_mut().zip(&journal.lengths) {
-            l.truncate(*n as u64);
+        if let Some(mla) = &mut self.mla {
+            for (layer, n) in mla.layers.iter_mut().zip(&journal.lengths) {
+                layer.truncate(*n);
+            }
+        } else {
+            for (l, n) in self.layers.iter_mut().zip(&journal.lengths) {
+                l.truncate(*n as u64);
+            }
         }
         self.owner.stamps.truncate(journal.stamps);
         self.open_txn = None;
@@ -434,7 +553,57 @@ impl KvCache {
         &self.layers
     }
 
+    /// The MLA rows, when this is an MLA cache. Conventional KV caches return
+    /// a typed refusal rather than exposing an empty slice as if it were a
+    /// valid latent history.
+    pub fn mla_contents(&self) -> Result<&[Vec<MlaCacheRow>]> {
+        self.mla
+            .as_ref()
+            .map(|mla| mla.layers.as_slice())
+            .ok_or(Error::InvalidRequest {
+                field: "mla_cache",
+                detail: "this is a conventional KV cache, not an MLA cache".into(),
+            })
+    }
+
+    /// Read one latent layer in the FP64 token form consumed by the shared MLA
+    /// oracle. The stored rows remain BF16-valued host data.
+    pub(crate) fn mla_history(&self, layer: u32) -> Result<Vec<MlaCachedToken>> {
+        let rows = self
+            .mla
+            .as_ref()
+            .ok_or(Error::InvalidRequest {
+                field: "mla_cache",
+                detail: "this is a conventional KV cache, not an MLA cache".into(),
+            })?
+            .layers
+            .get(layer as usize)
+            .ok_or(Error::InvalidRequest {
+                field: "layer",
+                detail: format!("layer {layer} of {}", self.layers()),
+            })?;
+        let mut history = crate::try_vec(rows.len())?;
+        for row in rows {
+            let mut latent = crate::try_vec(row.latent.len())?;
+            latent.extend(row.latent.iter().map(|value| *value as f64));
+            let mut rope = crate::try_vec(row.rope.len())?;
+            rope.extend(row.rope.iter().map(|value| *value as f64));
+            history.push(MlaCachedToken {
+                position: row.position,
+                latent,
+                rope,
+            });
+        }
+        Ok(history)
+    }
+
     pub fn history(&self, layer: u32) -> Result<&KvHistory> {
+        if self.mla.is_some() {
+            return Err(Error::InvalidRequest {
+                field: "kv_cache",
+                detail: "this cache stores MLA latent rows, not conventional KV histories".into(),
+            });
+        }
         self.layers
             .get(layer as usize)
             .ok_or(Error::InvalidRequest {
@@ -450,6 +619,12 @@ impl KvCache {
         key: Vec<f32>,
         value: Vec<f32>,
     ) -> Result<()> {
+        if self.mla.is_some() {
+            return Err(Error::InvalidRequest {
+                field: "kv_cache",
+                detail: "conventional KV rows cannot be appended to an MLA cache".into(),
+            });
+        }
         let n = self.layers.len();
         self.layers
             .get_mut(layer as usize)
@@ -458,6 +633,70 @@ impl KvCache {
                 detail: format!("layer {layer} of {n}"),
             })?
             .append(position, key, value)
+    }
+
+    /// Append one BF16 latent/rope row to an MLA cache's staged transaction.
+    pub(crate) fn append_mla(&mut self, layer: u32, row: MlaCacheRow) -> Result<()> {
+        let mla = self.mla.as_mut().ok_or(Error::InvalidRequest {
+            field: "mla_cache",
+            detail: "MLA rows cannot be appended to a conventional KV cache".into(),
+        })?;
+        let expected_latent = mla.descriptor.kv_lora_rank;
+        let expected_rope = mla.descriptor.qk_rope_head_dim;
+        if row.latent.len() != expected_latent || row.rope.len() != expected_rope {
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "MLA row has latent/rope lengths {}/{}, expected {expected_latent}/{expected_rope}",
+                    row.latent.len(),
+                    row.rope.len()
+                )
+                .into(),
+            });
+        }
+        if row
+            .latent
+            .iter()
+            .chain(&row.rope)
+            .any(|value| !value.is_finite() || !is_bf16_valued(*value))
+        {
+            return Err(Error::InvalidArtifact {
+                detail: "MLA cache rows must contain finite BF16-valued elements".into(),
+            });
+        }
+        let layer_count = mla.layers.len();
+        let target = mla
+            .layers
+            .get_mut(layer as usize)
+            .ok_or(Error::InvalidRequest {
+                field: "layer",
+                detail: format!("layer {layer} of {layer_count}"),
+            })?;
+        if row.position != target.len() as u64 {
+            return Err(Error::InvalidRequest {
+                field: "position",
+                detail: format!(
+                    "appending position {} to an MLA history holding {} row(s) leaves a gap",
+                    row.position,
+                    target.len()
+                ),
+            });
+        }
+        if row.position.checked_add(1).is_none() {
+            return Err(Error::InvalidRequest {
+                field: "position",
+                detail: format!(
+                    "appending position {} would overflow the MLA history endpoint",
+                    row.position
+                ),
+            });
+        }
+        target.try_reserve(1).map_err(|_| Error::CapacityExceeded {
+            tier: Some(moxie_types::Tier::Host(moxie_types::HostTier::CpuWorkspace)),
+            requested_bytes: std::mem::size_of::<MlaCacheRow>() as u64,
+            available_bytes: 0,
+        })?;
+        target.push(row);
+        Ok(())
     }
 
     /// Drop everything at or after `prefix`, on every layer, and re-stamp the
@@ -503,8 +742,14 @@ impl KvCache {
         // is the bypass the fifth review found -- it certifies whatever survived
         // the truncation, including bytes for positions that were rewritten.
         self.check_stamp(state, branch, prefix)?;
-        for l in &mut self.layers {
-            l.truncate(prefix);
+        if let Some(mla) = &mut self.mla {
+            for layer in &mut mla.layers {
+                layer.truncate(prefix as usize);
+            }
+        } else {
+            for l in &mut self.layers {
+                l.truncate(prefix);
+            }
         }
         self.owner.stamps.truncate(prefix as usize + 1);
         Ok(())
@@ -512,7 +757,10 @@ impl KvCache {
 
     /// The number of positions held, which must agree across layers.
     pub fn len(&self) -> usize {
-        self.layers.first().map(KvHistory::len).unwrap_or(0)
+        self.mla.as_ref().map_or_else(
+            || self.layers.first().map(KvHistory::len).unwrap_or(0),
+            |mla| mla.layers.first().map(Vec::len).unwrap_or(0),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -525,7 +773,17 @@ impl KvCache {
     /// which is precisely what staging appends is meant to prevent.
     pub fn is_coherent(&self) -> bool {
         let n = self.len();
-        self.layers.iter().all(|l| l.len() == n)
+        self.mla.as_ref().map_or_else(
+            || self.layers.iter().all(|l| l.len() == n),
+            |mla| mla.layers.iter().all(|layer| layer.len() == n),
+        )
+    }
+
+    fn layer_lengths(&self) -> Vec<usize> {
+        self.mla.as_ref().map_or_else(
+            || self.layers.iter().map(KvHistory::len).collect(),
+            |mla| mla.layers.iter().map(Vec::len).collect(),
+        )
     }
 }
 
