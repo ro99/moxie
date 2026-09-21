@@ -22,14 +22,13 @@ cuda = [
     # accepted oracle. The composition root may reach it; no production crate
     # does.
     "dep:moxie-oracles",
-    # Task 0038: the 32,768-row gate is driven through the state authority,
-    # which places every row and publishes the mapping. The composition root is
-    # where the authority and the performer meet; no production crate holds
-    # both.
+    # Task 0038: the 32,768-row gate drives the executor's production binding
+    # through the state authority, which places every row and publishes the
+    # mapping.
     "dep:moxie-state",
     "moxie-cuda/driver",
     "moxie-kernels/fatbin",
-    "moxie-executor/driver",
+    "moxie-executor/paged-attention-test-hooks",
 ]
 
 [dependencies]

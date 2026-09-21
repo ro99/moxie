@@ -794,12 +794,8 @@ const BATTERY_T0028: &[Mutation] = &[
         // is the one substitution that puts the abort back everywhere at once.
         name: "the-fallible-sink-grows-infallibly",
         file: "crates/moxie-executor/src/affine_linear.rs",
-        from: r#"    match sink.write_fmt(args) {
-        Ok(()) => sink.0,
-        Err(_) => String::new(),
-    }"#,
-        to: r#"    let _ = &sink;
-    args.to_string()"#,
+        from: r#"    moxie_memory::fallible::text(args).unwrap_or_default()"#,
+        to: r#"    args.to_string()"#,
         expect: Expect::Caught,
     },
     Mutation {
@@ -1143,4 +1139,128 @@ const BATTERY_T0029: &[Mutation] = &[
 const BUILDS_T0029: &[&[&str]] = &[
     &["-p", "moxie-memory", "--tests"],
     &["-p", "moxie-executor", "--features", "driver", "--tests"],
+];
+
+/// The final paged-attention binding's host, device and oracle gates.
+const LANES_T0037: &[Lane] = &[
+    Lane { name: "state", argv: &[r#"test"#, r#"-p"#, r#"moxie-state"#, r#"--lib"#, r#"--offline"#, r#"--locked"#, r#"device::tests"#] },
+    Lane { name: "oracle", argv: &[r#"test"#, r#"-p"#, r#"moxie-oracles"#, r#"--lib"#, r#"--offline"#, r#"--locked"#, r#"attention::tests"#] },
+    Lane { name: "binding", argv: &[r#"test"#, r#"-p"#, r#"moxie-executor"#, r#"--features"#, r#"paged-attention-test-hooks"#, r#"--offline"#, r#"--locked"#, r#"--test"#, r#"paged_attention_device"#] },
+    Lane { name: "device", argv: &[r#"xtask-cuda"#, r#"test-gpu"#, r#"--profile"#, r#"sm120"#] },
+];
+
+/// T0037: can the common kernel and its final state binding be wrong while
+/// their acceptance gates still pass?
+const BATTERY_T0037: &[Mutation] = &[
+    Mutation {
+        name: "one-layer-advances-a-multi-layer-frontier",
+        file: "crates/moxie-state/src/device.rs",
+        from: r#"        if self.completed_layers.iter().all(|done| *done) {"#,
+        to: r#"        if true {"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "commit-does-not-advance-retention",
+        file: "crates/moxie-state/src/device.rs",
+        from: r#"        let watermark_after = self.committed_high_water.max(self.rows);"#,
+        to: r#"        let watermark_after = self.committed_high_water;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "partial-page-view-publication-does-not-poison",
+        file: "crates/moxie-state/src/device.rs",
+        from: r#"            if let Err(error) = writers[layer].publish_view(layer, view) {
+                self.poisoned = true;
+                return Err(error);
+            }"#,
+        to: r#"            if let Err(error) = writers[layer].publish_view(layer, view) {
+                return Err(error);
+            }"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "authority-page-view-is-not-published",
+        file: "crates/moxie-executor/src/paged_attention.rs",
+        from: r#"            self.publish(layer, view)?;"#,
+        to: r#"            let _ = (layer, view);"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "selected-output-aliases-the-query",
+        file: "crates/moxie-executor/src/selected_attention.rs",
+        from: r#"        let output_value = node.output;"#,
+        to: r#"        let output_value = node.inputs[0];"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "selected-launch-forgets-the-reclaimed-base",
+        file: "crates/moxie-executor/src/selected_attention.rs",
+        from: r#"            retained.start,
+            retained.end - retained.start,"#,
+        to: r#"            0,
+            retained.end - retained.start,"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "error-bound-weights-ignore-the-declared-scale",
+        file: "crates/moxie-oracles/src/attention.rs",
+        from: r#"    if component >= value_dim {
+        return Err(Error::InvalidRequest {
+            field: "component",
+            detail: format!("component {component} is out of range for value width {value_dim}"),
+        });
+    }
+    let weights = softmax_weights(query_head, visible_keys, scale)?;"#,
+        to: r#"    if component >= value_dim {
+        return Err(Error::InvalidRequest {
+            field: "component",
+            detail: format!("component {component} is out of range for value width {value_dim}"),
+        });
+    }
+    let weights = softmax_weights(query_head, visible_keys, 1.0)?;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "decode-leaks-one-mebibyte-per-step",
+        file: "crates/moxie-executor/src/paged_attention.rs",
+        from: r#"        let mut writer = PagedKvWriterAdapter::new(layer, run, stream, source.keys, source.values);"#,
+        to: r#"        let _ = Box::leak(vec![0u8; 1 << 20].into_boxed_slice());
+        let mut writer = PagedKvWriterAdapter::new(layer, run, stream, source.keys, source.values);"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "kernel-ignores-the-declared-scale",
+        file: "crates/moxie-kernels/cuda/paged_attention.cu",
+        from: r#"                score = partial * scale;"#,
+        to: r#"                score = partial;"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "kernel-ignores-the-page-table",
+        file: "crates/moxie-kernels/cuda/paged_attention.cu",
+        from: r#"static_cast<unsigned long long>(page_table[page])"#,
+        to: r#"page"#,
+        expect: Expect::Caught,
+    },
+    Mutation {
+        name: "kernel-does-not-rescale-the-running-partial",
+        file: "crates/moxie-kernels/cuda/paged_attention.cu",
+        from: r#"        const float correction =
+            (run_max == moxie_attn_ninf_v1()) ? 0.0F : expf(run_max - new_max);"#,
+        to: r#"        const float correction = 1.0F;"#,
+        expect: Expect::Caught,
+    },
+];
+
+const BUILDS_T0037: &[&[&str]] = &[
+    &["-p", "moxie-state", "--lib"],
+    &["-p", "moxie-oracles", "--lib"],
+    &[
+        "-p",
+        "moxie-executor",
+        "--features",
+        "paged-attention-test-hooks",
+        "--tests",
+    ],
+    &["-p", "xtask", "--features", "cuda"],
 ];

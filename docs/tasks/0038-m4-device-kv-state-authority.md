@@ -1,15 +1,9 @@
 # Task 0038 — M4.1b the state authority owns the device pages, and the graph reaches them
 
-Status: active, not accepted. Opened 2026-09-19 after task 0037's kernel and
-binding were qualified and twice reviewed. Deliverable 1 (the state authority
-owns the device pages) is landed as of the 2026-09-20 regression evidence,
-including the write-callback shape (the owner amended "no trait object, no
-callback into the executor" below, 2026-09-20; see "Bounded deliverable") and
-the two defects that amendment left open (see "The writer callback"). Two
-things remain open: deliverable 2's graph wiring, and acceptance criterion 2's
-device evidence — tonight's regression run does not add it. This record does
-not retell the review history, which is in
-[the engineering log](../engineering-log.md).
+Status: closure candidate, not accepted. Opened 2026-09-19 after task 0037's
+kernel and binding were qualified and twice reviewed. Both bounded deliverables
+are implemented. The lifecycle, selected-plan and 32K device gates pass on both
+SM86 GPUs and SM120; final acceptance remains the repository owner's.
 
 ## Identity and authority
 
@@ -86,8 +80,7 @@ what the authority says.
 > buy, unchanged from a data-only boundary: a writer that returns `Ok` before
 > its copy has completed is lying, and the authority has no way to check that
 > from outside. This was the owner's decision, not an agent's, and it settles
-> the shape only — the two defects the reviewer found inside it (below) are
-> still open work.
+> the shape; the later lifecycle and visibility findings are closed below.
 
 **2. `OpParams::Attention` reaches it from the graph.** `moxie-plan` refuses
 every stateful graph today (`stateful_resource_plan`). That refusal is replaced
@@ -148,6 +141,14 @@ unsupported rather than silently BF16.
 6. Support matrix updated with what executes, on which devices, at which
    context, and with what remains unsupported. Task 0037's record is updated to
    point at whichever of its open items this closes.
+7. **Moved from task 0037's own scope, 2026-09-20 (owner):** the task mutation
+   battery. Task 0037 deliberately did not write one against a state binding
+   that did not yet exist; this task's own binding is what it must now measure.
+8. **Moved from task 0037's own scope, 2026-09-20 (owner):** host allocator
+   behaviour across decode steps, measured through the measured-allocator lane
+   rather than the "admission does not grow" assertion task 0037 used as a
+   placeholder. Task 0037 closed without this measurement on the understanding
+   that it belongs here.
 
 Stop for owner direction before changing the numerical bound, the cache
 precision, the canonical state ownership, or before any operation that writes
@@ -157,13 +158,12 @@ expressed as one contract.
 
 ## Progress — 2026-09-19, half one: the authority owns the pages
 
-Deliverable 1 is **landed** as of the 2026-09-20 regression evidence further
-below. Placement, retention, the frontier, transactions, abort and truncation
-are decided by the state authority, as below; the write-callback shape the
-owner amended "Bounded deliverable" above to permit, and the defects a review
-found inside it, are covered under "The writer callback" further below.
-**Deliverable 2 — lowering `OpParams::Attention` and binding device handles —
-remains partial**, so this task stays open and nothing below claims otherwise.
+Placement, retention, frontiers, transactions, abort and truncation are decided
+by the state authority. Commit republishes a changed page view before finalizing
+the state transition and poisons the sequence if a multi-layer publication
+partially succeeds. Raw page mutation is confined to the
+`paged-attention-test-hooks` feature; the production binding exposes only the
+authority-driven append and commit operations.
 
 ### What moved
 
@@ -175,9 +175,9 @@ remains partial**, so this task stays open and nothing below claims otherwise.
   (`retained`), what is history (`committed_rows`) and what a truncation or an
   abort leaves.
 - `moxie_types::PagePlacement` is the vocabulary between them. It lives in the
-  crate both already depend on, so the executor gained **no** dependency on
-  `moxie-state`: retention and frontiers stay out of the crate that launches
-  kernels, and `arch-check` is unchanged.
+  crate both already use. The executor's production state binding has an
+  optional `moxie-state` dependency; the test-hook feature extends that binding
+  with raw kernel qualification, and model crates cannot reach either path.
 - `PagedAttentionRun::append` became `write_rows`, taking placements instead of
   computing `position / page_tokens` itself. Its `committed_rows` became
   `written_rows` and is documented as what it always physically was — a
@@ -225,9 +225,8 @@ remains partial**, so this task stays open and nothing below claims otherwise.
 
 ## Progress — 2026-09-19, half two: the graph lowers, the handles exist
 
-Two of the three pieces deliverable 2 needs. **The third — executing a lowered
-attention node through its own plan's arena slots — is not done**, and
-acceptance 4 is therefore not met.
+The selected planner now chooses paged attention and the executor launches it
+from the selected plan's admitted query and output slots.
 
 ### The planner no longer refuses attention
 
@@ -262,15 +261,10 @@ caller's arena ranges, produces **byte-identical** output. A separate
 implementation that computed something else would satisfy the words and not the
 contract.
 
-### Still open
+### Still out of scope
 
-- **End-to-end execution through a lowered plan.** `lower_selected` does not
-  select attention nodes, and `chain.rs` binds the task 0012 chain rather than a
-  state-touching graph, so nothing yet walks a lowered attention node into
-  `attend_into` with the plan's own arena slots. That is acceptance 4 and it is
-  what remains of this task.
-- Everything named out of scope above: MLA, streaming, COW, prefix reuse, FP16
-  cache, tensor cores, timing.
+MLA, streaming, COW, prefix reuse, FP16 cache, tensor cores and timing remain
+outside this task.
 
 ## Progress — 2026-09-19, the second review's four blockers
 
@@ -322,31 +316,13 @@ a second attempt (item 6).
    now requests those three buffers only for `Staging::Host`, and the ledger
    test checks the missing-host-scope distinction rather than the arena bytes.
 
-**Evidence that was missing and now exists.** The host comparison had run over
-24 of 32 rows and wrapped neither store, so it compared two mappings where
-neither modulus had bitten. `the_two_mappings_still_agree_after_the_ring_has_
-wrapped` gives both stores four pages — the host by windowing 24 rows with 8 of
-headroom, the device by windowing 16 with the eviction page it adds — appends a
-hundred rows through a 32-row ring, and checks every row against the host
-store's **own table bytes**, asserting that more than sixty of them sit on a
-reused page. And `abort_truncate_and_reappend_hold_on_device` exercises the
-three transaction shapes on hardware, checking each by what attention *answers*:
-an abort leaves the committed decode byte-identical, a truncation leaves the
-prefix's decode byte-identical, and a re-append changes the answer rather than
-replaying the dropped rows.
-
-**Acceptance criterion 2 is not met.** The evidence above covers three of its
-five pieces and reads as satisfying it; it does not. Criterion 2 requires
-append/attend/abort/truncate/reappend together, with a reclaimed
-`history_base > 0`, on both SM86 GPUs and SM120. No test does that.
-`abort_truncate_and_reappend_hold_on_device` runs the three transaction shapes,
-but only on `RankId(0)` and only against a `Retention::All` layer — it never
-sets a reclaimed base. `a_wrapped_ring_answers_exactly_as_an_unwrapped_one`
-reaches a reclaimed base, but only exercises append and attend, and also runs
-on one ordinal only. Neither test selects an SM86 device versus SM120, so the
-"both architectures" half of the criterion is unaddressed by either. Required
-and missing: one device case combining all five operations with
-`history_base > 0`, run against both SM86 GPUs and SM120.
+**The missing lifecycle evidence now exists.** `paged_attention_state_lifecycle`
+runs append, attend, a real authority-driven tentative append and abort,
+truncate and re-append after the ring has wrapped. It then lowers, admits and
+executes an attention graph through the plan's own device slots against that
+same reclaimed state. The case passes on the SM120 and both SM86 devices and
+checks every answer against the FP64 oracle. The retained base is 80, so this
+is the `history_base > 0` case acceptance 2 required.
 
 Separately, `abort_truncate_and_reappend_hold_on_device`'s truncation assertion
 `sequence.committed_rows() == 8` (after truncating from 12) did not hold under
@@ -361,6 +337,11 @@ argument and bounded to what the transaction published), and a private
 `accept` past what the transaction published, closing the separate overflow
 this record had not previously named.
 
+**The numerical bound is closed.** It rejects nonfinite operands and
+nonpositive scales, derives its FP64 softmax weights from the supplied query,
+keys and scale, and refuses a nonfinite result. A caller can no longer supply a
+different distribution or make a NaN comparison read as a pass.
+
 **The writer callback.** `moxie_types::WriteReceipt` — a per-layer digest a
 caller could construct and hand back, with a public constructor and no
 sequence/layer/device/run identity in it — is **deleted**.
@@ -369,34 +350,27 @@ and called from `DeviceKvSequence::append`. `&mut dyn PagedKvWriter` called by
 `moxie-state` **is** the trait object and the callback into the executor that
 "Bounded deliverable" above originally ruled out by name — see the owner's
 amendment there, 2026-09-20: the callback stays, the contract line is amended.
-The three defects a review found inside it are **closed** as of the 2026-09-20
-regression run below:
+The lifecycle findings are closed. `PageView` is moved into the writer, commit
+publishes every changed view before finalization, and a partial multi-layer
+publication poisons the sequence. `PagedKvWriterAdapter` is private. Per the
+owner's ruling, raw mutation exists only behind `paged-attention-test-hooks`;
+the production `paged-attention-binding` feature does not expose it. A
+pre-enqueue refusal returns the key/value allocations unchanged, while an
+unknown completion keeps them quarantined.
 
-- `moxie_types::PageView` (moved from `moxie-state`, beside `PagePlacement`)
-  is now a fourth argument to `write_layer`; `append` hands over the view it
-  already computes, and `view_covering` — this task's own device test
-  reimplementing the retained-base/logical-page/modulo arithmetic — is
-  deleted from the test file rather than kept beside the authority that now
-  supplies it.
-- `PagedAttentionRun::publish_page_table` and `write_rows` are `pub(crate)`,
-  not `pub`. The one remaining public path, `RawPagedFixture`, takes the run
-  **by value** — surrendering it, so a run driven through
-  `PagedKvWriterAdapter` cannot also be driven this way — and exists by name
-  only for the kernel-numerics gate that must stress arbitrary page tables
-  with no authority behind them.
-- `PagedKvWriterAdapter` restores a pre-enqueue refusal's rows into itself
-  (via `RefusedSource::Rows`) instead of dropping them, so a retry or an abort
-  after a refusal can recover what it arrived with.
-
-## Progress — 2026-09-20, regression evidence
+## Earlier regression evidence (superseded)
 
 Measured fact, dated 2026-09-20, against commits `b1e9381..6984c17`. This is
-**regression evidence**: it says the 51 existing GPU cases and the host/driver
-suites still pass through the rewritten `append`/`PagedKvWriter` path — page
-table published from the authority's own `PageView`, not a caller's copy of
-its arithmetic. It does **not** satisfy acceptance criterion 2, which stays
-open exactly as described above, and it carries no timing or performance claim
-(O6/O7 remain open; nothing here was timed).
+historical regression evidence: it says the 51 then-existing GPU
+cases and the host/driver suites still pass through the committed
+`append`/`PagedKvWriter` path — page table published from the authority's own
+`PageView` on `append`, not a caller's copy of its arithmetic. A later review
+found it does not cover the uncommitted commit-to-page-table lifecycle change
+above, and it cannot establish invariants the public API still lets a caller
+bypass — passing tests over a path a caller can also reach directly are not
+evidence that the authority is exclusive. It did not satisfy acceptance 2;
+the closure run in the result below supersedes it. It carries no timing or
+performance claim (O6/O7 remain open; nothing here was timed).
 
 - Host: `cargo test --workspace`, 1185 passed, 0 failed.
 - Driver: `cargo test -p moxie-executor --lib --tests --features driver`, 160
@@ -411,12 +385,28 @@ open exactly as described above, and it carries no timing or performance claim
 
 ## Result, filled after work
 
-No completion is claimed. Acceptance 4 is open (the graph wiring) and
-acceptance 2 is open (see above) — the 2026-09-20 regression evidence confirms
-the existing 51 GPU cases and the host/driver suites still pass through the
-rewritten path; it does not add the combined append/attend/abort/truncate/
-reappend, reclaimed-base, both-architectures case criterion 2 requires. The
-callback-versus-contract disagreement is settled (the owner's amendment,
-2026-09-20), and the defects it left open — no page view handed to the writer,
-`publish_page_table`/`write_rows` public — are closed as of the same date. No
-timing or performance claim is made anywhere in this record (O6/O7 open).
+Acceptance 1–6 are implemented and awaiting owner acceptance, not yet
+independently reviewed to closure. `cargo test --workspace` passed with no
+failures; the executor's driver/test-hook lane passed 158 tests with no
+failures. Both clippy lanes, `arch-check` and `spec-check` pass. The final GPU
+lane passed 54 cases with 0 failed and 0 skipped/unmeasured on the SM120 and
+both SM86 GPUs. It includes the combined reclaimed-base lifecycle and
+selected-plan execution; the 32,768-row figures remain unchanged. No timing or
+performance claim is made (O6/O7 remain open).
+
+Acceptance 7 is met by the final binding's T0037 battery: 11 of 11 substitutions
+were caught, with zero survivors, unstable verdicts, invalid controls or
+skipped anchors. The four unmodified lanes passed three times before and after
+the run; [experiment 0008](../evidence/experiments/0008-paged-attention-mutations.md)
+records the exact substitutions and deciding lanes.
+
+Acceptance 8 is met by the existing 32-step decode case under its own
+thread-local counting allocator. It measured at most 9 allocation calls, a
+256 B transient peak, -256 B net within one operation (the consumed staging
+inputs exceed the returned output), and 1,000 B maximum live growth including
+the retained output and bounded lineage/page-table metadata. The declared
+metadata bound is 544 B. The battery's deliberate 1 MiB-per-step leak is caught
+by this lane.
+
+All eight acceptance criteria are implemented. Task 0038 remains a closure
+candidate pending owner acceptance; this record does not confer that acceptance.

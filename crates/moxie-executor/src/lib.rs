@@ -119,5 +119,10 @@ pub use chain::{
     selected_resource_request,
 };
 
+#[cfg(feature = "paged-attention-binding")]
+mod selected_attention;
+#[cfg(feature = "paged-attention-binding")]
+pub use selected_attention::{PagedAttentionInputs, PagedAttentionStep, PagedPlanRunRefused};
+
 #[cfg(feature = "driver")]
 pub use lease::{PrepareRefused, Upload};

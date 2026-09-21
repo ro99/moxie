@@ -1,5 +1,12 @@
 # Handover — paged attention runs; its state owner does not exist yet
 
+Status: **fulfilled by task 0038's closure candidate**. The historical
+"remaining" section below describes the boundary at task 0037's handoff; task
+0038 now owns the device state, reaches it from selected attention plans, and
+has completed the moved allocator and mutation gates. Its task record and
+[experiment 0008](../evidence/experiments/0008-paged-attention-mutations.md) are
+the current evidence.
+
 ## Workspace identity
 
 - Writable root `/home/rodrigo/Developer/moxie`, branch `main`. This work is

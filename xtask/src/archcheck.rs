@@ -294,6 +294,11 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                     // `second-residency-owner` rule keeps the driver from
                     // becoming a cache of its own.
                     "moxie-storage",
+                    // Task 0038: the executor performs page placements and
+                    // mapping publications chosen by the state authority.
+                    // This is the executor -> state edge already shown in
+                    // document 02; state still cannot reach CUDA or executor.
+                    "moxie-state",
                     // Task 0028: the quantized linear's launch is derived from
                     // the canonical affine descriptor -- width, group rule,
                     // zero-point mode, scale dtype -- which is `moxie-format`'s
@@ -3787,6 +3792,7 @@ mod tests {
 
         let executor = allow["moxie-executor"].workspace;
         assert!(executor.contains(&"moxie-kernels"));
+        assert!(executor.contains(&"moxie-state"));
         // Task 0028's descriptor edge, and the direction that stays refused:
         // the format crate may not reach back for the executor, and it may not
         // acquire the filesystem by being depended on from one that has it.

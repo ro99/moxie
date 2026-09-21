@@ -1137,10 +1137,14 @@ mod tests {
             &mut self,
             _layer: usize,
             _batch: BatchId,
-            _view: &PageView,
+            _view: PageView,
             placements: &[PagePlacement],
         ) -> Result<()> {
             self.placements = placements.to_vec();
+            Ok(())
+        }
+
+        fn publish_view(&mut self, _layer: usize, _view: PageView) -> Result<()> {
             Ok(())
         }
     }
@@ -1335,7 +1339,11 @@ mod tests {
         // Zero, because prompt tokens are accepted when they are appended:
         // accepting them again would count the same context twice.
         host.commit_prefix(txn, 0).unwrap();
-        device.commit(device_txn, 24).unwrap();
+        let mut writer_refs: Vec<&mut dyn PagedKvWriter> = writers
+            .iter_mut()
+            .map(|w| w as &mut dyn PagedKvWriter)
+            .collect();
+        device.commit(device_txn, 24, &mut writer_refs).unwrap();
         let device_placements: Vec<Vec<PagePlacement>> =
             writers.into_iter().map(|w| w.placements).collect();
 
@@ -1449,7 +1457,13 @@ mod tests {
                     &mut [&mut writer as &mut dyn PagedKvWriter],
                 )
                 .unwrap();
-            device.commit(device_txn, step).unwrap();
+            device
+                .commit(
+                    device_txn,
+                    step,
+                    &mut [&mut writer as &mut dyn PagedKvWriter],
+                )
+                .unwrap();
             written += step;
         }
         assert_eq!(device.committed_rows().unwrap(), ROWS);

@@ -45,7 +45,8 @@
 use std::ops::Range;
 
 use moxie_types::{
-    BatchId, DimError, Error, PagePlacement, PagedKvWriter, Result, StateTransactionId,
+    BatchId, DimError, Error, HostTier, PagePlacement, PagedKvWriter, Result, StateTransactionId,
+    Tier,
 };
 
 use crate::paged::{KvGeometry, Retention};
@@ -54,7 +55,14 @@ use crate::{ROOT, SequenceState, StateKind};
 fn invalid(field: &'static str, detail: &str) -> Error {
     Error::InvalidRequest {
         field,
-        detail: detail.into(),
+        detail: moxie_memory::fallible::text(format_args!("{detail}")).unwrap_or_default(),
+    }
+}
+
+fn unsupported(capability: &'static str, reason: &'static str) -> Error {
+    Error::Unsupported {
+        capability,
+        reason: moxie_memory::fallible::text(format_args!("{reason}")).unwrap_or_default(),
     }
 }
 
@@ -87,31 +95,21 @@ pub use moxie_types::PageView;
 
 /// Rows a transaction has reserved and not yet published.
 ///
-/// Returned by staging and consumed by publication inside
-/// [`DeviceKvSequence::append`]. The positions and the count are one value, so
-/// a caller cannot write one range and publish another.
+/// Private: [`DeviceKvSequence::append`] is the only producer and the only
+/// consumer, both inside this module. Nothing outside it stages a batch
+/// without also being the authority that publishes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "staged rows must be published or the transaction aborted"]
-pub struct StagedRows {
+struct StagedRows {
     transaction: StateTransactionId,
     first: u64,
     rows: u64,
 }
 
 impl StagedRows {
-    /// The absolute position of the first staged row.
-    pub const fn first(&self) -> u64 {
-        self.first
-    }
-
-    /// How many rows are staged.
-    pub const fn rows(&self) -> u64 {
-        self.rows
-    }
-
     /// The identity [`DeviceKvSequence::append`] passes to
     /// [`PagedKvWriter::write_layer`] for this batch.
-    pub const fn id(&self) -> BatchId {
+    const fn id(&self) -> BatchId {
         BatchId {
             transaction: self.transaction,
             first: self.first,
@@ -159,6 +157,13 @@ pub struct DeviceKvSequence {
     /// of a transaction that was rolled back.
     committed_high_water: u64,
     open: Option<OpenTransaction>,
+    /// Layers that completed the currently staged batch. This storage is
+    /// reused so a forward pass does not allocate per layer or per step.
+    completed_layers: Vec<bool>,
+    /// Set when a commit's mapping transition failed partway, after some
+    /// layer's writer may already have published a new view to the device.
+    /// Checked by every public method: see [`Self::check_poisoned`].
+    poisoned: bool,
 }
 
 impl DeviceKvSequence {
@@ -187,12 +192,11 @@ impl DeviceKvSequence {
         // this task inherited. It is `Unsupported` rather than invalid: the
         // request is coherent and this slice does not serve it.
         if geometry.precision != moxie_types::Precision::Bf16 {
-            return Err(Error::Unsupported {
-                capability: "device_kv_precision",
-                reason: "device paged state is BF16 in this slice; an FP16 or integer \
-                         cache is unsupported rather than reinterpreted"
-                    .into(),
-            });
+            return Err(unsupported(
+                "device_kv_precision",
+                "device paged state is BF16 in this slice; an FP16 or integer cache is \
+                 unsupported rather than reinterpreted",
+            ));
         }
         let page_tokens = geometry.page_tokens as u64;
         let mut layout = Vec::new();
@@ -208,12 +212,11 @@ impl DeviceKvSequence {
             // MLA-shaped, which task 0037 excluded by name and this task does
             // not widen.
             if layer.key_dim != layer.value_dim {
-                return Err(Error::Unsupported {
-                    capability: "device_kv_value_width",
-                    reason: "a value width that differs from the key width is MLA-shaped \
-                             and unsupported by this path"
-                        .into(),
-                });
+                return Err(unsupported(
+                    "device_kv_value_width",
+                    "a value width that differs from the key width is MLA-shaped and \
+                     unsupported by this path",
+                ));
             }
             if let Retention::Window { window } = layer.retention {
                 // A window of zero sees nothing, including the query's own
@@ -254,6 +257,15 @@ impl DeviceKvSequence {
                 row_elements,
             });
         }
+        let mut completed_layers = Vec::new();
+        completed_layers
+            .try_reserve_exact(layout.len())
+            .map_err(|_| Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::Pageable)),
+                requested_bytes: layout.len() as u64,
+                available_bytes: 0,
+            })?;
+        completed_layers.resize(layout.len(), false);
         Ok(Self {
             geometry,
             layout,
@@ -261,18 +273,42 @@ impl DeviceKvSequence {
             rows: 0,
             committed_high_water: 0,
             open: None,
+            completed_layers,
+            poisoned: false,
         })
     }
 
-    pub fn geometry(&self) -> &KvGeometry {
-        &self.geometry
+    /// Refuse if a previous commit's mapping transition failed partway.
+    ///
+    /// The device may already hold a page view no state here can vouch for —
+    /// a prior layer in that commit's writer order may have published
+    /// successfully before a later one refused — and there is no way to take
+    /// that back. Every public method calls this first, so the authority
+    /// stops trusting itself rather than guess at a mapping that might
+    /// already be inconsistent.
+    fn check_poisoned(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(invalid(
+                "sequence",
+                "a previous commit's mapping transition failed; this sequence can no longer \
+                 be trusted",
+            ));
+        }
+        Ok(())
     }
 
-    pub fn layer_count(&self) -> usize {
-        self.layout.len()
+    pub fn geometry(&self) -> Result<&KvGeometry> {
+        self.check_poisoned()?;
+        Ok(&self.geometry)
+    }
+
+    pub fn layer_count(&self) -> Result<usize> {
+        self.check_poisoned()?;
+        Ok(self.layout.len())
     }
 
     pub fn layout(&self, layer: usize) -> Result<DeviceLayerLayout> {
+        self.check_poisoned()?;
         self.layout
             .get(layer)
             .copied()
@@ -280,16 +316,33 @@ impl DeviceKvSequence {
     }
 
     /// The state machine underneath, for a caller that needs its frontiers.
-    pub fn state(&self) -> &SequenceState {
-        &self.state
+    pub fn state(&self) -> Result<&SequenceState> {
+        self.check_poisoned()?;
+        Ok(&self.state)
     }
 
     /// Rows this authority has published, **including** any a transaction has
     /// published but not yet committed. Not the admitted capacity, not the
     /// retained count and not [`Self::committed_rows`]; conflating any of
     /// these claims a context this authority does not hold.
-    pub fn published_rows(&self) -> u64 {
-        self.rows
+    pub fn published_rows(&self) -> Result<u64> {
+        self.check_poisoned()?;
+        Ok(self.rows)
+    }
+
+    /// Rows published for one layer. A completed layer can be one staged batch
+    /// ahead of the sequence frontier while later layers execute.
+    pub fn layer_published_rows(&self, layer: usize) -> Result<u64> {
+        self.check_poisoned()?;
+        self.layout(layer)?;
+        if self.completed_layers[layer]
+            && let Some((first, rows)) = self.open.and_then(|open| open.pending)
+        {
+            return first
+                .checked_add(rows)
+                .ok_or(Error::Dim(DimError::Overflow));
+        }
+        Ok(self.rows)
     }
 
     /// Rows a commit has accepted, from [`SequenceState`]'s own accepted
@@ -302,6 +355,7 @@ impl DeviceKvSequence {
     /// that one moves on every commit regardless of `accept`, because it
     /// tracks physical overwrite, not acceptance.
     pub fn committed_rows(&self) -> Result<u64> {
+        self.check_poisoned()?;
         Ok(self.state.frontiers(ROOT)?.accepted)
     }
 
@@ -312,6 +366,21 @@ impl DeviceKvSequence {
     /// rows are retained too, because the window that would evict them has
     /// not moved past them yet.
     pub fn retained(&self, layer: usize) -> Result<Range<u64>> {
+        self.check_poisoned()?;
+        self.retained_at(layer, self.committed_high_water, self.rows)
+    }
+
+    /// Retained rows currently published for one layer, including its staged
+    /// batch during an open transaction.
+    pub fn layer_retained(&self, layer: usize) -> Result<Range<u64>> {
+        let rows = self.layer_published_rows(layer)?;
+        self.retained_at(layer, self.committed_high_water, rows)
+    }
+
+    /// [`Self::retained`] against a caller-chosen watermark instead of the
+    /// current one — what [`Self::commit`] uses to preview the retained
+    /// range a candidate watermark would produce, before adopting it.
+    fn retained_at(&self, layer: usize, watermark: u64, rows: u64) -> Result<Range<u64>> {
         let layout = self.layout(layer)?;
         let page_tokens = self.geometry.page_tokens as u64;
         // The ring overwrites row `r` with row `r + capacity`, and a page is
@@ -319,20 +388,18 @@ impl DeviceKvSequence {
         // base rather than the tightest one.
         //
         // It is computed from the private retention watermark
-        // (`committed_high_water`), not the published frontier, and it adds
-        // the admitted undo headroom. So the highest row a transaction could
-        // legally write — `watermark + tentative_rows` — is already
-        // accounted for before the transaction starts, the base cannot move
-        // while it is open, and an abort cannot leave it advanced over rows
-        // the window still admits. It costs the headroom in retained rows,
-        // which is exactly what the headroom was admitted for.
-        let reach = self
-            .committed_high_water
-            .saturating_add(self.headroom())
-            .max(self.rows);
+        // (`committed_high_water`, or a candidate replacement for it), not
+        // the published frontier, and it adds the admitted undo headroom. So
+        // the highest row a transaction could legally write —
+        // `watermark + tentative_rows` — is already accounted for before the
+        // transaction starts, the base cannot move while it is open, and an
+        // abort cannot leave it advanced over rows the window still admits.
+        // It costs the headroom in retained rows, which is exactly what the
+        // headroom was admitted for.
+        let reach = watermark.saturating_add(self.headroom()).max(rows);
         let overwritten = reach.saturating_sub(layout.capacity_rows);
         let base = overwritten.div_ceil(page_tokens) * page_tokens;
-        Ok(base.min(self.rows)..self.rows)
+        Ok(base.min(rows)..rows)
     }
 
     /// The undo headroom a transaction may use, zero when nothing reclaims.
@@ -346,6 +413,7 @@ impl DeviceKvSequence {
 
     /// Where row `position` of one layer physically sits.
     pub fn placement_of(&self, layer: usize, position: u64) -> Result<Placement> {
+        self.check_poisoned()?;
         let layout = self.layout(layer)?;
         if position >= self.rows {
             return Err(invalid("position", "position has not been published"));
@@ -423,8 +491,17 @@ impl DeviceKvSequence {
     /// It covers the retained range and any rows this transaction has staged,
     /// because a performer must be able to write where it is about to write.
     pub fn page_view(&self, layer: usize) -> Result<PageView> {
-        let layout = self.layout(layer)?;
+        self.check_poisoned()?;
         let retained = self.retained(layer)?;
+        self.page_view_for(layer, retained)
+    }
+
+    /// [`Self::page_view`]'s table, for a retained range the caller already
+    /// computed — real or a candidate from [`Self::retained_at`]. Split out
+    /// so [`Self::commit`] can preview the view a prospective watermark would
+    /// produce without first adopting it.
+    fn page_view_for(&self, layer: usize, retained: Range<u64>) -> Result<PageView> {
+        let layout = self.layout(layer)?;
         let staged_end = self.open.and_then(|o| o.pending).map_or(0, |(f, n)| f + n);
         let end = self.rows.max(staged_end);
         if end == 0 || retained.start >= end {
@@ -458,6 +535,7 @@ impl DeviceKvSequence {
 
     /// Open a transaction. The frontier it starts at is what an abort restores.
     pub fn begin(&mut self) -> Result<StateTransactionId> {
+        self.check_poisoned()?;
         if self.open.is_some() {
             return Err(invalid("transaction", "a transaction is already open here"));
         }
@@ -467,6 +545,7 @@ impl DeviceKvSequence {
             base: self.rows,
             pending: None,
         });
+        self.completed_layers.fill(false);
         Ok(id)
     }
 
@@ -495,6 +574,7 @@ impl DeviceKvSequence {
         rows: u64,
         writers: &mut [&mut dyn PagedKvWriter],
     ) -> Result<()> {
+        self.check_poisoned()?;
         if writers.len() != self.layout.len() {
             return Err(invalid(
                 "writers",
@@ -506,9 +586,60 @@ impl DeviceKvSequence {
         for (layer, writer) in writers.iter_mut().enumerate() {
             let view = self.page_view(layer)?;
             let placements = self.placements(&staged, layer)?;
-            writer.write_layer(layer, batch, &view, &placements)?;
+            writer.write_layer(layer, batch, view, &placements)?;
+            self.completed_layers[layer] = true;
         }
         self.publish(txn, staged)
+    }
+
+    /// Append one layer of the staged batch.
+    ///
+    /// Layers execute in order, so an earlier layer must append and attend
+    /// before a later layer has produced its K/V rows. The first call stages
+    /// the batch. The sequence frontier advances only when every layer has
+    /// completed that same batch.
+    pub fn append_layer(
+        &mut self,
+        txn: StateTransactionId,
+        layer: usize,
+        rows: u64,
+        writer: &mut dyn PagedKvWriter,
+    ) -> Result<()> {
+        self.check_poisoned()?;
+        self.layout(layer)?;
+        let Some(next) = self.completed_layers.iter().position(|complete| !complete) else {
+            return Err(invalid(
+                "layer",
+                "the staged batch already completed every layer",
+            ));
+        };
+        if layer != next {
+            return Err(invalid("layer", "layers must append in graph order"));
+        }
+        let staged = match self.open_transaction(txn)?.pending {
+            Some((first, pending_rows)) if first == self.rows && pending_rows == rows => {
+                StagedRows {
+                    transaction: txn,
+                    first,
+                    rows,
+                }
+            }
+            Some(_) => {
+                return Err(invalid(
+                    "rows",
+                    "every layer must publish the same staged batch",
+                ));
+            }
+            None => self.stage(txn, rows)?,
+        };
+        let view = self.page_view(layer)?;
+        let placements = self.placements(&staged, layer)?;
+        writer.write_layer(layer, staged.id(), view, &placements)?;
+        self.completed_layers[layer] = true;
+        if self.completed_layers.iter().all(|done| *done) {
+            self.publish(txn, staged)?;
+        }
+        Ok(())
     }
 
     /// Reserve the next `rows` positions for this transaction to write.
@@ -590,10 +721,13 @@ impl DeviceKvSequence {
             .as_mut()
             .expect("a validated open transaction")
             .pending = None;
+        self.completed_layers.fill(false);
         Ok(())
     }
 
-    /// Accept `accept` of the transaction's rows and close it.
+    /// Accept `accept` of the transaction's rows, republish any layer whose
+    /// page view the resulting retention change moves, and close the
+    /// transaction.
     ///
     /// An unpublished staged batch is refused: its bytes may or may not have
     /// been written, and committing over that question is how a frontier ends
@@ -601,7 +735,30 @@ impl DeviceKvSequence {
     /// transaction itself published: [`SequenceState::commit_prefix`] would
     /// otherwise accept rows this transaction never wrote, and possibly rows
     /// this authority has not published at all.
-    pub fn commit(&mut self, txn: StateTransactionId, accept: u64) -> Result<()> {
+    ///
+    /// This is the one place that knows the retention transition, so it is
+    /// the one place that performs it: for each layer whose page view would
+    /// change under the watermark this commit is about to adopt, the
+    /// matching `writers` entry publishes it through
+    /// [`PagedKvWriter::publish_view`] **before** anything is finalized. A
+    /// layer whose view is unchanged is not republished.
+    ///
+    /// If every required publication succeeds, the commit finalizes. If any
+    /// refuses, the commit does not finalize and this sequence is
+    /// **poisoned**: a prior layer in `writers` order may already have
+    /// published successfully, the device may already hold a partially
+    /// updated mapping, and there is no way to take that back — see
+    /// [`Self::check_poisoned`].
+    ///
+    /// `writers` must hold exactly one entry per layer, in layer order, same
+    /// as [`Self::append`].
+    pub fn commit(
+        &mut self,
+        txn: StateTransactionId,
+        accept: u64,
+        writers: &mut [&mut dyn PagedKvWriter],
+    ) -> Result<()> {
+        self.check_poisoned()?;
         let open = self.open_transaction(txn)?;
         if open.pending.is_some() {
             return Err(invalid(
@@ -615,11 +772,61 @@ impl DeviceKvSequence {
                 "cannot accept more rows than this transaction published",
             ));
         }
-        self.state.commit_prefix(txn, accept)?;
+        if writers.len() != self.layout.len() {
+            return Err(invalid(
+                "writers",
+                "commit needs exactly one writer per layer, in layer order",
+            ));
+        }
+
+        // The watermark this commit is about to adopt. Publication and the
+        // transition it enables are decided from the same number commit will
+        // actually apply.
+        let watermark_after = self.committed_high_water.max(self.rows);
+        let mut updates = Vec::new();
+        updates
+            .try_reserve_exact(self.layout.len())
+            .map_err(|_| Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::Pageable)),
+                requested_bytes: self
+                    .layout
+                    .len()
+                    .saturating_mul(core::mem::size_of::<(usize, PageView)>())
+                    as u64,
+                available_bytes: 0,
+            })?;
+        for layer in 0..self.layout.len() {
+            // A sequence that has never published a row has no view to
+            // compare or republish for any layer.
+            if self.rows == 0 {
+                continue;
+            }
+            let before = self.retained(layer)?;
+            let after_retained = self.retained_at(layer, watermark_after, self.rows)?;
+            if before.start == after_retained.start {
+                continue;
+            }
+            updates.push((layer, self.page_view_for(layer, after_retained)?));
+        }
+
+        let published_mapping = !updates.is_empty();
+        for (layer, view) in updates {
+            if let Err(error) = writers[layer].publish_view(layer, view) {
+                self.poisoned = true;
+                return Err(error);
+            }
+        }
+
+        if let Err(error) = self.state.commit_prefix(txn, accept) {
+            if published_mapping {
+                self.poisoned = true;
+            }
+            return Err(error);
+        }
         self.open = None;
         // The ring's reach only moves at a commit. Everything the retained base
         // is derived from is therefore stable for the whole of a transaction.
-        self.committed_high_water = self.committed_high_water.max(self.rows);
+        self.committed_high_water = watermark_after;
         Ok(())
     }
 
@@ -631,11 +838,13 @@ impl DeviceKvSequence {
     /// why the admitted capacity carries the undo headroom: the rows the window
     /// still admits were never in the pages the transaction could reach.
     pub fn abort(&mut self, txn: StateTransactionId) -> Result<()> {
+        self.check_poisoned()?;
         let open = self.open_transaction(txn)?;
         let base = open.base;
         self.state.abort(txn)?;
         self.rows = base;
         self.open = None;
+        self.completed_layers.fill(false);
         Ok(())
     }
 
@@ -653,6 +862,7 @@ impl DeviceKvSequence {
     /// re-append from that prefix would report rows reclaimed the moment they
     /// were written.
     pub fn truncate(&mut self, prefix: u64) -> Result<()> {
+        self.check_poisoned()?;
         if self.open.is_some() {
             return Err(invalid(
                 "truncate",
@@ -674,6 +884,7 @@ impl DeviceKvSequence {
         }
         self.state.rollback_to(ROOT, prefix, &[])?;
         self.rows = prefix;
+        self.completed_layers.fill(false);
         Ok(())
     }
 
@@ -689,13 +900,7 @@ impl DeviceKvSequence {
         let open = self
             .open
             .ok_or_else(|| invalid("transaction", "no transaction is open"))?;
-        if open.id != txn
-            || !self
-                .state
-                .open_transactions()
-                .iter()
-                .any(|(id, _)| *id == txn)
-        {
+        if open.id != txn {
             return Err(invalid("transaction", "this transaction is not open here"));
         }
         Ok(open)
@@ -738,12 +943,11 @@ mod tests {
         }
     }
 
-    /// A writer that returns `Ok` without copying anything.
+    /// A writer that does no copy and returns `Ok`.
     ///
-    /// Under [`PagedKvWriter`]'s contract, `Ok` claims the bytes reached the
-    /// device and the copy was observed complete — this double lies about
-    /// that on purpose. These tests exercise the state authority's
-    /// bookkeeping, not a device, and have nothing to observe.
+    /// These tests exercise the state authority's bookkeeping — staging,
+    /// placement, frontiers, retention — not a device, so they have no copy
+    /// to observe.
     struct NullWriter;
 
     impl PagedKvWriter for NullWriter {
@@ -751,16 +955,52 @@ mod tests {
             &mut self,
             _layer: usize,
             _batch: BatchId,
-            _view: &PageView,
+            _view: PageView,
             _placements: &[PagePlacement],
         ) -> Result<()> {
             Ok(())
         }
+
+        fn publish_view(&mut self, _layer: usize, _view: PageView) -> Result<()> {
+            Ok(())
+        }
     }
 
-    /// One [`NullWriter`] per layer, boxed as [`Self::append`] needs them.
+    /// A writer that counts `publish_view` calls and can be told to refuse
+    /// them, for exercising [`DeviceKvSequence::commit`]'s own
+    /// view-transition invariant rather than a device.
+    #[derive(Default)]
+    struct CountingWriter {
+        publish_view_calls: usize,
+        refuse_publish_view: bool,
+    }
+
+    impl PagedKvWriter for CountingWriter {
+        fn write_layer(
+            &mut self,
+            _layer: usize,
+            _batch: BatchId,
+            _view: PageView,
+            _placements: &[PagePlacement],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn publish_view(&mut self, _layer: usize, _view: PageView) -> Result<()> {
+            self.publish_view_calls += 1;
+            if self.refuse_publish_view {
+                return Err(invalid("publish_view", "test refusal"));
+            }
+            Ok(())
+        }
+    }
+
+    /// One [`NullWriter`] per layer, boxed as [`DeviceKvSequence::append`]
+    /// and [`DeviceKvSequence::commit`] need them.
     fn null_writers(sequence: &DeviceKvSequence) -> Vec<NullWriter> {
-        (0..sequence.layer_count()).map(|_| NullWriter).collect()
+        (0..sequence.layer_count().expect("not poisoned"))
+            .map(|_| NullWriter)
+            .collect()
     }
 
     fn writer_refs(writers: &mut [NullWriter]) -> Vec<&mut dyn PagedKvWriter> {
@@ -790,7 +1030,10 @@ mod tests {
             sequence
                 .append(txn, step, &mut writer_refs(&mut writers))
                 .expect("append");
-            sequence.commit(txn, step).expect("commit");
+            let mut commit_writers = null_writers(sequence);
+            sequence
+                .commit(txn, step, &mut writer_refs(&mut commit_writers))
+                .expect("commit");
             done += step;
         }
     }
@@ -854,6 +1097,110 @@ mod tests {
         sequence
             .placement_of(0, 80)
             .expect("the first retained row");
+    }
+
+    #[test]
+    fn commit_republishes_a_moved_view_and_poisons_on_refusal() {
+        // Same geometry and fill pattern as `a_page_leaves_the_retained_range_whole`:
+        // a hundred rows leaves the base at 72..100, one more row does not
+        // move it, eight more moves it to 80..109.
+        let mut geometry = windowed(24, 8, 8);
+        geometry.layers.push(geometry.layers[0]);
+        let mut sequence = DeviceKvSequence::new(geometry).expect("a sequence");
+        fill(&mut sequence, 100);
+        assert_eq!(sequence.retained(0).expect("a range"), 72..100);
+
+        let append_one_batch = |sequence: &mut DeviceKvSequence, rows: u64| -> StateTransactionId {
+            let txn = sequence.begin().expect("a transaction");
+            let mut writers = null_writers(sequence);
+            sequence
+                .append(txn, rows, &mut writer_refs(&mut writers))
+                .expect("append");
+            txn
+        };
+
+        let mut first = CountingWriter::default();
+        let mut second = CountingWriter::default();
+
+        // A real forward publishes layers in order. The first layer can see
+        // its staged row while the sequence frontier waits for the second.
+        let txn = sequence.begin().expect("a transaction");
+        sequence
+            .append_layer(txn, 0, 1, &mut NullWriter)
+            .expect("first layer");
+        assert_eq!(sequence.published_rows().expect("frontier"), 100);
+        assert_eq!(sequence.layer_published_rows(0).expect("layer 0"), 101);
+        assert_eq!(sequence.layer_published_rows(1).expect("layer 1"), 100);
+        sequence
+            .append_layer(txn, 1, 1, &mut NullWriter)
+            .expect("second layer");
+        assert_eq!(sequence.published_rows().expect("frontier"), 101);
+
+        // The base does not move: nothing is republished.
+        sequence
+            .commit(txn, 1, &mut [&mut first, &mut second])
+            .expect("commit");
+        assert_eq!(
+            first.publish_view_calls, 0,
+            "an unmoved view was republished"
+        );
+        assert_eq!(
+            second.publish_view_calls, 0,
+            "an unmoved view was republished"
+        );
+        assert_eq!(sequence.retained(0).expect("a range"), 72..101);
+
+        // The base moves to 80: the writer sees exactly one republish.
+        let txn = append_one_batch(&mut sequence, 8);
+        sequence
+            .commit(txn, 8, &mut [&mut first, &mut second])
+            .expect("commit");
+        assert_eq!(
+            first.publish_view_calls, 1,
+            "a moved view was not republished"
+        );
+        assert_eq!(
+            second.publish_view_calls, 1,
+            "a moved view was not republished"
+        );
+        assert_eq!(sequence.retained(0).expect("a range"), 80..109);
+
+        // Force the base to move again and refuse the republish. Commit
+        // itself refuses, and the sequence is poisoned: every public method
+        // refuses from here on, including ones that only read.
+        second.refuse_publish_view = true;
+        let txn = append_one_batch(&mut sequence, 8);
+        assert!(
+            sequence
+                .commit(txn, 8, &mut [&mut first, &mut second])
+                .is_err()
+        );
+        assert_eq!(
+            first.publish_view_calls, 2,
+            "the first layer did not publish"
+        );
+        assert_eq!(
+            second.publish_view_calls, 2,
+            "the second layer was not attempted"
+        );
+        assert!(
+            sequence.published_rows().is_err(),
+            "poisoned but still answering"
+        );
+        assert!(
+            sequence.layer_count().is_err(),
+            "poisoned but still answering"
+        );
+        assert!(
+            sequence.retained(0).is_err(),
+            "poisoned but still answering"
+        );
+        assert!(
+            sequence
+                .append(txn, 1, &mut [&mut NullWriter as &mut dyn PagedKvWriter])
+                .is_err(),
+            "poisoned but still accepting writes"
+        );
     }
 
     #[test]
@@ -927,7 +1274,7 @@ mod tests {
         // Six rows from the frontier at 5: 5..7 in one page, 8..10 in the next.
         let txn = sequence.begin().expect("a transaction");
         let staged = sequence.stage(txn, 6).expect("stage");
-        assert_eq!((staged.first(), staged.rows()), (5, 6));
+        assert_eq!((staged.first, staged.rows), (5, 6));
         let runs = sequence.placements(&staged, 0).expect("placements");
         assert_eq!(runs.len(), 2);
         assert_eq!(
@@ -953,11 +1300,14 @@ mod tests {
         // frontier over rows nothing wrote.
         assert!(sequence.stage(txn, 1).is_err());
         // So is committing over an unpublished batch.
-        assert!(sequence.commit(txn, 6).is_err());
+        assert!(sequence.commit(txn, 6, &mut []).is_err());
         sequence.publish(txn, staged).expect("publish");
         // And publishing the same batch twice.
         assert!(sequence.publish(txn, staged).is_err());
-        sequence.commit(txn, 6).expect("commit");
+        let mut writers = null_writers(&sequence);
+        sequence
+            .commit(txn, 6, &mut writer_refs(&mut writers))
+            .expect("commit");
 
         // A run that starts on a boundary and covers exactly one page is one
         // placement, not two.
@@ -1002,7 +1352,7 @@ mod tests {
         fill(&mut sequence, 3);
         let txn = sequence.begin().expect("a transaction");
         let staged = sequence.stage(txn, 2).expect("stage");
-        assert_eq!(staged.first(), 3, "staging starts at the frontier");
+        assert_eq!(staged.first, 3, "staging starts at the frontier");
 
         // A batch from another sequence's transaction, and one this transaction
         // did not stage, are both refused.
@@ -1012,7 +1362,10 @@ mod tests {
         assert!(sequence.placements(&foreign, 0).is_err());
         assert!(sequence.publish(txn, foreign).is_err());
         sequence.publish(txn, staged).expect("publish");
-        sequence.commit(txn, 2).expect("commit");
+        let mut writers = null_writers(&sequence);
+        sequence
+            .commit(txn, 2, &mut writer_refs(&mut writers))
+            .expect("commit");
         assert_eq!(sequence.committed_rows().expect("frontiers"), 5);
         other.abort(other_txn).expect("abort");
     }
@@ -1025,7 +1378,7 @@ mod tests {
         let txn = sequence.begin().expect("a transaction");
         let staged = sequence.stage(txn, 6).expect("stage");
         sequence.publish(txn, staged).expect("publish");
-        assert_eq!(sequence.published_rows(), 16);
+        assert_eq!(sequence.published_rows().expect("not poisoned"), 16);
         // Tentative rows are legal state and are addressable before the commit
         // that accepts them: document 04 forbids publishing candidates before
         // verification, so they have to be readable without it.
@@ -1033,7 +1386,7 @@ mod tests {
             .placement_of(0, 15)
             .expect("a tentative row is placed");
         sequence.abort(txn).expect("abort");
-        assert_eq!(sequence.published_rows(), 10);
+        assert_eq!(sequence.published_rows().expect("not poisoned"), 10);
         assert_eq!(sequence.retained(0).expect("a range"), before);
         // And the rows it published are not addressable any more.
         assert!(sequence.placement_of(0, 10).is_err());
@@ -1078,7 +1431,7 @@ mod tests {
             .map(|p| sequence.placement_of(0, p).expect("a placement"))
             .collect();
         sequence.truncate(12).expect("truncate");
-        assert_eq!(sequence.published_rows(), 12);
+        assert_eq!(sequence.published_rows().expect("not poisoned"), 12);
         assert!(sequence.placement_of(0, 12).is_err());
         let after: Vec<Placement> = (0..12)
             .map(|p| sequence.placement_of(0, p).expect("a placement"))
@@ -1124,7 +1477,7 @@ mod tests {
             .expect_err("a truncation below the retained base was accepted");
         assert!(matches!(refused, Error::Reclaimed { .. }), "{refused:?}");
         assert_eq!(
-            sequence.published_rows(),
+            sequence.published_rows().expect("not poisoned"),
             100,
             "a refusal moved the frontier"
         );
@@ -1137,7 +1490,10 @@ mod tests {
         sequence
             .truncate(retained.start)
             .expect("truncate to the base");
-        assert_eq!(sequence.published_rows(), retained.start);
+        assert_eq!(
+            sequence.published_rows().expect("not poisoned"),
+            retained.start
+        );
         assert_eq!(
             sequence
                 .placement_of(0, retained.start - 1)
@@ -1149,7 +1505,10 @@ mod tests {
         let txn = sequence.begin().expect("a transaction");
         let staged = sequence.stage(txn, 1).expect("stage");
         sequence.publish(txn, staged).expect("publish");
-        sequence.commit(txn, 1).expect("commit");
+        let mut writers = null_writers(&sequence);
+        sequence
+            .commit(txn, 1, &mut writer_refs(&mut writers))
+            .expect("commit");
         assert_eq!(
             sequence
                 .placement_of(0, retained.start)
@@ -1185,7 +1544,7 @@ mod tests {
         );
         // And the transaction is still abortable, which is the point.
         sequence.abort(txn).expect("abort");
-        assert_eq!(sequence.published_rows(), 40);
+        assert_eq!(sequence.published_rows().expect("not poisoned"), 40);
     }
 
     #[test]
@@ -1271,7 +1630,10 @@ mod tests {
         );
         let staged = sequence.stage(txn, 1).expect("stage");
         sequence.publish(txn, staged).expect("publish");
-        sequence.commit(txn, 1).expect("commit");
+        let mut writers = null_writers(&sequence);
+        sequence
+            .commit(txn, 1, &mut writer_refs(&mut writers))
+            .expect("commit");
         other.abort(foreign_txn).expect("abort");
         assert!(
             sequence.stage(txn, 1).is_err(),

@@ -367,6 +367,12 @@ const BATTERIES: &[Battery] = &[
         mutations: BATTERY_T0029,
         builds: BUILDS_T0029,
     },
+    Battery {
+        tag: "0037",
+        lanes: LANES_T0037,
+        mutations: BATTERY_T0037,
+        builds: BUILDS_T0037,
+    },
 ];
 
 /// What every lane does on the **clean** tree, measured once.

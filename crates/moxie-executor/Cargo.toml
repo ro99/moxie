@@ -12,6 +12,10 @@ publish = false
 # the manual test double compile.
 default = ["numa"]
 driver = ["moxie-cuda/driver", "moxie-kernels/fatbin"]
+# The production binding connects the state authority to its device runs.
+# Raw page mutation remains available only to the qualification harness.
+paged-attention-binding = ["driver", "dep:moxie-state"]
+paged-attention-test-hooks = ["paged-attention-binding"]
 # NUMA-aware host placement (task 0021, roadmap M2 item 3). One audited glibc
 # FFI block for thread affinity; on by default because the benchmark machine has
 # two nodes and the GPUs are split across them, and `HostPlacementControl`'s
@@ -34,14 +38,9 @@ moxie-format.workspace = true
 moxie-cuda.workspace = true
 moxie-plan.workspace = true
 moxie-kernels.workspace = true
+moxie-state = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Task 0038: the device tests drive the state authority and this crate's
-# performer together, which is the only place the two meet. A dev dependency
-# only -- production code here names no state type, `arch-check` excludes
-# dev-dependencies from every table, and a fixture proves the production edge is
-# refused.
-moxie-state.workspace = true
 moxie-graph.workspace = true
 # Task 0020's real-artifact test builds its demand set the way a routed step
 # does, through the engine's route-to-chunk arithmetic. A dev dependency only:

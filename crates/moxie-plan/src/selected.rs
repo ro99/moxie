@@ -104,6 +104,9 @@ impl SelectedPlanCandidate {
     pub fn stages(&self) -> &[String] {
         &self.stages
     }
+    pub fn is_paged_attention(&self) -> bool {
+        matches!(self.nodes.as_slice(), [node] if node.descriptor.operation == SemanticKernelOp::PagedAttention)
+    }
     pub fn matches(
         &self,
         graph: &Graph,
@@ -130,6 +133,10 @@ pub fn lower_selected(
             "device",
             "workload UUID and measured capability differ",
         ));
+    }
+    if matches!(graph.nodes(), [node] if matches!(node.params, moxie_graph::OpParams::Attention { .. }))
+    {
+        return lower_attention(graph, workload, capability, catalogue);
     }
     let expected = [Op::Linear, Op::RmsNorm, Op::Residual];
     if graph.nodes().len() != expected.len()
@@ -406,6 +413,142 @@ pub fn lower_selected(
         workspace_region_bytes,
         combined_arena_bytes,
         stages,
+    })
+}
+
+fn lower_attention(
+    graph: &Graph,
+    workload: ResourceWorkload,
+    capability: &DeviceCapability,
+    catalogue: &KernelCatalogue,
+) -> Result<SelectedPlanCandidate, Error> {
+    let node = &graph.nodes()[0];
+    let moxie_graph::OpParams::Attention {
+        heads,
+        kv_heads: _,
+        head_dim,
+        ..
+    } = node.params
+    else {
+        unreachable!("caller selected an attention node")
+    };
+    if !graph.weights().is_empty()
+        || graph.inputs().len() != 4
+        || node.inputs.as_slice() != graph.inputs()
+        || node.output != graph.output()
+    {
+        return Err(Error::UnsupportedKernel {
+            operation: "graph",
+            detail: "paged attention requires exact query/key/value/position inputs".into(),
+        });
+    }
+
+    let bf16 = KernelOperand::Activation(moxie_types::ActivationPrecision::expect(
+        moxie_types::Precision::Bf16,
+    ));
+    let operands = [bf16, bf16, bf16, KernelOperand::PageIndex];
+    let mut selected = None;
+    let mut matched = 0usize;
+    for descriptor in catalogue.descriptors().iter().filter(|descriptor| {
+        descriptor.operation == SemanticKernelOp::PagedAttention
+            && descriptor.inputs.as_slice() == operands
+            && descriptor.output == node.contract.output
+            && descriptor.accumulation == node.contract.accumulation
+            && descriptor.rounding == moxie_types::RoundingProfile::FinalBf16Rne
+            && descriptor.layout == TensorLayout::ContiguousRowMajorV1
+            && descriptor.workspace == moxie_types::WorkspaceExpression::Zero
+            && descriptor.sm.major == capability.compute_major
+            && descriptor.sm.minor == capability.compute_minor
+            && workload.rows <= descriptor.shape.max_rows
+            && head_dim <= descriptor.shape.max_input
+            && head_dim <= descriptor.shape.max_output
+            && descriptor.symbols.len() == 1
+    }) {
+        matched += 1;
+        selected.get_or_insert(descriptor);
+    }
+    if matched != 1 {
+        return Err(Error::UnsupportedKernel {
+            operation: "paged_attention",
+            detail: format!(
+                "expected one descriptor for {} row(s), {heads} head(s) of width {head_dim} on sm_{}{}; found {}",
+                workload.rows, capability.compute_major, capability.compute_minor, matched
+            ),
+        });
+    }
+    let descriptor = selected.expect("one selected descriptor").clone();
+    if descriptor.abi_version != 1 {
+        return Err(Error::UnsupportedKernel {
+            operation: "paged_attention",
+            detail: "the selected descriptor ABI is unsupported".into(),
+        });
+    }
+
+    let base = lower(graph, workload)?;
+    let query = match base.binding(node.inputs[0]) {
+        Some(ValueBinding::ExternalInput(value)) => value,
+        _ => return Err(invalid("query", "attention query is not an external input")),
+    };
+    let output = match base.binding(node.output) {
+        Some(ValueBinding::ArenaTensor(value)) => value,
+        _ => return Err(invalid("output", "attention output has no arena tensor")),
+    };
+    let query_physical = align_up(query.required_bytes)?;
+    let output_physical = align_up(output.bytes)?;
+    let activation_region_bytes = checked_add(
+        query_physical,
+        output_physical,
+        "attention activation region",
+    )?;
+    let values = vec![
+        PlannedValue {
+            value: query.value,
+            role: query.role,
+            shape: query.shape.clone(),
+            region: StorageRegion::Activations,
+            slot: 0,
+            offset: 0,
+            logical_bytes: query.required_bytes,
+            physical_bytes: query_physical,
+            first_stage: 0,
+            last_stage: 0,
+        },
+        PlannedValue {
+            value: output.value,
+            role: output.role,
+            shape: output.shape.clone(),
+            region: StorageRegion::Activations,
+            slot: 1,
+            offset: query_physical,
+            logical_bytes: output.bytes,
+            physical_bytes: output_physical,
+            first_stage: 0,
+            last_stage: 1,
+        },
+    ];
+    Ok(SelectedPlanCandidate {
+        base,
+        device_sm: (capability.compute_major, capability.compute_minor),
+        catalogue_digest: catalogue.digest(),
+        nodes: vec![SelectedNode {
+            node: node.id,
+            descriptor,
+            workspace_logical_bytes: 0,
+        }],
+        values,
+        workspace: PlannedWorkspace {
+            node: node.id,
+            offset: activation_region_bytes,
+            logical_bytes: 0,
+            physical_bytes: 0,
+            first_stage: 0,
+            last_stage: 0,
+        },
+        weight_region_bytes: 0,
+        activation_region_bytes,
+        workspace_region_bytes: 0,
+        combined_arena_bytes: activation_region_bytes,
+        stages: vec!["attention".into(), "terminal-output".into()],
     })
 }
 
@@ -1134,6 +1277,67 @@ mod tests {
                 params.op().name()
             );
         }
+    }
+
+    #[test]
+    fn attention_selects_one_kernel_and_only_query_output_device_slots() {
+        let mut registry = OracleRegistry::new();
+        registry
+            .register(
+                Op::Attention,
+                ORACLE,
+                OracleEvidence {
+                    implementation: "moxie_plan::selected::tests",
+                    test_module: "moxie_plan::selected::tests",
+                },
+            )
+            .unwrap();
+        let activation = |width| {
+            TensorSpec::new(
+                ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
+                vec![Dim::symbol(ROWS), Dim::constant(width)],
+            )
+        };
+        let mut builder = GraphBuilder::new(ORACLE, ROWS);
+        let query = builder.input("query", activation(128));
+        let keys = builder.input("keys", activation(64));
+        let values = builder.input("values", activation(64));
+        let positions = builder.input(
+            "positions",
+            TensorSpec::new(
+                ValueRole::Index(moxie_graph::IndexEncoding::U64),
+                vec![Dim::symbol(ROWS)],
+            ),
+        );
+        let output = builder
+            .node(
+                OpParams::Attention {
+                    heads: 2,
+                    kv_heads: 1,
+                    head_dim: 64,
+                    scale: crate::reciprocal_sqrt_scale(64),
+                    visibility: crate::Visibility::Causal,
+                    layer: 0,
+                },
+                &[query, keys, values, positions],
+            )
+            .unwrap();
+        let graph = builder.finish(output, &registry).unwrap();
+        let sm = SmVersion::SM86;
+        let cap = capability(sm);
+        let catalogue =
+            KernelCatalogue::new(vec![descriptor(SemanticKernelOp::PagedAttention, sm)]).unwrap();
+        let plan = lower_selected(&graph, workload(&graph, 1), &cap, &catalogue).unwrap();
+
+        assert!(plan.is_paged_attention());
+        assert_eq!(plan.nodes().len(), 1);
+        assert_eq!(plan.values().len(), 2);
+        assert_eq!(plan.values()[0].value, query);
+        assert_eq!(plan.values()[1].value, output);
+        assert_eq!(plan.activation_region_bytes(), 512);
+        assert_eq!(plan.weight_region_bytes(), 0);
+        assert_eq!(plan.workspace_region_bytes(), 0);
+        assert_eq!(plan.stages(), &["attention", "terminal-output"]);
     }
 
     #[test]

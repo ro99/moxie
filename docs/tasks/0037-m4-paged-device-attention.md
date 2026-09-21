@@ -1,10 +1,15 @@
 # Task 0037 — M4.1 common paged device attention at actual 32K context
 
-Status: active, partially implemented. Authorized by the owner on 2026-09-19.
-The kernel, its binding and the 32,768-row gate run on all three GPUs; the
-`moxie-state` binding, the injected-failure sweeps and the mutation battery are
-open. See "Still open" below — no acceptance item is claimed that is not
-evidenced there.
+**Status: accepted and closed** (owner, 2026-09-20). Authorized by the owner on
+2026-09-19. All six acceptance items are met or explicitly reassigned: the
+kernel, its binding, the 32,768-row gate and the admission-failure/
+injected-fault sweeps are evidenced on all three GPUs; the state authority and
+semantic path this task scoped landed as task 0038's work, which is that
+task's to accept, not this one's to wait on. This task's own two remaining
+items — the mutation battery and host allocator growth across decode steps —
+are moved to task 0038's acceptance 7 and 8 rather than left as this task's
+unfinished work; see "Closed, or moved to task 0038" below for the item-by-item
+accounting.
 
 ## Identity and authority
 
@@ -379,11 +384,16 @@ attention was not; the second row is now the streaming and tensor-core work it
 meant. The module header claimed to hold no pages or frontier while doing both;
 it now says they are provisional executor mechanics pending the state binding.
 
-### Still open
+### Closed, or moved to task 0038
 
-Acceptance 1 is met for the launch contract and the oracles; acceptance 2 and 3
-are met as described above; acceptance 5 is met for fmt, clippy, architecture,
-specification and the affected suites. **Not done, and not claimed:**
+All six acceptance items are accounted for. 1 is met for the launch contract
+and the oracles, with the state-authority piece implemented under task 0038.
+2 and 3 are met. 4 is met for the injected-fault sweeps; the
+host-allocator-growth measurement moved to task 0038's acceptance 8. 5 is met
+for fmt, clippy, architecture, specification and the affected suites; the
+mutation battery moved to task 0038's acceptance 7. 6 is met: the support
+matrix is updated and this record points at task 0038 below. Nothing here is
+left as this task's own unfinished work.
 
 - ~~**The state authority binding.** `moxie-state` does not own these pages yet.
   There is no transaction, branch, retention or truncation behind them, and the
@@ -391,22 +401,16 @@ specification and the affected suites. **Not done, and not claimed:**
   rather than a journal entry.~~ This was the largest remaining piece of
   acceptance 1 and 4, and the record below is what was open at this task's own
   close. See the next bullet for what closed it.
-- **The semantic path.** Finding 1 above: planner lowering from
-  `OpParams::Attention`, device query/output handles rather than host staging,
-  and execution through the admitted graph plan. Until then this is a qualified
-  kernel and binding, not the engine's attention. Carried into
-  [task 0038](0038-m4-device-kv-state-authority.md) as its second deliverable,
-  which is not started.
-- **The state binding** is **closed by task 0038's first half**, as of the
-  2026-09-20 regression evidence: `moxie_state::DeviceKvSequence` decides
-  placement, retention, the frontier, transactions, abort and truncation, the
-  32,768-row gate is driven through it, the authority hands its performer a
-  page view rather than the performer reimplementing that arithmetic, and the
-  raw `publish_page_table`/`write_rows` are no longer a public bypass. The
-  callback that carries this was named out of scope by task 0038's original
-  contract; the owner amended that line 2026-09-20 and kept the callback. See
-  [task 0038](0038-m4-device-kv-state-authority.md) for detail — task 0038
-  itself remains open on its second half and its acceptance criterion 2.
+- **The semantic path is closed by task 0038's closure candidate.**
+  `lower_selected` selects `OpParams::Attention`, admission owns separate query
+  and output slots, and the executor launches from those device ranges against
+  authority-owned state. The host-staged path remains a separate test path.
+- **The state binding is closed by task 0038's closure candidate.**
+  `DeviceKvSequence` decides placement, retention, frontiers and lifecycle;
+  commit publishes mapping changes before finalization. Raw mutation is
+  test-feature-only. The 32,768-row gate and the reclaimed-base lifecycle run
+  through this binding on both SM86 GPUs and SM120. Task 0038 still awaits
+  owner acceptance.
 - ~~**A reclaimed base is host-checked only.**~~ **Closed by task 0038**:
   `a_wrapped_ring_answers_exactly_as_an_unwrapped_one` attends after the ring
   has wrapped, at a retained base of 48, and gets byte-identical results to a
@@ -417,21 +421,37 @@ specification and the affected suites. **Not done, and not claimed:**
   no device gate has actually attended over a history whose first logical row is
   above zero. That is the shape a sliding layer reaches once it reclaims, so it
   belongs in the state-binding task's gates rather than in prose.
-- **The task mutation battery** (acceptance 5) is not written and not run, and
-  deliberately so: a battery measures whether a task's gates can fail, and this
-  task's gates are not finished. Writing T0037 against a state binding that does
-  not exist would measure substitutions in code the next task replaces. It
-  belongs at the closure candidate, as T0006 and T0028 did.
-- **Host-side growth** is checked only as "admission does not grow": 32 append
-  and decode steps leave the arena bytes and the ledger's charged buffers
+- ~~**The task mutation battery** (acceptance 5) is not written and not run.~~
+  **Moved to task 0038's acceptance 7, 2026-09-20 (owner):** a battery measures
+  whether a task's gates can fail, and this task's gates were never finished on
+  their own — writing one against a state binding that did not exist would
+  have measured substitutions in code the next task replaces. It runs against
+  task 0038's binding instead, as T0006 and T0028's closure candidates did.
+  **Completed there:** 11 of 11 substitutions caught, with no survivors,
+  instability or skipped anchors; [experiment 0008](../evidence/experiments/0008-paged-attention-mutations.md)
+  records the battery.
+- ~~**Host-side growth** is checked only as "admission does not grow".~~
+  **Moved to task 0038's acceptance 8, 2026-09-20 (owner):** 32 append and
+  decode steps leave the arena bytes and the ledger's charged buffers
   unchanged, and each step's answer differs from the last so the appends are
-  demonstrably read. What is *not* measured is host allocator behaviour across
-  decode steps, which needs the measured-allocator lane rather than an
-  assertion.
+  demonstrably read — but host allocator behaviour across decode steps needs
+  the measured-allocator lane rather than that assertion, and task 0038 is
+  where it will run. **Completed there:** the 32-step lane measured at most 9
+  calls, a 256 B transient peak and 1,000 B maximum live growth, and its
+  deliberate 1 MiB-per-step leak mutation is caught.
 - MLA, host-backed streaming, COW forks, prefix reuse, FP16 cache, tensor cores
   and any performance claim remain out of scope and unsupported by name.
 
 ## Result, filled after work
 
-No completion is claimed. The task's own acceptance list is the gate, and four
-of its items are open above.
+**Accepted, 2026-09-20 (owner).** Acceptance 2, 3 and the injected-fault half
+of 4 are met and evidenced above. Acceptance 1's remaining piece and the
+semantic path named in 4 were implemented as task 0038's own work, which that
+task's own record and acceptance now carry — this task does not restate or
+wait on 0038's acceptance to close, because task 0038's contract always named
+these as its deliverable, not a debt this task owed. The two items that were
+genuinely this task's own and unfinished — the mutation battery (acceptance 5)
+and host allocator growth across decode steps (the remaining half of
+acceptance 4) — are moved to task 0038's acceptance 7 and 8, dated 2026-09-20,
+rather than closed here by assertion. Nothing in this task's own scope is
+open.

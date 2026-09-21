@@ -391,20 +391,20 @@ pub fn attend_multi_head(
 /// `head_dim` 128 the derived value is eleven times too small;
 /// `the_derived_scale_was_not_a_bound_for_a_layer_that_declares_its_own` holds
 /// a fixture where it is smaller than the error it claims to bound. The
-/// magnitude is taken, so no caller can drive the bound negative.
+/// Softmax weights are derived here in FP64 from the same query, keys and
+/// positive scale whose error is being bounded.
 pub fn attention_error_bound(
     query_head: &[f32],
     visible_keys: &[&[f32]],
     visible_values: &[&[f32]],
-    weights: &[f64],
     component: usize,
     scale: f32,
 ) -> Result<f64> {
-    let value_dim = validate_bound_inputs(query_head, visible_keys, visible_values, weights)?;
-    if !scale.is_finite() {
+    let value_dim = validate_bound_inputs(query_head, visible_keys, visible_values)?;
+    if !(scale.is_finite() && scale > 0.0) {
         return Err(Error::InvalidRequest {
             field: "scale",
-            detail: format!("score scale must be finite, got {scale}"),
+            detail: format!("score scale must be finite and positive, got {scale}"),
         });
     }
     if component >= value_dim {
@@ -413,27 +413,27 @@ pub fn attention_error_bound(
             detail: format!("component {component} is out of range for value width {value_dim}"),
         });
     }
+    let weights = softmax_weights(query_head, visible_keys, scale)?;
     let delta_s = score_error(query_head, visible_keys, scale);
-    Ok(component_bound(
+    checked_component_bound(
         delta_s,
         query_head.len(),
         visible_keys.len(),
         visible_values,
-        weights,
+        &weights,
         component,
-    ))
+    )
 }
 
 /// The preconditions both bound entry points share, checked explicitly instead
 /// of left to `zip` truncation or an out-of-bounds index: a nonzero head
-/// dimension, equal counts of keys, values and weights, every key as wide as
-/// the query, and every value row the same nonzero width. Returns that shared
-/// value width.
+/// dimension, every numerical element finite, equal counts of keys and values,
+/// every key as wide as the query, and every value row the same nonzero width.
+/// Returns that shared value width.
 fn validate_bound_inputs(
     query_head: &[f32],
     visible_keys: &[&[f32]],
     visible_values: &[&[f32]],
-    weights: &[f64],
 ) -> Result<usize> {
     if query_head.is_empty() {
         return Err(Error::InvalidRequest {
@@ -441,15 +441,26 @@ fn validate_bound_inputs(
             detail: "zero head dimension".into(),
         });
     }
-    if visible_keys.len() != visible_values.len() || visible_keys.len() != weights.len() {
+    if !query_head.iter().all(|q| q.is_finite()) {
+        return Err(Error::InvalidRequest {
+            field: "query_head",
+            detail: "query contains a non-finite element".into(),
+        });
+    }
+    if visible_keys.len() != visible_values.len() {
         return Err(Error::InvalidRequest {
             field: "attention_error_bound",
             detail: format!(
-                "{} key(s), {} value(s), {} weight(s)",
+                "{} key(s) but {} value(s)",
                 visible_keys.len(),
-                visible_values.len(),
-                weights.len()
+                visible_values.len()
             ),
+        });
+    }
+    if visible_keys.is_empty() {
+        return Err(Error::InvalidRequest {
+            field: "attention_error_bound",
+            detail: "no visible key/value row".into(),
         });
     }
     let Some(first) = visible_values.first() else {
@@ -476,6 +487,12 @@ fn validate_bound_inputs(
                 ),
             });
         }
+        if !key.iter().all(|k| k.is_finite()) {
+            return Err(Error::InvalidRequest {
+                field: "key",
+                detail: format!("key {i} has a non-finite element"),
+            });
+        }
     }
     for (i, value) in visible_values.iter().enumerate() {
         if value.len() != value_dim {
@@ -487,8 +504,40 @@ fn validate_bound_inputs(
                 ),
             });
         }
+        if !value.iter().all(|v| v.is_finite()) {
+            return Err(Error::InvalidRequest {
+                field: "value",
+                detail: format!("value {i} has a non-finite element"),
+            });
+        }
     }
     Ok(value_dim)
+}
+
+/// The FP64 softmax used by the bound.
+fn softmax_weights(query_head: &[f32], visible_keys: &[&[f32]], scale: f32) -> Result<Vec<f64>> {
+    let scale = scale as f64;
+    let mut scores = crate::try_vec(visible_keys.len())?;
+    for (i, key) in visible_keys.iter().enumerate() {
+        let dot: f64 = query_head
+            .iter()
+            .zip(key.iter())
+            .map(|(q, k)| *q as f64 * *k as f64)
+            .sum();
+        let score = dot * scale;
+        if !score.is_finite() {
+            return Err(Error::Numerical {
+                detail: format!("score for key {i} is {score}"),
+            });
+        }
+        scores.push(score);
+    }
+    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut weights = crate::try_vec(scores.len())?;
+    weights.extend(scores.iter().map(|s| (s - max).exp()));
+    let denom: f64 = weights.iter().sum();
+    weights.iter_mut().for_each(|w| *w /= denom);
+    Ok(weights)
 }
 
 /// Every component's bound at once, for a caller checking a whole output row.
@@ -508,9 +557,8 @@ pub fn attention_error_bounds(
     query_head: &[f32],
     visible_keys: &[&[f32]],
     visible_values: &[&[f32]],
-    weights: &[f64],
 ) -> Result<Vec<f64>> {
-    attention_error_bounds_at(query_head, visible_keys, visible_values, weights, 1.0)
+    attention_error_bounds_at(query_head, visible_keys, visible_values, 1.0)
 }
 
 /// [`attention_error_bounds`] at the layer's declared score scale.
@@ -518,27 +566,27 @@ pub fn attention_error_bounds_at(
     query_head: &[f32],
     visible_keys: &[&[f32]],
     visible_values: &[&[f32]],
-    weights: &[f64],
     scale: f32,
 ) -> Result<Vec<f64>> {
-    let value_dim = validate_bound_inputs(query_head, visible_keys, visible_values, weights)?;
-    if !scale.is_finite() {
+    let value_dim = validate_bound_inputs(query_head, visible_keys, visible_values)?;
+    if !(scale.is_finite() && scale > 0.0) {
         return Err(Error::InvalidRequest {
             field: "scale",
-            detail: format!("score scale must be finite, got {scale}"),
+            detail: format!("score scale must be finite and positive, got {scale}"),
         });
     }
+    let weights = softmax_weights(query_head, visible_keys, scale)?;
     let delta_s = score_error(query_head, visible_keys, scale);
     let mut out = crate::try_vec(value_dim)?;
     for component in 0..value_dim {
-        out.push(component_bound(
+        out.push(checked_component_bound(
             delta_s,
             query_head.len(),
             visible_keys.len(),
             visible_values,
-            weights,
+            &weights,
             component,
-        ));
+        )?);
     }
     Ok(out)
 }
@@ -584,6 +632,24 @@ fn component_bound(
     let softmax_term = (2.0 * delta_s).exp_m1() * max_v;
     let steps = 2 * k + head_dim as u64 + 3;
     softmax_term + crate::metric::bound(k + 2, weighted) + steps as f64 * crate::metric::FP32_ETA
+}
+
+/// Reject a nonfinite bound because it cannot constrain an acceptance gate.
+fn checked_component_bound(
+    delta_s: f64,
+    head_dim: usize,
+    keys: usize,
+    visible_values: &[&[f32]],
+    weights: &[f64],
+    component: usize,
+) -> Result<f64> {
+    let bound = component_bound(delta_s, head_dim, keys, visible_values, weights, component);
+    if !bound.is_finite() {
+        return Err(Error::Numerical {
+            detail: "attention error bound is not finite".into(),
+        });
+    }
+    Ok(bound)
 }
 
 #[cfg(test)]
@@ -696,7 +762,7 @@ mod tests {
             scale,
         };
         let got = attend_multi_head(q, history, pos, heads, vis).unwrap();
-        let (want, weights, visible) = reference(q, history, pos, vis, scale);
+        let (want, _weights, visible) = reference(q, history, pos, vis, scale);
         let keys: Vec<&[f32]> = visible
             .iter()
             .map(|i| history.keys[*i].as_slice())
@@ -708,7 +774,7 @@ mod tests {
 
         let mut worst = 0f64;
         for d in 0..q.len() {
-            let bound = attention_error_bound(q, &keys, &values, &weights, d, scale).unwrap();
+            let bound = attention_error_bound(q, &keys, &values, d, scale).unwrap();
             let err = (got[d] as f64 - want[d]).abs();
             assert!(
                 err <= bound,
@@ -741,7 +807,7 @@ mod tests {
 
         // On well-conditioned data the bound really is tight -- a few ulps, not
         // a licence. If this ever loosens, the bound has stopped saying anything.
-        let (want, weights, visible) = reference(
+        let (want, _weights, visible) = reference(
             &q,
             &history,
             (n - 1) as u64,
@@ -756,8 +822,7 @@ mod tests {
             .iter()
             .map(|i| history.values[*i].as_slice())
             .collect();
-        let bound =
-            attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(head_dim)).unwrap();
+        let bound = attention_error_bound(&q, &keys, &values, 0, mha_scale(head_dim)).unwrap();
         assert!(
             bound < 1e-4,
             "on benign data the bound should be tiny, got {bound:.3e}"
@@ -799,7 +864,7 @@ mod tests {
         let q = vec![1.0f32; hd];
 
         let got = attend_mha(&q, &history, 1, 1, hd, Visibility::Causal).unwrap();
-        let (want, weights, visible) =
+        let (want, _weights, visible) =
             reference(&q, &history, 1, Visibility::Causal, mha_scale(hd));
 
         // The disagreement is large and real: FP32 genuinely computes a
@@ -823,14 +888,13 @@ mod tests {
             .map(|i| history.values[*i].as_slice())
             .collect();
         for d in 0..2 {
-            let bound =
-                attention_error_bound(&q, &keys, &values, &weights, d, mha_scale(hd)).unwrap();
+            let bound = attention_error_bound(&q, &keys, &values, d, mha_scale(hd)).unwrap();
             let err = (got[d] as f64 - want[d]).abs();
             assert!(err <= bound, "component {d}: {err:.4e} > {bound:.4e}");
         }
 
         // And it is honest about being weak here rather than pretending.
-        let bound = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd)).unwrap();
+        let bound = attention_error_bound(&q, &keys, &values, 0, mha_scale(hd)).unwrap();
         assert!(
             bound > 0.1,
             "on data this ill-conditioned the bound must say so, got {bound:.3e}"
@@ -878,7 +942,7 @@ mod tests {
             scale: declared,
         };
         let got = attend_multi_head(&q, &history, 1, heads, Visibility::Causal).unwrap();
-        let (want, weights, visible) = reference(&q, &history, 1, Visibility::Causal, declared);
+        let (want, _weights, visible) = reference(&q, &history, 1, Visibility::Causal, declared);
 
         // FP32 loses the entire second key lane set and sees two equal scores.
         assert!(
@@ -898,10 +962,8 @@ mod tests {
             .map(|i| history.values[*i].as_slice())
             .collect();
 
-        let declared_bound =
-            attention_error_bound(&q, &keys, &values, &weights, 0, declared).unwrap();
-        let derived_bound =
-            attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd)).unwrap();
+        let declared_bound = attention_error_bound(&q, &keys, &values, 0, declared).unwrap();
+        let derived_bound = attention_error_bound(&q, &keys, &values, 0, mha_scale(hd)).unwrap();
         println!(
             "scale 1.0: error {err:.4e} declared bound {declared_bound:.4e} \
              derived bound {derived_bound:.4e}"
@@ -954,7 +1016,7 @@ mod tests {
             }
         }
 
-        let (_, weights, visible) = reference(&q, &history, 7, Visibility::Causal, 1.0);
+        let (_, _weights, visible) = reference(&q, &history, 7, Visibility::Causal, 1.0);
         let keys: Vec<&[f32]> = visible
             .iter()
             .map(|i| history.keys[*i].as_slice())
@@ -963,9 +1025,8 @@ mod tests {
             .iter()
             .map(|i| history.values[*i].as_slice())
             .collect();
-        let at_one = attention_error_bound(&q, &keys, &values, &weights, 0, 1.0).unwrap();
-        let at_conventional =
-            attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd)).unwrap();
+        let at_one = attention_error_bound(&q, &keys, &values, 0, 1.0).unwrap();
+        let at_conventional = attention_error_bound(&q, &keys, &values, 0, mha_scale(hd)).unwrap();
         assert!(
             at_one < 1e-5,
             "a scale of 1.0 is not a licence to be loose: {at_one:.3e}"
@@ -974,13 +1035,6 @@ mod tests {
             at_one > at_conventional,
             "a larger declared scale must give a larger score-error term: \
              {at_one:.3e} vs {at_conventional:.3e}"
-        );
-        // A negative scale cannot exist on a validated operation, but this
-        // helper is public: the magnitude is what enters the bound.
-        assert_eq!(
-            at_one,
-            attention_error_bound(&q, &keys, &values, &weights, 0, -1.0).unwrap(),
-            "the bound must use the magnitude of the declared scale"
         );
     }
 
@@ -1003,7 +1057,7 @@ mod tests {
         let history = history_of(&rows);
         let q: Vec<f32> = (0..hd).map(|d| (d as f32 - 3.0) / 4.0).collect();
         for scale in [1.0f32, mha_scale(hd), 0.125] {
-            let (_, weights, visible) = reference(&q, &history, 8, Visibility::Causal, scale);
+            let (_, _weights, visible) = reference(&q, &history, 8, Visibility::Causal, scale);
             let keys: Vec<&[f32]> = visible
                 .iter()
                 .map(|i| history.keys[*i].as_slice())
@@ -1012,19 +1066,19 @@ mod tests {
                 .iter()
                 .map(|i| history.values[*i].as_slice())
                 .collect();
-            let row = attention_error_bounds_at(&q, &keys, &values, &weights, scale).unwrap();
+            let row = attention_error_bounds_at(&q, &keys, &values, scale).unwrap();
             assert_eq!(row.len(), hd);
             for (d, bound) in row.iter().enumerate() {
                 assert_eq!(
                     *bound,
-                    attention_error_bound(&q, &keys, &values, &weights, d, scale).unwrap(),
+                    attention_error_bound(&q, &keys, &values, d, scale).unwrap(),
                     "component {d} at scale {scale}"
                 );
             }
         }
         // The default-scale entry point is the conventional one, and an empty
         // visible set is a typed refusal rather than an empty vector.
-        let (_, weights, visible) = reference(&q, &history, 8, Visibility::Causal, 1.0);
+        let (_, _weights, visible) = reference(&q, &history, 8, Visibility::Causal, 1.0);
         let keys: Vec<&[f32]> = visible
             .iter()
             .map(|i| history.keys[*i].as_slice())
@@ -1034,59 +1088,66 @@ mod tests {
             .map(|i| history.values[*i].as_slice())
             .collect();
         assert_eq!(
-            attention_error_bounds(&q, &keys, &values, &weights).unwrap(),
-            attention_error_bounds_at(&q, &keys, &values, &weights, 1.0).unwrap()
+            attention_error_bounds(&q, &keys, &values).unwrap(),
+            attention_error_bounds_at(&q, &keys, &values, 1.0).unwrap()
         );
-        assert!(attention_error_bounds(&q, &[], &[], &[]).is_err());
+        assert!(attention_error_bounds(&q, &[], &[]).is_err());
     }
 
     #[test]
     fn the_bound_functions_refuse_malformed_input_instead_of_truncating_or_panicking() {
-        // Keys, values and weights of matching width and count, so each case
-        // below is broken in exactly one way.
+        // Keys and values of matching width and count, so each case below is
+        // broken in exactly one way. Weights are no longer a caller input: the
+        // bound derives its own from `query`, `keys` and `scale`.
         let key0 = [1.0f32, 0.0];
         let key1 = [0.0f32, 1.0];
         let keys: [&[f32]; 2] = [&key0, &key1];
         let value0 = [1.0f32, 2.0];
         let value1 = [3.0f32, 4.0];
         let values: [&[f32]; 2] = [&value0, &value1];
-        let weights = [0.5f64, 0.5];
         let q = [1.0f32, 1.0];
-
-        // A weight count that does not match the key/value count is refused
-        // rather than `zip`-truncated into a partial, silently weaker bound.
-        assert!(attention_error_bound(&q, &keys, &values, &weights[..1], 0, 1.0).is_err());
-        assert!(attention_error_bounds_at(&q, &keys, &values, &weights[..1], 1.0).is_err());
 
         // A key narrower than the query is refused rather than `zip`-truncated
         // into a dot product over the wrong lanes.
         let short_key = [1.0f32];
         let mixed_keys: [&[f32]; 2] = [&short_key, &key1];
-        assert!(attention_error_bound(&q, &mixed_keys, &values, &weights, 0, 1.0).is_err());
+        assert!(attention_error_bound(&q, &mixed_keys, &values, 0, 1.0).is_err());
 
         // A value row narrower than the others is refused rather than indexed
         // out of bounds by a later component.
         let short_value = [1.0f32];
         let mixed_values: [&[f32]; 2] = [&value0, &short_value];
-        assert!(attention_error_bound(&q, &keys, &mixed_values, &weights, 1, 1.0).is_err());
-        assert!(attention_error_bounds_at(&q, &keys, &mixed_values, &weights, 1.0).is_err());
+        assert!(attention_error_bound(&q, &keys, &mixed_values, 1, 1.0).is_err());
+        assert!(attention_error_bounds_at(&q, &keys, &mixed_values, 1.0).is_err());
 
         // A component past the value width is refused rather than indexed out
         // of bounds.
-        assert!(attention_error_bound(&q, &keys, &values, &weights, 2, 1.0).is_err());
+        assert!(attention_error_bound(&q, &keys, &values, 2, 1.0).is_err());
 
-        // A non-finite scale is refused: this entry point takes the magnitude
-        // of a negative scale (asserted above), but not of an infinite one.
-        for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        // The bound accepts the same scale domain as the operation.
+        for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, -0.0, 0.0] {
             assert!(
-                attention_error_bound(&q, &keys, &values, &weights, 0, scale).is_err(),
+                attention_error_bound(&q, &keys, &values, 0, scale).is_err(),
                 "scale {scale} was accepted"
             );
             assert!(
-                attention_error_bounds_at(&q, &keys, &values, &weights, scale).is_err(),
+                attention_error_bounds_at(&q, &keys, &values, scale).is_err(),
                 "scale {scale} was accepted"
             );
         }
+
+        // A non-finite element in the query, a key or a value is refused by
+        // name rather than propagating into a bound that a `difference >
+        // bound` gate cannot compare against.
+        let nan_query = [f32::NAN, 1.0];
+        assert!(attention_error_bound(&nan_query, &keys, &values, 0, 1.0).is_err());
+        let nan_key0 = [f32::NAN, 0.0];
+        let nan_keys: [&[f32]; 2] = [&nan_key0, &key1];
+        assert!(attention_error_bound(&q, &nan_keys, &values, 0, 1.0).is_err());
+        let nan_value0 = [f32::NAN, 2.0];
+        let nan_values: [&[f32]; 2] = [&nan_value0, &value1];
+        assert!(attention_error_bound(&q, &keys, &nan_values, 0, 1.0).is_err());
+        assert!(attention_error_bounds_at(&q, &keys, &nan_values, 1.0).is_err());
 
         // Zero-width attention -- an empty query and equally empty value rows
         // -- is refused rather than handed back as an apparently valid empty
@@ -1095,13 +1156,8 @@ mod tests {
         let empty_value: [f32; 0] = [];
         let empty_keys: [&[f32]; 1] = [&empty_key];
         let empty_values: [&[f32]; 1] = [&empty_value];
-        let one_weight = [1.0f64];
-        assert!(
-            attention_error_bound(&[], &empty_keys, &empty_values, &one_weight, 0, 1.0).is_err()
-        );
-        assert!(
-            attention_error_bounds_at(&[], &empty_keys, &empty_values, &one_weight, 1.0).is_err()
-        );
+        assert!(attention_error_bound(&[], &empty_keys, &empty_values, 0, 1.0).is_err());
+        assert!(attention_error_bounds_at(&[], &empty_keys, &empty_values, 1.0).is_err());
     }
 
     #[test]
@@ -1124,7 +1180,7 @@ mod tests {
         let q = vec![0.0f32; hd];
 
         let got = attend_mha(&q, &history, 2, 1, hd, Visibility::Causal).unwrap();
-        let (want, weights, visible) =
+        let (want, _weights, visible) =
             reference(&q, &history, 2, Visibility::Causal, mha_scale(hd));
         let keys: Vec<&[f32]> = visible
             .iter()
@@ -1137,7 +1193,7 @@ mod tests {
 
         let err = (got[0] as f64 - want[0]).abs();
         assert!(err > 0.0, "the fixture must actually lose something");
-        let bound = attention_error_bound(&q, &keys, &values, &weights, 0, mha_scale(hd)).unwrap();
+        let bound = attention_error_bound(&q, &keys, &values, 0, mha_scale(hd)).unwrap();
         assert!(err <= bound, "error {err:e} exceeded bound {bound:e}");
 
         // The underflow term is what is carrying it: the relative terms alone
@@ -1160,7 +1216,7 @@ mod tests {
             .collect();
         let history = history_of(&rows);
         let q: Vec<f32> = (0..hd).map(|d| (d % 3) as f32 * 0.5 - 0.5).collect();
-        let (_, weights, visible) = reference(&q, &history, 5, Visibility::Causal, mha_scale(hd));
+        let (_, _weights, visible) = reference(&q, &history, 5, Visibility::Causal, mha_scale(hd));
         let keys: Vec<&[f32]> = visible
             .iter()
             .map(|i| history.keys[*i].as_slice())
@@ -1170,8 +1226,7 @@ mod tests {
             .map(|i| history.values[*i].as_slice())
             .collect();
         for d in 0..hd {
-            let bound =
-                attention_error_bound(&q, &keys, &values, &weights, d, mha_scale(hd)).unwrap();
+            let bound = attention_error_bound(&q, &keys, &values, d, mha_scale(hd)).unwrap();
             assert!(bound < 1e-5, "component {d} bound {bound:.3e} is not tight");
         }
         assert_within_bound(&q, &history, 5, Visibility::Causal, "benign");

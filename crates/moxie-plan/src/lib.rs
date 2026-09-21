@@ -367,24 +367,13 @@ fn lower_with_ids(
             layer,
         } = node.params
         {
-            // Operands are query, key, value, positions in that fixed order —
-            // `OpParams::arity` and `position_operand` are the one statement
-            // of it, and the graph carries no separate role tag, so position
-            // *is* the role here.
-            let operand_role = |index: usize, name: &'static str| -> Result<ValueRole> {
-                let operand = node.inputs.get(index).copied().ok_or_else(|| {
-                    invalid(
-                        "attention",
-                        format!("an attention node without a {name} operand"),
-                    )
-                })?;
-                Ok(graph.values()[operand.0 as usize].role)
+            // Graph construction already validates all three data operands as
+            // BF16 activations. The key carries the cache precision.
+            let ValueRole::Activation(precision) = graph.values()[node.inputs[1].0 as usize].role
+            else {
+                unreachable!("GraphBuilder requires an activation role for the key operand")
             };
-            let cache_precision = attention_cache_precision(
-                operand_role(0, "query")?,
-                operand_role(1, "key")?,
-                operand_role(2, "value")?,
-            )?;
+            let cache_precision = precision.get();
             state.try_reserve(1).map_err(|_| {
                 invalid("state", "the state requirement list could not be reserved")
             })?;
@@ -723,61 +712,6 @@ fn validate_external_input(role: ValueRole, shape: &[u64]) -> Result<u64> {
             "a route table is produced by a Route operation, not bound as an input",
         )),
     }
-}
-
-/// Validate one attention node's query, key and value roles and return the
-/// cache precision its state append uses.
-///
-/// Refuses a non-activation operand by name, a key/value precision mismatch,
-/// and a query or cache precision that is not BF16 -- the only precision the
-/// selected kernel and device state allocation serve in this slice. A plan
-/// that derived the cache precision from the key alone and left query and
-/// value unchecked would claim a stronger invariant than it actually checks.
-fn attention_cache_precision(
-    query: ValueRole,
-    key: ValueRole,
-    value: ValueRole,
-) -> Result<Precision> {
-    let activation = |role: ValueRole, name: &'static str| -> Result<Precision> {
-        match role {
-            ValueRole::Activation(precision) => Ok(precision.get()),
-            other => Err(invalid(
-                "attention",
-                format!("the {name} operand is {other:?}, which is not an activation"),
-            )),
-        }
-    };
-    let query = activation(query, "query")?;
-    if query != Precision::Bf16 {
-        return Err(invalid(
-            "attention",
-            format!(
-                "query precision {query:?} is not BF16, the only precision the selected \
-                 kernel serves in this slice"
-            ),
-        ));
-    }
-    let key = activation(key, "key")?;
-    let value = activation(value, "value")?;
-    if key != value {
-        return Err(invalid(
-            "attention",
-            format!(
-                "key precision {key:?} does not match value precision {value:?}; the state \
-                 cache holds one encoding for both"
-            ),
-        ));
-    }
-    if key != Precision::Bf16 {
-        return Err(invalid(
-            "attention",
-            format!(
-                "cache precision {key:?} is not BF16, the only precision the selected kernel \
-                 and device state allocation serve in this slice"
-            ),
-        ));
-    }
-    Ok(key)
 }
 
 fn align_up(value: u64, alignment: u64) -> Result<u64> {
@@ -1138,36 +1072,6 @@ mod tests {
         let mut branch = workload(&stateful, 2);
         branch.phase = Phase::Verify;
         assert_eq!(lower(&stateful, branch).unwrap_err().kind(), "unsupported");
-    }
-
-    // This exercises `attention_cache_precision` directly rather than through
-    // `lower`, because none of its four refusals can be reached that way:
-    // `GraphBuilder::node` now requires an activation role for every
-    // query/key/value slot (`moxie-graph`'s
-    // `attention_refuses_a_weight_in_a_query_key_or_value_slot` covers that
-    // refusal on the public path), and its node contract accepts only BF16
-    // activations, so a mismatched or non-BF16 pair cannot be constructed
-    // either. This is deliberately a unit test of a defense-in-depth
-    // function, not evidence about the public lowering path.
-    #[test]
-    fn attention_operand_validation_refuses_malformed_or_unsupported_roles() {
-        let bf16 = ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16));
-        let f16 = ValueRole::Activation(ActivationPrecision::expect(Precision::F16));
-        let disguised_weight = ValueRole::Weight(WeightPrecision::expect(Precision::Bf16));
-
-        // A weight in a query/key/value slot is not an activation at all.
-        assert!(attention_cache_precision(bf16, disguised_weight, bf16).is_err());
-        // Key and value must agree: one cache encoding, not two.
-        assert!(attention_cache_precision(bf16, bf16, f16).is_err());
-        // Equal but not BF16: this slice's kernel and state allocation are BF16-only.
-        assert!(attention_cache_precision(bf16, f16, f16).is_err());
-        // A BF16 key/value pair does not excuse a non-BF16 query.
-        assert!(attention_cache_precision(f16, bf16, bf16).is_err());
-
-        assert_eq!(
-            attention_cache_precision(bf16, bf16, bf16),
-            Ok(Precision::Bf16)
-        );
     }
 
     #[test]

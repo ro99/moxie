@@ -2017,6 +2017,7 @@ fn every_allocation_in_a_quantized_admission_refuses_rather_than_aborting() {
 /// must leave it exactly where it was. A frontier advanced on an unproven copy
 /// would make every later decode attend over bytes nothing wrote.
 #[test]
+#[cfg(feature = "paged-attention-test-hooks")]
 fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     let _serial = one_at_a_time();
     use moxie_executor::paged_attention::device::RawPagedFixture;
@@ -2114,7 +2115,10 @@ fn a_paged_attention_failure_keeps_its_query_and_its_frontier() {
     .map_err(|r| r.error)
     .expect("four rows fit");
     assert_eq!(run.run().written_rows(), 4);
-    let committed = run.run().read_rows(&first_four).expect("read the rows back");
+    let committed = run
+        .run()
+        .read_rows(&first_four)
+        .expect("read the rows back");
 
     // An append whose event record fails. The copies were submitted for real,
     // so their completion is unknown and the rows cannot be published.

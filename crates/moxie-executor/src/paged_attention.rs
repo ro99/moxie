@@ -957,9 +957,12 @@ pub mod device {
     use moxie_memory::{
         BufferRequest, Ledger, LedgerId, PlanRequest, Rejection, Reservation, StageSpan,
     };
+    #[cfg(feature = "paged-attention-binding")]
+    use moxie_state::DeviceKvSequence;
+    #[cfg(feature = "paged-attention-binding")]
+    use moxie_types::{BatchId, PageView, PagedKvWriter};
     use moxie_types::{
-        BatchId, DeviceTier, Error, HostTier, PagePlacement, PagedKvWriter, PageView, Result,
-        Scope, SemanticKernelDescriptor, Tier,
+        DeviceTier, Error, HostTier, PagePlacement, Result, Scope, SemanticKernelDescriptor, Tier,
     };
 
     use super::{PageGeometry, PagedAttentionLaunch, invalid, invalid_fmt, unsupported_kernel_fmt};
@@ -2563,35 +2566,21 @@ pub mod device {
         }
     }
 
-    /// A [`PagedKvWriter`] over one run, for the one layer it serves.
-    ///
-    /// `moxie_state::DeviceKvSequence` calls through this trait instead of
-    /// validating a token it was handed: it stages a batch, hands each
-    /// layer's writer the view and the placements it chose, and treats a
-    /// layer published only when that call returns `Ok`. This is the small
-    /// bridge back to the run's own (now crate-private) `publish_page_table`
-    /// and `write_rows`, which stay the actual mechanism -- the copy and the
-    /// completion observation are unchanged, only who is allowed to call them
-    /// is different: publishing the authority's view and writing the rows it
-    /// placed happen together, as one authorized operation, so nothing
-    /// outside this bridge can perform either alone.
-    ///
-    /// One run serves one layer; a sequence with more layers is driven with
-    /// one writer per layer, each holding its own run and its own share of
-    /// the rows.
+    /// Performs one state authority's page writes for one layer.
     #[derive(Debug)]
-    pub struct PagedKvWriterAdapter<'run, 'ctx> {
+    #[cfg(feature = "paged-attention-binding")]
+    struct PagedKvWriterAdapter<'run, 'ctx> {
         layer: usize,
         run: &'run mut PagedAttentionRun<'ctx>,
         stream: &'run Stream<'ctx>,
         keys: Vec<u8>,
         values: Vec<u8>,
+        retained: bool,
     }
 
+    #[cfg(feature = "paged-attention-binding")]
     impl<'run, 'ctx> PagedKvWriterAdapter<'run, 'ctx> {
-        /// Bind a run to the layer it serves, with the rows `write_layer` will
-        /// copy when the authority drives it.
-        pub fn new(
+        fn new(
             layer: usize,
             run: &'run mut PagedAttentionRun<'ctx>,
             stream: &'run Stream<'ctx>,
@@ -2604,90 +2593,168 @@ pub mod device {
                 stream,
                 keys,
                 values,
+                retained: false,
             }
         }
 
-        /// Take back whatever rows this writer still holds.
-        ///
-        /// Empty once `write_layer` has enqueued them (they are the run's
-        /// problem from there) or while a quarantined run retains them
-        /// internally; otherwise -- before the first call, or after a
-        /// pre-enqueue refusal restored them -- these are the same
-        /// `keys`/`values` this writer was constructed with, for a caller
-        /// that aborts rather than retries.
-        pub fn into_rows(self) -> (Vec<u8>, Vec<u8>) {
-            (self.keys, self.values)
+        /// Returns rows only when no device operation retained them.
+        fn into_rows(self) -> Option<(Vec<u8>, Vec<u8>)> {
+            (!self.retained).then_some((self.keys, self.values))
         }
-    }
 
-    impl PagedKvWriter for PagedKvWriterAdapter<'_, '_> {
-        fn write_layer(
-            &mut self,
-            layer: usize,
-            _batch: BatchId,
-            view: &PageView,
-            placements: &[PagePlacement],
-        ) -> moxie_types::Result<()> {
+        fn publish(&mut self, layer: usize, view: PageView) -> moxie_types::Result<()> {
             if layer != self.layer {
                 return Err(invalid_fmt(
                     "layer",
                     format_args!("this writer serves layer {}, not {layer}", self.layer),
                 ));
             }
-            // One authorized operation: publish the authority's own view --
-            // never one this adapter derives -- and only then write the rows
-            // it placed. Always republished rather than compared against the
-            // last one: correctness first, and an unconditional idempotent
-            // publish is cheaper to reason about than a cache that could be
-            // wrong about what the run currently holds.
             self.run
-                .publish_page_table(self.stream, view.base, view.table.clone())
-                .map_err(|refused| refused.error)?;
+                .publish_page_table(self.stream, view.base, view.table)
+                .map_err(|refused| refused.error)
+        }
+    }
+
+    #[cfg(feature = "paged-attention-binding")]
+    impl PagedKvWriter for PagedKvWriterAdapter<'_, '_> {
+        fn write_layer(
+            &mut self,
+            layer: usize,
+            _batch: BatchId,
+            view: PageView,
+            placements: &[PagePlacement],
+        ) -> moxie_types::Result<()> {
+            self.publish(layer, view)?;
             let keys = core::mem::take(&mut self.keys);
             let values = core::mem::take(&mut self.values);
             match self.run.write_rows(self.stream, placements, keys, values) {
                 Ok(()) => Ok(()),
                 Err(refused) => {
-                    // A pre-enqueue refusal hands the rows straight back, and
-                    // they belong in this writer again -- not on the floor --
-                    // so `into_rows` or a retry can still reach them. `None`
-                    // means the run already retained them internally because
-                    // completion is unknown; there is nothing to recover.
                     if let Some(RefusedSource::Rows { keys, values }) = refused.source {
                         self.keys = keys;
                         self.values = values;
+                    } else {
+                        self.retained = true;
                     }
                     Err(refused.error)
                 }
             }
         }
+
+        fn publish_view(&mut self, layer: usize, view: PageView) -> moxie_types::Result<()> {
+            self.publish(layer, view)
+        }
     }
 
-    /// A run driven with no state authority at all.
-    ///
-    /// Exists for the kernel-numerics gate (`cargo xtask-cuda test-gpu`),
-    /// which stresses the kernel against the FP64 oracle with shuffled and
-    /// arbitrary page tables -- values no authority's retention policy would
-    /// ever produce, because that is not a state decision to begin with.
-    /// Taking the run **by value** is the point: a run the authority is
-    /// driving through a [`PagedKvWriterAdapter`] cannot also be driven this
-    /// way, because reaching this path means surrendering the managed one,
-    /// and the type's name then marks every place that happened. Nothing
-    /// holding published history may construct one.
+    /// Refused authority-driven append. `source` is present only when no
+    /// in-flight device work retained the rows.
+    #[derive(Debug)]
+    #[cfg(feature = "paged-attention-binding")]
+    pub struct PagedKvRows {
+        pub keys: Vec<u8>,
+        pub values: Vec<u8>,
+    }
+
+    #[derive(Debug)]
+    #[cfg(feature = "paged-attention-binding")]
+    pub struct PagedStateAppendRefused {
+        pub error: Error,
+        pub source: Option<PagedKvRows>,
+    }
+
+    /// Append one layer through the state authority.
+    #[cfg(feature = "paged-attention-binding")]
+    #[allow(clippy::result_large_err)]
+    pub fn append_paged_layer<'ctx>(
+        state: &mut DeviceKvSequence,
+        txn: moxie_types::StateTransactionId,
+        layer: usize,
+        count: u64,
+        run: &mut PagedAttentionRun<'ctx>,
+        stream: &Stream<'ctx>,
+        source: PagedKvRows,
+    ) -> std::result::Result<(), PagedStateAppendRefused> {
+        let mut writer = PagedKvWriterAdapter::new(layer, run, stream, source.keys, source.values);
+        match state.append_layer(txn, layer, count, &mut writer) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(PagedStateAppendRefused {
+                error,
+                source: writer
+                    .into_rows()
+                    .map(|(keys, values)| PagedKvRows { keys, values }),
+            }),
+        }
+    }
+
+    /// Commit a completed batch and publish page-table transitions through the
+    /// matching run for every layer.
+    #[cfg(feature = "paged-attention-binding")]
+    pub fn commit_paged_state<'ctx>(
+        state: &mut DeviceKvSequence,
+        txn: moxie_types::StateTransactionId,
+        accept: u64,
+        runs: &mut [PagedAttentionRun<'ctx>],
+        stream: &Stream<'ctx>,
+    ) -> Result<()> {
+        if state.layer_count()? != runs.len() {
+            return Err(invalid(
+                "runs",
+                "commit needs exactly one device run per state layer",
+            ));
+        }
+        let mut adapters = moxie_memory::fallible::with_capacity(runs.len())?;
+        for (layer, run) in runs.iter_mut().enumerate() {
+            adapters.push(PagedKvWriterAdapter::new(
+                layer,
+                run,
+                stream,
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        let mut writers = moxie_memory::fallible::with_capacity(adapters.len())?;
+        writers.extend(
+            adapters
+                .iter_mut()
+                .map(|writer| writer as &mut dyn PagedKvWriter),
+        );
+        state.commit(txn, accept, &mut writers)
+    }
+
+    /// Single-layer form used by a standalone attention plan.
+    #[cfg(feature = "paged-attention-binding")]
+    pub fn commit_paged_layer<'ctx>(
+        state: &mut DeviceKvSequence,
+        txn: moxie_types::StateTransactionId,
+        accept: u64,
+        run: &mut PagedAttentionRun<'ctx>,
+        stream: &Stream<'ctx>,
+    ) -> Result<()> {
+        if state.layer_count()? != 1 {
+            return Err(invalid(
+                "runs",
+                "single-layer commit requires a one-layer state authority",
+            ));
+        }
+        let mut writer = PagedKvWriterAdapter::new(0, run, stream, Vec::new(), Vec::new());
+        state.commit(txn, accept, &mut [&mut writer])
+    }
+
+    /// Test-only access to raw page mutation for kernel qualification and
+    /// injected-fault cases.
     #[derive(Debug)]
     #[must_use = "an unclosed run keeps its arena and its reservation"]
+    #[cfg(feature = "paged-attention-test-hooks")]
     pub struct RawPagedFixture<'ctx> {
         run: PagedAttentionRun<'ctx>,
     }
 
+    #[cfg(feature = "paged-attention-test-hooks")]
     impl<'ctx> RawPagedFixture<'ctx> {
-        /// Surrender the managed path for `run`.
         pub fn new(run: PagedAttentionRun<'ctx>) -> Self {
             Self { run }
         }
 
-        /// Publish an arbitrary mapping -- shuffled, reversed, whatever the
-        /// gate is stressing -- with no authority behind it.
         #[allow(clippy::result_large_err)]
         pub fn publish_page_table(
             &mut self,
@@ -2698,8 +2765,6 @@ pub mod device {
             self.run.publish_page_table(stream, base, table)
         }
 
-        /// Write rows at placements this fixture chose, with no authority
-        /// behind them either.
         #[allow(clippy::result_large_err)]
         pub fn write_rows(
             &mut self,
@@ -2711,15 +2776,10 @@ pub mod device {
             self.run.write_rows(stream, placements, keys, values)
         }
 
-        /// The run's own public surface -- `attend`, `read_rows`,
-        /// `written_rows`, `arena_bytes` and the rest -- none of which needed
-        /// narrowing.
         pub fn run(&self) -> &PagedAttentionRun<'ctx> {
             &self.run
         }
 
-        /// Hand the run back once this fixture is done driving it directly,
-        /// so it can `attend`, `read_rows` or `close` through its own API.
         pub fn into_inner(self) -> PagedAttentionRun<'ctx> {
             self.run
         }

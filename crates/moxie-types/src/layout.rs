@@ -29,11 +29,9 @@ impl core::fmt::Display for TensorLayout {
 /// Where one run of paged rows physically sits.
 ///
 /// The vocabulary the state authority speaks and the executor performs. It
-/// lives here, in the crate both already depend on, because it is neither a
-/// state decision nor an execution effect but the *description* that passes
-/// between them — and because the alternative is a dependency edge from the
-/// executor to `moxie-state`, which would put retention and frontiers inside
-/// the crate that launches kernels.
+/// lives here because it is neither a state decision nor an execution effect,
+/// but the description passed between them. Keeping that description shared
+/// prevents the executor from inventing a second placement vocabulary.
 ///
 /// A run rather than a row: a dense append crosses page boundaries, and the
 /// physical pages it lands on need not be adjacent, so the unit that matters is
@@ -96,6 +94,10 @@ pub struct PageView {
 /// the placements it chose, and it publishes only if every writer returned `Ok`.
 /// There is no value a caller can hold that makes publication happen — the only
 /// way to reach it is to be the writer and to return success.
+///
+/// Two methods, because a mapping can need publishing with no rows attached:
+/// retention moves a layer's page table at a commit, not at a write, so
+/// [`Self::write_layer`] alone cannot keep a table current between batches.
 pub trait PagedKvWriter {
     /// Copy this batch's rows into `placements` and observe the copy complete.
     ///
@@ -116,7 +118,16 @@ pub trait PagedKvWriter {
         &mut self,
         layer: usize,
         batch: BatchId,
-        view: &PageView,
+        view: PageView,
         placements: &[PagePlacement],
     ) -> crate::Result<()>;
+
+    /// Publish a mapping with no rows attached.
+    ///
+    /// Retention can move a layer's page table without any row being written
+    /// afterward, and the authority has no other operation that republishes a
+    /// table on its own — [`Self::write_layer`] only exists with rows
+    /// attached. This is that republish: the authority calls it with the
+    /// layer's current mapping after a commit whose retention may have moved.
+    fn publish_view(&mut self, layer: usize, view: PageView) -> crate::Result<()>;
 }

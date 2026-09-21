@@ -175,6 +175,25 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                 invalid("plan", "graph/catalogue/capability/UUID binding changed"),
             ));
         }
+        let mut regions = match moxie_memory::fallible::with_capacity(3) {
+            Ok(regions) => regions,
+            Err(error) => return Err(fail(candidate, error)),
+        };
+        for region in [
+            (
+                DeviceTier::PackedResidentWeights,
+                candidate.weight_region_bytes(),
+            ),
+            (DeviceTier::Activations, candidate.activation_region_bytes()),
+            (
+                DeviceTier::KernelWorkspace,
+                candidate.workspace_region_bytes(),
+            ),
+        ] {
+            if region.1 != 0 {
+                regions.push(region);
+            }
+        }
         let request = match selected_resource_request(&candidate) {
             Ok(request) => request,
             Err(error) => return Err(fail(candidate, error)),
@@ -189,17 +208,6 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                 });
             }
         };
-        let regions = [
-            (
-                DeviceTier::PackedResidentWeights,
-                candidate.weight_region_bytes(),
-            ),
-            (DeviceTier::Activations, candidate.activation_region_bytes()),
-            (
-                DeviceTier::KernelWorkspace,
-                candidate.workspace_region_bytes(),
-            ),
-        ];
         let mut arena = match DeviceArena::create_partitioned(
             ledger,
             reservation,
@@ -227,13 +235,15 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                 .entry((value.region, value.slot))
                 .or_insert((value.offset, value.physical_bytes));
         }
-        specs.insert(
-            (StorageRegion::Workspace, 0),
-            (
-                candidate.workspace().offset,
-                candidate.workspace().physical_bytes,
-            ),
-        );
+        if candidate.workspace().physical_bytes != 0 {
+            specs.insert(
+                (StorageRegion::Workspace, 0),
+                (
+                    candidate.workspace().offset,
+                    candidate.workspace().physical_bytes,
+                ),
+            );
+        }
         let mut ranges = BTreeMap::new();
         for (key, (offset, bytes)) in specs {
             match arena.allocate(bytes, 256, format!("{:?}-{}", key.0, key.1)) {
@@ -317,6 +327,13 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                     "execution",
                     "admitted graph/catalogue/capability/stream changed",
                 ),
+            ));
+        }
+        if self.candidate.is_paged_attention() {
+            return Err(reject(
+                self,
+                bindings,
+                invalid("execution", "paged attention uses execute_paged_attention"),
             ));
         }
         if catalogue.digest() != moxie_kernels::bf16_chain_catalogue().digest() {
@@ -482,6 +499,38 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             .get(&(planned.region, planned.slot))
             .ok_or_else(|| invalid("range", "selected range is absent"))
     }
+
+    pub(crate) fn range_for_selected_value(&self, value: ValueId) -> Result<&DeviceRange<'ctx>> {
+        self.range_for_value(value)
+    }
+
+    pub(crate) fn take_range_for_value(
+        &mut self,
+        value: ValueId,
+    ) -> Result<((StorageRegion, u32), DeviceRange<'ctx>)> {
+        let planned = self
+            .candidate
+            .value(value)
+            .ok_or_else(|| invalid("value", "value is absent from selected plan"))?;
+        let key = (planned.region, planned.slot);
+        self.ranges
+            .remove(&key)
+            .map(|range| (key, range))
+            .ok_or_else(|| invalid("range", "selected range is absent"))
+    }
+
+    pub(crate) fn restore_range(
+        &mut self,
+        key: (StorageRegion, u32),
+        range: DeviceRange<'ctx>,
+    ) -> Result<()> {
+        if self.ranges.contains_key(&key) {
+            core::mem::forget(range);
+            return Err(invalid("range", "selected range was already present"));
+        }
+        self.ranges.insert(key, range);
+        Ok(())
+    }
 }
 
 impl<'ctx> OperationLease<SelectedCompletion<'ctx>, ChainOperation<'ctx>> {
@@ -590,32 +639,40 @@ pub fn selected_resource_request(candidate: &SelectedPlanCandidate) -> Result<Pl
     }
     let mut request = PlanRequest::new(
         moxie_memory::fallible::text(format_args!(
-            "selected-bf16-chain-{}",
+            "selected-plan-{}",
             candidate.base().id().get()
         ))?,
         stages,
     )?;
     let scope = Scope::Device(candidate.workload().device);
+    let last = u32::try_from(candidate.stages().len() - 1)
+        .map_err(|_| invalid("stages", "selected stage count exceeds u32"))?;
     for (label, tier, bytes, span) in [
         (
             "weights",
             DeviceTier::PackedResidentWeights,
             candidate.weight_region_bytes(),
-            StageSpan::inclusive(0, 4),
+            StageSpan::inclusive(0, last),
         ),
         (
             "activations",
             DeviceTier::Activations,
             candidate.activation_region_bytes(),
-            StageSpan::inclusive(0, 4),
+            StageSpan::inclusive(0, last),
         ),
         (
             "workspace",
             DeviceTier::KernelWorkspace,
             candidate.workspace_region_bytes(),
-            StageSpan::inclusive(1, 2),
+            StageSpan::inclusive(
+                candidate.workspace().first_stage,
+                candidate.workspace().last_stage,
+            ),
         ),
     ] {
+        if bytes == 0 {
+            continue;
+        }
         request.buffer(BufferRequest::new(
             label,
             scope,
@@ -642,19 +699,21 @@ pub fn selected_resource_request(candidate: &SelectedPlanCandidate) -> Result<Pl
         Scope::Host,
         Tier::Host(HostTier::Pageable),
         host_bytes,
-        StageSpan::inclusive(0, 4),
+        StageSpan::inclusive(0, last),
     ))?;
-    let output_bytes = candidate
-        .value(candidate.workload().output)
-        .ok_or_else(|| invalid("output", "selected output is absent from the physical plan"))?
-        .logical_bytes;
-    request.buffer(BufferRequest::new(
-        "final-output-readback",
-        Scope::Host,
-        Tier::Host(HostTier::Pageable),
-        output_bytes,
-        StageSpan::at(4),
-    ))?;
+    if !candidate.is_paged_attention() {
+        let output_bytes = candidate
+            .value(candidate.workload().output)
+            .ok_or_else(|| invalid("output", "selected output is absent from the physical plan"))?
+            .logical_bytes;
+        request.buffer(BufferRequest::new(
+            "final-output-readback",
+            Scope::Host,
+            Tier::Host(HostTier::Pageable),
+            output_bytes,
+            StageSpan::at(last),
+        ))?;
+    }
     Ok(request)
 }
 

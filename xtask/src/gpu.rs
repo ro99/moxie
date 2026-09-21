@@ -19,9 +19,9 @@ use moxie_cuda::{
     query_device,
 };
 use moxie_executor::{
-    AttentionLayer, DeviceArena, Lease, OwnedBinding, PageGeometry, PagedAttentionLaunch,
-    PagedAttentionRun, SelectedAdmitRefused, SelectedReservedPlan, Staging, Turn, Upload,
-    select_paged_attention_kernel,
+    AttentionLayer, DeviceArena, Lease, OwnedBinding, PageGeometry, PagedAttentionInputs,
+    PagedAttentionLaunch, PagedAttentionRun, PagedAttentionStep, SelectedAdmitRefused,
+    SelectedReservedPlan, Staging, Turn, Upload, select_paged_attention_kernel,
 };
 use moxie_graph::{
     Bindings, Graph, GraphBuilder, Op, OpParams, OracleEvidence, OracleId, OracleRegistry,
@@ -91,6 +91,7 @@ const CASES: &[&str] = &[
     "affine_linear_w4a16_w8a16",
     "paged_attention",
     "paged_attention_32k",
+    "paged_attention_state_lifecycle",
 ];
 
 /// Run every GPU case on every visible device.
@@ -225,6 +226,11 @@ pub fn run(profile: Option<&str>) -> i32 {
         results.push(case(&cap, "affine_linear_w4a16_w8a16", affine_linear(&cap)));
         results.push(case(&cap, "paged_attention", paged_attention(&cap)));
         results.push(case(&cap, "paged_attention_32k", paged_attention_32k(&cap)));
+        results.push(case(
+            &cap,
+            "paged_attention_state_lifecycle",
+            paged_attention_state_lifecycle(&cap),
+        ));
     }
 
     println!("\n--- results ---");
@@ -783,6 +789,55 @@ fn admitted_device_arena(cap: &DeviceCapability) -> Result<Outcome, Error> {
 
 const CHAIN_ROWS: SymbolId = SymbolId(1_212);
 const CHAIN_ORACLE: OracleId = OracleId("task-0012-device-chain");
+const ATTENTION_ROWS: SymbolId = SymbolId(3_038);
+const ATTENTION_ORACLE: OracleId = OracleId("task-0038-selected-attention");
+
+fn selected_attention_graph(
+    heads: u64,
+    kv_heads: u64,
+    head_dim: u64,
+    scale: f32,
+    visibility: Visibility,
+) -> Result<Graph, Error> {
+    let mut registry = OracleRegistry::new();
+    registry.register(
+        Op::Attention,
+        ATTENTION_ORACLE,
+        OracleEvidence {
+            implementation: "moxie-oracles",
+            test_module: "task-0038-selected-attention",
+        },
+    )?;
+    let activation = |width| {
+        TensorSpec::new(
+            ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
+            vec![Dim::symbol(ATTENTION_ROWS), Dim::constant(width)],
+        )
+    };
+    let mut builder = GraphBuilder::new(ATTENTION_ORACLE, ATTENTION_ROWS);
+    let query = builder.input("query", activation(heads * head_dim));
+    let keys = builder.input("keys", activation(kv_heads * head_dim));
+    let values = builder.input("values", activation(kv_heads * head_dim));
+    let positions = builder.input(
+        "positions",
+        TensorSpec::new(
+            ValueRole::Index(moxie_graph::IndexEncoding::U64),
+            vec![Dim::symbol(ATTENTION_ROWS)],
+        ),
+    );
+    let output = builder.node(
+        OpParams::Attention {
+            heads,
+            kv_heads,
+            head_dim,
+            scale,
+            visibility,
+            layer: 0,
+        },
+        &[query, keys, values, positions],
+    )?;
+    builder.finish(output, &registry)
+}
 
 struct ChainFixture {
     graph: Graph,
@@ -2695,21 +2750,15 @@ fn check_attention(
             .map_err(|e| Error::Numerical {
                 detail: format!("{label}: the oracle refused: {e}"),
             })?;
-            let weights = softmax_weights(&query_row, &key_views, launch.scale());
             // Every component's bound in one pass. The per-component entry
             // point recomputes the score-error term for each lane, which at
             // the 32,768-row gate is four billion operations per head; the two
             // are asserted bitwise equal in the oracle's own fixtures.
-            let bounds = attention_error_bounds_at(
-                &query_row,
-                &key_views,
-                &value_views,
-                &weights,
-                launch.scale(),
-            )
-            .map_err(|e| Error::Numerical {
-                detail: format!("{label}: the bound refused: {e}"),
-            })?;
+            let bounds =
+                attention_error_bounds_at(&query_row, &key_views, &value_views, launch.scale())
+                    .map_err(|e| Error::Numerical {
+                        detail: format!("{label}: the bound refused: {e}"),
+                    })?;
             for d in 0..head_dim {
                 let device = bf16_value(got[start + d]);
                 if !device.is_finite() {
@@ -2739,25 +2788,6 @@ fn check_attention(
         &device_values,
         &oracle_values,
     ))
-}
-
-/// The exact FP64 softmax weights the bound needs.
-fn softmax_weights(query: &[f32], keys: &[&[f32]], scale: f32) -> Vec<f64> {
-    let scores: Vec<f64> = keys
-        .iter()
-        .map(|k| {
-            let dot: f64 = query
-                .iter()
-                .zip(k.iter())
-                .map(|(a, b)| f64::from(*a) * f64::from(*b))
-                .sum();
-            dot * f64::from(scale)
-        })
-        .collect();
-    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let exps: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
-    let denom: f64 = exps.iter().sum();
-    exps.iter().map(|e| e / denom).collect()
 }
 
 /// One BF16 ulp at this magnitude.
@@ -2973,8 +3003,7 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
         // stressing the kernel against the FP64 oracle is not a state
         // decision -- so this drives the run directly through
         // `RawPagedFixture` rather than the authority's writer.
-        let mut run =
-            moxie_executor::paged_attention::device::RawPagedFixture::new(run);
+        let mut run = moxie_executor::paged_attention::device::RawPagedFixture::new(run);
         let table = shuffled_pages(case.geometry.pages);
         run.publish_page_table(&stream, 0, table.clone())
             .map_err(|r| r.error)?;
@@ -3018,7 +3047,8 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
                 case.label
             )));
         }
-        if run.run().written_rows() != case.history || run.run().read_rows(&whole_history)? != before
+        if run.run().written_rows() != case.history
+            || run.run().read_rows(&whole_history)? != before
         {
             return Ok(Outcome::Failed(format!(
                 "{}: a refused write moved the high-water mark or changed written bytes",
@@ -3126,6 +3156,60 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
     Ok(Outcome::Passed)
 }
 
+fn append_authority_rows<'ctx>(
+    sequence: &mut moxie_state::DeviceKvSequence,
+    run: &mut PagedAttentionRun<'ctx>,
+    stream: &Stream<'ctx>,
+    fixture: &AttentionFixture,
+    rows: u64,
+) -> Result<(), Error> {
+    let txn = sequence.begin()?;
+    let first = sequence.published_rows()?;
+    let (keys, values) = fixture.payload(first, rows);
+    moxie_executor::paged_attention::device::append_paged_layer(
+        sequence,
+        txn,
+        0,
+        rows,
+        run,
+        stream,
+        moxie_executor::paged_attention::device::PagedKvRows { keys, values },
+    )
+    .map_err(|refused| refused.error)?;
+    moxie_executor::paged_attention::device::commit_paged_layer(sequence, txn, rows, run, stream)
+}
+
+fn attend_authority<'ctx>(
+    run: &mut PagedAttentionRun<'ctx>,
+    stream: &Stream<'ctx>,
+    state: &moxie_state::DeviceKvSequence,
+    fixture: &AttentionFixture,
+    layer: AttentionLayer,
+    position: u64,
+    label: &str,
+) -> Result<Vec<u8>, Error> {
+    let retained = state.retained(0)?;
+    let committed = state.committed_rows()?;
+    if retained.end != committed {
+        return Err(Error::InvalidRequest {
+            field: "state",
+            detail: "a closed transaction retained rows past its committed frontier".into(),
+        });
+    }
+    let launch = PagedAttentionLaunch::new(
+        layer,
+        1,
+        position,
+        retained.start,
+        committed - retained.start,
+    )?;
+    let output = run
+        .attend(stream, &launch, fixture.query_bytes(position, 1))
+        .map_err(|r| r.error)?;
+    check_attention(fixture, &launch, &output, label)?;
+    Ok(output)
+}
+
 /// Task 0037 acceptance 3: **32,768 actual BF16 key/value rows**.
 ///
 /// Not an admitted capacity, not a declared maximum and not a short history
@@ -3184,30 +3268,6 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         Ok(sequence)
     };
 
-    /// Append `rows` rows from the frontier through `DeviceKvSequence::append`,
-    /// the only public way to move it: it stages, hands the writer the view
-    /// and placements it chose, and publishes only on success.
-    /// `PagedKvWriterAdapter::write_layer` publishes that view and writes the
-    /// rows as one authorized operation, so this gate no longer touches a
-    /// page table at all.
-    fn append_rows<'ctx>(
-        sequence: &mut moxie_state::DeviceKvSequence,
-        run: &mut PagedAttentionRun<'ctx>,
-        stream: &Stream<'ctx>,
-        fixture: &AttentionFixture,
-        rows: u64,
-    ) -> Result<(), Error> {
-        let txn = sequence.begin()?;
-        let first = sequence.published_rows();
-        let (keys, values) = fixture.payload(first, rows);
-        let mut writer = moxie_executor::paged_attention::device::PagedKvWriterAdapter::new(
-            0, run, stream, keys, values,
-        );
-        sequence.append(txn, rows, &mut [&mut writer])?;
-        sequence.commit(txn, rows)?;
-        Ok(())
-    }
-
     let decode = |first_position: u64, history_rows: u64, visibility: Visibility| {
         PagedAttentionLaunch::new(
             AttentionLayer {
@@ -3238,7 +3298,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     )
     .map_err(|r| r.error)?;
     let mut whole_state = authority()?;
-    append_rows(&mut whole_state, &mut whole, &stream, &fixture, CONTEXT)?;
+    append_authority_rows(&mut whole_state, &mut whole, &stream, &fixture, CONTEXT)?;
     if whole_state.committed_rows()? != CONTEXT || whole.written_rows() != CONTEXT {
         return Ok(Outcome::Failed(format!(
             "the authority committed {} row(s) and the run wrote {}, not {CONTEXT}",
@@ -3262,7 +3322,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let mut chunked_state = authority()?;
     let mut written = 0u64;
     for rows in [1u64, 255, 256, 7_000, 25_256] {
-        append_rows(&mut chunked_state, &mut chunked, &stream, &fixture, rows)?;
+        append_authority_rows(&mut chunked_state, &mut chunked, &stream, &fixture, rows)?;
         written += rows;
     }
     if written != CONTEXT || chunked_state.committed_rows()? != CONTEXT {
@@ -3324,7 +3384,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     }
 
     // Append row 32,768 -- the row after the context -- and decode it.
-    append_rows(&mut whole_state, &mut whole, &stream, &fixture, 1)?;
+    append_authority_rows(&mut whole_state, &mut whole, &stream, &fixture, 1)?;
     if whole_state.committed_rows()? != CONTEXT + 1 {
         return Ok(Outcome::Failed(format!(
             "the frontier is {} after appending row {CONTEXT}",
@@ -3378,6 +3438,292 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     chunked.close(&mut ledger).map_err(|r| r.error)?;
     if !ledger.outstanding().is_empty() {
         return Ok(Outcome::Failed("a closed run left bytes charged".into()));
+    }
+    Ok(Outcome::Passed)
+}
+
+/// Task 0038 acceptance 2: one state lifecycle after the page ring wraps.
+fn paged_attention_state_lifecycle(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    const INITIAL_ROWS: u64 = 100;
+    const MAX_ROWS: u64 = 128;
+    const WINDOW: usize = 16;
+    const TENTATIVE: usize = 8;
+
+    let geometry = PageGeometry {
+        kv_heads: 2,
+        head_dim: 64,
+        page_tokens: 8,
+        pages: 4,
+    };
+    let heads = 4;
+    let layer = AttentionLayer {
+        geometry,
+        heads,
+        scale: moxie_plan::reciprocal_sqrt_scale(geometry.head_dim),
+        visibility: Visibility::SlidingWindow {
+            window: WINDOW as u64,
+        },
+    };
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let stream = Stream::new(&ctx)?;
+    let catalogue = moxie_kernels::paged_attention_catalogue();
+    let probe = PagedAttentionLaunch::new(layer, 1, 0, 0, 1)?;
+    let descriptor = select_paged_attention_kernel(&catalogue, cap, &probe)?;
+    let mut ledger = measured_ledger(&ctx)?;
+    let mut run = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor,
+        geometry,
+        heads,
+        1,
+        Staging::Host,
+    )
+    .map_err(|r| r.error)?;
+    let mut state = moxie_state::DeviceKvSequence::new(moxie_state::KvGeometry {
+        layers: vec![moxie_state::LayerKv {
+            kv_heads: geometry.kv_heads as usize,
+            key_dim: geometry.head_dim as usize,
+            value_dim: geometry.head_dim as usize,
+            retention: moxie_state::Retention::Window { window: WINDOW },
+        }],
+        precision: Precision::Bf16,
+        page_tokens: geometry.page_tokens as usize,
+        max_tokens: MAX_ROWS as usize,
+        tentative_rows: TENTATIVE,
+    })?;
+    if state.layout(0)?.pages != geometry.pages {
+        return Ok(Outcome::Failed(format!(
+            "state admitted {} pages but the run admitted {}",
+            state.layout(0)?.pages,
+            geometry.pages
+        )));
+    }
+
+    let mut fixture = AttentionFixture::build(geometry, heads, MAX_ROWS, 0x0038_0001);
+    let mut written = 0;
+    while written < INITIAL_ROWS {
+        let rows = (INITIAL_ROWS - written).min(TENTATIVE as u64);
+        append_authority_rows(&mut state, &mut run, &stream, &fixture, rows)?;
+        written += rows;
+    }
+
+    let retained = state.retained(0)?;
+    if retained.start == 0 || retained != (80..INITIAL_ROWS) {
+        return Ok(Outcome::Failed(format!(
+            "the wrapped sequence retained {retained:?}, expected 80..{INITIAL_ROWS}"
+        )));
+    }
+    let before_abort = attend_authority(
+        &mut run,
+        &stream,
+        &state,
+        &fixture,
+        layer,
+        99,
+        "state-before-abort",
+    )?;
+
+    // Write a real tentative append, then abort it. The physical run may keep
+    // the observed high-water mark, but the authority must restore its own
+    // frontier and the previously checked answer bit for bit.
+    let txn = state.begin()?;
+    let first = state.published_rows()?;
+    let (keys, values) = fixture.payload(first, 4);
+    moxie_executor::paged_attention::device::append_paged_layer(
+        &mut state,
+        txn,
+        0,
+        4,
+        &mut run,
+        &stream,
+        moxie_executor::paged_attention::device::PagedKvRows { keys, values },
+    )
+    .map_err(|refused| refused.error)?;
+    if state.committed_rows()? != INITIAL_ROWS || state.published_rows()? != INITIAL_ROWS + 4 {
+        return Ok(Outcome::Failed(
+            "a tentative append was reported as committed or not published".into(),
+        ));
+    }
+    state.abort(txn)?;
+    if state.committed_rows()? != INITIAL_ROWS
+        || state.published_rows()? != INITIAL_ROWS
+        || state.retained(0)? != retained
+    {
+        return Ok(Outcome::Failed(
+            "abort did not restore the frontier and retained range".into(),
+        ));
+    }
+    let after_abort = attend_authority(
+        &mut run,
+        &stream,
+        &state,
+        &fixture,
+        layer,
+        99,
+        "state-after-abort",
+    )?;
+    if after_abort != before_abort {
+        return Ok(Outcome::Failed(
+            "abort changed the answer over committed history".into(),
+        ));
+    }
+
+    // A causal decode at 87 is independent of the suffix above it. Truncating
+    // to 88 must therefore leave this already-oracle-checked answer exact.
+    let before_truncate = attend_authority(
+        &mut run,
+        &stream,
+        &state,
+        &fixture,
+        layer,
+        87,
+        "state-before-truncate",
+    )?;
+    let old_suffix = attend_authority(
+        &mut run,
+        &stream,
+        &state,
+        &fixture,
+        layer,
+        95,
+        "state-old-suffix",
+    )?;
+    state.truncate(88)?;
+    let after_truncate = attend_authority(
+        &mut run,
+        &stream,
+        &state,
+        &fixture,
+        layer,
+        87,
+        "state-after-truncate",
+    )?;
+    if after_truncate != before_truncate {
+        return Ok(Outcome::Failed(
+            "truncate changed the retained prefix's answer".into(),
+        ));
+    }
+
+    // Replace positions 88..96 with a different deterministic suffix, append
+    // it through the authority, and check every resulting component against
+    // the FP64 oracle built from that mixed prefix/suffix history.
+    let replacement = AttentionFixture::build(geometry, heads, MAX_ROWS, 0x0038_9001);
+    let row_width = (geometry.kv_heads * geometry.head_dim) as usize;
+    let start = 88 * row_width;
+    let end = 96 * row_width;
+    fixture.keys[start..end].copy_from_slice(&replacement.keys[start..end]);
+    fixture.values[start..end].copy_from_slice(&replacement.values[start..end]);
+    append_authority_rows(&mut state, &mut run, &stream, &fixture, 8)?;
+    let after_reappend = attend_authority(
+        &mut run,
+        &stream,
+        &state,
+        &fixture,
+        layer,
+        95,
+        "state-reappend",
+    )?;
+    if after_reappend == old_suffix {
+        return Ok(Outcome::Failed(
+            "reappend answered with the suffix that truncation discarded".into(),
+        ));
+    }
+    if state.retained(0)?.start == 0 {
+        return Ok(Outcome::Failed(
+            "the lifecycle finished without a reclaimed history base".into(),
+        ));
+    }
+
+    let graph = selected_attention_graph(
+        heads,
+        geometry.kv_heads,
+        geometry.head_dim,
+        layer.scale,
+        layer.visibility,
+    )?;
+    let workload = ResourceWorkload {
+        phase: Phase::Decode,
+        rows: 1,
+        visible_tokens: WINDOW as u64,
+        branch_rows: 1,
+        output: graph.output(),
+        device: ctx.uuid(),
+    };
+    let candidate = lower_selected(&graph, workload, cap, &catalogue)?;
+    let mut plan =
+        match SelectedReservedPlan::admit(candidate, &graph, cap, &catalogue, &mut ledger, &ctx) {
+            Ok(plan) => plan,
+            Err(
+                SelectedAdmitRefused::Invalid { error, .. }
+                | SelectedAdmitRefused::Held { error, .. },
+            ) => return Err(error),
+            Err(SelectedAdmitRefused::Rejected { rejection, .. }) => {
+                return Err(Error::CapacityExceeded {
+                    tier: None,
+                    requested_bytes: rejection.shortfall_bytes,
+                    available_bytes: 0,
+                });
+            }
+        };
+    let position = state.published_rows()?;
+    let transaction = state.begin()?;
+    let (keys, values) = fixture.payload(position, 1);
+    plan.execute_paged_attention(PagedAttentionStep {
+        graph: &graph,
+        capability: cap,
+        catalogue: &catalogue,
+        ctx: &ctx,
+        stream: &stream,
+        state: &mut state,
+        transaction,
+        run: &mut run,
+        inputs: PagedAttentionInputs {
+            query: fixture.query_bytes(position, 1),
+            keys,
+            values,
+            positions: vec![position],
+        },
+    })
+    .map_err(|refused| refused.error)?;
+    let retained = state.layer_retained(0)?;
+    let launch = PagedAttentionLaunch::new(
+        layer,
+        1,
+        position,
+        retained.start,
+        retained.end - retained.start,
+    )?;
+    let mut selected_output = vec![0; launch.output_bytes()? as usize];
+    plan.read_paged_attention_output(&mut selected_output)?;
+    check_attention(
+        &fixture,
+        &launch,
+        &selected_output,
+        "selected-state-lifecycle",
+    )?;
+    moxie_executor::paged_attention::device::commit_paged_layer(
+        &mut state,
+        transaction,
+        1,
+        &mut run,
+        &stream,
+    )?;
+    plan.close(&mut ledger).map_err(|refused| refused.error)?;
+
+    println!(
+        "    {} state-lifecycle base={} committed={} written={} capacity={}",
+        cap.sm(),
+        state.retained(0)?.start,
+        state.committed_rows()?,
+        run.written_rows(),
+        run.capacity_rows()?
+    );
+    run.close(&mut ledger).map_err(|r| r.error)?;
+    if !ledger.outstanding().is_empty() {
+        return Ok(Outcome::Failed(
+            "a closed lifecycle run left bytes charged".into(),
+        ));
     }
     Ok(Outcome::Passed)
 }

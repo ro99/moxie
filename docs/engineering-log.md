@@ -39,7 +39,7 @@ Each links into the entries below.
 | Optimizing the architecture, and calling it a user benefit | offline repacking, built and packaged before its performance hypothesis was tested |
 | A tool that measures the tree it is editing | the mutation battery, twice: killed mid-substitution, and left unrunnable for two tasks |
 | A test measured by assertion rather than by mutation | tasks 0020, 0021, 0022, 0023, 0024 |
-| A record contradicting a fact it already contains | task 0022's expert inventory, task 0022's VRAM figure, task 0024's sign claim, task 0038's page-ownership claim in `AGENTS.md` and the support matrix, task 0038's writer-trait claim going stale in the opposite direction one round later |
+| A record contradicting a fact it already contains | task 0022's expert inventory, task 0022's VRAM figure, task 0024's sign claim, task 0038's page-ownership claim in `AGENTS.md` and the support matrix, task 0038's writer-trait claim going stale in the opposite direction one round later, task 0038's "deliverable 1 landed" claim called premature the very next round |
 | A comparison whose two sides are not independent | task 0022's FP64 transcription, task 0024's FP32-versus-BF16 arithmetic |
 | A fix that is not guarded by the test written for it | task 0023's fake axis, task 0024's helper-only regression |
 | A numerical gate whose denominator can collapse | task 0028's 2-ULP-at-the-result threshold |
@@ -1681,3 +1681,66 @@ caller-reimplemented one. It does not satisfy task 0038 acceptance criterion
 reclaimed `history_base > 0` on both SM86 GPUs and SM120; that case does not
 exist yet and criterion 2 stays open. No timing or performance claim is made
 anywhere in this evidence: O6 and O7 are open, and nothing was timed.
+
+## 2026-09-20 — the final task 0038 gate found an undeclared dependency edge
+
+The implementation and its tests compiled, but `arch-check` rejected the new
+optional `moxie-executor -> moxie-state` edge. Document 02 already shows that
+direction: state owns retention and frontiers; executor performs its page
+decisions. The missing piece was the checker declaration, not a reason to move
+state ownership into the executor or weaken dependency checking. The allowlist
+now names that one edge and still rejects the reverse `moxie-state -> CUDA` and
+`moxie-state -> executor` directions.
+
+The same pass removed two smaller closure hazards: `append_layer` no longer has
+a caller-reachable `expect` if a completed batch cannot publish, and the public
+attention-bound oracle refuses an empty visible history instead of returning a
+number for an attention operation that cannot exist.
+
+## 2026-09-20 — task 0037 closes; its remaining scope becomes 0038's own
+
+Task 0037's status line and Result section had drifted from its own body:
+the header still called the `moxie-state` binding and the injected-fault
+sweeps "open" after the body had already struck the binding through as
+closed by task 0038, and after the support matrix already documented the
+injected-fault sweeps passing. A record contradicting itself is the same
+defect this log has already named once tonight, one level up.
+
+Separately, two items were genuinely still task 0037's own and unfinished:
+the task mutation battery (deliberately deferred, since writing one against
+a state binding that did not yet exist would measure code the next task
+replaces) and host allocator growth across decode steps (checked only as
+"admission does not grow," never through the measured-allocator lane).
+Neither belongs to task 0037 once task 0038's binding exists to measure
+against, so the owner moved both into task 0038's acceptance as items 7 and
+8, and accepted task 0037 with nothing left in its own scope open.
+
+Lesson: a task that hands its hardest remaining work to a successor task by
+design (task 0038's own contract always named the state binding as its
+deliverable, not a debt task 0037 owed) does not need to wait on that
+successor's acceptance to close its own scope — but scope actually left
+over at the boundary, like a mutation battery deferred for a real reason,
+needs to be named as the successor's acceptance item, not silently dropped
+between two closed records.
+
+## 2026-09-20 — task 0038's last two gates are measurements
+
+The decode allocation gate could not require an identical call count: the
+authority's bounded page table and prefix-lineage vectors grow at capacity
+boundaries. It measures the quantities that matter instead — calls, transient
+peak, net bytes for each operation, and live bytes at the stable boundary —
+against bounds derived from the admitted table, lineage capacity and one
+retained output. Over 32 steps it observed 9 calls at worst, a 256 B transient
+peak and 1,000 B maximum live growth. A mutation leaking 1 MiB per step fails
+the live-byte bound. The measurement also exposed four avoidable calls per
+step: the device wrapper was collecting `SequenceState`'s open transactions to
+re-check the one ID it already owns. Removing that redundant collection took
+the observed maximum from 13 calls to 9.
+
+The final T0037 battery applies 11 substitutions across state publication,
+selected-plan wiring, the numerical bound and the CUDA kernel. All 11 are
+caught; the four clean lanes pass three times before and after restoration.
+[Experiment 0008](evidence/experiments/0008-paged-attention-mutations.md) holds
+the exact list. The mutation harness self-test also exposed one stale anchor
+left by the earlier shared fallible-allocation refactor; the anchor now mutates
+the shared sink actually in use rather than dead implementation text.

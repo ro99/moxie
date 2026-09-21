@@ -1932,7 +1932,10 @@ mod identity_tests {
             let v = g.input("v", activation(rows));
             let positions = g.input(
                 "positions",
-                TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![Dim::symbol(rows)]),
+                TensorSpec::new(
+                    ValueRole::Index(IndexEncoding::U64),
+                    vec![Dim::symbol(rows)],
+                ),
             );
             g.node(
                 OpParams::Attention {
