@@ -114,6 +114,54 @@ fn bounded_streaming_admission_names_its_staging_envelope_or_refuses_typed() {
     );
 }
 
+#[test]
+fn bounded_streaming_admission_names_n_and_refuses_beyond_the_bound() {
+    let d = gpu(42);
+    let mut request =
+        PlanRequest::new("three-block stream", ["resident", "stage", "merge"]).unwrap();
+    request.host_backed_blocks(3).unwrap();
+    request
+        .buffer(BufferRequest::new(
+            "resident page",
+            d,
+            KV,
+            64,
+            StageSpan::inclusive(0, 2),
+        ))
+        .unwrap()
+        .buffer(BufferRequest::new(
+            "reused staged page",
+            d,
+            STAGING,
+            36,
+            StageSpan::at(1),
+        ))
+        .unwrap();
+
+    let mut fits = Ledger::new([device_snapshot(d, 100), host_snapshot(1 << 20, 1 << 10)]).unwrap();
+    let report = fits.preview(&request).unwrap();
+    assert_eq!(
+        report.host_backed_plan,
+        moxie_memory::HostBackedPlan::with_max_staged_blocks(36, 3)
+    );
+    let reservation = fits.admit(&request).expect("the bounded N=3 plan fits");
+    fits.release(reservation).unwrap();
+
+    let mut too_many = request.clone();
+    too_many.host_backed_blocks(4).unwrap();
+    let refused = fits
+        .admit(&too_many)
+        .expect_err("a request beyond the admitted N bound was accepted");
+    match refused {
+        AdmitError::Invalid(moxie_types::Error::InvalidRequest { field, detail }) => {
+            assert_eq!(field, "host_backed_blocks");
+            assert!(detail.contains("maximum"));
+        }
+        other => panic!("expected a typed N-bound refusal, got {other:?}"),
+    }
+    assert!(fits.outstanding().is_empty());
+}
+
 fn rejection(e: &AdmitError) -> &moxie_memory::Rejection {
     e.as_rejection()
         .unwrap_or_else(|| panic!("expected a refusal, got {e}"))

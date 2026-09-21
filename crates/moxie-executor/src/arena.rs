@@ -372,6 +372,7 @@ mod driver_binding {
         /// whole cache or allocating a range per page. The extent is checked
         /// against this range, so a page identity that resolved wrongly is a
         /// typed refusal rather than a write into a neighbouring layer.
+        #[cfg_attr(not(feature = "paged-attention-binding"), allow(dead_code))]
         pub(crate) unsafe fn copy_from_host_async_at(
             &self,
             within: u64,

@@ -967,7 +967,28 @@ fn bounded_host_backed_plan(request: &PlanRequest, base: &Peaks) -> Result<Optio
             .checked_add(base.tier_peak(scope, staging).0)
             .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
     }
-    Ok(HostBackedPlan::new(bytes))
+    let requested_blocks = request.declared_host_backed_blocks().unwrap_or(1);
+    if requested_blocks > HostBackedPlan::MAX_STAGED_BLOCKS {
+        return Err(Error::InvalidRequest {
+            field: "host_backed_blocks",
+            detail: crate::fallible::text(format_args!(
+                "{requested_blocks} staged block(s) exceeds the admitted maximum of {}",
+                HostBackedPlan::MAX_STAGED_BLOCKS
+            ))?,
+        });
+    }
+    if request.declared_host_backed_blocks().is_some() && bytes == 0 {
+        return Err(Error::InvalidRequest {
+            field: "host_backed_blocks",
+            detail: crate::fallible::string(
+                "a bounded host-backed plan must declare a TransferStaging buffer",
+            )?,
+        });
+    }
+    Ok(HostBackedPlan::with_max_staged_blocks(
+        bytes,
+        requested_blocks,
+    ))
 }
 
 /// Where a device tier's bytes would go if its work moved to the host, or

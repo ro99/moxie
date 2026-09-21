@@ -39,9 +39,16 @@ SM86 GPUs and SM120. Reviewed twice: round 1 hit a real architectural stop
 condition (resolved by authorizing an additive, separately-qualified kernel
 variant, existing kernel untouched) and round 1's review then caught an
 unasserted, misleading numerical comparison, repaired and re-verified
-load-bearing. N-block generalization, prefetch/overlap and any long-context
-product claim remain separate, unopened work — not authorized by this
-acceptance. **M4.4 and M4.5 remain unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
+load-bearing. [Task 0042](docs/tasks/0042-m4-n-block-host-backed-streaming.md) **accepted**
+(owner, 2026-09-21): generalized to bounded N staged blocks, sequential, one
+reused staging buffer, one block read at a time (round 1's review caught a
+read-ahead violation in the first N-block API shape; repaired and
+re-verified). Prefetch/overlap is explicitly **not** in scope — that is
+document 06's own M6.3, gated behind M5, with O6 (performance) still open.
+**Not yet done for M4.3:** host-backed streaming is not wired into
+`moxie-plan`'s graph admission the way task 0040 wired MLA — a real graph
+cannot yet automatically select it under resource pressure. **M4.4 and M4.5
+remain unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
 path are explicitly out of M4.2's scope and are not opened by its acceptance.
 The [M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md)
 tracks this milestone's obligations.

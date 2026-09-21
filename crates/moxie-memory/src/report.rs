@@ -78,12 +78,28 @@ pub struct HostBackedPlan {
 }
 
 impl HostBackedPlan {
+    /// The first bounded host-streaming slice deliberately admits three
+    /// staged blocks. This is an execution bound, not a second memory
+    /// capacity: the one `TransferStaging` buffer is reused for every block.
+    pub const MAX_STAGED_BLOCKS: u64 = 3;
+
     pub fn new(staging_bytes: u64) -> Option<Self> {
         NonZeroU64::new(staging_bytes).map(|staging_bytes| Self { staging_bytes })
     }
 
+    pub fn with_max_staged_blocks(staging_bytes: u64, max_staged_blocks: u64) -> Option<Self> {
+        if max_staged_blocks == 0 || max_staged_blocks > Self::MAX_STAGED_BLOCKS {
+            return None;
+        }
+        Self::new(staging_bytes)
+    }
+
     pub const fn bytes(self) -> u64 {
         self.staging_bytes.get()
+    }
+
+    pub const fn max_blocks(self) -> u64 {
+        Self::MAX_STAGED_BLOCKS
     }
 }
 
@@ -113,7 +129,12 @@ impl fmt::Display for AdmissionReport {
     /// matter.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(plan) = self.host_backed_plan {
-            writeln!(f, "bounded host-backed staging plan: {} B", plan.bytes())?;
+            writeln!(
+                f,
+                "bounded host-backed staging plan: {} B, max {} staged block(s)",
+                plan.bytes(),
+                plan.max_blocks()
+            )?;
         }
         for s in &self.scopes {
             writeln!(

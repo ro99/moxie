@@ -500,10 +500,12 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             .ok_or_else(|| invalid("range", "selected range is absent"))
     }
 
+    #[cfg_attr(not(feature = "paged-attention-binding"), allow(dead_code))]
     pub(crate) fn range_for_selected_value(&self, value: ValueId) -> Result<&DeviceRange<'ctx>> {
         self.range_for_value(value)
     }
 
+    #[cfg_attr(not(feature = "paged-attention-binding"), allow(dead_code))]
     pub(crate) fn take_range_for_value(
         &mut self,
         value: ValueId,
@@ -519,6 +521,7 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             .ok_or_else(|| invalid("range", "selected range is absent"))
     }
 
+    #[cfg_attr(not(feature = "paged-attention-binding"), allow(dead_code))]
     pub(crate) fn restore_range(
         &mut self,
         key: (StorageRegion, u32),

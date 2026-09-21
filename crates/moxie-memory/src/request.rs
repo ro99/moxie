@@ -243,6 +243,7 @@ pub struct PlanRequest {
     stages: Vec<Label>,
     buffers: Vec<BufferRequest>,
     reserves: Vec<DerivedReserve>,
+    host_backed_blocks: Option<u64>,
 }
 
 impl PlanRequest {
@@ -294,7 +295,22 @@ impl PlanRequest {
             stages,
             buffers: Vec::new(),
             reserves: Vec::new(),
+            host_backed_blocks: None,
         })
+    }
+
+    /// Declare the bounded number of host-staged blocks a caller needs. The
+    /// ledger checks this against the host-backed plan's execution bound; it
+    /// does not turn the declaration into N simultaneous buffers.
+    pub fn host_backed_blocks(&mut self, blocks: u64) -> Result<&mut Self> {
+        if blocks == 0 {
+            return Err(invalid(
+                "host_backed_blocks",
+                format_args!("a host-backed plan needs at least one staged block"),
+            ));
+        }
+        self.host_backed_blocks = Some(blocks);
+        Ok(self)
     }
 
     pub fn buffer(&mut self, buffer: BufferRequest) -> Result<&mut Self> {
@@ -392,6 +408,10 @@ impl PlanRequest {
 
     pub fn reserves(&self) -> &[DerivedReserve] {
         &self.reserves
+    }
+
+    pub const fn declared_host_backed_blocks(&self) -> Option<u64> {
+        self.host_backed_blocks
     }
 
     /// Every scope the request touches, in identity order.
