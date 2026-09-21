@@ -901,6 +901,7 @@ mod tests {
             branch_rows: rows,
             output: graph.output(),
             device: DeviceUuid::from_bytes([9; 16]),
+            paged_state_capacity: None,
         }
     }
 

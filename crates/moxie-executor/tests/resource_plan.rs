@@ -77,6 +77,7 @@ fn workload(graph: &Graph, device: DeviceUuid) -> ResourceWorkload {
         branch_rows: 3,
         output: graph.output(),
         device,
+        paged_state_capacity: None,
     }
 }
 

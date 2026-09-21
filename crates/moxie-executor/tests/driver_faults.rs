@@ -518,6 +518,7 @@ fn resource_workload(graph: &Graph, ctx: &RankContext) -> ResourceWorkload {
         branch_rows: 2,
         output: graph.output(),
         device: ctx.uuid(),
+        paged_state_capacity: None,
     }
 }
 
@@ -600,6 +601,7 @@ fn selected_workload(graph: &Graph, ctx: &RankContext) -> ResourceWorkload {
         branch_rows: 1,
         output: graph.output(),
         device: ctx.uuid(),
+        paged_state_capacity: None,
     }
 }
 

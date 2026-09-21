@@ -28,8 +28,12 @@ use moxie_graph::{
     TensorSpec, ValueId, ValueRole,
 };
 use moxie_interp::{HostTensor, Interpreter, Value};
-use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSpan};
-use moxie_plan::{Phase, ResourceWorkload, Visibility, lower_selected};
+use moxie_memory::{
+    BufferRequest, CapacitySnapshot, HostBackedPlan, Ledger, PlanRequest, StageSpan,
+};
+use moxie_plan::{
+    PagedStateCapacity, Phase, ResourceWorkload, StateRequirementKind, Visibility, lower_selected,
+};
 use moxie_types::{
     ActivationPrecision, DeviceCapability, DeviceTier, Dim, Error, HostTier, PagePlacement,
     Precision, RankId, Scope, SymbolId, TensorLayout, Tier, WeightPrecision,
@@ -935,6 +939,7 @@ fn selected_bf16_device_chain(cap: &DeviceCapability) -> Result<Outcome, Error> 
             branch_rows: rows as u64,
             output: fixture.graph.output(),
             device: cap.uuid,
+            paged_state_capacity: None,
         };
         let catalogue = moxie_kernels::bf16_chain_catalogue();
         let candidate = lower_selected(&fixture.graph, workload, cap, &catalogue)?;
@@ -1166,6 +1171,7 @@ fn selected_bf16_invalid_rms_is_numerical(
         branch_rows: rows as u64,
         output: fixture.graph.output(),
         device: cap.uuid,
+        paged_state_capacity: None,
     };
     let catalogue = moxie_kernels::bf16_chain_catalogue();
     let candidate = lower_selected(&fixture.graph, workload, cap, &catalogue)?;
@@ -3566,12 +3572,69 @@ fn paged_attention_host_streaming_n3(cap: &DeviceCapability) -> Result<Outcome, 
         RESIDENT_ROWS,
     )?;
 
+    let graph = selected_attention_graph(
+        HEADS,
+        geometry.kv_heads,
+        geometry.head_dim,
+        scale,
+        Visibility::Causal,
+    )?;
+    let state_layout = resident_state.layout(0)?;
+    let state_page_tokens = resident_state.geometry()?.page_tokens as u64;
+    let workload = ResourceWorkload {
+        phase: Phase::Decode,
+        rows: 1,
+        visible_tokens: TOTAL_ROWS,
+        branch_rows: 1,
+        output: graph.output(),
+        device: cap.uuid,
+        paged_state_capacity: Some(PagedStateCapacity {
+            resident_rows: state_layout.capacity_rows,
+            page_tokens: state_page_tokens,
+            max_staged_blocks: HostBackedPlan::MAX_STAGED_BLOCKS,
+        }),
+    };
+    let candidate = lower_selected(&graph, workload, cap, &catalogue)?;
+    let [requirement] = candidate.base().state() else {
+        return Ok(Outcome::Failed(
+            "streaming graph plan did not report its state requirement".into(),
+        ));
+    };
+    let planned_staged_blocks = match requirement.kind {
+        StateRequirementKind::KvPagesHostBacked { staged_blocks } => staged_blocks,
+        kind => {
+            return Ok(Outcome::Failed(format!(
+                "streaming graph plan reported {kind:?}, expected {STAGED_BLOCKS} staged blocks"
+            )));
+        }
+    };
+    if planned_staged_blocks != STAGED_BLOCKS {
+        return Ok(Outcome::Failed(format!(
+            "streaming graph plan reported {planned_staged_blocks} staged blocks, expected {STAGED_BLOCKS}"
+        )));
+    }
+    let selected_plan =
+        match SelectedReservedPlan::admit(candidate, &graph, cap, &catalogue, &mut ledger, &ctx) {
+            Ok(plan) => plan,
+            Err(
+                SelectedAdmitRefused::Invalid { error, .. }
+                | SelectedAdmitRefused::Held { error, .. },
+            ) => return Err(error),
+            Err(SelectedAdmitRefused::Rejected { rejection, .. }) => {
+                return Err(Error::CapacityExceeded {
+                    tier: None,
+                    requested_bytes: rejection.shortfall_bytes,
+                    available_bytes: 0,
+                });
+            }
+        };
+
     let stream_launch =
         PagedAttentionLaunch::n_block_stream(stream_layer, 1, TOTAL_ROWS - 1, 0, TOTAL_ROWS)?;
-    if stream_launch.staged_blocks() != STAGED_BLOCKS {
+    if stream_launch.staged_blocks() != planned_staged_blocks {
         return Ok(Outcome::Failed(format!(
-            "N-block launch derived {} staged blocks, expected {STAGED_BLOCKS}",
-            stream_launch.staged_blocks()
+            "N-block launch derived {} staged blocks, plan admitted {planned_staged_blocks}",
+            stream_launch.staged_blocks(),
         )));
     }
     let (streamed_output, actual_transfer, expected_per_block) = {
@@ -3632,6 +3695,9 @@ fn paged_attention_host_streaming_n3(cap: &DeviceCapability) -> Result<Outcome, 
     )?;
 
     streamed_run
+        .close(&mut ledger)
+        .map_err(|refused| refused.error)?;
+    selected_plan
         .close(&mut ledger)
         .map_err(|refused| refused.error)?;
     // Compare the N=3 run's physical arena with the exact one-page staging
@@ -4559,6 +4625,7 @@ fn paged_attention_state_lifecycle(cap: &DeviceCapability) -> Result<Outcome, Er
         branch_rows: 1,
         output: graph.output(),
         device: ctx.uuid(),
+        paged_state_capacity: None,
     };
     let candidate = lower_selected(&graph, workload, cap, &catalogue)?;
     let mut plan =

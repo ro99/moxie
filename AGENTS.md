@@ -45,10 +45,23 @@ reused staging buffer, one block read at a time (round 1's review caught a
 read-ahead violation in the first N-block API shape; repaired and
 re-verified). Prefetch/overlap is explicitly **not** in scope — that is
 document 06's own M6.3, gated behind M5, with O6 (performance) still open.
-**Not yet done for M4.3:** host-backed streaming is not wired into
-`moxie-plan`'s graph admission the way task 0040 wired MLA — a real graph
-cannot yet automatically select it under resource pressure. **M4.4 and M4.5
-remain unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
+[Task 0043](docs/tasks/0043-m4-host-backed-streaming-plan-admission.md)
+**accepted** (owner, 2026-09-21): a graph whose declared history exceeds
+device-admitted capacity but fits the bounded staging maximum lowers to a
+streaming requirement and executes through the already-qualified N-block
+path, rather than refusing (round 1 caught a real plan/executor geometry
+mismatch — the planner accepted a resident-capacity shape the qualified
+executor could not actually run — closed by construction, not by a wider
+test). **This substantively completes M4.3's roadmap text for conventional
+attention.** MLA streaming and prefetch/overlap (M6.3) remain explicitly
+out of scope by design, not gaps. **M4.4 is active:** [task
+0044](docs/tasks/0044-m4-cow-paged-fork.md) (proposed 2026-09-21) qualifies
+`PagedSequence::fork` (`crates/moxie-state/src/paged.rs:857-861`), an
+existing explicit typed-refusal stub — "COW page sharing is not qualified;
+this pool owns one root branch" — for host paged KV, proving parent/child
+isolation. Device-side COW and recurrent/convolution/index-state
+snapshot/replay (document 04's other named M4.4 obligation) remain separate,
+unopened follow-ups. **M4.5 remains unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
 path are explicitly out of M4.2's scope and are not opened by its acceptance.
 The [M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md)
 tracks this milestone's obligations.

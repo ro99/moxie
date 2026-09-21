@@ -536,6 +536,7 @@ mod driver_binding {
                     branch_rows: 2,
                     output: graph.output(),
                     device: ctx.uuid(),
+                    paged_state_capacity: None,
                 };
                 let candidate = lower(&graph, workload).unwrap();
                 let candidate_id = candidate.id();
@@ -654,6 +655,7 @@ mod tests {
             branch_rows: 3,
             output: graph.output(),
             device,
+            paged_state_capacity: None,
         }
     }
 

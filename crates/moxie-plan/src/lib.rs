@@ -122,6 +122,30 @@ pub struct ResourceWorkload {
     pub branch_rows: u64,
     pub output: ValueId,
     pub device: DeviceUuid,
+    /// One composition-root report from the state and memory authorities.
+    /// `None` preserves the original resident-only lowering contract; a
+    /// conventional attention node with this report may lower to a bounded
+    /// host-backed requirement when resident rows are insufficient.
+    pub paged_state_capacity: Option<PagedStateCapacity>,
+}
+
+/// The one plan-time capacity report needed to choose conventional KV
+/// residency or the already-qualified host-backed stream.
+///
+/// The state authority owns the values: the composition root reads its
+/// [`DeviceKvSequence`](https://docs.rs/moxie-state) layout and passes the
+/// report here. The planner does not query a device or duplicate a capacity
+/// authority, and `max_staged_blocks` is supplied by the memory authority's
+/// `HostBackedPlan` contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PagedStateCapacity {
+    /// Rows the state authority admits in the one resident page supported by
+    /// the current host-backed executor path.
+    pub resident_rows: u64,
+    /// Rows in that physical page, used to derive the staged tail count.
+    pub page_tokens: u64,
+    /// The bounded host-backed maximum from the memory authority.
+    pub max_staged_blocks: u64,
 }
 
 /// What one lowered attention node needs from the state authority.
@@ -142,6 +166,9 @@ pub struct ResourceWorkload {
 pub enum StateRequirementKind {
     /// Conventional per-head key/value rows.
     KvPages,
+    /// Conventional KV rows whose tail must be supplied one bounded page at a
+    /// time by the host-backed N-block path.
+    KvPagesHostBacked { staged_blocks: u64 },
     /// MLA's latent plus shared positional-rope row.
     MlaLatent,
 }
@@ -389,7 +416,12 @@ fn lower_with_ids(
                     unreachable!("GraphBuilder requires an activation role for the key operand")
                 };
                 Some((
-                    StateRequirementKind::KvPages,
+                    match workload.paged_state_capacity {
+                        Some(capacity) => {
+                            conventional_state_kind(workload.visible_tokens, capacity)?
+                        }
+                        None => StateRequirementKind::KvPages,
+                    },
                     layer,
                     heads,
                     kv_heads,
@@ -400,17 +432,27 @@ fn lower_with_ids(
                     None,
                 ))
             }
-            OpParams::MlaAttention { descriptor } => Some((
-                StateRequirementKind::MlaLatent,
-                descriptor.layer,
-                descriptor.heads,
-                descriptor.heads,
-                descriptor.query_head_dim()?,
-                1.0 / (descriptor.query_head_dim()? as f32).sqrt(),
-                descriptor.visibility,
-                descriptor.cache_precision.get(),
-                Some(descriptor),
-            )),
+            OpParams::MlaAttention { descriptor } => {
+                if let Some(capacity) = workload.paged_state_capacity
+                    && workload.visible_tokens > capacity.resident_rows
+                {
+                    return Err(unsupported(
+                        "mla_host_backed_streaming",
+                        "MLA host-backed streaming is not admitted by this plan",
+                    ));
+                }
+                Some((
+                    StateRequirementKind::MlaLatent,
+                    descriptor.layer,
+                    descriptor.heads,
+                    descriptor.heads,
+                    descriptor.query_head_dim()?,
+                    1.0 / (descriptor.query_head_dim()? as f32).sqrt(),
+                    descriptor.visibility,
+                    descriptor.cache_precision.get(),
+                    Some(descriptor),
+                ))
+            }
             _ => None,
         };
         if let Some((
@@ -592,6 +634,50 @@ fn lower_with_ids(
         weight_bytes,
         state,
     })
+}
+
+fn conventional_state_kind(
+    visible_tokens: u64,
+    capacity: PagedStateCapacity,
+) -> Result<StateRequirementKind> {
+    if capacity.resident_rows == 0 {
+        return Err(invalid(
+            "resident_rows",
+            "the state authority must admit at least one resident row",
+        ));
+    }
+    if capacity.page_tokens == 0 {
+        return Err(invalid(
+            "page_tokens",
+            "the state authority must report a nonempty page",
+        ));
+    }
+    if !capacity.resident_rows.is_multiple_of(capacity.page_tokens) {
+        return Err(invalid(
+            "resident_rows",
+            "resident capacity must be a whole number of physical pages",
+        ));
+    }
+    if capacity.resident_rows != capacity.page_tokens {
+        return Err(invalid(
+            "resident_rows",
+            "host-backed streaming admits exactly one resident page",
+        ));
+    }
+    if visible_tokens <= capacity.resident_rows {
+        return Ok(StateRequirementKind::KvPages);
+    }
+    let staged_blocks = visible_tokens
+        .checked_sub(capacity.resident_rows)
+        .ok_or(Error::Dim(moxie_types::DimError::Overflow))?
+        .div_ceil(capacity.page_tokens);
+    if staged_blocks > capacity.max_staged_blocks {
+        return Err(unsupported(
+            "host_backed_state_streaming",
+            "declared history exceeds the bounded staged-block maximum",
+        ));
+    }
+    Ok(StateRequirementKind::KvPagesHostBacked { staged_blocks })
 }
 
 fn validate_workload(graph: &Graph, workload: ResourceWorkload) -> Result<()> {
@@ -785,6 +871,13 @@ fn invalid(field: &'static str, detail: impl Into<String>) -> Error {
     }
 }
 
+fn unsupported(capability: &'static str, reason: &'static str) -> Error {
+    Error::Unsupported {
+        capability,
+        reason: reason.into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,6 +1013,7 @@ mod tests {
             branch_rows: rows,
             output: graph.output(),
             device: uuid(),
+            paged_state_capacity: None,
         }
     }
 
@@ -1112,6 +1206,76 @@ mod tests {
         // The two row counts are different facts and stay separate: one is what
         // this step appends, the other is what it attends over.
         assert_eq!((need.appended_rows, need.visible_tokens), (2, 17));
+
+        let capacity = PagedStateCapacity {
+            resident_rows: 8,
+            page_tokens: 8,
+            max_staged_blocks: 3,
+        };
+        let mut streamed_workload = workload(&stateful, 2);
+        streamed_workload.visible_tokens = 32;
+        streamed_workload.paged_state_capacity = Some(capacity);
+        let streamed = lower(&stateful, streamed_workload)
+            .expect("bounded host-backed history is a legal plan");
+        assert_eq!(
+            streamed.state()[0].kind,
+            StateRequirementKind::KvPagesHostBacked { staged_blocks: 3 }
+        );
+
+        let mut resident_workload = streamed_workload;
+        resident_workload.visible_tokens = capacity.resident_rows;
+        let resident = lower(&stateful, resident_workload)
+            .expect("history within resident capacity keeps the single-shot requirement");
+        assert_eq!(resident.state()[0].kind, StateRequirementKind::KvPages);
+
+        let mut oversized_workload = streamed_workload;
+        oversized_workload.visible_tokens = 40;
+        let refused = lower(&stateful, oversized_workload)
+            .expect_err("history beyond the bounded staged maximum must refuse");
+        assert_eq!(refused.kind(), "unsupported");
+        assert!(refused.to_string().contains("staged-block maximum"));
+
+        for (capacity, reason) in [
+            (
+                PagedStateCapacity {
+                    resident_rows: 0,
+                    page_tokens: 8,
+                    max_staged_blocks: 3,
+                },
+                "at least one resident row",
+            ),
+            (
+                PagedStateCapacity {
+                    resident_rows: 8,
+                    page_tokens: 0,
+                    max_staged_blocks: 3,
+                },
+                "nonempty page",
+            ),
+            (
+                PagedStateCapacity {
+                    resident_rows: 12,
+                    page_tokens: 8,
+                    max_staged_blocks: 3,
+                },
+                "whole number of physical pages",
+            ),
+            (
+                PagedStateCapacity {
+                    resident_rows: 16,
+                    page_tokens: 8,
+                    max_staged_blocks: 3,
+                },
+                "exactly one resident page",
+            ),
+        ] {
+            let mut malformed = streamed_workload;
+            malformed.paged_state_capacity = Some(capacity);
+            let error = lower(&stateful, malformed).unwrap_err();
+            assert_eq!(error.kind(), "invalid_request");
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+
         // A stateless graph reports nothing, which is every graph lowered
         // before this task.
         assert!(
