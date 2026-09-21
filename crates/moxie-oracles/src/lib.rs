@@ -34,6 +34,7 @@ pub mod attention;
 pub mod linear;
 pub mod mask;
 pub mod metric;
+pub mod mla;
 pub mod norm;
 pub mod online_softmax;
 pub mod protocol;
@@ -122,6 +123,7 @@ pub fn register(registry: &mut OracleRegistry) -> Result<()> {
             "moxie_oracles::attention",
             "attention::tests",
         ),
+        (Op::MlaAttention, "moxie_oracles::mla", "mla::tests"),
         (Op::Residual, "moxie_oracles::residual", "residual::tests"),
         // Routing. M0 seeded `Route`, `Dispatch` and `Combine` as fixtures with
         // no interpreter consumer; task 0019 gives all four references and the
@@ -171,6 +173,7 @@ mod tests {
             Op::SwiGlu,
             Op::Rope,
             Op::Attention,
+            Op::MlaAttention,
             Op::Residual,
             Op::GeGlu,
             Op::Route,
@@ -185,7 +188,6 @@ mod tests {
         // Nothing is registered for operations this crate does not implement.
         // An over-broad registration would let an unvalidated operation lower.
         for op in [
-            Op::MlaAttention,
             Op::SparseIndexSelect,
             // R06: bounded in both terms, and not SwiGlu. Registering SwiGlu's
             // reference for it would be the substitution R06 warns against.

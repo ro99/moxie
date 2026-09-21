@@ -22,7 +22,18 @@ reads as instructions.
 0036](docs/tasks/0036-m3-final-closure.md)). M1 is complete, M2's five items are
 all accepted, and M2's formal closure statement remains the owner's to make.
 **M4 is authorized**, and **M4.1 is accepted and complete** (owner, 2026-09-20;
-task 0038). **M4.2 is active** as the next M4 deliverable.
+task 0038). **M4.2 is active**: [task
+0039](docs/tasks/0039-m4-mla-state-descriptors-and-glm52-fixtures.md)
+**accepted** (owner, 2026-09-21) — a shared MLA/state descriptor and a
+source-linked GLM-5.2 FP64 oracle, reviewed twice (two blocking RoPE-rotation
+defects found and repaired). [Task
+0040](docs/tasks/0040-m4-mla-reference-plan-admission.md) (proposed
+2026-09-21) is M4.2's second half — a reference (unabsorbed) MLA graph
+admitted and executed on the host interpreter, validated against task 0039's
+oracle. Absorbed/layout-specific paths and device execution remain deferred
+by the roadmap's own text until that lands. The
+[M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md) tracks
+this milestone's obligations.
 
 | | |
 |---|---|

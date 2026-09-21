@@ -132,6 +132,23 @@ with `codex --yolo`. One tab per worker: panes split from a single tab become
 unusably narrow, and a worker that shares a tab with the coordinator competes for
 the owner's focus.
 
+`codex --yolo` alone does **not** select luna or sol: it launches whatever model
+`~/.codex/config.toml`'s top-level `model`/`model_reasoning_effort` last left
+selected (observed 2026-09-20: both new panes came up as `gpt-5.6-sol high`,
+including the one meant to be luna). Pass the model and effort explicitly on
+the start command and verify the banner before assigning work:
+
+```bash
+herdr agent start luna --kind codex --pane <id> -- --yolo -c model="gpt-5.6-luna" -c model_reasoning_effort="max"
+herdr agent start sol  --kind codex --pane <id> -- --yolo -c model="gpt-5.6-sol"  -c model_reasoning_effort="high"
+herdr agent read luna --source recent-unwrapped --lines 15   # confirm "gpt-5.6-luna max"
+herdr agent read sol  --source recent-unwrapped --lines 15   # confirm "gpt-5.6-sol high"
+```
+
+If a pane already booted with the wrong model, `herdr agent prompt <name> "/quit"`
+returns it to `agent_not_running` at the shell prompt, then re-run `agent start`
+with the corrected `-c` flags on that same pane.
+
 The builder invokes `/ponytail:ponytail` before writing code and the reviewer
 invokes `/ponytail:ponytail-review` before reading it. Name the skill in the
 assignment; do not assume a worker carries it from a previous round.

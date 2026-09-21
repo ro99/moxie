@@ -38,7 +38,10 @@ pub use graph::{
 
 use std::collections::BTreeMap;
 
-use moxie_types::{AccumulationPolicy, ActivationPrecision, Dim, Error, Result, WeightPrecision};
+use moxie_types::{
+    AccumulationPolicy, ActivationPrecision, CachePrecision, Dim, Error, Precision, Result,
+    WeightPrecision,
+};
 
 /// The semantic operation catalogue from document 02.
 ///
@@ -150,6 +153,176 @@ impl Op {
         Op::ShortConv,
         Op::ResidualMix,
     ];
+}
+
+/// The checked shape, positional and cache contract for [`Op::MlaAttention`].
+///
+/// This is deliberately a descriptor rather than an `OpParams` variant for
+/// now. The current planner and interpreter intentionally refuse MLA; putting
+/// a variant in the executable graph would make that refusal look like an
+/// admitted execution path and would require a model/executor consumer before
+/// the reference algebra has been reviewed. The next MLA task can attach this
+/// closed descriptor to a node without inventing the geometry again.
+///
+/// The weight shapes use the same row-major `[out, in]` convention as
+/// [`OpParams::Linear`]. The descriptor states the unfused path from the
+/// released GLM-5.2 algebra: query down projection, query RMSNorm, query up
+/// projection, latent/rope KV down projection, latent RMSNorm, per-head KV
+/// decompression, and output projection. RoPE is applied to the rope slice
+/// only; the cache never expands to a full per-head KV row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MlaAttentionDescriptor {
+    /// Width of the input and output residual stream.
+    pub hidden: u64,
+    pub q_lora_rank: u64,
+    pub kv_lora_rank: u64,
+    pub qk_nope_head_dim: u64,
+    pub qk_rope_head_dim: u64,
+    pub v_head_dim: u64,
+    pub heads: u64,
+    pub rms_norm_eps: f32,
+    /// GLM-5.2's released reference uses interleaved RoPE with this base.
+    pub rope_base: f32,
+    pub rope_layout: RopeLayout,
+    pub visibility: Visibility,
+    pub layer: u32,
+    /// MLA state is intentionally narrower than full KV and is BF16 in this
+    /// task. FP16 remains a typed refusal until a later contract admits it.
+    pub cache_precision: CachePrecision,
+}
+
+impl MlaAttentionDescriptor {
+    /// The operation this descriptor describes.
+    pub const fn op(self) -> Op {
+        Op::MlaAttention
+    }
+
+    /// Validate all geometry that becomes a tensor or cache extent.
+    pub fn validate(self) -> Result<()> {
+        if self.hidden == 0
+            || self.q_lora_rank == 0
+            || self.kv_lora_rank == 0
+            || self.qk_nope_head_dim == 0
+            || self.qk_rope_head_dim == 0
+            || self.v_head_dim == 0
+            || self.heads == 0
+        {
+            return Err(Error::InvalidRequest {
+                field: "mla_geometry",
+                detail: "hidden, ranks, head dimensions and heads must be nonzero".into(),
+            });
+        }
+        if !(self.rms_norm_eps.is_finite() && self.rms_norm_eps > 0.0) {
+            return Err(Error::InvalidRequest {
+                field: "rms_norm_eps",
+                detail: format!(
+                    "RMSNorm epsilon must be finite and positive, got {}",
+                    self.rms_norm_eps
+                ),
+            });
+        }
+        if !(self.rope_base.is_finite() && self.rope_base > 1.0) {
+            return Err(Error::InvalidRequest {
+                field: "rope_base",
+                detail: format!("RoPE base must be finite and > 1, got {}", self.rope_base),
+            });
+        }
+        if !self.qk_rope_head_dim.is_multiple_of(2) {
+            return Err(Error::InvalidRequest {
+                field: "qk_rope_head_dim",
+                detail: format!(
+                    "interleaved RoPE requires an even rope width, got {}",
+                    self.qk_rope_head_dim
+                ),
+            });
+        }
+        if self.cache_precision.get() != Precision::Bf16 {
+            return Err(Error::Unsupported {
+                capability: "mla_cache_precision",
+                reason: "MLA latent state is BF16 in this descriptor; FP16 is not admitted".into(),
+            });
+        }
+        // Every product below is a physical tensor extent. Check it before a
+        // caller converts the public u64 dimensions to a host allocation.
+        let _ = self.query_width()?;
+        let _ = self.kv_projection_width()?;
+        let _ = self.decompressed_kv_width()?;
+        let _ = self.output_width()?;
+        Ok(())
+    }
+
+    /// Width of one query head before splitting nope and rope lanes.
+    pub fn query_head_dim(self) -> Result<u64> {
+        self.qk_nope_head_dim
+            .checked_add(self.qk_rope_head_dim)
+            .ok_or(moxie_types::DimError::Overflow.into())
+    }
+
+    /// Width of the query up-projection output.
+    pub fn query_width(self) -> Result<u64> {
+        self.heads
+            .checked_mul(self.query_head_dim()?)
+            .ok_or(moxie_types::DimError::Overflow.into())
+    }
+
+    /// Width of `kv_a_proj_with_mqa` and of one cached row.
+    pub fn kv_projection_width(self) -> Result<u64> {
+        self.kv_lora_rank
+            .checked_add(self.qk_rope_head_dim)
+            .ok_or(moxie_types::DimError::Overflow.into())
+    }
+
+    /// The exact latent/positional cache width, not a full per-head KV width.
+    pub fn cache_width(self) -> Result<u64> {
+        self.kv_projection_width()
+    }
+
+    /// Width of `kv_b_proj`'s output: nope key lanes followed by value lanes
+    /// for each head.
+    pub fn decompressed_kv_width(self) -> Result<u64> {
+        self.qk_nope_head_dim
+            .checked_add(self.v_head_dim)
+            .ok_or(moxie_types::DimError::Overflow)?
+            .checked_mul(self.heads)
+            .ok_or(moxie_types::DimError::Overflow.into())
+    }
+
+    /// Width entering `o_proj` after per-head attention values are concatenated.
+    pub fn output_width(self) -> Result<u64> {
+        self.heads
+            .checked_mul(self.v_head_dim)
+            .ok_or(moxie_types::DimError::Overflow.into())
+    }
+
+    /// `[out, in]` shape of `q_a_proj`.
+    pub fn q_a_proj_shape(self) -> Result<(u64, u64)> {
+        self.validate()?;
+        Ok((self.q_lora_rank, self.hidden))
+    }
+
+    /// `[out, in]` shape of `q_b_proj`.
+    pub fn q_b_proj_shape(self) -> Result<(u64, u64)> {
+        self.validate()?;
+        Ok((self.query_width()?, self.q_lora_rank))
+    }
+
+    /// `[out, in]` shape of `kv_a_proj_with_mqa`.
+    pub fn kv_a_proj_shape(self) -> Result<(u64, u64)> {
+        self.validate()?;
+        Ok((self.kv_projection_width()?, self.hidden))
+    }
+
+    /// `[out, in]` shape of `kv_b_proj`.
+    pub fn kv_b_proj_shape(self) -> Result<(u64, u64)> {
+        self.validate()?;
+        Ok((self.decompressed_kv_width()?, self.kv_lora_rank))
+    }
+
+    /// `[out, in]` shape of `o_proj`.
+    pub fn o_proj_shape(self) -> Result<(u64, u64)> {
+        self.validate()?;
+        Ok((self.hidden, self.output_width()?))
+    }
 }
 
 /// Identity of an independent host reference implementation.
@@ -353,7 +526,7 @@ impl OpContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moxie_types::Precision;
+    use moxie_types::{CachePrecision, Precision};
 
     const TEST_ORACLE: OracleId = OracleId("test");
 
@@ -497,6 +670,73 @@ mod tests {
         // collapsing them loses LayerNorm's mean subtraction.
         assert_ne!(Op::RmsNorm, Op::LayerNorm);
         assert_ne!(Op::RmsNorm.name(), Op::LayerNorm.name());
+    }
+
+    fn mla_descriptor() -> MlaAttentionDescriptor {
+        MlaAttentionDescriptor {
+            hidden: 6144,
+            q_lora_rank: 2048,
+            kv_lora_rank: 512,
+            qk_nope_head_dim: 192,
+            qk_rope_head_dim: 64,
+            v_head_dim: 256,
+            heads: 64,
+            rms_norm_eps: 1e-5,
+            rope_base: 8_000_000.0,
+            rope_layout: RopeLayout::Interleaved,
+            visibility: Visibility::Causal,
+            layer: 0,
+            cache_precision: CachePrecision::expect(Precision::Bf16),
+        }
+    }
+
+    #[test]
+    fn mla_descriptor_declares_latent_not_full_kv_geometry() {
+        let descriptor = mla_descriptor();
+        assert_eq!(descriptor.op(), Op::MlaAttention);
+        descriptor.validate().unwrap();
+        assert_eq!(descriptor.query_head_dim().unwrap(), 256);
+        assert_eq!(descriptor.query_width().unwrap(), 16_384);
+        assert_eq!(descriptor.cache_width().unwrap(), 576);
+        assert_eq!(descriptor.decompressed_kv_width().unwrap(), 28_672);
+        assert_eq!(descriptor.q_a_proj_shape().unwrap(), (2048, 6144));
+        assert_eq!(descriptor.q_b_proj_shape().unwrap(), (16_384, 2048));
+        assert_eq!(descriptor.kv_a_proj_shape().unwrap(), (576, 6144));
+        assert_eq!(descriptor.kv_b_proj_shape().unwrap(), (28_672, 512));
+        assert_eq!(descriptor.o_proj_shape().unwrap(), (6144, 16_384));
+    }
+
+    #[test]
+    fn mla_descriptor_refuses_zero_odd_and_non_bf16_geometry() {
+        let mut zero = mla_descriptor();
+        zero.kv_lora_rank = 0;
+        assert!(matches!(
+            zero.validate(),
+            Err(Error::InvalidRequest {
+                field: "mla_geometry",
+                ..
+            })
+        ));
+
+        let mut odd_rope = mla_descriptor();
+        odd_rope.qk_rope_head_dim = 63;
+        assert!(matches!(
+            odd_rope.validate(),
+            Err(Error::InvalidRequest {
+                field: "qk_rope_head_dim",
+                ..
+            })
+        ));
+
+        let mut f16 = mla_descriptor();
+        f16.cache_precision = CachePrecision::expect(Precision::F16);
+        assert!(matches!(
+            f16.validate(),
+            Err(Error::Unsupported {
+                capability: "mla_cache_precision",
+                ..
+            })
+        ));
     }
 
     #[test]

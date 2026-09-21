@@ -16,14 +16,14 @@ modified. Nothing here is an O1 catalog decision.
 Document 06's provisional bring-up order is "Gemma text for a dense slice;
 Laguna for early MoE; Inkling ... GLM-5.2 for MLA; Kimi and GLM-5.3 for
 recurrent/hybrid state; DeepSeek for compressed sparse attention". Of the seven
-families, **two are present on disk and five are absent**:
+families, **three are present on disk and four are absent**:
 
 | Family | Checkpoint on disk | Note |
 |---|---|---|
 | Gemma | **absent on 2026-09-07; present since** | see the [2026-09-12 update](#update-2026-09-12--gemma-4-31b-it-int8-is-now-on-disk) |
 | Laguna | **absent** | M2's proposed first MoE workload has no artifact |
 | Inkling | **absent** | |
-| GLM-5.2 | **absent** | M4's proposed MLA case has no artifact |
+| GLM-5.2 | **present since 2026-09-20** | see the [2026-09-20 update](#update-2026-09-20--glm-52-is-no-longer-absent); metadata-only MLA fixture |
 | Kimi K3 | present, 1.5 T | mixed MXFP4/BF16 — see below |
 | GLM-5.3 | present, two variants | 433 G and 178 G |
 | DeepSeek | **absent** | |
@@ -273,7 +273,8 @@ synthetic graph, which document 06 explicitly provides for, under
 O1 is still open and still blocks the bring-up order and the catalog; a
 downloaded artifact is not a catalog decision. O2 is still open and no quality
 statement exists. O5 is still open and nothing may be converted or requantized.
-Laguna, GLM-5.2 and DeepSeek remain absent under these roots.
+Laguna and DeepSeek remain absent under these roots; GLM-5.2 is present per the
+dated update below.
 
 ## Update 2026-09-13 — one Laguna shard hashed whole, and the hash checked against the hub's
 
@@ -303,3 +304,31 @@ Retention: unchanged. The artifact stays where it is, read-only; **nothing was
 written, converted, copied or deleted under any checkpoint root**. The repacked
 module went to a temporary directory under `/tmp` and was removed when its test
 finished.
+
+## Update 2026-09-20 — GLM-5.2 is no longer absent
+
+`/fast/models/cyankiwi/GLM-5.2-AWQ-INT4` is present, revision commit
+`6e4f5c19d96e79e705d9918f763e132059dc668e`, 83 safetensors shards, 442 GB,
+downloaded 2026-09-20 (user-initiated; no agent bulk download occurred). This
+corrects the "GLM-5.2 remain[s] absent" line two updates above, which is now
+stale for this one entry.
+
+`config.json` declares `architectures: GlmMoeDsaForCausalLM` — this revision
+fuses classic DeepSeek-style MLA (`q_lora_rank: 2048`, `kv_lora_rank: 512`,
+`qk_rope_head_dim: 64`, `qk_nope_head_dim: 192`, `v_head_dim: 256`,
+`heads: 64`) with a DeepSeek-Sparse-Attention indexer
+(`self_attn.indexer.{wq_b,wk,weights_proj,k_norm}`, `index_topk: 2048`,
+`index_n_heads: 32`). `model.safetensors.index.json` confirms the MLA tensor
+names (`q_a_proj`, `q_a_layernorm`, `q_b_proj`, `kv_a_proj_with_mqa`,
+`kv_a_layernorm`, `kv_b_proj`, `o_proj`) against the legacy runtime's algebra.
+Quantization is `pack-quantized` INT4, group size 32, asymmetric; the same
+attention/indexer/MLP projections named absent in every other entry here are
+`ignore`d (BF16) per layer, plus `first_k_dense_replace: 3` dense layers.
+
+This is still **not** an O1 v1-catalog revision — document 06 names GLM-5.2
+only as the provisional MLA stress case, and its presence here is not a
+catalog decision (O1 remains open) or a quality statement (O2 remains open).
+[Task 0039](../tasks/0039-m4-mla-state-descriptors-and-glm52-fixtures.md)
+uses this checkpoint's `config.json`/`model.safetensors.index.json` metadata
+only, to shape synthetic MLA oracle fixtures — no tensor weights are read.
+The indexer/DSA tensors are out of that task's scope by name.

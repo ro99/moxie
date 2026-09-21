@@ -52,7 +52,7 @@ pub use paged::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use moxie_types::{BranchId, Error, Result, StateTransactionId};
+use moxie_types::{BranchId, CachePrecision, Error, Precision, Result, StateTransactionId};
 
 /// The kinds of state a schema can declare (document 04).
 ///
@@ -69,6 +69,62 @@ pub enum StateKind {
     PositionCounter,
     SamplerHistory,
     ConstraintState,
+}
+
+/// The persistent schema for one [`StateKind::MlaLatent`] layer.
+///
+/// MLA does not retain a conventional `heads × head_dim` key/value row. It
+/// retains the RMS-normalized latent lanes and one shared positional-rope slice
+/// per token, so its row width is exactly `kv_lora_rank +
+/// qk_rope_head_dim`. This type belongs to the state authority rather than the
+/// graph or oracle: it describes bytes that survive a step, not the projection
+/// weights or the computation that produced them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlaLatentDescriptor {
+    pub kv_lora_rank: usize,
+    pub qk_rope_head_dim: usize,
+    pub precision: CachePrecision,
+}
+
+impl MlaLatentDescriptor {
+    /// Construct the BF16-only latent schema admitted by task 0039.
+    pub fn new(
+        kv_lora_rank: usize,
+        qk_rope_head_dim: usize,
+        precision: CachePrecision,
+    ) -> Result<Self> {
+        if kv_lora_rank == 0 || qk_rope_head_dim == 0 {
+            return Err(Error::InvalidRequest {
+                field: "mla_latent_geometry",
+                detail: "kv_lora_rank and qk_rope_head_dim must be nonzero".into(),
+            });
+        }
+        if precision.get() != Precision::Bf16 {
+            return Err(Error::Unsupported {
+                capability: "mla_latent_precision",
+                reason: "MLA latent state is BF16 in this descriptor; FP16 is not admitted".into(),
+            });
+        }
+        kv_lora_rank
+            .checked_add(qk_rope_head_dim)
+            .ok_or(moxie_types::DimError::Overflow)?;
+        Ok(Self {
+            kv_lora_rank,
+            qk_rope_head_dim,
+            precision,
+        })
+    }
+
+    pub const fn kind(self) -> StateKind {
+        StateKind::MlaLatent
+    }
+
+    /// The number of encoded elements retained per token.
+    pub fn cache_width(self) -> Result<usize> {
+        self.kv_lora_rank
+            .checked_add(self.qk_rope_head_dim)
+            .ok_or(moxie_types::DimError::Overflow.into())
+    }
 }
 
 /// How an earlier state of one component can be recovered.
@@ -1326,6 +1382,27 @@ mod tests {
         s.accept(ROOT, 4).unwrap();
         s.execute(ROOT, 8).unwrap();
         s
+    }
+
+    #[test]
+    fn mla_latent_schema_is_bf16_and_counts_only_latent_plus_rope() {
+        let descriptor =
+            MlaLatentDescriptor::new(512, 64, CachePrecision::expect(Precision::Bf16)).unwrap();
+        assert_eq!(descriptor.kind(), StateKind::MlaLatent);
+        assert_eq!(descriptor.cache_width().unwrap(), 576);
+        assert_eq!(
+            StateKind::MlaLatent.restore_capability(),
+            RestoreCapability::Truncate
+        );
+
+        assert!(matches!(
+            MlaLatentDescriptor::new(0, 64, CachePrecision::expect(Precision::Bf16)),
+            Err(Error::InvalidRequest { .. })
+        ));
+        assert!(matches!(
+            MlaLatentDescriptor::new(512, 64, CachePrecision::expect(Precision::F16)),
+            Err(Error::Unsupported { .. })
+        ));
     }
 
     #[test]
