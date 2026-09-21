@@ -43,9 +43,16 @@ use moxie_types::{Error, Result};
 /// touched it into a `NaN`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Partial {
-    max: f64,
-    sum: f64,
-    weighted: Vec<f64>,
+    /// The largest scaled score in this partial, or negative infinity when empty.
+    pub max: f64,
+    /// The denominator after subtracting [`Self::max`].
+    pub sum: f64,
+    /// The unnormalized weighted value sum after subtracting [`Self::max`].
+    ///
+    /// Device partial producers use the same representation before the host
+    /// calls [`Partial::merge`]. The algebra remains private to the methods;
+    /// these fields only make an already-computed partial transportable.
+    pub weighted: Vec<f64>,
 }
 
 impl Partial {

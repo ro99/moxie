@@ -42,6 +42,7 @@ moxie-state = { workspace = true, optional = true }
 
 [dev-dependencies]
 moxie-graph.workspace = true
+moxie-oracles.workspace = true
 # Task 0020's real-artifact test builds its demand set the way a routed step
 # does, through the engine's route-to-chunk arithmetic. A dev dependency only:
 # the executor's production code names no engine type, and a fixture proves the
@@ -50,7 +51,6 @@ moxie-engine.workspace = true
 # Task 0021: the grouped run's answer is checked against task 0019's accepted
 # oracle, and its NUMA placement is *measured* through the one crate ADR 0006
 # lets read `/proc`. Both are test-only; production code here names neither.
-moxie-oracles.workspace = true
 moxie-host.workspace = true
 # Task 0022: the second consumer's *declared geometry* comes from the model
 # definition rather than from literals repeated in a test. Document 02 allows

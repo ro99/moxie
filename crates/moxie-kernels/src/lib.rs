@@ -87,6 +87,10 @@ pub const AFFINE_LINEAR_TILE: u64 = 16;
 /// dimension, page width and the score scale are runtime parameters.
 pub const PAGED_ATTENTION: &str = "moxie_bf16_paged_attention_v1";
 pub const PAGED_ATTENTION_ABI: u32 = 1;
+/// The separately qualified partial-producing entry point used by the bounded
+/// two-block host-backed path. Its ABI is intentionally not the single-shot
+/// output ABI above.
+pub const PAGED_ATTENTION_PARTIAL: &str = "moxie_bf16_paged_attention_partial_v1";
 /// Keys the kernel scores, maximizes and folds into its running partial before
 /// it looks at the next ones.
 ///

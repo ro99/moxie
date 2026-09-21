@@ -258,6 +258,11 @@ pub struct PagedAttentionLaunch {
     first_position: u64,
     history_base: u64,
     history_rows: u64,
+    /// Explicitly admitted two-block streaming metadata. A normal launch may
+    /// never declare more history than its device geometry holds; this bit is
+    /// set only by [`Self::two_block_stream`], whose executor splits that
+    /// history before touching the single-shot kernel.
+    two_block_stream: bool,
 }
 
 impl PagedAttentionLaunch {
@@ -275,6 +280,43 @@ impl PagedAttentionLaunch {
             first_position,
             history_base,
             history_rows,
+            two_block_stream: false,
+        };
+        launch.check()?;
+        Ok(launch)
+    }
+
+    /// One explicit two-block host-backed launch.
+    ///
+    /// The resident block is exactly one device page and the staged block is a
+    /// nonempty tail page. The returned value describes the complete logical
+    /// history even when that history is larger than the run's device
+    /// geometry; only [`device::PagedAttentionRun::attend_two_block`] accepts
+    /// this marker, and it launches the separate partial ABI once per block.
+    pub fn two_block_stream(
+        layer: AttentionLayer,
+        rows: u64,
+        first_position: u64,
+        history_base: u64,
+        staged_rows: u64,
+    ) -> Result<Self> {
+        let resident_rows = layer.geometry.page_tokens;
+        if staged_rows == 0 || staged_rows > layer.geometry.page_tokens {
+            return Err(invalid(
+                "staged_rows",
+                "the staged block must contain one to one page of rows",
+            ));
+        }
+        let history_rows = resident_rows
+            .checked_add(staged_rows)
+            .ok_or(Error::Dim(DimError::Overflow))?;
+        let launch = Self {
+            layer,
+            rows,
+            first_position,
+            history_base,
+            history_rows,
+            two_block_stream: true,
         };
         launch.check()?;
         Ok(launch)
@@ -286,6 +328,12 @@ impl PagedAttentionLaunch {
     /// assignment: moving the query block changes which keys are visible, so it
     /// is re-checked rather than edited in place.
     pub fn at(&self, rows: u64, first_position: u64) -> Result<Self> {
+        if self.two_block_stream {
+            return Err(invalid(
+                "launch",
+                "a two-block stream has one fixed full-history launch",
+            ));
+        }
         Self::new(
             self.layer,
             rows,
@@ -297,6 +345,12 @@ impl PagedAttentionLaunch {
 
     /// The same launch over a different committed history.
     pub fn over(&self, history_base: u64, history_rows: u64) -> Result<Self> {
+        if self.two_block_stream {
+            return Err(invalid(
+                "launch",
+                "a two-block stream has one fixed full-history launch",
+            ));
+        }
         Self::new(
             self.layer,
             self.rows,
@@ -324,6 +378,11 @@ impl PagedAttentionLaunch {
 
     pub const fn visibility(&self) -> Visibility {
         self.layer.visibility
+    }
+
+    #[cfg(feature = "driver")]
+    pub(crate) const fn is_two_block_stream(&self) -> bool {
+        self.two_block_stream
     }
 
     pub const fn rows(&self) -> u64 {
@@ -416,12 +475,27 @@ impl PagedAttentionLaunch {
                  value before attending, because a causal query attends to itself",
             ));
         }
-        if self.history_rows > self.layer.geometry.capacity_rows()? {
+        if !self.two_block_stream && self.history_rows > self.layer.geometry.capacity_rows()? {
             return Err(Error::CapacityExceeded {
                 tier: None,
                 requested_bytes: self.history_rows,
                 available_bytes: self.layer.geometry.capacity_rows()?,
             });
+        }
+        if self.two_block_stream {
+            let two_pages = self
+                .layer
+                .geometry
+                .page_tokens
+                .checked_mul(2)
+                .ok_or(Error::Dim(DimError::Overflow))?;
+            if self.history_rows <= self.layer.geometry.page_tokens || self.history_rows > two_pages
+            {
+                return Err(invalid(
+                    "history_rows",
+                    "a two-block stream must contain one resident page and one staged page",
+                ));
+            }
         }
         // Every other scalar the launch hands the kernel, at the same width the
         // ABI declares. `grid` and `window` cannot fail after this.
@@ -962,10 +1036,14 @@ pub mod device {
     #[cfg(feature = "paged-attention-binding")]
     use moxie_types::{BatchId, PageView, PagedKvWriter};
     use moxie_types::{
-        DeviceTier, Error, HostTier, PagePlacement, Result, Scope, SemanticKernelDescriptor, Tier,
+        DeviceTier, DimError, Error, HostTier, PagePlacement, Result, Scope,
+        SemanticKernelDescriptor, Tier,
     };
 
-    use super::{PageGeometry, PagedAttentionLaunch, invalid, invalid_fmt, unsupported_kernel_fmt};
+    use super::{
+        PAGE_ENTRY_BYTES, PAYLOAD_BYTES, PageGeometry, PagedAttentionLaunch, invalid, invalid_fmt,
+        unsupported_kernel_fmt,
+    };
     use crate::arena::{DeviceArena, DeviceRange};
 
     /// 256-byte alignment, as every other device range in this crate uses.
@@ -990,6 +1068,9 @@ pub mod device {
         /// Admit only the persistent pages and table. `attend` refuses and
         /// names `attend_into`, which is the path.
         DeviceHandles,
+        /// Admit one bounded host-sourced page and one reusable FP32 partial
+        /// output buffer for the exact two-block streaming proof.
+        TwoBlock,
     }
 
     /// A refusal from admission, or from the unwind it runs on a partial
@@ -1033,6 +1114,13 @@ pub mod device {
         PageTable(Vec<u32>),
         /// One launch's query rows, or the encoded table bytes in flight.
         Query(Vec<u8>),
+        /// A two-block stream's query, host K/V page and page-table entry.
+        Stream {
+            query: Vec<u8>,
+            keys: Vec<u8>,
+            values: Vec<u8>,
+            table: [u8; 4],
+        },
     }
 
     /// A refused append, mapping or attend.
@@ -1044,6 +1132,28 @@ pub mod device {
     pub struct PagedRunRefused {
         pub error: Error,
         pub source: Option<RefusedSource>,
+    }
+
+    /// One raw FP32 partial produced by the separately-qualified device entry
+    /// point. The composition/qualification root widens these fields and calls
+    /// `moxie_oracles::online_softmax::Partial::merge`; the executor owns the
+    /// device launch, not a second copy of the merge algebra.
+    #[derive(Debug)]
+    pub struct DevicePartial {
+        pub max: f32,
+        pub sum: f32,
+        pub weighted: Vec<f32>,
+    }
+
+    /// The two raw per-block results from one bounded stream. The merge is
+    /// deliberately performed by the caller that owns the shared oracle.
+    /// `host_to_device_bytes` excludes the query upload and names the staged
+    /// block's K/V bytes plus its one page-table entry.
+    #[derive(Debug)]
+    pub struct TwoBlockAttention {
+        pub resident: Vec<DevicePartial>,
+        pub staged: Vec<DevicePartial>,
+        pub host_to_device_bytes: u64,
     }
 
     impl PagedRunRefused {
@@ -1098,6 +1208,14 @@ pub mod device {
         table: Option<DeviceRange<'ctx>>,
         query: Option<DeviceRange<'ctx>>,
         output: Option<DeviceRange<'ctx>>,
+        /// The one host-sourced page and reusable FP32 partial outputs used
+        /// only by [`Staging::TwoBlock`].
+        staged_keys: Option<DeviceRange<'ctx>>,
+        staged_values: Option<DeviceRange<'ctx>>,
+        staged_table: Option<DeviceRange<'ctx>>,
+        partial_max: Option<DeviceRange<'ctx>>,
+        partial_sum: Option<DeviceRange<'ctx>>,
+        partial_weighted: Option<DeviceRange<'ctx>>,
         /// The published mapping, and the absolute row its logical page zero
         /// names.
         ///
@@ -1136,6 +1254,9 @@ pub mod device {
         /// prevent, and never handing the pair back is what prevents it.
         held_ranges: Option<(DeviceRange<'ctx>, DeviceRange<'ctx>)>,
         quarantined: bool,
+        partial_symbol: Option<usize>,
+        #[cfg(feature = "paged-attention-test-hooks")]
+        staging_failure: bool,
     }
 
     impl<'ctx> PagedAttentionRun<'ctx> {
@@ -1291,7 +1412,10 @@ pub mod device {
             // per-step buffers at all, and a zero-byte region is not a
             // partition of anything.
             let mut regions: Vec<(DeviceTier, u64)> = Vec::new();
-            if regions.try_reserve_exact(2).is_err() {
+            if regions
+                .try_reserve_exact(if staging == Staging::TwoBlock { 3 } else { 2 })
+                .is_err()
+            {
                 return Err(give_back(
                     ledger,
                     reservation,
@@ -1305,6 +1429,9 @@ pub mod device {
             regions.push((DeviceTier::KvStatePages, extents.persistent));
             if extents.per_step != 0 {
                 regions.push((DeviceTier::Activations, extents.per_step));
+            }
+            if extents.transfer != 0 {
+                regions.push((DeviceTier::TransferStaging, extents.transfer));
             }
             let mut arena = match DeviceArena::create_partitioned(
                 ledger,
@@ -1323,8 +1450,13 @@ pub mod device {
                     return Err(give_back(ledger, refused.reservation, refused.error));
                 }
             };
+            let hold_count = match staging {
+                Staging::Host => 5,
+                Staging::DeviceHandles => 3,
+                Staging::TwoBlock => 10,
+            };
             let mut hold: Vec<DeviceRange<'ctx>> = Vec::new();
-            if hold.try_reserve_exact(5).is_err() {
+            if hold.try_reserve_exact(hold_count).is_err() {
                 return Err(unwind(
                     arena,
                     Vec::new(),
@@ -1350,6 +1482,17 @@ pub mod device {
             if staging == Staging::Host {
                 wanted.push((extents.query, "attention-query"));
                 wanted.push((extents.query, "attention-output"));
+            } else if staging == Staging::TwoBlock {
+                wanted.push((extents.query, "attention-stream-query"));
+                wanted.push((extents.staged_payload, "attention-stream-staged-keys"));
+                wanted.push((extents.staged_payload, "attention-stream-staged-values"));
+                wanted.push((extents.staged_table, "attention-stream-staged-table"));
+                wanted.push((extents.partial_scalars, "attention-stream-partial-max"));
+                wanted.push((extents.partial_scalars, "attention-stream-partial-sum"));
+                wanted.push((
+                    extents.partial_weighted,
+                    "attention-stream-partial-weighted",
+                ));
             }
             for (bytes, name) in wanted {
                 match allocate(&mut arena, bytes, name) {
@@ -1368,7 +1511,8 @@ pub mod device {
             };
             let symbols = {
                 let mut symbols: Vec<String> = Vec::new();
-                let mut room = symbols.try_reserve_exact(descriptor.symbols.len()).is_ok();
+                let needed = descriptor.symbols.len() + usize::from(staging == Staging::TwoBlock);
+                let mut room = symbols.try_reserve_exact(needed).is_ok();
                 if room {
                     for symbol in &descriptor.symbols {
                         match moxie_memory::fallible::text(format_args!("{}", symbol.0)) {
@@ -1392,8 +1536,34 @@ pub mod device {
                         },
                     ));
                 }
-                symbols
+                let partial_symbol = if staging == Staging::TwoBlock {
+                    match moxie_memory::fallible::text(format_args!(
+                        "{}",
+                        moxie_kernels::PAGED_ATTENTION_PARTIAL
+                    )) {
+                        Ok(name) => {
+                            symbols.push(name);
+                            Some(symbols.len() - 1)
+                        }
+                        Err(_) => {
+                            return Err(unwind(
+                                arena,
+                                hold,
+                                ledger,
+                                Error::CapacityExceeded {
+                                    tier: None,
+                                    requested_bytes: 0,
+                                    available_bytes: 0,
+                                },
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                (symbols, partial_symbol)
             };
+            let (symbols, partial_symbol) = symbols;
             let module = match Module::load(ctx, ModuleImage::Binary(image))
                 .and_then(|module| module.resolve_all(&symbols))
             {
@@ -1413,12 +1583,50 @@ pub mod device {
                     },
                 ));
             }
-            let (query, output) = if staging == Staging::Host {
-                let output = hold.pop().expect("output range");
-                let query = hold.pop().expect("query range");
-                (Some(query), Some(output))
-            } else {
-                (None, None)
+            let (
+                query,
+                output,
+                staged_keys,
+                staged_values,
+                staged_table,
+                partial_max,
+                partial_sum,
+                partial_weighted,
+            ) = match staging {
+                Staging::Host => {
+                    let output = hold.pop().expect("output range");
+                    let query = hold.pop().expect("query range");
+                    (
+                        Some(query),
+                        Some(output),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                }
+                Staging::TwoBlock => {
+                    let partial_weighted = hold.pop().expect("partial weighted range");
+                    let partial_sum = hold.pop().expect("partial sum range");
+                    let partial_max = hold.pop().expect("partial max range");
+                    let staged_table = hold.pop().expect("staged table range");
+                    let staged_values = hold.pop().expect("staged values range");
+                    let staged_keys = hold.pop().expect("staged keys range");
+                    let query = hold.pop().expect("query range");
+                    (
+                        Some(query),
+                        None,
+                        Some(staged_keys),
+                        Some(staged_values),
+                        Some(staged_table),
+                        Some(partial_max),
+                        Some(partial_sum),
+                        Some(partial_weighted),
+                    )
+                }
+                Staging::DeviceHandles => (None, None, None, None, None, None, None, None),
             };
             let table = hold.pop().expect("page table range");
             let values = hold.pop().expect("value range");
@@ -1435,6 +1643,12 @@ pub mod device {
                 table: Some(table),
                 query,
                 output,
+                staged_keys,
+                staged_values,
+                staged_table,
+                partial_max,
+                partial_sum,
+                partial_weighted,
                 staging,
                 page_table,
                 page_table_base: 0,
@@ -1445,6 +1659,9 @@ pub mod device {
                 held: None,
                 held_ranges: None,
                 quarantined: false,
+                partial_symbol,
+                #[cfg(feature = "paged-attention-test-hooks")]
+                staging_failure: false,
             })
         }
 
@@ -1480,6 +1697,14 @@ pub mod device {
             &self.descriptor
         }
 
+        /// Cause the next host-block staging operation to fail after its key
+        /// copy is enqueued. Qualification uses this to prove a partial copy
+        /// quarantines the run instead of launching over an incomplete page.
+        #[cfg(feature = "paged-attention-test-hooks")]
+        pub fn inject_staging_failure(&mut self) {
+            self.staging_failure = true;
+        }
+
         /// Publish the logical-to-physical page mapping this run will use.
         ///
         /// Republishing is legal -- the state authority's retained range slides
@@ -1498,6 +1723,7 @@ pub mod device {
         /// this directly could publish a mapping the authority never decided.
         /// `RawPagedFixture` is the one named exception, for a gate that has no
         /// authority to begin with.
+        #[allow(clippy::result_large_err)]
         pub(crate) fn publish_page_table(
             &mut self,
             stream: &Stream<'ctx>,
@@ -2205,6 +2431,407 @@ pub mod device {
             Ok(())
         }
 
+        /// Check one block of a full launch for the partial-producing symbol.
+        ///
+        /// A `PagedAttentionLaunch` describes the complete visible history and
+        /// therefore includes the query row. The partial kernel sees one block
+        /// of that history at a time, so its block range is checked separately:
+        /// the resident block must be in this run's published pages, while the
+        /// staged block is exactly one bounded page supplied by the caller.
+        fn check_partial(
+            &self,
+            stream: &Stream<'ctx>,
+            launch: &PagedAttentionLaunch,
+            block_base: u64,
+            block_rows: u64,
+            staged: bool,
+        ) -> Result<()> {
+            if self.quarantined {
+                return Err(invalid("run", "this run is quarantined"));
+            }
+            self.same_device(stream)?;
+            if self.partial_symbol.is_none() {
+                return Err(unsupported_kernel_fmt(
+                    "paged_attention_partial",
+                    format_args!(
+                        "the run was admitted without the separately-qualified partial symbol"
+                    ),
+                ));
+            }
+            super::descriptor_serves(&self.descriptor, launch)?;
+            check_grid(launch, self.ctx)?;
+            if *launch.geometry() != self.geometry
+                || launch.heads() != self.heads
+                || launch.rows() > self.max_rows
+            {
+                return Err(invalid(
+                    "launch",
+                    "this partial launch's geometry is not the one this run was admitted for",
+                ));
+            }
+            if block_rows == 0 || block_rows > self.geometry.page_tokens {
+                return Err(invalid(
+                    "block_rows",
+                    "a partial launch must cover one nonempty page or less",
+                ));
+            }
+            if !block_base.is_multiple_of(self.geometry.page_tokens) {
+                return Err(invalid(
+                    "block_base",
+                    "a partial block must start on a page boundary",
+                ));
+            }
+            let block_end = block_base
+                .checked_add(block_rows)
+                .ok_or(Error::Dim(DimError::Overflow))?;
+            let history_end = launch
+                .history_base()
+                .checked_add(launch.history_rows())
+                .ok_or(Error::Dim(DimError::Overflow))?;
+            if block_base < launch.history_base() || block_end > history_end {
+                return Err(invalid(
+                    "block",
+                    "the partial block is outside the launch's visible history",
+                ));
+            }
+            if staged {
+                return Ok(());
+            }
+            if block_base != self.page_table_base {
+                return Err(invalid_fmt(
+                    "block_base",
+                    format_args!(
+                        "the resident partial starts at {block_base}, but the published mapping \
+                         starts at {}",
+                        self.page_table_base
+                    ),
+                ));
+            }
+            if block_end > self.written {
+                return Err(invalid_fmt(
+                    "block_rows",
+                    format_args!(
+                        "the resident partial reads through {block_end}, but {} row(s) were \
+                         copied",
+                        self.written
+                    ),
+                ));
+            }
+            if block_rows.div_ceil(self.geometry.page_tokens) > self.page_table.len() as u64 {
+                return Err(invalid(
+                    "page_table",
+                    "the published mapping is shorter than the resident partial",
+                ));
+            }
+            Ok(())
+        }
+
+        /// Stage the host block into the one bounded device page admitted for
+        /// `Staging::TwoBlock`.
+        fn stage_stream(&mut self, stream: &Stream<'ctx>) -> Result<()> {
+            if self.quarantined {
+                return Err(invalid("run", "this run is quarantined"));
+            }
+            self.same_device(stream)?;
+            let (keys, values, table) = match self.held.as_ref() {
+                Some(RefusedSource::Stream {
+                    keys,
+                    values,
+                    table,
+                    ..
+                }) => (keys.as_slice(), values.as_slice(), *table),
+                _ => return Err(invalid("stream", "no host block is retained for staging")),
+            };
+            let key_range = self
+                .staged_keys
+                .as_ref()
+                .expect("two-block admission has staged keys");
+            let value_range = self
+                .staged_values
+                .as_ref()
+                .expect("two-block admission has staged values");
+            let table_range = self
+                .staged_table
+                .as_ref()
+                .expect("two-block admission has a staged table");
+            if keys.len() as u64 > key_range.bytes() || values.len() as u64 > value_range.bytes() {
+                return Err(invalid(
+                    "stream",
+                    "the host block exceeds its bounded device staging page",
+                ));
+            }
+            // SAFETY: `self.held` owns `keys` until this settled copy completes,
+            // and `key_range` is this run's admitted device staging range.
+            if let Err(error) = unsafe { key_range.copy_from_host_async(keys, stream) } {
+                self.quarantined = true;
+                return Err(self.attribute(error));
+            }
+            #[cfg(feature = "paged-attention-test-hooks")]
+            if self.staging_failure {
+                self.staging_failure = false;
+                self.quarantined = true;
+                return Err(invalid(
+                    "staging",
+                    "injected failure after the staged key copy",
+                ));
+            }
+            // SAFETY: the source remains in `self.held` and the destination is
+            // the run's admitted value staging range until `settle` returns.
+            if let Err(error) = unsafe { value_range.copy_from_host_async(values, stream) } {
+                self.quarantined = true;
+                return Err(self.attribute(error));
+            }
+            // SAFETY: the table bytes are copied from the retained source into
+            // this run's admitted one-entry staging range.
+            if let Err(error) = unsafe { table_range.copy_from_host_async(&table, stream) } {
+                self.quarantined = true;
+                return Err(self.attribute(error));
+            }
+            self.settle(Ok(()), stream)
+        }
+
+        /// Launch the separate partial-producing ABI over one block.
+        fn launch_partial(
+            &mut self,
+            stream: &Stream<'ctx>,
+            launch: &PagedAttentionLaunch,
+            block_base: u64,
+            block_rows: u64,
+            staged: bool,
+        ) -> Result<()> {
+            let query_address = self
+                .query
+                .as_ref()
+                .expect("two-block admission has a query range")
+                .device_address()?;
+            let key_address = if staged {
+                self.staged_keys
+                    .as_ref()
+                    .expect("two-block admission has staged keys")
+                    .device_address()?
+            } else {
+                self.keys
+                    .as_ref()
+                    .expect("live key range")
+                    .device_address()?
+            };
+            let value_address = if staged {
+                self.staged_values
+                    .as_ref()
+                    .expect("two-block admission has staged values")
+                    .device_address()?
+            } else {
+                self.values
+                    .as_ref()
+                    .expect("live value range")
+                    .device_address()?
+            };
+            let table_address = if staged {
+                self.staged_table
+                    .as_ref()
+                    .expect("two-block admission has a staged table")
+                    .device_address()?
+            } else {
+                self.table
+                    .as_ref()
+                    .expect("live page table range")
+                    .device_address()?
+            };
+            let partial_max = self
+                .partial_max
+                .as_ref()
+                .expect("two-block admission has a partial max range")
+                .device_address()?;
+            let partial_sum = self
+                .partial_sum
+                .as_ref()
+                .expect("two-block admission has a partial sum range")
+                .device_address()?;
+            let partial_weighted = self
+                .partial_weighted
+                .as_ref()
+                .expect("two-block admission has weighted partials")
+                .device_address()?;
+            let scalars = Self::abi_scalars(launch)?;
+            let AbiScalars {
+                rows,
+                first_position,
+                heads,
+                kv_heads,
+                head_dim,
+                page_tokens,
+                window,
+                scale,
+                grid,
+                ..
+            } = scalars;
+            let mut query_address = query_address;
+            let mut key_address = key_address;
+            let mut value_address = value_address;
+            let mut table_address = table_address;
+            let mut partial_max = partial_max;
+            let mut partial_sum = partial_sum;
+            let mut partial_weighted = partial_weighted;
+            let mut rows = rows;
+            let mut first_position = first_position;
+            let mut block_base = block_base;
+            let mut block_rows = block_rows;
+            let mut heads = heads;
+            let mut kv_heads = kv_heads;
+            let mut head_dim = head_dim;
+            let mut page_tokens = page_tokens;
+            let mut window = window;
+            let mut scale = scale;
+            let mut params: [*mut c_void; 17] = [
+                (&raw mut query_address).cast(),
+                (&raw mut key_address).cast(),
+                (&raw mut value_address).cast(),
+                (&raw mut table_address).cast(),
+                (&raw mut partial_max).cast(),
+                (&raw mut partial_sum).cast(),
+                (&raw mut partial_weighted).cast(),
+                (&raw mut rows).cast(),
+                (&raw mut first_position).cast(),
+                (&raw mut block_base).cast(),
+                (&raw mut block_rows).cast(),
+                (&raw mut heads).cast(),
+                (&raw mut kv_heads).cast(),
+                (&raw mut head_dim).cast(),
+                (&raw mut page_tokens).cast(),
+                (&raw mut window).cast(),
+                (&raw mut scale).cast(),
+            ];
+            let symbol = self
+                .partial_symbol
+                .expect("check_partial validated the partial symbol");
+            // SAFETY: the separately-qualified symbol's ABI is declared beside
+            // the kernel. Every address names an admitted range and every
+            // scalar was checked before this launch.
+            let launched = unsafe {
+                self.module.launch_async(
+                    symbol,
+                    stream,
+                    grid,
+                    (moxie_kernels::PAGED_ATTENTION_THREADS, 1, 1),
+                    0,
+                    &mut params,
+                )
+            };
+            self.settle(launched, stream)
+        }
+
+        /// Read the FP32 partial buffers after the producing launch settled.
+        fn read_partials(&self, rows: u64) -> Result<Vec<DevicePartial>> {
+            if self.quarantined {
+                return Err(invalid("run", "this run is quarantined"));
+            }
+            let count = rows
+                .checked_mul(self.heads)
+                .ok_or(Error::Dim(DimError::Overflow))?;
+            let scalar_bytes = count.checked_mul(4).ok_or(Error::Dim(DimError::Overflow))?;
+            let weighted_bytes = count
+                .checked_mul(self.geometry.head_dim)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or(Error::Dim(DimError::Overflow))?;
+            let scalar_len = usize::try_from(scalar_bytes)
+                .map_err(|_| invalid("partial", "scalar readback exceeds host addressability"))?;
+            let weighted_len = usize::try_from(weighted_bytes)
+                .map_err(|_| invalid("partial", "weighted readback exceeds host addressability"))?;
+            let mut max_bytes = super::try_zeroed(scalar_len)?;
+            let mut sum_bytes = super::try_zeroed(scalar_len)?;
+            let mut weighted_bytes_host = super::try_zeroed(weighted_len)?;
+            self.partial_max
+                .as_ref()
+                .expect("two-block admission has a partial max range")
+                .copy_to_host(&mut max_bytes)?;
+            self.partial_sum
+                .as_ref()
+                .expect("two-block admission has a partial sum range")
+                .copy_to_host(&mut sum_bytes)?;
+            self.partial_weighted
+                .as_ref()
+                .expect("two-block admission has weighted partials")
+                .copy_to_host(&mut weighted_bytes_host)?;
+            let heads = usize::try_from(self.heads)
+                .map_err(|_| invalid("heads", "head count exceeds host addressability"))?;
+            let head_dim = usize::try_from(self.geometry.head_dim)
+                .map_err(|_| invalid("head_dim", "head dimension exceeds host addressability"))?;
+            let count = usize::try_from(count)
+                .map_err(|_| invalid("partial", "partial count exceeds host addressability"))?;
+            let mut partials = Vec::new();
+            partials
+                .try_reserve_exact(count)
+                .map_err(|_| Error::CapacityExceeded {
+                    tier: Some(Tier::Host(HostTier::Pageable)),
+                    requested_bytes: scalar_bytes,
+                    available_bytes: 0,
+                })?;
+            for index in 0..count {
+                let scalar_offset = index * 4;
+                let max = f32::from_le_bytes(
+                    max_bytes[scalar_offset..scalar_offset + 4]
+                        .try_into()
+                        .expect("scalar readback is four-byte aligned"),
+                );
+                let sum = f32::from_le_bytes(
+                    sum_bytes[scalar_offset..scalar_offset + 4]
+                        .try_into()
+                        .expect("scalar readback is four-byte aligned"),
+                );
+                let mut weighted = Vec::new();
+                weighted
+                    .try_reserve_exact(head_dim)
+                    .map_err(|_| Error::CapacityExceeded {
+                        tier: Some(Tier::Host(HostTier::Pageable)),
+                        requested_bytes: self.geometry.head_dim * 8,
+                        available_bytes: 0,
+                    })?;
+                weighted.resize(head_dim, 0.0);
+                let partial = if sum == 0.0 {
+                    if max != f32::NEG_INFINITY {
+                        return Err(Error::Numerical {
+                            detail: super::fallible(format_args!(
+                                "empty device partial {index} did not carry negative infinity"
+                            )),
+                        });
+                    }
+                    DevicePartial { max, sum, weighted }
+                } else {
+                    if !(max.is_finite() && sum.is_finite() && sum > 0.0) {
+                        return Err(Error::Numerical {
+                            detail: super::fallible(format_args!(
+                                "device partial {index} has max {max} and sum {sum}"
+                            )),
+                        });
+                    }
+                    let weighted_offset = index
+                        .checked_mul(head_dim)
+                        .and_then(|v| v.checked_mul(4))
+                        .ok_or(Error::Dim(DimError::Overflow))?;
+                    for (component, slot) in weighted.iter_mut().enumerate() {
+                        let offset = weighted_offset + component * 4;
+                        let value = f32::from_le_bytes(
+                            weighted_bytes_host[offset..offset + 4]
+                                .try_into()
+                                .expect("weighted readback is four-byte aligned"),
+                        );
+                        if !value.is_finite() {
+                            return Err(Error::Numerical {
+                                detail: super::fallible(format_args!(
+                                    "device partial {index} has nonfinite weighted value {value}"
+                                )),
+                            });
+                        }
+                        *slot = value;
+                    }
+                    DevicePartial { max, sum, weighted }
+                };
+                partials.push(partial);
+            }
+            debug_assert_eq!(partials.len(), rows as usize * heads);
+            Ok(partials)
+        }
+
         /// Attend `launch.rows` query rows against the rows this run has
         /// physically written.
         ///
@@ -2340,6 +2967,262 @@ pub mod device {
             self.query = Some(query_range);
             self.output = Some(output_range);
             Ok(out)
+        }
+
+        /// Attend one query over one resident page and one host-sourced page.
+        ///
+        /// `launch` describes the resident block. The host block must be the
+        /// immediately following page and is staged into the one bounded page
+        /// pair admitted by [`Staging::TwoBlock`]. Each block uses the new
+        /// partial-producing symbol once; the raw partials are returned to the
+        /// caller, which deliberately widens and merges them.
+        #[allow(clippy::result_large_err)]
+        pub fn attend_two_block(
+            &mut self,
+            stream: &Stream<'ctx>,
+            launch: &PagedAttentionLaunch,
+            query: Vec<u8>,
+            host_keys: Vec<u8>,
+            host_values: Vec<u8>,
+        ) -> std::result::Result<TwoBlockAttention, PagedRunRefused> {
+            let table = [0u8; 4];
+            let give_back = |error, query, keys, values| PagedRunRefused {
+                error,
+                source: Some(RefusedSource::Stream {
+                    query,
+                    keys,
+                    values,
+                    table,
+                }),
+            };
+            if !launch.is_two_block_stream() {
+                return Err(give_back(
+                    invalid(
+                        "launch",
+                        "a two-block launch must come from two_block_stream",
+                    ),
+                    query,
+                    host_keys,
+                    host_values,
+                ));
+            }
+            if self.staging != Staging::TwoBlock {
+                return Err(give_back(
+                    invalid(
+                        "staging",
+                        "a two-block launch requires Staging::TwoBlock admission",
+                    ),
+                    query,
+                    host_keys,
+                    host_values,
+                ));
+            }
+            if launch.rows() != 1 {
+                return Err(give_back(
+                    invalid("rows", "the bounded streaming slice serves one query row"),
+                    query,
+                    host_keys,
+                    host_values,
+                ));
+            }
+            let resident_rows = self.geometry.page_tokens;
+            if launch.history_rows() <= resident_rows {
+                return Err(give_back(
+                    invalid(
+                        "history_rows",
+                        "the total history must contain a resident and a staged block",
+                    ),
+                    query,
+                    host_keys,
+                    host_values,
+                ));
+            }
+            if !launch
+                .history_base()
+                .is_multiple_of(self.geometry.page_tokens)
+            {
+                return Err(give_back(
+                    invalid_fmt(
+                        "history_base",
+                        format_args!("{} is not page aligned", launch.history_base()),
+                    ),
+                    query,
+                    host_keys,
+                    host_values,
+                ));
+            }
+            let row_bytes = match self.geometry.row_elements().and_then(|elements| {
+                elements
+                    .checked_mul(PAYLOAD_BYTES)
+                    .ok_or(Error::Dim(DimError::Overflow))
+            }) {
+                Ok(bytes) => bytes,
+                Err(error) => return Err(give_back(error, query, host_keys, host_values)),
+            };
+            let host_rows = match u64::try_from(host_keys.len())
+                .ok()
+                .and_then(|len| len.checked_div(row_bytes))
+            {
+                Some(rows) if rows > 0 && rows <= self.geometry.page_tokens => rows,
+                _ => {
+                    return Err(give_back(
+                        invalid(
+                            "host_block",
+                            "the staged block must contain one to one page of complete rows",
+                        ),
+                        query,
+                        host_keys,
+                        host_values,
+                    ));
+                }
+            };
+            if host_keys.len() as u64 != host_rows * row_bytes
+                || host_values.len() as u64 != host_rows * row_bytes
+            {
+                return Err(give_back(
+                    invalid(
+                        "host_block",
+                        "host key and value blocks must have equal row width",
+                    ),
+                    query,
+                    host_keys,
+                    host_values,
+                ));
+            }
+            let total_rows = match resident_rows.checked_add(host_rows) {
+                Some(rows) if rows == launch.history_rows() => rows,
+                _ => {
+                    return Err(give_back(
+                        invalid_fmt(
+                            "host_block",
+                            format_args!(
+                                "resident block plus staged block must equal the {}-row history",
+                                launch.history_rows()
+                            ),
+                        ),
+                        query,
+                        host_keys,
+                        host_values,
+                    ));
+                }
+            };
+            let host_base = match launch.history_base().checked_add(resident_rows) {
+                Some(base) => base,
+                None => {
+                    return Err(give_back(
+                        Error::Dim(DimError::Overflow),
+                        query,
+                        host_keys,
+                        host_values,
+                    ));
+                }
+            };
+            debug_assert_eq!(total_rows, launch.history_rows());
+            let query_bytes = match launch.query_bytes() {
+                Ok(bytes) => bytes,
+                Err(error) => return Err(give_back(error, query, host_keys, host_values)),
+            };
+            if query.len() as u64 != query_bytes {
+                return Err(give_back(
+                    invalid_fmt(
+                        "query",
+                        format_args!("{} byte(s) supplied, expected {query_bytes}", query.len()),
+                    ),
+                    query,
+                    host_keys,
+                    host_values,
+                ));
+            }
+            if let Err(error) =
+                self.check_partial(stream, launch, launch.history_base(), resident_rows, false)
+            {
+                return Err(give_back(error, query, host_keys, host_values));
+            }
+            if let Err(error) = self.check_partial(stream, launch, host_base, host_rows, true) {
+                return Err(give_back(error, query, host_keys, host_values));
+            }
+            let host_to_device_bytes = (host_keys.len() as u64)
+                .checked_add(host_values.len() as u64)
+                .and_then(|bytes| bytes.checked_add(table.len() as u64));
+            let Some(host_to_device_bytes) = host_to_device_bytes else {
+                return Err(give_back(
+                    Error::Dim(DimError::Overflow),
+                    query,
+                    host_keys,
+                    host_values,
+                ));
+            };
+
+            self.held = Some(RefusedSource::Stream {
+                query,
+                keys: host_keys,
+                values: host_values,
+                table,
+            });
+            let Some(RefusedSource::Stream { query, .. }) = self.held.as_ref() else {
+                unreachable!("just assigned")
+            };
+            // SAFETY: `self.held` owns the query until the resident and staged
+            // partial launches have settled, and the destination is admitted
+            // exclusively to this run.
+            if let Err(error) = unsafe {
+                self.query
+                    .as_ref()
+                    .expect("two-block admission has a query range")
+                    .copy_from_host_async(query, stream)
+            } {
+                self.quarantined = true;
+                return Err(PagedRunRefused {
+                    error: self.attribute(error),
+                    source: None,
+                });
+            }
+            if let Err(error) =
+                self.launch_partial(stream, launch, launch.history_base(), resident_rows, false)
+            {
+                return Err(PagedRunRefused {
+                    error,
+                    source: None,
+                });
+            }
+            let resident = match self.read_partials(launch.rows()) {
+                Ok(partials) => partials,
+                Err(error) => {
+                    self.quarantined = true;
+                    return Err(PagedRunRefused {
+                        error: self.attribute(error),
+                        source: None,
+                    });
+                }
+            };
+            if let Err(error) = self.stage_stream(stream) {
+                return Err(PagedRunRefused {
+                    error,
+                    source: None,
+                });
+            }
+            if let Err(error) = self.launch_partial(stream, launch, host_base, host_rows, true) {
+                return Err(PagedRunRefused {
+                    error,
+                    source: None,
+                });
+            }
+            let staged = match self.read_partials(launch.rows()) {
+                Ok(partials) => partials,
+                Err(error) => {
+                    self.quarantined = true;
+                    return Err(PagedRunRefused {
+                        error: self.attribute(error),
+                        source: None,
+                    });
+                }
+            };
+            self.held = None;
+            Ok(TwoBlockAttention {
+                resident,
+                staged,
+                host_to_device_bytes,
+            })
         }
 
         /// Every scalar this ABI needs, derived **before** anything is
@@ -2499,13 +3382,19 @@ pub mod device {
                 let error = invalid("ledger", "this run belongs to another ledger");
                 return Err(PagedCloseRefused { run: self, error });
             }
-            for slot in 0..5 {
+            for slot in 0..11 {
                 let taken = match slot {
                     0 => self.output.take(),
                     1 => self.query.take(),
                     2 => self.table.take(),
                     3 => self.values.take(),
-                    _ => self.keys.take(),
+                    4 => self.keys.take(),
+                    5 => self.staged_table.take(),
+                    6 => self.staged_values.take(),
+                    7 => self.staged_keys.take(),
+                    8 => self.partial_weighted.take(),
+                    9 => self.partial_sum.take(),
+                    _ => self.partial_max.take(),
                 };
                 let Some(range) = taken else { continue };
                 let arena = self.arena.as_mut().expect("an open run has its arena");
@@ -2519,7 +3408,13 @@ pub mod device {
                         1 => self.query = Some(refused.range),
                         2 => self.table = Some(refused.range),
                         3 => self.values = Some(refused.range),
-                        _ => self.keys = Some(refused.range),
+                        4 => self.keys = Some(refused.range),
+                        5 => self.staged_table = Some(refused.range),
+                        6 => self.staged_values = Some(refused.range),
+                        7 => self.staged_keys = Some(refused.range),
+                        8 => self.partial_weighted = Some(refused.range),
+                        9 => self.partial_sum = Some(refused.range),
+                        _ => self.partial_max = Some(refused.range),
                     }
                     let error = refused.error;
                     return Err(PagedCloseRefused { run: self, error });
@@ -2554,6 +3449,16 @@ pub mod device {
                     }
                     RefusedSource::PageTable(table) => core::mem::forget(table),
                     RefusedSource::Query(bytes) => core::mem::forget(bytes),
+                    RefusedSource::Stream {
+                        query,
+                        keys,
+                        values,
+                        table: _,
+                    } => {
+                        core::mem::forget(query);
+                        core::mem::forget(keys);
+                        core::mem::forget(values);
+                    }
                 }
             }
             // `held_ranges` needs no such rescue: a `DeviceRange` has no
@@ -2835,6 +3740,11 @@ pub mod device {
         query: u64,
         persistent: u64,
         per_step: u64,
+        transfer: u64,
+        staged_payload: u64,
+        staged_table: u64,
+        partial_scalars: u64,
+        partial_weighted: u64,
         total: u64,
         pages_usize: usize,
     }
@@ -2864,18 +3774,69 @@ pub mod device {
                 .checked_mul(2)
                 .and_then(|v| v.checked_add(table))
                 .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
-            // Zero for a direct-device run: the caller's ranges are the query
-            // and the output, and charging for a second pair here is what makes
-            // an admissible plan refusable.
-            let per_step = if staging == Staging::Host {
-                query
+            let (
+                transfer,
+                per_step,
+                staged_payload,
+                staged_table,
+                partial_scalars,
+                partial_weighted,
+            ) = if staging == Staging::TwoBlock {
+                let staged_payload = align_up(geometry.page_bytes()?)?;
+                let staged_table = align_up(PAGE_ENTRY_BYTES)?;
+                let partial_scalars = align_up(
+                    max_rows
+                        .checked_mul(heads)
+                        .and_then(|v| v.checked_mul(4))
+                        .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
+                )?;
+                let partial_weighted = align_up(
+                    max_rows
+                        .checked_mul(heads)
+                        .and_then(|v| v.checked_mul(geometry.head_dim))
+                        .and_then(|v| v.checked_mul(4))
+                        .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
+                )?;
+                let transfer = staged_payload
                     .checked_mul(2)
-                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))?
+                    .and_then(|v| v.checked_add(staged_table))
+                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+                let per_step = query
+                    .checked_add(
+                        partial_scalars
+                            .checked_mul(2)
+                            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
+                    )
+                    .and_then(|v| v.checked_add(partial_weighted))
+                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+                (
+                    transfer,
+                    per_step,
+                    staged_payload,
+                    staged_table,
+                    partial_scalars,
+                    partial_weighted,
+                )
+            } else if staging == Staging::Host {
+                // Zero for a direct-device run: the caller's ranges are the
+                // query and the output, and charging for a second pair here is
+                // what makes an admissible plan refusable.
+                (
+                    0,
+                    query
+                        .checked_mul(2)
+                        .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
             } else {
-                0
+                (0, 0, 0, 0, 0, 0)
             };
             let total = persistent
                 .checked_add(per_step)
+                .and_then(|v| v.checked_add(transfer))
                 .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
             let pages_usize = usize::try_from(geometry.pages)
                 .map_err(|_| invalid("pages", "the page count exceeds this host's usize"))?;
@@ -2885,6 +3846,11 @@ pub mod device {
                 query,
                 persistent,
                 per_step,
+                transfer,
+                staged_payload,
+                staged_table,
+                partial_scalars,
+                partial_weighted,
                 total,
                 pages_usize,
             })
@@ -2896,12 +3862,9 @@ pub mod device {
     /// Three device buffers always: keys, values and the page table, each
     /// named for what it is and charged as `KvStatePages`. `Staging::Host`
     /// adds two more device buffers (query and output, charged as
-    /// `Activations`) and one host readback; `Staging::DeviceHandles` adds
-    /// none of those three, because the caller's own arena slots are the
-    /// query and output, and charging this ledger a second time for bytes it
-    /// will never hold is what lets an admissible direct-device plan be
-    /// refused. The ledger's report is about what memory is *for*, and a
-    /// cache charged as scratch is a cache nobody can see growing.
+    /// `Activations`) and one host readback. `Staging::TwoBlock` adds one
+    /// bounded page pair in `TransferStaging`, the query and FP32 partials in
+    /// `Activations`, and no unbounded history buffer.
     pub fn resource_request(
         geometry: &PageGeometry,
         heads: u64,
@@ -2965,6 +3928,60 @@ pub mod device {
                 Tier::Host(HostTier::Pageable),
                 extents.query,
                 StageSpan::at(2),
+            ))?;
+        } else if staging == Staging::TwoBlock {
+            request.buffer(BufferRequest::new(
+                "attention-stream-query",
+                scope,
+                Tier::Device(DeviceTier::Activations),
+                extents.query,
+                StageSpan::inclusive(1, 2),
+            ))?;
+            request.buffer(BufferRequest::new(
+                "attention-stream-partial-max",
+                scope,
+                Tier::Device(DeviceTier::Activations),
+                extents.partial_scalars,
+                // The run owns one contiguous physical arena. Keep the
+                // reusable partial slots live across staging as well as
+                // readback so ledger admission covers that real allocation,
+                // not only the non-overlapping kernel lifetimes.
+                StageSpan::inclusive(1, 2),
+            ))?;
+            request.buffer(BufferRequest::new(
+                "attention-stream-partial-sum",
+                scope,
+                Tier::Device(DeviceTier::Activations),
+                extents.partial_scalars,
+                StageSpan::inclusive(1, 2),
+            ))?;
+            request.buffer(BufferRequest::new(
+                "attention-stream-partial-weighted",
+                scope,
+                Tier::Device(DeviceTier::Activations),
+                extents.partial_weighted,
+                StageSpan::inclusive(1, 2),
+            ))?;
+            request.buffer(BufferRequest::new(
+                "attention-stream-staged-keys",
+                scope,
+                Tier::Device(DeviceTier::TransferStaging),
+                extents.staged_payload,
+                StageSpan::at(1),
+            ))?;
+            request.buffer(BufferRequest::new(
+                "attention-stream-staged-values",
+                scope,
+                Tier::Device(DeviceTier::TransferStaging),
+                extents.staged_payload,
+                StageSpan::at(1),
+            ))?;
+            request.buffer(BufferRequest::new(
+                "attention-stream-staged-table",
+                scope,
+                Tier::Device(DeviceTier::TransferStaging),
+                extents.staged_table,
+                StageSpan::at(1),
             ))?;
         }
         Ok(request)

@@ -1087,6 +1087,61 @@ impl PagedSequence {
         })
     }
 
+    /// Copy one bounded logical block in row order for an explicit host-backed
+    /// consumer. The ring remains the authority for placement and retention;
+    /// this only materializes the requested rows without exposing its physical
+    /// page layout to an executor.
+    pub fn read_block(&self, layer: usize, first: u64, rows: u64) -> Result<(Vec<u8>, Vec<u8>)> {
+        if rows == 0 || rows > self.geometry.page_tokens as u64 {
+            return Err(invalid(
+                "rows",
+                "a host-backed block must contain one to one page of rows",
+            ));
+        }
+        let end = first.checked_add(rows).ok_or(DimError::Overflow)?;
+        if end > self.rows as u64 {
+            return Err(invalid(
+                "rows",
+                "the requested block exceeds the executed frontier",
+            ));
+        }
+        let layer_layout = self
+            .layout
+            .layers
+            .get(layer)
+            .ok_or_else(|| invalid("layer", "layer is outside this sequence"))?;
+        let rows_usize = usize::try_from(rows).map_err(|_| DimError::Overflow)?;
+        let key_len = layer_layout
+            .key_bytes
+            .checked_mul(rows_usize)
+            .ok_or(DimError::Overflow)?;
+        let value_len = layer_layout
+            .value_bytes
+            .checked_mul(rows_usize)
+            .ok_or(DimError::Overflow)?;
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        keys.try_reserve_exact(key_len)
+            .map_err(|_| Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::Pageable)),
+                requested_bytes: key_len as u64,
+                available_bytes: 0,
+            })?;
+        values
+            .try_reserve_exact(value_len)
+            .map_err(|_| Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::Pageable)),
+                requested_bytes: value_len as u64,
+                available_bytes: 0,
+            })?;
+        for position in first..end {
+            let row = self.row(layer, position)?;
+            keys.extend_from_slice(row.key);
+            values.extend_from_slice(row.value);
+        }
+        Ok((keys, values))
+    }
+
     fn truncate(&mut self, rows: usize) {
         for layer in 0..self.geometry.layers.len() {
             // Only the last `capacity` discarded rows have slots of their own;

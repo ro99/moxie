@@ -6,7 +6,7 @@
 //! legal alternatives". Both halves are types here rather than log lines,
 //! because a caller has to be able to act on them.
 
-use core::fmt;
+use core::{fmt, num::NonZeroU64};
 
 use moxie_types::{Error, Scope, Tier};
 
@@ -59,6 +59,32 @@ pub struct AdmissionReport {
     /// The request's stage labels, so a `peak_stage` index reads as a name.
     pub stages: Vec<crate::request::Label>,
     pub scopes: Vec<ScopeReport>,
+    /// A bounded device staging envelope, when this request declares one.
+    /// This is a plan description, not an automatic fallback: the caller
+    /// still has to select host-backed execution explicitly and admission must
+    /// succeed for the complete request.
+    pub host_backed_plan: Option<HostBackedPlan>,
+}
+
+/// The bounded staging part of an explicit host-backed execution plan.
+///
+/// The source remains owned by the state authority; the ledger names only the
+/// device-side buffer it admits for one streamed block. Keeping this typed and
+/// in the normal admission report makes the bound visible without adding a
+/// second planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostBackedPlan {
+    pub staging_bytes: NonZeroU64,
+}
+
+impl HostBackedPlan {
+    pub fn new(staging_bytes: u64) -> Option<Self> {
+        NonZeroU64::new(staging_bytes).map(|staging_bytes| Self { staging_bytes })
+    }
+
+    pub const fn bytes(self) -> u64 {
+        self.staging_bytes.get()
+    }
 }
 
 impl AdmissionReport {
@@ -86,6 +112,9 @@ impl fmt::Display for AdmissionReport {
     /// that wants them, but twenty-one empty rows per device hide the two that
     /// matter.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(plan) = self.host_backed_plan {
+            writeln!(f, "bounded host-backed staging plan: {} B", plan.bytes())?;
+        }
         for s in &self.scopes {
             writeln!(
                 f,

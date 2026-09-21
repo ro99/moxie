@@ -43,8 +43,8 @@ pub use ledger::{
     AdmitError, Ledger, LedgerId, Outstanding, ReleaseRefused, Reservation, ReservationId,
 };
 pub use report::{
-    AdmissionReport, BindingConstraint, BindingKind, LegalAlternative, Rejection, ScopeReport,
-    TierReport,
+    AdmissionReport, BindingConstraint, BindingKind, HostBackedPlan, LegalAlternative, Rejection,
+    ScopeReport, TierReport,
 };
 pub use request::{BufferRequest, DerivedReserve, PlanRequest, ReserveRule, Scaling, StageSpan};
 pub use residency::{

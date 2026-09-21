@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use moxie_types::{DeviceTier, Error, HostTier, Result, Scope, ScopeKind, Tier};
 
 use crate::report::{
-    AdmissionReport, BindingConstraint, BindingKind, LegalAlternative, Rejection, ScopeReport,
-    TierReport,
+    AdmissionReport, BindingConstraint, BindingKind, HostBackedPlan, LegalAlternative, Rejection,
+    ScopeReport, TierReport,
 };
 use crate::request::{BufferRequest, PlanRequest, ReserveRule, Scaling};
 use crate::snapshot::CapacitySnapshot;
@@ -661,7 +661,7 @@ impl Ledger {
             )?;
         }
 
-        let alternatives = self.alternatives(request, &binding, &base)?;
+        let (alternatives, host_backed_plan) = self.alternatives(request, &binding, &base)?;
 
         Ok(Evaluation {
             report: AdmissionReport {
@@ -678,6 +678,7 @@ impl Ledger {
                     stages
                 },
                 scopes: scope_reports,
+                host_backed_plan,
             },
             charges,
             scope_charges,
@@ -712,10 +713,11 @@ impl Ledger {
         request: &PlanRequest,
         binding: &[BindingConstraint],
         base: &Peaks,
-    ) -> Result<Vec<LegalAlternative>> {
+    ) -> Result<(Vec<LegalAlternative>, Option<HostBackedPlan>)> {
         let mut out = Vec::new();
+        let host_backed_plan = bounded_host_backed_plan(request, base)?;
         if binding.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), host_backed_plan));
         }
 
         for (scaling, alternative) in [
@@ -829,7 +831,7 @@ impl Ledger {
 
         out.sort_unstable();
         out.dedup();
-        Ok(out)
+        Ok((out, host_backed_plan))
     }
 
     /// Build one concrete relocation of `scope`'s movable bytes onto the host,
@@ -949,6 +951,23 @@ impl Ledger {
         }
         Ok(Some(peaks(&relocated, &|_| false)?))
     }
+}
+
+/// Extract the bounded device-side envelope for an explicit streamed-page
+/// request. The request itself remains the admission authority; this helper
+/// only gives callers a typed size to report and to compare with a device cap.
+fn bounded_host_backed_plan(request: &PlanRequest, base: &Peaks) -> Result<Option<HostBackedPlan>> {
+    let staging = Tier::Device(DeviceTier::TransferStaging);
+    let mut bytes = 0u64;
+    for scope in request.scopes()? {
+        if scope.kind() != ScopeKind::Device {
+            continue;
+        }
+        bytes = bytes
+            .checked_add(base.tier_peak(scope, staging).0)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+    }
+    Ok(HostBackedPlan::new(bytes))
 }
 
 /// Where a device tier's bytes would go if its work moved to the host, or

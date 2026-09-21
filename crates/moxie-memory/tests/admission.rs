@@ -47,6 +47,73 @@ fn counters(ledger: &Ledger) -> Vec<(Scope, Option<Tier>, u64)> {
     out
 }
 
+#[test]
+fn bounded_streaming_admission_names_its_staging_envelope_or_refuses_typed() {
+    let d = gpu(41);
+    let mut request = PlanRequest::new("two-block stream", ["resident", "stage", "merge"]).unwrap();
+    request
+        .buffer(BufferRequest::new(
+            "resident page",
+            d,
+            KV,
+            64,
+            StageSpan::inclusive(0, 2),
+        ))
+        .unwrap()
+        .buffer(BufferRequest::new(
+            "staged keys",
+            d,
+            STAGING,
+            16,
+            StageSpan::at(1),
+        ))
+        .unwrap()
+        .buffer(BufferRequest::new(
+            "staged values",
+            d,
+            STAGING,
+            16,
+            StageSpan::at(1),
+        ))
+        .unwrap()
+        .buffer(BufferRequest::new(
+            "staged table",
+            d,
+            STAGING,
+            4,
+            StageSpan::at(1),
+        ))
+        .unwrap();
+
+    let mut fits = Ledger::new([device_snapshot(d, 100), host_snapshot(1 << 20, 1 << 10)]).unwrap();
+    let report = fits.preview(&request).unwrap();
+    assert_eq!(
+        report.host_backed_plan,
+        moxie_memory::HostBackedPlan::new(36)
+    );
+    let reservation = fits
+        .admit(&request)
+        .expect("the bounded two-block plan fits");
+    fits.release(reservation).unwrap();
+
+    let mut too_small =
+        Ledger::new([device_snapshot(d, 99), host_snapshot(1 << 20, 1 << 10)]).unwrap();
+    let refused = too_small
+        .admit(&request)
+        .expect_err("the complete bounded stream must not be silently shortened");
+    let rejection = refused.as_rejection().expect("a typed capacity rejection");
+    assert_eq!(
+        rejection.report.host_backed_plan,
+        moxie_memory::HostBackedPlan::new(36)
+    );
+    assert!(
+        rejection
+            .binding
+            .iter()
+            .any(|constraint| { constraint.tier == KV || constraint.tier == STAGING })
+    );
+}
+
 fn rejection(e: &AdmitError) -> &moxie_memory::Rejection {
     e.as_rejection()
         .unwrap_or_else(|| panic!("expected a refusal, got {e}"))

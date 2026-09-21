@@ -295,3 +295,210 @@ extern "C" __global__ void moxie_bf16_paged_attention_v1(
             __float2bfloat16_rn(isfinite(value) ? value : moxie_attn_failure_v1());
     }
 }
+
+// The host-backed two-block path uses the same arithmetic and visibility rules
+// but needs the partial state before the final division. This is a separate
+// symbol and ABI on purpose: the accepted single-shot kernel above keeps its
+// output contract and its qualified launch untouched.
+//
+// Outputs are laid out as `[rows][heads]` for max/sum and
+// `[rows][heads][head_dim]` for weighted. All three are FP32, matching the
+// accumulator precision of the existing kernel; the host widens them to the
+// oracle's FP64 Partial representation before calling Partial::merge.
+extern "C" __global__ void moxie_bf16_paged_attention_partial_v1(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ key_pages,
+    const __nv_bfloat16* __restrict__ value_pages,
+    const unsigned int* __restrict__ page_table,
+    float* __restrict__ partial_max,
+    float* __restrict__ partial_sum,
+    float* __restrict__ partial_weighted,
+    unsigned long long rows,
+    unsigned long long first_position,
+    unsigned long long history_base,
+    unsigned long long history_rows,
+    unsigned int heads,
+    unsigned int kv_heads,
+    unsigned int head_dim,
+    unsigned int page_tokens,
+    unsigned int window,
+    float scale) {
+    const unsigned long long row = blockIdx.x;
+    const unsigned head = blockIdx.y;
+    if (row >= rows || head >= heads) return;
+
+    const unsigned tid = threadIdx.x;
+    const unsigned lane = tid & 31U;
+    const unsigned warp = tid >> 5;
+    const unsigned long long partial_index = row * heads + head;
+    const unsigned long long weighted_base = partial_index * head_dim;
+
+    __shared__ float q_sh[MOXIE_ATTN_MAX_HEAD_DIM];
+    __shared__ float score_sh[MOXIE_ATTN_TILE];
+    __shared__ unsigned long long base_sh[MOXIE_ATTN_TILE];
+    __shared__ float reduce_sh[MOXIE_ATTN_WARPS];
+    __shared__ float tile_sh[2];
+
+    const unsigned long long position = first_position + row;
+    const unsigned kv_head = head / (heads / kv_heads);
+    const unsigned long long row_head_base =
+        (row * heads + head) * static_cast<unsigned long long>(head_dim);
+
+    bool empty = history_rows == 0ULL;
+    unsigned long long lo_abs = history_base;
+    unsigned long long hi_abs = 0ULL;
+    if (!empty) {
+        if (window != 0U) {
+            const unsigned long long w = window;
+            const unsigned long long floor_abs =
+                (position + 1ULL > w) ? (position + 1ULL - w) : 0ULL;
+            if (floor_abs > lo_abs) lo_abs = floor_abs;
+        }
+        const unsigned long long last = history_base + history_rows - 1ULL;
+        hi_abs = (position < last) ? position : last;
+        empty = hi_abs < lo_abs;
+    }
+    if (empty) {
+        if (tid == 0U) {
+            partial_max[partial_index] = moxie_attn_ninf_v1();
+            partial_sum[partial_index] = 0.0F;
+        }
+        for (unsigned d = tid; d < head_dim; d += MOXIE_ATTN_THREADS) {
+            partial_weighted[weighted_base + d] = 0.0F;
+        }
+        return;
+    }
+
+    const unsigned long long lo = lo_abs - history_base;
+    const unsigned long long hi = hi_abs - history_base;
+
+    for (unsigned d = tid; d < head_dim; d += MOXIE_ATTN_THREADS) {
+        q_sh[d] = __bfloat162float(query[row_head_base + d]);
+    }
+
+    float acc[MOXIE_ATTN_ACC_SLOTS];
+#pragma unroll
+    for (unsigned s = 0; s < MOXIE_ATTN_ACC_SLOTS; ++s) acc[s] = 0.0F;
+    float run_max = moxie_attn_ninf_v1();
+    float run_sum = 0.0F;
+    __syncthreads();
+
+    const unsigned long long row_stride =
+        static_cast<unsigned long long>(kv_heads) * static_cast<unsigned long long>(head_dim);
+    const unsigned long long head_off =
+        static_cast<unsigned long long>(kv_head) * static_cast<unsigned long long>(head_dim);
+
+    for (unsigned long long tile = (lo / MOXIE_ATTN_TILE) * MOXIE_ATTN_TILE; tile <= hi;
+         tile += MOXIE_ATTN_TILE) {
+        for (unsigned t = warp; t < MOXIE_ATTN_TILE; t += MOXIE_ATTN_WARPS) {
+            const unsigned long long logical = tile + t;
+            float score = moxie_attn_ninf_v1();
+            unsigned long long base = 0ULL;
+            if (logical >= lo && logical <= hi) {
+                const unsigned long long page = logical / page_tokens;
+                const unsigned long long slot = logical % page_tokens;
+                base = ((static_cast<unsigned long long>(page_table[page]) * page_tokens) + slot) *
+                           row_stride +
+                       head_off;
+                float partial = 0.0F;
+                for (unsigned d = lane; d < head_dim; d += 32U) {
+                    partial = fmaf(q_sh[d], __bfloat162float(key_pages[base + d]), partial);
+                }
+                for (unsigned offset = 16U; offset > 0U; offset >>= 1) {
+                    partial += __shfl_down_sync(0xffffffffU, partial, offset);
+                }
+                score = partial * scale;
+            }
+            if (lane == 0U) {
+                score_sh[t] = score;
+                base_sh[t] = base;
+            }
+        }
+        __syncthreads();
+
+        float local = moxie_attn_ninf_v1();
+        for (unsigned t = tid; t < MOXIE_ATTN_TILE; t += MOXIE_ATTN_THREADS) {
+            local = fmaxf(local, score_sh[t]);
+        }
+        for (unsigned offset = 16U; offset > 0U; offset >>= 1) {
+            local = fmaxf(local, __shfl_down_sync(0xffffffffU, local, offset));
+        }
+        if (lane == 0U) reduce_sh[warp] = local;
+        __syncthreads();
+        if (tid == 0U) {
+            float m = reduce_sh[0];
+            for (unsigned w = 1; w < MOXIE_ATTN_WARPS; ++w) m = fmaxf(m, reduce_sh[w]);
+            tile_sh[0] = m;
+        }
+        __syncthreads();
+        const float tile_max = tile_sh[0];
+        if (tile_max == moxie_attn_ninf_v1()) {
+            __syncthreads();
+            continue;
+        }
+
+        const float new_max = fmaxf(run_max, tile_max);
+        const float correction =
+            (run_max == moxie_attn_ninf_v1()) ? 0.0F : expf(run_max - new_max);
+        for (unsigned t = tid; t < MOXIE_ATTN_TILE; t += MOXIE_ATTN_THREADS) {
+            const float s = score_sh[t];
+            score_sh[t] = (s == moxie_attn_ninf_v1()) ? 0.0F : expf(s - new_max);
+        }
+        __syncthreads();
+
+        float sum_local = 0.0F;
+        for (unsigned t = tid; t < MOXIE_ATTN_TILE; t += MOXIE_ATTN_THREADS) {
+            sum_local += score_sh[t];
+        }
+        for (unsigned offset = 16U; offset > 0U; offset >>= 1) {
+            sum_local += __shfl_down_sync(0xffffffffU, sum_local, offset);
+        }
+        if (lane == 0U) reduce_sh[warp] = sum_local;
+        __syncthreads();
+        if (tid == 0U) {
+            float s = reduce_sh[0];
+            for (unsigned w = 1; w < MOXIE_ATTN_WARPS; ++w) s += reduce_sh[w];
+            tile_sh[1] = s;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (unsigned s = 0; s < MOXIE_ATTN_ACC_SLOTS; ++s) {
+            const unsigned d = tid + s * MOXIE_ATTN_THREADS;
+            if (d >= head_dim) continue;
+            float sum = acc[s] * correction;
+            for (unsigned t = 0; t < MOXIE_ATTN_TILE; ++t) {
+                const float w = score_sh[t];
+                if (w != 0.0F) {
+                    sum = fmaf(w, __bfloat162float(value_pages[base_sh[t] + d]), sum);
+                }
+            }
+            acc[s] = sum;
+        }
+        run_sum = run_sum * correction + tile_sh[1];
+        run_max = new_max;
+        __syncthreads();
+    }
+
+    if (!(run_sum > 0.0F)) {
+        if (tid == 0U) {
+            partial_max[partial_index] = moxie_attn_ninf_v1();
+            partial_sum[partial_index] = 0.0F;
+        }
+        for (unsigned d = tid; d < head_dim; d += MOXIE_ATTN_THREADS) {
+            partial_weighted[weighted_base + d] = 0.0F;
+        }
+        return;
+    }
+
+    if (tid == 0U) {
+        partial_max[partial_index] = run_max;
+        partial_sum[partial_index] = run_sum;
+    }
+#pragma unroll
+    for (unsigned s = 0; s < MOXIE_ATTN_ACC_SLOTS; ++s) {
+        const unsigned d = tid + s * MOXIE_ATTN_THREADS;
+        if (d >= head_dim) continue;
+        partial_weighted[weighted_base + d] = acc[s];
+    }
+}

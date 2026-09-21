@@ -30,8 +30,18 @@ shared MLA/state descriptor and a source-linked GLM-5.2 FP64 oracle — and
 interpreter, validated against task 0039's oracle. Both tasks were reviewed
 twice; each round 1 found a real blocking defect (a RoPE-rotation output-
 placement bug in task 0039, an untested attention-score-scale formula in task
-0040) that round 2 repaired and re-review confirmed. **M4.3 through M4.5
-remain unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
+0040) that round 2 repaired and re-review confirmed. **M4.3's first bounded slice is accepted** (owner, 2026-09-21): [task
+0041](docs/tasks/0041-m4-host-backed-page-streaming.md) — one query attending
+over history split across exactly one already-device-resident block and one
+host-staged block, merged via the already-proven `moxie_oracles::online_softmax`
+algebra, matching the existing single-shot whole-history device path on both
+SM86 GPUs and SM120. Reviewed twice: round 1 hit a real architectural stop
+condition (resolved by authorizing an additive, separately-qualified kernel
+variant, existing kernel untouched) and round 1's review then caught an
+unasserted, misleading numerical comparison, repaired and re-verified
+load-bearing. N-block generalization, prefetch/overlap and any long-context
+product claim remain separate, unopened work — not authorized by this
+acceptance. **M4.4 and M4.5 remain unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
 path are explicitly out of M4.2's scope and are not opened by its acceptance.
 The [M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md)
 tracks this milestone's obligations.

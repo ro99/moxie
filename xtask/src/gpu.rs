@@ -21,7 +21,7 @@ use moxie_cuda::{
 use moxie_executor::{
     AttentionLayer, DeviceArena, Lease, OwnedBinding, PageGeometry, PagedAttentionInputs,
     PagedAttentionLaunch, PagedAttentionRun, PagedAttentionStep, SelectedAdmitRefused,
-    SelectedReservedPlan, Staging, Turn, Upload, select_paged_attention_kernel,
+    SelectedReservedPlan, Staging, Turn, TwoBlockAttention, Upload, select_paged_attention_kernel,
 };
 use moxie_graph::{
     Bindings, Graph, GraphBuilder, Op, OpParams, OracleEvidence, OracleId, OracleRegistry,
@@ -90,6 +90,7 @@ const CASES: &[&str] = &[
     "grouped_expert_mlp",
     "affine_linear_w4a16_w8a16",
     "paged_attention",
+    "paged_attention_host_streaming",
     "paged_attention_32k",
     "paged_attention_state_lifecycle",
 ];
@@ -225,6 +226,11 @@ pub fn run(profile: Option<&str>) -> i32 {
         results.push(case(&cap, "grouped_expert_mlp", grouped_expert_mlp(&cap)));
         results.push(case(&cap, "affine_linear_w4a16_w8a16", affine_linear(&cap)));
         results.push(case(&cap, "paged_attention", paged_attention(&cap)));
+        results.push(case(
+            &cap,
+            "paged_attention_host_streaming",
+            paged_attention_host_streaming(&cap),
+        ));
         results.push(case(&cap, "paged_attention_32k", paged_attention_32k(&cap)));
         results.push(case(
             &cap,
@@ -3154,6 +3160,455 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
         return Ok(Outcome::Failed("no component was compared".into()));
     }
     Ok(Outcome::Passed)
+}
+
+/// Task 0041: one resident page plus one host page, with the device partial
+/// producer kept separate from the accepted single-shot kernel.
+///
+/// The host page is read from `moxie_state::PagedSequence`, the resident page
+/// is committed through `DeviceKvSequence`. The executor returns the two raw
+/// device partials; this composition root widens them and calls the shared
+/// `Partial::merge`. The raw merge is checked against
+/// `attention_error_bounds_at` without a BF16 allowance. The cross-path check
+/// first applies the declared BF16 output boundary to that raw result, then
+/// compares like representations with the same per-lane bound.
+fn paged_attention_host_streaming(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    const HEADS: u64 = 4;
+    const HEAD_DIM: u64 = 64;
+    const PAGE_TOKENS: u64 = 8;
+    const RESIDENT_ROWS: u64 = PAGE_TOKENS;
+    const STAGED_ROWS: u64 = PAGE_TOKENS;
+    const TOTAL_ROWS: u64 = RESIDENT_ROWS + STAGED_ROWS;
+    let geometry = PageGeometry {
+        kv_heads: 2,
+        head_dim: HEAD_DIM,
+        page_tokens: PAGE_TOKENS,
+        pages: 2,
+    };
+    let scale = moxie_plan::reciprocal_sqrt_scale(HEAD_DIM);
+    let fixture = AttentionFixture::build(geometry, HEADS, TOTAL_ROWS, 0x0041_0001);
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let stream = Stream::new(&ctx)?;
+    let catalogue = moxie_kernels::paged_attention_catalogue();
+
+    let stream_geometry = PageGeometry {
+        pages: 1,
+        ..geometry
+    };
+    let stream_layer = AttentionLayer {
+        geometry: stream_geometry,
+        heads: HEADS,
+        scale,
+        visibility: Visibility::Causal,
+    };
+    let stream_probe = PagedAttentionLaunch::new(stream_layer, 1, 0, 0, 1)?;
+    let stream_descriptor = select_paged_attention_kernel(&catalogue, cap, &stream_probe)?;
+
+    let mut ledger = measured_ledger(&ctx)?;
+    let host_geometry = moxie_state::KvGeometry {
+        layers: vec![moxie_state::LayerKv {
+            kv_heads: geometry.kv_heads as usize,
+            key_dim: geometry.head_dim as usize,
+            value_dim: geometry.head_dim as usize,
+            retention: moxie_state::Retention::All,
+        }],
+        precision: Precision::Bf16,
+        page_tokens: PAGE_TOKENS as usize,
+        max_tokens: TOTAL_ROWS as usize,
+        tentative_rows: TOTAL_ROWS as usize,
+    };
+    let mut host = moxie_state::PagedSequence::new(&mut ledger, host_geometry)?;
+    let host_txn = host.begin()?;
+    host.append_prompt(TOTAL_ROWS)?;
+    for position in 0..TOTAL_ROWS {
+        let (keys, values) = fixture.payload(position, 1);
+        let rows = [moxie_state::KvRow {
+            key: &keys,
+            value: &values,
+        }];
+        host.append(
+            host_txn,
+            position,
+            &rows,
+            &std::sync::atomic::AtomicBool::new(false),
+        )?;
+    }
+    host.commit_prefix(host_txn, 0)?;
+
+    let mut streamed_run = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        stream_descriptor,
+        stream_geometry,
+        HEADS,
+        1,
+        Staging::TwoBlock,
+    )
+    .map_err(|refused| refused.error)?;
+    let mut resident_state = moxie_state::DeviceKvSequence::new(moxie_state::KvGeometry {
+        layers: vec![moxie_state::LayerKv {
+            kv_heads: geometry.kv_heads as usize,
+            key_dim: geometry.head_dim as usize,
+            value_dim: geometry.head_dim as usize,
+            retention: moxie_state::Retention::All,
+        }],
+        precision: Precision::Bf16,
+        page_tokens: PAGE_TOKENS as usize,
+        max_tokens: RESIDENT_ROWS as usize,
+        tentative_rows: RESIDENT_ROWS as usize,
+    })?;
+    append_authority_rows(
+        &mut resident_state,
+        &mut streamed_run,
+        &stream,
+        &fixture,
+        RESIDENT_ROWS,
+    )?;
+    let (host_keys, host_values) = host.read_block(0, RESIDENT_ROWS, STAGED_ROWS)?;
+    let expected_transfer = host_keys
+        .len()
+        .checked_add(host_values.len())
+        .and_then(|bytes| bytes.checked_add(4))
+        .ok_or(moxie_types::DimError::Overflow)? as u64;
+    let stream_launch =
+        PagedAttentionLaunch::two_block_stream(stream_layer, 1, TOTAL_ROWS - 1, 0, STAGED_ROWS)?;
+    let streamed = streamed_run
+        .attend_two_block(
+            &stream,
+            &stream_launch,
+            fixture.query_bytes(TOTAL_ROWS - 1, 1),
+            host_keys,
+            host_values,
+        )
+        .map_err(|refused| refused.error)?;
+    if streamed.host_to_device_bytes != expected_transfer {
+        return Ok(Outcome::Failed(format!(
+            "{} streamed {} B but the staged block transferred {} B",
+            cap.uuid, streamed.host_to_device_bytes, expected_transfer
+        )));
+    }
+
+    // The comparison uses the same independent FP64 equation and unchanged
+    // attention_error_bound gate as the accepted single-shot case.
+    let streamed_output = merge_device_partials(&streamed, HEADS, HEAD_DIM)?;
+    let (stream_summary, pairwise_bounds) =
+        check_streamed_attention(&fixture, &stream_launch, &streamed_output, "host-streamed")?;
+    // The comparison run is an alternative execution plan, not a concurrent
+    // consumer. Return the bounded streaming arena before admitting the
+    // two-page single-shot arena so the ledger measures the actual peak.
+    streamed_run
+        .close(&mut ledger)
+        .map_err(|refused| refused.error)?;
+
+    // A second run with both pages resident exercises the already-qualified
+    // single-shot symbol over the identical logical history.
+    let full_layer = AttentionLayer {
+        geometry,
+        heads: HEADS,
+        scale,
+        visibility: Visibility::Causal,
+    };
+    let full_launch = PagedAttentionLaunch::new(full_layer, 1, TOTAL_ROWS - 1, 0, TOTAL_ROWS)?;
+    let full_descriptor = select_paged_attention_kernel(&catalogue, cap, &full_launch)?;
+    let mut full_run = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        full_descriptor,
+        geometry,
+        HEADS,
+        1,
+        Staging::Host,
+    )
+    .map_err(|refused| refused.error)?;
+    let mut full_state = moxie_state::DeviceKvSequence::new(moxie_state::KvGeometry {
+        layers: vec![moxie_state::LayerKv {
+            kv_heads: geometry.kv_heads as usize,
+            key_dim: geometry.head_dim as usize,
+            value_dim: geometry.head_dim as usize,
+            retention: moxie_state::Retention::All,
+        }],
+        precision: Precision::Bf16,
+        page_tokens: PAGE_TOKENS as usize,
+        max_tokens: TOTAL_ROWS as usize,
+        tentative_rows: TOTAL_ROWS as usize,
+    })?;
+    append_authority_rows(
+        &mut full_state,
+        &mut full_run,
+        &stream,
+        &fixture,
+        TOTAL_ROWS,
+    )?;
+    let one_shot = full_run
+        .attend(
+            &stream,
+            &full_launch,
+            fixture.query_bytes(TOTAL_ROWS - 1, 1),
+        )
+        .map_err(|refused| refused.error)?;
+    let one_shot_summary = check_attention(&fixture, &full_launch, &one_shot, "single-shot")?;
+    let one_shot_values = decode_u16(&one_shot);
+    let one_shot_values: Vec<f64> = one_shot_values
+        .into_iter()
+        .map(|bits| f64::from(bf16_value(bits)))
+        .collect();
+    if streamed_output.len() != one_shot_values.len()
+        || streamed_output.len() != pairwise_bounds.len()
+    {
+        return Ok(Outcome::Failed(
+            "streamed and single-shot output widths differ".into(),
+        ));
+    }
+    let narrowed_streamed: Vec<f64> = streamed_output
+        .iter()
+        .map(|value| f64::from(bf16_value(host_f32_to_bf16_bits(*value as f32))))
+        .collect();
+    let mut max_pairwise: f64 = 0.0;
+    for (index, ((streamed, one_shot), bound)) in narrowed_streamed
+        .iter()
+        .zip(one_shot_values.iter())
+        .zip(pairwise_bounds.iter())
+        .enumerate()
+    {
+        if !streamed.is_finite() {
+            return Ok(Outcome::Failed(format!(
+                "streamed BF16 output {index} is not finite"
+            )));
+        }
+        let difference = (streamed - one_shot).abs();
+        max_pairwise = max_pairwise.max(difference);
+        if difference > *bound {
+            return Ok(Outcome::Failed(format!(
+                "streamed and single-shot output {index} differ by {difference:.3e}, \
+                 beyond attention bound {bound:.3e}"
+            )));
+        }
+    }
+    println!(
+        "    {} host-streamed two-block transfer={} B stream={} single-shot={} max_pairwise={:.3e}",
+        cap.sm(),
+        streamed.host_to_device_bytes,
+        stream_summary.max,
+        one_shot_summary.max,
+        max_pairwise
+    );
+
+    full_run
+        .close(&mut ledger)
+        .map_err(|refused| refused.error)?;
+    // Device state is the task-0038 authority and releases on drop; the host
+    // paged store owns the ledger-backed close explicitly.
+    host.close(&mut ledger).map_err(|refused| refused.error)?;
+    if !ledger.outstanding().is_empty() {
+        return Ok(Outcome::Failed(
+            "host-backed proof left an admission charge outstanding".into(),
+        ));
+    }
+
+    // Inject a failure after the key copy but before the value/table copies.
+    // The run is deliberately quarantined: submitted work may still read the
+    // retained host vectors, so it cannot be reused or closed as successful.
+    let mut fault_ledger = measured_ledger(&ctx)?;
+    let mut fault_run = PagedAttentionRun::admit(
+        &mut fault_ledger,
+        &ctx,
+        select_paged_attention_kernel(&catalogue, cap, &stream_probe)?,
+        stream_geometry,
+        HEADS,
+        1,
+        Staging::TwoBlock,
+    )
+    .map_err(|refused| refused.error)?;
+    let mut fault_state = moxie_state::DeviceKvSequence::new(moxie_state::KvGeometry {
+        layers: vec![moxie_state::LayerKv {
+            kv_heads: geometry.kv_heads as usize,
+            key_dim: geometry.head_dim as usize,
+            value_dim: geometry.head_dim as usize,
+            retention: moxie_state::Retention::All,
+        }],
+        precision: Precision::Bf16,
+        page_tokens: PAGE_TOKENS as usize,
+        max_tokens: RESIDENT_ROWS as usize,
+        tentative_rows: RESIDENT_ROWS as usize,
+    })?;
+    append_authority_rows(
+        &mut fault_state,
+        &mut fault_run,
+        &stream,
+        &fixture,
+        RESIDENT_ROWS,
+    )?;
+    let (fault_keys, fault_values) = fixture.payload(RESIDENT_ROWS, STAGED_ROWS);
+    fault_run.inject_staging_failure();
+    let refused = fault_run
+        .attend_two_block(
+            &stream,
+            &stream_launch,
+            fixture.query_bytes(TOTAL_ROWS - 1, 1),
+            fault_keys,
+            fault_values,
+        )
+        .expect_err("an injected partial staging failure was accepted");
+    if !refused.retained_source() {
+        return Ok(Outcome::Failed(
+            "a partial staging failure returned host bytes that may still be in flight".into(),
+        ));
+    }
+    // `fault_run` remains quarantined by design and is dropped without a
+    // release path: the unknown completion must keep its arena charged.
+    drop(fault_run);
+    Ok(Outcome::Passed)
+}
+
+fn check_streamed_attention(
+    fixture: &AttentionFixture,
+    launch: &PagedAttentionLaunch,
+    output: &[f64],
+    label: &str,
+) -> Result<(moxie_oracles::metric::ErrorSummary, Vec<f64>), Error> {
+    use moxie_oracles::attention::attention_error_bounds_at;
+    use moxie_oracles::online_softmax::attend_row_blocked;
+
+    let head_dim = fixture.geometry.head_dim as usize;
+    let group = fixture.heads / fixture.geometry.kv_heads;
+    let block = fixture.query(launch.first_position(), launch.rows());
+    let mut got = Vec::new();
+    let mut want_all = Vec::new();
+    let mut bounds_all = Vec::new();
+    for row in 0..launch.rows() {
+        let visible: Vec<u64> = (launch.history_base()
+            ..launch.history_base() + launch.history_rows())
+            .filter(|key| launch.allows(row, *key))
+            .collect();
+        if visible.is_empty() {
+            return Err(Error::Numerical {
+                detail: format!("{label}: row {row} sees nothing"),
+            });
+        }
+        for head in 0..fixture.heads {
+            let kv_head = head / group;
+            let start = ((row * fixture.heads + head) * fixture.geometry.head_dim) as usize;
+            let query_row: Vec<f32> = block[start..start + head_dim]
+                .iter()
+                .map(|bits| bf16_value(*bits))
+                .collect();
+            let keys: Vec<Vec<f32>> = visible
+                .iter()
+                .map(|position| fixture.head_slice(&fixture.keys, *position, kv_head))
+                .collect();
+            let values: Vec<Vec<f32>> = visible
+                .iter()
+                .map(|position| fixture.head_slice(&fixture.values, *position, kv_head))
+                .collect();
+            let key_views: Vec<&[f32]> = keys.iter().map(Vec::as_slice).collect();
+            let value_views: Vec<&[f32]> = values.iter().map(Vec::as_slice).collect();
+            let allowed = vec![true; visible.len()];
+            let want = attend_row_blocked(
+                &query_row,
+                &key_views,
+                &value_views,
+                &allowed,
+                launch.scale(),
+                37,
+            )
+            .map_err(numerical)?;
+            let bounds =
+                attention_error_bounds_at(&query_row, &key_views, &value_views, launch.scale())
+                    .map_err(numerical)?;
+            for d in 0..head_dim {
+                let index = start + d;
+                let device = *output.get(index).ok_or_else(|| Error::InvalidRequest {
+                    field: "output",
+                    detail: "streamed output is shorter than its launch".into(),
+                })?;
+                if !device.is_finite() {
+                    return Err(Error::Numerical {
+                        detail: format!("{label}: output {index} is {device}"),
+                    });
+                }
+                let difference = (device - want[d]).abs();
+                if difference > bounds[d] {
+                    return Err(Error::Numerical {
+                        detail: format!(
+                            "{label}: row {row} head {head} lane {d}: {device} against \
+                             oracle {}, {difference:.3e} apart; bound {:.3e}",
+                            want[d], bounds[d]
+                        ),
+                    });
+                }
+                got.push(device as f32);
+                want_all.push(want[d]);
+                bounds_all.push(bounds[d]);
+            }
+        }
+    }
+    if output.len() != got.len() {
+        return Err(Error::InvalidRequest {
+            field: "output",
+            detail: format!(
+                "{} value(s) where the launch produces {}",
+                output.len(),
+                got.len()
+            ),
+        });
+    }
+    Ok((
+        moxie_oracles::metric::ErrorSummary::absolute(&got, &want_all),
+        bounds_all,
+    ))
+}
+
+fn merge_device_partials(
+    streamed: &TwoBlockAttention,
+    heads: u64,
+    head_dim: u64,
+) -> Result<Vec<f64>, Error> {
+    use moxie_oracles::online_softmax::Partial;
+
+    if streamed.resident.len() != streamed.staged.len() {
+        return Err(Error::InvalidRequest {
+            field: "partial",
+            detail: "resident and staged partial counts differ".into(),
+        });
+    }
+    let heads = usize::try_from(heads).map_err(|_| Error::Dim(moxie_types::DimError::Overflow))?;
+    let head_dim =
+        usize::try_from(head_dim).map_err(|_| Error::Dim(moxie_types::DimError::Overflow))?;
+    if heads == 0 || head_dim == 0 || !streamed.resident.len().is_multiple_of(heads) {
+        return Err(Error::InvalidRequest {
+            field: "partial",
+            detail: "partial count is not a whole nonempty head group".into(),
+        });
+    }
+    let mut output = Vec::with_capacity(streamed.resident.len() * head_dim);
+    for (resident, staged) in streamed.resident.iter().zip(&streamed.staged) {
+        if resident.weighted.len() != head_dim || staged.weighted.len() != head_dim {
+            return Err(Error::InvalidRequest {
+                field: "partial",
+                detail: "device partial value widths differ from the launch".into(),
+            });
+        }
+        let resident = Partial {
+            max: f64::from(resident.max),
+            sum: f64::from(resident.sum),
+            weighted: resident
+                .weighted
+                .iter()
+                .map(|value| f64::from(*value))
+                .collect(),
+        };
+        let staged = Partial {
+            max: f64::from(staged.max),
+            sum: f64::from(staged.sum),
+            weighted: staged
+                .weighted
+                .iter()
+                .map(|value| f64::from(*value))
+                .collect(),
+        };
+        output.extend(resident.merge(&staged)?.finish()?);
+    }
+    Ok(output)
 }
 
 fn append_authority_rows<'ctx>(

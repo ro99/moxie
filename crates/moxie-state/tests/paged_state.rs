@@ -140,6 +140,38 @@ fn whole_and_every_chunk_width_preserve_all_bytes_across_two_geometries_and_enco
 }
 
 #[test]
+fn read_block_returns_one_logical_host_page_without_exposing_storage_layout() {
+    let g = geometry();
+    let mut owner = ledger(1 << 20);
+    let mut sequence = PagedSequence::new(&mut owner, g.clone()).unwrap();
+    let txn = sequence.begin().unwrap();
+    sequence.append_prompt(6).unwrap();
+    for position in 0..6 {
+        append(&mut sequence, txn, position);
+    }
+    sequence.commit_prefix(txn, 0).unwrap();
+
+    let (keys, values) = sequence.read_block(1, 3, 3).unwrap();
+    let expected: Vec<_> = (3..6)
+        .map(|position| encoded(&g, position)[1].clone())
+        .collect();
+    let expected_keys: Vec<u8> = expected
+        .iter()
+        .flat_map(|(key, _)| key.iter().copied())
+        .collect();
+    let expected_values: Vec<u8> = expected
+        .iter()
+        .flat_map(|(_, value)| value.iter().copied())
+        .collect();
+    assert_eq!(keys, expected_keys);
+    assert_eq!(values, expected_values);
+    assert!(sequence.read_block(0, 4, 4).is_err());
+    assert!(sequence.read_block(0, 6, 1).is_err());
+
+    sequence.close(&mut owner).unwrap();
+}
+
+#[test]
 fn every_partial_acceptance_truncates_to_replay_and_materializes_a_pending_bonus() {
     for accepted in 0..=7 {
         let mut owner = ledger(1 << 20);
