@@ -335,7 +335,7 @@ fn malformed_rows_positions_and_cancellation_abort_all_prior_appends() {
 }
 
 #[test]
-fn full_context_failed_commit_and_unsupported_fork_never_change_capacity_or_precision() {
+fn full_context_failed_commit_and_fork_never_change_capacity_or_precision() {
     let g = KvGeometry {
         max_tokens: 4,
         ..geometry()
@@ -363,7 +363,8 @@ fn full_context_failed_commit_and_unsupported_fork_never_change_capacity_or_prec
     check_rows(&sequence, 4);
     assert!(sequence.append_prompt(1).is_err());
     assert!(sequence.accept(u64::MAX).is_err());
-    assert!(matches!(sequence.fork(4), Err(Error::Unsupported { .. })));
+    let child = sequence.fork(&mut owner, 4).unwrap();
+    sequence.discard_branch(&mut owner, child).unwrap();
     assert_eq!(sequence.geometry(), &g);
     sequence.close(&mut owner).unwrap();
 }

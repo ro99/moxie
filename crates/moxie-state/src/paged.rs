@@ -1,9 +1,10 @@
 //! Appendable host KV pages bound to the accepted sequence transaction journal.
 //!
-//! This is storage, not an attention executor. All pages belong exclusively to
-//! one root branch. A fixed envelope is admitted before use; growth, COW and
-//! device views require later capability qualification.
+//! This is storage, not an attention executor. The root and its host branches
+//! each own an admitted fixed envelope. Forks eagerly copy that envelope; lazy
+//! COW and device views require later capability qualification.
 
+use std::collections::BTreeMap;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -128,6 +129,51 @@ struct Layout {
     control_bytes: usize,
 }
 
+fn row_ranges(
+    layout: &Layout,
+    geometry: &KvGeometry,
+    backing: &HostBuffer,
+    layer: usize,
+    row: usize,
+) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    let l = &layout.layers[layer];
+    let page = (row / geometry.page_tokens) % l.pages;
+    let local = row % geometry.page_tokens;
+    let entry = (l.table_base + page) * 8;
+    let table = &backing.bytes()[entry..entry + 8];
+    let base = u64::from_le_bytes(table.try_into().expect("eight-byte entry")) as usize;
+    let key = base + local * l.key_bytes;
+    let value = base + geometry.page_tokens * l.key_bytes + local * l.value_bytes;
+    (key..key + l.key_bytes, value..value + l.value_bytes)
+}
+
+fn truncate_storage(
+    layout: &Layout,
+    geometry: &KvGeometry,
+    backing: &mut HostBuffer,
+    current: usize,
+    rows: usize,
+) {
+    for (index, layer) in layout.layers.iter().enumerate() {
+        // Only the last `capacity` discarded rows have slots of their own;
+        // anything older shares a slot with a row already zeroed here.
+        // Zeroing a slot can clear the bytes of the row `capacity` below
+        // it, which was already overwritten by the row being cleared and so
+        // is below every retained start -- nothing readable is lost.
+        for row in rows.max(current.saturating_sub(layer.capacity))..current {
+            let (key, value) = row_ranges(layout, geometry, backing, index, row);
+            backing.bytes_mut()[key].fill(0);
+            backing.bytes_mut()[value].fill(0);
+        }
+    }
+}
+
+fn btree_node_bound(entry: usize) -> usize {
+    // The pinned Rust BTreeMap (11 entries, 12 edges) needs this conservative
+    // bound for one node, including padding and the edge array.
+    11 * (entry + size_of::<usize>()) + 16 * size_of::<usize>()
+}
+
 fn mul(a: usize, b: usize) -> Result<usize> {
     a.checked_mul(b).ok_or(DimError::Overflow.into())
 }
@@ -211,12 +257,9 @@ impl KvGeometry {
         }
         let table_bytes = mul(entries, size_of::<u64>())?;
         let backing_bytes = add(table_bytes, pool_bytes)?;
-        // The facade permits one branch, one open journal and no retained
-        // results. Lineage is reserved exactly once. A conservative node bound
-        // for the pinned Rust BTreeMap (11 entries, 12 edges) covers each map's
-        // single node, including padding/header, even when the branch has only
-        // one entry. No per-token map entries can accumulate here.
-        let node_bound = |entry: usize| 11 * (entry + size_of::<usize>()) + 16 * size_of::<usize>();
+        // The facade permits one root branch, one open journal and no retained
+        // results. Lineage is reserved exactly once. No per-token map entries
+        // can accumulate here.
         let control_bytes = add(
             add(
                 mul(add(self.max_tokens, 1)?, size_of::<PrefixLineage>())?,
@@ -230,9 +273,9 @@ impl KvGeometry {
             size_of::<Self>()
                 + size_of::<PagedSequence>()
                 + size_of::<StateKind>()
-                + node_bound(size_of::<(BranchId, Branch)>())
-                + node_bound(size_of::<(StateTransactionId, Journal)>())
-                + node_bound(size_of::<(crate::ResultId, crate::LogitsHandle)>()),
+                + btree_node_bound(size_of::<(BranchId, Branch)>())
+                + btree_node_bound(size_of::<(StateTransactionId, Journal)>())
+                + btree_node_bound(size_of::<(crate::ResultId, crate::LogitsHandle)>()),
         )?;
         if backing_bytes > isize::MAX as usize || control_bytes > isize::MAX as usize {
             return Err(DimError::Overflow.into());
@@ -305,6 +348,35 @@ pub struct PagedSequence {
     tentative_base: Option<usize>,
     sampler: Option<Sampler>,
     execution: Option<PagedExecutionBinding>,
+    children: BTreeMap<BranchId, PagedBranchStorage>,
+}
+
+#[derive(Debug)]
+struct PagedBranchStorage {
+    backing: HostBuffer,
+    rows: usize,
+    high_water: usize,
+    tentative_base: Option<usize>,
+    retained_from: Vec<usize>,
+}
+
+struct PagedRead<'a> {
+    backing: &'a HostBuffer,
+    rows: usize,
+    high_water: usize,
+    retained_from: Option<&'a [usize]>,
+}
+
+/// A mutable view of one eagerly-copied host paged child branch.
+///
+/// The view borrows its parent sequence, so a child cannot be used after the
+/// sequence is discarded or closed, and the parent cannot release the child's
+/// bytes while this view exists. The root branch keeps the original API;
+/// branch operations are explicit here so existing consumers remain unchanged.
+#[derive(Debug)]
+pub struct PagedBranch<'a> {
+    sequence: &'a mut PagedSequence,
+    branch: BranchId,
 }
 
 /// Opaque authority for the one immutable execution configuration bound to a
@@ -508,6 +580,7 @@ impl PagedSequence {
             tentative_base: None,
             sampler,
             execution: None,
+            children: BTreeMap::new(),
         })
     }
 
@@ -609,34 +682,49 @@ impl PagedSequence {
     }
 
     fn retained_start(&self, layer: usize) -> usize {
-        let evicted = self
-            .high_water
-            .saturating_sub(self.layout.layers[layer].capacity);
+        self.retained_start_for(layer, self.rows, self.high_water)
+    }
+
+    fn retained_start_for(&self, layer: usize, rows: usize, high_water: usize) -> usize {
+        let evicted = high_water.saturating_sub(self.layout.layers[layer].capacity);
         match self.geometry.layers[layer].retention.window() {
             // `capacity >= max_tokens >= high_water`, so `evicted` is zero.
             None => evicted,
-            Some(window) => self.rows.saturating_sub(window).max(evicted),
+            Some(window) => rows.saturating_sub(window).max(evicted),
         }
     }
 
     pub fn usage(&self) -> PagedUsage {
+        self.usage_for(self.rows, self.high_water)
+    }
+
+    fn usage_for(&self, rows: usize, high_water: usize) -> PagedUsage {
+        self.usage_for_branch(rows, high_water, None)
+    }
+
+    fn usage_for_branch(
+        &self,
+        rows: usize,
+        high_water: usize,
+        retained_from: Option<&[usize]>,
+    ) -> PagedUsage {
         let mut live_pages = 0;
         let mut live_page_bytes = 0;
         let mut retained_rows = 0;
         let mut logical_kv_bytes = 0;
         for (index, layer) in self.layout.layers.iter().enumerate() {
-            let pages = self
-                .rows
-                .div_ceil(self.geometry.page_tokens)
-                .min(layer.pages);
+            let pages = rows.div_ceil(self.geometry.page_tokens).min(layer.pages);
             live_pages += pages;
             live_page_bytes += pages * layer.page_bytes;
-            let retained = self.rows - self.retained_start(index);
+            let start = self
+                .retained_start_for(index, rows, high_water)
+                .max(retained_from.map_or(0, |from| from[index]));
+            let retained = rows.saturating_sub(start);
             retained_rows += retained;
             logical_kv_bytes += retained * (layer.key_bytes + layer.value_bytes);
         }
         PagedUsage {
-            rows: self.rows,
+            rows,
             retained_rows,
             live_pages,
             live_page_bytes,
@@ -835,37 +923,418 @@ impl PagedSequence {
     /// needs re-prefill. Do not silently change results." Reported, not
     /// silently served, and checked before anything mutates.
     fn check_retained_at(&self, prefix: u64) -> Result<()> {
+        self.check_retained_at_with_floor(self.high_water, prefix, None)
+    }
+
+    fn check_retained_at_with_floor(
+        &self,
+        high_water: usize,
+        prefix: u64,
+        retained_from: Option<&[usize]>,
+    ) -> Result<()> {
         for (index, layer) in self.geometry.layers.iter().enumerate() {
             let Some(window) = layer.retention.window() else {
                 continue;
             };
-            let evicted =
-                self.high_water
-                    .saturating_sub(self.layout.layers[index].capacity) as u64;
+            let evicted = high_water.saturating_sub(self.layout.layers[index].capacity) as u64;
             let wanted = prefix.saturating_sub(window as u64);
-            if wanted < evicted {
+            let retained_start =
+                retained_from.map_or(evicted, |from| evicted.max(from[index] as u64));
+            if wanted < retained_start {
                 return Err(Error::Reclaimed {
                     layer: index as u32,
                     position: wanted,
-                    retained_from: evicted,
+                    retained_from: retained_start,
                 });
             }
         }
         Ok(())
     }
 
-    pub fn fork(&mut self, _at: u64) -> Result<BranchId> {
-        Err(Error::Unsupported {
-            capability: "paged state fork",
-            reason: "COW page sharing is not qualified; this pool owns one root branch".into(),
+    fn child_storage(&self, branch: BranchId) -> Result<&PagedBranchStorage> {
+        self.children.get(&branch).ok_or_else(|| {
+            invalid(
+                "branch",
+                format!("branch {branch} has no host paged storage"),
+            )
         })
     }
 
+    fn child_storage_mut(&mut self, branch: BranchId) -> Result<&mut PagedBranchStorage> {
+        self.children.get_mut(&branch).ok_or_else(|| {
+            invalid(
+                "branch",
+                format!("branch {branch} has no host paged storage"),
+            )
+        })
+    }
+
+    fn branch_control_bytes(&self) -> Result<usize> {
+        add(
+            add(
+                mul(
+                    add(self.geometry.max_tokens, 1)?,
+                    size_of::<PrefixLineage>(),
+                )?,
+                mul(self.geometry.layers.len(), size_of::<usize>())?,
+            )?,
+            btree_node_bound(size_of::<(BranchId, Branch)>())
+                + btree_node_bound(size_of::<(StateTransactionId, Journal)>())
+                + btree_node_bound(size_of::<(BranchId, PagedBranchStorage)>()),
+        )
+    }
+
+    /// Borrow one eagerly-copied host branch for mutation and reads.
+    pub fn branch(&mut self, branch: BranchId) -> Result<PagedBranch<'_>> {
+        if branch == ROOT {
+            return Err(invalid(
+                "branch",
+                "the root branch is operated through PagedSequence",
+            ));
+        }
+        self.child_storage(branch)?;
+        self.state.frontiers(branch)?;
+        Ok(PagedBranch {
+            sequence: self,
+            branch,
+        })
+    }
+
+    /// Fork the committed root prefix into an independent host backing.
+    ///
+    /// The implementation deliberately chooses eager copying over lazy COW:
+    /// the second branch has an ordinary `HostBuffer` reservation and therefore
+    /// needs no new sharing, refcount, or write-barrier authority. The copy is
+    /// made before `SequenceState` is changed, so allocation and copy failures
+    /// leave the root branch untouched; a post-fork checkpoint unwinds both
+    /// participants before reporting its failure.
+    pub fn fork(&mut self, ledger: &mut Ledger, at: u64) -> Result<BranchId> {
+        self.fork_checked(ledger, at, || Ok(()))
+    }
+
+    fn fork_checked(
+        &mut self,
+        ledger: &mut Ledger,
+        at: u64,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<BranchId> {
+        if self.sampler.is_some() {
+            return Err(Error::Unsupported {
+                capability: "paged state fork",
+                reason: "sampler-history branching is outside the host KV fork primitive".into(),
+            });
+        }
+        if self.state.open_on(ROOT).is_some() {
+            return Err(invalid(
+                "branch",
+                "fork requires a committed root prefix outside a transaction",
+            ));
+        }
+        let frontier = self.state.frontiers(ROOT)?;
+        if at > frontier.accepted {
+            return Err(invalid(
+                "at",
+                format!(
+                    "cannot fork at {at}, root has only {} accepted",
+                    frontier.accepted
+                ),
+            ));
+        }
+        if at > self.rows as u64 {
+            return Err(invalid(
+                "at",
+                "cannot fork before the requested prefix has physical KV rows",
+            ));
+        }
+        let mut retained_from = try_vec(self.geometry.layers.len())?;
+        for layer in 0..self.geometry.layers.len() {
+            retained_from.push(self.retained_start(layer));
+        }
+        self.check_retained_at_with_floor(self.high_water, at, Some(&retained_from))?;
+        let at = usize::try_from(at).map_err(|_| DimError::Overflow)?;
+        checkpoint()?;
+
+        let branch_control = self.branch_control_bytes()?;
+        let mut backing = HostBuffer::allocate_with_workspace(
+            ledger,
+            "paged branch",
+            self.layout.backing_bytes,
+            0,
+            branch_control,
+        )?;
+        if let Err(error) = checkpoint() {
+            backing.release(ledger).expect("the admitting ledger");
+            return Err(error);
+        }
+        backing.bytes_mut().copy_from_slice(self.backing.bytes());
+        if let Err(error) = checkpoint() {
+            backing.release(ledger).expect("the admitting ledger");
+            return Err(error);
+        }
+
+        let child = match self.state.fork(ROOT, at as u64) {
+            Ok(child) => child,
+            Err(error) => {
+                backing.release(ledger).expect("the admitting ledger");
+                return Err(error);
+            }
+        };
+        if let Err(error) = checkpoint() {
+            self.state
+                .discard_branch(child)
+                .expect("new logical branch is not open");
+            backing.release(ledger).expect("the admitting ledger");
+            return Err(error);
+        }
+        let lineage_capacity = add(self.geometry.max_tokens, 1)?;
+        let lineage_ready = {
+            let lineage = &mut self
+                .state
+                .branches
+                .get_mut(&child)
+                .expect("new logical branch")
+                .lineage;
+            lineage
+                .try_reserve_exact(lineage_capacity - lineage.len())
+                .is_ok()
+                && lineage.capacity() == lineage_capacity
+        };
+        if !lineage_ready {
+            self.state
+                .discard_branch(child)
+                .expect("new logical branch is not open");
+            backing.release(ledger).expect("the admitting ledger");
+            return Err(Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::Pageable)),
+                requested_bytes: branch_control as u64,
+                available_bytes: 0,
+            });
+        }
+        let previous = self.children.insert(
+            child,
+            PagedBranchStorage {
+                backing,
+                rows: at,
+                high_water: self.high_water,
+                tentative_base: None,
+                retained_from,
+            },
+        );
+        debug_assert!(
+            previous.is_none(),
+            "SequenceState issued a duplicate branch id"
+        );
+        Ok(child)
+    }
+
+    /// Discard a child branch and release exactly its eager-copy reservation.
+    pub fn discard_branch(&mut self, ledger: &mut Ledger, branch: BranchId) -> Result<()> {
+        if branch == ROOT {
+            return Err(invalid("branch", "the root branch cannot be discarded"));
+        }
+        self.child_storage(branch)?;
+        self.state.frontiers(branch)?;
+        if self.state.open_on(branch).is_some() {
+            return Err(invalid(
+                "branch",
+                "resolve the child transaction before discarding its branch",
+            ));
+        }
+        let mut storage = self
+            .children
+            .remove(&branch)
+            .expect("validated child storage");
+        if let Err(error) = storage.backing.release(ledger) {
+            self.children.insert(branch, storage);
+            return Err(error);
+        }
+        // All refusal conditions in SequenceState::discard_branch were
+        // checked above; keeping this as its authority preserves its logical
+        // branch/result cleanup instead of duplicating that bookkeeping here.
+        self.state
+            .discard_branch(branch)
+            .expect("validated child branch");
+        Ok(())
+    }
+
+    fn check_branch_transaction(&self, branch: BranchId, txn: StateTransactionId) -> Result<()> {
+        self.check_transaction_on(branch, txn)
+    }
+
+    fn begin_branch(&mut self, branch: BranchId) -> Result<StateTransactionId> {
+        self.child_storage(branch)?;
+        self.state.frontiers(branch)?;
+        let txn = self.state.begin(branch)?;
+        self.state
+            .open
+            .get_mut(&txn)
+            .expect("opened child journal")
+            .sampler_len = 0;
+        let rows = self.child_storage(branch)?.rows;
+        self.child_storage_mut(branch)?.tentative_base = Some(rows);
+        Ok(txn)
+    }
+
+    fn commit_branch(&mut self, branch: BranchId, txn: StateTransactionId, n: u64) -> Result<()> {
+        self.check_branch_transaction(branch, txn)?;
+        let accepted = self.state.frontiers(branch)?.accepted;
+        self.check_frontier(accepted, n)?;
+        let result = (|| {
+            self.state.accept(branch, n)?;
+            self.state.commit_prefix(txn, 0)
+        })();
+        if result.is_err() {
+            self.abort_branch(branch, txn)
+                .expect("validated child transaction");
+        } else {
+            self.child_storage_mut(branch)?.tentative_base = None;
+        }
+        result
+    }
+
+    fn abort_branch(&mut self, branch: BranchId, txn: StateTransactionId) -> Result<()> {
+        self.check_branch_transaction(branch, txn)?;
+        self.state.abort(txn)?;
+        let rows = self.state.frontiers(branch)?.executed as usize;
+        self.truncate_child(branch, rows);
+        self.child_storage_mut(branch)?.tentative_base = None;
+        Ok(())
+    }
+
+    fn rollback_branch(&mut self, branch: BranchId, prefix: u64) -> Result<()> {
+        let child = self.child_storage(branch)?;
+        self.check_retained_at_with_floor(child.high_water, prefix, Some(&child.retained_from))?;
+        self.state.rollback_to(branch, prefix, &[])?;
+        let rows = self.state.frontiers(branch)?.executed as usize;
+        self.truncate_child(branch, rows);
+        self.child_storage_mut(branch)?.tentative_base = None;
+        Ok(())
+    }
+
+    fn truncate_child(&mut self, branch: BranchId, rows: usize) {
+        let mut storage = self
+            .children
+            .remove(&branch)
+            .expect("validated child storage");
+        let current = storage.rows;
+        truncate_storage(
+            &self.layout,
+            &self.geometry,
+            &mut storage.backing,
+            current,
+            rows,
+        );
+        storage.rows = rows;
+        self.children.insert(branch, storage);
+    }
+
+    fn append_child(
+        &mut self,
+        branch: BranchId,
+        txn: StateTransactionId,
+        position: u64,
+        layers: &[KvRow<'_>],
+        cancelled: &AtomicBool,
+    ) -> Result<()> {
+        self.append_child_checked(branch, txn, position, layers, || {
+            if cancelled.load(Ordering::Relaxed) {
+                Err(Error::Cancelled {
+                    at: "paged branch append",
+                })
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn append_child_checked(
+        &mut self,
+        branch: BranchId,
+        txn: StateTransactionId,
+        position: u64,
+        layers: &[KvRow<'_>],
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.check_branch_transaction(branch, txn)?;
+        let result = (|| {
+            checkpoint()?;
+            let (current, base) = {
+                let child = self.child_storage(branch)?;
+                (
+                    child.rows,
+                    child.tentative_base.expect("validated child transaction"),
+                )
+            };
+            if position != current as u64 {
+                return Err(invalid(
+                    "position",
+                    "append must start at the child executed frontier",
+                ));
+            }
+            self.check_frontier(position, 1)?;
+            if self.reclaims() && current + 1 - base > self.geometry.tentative_rows {
+                return Err(invalid(
+                    "tentative_rows",
+                    format!(
+                        "this child transaction has appended {} row(s) and a reclaiming \
+                         sequence admits {}; commit before appending more",
+                        current - base,
+                        self.geometry.tentative_rows
+                    ),
+                ));
+            }
+            if layers.len() != self.layout.layers.len()
+                || layers
+                    .iter()
+                    .zip(&self.layout.layers)
+                    .any(|(r, l)| r.key.len() != l.key_bytes || r.value.len() != l.value_bytes)
+            {
+                return Err(invalid(
+                    "kv_rows",
+                    "every layer must supply exactly one complete K/V row of its own width",
+                ));
+            }
+            let layout = &self.layout;
+            let geometry = &self.geometry;
+            let child = self
+                .children
+                .get_mut(&branch)
+                .expect("validated child storage");
+            let row = child.rows;
+            child.rows += 1;
+            child.high_water = child.high_water.max(child.rows);
+            for (layer, values) in layers.iter().enumerate() {
+                let (key, value) = row_ranges(layout, geometry, &child.backing, layer, row);
+                child.backing.bytes_mut()[key].copy_from_slice(values.key);
+                child.backing.bytes_mut()[value].copy_from_slice(values.value);
+                checkpoint()?;
+            }
+            self.state.execute(branch, 1)?;
+            checkpoint()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.abort_branch(branch, txn)
+                .expect("the validated child transaction");
+        }
+        result
+    }
+
     fn check_transaction(&self, txn: StateTransactionId) -> Result<()> {
-        if !self.state.open.contains_key(&txn) {
+        self.check_transaction_on(ROOT, txn)
+    }
+
+    fn check_transaction_on(&self, branch: BranchId, txn: StateTransactionId) -> Result<()> {
+        let Some(journal) = self.state.open.get(&txn) else {
             return Err(invalid(
                 "transaction",
                 "no such open transaction on this sequence",
+            ));
+        };
+        if journal.branch != branch {
+            return Err(invalid(
+                "transaction",
+                "transaction belongs to another paged branch",
             ));
         }
         Ok(())
@@ -1046,15 +1515,16 @@ impl PagedSequence {
     /// already used the ring (`:1066`), and the ring is the one that costs
     /// nothing per token.
     fn ranges(&self, layer: usize, row: usize) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
-        let l = &self.layout.layers[layer];
-        let page = (row / self.geometry.page_tokens) % l.pages;
-        let local = row % self.geometry.page_tokens;
-        let entry = (l.table_base + page) * 8;
-        let table = &self.backing.bytes()[entry..entry + 8];
-        let base = u64::from_le_bytes(table.try_into().expect("eight-byte entry")) as usize;
-        let key = base + local * l.key_bytes;
-        let value = base + self.geometry.page_tokens * l.key_bytes + local * l.value_bytes;
-        (key..key + l.key_bytes, value..value + l.value_bytes)
+        self.ranges_in(&self.backing, layer, row)
+    }
+
+    fn ranges_in(
+        &self,
+        backing: &HostBuffer,
+        layer: usize,
+        row: usize,
+    ) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        row_ranges(&self.layout, &self.geometry, backing, layer, row)
     }
 
     /// One retained row.
@@ -1066,13 +1536,25 @@ impl PagedSequence {
     /// either of the others is exactly the silent wrong answer document 04
     /// forbids.
     pub fn row(&self, layer: usize, position: u64) -> Result<KvRow<'_>> {
+        let source = PagedRead {
+            backing: &self.backing,
+            rows: self.rows,
+            high_water: self.high_water,
+            retained_from: None,
+        };
+        self.row_in(&source, layer, position)
+    }
+
+    fn row_in<'a>(&self, source: &PagedRead<'a>, layer: usize, position: u64) -> Result<KvRow<'a>> {
         if layer >= self.geometry.layers.len() {
             return Err(invalid("kv_row", "layer is outside this sequence"));
         }
-        if position >= self.rows as u64 {
+        if position >= source.rows as u64 {
             return Err(invalid("kv_row", "position has not been executed"));
         }
-        let start = self.retained_start(layer);
+        let start = self
+            .retained_start_for(layer, source.rows, source.high_water)
+            .max(source.retained_from.map_or(0, |from| from[layer]));
         if position < start as u64 {
             return Err(Error::Reclaimed {
                 layer: layer as u32,
@@ -1080,10 +1562,10 @@ impl PagedSequence {
                 retained_from: start as u64,
             });
         }
-        let (key, value) = self.ranges(layer, position as usize);
+        let (key, value) = self.ranges_in(source.backing, layer, position as usize);
         Ok(KvRow {
-            key: &self.backing.bytes()[key],
-            value: &self.backing.bytes()[value],
+            key: &source.backing.bytes()[key],
+            value: &source.backing.bytes()[value],
         })
     }
 
@@ -1092,6 +1574,22 @@ impl PagedSequence {
     /// this only materializes the requested rows without exposing its physical
     /// page layout to an executor.
     pub fn read_block(&self, layer: usize, first: u64, rows: u64) -> Result<(Vec<u8>, Vec<u8>)> {
+        let source = PagedRead {
+            backing: &self.backing,
+            rows: self.rows,
+            high_water: self.high_water,
+            retained_from: None,
+        };
+        self.read_block_in(&source, layer, first, rows)
+    }
+
+    fn read_block_in(
+        &self,
+        source: &PagedRead<'_>,
+        layer: usize,
+        first: u64,
+        rows: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
         if rows == 0 || rows > self.geometry.page_tokens as u64 {
             return Err(invalid(
                 "rows",
@@ -1099,7 +1597,7 @@ impl PagedSequence {
             ));
         }
         let end = first.checked_add(rows).ok_or(DimError::Overflow)?;
-        if end > self.rows as u64 {
+        if end > source.rows as u64 {
             return Err(invalid(
                 "rows",
                 "the requested block exceeds the executed frontier",
@@ -1135,7 +1633,7 @@ impl PagedSequence {
                 available_bytes: 0,
             })?;
         for position in first..end {
-            let row = self.row(layer, position)?;
+            let row = self.row_in(source, layer, position)?;
             keys.extend_from_slice(row.key);
             values.extend_from_slice(row.value);
         }
@@ -1143,19 +1641,14 @@ impl PagedSequence {
     }
 
     fn truncate(&mut self, rows: usize) {
-        for layer in 0..self.geometry.layers.len() {
-            // Only the last `capacity` discarded rows have slots of their own;
-            // anything older shares a slot with a row already zeroed here.
-            // Zeroing a slot can clear the bytes of the row `capacity` below
-            // it, which was already overwritten by the row being cleared and so
-            // is below every retained start -- nothing readable is lost.
-            let capacity = self.layout.layers[layer].capacity;
-            for row in rows.max(self.rows.saturating_sub(capacity))..self.rows {
-                let (key, value) = self.ranges(layer, row);
-                self.backing.bytes_mut()[key].fill(0);
-                self.backing.bytes_mut()[value].fill(0);
-            }
-        }
+        let current = self.rows;
+        truncate_storage(
+            &self.layout,
+            &self.geometry,
+            &mut self.backing,
+            current,
+            rows,
+        );
         self.rows = rows;
     }
 
@@ -1163,6 +1656,15 @@ impl PagedSequence {
     /// synchronous; there is no device work to drain. Wrong-ledger failure
     /// returns the live sequence so cleanup can be retried.
     pub fn close(mut self, ledger: &mut Ledger) -> std::result::Result<(), Box<PagedCloseRefused>> {
+        if !self.children.is_empty() {
+            return Err(Box::new(PagedCloseRefused {
+                sequence: self,
+                error: invalid(
+                    "branch",
+                    "discard child branches before closing the paged sequence",
+                ),
+            }));
+        }
         if let Err(error) = self.backing.release(ledger) {
             return Err(Box::new(PagedCloseRefused {
                 sequence: self,
@@ -1170,6 +1672,75 @@ impl PagedSequence {
             }));
         }
         Ok(())
+    }
+}
+
+impl<'a> PagedBranch<'a> {
+    pub fn begin(&mut self) -> Result<StateTransactionId> {
+        self.sequence.begin_branch(self.branch)
+    }
+
+    pub fn commit_prefix(&mut self, txn: StateTransactionId, n: u64) -> Result<()> {
+        self.sequence.commit_branch(self.branch, txn, n)
+    }
+
+    pub fn abort(&mut self, txn: StateTransactionId) -> Result<()> {
+        self.sequence.abort_branch(self.branch, txn)
+    }
+
+    pub fn rollback_to(&mut self, prefix: u64) -> Result<()> {
+        self.sequence.rollback_branch(self.branch, prefix)
+    }
+
+    pub fn append(
+        &mut self,
+        txn: StateTransactionId,
+        position: u64,
+        layers: &[KvRow<'_>],
+        cancelled: &AtomicBool,
+    ) -> Result<()> {
+        self.sequence
+            .append_child(self.branch, txn, position, layers, cancelled)
+    }
+
+    pub fn retained_range(&self, layer: usize) -> Result<std::ops::Range<u64>> {
+        if layer >= self.sequence.geometry.layers.len() {
+            return Err(invalid("kv_row", "layer is outside this sequence"));
+        }
+        let child = self.sequence.child_storage(self.branch)?;
+        Ok(self
+            .sequence
+            .retained_start_for(layer, child.rows, child.high_water)
+            .max(child.retained_from[layer]) as u64..child.rows as u64)
+    }
+
+    pub fn usage(&self) -> Result<PagedUsage> {
+        let child = self.sequence.child_storage(self.branch)?;
+        Ok(self
+            .sequence
+            .usage_for_branch(child.rows, child.high_water, Some(&child.retained_from)))
+    }
+
+    pub fn row(&self, layer: usize, position: u64) -> Result<KvRow<'_>> {
+        let child = self.sequence.child_storage(self.branch)?;
+        let source = PagedRead {
+            backing: &child.backing,
+            rows: child.rows,
+            high_water: child.high_water,
+            retained_from: Some(&child.retained_from),
+        };
+        self.sequence.row_in(&source, layer, position)
+    }
+
+    pub fn read_block(&self, layer: usize, first: u64, rows: u64) -> Result<(Vec<u8>, Vec<u8>)> {
+        let child = self.sequence.child_storage(self.branch)?;
+        let source = PagedRead {
+            backing: &child.backing,
+            rows: child.rows,
+            high_water: child.high_water,
+            retained_from: Some(&child.retained_from),
+        };
+        self.sequence.read_block_in(&source, layer, first, rows)
     }
 }
 
@@ -1202,6 +1773,246 @@ mod tests {
         fn publish_view(&mut self, _layer: usize, _view: PageView) -> Result<()> {
             Ok(())
         }
+    }
+
+    fn fork_ledger() -> Ledger {
+        Ledger::new([CapacitySnapshot::new(Scope::Host, 1 << 20, 1 << 14).unwrap()]).unwrap()
+    }
+
+    fn append_test_row(
+        sequence: &mut PagedSequence,
+        txn: StateTransactionId,
+        position: u64,
+        seed: u8,
+    ) {
+        let key = [seed, seed.wrapping_add(1)];
+        let value = [seed.wrapping_add(2), seed.wrapping_add(3)];
+        sequence
+            .append(
+                txn,
+                position,
+                &[KvRow {
+                    key: &key,
+                    value: &value,
+                }],
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn eager_fork_isolates_parent_bytes_across_child_divergence_and_releases_child() {
+        let geometry = KvGeometry::uniform(1, 1, 1, 1, Precision::Bf16, 2, 16);
+        let mut ledger = fork_ledger();
+        let mut sequence = PagedSequence::new(&mut ledger, geometry).unwrap();
+        sequence.append_prompt(4).unwrap();
+        let txn = sequence.begin().unwrap();
+        for position in 0..4 {
+            append_test_row(&mut sequence, txn, position, 10 + position as u8);
+        }
+        sequence.commit_prefix(txn, 0).unwrap();
+
+        let parent_before: Vec<_> = (0..4)
+            .map(|position| {
+                let row = sequence.row(0, position).unwrap();
+                (row.key.to_vec(), row.value.to_vec())
+            })
+            .collect();
+        let frontiers_before = sequence.state.frontiers(ROOT).unwrap();
+        let lineage_before = sequence.state.branches[&ROOT].lineage.clone();
+        assert!(matches!(
+            sequence.fork(&mut ledger, 5),
+            Err(Error::InvalidRequest { field: "at", .. })
+        ));
+        let charge_before = ledger.scope_committed(Scope::Host);
+        let usage = sequence.usage();
+        let branch_control = sequence.branch_control_bytes().unwrap();
+        let branch = sequence.fork(&mut ledger, 4).unwrap();
+        assert_eq!(
+            ledger.scope_committed(Scope::Host),
+            charge_before + (usage.backing_bytes + branch_control) as u64
+        );
+
+        {
+            let child = sequence.branch(branch).unwrap();
+            let child_prefix: Vec<_> = (0..4)
+                .map(|position| {
+                    let row = child.row(0, position).unwrap();
+                    (row.key.to_vec(), row.value.to_vec())
+                })
+                .collect();
+            assert_eq!(child_prefix, parent_before);
+        }
+
+        {
+            let mut child = sequence.branch(branch).unwrap();
+            let txn = child.begin().unwrap();
+            let key = [90, 91];
+            let value = [92, 93];
+            child
+                .append(
+                    txn,
+                    4,
+                    &[KvRow {
+                        key: &key,
+                        value: &value,
+                    }],
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            child.commit_prefix(txn, 0).unwrap();
+            assert_eq!(child.row(0, 4).unwrap().key, &key);
+
+            // Truncate the first child continuation, then diverge from the
+            // same committed prefix with different physical bytes.
+            child.rollback_to(4).unwrap();
+            let txn = child.begin().unwrap();
+            let key = [120, 121];
+            let value = [122, 123];
+            child
+                .append(
+                    txn,
+                    4,
+                    &[KvRow {
+                        key: &key,
+                        value: &value,
+                    }],
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            child.commit_prefix(txn, 0).unwrap();
+            assert_eq!(child.row(0, 4).unwrap().key, &key);
+
+            let child_prefix: Vec<_> = (0..4)
+                .map(|position| {
+                    let row = child.row(0, position).unwrap();
+                    (row.key.to_vec(), row.value.to_vec())
+                })
+                .collect();
+            assert_eq!(child_prefix, parent_before);
+        }
+
+        let parent_after_child: Vec<_> = (0..4)
+            .map(|position| {
+                let row = sequence.row(0, position).unwrap();
+                (row.key.to_vec(), row.value.to_vec())
+            })
+            .collect();
+        assert_eq!(parent_after_child, parent_before);
+        assert_eq!(sequence.state.frontiers(ROOT).unwrap(), frontiers_before);
+        assert_eq!(sequence.state.branches[&ROOT].lineage, lineage_before);
+
+        // The root may continue independently after the child diverges.
+        let txn = sequence.begin().unwrap();
+        append_test_row(&mut sequence, txn, 4, 200);
+        sequence.commit_prefix(txn, 0).unwrap();
+        let parent_prefix_after_continue: Vec<_> = (0..4)
+            .map(|position| {
+                let row = sequence.row(0, position).unwrap();
+                (row.key.to_vec(), row.value.to_vec())
+            })
+            .collect();
+        assert_eq!(parent_prefix_after_continue, parent_before);
+        assert_eq!(
+            sequence.state.branches[&ROOT].lineage[..=4],
+            lineage_before[..=4]
+        );
+
+        sequence.discard_branch(&mut ledger, branch).unwrap();
+        assert_eq!(ledger.scope_committed(Scope::Host), charge_before);
+        assert_eq!(sequence.state.branch_ids(), vec![ROOT]);
+        sequence.close(&mut ledger).unwrap();
+        assert!(ledger.outstanding().is_empty());
+    }
+
+    #[test]
+    fn fork_refuses_a_reclaimed_window_but_accepts_its_retained_boundary() {
+        let geometry = KvGeometry {
+            layers: vec![LayerKv {
+                kv_heads: 1,
+                key_dim: 1,
+                value_dim: 1,
+                retention: Retention::Window { window: 2 },
+            }],
+            precision: Precision::Bf16,
+            page_tokens: 2,
+            max_tokens: 8,
+            tentative_rows: 2,
+        };
+        let mut ledger = fork_ledger();
+        let mut sequence = PagedSequence::new(&mut ledger, geometry).unwrap();
+        sequence.append_prompt(8).unwrap();
+        for start in (0..8).step_by(2) {
+            let txn = sequence.begin().unwrap();
+            append_test_row(&mut sequence, txn, start, start as u8);
+            append_test_row(&mut sequence, txn, start + 1, start as u8 + 1);
+            sequence.commit_prefix(txn, 0).unwrap();
+        }
+        assert_eq!(sequence.retained_range(0).unwrap().start, 6);
+        assert!(matches!(
+            sequence.fork(&mut ledger, 5),
+            Err(Error::Reclaimed { .. })
+        ));
+        let branch = sequence.fork(&mut ledger, 8).unwrap();
+        {
+            let child = sequence.branch(branch).unwrap();
+            assert_eq!(child.retained_range(0).unwrap(), 6..8);
+            assert_eq!(child.row(0, 6).unwrap().key, &[6, 7]);
+            assert!(matches!(child.row(0, 5), Err(Error::Reclaimed { .. })));
+        }
+        sequence.discard_branch(&mut ledger, branch).unwrap();
+        sequence.close(&mut ledger).unwrap();
+        assert!(ledger.outstanding().is_empty());
+    }
+
+    #[test]
+    fn injected_mid_fork_failure_restores_parent_bytes_state_and_charge() {
+        let geometry = KvGeometry::uniform(1, 1, 1, 1, Precision::Bf16, 2, 16);
+        let mut ledger = fork_ledger();
+        let mut sequence = PagedSequence::new(&mut ledger, geometry).unwrap();
+        sequence.append_prompt(4).unwrap();
+        let txn = sequence.begin().unwrap();
+        for position in 0..4 {
+            append_test_row(&mut sequence, txn, position, 30 + position as u8);
+        }
+        sequence.commit_prefix(txn, 0).unwrap();
+        let parent_before: Vec<_> = (0..4)
+            .map(|position| {
+                let row = sequence.row(0, position).unwrap();
+                (row.key.to_vec(), row.value.to_vec())
+            })
+            .collect();
+        let frontiers_before = sequence.state.frontiers(ROOT).unwrap();
+        let lineage_before = sequence.state.branches[&ROOT].lineage.clone();
+        let charge_before = ledger.scope_committed(Scope::Host);
+        let mut boundary = 0;
+        let result = sequence.fork_checked(&mut ledger, 4, || {
+            let fail = boundary == 3;
+            boundary += 1;
+            if fail {
+                Err(Error::Cancelled {
+                    at: "injected post-logical-fork cleanup",
+                })
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(boundary, 4);
+        assert!(sequence.children.is_empty());
+        assert_eq!(sequence.state.branch_ids(), vec![ROOT]);
+        assert_eq!(ledger.scope_committed(Scope::Host), charge_before);
+        assert_eq!(sequence.state.frontiers(ROOT).unwrap(), frontiers_before);
+        assert_eq!(sequence.state.branches[&ROOT].lineage, lineage_before);
+        let parent_after: Vec<_> = (0..4)
+            .map(|position| {
+                let row = sequence.row(0, position).unwrap();
+                (row.key.to_vec(), row.value.to_vec())
+            })
+            .collect();
+        assert_eq!(parent_after, parent_before);
+        sequence.close(&mut ledger).unwrap();
+        assert!(ledger.outstanding().is_empty());
     }
 
     #[test]
