@@ -1,9 +1,12 @@
 # Task 0038 — M4.1b the state authority owns the device pages, and the graph reaches them
 
-Status: closure candidate, not accepted. Opened 2026-09-19 after task 0037's
-kernel and binding were qualified and twice reviewed. Both bounded deliverables
-are implemented. The lifecycle, selected-plan and 32K device gates pass on both
-SM86 GPUs and SM120; final acceptance remains the repository owner's.
+**Status: accepted and closed** (owner, 2026-09-20). Opened 2026-09-19 after
+task 0037's kernel and binding were qualified and twice reviewed. Both bounded
+deliverables landed, and the two items moved from task 0037 (the mutation
+battery and the measured-allocator lane) are met: 11 of 11 mutations caught,
+32 decode steps bounded and a deliberate leak caught. The lifecycle,
+selected-plan and 32K device gates pass on both SM86 GPUs and SM120. This
+closes M4.1 (roadmap deliverable 1 of 5); M4.2 through M4.5 remain unstarted.
 
 ## Identity and authority
 
@@ -408,5 +411,5 @@ the retained output and bounded lineage/page-table metadata. The declared
 metadata bound is 544 B. The battery's deliberate 1 MiB-per-step leak is caught
 by this lane.
 
-All eight acceptance criteria are implemented. Task 0038 remains a closure
-candidate pending owner acceptance; this record does not confer that acceptance.
+All eight acceptance criteria are implemented and evidenced above. **Accepted,
+2026-09-20 (owner).** This closes task 0038 and M4.1.
