@@ -1,6 +1,22 @@
 # Task 0051 — M4 closure: 100k/200k/1m admission and positional-capability report
 
-Status: proposed
+Status: **accepted** (owner, 2026-09-22). Built
+by Codex `luna`, independently reviewed by Codex `sol` across two rounds.
+Round 1's every raw input (measured VRAM, per-row byte cost, layer-count
+assumption) was confirmed correct on first read, and the positional check
+was accepted clean from round 1 — but round 1 found a real arithmetic-
+composition defect: the report treated the qualified N=3 host-backed
+streaming bound as additive on top of a much larger device-resident
+capacity, when the accepted task 0043 contract actually qualifies them as
+**alternative** geometries (host-backed streaming requires exactly one
+resident page, not an arbitrary large resident budget plus streaming on
+top) — the same non-composability task 0043's own review round already
+established, now caught again in a report rather than code. Tier
+classifications were unaffected, but every stated margin was wrong.
+Repaired using pure resident-only capacity with the streaming total
+reported separately and explicitly labeled non-additive; re-review
+independently recomputed every figure from source and confirmed no stale
+numbers or wording survived anywhere across the four updated documents.
 
 ## Identity and authority
 
@@ -38,16 +54,18 @@ Status: proposed
   `3` (`crates/moxie-memory/src/report.rs:84`) — the only qualified
   host-backed streaming bound, proven at that exact value by tasks
   0041–0043. With the 32K gate's own geometry (`page_tokens: 256`), that
-  bound admits at most 768 rows beyond whatever fits device-resident —
-  nowhere close to bridging real single-GPU VRAM capacity
+  bound admits exactly one resident page plus three staged pages, or 1,024
+  total rows. It is an alternative qualified geometry, not 768 rows added to
+  an arbitrary resident-only budget, and is nowhere close to bridging real
+  single-GPU VRAM capacity
   (`docs/evidence/hardware-inventory.md`: aggregate **62.6 GiB** across
   three GPUs, no TP/multi-GPU partitioning exists yet — M5, unstarted — so
   a single active generation is bound by one GPU's VRAM, not the
   aggregate) up to 100k, 200k or 1m tokens for any realistic per-token KV
-  byte cost. If the arithmetic below confirms this, the correct Result is
-  "100k/200k/1m are blocked, by this exact margin, pending N-block
-  generalization beyond the qualified N=3" — not a strained attempt to
-  make a larger tier appear reachable.
+  byte cost. The arithmetic below must report each tier as reached, partial,
+  or blocked by its exact margin; a blocked result is pending a separately
+  qualified geometry/generalization, not a strained attempt to make a larger
+  tier appear reachable.
 - Required documents: M4's full exit-gate text (quoted above), R04/R18/R19/
   R21 (`docs/spec/08-strata-reference-map.md:35,119,125,137`).
 - Required source reading: `docs/evidence/hardware-inventory.md` (actual
@@ -75,8 +93,9 @@ Status: proposed
      compute: (a) how many actual tokens fit device-resident-only within
      one GPU's actual measured VRAM headroom (not total VRAM — leave
      realistic headroom for weights/activations/workspace, name the
-     assumption), (b) how many additional tokens the qualified N=3
-     host-backed streaming bound adds on top of that, (c) whether 100k,
+     assumption), (b) the qualified host-backed total separately (1,024
+     rows: one resident page plus three staged pages, not added to the
+     resident-only budget), (c) whether 100k,
      200k and 1m are each reached, partially reached, or blocked by that
      arithmetic, with the exact numeric margin. This is arithmetic over
      already-published facts (hardware inventory, task 0042/0043's
@@ -174,11 +193,42 @@ Status: proposed
 
 ## Result, filled after work
 
-- Changed shared owners and consumers; source commit:
+- Changed shared owners and consumers; source commit: no production owner or
+  consumer changed. Added the host-only positional regression in
+  `crates/moxie-oracles/src/rope.rs` and published
+  [evidence/0051-m4-large-tier-admission-and-positional-report.md](../evidence/0051-m4-large-tier-admission-and-positional-report.md),
+  the support-matrix row and this ledger update. Source tree starts at
+  accepted task-0050 commit `c3bdc8d`; no checkpoint weights were read.
 - Commands and result IDs; passed / failed / skipped separately:
-- Measured effect and uncertainty:
-- Deleted/replaced paths:
-- Remaining blockers and next bounded task:
+  - `cargo test -p moxie-oracles --lib rope::tests::large_tier_positions_match_fp64_and_absolute_masking --locked -- --nocapture` — **passed**, 1/1; all three positional rows are within `gamma(4)`.
+  - `cargo test --workspace --locked --offline` — **passed**, all workspace suites and doc tests.
+  - `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` — **passed**.
+  - `cargo clippy --workspace --all-targets --locked --offline --features moxie-executor/driver -- -D warnings` — **passed**.
+  - `cargo xtask arch-check` — **passed**, 79 rejected and 21 accepted fixtures, 13 rules.
+  - `cargo xtask spec-check` — **passed**, all 10 normative documents unchanged.
+  - `cargo fmt --all -- --check` and `git diff --check` — **passed**.
+  - No final command failed or was skipped; no GPU command was required or run.
+- Measured effect and uncertainty: with a 2,048 MiB explicit non-KV reserve,
+  the 32K synthetic geometry costs 1,024 B/row/layer. The direct one-layer
+  fixture arithmetic reaches all three numeric tiers, but is not model support.
+  In the separate 78-layer metadata accounting scenario, 100k is reached on
+  both measured GPU classes, 200k is partial across hardware (3090 reaches;
+  5060 Ti resident-only capacity is short by 18,372 rows),
+  and 1m is blocked by 818,372 rows on the 5060 Ti and 710,195 on the 3090.
+  The qualified host-backed path is an alternative exactly 1,024-row
+  geometry (one resident page plus three staged pages); it is not added to
+  the larger resident-only envelope and therefore contributes no tier-margin
+  rows here.
+  Existing positional/masking/oracle arithmetic passes at positions 99,999,
+  199,999 and 999,999 with normalized maxima `5.882e-8`, `6.213e-8` and
+  `6.072e-8`, against predeclared `gamma(4) = 2.384186359449949e-7`.
+  These are arithmetic and host-oracle results only, not execution or
+  performance evidence.
+- Deleted/replaced paths: none.
+- Remaining blockers and next bounded task: owner acceptance of this report is
+  required before any M4 closure statement. N-block generalization beyond 3,
+  real model-level KV geometry/admission, and executed 100k/200k/1m tiers are
+  separate future tasks. This record does not declare M4 closed.
 
 Do not fill acceptance with "M4 is done" or "long context supported" for any
 tier this task finds blocked or partially reached. This task's Result,

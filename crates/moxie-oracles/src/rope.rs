@@ -223,6 +223,70 @@ mod tests {
     }
 
     #[test]
+    fn large_tier_positions_match_fp64_and_absolute_masking() {
+        let d = 64usize;
+        let x: Vec<f32> = (0..d)
+            .map(|i| ((i * 19 % 47) as f32 - 23.0) / 6.0)
+            .collect();
+        for (tier, pos) in [
+            (100_000u64, 99_999),
+            (200_000, 199_999),
+            (1_000_000, 999_999),
+        ] {
+            let got = rope_interleaved(&x, pos, 10_000.0, d).unwrap();
+            let want = rope_head_f64(&x, pos, 10_000.0, d);
+            let scale: Vec<f64> = (0..d)
+                .map(|i| {
+                    let pair = i / 2 * 2;
+                    (x[pair] as f64).abs() + (x[pair + 1] as f64).abs()
+                })
+                .collect();
+            let summary = ErrorSummary::normalized(&got, &want, &scale);
+            assert!(got.iter().all(|value| value.is_finite()), "tier {tier}");
+            assert!(
+                summary.within(gamma(4)),
+                "tier {tier}, pos {pos}: {summary}"
+            );
+
+            let mask = crate::mask::chunk_mask(
+                crate::mask::Chunk { start: pos, len: 1 },
+                pos + 1,
+                crate::mask::Visibility::Causal,
+            )
+            .unwrap();
+            assert!(
+                mask[0][0] && mask[0][pos as usize],
+                "tier {tier}, pos {pos}"
+            );
+            assert_eq!(crate::mask::page_of(pos, 256), pos / 256);
+
+            let mut history = crate::attention::KvHistory::try_with_base(pos - 2, 3).unwrap();
+            history
+                .append(pos - 2, vec![1.0, 0.0], vec![100.0, 0.0])
+                .unwrap();
+            history
+                .append(pos - 1, vec![1.0, 0.0], vec![2.0, 0.0])
+                .unwrap();
+            history.append(pos, vec![1.0, 0.0], vec![4.0, 0.0]).unwrap();
+            let attended = crate::attention::attend_multi_head(
+                &[1.0, 0.0],
+                &history,
+                pos,
+                crate::attention::Heads {
+                    query: 1,
+                    key_value: 1,
+                    head_dim: 2,
+                    scale: 1.0,
+                },
+                crate::mask::Visibility::SlidingWindow { window: 2 },
+            )
+            .unwrap();
+            assert_eq!(attended, vec![3.0, 0.0], "tier {tier}, pos {pos}");
+            println!("tier {tier} pos {pos}: {summary}");
+        }
+    }
+
+    #[test]
     fn position_zero_is_the_identity() {
         // theta = 0 for every j, so cos = 1 and sin = 0 exactly.
         let x: Vec<f32> = (0..16).map(|i| i as f32 - 8.0).collect();
