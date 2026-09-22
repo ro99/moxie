@@ -1089,9 +1089,9 @@ pub mod device {
         BufferRequest, Ledger, LedgerId, PlanRequest, Rejection, Reservation, StageSpan,
     };
     #[cfg(feature = "paged-attention-binding")]
-    use moxie_state::DeviceKvSequence;
+    use moxie_state::{DeviceBranch, DeviceKvSequence};
     #[cfg(feature = "paged-attention-binding")]
-    use moxie_types::{BatchId, PageView, PagedKvWriter};
+    use moxie_types::{BatchId, BranchId, PageView, PagedKvWriter};
     use moxie_types::{
         DeviceTier, DimError, Error, HostTier, PagePlacement, Result, Scope,
         SemanticKernelDescriptor, Tier,
@@ -1360,6 +1360,8 @@ pub mod device {
         partial_symbol: Option<usize>,
         #[cfg(feature = "paged-attention-test-hooks")]
         staging_failure_after: Option<u64>,
+        #[cfg(feature = "paged-attention-test-hooks")]
+        branch_copy_failure_after: Option<u64>,
     }
 
     impl<'ctx> PagedAttentionRun<'ctx> {
@@ -1778,6 +1780,8 @@ pub mod device {
                 partial_symbol,
                 #[cfg(feature = "paged-attention-test-hooks")]
                 staging_failure_after: None,
+                #[cfg(feature = "paged-attention-test-hooks")]
+                branch_copy_failure_after: None,
             })
         }
 
@@ -1827,6 +1831,14 @@ pub mod device {
         #[cfg(feature = "paged-attention-test-hooks")]
         pub fn inject_staging_failure_after(&mut self, successful_blocks: u64) {
             self.staging_failure_after = Some(successful_blocks);
+        }
+
+        /// Cause an eager child copy to fail after this many physical pages
+        /// have completed. The callback is invoked after the logical state
+        /// fork, so this exercises cleanup of a real partial child.
+        #[cfg(feature = "paged-attention-test-hooks")]
+        pub fn inject_branch_copy_failure_after(&mut self, successful_pages: u64) {
+            self.branch_copy_failure_after = Some(successful_pages);
         }
 
         /// Publish the logical-to-physical page mapping this run will use.
@@ -2025,6 +2037,133 @@ pub mod device {
             self.held = None;
             self.page_table = table;
             self.page_table_base = base;
+            Ok(())
+        }
+
+        /// Eagerly copy one parent's complete admitted page storage into this
+        /// child run. The state authority has already created the child and
+        /// supplied its page view through [`PagedKvWriter::copy_branch`]; this
+        /// method only performs the device effect and records the copied
+        /// frontier.
+        #[cfg(feature = "paged-attention-binding")]
+        pub(crate) fn copy_branch_from(
+            &mut self,
+            stream: &Stream<'ctx>,
+            source: &Self,
+            view: PageView,
+            rows: u64,
+        ) -> Result<()> {
+            if self.quarantined || source.quarantined {
+                return Err(invalid("run", "a branch copy names a quarantined run"));
+            }
+            self.same_device(stream)?;
+            source.same_device(stream)?;
+            if self.geometry != source.geometry
+                || self.heads != source.heads
+                || self.max_rows != source.max_rows
+            {
+                return Err(invalid(
+                    "branch",
+                    "parent and child runs do not have identical admitted geometry",
+                ));
+            }
+            if rows == 0 {
+                return Ok(());
+            }
+            if rows > source.written {
+                return Err(invalid(
+                    "rows",
+                    "the parent run has not observed the fork prefix copied",
+                ));
+            }
+            if self.written != 0 || !self.page_table.is_empty() {
+                return Err(invalid(
+                    "branch",
+                    "the child run already contains published device state",
+                ));
+            }
+            if view.base != source.page_table_base
+                || view.table.is_empty()
+                || view.table.len() > source.page_table.len()
+                || source.page_table[..view.table.len()] != view.table
+            {
+                return Err(invalid(
+                    "page_table",
+                    "the child fork view does not match the parent's published mapping",
+                ));
+            }
+            let page_bytes = self.geometry.page_bytes()?;
+            for physical_page in 0..self.geometry.pages {
+                let within = physical_page
+                    .checked_mul(page_bytes)
+                    .ok_or(Error::Dim(DimError::Overflow))?;
+                let copied = (|| -> Result<()> {
+                    let target_keys = self.keys.as_ref().expect("live child key range");
+                    let source_keys = source.keys.as_ref().expect("live parent key range");
+                    // SAFETY: both runs retain their ranges through the
+                    // synchronous settle below, and the arena method checks
+                    // both extents and the device identity.
+                    unsafe {
+                        target_keys.copy_from_device_async_at(
+                            within,
+                            source_keys,
+                            within,
+                            page_bytes,
+                            stream,
+                        )?
+                    };
+                    let target_values = self.values.as_ref().expect("live child value range");
+                    let source_values = source.values.as_ref().expect("live parent value range");
+                    // SAFETY: as for the key page above.
+                    unsafe {
+                        target_values.copy_from_device_async_at(
+                            within,
+                            source_values,
+                            within,
+                            page_bytes,
+                            stream,
+                        )
+                    }
+                })();
+                if let Err(error) = copied {
+                    self.quarantined = true;
+                    return Err(self.attribute(error));
+                }
+                self.settle(Ok(()), stream)?;
+                #[cfg(feature = "paged-attention-test-hooks")]
+                if let Some(remaining) = self.branch_copy_failure_after {
+                    if remaining <= 1 {
+                        self.branch_copy_failure_after = None;
+                        return Err(Error::Cancelled {
+                            at: "injected device branch copy",
+                        });
+                    }
+                    self.branch_copy_failure_after = Some(remaining - 1);
+                }
+            }
+
+            let table_bytes = view
+                .table
+                .len()
+                .checked_mul(core::mem::size_of::<u32>())
+                .ok_or(Error::Dim(DimError::Overflow))?;
+            let source_table = source.table.as_ref().expect("live parent table range");
+            let target_table = self.table.as_ref().expect("live child table range");
+            // SAFETY: the table extent is checked by the arena wrapper and the
+            // source table contains the same entries validated above.
+            unsafe {
+                target_table.copy_from_device_async_at(
+                    0,
+                    source_table,
+                    0,
+                    table_bytes as u64,
+                    stream,
+                )?
+            };
+            self.settle(Ok(()), stream)?;
+            self.page_table = view.table;
+            self.page_table_base = view.base;
+            self.written = rows;
             Ok(())
         }
 
@@ -3905,6 +4044,7 @@ pub mod device {
         keys: Vec<u8>,
         values: Vec<u8>,
         retained: bool,
+        source: Option<&'run PagedAttentionRun<'ctx>>,
     }
 
     #[cfg(feature = "paged-attention-binding")]
@@ -3923,6 +4063,24 @@ pub mod device {
                 keys,
                 values,
                 retained: false,
+                source: None,
+            }
+        }
+
+        fn for_branch(
+            layer: usize,
+            source: &'run PagedAttentionRun<'ctx>,
+            run: &'run mut PagedAttentionRun<'ctx>,
+            stream: &'run Stream<'ctx>,
+        ) -> Self {
+            Self {
+                layer,
+                run,
+                stream,
+                keys: Vec::new(),
+                values: Vec::new(),
+                retained: false,
+                source: Some(source),
             }
         }
 
@@ -3973,6 +4131,27 @@ pub mod device {
         fn publish_view(&mut self, layer: usize, view: PageView) -> moxie_types::Result<()> {
             self.publish(layer, view)
         }
+
+        fn copy_branch(
+            &mut self,
+            layer: usize,
+            view: PageView,
+            rows: u64,
+        ) -> moxie_types::Result<()> {
+            if layer != self.layer {
+                return Err(invalid_fmt(
+                    "layer",
+                    format_args!("this writer serves layer {}, not {layer}", self.layer),
+                ));
+            }
+            let source = self.source.ok_or_else(|| {
+                invalid(
+                    "branch",
+                    "this writer was not constructed for a device branch copy",
+                )
+            })?;
+            self.run.copy_branch_from(self.stream, source, view, rows)
+        }
     }
 
     /// Refused authority-driven append. `source` is present only when no
@@ -4013,6 +4192,65 @@ pub mod device {
                     .map(|(keys, values)| PagedKvRows { keys, values }),
             }),
         }
+    }
+
+    /// Fork one layer through the existing state-to-executor writer callback.
+    /// The child run is allocated by the caller and is closed by the caller if
+    /// the post-logical-fork copy refuses.
+    #[cfg(feature = "paged-attention-binding")]
+    pub fn fork_paged_layer<'ctx>(
+        state: &mut DeviceKvSequence,
+        at: u64,
+        parent: &PagedAttentionRun<'ctx>,
+        child: &mut PagedAttentionRun<'ctx>,
+        stream: &Stream<'ctx>,
+    ) -> Result<BranchId> {
+        if state.layer_count()? != 1 {
+            return Err(invalid(
+                "layers",
+                "single-layer device fork requires a one-layer state authority",
+            ));
+        }
+        let mut writer = PagedKvWriterAdapter::for_branch(0, parent, child, stream);
+        state.fork(at, &mut [&mut writer])
+    }
+
+    /// Append one layer on a child branch through the same writer callback as
+    /// the root path.
+    #[cfg(feature = "paged-attention-binding")]
+    #[allow(clippy::result_large_err)]
+    pub fn append_paged_branch<'ctx>(
+        branch: &mut DeviceBranch<'_>,
+        txn: moxie_types::StateTransactionId,
+        layer: usize,
+        count: u64,
+        run: &mut PagedAttentionRun<'ctx>,
+        stream: &Stream<'ctx>,
+        source: PagedKvRows,
+    ) -> std::result::Result<(), PagedStateAppendRefused> {
+        let mut writer = PagedKvWriterAdapter::new(layer, run, stream, source.keys, source.values);
+        match branch.append_layer(txn, layer, count, &mut writer) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(PagedStateAppendRefused {
+                error,
+                source: writer
+                    .into_rows()
+                    .map(|(keys, values)| PagedKvRows { keys, values }),
+            }),
+        }
+    }
+
+    /// Commit one child branch and publish any retained-page transition.
+    #[cfg(feature = "paged-attention-binding")]
+    pub fn commit_paged_branch<'ctx>(
+        branch: &mut DeviceBranch<'_>,
+        txn: moxie_types::StateTransactionId,
+        accept: u64,
+        run: &mut PagedAttentionRun<'ctx>,
+        stream: &Stream<'ctx>,
+    ) -> Result<()> {
+        let mut writer = PagedKvWriterAdapter::new(0, run, stream, Vec::new(), Vec::new());
+        branch.commit(txn, accept, &mut [&mut writer])
     }
 
     /// Commit a completed batch and publish page-table transitions through the

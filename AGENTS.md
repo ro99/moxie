@@ -60,9 +60,20 @@ out of scope by design, not gaps. **M4.4 is active:** [task
 paged KV — eager copy, parent/child byte-level isolation proven, including a
 genuine post-logical-fork injected-failure unwind (round 1 caught two proof
 gaps where the production mechanism was already correct but the tests
-didn't prove it). Device-side COW and recurrent/convolution/index-state
-snapshot/replay (document 04's other named M4.4 obligation) remain separate,
-unopened follow-ups. **M4.5 remains unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
+didn't prove it). [Task 0045](docs/tasks/0045-m4-device-cow-fork.md) **accepted** (owner,
+2026-09-21): the same fork/isolation contract for device-resident KV, on
+both SM86 GPUs and SM120, eager copy through `PagedKvWriter`'s new additive
+`copy_branch` default. Three review rounds — round 1 caught the
+implementation silently permitting N simultaneous device children against
+the task's own single-child scope, plus two proof gaps; round 2's repair
+closed those but its own review then caught a subtler gap (no assertion
+could detect `DeviceKvSequence`'s internal branch map staying stale after
+cleanup, since every check inspected `SequenceState` instead); round 3
+closed it by requiring a post-fault retry fork to actually succeed — the
+only way to observe the internal map was genuinely cleaned. Recurrent/
+convolution/index-state snapshot/replay (document 04's other named M4.4
+obligation) and N-branch generalization remain separate, unopened work.
+**M4.5 remains unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
 path are explicitly out of M4.2's scope and are not opened by its acceptance.
 The [M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md)
 tracks this milestone's obligations.

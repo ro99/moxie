@@ -80,6 +80,12 @@ unsafe extern "C" {
     pub fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult;
     pub fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, byte_count: usize) -> CUresult;
     pub fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CUdeviceptr, byte_count: usize) -> CUresult;
+    pub fn cuMemcpyDtoDAsync_v2(
+        dst: CUdeviceptr,
+        src: CUdeviceptr,
+        byte_count: usize,
+        stream: CUstream,
+    ) -> CUresult;
     pub fn cuMemcpyHtoDAsync_v2(
         dst: CUdeviceptr,
         src: *const c_void,

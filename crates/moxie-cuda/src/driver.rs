@@ -712,6 +712,85 @@ impl<'ctx> DeviceBuffer<'ctx> {
         )
     }
 
+    /// Enqueue a device-to-device copy between allocations on the same GPU.
+    ///
+    /// # Safety
+    /// Both allocations and the stream must remain valid until the copy is
+    /// observed complete by the caller. The typed lifetimes bind the context;
+    /// the device identity checks below bind the actual GPU.
+    pub unsafe fn copy_from_device_async_at(
+        &self,
+        offset: usize,
+        source: &DeviceBuffer<'ctx>,
+        source_offset: usize,
+        byte_count: usize,
+        stream: &Stream<'ctx>,
+    ) -> Result<()> {
+        let destination_end =
+            offset
+                .checked_add(byte_count)
+                .ok_or_else(|| Error::InvalidRequest {
+                    field: "dst",
+                    detail: "copy range overflowed".into(),
+                })?;
+        if destination_end > self.len {
+            return Err(Error::InvalidRequest {
+                field: "dst",
+                detail: format!(
+                    "{byte_count} bytes at offset {offset} into a {}-byte buffer",
+                    self.len
+                ),
+            });
+        }
+        let source_end =
+            source_offset
+                .checked_add(byte_count)
+                .ok_or_else(|| Error::InvalidRequest {
+                    field: "src",
+                    detail: "copy range overflowed".into(),
+                })?;
+        if source_end > source.len {
+            return Err(Error::InvalidRequest {
+                field: "src",
+                detail: format!(
+                    "{byte_count} bytes at offset {source_offset} out of a {}-byte buffer",
+                    source.len
+                ),
+            });
+        }
+        if self.device_uuid() != source.device_uuid() || stream.device_uuid() != self.device_uuid()
+        {
+            return Err(Error::InvalidRequest {
+                field: "stream",
+                detail: "device-to-device copy requires one device and its stream".into(),
+            });
+        }
+        if byte_count == 0 {
+            return Ok(());
+        }
+        let destination =
+            self.ptr
+                .checked_add(offset as u64)
+                .ok_or_else(|| Error::InvalidRequest {
+                    field: "dst",
+                    detail: "device address overflowed".into(),
+                })?;
+        let source = source
+            .ptr
+            .checked_add(source_offset as u64)
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "src",
+                detail: "device address overflowed".into(),
+            })?;
+        self.ctx.make_current()?;
+        check(
+            // SAFETY: both ranges, their device identity and the stream were
+            // checked above; the caller owns their lifetime through completion.
+            unsafe { ffi::cuMemcpyDtoDAsync_v2(destination, source, byte_count, stream.raw()) },
+            "cuMemcpyDtoDAsync",
+        )
+    }
+
     pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<()> {
         self.copy_to_host_at(0, dst)
     }

@@ -400,6 +400,63 @@ mod driver_binding {
             }
         }
 
+        /// Enqueue a device-to-device copy between two ranges in one device
+        /// arena context. The operation caller owns both ranges until the
+        /// completion it observes after this copy.
+        #[cfg_attr(not(feature = "paged-attention-binding"), allow(dead_code))]
+        pub(crate) unsafe fn copy_from_device_async_at(
+            &self,
+            within: u64,
+            source: &DeviceRange<'ctx>,
+            source_within: u64,
+            bytes: u64,
+            stream: &Stream<'ctx>,
+        ) -> moxie_types::Result<()> {
+            let end = within
+                .checked_add(bytes)
+                .ok_or_else(|| invalid("destination", "copy extent overflowed"))?;
+            if end > self.bytes() {
+                return Err(invalid("destination", "copy exceeds its admitted range"));
+            }
+            let source_end = source_within
+                .checked_add(bytes)
+                .ok_or_else(|| invalid("source", "copy extent overflowed"))?;
+            if source_end > source.bytes() {
+                return Err(invalid("source", "copy exceeds its admitted range"));
+            }
+            if self.device_uuid() != source.device_uuid()
+                || self.device_uuid() != stream.device_uuid()
+            {
+                return Err(invalid(
+                    "stream",
+                    "device-to-device copy requires one device and its stream",
+                ));
+            }
+            let destination = self
+                .offset()
+                .checked_add(within)
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| invalid("destination", "range offset is not addressable"))?;
+            let source_offset = source
+                .offset()
+                .checked_add(source_within)
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| invalid("source", "range offset is not addressable"))?;
+            let bytes = usize::try_from(bytes)
+                .map_err(|_| invalid("bytes", "copy size is not addressable"))?;
+            // SAFETY: bounds and device identity are checked above; the caller
+            // keeps both ranges and the stream live until completion.
+            unsafe {
+                self.core.buffer.copy_from_device_async_at(
+                    destination,
+                    &source.core.buffer,
+                    source_offset,
+                    bytes,
+                    stream,
+                )
+            }
+        }
+
         /// Read one slice of this range back, at an offset inside it.
         ///
         /// Task 0021 reads a grouped launch's slots back one at a time: the

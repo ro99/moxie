@@ -98,6 +98,7 @@ const CASES: &[&str] = &[
     "paged_attention_host_streaming_n3",
     "paged_attention_32k",
     "paged_attention_state_lifecycle",
+    "paged_attention_device_cow",
 ];
 
 /// Run every GPU case on every visible device.
@@ -246,6 +247,11 @@ pub fn run(profile: Option<&str>) -> i32 {
             &cap,
             "paged_attention_state_lifecycle",
             paged_attention_state_lifecycle(&cap),
+        ));
+        results.push(case(
+            &cap,
+            "paged_attention_device_cow",
+            paged_attention_device_cow(&cap),
         ));
     }
 
@@ -4186,6 +4192,32 @@ fn attend_authority<'ctx>(
     Ok(output)
 }
 
+fn device_state_row_placements(
+    state: &moxie_state::DeviceKvSequence,
+    first: u64,
+    rows: u64,
+) -> Result<Vec<PagePlacement>, Error> {
+    (first
+        ..first
+            .checked_add(rows)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?)
+        .map(|position| state.placement_of(0, position))
+        .collect()
+}
+
+fn device_branch_row_placements(
+    branch: &moxie_state::DeviceBranch<'_>,
+    first: u64,
+    rows: u64,
+) -> Result<Vec<PagePlacement>, Error> {
+    (first
+        ..first
+            .checked_add(rows)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?)
+        .map(|position| branch.placement_of(0, position))
+        .collect()
+}
+
 /// Task 0037 acceptance 3: **32,768 actual BF16 key/value rows**.
 ///
 /// Not an admitted capacity, not a declared maximum and not a short history
@@ -4702,6 +4734,394 @@ fn paged_attention_state_lifecycle(cap: &DeviceCapability) -> Result<Outcome, Er
             "a closed lifecycle run left bytes charged".into(),
         ));
     }
+    Ok(Outcome::Passed)
+}
+
+/// Task 0045: eager device COW fork.
+///
+/// `DeviceKvSequence` creates the child decisions first, then the executor
+/// copies the parent's complete admitted page storage through the existing
+/// writer callback. The proof reads back device bytes before and after child
+/// append/truncate/reappend operations; counters alone are deliberately not
+/// accepted as evidence.
+fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    const FORK_AT: u64 = 8;
+    const PAGE_TOKENS: u64 = 4;
+    const PAGES: u64 = 4;
+    const MAX_ROWS: u64 = PAGE_TOKENS * PAGES;
+    let geometry = PageGeometry {
+        kv_heads: 2,
+        head_dim: 64,
+        page_tokens: PAGE_TOKENS,
+        pages: PAGES,
+    };
+    let heads = 4;
+    let layer = AttentionLayer {
+        geometry,
+        heads,
+        scale: moxie_plan::reciprocal_sqrt_scale(geometry.head_dim),
+        visibility: Visibility::Causal,
+    };
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let stream = Stream::new(&ctx)?;
+    let catalogue = moxie_kernels::paged_attention_catalogue();
+    let probe = PagedAttentionLaunch::new(layer, 1, 0, 0, 1)?;
+    let descriptor = select_paged_attention_kernel(&catalogue, cap, &probe)?;
+    let mut ledger = measured_ledger(&ctx)?;
+    let mut parent = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor.try_clone()?,
+        geometry,
+        heads,
+        1,
+        Staging::Host,
+    )
+    .map_err(|r| r.error)?;
+    let mut state = moxie_state::DeviceKvSequence::new(moxie_state::KvGeometry {
+        layers: vec![moxie_state::LayerKv {
+            kv_heads: geometry.kv_heads as usize,
+            key_dim: geometry.head_dim as usize,
+            value_dim: geometry.head_dim as usize,
+            retention: moxie_state::Retention::All,
+        }],
+        precision: Precision::Bf16,
+        page_tokens: PAGE_TOKENS as usize,
+        max_tokens: MAX_ROWS as usize,
+        tentative_rows: MAX_ROWS as usize,
+    })?;
+    let parent_fixture = AttentionFixture::build(geometry, heads, MAX_ROWS, 0x0045_0001);
+    append_authority_rows(&mut state, &mut parent, &stream, &parent_fixture, FORK_AT)?;
+    let parent_frontier_before_child = state.committed_rows()?;
+    let parent_retained_before_child = state.retained(0)?;
+    let parent_placements = device_state_row_placements(&state, 0, FORK_AT)?;
+    let parent_before = parent.read_rows(&parent_placements)?;
+
+    let mut child = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor.try_clone()?,
+        geometry,
+        heads,
+        1,
+        Staging::Host,
+    )
+    .map_err(|r| r.error)?;
+    let child_id = moxie_executor::paged_attention::device::fork_paged_layer(
+        &mut state, FORK_AT, &parent, &mut child, &stream,
+    )?;
+    let child_before = {
+        let branch = state.branch(child_id)?;
+        let placements = device_branch_row_placements(&branch, 0, FORK_AT)?;
+        child.read_rows(&placements)?
+    };
+    if child_before != parent_before {
+        return Ok(Outcome::Failed(
+            "device fork did not reproduce the parent's inherited bytes".into(),
+        ));
+    }
+
+    // The child gets a different suffix, then truncates and diverges again.
+    // Neither operation may alter the inherited prefix in its own copy.
+    let child_fixture = AttentionFixture::build(geometry, heads, MAX_ROWS, 0x0045_1001);
+    let child_fixture_after_truncate =
+        AttentionFixture::build(geometry, heads, MAX_ROWS, 0x0045_2001);
+    {
+        let mut branch = state.branch(child_id)?;
+        let txn = branch.begin()?;
+        let (keys, values) = child_fixture.payload(FORK_AT, 1);
+        moxie_executor::paged_attention::device::append_paged_branch(
+            &mut branch,
+            txn,
+            0,
+            1,
+            &mut child,
+            &stream,
+            moxie_executor::paged_attention::device::PagedKvRows { keys, values },
+        )
+        .map_err(|refused| refused.error)?;
+        moxie_executor::paged_attention::device::commit_paged_branch(
+            &mut branch,
+            txn,
+            1,
+            &mut child,
+            &stream,
+        )?;
+        branch.truncate(FORK_AT)?;
+        let txn = branch.begin()?;
+        let (keys, values) = child_fixture_after_truncate.payload(FORK_AT, 1);
+        moxie_executor::paged_attention::device::append_paged_branch(
+            &mut branch,
+            txn,
+            0,
+            1,
+            &mut child,
+            &stream,
+            moxie_executor::paged_attention::device::PagedKvRows { keys, values },
+        )
+        .map_err(|refused| refused.error)?;
+        moxie_executor::paged_attention::device::commit_paged_branch(
+            &mut branch,
+            txn,
+            1,
+            &mut child,
+            &stream,
+        )?;
+        let placements = device_branch_row_placements(&branch, 0, FORK_AT)?;
+        if child.read_rows(&placements)? != parent_before {
+            return Ok(Outcome::Failed(
+                "child divergence changed inherited device bytes".into(),
+            ));
+        }
+    }
+    if state.committed_rows()? != parent_frontier_before_child
+        || state.retained(0)? != parent_retained_before_child
+    {
+        return Ok(Outcome::Failed(
+            "child operations changed the parent's frontier or retained range".into(),
+        ));
+    }
+
+    // The parent now writes its own suffix. Read its original prefix again
+    // after the child has diverged, which is the other half of isolation.
+    append_authority_rows(&mut state, &mut parent, &stream, &parent_fixture, 1)?;
+    let parent_after = parent.read_rows(&device_state_row_placements(&state, 0, FORK_AT)?)?;
+    if parent_after != parent_before {
+        return Ok(Outcome::Failed(
+            "child divergence changed the parent's device bytes".into(),
+        ));
+    }
+    let parent_frontier_before_discard = state.committed_rows()?;
+    let parent_retained_before_discard = state.retained(0)?;
+    state.discard_branch(child_id)?;
+    if state.committed_rows()? != parent_frontier_before_discard
+        || state.retained(0)? != parent_retained_before_discard
+    {
+        return Ok(Outcome::Failed(
+            "discarding the child changed the parent's frontier or retained range".into(),
+        ));
+    }
+    child.close(&mut ledger).map_err(|r| r.error)?;
+    let parent_after_discard = parent.read_rows(&parent_placements)?;
+    parent.close(&mut ledger).map_err(|r| r.error)?;
+    if !ledger.outstanding().is_empty() {
+        return Ok(Outcome::Failed(
+            "normal device fork cleanup left bytes charged".into(),
+        ));
+    }
+    if parent_after_discard != parent_before {
+        return Ok(Outcome::Failed(
+            "discarding the child changed the parent's device bytes".into(),
+        ));
+    }
+
+    // A wrapped, windowed parent carries a retained floor into the child. The
+    // child must copy the visible device pages, while a placement below that
+    // floor remains a typed reclaimed-row refusal rather than reading stale
+    // bytes from the copied ring.
+    let window_geometry = PageGeometry {
+        kv_heads: 2,
+        head_dim: 64,
+        page_tokens: PAGE_TOKENS,
+        pages: 3,
+    };
+    let window_layer = AttentionLayer {
+        geometry: window_geometry,
+        heads,
+        scale: moxie_plan::reciprocal_sqrt_scale(window_geometry.head_dim),
+        visibility: Visibility::SlidingWindow { window: 4 },
+    };
+    let window_descriptor = select_paged_attention_kernel(
+        &catalogue,
+        cap,
+        &PagedAttentionLaunch::new(window_layer, 1, 0, 0, 1)?,
+    )?;
+    let mut window_parent = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        window_descriptor.try_clone()?,
+        window_geometry,
+        heads,
+        1,
+        Staging::Host,
+    )
+    .map_err(|r| r.error)?;
+    let mut window_state = moxie_state::DeviceKvSequence::new(moxie_state::KvGeometry {
+        layers: vec![moxie_state::LayerKv {
+            kv_heads: window_geometry.kv_heads as usize,
+            key_dim: window_geometry.head_dim as usize,
+            value_dim: window_geometry.head_dim as usize,
+            retention: moxie_state::Retention::Window { window: 4 },
+        }],
+        precision: Precision::Bf16,
+        page_tokens: PAGE_TOKENS as usize,
+        max_tokens: 16,
+        tentative_rows: 4,
+    })?;
+    let window_fixture = AttentionFixture::build(window_geometry, heads, 16, 0x0045_3001);
+    for _ in 0..3 {
+        append_authority_rows(
+            &mut window_state,
+            &mut window_parent,
+            &stream,
+            &window_fixture,
+            4,
+        )?;
+    }
+    let window_retained = window_state.retained(0)?;
+    if window_retained != (4..12) {
+        return Ok(Outcome::Failed(format!(
+            "windowed device parent retained {window_retained:?}, expected 4..12"
+        )));
+    }
+    let window_before = window_parent.read_rows(&device_state_row_placements(
+        &window_state,
+        window_retained.start,
+        window_retained.end - window_retained.start,
+    )?)?;
+    let mut window_child = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        window_descriptor,
+        window_geometry,
+        heads,
+        1,
+        Staging::Host,
+    )
+    .map_err(|r| r.error)?;
+    let window_child_id = moxie_executor::paged_attention::device::fork_paged_layer(
+        &mut window_state,
+        12,
+        &window_parent,
+        &mut window_child,
+        &stream,
+    )?;
+    {
+        let window_branch = window_state.branch(window_child_id)?;
+        if window_branch.placement_of(0, 0).is_ok() {
+            return Ok(Outcome::Failed(
+                "windowed child exposed a row below the parent's retained floor".into(),
+            ));
+        }
+        let placements = device_branch_row_placements(&window_branch, 4, 8)?;
+        if window_child.read_rows(&placements)? != window_before {
+            return Ok(Outcome::Failed(
+                "windowed child did not reproduce the retained device bytes".into(),
+            ));
+        }
+    }
+    window_state.discard_branch(window_child_id)?;
+    window_child.close(&mut ledger).map_err(|r| r.error)?;
+    window_parent.close(&mut ledger).map_err(|r| r.error)?;
+    if !ledger.outstanding().is_empty() {
+        return Ok(Outcome::Failed(
+            "windowed device fork cleanup left bytes charged".into(),
+        ));
+    }
+
+    // Fault after the first physical page copy. The logical branch has
+    // already been created at this point; a passing cleanup assertion must
+    // therefore cover both SequenceState and the child run's allocation.
+    let mut fault_parent = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor.try_clone()?,
+        geometry,
+        heads,
+        1,
+        Staging::Host,
+    )
+    .map_err(|r| r.error)?;
+    let mut fault_state = moxie_state::DeviceKvSequence::new(moxie_state::KvGeometry {
+        layers: vec![moxie_state::LayerKv {
+            kv_heads: geometry.kv_heads as usize,
+            key_dim: geometry.head_dim as usize,
+            value_dim: geometry.head_dim as usize,
+            retention: moxie_state::Retention::All,
+        }],
+        precision: Precision::Bf16,
+        page_tokens: PAGE_TOKENS as usize,
+        max_tokens: MAX_ROWS as usize,
+        tentative_rows: MAX_ROWS as usize,
+    })?;
+    append_authority_rows(
+        &mut fault_state,
+        &mut fault_parent,
+        &stream,
+        &parent_fixture,
+        PAGE_TOKENS,
+    )?;
+    let fault_placements = device_state_row_placements(&fault_state, 0, PAGE_TOKENS)?;
+    let fault_before = fault_parent.read_rows(&fault_placements)?;
+    let fault_root_frontier = fault_state.committed_rows()?;
+    let fault_root_retained = fault_state.retained(0)?;
+    let parent_charge = ledger.outstanding_count();
+    let mut fault_child = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor,
+        geometry,
+        heads,
+        1,
+        Staging::Host,
+    )
+    .map_err(|r| r.error)?;
+    fault_child.inject_branch_copy_failure_after(1);
+    let fork_error = moxie_executor::paged_attention::device::fork_paged_layer(
+        &mut fault_state,
+        PAGE_TOKENS,
+        &fault_parent,
+        &mut fault_child,
+        &stream,
+    );
+    if fork_error.is_ok() {
+        return Ok(Outcome::Failed(
+            "the injected post-fork device copy did not refuse".into(),
+        ));
+    }
+    if fault_state.state()?.branch_ids() != vec![moxie_state::ROOT]
+        || fault_state.committed_rows()? != fault_root_frontier
+        || fault_state.retained(0)? != fault_root_retained
+        || fault_parent.read_rows(&fault_placements)? != fault_before
+    {
+        return Ok(Outcome::Failed(
+            "post-fork copy failure changed logical or parent state".into(),
+        ));
+    }
+    fault_child.close(&mut ledger).map_err(|r| r.error)?;
+    if ledger.outstanding_count() != parent_charge {
+        return Ok(Outcome::Failed(
+            "post-fork copy failure stranded the child charge".into(),
+        ));
+    }
+    fault_parent.close(&mut ledger).map_err(|r| r.error)?;
+    if !ledger.outstanding().is_empty() {
+        return Ok(Outcome::Failed(
+            "faulted device fork cleanup left bytes charged".into(),
+        ));
+    }
+    let normal_copy_bytes = geometry
+        .page_bytes()?
+        .checked_mul(PAGES * 2)
+        .and_then(|bytes| bytes.checked_add((FORK_AT / PAGE_TOKENS) * 4))
+        .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+    let window_copy_bytes = window_geometry
+        .page_bytes()?
+        .checked_mul(3 * 2)
+        .and_then(|bytes| bytes.checked_add((8 / PAGE_TOKENS) * 4))
+        .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+    let fault_copy_bytes = geometry
+        .page_bytes()?
+        .checked_mul(2)
+        .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+    println!(
+        "    {} device-cow inherited={} rows, copy_bytes={} window_copy_bytes={} fault_bytes_before_refusal={}, post-fork fault cleaned",
+        cap.sm(),
+        FORK_AT,
+        normal_copy_bytes,
+        window_copy_bytes,
+        fault_copy_bytes
+    );
     Ok(Outcome::Passed)
 }
 

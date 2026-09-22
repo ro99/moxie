@@ -130,4 +130,15 @@ pub trait PagedKvWriter {
     /// attached. This is that republish: the authority calls it with the
     /// layer's current mapping after a commit whose retention may have moved.
     fn publish_view(&mut self, layer: usize, view: PageView) -> crate::Result<()>;
+
+    /// Eagerly copy an already-published branch into this writer's child
+    /// storage. Implementations that do not own device pages keep the default
+    /// refusal; the CUDA executor supplies this through the same callback
+    /// boundary as row writes and page-view publication.
+    fn copy_branch(&mut self, _layer: usize, _view: PageView, _rows: u64) -> crate::Result<()> {
+        Err(crate::Error::Unsupported {
+            capability: "paged_kv_branch_copy",
+            reason: "this paged-KV writer does not provide device branch copying".into(),
+        })
+    }
 }

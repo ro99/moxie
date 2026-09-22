@@ -41,7 +41,7 @@
 #![forbid(unsafe_code)]
 
 pub mod device;
-pub use device::{DeviceKvSequence, DeviceLayerLayout, PageView, Placement};
+pub use device::{DeviceBranch, DeviceKvSequence, DeviceLayerLayout, PageView, Placement};
 
 pub mod paged;
 pub use paged::{

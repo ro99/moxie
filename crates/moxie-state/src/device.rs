@@ -42,11 +42,12 @@
 //! wrong, they are *gone*: reading one is [`Error::Reclaimed`], exactly as it is
 //! on the host.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use moxie_types::{
-    BatchId, DimError, Error, HostTier, PagePlacement, PagedKvWriter, Result, StateTransactionId,
-    Tier,
+    BatchId, BranchId, DimError, Error, HostTier, PagePlacement, PagedKvWriter, Result,
+    StateTransactionId, Tier,
 };
 
 use crate::paged::{KvGeometry, Retention};
@@ -130,6 +131,21 @@ struct OpenTransaction {
     pending: Option<(u64, u64)>,
 }
 
+/// The physical decisions for one logical branch. The root uses the same
+/// shape as children; keeping the bookkeeping together prevents branch paths
+/// from acquiring a second retention or transaction rule.
+#[derive(Debug)]
+struct DeviceBranchStorage {
+    rows: u64,
+    committed_high_water: u64,
+    open: Option<OpenTransaction>,
+    completed_layers: Vec<bool>,
+    poisoned: bool,
+    /// The parent's retained floor at fork time. A child cannot resurrect a
+    /// device row the parent had already reclaimed when it was forked.
+    retained_floor: Vec<u64>,
+}
+
 /// The authority for one sequence's device-resident KV pages.
 ///
 /// It holds no bytes. Every method answers a question about placement,
@@ -140,30 +156,15 @@ pub struct DeviceKvSequence {
     geometry: KvGeometry,
     layout: Vec<DeviceLayerLayout>,
     state: SequenceState,
-    /// The published frontier, including rows a transaction has published but
-    /// not yet committed. Tentative rows are legal state (document 04), and
-    /// they are readable and attendable before the commit that accepts them.
-    rows: u64,
-    /// A private, monotonic watermark on how far this sequence has physically
-    /// overwritten. Used only by [`Self::retained`] and never exposed — it is
-    /// **not** [`Self::committed_rows`], which answers a different question
-    /// (how many rows a commit has accepted) from [`SequenceState`] instead.
-    ///
-    /// Not updated by `publish`: the retained base is derived from this plus
-    /// the admitted undo headroom, so it cannot move while a transaction is
-    /// open. When it was derived from the published frontier instead, a
-    /// tentative append advanced the base and an abort left it advanced —
-    /// rows the window still admitted became permanently unreadable because
-    /// of a transaction that was rolled back.
-    committed_high_water: u64,
-    open: Option<OpenTransaction>,
-    /// Layers that completed the currently staged batch. This storage is
-    /// reused so a forward pass does not allocate per layer or per step.
-    completed_layers: Vec<bool>,
-    /// Set when a commit's mapping transition failed partway, after some
-    /// layer's writer may already have published a new view to the device.
-    /// Checked by every public method: see [`Self::check_poisoned`].
-    poisoned: bool,
+    /// Root and child branch decisions. Device bytes remain in executor runs.
+    branches: BTreeMap<BranchId, DeviceBranchStorage>,
+}
+
+/// A mutable view of one child branch's device-state decisions.
+#[derive(Debug)]
+pub struct DeviceBranch<'a> {
+    sequence: &'a mut DeviceKvSequence,
+    branch: BranchId,
 }
 
 impl DeviceKvSequence {
@@ -266,15 +267,23 @@ impl DeviceKvSequence {
                 available_bytes: 0,
             })?;
         completed_layers.resize(layout.len(), false);
+        let mut branches = BTreeMap::new();
+        branches.insert(
+            ROOT,
+            DeviceBranchStorage {
+                rows: 0,
+                committed_high_water: 0,
+                open: None,
+                completed_layers,
+                poisoned: false,
+                retained_floor: vec![0; layout.len()],
+            },
+        );
         Ok(Self {
             geometry,
             layout,
             state: SequenceState::new([StateKind::KvPages, StateKind::PositionCounter]),
-            rows: 0,
-            committed_high_water: 0,
-            open: None,
-            completed_layers,
-            poisoned: false,
+            branches,
         })
     }
 
@@ -286,8 +295,26 @@ impl DeviceKvSequence {
     /// that back. Every public method calls this first, so the authority
     /// stops trusting itself rather than guess at a mapping that might
     /// already be inconsistent.
-    fn check_poisoned(&self) -> Result<()> {
-        if self.poisoned {
+    fn branch_storage(&self, branch: BranchId) -> Result<&DeviceBranchStorage> {
+        self.branches.get(&branch).ok_or_else(|| {
+            invalid(
+                "branch",
+                "the device sequence has no bookkeeping for this branch",
+            )
+        })
+    }
+
+    fn branch_storage_mut(&mut self, branch: BranchId) -> Result<&mut DeviceBranchStorage> {
+        self.branches.get_mut(&branch).ok_or_else(|| {
+            invalid(
+                "branch",
+                "the device sequence has no bookkeeping for this branch",
+            )
+        })
+    }
+
+    fn check_poisoned_on(&self, branch: BranchId) -> Result<()> {
+        if self.branch_storage(branch)?.poisoned {
             return Err(invalid(
                 "sequence",
                 "a previous commit's mapping transition failed; this sequence can no longer \
@@ -295,6 +322,10 @@ impl DeviceKvSequence {
             ));
         }
         Ok(())
+    }
+
+    fn check_poisoned(&self) -> Result<()> {
+        self.check_poisoned_on(ROOT)
     }
 
     pub fn geometry(&self) -> Result<&KvGeometry> {
@@ -326,23 +357,35 @@ impl DeviceKvSequence {
     /// retained count and not [`Self::committed_rows`]; conflating any of
     /// these claims a context this authority does not hold.
     pub fn published_rows(&self) -> Result<u64> {
-        self.check_poisoned()?;
-        Ok(self.rows)
+        self.published_rows_for(ROOT)
+    }
+
+    fn published_rows_for(&self, branch: BranchId) -> Result<u64> {
+        self.check_poisoned_on(branch)?;
+        Ok(self.branch_storage(branch)?.rows)
     }
 
     /// Rows published for one layer. A completed layer can be one staged batch
     /// ahead of the sequence frontier while later layers execute.
     pub fn layer_published_rows(&self, layer: usize) -> Result<u64> {
-        self.check_poisoned()?;
-        self.layout(layer)?;
-        if self.completed_layers[layer]
-            && let Some((first, rows)) = self.open.and_then(|open| open.pending)
+        self.layer_published_rows_for(ROOT, layer)
+    }
+
+    fn layer_published_rows_for(&self, branch: BranchId, layer: usize) -> Result<u64> {
+        self.check_poisoned_on(branch)?;
+        self.layout
+            .get(layer)
+            .copied()
+            .ok_or_else(|| invalid("layer", "layer is outside this sequence"))?;
+        let storage = self.branch_storage(branch)?;
+        if storage.completed_layers[layer]
+            && let Some((first, rows)) = storage.open.and_then(|open| open.pending)
         {
             return first
                 .checked_add(rows)
                 .ok_or(Error::Dim(DimError::Overflow));
         }
-        Ok(self.rows)
+        Ok(storage.rows)
     }
 
     /// Rows a commit has accepted, from [`SequenceState`]'s own accepted
@@ -355,8 +398,12 @@ impl DeviceKvSequence {
     /// that one moves on every commit regardless of `accept`, because it
     /// tracks physical overwrite, not acceptance.
     pub fn committed_rows(&self) -> Result<u64> {
-        self.check_poisoned()?;
-        Ok(self.state.frontiers(ROOT)?.accepted)
+        self.committed_rows_for(ROOT)
+    }
+
+    fn committed_rows_for(&self, branch: BranchId) -> Result<u64> {
+        self.check_poisoned_on(branch)?;
+        Ok(self.state.frontiers(branch)?.accepted)
     }
 
     /// The rows one layer still holds, as absolute positions.
@@ -366,22 +413,42 @@ impl DeviceKvSequence {
     /// rows are retained too, because the window that would evict them has
     /// not moved past them yet.
     pub fn retained(&self, layer: usize) -> Result<Range<u64>> {
-        self.check_poisoned()?;
-        self.retained_at(layer, self.committed_high_water, self.rows)
+        self.retained_for(ROOT, layer)
+    }
+
+    fn retained_for(&self, branch: BranchId, layer: usize) -> Result<Range<u64>> {
+        self.check_poisoned_on(branch)?;
+        let storage = self.branch_storage(branch)?;
+        self.retained_at(branch, layer, storage.committed_high_water, storage.rows)
     }
 
     /// Retained rows currently published for one layer, including its staged
     /// batch during an open transaction.
     pub fn layer_retained(&self, layer: usize) -> Result<Range<u64>> {
-        let rows = self.layer_published_rows(layer)?;
-        self.retained_at(layer, self.committed_high_water, rows)
+        self.layer_retained_for(ROOT, layer)
+    }
+
+    fn layer_retained_for(&self, branch: BranchId, layer: usize) -> Result<Range<u64>> {
+        let rows = self.layer_published_rows_for(branch, layer)?;
+        let storage = self.branch_storage(branch)?;
+        self.retained_at(branch, layer, storage.committed_high_water, rows)
     }
 
     /// [`Self::retained`] against a caller-chosen watermark instead of the
     /// current one — what [`Self::commit`] uses to preview the retained
     /// range a candidate watermark would produce, before adopting it.
-    fn retained_at(&self, layer: usize, watermark: u64, rows: u64) -> Result<Range<u64>> {
-        let layout = self.layout(layer)?;
+    fn retained_at(
+        &self,
+        branch: BranchId,
+        layer: usize,
+        watermark: u64,
+        rows: u64,
+    ) -> Result<Range<u64>> {
+        let layout = self
+            .layout
+            .get(layer)
+            .copied()
+            .ok_or_else(|| invalid("layer", "layer is outside this sequence"))?;
         let page_tokens = self.geometry.page_tokens as u64;
         // The ring overwrites row `r` with row `r + capacity`, and a page is
         // gone once any of its rows has been. Two things make this the *stable*
@@ -399,7 +466,8 @@ impl DeviceKvSequence {
         let reach = watermark.saturating_add(self.headroom()).max(rows);
         let overwritten = reach.saturating_sub(layout.capacity_rows);
         let base = overwritten.div_ceil(page_tokens) * page_tokens;
-        Ok(base.min(rows)..rows)
+        let floor = self.branch_storage(branch)?.retained_floor[layer];
+        Ok(base.max(floor).min(rows)..rows)
     }
 
     /// The undo headroom a transaction may use, zero when nothing reclaims.
@@ -413,12 +481,20 @@ impl DeviceKvSequence {
 
     /// Where row `position` of one layer physically sits.
     pub fn placement_of(&self, layer: usize, position: u64) -> Result<Placement> {
-        self.check_poisoned()?;
-        let layout = self.layout(layer)?;
-        if position >= self.rows {
+        self.placement_of_for(ROOT, layer, position)
+    }
+
+    fn placement_of_for(&self, branch: BranchId, layer: usize, position: u64) -> Result<Placement> {
+        self.check_poisoned_on(branch)?;
+        let layout = self
+            .layout
+            .get(layer)
+            .copied()
+            .ok_or_else(|| invalid("layer", "layer is outside this sequence"))?;
+        if position >= self.branch_storage(branch)?.rows {
             return Err(invalid("position", "position has not been published"));
         }
-        let retained = self.retained(layer)?;
+        let retained = self.retained_for(branch, layer)?;
         if position < retained.start {
             return Err(Error::Reclaimed {
                 layer: layer as u32,
@@ -438,9 +514,19 @@ impl DeviceKvSequence {
     ///
     /// The positions come from [`StagedRows`], not from an argument: they are
     /// the authority's to choose and they are always the frontier.
-    fn placements(&self, staged: &StagedRows, layer: usize) -> Result<Vec<Placement>> {
-        let layout = self.layout(layer)?;
+    fn placements_for(
+        &self,
+        branch: BranchId,
+        staged: &StagedRows,
+        layer: usize,
+    ) -> Result<Vec<Placement>> {
+        let layout = self
+            .layout
+            .get(layer)
+            .copied()
+            .ok_or_else(|| invalid("layer", "layer is outside this sequence"))?;
         let open = self
+            .branch_storage(branch)?
             .open
             .ok_or_else(|| invalid("transaction", "no transaction is open"))?;
         if open.id != staged.transaction || open.pending != Some((staged.first, staged.rows)) {
@@ -475,6 +561,11 @@ impl DeviceKvSequence {
         Ok(out)
     }
 
+    #[cfg(test)]
+    fn placements(&self, staged: &StagedRows, layer: usize) -> Result<Vec<Placement>> {
+        self.placements_for(ROOT, staged, layer)
+    }
+
     fn place(&self, layout: DeviceLayerLayout, position: u64, rows: u64) -> Placement {
         let page_tokens = self.geometry.page_tokens as u64;
         Placement {
@@ -491,19 +582,35 @@ impl DeviceKvSequence {
     /// It covers the retained range and any rows this transaction has staged,
     /// because a performer must be able to write where it is about to write.
     pub fn page_view(&self, layer: usize) -> Result<PageView> {
-        self.check_poisoned()?;
-        let retained = self.retained(layer)?;
-        self.page_view_for(layer, retained)
+        self.page_view_for_branch(ROOT, layer)
+    }
+
+    fn page_view_for_branch(&self, branch: BranchId, layer: usize) -> Result<PageView> {
+        let retained = self.retained_for(branch, layer)?;
+        self.page_view_for(branch, layer, retained)
     }
 
     /// [`Self::page_view`]'s table, for a retained range the caller already
     /// computed — real or a candidate from [`Self::retained_at`]. Split out
     /// so [`Self::commit`] can preview the view a prospective watermark would
     /// produce without first adopting it.
-    fn page_view_for(&self, layer: usize, retained: Range<u64>) -> Result<PageView> {
-        let layout = self.layout(layer)?;
-        let staged_end = self.open.and_then(|o| o.pending).map_or(0, |(f, n)| f + n);
-        let end = self.rows.max(staged_end);
+    fn page_view_for(
+        &self,
+        branch: BranchId,
+        layer: usize,
+        retained: Range<u64>,
+    ) -> Result<PageView> {
+        let layout = self
+            .layout
+            .get(layer)
+            .copied()
+            .ok_or_else(|| invalid("layer", "layer is outside this sequence"))?;
+        let storage = self.branch_storage(branch)?;
+        let staged_end = storage
+            .open
+            .and_then(|o| o.pending)
+            .map_or(0, |(f, n)| f.saturating_add(n));
+        let end = storage.rows.max(staged_end);
         if end == 0 || retained.start >= end {
             return Err(invalid("retained", "this layer holds no row"));
         }
@@ -535,17 +642,22 @@ impl DeviceKvSequence {
 
     /// Open a transaction. The frontier it starts at is what an abort restores.
     pub fn begin(&mut self) -> Result<StateTransactionId> {
-        self.check_poisoned()?;
-        if self.open.is_some() {
+        self.begin_for(ROOT)
+    }
+
+    fn begin_for(&mut self, branch: BranchId) -> Result<StateTransactionId> {
+        self.check_poisoned_on(branch)?;
+        if self.branch_storage(branch)?.open.is_some() {
             return Err(invalid("transaction", "a transaction is already open here"));
         }
-        let id = self.state.begin(ROOT)?;
-        self.open = Some(OpenTransaction {
+        let id = self.state.begin(branch)?;
+        let storage = self.branch_storage_mut(branch)?;
+        storage.open = Some(OpenTransaction {
             id,
-            base: self.rows,
+            base: storage.rows,
             pending: None,
         });
-        self.completed_layers.fill(false);
+        storage.completed_layers.fill(false);
         Ok(id)
     }
 
@@ -574,22 +686,32 @@ impl DeviceKvSequence {
         rows: u64,
         writers: &mut [&mut dyn PagedKvWriter],
     ) -> Result<()> {
-        self.check_poisoned()?;
+        self.append_for(ROOT, txn, rows, writers)
+    }
+
+    fn append_for(
+        &mut self,
+        branch: BranchId,
+        txn: StateTransactionId,
+        rows: u64,
+        writers: &mut [&mut dyn PagedKvWriter],
+    ) -> Result<()> {
+        self.check_poisoned_on(branch)?;
         if writers.len() != self.layout.len() {
             return Err(invalid(
                 "writers",
                 "append needs exactly one writer per layer, in layer order",
             ));
         }
-        let staged = self.stage(txn, rows)?;
+        let staged = self.stage_for(branch, txn, rows)?;
         let batch = staged.id();
         for (layer, writer) in writers.iter_mut().enumerate() {
-            let view = self.page_view(layer)?;
-            let placements = self.placements(&staged, layer)?;
+            let view = self.page_view_for_branch(branch, layer)?;
+            let placements = self.placements_for(branch, &staged, layer)?;
             writer.write_layer(layer, batch, view, &placements)?;
-            self.completed_layers[layer] = true;
+            self.branch_storage_mut(branch)?.completed_layers[layer] = true;
         }
-        self.publish(txn, staged)
+        self.publish_for(branch, txn, staged)
     }
 
     /// Append one layer of the staged batch.
@@ -605,9 +727,27 @@ impl DeviceKvSequence {
         rows: u64,
         writer: &mut dyn PagedKvWriter,
     ) -> Result<()> {
-        self.check_poisoned()?;
-        self.layout(layer)?;
-        let Some(next) = self.completed_layers.iter().position(|complete| !complete) else {
+        self.append_layer_for(ROOT, txn, layer, rows, writer)
+    }
+
+    fn append_layer_for(
+        &mut self,
+        branch: BranchId,
+        txn: StateTransactionId,
+        layer: usize,
+        rows: u64,
+        writer: &mut dyn PagedKvWriter,
+    ) -> Result<()> {
+        self.check_poisoned_on(branch)?;
+        if self.layout.get(layer).is_none() {
+            return Err(invalid("layer", "layer is outside this sequence"));
+        }
+        let Some(next) = self
+            .branch_storage(branch)?
+            .completed_layers
+            .iter()
+            .position(|complete| !complete)
+        else {
             return Err(invalid(
                 "layer",
                 "the staged batch already completed every layer",
@@ -616,8 +756,10 @@ impl DeviceKvSequence {
         if layer != next {
             return Err(invalid("layer", "layers must append in graph order"));
         }
-        let staged = match self.open_transaction(txn)?.pending {
-            Some((first, pending_rows)) if first == self.rows && pending_rows == rows => {
+        let staged = match self.open_transaction_for(branch, txn)?.pending {
+            Some((first, pending_rows))
+                if first == self.branch_storage(branch)?.rows && pending_rows == rows =>
+            {
                 StagedRows {
                     transaction: txn,
                     first,
@@ -630,14 +772,15 @@ impl DeviceKvSequence {
                     "every layer must publish the same staged batch",
                 ));
             }
-            None => self.stage(txn, rows)?,
+            None => self.stage_for(branch, txn, rows)?,
         };
-        let view = self.page_view(layer)?;
-        let placements = self.placements(&staged, layer)?;
+        let view = self.page_view_for_branch(branch, layer)?;
+        let placements = self.placements_for(branch, &staged, layer)?;
         writer.write_layer(layer, staged.id(), view, &placements)?;
-        self.completed_layers[layer] = true;
-        if self.completed_layers.iter().all(|done| *done) {
-            self.publish(txn, staged)?;
+        let storage = self.branch_storage_mut(branch)?;
+        storage.completed_layers[layer] = true;
+        if storage.completed_layers.iter().all(|done| *done) {
+            self.publish_for(branch, txn, staged)?;
         }
         Ok(())
     }
@@ -651,8 +794,13 @@ impl DeviceKvSequence {
     ///
     /// One batch at a time. Two outstanding batches could be published out of
     /// order, which would move the frontier over rows nothing had written.
-    fn stage(&mut self, txn: StateTransactionId, rows: u64) -> Result<StagedRows> {
-        let open = self.open_transaction(txn)?;
+    fn stage_for(
+        &mut self,
+        branch: BranchId,
+        txn: StateTransactionId,
+        rows: u64,
+    ) -> Result<StagedRows> {
+        let open = self.open_transaction_for(branch, txn)?;
         if open.pending.is_some() {
             return Err(invalid(
                 "staged",
@@ -663,6 +811,7 @@ impl DeviceKvSequence {
             return Err(invalid("rows", "staging no row"));
         }
         let end = self
+            .branch_storage(branch)?
             .rows
             .checked_add(rows)
             .ok_or(Error::Dim(DimError::Overflow))?;
@@ -684,14 +833,20 @@ impl DeviceKvSequence {
         }
         let staged = StagedRows {
             transaction: txn,
-            first: self.rows,
+            first: self.branch_storage(branch)?.rows,
             rows,
         };
-        self.open
+        self.branch_storage_mut(branch)?
+            .open
             .as_mut()
             .expect("a validated open transaction")
             .pending = Some((staged.first, staged.rows));
         Ok(staged)
+    }
+
+    #[cfg(test)]
+    fn stage(&mut self, txn: StateTransactionId, rows: u64) -> Result<StagedRows> {
+        self.stage_for(ROOT, txn, rows)
     }
 
     /// Publish a staged batch as history.
@@ -701,28 +856,40 @@ impl DeviceKvSequence {
     /// no reader; after this call they are state. There is no moment in
     /// between, which is why this is a separate step from [`Self::stage`]
     /// rather than something that call does for you.
-    fn publish(&mut self, txn: StateTransactionId, staged: StagedRows) -> Result<()> {
-        let open = self.open_transaction(txn)?;
+    fn publish_for(
+        &mut self,
+        branch: BranchId,
+        txn: StateTransactionId,
+        staged: StagedRows,
+    ) -> Result<()> {
+        let open = self.open_transaction_for(branch, txn)?;
         if staged.transaction != txn || open.pending != Some((staged.first, staged.rows)) {
             return Err(invalid(
                 "staged",
                 "these rows are not the batch this transaction staged",
             ));
         }
-        if staged.first != self.rows {
+        if staged.first != self.branch_storage(branch)?.rows {
             return Err(invalid(
                 "staged",
                 "the staged batch no longer starts at the frontier",
             ));
         }
-        self.state.execute(ROOT, staged.rows)?;
-        self.rows = staged.first + staged.rows;
-        self.open
+        self.state.execute(branch, staged.rows)?;
+        let storage = self.branch_storage_mut(branch)?;
+        storage.rows = staged.first + staged.rows;
+        storage
+            .open
             .as_mut()
             .expect("a validated open transaction")
             .pending = None;
-        self.completed_layers.fill(false);
+        storage.completed_layers.fill(false);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn publish(&mut self, txn: StateTransactionId, staged: StagedRows) -> Result<()> {
+        self.publish_for(ROOT, txn, staged)
     }
 
     /// Accept `accept` of the transaction's rows, republish any layer whose
@@ -758,15 +925,26 @@ impl DeviceKvSequence {
         accept: u64,
         writers: &mut [&mut dyn PagedKvWriter],
     ) -> Result<()> {
-        self.check_poisoned()?;
-        let open = self.open_transaction(txn)?;
+        self.commit_for(ROOT, txn, accept, writers)
+    }
+
+    fn commit_for(
+        &mut self,
+        branch: BranchId,
+        txn: StateTransactionId,
+        accept: u64,
+        writers: &mut [&mut dyn PagedKvWriter],
+    ) -> Result<()> {
+        self.check_poisoned_on(branch)?;
+        let open = self.open_transaction_for(branch, txn)?;
         if open.pending.is_some() {
             return Err(invalid(
                 "staged",
                 "a staged batch is unpublished; publish it or abort the transaction",
             ));
         }
-        if accept > self.rows - open.base {
+        let storage = self.branch_storage(branch)?;
+        if accept > storage.rows - open.base {
             return Err(invalid(
                 "accept",
                 "cannot accept more rows than this transaction published",
@@ -782,7 +960,7 @@ impl DeviceKvSequence {
         // The watermark this commit is about to adopt. Publication and the
         // transition it enables are decided from the same number commit will
         // actually apply.
-        let watermark_after = self.committed_high_water.max(self.rows);
+        let watermark_after = storage.committed_high_water.max(storage.rows);
         let mut updates = Vec::new();
         updates
             .try_reserve_exact(self.layout.len())
@@ -798,35 +976,36 @@ impl DeviceKvSequence {
         for layer in 0..self.layout.len() {
             // A sequence that has never published a row has no view to
             // compare or republish for any layer.
-            if self.rows == 0 {
+            if storage.rows == 0 {
                 continue;
             }
-            let before = self.retained(layer)?;
-            let after_retained = self.retained_at(layer, watermark_after, self.rows)?;
+            let before = self.retained_for(branch, layer)?;
+            let after_retained = self.retained_at(branch, layer, watermark_after, storage.rows)?;
             if before.start == after_retained.start {
                 continue;
             }
-            updates.push((layer, self.page_view_for(layer, after_retained)?));
+            updates.push((layer, self.page_view_for(branch, layer, after_retained)?));
         }
 
         let published_mapping = !updates.is_empty();
         for (layer, view) in updates {
             if let Err(error) = writers[layer].publish_view(layer, view) {
-                self.poisoned = true;
+                self.branch_storage_mut(branch)?.poisoned = true;
                 return Err(error);
             }
         }
 
         if let Err(error) = self.state.commit_prefix(txn, accept) {
             if published_mapping {
-                self.poisoned = true;
+                self.branch_storage_mut(branch)?.poisoned = true;
             }
             return Err(error);
         }
-        self.open = None;
+        let storage = self.branch_storage_mut(branch)?;
+        storage.open = None;
         // The ring's reach only moves at a commit. Everything the retained base
         // is derived from is therefore stable for the whole of a transaction.
-        self.committed_high_water = watermark_after;
+        storage.committed_high_water = watermark_after;
         Ok(())
     }
 
@@ -838,13 +1017,18 @@ impl DeviceKvSequence {
     /// why the admitted capacity carries the undo headroom: the rows the window
     /// still admits were never in the pages the transaction could reach.
     pub fn abort(&mut self, txn: StateTransactionId) -> Result<()> {
-        self.check_poisoned()?;
-        let open = self.open_transaction(txn)?;
+        self.abort_for(ROOT, txn)
+    }
+
+    fn abort_for(&mut self, branch: BranchId, txn: StateTransactionId) -> Result<()> {
+        self.check_poisoned_on(branch)?;
+        let open = self.open_transaction_for(branch, txn)?;
         let base = open.base;
         self.state.abort(txn)?;
-        self.rows = base;
-        self.open = None;
-        self.completed_layers.fill(false);
+        let storage = self.branch_storage_mut(branch)?;
+        storage.rows = base;
+        storage.open = None;
+        storage.completed_layers.fill(false);
         Ok(())
     }
 
@@ -862,18 +1046,22 @@ impl DeviceKvSequence {
     /// re-append from that prefix would report rows reclaimed the moment they
     /// were written.
     pub fn truncate(&mut self, prefix: u64) -> Result<()> {
-        self.check_poisoned()?;
-        if self.open.is_some() {
+        self.truncate_for(ROOT, prefix)
+    }
+
+    fn truncate_for(&mut self, branch: BranchId, prefix: u64) -> Result<()> {
+        self.check_poisoned_on(branch)?;
+        if self.branch_storage(branch)?.open.is_some() {
             return Err(invalid(
                 "truncate",
                 "a transaction is open; commit or abort before truncating",
             ));
         }
-        if prefix > self.rows {
+        if prefix > self.branch_storage(branch)?.rows {
             return Err(invalid("prefix", "truncating past the frontier"));
         }
         for layer in 0..self.layout.len() {
-            let retained = self.retained(layer)?;
+            let retained = self.retained_for(branch, layer)?;
             if prefix < retained.start {
                 return Err(Error::Reclaimed {
                     layer: layer as u32,
@@ -882,9 +1070,10 @@ impl DeviceKvSequence {
                 });
             }
         }
-        self.state.rollback_to(ROOT, prefix, &[])?;
-        self.rows = prefix;
-        self.completed_layers.fill(false);
+        self.state.rollback_to(branch, prefix, &[])?;
+        let storage = self.branch_storage_mut(branch)?;
+        storage.rows = prefix;
+        storage.completed_layers.fill(false);
         Ok(())
     }
 
@@ -896,14 +1085,211 @@ impl DeviceKvSequence {
     }
 
     /// The open transaction, if it is this one.
-    fn open_transaction(&self, txn: StateTransactionId) -> Result<OpenTransaction> {
+    fn open_transaction_for(
+        &self,
+        branch: BranchId,
+        txn: StateTransactionId,
+    ) -> Result<OpenTransaction> {
         let open = self
+            .branch_storage(branch)?
             .open
             .ok_or_else(|| invalid("transaction", "no transaction is open"))?;
         if open.id != txn {
             return Err(invalid("transaction", "this transaction is not open here"));
         }
         Ok(open)
+    }
+
+    /// Fork the device decisions at an accepted root prefix and ask the
+    /// executor-owned writers to eagerly copy the corresponding device pages.
+    ///
+    /// The logical child is created before the callbacks run. If a device copy
+    /// refuses, both that child bookkeeping and the logical `SequenceState`
+    /// branch are discarded, so a partially copied child cannot escape.
+    pub fn fork(&mut self, at: u64, writers: &mut [&mut dyn PagedKvWriter]) -> Result<BranchId> {
+        self.check_poisoned()?;
+        if self.branches.len() > 1 {
+            return Err(invalid(
+                "branch",
+                "only one live device child branch is supported",
+            ));
+        }
+        if writers.len() != self.layout.len() {
+            return Err(invalid(
+                "writers",
+                "fork needs exactly one writer per layer, in layer order",
+            ));
+        }
+        if self.branch_storage(ROOT)?.open.is_some() {
+            return Err(invalid(
+                "branch",
+                "fork requires a committed root prefix outside a transaction",
+            ));
+        }
+        let parent_rows = self.branch_storage(ROOT)?.rows;
+        let parent_high_water = self.branch_storage(ROOT)?.committed_high_water;
+        let accepted = self.state.frontiers(ROOT)?.accepted;
+        if at > accepted {
+            return Err(invalid(
+                "at",
+                "a device branch cannot start past the parent's accepted frontier",
+            ));
+        }
+        if at > parent_rows {
+            return Err(invalid(
+                "at",
+                "a device branch cannot start past the parent's published rows",
+            ));
+        }
+        let mut retained_floor = Vec::with_capacity(self.layout.len());
+        for layer in 0..self.layout.len() {
+            let retained = self.retained_for(ROOT, layer)?;
+            if at < retained.start {
+                return Err(Error::Reclaimed {
+                    layer: layer as u32,
+                    position: at,
+                    retained_from: retained.start,
+                });
+            }
+            retained_floor.push(retained.start);
+        }
+
+        let child = self.state.fork(ROOT, at)?;
+        self.branches.insert(
+            child,
+            DeviceBranchStorage {
+                rows: at,
+                committed_high_water: parent_high_water.min(at),
+                open: None,
+                completed_layers: vec![false; self.layout.len()],
+                poisoned: false,
+                retained_floor,
+            },
+        );
+
+        let copy_result = (|| {
+            if at == 0 {
+                return Ok(());
+            }
+            for (layer, writer) in writers.iter_mut().enumerate() {
+                let view = self.page_view_for_branch(child, layer)?;
+                writer.copy_branch(layer, view, at)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = copy_result {
+            self.branches.remove(&child);
+            // The logical fork was created before the device callbacks. This
+            // is the post-fork cleanup path, not an early allocation refusal.
+            let _ = self.state.discard_branch(child);
+            return Err(error);
+        }
+        Ok(child)
+    }
+
+    /// Release the child decisions after its executor run has been closed.
+    pub fn discard_branch(&mut self, branch: BranchId) -> Result<()> {
+        self.check_poisoned_on(branch)?;
+        if branch == ROOT {
+            return Err(invalid("branch", "the root branch cannot be discarded"));
+        }
+        if self.branch_storage(branch)?.open.is_some() {
+            return Err(invalid(
+                "branch",
+                "resolve the branch transaction before discarding it",
+            ));
+        }
+        self.state.discard_branch(branch)?;
+        self.branches.remove(&branch);
+        Ok(())
+    }
+
+    /// Borrow one child branch's decisions for transaction and placement
+    /// operations. The branch object is only a view; device bytes remain in
+    /// the executor run that the caller supplies to the writer callbacks.
+    pub fn branch(&mut self, branch: BranchId) -> Result<DeviceBranch<'_>> {
+        if branch == ROOT {
+            return Err(invalid(
+                "branch",
+                "the root branch is accessed through DeviceKvSequence",
+            ));
+        }
+        self.check_poisoned_on(branch)?;
+        Ok(DeviceBranch {
+            sequence: self,
+            branch,
+        })
+    }
+}
+
+impl DeviceBranch<'_> {
+    pub fn id(&self) -> BranchId {
+        self.branch
+    }
+
+    pub fn published_rows(&self) -> Result<u64> {
+        self.sequence.published_rows_for(self.branch)
+    }
+
+    pub fn committed_rows(&self) -> Result<u64> {
+        self.sequence.committed_rows_for(self.branch)
+    }
+
+    pub fn retained(&self, layer: usize) -> Result<Range<u64>> {
+        self.sequence.retained_for(self.branch, layer)
+    }
+
+    pub fn layer_retained(&self, layer: usize) -> Result<Range<u64>> {
+        self.sequence.layer_retained_for(self.branch, layer)
+    }
+
+    pub fn placement_of(&self, layer: usize, position: u64) -> Result<Placement> {
+        self.sequence.placement_of_for(self.branch, layer, position)
+    }
+
+    pub fn page_view(&self, layer: usize) -> Result<PageView> {
+        self.sequence.page_view_for_branch(self.branch, layer)
+    }
+
+    pub fn begin(&mut self) -> Result<StateTransactionId> {
+        self.sequence.begin_for(self.branch)
+    }
+
+    pub fn append(
+        &mut self,
+        txn: StateTransactionId,
+        rows: u64,
+        writers: &mut [&mut dyn PagedKvWriter],
+    ) -> Result<()> {
+        self.sequence.append_for(self.branch, txn, rows, writers)
+    }
+
+    pub fn append_layer(
+        &mut self,
+        txn: StateTransactionId,
+        layer: usize,
+        rows: u64,
+        writer: &mut dyn PagedKvWriter,
+    ) -> Result<()> {
+        self.sequence
+            .append_layer_for(self.branch, txn, layer, rows, writer)
+    }
+
+    pub fn commit(
+        &mut self,
+        txn: StateTransactionId,
+        accept: u64,
+        writers: &mut [&mut dyn PagedKvWriter],
+    ) -> Result<()> {
+        self.sequence.commit_for(self.branch, txn, accept, writers)
+    }
+
+    pub fn abort(&mut self, txn: StateTransactionId) -> Result<()> {
+        self.sequence.abort_for(self.branch, txn)
+    }
+
+    pub fn truncate(&mut self, prefix: u64) -> Result<()> {
+        self.sequence.truncate_for(self.branch, prefix)
     }
 }
 
@@ -995,6 +1381,35 @@ mod tests {
         }
     }
 
+    struct ForkWriter {
+        copy_calls: usize,
+        refuse_copy: bool,
+    }
+
+    impl PagedKvWriter for ForkWriter {
+        fn write_layer(
+            &mut self,
+            _layer: usize,
+            _batch: BatchId,
+            _view: PageView,
+            _placements: &[PagePlacement],
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn publish_view(&mut self, _layer: usize, _view: PageView) -> Result<()> {
+            Ok(())
+        }
+
+        fn copy_branch(&mut self, _layer: usize, _view: PageView, _rows: u64) -> Result<()> {
+            self.copy_calls += 1;
+            if self.refuse_copy {
+                return Err(invalid("copy_branch", "injected post-fork copy refusal"));
+            }
+            Ok(())
+        }
+    }
+
     /// One [`NullWriter`] per layer, boxed as [`DeviceKvSequence::append`]
     /// and [`DeviceKvSequence::commit`] need them.
     fn null_writers(sequence: &DeviceKvSequence) -> Vec<NullWriter> {
@@ -1036,6 +1451,95 @@ mod tests {
                 .expect("commit");
             done += step;
         }
+    }
+
+    #[test]
+    fn device_fork_keeps_branch_bookkeeping_independent() {
+        let mut sequence = DeviceKvSequence::new(full(8, 64)).expect("a sequence");
+        fill(&mut sequence, 8);
+        let parent_frontier = sequence.committed_rows().expect("parent frontier");
+        let parent_view = sequence.page_view(0).expect("parent view");
+        let mut writer = ForkWriter {
+            copy_calls: 0,
+            refuse_copy: false,
+        };
+        let open = sequence.begin().expect("transaction");
+        assert!(sequence.fork(4, &mut [&mut writer]).is_err());
+        sequence.abort(open).expect("abort transaction");
+        let child_id = sequence
+            .fork(4, &mut [&mut writer])
+            .expect("fork after the logical state exists");
+        assert_eq!(writer.copy_calls, 1);
+        assert_eq!(sequence.state().expect("state").branch_ids().len(), 2);
+        let second_error = sequence
+            .fork(4, &mut [&mut writer])
+            .expect_err("a second live device child was admitted");
+        assert!(matches!(
+            second_error,
+            Error::InvalidRequest {
+                field: "branch",
+                ..
+            }
+        ));
+        assert_eq!(writer.copy_calls, 1);
+        {
+            let mut child = sequence.branch(child_id).expect("child view");
+            assert_eq!(child.committed_rows().expect("child frontier"), 4);
+            assert_eq!(child.published_rows().expect("child rows"), 4);
+            assert_eq!(child.page_view(0).expect("child view"), parent_view);
+
+            let txn = child.begin().expect("child transaction");
+            let mut writers = [NullWriter];
+            child
+                .append(txn, 1, &mut writer_refs(&mut writers))
+                .expect("child append");
+            let mut commit_writers = [NullWriter];
+            child
+                .commit(txn, 1, &mut writer_refs(&mut commit_writers))
+                .expect("child commit");
+            assert_eq!(child.committed_rows().expect("child frontier"), 5);
+            child.truncate(4).expect("child truncate");
+            assert_eq!(child.committed_rows().expect("child frontier"), 4);
+        }
+        assert_eq!(
+            sequence.committed_rows().expect("parent frontier"),
+            parent_frontier
+        );
+        assert_eq!(sequence.page_view(0).expect("parent view"), parent_view);
+        sequence
+            .discard_branch(child_id)
+            .expect("discard child decisions");
+        assert_eq!(sequence.state().expect("state").branch_ids(), vec![ROOT]);
+    }
+
+    #[test]
+    fn device_fork_copy_refusal_discards_post_fork_child() {
+        let mut sequence = DeviceKvSequence::new(full(8, 64)).expect("a sequence");
+        fill(&mut sequence, 8);
+        let parent_frontier = sequence.committed_rows().expect("parent frontier");
+        let parent_view = sequence.page_view(0).expect("parent view");
+        let mut writer = ForkWriter {
+            copy_calls: 0,
+            refuse_copy: true,
+        };
+        assert!(sequence.fork(4, &mut [&mut writer]).is_err());
+        assert_eq!(writer.copy_calls, 1);
+        assert_eq!(sequence.state().expect("state").branch_ids(), vec![ROOT]);
+        assert_eq!(
+            sequence.committed_rows().expect("parent frontier"),
+            parent_frontier
+        );
+        assert_eq!(sequence.page_view(0).expect("parent view"), parent_view);
+
+        writer.refuse_copy = false;
+        let fresh_child = sequence
+            .fork(4, &mut [&mut writer])
+            .expect("a fresh fork proves the child bookkeeping was removed");
+        assert_eq!(writer.copy_calls, 2);
+        sequence
+            .discard_branch(fresh_child)
+            .expect("discard the fresh child");
+        assert_eq!(sequence.state().expect("state").branch_ids(), vec![ROOT]);
     }
 
     #[test]
