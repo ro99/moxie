@@ -1,6 +1,8 @@
 # Task 0054 — weight-shard byte-range addressing through the canonical format and residency authority
 
-Status: **proposed**.
+Status: **accepted** (owner, 2026-09-22). Built by Codex `luna`, independently
+reviewed by Codex `sol` across three rounds; the coordinator re-ran the
+focused suite (16/16) and `arch-check`.
 
 **Amendment, 2026-09-22 (coordinator, coordinator.md §3).** Old premise:
 both `ColumnShardable` and `RowShardable` map to one `LogicalRange` per rank,
@@ -185,8 +187,38 @@ Authority: coordinator.
 
 ## Result, filled after work
 
-- Changed shared owners and consumers; source commit:
+- Changed shared owners and consumers; source commit: `moxie-executor` now owns
+  `shard_weight_ranges` and its `WeightShardSpec`/`WeightShardRanges` contract;
+  the builder diff is based on current source `528325e` (which includes the
+  coordinator's intervening records-only commit) and is not committed yet.
+  `moxie-executor -> moxie-graph` is a direct, declared and arch-check-listed
+  edge because the function consumes the settled `PartitionRule`; it still
+  produces ranges through the existing `moxie-memory::LogicalRange` type.
 - Commands and result IDs; passed / failed / skipped separately:
-- Measured effect and uncertainty:
-- Deleted/replaced paths:
-- Remaining blockers and next bounded task:
+  - **Passed:** `cargo fmt --all -- --check`; `cargo clippy --workspace
+    --all-targets --locked -- -D warnings`; `cargo test --workspace --locked`;
+    `cargo xtask arch-check`; `cargo xtask spec-check`; and the focused
+    executor suite `cargo test -p moxie-executor affine_linear::tests --locked`.
+  - **Failed:** none.
+  - **Skipped:** GPU, distributed and state-specific gates — the contract
+    requires host-only validation and no execution or residency admission.
+- Measured effect and uncertainty: no performance or hardware effect measured;
+  this is checked address arithmetic only. Column shards use each canonical
+  component's own row width (codes, scales, and optional zero points), while
+  Row sharding returns the named strided-layout refusal. Group-boundary
+  checking is explicitly deferred to M5.2 because `group_of(k)` groups input
+  columns and ColumnShardable splits complete output rows.
+- Review trail (sol, read-only, `/ponytail:ponytail-review`). Round 1:
+  F1 high, BF16 checked only shard-local arithmetic, so rank 0 accepted
+  `{2, u64::MAX/2}` while rank 1 refused it; F2, component widths
+  duplicated `canonical::affine_components` and hard-coded the zero-point
+  width; F3, the rank-domain and other-rule refusals were untested; F4, two
+  assertions checked only fixture data. Round 2: F1–F4 closed; F5 low, the
+  repair re-validated `affine_components`' own output twice. Round 3: F5
+  closed, **ACCEPT**. The two `expect` calls assert the fixed codes/scales
+  order that `affine_components` constructs, and no caller can reach them.
+- Deleted/replaced paths: none. Existing whole-tensor consumers and the
+  canonical descriptor/memory range invariants are unchanged.
+- Remaining blockers and next bounded task: none for this task. M5.2 must own
+  row-sharded addressing (strided ranges or an explicitly authorized
+  pre-sharded layout) and quantization-group checks for that path.

@@ -281,6 +281,9 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                 // reach planning, execution or models.
                 workspace: &[
                     "moxie-types",
+                    // Task 0054: weight-shard addressing consumes the graph's
+                    // settled partition rule while producing memory ranges.
+                    "moxie-graph",
                     "moxie-memory",
                     "moxie-cuda",
                     "moxie-plan",

@@ -155,7 +155,7 @@ tracks this milestone's obligations.
 **M5 is open** (owner, 2026-09-22: "open M5 for luna to work"). [Task
 0053](docs/tasks/0053-m5-attention-partition-semantics.md) is accepted:
 `Attention` and `MlaAttention` declare `PartitionRule::HeadShardable`.
-[Task 0054](docs/tasks/0054-m5-weight-shard-addressing.md) (active) maps a
+[Task 0054](docs/tasks/0054-m5-weight-shard-addressing.md) is accepted: it maps a
 column-sharded weight to the byte range each rank owns. **M5.1 is not
 closed.** The partition rules do not yet require shard boundaries to fall on
 head boundaries (`Rope`, and the Q/K/V `Linear`s that feed attention). One

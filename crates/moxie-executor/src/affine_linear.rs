@@ -20,11 +20,14 @@
 //! `moxie-memory` decided what is resident; this file only reads addresses.
 
 use moxie_format::affine::{AffineDescriptor, AffineTensor, Grouping, IntWidth};
+use moxie_format::canonical::affine_components;
 use moxie_format::payload::ZeroPointSection;
 use moxie_format::scale::ScaleDtype;
+use moxie_graph::PartitionRule;
+use moxie_memory::LogicalRange;
 use moxie_types::{
-    ActivationPrecision, DeviceCapability, Error, KernelCatalogue, KernelOperand, Precision,
-    Result, SemanticKernelDescriptor, SemanticKernelOp, WeightPrecision,
+    ActivationPrecision, DeviceCapability, DimError, Error, KernelCatalogue, KernelOperand,
+    Precision, Result, SemanticKernelDescriptor, SemanticKernelOp, WeightPrecision,
 };
 
 fn invalid(field: &'static str, detail: impl Into<String>) -> Error {
@@ -88,6 +91,184 @@ fn unsupported(capability: &'static str, reason: impl Into<String>) -> Error {
         capability,
         reason: reason.into(),
     }
+}
+
+/// The canonical weight geometry accepted by [`shard_weight_ranges`].
+///
+/// Affine weights identify the zero-point component separately because an
+/// [`AffineDescriptor`] intentionally describes code/group geometry, not
+/// whether the payload is symmetric. That same distinction is used by
+/// `moxie-format::canonical::affine_components`.
+#[derive(Debug, Clone, Copy)]
+pub enum WeightShardSpec<'a> {
+    /// One BF16 physical tensor with logical shape `[out_features, in_features]`.
+    Bf16 { out_features: u64, in_features: u64 },
+    /// Canonical affine components for one logical `[out_features, in_features]`
+    /// weight. The returned ranges address codes, scales and, when present,
+    /// zero points independently.
+    Affine {
+        descriptor: &'a AffineDescriptor,
+        zero_points: ZeroPointSection,
+    },
+}
+
+/// Per-component ranges owned by one rank for a canonical weight.
+///
+/// A single `LogicalRange` cannot span canonical affine components: codes,
+/// scales and zero points are separate physical tensors. Keeping their ranges
+/// named here prevents a caller from accidentally treating one component's
+/// width as another's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightShardRanges {
+    Bf16 {
+        weights: LogicalRange,
+    },
+    Affine {
+        codes: LogicalRange,
+        scales: LogicalRange,
+        zero_points: Option<LogicalRange>,
+    },
+}
+
+/// Compute the canonical byte ranges owned by one rank for a column-sharded
+/// weight.
+///
+/// Canonical weights are row-major `[out, in]`, so `ColumnShardable` owns a
+/// contiguous run of complete output rows. Every affine component has its own
+/// row width and receives its own range. `RowShardable` is deliberately
+/// refused: input-column ownership is strided in this layout and cannot be
+/// represented by one `LogicalRange`; M5.2 owns that addressing contract.
+///
+/// Quantization groups are along the input-column axis (`group_of(k)`), while
+/// this function splits complete output rows. A column boundary therefore
+/// cannot split a quantization group; group-boundary checking belongs with the
+/// future row-sharded address representation.
+pub fn shard_weight_ranges(
+    rule: PartitionRule,
+    weight: WeightShardSpec<'_>,
+    rank_count: u32,
+    rank_index: u32,
+) -> Result<WeightShardRanges> {
+    let rank_count = u64::from(rank_count);
+    let rank_index = u64::from(rank_index);
+    if rank_count == 0 {
+        return Err(invalid("rank_count", "a shard needs at least one rank"));
+    }
+    if rank_index >= rank_count {
+        return Err(invalid_fmt(
+            "rank_index",
+            format_args!("rank {rank_index} is outside rank count {rank_count}"),
+        ));
+    }
+
+    match weight {
+        WeightShardSpec::Bf16 {
+            out_features,
+            in_features,
+        } => {
+            validate_shape(out_features, in_features)?;
+            let (first_row, row_count) = shard_rows(rule, out_features, rank_count, rank_index)?;
+            let row_bytes = in_features
+                .checked_mul(2)
+                .ok_or_else(|| invalid("shape", "the BF16 row width overflows"))?;
+            Ok(WeightShardRanges::Bf16 {
+                weights: range_for_rows(first_row, row_count, out_features, row_bytes)?,
+            })
+        }
+        WeightShardSpec::Affine {
+            descriptor,
+            zero_points,
+        } => {
+            let components = affine_components("weight", descriptor, zero_points)?;
+            let out_features = u64::try_from(descriptor.out_features)
+                .map_err(|_| invalid("shape", "the output dimension does not fit in u64"))?;
+            let (first_row, row_count) = shard_rows(rule, out_features, rank_count, rank_index)?;
+            let mut ranges = components.into_iter().map(|component| {
+                range_for_extent(first_row, row_count, component.len / out_features)
+            });
+            let codes = ranges.next().expect("canonical codes are present")?;
+            let scales = ranges.next().expect("canonical scales are present")?;
+            let zero_points = ranges.next().transpose()?;
+
+            Ok(WeightShardRanges::Affine {
+                codes,
+                scales,
+                zero_points,
+            })
+        }
+    }
+}
+
+fn validate_shape(out_features: u64, in_features: u64) -> Result<()> {
+    if out_features == 0 {
+        return Err(invalid(
+            "out_features",
+            "a weight needs at least one output row",
+        ));
+    }
+    if in_features == 0 {
+        return Err(invalid(
+            "in_features",
+            "a weight needs at least one input column",
+        ));
+    }
+    Ok(())
+}
+
+fn shard_rows(
+    rule: PartitionRule,
+    out_features: u64,
+    rank_count: u64,
+    rank_index: u64,
+) -> Result<(u64, u64)> {
+    match rule {
+        PartitionRule::ColumnShardable => {
+            if !out_features.is_multiple_of(rank_count) {
+                return Err(Error::Dim(DimError::NotDivisible {
+                    value: out_features,
+                    by: rank_count,
+                }));
+            }
+            let row_count = out_features / rank_count;
+            let first_row = rank_index
+                .checked_mul(row_count)
+                .ok_or_else(|| invalid("rank_index", "the first row offset overflows"))?;
+            Ok((first_row, row_count))
+        }
+        PartitionRule::RowShardable => Err(unsupported_fmt(
+            "row_sharded_weight_addressing",
+            format_args!(
+                "RowShardable owns input columns, which are strided in canonical row-major \
+                 [out, in] storage and cannot be represented by one LogicalRange"
+            ),
+        )),
+        other => Err(unsupported_fmt(
+            "weight_shard_partition",
+            format_args!("partition rule {other:?} is outside weight-shard addressing"),
+        )),
+    }
+}
+
+fn range_for_rows(
+    first_row: u64,
+    row_count: u64,
+    total_rows: u64,
+    row_bytes: u64,
+) -> Result<LogicalRange> {
+    total_rows
+        .checked_mul(row_bytes)
+        .ok_or_else(|| invalid("range", "the full tensor extent overflows"))?;
+    range_for_extent(first_row, row_count, row_bytes)
+}
+
+fn range_for_extent(first_row: u64, row_count: u64, row_bytes: u64) -> Result<LogicalRange> {
+    let offset = first_row
+        .checked_mul(row_bytes)
+        .ok_or_else(|| invalid("range", "the shard offset overflows"))?;
+    let len = row_count
+        .checked_mul(row_bytes)
+        .ok_or_else(|| invalid("range", "the shard length overflows"))?;
+    LogicalRange::new(offset, len)
 }
 
 /// Everything the kernel needs that is not an address, derived once from the
@@ -1544,7 +1725,9 @@ pub use device::{
 mod tests {
     use super::*;
     use moxie_format::affine::{ALLOWED_GROUP_SIZES, ZeroPoints};
+    use moxie_format::canonical::{ComponentKind, affine_components};
     use moxie_format::scale::ScaleValues;
+    use moxie_graph::{AttentionOutputReduction, KvHeadPartition};
     use moxie_types::{
         AccumulationPolicy, DeviceUuid, KernelId, KernelShapeBounds, KernelSymbol, RoundingProfile,
         SmVersion, TensorLayout, WorkspaceExpression,
@@ -1563,6 +1746,198 @@ mod tests {
             grouping,
             group_index: None,
             scale_dtype: ScaleDtype::Bf16,
+        }
+    }
+
+    fn assert_partition(ranges: &[LogicalRange], total: u64) {
+        let mut next = 0;
+        for range in ranges {
+            assert_eq!(range.offset_bytes(), next);
+            next += range.len_bytes();
+        }
+        assert_eq!(next, total);
+    }
+
+    #[test]
+    fn bf16_column_ranges_partition_rows_and_single_rank_is_whole_tensor() {
+        let spec = WeightShardSpec::Bf16 {
+            out_features: 6,
+            in_features: 5,
+        };
+        let one = shard_weight_ranges(PartitionRule::ColumnShardable, spec, 1, 0).unwrap();
+        assert_eq!(
+            one,
+            WeightShardRanges::Bf16 {
+                weights: LogicalRange::new(0, 6 * 5 * 2).unwrap()
+            }
+        );
+
+        let ranges: Vec<_> = (0..3)
+            .map(|rank| {
+                match shard_weight_ranges(PartitionRule::ColumnShardable, spec, 3, rank).unwrap() {
+                    WeightShardRanges::Bf16 { weights } => weights,
+                    WeightShardRanges::Affine { .. } => unreachable!(),
+                }
+            })
+            .collect();
+        assert_partition(&ranges, 6 * 5 * 2);
+        assert_eq!(ranges[0].len_bytes(), 2 * 5 * 2);
+
+        let huge = WeightShardSpec::Bf16 {
+            out_features: 2,
+            in_features: u64::MAX / 2,
+        };
+        for rank in 0..2 {
+            assert!(shard_weight_ranges(PartitionRule::ColumnShardable, huge, 2, rank).is_err());
+        }
+    }
+
+    #[test]
+    fn affine_column_ranges_use_each_canonical_component_row_width() {
+        // Reuse the affine-linear fixture's real descriptor shape: four output
+        // rows, 64 input columns, INT4 group-32, and one scale per group.
+        let descriptor = descriptor(IntWidth::Int4, 64, 4, Grouping::Contiguous { size: 32 });
+        let components =
+            affine_components("fixture", &descriptor, ZeroPointSection::PerGroup).unwrap();
+        let component = |kind| {
+            components
+                .iter()
+                .find(|component| component.kind == kind)
+                .unwrap()
+        };
+        let codes = component(ComponentKind::Codes);
+        let scales = component(ComponentKind::Scales);
+        let zero_points = component(ComponentKind::ZeroPoints);
+        let spec = WeightShardSpec::Affine {
+            descriptor: &descriptor,
+            zero_points: ZeroPointSection::PerGroup,
+        };
+
+        let one = shard_weight_ranges(PartitionRule::ColumnShardable, spec, 1, 0).unwrap();
+        assert_eq!(
+            one,
+            WeightShardRanges::Affine {
+                codes: LogicalRange::new(0, codes.len).unwrap(),
+                scales: LogicalRange::new(0, scales.len).unwrap(),
+                zero_points: Some(LogicalRange::new(0, zero_points.len).unwrap()),
+            }
+        );
+
+        let shards: Vec<_> = (0..2)
+            .map(|rank| {
+                match shard_weight_ranges(PartitionRule::ColumnShardable, spec, 2, rank).unwrap() {
+                    WeightShardRanges::Affine {
+                        codes,
+                        scales,
+                        zero_points: Some(zero_points),
+                    } => (codes, scales, zero_points),
+                    WeightShardRanges::Affine {
+                        zero_points: None, ..
+                    }
+                    | WeightShardRanges::Bf16 { .. } => unreachable!(),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_partition(
+            &shards
+                .iter()
+                .map(|(codes, _, _)| *codes)
+                .collect::<Vec<_>>(),
+            codes.len,
+        );
+        assert_partition(
+            &shards
+                .iter()
+                .map(|(_, scales, _)| *scales)
+                .collect::<Vec<_>>(),
+            scales.len,
+        );
+        assert_partition(
+            &shards
+                .iter()
+                .map(|(_, _, zero_points)| *zero_points)
+                .collect::<Vec<_>>(),
+            zero_points.len,
+        );
+        // The widths are deliberately different: using code bytes for every
+        // component would make at least one of these assertions fail.
+        assert_eq!(shards[0].0.len_bytes(), codes.len / 2);
+        assert_eq!(shards[0].1.len_bytes(), scales.len / 2);
+        assert_eq!(shards[0].2.len_bytes(), zero_points.len / 2);
+
+        let symmetric = WeightShardSpec::Affine {
+            descriptor: &descriptor,
+            zero_points: ZeroPointSection::Absent,
+        };
+        assert!(matches!(
+            shard_weight_ranges(PartitionRule::ColumnShardable, symmetric, 1, 0).unwrap(),
+            WeightShardRanges::Affine {
+                zero_points: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn column_sharding_refuses_an_output_dimension_not_divisible_by_ranks() {
+        let error = shard_weight_ranges(
+            PartitionRule::ColumnShardable,
+            WeightShardSpec::Bf16 {
+                out_features: 5,
+                in_features: 8,
+            },
+            2,
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            Error::Dim(DimError::NotDivisible { value: 5, by: 2 })
+        );
+    }
+
+    #[test]
+    fn row_sharding_refuses_bf16_and_affine_for_the_strided_layout() {
+        let affine = descriptor(IntWidth::Int8, 64, 4, Grouping::Contiguous { size: 32 });
+        for spec in [
+            WeightShardSpec::Bf16 {
+                out_features: 4,
+                in_features: 64,
+            },
+            WeightShardSpec::Affine {
+                descriptor: &affine,
+                zero_points: ZeroPointSection::Absent,
+            },
+        ] {
+            let error = shard_weight_ranges(PartitionRule::RowShardable, spec, 2, 0).unwrap_err();
+            match error {
+                Error::Unsupported { capability, reason } => {
+                    assert_eq!(capability, "row_sharded_weight_addressing");
+                    assert!(reason.contains("strided"));
+                }
+                other => panic!("expected typed strided-layout refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_domain_shard_requests_are_refused() {
+        let spec = WeightShardSpec::Bf16 {
+            out_features: 4,
+            in_features: 8,
+        };
+        assert!(shard_weight_ranges(PartitionRule::ColumnShardable, spec, 0, 0).is_err());
+        assert!(shard_weight_ranges(PartitionRule::ColumnShardable, spec, 2, 2).is_err());
+
+        for rule in [
+            PartitionRule::Replicated,
+            PartitionRule::HeadShardable {
+                kv: KvHeadPartition::GqaReplicateWhenOversubscribed,
+                output: AttentionOutputReduction::ConcatenateHeads,
+            },
+            PartitionRule::NotDetermined,
+        ] {
+            assert!(shard_weight_ranges(rule, spec, 1, 0).is_err());
         }
     }
 
