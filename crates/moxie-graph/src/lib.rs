@@ -698,11 +698,6 @@ mod tests {
 
         c.partition = PartitionRule::RowShardable;
         assert!(c.check_partitionable().is_ok());
-        c.partition = PartitionRule::HeadShardable {
-            kv: KvHeadPartition::GqaReplicateWhenOversubscribed,
-            output: AttentionOutputReduction::ConcatenateHeads,
-        };
-        assert!(c.check_partitionable().is_ok());
         assert_eq!(PartitionRule::default(), PartitionRule::NotDetermined);
     }
 

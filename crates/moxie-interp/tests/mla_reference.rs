@@ -71,7 +71,6 @@ struct Fixture {
     weight_bindings: Vec<(ValueId, Vec<f32>, Vec<usize>)>,
     input: ValueId,
     positions: ValueId,
-    o_proj: ValueId,
 }
 
 fn role_activation() -> ValueRole {
@@ -168,7 +167,6 @@ fn build() -> Fixture {
         weight_bindings,
         input,
         positions,
-        o_proj: o,
     }
 }
 
@@ -240,49 +238,12 @@ fn mla_plan_and_interpreter_read_latent_cache_across_prefill_and_decode() {
     let fixture = build();
     assert_eq!(fixture.graph.attention_layers(), vec![0]);
     let node = &fixture.graph.nodes()[0];
-    let descriptor = match &node.params {
-        OpParams::MlaAttention { descriptor } => *descriptor,
-        other => panic!("expected MLA node, got {other:?}"),
-    };
     assert_eq!(
         node.contract.partition,
         PartitionRule::HeadShardable {
             kv: KvHeadPartition::SharedLatentReplicated,
             output: AttentionOutputReduction::GlobalReduction,
         }
-    );
-    assert_eq!(
-        node.inputs.get(8),
-        Some(&fixture.o_proj),
-        "the real ninth MLA operand must be the fixture's o_proj weight"
-    );
-    assert_eq!(fixture.graph.name(fixture.o_proj), Some("o_proj"));
-    assert_eq!(
-        fixture.graph.spec(fixture.o_proj).unwrap().role,
-        role_weight(),
-        "the operand bound as o_proj must remain a model weight"
-    );
-    assert_eq!(
-        node.output,
-        fixture.graph.output(),
-        "MLA's output projection must finish the operation, not feed a downstream node"
-    );
-    assert!(
-        fixture
-            .graph
-            .nodes()
-            .iter()
-            .skip(1)
-            .all(|node| !matches!(&node.params, OpParams::Linear { .. })),
-        "the MLA fixture must not duplicate o_proj in a downstream Linear"
-    );
-    assert_eq!(
-        fixture.graph.spec(fixture.o_proj).unwrap().shape,
-        vec![
-            moxie_types::Dim::constant(descriptor.hidden),
-            moxie_types::Dim::constant(descriptor.output_width().unwrap()),
-        ],
-        "the bound o_proj operand must have the descriptor's output-projection shape"
     );
 
     let hidden_rows = vec![

@@ -1,6 +1,7 @@
 # Task 0055 — trim task 0053's redundant partition tests
 
-Status: **proposed**.
+Status: **accepted** (owner, 2026-09-22). Built by Codex `luna`; reviewed by Codex
+`sol`, round 1 ACCEPT.
 
 ## Identity and authority
 
@@ -98,8 +99,30 @@ Oracle: the mutation check below.
 
 ## Result, filled after work
 
-- Changed files; source commit:
-- Commands; passed / failed / skipped:
-- Mutation results and restoration evidence:
-- Net line change:
-- Remaining blockers:
+- Changed files; source commit: test-only, on base `50bfee2`.
+  `crates/moxie-interp/tests/reference_graphs.rs` (-66),
+  `crates/moxie-interp/tests/mla_reference.rs` (-39),
+  `crates/moxie-graph/src/lib.rs` (-5); 110 lines deleted, none added.
+- Commands: `cargo fmt --all -- --check`, `cargo clippy --workspace
+  --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`,
+  `cargo xtask arch-check`, `cargo xtask spec-check`, `git diff --check`, all
+  passed (builder). The reviewer re-ran `moxie-graph --lib` (19/19) and
+  `moxie-interp` `reference_graphs` + `mla_reference` (33/33). None failed or
+  were skipped.
+- Mutation results: each was applied to `OpParams::partition_rule()` and then
+  restored. `Attention` → `NotDetermined`: the contract-table row failed.
+  `MlaAttention` output → `ConcatenateHeads`: the contract-table row and the
+  `mla_reference` node assertion both failed. `Attention` kv →
+  `SharedLatentReplicated`: the contract-table row failed. `git diff
+  crates/moxie-graph/src/graph.rs` was empty afterwards; the reviewer and the
+  coordinator both confirmed this.
+- Review: sol, round 1, ACCEPT. The diff is exactly the contract's named
+  deletions. Removing the direct `MlaAttention` pattern match loses no
+  coverage: the fixture has one node, `attention_layers() == [0]` requires
+  that node to be an attention op, the kept `SharedLatent`/`GlobalReduction`
+  assertion distinguishes MLA, and the interpreter execution depends on
+  MLA's nine-input semantics. No further redundancy was found. The reviewer's
+  account hit its usage limit after the verdict was written and before the
+  Herdr notification was sent; the verdict and evidence are in its pane
+  (`wC:pY`), read by the coordinator on 2026-09-22.
+- Remaining blockers: none.

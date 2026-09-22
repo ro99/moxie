@@ -746,9 +746,6 @@ fn the_contract_table_is_what_the_code_says() {
         ),
         (
             OpParams::Attention {
-                // A GQA shape: a hypothetical four-rank lowering has more
-                // ranks than these two KV heads, so the rule must require KV
-                // replication rather than silently dropping a head.
                 heads: 8,
                 head_dim: 2,
                 visibility: Visibility::Causal,
@@ -765,8 +762,6 @@ fn the_contract_table_is_what_the_code_says() {
         ),
         (
             OpParams::MlaAttention {
-                // MLA's cache is a shared latent/positional row, not a
-                // per-head KV tensor; its descriptor also includes o_proj.
                 descriptor: MlaAttentionDescriptor {
                     hidden: 4,
                     q_lora_rank: 2,
@@ -810,69 +805,8 @@ fn the_contract_table_is_what_the_code_says() {
     for (params, partition, effect, precision) in cases {
         let op = params.op().name();
         assert_eq!(params.partition_rule(), *partition, "{op} partition");
-        assert!(
-            params.partition_rule().is_partitionable(),
-            "{op} partitionability"
-        );
         assert_eq!(params.state_effect(), *effect, "{op} state effect");
         assert_eq!(params.output_precision().get(), *precision, "{op} output");
-
-        match params {
-            OpParams::Attention {
-                heads, kv_heads, ..
-            } => {
-                let heads = *heads;
-                let kv_heads = *kv_heads;
-                const HYPOTHETICAL_RANKS: u64 = 4;
-                assert_eq!(
-                    heads % HYPOTHETICAL_RANKS,
-                    0,
-                    "the GQA fixture must be splittable across the hypothetical ranks"
-                );
-                assert!(
-                    kv_heads < HYPOTHETICAL_RANKS,
-                    "the GQA fixture must exercise rank oversubscription of KV heads"
-                );
-                assert!(
-                    kv_heads < heads,
-                    "the attention fixture must actually be grouped-query attention"
-                );
-                assert_eq!(
-                    heads % kv_heads,
-                    0,
-                    "the GQA fixture must have an integral query-to-KV grouping"
-                );
-            }
-            OpParams::MlaAttention { descriptor } => {
-                let descriptor = *descriptor;
-                let cache_width = descriptor.cache_width().unwrap();
-                let per_head_kv_width = descriptor.decompressed_kv_width().unwrap();
-                assert_eq!(
-                    cache_width,
-                    descriptor.kv_lora_rank + descriptor.qk_rope_head_dim,
-                    "MLA cache is latent state plus one shared positional-rope slice"
-                );
-                assert!(
-                    cache_width < per_head_kv_width,
-                    "MLA cache must stay narrower than decompressed per-head KV"
-                );
-
-                let more_query_heads = MlaAttentionDescriptor {
-                    heads: descriptor.heads + 1,
-                    ..descriptor
-                };
-                assert_eq!(
-                    more_query_heads.cache_width().unwrap(),
-                    cache_width,
-                    "shared MLA latent/positional cache must not scale per query head"
-                );
-                assert!(
-                    more_query_heads.decompressed_kv_width().unwrap() > per_head_kv_width,
-                    "the decompressed comparison must scale with query heads"
-                );
-            }
-            _ => {}
-        }
     }
 
     // Attention is the only state-touching node in this conventional fixture,
