@@ -57,23 +57,24 @@ wrong. Rows M5.1-c and M5.1-d record what it missed.
 |---|---|---|---|---|---|---|
 | M5.1-a | Attention/MLA op-level partition rule | **Accepted** (owner, 2026-09-22) | closed | none | [Task 0053](../tasks/0053-m5-attention-partition-semantics.md): `Attention` → `HeadShardable{GqaReplicateWhenOversubscribed, ConcatenateHeads}`, `MlaAttention` → `HeadShardable{SharedLatentReplicated, GlobalReduction}`. The semantics are correct. Most of its new test lines check fixture literals, re-test descriptor methods already pinned in `moxie-graph`, or check the fixture's own wiring (see M5.1-e) | none |
 | M5.1-b | Column-sharded weights addressed through the canonical format and residency authority (`LogicalRange` per component) | **Accepted** (owner, 2026-09-22) | closed | none | [Task 0054](../tasks/0054-m5-weight-shard-addressing.md), amended twice before any code: input-axis (row) shards are strided in row-major `[out, in]`, and quantization groups lie along `k`, so a column shard never splits a group. Three review rounds: a rank-dependent overflow verdict (fixed by validating the full extent first), hand-derived component widths (now `affine_components`), then redundant re-validation removed | none |
-| M5.1-c | Head-aligned partition: `Rope` rotates pairs within a head (`HalfSplit` pairs j and j + head_dim/2), and the Q/K/V `Linear`s produce heads, yet both are plain `ColumnShardable` with no head-boundary requirement. Under GQA oversubscription (8 query heads, 2 KV heads, 4 ranks), an even column split of `k_proj` cuts each KV head in half | **Queued** | luna / sol / coordinator | M5.1-b accepted (both touch partition consumers; serialize) | coordinator review of task 0053, 2026-09-22. The rules come from task 0003 and were not visited by task 0053 | open as a task after M5.1-b and M5.1-e; the contract must first check how the graph ties a projection to the attention op that consumes it |
-| M5.1-d | Per-weight partition inside `MlaAttention`: `q_a_proj`/`kv_a_proj` replicated, `q_b_proj`/`kv_b_proj` split by head, `o_proj` split along its input axis. One `PartitionRule` per op cannot express this, so M5.1-b's addressing cannot serve MLA weights | **Queued** | luna / sol / coordinator | M5.1-c (same head-alignment vocabulary); `o_proj`'s input-axis split also needs M5.2's strided addressing | coordinator review of task 0053, 2026-09-22 | fold into the M5.1-c task if the same mechanism covers it; otherwise its own task |
+| M5.1-c | Head-aligned partition across the head chain (`q/k/v` `Linear` → per-head `RmsNorm` → `Rope` → `Attention`) | **Moved into M5.2 task 0056** (owner, 2026-09-22) | luna / reviewer / coordinator | none | Partition rules have no production reader, so per-op labels could only be tested as constants. Head alignment is now proven by a host TP lowering whose split result must be bit-identical to the unsplit graph | see M5.2 |
+| M5.1-d | Per-weight partition inside `MlaAttention` (`q_a`/`kv_a` replicated, `q_b`/`kv_b` split by head, `o_proj` split along its input axis) | **Moved to a later M5.2 slice** (owner, 2026-09-22) | unassigned | task 0056's lowering; `o_proj` also needs strided addressing | task 0056 refuses `MlaAttention` explicitly | after task 0056 |
 | M5.1-e | Trim task 0053's redundant tests to one assertion per invariant (owner instruction, 2026-09-19) | **Accepted** (owner, 2026-09-22) | closed | none | Keep: the contract-table enum rows and the single `node.contract.partition` assertion on the real MLA node in `mla_reference.rs`. Remove: the GQA-literal block and the `cache_width`/`more_query_heads` block in `reference_graphs.rs`, the fixture-wiring assertions in `mla_reference.rs`, and the new `HeadShardable` line in `moxie-graph`'s `partition_semantics_fail_closed_until_defined` | [Task 0055](../tasks/0055-m5-trim-task-0053-tests.md) opened, 2026-09-22 |
 | M5.1-f | State (KV) shard addressing through the residency authority | Not started | unassigned | M5.1-c (which KV heads a rank owns) | named in task 0054's non-goals | after M5.1-c |
-| M5.2 | TP2 on the 3090 pair: column/row linears, head/KV ownership, global routing/vocabulary ops, collective ordering and failure handling | Not started | unassigned | M5.1 | none | Carries from M5.1: reject non-divisible head/rank combinations (review-task-0053-round-1); input-axis (row-sharded) weight addressing and quantization-group alignment (task 0054 amendments), via a strided-range primitive or an ADR for a pre-sharded layout |
+| M5.2 | TP2 on the 3090 pair: column/row linears, head/KV ownership, global routing/vocabulary ops, collective ordering and failure handling | **Active: slice 1** | luna / reviewer / coordinator | M5.1-a/b accepted | [Task 0056](../tasks/0056-m5-host-tp-attention-lowering.md): host-only lowering of the dense Gemma 4 attention sublayer for R = 2 and 4, bit-identical to the unsplit graph; design proposal first. It also closes the carried non-divisible-head refusal | Later slices: MLA (M5.1-d); row-parallel `o_proj` plus strided addressing and group alignment (task 0054 amendments); state KV shard addressing (M5.1-f); device collectives on the 3090 pair, replacing task 0056's host harness |
 | M5.3 | PP with uneven stages, microbatch-aware prefill, mixed TP+PP stage groups | Not started | unassigned | M5.2 | none | after M5.2 |
 | M5.4 | Bounded expert-owner partitioning: shared dispatch/transport/reduction, duplicate destinations, host experts, route unions | Not started | unassigned | `ExpertMlp`/`Combine` partition rule (still `NotDetermined`) | none | its own task once expert-owner semantics are written |
 | M5.5 | Topology cost probes and a deterministic plan comparison tool | Not started | unassigned | M5.2/M5.3/M5.4 | none | not queued |
 
 ## Work queue (critical path)
 
-1. Task 0054 (M5.1-b): accepted.
-2. M5.1-e test trim (task 0055): accepted, 110 test lines removed.
-3. M5.1-c head alignment, with M5.1-d if one mechanism covers both. This is the
-   substantive remaining M5.1 work; M5.2 cannot lower a real attention block
-   without it.
-4. M5.1-f state addressing, then M5.2.
+1. Tasks 0054 (M5.1-b) and 0055 (M5.1-e): accepted.
+2. Task 0056, M5.2 slice 1: host TP lowering of the attention sublayer.
+   Luna sends a design proposal first; implementation starts after the
+   coordinator answers.
+3. Then device collectives on the 3090 pair, MLA, and row-parallel
+   `o_proj`, each as its own slice, in whichever order the first slice's
+   result makes cheapest.
 
 Lesson applied to every contract written from here on: read the storage layout,
 group axis and graph wiring a contract depends on before writing its acceptance
@@ -88,5 +89,4 @@ abstraction; whether TP2 needs a rank-group type is M5.2's question. Document
 
 ## Next task
 
-Task 0054 is active. When it is accepted, the M5.1-e test trim goes to luna, then
-M5.1-c. Each gets a full contract under `docs/tasks/` when it opens.
+Task 0056 (M5.2 slice 1) is assigned to luna, design first.

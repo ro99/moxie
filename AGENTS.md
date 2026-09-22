@@ -156,13 +156,15 @@ tracks this milestone's obligations.
 0053](docs/tasks/0053-m5-attention-partition-semantics.md) is accepted:
 `Attention` and `MlaAttention` declare `PartitionRule::HeadShardable`.
 [Task 0054](docs/tasks/0054-m5-weight-shard-addressing.md) is accepted: it maps a
-column-sharded weight to the byte range each rank owns. **M5.1 is not
-closed.** The partition rules do not yet require shard boundaries to fall on
-head boundaries (`Rope`, and the Q/K/V `Linear`s that feed attention). One
-rule per op also cannot describe MLA's seven differently-partitioned weights.
-`ExpertMlp`/`Combine` stay `NotDetermined` for M5.4. The [M5
+column-sharded weight to the byte range each rank owns. Partition rules
+have no production reader yet, so head alignment and MLA's per-weight
+partition are proven by lowering rather than by more labels. [Task
+0056](docs/tasks/0056-m5-host-tp-attention-lowering.md) (active, M5.2 slice 1)
+is a host-only TP lowering of the attention sublayer. Its split result must
+be bit-identical to the unsplit graph. `ExpertMlp`/`Combine` stay
+`NotDetermined` for M5.4. The [M5
 ledger](docs/handovers/2026-09-22-m4-closure-to-m5.md) carries each open
-obligation and the queued tasks.
+obligation and the queue.
 
 | | |
 |---|---|
