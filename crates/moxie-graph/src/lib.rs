@@ -418,6 +418,45 @@ pub enum PartitionRule {
     RowShardable,
     /// Replicated on every rank; bias and residual terms applied exactly once.
     Replicated,
+    /// Query heads are owned along the head axis.
+    ///
+    /// Each rank owns whole query heads. The lowering must reject a rank count
+    /// that cannot divide the query-head count; this rule does not permit
+    /// truncation or an implicit reshape. `kv` describes the corresponding
+    /// key/value state, and `output` describes the boundary at which the
+    /// per-rank head results become the operation's output.
+    HeadShardable {
+        kv: KvHeadPartition,
+        output: AttentionOutputReduction,
+    },
+}
+
+/// How key/value state follows query-head ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvHeadPartition {
+    /// Split complete KV heads with the query-head owners when possible. If
+    /// the rank count exceeds the KV-head count, replicate those KV heads to
+    /// every rank that owns their query heads; never drop or truncate a head.
+    GqaReplicateWhenOversubscribed,
+    /// MLA stores one latent row plus one shared positional-rope row, not a
+    /// per-head KV row. Replicate that shared latent/positional state to every
+    /// query-head owner.
+    SharedLatentReplicated,
+}
+
+/// Where a head-sharded attention result is combined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionOutputReduction {
+    /// Concatenate the rank-local whole-head outputs in global head order.
+    /// This is an activation concatenation, not a sum, and is the plain
+    /// Attention node's output boundary; its following Linear keeps its own
+    /// existing partition rule.
+    ConcatenateHeads,
+    /// Sum rank-local partial output-projection results globally, producing a
+    /// replicated residual-stream output. `MlaAttention` includes that output
+    /// projection in its own descriptor, so this reduction is part of its
+    /// operation boundary.
+    GlobalReduction,
 }
 
 impl PartitionRule {
@@ -658,6 +697,11 @@ mod tests {
         assert!(c.check_lowerable(&registry(Op::Linear)).is_ok());
 
         c.partition = PartitionRule::RowShardable;
+        assert!(c.check_partitionable().is_ok());
+        c.partition = PartitionRule::HeadShardable {
+            kv: KvHeadPartition::GqaReplicateWhenOversubscribed,
+            output: AttentionOutputReduction::ConcatenateHeads,
+        };
         assert!(c.check_partitionable().is_ok());
         assert_eq!(PartitionRule::default(), PartitionRule::NotDetermined);
     }

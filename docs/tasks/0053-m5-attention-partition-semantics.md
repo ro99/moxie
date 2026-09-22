@@ -1,6 +1,9 @@
 # Task 0053 — attention head-ownership, GQA KV-replication and output-reduction partition semantics
 
-Status: **proposed**.
+Status: **accepted** (owner, 2026-09-22). Built by Codex `luna`,
+independently reviewed by Codex `sol` across three rounds; coordinator
+Claude Opus verified the reported gates independently before presenting
+this package.
 
 ## Identity and authority
 
@@ -150,8 +153,62 @@ Status: **proposed**.
 
 ## Result, filled after work
 
-- Changed shared owners and consumers; source commit:
+- Changed shared owners and consumers; source identity: assignment
+  `task-0053-round-3`, repairing `review-task-0053-round-2`, in the
+  uncommitted working tree on `main` at `c54e32d`.
+  `moxie-graph` now owns `HeadShardable`, `KvHeadPartition` and
+  `AttentionOutputReduction`; `Attention` declares GQA KV replication with
+  concatenated whole-head output, while `MlaAttention` declares replicated
+  shared latent/positional state with global output reduction. The existing
+  `moxie-interp` reference-graph contract table covers one GQA shape and one
+  MLA shape. The unrelated dirty paths
+  `docs/evidence/specification-version.md` and
+  `docs/decisions/adr/0034-tokenizers-crate-named-at-m8.md` were preserved.
+- Round-2 repair: the existing reference-graph contract fixture now makes its
+  geometry load-bearing. Its GQA case must divide across four hypothetical
+  ranks while having fewer KV heads than ranks and query heads; its MLA case
+  proves the latent/positional cache width is independent of query-head count
+  and narrower than decompressed per-head KV.
+- Round-3 repair: the existing `mla_reference` fixture now inspects the real
+  `MlaAttention` graph node used by its oracle execution. It binds the node's
+  ninth input to the fixture's actual `o_proj` value, checks that value's name,
+  role and descriptor shape, checks the node's `GlobalReduction` contract, and
+  proves the node is the graph output with no downstream `Linear` duplicating
+  the projection. The previous arity-only boundary assertion was removed.
+- Review trail (independent reviewer Codex `sol`, read-only,
+  `/ponytail:ponytail-review`): round 1 found one real, task-blocking finding
+  — the GQA/MLA fixtures compared static enum constants without the geometry
+  actually exercising the oversubscription/shared-latent properties they
+  claimed, so the required proof was not load-bearing; everything else
+  (`Linear`/`Route`/`ExpertMlp`/`Combine` untouched, all gates passing, the
+  semantic design itself) was clean. Round 2's repair fixed the GQA proof but
+  left a residual gap — the MLA output-projection-boundary claim rested on
+  operand *cardinality* (`arity() == 9`) rather than operand *role*, which a
+  mutation (swap input 8, or move `o_proj` downstream while keeping 9
+  operands) would not have caught. Round 3 closed it by binding the claim to
+  the real graph node's actual operand identity/name/role/shape and topology
+  instead. Round 3: **ACCEPT**, no remaining findings.
 - Commands and result IDs; passed / failed / skipped separately:
-- Measured effect and uncertainty:
-- Deleted/replaced paths:
-- Remaining blockers and next bounded task:
+  - Passed: `cargo fmt --all -- --check`; `cargo test --workspace --locked`
+    (exit 0); `cargo test -p moxie-graph --lib --locked` (19/19);
+    `cargo test -p moxie-interp --test mla_reference --locked` (2/2);
+    `cargo test -p moxie-interp --test reference_graphs --locked` (31/31);
+    `cargo clippy --workspace --all-targets --locked -- -D warnings`;
+    `cargo xtask arch-check` (79 rejected fixtures, 21 accepted fixtures, 13
+    rules exercised); `cargo xtask spec-check` (10 documents); and
+    `git diff --check`.
+  - Failed and repaired: the first clippy attempt found an identical-branch
+    test assertion after the contract change; the test was simplified and the
+    final clippy and workspace runs passed.
+  - Skipped: GPU, distributed, driver/CUDA and performance lanes; this task
+    changes only host-side legality contracts and executes no new path.
+- Measured effect and uncertainty: no timing or quality measurement. The
+  change makes the document 04 attention partition legality explicit; it does
+  not add rank lowering, collectives, execution, padding or reshaping. A
+  lowering must still reject non-divisible head assignments explicitly.
+- Deleted/replaced paths: none. `Route`, `ExpertMlp`, `Combine` and `Linear`
+  partition rules are unchanged; no plan or executor path was modified.
+- Remaining blockers and next bounded task: no named stop condition was
+  reached. Independent review is complete and clean (ACCEPT, round 3);
+  ready for owner acceptance. TP2/collective execution remains M5.2, and
+  expert partition semantics remain M5.4 — neither is opened by this task.

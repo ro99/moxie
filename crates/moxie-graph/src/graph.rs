@@ -34,8 +34,8 @@ use moxie_types::{
 };
 
 use crate::{
-    MlaAttentionDescriptor, Op, OpContract, OracleId, OracleRegistry, PartitionRule, StateEffect,
-    Visibility,
+    AttentionOutputReduction, KvHeadPartition, MlaAttentionDescriptor, Op, OpContract, OracleId,
+    OracleRegistry, PartitionRule, StateEffect, Visibility,
 };
 
 /// Process-unique identity of one immutable validated graph.
@@ -688,11 +688,19 @@ impl OpParams {
             OpParams::Embedding { .. } | OpParams::RmsNorm { .. } | OpParams::Residual { .. } => {
                 PartitionRule::Replicated
             }
-            // Head ownership, GQA KV replication and the output reduction are
-            // document 04's M5 work. Undetermined until then, deliberately.
-            OpParams::Attention { .. } | OpParams::MlaAttention { .. } => {
-                PartitionRule::NotDetermined
-            }
+            // Plain attention owns query heads and concatenates their outputs;
+            // its separate output Linear keeps its existing contract.
+            OpParams::Attention { .. } => PartitionRule::HeadShardable {
+                kv: KvHeadPartition::GqaReplicateWhenOversubscribed,
+                output: AttentionOutputReduction::ConcatenateHeads,
+            },
+            // MLA owns query heads too, but its latent/positional cache is
+            // shared rather than per-head and its descriptor includes o_proj,
+            // so the operation boundary includes the global output reduction.
+            OpParams::MlaAttention { .. } => PartitionRule::HeadShardable {
+                kv: KvHeadPartition::SharedLatentReplicated,
+                output: AttentionOutputReduction::GlobalReduction,
+            },
             // Replicated, and that is a correctness requirement rather than a
             // cost choice. Every rank must reach the same selection from the
             // same row: a router sharded over its expert axis would reduce

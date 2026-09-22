@@ -8,8 +8,9 @@
 //! contracts, and adds that synthetic output is never described as model support.
 
 use moxie_graph::{
-    Bindings, Graph, GraphBuilder, IndexEncoding, OpParams, OracleRegistry, PartitionRule,
-    RopeLayout, StateEffect, TensorSpec, ValueId, ValueRole, Visibility, reciprocal_sqrt_scale,
+    AttentionOutputReduction, Bindings, Graph, GraphBuilder, IndexEncoding, KvHeadPartition,
+    MlaAttentionDescriptor, OpParams, OracleRegistry, PartitionRule, RopeLayout, StateEffect,
+    TensorSpec, ValueId, ValueRole, Visibility, reciprocal_sqrt_scale,
 };
 use moxie_interp::{Cancel, HostTensor, Interpreter, KvCache, Value};
 use moxie_oracles::metric::{ErrorSummary, gamma};
@@ -745,14 +746,47 @@ fn the_contract_table_is_what_the_code_says() {
         ),
         (
             OpParams::Attention {
-                heads: 1,
+                // A GQA shape: a hypothetical four-rank lowering has more
+                // ranks than these two KV heads, so the rule must require KV
+                // replication rather than silently dropping a head.
+                heads: 8,
                 head_dim: 2,
                 visibility: Visibility::Causal,
                 layer: 0,
-                kv_heads: 1,
+                kv_heads: 2,
                 scale: reciprocal_sqrt_scale(2),
             },
-            PartitionRule::NotDetermined,
+            PartitionRule::HeadShardable {
+                kv: KvHeadPartition::GqaReplicateWhenOversubscribed,
+                output: AttentionOutputReduction::ConcatenateHeads,
+            },
+            StateEffect::Appends,
+            Precision::Bf16,
+        ),
+        (
+            OpParams::MlaAttention {
+                // MLA's cache is a shared latent/positional row, not a
+                // per-head KV tensor; its descriptor also includes o_proj.
+                descriptor: MlaAttentionDescriptor {
+                    hidden: 4,
+                    q_lora_rank: 2,
+                    kv_lora_rank: 2,
+                    qk_nope_head_dim: 2,
+                    qk_rope_head_dim: 2,
+                    v_head_dim: 2,
+                    heads: 2,
+                    rms_norm_eps: 1e-5,
+                    rope_base: 10_000.0,
+                    rope_layout: RopeLayout::Interleaved,
+                    visibility: Visibility::Causal,
+                    layer: 0,
+                    cache_precision: moxie_types::CachePrecision::expect(Precision::Bf16),
+                },
+            },
+            PartitionRule::HeadShardable {
+                kv: KvHeadPartition::SharedLatentReplicated,
+                output: AttentionOutputReduction::GlobalReduction,
+            },
             StateEffect::Appends,
             Precision::Bf16,
         ),
@@ -776,22 +810,79 @@ fn the_contract_table_is_what_the_code_says() {
     for (params, partition, effect, precision) in cases {
         let op = params.op().name();
         assert_eq!(params.partition_rule(), *partition, "{op} partition");
+        assert!(
+            params.partition_rule().is_partitionable(),
+            "{op} partitionability"
+        );
         assert_eq!(params.state_effect(), *effect, "{op} state effect");
         assert_eq!(params.output_precision().get(), *precision, "{op} output");
+
+        match params {
+            OpParams::Attention {
+                heads, kv_heads, ..
+            } => {
+                let heads = *heads;
+                let kv_heads = *kv_heads;
+                const HYPOTHETICAL_RANKS: u64 = 4;
+                assert_eq!(
+                    heads % HYPOTHETICAL_RANKS,
+                    0,
+                    "the GQA fixture must be splittable across the hypothetical ranks"
+                );
+                assert!(
+                    kv_heads < HYPOTHETICAL_RANKS,
+                    "the GQA fixture must exercise rank oversubscription of KV heads"
+                );
+                assert!(
+                    kv_heads < heads,
+                    "the attention fixture must actually be grouped-query attention"
+                );
+                assert_eq!(
+                    heads % kv_heads,
+                    0,
+                    "the GQA fixture must have an integral query-to-KV grouping"
+                );
+            }
+            OpParams::MlaAttention { descriptor } => {
+                let descriptor = *descriptor;
+                let cache_width = descriptor.cache_width().unwrap();
+                let per_head_kv_width = descriptor.decompressed_kv_width().unwrap();
+                assert_eq!(
+                    cache_width,
+                    descriptor.kv_lora_rank + descriptor.qk_rope_head_dim,
+                    "MLA cache is latent state plus one shared positional-rope slice"
+                );
+                assert!(
+                    cache_width < per_head_kv_width,
+                    "MLA cache must stay narrower than decompressed per-head KV"
+                );
+
+                let more_query_heads = MlaAttentionDescriptor {
+                    heads: descriptor.heads + 1,
+                    ..descriptor
+                };
+                assert_eq!(
+                    more_query_heads.cache_width().unwrap(),
+                    cache_width,
+                    "shared MLA latent/positional cache must not scale per query head"
+                );
+                assert!(
+                    more_query_heads.decompressed_kv_width().unwrap() > per_head_kv_width,
+                    "the decompressed comparison must scale with query heads"
+                );
+            }
+            _ => {}
+        }
     }
 
-    // Attention is the only state-touching node, and TP lowering fails closed
-    // on it until document 04's M5 work defines head ownership.
+    // Attention is the only state-touching node in this conventional fixture,
+    // and its newly defined head ownership is accepted by the contract gate.
     let f = build(A, 3);
     let effects = f.graph.state_effects();
     assert_eq!(effects.len(), 1);
     assert_eq!(effects[0].1, StateEffect::Appends);
     for node in f.graph.nodes() {
-        if matches!(node.params, OpParams::Attention { .. }) {
-            assert!(node.contract.check_partitionable().is_err());
-        } else {
-            assert!(node.contract.check_partitionable().is_ok());
-        }
+        assert!(node.contract.check_partitionable().is_ok());
     }
 }
 
