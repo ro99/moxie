@@ -99,4 +99,4 @@ abstraction; whether TP2 needs a rank-group type is M5.2's question. Document
 
 ## Next task
 
-Slice 1 (dense TP on the host) is next, for luna.
+Slice 1 is [task 0058](../tasks/0058-m5-dense-tp-host-lowering.md), assigned to luna, design first.
