@@ -95,19 +95,28 @@ generalization remains named out of scope by tasks 0044/0045 and stays
 separately unopened — it is not required for M4.4's roadmap text and is
 not automatically authorized by this closure.
 
-**M4.5 is the next M4 deliverable, not yet started, no task opened.**
-Roadmap text: "Add same-user prefix reuse and continuation with correct
-checkpoint/config identity; ensure a full prefix hit still produces valid
-next-token logits or recomputes the required boundary step." Document 04
-line 35 is the relevant contract: prefix reuse and transaction commits
-must distinguish "committed in history" from "materialized forward/state
-position" — a token can be accepted without its forward pass having run
-yet, and reusing a prefix means checking logit validity against the exact
-branch/prefix/graph generation, not just position/counter equality. This
-is the natural point to also produce M4's own closure/handover, since
-M4.1–M4.4 are now all accepted and only M4.5 plus the milestone's
-overall integration exit gate (32,768-token generation, real prefill/
-decode/multiturn — untouched by any task so far) remain. Device (GPU) execution of MLA and the absorbed/fused fast
+[Task 0049](docs/tasks/0049-m4-prefix-reuse-key-and-boundary-decision.md)
+**accepted** (owner, 2026-09-21): the prefix-reuse identity/admission
+decision, closing the exact gap `PrefixLineage`'s own doc comment named.
+Three review rounds — the deepest scrutiny of this session — caught a real
+correctness defect (the boundary calculation used a single ephemeral
+cached logits handle instead of `Frontiers::executed`, the actual
+materialized-state frontier, and would have silently discarded valid state
+and fallen back to full recompute) and then a test-completeness gap in its
+own repair (every fixture had `claimed_prefix == executed`, so a mutant
+deleting `executed` from the formula would still have passed). Both
+repaired and traced. This is a pure host-only decision primitive with no
+consumer wired yet.
+
+[Task 0050](docs/tasks/0050-m4-integrated-closure.md) (proposed
+2026-09-22) is the milestone-closing integration task: every M4.1–M4.5
+primitive so far has been proven in isolation, against synthetic fixtures,
+never combined — the 32,768-actual-row paged attention gate (tasks
+0037/0038) has no later-turn continuation, and COW fork/prefix reuse have
+never been exercised at that scale. M4's own exit gate ("supported graph
+runs at 32,768 actual context tokens, including decode after long prefill
+and later-turn continuation... test page/ring/tail boundaries") is
+unmet until something combines them. Device (GPU) execution of MLA and the absorbed/fused fast
 path are explicitly out of M4.2's scope and are not opened by its acceptance.
 The [M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md)
 tracks this milestone's obligations.

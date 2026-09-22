@@ -52,6 +52,9 @@ pub use convolution::{ConvolutionHistory, ConvolutionHistorySnapshot, Convolutio
 pub mod sparse_index;
 pub use sparse_index::{SparseIndex, SparseIndexReplaySource, SparseIndexSnapshot};
 
+pub mod prefix_reuse;
+pub use prefix_reuse::{PrefixReuseDecision, PrefixReuseKey, PrefixReuseRefusal};
+
 pub mod paged;
 pub use paged::{
     KvGeometry, KvRow, LayerKv, PagedCloseRefused, PagedExecutionBinding, PagedSequence,
@@ -339,8 +342,9 @@ impl StateGeneration {
 ///
 /// It is a lineage, **not** a content digest: it distinguishes "this suffix was
 /// replaced" from "this suffix is unchanged". Document 04's prefix-reuse key --
-/// checkpoint, tokenizer/template, configuration and token IDs -- is a separate
-/// identity that composes with this one and is not implemented here.
+/// checkpoint, tokenizer/template, configuration and token-prefix identity --
+/// is represented by [`PrefixReuseKey`], while token-content comparison remains
+/// the caller's responsibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PrefixLineage(u64);
 
