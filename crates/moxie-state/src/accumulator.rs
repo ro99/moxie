@@ -6,6 +6,8 @@
 //! branch identity, prefix lineage and rollback evidence; this module only
 //! makes that evidence correspond to actual bytes.
 
+use core::marker::PhantomData;
+
 use moxie_memory::{HostBuffer, Ledger};
 use moxie_types::{BranchId, Error, HostTier, Result, StateTransactionId, Tier};
 
@@ -13,19 +15,150 @@ use crate::{
     Branch, Journal, PrefixLineage, ROOT, Restore, RestoreMethod, SequenceState, StateKind,
 };
 
-/// A physical snapshot of one recurrent accumulator prefix.
+mod sealed {
+    pub trait StateStoreKind {}
+}
+
+/// The three explicit-restore stores differ only in the state kind and their
+/// diagnostic vocabulary. The zero-sized marker keeps that choice out of the
+/// admitted control-byte size while the implementation remains one type.
+pub trait StateStoreKind: sealed::StateStoreKind {
+    const KIND: StateKind;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RecurrentStoreKind;
+
+impl sealed::StateStoreKind for RecurrentStoreKind {}
+
+impl StateStoreKind for RecurrentStoreKind {
+    const KIND: StateKind = StateKind::RecurrentAccumulator;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ConvolutionStoreKind;
+
+impl sealed::StateStoreKind for ConvolutionStoreKind {}
+
+impl StateStoreKind for ConvolutionStoreKind {
+    const KIND: StateKind = StateKind::ConvolutionHistory;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SparseIndexStoreKind;
+
+impl sealed::StateStoreKind for SparseIndexStoreKind {}
+
+impl StateStoreKind for SparseIndexStoreKind {
+    const KIND: StateKind = StateKind::SparseIndex;
+}
+
+#[derive(Clone, Copy)]
+struct StoreText {
+    initial_field: &'static str,
+    initial_detail: &'static str,
+    state_label: &'static str,
+    start_label: &'static str,
+    current_ownership: &'static str,
+    start_ownership: &'static str,
+    step_label: &'static str,
+    step_ownership: &'static str,
+    begin_ownership: &'static str,
+    commit_ownership: &'static str,
+    snapshot_label: &'static str,
+    snapshot_mismatch: &'static str,
+    replay_label: &'static str,
+    replay_ownership: &'static str,
+    rollback_label: &'static str,
+    prefix_overflow: &'static str,
+    released: &'static str,
+    truncate_capability: &'static str,
+    truncate_reason: &'static str,
+}
+
+fn store_text(kind: StateKind) -> StoreText {
+    match kind {
+        StateKind::RecurrentAccumulator => StoreText {
+            initial_field: "initial",
+            initial_detail: "recurrent accumulator state must contain at least one byte",
+            state_label: "recurrent accumulator state",
+            start_label: "recurrent accumulator start",
+            current_ownership: "the admitting ledger owns current accumulator bytes",
+            start_ownership: "the admitting ledger owns start accumulator bytes",
+            step_label: "recurrent accumulator step",
+            step_ownership: "the admitting ledger owns step scratch",
+            begin_ownership: "the new accumulator transaction is open",
+            commit_ownership: "the failed accumulator commit remains abortable",
+            snapshot_label: "recurrent accumulator snapshot",
+            snapshot_mismatch: "snapshot does not belong to this accumulator's current lineage",
+            replay_label: "recurrent accumulator replay",
+            replay_ownership: "the admitting ledger owns replay scratch",
+            rollback_label: "physical accumulator",
+            prefix_overflow: "recurrent accumulator prefix counter overflow",
+            released: "recurrent accumulator has been released",
+            truncate_capability: "recurrent_accumulator_truncate",
+            truncate_reason: "accumulated state requires an explicit snapshot or replay",
+        },
+        StateKind::ConvolutionHistory => StoreText {
+            initial_field: "initial_window",
+            initial_detail: "convolution history must retain at least one byte",
+            state_label: "convolution history state",
+            start_label: "convolution history start",
+            current_ownership: "the admitting ledger owns current convolution bytes",
+            start_ownership: "the admitting ledger owns start convolution bytes",
+            step_label: "convolution history step",
+            step_ownership: "the admitting ledger owns convolution step scratch",
+            begin_ownership: "the new convolution transaction is open",
+            commit_ownership: "the failed convolution commit remains abortable",
+            snapshot_label: "convolution history snapshot",
+            snapshot_mismatch: "snapshot does not belong to this convolution history's current lineage",
+            replay_label: "convolution history replay",
+            replay_ownership: "the admitting ledger owns convolution replay scratch",
+            rollback_label: "physical convolution history",
+            prefix_overflow: "convolution history prefix counter overflow",
+            released: "convolution history has been released",
+            truncate_capability: "convolution_history_truncate",
+            truncate_reason: "raw window history requires an explicit snapshot or replay",
+        },
+        StateKind::SparseIndex => StoreText {
+            initial_field: "initial",
+            initial_detail: "sparse index state must contain at least one byte",
+            state_label: "sparse index state",
+            start_label: "sparse index start",
+            current_ownership: "the admitting ledger owns current sparse-index bytes",
+            start_ownership: "the admitting ledger owns start sparse-index bytes",
+            step_label: "sparse index step",
+            step_ownership: "the admitting ledger owns sparse-index step scratch",
+            begin_ownership: "the new sparse-index transaction is open",
+            commit_ownership: "the failed sparse-index commit remains abortable",
+            snapshot_label: "sparse index snapshot",
+            snapshot_mismatch: "snapshot does not belong to this sparse index's current lineage",
+            replay_label: "sparse index replay",
+            replay_ownership: "the admitting ledger owns sparse-index replay scratch",
+            rollback_label: "physical sparse index",
+            prefix_overflow: "sparse index prefix counter overflow",
+            released: "sparse index has been released",
+            truncate_capability: "sparse_index_truncate",
+            truncate_reason: "maintained selection requires an explicit snapshot or replay",
+        },
+        _ => unreachable!("unsupported bounded state-store kind"),
+    }
+}
+
+/// A physical snapshot of one bounded explicit-restore state prefix.
 ///
 /// The payload has its own ledger reservation and must be explicitly released,
 /// just like the other host-backed state owned by this crate.  Dropping it
 /// without releasing it intentionally leaves the charge visible to the ledger.
 #[derive(Debug)]
-pub struct RecurrentSnapshot {
+pub struct BoundedSnapshot<K: StateStoreKind> {
     prefix: u64,
     evidence: Restore,
     bytes: HostBuffer,
+    marker: PhantomData<K>,
 }
 
-impl RecurrentSnapshot {
+impl<K: StateStoreKind> BoundedSnapshot<K> {
     /// The accepted prefix represented by this snapshot.
     pub const fn prefix(&self) -> u64 {
         self.prefix
@@ -47,16 +180,16 @@ impl RecurrentSnapshot {
     }
 }
 
-/// Where a replay starts.
+/// Where a bounded explicit-restore replay starts.
 #[derive(Debug, Clone, Copy)]
-pub enum ReplaySource<'a> {
-    /// Re-run from the accumulator's initial bytes at prefix zero.
+pub enum BoundedReplaySource<'a, K: StateStoreKind> {
+    /// Re-run from the store's initial bytes at prefix zero.
     Start,
-    /// Re-run from an exact snapshot owned by this accumulator's sequence.
-    Snapshot(&'a RecurrentSnapshot),
+    /// Re-run from an exact snapshot owned by this store's sequence.
+    Snapshot(&'a BoundedSnapshot<K>),
 }
 
-/// A host-backed, model-independent recurrent accumulator.
+/// A host-backed, model-independent bounded explicit-restore state store.
 ///
 /// The current state and the prefix-zero source are separate admitted host
 /// buffers.  Replay uses a third, short-lived admitted buffer, so a failed
@@ -64,22 +197,24 @@ pub enum ReplaySource<'a> {
 /// after the whole replay and the existing [`SequenceState::restore_evidence`]
 /// check have succeeded.
 #[derive(Debug)]
-pub struct RecurrentAccumulator {
+pub struct BoundedStateStore<K: StateStoreKind> {
     sequence: Option<SequenceState>,
     start: HostBuffer,
     current: HostBuffer,
     prefix: u64,
     max_prefix: u64,
+    marker: PhantomData<K>,
 }
 
-impl RecurrentAccumulator {
-    /// Create a recurrent accumulator whose opaque state has a fixed byte
-    /// width and whose accepted prefix is bounded by `max_prefix`.
+impl<K: StateStoreKind> BoundedStateStore<K> {
+    /// Create a bounded store whose opaque state has a fixed byte width and
+    /// whose accepted prefix is bounded by `max_prefix`.
     pub fn new(ledger: &mut Ledger, initial: &[u8], max_prefix: u64) -> Result<Self> {
+        let text = store_text(K::KIND);
         if initial.is_empty() {
             return Err(Error::InvalidRequest {
-                field: "initial",
-                detail: "recurrent accumulator state must contain at least one byte".into(),
+                field: text.initial_field,
+                detail: text.initial_detail.into(),
             });
         }
         let lineage_capacity = max_prefix
@@ -90,6 +225,8 @@ impl RecurrentAccumulator {
         let lineage_bytes = lineage_capacity
             .checked_mul(core::mem::size_of::<PrefixLineage>())
             .ok_or(moxie_types::DimError::Overflow)?;
+        let lineage_bytes_u64 =
+            u64::try_from(lineage_bytes).map_err(|_| moxie_types::DimError::Overflow)?;
         let control_bytes = core::mem::size_of::<Self>()
             .checked_add(core::mem::size_of::<StateKind>())
             .and_then(|bytes| bytes.checked_add(lineage_bytes))
@@ -107,25 +244,18 @@ impl RecurrentAccumulator {
             return Err(moxie_types::DimError::Overflow.into());
         }
 
-        let mut current = HostBuffer::allocate(
-            ledger,
-            "recurrent accumulator state",
-            initial.len(),
-            control_bytes,
-        )?;
-        let mut start =
-            match HostBuffer::allocate(ledger, "recurrent accumulator start", initial.len(), 0) {
-                Ok(buffer) => buffer,
-                Err(error) => {
-                    current
-                        .release(ledger)
-                        .expect("the admitting ledger owns current accumulator bytes");
-                    return Err(error);
-                }
-            };
+        let mut current =
+            HostBuffer::allocate(ledger, text.state_label, initial.len(), control_bytes)?;
+        let mut start = match HostBuffer::allocate(ledger, text.start_label, initial.len(), 0) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                current.release(ledger).expect(text.current_ownership);
+                return Err(error);
+            }
+        };
         current.bytes_mut().copy_from_slice(initial);
         start.bytes_mut().copy_from_slice(initial);
-        let mut sequence = SequenceState::new([StateKind::RecurrentAccumulator]);
+        let mut sequence = SequenceState::new([K::KIND]);
         let lineage = &mut sequence
             .branches
             .get_mut(&ROOT)
@@ -137,15 +267,11 @@ impl RecurrentAccumulator {
             || lineage.capacity() != lineage_capacity
         {
             drop(sequence);
-            start
-                .release(ledger)
-                .expect("the admitting ledger owns start accumulator bytes");
-            current
-                .release(ledger)
-                .expect("the admitting ledger owns current accumulator bytes");
+            start.release(ledger).expect(text.start_ownership);
+            current.release(ledger).expect(text.current_ownership);
             return Err(Error::CapacityExceeded {
                 tier: Some(Tier::Host(HostTier::Pageable)),
-                requested_bytes: lineage_bytes as u64,
+                requested_bytes: lineage_bytes_u64,
                 available_bytes: 0,
             });
         }
@@ -156,6 +282,7 @@ impl RecurrentAccumulator {
             current,
             prefix: 0,
             max_prefix,
+            marker: PhantomData,
         })
     }
 
@@ -184,6 +311,7 @@ impl RecurrentAccumulator {
     where
         F: FnMut(&[u8], &mut [u8]) -> Result<()>,
     {
+        let text = store_text(K::KIND);
         self.require_open()?;
         self.require_aligned()?;
         if self.prefix >= self.max_prefix {
@@ -194,17 +322,11 @@ impl RecurrentAccumulator {
             });
         }
         let next_prefix = self.next_prefix()?;
-        let mut scratch = HostBuffer::allocate(
-            ledger,
-            "recurrent accumulator step",
-            self.current.bytes().len(),
-            0,
-        )?;
+        let mut scratch =
+            HostBuffer::allocate(ledger, text.step_label, self.current.bytes().len(), 0)?;
         scratch.bytes_mut().copy_from_slice(self.current.bytes());
         if let Err(error) = step(input, scratch.bytes_mut()) {
-            scratch
-                .release(ledger)
-                .expect("the admitting ledger owns step scratch");
+            scratch.release(ledger).expect(text.step_ownership);
             return Err(error);
         }
 
@@ -212,44 +334,33 @@ impl RecurrentAccumulator {
         let transaction = match sequence.begin(ROOT) {
             Ok(transaction) => transaction,
             Err(error) => {
-                scratch
-                    .release(ledger)
-                    .expect("the admitting ledger owns step scratch");
+                scratch.release(ledger).expect(text.step_ownership);
                 return Err(error);
             }
         };
         if let Err(error) = sequence.execute(ROOT, 1) {
-            sequence
-                .abort(transaction)
-                .expect("the new accumulator transaction is open");
-            scratch
-                .release(ledger)
-                .expect("the admitting ledger owns step scratch");
+            sequence.abort(transaction).expect(text.begin_ownership);
+            scratch.release(ledger).expect(text.step_ownership);
             return Err(error);
         }
         if let Err(error) = sequence.commit_prefix(transaction, 1) {
-            sequence
-                .abort(transaction)
-                .expect("the failed accumulator commit remains abortable");
-            scratch
-                .release(ledger)
-                .expect("the admitting ledger owns step scratch");
+            sequence.abort(transaction).expect(text.commit_ownership);
+            scratch.release(ledger).expect(text.step_ownership);
             return Err(error);
         }
         self.current.bytes_mut().copy_from_slice(scratch.bytes());
         self.prefix = next_prefix;
-        scratch
-            .release(ledger)
-            .expect("the admitting ledger owns step scratch");
+        scratch.release(ledger).expect(text.step_ownership);
         Ok(())
     }
 
     /// Capture the current bytes and stamp existing snapshot evidence.
-    pub fn snapshot(&self, ledger: &mut Ledger) -> Result<RecurrentSnapshot> {
+    pub fn snapshot(&self, ledger: &mut Ledger) -> Result<BoundedSnapshot<K>> {
+        let text = store_text(K::KIND);
         self.require_open()?;
         self.require_aligned()?;
         let evidence = self.sequence_ref()?.restore_evidence(
-            StateKind::RecurrentAccumulator,
+            K::KIND,
             ROOT,
             RestoreMethod::Snapshot {
                 of_prefix: self.prefix,
@@ -257,15 +368,16 @@ impl RecurrentAccumulator {
         )?;
         let mut bytes = HostBuffer::allocate(
             ledger,
-            "recurrent accumulator snapshot",
+            text.snapshot_label,
             self.current.bytes().len(),
-            core::mem::size_of::<RecurrentSnapshot>(),
+            core::mem::size_of::<BoundedSnapshot<K>>(),
         )?;
         bytes.bytes_mut().copy_from_slice(self.current.bytes());
-        Ok(RecurrentSnapshot {
+        Ok(BoundedSnapshot {
             prefix: self.prefix,
             evidence,
             bytes,
+            marker: PhantomData,
         })
     }
 
@@ -279,7 +391,7 @@ impl RecurrentAccumulator {
     pub fn replay<F>(
         &mut self,
         ledger: &mut Ledger,
-        source: ReplaySource<'_>,
+        source: BoundedReplaySource<'_, K>,
         target: u64,
         inputs: &[&[u8]],
         mut step: F,
@@ -287,15 +399,16 @@ impl RecurrentAccumulator {
     where
         F: FnMut(&[u8], &mut [u8]) -> Result<()>,
     {
+        let text = store_text(K::KIND);
         self.require_open()?;
         let (from, source_bytes) = match source {
-            ReplaySource::Start => (0, self.start.bytes()),
-            ReplaySource::Snapshot(snapshot) => {
+            BoundedReplaySource::Start => (0, self.start.bytes()),
+            BoundedReplaySource::Snapshot(snapshot) => {
                 let sequence = self.sequence_ref()?;
                 if snapshot.evidence.sequence() != sequence.id()
                     || snapshot.evidence.branch() != ROOT
                     || snapshot.evidence.generation() != sequence.generation()
-                    || snapshot.evidence.kind() != StateKind::RecurrentAccumulator
+                    || snapshot.evidence.kind() != K::KIND
                     || snapshot.evidence.method()
                         != (RestoreMethod::Snapshot {
                             of_prefix: snapshot.prefix,
@@ -306,8 +419,7 @@ impl RecurrentAccumulator {
                 {
                     return Err(Error::InvalidRequest {
                         field: "snapshot",
-                        detail: "snapshot does not belong to this accumulator's current lineage"
-                            .into(),
+                        detail: text.snapshot_mismatch.into(),
                     });
                 }
                 (snapshot.prefix, snapshot.bytes())
@@ -345,40 +457,30 @@ impl RecurrentAccumulator {
                 detail: format!("prefix {target} is not occupied in the logical sequence"),
             })?;
 
-        let mut scratch = HostBuffer::allocate(
-            ledger,
-            "recurrent accumulator replay",
-            self.current.bytes().len(),
-            0,
-        )?;
+        let mut scratch =
+            HostBuffer::allocate(ledger, text.replay_label, self.current.bytes().len(), 0)?;
         scratch.bytes_mut().copy_from_slice(source_bytes);
         for input in inputs {
             if let Err(error) = step(input, scratch.bytes_mut()) {
-                scratch
-                    .release(ledger)
-                    .expect("the admitting ledger owns replay scratch");
+                scratch.release(ledger).expect(text.replay_ownership);
                 return Err(error);
             }
         }
 
         let evidence = match self.sequence_ref()?.restore_evidence(
-            StateKind::RecurrentAccumulator,
+            K::KIND,
             ROOT,
             RestoreMethod::Replay { from, to: target },
         ) {
             Ok(evidence) => evidence,
             Err(error) => {
-                scratch
-                    .release(ledger)
-                    .expect("the admitting ledger owns replay scratch");
+                scratch.release(ledger).expect(text.replay_ownership);
                 return Err(error);
             }
         };
         self.current.bytes_mut().copy_from_slice(scratch.bytes());
         self.prefix = target;
-        scratch
-            .release(ledger)
-            .expect("the admitting ledger owns replay scratch");
+        scratch.release(ledger).expect(text.replay_ownership);
         Ok(evidence)
     }
 
@@ -387,24 +489,26 @@ impl RecurrentAccumulator {
     /// All validation, including identity, lineage, generation and explicit
     /// coverage, is delegated to [`SequenceState::rollback_to`].
     pub fn rollback_to(&mut self, target: u64, evidence: Restore) -> Result<()> {
+        let text = store_text(K::KIND);
         self.require_open()?;
         if self.prefix != target {
             return Err(Error::InvalidRequest {
                 field: "target",
                 detail: format!(
-                    "physical accumulator is at {}, not replay target {target}",
-                    self.prefix
+                    "{} is at {}, not replay target {target}",
+                    text.rollback_label, self.prefix
                 ),
             });
         }
         self.sequence_mut()?.rollback_to(ROOT, target, &[evidence])
     }
 
-    /// Recurrent accumulated state cannot be restored by dropping a prefix.
+    /// Explicit-restore state cannot be restored by dropping a prefix.
     pub fn truncate(&mut self, _target: u64) -> Result<()> {
+        let text = store_text(K::KIND);
         Err(Error::Unsupported {
-            capability: "recurrent_accumulator_truncate",
-            reason: "accumulated state requires an explicit snapshot or replay".into(),
+            capability: text.truncate_capability,
+            reason: text.truncate_reason.into(),
         })
     }
 
@@ -419,7 +523,7 @@ impl RecurrentAccumulator {
     fn next_prefix(&self) -> Result<u64> {
         self.prefix.checked_add(1).ok_or(Error::InvalidRequest {
             field: "prefix",
-            detail: "recurrent accumulator prefix counter overflow".into(),
+            detail: store_text(K::KIND).prefix_overflow.into(),
         })
     }
 
@@ -430,7 +534,7 @@ impl RecurrentAccumulator {
         {
             return Err(Error::InvalidRequest {
                 field: "state",
-                detail: "recurrent accumulator has been released".into(),
+                detail: store_text(K::KIND).released.into(),
             });
         }
         Ok(())
@@ -453,14 +557,14 @@ impl RecurrentAccumulator {
     fn sequence_ref(&self) -> Result<&SequenceState> {
         self.sequence.as_ref().ok_or(Error::InvalidRequest {
             field: "state",
-            detail: "recurrent accumulator has been released".into(),
+            detail: store_text(K::KIND).released.into(),
         })
     }
 
     fn sequence_mut(&mut self) -> Result<&mut SequenceState> {
         self.sequence.as_mut().ok_or(Error::InvalidRequest {
             field: "state",
-            detail: "recurrent accumulator has been released".into(),
+            detail: store_text(K::KIND).released.into(),
         })
     }
 }
@@ -469,6 +573,17 @@ fn btree_node_bound(entry: usize) -> usize {
     // Match the bounded control reserve used by PagedSequence for one node.
     11 * (entry + core::mem::size_of::<usize>()) + 16 * core::mem::size_of::<usize>()
 }
+
+pub type RecurrentAccumulator = BoundedStateStore<RecurrentStoreKind>;
+pub type RecurrentSnapshot = BoundedSnapshot<RecurrentStoreKind>;
+pub type ReplaySource<'a> = BoundedReplaySource<'a, RecurrentStoreKind>;
+
+const _: fn() = || {
+    fn assert_clone_copy<T: Clone + Copy>() {}
+    assert_clone_copy::<ReplaySource<'static>>();
+    assert_clone_copy::<crate::convolution::ConvolutionReplaySource<'static>>();
+    assert_clone_copy::<crate::sparse_index::SparseIndexReplaySource<'static>>();
+};
 
 #[cfg(test)]
 mod tests {
