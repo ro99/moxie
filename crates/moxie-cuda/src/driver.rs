@@ -195,6 +195,14 @@ pub struct RankContext {
     ctx: ffi::CUcontext,
     rank: RankId,
     capability: DeviceCapability,
+    /// This acquisition's process-unique identity. A context handle can be
+    /// reused after release, so a grant names the acquisition, not the handle
+    /// or the device.
+    generation: u64,
+    /// Acquisitions whose memory this context has been granted direct access
+    /// to. A peer copy is refused unless its source is listed here: without
+    /// the grant, `cuMemcpyPeerAsync` silently stages through host memory.
+    peers: core::cell::RefCell<Vec<u64>>,
 }
 
 /// How a failed `attach` left the rank claim.
@@ -286,6 +294,11 @@ impl RankContext {
             ctx,
             rank,
             capability,
+            generation: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
+            peers: core::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -370,6 +383,48 @@ impl RankContext {
             "cuCtxSynchronize",
         )
     }
+
+    /// Let this context read and write `peer`'s device memory directly.
+    ///
+    /// Refused with `Unsupported { capability: "peer_access" }` when the driver
+    /// does not grant the pair. Idempotent: an already enabled grant succeeds.
+    pub fn enable_peer_access(&self, peer: &RankContext) -> Result<()> {
+        if peer.uuid() == self.uuid() {
+            return Err(Error::InvalidRequest {
+                field: "peer",
+                detail: "a device is not its own peer".into(),
+            });
+        }
+        let mut can: c_int = 0;
+        check(
+            // SAFETY: valid out-parameter; both devices came from `cuDeviceGet`.
+            unsafe { ffi::cuDeviceCanAccessPeer(&mut can, self.device, peer.device) },
+            "cuDeviceCanAccessPeer",
+        )?;
+        if can == 0 {
+            return Err(Error::Unsupported {
+                capability: "peer_access",
+                reason: format!("{} cannot access {}", self.uuid(), peer.uuid()),
+            });
+        }
+        self.make_current()?;
+        // SAFETY: this context is current and `peer.ctx` is live for as long
+        // as `peer` is; flags must be zero.
+        let code = unsafe { ffi::cuCtxEnablePeerAccess(peer.ctx, 0) };
+        // PEER_ACCESS_ALREADY_ENABLED: the grant this call exists to make.
+        if code != 704 {
+            check(code, "cuCtxEnablePeerAccess")?;
+        }
+        let mut peers = self.peers.borrow_mut();
+        if !peers.contains(&peer.generation) {
+            peers.push(peer.generation);
+        }
+        Ok(())
+    }
+
+    fn can_address(&self, other: &RankContext) -> bool {
+        other.generation == self.generation || self.peers.borrow().contains(&other.generation)
+    }
 }
 
 impl Drop for RankContext {
@@ -430,6 +485,18 @@ impl<'ctx> Stream<'ctx> {
             // SAFETY: live stream created on the context made current above.
             unsafe { ffi::cuStreamSynchronize(self.stream) },
             "cuStreamSynchronize",
+        )
+    }
+
+    /// Order this stream's later work after `event`, which may belong to
+    /// another device. Nothing blocks on the host.
+    pub fn wait_event(&self, event: &Event<'_>) -> Result<()> {
+        self.ctx.make_current()?;
+        check(
+            // SAFETY: live stream on the current context and a live event;
+            // the driver permits an event from another context here.
+            unsafe { ffi::cuStreamWaitEvent(self.stream, event.event, 0) },
+            "cuStreamWaitEvent",
         )
     }
 }
@@ -791,6 +858,62 @@ impl<'ctx> DeviceBuffer<'ctx> {
         )
     }
 
+    /// Enqueue a direct copy from an allocation on this device or on a peer
+    /// this context has been granted access to.
+    ///
+    /// A source on a device without an enabled grant is refused rather than
+    /// handed to the driver, which would stage it through host memory.
+    ///
+    /// # Safety
+    /// Both allocations and the stream must remain valid until the copy is
+    /// observed complete by the caller.
+    pub unsafe fn copy_from_peer_async_at(
+        &self,
+        offset: usize,
+        source: &DeviceBuffer<'_>,
+        source_offset: usize,
+        byte_count: usize,
+        stream: &Stream<'ctx>,
+    ) -> Result<()> {
+        let destination = span(self, offset, byte_count, "dst")?;
+        let from = span(source, source_offset, byte_count, "src")?;
+        if stream.device_uuid() != self.device_uuid() {
+            return Err(Error::InvalidRequest {
+                field: "stream",
+                detail: "a peer copy is enqueued on the destination device's stream".into(),
+            });
+        }
+        if !self.ctx.can_address(source.ctx) {
+            return Err(Error::Unsupported {
+                capability: "peer_access",
+                reason: format!(
+                    "{} has no peer access to {}; refusing a host-staged copy",
+                    self.device_uuid(),
+                    source.device_uuid()
+                ),
+            });
+        }
+        if byte_count == 0 {
+            return Ok(());
+        }
+        self.ctx.make_current()?;
+        check(
+            // SAFETY: both extents, the stream's device and the peer grant were
+            // checked above; the caller owns their lifetime through completion.
+            unsafe {
+                ffi::cuMemcpyPeerAsync(
+                    destination,
+                    self.ctx.raw(),
+                    from,
+                    source.ctx.raw(),
+                    byte_count,
+                    stream.raw(),
+                )
+            },
+            "cuMemcpyPeerAsync",
+        )
+    }
+
     pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<()> {
         self.copy_to_host_at(0, dst)
     }
@@ -886,6 +1009,32 @@ impl<'ctx> DeviceBuffer<'ctx> {
         self.ptr = 0;
         Ok(())
     }
+}
+
+/// The device address of `len` bytes at `offset` inside `buffer`, checked.
+fn span(buffer: &DeviceBuffer<'_>, offset: usize, len: usize, field: &'static str) -> Result<u64> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| Error::InvalidRequest {
+            field,
+            detail: "copy range overflowed".into(),
+        })?;
+    if end > buffer.len {
+        return Err(Error::InvalidRequest {
+            field,
+            detail: format!(
+                "{len} bytes at offset {offset} in a {}-byte buffer",
+                buffer.len
+            ),
+        });
+    }
+    buffer
+        .ptr
+        .checked_add(offset as u64)
+        .ok_or_else(|| Error::InvalidRequest {
+            field,
+            detail: "device address overflowed".into(),
+        })
 }
 
 impl Drop for DeviceBuffer<'_> {

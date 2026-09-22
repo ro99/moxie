@@ -223,6 +223,11 @@ impl<C> Lifecycle<C> {
         self.state
     }
 
+    #[cfg(feature = "driver")]
+    pub(crate) fn completion(&self) -> Option<&C> {
+        self.completion.as_ref()
+    }
+
     pub(crate) fn is_tracked_or_lost(&self) -> bool {
         self.completion.is_some() || self.state == LeaseState::Lost
     }

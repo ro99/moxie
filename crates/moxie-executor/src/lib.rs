@@ -122,6 +122,13 @@ pub use chain::{
     selected_resource_request,
 };
 
+#[cfg(feature = "driver")]
+pub mod tensor_parallel;
+#[cfg(feature = "driver")]
+pub use tensor_parallel::{
+    ColumnLinear, GatherDeclaration, GatherRefused, Gathered, LinearShape, RankGroup, RankShard,
+};
+
 #[cfg(feature = "paged-attention-binding")]
 mod selected_attention;
 #[cfg(feature = "paged-attention-binding")]

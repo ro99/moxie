@@ -71,10 +71,11 @@ wrong. Rows M5.1-c and M5.1-d record what it missed.
 1. Tasks 0054 (M5.1-b) and 0055 (M5.1-e): accepted.
 2. Task 0056, M5.2 slice 1: accepted. The host TP lowering of the attention
    sublayer is bit-identical at 2, 4 and 8 ranks.
-3. Task 0057, M5.2 slice 2: a TP2 rank group and an ordered all-gather on
-   the 3090 pair, proven by a column-sharded BF16 `Linear`, bit-identical to
-   one GPU, with rank-failure, mismatch and cancellation injection. It is the
-   first real consumer of task 0054's byte ranges.
+3. Task 0057, M5.2 slice 2: accepted. A TP2 rank group and a sequenced
+   all-gather on the 3090 pair, bit-identical to one GPU. Failures are typed
+   and bounded; a missed drain withholds every range; peer grants are tied to
+   the live context. Follow-up: about 75 lines of test-gate setup duplicate
+   `tests/device_arena.rs`.
 4. **Decided (owner, 2026-09-22; ADR 0036):** TP reductions are exact, following
    Strata's approach. FP32 per-shard partials are combined in a declared order
    and rounded to BF16 once, and the single-rank path runs the same order. A

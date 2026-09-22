@@ -74,6 +74,7 @@ unsafe extern "C" {
     pub fn cuDevicePrimaryCtxRelease_v2(dev: CUdevice) -> CUresult;
     pub fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult;
     pub fn cuCtxSynchronize() -> CUresult;
+    pub fn cuCtxEnablePeerAccess(peer_context: CUcontext, flags: c_uint) -> CUresult;
 
     pub fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
@@ -83,6 +84,14 @@ unsafe extern "C" {
     pub fn cuMemcpyDtoDAsync_v2(
         dst: CUdeviceptr,
         src: CUdeviceptr,
+        byte_count: usize,
+        stream: CUstream,
+    ) -> CUresult;
+    pub fn cuMemcpyPeerAsync(
+        dst: CUdeviceptr,
+        dst_context: CUcontext,
+        src: CUdeviceptr,
+        src_context: CUcontext,
         byte_count: usize,
         stream: CUstream,
     ) -> CUresult;
@@ -101,6 +110,7 @@ unsafe extern "C" {
 
     pub fn cuStreamCreate(stream: *mut CUstream, flags: c_uint) -> CUresult;
     pub fn cuStreamSynchronize(stream: CUstream) -> CUresult;
+    pub fn cuStreamWaitEvent(stream: CUstream, event: CUevent, flags: c_uint) -> CUresult;
     pub fn cuStreamDestroy_v2(stream: CUstream) -> CUresult;
 
     pub fn cuEventCreate(event: *mut CUevent, flags: c_uint) -> CUresult;

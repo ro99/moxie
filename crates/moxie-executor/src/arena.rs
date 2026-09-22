@@ -101,6 +101,12 @@ impl<C: Completion, R> OperationLease<C, R> {
         self.lifecycle.cancel();
     }
 
+    /// The recorded completion, for ordering another stream after it.
+    #[cfg(feature = "driver")]
+    pub(crate) fn completion(&self) -> Option<&C> {
+        self.lifecycle.completion()
+    }
+
     pub fn mark_lost(&mut self, device: u32, detail: impl Into<String>) {
         self.lifecycle.mark_lost(device, detail);
     }
@@ -451,6 +457,49 @@ mod driver_binding {
                     destination,
                     &source.core.buffer,
                     source_offset,
+                    bytes,
+                    stream,
+                )
+            }
+        }
+
+        /// Enqueue a direct copy from a range in another device's arena, on
+        /// this range's stream. `moxie-cuda` refuses a source whose device has
+        /// not granted this context peer access.
+        pub(crate) unsafe fn copy_from_peer_async_at(
+            &self,
+            within: u64,
+            source: &DeviceRange<'_>,
+            source_within: u64,
+            bytes: u64,
+            stream: &Stream<'ctx>,
+        ) -> moxie_types::Result<()> {
+            let end = within
+                .checked_add(bytes)
+                .ok_or_else(|| invalid("destination", "copy extent overflowed"))?;
+            let source_end = source_within
+                .checked_add(bytes)
+                .ok_or_else(|| invalid("source", "copy extent overflowed"))?;
+            if end > self.bytes() || source_end > source.bytes() {
+                return Err(invalid("range", "peer copy exceeds its admitted range"));
+            }
+            let address = |range: &DeviceRange<'_>, within: u64| {
+                range
+                    .offset()
+                    .checked_add(within)
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| invalid("range", "range offset is not addressable"))
+            };
+            let bytes = usize::try_from(bytes)
+                .map_err(|_| invalid("bytes", "copy size is not addressable"))?;
+            // SAFETY: both extents are checked above and the peer grant is
+            // checked by the wrapper; the caller keeps both ranges and the
+            // stream live until completion.
+            unsafe {
+                self.core.buffer.copy_from_peer_async_at(
+                    address(self, within)?,
+                    &source.core.buffer,
+                    address(source, source_within)?,
                     bytes,
                     stream,
                 )

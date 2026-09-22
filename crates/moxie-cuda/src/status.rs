@@ -58,6 +58,12 @@ pub fn classify(code: CUresult, detail: String) -> Result<()> {
             capability: "cuda_device",
             reason: detail,
         }),
+        // PEER_ACCESS_UNSUPPORTED: this pair of devices cannot address each
+        // other's memory. A capability, not a numerical failure.
+        217 => Err(Error::Unsupported {
+            capability: "peer_access",
+            reason: detail,
+        }),
         // NOT_FOUND, INVALID_PTX, UNSUPPORTED_PTX_VERSION, NO_BINARY_FOR_GPU,
         // INVALID_IMAGE, INVALID_SOURCE. The last two are what a truncated or
         // non-image byte buffer produces, and they belong with the other
