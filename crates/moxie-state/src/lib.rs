@@ -49,6 +49,9 @@ pub use accumulator::{RecurrentAccumulator, RecurrentSnapshot, ReplaySource};
 pub mod convolution;
 pub use convolution::{ConvolutionHistory, ConvolutionHistorySnapshot, ConvolutionReplaySource};
 
+pub mod sparse_index;
+pub use sparse_index::{SparseIndex, SparseIndexReplaySource, SparseIndexSnapshot};
+
 pub mod paged;
 pub use paged::{
     KvGeometry, KvRow, LayerKv, PagedCloseRefused, PagedExecutionBinding, PagedSequence,

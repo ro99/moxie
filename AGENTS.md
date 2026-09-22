@@ -84,8 +84,30 @@ store, grounded in Kimi K3's short-convolution shape but proven against a
 synthetic window transform. **This session's first task accepted clean on
 round 1** — both defect classes task 0046 caught in separate review rounds
 (resource-accounting exactness, non-consuming release-with-retry) were
-applied proactively this time. `SparseIndex` and N-branch COW
-generalization remain separate, unopened work. **M4.5 remains unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
+applied proactively this time. [Task 0048](docs/tasks/0048-m4-sparse-index-snapshot-replay.md) **accepted**
+(owner, 2026-09-21): `SparseIndex`'s own store, grounded in GLM-5.3's real
+DSA indexer shape (`glm_index_topk_f32`, hand-verified, not implemented)
+but proven against a synthetic bounded top-K selection with
+value-dependent (not position-dependent) eviction — a third genuinely
+distinct irreversibility shape from tasks 0046/0047. **This closes M4.4's
+five-task snapshot/replay arc (tasks 0044–0048) in full.** N-branch COW
+generalization remains named out of scope by tasks 0044/0045 and stays
+separately unopened — it is not required for M4.4's roadmap text and is
+not automatically authorized by this closure.
+
+**M4.5 is the next M4 deliverable, not yet started, no task opened.**
+Roadmap text: "Add same-user prefix reuse and continuation with correct
+checkpoint/config identity; ensure a full prefix hit still produces valid
+next-token logits or recomputes the required boundary step." Document 04
+line 35 is the relevant contract: prefix reuse and transaction commits
+must distinguish "committed in history" from "materialized forward/state
+position" — a token can be accepted without its forward pass having run
+yet, and reusing a prefix means checking logit validity against the exact
+branch/prefix/graph generation, not just position/counter equality. This
+is the natural point to also produce M4's own closure/handover, since
+M4.1–M4.4 are now all accepted and only M4.5 plus the milestone's
+overall integration exit gate (32,768-token generation, real prefill/
+decode/multiturn — untouched by any task so far) remain. Device (GPU) execution of MLA and the absorbed/fused fast
 path are explicitly out of M4.2's scope and are not opened by its acceptance.
 The [M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md)
 tracks this milestone's obligations.
