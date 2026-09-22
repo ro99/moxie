@@ -25,12 +25,38 @@ pub fn linear_row(
     out_features: usize,
     bias: Option<&[f32]>,
 ) -> Result<Vec<f32>> {
+    linear_row_ordered(x, w, out_features, bias, 1)
+}
+
+/// One row of a linearly split `y = x·Wᵀ (+ b)`.
+///
+/// The input is divided into `blocks` equal contiguous k-ranges. Each range is
+/// accumulated from zero in ascending k order; those FP32 partials are then
+/// combined in ascending block order, and bias is applied once at the end.
+/// With one block this is exactly [`linear_row`]'s original loop.
+pub fn linear_row_ordered(
+    x: &[f32],
+    w: &[f32],
+    out_features: usize,
+    bias: Option<&[f32]>,
+    blocks: u32,
+) -> Result<Vec<f32>> {
     let k = x.len();
     if k == 0 || out_features == 0 {
         return Err(Error::InvalidRequest {
             field: "linear",
             detail: format!("degenerate shape: {k} inputs, {out_features} outputs"),
         });
+    }
+    let blocks = usize::try_from(blocks).map_err(|_| Error::InvalidRequest {
+        field: "linear_blocks",
+        detail: "the declared reduction block count does not fit usize".into(),
+    })?;
+    if blocks == 0 || !k.is_multiple_of(blocks) {
+        return Err(Error::Dim(moxie_types::DimError::NotDivisible {
+            value: k as u64,
+            by: blocks as u64,
+        }));
     }
     if w.len() != out_features * k {
         return Err(Error::InvalidArtifact {
@@ -49,13 +75,27 @@ pub fn linear_row(
         });
     }
 
+    let block_width = k / blocks;
+    let mut partials = crate::try_vec(out_features * blocks)?;
+    for block in 0..blocks {
+        let start = block * block_width;
+        let end = start + block_width;
+        for o in 0..out_features {
+            // Sequential ascending k within one declared block. Not
+            // reassociated, and not fused into a different reduction pattern.
+            let mut acc = 0f32;
+            for i in start..end {
+                acc += x[i] * w[o * k + i];
+            }
+            partials.push(acc);
+        }
+    }
+
     let mut out = crate::try_vec(out_features)?;
     for o in 0..out_features {
-        // Sequential ascending k, FP32 accumulator. Not reassociated, not
-        // fused-multiply-added into a different rounding pattern.
         let mut acc = 0f32;
-        for (i, xi) in x.iter().enumerate() {
-            acc += xi * w[o * k + i];
+        for block in 0..blocks {
+            acc += partials[block * out_features + o];
         }
         if let Some(b) = bias {
             acc += b[o];
@@ -63,6 +103,12 @@ pub fn linear_row(
         out.push(acc);
     }
     Ok(out)
+}
+
+/// Compute one rank-local input-axis partial. Both operands are already
+/// compacted to the same slice; the result remains unrounded FP32.
+pub fn linear_row_partial(x: &[f32], w: &[f32], out_features: usize) -> Result<Vec<f32>> {
+    linear_row_ordered(x, w, out_features, None, 1)
 }
 
 /// The scale a `linear_row` error bound is stated against: `Σ|x_k·w_ok|`.
@@ -271,6 +317,23 @@ mod tests {
         let want = linear_row_f64(&x, &w, 1, None);
         let scale = linear_row_scale(&x, &w, 1, None);
         assert!(ErrorSummary::normalized(&[forward], &want, &scale).within(gamma(k as u64 + 1)));
+    }
+
+    #[test]
+    fn declared_block_order_is_load_bearing() {
+        let x = [1.0e20, -1.0e20, 1.0, 1.0];
+        let w = [1.0f32; 4];
+        let got = linear_row_ordered(&x, &w, 1, None, 4).unwrap();
+        assert_eq!(got, [2.0]);
+    }
+
+    #[test]
+    fn ordered_partials_remain_fp32_until_the_combine() {
+        let x = [1.0f32, 0.003, 1.0, 0.0];
+        let w = [1.0f32; 4];
+        let got = linear_row_ordered(&x, &w, 1, None, 2).unwrap()[0];
+        let early = crate::bf16_round(x[0] + x[1]) + crate::bf16_round(x[2] + x[3]);
+        assert_ne!(got, early);
     }
 
     #[test]

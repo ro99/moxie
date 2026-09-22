@@ -25,7 +25,7 @@ pub use selected::{
     lower_selected,
 };
 pub use tensor_parallel::{
-    RankPart, Stage, TensorParallelLowering, TensorParallelRefused, lower_tensor_parallel,
+    Join, RankPart, Stage, TensorParallelLowering, TensorParallelRefused, lower_tensor_parallel,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

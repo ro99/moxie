@@ -106,4 +106,4 @@ abstraction; whether TP2 needs a rank-group type is M5.2's question. Document
 
 ## Next task
 
-Slice 1 is [task 0058](../tasks/0058-m5-dense-tp-host-lowering.md), assigned to luna, design first.
+Slice 1 ([task 0058](../tasks/0058-m5-dense-tp-host-lowering.md)) is **accepted**: the dense layer and vocabulary lowered on the host, with exact reductions under ADR 0036 and strided weight addressing. Slice 2 (dense TP2 on the 3090 pair) is next.

@@ -1,6 +1,9 @@
 # Task 0058 — dense TP on the host: the MLP and the vocabulary projection
 
-Status: **proposed**.
+Status: **accepted** (coordinator, 2026-09-22, under the owner's auto-mode
+delegation). Built by Codex `luna`; reviewed by Codex `sol` over three
+rounds, round 3 ACCEPT with no findings. The coordinator re-ran the focused
+tests, `arch-check` and `spec-check`.
 
 ## Identity and authority
 
@@ -149,8 +152,69 @@ wrong, say so in that report.
 
 ## Result, filled after work
 
-- Design decision (phase 1) and coordinator answer:
-- Changed owners and consumers; source commit:
-- Commands; passed / failed / skipped:
-- Mutation results and restoration:
-- Remaining obligations:
+- Design decision (phase 1) and coordinator answer: the declared split is a
+  node-keyed `moxie-graph::LinearReductionOrder` sidecar, so the 31 model-side
+  `OpParams::Linear` constructors remain unchanged. The interpreter gets
+  additive sidecar-aware entry points while `run()` remains the S=1 path;
+  `moxie-oracles::linear` states the ordered arithmetic independently. The
+  coordinator approved `Stage::Local { nodes, join }`, with `Gather` for the
+  head output and F32 vocabulary output and `Reduce` for `down_proj` and
+  `o_proj`; biased row-parallel linears are refused. The coordinator also
+  approved compact `LinearInputSlice` and per-component strided views beside
+  `shard_weight_ranges`, with canonical affine geometry and group validation,
+  and corrected labels: `RmsNorm` group 1 is `Replicated`, grouped `RmsNorm`
+  is `HeadAligned` like `Rope`, and `Linear` remains `ColumnShardable`.
+- Changed owners and consumers; source commit: `moxie-graph` owns the
+  partition labels and sidecar value types; `moxie-plan` owns rank-local
+  stages, joins, slices and declarations; `moxie-interp` consumes the
+  declarations; `moxie-oracles` owns the independent ordered linear
+  reference; `moxie-executor` owns canonical BF16/affine strided addressing;
+  and the existing `moxie-cli` tensor-parallel harness is the consumer
+  fixture. `reference_graphs.rs` covers the additive interpreter contract.
+  No model crate or Cargo dependency changed; no source commit was made.
+- Commands; passed / failed / skipped: passed `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `cargo test --workspace --locked`, `cargo xtask arch-check` (79 rejected
+  and 21 accepted fixtures; 13 rules exercised), `cargo xtask spec-check` (10
+  documents), and `git diff --check`. No required acceptance gate failed or
+  was skipped. GPU/device execution and timing remain intentionally skipped
+  as non-goals. Round 3 also passed the focused tensor-parallel and affine
+  group-refusal tests before the full host-gate rerun.
+- Mutation results and restoration: descending partial combination failed
+  `moxie-oracles::linear::tests::declared_block_order_is_load_bearing`; early
+  BF16 rounding failed
+  `moxie-oracles::linear::tests::ordered_partials_remain_fp32_until_the_combine`;
+  forcing the reference to S=1 failed
+  `moxie-interp/tests/reference_graphs.rs::a_declared_linear_split_reaches_the_host_interpreter`;
+  adding one byte to the row stride failed
+  `moxie-executor::affine_linear::tests::row_sharding_exposes_one_compact_run_per_affine_component`;
+  and making GLU use the global rather than local width failed
+  `moxie-cli/tests/tensor_parallel.rs::dense_tp_is_bit_identical_to_the_unsplit_graph_at_prefill_and_decode`
+  at graph construction. Each mutation was restored and the gates were rerun.
+  S=1 preserves the existing reduced-Gemma logits: `linear_row` delegates to
+  the ordered oracle with one block, and the unchanged
+  `moxie-cli/tests/gemma.rs` tests `both_reduced_geometries_generate_through_the_shared_service`,
+  `paged_and_dense_logits_are_bit_identical_across_pages_and_decode`, and
+  `the_cli_selects_the_reduced_shapes_and_agrees_with_the_service` all pass.
+- Review trail (round 2, sol): the affine row-shard path now rejects
+  non-contiguous, non-monotone activation-order group maps globally before
+  checking rank boundaries; `row_sharding_refuses_a_split_inside_an_affine_group`
+  covers both ranks of the alternating Int8 repro. MLP gate/up/GLU outputs
+  now reject consumers outside their local four-node stage; the refusal table
+  covers an extra Linear consuming the gate. The TP fixture now compares the
+  split result only with its declared S=2/4 reference, and the one-use
+  `JoinOutput` trait is inlined. Sol's other findings remain closed: oracle
+  order, S=1 compatibility, truthful labels, no model edits or crate edges,
+  and contiguous-group offsets were rechecked.
+- Review trail (round 3, sol): one generic local-stage boundary check now
+  covers attention, MLP and vocabulary stages; any non-join value read by a
+  node in another stage or used as `graph.output()` is refused. The
+  pattern-specific attention and MLP escape checks were removed, and the
+  refusal table adds the graph-output gate repro. The redundant
+  `validate_group_slice` helper and call were deleted; affine group ownership
+  remains checked globally by `validate_group_ownership`.
+- Remaining obligations: the current fixture is insensitive to summation order
+  (S=2 bits equal S=1), so the end-to-end test cannot detect a wrong combine
+  order; the device slice needs an order-sensitive fixture. The device TP
+  slice, MLA and routed-op lowering, and vocabulary-parallel embedding remain
+  out of this task. No performance claim is made.

@@ -20,7 +20,7 @@
 //! `moxie-memory` decided what is resident; this file only reads addresses.
 
 use moxie_format::affine::{AffineDescriptor, AffineTensor, Grouping, IntWidth};
-use moxie_format::canonical::affine_components;
+use moxie_format::canonical::{Component, ComponentKind, affine_components};
 use moxie_format::payload::ZeroPointSection;
 use moxie_format::scale::ScaleDtype;
 use moxie_graph::PartitionRule;
@@ -130,6 +130,30 @@ pub enum WeightShardRanges {
     },
 }
 
+/// One compact strided run in every row of a row-major tensor.
+///
+/// `first` names the run in row zero; subsequent rows begin at
+/// `first.offset + row_stride_bytes`. No per-row address list is materialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StridedLogicalRange {
+    pub first: LogicalRange,
+    pub row_stride_bytes: u64,
+    pub rows: u64,
+}
+
+/// Per-component input-axis ranges for a row-sharded canonical weight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StridedWeightShardRanges {
+    Bf16 {
+        weights: StridedLogicalRange,
+    },
+    Affine {
+        codes: StridedLogicalRange,
+        scales: StridedLogicalRange,
+        zero_points: Option<StridedLogicalRange>,
+    },
+}
+
 /// Compute the canonical byte ranges owned by one rank for a column-sharded
 /// weight.
 ///
@@ -137,12 +161,13 @@ pub enum WeightShardRanges {
 /// contiguous run of complete output rows. Every affine component has its own
 /// row width and receives its own range. `RowShardable` is deliberately
 /// refused: input-column ownership is strided in this layout and cannot be
-/// represented by one `LogicalRange`; M5.2 owns that addressing contract.
+/// represented by one `LogicalRange`; [`shard_weight_strided_ranges`] owns
+/// that compact address view.
 ///
 /// Quantization groups are along the input-column axis (`group_of(k)`), while
 /// this function splits complete output rows. A column boundary therefore
-/// cannot split a quantization group; group-boundary checking belongs with the
-/// future row-sharded address representation.
+/// cannot split a quantization group; the input-axis API below checks group
+/// boundaries where they matter.
 pub fn shard_weight_ranges(
     rule: PartitionRule,
     weight: WeightShardSpec<'_>,
@@ -197,6 +222,283 @@ pub fn shard_weight_ranges(
             })
         }
     }
+}
+
+/// Compute compact input-axis addresses for a row-sharded weight.
+///
+/// Canonical row-major storage makes each rank's input run strided across
+/// output rows. BF16 uses the logical row width directly. Affine components
+/// use their own `Component` shape, dtype and byte length, and a shard is
+/// accepted only when every boundary is a genuine `group_of` boundary. A
+/// non-monotone activation-order map is refused because its selected scale
+/// groups would not be one compact physical run per row.
+pub fn shard_weight_strided_ranges(
+    rule: PartitionRule,
+    weight: WeightShardSpec<'_>,
+    rank_count: u32,
+    rank_index: u32,
+) -> Result<StridedWeightShardRanges> {
+    if rule != PartitionRule::RowShardable {
+        return Err(unsupported_fmt(
+            "row_sharded_weight_addressing",
+            format_args!("partition rule {rule:?} is not an input-axis shard"),
+        ));
+    }
+    let rank_count = u64::from(rank_count);
+    let rank_index = u64::from(rank_index);
+    if rank_count == 0 {
+        return Err(invalid("rank_count", "a shard needs at least one rank"));
+    }
+    if rank_index >= rank_count {
+        return Err(invalid_fmt(
+            "rank_index",
+            format_args!("rank {rank_index} is outside rank count {rank_count}"),
+        ));
+    }
+
+    match weight {
+        WeightShardSpec::Bf16 {
+            out_features,
+            in_features,
+        } => {
+            validate_shape(out_features, in_features)?;
+            let (first, width) = input_slice(in_features, rank_count, rank_index)?;
+            let row_stride = in_features
+                .checked_mul(2)
+                .ok_or_else(|| invalid("shape", "the BF16 row width overflows"))?;
+            let row_bytes = width
+                .checked_mul(2)
+                .ok_or_else(|| invalid("shape", "the BF16 shard width overflows"))?;
+            Ok(StridedWeightShardRanges::Bf16 {
+                weights: strided_extent(
+                    first
+                        .checked_mul(2)
+                        .ok_or_else(|| invalid("range", "the BF16 shard offset overflows"))?,
+                    row_bytes,
+                    row_stride,
+                    out_features,
+                    out_features,
+                    row_stride,
+                )?,
+            })
+        }
+        WeightShardSpec::Affine {
+            descriptor,
+            zero_points,
+        } => {
+            let components = affine_components("weight", descriptor, zero_points)?;
+            let out_features = u64::try_from(descriptor.out_features)
+                .map_err(|_| invalid("shape", "the output dimension does not fit in u64"))?;
+            let (first, width) = input_slice(
+                u64::try_from(descriptor.in_features)
+                    .map_err(|_| invalid("shape", "the input dimension does not fit in u64"))?,
+                rank_count,
+                rank_index,
+            )?;
+            validate_group_ownership(descriptor, rank_count)?;
+            let codes = affine_strided_component(
+                find_component(&components, ComponentKind::Codes)?,
+                descriptor,
+                first as usize,
+                width as usize,
+                out_features,
+            )?;
+            let scales = affine_strided_component(
+                find_component(&components, ComponentKind::Scales)?,
+                descriptor,
+                first as usize,
+                width as usize,
+                out_features,
+            )?;
+            let zero_points = components
+                .iter()
+                .find(|component| component.kind == ComponentKind::ZeroPoints)
+                .map(|component| {
+                    affine_strided_component(
+                        component,
+                        descriptor,
+                        first as usize,
+                        width as usize,
+                        out_features,
+                    )
+                })
+                .transpose()?;
+            Ok(StridedWeightShardRanges::Affine {
+                codes,
+                scales,
+                zero_points,
+            })
+        }
+    }
+}
+
+fn input_slice(in_features: u64, rank_count: u64, rank_index: u64) -> Result<(u64, u64)> {
+    if !in_features.is_multiple_of(rank_count) {
+        return Err(Error::Dim(DimError::NotDivisible {
+            value: in_features,
+            by: rank_count,
+        }));
+    }
+    let width = in_features / rank_count;
+    let first = rank_index
+        .checked_mul(width)
+        .ok_or_else(|| invalid("rank_index", "the first input column overflows"))?;
+    Ok((first, width))
+}
+
+fn strided_extent(
+    offset: u64,
+    row_bytes: u64,
+    row_stride: u64,
+    rows: u64,
+    total_rows: u64,
+    total_row_bytes: u64,
+) -> Result<StridedLogicalRange> {
+    if rows == 0 || row_bytes == 0 || rows > total_rows || row_bytes > row_stride {
+        return Err(invalid(
+            "range",
+            "the strided extent is empty or exceeds its row",
+        ));
+    }
+    total_rows
+        .checked_mul(total_row_bytes)
+        .ok_or_else(|| invalid("range", "the full tensor extent overflows"))?;
+    let last = rows
+        .checked_sub(1)
+        .and_then(|n| n.checked_mul(row_stride))
+        .and_then(|n| n.checked_add(offset))
+        .and_then(|n| n.checked_add(row_bytes))
+        .ok_or_else(|| invalid("range", "the strided extent overflows"))?;
+    let total = total_rows
+        .checked_mul(total_row_bytes)
+        .ok_or_else(|| invalid("range", "the full tensor extent overflows"))?;
+    if last > total {
+        return Err(invalid("range", "the strided extent exceeds its component"));
+    }
+    Ok(StridedLogicalRange {
+        first: LogicalRange::new(offset, row_bytes)?,
+        row_stride_bytes: row_stride,
+        rows,
+    })
+}
+
+fn validate_group_ownership(descriptor: &AffineDescriptor, rank_count: u64) -> Result<()> {
+    let groups = descriptor.groups_per_row()?;
+    let mut previous = descriptor.group_of(0)?;
+    for column in 1..descriptor.in_features {
+        let group = descriptor.group_of(column)?;
+        if group < previous || group > previous.saturating_add(1) || group >= groups {
+            return Err(unsupported_fmt(
+                "row_sharded_weight_addressing",
+                format_args!(
+                    "activation-order groups are not contiguous and monotone for input sharding"
+                ),
+            ));
+        }
+        previous = group;
+    }
+
+    let rank_count = usize::try_from(rank_count)
+        .map_err(|_| invalid("rank_count", "the rank count does not fit usize"))?;
+    let width = descriptor.in_features / rank_count;
+    for rank in 1..rank_count {
+        let boundary = rank
+            .checked_mul(width)
+            .ok_or_else(|| invalid("range", "the input shard boundary overflows"))?;
+        if descriptor.group_of(boundary - 1)? == descriptor.group_of(boundary)? {
+            return Err(unsupported_fmt(
+                "row_sharded_weight_addressing",
+                format_args!("an input shard boundary splits inside affine group"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn find_component(components: &[Component], kind: ComponentKind) -> Result<&Component> {
+    components
+        .iter()
+        .find(|component| component.kind == kind)
+        .ok_or_else(|| invalid("component", "canonical affine components are incomplete"))
+}
+
+fn affine_strided_component(
+    component: &Component,
+    descriptor: &AffineDescriptor,
+    first: usize,
+    width: usize,
+    rows: u64,
+) -> Result<StridedLogicalRange> {
+    let out = u64::try_from(descriptor.out_features)
+        .map_err(|_| invalid("shape", "the output dimension does not fit in u64"))?;
+    let full_row_bytes = component
+        .len
+        .checked_div(out)
+        .ok_or_else(|| invalid("component", "component row width is invalid"))?;
+    let row_stride_from_shape = component
+        .shape
+        .get(1)
+        .copied()
+        .and_then(|width| width.checked_mul(component.dtype.bytes() as u64))
+        .ok_or_else(|| invalid("component", "component row width overflows"))?;
+    if full_row_bytes != row_stride_from_shape {
+        return Err(invalid("component", "component length and shape disagree"));
+    }
+    let (row_offset, row_bytes) = match component.kind {
+        ComponentKind::Codes => {
+            let codes_per_byte = u64::from(descriptor.width.codes_per_byte() as u32);
+            let first = u64::try_from(first)
+                .map_err(|_| invalid("component", "input offset does not fit in u64"))?;
+            let width = u64::try_from(width)
+                .map_err(|_| invalid("component", "input width does not fit in u64"))?;
+            if !first.is_multiple_of(codes_per_byte)
+                || (!width.is_multiple_of(codes_per_byte)
+                    && first + width != descriptor.in_features as u64)
+            {
+                return Err(unsupported_fmt(
+                    "row_sharded_weight_addressing",
+                    format_args!("input shard is not byte-aligned for packed codes"),
+                ));
+            }
+            let offset = first / codes_per_byte * component.dtype.bytes() as u64;
+            let len = width
+                .checked_add(codes_per_byte - 1)
+                .ok_or_else(|| invalid("component", "packed code width overflows"))?
+                / codes_per_byte
+                * component.dtype.bytes() as u64;
+            (offset, len)
+        }
+        ComponentKind::Scales | ComponentKind::ZeroPoints => {
+            let first_group = descriptor.group_of(first)? as u64;
+            let last_group = descriptor.group_of(first + width - 1)? as u64;
+            let groups = descriptor.groups_per_row()? as u64;
+            let group_bytes = full_row_bytes
+                .checked_div(groups)
+                .ok_or_else(|| invalid("component", "group width is invalid"))?;
+            (
+                first_group
+                    .checked_mul(group_bytes)
+                    .ok_or_else(|| invalid("component", "group offset overflows"))?,
+                (last_group - first_group + 1)
+                    .checked_mul(group_bytes)
+                    .ok_or_else(|| invalid("component", "group width overflows"))?,
+            )
+        }
+        ComponentKind::Weights => {
+            return Err(invalid(
+                "component",
+                "a canonical affine weight has no BF16 component",
+            ));
+        }
+    };
+    strided_extent(
+        row_offset,
+        row_bytes,
+        full_row_bytes,
+        rows,
+        rows,
+        full_row_bytes,
+    )
 }
 
 fn validate_shape(out_features: u64, in_features: u64) -> Result<()> {
@@ -1916,6 +2218,86 @@ mod tests {
                     assert!(reason.contains("strided"));
                 }
                 other => panic!("expected typed strided-layout refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn row_sharding_exposes_one_compact_run_per_affine_component() {
+        let descriptor = descriptor(IntWidth::Int4, 64, 4, Grouping::Contiguous { size: 32 });
+        let spec = WeightShardSpec::Affine {
+            descriptor: &descriptor,
+            zero_points: ZeroPointSection::PerGroup,
+        };
+        let shards: Vec<_> = (0..2)
+            .map(|rank| shard_weight_strided_ranges(PartitionRule::RowShardable, spec, 2, rank))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let ranges = shards
+            .iter()
+            .map(|shard| match shard {
+                StridedWeightShardRanges::Affine {
+                    codes,
+                    scales,
+                    zero_points: Some(zero_points),
+                } => (*codes, *scales, *zero_points),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ranges[0].0.first, LogicalRange::new(0, 16).unwrap());
+        assert_eq!(ranges[1].0.first, LogicalRange::new(16, 16).unwrap());
+        assert_eq!(ranges[0].0.row_stride_bytes, 32);
+        assert_eq!(ranges[0].0.rows, 4);
+        assert_eq!(ranges[0].1.first, LogicalRange::new(0, 2).unwrap());
+        assert_eq!(ranges[1].1.first, LogicalRange::new(2, 2).unwrap());
+        assert_eq!(ranges[0].2.first, LogicalRange::new(0, 2).unwrap());
+        assert_eq!(ranges[1].2.first, LogicalRange::new(2, 2).unwrap());
+        assert_eq!(ranges[0].1.row_stride_bytes, 4);
+        assert_eq!(ranges[0].2.row_stride_bytes, 4);
+    }
+
+    #[test]
+    fn row_sharding_refuses_a_split_inside_an_affine_group() {
+        let contiguous = descriptor(IntWidth::Int8, 64, 4, Grouping::Contiguous { size: 32 });
+        let error = shard_weight_strided_ranges(
+            PartitionRule::RowShardable,
+            WeightShardSpec::Affine {
+                descriptor: &contiguous,
+                zero_points: ZeroPointSection::Absent,
+            },
+            4,
+            0,
+        )
+        .unwrap_err();
+        match error {
+            Error::Unsupported { capability, reason } => {
+                assert_eq!(capability, "row_sharded_weight_addressing");
+                assert!(reason.contains("inside affine group"));
+            }
+            other => panic!("expected group-boundary refusal, got {other:?}"),
+        }
+
+        let mut activation_order =
+            descriptor(IntWidth::Int8, 64, 4, Grouping::Contiguous { size: 32 });
+        activation_order.group_index =
+            Some((0..64).map(|column| (column / 16) as u32 % 2).collect());
+        for rank in 0..2 {
+            let error = shard_weight_strided_ranges(
+                PartitionRule::RowShardable,
+                WeightShardSpec::Affine {
+                    descriptor: &activation_order,
+                    zero_points: ZeroPointSection::Absent,
+                },
+                2,
+                rank,
+            )
+            .unwrap_err();
+            match error {
+                Error::Unsupported { capability, reason } => {
+                    assert_eq!(capability, "row_sharded_weight_addressing");
+                    assert!(reason.contains("contiguous and monotone"));
+                }
+                other => panic!("expected activation-order refusal, got {other:?}"),
             }
         }
     }

@@ -682,12 +682,21 @@ impl OpParams {
             OpParams::Linear { .. }
             | OpParams::SwiGlu { .. }
             | OpParams::GeGlu { .. }
-            | OpParams::Rope { .. }
             | OpParams::VocabProjection { .. } => PartitionRule::ColumnShardable,
-            // Applied exactly once; the norm reduces over the whole hidden axis.
-            OpParams::Embedding { .. } | OpParams::RmsNorm { .. } | OpParams::Residual { .. } => {
-                PartitionRule::Replicated
+            // Ordinary norms reduce over the whole hidden axis and therefore
+            // run once. Grouped norms reduce each head independently and are
+            // legal only when the lowering owns whole heads.
+            OpParams::Embedding { .. } | OpParams::Residual { .. } => PartitionRule::Replicated,
+            OpParams::RmsNorm { group, .. } => {
+                if *group == 1 {
+                    PartitionRule::Replicated
+                } else {
+                    PartitionRule::HeadAligned
+                }
             }
+            // Rotation is independent per head, but its layout is head-sized,
+            // not an arbitrary output-column split.
+            OpParams::Rope { .. } => PartitionRule::HeadAligned,
             // Plain attention owns query heads and concatenates their outputs;
             // its separate output Linear keeps its existing contract.
             OpParams::Attention { .. } => PartitionRule::HeadShardable {

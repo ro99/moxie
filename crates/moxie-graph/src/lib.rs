@@ -418,6 +418,12 @@ pub enum PartitionRule {
     RowShardable,
     /// Replicated on every rank; bias and residual terms applied exactly once.
     Replicated,
+    /// A whole-head-local operation with no cross-head arithmetic.
+    ///
+    /// This is narrower than arbitrary column sharding: the lowering must
+    /// preserve complete head boundaries. It is used by per-head norms and
+    /// rotary position encoding, whose equations are independent per head.
+    HeadAligned,
     /// Query heads are owned along the head axis.
     ///
     /// Each rank owns whole query heads. The lowering must reject a rank count
@@ -463,6 +469,31 @@ impl PartitionRule {
     pub const fn is_partitionable(self) -> bool {
         !matches!(self, PartitionRule::NotDetermined)
     }
+}
+
+/// The compact input slice used by an input-axis split.
+///
+/// It describes one contiguous run inside every row of a row-major weight (or
+/// activation). The physical address is deliberately left to the owner of the
+/// tensor format; callers must not expand this into one descriptor per row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinearInputSlice {
+    pub first: u64,
+    pub width: u64,
+    pub full_width: u64,
+}
+
+/// The declared reduction order for one `Linear` node.
+///
+/// `slice == None` describes the full reference operation: split the input
+/// axis into `blocks` contiguous blocks and combine their FP32 partials in
+/// ascending block order. `slice == Some` describes one rank's local block;
+/// its input and weight have already been compacted to that slice, while the
+/// same `blocks` value remains the declaration the plan came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinearReductionOrder {
+    pub blocks: u32,
+    pub slice: Option<LinearInputSlice>,
 }
 
 /// What an operation does to sequence state.

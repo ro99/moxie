@@ -347,7 +347,14 @@ impl Interpreter {
         )?;
         for node in graph.nodes() {
             cancel.check(node.params.op().name())?;
-            let value = self.eval(node, &values, sequence, &mut staged, &positions)?;
+            let value = self.eval(
+                node,
+                &values,
+                sequence,
+                &mut staged,
+                &positions,
+                &std::collections::BTreeMap::new(),
+            )?;
             if let Value::Float(t) = &value
                 && t.data().iter().any(|x| !x.is_finite())
             {

@@ -7,10 +7,12 @@
 //! tokenizer. Document 06 M1.5 allows a reduced synthetic graph to prove
 //! contracts, and adds that synthetic output is never described as model support.
 
+use std::collections::BTreeMap;
+
 use moxie_graph::{
     AttentionOutputReduction, Bindings, Graph, GraphBuilder, IndexEncoding, KvHeadPartition,
-    MlaAttentionDescriptor, OpParams, OracleRegistry, PartitionRule, RopeLayout, StateEffect,
-    TensorSpec, ValueId, ValueRole, Visibility, reciprocal_sqrt_scale,
+    LinearReductionOrder, MlaAttentionDescriptor, NodeId, OpParams, OracleRegistry, PartitionRule,
+    RopeLayout, StateEffect, TensorSpec, ValueId, ValueRole, Visibility, reciprocal_sqrt_scale,
 };
 use moxie_interp::{Cancel, HostTensor, Interpreter, KvCache, Value};
 use moxie_oracles::metric::{ErrorSummary, gamma};
@@ -726,6 +728,16 @@ fn the_contract_table_is_what_the_code_says() {
             Precision::Bf16,
         ),
         (
+            OpParams::RmsNorm {
+                hidden: 4,
+                eps: 1e-5,
+                group: 2,
+            },
+            PartitionRule::HeadAligned,
+            StateEffect::None,
+            Precision::Bf16,
+        ),
+        (
             OpParams::SwiGlu { width: 2 },
             PartitionRule::ColumnShardable,
             StateEffect::None,
@@ -740,7 +752,7 @@ fn the_contract_table_is_what_the_code_says() {
                 frequency_dim: 2,
                 layout: RopeLayout::Interleaved,
             },
-            PartitionRule::ColumnShardable,
+            PartitionRule::HeadAligned,
             StateEffect::None,
             Precision::Bf16,
         ),
@@ -818,6 +830,72 @@ fn the_contract_table_is_what_the_code_says() {
     for node in f.graph.nodes() {
         assert!(node.contract.check_partitionable().is_ok());
     }
+}
+
+#[test]
+fn a_declared_linear_split_reaches_the_host_interpreter() {
+    let mut g = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
+    let x = g.input(
+        "x",
+        TensorSpec::new(
+            ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
+            vec![rows_symbol(), Dim::constant(4)],
+        ),
+    );
+    let w = g
+        .weight(
+            "w",
+            TensorSpec::new(weight(), vec![Dim::constant(1), Dim::constant(4)]),
+        )
+        .unwrap();
+    let y = g
+        .node(
+            OpParams::Linear {
+                in_features: 4,
+                out_features: 1,
+                bias: false,
+            },
+            &[x, w],
+        )
+        .unwrap();
+    let graph = g.finish(y, &oracles()).unwrap();
+    let mut bindings = Bindings::new();
+    bindings.set(
+        x,
+        Value::Float(
+            HostTensor::bf16(
+                [
+                    moxie_interp::tensor::to_bf16(1.0e20),
+                    moxie_interp::tensor::to_bf16(1.0),
+                    moxie_interp::tensor::to_bf16(-1.0e20),
+                    moxie_interp::tensor::to_bf16(1.0),
+                ]
+                .into(),
+                vec![1, 4],
+            )
+            .unwrap(),
+        ),
+    );
+    bindings.set(
+        w,
+        Value::Float(HostTensor::bf16(vec![1.0; 4], vec![1, 4]).unwrap()),
+    );
+    let ordinary = Interpreter::new().run_stateless(&graph, &bindings).unwrap();
+    let ordered = Interpreter::new()
+        .run_stateless_with_linear_orders(
+            &graph,
+            &bindings,
+            &BTreeMap::from([(
+                NodeId(0),
+                LinearReductionOrder {
+                    blocks: 2,
+                    slice: None,
+                },
+            )]),
+        )
+        .unwrap();
+    assert_eq!(ordinary.output().as_float().unwrap().data(), &[1.0]);
+    assert_eq!(ordered.output().as_float().unwrap().data(), &[0.0]);
 }
 
 #[test]

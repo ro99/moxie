@@ -34,11 +34,16 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
+
 pub mod kv;
 pub mod paged;
 pub mod tensor;
 
-use moxie_graph::{Bindings, Graph, MlaAttentionDescriptor, Node, OpParams, ValueId};
+use moxie_graph::{
+    Bindings, Graph, LinearInputSlice, LinearReductionOrder, MlaAttentionDescriptor, Node, NodeId,
+    OpParams, ValueId,
+};
 use moxie_oracles::{activation, attention, linear, mla, norm, residual, rope, route};
 use moxie_state::{LogitsHandle, MlaLatentDescriptor, SequenceState};
 use moxie_types::BranchId;
@@ -71,6 +76,30 @@ fn try_shape2(first: usize, second: usize) -> Result<Vec<usize>> {
     let mut shape = try_vec(2)?;
     shape.extend([first, second]);
     Ok(shape)
+}
+
+fn validate_linear_slice(
+    slice: LinearInputSlice,
+    local_width: u64,
+    x: &HostTensor,
+    w: &HostTensor,
+    blocks: u32,
+) -> Result<()> {
+    if blocks == 0
+        || slice.width == 0
+        || slice.width != local_width
+        || slice.full_width == 0
+        || !slice.full_width.is_multiple_of(u64::from(blocks))
+        || slice.width != slice.full_width / u64::from(blocks)
+        || slice.first > slice.full_width - slice.width
+        || x.cols() as u64 != slice.width
+        || w.cols() as u64 != slice.width
+    {
+        return Err(Error::InvalidArtifact {
+            detail: "the linear input slice does not match its compact operands".into(),
+        });
+    }
+    Ok(())
 }
 
 /// A cancellation token checked at every operation boundary.
@@ -213,6 +242,20 @@ impl Interpreter {
         graph: &Graph,
         bindings: &Bindings<Value>,
     ) -> Result<StatelessTrace> {
+        self.run_stateless_with_linear_orders(graph, bindings, &BTreeMap::new())
+    }
+
+    /// Stateless execution with a plan-declared input-axis reduction order.
+    ///
+    /// The ordinary entry point remains the S=1 path. This additive entry point
+    /// lets a plan make the reference's block order explicit without changing
+    /// model-owned `OpParams::Linear` values.
+    pub fn run_stateless_with_linear_orders(
+        &self,
+        graph: &Graph,
+        bindings: &Bindings<Value>,
+        orders: &BTreeMap<NodeId, LinearReductionOrder>,
+    ) -> Result<StatelessTrace> {
         if !graph.state_effects().is_empty() {
             return Err(Error::InvalidRequest {
                 field: "graph",
@@ -290,7 +333,7 @@ impl Interpreter {
         let mut staged = Vec::new();
         let mut node_outputs = Vec::with_capacity(graph.nodes().len());
         for node in graph.nodes() {
-            let output = self.eval(node, &values, &kv, &mut staged, &[])?;
+            let output = self.eval(node, &values, &kv, &mut staged, &[], orders)?;
             if let Value::Float(tensor) = &output
                 && tensor.data().iter().any(|element| !element.is_finite())
             {
@@ -333,6 +376,21 @@ impl Interpreter {
         branch: BranchId,
         kv: &mut KvCache,
         cancel: &Cancel,
+    ) -> Result<StepOutput> {
+        self.run_with_linear_orders(graph, bindings, state, branch, kv, cancel, &BTreeMap::new())
+    }
+
+    /// Execute one step with a plan-declared linear reduction order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_linear_orders(
+        &self,
+        graph: &Graph,
+        bindings: &Bindings<Value>,
+        state: &mut SequenceState,
+        branch: BranchId,
+        kv: &mut KvCache,
+        cancel: &Cancel,
+        orders: &BTreeMap<NodeId, LinearReductionOrder>,
     ) -> Result<StepOutput> {
         let before = state.frontiers(branch)?;
         // The cache must be this branch's, at this prefix, holding this version
@@ -524,7 +582,7 @@ impl Interpreter {
 
         for node in graph.nodes() {
             cancel.check(node.params.op().name())?;
-            let out = self.eval(node, &values, kv, &mut staged, &positions)?;
+            let out = self.eval(node, &values, kv, &mut staged, &positions, orders)?;
             // Checked per node, not only at the output: attributing a NaN to the
             // operation that produced it is the difference between a defect
             // report and a puzzle.
@@ -706,6 +764,7 @@ impl Interpreter {
         kv: &impl paged::HistorySource,
         staged: &mut Vec<StagedAppend>,
         positions: &[u64],
+        orders: &BTreeMap<NodeId, LinearReductionOrder>,
     ) -> Result<Value> {
         let input = |i: usize| -> Result<&Value> {
             values[node.inputs[i].0 as usize]
@@ -755,7 +814,9 @@ impl Interpreter {
                 }
             }
             OpParams::Linear {
-                out_features, bias, ..
+                in_features,
+                out_features,
+                bias,
             } => {
                 let x = input(0)?.as_float()?;
                 let w = input(1)?.as_float()?;
@@ -765,13 +826,61 @@ impl Interpreter {
                     None
                 };
                 let mut out = try_vec(x.rows() * out_features as usize)?;
+                let order = orders.get(&node.id).copied();
+                if let Some(LinearReductionOrder {
+                    blocks,
+                    slice: Some(slice),
+                }) = order
+                {
+                    validate_linear_slice(slice, in_features, x, w, blocks)?;
+                }
+                if let Some(order) = order
+                    && order.slice.is_some()
+                    && bias
+                {
+                    return Err(Error::Unsupported {
+                        capability: "biased_input_axis_linear",
+                        reason: "a rank-local reduction cannot apply a bias more than once".into(),
+                    });
+                }
                 for r in 0..x.rows() {
-                    out.extend(linear::linear_row(
-                        x.row(r)?,
-                        w.data(),
-                        out_features as usize,
-                        b.as_deref(),
-                    )?);
+                    let row = x.row(r)?;
+                    let values = match order {
+                        Some(LinearReductionOrder {
+                            blocks,
+                            slice: None,
+                        }) => linear::linear_row_ordered(
+                            row,
+                            w.data(),
+                            out_features as usize,
+                            b.as_deref(),
+                            blocks,
+                        )?,
+                        Some(LinearReductionOrder {
+                            blocks: _,
+                            slice: Some(_slice),
+                        }) => linear::linear_row_partial(row, w.data(), out_features as usize)?,
+                        None => {
+                            linear::linear_row(row, w.data(), out_features as usize, b.as_deref())?
+                        }
+                    };
+                    out.extend(values);
+                }
+                if let Some(LinearReductionOrder {
+                    blocks,
+                    slice: Some(_),
+                }) = order
+                {
+                    if blocks == 0 {
+                        return Err(Error::InvalidRequest {
+                            field: "linear_blocks",
+                            detail: "the declared reduction block count must be positive".into(),
+                        });
+                    }
+                    return Ok(Value::Float(HostTensor::f32(
+                        out,
+                        try_shape2(x.rows(), out_features as usize)?,
+                    )?));
                 }
                 Value::Float(HostTensor::round_to_bf16(
                     out,

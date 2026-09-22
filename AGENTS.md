@@ -161,7 +161,11 @@ have no production reader yet, so head alignment and MLA's per-weight
 partition are proven by lowering rather than by more labels. [Task
 0056](docs/tasks/0056-m5-host-tp-attention-lowering.md) (accepted, M5.2 slice 1)
 is a host-only TP lowering of the attention sublayer, bit-identical to the
-unsplit graph at 2, 4 and 8 ranks. `ExpertMlp`/`Combine` stay
+unsplit graph at 2, 4 and 8 ranks. [Task 0058](docs/tasks/0058-m5-dense-tp-host-lowering.md)
+(accepted) extends it to the MLP and the vocabulary projection, with exact
+reductions (ADR 0036) and strided input-axis weight addressing. The M5 route
+is six slices, listed in the ledger; slice 2, dense TP2 on the 3090 pair, is
+next. `ExpertMlp`/`Combine` stay
 `NotDetermined` for M5.4. The [M5
 ledger](docs/handovers/2026-09-22-m4-closure-to-m5.md) carries each open
 obligation and the queue.

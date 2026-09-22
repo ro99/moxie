@@ -51,8 +51,9 @@ pub use plan::{resource_request, validate_plan_binding};
 
 pub mod affine_linear;
 pub use affine_linear::{
-    AffineLaunch, WeightShardRanges, WeightShardSpec, descriptor_serves,
-    select_affine_linear_kernel, shard_weight_ranges,
+    AffineLaunch, StridedLogicalRange, StridedWeightShardRanges, WeightShardRanges,
+    WeightShardSpec, descriptor_serves, select_affine_linear_kernel, shard_weight_ranges,
+    shard_weight_strided_ranges,
 };
 
 pub mod paged_attention;
