@@ -108,15 +108,28 @@ deleting `executed` from the formula would still have passed). Both
 repaired and traced. This is a pure host-only decision primitive with no
 consumer wired yet.
 
-[Task 0050](docs/tasks/0050-m4-integrated-closure.md) (proposed
-2026-09-22) is the milestone-closing integration task: every M4.1–M4.5
-primitive so far has been proven in isolation, against synthetic fixtures,
-never combined — the 32,768-actual-row paged attention gate (tasks
-0037/0038) has no later-turn continuation, and COW fork/prefix reuse have
-never been exercised at that scale. M4's own exit gate ("supported graph
-runs at 32,768 actual context tokens, including decode after long prefill
-and later-turn continuation... test page/ring/tail boundaries") is
-unmet until something combines them. Device (GPU) execution of MLA and the absorbed/fused fast
+[Task 0050](docs/tasks/0050-m4-integrated-closure.md) **accepted** (owner,
+2026-09-22): a genuine second turn via device COW fork, continuing from the
+existing 32,768-row single-turn gate, with a real decode-after-continuation
+step (round 1's review caught the first attempt re-querying an
+already-computed row instead of genuinely appending one — repaired).
+Satisfies M4's exit gate's **first** sentence (32,768 actual tokens,
+decode after long prefill, later-turn continuation, page/ring/tail
+boundaries).
+
+**The exit gate has a second sentence task 0050 does not address:** "For
+100k/200k/1m publish admission and positional-capability results
+separately from measured performance; blocked tiers are not
+supported-by-assertion." Nothing built through task 0050 has published
+anything about those tiers. [Task 0051](docs/tasks/0051-m4-large-tier-admission-and-positional-report.md)
+(proposed 2026-09-22) is that report — admission arithmetic from the
+already-qualified `MAX_STAGED_BLOCKS = 3` streaming bound and measured
+hardware VRAM, plus a positional-capability check of the existing
+oracle arithmetic at large position values. It is expected, in advance,
+to find some or all of 100k/200k/1m blocked by the current qualified
+bound — that is a complete, legitimate result the gate explicitly permits
+("blocked tiers are not supported-by-assertion"), not a shortfall to
+paper over. Device (GPU) execution of MLA and the absorbed/fused fast
 path are explicitly out of M4.2's scope and are not opened by its acceptance.
 The [M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md)
 tracks this milestone's obligations.
