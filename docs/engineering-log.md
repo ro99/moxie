@@ -44,6 +44,7 @@ Each links into the entries below.
 | A fix that is not guarded by the test written for it | task 0023's fake axis, task 0024's helper-only regression |
 | A numerical gate whose denominator can collapse | task 0028's 2-ULP-at-the-result threshold |
 | A check attached to a value nobody has to keep | task 0028's public launch fields, trusted descriptor, unchecked lease scope and borrowed operands; task 0038's `WriteReceipt` and the quarantined range `PagedCloseRefused` handed back on the refusing path |
+| An upload source dropped while its copy may still be in flight | task 0057's peer-gather sources, released after only their producer event; task 0059's RoPE angle table, a local `Vec` dropped by `?` after an async host-to-device enqueue |
 | Work that exists on one disk and nowhere else | 24 commits, four tasks and five review rounds, unpushed for thirty hours |
 | A repair that satisfies the test rather than the property | task 0029, four rounds: an owned label the fixture never used, a prefix measured on a warmed ledger, a mutant that panicked before it mutated, an aggregate standing in for a state |
 | A harness with no tests of its own | the mutation guard, after three rounds of guard bugs: the self-test covers verdicts, selectors and anchors, and never touched restoration |
