@@ -124,12 +124,12 @@ Use the established team unless the owner changes it (owner direction,
 | Role | Agent | Effort | Skill it works under |
 |---|---|---|---|
 | Builder | Claude Opus, Herdr name `builder`, in its own tab | high | `/ponytail:ponytail` |
-| Independent reviewer | Claude Opus, Herdr name `reviewer`, in its own tab (not the coordinator's session) | read-only | `/ponytail:ponytail-review` |
+| Independent reviewer | Codex `sol` (`gpt-6-sol`), in its own tab | high, read-only | `/ponytail:ponytail-review` |
 | Coordinator | Claude Opus, Herdr name `coordinator` | high | `/ponytail:ponytail-audit` at milestone end |
 
 Owner direction, 2026-09-22: Codex `sol` and then Codex `luna` hit their
-usage limits. Separate Claude Opus sessions replace them as `reviewer` and
-`builder`. The coordinator never builds or reviews its own assignments; the
+usage limits. A Claude Opus session replaced luna as `builder`. A Claude
+Opus `reviewer` covered briefly, and then sol returned (now `gpt-6-sol`). The coordinator never builds or reviews its own assignments; the
 owner keeps each role in its own session. With several Claude sessions live,
 `claude` is not a unique target: workers report to `coordinator` by name.
 
