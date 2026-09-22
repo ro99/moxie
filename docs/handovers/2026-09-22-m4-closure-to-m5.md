@@ -71,9 +71,17 @@ wrong. Rows M5.1-c and M5.1-d record what it missed.
 1. Tasks 0054 (M5.1-b) and 0055 (M5.1-e): accepted.
 2. Task 0056, M5.2 slice 1: accepted. The host TP lowering of the attention
    sublayer is bit-identical at 2, 4 and 8 ranks.
-3. Then device collectives on the 3090 pair, MLA, and row-parallel
-   `o_proj`, each as its own slice, in whichever order the first slice's
-   result makes cheapest.
+3. Task 0057, M5.2 slice 2: a TP2 rank group and an ordered all-gather on
+   the 3090 pair, proven by a column-sharded BF16 `Linear`, bit-identical to
+   one GPU, with rank-failure, mismatch and cancellation injection. It is the
+   first real consumer of task 0054's byte ranges.
+4. **Owner decision pending:** the numerical gate for TP reductions. A
+   row-parallel `o_proj`/`down_proj` sums partial products across ranks in a
+   different order, so bit-identity cannot hold. ADR 0028's two-clause gate
+   covers a quantized linear's reduction; whether it extends to TP
+   reductions is the owner's call.
+5. Device RoPE (needed before task 0056's head chain can run on the GPU),
+   whole-rank-step atomicity, and MLA, each as its own slice.
 
 Lesson applied to every contract written from here on: read the storage layout,
 group axis and graph wiring a contract depends on before writing its acceptance
