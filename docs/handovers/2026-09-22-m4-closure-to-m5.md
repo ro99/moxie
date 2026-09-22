@@ -57,32 +57,34 @@ wrong. Rows M5.1-c and M5.1-d record what it missed.
 |---|---|---|---|---|---|---|
 | M5.1-a | Attention/MLA op-level partition rule | **Accepted** (owner, 2026-09-22) | closed | none | [Task 0053](../tasks/0053-m5-attention-partition-semantics.md): `Attention` → `HeadShardable{GqaReplicateWhenOversubscribed, ConcatenateHeads}`, `MlaAttention` → `HeadShardable{SharedLatentReplicated, GlobalReduction}`. The semantics are correct. Most of its new test lines check fixture literals, re-test descriptor methods already pinned in `moxie-graph`, or check the fixture's own wiring (see M5.1-e) | none |
 | M5.1-b | Column-sharded weights addressed through the canonical format and residency authority (`LogicalRange` per component) | **Accepted** (owner, 2026-09-22) | closed | none | [Task 0054](../tasks/0054-m5-weight-shard-addressing.md), amended twice before any code: input-axis (row) shards are strided in row-major `[out, in]`, and quantization groups lie along `k`, so a column shard never splits a group. Three review rounds: a rank-dependent overflow verdict (fixed by validating the full extent first), hand-derived component widths (now `affine_components`), then redundant re-validation removed | none |
-| M5.1-c | Head-aligned partition across the head chain (`q/k/v` `Linear` → per-head `RmsNorm` → `Rope` → `Attention`) | **Moved into M5.2 task 0056** (owner, 2026-09-22) | builder / sol / coordinator | none | Partition rules have no production reader, so per-op labels could only be tested as constants. Head alignment is now proven by a host TP lowering whose split result must be bit-identical to the unsplit graph | see M5.2 |
+| M5.1-c | Head-aligned partition across the head chain (`q/k/v` `Linear` → per-head `RmsNorm` → `Rope` → `Attention`) | **Moved into M5.2 task 0056** (owner, 2026-09-22) | luna / sol / coordinator | none | Partition rules have no production reader, so per-op labels could only be tested as constants. Head alignment is now proven by a host TP lowering whose split result must be bit-identical to the unsplit graph | see M5.2 |
 | M5.1-d | Per-weight partition inside `MlaAttention` (`q_a`/`kv_a` replicated, `q_b`/`kv_b` split by head, `o_proj` split along its input axis) | **Moved to a later M5.2 slice** (owner, 2026-09-22) | unassigned | task 0056's lowering; `o_proj` also needs strided addressing | task 0056 refuses `MlaAttention` explicitly | after task 0056 |
 | M5.1-e | Trim task 0053's redundant tests to one assertion per invariant (owner instruction, 2026-09-19) | **Accepted** (owner, 2026-09-22) | closed | none | Keep: the contract-table enum rows and the single `node.contract.partition` assertion on the real MLA node in `mla_reference.rs`. Remove: the GQA-literal block and the `cache_width`/`more_query_heads` block in `reference_graphs.rs`, the fixture-wiring assertions in `mla_reference.rs`, and the new `HeadShardable` line in `moxie-graph`'s `partition_semantics_fail_closed_until_defined` | [Task 0055](../tasks/0055-m5-trim-task-0053-tests.md) opened, 2026-09-22 |
 | M5.1-f | State (KV) shard addressing through the residency authority | Not started | unassigned | M5.1-c (which KV heads a rank owns) | named in task 0054's non-goals | after M5.1-c |
-| M5.2 | TP2 on the 3090 pair: column/row linears, head/KV ownership, global routing/vocabulary ops, collective ordering and failure handling | **Slice 1 accepted** (owner, 2026-09-22); M5.2 open | builder / sol / coordinator | M5.1-a/b accepted | [Task 0056](../tasks/0056-m5-host-tp-attention-lowering.md): host-only lowering of the dense Gemma 4 attention sublayer for R = 2 and 4, bit-identical to the unsplit graph; design proposal first. It also closes the carried non-divisible-head refusal | Later slices: thread-per-rank device execution (document 01's one execution thread per GPU; task 0057 drives both ranks from one host thread because `RankContext`/`DeviceRange` are `!Send`, so a cross-thread peer-range handle is needed; failure must reach every rank the way Strata's status collective did, MAX over a status word, with a failing rank still entering every collective); whole-rank-step atomicity (task 0056 harness runs each rank/layer as its own interpreter transaction; the device slice must make a rank step one transaction); MLA (M5.1-d); row-parallel `o_proj` plus strided addressing and group alignment (task 0054 amendments); state KV shard addressing (M5.1-f); device collectives on the 3090 pair, replacing task 0056's host harness |
+| M5.2 | TP2 on the 3090 pair: column/row linears, head/KV ownership, global routing/vocabulary ops, collective ordering and failure handling | **Slice 1 accepted** (owner, 2026-09-22); M5.2 open | luna / sol / coordinator | M5.1-a/b accepted | [Task 0056](../tasks/0056-m5-host-tp-attention-lowering.md): host-only lowering of the dense Gemma 4 attention sublayer for R = 2 and 4, bit-identical to the unsplit graph; design proposal first. It also closes the carried non-divisible-head refusal | Later slices: thread-per-rank device execution (document 01's one execution thread per GPU; task 0057 drives both ranks from one host thread because `RankContext`/`DeviceRange` are `!Send`, so a cross-thread peer-range handle is needed; failure must reach every rank the way Strata's status collective did, MAX over a status word, with a failing rank still entering every collective); whole-rank-step atomicity (task 0056 harness runs each rank/layer as its own interpreter transaction; the device slice must make a rank step one transaction); MLA (M5.1-d); row-parallel `o_proj` plus strided addressing and group alignment (task 0054 amendments); state KV shard addressing (M5.1-f); device collectives on the 3090 pair, replacing task 0056's host harness |
 | M5.3 | PP with uneven stages, microbatch-aware prefill, mixed TP+PP stage groups | Not started | unassigned | M5.2 | none | after M5.2 |
 | M5.4 | Bounded expert-owner partitioning: shared dispatch/transport/reduction, duplicate destinations, host experts, route unions | Not started | unassigned | `ExpertMlp`/`Combine` partition rule (still `NotDetermined`) | none | its own task once expert-owner semantics are written |
 | M5.5 | Topology cost probes and a deterministic plan comparison tool | Not started | unassigned | M5.2/M5.3/M5.4 | none | not queued |
 
-## Work queue (critical path)
+## Route to M5 closure (owner-agreed plan, 2026-09-22)
 
-1. Tasks 0054 (M5.1-b) and 0055 (M5.1-e): accepted.
-2. Task 0056, M5.2 slice 1: accepted. The host TP lowering of the attention
-   sublayer is bit-identical at 2, 4 and 8 ranks.
-3. Task 0057, M5.2 slice 2: accepted. A TP2 rank group and a sequenced
-   all-gather on the 3090 pair, bit-identical to one GPU. Failures are typed
-   and bounded; a missed drain withholds every range; peer grants are tied to
-   the live context. Follow-up: about 75 lines of test-gate setup duplicate
-   `tests/device_arena.rs`.
-4. **Decided (owner, 2026-09-22; ADR 0036):** TP reductions are exact, following
-   Strata's approach. FP32 per-shard partials are combined in a declared order
-   and rounded to BF16 once, and the single-rank path runs the same order. A
-   row-parallel `o_proj`/`down_proj` slice is compared bit for bit, with no
-   tolerance.
-5. Device RoPE (needed before task 0056's head chain can run on the GPU),
-   whole-rank-step atomicity, and MLA, each as its own slice.
+Accepted so far: tasks 0053–0057. This covers the attention partition rule,
+column-shard weight ranges, the test trim, the host TP lowering of attention,
+and a TP2 rank group with an all-gather on the 3090 pair. M5.1 is **not
+closed**. Its leftovers are routed into the slices below. A slice may take
+more than one task; the order holds.
+
+| Order | Slice | Delivers | Closes |
+|---|---|---|---|
+| 1 | Dense TP on the host | Extend the task 0056 lowering to the MLP (`gate`/`up` column split, local GLU, input-axis-split `down_proj` with exact FP32 reduction per ADR 0036) and to the vocabulary projection (split and gather). Input-axis weights addressed as strided slices with group-alignment checks, as in Strata's `Dsv4RankShardDescriptor`. Correct or retire the partition labels the lowering does not use (`Rope`'s is inaccurate). Reduced Gemma 4 bit-identical to one rank. | M5.1 for dense ops; M5.2 input-axis split and vocabulary |
+| 2 | Dense TP2 on the 3090 pair | Device RoPE with per-head norm (port of Strata `gemma4_norm_rope_kernel`, keyed by layout) and GLU kernels; FP32 partial-sum `Linear` with an exact all-reduce; slice 1's lowering wired to the device; per-rank device KV (M5.1-f); a whole rank step as one transaction. Reduced Gemma bit-identical to one GPU. | M5.2 core; M5.1 state clause |
+| 3 | Robust rank execution | One thread per GPU (document 01); failure propagation with Strata's status collective, where a failing rank still enters every collective; rank-failure and mismatch injection at graph level; remove task 0057's duplicated test gate. | M5 exit fault injection |
+| 4 | MoE and MLA partitioning | Expert ownership with dispatch, transport and combine in the declared expert order; duplicate destinations; host experts. MLA per-weight partition. Host first, then the pair. | M5.4; M5.1's last ops; M5 exit expert-partitioned plan |
+| 5 | PP and combined TP + PP | Uneven stages; microbatch-aware prefill; a TP2 stage on the 3090s plus a TP1 stage on the 5060 Ti, with an explicit, reported host-staged handoff (no cross-socket peer access); report the capacity and latency effect. Strata never did PP. | M5.3; M5 exit combined plan |
+| 6 | Probes, plan comparison, close | Topology cost probes; a deterministic plan-ranking tool; milestone-end `/ponytail:ponytail-audit`; acceptance package. | M5.5; M5 closure |
+
+Slices 4 and 5 are independent and may swap. Rows M5.1-c/d/f and the M5.2
+carried obligations above map into slices 1–4.
 
 Lesson applied to every contract written from here on: read the storage layout,
 group axis and graph wiring a contract depends on before writing its acceptance
@@ -97,5 +99,4 @@ abstraction; whether TP2 needs a rank-group type is M5.2's question. Document
 
 ## Next task
 
-Task 0056 (M5.2 slice 1) is assigned to `builder` (Claude Opus, replacing
-luna 2026-09-22), design first.
+Slice 1 (dense TP on the host) is next, for luna.

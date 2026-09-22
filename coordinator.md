@@ -123,15 +123,15 @@ Use the established team unless the owner changes it (owner direction,
 
 | Role | Agent | Effort | Skill it works under |
 |---|---|---|---|
-| Builder | Claude Opus, Herdr name `builder`, in its own tab | high | `/ponytail:ponytail` |
+| Builder | Codex `luna` (`gpt-5.6-luna`), in its own tab | max | `/ponytail:ponytail` |
 | Independent reviewer | Codex `sol` (`gpt-6-sol`), in its own tab | high, read-only | `/ponytail:ponytail-review` |
 | Coordinator | Claude Opus, Herdr name `coordinator` | high | `/ponytail:ponytail-audit` at milestone end |
 
-Owner direction, 2026-09-22: Codex `sol` and then Codex `luna` hit their
-usage limits. A Claude Opus session replaced luna as `builder`. A Claude
-Opus `reviewer` covered briefly, and then sol returned (now `gpt-6-sol`). The coordinator never builds or reviews its own assignments; the
-owner keeps each role in its own session. With several Claude sessions live,
-`claude` is not a unique target: workers report to `coordinator` by name.
+Owner direction, 2026-09-22: while Codex was out of credits, Claude Opus
+sessions covered as `builder` and `reviewer`. Codex returned and luna and sol
+resumed their roles (sol now on `gpt-6-sol`). The coordinator never builds or
+reviews its own assignments. Workers report to `coordinator` by name, because
+`claude` is not a unique target when several Claude sessions are live.
 
 Start each worker in its **own Herdr tab**, in the repository working directory,
 with `codex --yolo`. One tab per worker: panes split from a single tab become
