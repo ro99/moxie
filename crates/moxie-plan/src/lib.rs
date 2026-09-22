@@ -14,6 +14,7 @@
 
 pub mod expert;
 mod selected;
+pub mod tensor_parallel;
 pub use expert::{
     BoundOn, Candidate, ChunkResidency, EnvelopePrediction, Exactness, ExpertBudget,
     ExpertEnvelope, ExpertGroup, ExpertPlan, ExpertPlanRefused, ExpertPolicy, ExpertShape,
@@ -22,6 +23,9 @@ pub use expert::{
 pub use selected::{
     PlannedValue, PlannedWorkspace, SelectedNode, SelectedPlanCandidate, StorageRegion,
     lower_selected,
+};
+pub use tensor_parallel::{
+    RankPart, Stage, TensorParallelLowering, TensorParallelRefused, lower_tensor_parallel,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

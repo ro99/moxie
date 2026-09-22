@@ -58,6 +58,7 @@ dependencies = [
  "moxie-model-api",
  "moxie-models",
  "moxie-oracles",
+ "moxie-plan",
  "moxie-state",
  "moxie-types",
  "serde_json",

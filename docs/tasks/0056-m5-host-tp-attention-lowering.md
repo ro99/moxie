@@ -1,14 +1,17 @@
 # Task 0056 — host-only tensor-parallel lowering of the attention sublayer
 
-Status: **proposed**.
+Status: **accepted** (owner, 2026-09-22). Built by Claude Opus `builder`; reviewed
+by Codex `sol`; round 2 ACCEPT. The coordinator re-ran the focused tests
+and `arch-check`.
 
 ## Identity and authority
 
 - Task0056, the first M5.2 slice. It replaces the queued M5.1-c/M5.1-d
   labelling tasks (owner, 2026-09-22: "restructure the queue this way").
   Builder Claude Opus session `builder` (`/ponytail:ponytail`; replaced
-  Codex `luna`, out of credits, 2026-09-22); reviewer Claude Opus session
-  `reviewer` (read-only, `/ponytail:ponytail-review`); coordinator
+  Codex `luna`, out of credits, 2026-09-22); reviewer Codex `sol`
+  (read-only, `/ponytail:ponytail-review`; a Claude Opus `reviewer` was
+  briefly assigned while sol was out of credits and did not review); coordinator
   Claude Opus. Owner accepts.
 - Root `/home/rodrigo/Developer/moxie`, branch `main`, base `8d19da3`.
   Preserve the unrelated carried work (`docs/evidence/specification-version.md`
@@ -162,9 +165,103 @@ The coordinator answers before implementation starts.
 
 ## Result, filled after work
 
-- Design decision (phase 1) and coordinator answer:
-- Changed owners and consumers; source commit:
-- Commands; passed / failed / skipped:
-- Mutation results and restoration:
-- Temporary harness and its expiry:
-- Remaining obligations (MLA slice, row-parallel `o_proj`, device collectives):
+- **Design decision (phase 1) and coordinator answer:**
+  - The approved design runs each stage as its own small graph, with no
+    interpreter change. Replicated stages go through the existing
+    `Interpreter::run_stateless`, which builds its own empty `SequenceState`
+    and zero-layer cache and never touches the caller's. Head-local stages go
+    through the unchanged `Interpreter::run`, with one `SequenceState` and one
+    one-layer `KvCache` per (rank, attention layer).
+  - **The harness does not make a rank step atomic.** One rank step is one
+    transaction per layer, so a failure part-way through a step would leave
+    earlier layers appended. The coordinator recorded the M5.2 obligation that
+    the device slice makes a whole rank step one transaction.
+  - Fact corrections, accepted:
+    - Shape A has no layer whose KV heads divide over 4 ranks. The test
+      therefore uses Shape A through `gemma::build_with_config` with 8 query
+      heads, 4 sliding KV heads and 1 global KV head. At both R=2 and R=4 the
+      sliding layers split their KV heads and the global layer replicates its
+      one.
+    - `GraphBuilder::finish` requires attention layers numbered densely from 0,
+      so the harness renumbers each stage subgraph's attention to layer 0.
+    - `k_proj` is sharded as a KV projection, because on global layers it
+      feeds V.
+  - One further fact, found during implementation: a global layer's per-head
+    K norm has `group == kv_heads == 1`. The chain therefore takes every
+    `RmsNorm` between a projection and attention as per-head, not only those
+    with `group > 1`, and then checks that `group` equals the axis's head
+    count.
+- **Changed owners and consumers; source commit:** uncommitted on base
+  `1090e80`.
+  - `crates/moxie-plan/src/tensor_parallel.rs` (new) holds
+    `lower_tensor_parallel`, `Stage`, `RankPart`, `TensorParallelLowering` and
+    `TensorParallelRefused`. They are re-exported from
+    `crates/moxie-plan/src/lib.rs`, and `moxie-plan`'s dependencies are
+    unchanged.
+  - `crates/moxie-cli/tests/tensor_parallel.rs` (new) is the temporary
+    harness, with two tests.
+  - `crates/moxie-cli/Cargo.toml` adds `moxie-plan` as a dev-dependency only;
+    `Cargo.lock` records it. `arch-check` does not govern dev-dependencies.
+  - The first consumer of `partition_rule()` outside tests is the lowering's
+    fail-closed refusal of `NotDetermined`.
+- **Commands; passed / failed / skipped:**
+  - `cargo fmt --all -- --check` passed.
+  - `cargo clippy --workspace --all-targets --locked -- -D warnings` passed.
+  - `cargo xtask arch-check` passed.
+  - `cargo xtask spec-check` passed.
+  - `cargo test --workspace --locked`: passed (exit 0; 108 test binaries, 1232 passed, 0 failed, 0 ignored; round 2 log /tmp/claude-1000/-home-rodrigo-Developer-moxie/75e03800-b1df-4452-b029-94f209bf853d/scratchpad/test-workspace-r2.log).
+  - The bit-identity test covers R in {2, 4, 8}: a 5-row prefill, then two
+    1-row decodes. R=8 was added in round 2 so that a replicated KV head with
+    `kv_heads > 1` is exercised (each of the 4 sliding KV heads over 2 ranks). It compares logit bits and asserts at every replicated stage that
+    every rank's values agree bit for bit.
+  - The refusal test's table covers 4 query heads over 3 ranks (`Heads`), 3
+    global KV heads over 2 ranks (`KvHeads`), the routed Shape C graph (`Op`)
+    and a biased query projection (`HeadChain`).
+  - Nothing was skipped. There was no GPU work and no timing.
+- **Mutation results and restoration.** Each mutation was applied to
+  `tensor_parallel.rs`, followed by `cargo test -p moxie-cli --test
+  tensor_parallel head_split`, then a restore from a copy verified with
+  `cmp`. Every mutation fails the bit-identity test.
+  - The shared KV head's rows split across the ranks that share it, instead
+    of replicated, fails when the stage subgraph is validated: `linear: input
+    1 axis 0 must be 32, got Const(16)`.
+  - Query heads assigned out of rank order fail on the logits comparison
+    itself: the R=2 logit bits differ.
+  - A rank's `Attention.kv_heads` left global fails at subgraph validation:
+    `attention: input 1 axis 1 must be 64, got Const(32)`.
+  - The per-head `RmsNorm` group not rewritten fails at subgraph validation:
+    `rms_norm: input 1 axis 0 must be 8, got Const(16)`.
+  - Three of the four are caught by the graph builder's shape validation of
+    the rank's stage, before any logits exist. Only the reordering reaches
+    the bit comparison, because it is the only one of the four that stays
+    shape-consistent.
+  - Round 2 (review-task-0056-round-1). F1: the harness now takes each
+    head-local stage's output and gather point from `Stage::HeadLocal.gather`
+    rather than assuming the stage's last node. Mutating the lowering to
+    gather at `nodes[attention].inputs[0]` (the query RoPE output, same
+    width) fails: the rank graphs return the RoPE output, the gathered value
+    is stored under the RoPE id, and the next stage's read of the real
+    attention output panics (`no entry found for key` in `bind`). F2: with
+    R=8, mutating the replicated KV head index to `rank % kv_heads` fails the
+    R=8 logit bit comparison. Both were restored and checked with `cmp`.
+- **Review trail (sol).** Round 1: F1 major, the harness never read
+  `Stage::HeadLocal.gather`, so a wrong gather point passed; a coverage gap,
+  every replicated KV case had one KV head. Both were repaired in round 2 in
+  the harness only, since the production lowering was correct. Round 2:
+  **ACCEPT**, with the gather-point failure confirmed load-bearing because
+  value ids are unique. Sol also confirmed, by arithmetic, the local-to-global
+  GQA mapping in the split and replicated cases, and that head-chain
+  traversal admits only `Linear`/`RmsNorm`/`Rope`.
+- **Temporary harness and its expiry.** The multi-rank runner, the host
+  column gather and the `stage_graph` subgraph helper all live in
+  `crates/moxie-cli/tests/tensor_parallel.rs`. They are test-only and are
+  marked temporary in the file's header. They expire when executor
+  collectives land in the device TP2 slice.
+- **Remaining obligations:**
+  - MLA lowering (a later slice).
+  - Row-parallel `o_proj`, whose strided input-axis addressing M5.2 still
+    owes.
+  - Device collectives and a rank-group type in the executor.
+  - One transaction per whole rank step on device (above).
+  - `ExpertMlp`/`Combine` partitioning (M5.4).
+  - Converting row ranges to canonical bytes (the device slice).

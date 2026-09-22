@@ -159,9 +159,9 @@ tracks this milestone's obligations.
 column-sharded weight to the byte range each rank owns. Partition rules
 have no production reader yet, so head alignment and MLA's per-weight
 partition are proven by lowering rather than by more labels. [Task
-0056](docs/tasks/0056-m5-host-tp-attention-lowering.md) (active, M5.2 slice 1)
-is a host-only TP lowering of the attention sublayer. Its split result must
-be bit-identical to the unsplit graph. `ExpertMlp`/`Combine` stay
+0056](docs/tasks/0056-m5-host-tp-attention-lowering.md) (accepted, M5.2 slice 1)
+is a host-only TP lowering of the attention sublayer, bit-identical to the
+unsplit graph at 2, 4 and 8 ranks. `ExpertMlp`/`Combine` stay
 `NotDetermined` for M5.4. The [M5
 ledger](docs/handovers/2026-09-22-m4-closure-to-m5.md) carries each open
 obligation and the queue.
