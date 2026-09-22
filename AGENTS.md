@@ -152,6 +152,16 @@ path are explicitly out of M4.2's scope and are not opened by its acceptance.
 The [M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md)
 tracks this milestone's obligations.
 
+**M5 is open** (owner, 2026-09-22: "open M5 for luna to work"). [Task
+0053](docs/tasks/0053-m5-attention-partition-semantics.md) is M5.1's first
+bounded slice: `Attention`/`MlaAttention` currently return
+`PartitionRule::NotDetermined` in `crates/moxie-graph`, deliberately fail-closed
+pending document 04's TP section (head ownership, GQA KV replication, output
+reduction) — the only implemented-op gap M5.1 still has to close;
+`ExpertMlp`/`Combine` stay `NotDetermined`, reserved for M5.4. The
+[M4→M5 handover](docs/handovers/2026-09-22-m4-closure-to-m5.md) carries the
+M5 milestone ledger.
+
 | | |
 |---|---|
 | Accepted M3.1 | Tasks [0025](docs/tasks/0025-m3-offline-repack-publication.md), [0026](docs/tasks/0026-m3-canonical-safetensors-publication.md), [0030](docs/tasks/0030-m3-repack-correctness-package.md) and [0031](docs/tasks/0031-m3-battery-closure.md): bounded canonical safetensors publication and final T0006, 63/63 defects caught plus three controls held. Repacking remains provisional under ADR0027. |
