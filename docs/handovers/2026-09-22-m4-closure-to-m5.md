@@ -46,6 +46,13 @@ it, following the same pattern as the 2026-09-19 M3→M4 authorization. No
 other M5 scope beyond the first task below is authorized by this instruction;
 later M5 items get their own bounded tasks as each dependency clears.
 
+Owner direction, 2026-09-22 ("go auto-mode until I say differently … keep
+advancing … with the goal of completing M5"): until the owner revokes it, the
+coordinator accepts reviewed tasks and opens the next slice without waiting
+for owner approval. Each acceptance record says "coordinator, under the
+owner's auto-mode delegation" rather than "owner". Owner-reserved matters not
+settled by Strata or an existing ADR still go to the owner, per AGENTS.md.
+
 ## Milestone obligations (roadmap M5, original item numbers)
 
 M5.1 is split into explicit obligations (coordinator.md §2). A post-acceptance
