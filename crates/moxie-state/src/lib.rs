@@ -43,6 +43,9 @@
 pub mod device;
 pub use device::{DeviceBranch, DeviceKvSequence, DeviceLayerLayout, PageView, Placement};
 
+pub mod accumulator;
+pub use accumulator::{RecurrentAccumulator, RecurrentSnapshot, ReplaySource};
+
 pub mod paged;
 pub use paged::{
     KvGeometry, KvRow, LayerKv, PagedCloseRefused, PagedExecutionBinding, PagedSequence,

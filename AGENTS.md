@@ -70,10 +70,19 @@ closed those but its own review then caught a subtler gap (no assertion
 could detect `DeviceKvSequence`'s internal branch map staying stale after
 cleanup, since every check inspected `SequenceState` instead); round 3
 closed it by requiring a post-fault retry fork to actually succeed — the
-only way to observe the internal map was genuinely cleaned. Recurrent/
-convolution/index-state snapshot/replay (document 04's other named M4.4
-obligation) and N-branch generalization remain separate, unopened work.
-**M4.5 remains unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
+only way to observe the internal map was genuinely cleaned. [Task 0046](docs/tasks/0046-m4-recurrent-state-snapshot-replay.md)
+**accepted** (owner, 2026-09-21): a model-independent snapshot/replay store
+for `StateKind::RecurrentAccumulator`, proven against a synthetic
+non-invertible accumulator — not Kimi K3's or GLM-5.3's actual math, which
+is M7's model-bring-up-gated scope. Round 1 found the store unbounded (no
+resource limit unlike `PagedSequence`'s precedent) and a snapshot-release
+bug that permanently lost the snapshot on a mere wrong-ledger mistake; both
+repaired and re-verified by tracing the exact allocation accounting.
+`ConvolutionHistory`'s own physical store — structurally similar but
+irreversible for a different reason (bounded-window information loss, not
+decay/mixing) — is M4.4's natural remaining piece. N-branch COW
+generalization also remains separate, unopened work. **M4.5 remains
+unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
 path are explicitly out of M4.2's scope and are not opened by its acceptance.
 The [M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md)
 tracks this milestone's obligations.
