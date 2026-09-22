@@ -64,6 +64,10 @@ moxie-models.workspace = true
 # executor's production code names no converter, and nothing here may write
 # under a checkpoint root.
 moxie-repack.workspace = true
+# The reduced Gemma composition root and host interpreter are test-only
+# consumers of this device binding; production remains model-independent.
+moxie-cli = { path = "../moxie-cli" }
+moxie-interp.workspace = true
 
 [lints]
 workspace = true

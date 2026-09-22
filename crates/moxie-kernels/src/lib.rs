@@ -5,9 +5,8 @@
 //! discovery. It exposes *images and descriptors*; loading and launching belong
 //! to `moxie-cuda` and, later, to the executor.
 //!
-//! Scope: toolchain smoke kernels plus the narrowly qualified BF16 Linear,
-//! RMSNorm and Residual package. More operations arrive only with their own
-//! semantic and numerical contracts.
+//! Scope: toolchain smoke kernels plus the qualified BF16 operation packages.
+//! Each package has its own semantic and numerical contract.
 //!
 //! The images and their build identity are behind the **`fatbin`** feature,
 //! which is off by default: document 07 requires the host lane to build with no
@@ -107,6 +106,14 @@ pub const PAGED_ATTENTION_THREADS: u32 = 128;
 /// than letting the kernel read past a row.
 pub const PAGED_ATTENTION_MAX_HEAD_DIM: u64 = 256;
 
+pub const DENSE_EMBEDDING: &str = "moxie_dense_embedding_v1";
+pub const DENSE_GROUPED_RMS: &str = "moxie_dense_grouped_rms_v1";
+pub const DENSE_ROPE: &str = "moxie_dense_rope_v1";
+pub const DENSE_GEGLU: &str = "moxie_dense_geglu_v1";
+pub const DENSE_RESIDUAL_SCALED: &str = "moxie_dense_residual_scaled_v1";
+pub const DENSE_VOCAB_PROJECTION: &str = "moxie_dense_vocab_projection_v1";
+pub const DENSE_GRAPH_ABI: u32 = 1;
+
 /// The catalogue identity this build publishes for one architecture.
 ///
 /// A `&'static str` per SM rather than a formatted name, because
@@ -164,6 +171,11 @@ pub fn paged_attention_declares(descriptor: &moxie_types::SemanticKernelDescript
 
 #[cfg(feature = "fatbin")]
 mod images {
+    use super::{
+        BF16_LINEAR, BF16_RESIDUAL, BF16_RMS_APPLY, BF16_RMS_SUM, DENSE_EMBEDDING, DENSE_GEGLU,
+        DENSE_GRAPH_ABI, DENSE_GROUPED_RMS, DENSE_RESIDUAL_SCALED, DENSE_ROPE,
+        DENSE_VOCAB_PROJECTION,
+    };
     use moxie_types::{
         AccumulationPolicy, ActivationPrecision, GateTransform, KernelCapability, KernelCatalogue,
         KernelId, KernelOperand, KernelShapeBounds, KernelSymbol, Precision, RoundingProfile,
@@ -189,6 +201,7 @@ mod images {
     pub const EXPERT_MLP_FATBIN: &[u8] = include_bytes!(env!("MOXIE_EXPERT_MLP_FATBIN"));
     pub const AFFINE_LINEAR_FATBIN: &[u8] = include_bytes!(env!("MOXIE_AFFINE_LINEAR_FATBIN"));
     pub const PAGED_ATTENTION_FATBIN: &[u8] = include_bytes!(env!("MOXIE_PAGED_ATTENTION_FATBIN"));
+    pub const DENSE_GRAPH_FATBIN: &[u8] = include_bytes!(env!("MOXIE_DENSE_GRAPH_FATBIN"));
 
     /// Compute capabilities actually compiled into [`SMOKE_FATBIN`].
     pub const KERNEL_ARCHS: &str = env!("MOXIE_KERNEL_ARCHS");
@@ -200,6 +213,7 @@ mod images {
     pub const EXPERT_MLP_FATBIN_SHA256: &str = env!("MOXIE_EXPERT_MLP_FATBIN_SHA256");
     pub const AFFINE_LINEAR_FATBIN_SHA256: &str = env!("MOXIE_AFFINE_LINEAR_FATBIN_SHA256");
     pub const PAGED_ATTENTION_FATBIN_SHA256: &str = env!("MOXIE_PAGED_ATTENTION_FATBIN_SHA256");
+    pub const DENSE_GRAPH_FATBIN_SHA256: &str = env!("MOXIE_DENSE_GRAPH_FATBIN_SHA256");
     /// What `nvcc --version` reported, verified against the pin in `build.rs`.
     pub const NVCC_VERSION: &str = env!("MOXIE_NVCC_VERSION");
     /// The host compiler nvcc drove. Recorded, not pinned.
@@ -482,6 +496,167 @@ mod images {
         KernelCatalogue::new(descriptors).expect("built-in descriptors are unique")
     }
 
+    /// The shared dense graph package. Existing Linear, whole-row RMSNorm and
+    /// unit Residual symbols are included in this image so one module can run
+    /// a graph containing old and new operations. Paged attention keeps the
+    /// already-qualified descriptor and image identity; its state run owns the
+    /// separate module load.
+    pub fn dense_graph_catalogue() -> KernelCatalogue {
+        let hash = parse_sha256(DENSE_GRAPH_FATBIN_SHA256);
+        let bf16 = KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16));
+        let weight = KernelOperand::Weight(WeightPrecision::expect(Precision::Bf16));
+        let index = KernelOperand::PositionIndex;
+        let shape = KernelShapeBounds {
+            max_rows: 65_536,
+            max_input: 65_536,
+            max_output: 65_536,
+        };
+        let mut descriptors = Vec::new();
+        for sm in [SmVersion::SM86, SmVersion::SM120] {
+            let suffix = sm.name();
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-embedding-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::Embedding,
+                inputs: vec![KernelOperand::TokenIndex, weight],
+                output: ActivationPrecision::expect(Precision::Bf16),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::FinalBf16Rne,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(DENSE_EMBEDDING.to_string())],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-linear-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::Linear,
+                inputs: vec![bf16, weight],
+                output: ActivationPrecision::expect(Precision::Bf16),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::FinalBf16Rne,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(BF16_LINEAR.to_string())],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-rms-norm-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::RmsNorm,
+                inputs: vec![bf16, weight],
+                output: ActivationPrecision::expect(Precision::Bf16),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::FinalBf16Rne,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::RowsTimesF32,
+                image_sha256: hash,
+                symbols: vec![
+                    KernelSymbol(BF16_RMS_SUM.to_string()),
+                    KernelSymbol(BF16_RMS_APPLY.to_string()),
+                ],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-grouped-rms-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::GroupedRmsNorm,
+                inputs: vec![bf16, weight],
+                output: ActivationPrecision::expect(Precision::Bf16),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::FinalBf16Rne,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(DENSE_GROUPED_RMS.to_string())],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-rope-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::Rope,
+                inputs: vec![bf16, index],
+                output: ActivationPrecision::expect(Precision::Bf16),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::FinalBf16Rne,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::RowsTimesRopeAnglesF32,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(DENSE_ROPE.to_string())],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-geglu-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::GeGlu,
+                inputs: vec![bf16, bf16],
+                output: ActivationPrecision::expect(Precision::Bf16),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::FinalBf16Rne,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(DENSE_GEGLU.to_string())],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-residual-scaled-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::ScaledResidual,
+                inputs: vec![bf16, bf16],
+                output: ActivationPrecision::expect(Precision::Bf16),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::FinalBf16Rne,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(DENSE_RESIDUAL_SCALED.to_string())],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-vocab-projection-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::VocabProjection,
+                inputs: vec![bf16, weight],
+                output: ActivationPrecision::expect(Precision::F32),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::Unrounded,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(DENSE_VOCAB_PROJECTION.to_string())],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-residual-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::Residual,
+                inputs: vec![bf16, bf16],
+                output: ActivationPrecision::expect(Precision::Bf16),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::FinalBf16Rne,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(BF16_RESIDUAL.to_string())],
+            });
+        }
+        descriptors.extend(paged_attention_catalogue().descriptors().iter().cloned());
+        KernelCatalogue::new(descriptors).expect("built-in dense descriptors are unique")
+    }
+
     fn descriptor(
         id: String,
         operation: SemanticKernelOp,
@@ -545,10 +720,11 @@ pub const fn profile_name(width: moxie_types::Precision) -> &'static str {
 #[cfg(feature = "fatbin")]
 pub use images::{
     AFFINE_LINEAR_FATBIN, AFFINE_LINEAR_FATBIN_SHA256, BF16_CHAIN_FATBIN, BF16_CHAIN_FATBIN_SHA256,
-    EXPERT_MLP_FATBIN, EXPERT_MLP_FATBIN_SHA256, HOST_COMPILER_VERSION, KERNEL_ARCHS, NVCC_VERSION,
-    PAGED_ATTENTION_FATBIN, PAGED_ATTENTION_FATBIN_SHA256, SMOKE_FATBIN, SMOKE_FATBIN_SHA256,
-    SMOKE_FATBIN_SM86_ONLY, SMOKE_FATBIN_SM86_SHA256, affine_linear_catalogue, axpy_capability,
-    bf16_chain_catalogue, compiled_sm, expert_mlp_catalogue, paged_attention_catalogue,
+    DENSE_GRAPH_FATBIN, DENSE_GRAPH_FATBIN_SHA256, EXPERT_MLP_FATBIN, EXPERT_MLP_FATBIN_SHA256,
+    HOST_COMPILER_VERSION, KERNEL_ARCHS, NVCC_VERSION, PAGED_ATTENTION_FATBIN,
+    PAGED_ATTENTION_FATBIN_SHA256, SMOKE_FATBIN, SMOKE_FATBIN_SHA256, SMOKE_FATBIN_SM86_ONLY,
+    SMOKE_FATBIN_SM86_SHA256, affine_linear_catalogue, axpy_capability, bf16_chain_catalogue,
+    compiled_sm, dense_graph_catalogue, expert_mlp_catalogue, paged_attention_catalogue,
 };
 
 #[cfg(test)]
@@ -571,6 +747,7 @@ mod tests {
         assert!(SMOKE_FATBIN.len() > 1024, "fatbin looks empty");
         assert!(SMOKE_FATBIN_SM86_ONLY.len() > 512);
         assert!(BF16_CHAIN_FATBIN.len() > 1024);
+        assert!(DENSE_GRAPH_FATBIN.len() > 1024);
         // The multi-arch image must be the larger of the two: it carries strictly
         // more code. If this ever inverts, the build lost an architecture.
         assert!(
@@ -598,6 +775,7 @@ mod tests {
         assert_eq!(SMOKE_FATBIN_SM86_SHA256.len(), 64);
         assert_ne!(SMOKE_FATBIN_SHA256, SMOKE_FATBIN_SM86_SHA256);
         assert_eq!(BF16_CHAIN_FATBIN_SHA256.len(), 64);
+        assert_eq!(DENSE_GRAPH_FATBIN_SHA256.len(), 64);
         assert!(NVCC_VERSION.contains("13.0"), "{NVCC_VERSION}");
         assert!(!HOST_COMPILER_VERSION.is_empty());
     }

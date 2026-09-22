@@ -48,6 +48,13 @@ pub struct PlannedWorkspace {
     pub last_stage: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedPackage {
+    Chain,
+    Attention,
+    Dense,
+}
+
 /// Fully selected pure candidate. It still owns no reservation or device byte.
 #[derive(Debug)]
 pub struct SelectedPlanCandidate {
@@ -62,6 +69,8 @@ pub struct SelectedPlanCandidate {
     workspace_region_bytes: u64,
     combined_arena_bytes: u64,
     stages: Vec<String>,
+    package: SelectedPackage,
+    host_workspace_bytes: u64,
 }
 
 impl SelectedPlanCandidate {
@@ -103,6 +112,12 @@ impl SelectedPlanCandidate {
     }
     pub fn stages(&self) -> &[String] {
         &self.stages
+    }
+    pub const fn is_dense(&self) -> bool {
+        matches!(self.package, SelectedPackage::Dense)
+    }
+    pub const fn host_workspace_bytes(&self) -> u64 {
+        self.host_workspace_bytes
     }
     pub fn is_paged_attention(&self) -> bool {
         matches!(self.nodes.as_slice(), [node] if node.descriptor.operation == SemanticKernelOp::PagedAttention)
@@ -146,10 +161,7 @@ pub fn lower_selected(
             .zip(expected)
             .any(|(node, op)| node.params.op() != op)
     {
-        return Err(Error::UnsupportedKernel {
-            operation: "graph",
-            detail: "task 0012 selects exactly Linear -> RmsNorm -> Residual".into(),
-        });
+        return lower_dense(graph, workload, capability, catalogue);
     }
     let linear = &graph.nodes()[0];
     let rms = &graph.nodes()[1];
@@ -161,10 +173,7 @@ pub fn lower_selected(
         && residual.inputs.as_slice() == [graph.inputs()[0], rms.output]
         && graph.output() == residual.output;
     if !exact_edges {
-        return Err(Error::UnsupportedKernel {
-            operation: "graph",
-            detail: "task 0012 requires exact x,W -> h; h,gain -> n; x,n -> y edges".into(),
-        });
+        return lower_dense(graph, workload, capability, catalogue);
     }
 
     let mut selected = Vec::with_capacity(3);
@@ -413,6 +422,8 @@ pub fn lower_selected(
         workspace_region_bytes,
         combined_arena_bytes,
         stages,
+        package: SelectedPackage::Chain,
+        host_workspace_bytes: 0,
     })
 }
 
@@ -549,7 +560,393 @@ fn lower_attention(
         workspace_region_bytes: 0,
         combined_arena_bytes: activation_region_bytes,
         stages: vec!["attention".into(), "terminal-output".into()],
+        package: SelectedPackage::Attention,
+        host_workspace_bytes: 0,
     })
+}
+
+fn lower_dense(
+    graph: &Graph,
+    workload: ResourceWorkload,
+    capability: &DeviceCapability,
+    catalogue: &KernelCatalogue,
+) -> Result<SelectedPlanCandidate, Error> {
+    if graph.nodes().is_empty()
+        || !graph
+            .nodes()
+            .iter()
+            .any(|node| node.params.op() == Op::Embedding)
+        || !graph
+            .nodes()
+            .iter()
+            .any(|node| node.params.op() == Op::VocabProjection)
+        || !graph
+            .nodes()
+            .iter()
+            .any(|node| node.params.op() == Op::Attention)
+    {
+        return Err(Error::UnsupportedKernel {
+            operation: "graph",
+            detail:
+                "selected dense package requires Embedding, paged Attention and VocabProjection"
+                    .into(),
+        });
+    }
+
+    let mut selected = Vec::new();
+    let mut workspace_logical_bytes = 0u64;
+    let mut host_workspace_bytes = 0u64;
+    for node in graph.nodes() {
+        let operation = dense_semantic(node)?;
+        let roles = dense_operands(operation, node, graph)?;
+        let (input, output) = dense_shape(node)?;
+        let matches: Vec<_> = catalogue
+            .descriptors()
+            .iter()
+            .filter(|descriptor| {
+                descriptor.operation == operation
+                    && descriptor.inputs == roles
+                    && descriptor.output == node.contract.output
+                    && descriptor.accumulation == node.contract.accumulation
+                    && descriptor.rounding
+                        == if operation == SemanticKernelOp::VocabProjection {
+                            moxie_types::RoundingProfile::Unrounded
+                        } else {
+                            moxie_types::RoundingProfile::FinalBf16Rne
+                        }
+                    && descriptor.layout == TensorLayout::ContiguousRowMajorV1
+                    && descriptor.sm.major == capability.compute_major
+                    && descriptor.sm.minor == capability.compute_minor
+                    && workload.rows <= descriptor.shape.max_rows
+                    && input <= descriptor.shape.max_input
+                    && output <= descriptor.shape.max_output
+            })
+            .collect();
+        if matches.len() != 1 {
+            return Err(Error::UnsupportedKernel {
+                operation: node.params.op().name(),
+                detail: format!(
+                    "expected exactly one dense descriptor for rows={}, input={}, output={}, sm_{}{}; found {}",
+                    workload.rows,
+                    input,
+                    output,
+                    capability.compute_major,
+                    capability.compute_minor,
+                    matches.len()
+                ),
+            });
+        }
+        let descriptor = (*matches[0]).clone();
+        if descriptor.symbols.is_empty() {
+            return Err(Error::UnsupportedKernel {
+                operation: node.params.op().name(),
+                detail: "dense descriptor has no ordered symbols".into(),
+            });
+        }
+        let (workspace, workspace_bytes, host_bytes) =
+            dense_workspace(node, operation, workload.rows)?;
+        if descriptor.workspace != workspace {
+            return Err(Error::UnsupportedKernel {
+                operation: node.params.op().name(),
+                detail: "dense descriptor workspace differs from the operation contract".into(),
+            });
+        }
+        workspace_logical_bytes = workspace_logical_bytes.max(workspace_bytes);
+        host_workspace_bytes = host_workspace_bytes.max(host_bytes);
+        selected.push(SelectedNode {
+            node: node.id,
+            descriptor,
+            workspace_logical_bytes: workspace_bytes,
+        });
+    }
+
+    let base = lower(graph, workload)?;
+    let last_stage = u32::try_from(graph.nodes().len())
+        .map_err(|_| invalid("stages", "dense graph stage count exceeds u32"))?;
+    let mut values = Vec::new();
+    let mut weight_cursor = 0u64;
+    for binding in base.bindings() {
+        if let ValueBinding::ExternalWeight(weight) = binding {
+            let physical = align_up(weight.required_bytes)?;
+            let offset = weight_cursor;
+            weight_cursor = checked_add(weight_cursor, physical, "weight region")?;
+            values.push(PlannedValue {
+                value: weight.value,
+                role: weight.role,
+                shape: weight.shape.clone(),
+                region: StorageRegion::Weights,
+                slot: values.len() as u32,
+                offset,
+                logical_bytes: weight.required_bytes,
+                physical_bytes: physical,
+                first_stage: 0,
+                last_stage,
+            });
+        }
+    }
+    let weight_region_bytes = weight_cursor;
+
+    #[derive(Debug)]
+    struct Pending {
+        value: ValueId,
+        role: ValueRole,
+        shape: Vec<u64>,
+        bytes: u64,
+        first: u32,
+        last: u32,
+        slot: usize,
+    }
+    let mut pending = Vec::new();
+    for binding in base.bindings() {
+        match binding {
+            ValueBinding::ExternalInput(input) => pending.push(Pending {
+                value: input.value,
+                role: input.role,
+                shape: input.shape.clone(),
+                bytes: input.required_bytes,
+                first: 0,
+                last: last_stage,
+                slot: usize::MAX,
+            }),
+            ValueBinding::ArenaTensor(tensor) => pending.push(Pending {
+                value: tensor.value,
+                role: tensor.role,
+                shape: tensor.shape.clone(),
+                bytes: tensor.bytes,
+                first: tensor.live.first,
+                last: tensor.live.last,
+                slot: usize::MAX,
+            }),
+            ValueBinding::ExternalWeight(_) => {}
+        }
+    }
+    pending.sort_by_key(|value| (value.first, value.value));
+    let mut slots: Vec<(u64, u32)> = Vec::new();
+    for value in &mut pending {
+        let slot = slots
+            .iter()
+            .position(|(_, available)| *available < value.first)
+            .unwrap_or(slots.len());
+        if slot == slots.len() {
+            slots.push((value.bytes, value.last));
+        } else {
+            slots[slot].0 = slots[slot].0.max(value.bytes);
+            slots[slot].1 = value.last;
+        }
+        value.slot = slot;
+    }
+    let mut activation_offsets = Vec::new();
+    let mut activation_cursor = 0u64;
+    for (bytes, _) in &slots {
+        activation_offsets.push(activation_cursor);
+        activation_cursor = checked_add(activation_cursor, align_up(*bytes)?, "activation region")?;
+    }
+    let activation_region_bytes = activation_cursor;
+    for value in pending {
+        let physical = align_up(slots[value.slot].0)?;
+        values.push(PlannedValue {
+            value: value.value,
+            role: value.role,
+            shape: value.shape,
+            region: StorageRegion::Activations,
+            slot: value.slot as u32,
+            offset: checked_add(
+                weight_region_bytes,
+                activation_offsets[value.slot],
+                "activation offset",
+            )?,
+            logical_bytes: value.bytes,
+            physical_bytes: physical,
+            first_stage: value.first,
+            last_stage: value.last,
+        });
+    }
+    values.sort_by_key(|value| value.value);
+
+    let workspace_region_bytes = align_up(workspace_logical_bytes)?;
+    let workspace_offset = checked_add(
+        weight_region_bytes,
+        activation_region_bytes,
+        "workspace offset",
+    )?;
+    let combined_arena_bytes =
+        checked_add(workspace_offset, workspace_region_bytes, "combined arena")?;
+    let workspace_node = selected
+        .iter()
+        .find(|node| node.workspace_logical_bytes != 0)
+        .map(|node| node.node)
+        .unwrap_or(graph.nodes()[0].id);
+    Ok(SelectedPlanCandidate {
+        base,
+        device_sm: (capability.compute_major, capability.compute_minor),
+        catalogue_digest: catalogue.digest(),
+        nodes: selected,
+        values,
+        workspace: PlannedWorkspace {
+            node: workspace_node,
+            offset: workspace_offset,
+            logical_bytes: workspace_logical_bytes,
+            physical_bytes: workspace_region_bytes,
+            first_stage: 0,
+            last_stage,
+        },
+        weight_region_bytes,
+        activation_region_bytes,
+        workspace_region_bytes,
+        combined_arena_bytes,
+        stages: graph
+            .nodes()
+            .iter()
+            .map(|node| format!("node-{}-{}", node.id.0, node.params.op().name()))
+            .chain(std::iter::once("terminal-output".into()))
+            .collect(),
+        package: SelectedPackage::Dense,
+        host_workspace_bytes,
+    })
+}
+
+fn dense_semantic(node: &moxie_graph::Node) -> Result<SemanticKernelOp, Error> {
+    match node.params {
+        moxie_graph::OpParams::Embedding { .. } => Ok(SemanticKernelOp::Embedding),
+        moxie_graph::OpParams::Linear { bias, .. } if !bias => Ok(SemanticKernelOp::Linear),
+        moxie_graph::OpParams::Linear { .. } => Err(Error::UnsupportedKernel {
+            operation: "linear",
+            detail: "the dense BF16 package has no biased linear kernel".into(),
+        }),
+        moxie_graph::OpParams::RmsNorm { group: 1, .. } => Ok(SemanticKernelOp::RmsNorm),
+        moxie_graph::OpParams::RmsNorm { .. } => Ok(SemanticKernelOp::GroupedRmsNorm),
+        moxie_graph::OpParams::Rope { .. } => Ok(SemanticKernelOp::Rope),
+        moxie_graph::OpParams::Attention { .. } => Ok(SemanticKernelOp::PagedAttention),
+        moxie_graph::OpParams::GeGlu { .. } => Ok(SemanticKernelOp::GeGlu),
+        moxie_graph::OpParams::Residual { scale: 1.0 } => Ok(SemanticKernelOp::Residual),
+        moxie_graph::OpParams::Residual { .. } => Ok(SemanticKernelOp::ScaledResidual),
+        moxie_graph::OpParams::VocabProjection { .. } => Ok(SemanticKernelOp::VocabProjection),
+        _ => Err(Error::UnsupportedKernel {
+            operation: node.params.op().name(),
+            detail: "operation is outside the reduced dense device package".into(),
+        }),
+    }
+}
+
+fn dense_operands(
+    operation: SemanticKernelOp,
+    node: &moxie_graph::Node,
+    graph: &Graph,
+) -> Result<Vec<KernelOperand>, Error> {
+    if operation == SemanticKernelOp::PagedAttention {
+        return Ok(vec![
+            KernelOperand::Activation(moxie_types::ActivationPrecision::expect(
+                moxie_types::Precision::Bf16,
+            )),
+            KernelOperand::Activation(moxie_types::ActivationPrecision::expect(
+                moxie_types::Precision::Bf16,
+            )),
+            KernelOperand::Activation(moxie_types::ActivationPrecision::expect(
+                moxie_types::Precision::Bf16,
+            )),
+            KernelOperand::PageIndex,
+        ]);
+    }
+    node.inputs
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let role = graph.values()[value.0 as usize].role;
+            match role {
+                ValueRole::Index(_) => {
+                    Ok(if operation == SemanticKernelOp::Embedding && index == 0 {
+                        KernelOperand::TokenIndex
+                    } else {
+                        KernelOperand::PositionIndex
+                    })
+                }
+                other => operand(other),
+            }
+        })
+        .collect()
+}
+
+fn dense_shape(node: &moxie_graph::Node) -> Result<(u64, u64), Error> {
+    let product = |a: u64, b: u64| {
+        a.checked_mul(b)
+            .ok_or_else(|| invalid("shape", "dense kernel shape overflowed"))
+    };
+    match node.params {
+        moxie_graph::OpParams::Embedding { hidden, .. }
+        | moxie_graph::OpParams::RmsNorm { hidden, .. }
+        | moxie_graph::OpParams::VocabProjection { hidden, .. } => match node.params {
+            moxie_graph::OpParams::VocabProjection { vocab, hidden, .. } => Ok((hidden, vocab)),
+            _ => Ok((hidden, hidden)),
+        },
+        moxie_graph::OpParams::Linear {
+            in_features,
+            out_features,
+            ..
+        } => Ok((in_features, out_features)),
+        moxie_graph::OpParams::Rope {
+            heads, head_dim, ..
+        } => {
+            let width = product(heads, head_dim)?;
+            Ok((width, width))
+        }
+        moxie_graph::OpParams::Attention {
+            heads, head_dim, ..
+        } => {
+            let width = product(heads, head_dim)?;
+            Ok((head_dim, width))
+        }
+        moxie_graph::OpParams::GeGlu { width } => Ok((width, width)),
+        moxie_graph::OpParams::Residual { .. } => Ok((1, 1)),
+        _ => Err(Error::UnsupportedKernel {
+            operation: node.params.op().name(),
+            detail: "operation has no dense descriptor shape".into(),
+        }),
+    }
+}
+
+fn dense_workspace(
+    node: &moxie_graph::Node,
+    operation: SemanticKernelOp,
+    rows: u64,
+) -> Result<(moxie_types::WorkspaceExpression, u64, u64), Error> {
+    match operation {
+        SemanticKernelOp::RmsNorm => {
+            let bytes = rows
+                .checked_mul(4)
+                .ok_or_else(|| invalid("workspace", "RMS workspace overflowed"))?;
+            Ok((moxie_types::WorkspaceExpression::RowsTimesF32, bytes, 0))
+        }
+        SemanticKernelOp::Rope => {
+            let moxie_graph::OpParams::Rope { rotary_dim, .. } = node.params else {
+                unreachable!("dense Rope operation")
+            };
+            let pairs = rotary_dim / 2;
+            let bytes = rows
+                .checked_mul(pairs)
+                .and_then(|v| v.checked_mul(8))
+                .ok_or_else(|| invalid("workspace", "RoPE angle table overflowed"))?;
+            Ok((
+                moxie_types::WorkspaceExpression::RowsTimesRopeAnglesF32,
+                bytes,
+                bytes,
+            ))
+        }
+        SemanticKernelOp::PagedAttention => {
+            let moxie_graph::OpParams::Attention {
+                kv_heads, head_dim, ..
+            } = node.params
+            else {
+                unreachable!("dense paged-attention operation")
+            };
+            let bytes = rows
+                .checked_mul(kv_heads)
+                .and_then(|v| v.checked_mul(head_dim))
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(|| invalid("host_workspace", "attention K/V staging overflowed"))?;
+            Ok((moxie_types::WorkspaceExpression::Zero, 0, bytes))
+        }
+        _ => Ok((moxie_types::WorkspaceExpression::Zero, 0, 0)),
+    }
 }
 
 fn semantic(op: Op) -> Option<SemanticKernelOp> {
@@ -833,6 +1230,12 @@ mod tests {
                 KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
                 KernelOperand::PageIndex,
             ],
+            SemanticKernelOp::Embedding
+            | SemanticKernelOp::GroupedRmsNorm
+            | SemanticKernelOp::Rope
+            | SemanticKernelOp::GeGlu
+            | SemanticKernelOp::ScaledResidual
+            | SemanticKernelOp::VocabProjection => Vec::new(),
         };
         SemanticKernelDescriptor {
             id: KernelId(format!("{}-{}", op.name(), sm.name())),

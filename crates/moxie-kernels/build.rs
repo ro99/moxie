@@ -39,6 +39,8 @@ fn main() {
     println!("cargo:rerun-if-changed=cuda/expert_mlp.cu");
     println!("cargo:rerun-if-changed=cuda/affine_linear.cu");
     println!("cargo:rerun-if-changed=cuda/paged_attention.cu");
+    println!("cargo:rerun-if-changed=cuda/dense_graph.cu");
+    println!("cargo:rerun-if-changed=cuda/dense_ops.cu");
     println!("cargo:rerun-if-changed=cuda/affine_decode.cuh");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=archs.rs");
@@ -138,6 +140,15 @@ fn main() {
         ARCHS,
     );
 
+    let dense_graph = build_source_fatbin(
+        &nvcc,
+        &host_cc,
+        &out,
+        "dense_graph.fatbin",
+        "cuda/dense_graph.cu",
+        ARCHS,
+    );
+
     println!(
         "cargo:rustc-env=MOXIE_SMOKE_FATBIN={}",
         out.join("smoke.fatbin").display()
@@ -169,6 +180,11 @@ fn main() {
         out.join("paged_attention.fatbin").display()
     );
     println!("cargo:rustc-env=MOXIE_PAGED_ATTENTION_FATBIN_SHA256={attention}");
+    println!(
+        "cargo:rustc-env=MOXIE_DENSE_GRAPH_FATBIN={}",
+        out.join("dense_graph.fatbin").display()
+    );
+    println!("cargo:rustc-env=MOXIE_DENSE_GRAPH_FATBIN_SHA256={dense_graph}");
     println!(
         "cargo:rustc-env=MOXIE_NVCC_VERSION={}",
         one_line(&nvcc_version)

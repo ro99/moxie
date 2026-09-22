@@ -181,6 +181,17 @@ impl PageGeometry {
             .ok_or(Error::Dim(DimError::Overflow))
     }
 
+    /// Bytes for the reusable little-endian page-table upload buffer.
+    ///
+    /// Page-table validation is performed in place, so the upload buffer is
+    /// the only host workspace this run needs for publication. It is allocated
+    /// during admission and reused for every publication.
+    pub fn page_table_upload_bytes(&self) -> Result<u64> {
+        self.pages
+            .checked_mul(PAGE_ENTRY_BYTES)
+            .ok_or(Error::Dim(DimError::Overflow))
+    }
+
     /// The physical rows these pages hold.
     pub fn capacity_rows(&self) -> Result<u64> {
         self.page_tokens
@@ -1328,6 +1339,9 @@ pub mod device {
         /// both describe a page that holds written rows.
         page_table: Vec<u32>,
         page_table_base: u64,
+        /// Reusable little-endian page-table bytes. Allocated during admission
+        /// so publishing never creates an unaccounted host buffer.
+        page_table_upload: Vec<u8>,
         staging: Staging,
         /// Rows whose copy into the pages this run has **observed** complete.
         ///
@@ -1701,6 +1715,24 @@ pub mod device {
                     },
                 ));
             }
+            let page_table_upload_len = match usize::try_from(extents.page_table_upload) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Err(unwind(
+                        arena,
+                        hold,
+                        ledger,
+                        invalid(
+                            "page_table",
+                            "the upload buffer exceeds host addressability",
+                        ),
+                    ));
+                }
+            };
+            let page_table_upload = match super::try_zeroed(page_table_upload_len) {
+                Ok(bytes) => bytes,
+                Err(error) => return Err(unwind(arena, hold, ledger, error)),
+            };
             let (
                 query,
                 output,
@@ -1770,6 +1802,7 @@ pub mod device {
                 staging,
                 page_table,
                 page_table_base: 0,
+                page_table_upload,
                 written: 0,
                 arena_bytes: extents.total,
                 ledger: ledger.id(),
@@ -1917,42 +1950,62 @@ pub mod device {
             // Every physical identity must exist, and no two logical pages may
             // name the same one: aliasing pages would make an append overwrite
             // history that is still visible, which no later check could detect.
-            let mut seen: Vec<bool> = Vec::new();
-            if seen.try_reserve_exact(pages as usize).is_err() {
+            // Reuse the admitted upload buffer as a bitset, then overwrite it
+            // with the encoded table below. The buffer is cleared on every
+            // publication because a successful publication left encoded bytes
+            // in it and a refused one may have left partial bits.
+            let bitset_bytes = match pages
+                .checked_add(7)
+                .and_then(|pages| pages.checked_div(8))
+                .and_then(|bytes| usize::try_from(bytes).ok())
+            {
+                Some(bytes) => bytes,
+                None => return Err(give_back(Error::Dim(DimError::Overflow), table)),
+            };
+            if bitset_bytes > self.page_table_upload.len() {
                 return Err(give_back(
-                    Error::CapacityExceeded {
-                        tier: Some(Tier::Host(HostTier::CpuWorkspace)),
-                        requested_bytes: pages,
-                        available_bytes: 0,
-                    },
+                    invalid("page_table", "the admitted upload buffer is too small"),
                     table,
                 ));
             }
-            seen.resize(pages as usize, false);
-            for (logical, physical) in table.iter().enumerate() {
-                let physical = u64::from(*physical);
-                if physical >= pages {
-                    return Err(give_back(
-                        invalid_fmt(
-                            "page_table",
-                            format_args!(
-                                "logical page {logical} names physical page {physical} of \
-                                 {pages} admitted"
+            {
+                let bitset = &mut self.page_table_upload[..bitset_bytes];
+                bitset.fill(0);
+                for (logical, physical_entry) in table.iter().copied().enumerate() {
+                    let physical = u64::from(physical_entry);
+                    if physical >= pages {
+                        return Err(give_back(
+                            invalid_fmt(
+                                "page_table",
+                                format_args!(
+                                    "logical page {logical} names physical page {physical} of \
+                                     {pages} admitted"
+                                ),
                             ),
-                        ),
-                        table,
-                    ));
+                            table,
+                        ));
+                    }
+                    let byte = match usize::try_from(physical / 8) {
+                        Ok(byte) => byte,
+                        Err(_) => {
+                            return Err(give_back(
+                                invalid("page_table", "a physical page is not addressable"),
+                                table,
+                            ));
+                        }
+                    };
+                    let mask = 1u8 << (physical % 8);
+                    if bitset[byte] & mask != 0 {
+                        return Err(give_back(
+                            invalid_fmt(
+                                "page_table",
+                                format_args!("physical page {physical} is named twice"),
+                            ),
+                            table,
+                        ));
+                    }
+                    bitset[byte] |= mask;
                 }
-                if seen[physical as usize] {
-                    return Err(give_back(
-                        invalid_fmt(
-                            "page_table",
-                            format_args!("physical page {physical} is named twice"),
-                        ),
-                        table,
-                    ));
-                }
-                seen[physical as usize] = true;
             }
 
             // **Agreement with the mapping it replaces**, wherever both describe
@@ -1995,19 +2048,25 @@ pub mod device {
                 }
             }
 
-            let mut bytes: Vec<u8> = Vec::new();
-            if bytes.try_reserve_exact(table.len() * 4).is_err() {
+            let encoded_len = match table.len().checked_mul(core::mem::size_of::<u32>()) {
+                Some(bytes) => bytes,
+                None => {
+                    return Err(give_back(Error::Dim(DimError::Overflow), table));
+                }
+            };
+            let mut bytes = core::mem::take(&mut self.page_table_upload);
+            if encoded_len > bytes.len() {
+                self.page_table_upload = bytes;
                 return Err(give_back(
-                    Error::CapacityExceeded {
-                        tier: Some(Tier::Host(HostTier::Pageable)),
-                        requested_bytes: (table.len() * 4) as u64,
-                        available_bytes: 0,
-                    },
+                    invalid("page_table", "the admitted upload buffer is too small"),
                     table,
                 ));
             }
-            for entry in &table {
-                bytes.extend_from_slice(&entry.to_le_bytes());
+            for (entry, destination) in table
+                .iter()
+                .zip(bytes[..encoded_len].chunks_exact_mut(core::mem::size_of::<u32>()))
+            {
+                destination.copy_from_slice(&entry.to_le_bytes());
             }
             let range = self.table.as_ref().expect("live page table range");
             // Owned by `self.held` before the first enqueue, exactly as
@@ -2021,7 +2080,8 @@ pub mod device {
             };
             // SAFETY: the source is owned by `self.held` until completion is
             // observed, and the destination is this run's own admitted range.
-            if let Err(error) = unsafe { range.copy_from_host_async(bytes, stream) } {
+            if let Err(error) = unsafe { range.copy_from_host_async(&bytes[..encoded_len], stream) }
+            {
                 self.quarantined = true;
                 return Err(PagedRunRefused {
                     error: self.attribute(error),
@@ -2034,7 +2094,10 @@ pub mod device {
                     source: None,
                 });
             }
-            self.held = None;
+            let Some(RefusedSource::Query(bytes)) = self.held.take() else {
+                unreachable!("page-table upload source is still held after settlement")
+            };
+            self.page_table_upload = bytes;
             self.page_table = table;
             self.page_table_base = base;
             Ok(())
@@ -4399,6 +4462,7 @@ pub mod device {
     struct Extents {
         payload: u64,
         table: u64,
+        page_table_upload: u64,
         query: u64,
         persistent: u64,
         per_step: u64,
@@ -4425,6 +4489,7 @@ pub mod device {
                     .checked_mul(4)
                     .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
             )?;
+            let page_table_upload = geometry.page_table_upload_bytes()?;
             let query = align_up(
                 max_rows
                     .checked_mul(heads)
@@ -4505,6 +4570,7 @@ pub mod device {
             Ok(Self {
                 payload,
                 table,
+                page_table_upload,
                 query,
                 persistent,
                 per_step,
@@ -4524,8 +4590,10 @@ pub mod device {
     /// Three device buffers always: keys, values and the page table, each
     /// named for what it is and charged as `KvStatePages`. `Staging::Host`
     /// adds two more device buffers (query and output, charged as
-    /// `Activations`) and one host readback. `Staging::TwoBlock` adds one
-    /// bounded page pair in `TransferStaging`, the query and FP32 partials in
+    /// `Activations`) and one host readback. Every staging mode also admits
+    /// the reusable host page-table upload buffer; validation is in place and
+    /// needs no second host allocation. `Staging::TwoBlock` adds one bounded
+    /// page pair in `TransferStaging`, the query and FP32 partials in
     /// `Activations`, and no unbounded history buffer.
     pub fn resource_request(
         geometry: &PageGeometry,
@@ -4565,6 +4633,13 @@ pub mod device {
             scope,
             Tier::Device(DeviceTier::KvStatePages),
             extents.table,
+            StageSpan::inclusive(0, 2),
+        ))?;
+        request.buffer(BufferRequest::new(
+            "page-table-upload-workspace",
+            Scope::Host,
+            Tier::Host(HostTier::Pageable),
+            extents.page_table_upload,
             StageSpan::inclusive(0, 2),
         ))?;
         // Host staging only: a direct-device run's query and output are the
@@ -4774,7 +4849,7 @@ mod device_tests {
     use moxie_cuda::{RankContext, Stream};
     use moxie_memory::{CapacitySnapshot, Ledger};
     use moxie_plan::Visibility;
-    use moxie_types::{PagePlacement, RankId};
+    use moxie_types::{PagePlacement, RankId, Scope};
 
     use super::device::{PagedAttentionRun, Staging};
     use super::{AttentionLayer, PageGeometry, PagedAttentionLaunch};
@@ -4805,15 +4880,15 @@ mod device_tests {
         out
     }
 
-    /// A direct-device run is not charged for staging it never uses.
+    /// A direct-device run is charged for its admitted page-table upload, but
+    /// not for query/output staging it never uses.
     ///
     /// Proved through the ledger's own admission, not the physical arena's
-    /// byte counter: a ledger with **no host capacity snapshot at all** must
-    /// still admit `Staging::DeviceHandles` -- its request names no host
-    /// buffer -- and must refuse `Staging::Host` on the missing scope, which
-    /// is only possible if that request actually names one. A byte-count
-    /// comparison of two admitted arenas cannot tell "the ledger was never
-    /// asked" from "it was asked and happened to fit."
+    /// byte counter: a ledger with exactly the page-table upload's host
+    /// capacity must admit `Staging::DeviceHandles`, and must refuse
+    /// `Staging::Host` because that request adds query/output staging. A
+    /// byte-count comparison of two admitted arenas cannot tell "the ledger
+    /// was never asked" from "it was asked and happened to fit."
     #[test]
     fn a_direct_device_run_is_not_charged_for_staging_it_never_uses() {
         let _guard = crate::DRIVER_TEST_LOCK
@@ -4842,10 +4917,15 @@ mod device_tests {
         };
 
         let measurement = ctx.measure().expect("measure");
+        let page_table_upload = geometry()
+            .page_table_upload_bytes()
+            .expect("page-table upload extent");
         let mut ledger = Ledger::new([
-            CapacitySnapshot::measured(&measurement, 1 << 20).expect("device capacity")
+            CapacitySnapshot::measured(&measurement, 1 << 20).expect("device capacity"),
+            CapacitySnapshot::new(Scope::Host, page_table_upload + 1, 1)
+                .expect("exact page-table host capacity"),
         ])
-        .expect("a ledger with device capacity and no host scope at all");
+        .expect("a ledger with device and exact page-table host capacity");
 
         let mut direct = PagedAttentionRun::admit(
             &mut ledger,
@@ -4857,7 +4937,7 @@ mod device_tests {
             Staging::DeviceHandles,
         )
         .map_err(|r| r.error)
-        .expect("a direct-device run needs no host capacity to admit");
+        .expect("a direct-device run needs its page-table host capacity to admit");
         // `direct` itself is outstanding from here on -- the assertion below
         // is about whether the *failed* admission changes that count, not
         // about the ledger being empty, which it never is while `direct`
@@ -4873,13 +4953,10 @@ mod device_tests {
             4,
             Staging::Host,
         )
-        .expect_err("a host-staged run without host capacity was admitted")
+        .expect_err("a host-staged run exceeded the page-table-only host capacity")
         .error;
         assert!(
-            matches!(
-                staged_error,
-                moxie_types::Error::InvalidRequest { field: "scope", .. }
-            ),
+            matches!(staged_error, moxie_types::Error::CapacityExceeded { .. }),
             "{staged_error:?}"
         );
         assert_eq!(

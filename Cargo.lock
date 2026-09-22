@@ -87,11 +87,13 @@ dependencies = [
 name = "moxie-executor"
 version = "0.0.0"
 dependencies = [
+ "moxie-cli",
  "moxie-cuda",
  "moxie-engine",
  "moxie-format",
  "moxie-graph",
  "moxie-host",
+ "moxie-interp",
  "moxie-kernels",
  "moxie-memory",
  "moxie-models",

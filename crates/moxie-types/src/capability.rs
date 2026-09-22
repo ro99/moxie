@@ -46,9 +46,21 @@ impl GateTransform {
 /// Closed semantic operations that may cross the planning/execution boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SemanticKernelOp {
+    /// Token-id gather with the operation's optional output scale.
+    Embedding,
     Linear,
     RmsNorm,
+    /// RMSNorm over independent contiguous groups (one group per head).
+    GroupedRmsNorm,
+    /// Host-angle-table rotary position encoding.
+    Rope,
+    /// `bf16(bf16(gelu_tanh(g)) * u)`.
+    GeGlu,
     Residual,
+    /// Residual with the declared intermediate BF16 boundary and scale.
+    ScaledResidual,
+    /// Unrounded FP32 vocabulary projection, optionally soft-capped.
+    VocabProjection,
     /// The gated expert feed-forward, evaluated per selected slot. The gate
     /// transform is part of the operation's identity, not a parameter of it.
     ExpertMlp(GateTransform),
@@ -66,9 +78,15 @@ pub enum SemanticKernelOp {
 impl SemanticKernelOp {
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Embedding => "embedding",
             Self::Linear => "linear",
             Self::RmsNorm => "rms_norm",
+            Self::GroupedRmsNorm => "grouped_rms_norm",
+            Self::Rope => "rope",
+            Self::GeGlu => "geglu",
             Self::Residual => "residual",
+            Self::ScaledResidual => "scaled_residual",
+            Self::VocabProjection => "vocab_projection",
             Self::ExpertMlp(GateTransform::GeluTanh) => "expert_mlp_gelu_tanh",
             Self::ExpertMlp(GateTransform::Silu) => "expert_mlp_silu",
             Self::PagedAttention => "paged_attention",
@@ -91,6 +109,10 @@ pub enum KernelOperand {
     /// it as an activation precision would invite a precision predicate to be
     /// applied to a row number.
     RouteIndex,
+    /// A token id consumed by an embedding gather.
+    TokenIndex,
+    /// An absolute sequence position consumed by RoPE or attention.
+    PositionIndex,
     /// A `u32` physical page identity per logical page of one layer's history.
     ///
     /// The other half of document 02's integer roles, and distinct from
@@ -104,6 +126,8 @@ pub enum KernelOperand {
 /// The one output-rounding boundary qualified by task 0012.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RoundingProfile {
+    /// The operation stores its FP32 result without a BF16 output boundary.
+    Unrounded,
     FinalBf16Rne,
 }
 
@@ -139,6 +163,8 @@ pub struct KernelShapeBounds {
 pub enum WorkspaceExpression {
     Zero,
     RowsTimesF32,
+    /// `rows * rotary_pairs * 2 * 4`: one FP32 cosine/sine pair per row.
+    RowsTimesRopeAnglesF32,
     /// `rows * intermediate * 4`: one FP32 gated-intermediate vector per row.
     ///
     /// The expert feed-forward's intermediate is `intermediate` wide and does
@@ -161,13 +187,14 @@ impl WorkspaceExpression {
         match self {
             Self::Zero => Some(0),
             Self::RowsTimesF32 => rows.checked_mul(4),
-            Self::RowsTimesIntermediateF32 => None,
+            Self::RowsTimesRopeAnglesF32 | Self::RowsTimesIntermediateF32 => None,
         }
     }
 
     /// Bytes, given the operation's intermediate width where one is needed.
     pub fn evaluate_with(self, rows: u64, intermediate: u64) -> Option<u64> {
         match self {
+            Self::RowsTimesRopeAnglesF32 => rows.checked_mul(intermediate)?.checked_mul(8),
             Self::RowsTimesIntermediateF32 => rows
                 .checked_mul(intermediate)
                 .and_then(|v| v.checked_mul(4)),

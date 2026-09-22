@@ -135,5 +135,10 @@ mod selected_attention;
 #[cfg(feature = "paged-attention-binding")]
 pub use selected_attention::{PagedAttentionInputs, PagedAttentionStep, PagedPlanRunRefused};
 
+#[cfg(feature = "paged-attention-binding")]
+mod dense;
+#[cfg(feature = "paged-attention-binding")]
+pub use dense::{DenseGraphResult, DenseGraphStep, DensePlanRunRefused};
+
 #[cfg(feature = "driver")]
 pub use lease::{PrepareRefused, Upload};

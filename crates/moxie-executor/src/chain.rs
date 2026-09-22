@@ -76,9 +76,9 @@ pub struct SelectedLaunchRefused<'ctx> {
 /// before the shared lifecycle persists them.
 #[derive(Debug)]
 pub struct SelectedCompletion<'ctx> {
-    event: Event<'ctx>,
-    device_ordinal: u32,
-    attribution: String,
+    pub(crate) event: Event<'ctx>,
+    pub(crate) device_ordinal: u32,
+    pub(crate) attribution: String,
 }
 
 impl Completion for SelectedCompletion<'_> {
@@ -96,6 +96,16 @@ impl Completion for SelectedCompletion<'_> {
 
     fn describe(&self) -> String {
         format!("{} ({})", self.event.device_uuid(), self.attribution)
+    }
+}
+
+impl<'ctx> SelectedCompletion<'ctx> {
+    pub(crate) fn new(event: Event<'ctx>, device_ordinal: u32, attribution: String) -> Self {
+        Self {
+            event,
+            device_ordinal,
+            attribution,
+        }
     }
 }
 
@@ -297,6 +307,18 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         self.bound_weights.len()
     }
 
+    pub(crate) fn settle_sources(&mut self, sources: Vec<OwnedBinding>) -> Vec<OwnedBinding> {
+        let mut returned_inputs = Vec::new();
+        for binding in sources {
+            if matches!(binding.role, ValueRole::Weight(_)) {
+                self.bound_weights.insert(binding.value, binding);
+            } else {
+                returned_inputs.push(binding);
+            }
+        }
+        returned_inputs
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn launch(
         self,
@@ -490,7 +512,7 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         }
     }
 
-    fn range_for_value(&self, value: ValueId) -> Result<&DeviceRange<'ctx>> {
+    pub(crate) fn range_for_value(&self, value: ValueId) -> Result<&DeviceRange<'ctx>> {
         let planned = self
             .candidate
             .value(value)
@@ -498,6 +520,12 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         self.ranges
             .get(&(planned.region, planned.slot))
             .ok_or_else(|| invalid("range", "selected range is absent"))
+    }
+
+    pub(crate) fn workspace_range(&self) -> Result<&DeviceRange<'ctx>> {
+        self.ranges
+            .get(&(StorageRegion::Workspace, 0))
+            .ok_or_else(|| invalid("workspace", "selected workspace range is absent"))
     }
 
     #[cfg_attr(not(feature = "paged-attention-binding"), allow(dead_code))]
@@ -684,7 +712,7 @@ pub fn selected_resource_request(candidate: &SelectedPlanCandidate) -> Result<Pl
             span,
         ))?;
     }
-    let host_bytes = candidate
+    let source_bytes = candidate
         .base()
         .bindings()
         .iter()
@@ -697,6 +725,9 @@ pub fn selected_resource_request(candidate: &SelectedPlanCandidate) -> Result<Pl
             sum.checked_add(bytes)
                 .ok_or_else(|| invalid("host_sources", "source extent overflowed"))
         })?;
+    let host_bytes = source_bytes
+        .checked_add(candidate.host_workspace_bytes())
+        .ok_or_else(|| invalid("host_sources", "dense host workspace overflowed"))?;
     request.buffer(BufferRequest::new(
         "retained-upload-sources",
         Scope::Host,
@@ -720,7 +751,7 @@ pub fn selected_resource_request(candidate: &SelectedPlanCandidate) -> Result<Pl
     Ok(request)
 }
 
-fn validate_bindings(
+pub(crate) fn validate_bindings(
     plan: &SelectedReservedPlan<'_>,
     graph: &Graph,
     bindings: &[OwnedBinding],
@@ -752,7 +783,10 @@ fn validate_bindings(
                 ),
             ));
         }
-        if binding
+        if matches!(
+            binding.role,
+            ValueRole::Activation(_) | ValueRole::Weight(_)
+        ) && binding
             .bytes
             .chunks_exact(2)
             .any(|word| !bf16_is_finite(u16::from_le_bytes([word[0], word[1]])))
@@ -1008,7 +1042,12 @@ fn bf16_is_finite(bits: u16) -> bool {
     bits & 0x7f80 != 0x7f80
 }
 
-fn attribute_node_error(error: Error, device: u32, node: &SelectedNode, symbol: &str) -> Error {
+pub(crate) fn attribute_node_error(
+    error: Error,
+    device: u32,
+    node: &SelectedNode,
+    symbol: &str,
+) -> Error {
     attribute_error(
         error,
         device,
@@ -1019,7 +1058,7 @@ fn attribute_node_error(error: Error, device: u32, node: &SelectedNode, symbol: 
     )
 }
 
-fn attribute_chain_error(
+pub(crate) fn attribute_chain_error(
     error: Error,
     device: u32,
     candidate: &SelectedPlanCandidate,
@@ -1038,7 +1077,7 @@ fn chain_attribution(candidate: &SelectedPlanCandidate, boundary: &str) -> Strin
     format!("{boundary} for [{kernels}]")
 }
 
-fn attribute_error(error: Error, device: u32, attribution: String) -> Error {
+pub(crate) fn attribute_error(error: Error, device: u32, attribution: String) -> Error {
     match error {
         Error::DeviceLost { detail, .. } => Error::DeviceLost {
             device,
