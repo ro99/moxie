@@ -106,4 +106,4 @@ abstraction; whether TP2 needs a rank-group type is M5.2's question. Document
 
 ## Next task
 
-Slice 1 ([task 0058](../tasks/0058-m5-dense-tp-host-lowering.md)) is **accepted**: the dense layer and vocabulary lowered on the host, with exact reductions under ADR 0036 and strided weight addressing. Slice 2 (dense TP2 on the 3090 pair) is next.
+Slice 1 ([task 0058](../tasks/0058-m5-dense-tp-host-lowering.md)) is **accepted**: the dense layer and vocabulary lowered on the host, with exact reductions under ADR 0036 and strided weight addressing. Slice 2 is split in two: [task 0059](../tasks/0059-m5-single-gpu-dense-gemma-device.md) runs the reduced dense Gemma graph on one GPU (the missing device kernels; RoPE with a host-computed angle table, following Strata), and task 0060 splits it across the pair, bit-identical to one GPU. Task 0059 is assigned to luna, design first.
