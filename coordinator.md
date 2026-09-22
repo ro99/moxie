@@ -119,17 +119,19 @@ not a handoff. Authorize messages to the assigned coordinator, not arbitrary
 control of other panes or agents.
 
 Use the established team unless the owner changes it (owner direction,
-2026-09-20; reviewer replaced 2026-09-22):
+2026-09-20; builder and reviewer replaced 2026-09-22):
 
 | Role | Agent | Effort | Skill it works under |
 |---|---|---|---|
-| Builder | Codex `luna` | max | `/ponytail:ponytail` |
+| Builder | Claude Opus, Herdr name `builder`, in its own tab | high | `/ponytail:ponytail` |
 | Independent reviewer | Claude Opus, Herdr name `reviewer`, in its own tab (not the coordinator's session) | read-only | `/ponytail:ponytail-review` |
-| Coordinator | Claude Opus | high | `/ponytail:ponytail-audit` at milestone end |
+| Coordinator | Claude Opus, Herdr name `coordinator` | high | `/ponytail:ponytail-audit` at milestone end |
 
-Owner direction, 2026-09-22: Codex `sol` hit its usage limit, so a separate
-Claude Opus session replaces it as reviewer. The coordinator never reviews
-its own assignments; the owner keeps the two roles in separate sessions.
+Owner direction, 2026-09-22: Codex `sol` and then Codex `luna` hit their
+usage limits. Separate Claude Opus sessions replace them as `reviewer` and
+`builder`. The coordinator never builds or reviews its own assignments; the
+owner keeps each role in its own session. With several Claude sessions live,
+`claude` is not a unique target: workers report to `coordinator` by name.
 
 Start each worker in its **own Herdr tab**, in the repository working directory,
 with `codex --yolo`. One tab per worker: panes split from a single tab become

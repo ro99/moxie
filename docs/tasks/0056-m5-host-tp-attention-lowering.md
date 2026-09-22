@@ -6,8 +6,9 @@ Status: **proposed**.
 
 - Task0056, the first M5.2 slice. It replaces the queued M5.1-c/M5.1-d
   labelling tasks (owner, 2026-09-22: "restructure the queue this way").
-  Builder Codex `luna` (max, `/ponytail:ponytail`); reviewer Claude Opus
-  session `reviewer` (read-only, `/ponytail:ponytail-review`); coordinator
+  Builder Claude Opus session `builder` (`/ponytail:ponytail`; replaced
+  Codex `luna`, out of credits, 2026-09-22); reviewer Claude Opus session
+  `reviewer` (read-only, `/ponytail:ponytail-review`); coordinator
   Claude Opus. Owner accepts.
 - Root `/home/rodrigo/Developer/moxie`, branch `main`, base `8d19da3`.
   Preserve the unrelated carried work (`docs/evidence/specification-version.md`
