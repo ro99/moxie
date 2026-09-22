@@ -21,7 +21,25 @@ reads as instructions.
 **M3 is accepted and complete** (owner, 2026-09-19; [task
 0036](docs/tasks/0036-m3-final-closure.md)). M1 is complete, M2's five items are
 all accepted, and M2's formal closure statement remains the owner's to make.
-**M4 is authorized**. **M4.1 is accepted and complete** (owner, 2026-09-20;
+**M4 is accepted and complete** (owner, 2026-09-22; tasks 0037–0051). Both
+sentences of M4's exit gate are met with evidence: 32,768 actual tokens,
+decode after long prefill, later-turn continuation, whole/chunked/multiturn
+comparison and page/ring/tail boundaries (task 0050, on both SM86 GPUs and
+SM120); and the 100k/200k/1m admission/positional-capability report (task
+0051 — 100k reached on both measured GPU classes, 200k partial, 1m blocked,
+each stated with its exact margin, none rounded up). A milestone-end
+`/ponytail:ponytail-audit` found one finding, carried forward rather than
+acted on: `crates/moxie-state`'s `accumulator.rs`/`convolution.rs`/
+`sparse_index.rs` are three hand-duplicated instantiations of one generic
+bounded/explicit-restore state store (~2,000 lines, identical public APIs)
+— a real but non-blocking maintenance item, not opened as a task here.
+Explicitly **not** claimed by M4's closure: MLA device execution (host-only
+by design), M4.3 streaming combined with the 32K gate, task 0049's
+prefix-reuse decision executed by a real consumer, real recurrent/
+convolution/sparse-index model math, N-branch COW generalization, executed
+100k+ tiers, any real checkpoint, and any performance number — each is
+separate, unstarted or unconsumed work, named precisely rather than
+silently implied. **M4.1 is accepted and complete** (owner, 2026-09-20;
 task 0038). **M4.2 is accepted and complete** (owner, 2026-09-21): [task
 0039](docs/tasks/0039-m4-mla-state-descriptors-and-glm52-fixtures.md) — a
 shared MLA/state descriptor and a source-linked GLM-5.2 FP64 oracle — and
