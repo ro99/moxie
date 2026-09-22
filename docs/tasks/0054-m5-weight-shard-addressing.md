@@ -2,6 +2,25 @@
 
 Status: **proposed**.
 
+**Amendment, 2026-09-22 (coordinator, coordinator.md §3).** Old premise:
+both `ColumnShardable` and `RowShardable` map to one `LogicalRange` per rank,
+with disjoint ranges covering the tensor. Evidence (builder, round 1, before
+any edit): canonical BF16 and affine tensors are row-major `[out, in]`.
+An output-channel (`ColumnShardable`) shard is a contiguous run of rows. An
+input-channel (`RowShardable`) shard takes a slice from every row, so it is
+strided and one `LogicalRange` cannot express it. Replacement criterion:
+`ColumnShardable` maps to one `LogicalRange` per component tensor (packed
+codes, scales, zero points where present), and those ranges are disjoint and
+cover each component. `RowShardable` returns a typed refusal that names the
+strided-layout reason. A test proves that refusal. No implemented op produces
+`RowShardable` today (`graph.rs` assigns `ColumnShardable`, `Replicated` or
+`HeadShardable`), so no current consumer loses anything. Row-sharded weight
+addressing becomes a named M5.2 obligation. Its options are a strided-range
+primitive in `moxie-memory` or a TP-specific pre-sharded layout. The second
+changes the canonical format, so it needs an ADR. Authority: coordinator.
+The builder's round-1 evidence disproved the premise; the required behavior
+and its oracle are otherwise unchanged.
+
 ## Identity and authority
 
 - Task0054, M5.1's second bounded slice (the first, task 0053, closed the
