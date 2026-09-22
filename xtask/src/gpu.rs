@@ -4231,6 +4231,8 @@ fn device_branch_row_placements(
 /// and bounded state.
 fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     const CONTEXT: u64 = 32_768;
+    const SECOND_TURN_PREFILL_ROWS: u64 = 255;
+    const SECOND_TURN_ROWS: u64 = SECOND_TURN_PREFILL_ROWS + 1;
     let geometry = PageGeometry {
         kv_heads: 2,
         head_dim: 128,
@@ -4240,15 +4242,16 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     };
     let heads = 8;
     let scale = moxie_plan::reciprocal_sqrt_scale(128);
-    // The widest launch this gate makes: a prefill chunk at the far end of the
-    // history, which is also what proves a multi-row launch and a one-row
-    // decode agree at 32K.
+    // The first-turn multi-row prefill chunk at the far end of the history,
+    // which is also what proves a multi-row launch and a one-row decode agree
+    // at 32K. The second turn below prefills 255 rows, then appends and
+    // decodes the page-tail row separately.
     let chunk_rows = 24u64;
 
     let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
     let stream = Stream::new(&ctx)?;
     let catalogue = moxie_kernels::paged_attention_catalogue();
-    let fixture = AttentionFixture::build(geometry, heads, CONTEXT + 1, 0x0037_8000);
+    let fixture = AttentionFixture::build(geometry, heads, CONTEXT + SECOND_TURN_ROWS, 0x0037_8000);
 
     // Task 0038: the state authority owns this history. It places every row,
     // publishes the mapping for its own retained range, and is the only thing
@@ -4390,6 +4393,476 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
             )));
         }
     }
+
+    // Task 0050: continue from the exact committed 32K parent through the
+    // accepted eager device-COW path. The later turn prefills 255 rows across
+    // the new page, then appends and decodes its page-tail row separately.
+    // That keeps the decode-after operation distinct from the prefill while
+    // retaining the full 256-row second-turn envelope.
+    let parent_frontier_before_turn = whole_state.committed_rows()?;
+    let parent_retained_before_turn = whole_state.retained(0)?;
+    if parent_frontier_before_turn != CONTEXT || parent_retained_before_turn != (0..CONTEXT) {
+        return Ok(Outcome::Failed(format!(
+            "the 32K parent is {:?} with retained {:?} before the second turn",
+            parent_frontier_before_turn, parent_retained_before_turn
+        )));
+    }
+    let parent_placements = device_state_row_placements(&whole_state, 0, CONTEXT)?;
+    let parent_before = whole.read_rows(&parent_placements)?;
+    let parent_arena_bytes = whole.arena_bytes();
+    let second_prefill = PagedAttentionLaunch::new(
+        AttentionLayer {
+            geometry,
+            heads,
+            scale,
+            visibility: Visibility::Causal,
+        },
+        SECOND_TURN_PREFILL_ROWS,
+        CONTEXT,
+        0,
+        CONTEXT + SECOND_TURN_PREFILL_ROWS,
+    )?;
+    let decode_position = CONTEXT + SECOND_TURN_PREFILL_ROWS;
+    let second_decode = PagedAttentionLaunch::new(
+        AttentionLayer {
+            geometry,
+            heads,
+            scale,
+            visibility: Visibility::Causal,
+        },
+        1,
+        decode_position,
+        0,
+        CONTEXT + SECOND_TURN_ROWS,
+    )?;
+    let prefill_tail_position = CONTEXT + SECOND_TURN_PREFILL_ROWS - 1;
+
+    // First second-turn construction: one whole append in the forked child.
+    let mut whole_turn = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor.try_clone()?,
+        geometry,
+        heads,
+        chunk_rows,
+        Staging::Host,
+    )
+    .map_err(|r| r.error)?;
+    let whole_child_id = moxie_executor::paged_attention::device::fork_paged_layer(
+        &mut whole_state,
+        CONTEXT,
+        &whole,
+        &mut whole_turn,
+        &stream,
+    )?;
+    {
+        let branch = whole_state.branch(whole_child_id)?;
+        let inherited =
+            whole_turn.read_rows(&device_branch_row_placements(&branch, 0, CONTEXT)?)?;
+        if inherited != parent_before {
+            return Ok(Outcome::Failed(
+                "the 32K child did not inherit the parent's exact device bytes".into(),
+            ));
+        }
+        let parent_last = branch.placement_of(0, CONTEXT - 1)?;
+        let expected_new_page = CONTEXT / geometry.page_tokens;
+        if parent_last.physical_page != expected_new_page - 1
+            || parent_last.slot != geometry.page_tokens - 1
+        {
+            return Ok(Outcome::Failed(format!(
+                "the 32K parent page boundary was wrong: parent={parent_last:?}"
+            )));
+        }
+    }
+    if whole.read_rows(&parent_placements)? != parent_before
+        || whole_state.committed_rows()? != parent_frontier_before_turn
+        || whole_state.retained(0)? != parent_retained_before_turn
+    {
+        return Ok(Outcome::Failed(
+            "creating the 32K COW child changed the parent's bytes or frontier".into(),
+        ));
+    }
+    {
+        let mut branch = whole_state.branch(whole_child_id)?;
+        let txn = branch.begin()?;
+        let first = branch.published_rows()?;
+        if first != CONTEXT {
+            return Ok(Outcome::Failed(format!(
+                "the whole second-turn child began at row {first}, not {CONTEXT}"
+            )));
+        }
+        let (keys, values) = fixture.payload(first, SECOND_TURN_PREFILL_ROWS);
+        moxie_executor::paged_attention::device::append_paged_branch(
+            &mut branch,
+            txn,
+            0,
+            SECOND_TURN_PREFILL_ROWS,
+            &mut whole_turn,
+            &stream,
+            moxie_executor::paged_attention::device::PagedKvRows { keys, values },
+        )
+        .map_err(|refused| refused.error)?;
+        moxie_executor::paged_attention::device::commit_paged_branch(
+            &mut branch,
+            txn,
+            SECOND_TURN_PREFILL_ROWS,
+            &mut whole_turn,
+            &stream,
+        )?;
+        let child_first = branch.placement_of(0, CONTEXT)?;
+        let child_prefill_tail = branch.placement_of(0, prefill_tail_position)?;
+        let expected_new_page = CONTEXT / geometry.page_tokens;
+        if child_first.physical_page != expected_new_page
+            || child_first.slot != 0
+            || child_prefill_tail.physical_page != expected_new_page
+            || child_prefill_tail.slot != geometry.page_tokens - 2
+        {
+            return Ok(Outcome::Failed(format!(
+                "the second-turn page boundary was wrong: child_first={child_first:?}, \
+                 child_prefill_tail={child_prefill_tail:?}"
+            )));
+        }
+        if branch.committed_rows()? != CONTEXT + SECOND_TURN_PREFILL_ROWS
+            || branch.retained(0)? != (0..CONTEXT + SECOND_TURN_PREFILL_ROWS)
+        {
+            return Ok(Outcome::Failed(
+                "the whole second-turn child did not commit its prefill".into(),
+            ));
+        }
+    }
+    let mut whole_prefill_output =
+        Vec::with_capacity(SECOND_TURN_PREFILL_ROWS as usize * lane_bytes);
+    let mut first = CONTEXT;
+    while first < CONTEXT + SECOND_TURN_PREFILL_ROWS {
+        let rows = chunk_rows.min(CONTEXT + SECOND_TURN_PREFILL_ROWS - first);
+        let launch = second_prefill.at(rows, first)?;
+        let output = whole_turn
+            .attend(&stream, &launch, fixture.query_bytes(first, rows))
+            .map_err(|r| r.error)?;
+        whole_prefill_output.extend_from_slice(&output);
+        first += rows;
+    }
+    let first_second_summary = check_attention(
+        &fixture,
+        &second_prefill.at(1, CONTEXT)?,
+        &whole_prefill_output[..lane_bytes],
+        "32k-second-turn-first-page-row",
+    )?;
+    let prefill_tail_start = (SECOND_TURN_PREFILL_ROWS as usize - 1) * lane_bytes;
+    let last_second_summary = check_attention(
+        &fixture,
+        &second_prefill.at(1, prefill_tail_position)?,
+        &whole_prefill_output[prefill_tail_start..prefill_tail_start + lane_bytes],
+        "32k-second-turn-prefill-tail-row",
+    )?;
+    {
+        let mut branch = whole_state.branch(whole_child_id)?;
+        let txn = branch.begin()?;
+        let first = branch.published_rows()?;
+        if first != decode_position {
+            return Ok(Outcome::Failed(format!(
+                "the whole second-turn decode row began at {first}, not {decode_position}"
+            )));
+        }
+        let (keys, values) = fixture.payload(first, 1);
+        moxie_executor::paged_attention::device::append_paged_branch(
+            &mut branch,
+            txn,
+            0,
+            1,
+            &mut whole_turn,
+            &stream,
+            moxie_executor::paged_attention::device::PagedKvRows { keys, values },
+        )
+        .map_err(|refused| refused.error)?;
+        moxie_executor::paged_attention::device::commit_paged_branch(
+            &mut branch,
+            txn,
+            1,
+            &mut whole_turn,
+            &stream,
+        )?;
+        let child_decode_tail = branch.placement_of(0, decode_position)?;
+        let expected_new_page = CONTEXT / geometry.page_tokens;
+        if child_decode_tail.physical_page != expected_new_page
+            || child_decode_tail.slot != geometry.page_tokens - 1
+            || branch.committed_rows()? != CONTEXT + SECOND_TURN_ROWS
+            || branch.retained(0)? != (0..CONTEXT + SECOND_TURN_ROWS)
+        {
+            return Ok(Outcome::Failed(format!(
+                "the whole second-turn decode row was not the page tail: \
+                 placement={child_decode_tail:?}, committed={} retained={:?}",
+                branch.committed_rows()?,
+                branch.retained(0)?
+            )));
+        }
+    }
+    let whole_decode_output = whole_turn
+        .attend(
+            &stream,
+            &second_decode,
+            fixture.query_bytes(decode_position, 1),
+        )
+        .map_err(|r| r.error)?;
+    let second_decode_summary = check_attention(
+        &fixture,
+        &second_decode,
+        &whole_decode_output,
+        "32k-second-turn-decode",
+    )?;
+    // Adversarial isolation check: an implementation that aliases the parent
+    // pages would survive only-new-page appends. Rewrite the child's final
+    // inherited row after the second-turn result has been checked, and prove
+    // that the child changes to the alternate bytes while the parent prefix
+    // remains byte-identical.
+    let divergence_fixture =
+        AttentionFixture::build(geometry, heads, CONTEXT + SECOND_TURN_ROWS, 0x0050_0001);
+    let parent_prefix_before_divergence =
+        whole.read_rows(&device_state_row_placements(&whole_state, 0, CONTEXT - 1)?)?;
+    let parent_last_row_before_divergence =
+        whole.read_rows(&device_state_row_placements(&whole_state, CONTEXT - 1, 1)?)?;
+    let (divergent_keys, divergent_values) = divergence_fixture.payload(CONTEXT - 1, 1);
+    let mut expected_divergent_row = divergent_keys.clone();
+    expected_divergent_row.extend_from_slice(&divergent_values);
+    {
+        let mut branch = whole_state.branch(whole_child_id)?;
+        branch.truncate(CONTEXT - 1)?;
+        let txn = branch.begin()?;
+        moxie_executor::paged_attention::device::append_paged_branch(
+            &mut branch,
+            txn,
+            0,
+            1,
+            &mut whole_turn,
+            &stream,
+            moxie_executor::paged_attention::device::PagedKvRows {
+                keys: divergent_keys,
+                values: divergent_values,
+            },
+        )
+        .map_err(|refused| refused.error)?;
+        moxie_executor::paged_attention::device::commit_paged_branch(
+            &mut branch,
+            txn,
+            1,
+            &mut whole_turn,
+            &stream,
+        )?;
+        let child_prefix_after_divergence =
+            whole_turn.read_rows(&device_branch_row_placements(&branch, 0, CONTEXT - 1)?)?;
+        let child_last_row_after_divergence =
+            whole_turn.read_rows(&device_branch_row_placements(&branch, CONTEXT - 1, 1)?)?;
+        if child_prefix_after_divergence != parent_prefix_before_divergence
+            || child_last_row_after_divergence != expected_divergent_row
+            || child_last_row_after_divergence == parent_last_row_before_divergence
+        {
+            return Ok(Outcome::Failed(
+                "32K child divergence did not isolate the inherited final row".into(),
+            ));
+        }
+    }
+    let whole_turn_arena_bytes = whole_turn.arena_bytes();
+    if whole.read_rows(&parent_placements)? != parent_before
+        || whole_state.committed_rows()? != parent_frontier_before_turn
+        || whole_state.retained(0)? != parent_retained_before_turn
+    {
+        return Ok(Outcome::Failed(
+            "whole second-turn execution changed the parent's bytes or frontier".into(),
+        ));
+    }
+    let parent_frontier_before_turn_discard = whole_state.committed_rows()?;
+    let parent_retained_before_turn_discard = whole_state.retained(0)?;
+    whole_state.discard_branch(whole_child_id)?;
+    if whole_state.committed_rows()? != parent_frontier_before_turn_discard
+        || whole_state.retained(0)? != parent_retained_before_turn_discard
+        || whole.read_rows(&parent_placements)? != parent_before
+    {
+        return Ok(Outcome::Failed(
+            "discarding the whole second-turn child changed the parent".into(),
+        ));
+    }
+    whole_turn.close(&mut ledger).map_err(|r| r.error)?;
+
+    // Second second-turn construction: fork the same parent again and append
+    // the identical page in uneven chunks. Exact output parity with the whole
+    // append catches a chunk-boundary mistake; the parent readback below
+    // keeps this branch's existence and cleanup in the same isolation proof.
+    let mut chunked_turn = PagedAttentionRun::admit(
+        &mut ledger,
+        &ctx,
+        descriptor.try_clone()?,
+        geometry,
+        heads,
+        chunk_rows,
+        Staging::Host,
+    )
+    .map_err(|r| r.error)?;
+    let chunked_child_id = moxie_executor::paged_attention::device::fork_paged_layer(
+        &mut whole_state,
+        CONTEXT,
+        &whole,
+        &mut chunked_turn,
+        &stream,
+    )?;
+    {
+        let branch = whole_state.branch(chunked_child_id)?;
+        if chunked_turn.read_rows(&device_branch_row_placements(&branch, 0, CONTEXT)?)?
+            != parent_before
+        {
+            return Ok(Outcome::Failed(
+                "the chunked second-turn child did not inherit the parent bytes".into(),
+            ));
+        }
+    }
+    let second_turn_chunks = [1u64, 63, 64, 127];
+    for rows in second_turn_chunks {
+        let mut branch = whole_state.branch(chunked_child_id)?;
+        let txn = branch.begin()?;
+        let first = branch.published_rows()?;
+        let (keys, values) = fixture.payload(first, rows);
+        moxie_executor::paged_attention::device::append_paged_branch(
+            &mut branch,
+            txn,
+            0,
+            rows,
+            &mut chunked_turn,
+            &stream,
+            moxie_executor::paged_attention::device::PagedKvRows { keys, values },
+        )
+        .map_err(|refused| refused.error)?;
+        moxie_executor::paged_attention::device::commit_paged_branch(
+            &mut branch,
+            txn,
+            rows,
+            &mut chunked_turn,
+            &stream,
+        )?;
+    }
+    {
+        let branch = whole_state.branch(chunked_child_id)?;
+        if branch.committed_rows()? != CONTEXT + SECOND_TURN_PREFILL_ROWS
+            || branch.retained(0)? != (0..CONTEXT + SECOND_TURN_PREFILL_ROWS)
+        {
+            return Ok(Outcome::Failed(
+                "the chunked second-turn child did not commit its prefill".into(),
+            ));
+        }
+    }
+    let mut chunked_prefill_output =
+        Vec::with_capacity(SECOND_TURN_PREFILL_ROWS as usize * lane_bytes);
+    let mut first = CONTEXT;
+    while first < CONTEXT + SECOND_TURN_PREFILL_ROWS {
+        let rows = chunk_rows.min(CONTEXT + SECOND_TURN_PREFILL_ROWS - first);
+        let launch = second_prefill.at(rows, first)?;
+        let output = chunked_turn
+            .attend(&stream, &launch, fixture.query_bytes(first, rows))
+            .map_err(|r| r.error)?;
+        chunked_prefill_output.extend_from_slice(&output);
+        first += rows;
+    }
+    if chunked_prefill_output != whole_prefill_output {
+        return Ok(Outcome::Failed(
+            "whole and chunked second-turn prefill outputs differ".into(),
+        ));
+    }
+    {
+        let mut branch = whole_state.branch(chunked_child_id)?;
+        let txn = branch.begin()?;
+        let first = branch.published_rows()?;
+        if first != decode_position {
+            return Ok(Outcome::Failed(format!(
+                "the chunked second-turn decode row began at {first}, not {decode_position}"
+            )));
+        }
+        let (keys, values) = fixture.payload(first, 1);
+        moxie_executor::paged_attention::device::append_paged_branch(
+            &mut branch,
+            txn,
+            0,
+            1,
+            &mut chunked_turn,
+            &stream,
+            moxie_executor::paged_attention::device::PagedKvRows { keys, values },
+        )
+        .map_err(|refused| refused.error)?;
+        moxie_executor::paged_attention::device::commit_paged_branch(
+            &mut branch,
+            txn,
+            1,
+            &mut chunked_turn,
+            &stream,
+        )?;
+        let child_decode_tail = branch.placement_of(0, decode_position)?;
+        let expected_new_page = CONTEXT / geometry.page_tokens;
+        if child_decode_tail.physical_page != expected_new_page
+            || child_decode_tail.slot != geometry.page_tokens - 1
+            || branch.committed_rows()? != CONTEXT + SECOND_TURN_ROWS
+            || branch.retained(0)? != (0..CONTEXT + SECOND_TURN_ROWS)
+        {
+            return Ok(Outcome::Failed(format!(
+                "the chunked second-turn decode row was not the page tail: \
+                 placement={child_decode_tail:?}, committed={} retained={:?}",
+                branch.committed_rows()?,
+                branch.retained(0)?
+            )));
+        }
+    }
+    let chunked_decode_output = chunked_turn
+        .attend(
+            &stream,
+            &second_decode,
+            fixture.query_bytes(decode_position, 1),
+        )
+        .map_err(|r| r.error)?;
+    if chunked_decode_output != whole_decode_output {
+        return Ok(Outcome::Failed(
+            "whole and chunked second-turn decode outputs differ".into(),
+        ));
+    }
+    check_attention(
+        &fixture,
+        &second_decode,
+        &chunked_decode_output,
+        "32k-second-turn-chunked-decode",
+    )?;
+    let chunked_turn_arena_bytes = chunked_turn.arena_bytes();
+    if whole_turn_arena_bytes != chunked_turn_arena_bytes
+        || parent_arena_bytes != whole_turn_arena_bytes
+    {
+        return Ok(Outcome::Failed(format!(
+            "second-turn arena sizes differ: parent={parent_arena_bytes} B, \
+             whole_child={whole_turn_arena_bytes} B, chunked_child={chunked_turn_arena_bytes} B"
+        )));
+    }
+    if whole.read_rows(&parent_placements)? != parent_before
+        || whole_state.committed_rows()? != parent_frontier_before_turn
+        || whole_state.retained(0)? != parent_retained_before_turn
+    {
+        return Ok(Outcome::Failed(
+            "chunked second-turn execution changed the parent's bytes or frontier".into(),
+        ));
+    }
+    let parent_frontier_before_chunked_discard = whole_state.committed_rows()?;
+    let parent_retained_before_chunked_discard = whole_state.retained(0)?;
+    whole_state.discard_branch(chunked_child_id)?;
+    if whole_state.committed_rows()? != parent_frontier_before_chunked_discard
+        || whole_state.retained(0)? != parent_retained_before_chunked_discard
+        || whole.read_rows(&parent_placements)? != parent_before
+    {
+        return Ok(Outcome::Failed(
+            "discarding the chunked second-turn child changed the parent".into(),
+        ));
+    }
+    chunked_turn.close(&mut ledger).map_err(|r| r.error)?;
+    println!(
+        "    {} 32k-second-turn prefill_rows={} decode_rows=1 total={} first={first_second_summary} tail={last_second_summary} decode={second_decode_summary} parent_bytes={} B child_arena_whole={} B child_arena_chunked={} B",
+        cap.sm(),
+        SECOND_TURN_PREFILL_ROWS,
+        CONTEXT + SECOND_TURN_ROWS,
+        parent_before.len(),
+        whole_turn_arena_bytes,
+        chunked_turn_arena_bytes,
+    );
 
     // Append row 32,768 -- the row after the context -- and decode it.
     append_authority_rows(&mut whole_state, &mut whole, &stream, &fixture, 1)?;
