@@ -206,6 +206,17 @@ work:
 Ask about an open gate in a batch, before dependent conclusions or irreversible
 work. A task cannot resolve an owner gate through local inference.
 
+**Search Strata before asking the owner** (owner, 2026-09-22). When a
+technical, numerical or design choice is uncertain, investigate the read-only
+legacy checkout `/home/rodrigo/Developer/strata` first: its code, `docs/` and
+experiment records. It almost always holds the answer, because it already
+solved these problems on this hardware. If it settles the question, adopt
+Strata's approach within this repository's ownership rules, and record it in
+the task or an ADR with the Strata file cited. Bring the owner only what
+Strata and the specification leave open, and bring it with that evidence and
+a recommendation, not as an open question. ADR 0036 is the example: the
+owner had to point out that Strata already defined exact TP reductions.
+
 ## Read before editing
 
 Read [README.md](README.md), [product boundaries](docs/spec/01-product-and-decisions.md), [common API](docs/spec/02-architecture-and-common-api.md), [agent playbooks](docs/spec/09-agent-playbooks.md), and the assigned milestone in [the roadmap](docs/spec/06-implementation-roadmap.md). Then read the relevant memory, attention/state, sampling/application and validation contracts linked there, and their actual legacy source references. These documents are normative; this short file is their discovery entry point. Read [the engineering log](docs/engineering-log.md) once when starting on this repository, and again whenever a review finds something in your work — most findings there are a shape that has appeared before.
