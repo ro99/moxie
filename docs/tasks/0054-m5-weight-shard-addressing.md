@@ -21,6 +21,22 @@ changes the canonical format, so it needs an ADR. Authority: coordinator.
 The builder's round-1 evidence disproved the premise; the required behavior
 and its oracle are otherwise unchanged.
 
+**Second amendment, 2026-09-22 (coordinator).** Old premise: a quantized
+shard needs a "group-aligned accepted / group-misaligned refused" pair.
+Evidence (builder, before any edit): `AffineDescriptor::group_of(k)` and
+`groups_per_row()` group the input `k` axis, while a `ColumnShardable` shard
+splits whole output rows. A column boundary therefore cannot split a
+quantization group, and every `RowShardable` request is refused before group
+checking applies. The misaligned case cannot occur. Replacement criterion:
+(1) a quantized `ColumnShardable` shard is accepted, and each component's
+range (codes, scales, zero points) is derived from its own per-row width, is
+disjoint from the other ranks' ranges, and covers the component; (2) an output
+dimension that the rank count does not divide is refused; (3) `RowShardable`
+is refused, for both BF16 and quantized tensors. Group-boundary checking moves
+to M5.2 together with row-sharded addressing, where it can actually fail. The
+second-consumer bullet and oracle (c) below are read under this amendment.
+Authority: coordinator.
+
 ## Identity and authority
 
 - Task0054, M5.1's second bounded slice (the first, task 0053, closed the
