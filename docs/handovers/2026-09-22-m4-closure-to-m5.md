@@ -48,44 +48,45 @@ later M5 items get their own bounded tasks as each dependency clears.
 
 ## Milestone obligations (roadmap M5, original item numbers)
 
+M5.1 is split into explicit obligations (coordinator.md §2). A post-acceptance
+coordinator review of task 0053 (2026-09-22) found that the earlier statement
+"attention was the only implemented-op gap M5.1 still has to close" was
+wrong. Rows M5.1-c and M5.1-d record what it missed.
+
 | Item | Outcome | State | Owner | Dependency | Evidence | Next action |
 |---|---|---|---|---|---|---|
-| M5.1 | Legal partition semantics for all implemented ops; sharded weights and state use the canonical format and common residency authority | **Task 0053 accepted** (owner, 2026-09-22); M5.1 itself remains open | luna (build) / sol (review) / coordinator | none technical | [Task 0053](../tasks/0053-m5-attention-partition-semantics.md) **accepted**: `Attention`/`MlaAttention` now return `PartitionRule::HeadShardable` (GQA KV replication or shared-latent replication, concatenated or global-reduction output) instead of `NotDetermined`. Three review rounds — round 1 found the new GQA/MLA fixtures were not load-bearing (compared static enum constants, geometry unchecked); round 2 fixed GQA but left the MLA output-projection-boundary claim resting on operand cardinality instead of identity; round 3 bound it to the real graph node's operand/name/role/shape/topology. Round 3: sol ACCEPT, no remaining findings. Coordinator independently re-ran the focused suites clean. `Route`/`ExpertMlp`/`Combine`/`Linear` untouched | Task 0053 covers only the op-contract (`Attention`/`MlaAttention` partition rule) half of M5.1's text. [Task 0054](../tasks/0054-m5-weight-shard-addressing.md) opened, 2026-09-22, for the weight-shard-addressing half — a pure function from `PartitionRule` + rank count/index to the `LogicalRange` a rank owns, respecting `AffineDescriptor` quantization-group boundaries. State (KV) shard addressing remains a distinct, unopened obligation named in task 0054's non-goals |
-| M5.2 | TP2 on the 3090 pair: column/row linears, head/KV ownership, global routing/vocabulary ops, collective ordering and failure handling | Not started | unassigned | M5.1 (partition semantics must exist before lowering to them) | none | queue after M5.1. Carries two obligations from M5.1: reject non-divisible head/rank combinations (review-task-0053-round-1), and address row-sharded (input-channel) weights, which task 0054's 2026-09-22 amendment found strided in canonical row-major layout (a strided-range primitive, or an ADR for a pre-sharded layout) |
-| M5.3 | PP with uneven stages, microbatch-aware prefill, mixed TP+PP stage groups | Not started | unassigned | M5.2 (needs a working TP lowering to compose a stage with) | none | queue after M5.2 |
-| M5.4 | Bounded expert-owner partitioning: shared dispatch/transport/reduction, duplicate destinations, host experts, route unions | Not started | unassigned | M5.1 for `ExpertMlp`/`Combine`'s own partition rule (currently `NotDetermined` by the same code path task 0053 touches, deliberately out of task 0053's scope — see its non-goals) | none | not queued; needs its own task once M5.1's expert-owner semantics are written |
-| M5.5 | Topology cost probes and a deterministic plan comparison tool | Not started | unassigned | M5.2/M5.3/M5.4 (needs real candidate plans to compare) | none | not queued |
+| M5.1-a | Attention/MLA op-level partition rule | **Accepted** (owner, 2026-09-22) | closed | none | [Task 0053](../tasks/0053-m5-attention-partition-semantics.md): `Attention` → `HeadShardable{GqaReplicateWhenOversubscribed, ConcatenateHeads}`, `MlaAttention` → `HeadShardable{SharedLatentReplicated, GlobalReduction}`. The semantics are correct. Most of its new test lines check fixture literals, re-test descriptor methods already pinned in `moxie-graph`, or check the fixture's own wiring (see M5.1-e) | none |
+| M5.1-b | Column-sharded weights addressed through the canonical format and residency authority (`LogicalRange` per component) | **Active** | luna / sol / coordinator | none | [Task 0054](../tasks/0054-m5-weight-shard-addressing.md), amended twice before any code: input-axis (row) shards are strided in row-major `[out, in]`, and quantization groups lie along `k`, so a column shard never splits a group | review when luna reports ready |
+| M5.1-c | Head-aligned partition: `Rope` rotates pairs within a head (`HalfSplit` pairs j and j + head_dim/2), and the Q/K/V `Linear`s produce heads, yet both are plain `ColumnShardable` with no head-boundary requirement. Under GQA oversubscription (8 query heads, 2 KV heads, 4 ranks), an even column split of `k_proj` cuts each KV head in half | **Queued** | luna / sol / coordinator | M5.1-b accepted (both touch partition consumers; serialize) | coordinator review of task 0053, 2026-09-22. The rules come from task 0003 and were not visited by task 0053 | open as a task after M5.1-b and M5.1-e; the contract must first check how the graph ties a projection to the attention op that consumes it |
+| M5.1-d | Per-weight partition inside `MlaAttention`: `q_a_proj`/`kv_a_proj` replicated, `q_b_proj`/`kv_b_proj` split by head, `o_proj` split along its input axis. One `PartitionRule` per op cannot express this, so M5.1-b's addressing cannot serve MLA weights | **Queued** | luna / sol / coordinator | M5.1-c (same head-alignment vocabulary); `o_proj`'s input-axis split also needs M5.2's strided addressing | coordinator review of task 0053, 2026-09-22 | fold into the M5.1-c task if the same mechanism covers it; otherwise its own task |
+| M5.1-e | Trim task 0053's redundant tests to one assertion per invariant (owner instruction, 2026-09-19) | **Queued** | luna / sol / coordinator | M5.1-b accepted (luna is busy; same test files) | Keep: the contract-table enum rows and the single `node.contract.partition` assertion on the real MLA node in `mla_reference.rs`. Remove: the GQA-literal block and the `cache_width`/`more_query_heads` block in `reference_graphs.rs`, the fixture-wiring assertions in `mla_reference.rs`, and the new `HeadShardable` line in `moxie-graph`'s `partition_semantics_fail_closed_until_defined` | next task for luna after M5.1-b; small, test-only |
+| M5.1-f | State (KV) shard addressing through the residency authority | Not started | unassigned | M5.1-c (which KV heads a rank owns) | named in task 0054's non-goals | after M5.1-c |
+| M5.2 | TP2 on the 3090 pair: column/row linears, head/KV ownership, global routing/vocabulary ops, collective ordering and failure handling | Not started | unassigned | M5.1 | none | Carries from M5.1: reject non-divisible head/rank combinations (review-task-0053-round-1); input-axis (row-sharded) weight addressing and quantization-group alignment (task 0054 amendments), via a strided-range primitive or an ADR for a pre-sharded layout |
+| M5.3 | PP with uneven stages, microbatch-aware prefill, mixed TP+PP stage groups | Not started | unassigned | M5.2 | none | after M5.2 |
+| M5.4 | Bounded expert-owner partitioning: shared dispatch/transport/reduction, duplicate destinations, host experts, route unions | Not started | unassigned | `ExpertMlp`/`Combine` partition rule (still `NotDetermined`) | none | its own task once expert-owner semantics are written |
+| M5.5 | Topology cost probes and a deterministic plan comparison tool | Not started | unassigned | M5.2/M5.3/M5.4 | none | not queued |
 
-M5.1 is the only implemented-op gap the codebase itself already flags:
-`crates/moxie-graph/src/graph.rs`'s `OpParams::partition_rule()` assigns
-`PartitionRule::NotDetermined` to `Attention`/`MlaAttention` with a comment
-naming exactly this as "document 04's M5 work," and separately to
-`ExpertMlp`/`Combine` naming that as M5.4's own expert-partitioning decision.
-Task 0053 is scoped to the first of those two, matching the roadmap's own
-"complete the shared contract before its adapters" ordering — M5.2's TP2
-lowering needs attention's partition rule defined before it can lower
-anything through it.
+## Work queue (critical path)
+
+1. Task 0054 (M5.1-b): active with luna.
+2. M5.1-e test trim: small and test-only, cleared before the same files change again.
+3. M5.1-c head alignment, with M5.1-d if one mechanism covers both. This is the
+   substantive remaining M5.1 work; M5.2 cannot lower a real attention block
+   without it.
+4. M5.1-f state addressing, then M5.2.
+
+Lesson applied to every contract written from here on: read the storage layout,
+group axis and graph wiring a contract depends on before writing its acceptance
+clauses. Task 0053's shape-proof clause and task 0054's two amendments all came
+from skipping that step.
 
 ## Remaining hypotheses and blockers
 
-None blocking task 0053. `RankId`/`RankContext` (`crates/moxie-types`,
-`crates/moxie-executor`) already exist as a single-rank-per-device
-abstraction from earlier milestones' resource-ledger work; whether that
-abstraction extends to a rank *group* (TP2's two collaborating ranks) or
-needs a new type is an open design question task 0053 does not have to
-answer — it defines partition legality, not the group/collective machinery
-that lowers to it (M5.2's scope). Document 04's TP section (`04-attention-
-parallelism-and-speculation.md:49-57`) is the normative source for what
-"legal" means here: row/column linear partition semantics (already decided,
-task 0003), attention head ownership, GQA KV replication when fewer KV heads
-than ranks, output reduction, and bias/residual applied exactly once.
+None blocking. `RankId`/`RankContext` exist as a single-rank-per-device
+abstraction; whether TP2 needs a rank-group type is M5.2's question. Document
+04's TP section (lines 49–57) is the normative source for partition legality.
 
 ## Next task
 
-[Task 0053](../tasks/0053-m5-attention-partition-semantics.md): define
-`Attention`/`MlaAttention`'s partition rule — head ownership across ranks,
-GQA KV-head replication where ranks exceed KV heads, and where the output
-reduction legally happens — replacing today's fail-closed `NotDetermined`.
-Semantics only; no TP2 execution, no collective/NCCL plumbing, no rank-group
-type, no `ExpertMlp`/`Combine` (M5.4). Start luna in a new Herdr tab under
-`/ponytail:ponytail`; assign with the return protocol in coordinator.md §6.
+Task 0054 is active. When it is accepted, the M5.1-e test trim goes to luna, then
+M5.1-c. Each gets a full contract under `docs/tasks/` when it opens.

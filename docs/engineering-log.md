@@ -35,7 +35,7 @@ Each links into the entries below.
 | A boundary invented before it had two sides | task 0025's `moxie-storage-write`, which forced a second copy of the reader's `pread` |
 | A format assumption nobody asked the format about | task 0026's eight-byte alignment, refused by the reference reader |
 | A new boundary that hides the boundary beside it | task 0026's shard-header pass, which absorbed every payload fault |
-| A claim checked against a copy of itself | task 0026's component validation, shape check, source digest and memory bound; task 0038's device test reimplementing the authority's page-table arithmetic instead of reading it from the authority |
+| A claim checked against a copy of itself | task 0026's component validation, shape check, source digest and memory bound; task 0038's device test reimplementing the authority's page-table arithmetic instead of reading it from the authority; task 0053's fixture asserting the graph it had just built |
 | Optimizing the architecture, and calling it a user benefit | offline repacking, built and packaged before its performance hypothesis was tested |
 | A tool that measures the tree it is editing | the mutation battery, twice: killed mid-substitution, and left unrunnable for two tasks |
 | A test measured by assertion rather than by mutation | tasks 0020, 0021, 0022, 0023, 0024 |
@@ -1744,3 +1744,39 @@ caught; the four clean lanes pass three times before and after restoration.
 the exact list. The mutation harness self-test also exposed one stale anchor
 left by the earlier shared fallible-allocation refactor; the anchor now mutates
 the shared sink actually in use rather than dead implementation text.
+
+## 2026-09-22 — task 0053: a proof demanded of a property the code does not have
+
+Task 0053 made `Attention` and `MlaAttention` return a constant
+`HeadShardable` rule per op, with no geometry input. The contract still
+asked the builder to "prove the rule against a GQA shape and an MLA shape."
+The builder complied, and review then spent two more rounds enforcing that
+clause: round 1 found the shapes were not load-bearing, and round 2 found the
+MLA `o_proj` boundary rested on operand count. Each round was correct under
+the contract, and each added assertions that could not fail through a
+production change. They checked the test's own literals, re-tested
+`MlaAttentionDescriptor` widths already pinned in `moxie-graph`, or checked
+that the fixture had wired the graph it built. About 170 test lines resulted.
+Only the enum rows and one assertion on the real MLA node were needed.
+
+A post-acceptance coordinator review found two things the three rounds did
+not look for, because the contract did not point there. `Rope` and the Q/K/V
+`Linear`s are `ColumnShardable` without any head-boundary requirement. Under
+the GQA case the test itself uses, an even column split of `k_proj` cuts each
+KV head in half. Separately, one rule per op cannot describe MLA's seven
+differently-partitioned weights. The records had called attention "the only
+implemented-op gap M5.1 still has to close."
+
+The same session's next contract, task 0054, needed two amendments before
+any code was written. Input-axis shards are strided in row-major `[out, in]`
+storage, and quantization groups lie along `k`, so a column shard cannot
+split one. The builder found both by reading the code the contract had not
+read.
+
+Lesson: an acceptance clause is a claim about the code, and it expires as
+fast as a status claim. Before writing one, read the storage layout, the
+axis a quantity lives on, and how the graph wires the op. Ask what mutation
+of production code the demanded test could catch. If the answer is none,
+the clause asks for a test the repository's one-test-per-invariant rule
+forbids. Review enforces the contract as written, so a wrong clause costs a
+round for every reviewer who reads it faithfully.

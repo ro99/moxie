@@ -153,23 +153,16 @@ The [M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md)
 tracks this milestone's obligations.
 
 **M5 is open** (owner, 2026-09-22: "open M5 for luna to work"). [Task
-0053](docs/tasks/0053-m5-attention-partition-semantics.md) **accepted**
-(owner, 2026-09-22): `Attention`/`MlaAttention` now return
-`PartitionRule::HeadShardable` (GQA KV replication or shared-latent
-replication; concatenated or global-reduction output) instead of the
-fail-closed `NotDetermined` they held pending document 04's TP section.
-Three review rounds — round 1 found the new GQA/MLA test fixtures were not
-load-bearing (static enum comparison, geometry unchecked); round 2 fixed GQA
-but left the MLA output-projection-boundary claim resting on operand
-cardinality instead of identity; round 3 bound it to the real graph node's
-actual operand/name/role/shape/topology, and review closed clean.
-`ExpertMlp`/`Combine` stay `NotDetermined`, reserved for M5.4; `Route` and
-`Linear` untouched. M5.1's own text is not fully closed by task 0053: the
-op-contract half is done, but "sharded weights... use the canonical format
-and common residency authority" remains open — nothing yet computes a
-rank's owned byte range from a `PartitionRule`. The [M4→M5
-handover](docs/handovers/2026-09-22-m4-closure-to-m5.md) carries the M5
-milestone ledger.
+0053](docs/tasks/0053-m5-attention-partition-semantics.md) is accepted:
+`Attention` and `MlaAttention` declare `PartitionRule::HeadShardable`.
+[Task 0054](docs/tasks/0054-m5-weight-shard-addressing.md) (active) maps a
+column-sharded weight to the byte range each rank owns. **M5.1 is not
+closed.** The partition rules do not yet require shard boundaries to fall on
+head boundaries (`Rope`, and the Q/K/V `Linear`s that feed attention). One
+rule per op also cannot describe MLA's seven differently-partitioned weights.
+`ExpertMlp`/`Combine` stay `NotDetermined` for M5.4. The [M5
+ledger](docs/handovers/2026-09-22-m4-closure-to-m5.md) carries each open
+obligation and the queued tasks.
 
 | | |
 |---|---|
