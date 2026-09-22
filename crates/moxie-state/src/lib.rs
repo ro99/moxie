@@ -46,6 +46,9 @@ pub use device::{DeviceBranch, DeviceKvSequence, DeviceLayerLayout, PageView, Pl
 pub mod accumulator;
 pub use accumulator::{RecurrentAccumulator, RecurrentSnapshot, ReplaySource};
 
+pub mod convolution;
+pub use convolution::{ConvolutionHistory, ConvolutionHistorySnapshot, ConvolutionReplaySource};
+
 pub mod paged;
 pub use paged::{
     KvGeometry, KvRow, LayerKv, PagedCloseRefused, PagedExecutionBinding, PagedSequence,

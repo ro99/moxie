@@ -78,11 +78,14 @@ is M7's model-bring-up-gated scope. Round 1 found the store unbounded (no
 resource limit unlike `PagedSequence`'s precedent) and a snapshot-release
 bug that permanently lost the snapshot on a mere wrong-ledger mistake; both
 repaired and re-verified by tracing the exact allocation accounting.
-`ConvolutionHistory`'s own physical store — structurally similar but
-irreversible for a different reason (bounded-window information loss, not
-decay/mixing) — is M4.4's natural remaining piece. N-branch COW
-generalization also remains separate, unopened work. **M4.5 remains
-unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
+[Task 0047](docs/tasks/0047-m4-convolution-history-snapshot-replay.md)
+**accepted** (owner, 2026-09-21) — `ConvolutionHistory`'s own physical
+store, grounded in Kimi K3's short-convolution shape but proven against a
+synthetic window transform. **This session's first task accepted clean on
+round 1** — both defect classes task 0046 caught in separate review rounds
+(resource-accounting exactness, non-consuming release-with-retry) were
+applied proactively this time. `SparseIndex` and N-branch COW
+generalization remain separate, unopened work. **M4.5 remains unstarted.** Device (GPU) execution of MLA and the absorbed/fused fast
 path are explicitly out of M4.2's scope and are not opened by its acceptance.
 The [M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md)
 tracks this milestone's obligations.
