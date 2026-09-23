@@ -151,12 +151,9 @@ herdr agent read luna --source recent-unwrapped --lines 15   # confirm "gpt-6-lu
 herdr agent read sol  --source recent-unwrapped --lines 15   # confirm "gpt-6-sol high"
 ```
 
-A Codex start can stop at an interactive "Update available" menu (observed
-2026-09-23). Do not send blind key presses: read the pane, and select "Skip"
-explicitly. A wrong key there installed a CLI update without the owner's
-approval. The coordinator's own name binding (`coordinator`) can also drop
-on reconnect; re-bind it with `herdr agent rename <own-pane> coordinator`
-before workers report.
+The coordinator's own name binding (`coordinator`) can drop on reconnect;
+re-bind it with `herdr agent rename <own-pane> coordinator` before workers
+report.
 
 If a pane already booted with the wrong model, `herdr agent prompt <name> "/quit"`
 returns it to `agent_not_running` at the shell prompt, then re-run `agent start`
