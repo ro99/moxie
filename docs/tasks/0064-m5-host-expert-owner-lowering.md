@@ -166,7 +166,12 @@ delta breaks. `luna2` was closed; `luna` continues as the only builder.
 `crates/moxie-graph/src/lib.rs`, `crates/moxie-graph/src/graph.rs`,
 `crates/moxie-oracles/src/route.rs`, `crates/moxie-interp/src/lib.rs`,
 `crates/moxie-plan/src/tensor_parallel.rs`, `crates/moxie-plan/src/lib.rs`
-(exports only), `crates/moxie-cli/tests/tensor_parallel.rs`, and this task
+(exports only), `crates/moxie-interp/src/paged.rs` (the call-site arity),
+the two existing `ExpertMlp`/`Combine` partition-label expectations in
+`crates/moxie-interp/tests/reference_graphs.rs` (around line 2325) and
+`crates/moxie-plan/src/selected.rs` (around line 1869), updated from
+`NotDetermined` to `ExpertOwnerShardable` (amended 2026-09-23),
+`crates/moxie-cli/tests/tensor_parallel.rs`, and this task
 file's Result. **Not** `moxie-executor` or `moxie-cuda`, which task 0062
 owns.
 
