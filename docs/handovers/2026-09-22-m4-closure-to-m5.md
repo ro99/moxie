@@ -79,7 +79,7 @@ comparison) are **not** deferred; they stay in M5. Slice 4 began with
 [task 0064](../tasks/0064-m5-host-expert-owner-lowering.md), **accepted**
 2026-09-23: a host expert-owner lowering of the routed block, bit-identical at
 2 and 4 ranks, covering duplicate-owner, cross-owner and empty-owner routes.
-[Task 0065](../tasks/0065-m5-routed-gemma-single-gpu.md), **accepted** 2026-09-23: the routed Gemma graph runs on one GPU (Route, ExpertMlp and Combine device kernels), matching the host on all three GPUs. It also fixed a latent softcap defect in task 0059's vocabulary kernel. Still open in slice 4: device execution of the expert-partitioned plan (the
+[Task 0065](../tasks/0065-m5-routed-gemma-single-gpu.md), **accepted** 2026-09-23: the routed Gemma graph runs on one GPU (Route, ExpertMlp and Combine device kernels), matching the host on all three GPUs. It also fixed a latent softcap defect in task 0059's vocabulary kernel. [Task 0066](../tasks/0066-m5-expert-owner-tp2-on-the-pair.md), opened 2026-09-23: expert-owner TP2 on the pair, with resource and mid-step cancellation tests. Remaining slice-4 plan (coordinator, 2026-09-23): task 0067, host-owned experts (M5.4 "host experts"); task 0068, MLA per-weight partitioning. That is one task more than first planned, because host experts were split out of task 0066. Ledger: a scaled combine (Laguna 2.5) under expert-owner TP is still refused, fail-closed, by task 0064; it is not required by the M5 exit gate. Earlier status: still open in slice 4: device execution of the expert-partitioned plan (the
 exit gate's resource and cancellation tests), host-owned experts, a scaled
 combine (Laguna 2.5), and MLA per-weight partitioning.
 
