@@ -123,7 +123,7 @@ Use the established team unless the owner changes it (owner direction,
 
 | Role | Agent | Effort | Skill it works under |
 |---|---|---|---|
-| Builder | Codex `luna` (`gpt-5.6-luna`), in its own tab | max | `/ponytail:ponytail` |
+| Builder | Codex `luna` (`gpt-6-luna`), in its own tab; the Claude Opus `builder` takes complex or stuck tasks, by owner direction on 2026-09-22 (task 0060 rescue) | max | `/ponytail:ponytail` |
 | Independent reviewer | Codex `sol` (`gpt-6-sol`), in its own tab | high, read-only | `/ponytail:ponytail-review` |
 | Coordinator | Claude Opus, Herdr name `coordinator` | high | `/ponytail:ponytail-audit` at milestone end |
 
@@ -145,11 +145,18 @@ including the one meant to be luna). Pass the model and effort explicitly on
 the start command and verify the banner before assigning work:
 
 ```bash
-herdr agent start luna --kind codex --pane <id> -- --yolo -c model="gpt-5.6-luna" -c model_reasoning_effort="max"
-herdr agent start sol  --kind codex --pane <id> -- --yolo -c model="gpt-5.6-sol"  -c model_reasoning_effort="high"
-herdr agent read luna --source recent-unwrapped --lines 15   # confirm "gpt-5.6-luna max"
-herdr agent read sol  --source recent-unwrapped --lines 15   # confirm "gpt-5.6-sol high"
+herdr agent start luna --kind codex --pane <id> -- --yolo -c model="gpt-6-luna" -c model_reasoning_effort="max"
+herdr agent start sol  --kind codex --pane <id> -- --yolo -c model="gpt-6-sol"   -c model_reasoning_effort="high"
+herdr agent read luna --source recent-unwrapped --lines 15   # confirm "gpt-6-luna max"
+herdr agent read sol  --source recent-unwrapped --lines 15   # confirm "gpt-6-sol high"
 ```
+
+A Codex start can stop at an interactive "Update available" menu (observed
+2026-09-23). Do not send blind key presses: read the pane, and select "Skip"
+explicitly. A wrong key there installed a CLI update without the owner's
+approval. The coordinator's own name binding (`coordinator`) can also drop
+on reconnect; re-bind it with `herdr agent rename <own-pane> coordinator`
+before workers report.
 
 If a pane already booted with the wrong model, `herdr agent prompt <name> "/quit"`
 returns it to `agent_not_running` at the shell prompt, then re-run `agent start`
