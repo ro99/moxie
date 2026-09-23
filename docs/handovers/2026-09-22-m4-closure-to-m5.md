@@ -73,6 +73,12 @@ wrong. Rows M5.1-c and M5.1-d record what it missed.
 | M5.4 | Bounded expert-owner partitioning: shared dispatch/transport/reduction, duplicate destinations, host experts, route unions | Not started | unassigned | `ExpertMlp`/`Combine` partition rule (still `NotDetermined`) | none | its own task once expert-owner semantics are written |
 | M5.5 | Topology cost probes and a deterministic plan comparison tool | Not started | unassigned | M5.2/M5.3/M5.4 | none | not queued |
 
+Owner direction, 2026-09-23: a second builder starts slice 4 in parallel
+with task 0062. MLA partitioning and M5.5 (topology probes and plan
+comparison) are **not** deferred; they stay in M5. Slice 4 begins with
+[task 0064](../tasks/0064-m5-host-expert-owner-lowering.md), a host
+expert-owner lowering designed by the coordinator and built by `luna2`.
+
 ## Route to M5 closure (owner-agreed plan, 2026-09-22)
 
 Accepted so far: tasks 0053–0057. This covers the attention partition rule,
