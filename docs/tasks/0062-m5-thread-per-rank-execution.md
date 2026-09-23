@@ -5,13 +5,16 @@ Status: **proposed**.
 ## Identity and authority
 
 - Task0062, second half of M5 plan slice 3 ("Robust rank execution").
-  Builder: the Claude Opus session `builder`, which takes complex tasks by
-  owner direction of 2026-09-22 (`/ponytail:ponytail`). Reviewer: Codex
+  Builder: Codex `luna` (max, `/ponytail:ponytail`). The Claude Opus
+  `builder` would normally take a complex task, but the shared Claude account
+  was at 86% of its weekly limit on 2026-09-23, and the coordinator runs on
+  the same account. The builder stays on standby for a rescue, as on
+  task 0060. Reviewer: Codex
   `sol` (read-only, `/ponytail:ponytail-review`). Coordinator: Claude Opus
   `coordinator`. Accepted by the coordinator under the owner's auto-mode
   delegation.
-- Root `/home/rodrigo/Developer/moxie`, branch `main`. Base: the task 0061
-  acceptance commit. Preserve the unrelated carried work
+- Root `/home/rodrigo/Developer/moxie`, branch `main`, base `d6470b7` (after
+  tasks 0061 and 0063). Preserve the unrelated carried work
   (`docs/evidence/specification-version.md` and ADRs 0034 and 0035).
 - Requirements:
   - Document 01, line 35: "Local single-process control with one rank
