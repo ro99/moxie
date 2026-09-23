@@ -22,10 +22,11 @@ pub use expert::{
 };
 pub use selected::{
     PlannedValue, PlannedWorkspace, SelectedNode, SelectedPlanCandidate, StorageRegion,
-    lower_selected,
+    lower_selected, lower_selected_ordered,
 };
 pub use tensor_parallel::{
-    Join, RankPart, Stage, TensorParallelLowering, TensorParallelRefused, lower_tensor_parallel,
+    Join, RankPart, Stage, StageGraph, StageRead, StageWeight, TensorParallelLowering,
+    TensorParallelRefused, build_stage_graph, lower_tensor_parallel,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -41,7 +41,9 @@
 #![forbid(unsafe_code)]
 
 pub mod device;
-pub use device::{DeviceBranch, DeviceKvSequence, DeviceLayerLayout, PageView, Placement};
+pub use device::{
+    DeviceBranch, DeviceKvSequence, DeviceLayerLayout, PageView, Placement, PreparedCommit,
+};
 
 pub mod accumulator;
 pub use accumulator::{RecurrentAccumulator, RecurrentSnapshot, ReplaySource};

@@ -11,8 +11,9 @@ use std::collections::BTreeMap;
 
 use moxie_graph::{
     AttentionOutputReduction, Bindings, Graph, GraphBuilder, IndexEncoding, KvHeadPartition,
-    LinearReductionOrder, MlaAttentionDescriptor, NodeId, OpParams, OracleRegistry, PartitionRule,
-    RopeLayout, StateEffect, TensorSpec, ValueId, ValueRole, Visibility, reciprocal_sqrt_scale,
+    LinearInputSlice, LinearReductionOrder, MlaAttentionDescriptor, NodeId, OpParams,
+    OracleRegistry, PartitionRule, RopeLayout, StateEffect, TensorSpec, ValueId, ValueRole,
+    Visibility, reciprocal_sqrt_scale,
 };
 use moxie_interp::{Cancel, HostTensor, Interpreter, KvCache, Value};
 use moxie_oracles::metric::{ErrorSummary, gamma};
@@ -896,6 +897,24 @@ fn a_declared_linear_split_reaches_the_host_interpreter() {
         .unwrap();
     assert_eq!(ordinary.output().as_float().unwrap().data(), &[1.0]);
     assert_eq!(ordered.output().as_float().unwrap().data(), &[0.0]);
+    // A rank's slice is one whole declared block, never a window across two.
+    let straddling = LinearReductionOrder {
+        blocks: 2,
+        slice: Some(LinearInputSlice {
+            first: 1,
+            width: 4,
+            full_width: 8,
+        }),
+    };
+    assert!(
+        Interpreter::new()
+            .run_stateless_with_linear_orders(
+                &graph,
+                &bindings,
+                &BTreeMap::from([(NodeId(0), straddling)]),
+            )
+            .is_err()
+    );
 }
 
 #[test]

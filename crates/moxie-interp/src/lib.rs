@@ -85,6 +85,7 @@ fn validate_linear_slice(
     w: &HostTensor,
     blocks: u32,
 ) -> Result<()> {
+    // A slice is one whole declared block: aligned to its own width.
     if blocks == 0
         || slice.width == 0
         || slice.width != local_width
@@ -92,6 +93,7 @@ fn validate_linear_slice(
         || !slice.full_width.is_multiple_of(u64::from(blocks))
         || slice.width != slice.full_width / u64::from(blocks)
         || slice.first > slice.full_width - slice.width
+        || !slice.first.is_multiple_of(slice.width)
         || x.cols() as u64 != slice.width
         || w.cols() as u64 != slice.width
     {

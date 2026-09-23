@@ -47,6 +47,9 @@ fn split_sm(list: &str) -> Vec<String> {
 pub const AXPY_F32: &str = "moxie_smoke_axpy_f32";
 pub const F32_TO_BF16_BITS: &str = "moxie_smoke_f32_to_bf16_bits";
 pub const BF16_LINEAR: &str = "moxie_bf16_linear_v1";
+pub const DENSE_LINEAR_SPLIT: &str = "moxie_dense_linear_split_v1";
+pub const DENSE_LINEAR_PARTIAL: &str = "moxie_dense_linear_partial_v1";
+pub const TP_REDUCE_F32: &str = "moxie_tp_reduce_f32_v1";
 pub const BF16_RMS_SUM: &str = "moxie_bf16_rms_sum_v1";
 pub const BF16_RMS_APPLY: &str = "moxie_bf16_rms_apply_v1";
 pub const BF16_RESIDUAL: &str = "moxie_bf16_residual_v1";
@@ -173,8 +176,8 @@ pub fn paged_attention_declares(descriptor: &moxie_types::SemanticKernelDescript
 mod images {
     use super::{
         BF16_LINEAR, BF16_RESIDUAL, BF16_RMS_APPLY, BF16_RMS_SUM, DENSE_EMBEDDING, DENSE_GEGLU,
-        DENSE_GRAPH_ABI, DENSE_GROUPED_RMS, DENSE_RESIDUAL_SCALED, DENSE_ROPE,
-        DENSE_VOCAB_PROJECTION,
+        DENSE_GRAPH_ABI, DENSE_GROUPED_RMS, DENSE_LINEAR_PARTIAL, DENSE_LINEAR_SPLIT,
+        DENSE_RESIDUAL_SCALED, DENSE_ROPE, DENSE_VOCAB_PROJECTION,
     };
     use moxie_types::{
         AccumulationPolicy, ActivationPrecision, GateTransform, KernelCapability, KernelCatalogue,
@@ -543,6 +546,36 @@ mod images {
                 workspace: WorkspaceExpression::Zero,
                 image_sha256: hash,
                 symbols: vec![KernelSymbol(BF16_LINEAR.to_string())],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-linear-split-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::LinearSplit,
+                inputs: vec![bf16, weight],
+                output: ActivationPrecision::expect(Precision::Bf16),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::FinalBf16Rne,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(DENSE_LINEAR_SPLIT.to_string())],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-linear-partial-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::LinearPartial,
+                inputs: vec![bf16, weight],
+                output: ActivationPrecision::expect(Precision::F32),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::Unrounded,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(DENSE_LINEAR_PARTIAL.to_string())],
             });
             descriptors.push(SemanticKernelDescriptor {
                 id: KernelId(format!("dense-rms-norm-v1-{suffix}")),

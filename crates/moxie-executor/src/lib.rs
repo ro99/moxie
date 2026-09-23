@@ -139,6 +139,10 @@ pub use selected_attention::{PagedAttentionInputs, PagedAttentionStep, PagedPlan
 mod dense;
 #[cfg(feature = "paged-attention-binding")]
 pub use dense::{DenseGraphResult, DenseGraphStep, DensePlanRunRefused};
+#[cfg(feature = "paged-attention-binding")]
+mod dense_tp;
+#[cfg(feature = "paged-attention-binding")]
+pub use dense_tp::{DenseRank, DenseStep, DenseTensorParallelStep};
 
 #[cfg(feature = "driver")]
 pub use lease::{PrepareRefused, Upload};

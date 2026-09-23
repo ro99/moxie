@@ -63,6 +63,9 @@ pub struct RankGroup<'ctx> {
     ranks: [&'ctx RankContext; 2],
     sequence: u64,
     deadline: Duration,
+    /// Why the group can no longer be used, once a drain could not be
+    /// observed or a commit's device publication failed.
+    lost: Option<Error>,
 }
 
 /// A refused collective: the typed error each rank receives.
@@ -119,6 +122,7 @@ impl<'ctx> RankGroup<'ctx> {
             ranks,
             sequence: 0,
             deadline,
+            lost: None,
         })
     }
 
@@ -144,6 +148,12 @@ impl<'ctx> RankGroup<'ctx> {
         streams: [&Stream<'ctx>; 2],
         cancel: &AtomicBool,
     ) -> std::result::Result<[Gathered<'ctx>; 2], GatherRefused> {
+        if let Some(lost) = &self.lost {
+            // Dropping the shards withholds them, as the group already has.
+            return Err(GatherRefused {
+                errors: [lost.clone(), lost.clone()],
+            });
+        }
         let sequence = self.sequence;
         self.sequence += 1;
         let deadline = Instant::now() + self.deadline;
@@ -157,7 +167,19 @@ impl<'ctx> RankGroup<'ctx> {
             }
         }
         if failure.is_none() {
-            failure = self.agree(sequence, &submitted, streams, cancel).err();
+            let [(_, first), (_, second)] = [&submitted[0], &submitted[1]];
+            failure = self
+                .agree(
+                    sequence,
+                    [first.declaration, second.declaration],
+                    [
+                        &first.lease.resource().local,
+                        &second.lease.resource().local,
+                    ],
+                    streams,
+                    cancel,
+                )
+                .err();
         }
         let mut arenas = arenas;
         if let Some(error) = failure {
@@ -254,6 +276,293 @@ impl<'ctx> RankGroup<'ctx> {
         ])
     }
 
+    /// Gather two completed rank-local stage outputs by column, in rank order.
+    ///
+    /// Unlike [`Self::all_gather`] the sources are borrowed and carry no
+    /// event: the one caller, the dense tensor-parallel step, has already
+    /// observed their producing stage complete. Each rank receives its own
+    /// full-width output in `arenas[r]`.
+    #[cfg(feature = "paged-attention-binding")]
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn gather(
+        &mut self,
+        declarations: [GatherDeclaration; 2],
+        sources: [&DeviceRange<'ctx>; 2],
+        arenas: [&mut DeviceArena<'ctx>; 2],
+        streams: [&Stream<'ctx>; 2],
+        cancel: &AtomicBool,
+    ) -> std::result::Result<[DeviceRange<'ctx>; 2], GatherRefused> {
+        self.join(false, declarations, sources, arenas, streams, cancel)
+    }
+
+    /// Reduce two completed FP32 row-parallel partials exactly (ADR 0036).
+    ///
+    /// Each rank pulls its peer's partial, then adds rank 0's partial to rank
+    /// 1's in FP32 and rounds once to BF16, so both ranks hold the same bits.
+    /// `declarations` name the partial: its full output width and `F32`.
+    #[cfg(feature = "paged-attention-binding")]
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn reduce(
+        &mut self,
+        declarations: [GatherDeclaration; 2],
+        partials: [&DeviceRange<'ctx>; 2],
+        arenas: [&mut DeviceArena<'ctx>; 2],
+        streams: [&Stream<'ctx>; 2],
+        cancel: &AtomicBool,
+    ) -> std::result::Result<[DeviceRange<'ctx>; 2], GatherRefused> {
+        self.join(true, declarations, partials, arenas, streams, cancel)
+    }
+
+    /// The shared body of [`Self::gather`] and [`Self::reduce`]: agreement,
+    /// every fallible allocation, then the copies. Whatever happens once a
+    /// copy may be enqueued, both streams go through [`Self::drain`] before
+    /// any range is released; if that fails, every range is withheld.
+    #[cfg(feature = "paged-attention-binding")]
+    #[allow(clippy::result_large_err)]
+    fn join(
+        &mut self,
+        reduce: bool,
+        declarations: [GatherDeclaration; 2],
+        sources: [&DeviceRange<'ctx>; 2],
+        arenas: [&mut DeviceArena<'ctx>; 2],
+        streams: [&Stream<'ctx>; 2],
+        cancel: &AtomicBool,
+    ) -> std::result::Result<[DeviceRange<'ctx>; 2], GatherRefused> {
+        let refuse = |error: Error| GatherRefused {
+            errors: [error.clone(), error],
+        };
+        if let Some(lost) = &self.lost {
+            return Err(refuse(lost.clone()));
+        }
+        let sequence = self.sequence;
+        self.sequence += 1;
+        self.agree(sequence, declarations, sources, streams, cancel)
+            .map_err(refuse)?;
+        let declaration = declarations[0];
+        let element = match (reduce, declaration.precision) {
+            (_, Precision::F32) => 4,
+            (false, Precision::Bf16) => BF16_BYTES,
+            (_, precision) => {
+                return Err(refuse(collective(format!(
+                    "no {} of {precision:?}",
+                    if reduce { "reduce" } else { "gather" }
+                ))));
+            }
+        };
+        let overflow = || refuse(collective("collective extent overflowed".into()));
+        let elements = declaration
+            .rows
+            .checked_mul(declaration.columns)
+            .ok_or_else(overflow)?;
+        let part = elements.checked_mul(element).ok_or_else(overflow)?;
+        let [output_bytes, scratch_bytes] = if reduce {
+            [elements.checked_mul(BF16_BYTES).ok_or_else(overflow)?, part]
+        } else {
+            [part.checked_mul(2).ok_or_else(overflow)?, 0]
+        };
+        let grid = u32::try_from(elements.div_ceil(256)).map_err(|_| overflow())?;
+        if sources.iter().any(|source| source.bytes() < part) {
+            return Err(refuse(collective(format!(
+                "a source is smaller than the declared {part} bytes"
+            ))));
+        }
+        // ponytail: the reduce image is loaded per call; hold it in the group
+        // if the per-step load ever shows up.
+        let mut kernels = Vec::new();
+        if reduce {
+            // SAFETY: the build's own `include_bytes!` of the pinned nvcc output.
+            let image =
+                unsafe { TrustedImage::from_build_output(moxie_kernels::DENSE_GRAPH_FATBIN) }
+                    .map_err(refuse)?;
+            for rank in self.ranks {
+                kernels.push(
+                    Module::load(rank, ModuleImage::Binary(image))
+                        .and_then(|module| {
+                            module.resolve_all(&[moxie_kernels::TP_REDUCE_F32.to_string()])
+                        })
+                        .map_err(refuse)?,
+                );
+            }
+        }
+
+        // Output first, then the reduce's peer-partial scratch.
+        let mut arenas = arenas;
+        let mut ranges: Vec<Vec<DeviceRange<'ctx>>> = Vec::new();
+        let mut unallocated = None;
+        'allocate: for arena in arenas.iter_mut() {
+            let mut held = Vec::new();
+            for (bytes, owner) in [
+                (output_bytes, "collective output"),
+                (scratch_bytes, "reduce peer partial"),
+            ] {
+                if bytes == 0 {
+                    continue;
+                }
+                match arena.allocate(bytes, ALIGNMENT, owner) {
+                    Ok(range) => held.push(range),
+                    Err(refused) => {
+                        ranges.push(held);
+                        unallocated = Some(refused.error);
+                        break 'allocate;
+                    }
+                }
+            }
+            ranges.push(held);
+        }
+        if let Some(error) = unallocated {
+            // Nothing is enqueued yet.
+            self.release_all(&mut arenas, ranges).map_err(refuse)?;
+            return Err(refuse(error));
+        }
+
+        let mut enqueued = Ok(());
+        for rank in 0..2 {
+            enqueued = if reduce {
+                self.enqueue_reduce(
+                    rank,
+                    [elements, part],
+                    grid,
+                    sources,
+                    &ranges[rank],
+                    &kernels[rank],
+                    streams[rank],
+                )
+            } else {
+                copy_columns(declaration, sources, &ranges[rank][0], streams[rank])
+            };
+            if enqueued.is_err() {
+                break;
+            }
+        }
+        // Dropping an unreleased range withholds it.
+        self.drain(streams).map_err(refuse)?;
+        if let Err(error) = enqueued {
+            self.release_all(&mut arenas, ranges).map_err(refuse)?;
+            return Err(refuse(error));
+        }
+        let mut outputs = Vec::new();
+        let mut scratch = Vec::new();
+        for mut held in ranges {
+            scratch.push(held.split_off(1));
+            outputs.push(held.pop().expect("one output range"));
+        }
+        self.release_all(&mut arenas, scratch).map_err(refuse)?;
+        let mut outputs = outputs.into_iter();
+        Ok([
+            outputs.next().expect("two ranks"),
+            outputs.next().expect("two ranks"),
+        ])
+    }
+
+    /// Observe both ranks' streams complete, each on its own, within the
+    /// group's deadline. Every failure path of a tensor-parallel step settles
+    /// here before releasing anything its streams may touch. If either rank
+    /// cannot be observed, the group is lost: the caller withholds
+    /// everything, and every later collective or step refuses with the
+    /// recorded reason.
+    #[cfg(feature = "paged-attention-binding")]
+    pub(crate) fn drain(&mut self, streams: [&Stream<'ctx>; 2]) -> Result<()> {
+        if let Some(lost) = &self.lost {
+            return Err(lost.clone());
+        }
+        let deadline = Instant::now() + self.deadline;
+        let mut failures = Vec::new();
+        for (rank, (ctx, stream)) in self.ranks.into_iter().zip(streams).enumerate() {
+            let observed = Event::new(ctx).and_then(|done| {
+                done.record(stream)?;
+                while !done.is_complete()? {
+                    if Instant::now() >= deadline {
+                        return Err(collective("completion not observed".into()));
+                    }
+                    std::thread::yield_now();
+                }
+                Ok(())
+            });
+            if let Err(error) = observed {
+                failures.push(format!("rank {rank}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            return Ok(());
+        }
+        Err(self.lose(format!(
+            "a rank stream was not observed drained within {} ms ({}); every range of \
+             the step is withheld",
+            self.deadline.as_millis(),
+            failures.join("; ")
+        )))
+    }
+
+    /// Return each rank's ranges to its arena. A range that cannot be
+    /// released stays allocated and charged, so the group is lost.
+    #[cfg(feature = "paged-attention-binding")]
+    fn release_all(
+        &mut self,
+        arenas: &mut [&mut DeviceArena<'ctx>; 2],
+        ranges: Vec<Vec<DeviceRange<'ctx>>>,
+    ) -> Result<()> {
+        for (arena, ranges) in arenas.iter_mut().zip(ranges) {
+            if let Err(error) = release(arena, ranges) {
+                return Err(self.lose(format!(
+                    "a collective range could not be released ({error}); it is withheld"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark the group unusable and record why. The first reason is kept.
+    #[cfg(feature = "paged-attention-binding")]
+    pub(crate) fn lose(&mut self, detail: String) -> Error {
+        let lost = Error::DeviceLost {
+            device: self.ranks[0].ordinal(),
+            detail,
+        };
+        self.lost.get_or_insert(lost).clone()
+    }
+
+    /// The reason the group is unusable, if it is.
+    pub fn lost(&self) -> Option<&Error> {
+        self.lost.as_ref()
+    }
+
+    /// Pull the peer's partial into `buffers[1]`, then add rank 0's partial
+    /// to rank 1's and round once into `buffers[0]`.
+    #[cfg(feature = "paged-attention-binding")]
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_reduce(
+        &self,
+        rank: usize,
+        [elements, bytes]: [u64; 2],
+        grid: u32,
+        partials: [&DeviceRange<'ctx>; 2],
+        buffers: &[DeviceRange<'ctx>],
+        kernel: &ResolvedModule<'ctx>,
+        stream: &Stream<'ctx>,
+    ) -> Result<()> {
+        let [output, scratch] = [&buffers[0], &buffers[1]];
+        let peer = partials[1 - rank];
+        // SAFETY: the caller's lease retains `scratch` until its event is
+        // observed or it is withheld; the completed peer partial is the
+        // caller's until this collective returns.
+        unsafe { scratch.copy_from_peer_async_at(0, peer, 0, bytes, stream)? };
+        let mut operands = [partials[0], partials[1]];
+        operands[1 - rank] = scratch;
+        let mut rank_zero = operands[0].device_address()?;
+        let mut rank_one = operands[1].device_address()?;
+        let mut sum = output.device_address()?;
+        let mut count = elements;
+        let mut params: [*mut c_void; 4] = [
+            (&raw mut rank_zero).cast(),
+            (&raw mut rank_one).cast(),
+            (&raw mut sum).cast(),
+            (&raw mut count).cast(),
+        ];
+        // SAFETY: four arguments matching `moxie_tp_reduce_f32_v1`, all
+        // within ranges this collective retains.
+        unsafe { kernel.launch_async(0, stream, (grid, 1, 1), (256, 1, 1), 0, &mut params) }
+    }
+
     /// Refuse a collective that moved no byte. A source's only reader is its
     /// own producer, so settling that is enough to release it.
     fn refuse_before_copies(
@@ -277,33 +586,32 @@ impl<'ctx> RankGroup<'ctx> {
     fn agree(
         &self,
         sequence: u64,
-        submitted: &[(usize, RankShard<'ctx>)],
+        declarations: [GatherDeclaration; 2],
+        sources: [&DeviceRange<'ctx>; 2],
         streams: [&Stream<'ctx>; 2],
         cancel: &AtomicBool,
     ) -> Result<()> {
         if cancel.load(Ordering::Acquire) {
             return Err(Error::Cancelled { at: "all-gather" });
         }
-        for (rank, shard) in submitted {
-            let uuid = self.ranks[*rank].uuid();
-            if shard.lease.resource().local.device_uuid() != uuid
-                || streams[*rank].device_uuid() != uuid
-            {
+        for rank in 0..2 {
+            let uuid = self.ranks[rank].uuid();
+            if sources[rank].device_uuid() != uuid || streams[rank].device_uuid() != uuid {
                 return Err(collective(format!(
                     "rank {rank}'s shard or stream is not on its device {uuid}"
                 )));
             }
-            if shard.declaration.sequence != sequence {
+            if declarations[rank].sequence != sequence {
                 return Err(collective(format!(
                     "rank {rank} declared sequence {} but the group is at {sequence}",
-                    shard.declaration.sequence
+                    declarations[rank].sequence
                 )));
             }
         }
         // The sequence is each rank's agreement with the schedule, checked
         // above; the shape and precision are the ranks' agreement with each
         // other.
-        let [d0, d1] = [submitted[0].1.declaration, submitted[1].1.declaration];
+        let [d0, d1] = declarations;
         if (d0.rows, d0.columns, d0.precision) != (d1.rows, d1.columns, d1.precision) {
             return Err(collective(format!("ranks declared {d0:?} and {d1:?}")));
         }
@@ -319,8 +627,6 @@ impl<'ctx> RankGroup<'ctx> {
         stream: &Stream<'ctx>,
         done: &Event<'ctx>,
     ) -> Result<()> {
-        let part = declaration.columns * BF16_BYTES;
-        let row = part * 2;
         for shard in shards {
             let ready = shard
                 .lease
@@ -328,25 +634,8 @@ impl<'ctx> RankGroup<'ctx> {
                 .expect("a submitted shard has an event");
             stream.wait_event(ready)?;
         }
-        // ponytail: one peer copy per row and rank; a pitched peer copy
-        // (cuMemcpy3DPeerAsync) replaces them when row counts grow.
-        for (source, shard) in shards.iter().enumerate() {
-            let local = &shard.lease.resource().local;
-            for r in 0..declaration.rows {
-                // SAFETY: the shard leases retain `local`, and the caller's
-                // lease retains `gathered`, until `done` is observed or both
-                // are withheld.
-                unsafe {
-                    gathered.copy_from_peer_async_at(
-                        r * row + source as u64 * part,
-                        local,
-                        r * part,
-                        part,
-                        stream,
-                    )?;
-                }
-            }
-        }
+        let locals = shards.map(|shard| &shard.lease.resource().local);
+        copy_columns(declaration, locals, gathered, stream)?;
         done.record(stream)
     }
 
@@ -592,6 +881,39 @@ fn release<'ctx>(
         }
     }
     result
+}
+
+/// Concatenate two row-major `[rows, columns]` sources by column into
+/// `gathered`, rank 0 first.
+// ponytail: one peer copy per row and rank; a pitched peer copy
+// (cuMemcpy3DPeerAsync) replaces them when row counts grow.
+fn copy_columns<'ctx>(
+    declaration: GatherDeclaration,
+    sources: [&DeviceRange<'ctx>; 2],
+    gathered: &DeviceRange<'ctx>,
+    stream: &Stream<'ctx>,
+) -> Result<()> {
+    let width = match declaration.precision {
+        Precision::F32 => 4,
+        _ => BF16_BYTES,
+    };
+    let part = declaration.columns * width;
+    for (rank, source) in sources.into_iter().enumerate() {
+        for r in 0..declaration.rows {
+            // SAFETY: the caller retains every source, and its lease retains
+            // `gathered`, until the copy's event is observed or withheld.
+            unsafe {
+                gathered.copy_from_peer_async_at(
+                    r * part * 2 + rank as u64 * part,
+                    source,
+                    r * part,
+                    part,
+                    stream,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn collective(detail: String) -> Error {

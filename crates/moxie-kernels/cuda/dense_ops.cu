@@ -14,6 +14,71 @@ static __device__ __forceinline__ float moxie_dense_bf16_v1(float value) {
     return __bfloat162float(__float2bfloat16_rn(value));
 }
 
+// The single-device declared-S reference.  Each input-axis block starts from
+// zero in FP32, blocks are combined in ascending order, and only the final
+// result crosses the BF16 boundary.  This is intentionally a separate symbol
+// from the TP partial kernel below: the reference must not share its arithmetic
+// path with the pair's partial/reduce implementation.
+extern "C" __global__ void moxie_dense_linear_split_v1(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight,
+    __nv_bfloat16* output, unsigned long long rows,
+    unsigned long long input_width, unsigned long long output_width,
+    unsigned long long blocks) {
+    const unsigned long long index =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long count = rows * output_width;
+    if (index >= count || blocks == 0 || input_width % blocks != 0) return;
+    const unsigned long long row = index / output_width;
+    const unsigned long long column = index % output_width;
+    const unsigned long long block_width = input_width / blocks;
+    float total = 0.0F;
+    for (unsigned long long block = 0; block < blocks; ++block) {
+        float partial = 0.0F;
+        const unsigned long long first = block * block_width;
+        for (unsigned long long k = 0; k < block_width; ++k) {
+            const unsigned long long offset = row * input_width + first + k;
+            partial = __fadd_rn(partial, __fmul_rn(
+                __bfloat162float(x[offset]),
+                __bfloat162float(weight[column * input_width + first + k])));
+        }
+        total = __fadd_rn(total, partial);
+    }
+    output[index] = __float2bfloat16_rn(total);
+}
+
+// The TP row-parallel partial.  It deliberately stores FP32 and does not
+// round; RankGroup::reduce owns the one declared output rounding boundary.
+extern "C" __global__ void moxie_dense_linear_partial_v1(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight,
+    float* output, unsigned long long rows,
+    unsigned long long input_width, unsigned long long output_width) {
+    const unsigned long long index =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long count = rows * output_width;
+    if (index >= count) return;
+    const unsigned long long row = index / output_width;
+    const unsigned long long column = index % output_width;
+    float sum = 0.0F;
+    for (unsigned long long k = 0; k < input_width; ++k) {
+        sum = __fadd_rn(sum, __fmul_rn(
+            __bfloat162float(x[row * input_width + k]),
+            __bfloat162float(weight[column * input_width + k])));
+    }
+    output[index] = sum;
+}
+
+// Two-rank exact reduce: the arguments are already FP32 partials.  The order
+// is explicit even though two-term addition is commutative, because the ABI is
+// the two-rank specialization of the declared ascending-rank contract.
+extern "C" __global__ void moxie_tp_reduce_f32_v1(
+    const float* rank_zero, const float* rank_one,
+    __nv_bfloat16* output, unsigned long long elements) {
+    const unsigned long long index =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    output[index] = __float2bfloat16_rn(__fadd_rn(rank_zero[index], rank_one[index]));
+}
+
 extern "C" __global__ void moxie_dense_embedding_v1(
     const unsigned long long* token_ids, const __nv_bfloat16* table,
     __nv_bfloat16* output, unsigned long long rows, unsigned long long vocab,

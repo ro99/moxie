@@ -49,6 +49,14 @@ pub enum SemanticKernelOp {
     /// Token-id gather with the operation's optional output scale.
     Embedding,
     Linear,
+    /// One full-device linear that evaluates declared input-axis blocks from
+    /// zero in FP32, combines those blocks in order, and rounds once.
+    ///
+    /// This is deliberately distinct from [`SemanticKernelOp::LinearPartial`]
+    /// so the single-device S>1 reference cannot share the TP partial path.
+    LinearSplit,
+    /// A row-parallel linear partial: BF16 inputs, FP32 output, no rounding.
+    LinearPartial,
     RmsNorm,
     /// RMSNorm over independent contiguous groups (one group per head).
     GroupedRmsNorm,
@@ -80,6 +88,8 @@ impl SemanticKernelOp {
         match self {
             Self::Embedding => "embedding",
             Self::Linear => "linear",
+            Self::LinearSplit => "linear_split",
+            Self::LinearPartial => "linear_partial",
             Self::RmsNorm => "rms_norm",
             Self::GroupedRmsNorm => "grouped_rms_norm",
             Self::Rope => "rope",

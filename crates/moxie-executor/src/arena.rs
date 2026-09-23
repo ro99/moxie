@@ -120,6 +120,18 @@ impl<C: Completion, R> OperationLease<C, R> {
         self.lifecycle.synchronize()
     }
 
+    /// Take the resource of a lease, in any state, whose device work the
+    /// caller has observed complete by other means: every stream that could
+    /// touch the resource was drained after the lease's last submission. Only
+    /// the tensor-parallel step calls this, after `RankGroup::drain`
+    /// succeeds; every other owner keeps [`Self::retire`]'s contract.
+    #[cfg(feature = "paged-attention-binding")]
+    pub(crate) fn reclaim_drained(mut self) -> R {
+        self.resource
+            .take()
+            .expect("operation lease retains its resource until retirement")
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn retire(mut self) -> std::result::Result<(LeaseId, R), OperationRetireRefused<C, R>> {
         let refuse = |lease: Self, error| OperationRetireRefused { lease, error };

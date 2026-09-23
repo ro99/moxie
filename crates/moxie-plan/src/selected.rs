@@ -1,6 +1,8 @@
 //! Pure semantic-kernel selection and exact combined-arena lowering.
 
-use moxie_graph::{NodeId, Op, ValueId, ValueRole};
+use std::collections::{BTreeMap, BTreeSet};
+
+use moxie_graph::{LinearReductionOrder, NodeId, Op, ValueId, ValueRole};
 use moxie_types::{
     DeviceCapability, Error, KernelCatalogue, KernelOperand, SemanticKernelDescriptor,
     SemanticKernelOp, TensorLayout,
@@ -71,6 +73,7 @@ pub struct SelectedPlanCandidate {
     stages: Vec<String>,
     package: SelectedPackage,
     host_workspace_bytes: u64,
+    linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
 }
 
 impl SelectedPlanCandidate {
@@ -118,6 +121,9 @@ impl SelectedPlanCandidate {
     }
     pub const fn host_workspace_bytes(&self) -> u64 {
         self.host_workspace_bytes
+    }
+    pub fn linear_orders(&self) -> &BTreeMap<NodeId, LinearReductionOrder> {
+        &self.linear_orders
     }
     pub fn is_paged_attention(&self) -> bool {
         matches!(self.nodes.as_slice(), [node] if node.descriptor.operation == SemanticKernelOp::PagedAttention)
@@ -424,7 +430,68 @@ pub fn lower_selected(
         stages,
         package: SelectedPackage::Chain,
         host_workspace_bytes: 0,
+        linear_orders: BTreeMap::new(),
     })
+}
+
+/// Lower a dense graph whose row-parallel `Linear`s carry a declared
+/// reduction order (ADR 0036). An order without a slice is the single-device
+/// reference: the split-aware kernel sums every declared block and rounds
+/// once. An order with a slice is one rank's stage: the partial kernel writes
+/// FP32 for the tensor-parallel reduce to combine. A stage need not contain
+/// the whole graph.
+pub fn lower_selected_ordered(
+    graph: &Graph,
+    workload: ResourceWorkload,
+    capability: &DeviceCapability,
+    catalogue: &KernelCatalogue,
+    orders: &BTreeMap<NodeId, LinearReductionOrder>,
+) -> Result<SelectedPlanCandidate, Error> {
+    if capability.uuid != workload.device {
+        return Err(invalid(
+            "device",
+            "workload UUID and measured capability differ",
+        ));
+    }
+    for (id, order) in orders {
+        let Some(moxie_graph::OpParams::Linear {
+            in_features,
+            bias: false,
+            ..
+        }) = graph
+            .nodes()
+            .get(id.0 as usize)
+            .filter(|node| node.id == *id)
+            .map(|node| &node.params)
+        else {
+            return Err(invalid(
+                "linear_order",
+                "an order names no unbiased Linear of this graph",
+            ));
+        };
+        let blocks = u64::from(order.blocks);
+        // The interpreter's rule (`validate_linear_slice`): a slice is one
+        // whole declared block of the full input axis.
+        let fits = blocks > 0
+            && match order.slice {
+                None => in_features.is_multiple_of(blocks),
+                Some(slice) => {
+                    slice.width == *in_features
+                        && slice.width > 0
+                        && slice.full_width.is_multiple_of(blocks)
+                        && slice.width == slice.full_width / blocks
+                        && slice.first <= slice.full_width - slice.width
+                        && slice.first.is_multiple_of(slice.width)
+                }
+            };
+        if !fits {
+            return Err(invalid(
+                "linear_order",
+                "the declared order does not divide this Linear's input axis",
+            ));
+        }
+    }
+    lower_dense_mode(graph, workload, capability, catalogue, false, orders)
 }
 
 fn lower_attention(
@@ -562,6 +629,7 @@ fn lower_attention(
         stages: vec!["attention".into(), "terminal-output".into()],
         package: SelectedPackage::Attention,
         host_workspace_bytes: 0,
+        linear_orders: BTreeMap::new(),
     })
 }
 
@@ -571,19 +639,38 @@ fn lower_dense(
     capability: &DeviceCapability,
     catalogue: &KernelCatalogue,
 ) -> Result<SelectedPlanCandidate, Error> {
-    if graph.nodes().is_empty()
-        || !graph
-            .nodes()
-            .iter()
-            .any(|node| node.params.op() == Op::Embedding)
-        || !graph
-            .nodes()
-            .iter()
-            .any(|node| node.params.op() == Op::VocabProjection)
-        || !graph
-            .nodes()
-            .iter()
-            .any(|node| node.params.op() == Op::Attention)
+    lower_dense_mode(
+        graph,
+        workload,
+        capability,
+        catalogue,
+        true,
+        &BTreeMap::new(),
+    )
+}
+
+fn lower_dense_mode(
+    graph: &Graph,
+    workload: ResourceWorkload,
+    capability: &DeviceCapability,
+    catalogue: &KernelCatalogue,
+    require_complete_graph: bool,
+    orders: &BTreeMap<NodeId, LinearReductionOrder>,
+) -> Result<SelectedPlanCandidate, Error> {
+    if require_complete_graph
+        && (graph.nodes().is_empty()
+            || !graph
+                .nodes()
+                .iter()
+                .any(|node| node.params.op() == Op::Embedding)
+            || !graph
+                .nodes()
+                .iter()
+                .any(|node| node.params.op() == Op::VocabProjection)
+            || !graph
+                .nodes()
+                .iter()
+                .any(|node| node.params.op() == Op::Attention))
     {
         return Err(Error::UnsupportedKernel {
             operation: "graph",
@@ -597,7 +684,15 @@ fn lower_dense(
     let mut workspace_logical_bytes = 0u64;
     let mut host_workspace_bytes = 0u64;
     for node in graph.nodes() {
-        let operation = dense_semantic(node)?;
+        let mut operation = dense_semantic(node)?;
+        // `lower_selected_ordered` validated every order against its node.
+        if let Some(order) = orders.get(&node.id) {
+            operation = if order.slice.is_some() {
+                SemanticKernelOp::LinearPartial
+            } else {
+                SemanticKernelOp::LinearSplit
+            };
+        }
         let roles = dense_operands(operation, node, graph)?;
         let (input, output) = dense_shape(node)?;
         let matches: Vec<_> = catalogue
@@ -606,10 +701,18 @@ fn lower_dense(
             .filter(|descriptor| {
                 descriptor.operation == operation
                     && descriptor.inputs == roles
-                    && descriptor.output == node.contract.output
+                    && descriptor.output
+                        == if operation == SemanticKernelOp::LinearPartial {
+                            moxie_types::ActivationPrecision::expect(moxie_types::Precision::F32)
+                        } else {
+                            node.contract.output
+                        }
                     && descriptor.accumulation == node.contract.accumulation
                     && descriptor.rounding
-                        == if operation == SemanticKernelOp::VocabProjection {
+                        == if matches!(
+                            operation,
+                            SemanticKernelOp::VocabProjection | SemanticKernelOp::LinearPartial
+                        ) {
                             moxie_types::RoundingProfile::Unrounded
                         } else {
                             moxie_types::RoundingProfile::FinalBf16Rne
@@ -665,6 +768,16 @@ fn lower_dense(
         .map_err(|_| invalid("stages", "dense graph stage count exceeds u32"))?;
     let mut values = Vec::new();
     let mut weight_cursor = 0u64;
+    let partial_outputs: BTreeSet<ValueId> = graph
+        .nodes()
+        .iter()
+        .filter(|node| {
+            orders
+                .get(&node.id)
+                .is_some_and(|order| order.slice.is_some())
+        })
+        .map(|node| node.output)
+        .collect();
     for binding in base.bindings() {
         if let ValueBinding::ExternalWeight(weight) = binding {
             let physical = align_up(weight.required_bytes)?;
@@ -708,15 +821,34 @@ fn lower_dense(
                 last: last_stage,
                 slot: usize::MAX,
             }),
-            ValueBinding::ArenaTensor(tensor) => pending.push(Pending {
-                value: tensor.value,
-                role: tensor.role,
-                shape: tensor.shape.clone(),
-                bytes: tensor.bytes,
-                first: tensor.live.first,
-                last: tensor.live.last,
-                slot: usize::MAX,
-            }),
+            ValueBinding::ArenaTensor(tensor) => {
+                let role = if partial_outputs.contains(&tensor.value) {
+                    ValueRole::Activation(moxie_types::ActivationPrecision::expect(
+                        moxie_types::Precision::F32,
+                    ))
+                } else {
+                    tensor.role
+                };
+                let bytes = if partial_outputs.contains(&tensor.value) {
+                    tensor
+                        .shape
+                        .iter()
+                        .try_fold(1u64, |total, extent| total.checked_mul(*extent))
+                        .and_then(|elements| elements.checked_mul(4))
+                        .ok_or_else(|| invalid("partial_linear", "partial extent overflowed"))?
+                } else {
+                    tensor.bytes
+                };
+                pending.push(Pending {
+                    value: tensor.value,
+                    role,
+                    shape: tensor.shape.clone(),
+                    bytes,
+                    first: tensor.live.first,
+                    last: tensor.live.last,
+                    slot: usize::MAX,
+                })
+            }
             ValueBinding::ExternalWeight(_) => {}
         }
     }
@@ -802,6 +934,7 @@ fn lower_dense(
             .collect(),
         package: SelectedPackage::Dense,
         host_workspace_bytes,
+        linear_orders: orders.clone(),
     })
 }
 
@@ -1204,7 +1337,10 @@ mod tests {
 
     fn descriptor(op: SemanticKernelOp, sm: SmVersion) -> SemanticKernelDescriptor {
         let inputs = match op {
-            SemanticKernelOp::Linear | SemanticKernelOp::RmsNorm => vec![
+            SemanticKernelOp::Linear
+            | SemanticKernelOp::LinearSplit
+            | SemanticKernelOp::LinearPartial
+            | SemanticKernelOp::RmsNorm => vec![
                 KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
                 KernelOperand::Weight(WeightPrecision::expect(Precision::Bf16)),
             ],
@@ -1420,6 +1556,60 @@ mod tests {
             KernelCatalogue::new(duplicate).unwrap_err().kind(),
             "invalid_artifact"
         );
+    }
+
+    #[test]
+    fn a_declared_order_must_fit_an_existing_unbiased_linear() {
+        let selected_graph = graph(8, 3.5);
+        let cap = capability(SmVersion::SM86);
+        let linear = selected_graph
+            .nodes()
+            .iter()
+            .find(|node| node.params.op() == Op::Linear)
+            .unwrap()
+            .id;
+        let other = selected_graph
+            .nodes()
+            .iter()
+            .find(|node| node.params.op() != Op::Linear)
+            .unwrap()
+            .id;
+        let order = |blocks, slice| LinearReductionOrder { blocks, slice };
+        let slice = |first, width, full_width| {
+            Some(moxie_graph::LinearInputSlice {
+                first,
+                width,
+                full_width,
+            })
+        };
+        for (id, declared) in [
+            (linear, order(0, None)),
+            (linear, order(3, None)),
+            (linear, order(2, slice(0, 4, 8))),
+            (linear, order(2, slice(12, 8, 16))),
+            (linear, order(2, slice(1, 8, 16))),
+            (other, order(1, None)),
+            (NodeId(999), order(1, None)),
+        ] {
+            let refused = lower_selected_ordered(
+                &selected_graph,
+                workload(&selected_graph, 1),
+                &cap,
+                &catalogue(SmVersion::SM86),
+                &BTreeMap::from([(id, declared)]),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    refused,
+                    Error::InvalidRequest {
+                        field: "linear_order",
+                        ..
+                    }
+                ),
+                "{id:?} {declared:?}: {refused}"
+            );
+        }
     }
 
     #[test]

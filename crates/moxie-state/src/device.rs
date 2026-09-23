@@ -44,6 +44,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use moxie_types::{
     BatchId, BranchId, DimError, Error, HostTier, PagePlacement, PagedKvWriter, Result,
@@ -158,6 +159,25 @@ pub struct DeviceKvSequence {
     state: SequenceState,
     /// Root and child branch decisions. Device bytes remain in executor runs.
     branches: BTreeMap<BranchId, DeviceBranchStorage>,
+    /// This sequence's identity and a count every mutation advances, so a
+    /// [`PreparedCommit`] can prove it was prepared against exactly this state.
+    id: u64,
+    generation: u64,
+}
+
+/// A root commit with every host-side refusal already taken: validation and
+/// each page view the commit will publish. It changes nothing until
+/// [`DeviceKvSequence::apply_commit`], which refuses it once the sequence it
+/// was prepared on has changed, or on any other sequence.
+#[derive(Debug)]
+#[must_use = "a prepared commit changes nothing until it is applied"]
+pub struct PreparedCommit {
+    sequence: u64,
+    generation: u64,
+    txn: StateTransactionId,
+    accept: u64,
+    watermark_after: u64,
+    updates: Vec<(usize, PageView)>,
 }
 
 /// A mutable view of one child branch's device-state decisions.
@@ -284,6 +304,11 @@ impl DeviceKvSequence {
             layout,
             state: SequenceState::new([StateKind::KvPages, StateKind::PositionCounter]),
             branches,
+            id: {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            },
+            generation: 0,
         })
     }
 
@@ -305,6 +330,8 @@ impl DeviceKvSequence {
     }
 
     fn branch_storage_mut(&mut self, branch: BranchId) -> Result<&mut DeviceBranchStorage> {
+        // Every mutation of branch bookkeeping comes through here.
+        self.generation += 1;
         self.branches.get_mut(&branch).ok_or_else(|| {
             invalid(
                 "branch",
@@ -928,6 +955,31 @@ impl DeviceKvSequence {
         self.commit_for(ROOT, txn, accept, writers)
     }
 
+    /// Take every refusal [`Self::commit`] could make before its first
+    /// effect, and preview the page views it will publish, without changing
+    /// anything. `commit` is exactly this followed by [`Self::apply_commit`].
+    pub fn prepare_commit(&self, txn: StateTransactionId, accept: u64) -> Result<PreparedCommit> {
+        self.prepare_for(ROOT, txn, accept)
+    }
+
+    /// Apply a commit prepared on this sequence, in this exact state. After
+    /// the staleness check, the only refusals left are a writer count that is
+    /// not one per layer, and a device publication failure, which poisons the
+    /// sequence as [`Self::commit`] describes.
+    pub fn apply_commit(
+        &mut self,
+        prepared: PreparedCommit,
+        writers: &mut [&mut dyn PagedKvWriter],
+    ) -> Result<()> {
+        if prepared.sequence != self.id || prepared.generation != self.generation {
+            return Err(invalid(
+                "prepared_commit",
+                "prepared on another sequence, or this one has changed since",
+            ));
+        }
+        self.apply_for(ROOT, prepared, writers)
+    }
+
     fn commit_for(
         &mut self,
         branch: BranchId,
@@ -935,6 +987,16 @@ impl DeviceKvSequence {
         accept: u64,
         writers: &mut [&mut dyn PagedKvWriter],
     ) -> Result<()> {
+        let prepared = self.prepare_for(branch, txn, accept)?;
+        self.apply_for(branch, prepared, writers)
+    }
+
+    fn prepare_for(
+        &self,
+        branch: BranchId,
+        txn: StateTransactionId,
+        accept: u64,
+    ) -> Result<PreparedCommit> {
         self.check_poisoned_on(branch)?;
         let open = self.open_transaction_for(branch, txn)?;
         if open.pending.is_some() {
@@ -950,12 +1012,11 @@ impl DeviceKvSequence {
                 "cannot accept more rows than this transaction published",
             ));
         }
-        if writers.len() != self.layout.len() {
-            return Err(invalid(
-                "writers",
-                "commit needs exactly one writer per layer, in layer order",
-            ));
-        }
+        self.state
+            .frontiers(branch)?
+            .accepted
+            .checked_add(accept)
+            .ok_or(Error::Dim(DimError::Overflow))?;
 
         // The watermark this commit is about to adopt. Publication and the
         // transition it enables are decided from the same number commit will
@@ -986,16 +1047,37 @@ impl DeviceKvSequence {
             }
             updates.push((layer, self.page_view_for(branch, layer, after_retained)?));
         }
+        Ok(PreparedCommit {
+            sequence: self.id,
+            generation: self.generation,
+            txn,
+            accept,
+            watermark_after,
+            updates,
+        })
+    }
 
-        let published_mapping = !updates.is_empty();
-        for (layer, view) in updates {
+    fn apply_for(
+        &mut self,
+        branch: BranchId,
+        prepared: PreparedCommit,
+        writers: &mut [&mut dyn PagedKvWriter],
+    ) -> Result<()> {
+        if writers.len() != self.layout.len() {
+            return Err(invalid(
+                "writers",
+                "commit needs exactly one writer per layer, in layer order",
+            ));
+        }
+        let published_mapping = !prepared.updates.is_empty();
+        for (layer, view) in prepared.updates {
             if let Err(error) = writers[layer].publish_view(layer, view) {
                 self.branch_storage_mut(branch)?.poisoned = true;
                 return Err(error);
             }
         }
 
-        if let Err(error) = self.state.commit_prefix(txn, accept) {
+        if let Err(error) = self.state.commit_prefix(prepared.txn, prepared.accept) {
             if published_mapping {
                 self.branch_storage_mut(branch)?.poisoned = true;
             }
@@ -1005,7 +1087,7 @@ impl DeviceKvSequence {
         storage.open = None;
         // The ring's reach only moves at a commit. Everything the retained base
         // is derived from is therefore stable for the whole of a transaction.
-        storage.committed_high_water = watermark_after;
+        storage.committed_high_water = prepared.watermark_after;
         Ok(())
     }
 
@@ -1107,6 +1189,7 @@ impl DeviceKvSequence {
     /// refuses, both that child bookkeeping and the logical `SequenceState`
     /// branch are discarded, so a partially copied child cannot escape.
     pub fn fork(&mut self, at: u64, writers: &mut [&mut dyn PagedKvWriter]) -> Result<BranchId> {
+        self.generation += 1;
         self.check_poisoned()?;
         if self.branches.len() > 1 {
             return Err(invalid(
@@ -1189,6 +1272,7 @@ impl DeviceKvSequence {
 
     /// Release the child decisions after its executor run has been closed.
     pub fn discard_branch(&mut self, branch: BranchId) -> Result<()> {
+        self.generation += 1;
         self.check_poisoned_on(branch)?;
         if branch == ROOT {
             return Err(invalid("branch", "the root branch cannot be discarded"));
@@ -1894,6 +1978,42 @@ mod tests {
         assert_eq!(sequence.retained(0).expect("a range"), before);
         // And the rows it published are not addressable any more.
         assert!(sequence.placement_of(0, 10).is_err());
+    }
+
+    #[test]
+    fn a_prepared_commit_changes_nothing_and_binds_to_its_exact_state() {
+        let mut sequence = DeviceKvSequence::new(windowed(8, 4, 4)).expect("a sequence");
+        fill(&mut sequence, 20);
+        let txn = sequence.begin().expect("a transaction");
+        let staged = sequence.stage(txn, 3).expect("stage");
+        sequence.publish(txn, staged).expect("publish");
+        let observe = |s: &DeviceKvSequence| {
+            (
+                s.published_rows().unwrap(),
+                s.committed_rows().unwrap(),
+                s.retained(0).unwrap(),
+                s.page_view(0).unwrap(),
+            )
+        };
+        let before = observe(&sequence);
+        let stale = sequence.prepare_commit(txn, 3).expect("prepare");
+        assert!(!stale.updates.is_empty(), "this commit moves the window");
+        assert_eq!(observe(&sequence), before, "preparing changes nothing");
+
+        let mut other = DeviceKvSequence::new(windowed(8, 4, 4)).expect("a sequence");
+        let other_txn = other.begin().expect("a transaction");
+        let foreign = other.prepare_commit(other_txn, 0).expect("prepare");
+        let mut writer = NullWriter;
+        assert!(sequence.apply_commit(foreign, &mut [&mut writer]).is_err());
+        // Any mutation after preparing makes the preparation stale.
+        let staged = sequence.stage(txn, 1).expect("stage");
+        sequence.publish(txn, staged).expect("publish");
+        assert!(sequence.apply_commit(stale, &mut [&mut writer]).is_err());
+        let fresh = sequence.prepare_commit(txn, 4).expect("prepare");
+        sequence
+            .apply_commit(fresh, &mut [&mut writer])
+            .expect("a fresh preparation applies");
+        assert_eq!(sequence.committed_rows().unwrap(), 24);
     }
 
     #[test]

@@ -100,6 +100,7 @@ impl Completion for SelectedCompletion<'_> {
 }
 
 impl<'ctx> SelectedCompletion<'ctx> {
+    #[cfg(feature = "paged-attention-binding")]
     pub(crate) fn new(event: Event<'ctx>, device_ordinal: u32, attribution: String) -> Self {
         Self {
             event,
@@ -307,6 +308,7 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         self.bound_weights.len()
     }
 
+    #[cfg(feature = "paged-attention-binding")]
     pub(crate) fn settle_sources(&mut self, sources: Vec<OwnedBinding>) -> Vec<OwnedBinding> {
         let mut returned_inputs = Vec::new();
         for binding in sources {
@@ -522,6 +524,7 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             .ok_or_else(|| invalid("range", "selected range is absent"))
     }
 
+    #[cfg(feature = "paged-attention-binding")]
     pub(crate) fn workspace_range(&self) -> Result<&DeviceRange<'ctx>> {
         self.ranges
             .get(&(StorageRegion::Workspace, 0))
@@ -547,6 +550,25 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             .remove(&key)
             .map(|range| (key, range))
             .ok_or_else(|| invalid("range", "selected range is absent"))
+    }
+
+    /// Return to this plan's arena a range it allocated that a nested owner
+    /// kept across an unobserved launch and has handed back after the
+    /// caller observed the launch's stream drained. A range from another
+    /// arena comes back refused.
+    #[cfg(feature = "paged-attention-binding")]
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn release_reclaimed(
+        &mut self,
+        range: DeviceRange<'ctx>,
+    ) -> std::result::Result<(), RangeReleaseRefused<'ctx>> {
+        match self.arena.as_mut() {
+            Some(arena) => arena.release(range),
+            None => Err(RangeReleaseRefused {
+                range,
+                error: invalid("arena", "selected plan arena is already closed"),
+            }),
+        }
     }
 
     #[cfg_attr(not(feature = "paged-attention-binding"), allow(dead_code))]
@@ -756,10 +778,25 @@ pub(crate) fn validate_bindings(
     graph: &Graph,
     bindings: &[OwnedBinding],
 ) -> Result<()> {
+    validate_bindings_except(plan, graph, bindings, &BTreeSet::new())
+}
+
+/// [`validate_bindings`], except that the `resident` inputs are already in
+/// the plan's own ranges and so have no host binding.
+pub(crate) fn validate_bindings_except(
+    plan: &SelectedReservedPlan<'_>,
+    graph: &Graph,
+    bindings: &[OwnedBinding],
+    resident: &BTreeSet<ValueId>,
+) -> Result<()> {
     let mut seen = BTreeSet::new();
     for binding in bindings {
         if !seen.insert(binding.value) {
             return Err(invalid("bindings", "duplicate value binding"));
+        }
+        if resident.contains(&binding.value) {
+            // Its upload would overwrite the resident value.
+            return Err(invalid("bindings", "a host binding names a resident input"));
         }
         let planned = plan
             .candidate
@@ -803,7 +840,7 @@ pub(crate) fn validate_bindings(
         }
     }
     for value in graph.inputs() {
-        if !seen.contains(value) {
+        if !seen.contains(value) && !resident.contains(value) {
             return Err(invalid(
                 "bindings",
                 format!("missing per-step input {}", value.0),

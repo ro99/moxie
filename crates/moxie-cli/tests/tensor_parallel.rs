@@ -52,105 +52,48 @@ fn stage_graph(
 ) -> StageGraph {
     let mut oracles = OracleRegistry::new();
     moxie_oracles::register(&mut oracles).unwrap();
-    let mut builder = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, graph.rows_symbol());
-    let mut map: BTreeMap<ValueId, ValueId> = BTreeMap::new();
+    let built = moxie_plan::build_stage_graph(
+        graph,
+        part,
+        nodes,
+        output,
+        moxie_oracles::HOST_REFERENCE,
+        &oracles,
+    )
+    .unwrap();
     let mut bindings = Bindings::new();
-    let mut reads = Vec::new();
-    let mut produces = Vec::new();
-    let mut linear_orders = BTreeMap::new();
-    let mut last = None;
-
-    for (local_index, node) in graph.nodes()[nodes].iter().enumerate() {
-        let mut inputs = Vec::new();
-        for &input in &node.inputs {
-            let id = *map.entry(input).or_insert_with(|| {
-                let name = graph.name(input).unwrap_or("value");
-                let slice = if graph.weights().contains(&input) {
-                    part.and_then(|p| p.slices.get(&node.inputs[0])).copied()
-                } else {
-                    part.and_then(|p| p.slices.get(&input)).copied()
-                };
-                let mut spec = graph.spec(input).unwrap().clone();
-                if graph.weights().contains(&input) {
-                    let mut value = weights.get(input).unwrap().clone();
-                    if let Some(rows) = part.and_then(|p| p.rows.get(&input)) {
-                        let whole = value.as_float().unwrap();
-                        let cols = whole.cols();
-                        let (start, end) = (rows.start as usize, rows.end as usize);
-                        spec.shape[0] = Dim::constant(rows.end - rows.start);
-                        let data = whole.data()[start * cols..end * cols].to_vec();
-                        value =
-                            Value::Float(HostTensor::bf16(data, vec![end - start, cols]).unwrap());
-                    } else if let Some(slice) = slice {
-                        // A row-parallel weight has one compact input run in
-                        // every physical row.
-                        let whole = value.as_float().unwrap();
-                        let rows = whole.rows();
-                        let cols = whole.cols();
-                        let start = slice.first as usize;
-                        let end = start + slice.width as usize;
-                        let mut data = Vec::with_capacity(rows * (end - start));
-                        for row in 0..rows {
-                            data.extend_from_slice(
-                                &whole.data()[row * cols + start..row * cols + end],
-                            );
-                        }
-                        spec.shape[1] = Dim::constant(slice.width);
-                        value =
-                            Value::Float(HostTensor::bf16(data, vec![rows, end - start]).unwrap());
-                    }
-                    let id = builder.weight(name, spec).unwrap();
-                    bindings.set(id, value);
-                    id
-                } else {
-                    if let Some(slice) = slice {
-                        spec.shape[1] = Dim::constant(slice.width);
-                    }
-                    let id = builder.input(name, spec);
-                    reads.push((input, id, slice));
-                    id
-                }
-            });
-            inputs.push(id);
+    for weight in &built.weights {
+        let mut value = weights.get(weight.original).unwrap().clone();
+        if let Some(rows) = &weight.rows {
+            let whole = value.as_float().unwrap();
+            let cols = whole.cols();
+            let (start, end) = (rows.start as usize, rows.end as usize);
+            let data = whole.data()[start * cols..end * cols].to_vec();
+            value = Value::Float(HostTensor::bf16(data, vec![end - start, cols]).unwrap());
+        } else if let Some(slice) = weight.slice {
+            let whole = value.as_float().unwrap();
+            let rows = whole.rows();
+            let cols = whole.cols();
+            let start = slice.first as usize;
+            let end = start + slice.width as usize;
+            let mut data = Vec::with_capacity(rows * (end - start));
+            for row in 0..rows {
+                data.extend_from_slice(&whole.data()[row * cols + start..row * cols + end]);
+            }
+            value = Value::Float(HostTensor::bf16(data, vec![rows, end - start]).unwrap());
         }
-        let params = match part.and_then(|p| p.params.get(&node.id)).cloned() {
-            Some(OpParams::Attention {
-                heads,
-                kv_heads,
-                head_dim,
-                scale,
-                visibility,
-                ..
-            }) => OpParams::Attention {
-                heads,
-                kv_heads,
-                head_dim,
-                scale,
-                visibility,
-                layer: 0,
-            },
-            Some(params) => params,
-            None => node.params.clone(),
-        };
-        let out = builder.node(params, &inputs).unwrap();
-        if let Some(order) = part.and_then(|p| p.linear_orders.get(&node.id)).copied() {
-            linear_orders.insert(NodeId(local_index as u32), order);
-        }
-        map.insert(node.output, out);
-        produces.push((node.output, out));
-        last = Some(out);
+        bindings.set(weight.local, value);
     }
     StageGraph {
-        graph: builder
-            .finish(
-                output.map_or(last.unwrap(), |original| map[&original]),
-                &oracles,
-            )
-            .unwrap(),
+        graph: built.graph,
         bindings,
-        reads,
-        produces,
-        linear_orders,
+        reads: built
+            .reads
+            .into_iter()
+            .map(|read| (read.original, read.local, read.slice))
+            .collect(),
+        produces: built.produces,
+        linear_orders: built.linear_orders,
     }
 }
 

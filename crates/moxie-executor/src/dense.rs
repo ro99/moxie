@@ -8,17 +8,21 @@
 #![cfg(all(feature = "driver", feature = "paged-attention-binding"))]
 
 use core::ffi::c_void;
+use std::collections::{BTreeMap, BTreeSet};
 
 use moxie_cuda::{Event, Module, ModuleImage, RankContext, ResolvedModule, Stream, TrustedImage};
-use moxie_graph::{Graph, OpParams, RopeLayout, ValueId, ValueRole};
+use moxie_graph::{Graph, NodeId, OpParams, RopeLayout, ValueId, ValueRole};
 use moxie_plan::{SelectedNode, Visibility};
 use moxie_state::DeviceKvSequence;
-use moxie_types::{DeviceCapability, Error, KernelCatalogue, Result, StateTransactionId};
+use moxie_types::{
+    DeviceCapability, Error, KernelCatalogue, Precision, Result, SemanticKernelOp,
+    StateTransactionId,
+};
 
 use crate::arena::{OperationLease, OperationRetireRefused};
 use crate::chain::{
     OwnedBinding, SelectedCompletion, SelectedReservedPlan, attribute_chain_error,
-    attribute_node_error, validate_bindings,
+    attribute_node_error, validate_bindings_except,
 };
 use crate::paged_attention::device::{PagedAttentionRun, PagedKvRows, append_paged_layer};
 use crate::{AttentionLayer, PageGeometry, PagedAttentionLaunch};
@@ -95,6 +99,23 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
         DensePlanRunRefused<'ctx>,
     > {
+        self.execute_dense_stage(step, &BTreeSet::new(), &BTreeMap::new())
+    }
+
+    /// [`Self::execute_dense`] for one tensor-parallel stage graph. `resident`
+    /// inputs were already copied into this plan's input ranges on `stream`,
+    /// so no host binding names them. `layers` restores each stage-local
+    /// attention node's layer in the rank's full KV authority.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn execute_dense_stage(
+        self,
+        step: DenseGraphStep<'_, 'ctx>,
+        resident: &BTreeSet<ValueId>,
+        layers: &BTreeMap<NodeId, u32>,
+    ) -> std::result::Result<
+        OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+        DensePlanRunRefused<'ctx>,
+    > {
         let DenseGraphStep {
             graph,
             capability,
@@ -124,7 +145,7 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                 invalid("execution", "admitted dense graph identity changed"),
             ));
         }
-        if let Err(error) = validate_bindings(&self, graph, &bindings) {
+        if let Err(error) = validate_bindings_except(&self, graph, &bindings, resident) {
             return Err(reject(self, bindings, error));
         }
         let symbols: Vec<String> = self
@@ -161,7 +182,9 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         };
         let mut lease = OperationLease::new("selected reduced dense graph", operation)
             .expect("static label is nonempty");
-        if let Err(error) = enqueue_dense(&mut lease, graph, state, transaction, runs, stream) {
+        if let Err(error) =
+            enqueue_dense(&mut lease, graph, state, transaction, runs, layers, stream)
+        {
             lease.mark_lost(
                 ctx.ordinal(),
                 format!("selected dense graph submission failed: {error}"),
@@ -241,19 +264,23 @@ impl<'ctx> OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>> {
             );
             return Err(OperationRetireRefused { lease: self, error });
         }
-        let (output_value, bytes, device_ordinal) = {
+        let (output_value, bytes, role, device_ordinal) = {
             let operation = self.resource();
             let plan = operation
                 .plan
                 .as_ref()
                 .expect("dense operation retains plan");
             let output = plan.candidate().workload().output;
-            let bytes = plan
+            let planned = plan
                 .candidate()
                 .value(output)
-                .expect("planned dense output")
-                .logical_bytes;
-            (output, bytes, operation.device_ordinal)
+                .expect("planned dense output");
+            (
+                output,
+                planned.logical_bytes,
+                planned.role,
+                operation.device_ordinal,
+            )
         };
         let mut output = vec![0u8; bytes as usize];
         let read = self
@@ -277,8 +304,11 @@ impl<'ctx> OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>> {
             self.persist_loss(error.clone());
             return Err(OperationRetireRefused { lease: self, error });
         }
-        if !output.len().is_multiple_of(4)
-            || output.chunks_exact(4).any(|word| {
+        // Only an FP32 output (logits, or a TP partial) is checked here; a
+        // stage's BF16 boundary is not four-byte words.
+        let f32_output = matches!(role, ValueRole::Activation(p) if p.get() == Precision::F32);
+        if f32_output
+            && output.chunks_exact(4).any(|word| {
                 f32::from_le_bytes([word[0], word[1], word[2], word[3]]).is_nan()
                     || !f32::from_le_bytes([word[0], word[1], word[2], word[3]]).is_finite()
             })
@@ -309,6 +339,7 @@ fn enqueue_dense<'ctx>(
     state: &mut DeviceKvSequence,
     transaction: StateTransactionId,
     runs: &mut [PagedAttentionRun<'ctx>],
+    layers: &BTreeMap<NodeId, u32>,
     stream: &Stream<'ctx>,
 ) -> Result<()> {
     let rows = lease
@@ -319,14 +350,12 @@ fn enqueue_dense<'ctx>(
         .candidate()
         .workload()
         .rows;
-    let positions_value = graph
-        .nodes()
-        .iter()
-        .find_map(|node| match node.params {
-            OpParams::Rope { .. } => node.inputs.get(1).copied(),
-            _ => None,
-        })
-        .ok_or_else(|| invalid("positions", "dense graph has no position input"))?;
+    let positions_value = graph.nodes().iter().find_map(|node| match node.params {
+        OpParams::Rope { .. } => node.inputs.get(1).copied(),
+        _ => None,
+    });
+    // A tensor-parallel stage without RoPE has no position input.
+    let positions = || positions_value.ok_or_else(|| invalid("positions", "no position input"));
     let mut attention_index = 0usize;
     let mut symbol_index = 0usize;
     upload_sources(lease, stream)?;
@@ -397,13 +426,35 @@ fn enqueue_dense<'ctx>(
                 let mut launch_rows = rows;
                 let mut launch_input = in_features;
                 let mut launch_output = out_features;
-                let mut params: [*mut c_void; 6] = [
+                // Only the split kernel reads the seventh argument, the
+                // declared block count.
+                let (symbol, arguments, mut blocks) = match selected.descriptor.operation {
+                    SemanticKernelOp::Linear => (moxie_kernels::BF16_LINEAR, 6, 1),
+                    SemanticKernelOp::LinearPartial => (moxie_kernels::DENSE_LINEAR_PARTIAL, 6, 1),
+                    SemanticKernelOp::LinearSplit => (
+                        moxie_kernels::DENSE_LINEAR_SPLIT,
+                        7,
+                        lease
+                            .resource()
+                            .plan
+                            .as_ref()
+                            .expect("dense operation retains plan")
+                            .candidate()
+                            .linear_orders()
+                            .get(&node.id)
+                            .map(|order| u64::from(order.blocks))
+                            .ok_or_else(|| invalid("linear", "split linear has no order"))?,
+                    ),
+                    _ => return Err(invalid("linear", "descriptor is not a linear kernel")),
+                };
+                let mut params: [*mut c_void; 7] = [
                     (&raw mut input_address).cast(),
                     (&raw mut weight_address).cast(),
                     (&raw mut output_address).cast(),
                     (&raw mut launch_rows).cast(),
                     (&raw mut launch_input).cast(),
                     (&raw mut launch_output).cast(),
+                    (&raw mut blocks).cast(),
                 ];
                 let elements = rows
                     .checked_mul(out_features)
@@ -414,9 +465,9 @@ fn enqueue_dense<'ctx>(
                     stream,
                     (elements.div_ceil(256) as u32, 1, 1),
                     (256, 1, 1),
-                    &mut params,
+                    &mut params[..arguments],
                     selected,
-                    moxie_kernels::BF16_LINEAR,
+                    symbol,
                 )?;
                 push_launch(lease, "linear");
             }
@@ -512,7 +563,7 @@ fn enqueue_dense<'ctx>(
                 base: rope_base,
                 layout: RopeLayout::HalfSplit,
             } => {
-                let positions = index_values(lease.resource(), positions_value, rows)?;
+                let positions = index_values(lease.resource(), positions()?, rows)?;
                 let angles = angle_table(positions, rotary_dim, frequency_dim, rope_base)?;
                 let mut input_address = address(lease.resource(), node.inputs[0])?;
                 let mut angle_address = workspace_address(lease.resource())?;
@@ -594,8 +645,8 @@ fn enqueue_dense<'ctx>(
                     head_dim,
                     scale,
                     visibility,
-                    layer,
-                    positions_value,
+                    layers.get(&node.id).copied().unwrap_or(layer),
+                    positions()?,
                     state,
                     transaction,
                     runs,
@@ -725,7 +776,9 @@ fn enqueue_dense<'ctx>(
             }
         }
     }
-    if attention_index != runs.len() {
+    // A stage graph's attention nodes each name their layer's run; only a
+    // whole graph must use every run.
+    if layers.is_empty() && attention_index != runs.len() {
         return Err(invalid(
             "runs",
             "dense graph attention nodes and admitted device runs differ",
@@ -778,7 +831,7 @@ fn execute_attention<'ctx>(
     }
     let first_position = positions.get(0);
     let run_count = runs.len();
-    let run = runs.get_mut(*attention_index).ok_or_else(|| {
+    let run = runs.get_mut(layer as usize).ok_or_else(|| {
         invalid(
             "runs",
             "dense graph has more attention nodes than admitted runs",

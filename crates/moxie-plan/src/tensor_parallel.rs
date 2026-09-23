@@ -10,8 +10,10 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use moxie_graph::{
-    Graph, LinearInputSlice, LinearReductionOrder, NodeId, Op, OpParams, PartitionRule, ValueId,
+    Graph, GraphBuilder, LinearInputSlice, LinearReductionOrder, NodeId, Op, OpParams, OracleId,
+    OracleRegistry, PartitionRule, ValueId,
 };
+use moxie_types::{Dim, Error};
 
 /// Consecutive nodes that run the same way.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +47,172 @@ pub struct RankPart {
     pub slices: BTreeMap<ValueId, LinearInputSlice>,
     /// The local view of each input-axis-split linear's declared order.
     pub linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
+}
+
+/// One boundary value read by a production stage graph. `original` is the
+/// value in the full graph; `local` is the value the rebuilt graph binds.
+/// `slice` is present only for a compact row-parallel activation view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageRead {
+    pub original: ValueId,
+    pub local: ValueId,
+    pub slice: Option<LinearInputSlice>,
+}
+
+/// One weight binding in a stage graph, with the compact view applied by the
+/// rank part. The composition root uses this to materialize the corresponding
+/// host bytes without duplicating the lowering decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageWeight {
+    pub original: ValueId,
+    pub local: ValueId,
+    pub rows: Option<Range<u64>>,
+    pub slice: Option<LinearInputSlice>,
+}
+
+/// A standalone graph for one lowered stage, plus the small remapping table a
+/// device consumer needs to bind its original inputs and publish its outputs.
+/// Construction stays in `moxie-plan`; a composition root supplies the oracle
+/// registry and owns the concrete host/device bindings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StageGraph {
+    pub graph: Graph,
+    pub reads: Vec<StageRead>,
+    pub weights: Vec<StageWeight>,
+    pub produces: Vec<(ValueId, ValueId)>,
+    pub linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
+    /// Stage-local attention nodes use layer zero so the standalone graph's
+    /// state schema remains valid; the device consumer restores this original
+    /// layer when it appends to the rank's full KV authority.
+    pub state_layers: BTreeMap<NodeId, u32>,
+}
+
+/// Rebuild a consecutive stage as a standalone validated graph.
+pub fn build_stage_graph(
+    graph: &Graph,
+    part: Option<&RankPart>,
+    nodes: Range<usize>,
+    output: Option<ValueId>,
+    oracle: OracleId,
+    oracles: &OracleRegistry,
+) -> moxie_types::Result<StageGraph> {
+    if nodes.start >= nodes.end || nodes.end > graph.nodes().len() {
+        return Err(Error::InvalidRequest {
+            field: "stage",
+            detail: "stage node range is empty or outside the graph".into(),
+        });
+    }
+    let mut builder = GraphBuilder::new(oracle, graph.rows_symbol());
+    let mut map = BTreeMap::new();
+    let mut reads = Vec::new();
+    let mut weights = Vec::new();
+    let mut produces = Vec::new();
+    let mut linear_orders = BTreeMap::new();
+    let mut state_layers = BTreeMap::new();
+    let mut last = None;
+
+    for (local_index, node) in graph.nodes()[nodes.clone()].iter().enumerate() {
+        let mut inputs = Vec::with_capacity(node.inputs.len());
+        for &input in &node.inputs {
+            let local = if let Some(&local) = map.get(&input) {
+                local
+            } else {
+                let name = graph.name(input).unwrap_or("value");
+                let slice = part.and_then(|p| {
+                    if graph.weights().contains(&input) {
+                        p.slices.get(&node.inputs[0]).copied()
+                    } else {
+                        p.slices.get(&input).copied()
+                    }
+                });
+                let mut spec = graph
+                    .spec(input)
+                    .cloned()
+                    .ok_or_else(|| invalid("stage", "stage input has no tensor spec"))?;
+                if let Some(rows) = part.and_then(|p| p.rows.get(&input)) {
+                    if spec.shape.len() != 2 {
+                        return Err(invalid("stage", "row-sharded weight is not rank two"));
+                    }
+                    spec.shape[0] = Dim::constant(rows.end - rows.start);
+                } else if let Some(slice) = slice {
+                    if spec.shape.len() != 2 {
+                        return Err(invalid("stage", "input-sharded tensor is not rank two"));
+                    }
+                    spec.shape[1] = Dim::constant(slice.width);
+                }
+                let local = if graph.weights().contains(&input) {
+                    let local = builder.weight(name, spec)?;
+                    weights.push(StageWeight {
+                        original: input,
+                        local,
+                        rows: part.and_then(|p| p.rows.get(&input)).cloned(),
+                        slice,
+                    });
+                    local
+                } else {
+                    let local = builder.input(name, spec);
+                    reads.push(StageRead {
+                        original: input,
+                        local,
+                        slice,
+                    });
+                    local
+                };
+                map.insert(input, local);
+                local
+            };
+            inputs.push(local);
+        }
+        let mut params = part
+            .and_then(|p| p.params.get(&node.id))
+            .cloned()
+            .unwrap_or_else(|| node.params.clone());
+        if let OpParams::Attention { layer, .. } = &params {
+            state_layers.insert(NodeId(local_index as u32), *layer);
+            if let OpParams::Attention {
+                heads,
+                kv_heads,
+                head_dim,
+                scale,
+                visibility,
+                ..
+            } = params
+            {
+                params = OpParams::Attention {
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    scale,
+                    visibility,
+                    layer: 0,
+                };
+            }
+        }
+        let local_output = builder.node(params, &inputs)?;
+        if let Some(order) = part.and_then(|p| p.linear_orders.get(&node.id)).copied() {
+            linear_orders.insert(NodeId(local_index as u32), order);
+        }
+        map.insert(node.output, local_output);
+        produces.push((node.output, local_output));
+        last = Some(local_output);
+    }
+    let selected_output = output
+        .map(|original| {
+            map.get(&original)
+                .copied()
+                .ok_or_else(|| invalid("stage", "stage output is not produced in the stage"))
+        })
+        .transpose()?
+        .or(last)
+        .ok_or_else(|| invalid("stage", "stage did not produce an output"))?;
+    Ok(StageGraph {
+        graph: builder.finish(selected_output, oracles)?,
+        reads,
+        weights,
+        produces,
+        linear_orders,
+        state_layers,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -742,6 +910,13 @@ fn linear_shape(node: &moxie_graph::Node) -> (u64, u64) {
             ..
         } => (in_features, out_features),
         _ => unreachable!("the MLP matcher only stores linear nodes"),
+    }
+}
+
+fn invalid(field: &'static str, detail: impl Into<String>) -> Error {
+    Error::InvalidRequest {
+        field,
+        detail: detail.into(),
     }
 }
 

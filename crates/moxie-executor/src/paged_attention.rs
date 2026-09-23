@@ -1199,8 +1199,12 @@ pub mod device {
         Rows { keys: Vec<u8>, values: Vec<u8> },
         /// A page mapping, still the `u32` entries it arrived as.
         PageTable(Vec<u32>),
-        /// One launch's query rows, or the encoded table bytes in flight.
+        /// One launch's query rows.
         Query(Vec<u8>),
+        /// The run's own admitted page-table upload buffer, held across its
+        /// copy. Never handed to a caller: it returns to the run once the copy
+        /// is observed complete.
+        PageTableUpload(Vec<u8>),
         /// A host-backed stream's query, current host K/V page and page-table entry.
         Stream {
             query: Vec<u8>,
@@ -1379,6 +1383,47 @@ pub mod device {
     }
 
     impl<'ctx> PagedAttentionRun<'ctx> {
+        /// Neither quarantined nor holding a refused source or range: no
+        /// operation of this run is outstanding.
+        #[cfg(feature = "paged-attention-binding")]
+        pub(crate) fn is_idle(&self) -> bool {
+            !self.quarantined && self.held.is_none() && self.held_ranges.is_none()
+        }
+
+        /// Clear a quarantine this caller caused and has since observed
+        /// drained. Only the tensor-parallel step calls this, from its settle
+        /// after `RankGroup::drain`, and only for runs it accepted idle
+        /// ([`Self::is_idle`]) and then used on the drained rank stream alone.
+        /// So everything held here was created by that step's own work on
+        /// that stream. Every other owner keeps the quarantine, and `close`'s
+        /// refusal of it (task 0038).
+        ///
+        /// The held source is resolved by what it is. The run's own admitted
+        /// page-table upload buffer is restored, since publishing reuses it.
+        /// An append's rows are that step's own copies and are dropped. A host
+        /// query or stream source no tensor-parallel step creates, so it
+        /// stays held, the run stays quarantined and the refusal says so. The
+        /// held query and output ranges go back to the caller, which owns
+        /// them.
+        #[cfg(feature = "paged-attention-binding")]
+        pub(crate) fn reclaim_drained(
+            &mut self,
+        ) -> Result<Option<(DeviceRange<'ctx>, DeviceRange<'ctx>)>> {
+            match self.held.take() {
+                None | Some(RefusedSource::Rows { .. }) => {}
+                Some(RefusedSource::PageTableUpload(bytes)) => self.page_table_upload = bytes,
+                Some(other) => {
+                    self.held = Some(other);
+                    return Err(invalid(
+                        "run",
+                        "this run holds a source a tensor-parallel step does not create",
+                    ));
+                }
+            }
+            self.quarantined = false;
+            Ok(self.held_ranges.take())
+        }
+
         /// Charge the pages, the table and one launch's query and output;
         /// materialize them; resolve the symbol.
         #[allow(clippy::result_large_err)]
@@ -2074,8 +2119,8 @@ pub mod device {
             // still have submitted work the driver has not unwound, so the
             // encoded bytes must already be something other than this local
             // variable before that call runs, not after.
-            self.held = Some(RefusedSource::Query(bytes));
-            let Some(RefusedSource::Query(bytes)) = self.held.as_ref() else {
+            self.held = Some(RefusedSource::PageTableUpload(bytes));
+            let Some(RefusedSource::PageTableUpload(bytes)) = self.held.as_ref() else {
                 unreachable!("just assigned")
             };
             // SAFETY: the source is owned by `self.held` until completion is
@@ -2094,7 +2139,7 @@ pub mod device {
                     source: None,
                 });
             }
-            let Some(RefusedSource::Query(bytes)) = self.held.take() else {
+            let Some(RefusedSource::PageTableUpload(bytes)) = self.held.take() else {
                 unreachable!("page-table upload source is still held after settlement")
             };
             self.page_table_upload = bytes;
@@ -4074,7 +4119,9 @@ pub mod device {
                         core::mem::forget(values);
                     }
                     RefusedSource::PageTable(table) => core::mem::forget(table),
-                    RefusedSource::Query(bytes) => core::mem::forget(bytes),
+                    RefusedSource::Query(bytes) | RefusedSource::PageTableUpload(bytes) => {
+                        core::mem::forget(bytes)
+                    }
                     RefusedSource::Stream {
                         query,
                         keys,
@@ -4314,6 +4361,71 @@ pub mod device {
     ) -> Result<()> {
         let mut writer = PagedKvWriterAdapter::new(0, run, stream, Vec::new(), Vec::new());
         branch.commit(txn, accept, &mut [&mut writer])
+    }
+
+    /// Why [`commit_paged_pair`] did not commit.
+    #[cfg(feature = "paged-attention-binding")]
+    #[derive(Debug)]
+    pub(crate) enum PairCommitRefused {
+        /// A rank refused while preparing. Neither rank changed.
+        Prepare(Error),
+        /// A rank's device publication failed after both prepared. That rank
+        /// is poisoned and the other may have committed: terminal.
+        Apply(Error),
+    }
+
+    /// Commit two ranks' transactions as one step, in two phases. Every
+    /// fallible host step of both ranks runs first, with no visible change:
+    /// each sequence's `prepare_commit`, the writer adapters and the writer
+    /// slices. Only then does each rank apply, where the one refusal left is a
+    /// device publication failure.
+    #[cfg(feature = "paged-attention-binding")]
+    pub(crate) fn commit_paged_pair<'ctx>(
+        states: [&mut DeviceKvSequence; 2],
+        transactions: [moxie_types::StateTransactionId; 2],
+        runs: [&mut [PagedAttentionRun<'ctx>]; 2],
+        streams: [&Stream<'ctx>; 2],
+    ) -> std::result::Result<(), PairCommitRefused> {
+        let prepare = PairCommitRefused::Prepare;
+        let mut prepared = Vec::new();
+        let mut adapters = [Vec::new(), Vec::new()];
+        for (rank, (state, runs)) in states.iter().zip(runs).enumerate() {
+            if runs.len() != state.layer_count().map_err(prepare)? {
+                return Err(prepare(invalid(
+                    "runs",
+                    "commit needs exactly one device run per state layer",
+                )));
+            }
+            prepared.push(
+                state
+                    .prepare_commit(transactions[rank], 0)
+                    .map_err(prepare)?,
+            );
+            adapters[rank] = moxie_memory::fallible::with_capacity(runs.len()).map_err(prepare)?;
+            for (layer, run) in runs.iter_mut().enumerate() {
+                adapters[rank].push(PagedKvWriterAdapter::new(
+                    layer,
+                    run,
+                    streams[rank],
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+        }
+        let mut writers: [Vec<&mut dyn PagedKvWriter>; 2] = [
+            moxie_memory::fallible::with_capacity(adapters[0].len()).map_err(prepare)?,
+            moxie_memory::fallible::with_capacity(adapters[1].len()).map_err(prepare)?,
+        ];
+        for (writers, adapters) in writers.iter_mut().zip(adapters.iter_mut()) {
+            // Within the reserved capacity: no allocation.
+            writers.extend(adapters.iter_mut().map(|a| a as &mut dyn PagedKvWriter));
+        }
+        for ((state, prepared), writers) in states.into_iter().zip(prepared).zip(&mut writers) {
+            state
+                .apply_commit(prepared, writers)
+                .map_err(PairCommitRefused::Apply)?;
+        }
+        Ok(())
     }
 
     /// Commit a completed batch and publish page-table transitions through the
