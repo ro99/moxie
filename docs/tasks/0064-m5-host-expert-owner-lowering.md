@@ -143,7 +143,9 @@ delta breaks. `luna2` was closed; `luna` continues as the only builder.
 5. **`crates/moxie-cli/tests/tensor_parallel.rs`:** the existing harness
    gains the routed case. Add no new test file.
    - Config: the Shape C routed geometry through `build_with_config` with
-     **8 experts, top_k 2**, everything else as Shape C.
+     **8 experts, top_k 2, vocab 12**, everything else as Shape C.
+     (Amended 2026-09-23: Shape C's vocab of 11 does not divide by R, and
+     task 0058 correctly refuses that; the dense TP fixture already uses 12.)
    - R ∈ {2, 4}; a multi-row prefill plus decode. The logits must be
      bit-identical to the reference running declared `groups = R`.
    - The fixture must include, and the test must assert that the route
