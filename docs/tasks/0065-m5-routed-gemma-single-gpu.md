@@ -1,7 +1,13 @@
 # Task 0065 — the routed Gemma 4 graph runs on one GPU
 
-Status: **open** (coordinator, 2026-09-23, under the owner's auto-mode
-delegation). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-23, under the owner's auto-mode
+delegation). Built by Codex `luna` from the coordinator's design, with three
+amendments (a latent task 0059 softcap defect, and two fixture blind spots)
+and one review round. Sol returned REVISE in round 1 (an out-of-bounds
+expert read on a malformed routed graph, and the GPU-gate coverage claim),
+then ACCEPT in round 2. The coordinator re-ran `fmt`, workspace and driver
+`clippy`, `arch-check`, `spec-check`, `dense_gemma_device` (3/3, all three
+GPUs) and the Combine kernel test (1/1).
 
 **GPUs released (owner, 2026-09-23).** The reservation below is lifted. The
 builder now runs the GPU gates too: the end-to-end test and the mutations.
@@ -9,6 +15,46 @@ Only one agent uses the GPUs at a time; during this task that agent is the
 builder. Always set `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
 
 ~~GPU reservation (owner, 2026-09-23): host and compile-only gates only.~~
+
+**Amendment, 2026-09-23 (coordinator), after the builder's STOP report.**
+- *Observation:* Shape C prefill missed the gate at logit 40 (2 BF16 ULP) on
+  the 5060 Ti.
+- *Diagnosis (coordinator):* the miss already occurs with one layer, and
+  2–5 layers pass. Temporary per-node dumps, since reverted, show every
+  node through the final RMSNorm **bit-identical**, including Route,
+  ExpertMlp and Combine. Only the final `VocabProjection` differs. An FP64
+  host softmax `exp` changed nothing.
+- *Cause:* task 0059's `moxie_dense_vocab_projection_v1` softcap departs
+  from the oracle `moxie-oracles/src/activation.rs::softcap` (line 162) in
+  two places. It does not round `bf16(x) / cap` to BF16, and it uses FP32
+  `tanhf` where the oracle uses FP64 `tanh`. Shapes A and B never landed on
+  a boundary; Shape C does. This is a demonstrated defect in accepted task
+  0059's scope, so it is fixed here.
+- *Replacement:* change 10 below.
+- *Authority:* coordinator.
+
+**Amendment 2, 2026-09-23 (coordinator), after the second STOP.**
+- *Observation:* two mutations survived: Combine in selection order, and
+  ties broken to the higher id.
+- *Cause:* the Shape C fixture cannot see either rule. With `top_k = 2`,
+  `0 + a + b` equals `0 + b + a` bit for bit (the first addition is exact),
+  and its router never ties.
+- *Replacement:* change 11. It adds two fixture variants to the existing
+  end-to-end loop and no new test. Neither mutation is waived.
+- *Authority:* coordinator.
+
+**Amendment 3, 2026-09-23 (coordinator), after the third STOP.**
+- *Observation:* the Combine selection-order mutation still passes, even
+  with `gemma-c-top3`.
+- *Cause:* reordering FP32 addends changes only the last FP32 bits. The
+  BF16 output rounding erases that unless the terms cancel, and no
+  end-to-end fixture produces that cancellation. Task 0059's rule applies:
+  "one test per new kernel against its oracle, unless the end-to-end test
+  already fails on every plausible mutation of that kernel". Combine now
+  gets its one kernel test.
+- *Replacement:* change 12. `gemma-c-top3` stays: it runs the three-term
+  path end to end.
+- *Authority:* coordinator.
 
 ## Identity and authority
 
@@ -258,7 +304,7 @@ builder. Always set `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
    `[Shape::A, Shape::B, Shape::C]`, and update the test's doc comment or
    message to say "dense and routed". Nothing else in that test changes;
    it already builds the fixture through `moxie_cli::gemma::build(shape)`.
-   This is the end-to-end GPU gate (**pending**).
+   This is the end-to-end GPU gate (passed on all three GPUs; see Result).
 
 8. **Stale expectations:** if a host test asserts the dense catalogue's
    descriptor count, or that `Route`/`ExpertMlp`/`Combine` are refused by
@@ -283,6 +329,100 @@ builder. Always set `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
    -- --exact`. **Never run that test binary unfiltered while the GPUs are
    reserved.**
 
+10. **`crates/moxie-kernels/cuda/dense_ops.cu`,
+    `moxie_dense_vocab_projection_v1`:** make the softcap follow the oracle
+    exactly. Replace the three softcap lines with:
+    `const float scaled = moxie_dense_bf16_v1(__fdiv_rn(moxie_dense_bf16_v1(sum), softcap));`
+    `const float bent = moxie_dense_bf16_v1(static_cast<float>(tanh(static_cast<double>(scaled))));`
+    `sum = moxie_dense_bf16_v1(__fmul_rn(bent, softcap));`
+    Add one mutation to the GPU batch: revert `scaled` to the unrounded
+    quotient. Shape C must then fail.
+
+11. **`crates/moxie-executor/tests/dense_gemma_device.rs`, the end-to-end
+    test only:** iterate over five labelled `(config, fixture)` cases
+    instead of three shapes. The loop body is unchanged apart from reading
+    `config` and `fixture` from the case.
+    - `gemma-a`, `gemma-b`, `gemma-c-moe`: as today.
+    - `gemma-c-top3`: `Shape::C.config()` with `moe.top_k = 3`, built with
+      `moxie_cli::gemma::build_with_config`. Three terms make the combine
+      order observable.
+    - `gemma-c-tied`: the same `top_k = 3` config. After building, set every
+      weight whose name starts with `router_proj.` to all zeros (BF16, same
+      shape), as `routed_expert_owners_are_bit_identical_at_prefill_and_decode`
+      in `crates/moxie-cli/tests/tensor_parallel.rs` does. Every probability
+      then ties, and the lower-id rule must select experts 0, 1 and 2.
+
+    Re-run the two surviving mutations. Each must now fail on at least one
+    case. If one still passes, STOP and report which case you expected to
+    catch it.
+
+12. **One Combine kernel test, in the `#[cfg(test)] mod tests` of
+    `crates/moxie-executor/src/dense.rs`:**
+    `combine_kernel_sums_in_ascending_expert_order`. For the mechanics
+    (context, stream, arena allocation, host upload, launch, readback),
+    copy the device test pattern in `crates/moxie-executor/src/grouped_device.rs`
+    `mod tests`. Load the module from `moxie_kernels::DENSE_GRAPH_FATBIN`
+    and resolve `DENSE_COMBINE`, as `dense_tp_workers.rs` (around line
+    1870) does for `TP_REDUCE_F32`. Use ordinal 0.
+
+    Inputs: `rows = 1`, `top_k = 3`, `hidden = 1`, `output_scale = 1.0`.
+    - `ids = [2, 0, 1]`: the selection order, deliberately not ascending.
+    - `coefficients = [1.0, 1.0, 1.0]`.
+    - `slots` (BF16), one per slot: slot 0 (expert 2) = `-1.0`, slot 1
+      (expert 0) = `1.0`, slot 2 (expert 1) = `2^-30`.
+
+    Hand-derived FP32 results:
+    - Ascending expert id (0, 1, 2): `1 + 2^-30 = 1` (absorbed), then
+      `1 + (-1) = 0`. The output is `0.0`.
+    - Selection order (slots 0, 1, 2): `-1 + 1 = 0`, then `0 + 2^-30`,
+      giving BF16 `2^-30`.
+
+    Assert that the output's BF16 bits equal `0.0`'s. Put the two
+    derivations in one comment. Then re-run the selection-order mutation:
+    this test must fail.
+
+**Review round 1 fixes (sol REVISE, 2026-09-23; coordinator's design):**
+
+13. **`crates/moxie-plan/src/selected.rs`: routed edges are checked
+    before any kernel is selected.** Add `fn check_routed_edges(graph:
+    &Graph) -> Result<(), Error>` and call it as the first statement of
+    `lower_dense_mode`, before the complete-graph check. For each node:
+    - `ExpertMlp { experts, top_k, .. }`: the producer of `inputs[1]` must
+      be a `Route` with the same `experts` and `top_k`.
+    - `Combine { top_k, .. }`: the producer of `inputs[0]` must be a
+      `Route` with the same `top_k`. The producer of `inputs[1]` must be an
+      `ExpertMlp` whose own `inputs[1]` is this `Combine`'s `inputs[0]`
+      (the same route).
+    - Otherwise return `Error::UnsupportedKernel { operation: "route", detail
+      }`, where the detail names the mismatch.
+
+    Find a producer as the interpreter does, with
+    `graph.nodes().iter().find(|n| n.output == value)`. Add **one** host
+    test in `selected.rs` `mod tests`,
+    `routed_edges_must_agree_on_the_route`. Build, with `GraphBuilder`, an
+    input, a `Route` with `experts = 5`, and an `ExpertMlp` with
+    `experts = 4` (four-expert weights) fed by that route. Assert that
+    `lower_selected` refuses it with that error. This is sol's
+    malformed-graph case.
+14. **`crates/moxie-executor/src/dense.rs`,
+    `combine_kernel_sums_in_ascending_expert_order`:** delete the
+    no-device success path. With no CUDA device, the test must fail (an
+    `expect` on acquiring ordinal 0), not pass.
+15. **`crates/moxie-executor/tests/dense_gemma_device.rs`:** replace the
+    three near-identical descriptor-count filters in
+    `routed_gemma_lowers_through_the_dense_package` with one loop over
+    `[Route, ExpertMlp(GeluTanh), Combine]`. Keep the same assertions.
+16. **GPU gate reporting, no xtask change.** `xtask test-gpu` runs a fixed
+    case list. It never ran `dense_gemma_device`, task 0059 included. This
+    task's GPU gate is therefore these two commands, run with
+    `CUDA_DEVICE_ORDER=PCI_BUS_ID`, and the Result must say so explicitly:
+    `cargo test -p moxie-executor --features driver,paged-attention-binding
+    --test dense_gemma_device` and `cargo test -p moxie-executor --features
+    driver,paged-attention-binding --lib
+    combine_kernel_sums_in_ascending_expert_order`. `xtask test-gpu` stays
+    a separate no-regression check. Correct the Result where it implies
+    that 63/63 covers the new tests.
+
 ## Allowed files
 
 - `crates/moxie-types/src/capability.rs`
@@ -293,6 +433,8 @@ builder. Always set `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
 - `crates/moxie-plan/src/selected.rs`
 - `crates/moxie-executor/src/dense.rs`
 - `crates/moxie-executor/tests/dense_gemma_device.rs`
+- `crates/moxie-kernels/cuda/dense_ops.cu` (change 10 only)
+- `crates/moxie-executor/src/dense.rs` `mod tests` (change 12)
 - Other files only for a compiler-reported exhaustive match (change 1) or
   a stale expectation (change 8). Name each one in the Result.
 
@@ -340,34 +482,62 @@ builder. Always set `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
   route-value range and admitted expert workspace. Change 7 adds Shape C to
   the existing prefill/decode comparison. Change 9 adds the exact host-only
   lowering assertion for five rows, one descriptor of each routed operation
-  per routed layer, and `rows * top_k * 8` route bytes.
+  per routed layer, and `rows * top_k * 8` route bytes. Change 10 makes the
+  dense vocabulary softcap match the oracle's BF16 boundaries and FP64 tanh.
+  Change 11 extends the same end-to-end test to five labelled cases, including
+  top-3 and tied-router Shape C fixtures; it adds no test. Change 12 adds the
+  cancellation-sensitive Combine kernel test for ascending expert order.
+  Change 13 checks Route/ExpertMlp/Combine edges before any kernel selection.
+  Change 14 makes the Combine kernel test fail if ordinal 0 is unavailable.
+  Change 15 uses one loop for the three routed descriptor assertions.
 - Change 8: no stale dense-catalogue count or refusal expectation was found.
   `selected_chain_refuses_routed_operations` remains valid: it exercises the
   separate reduced BF16 chain catalogue, not the dense graph package.
-- Host gates passed: `cargo fmt --all -- --check`; workspace clippy with
-  `-D warnings`; driver/paged-attention clippy with `-D warnings` (nvcc image
-  compiled; no device opened); `cargo test --workspace --locked`; `cargo xtask
-  arch-check` (79 rejected fixtures, 21 accepted, 13 rules); `cargo xtask
-  spec-check` (10 specification documents unchanged); and the required exact
-  filtered test (`1 passed`, `2 filtered out`).
-- GPU gate pending: the Shape A/B/C prefill/decode test on both 3090s and the
-  5060 Ti, the four runtime mutations below, and `cargo xtask-cuda test-gpu`.
-  They were not run because the owner's GPU reservation forbids device work.
+- Host gates passed after changes 13–15: `cargo fmt --all -- --check`;
+  workspace clippy and executor driver/paged-attention clippy with
+  `-D warnings` (the latter compiled the nvcc image);
+  `cargo test --workspace --locked`; `cargo xtask arch-check` (79 rejected
+  fixtures, 21 accepted, 13 rules); `cargo xtask spec-check` (10 documents
+  unchanged); and change 9's exact filtered test (`1 passed`, 2 filtered out).
+- This task's GPU gates are the following two commands, both run with
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID`:
+  `cargo test -p moxie-executor --features driver,paged-attention-binding
+  --test dense_gemma_device` passed all three test functions; its five-case
+  prefill/decode loop passed on both 3090s and the 5060 Ti.
+  `cargo test -p moxie-executor --features driver,paged-attention-binding
+  --lib combine_kernel_sums_in_ascending_expert_order` passed (`1 passed`)
+  on ordinal 0. The routed-edge host test also passed separately:
+  `cargo test -p moxie-plan routed_edges_must_agree_on_the_route` (`1 passed`).
+  The two top-3 fixtures share one config; the first three cases are generated
+  from their `Shape` values.
+- All five mutation patches below were applied individually, run and restored.
+  Per-expert scaling failed at Shape C logit 0 (52 BF16 ULP); slot-indexed
+  ExpertMlp failed at Shape C logit 1 (9 BF16 ULP); removing the softcap
+  quotient's BF16 rounding failed at Shape C logit 40 (2 BF16 ULP). After
+  change 12, selection-order Combine failed the kernel test: mutated output
+  BF16 bits were 12416 (`2^-30`) rather than zero. The higher-ID route tie
+  mutation failed specifically on `gemma-c-tied` prefill (5 BF16 ULP).
+- Before the review-round-1 fixes, `CUDA_DEVICE_ORDER=PCI_BUS_ID cargo
+  xtask-cuda test-gpu` passed 63/63 cases, 0 failed and 0 skipped/unmeasured;
+  SM86 and SM120 were qualified across the three GPUs. Its fixed case list
+  does not run either task-specific GPU command above; it is a separate
+  no-regression check, not coverage of these new tests.
 
 ### Mutation patches for the GPU batch
 
-These are unapplied, one-line substitutions; apply and restore each in the
-GPU window.
+These are the exact one-line substitutions used. Each was restored after its
+run; mutation outcomes are recorded above.
 
-1. Combine by selection slot: `const unsigned int expert = row_ids[slot];` → `const unsigned int expert = static_cast<unsigned int>(slot);`
+1. Combine by selection slot (also the change 12 kernel-test mutation): `const unsigned int expert = row_ids[slot];` → `const unsigned int expert = static_cast<unsigned int>(slot);`
 2. Break equal route probabilities toward the higher id: `|| (probability == best_probability && expert < best_expert)) {` → `|| (probability == best_probability && expert > best_expert)) {`
 3. Drop per-expert scaling: `__fdiv_rn(probability, mass), __bfloat162float(per_expert[expert]));` → `__fdiv_rn(probability, mass), 1.0F);`
 4. Use slot `j` for the gate/up expert weights: `gate_up + static_cast<unsigned long long>(ids[slot]) * 2 * intermediate * hidden;` → `gate_up + static_cast<unsigned long long>(slot % top_k) * 2 * intermediate * hidden;`
+5. Remove the quotient's BF16 rounding: `moxie_dense_bf16_v1(__fdiv_rn(moxie_dense_bf16_v1(sum), softcap))` → `__fdiv_rn(moxie_dense_bf16_v1(sum), softcap)`.
 
 ### Review map
 
-The code changes are confined to the allowed implementation and test files;
-this task record contains the Result. The carried `.gitignore`,
+The implementation changes are confined to the allowed implementation and
+test files; this task record contains the Result. The carried `.gitignore`,
 `specification-version.md`, and ADRs 0034/0035 remain untouched.
 
 | File | Change |
@@ -375,12 +545,14 @@ this task record contains the Result. The carried `.gitignore`,
 | `crates/moxie-types/src/capability.rs` | +6 / −0; add Route and Combine semantic operation identities. |
 | `crates/moxie-kernels/cuda/routed_ops.cu` | +214 / −0; route, expert project/down, and combine kernels. |
 | `crates/moxie-kernels/cuda/dense_graph.cu` | +2 / −0; include expert helpers and routed kernels. |
+| `crates/moxie-kernels/cuda/dense_ops.cu` | +2 / −2; round softcap input and use FP64 `tanh` per the oracle. |
 | `crates/moxie-kernels/build.rs` | +1 / −0; track the new source. |
 | `crates/moxie-kernels/src/lib.rs` | +59 / −6; routed symbols and per-SM descriptors. |
-| `crates/moxie-plan/src/selected.rs` | +79 / −3; supported lowering, route operands/shapes, and checked workspace charge. |
-| `crates/moxie-executor/src/dense.rs` | +194 / −0; bind routed operations and document route-range layout. |
-| `crates/moxie-executor/tests/dense_gemma_device.rs` | +91 / −6; extend the pending device gate and add the host lowering test. |
-| `docs/tasks/0065-m5-routed-gemma-single-gpu.md` | +50 / −1; record results and unapplied GPU mutation patches. |
+| `crates/moxie-plan/src/selected.rs` | +192 / −12; routed lowering, preflight edge validation, and the malformed-edge host test. |
+| `crates/moxie-executor/src/dense.rs` | +304 / −1; bind routed operations, document route-range layout, and add the Combine cancellation test. |
+| `crates/moxie-executor/tests/dense_gemma_device.rs` | +137 / −21; add the host lowering assertion and run the same device gate over five labelled fixtures. |
+| `docs/tasks/0065-m5-routed-gemma-single-gpu.md` | +189 / −23; record changes, GPU results and exact mutation patches. |
 
-No model code, lease/ledger semantics, or files outside this set were changed;
-no commit was created.
+No model code or lease/ledger semantics changed. The carried `.gitignore`,
+`specification-version.md`, and ADRs 0034/0035 were preserved without edits.
+No commit was created.

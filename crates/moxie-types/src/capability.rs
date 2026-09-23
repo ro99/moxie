@@ -69,9 +69,13 @@ pub enum SemanticKernelOp {
     ScaledResidual,
     /// Unrounded FP32 vocabulary projection, optionally soft-capped.
     VocabProjection,
+    /// Selects routed experts and emits ids with FP32 coefficients.
+    Route,
     /// The gated expert feed-forward, evaluated per selected slot. The gate
     /// transform is part of the operation's identity, not a parameter of it.
     ExpertMlp(GateTransform),
+    /// Combines routed expert slots in the declared expert order.
+    Combine,
     /// Attention over paged key/value state: prefill, append and decode.
     ///
     /// One operation rather than three, because whole prefill, a prefill chunk
@@ -97,8 +101,10 @@ impl SemanticKernelOp {
             Self::Residual => "residual",
             Self::ScaledResidual => "scaled_residual",
             Self::VocabProjection => "vocab_projection",
+            Self::Route => "route",
             Self::ExpertMlp(GateTransform::GeluTanh) => "expert_mlp_gelu_tanh",
             Self::ExpertMlp(GateTransform::Silu) => "expert_mlp_silu",
+            Self::Combine => "combine",
             Self::PagedAttention => "paged_attention",
         }
     }

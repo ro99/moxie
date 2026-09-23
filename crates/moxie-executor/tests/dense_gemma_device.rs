@@ -1,9 +1,9 @@
-//! Task 0059's one load-bearing dense-device gate.
+//! Task 0059/0065's dense and routed-device gate.
 //!
 //! The reduced Gemma composition root stays unchanged.  This test lowers its
-//! dense graph through the selected package, runs a multi-row prefill and one
-//! decode row through the existing device KV authority, and compares both
-//! outputs with the host interpreter on every visible GPU.
+//! dense and routed graph through the selected package, runs a multi-row
+//! prefill and one decode row through the existing device KV authority, and
+//! compares both outputs with the host interpreter on every visible GPU.
 #![cfg(feature = "paged-attention-binding")]
 
 use std::ffi::{c_char, c_int, c_void};
@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Mutex, MutexGuard};
 
 use moxie_cuda::{RankContext, Stream, device_count, query_device};
-use moxie_engine::Value;
+use moxie_engine::{HostTensor, Value};
 use moxie_executor::paged_attention::device::commit_paged_state;
 use moxie_executor::{
     DenseGraphStep, PageGeometry, PagedAttentionRun, SelectedReservedPlan, Staging,
@@ -23,7 +23,8 @@ use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_plan::{Phase, ResourceWorkload, lower_selected};
 use moxie_state::{DeviceKvSequence, KvGeometry, LayerKv, Retention, SequenceState, StateKind};
 use moxie_types::{
-    DeviceCapability, Dim, HostTier, PagePlacement, Precision, RankId, Scope, TensorLayout, Tier,
+    DeviceCapability, DeviceUuid, Dim, HostTier, PagePlacement, Precision, RankId, Scope,
+    TensorLayout, Tier,
 };
 
 static DEVICE_TEST: Mutex<()> = Mutex::new(());
@@ -301,6 +302,60 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
         count >= 3,
         "task 0059 requires both 3090s and the 5060 Ti; saw {count}"
     );
+    let mut cases: Vec<_> = [
+        moxie_cli::gemma::Shape::A,
+        moxie_cli::gemma::Shape::B,
+        moxie_cli::gemma::Shape::C,
+    ]
+    .into_iter()
+    .map(|shape| {
+        (
+            shape.name(),
+            shape.config(),
+            moxie_cli::gemma::build(shape).expect("build Gemma fixture"),
+        )
+    })
+    .collect();
+    let mut top3_config = moxie_cli::gemma::Shape::C.config();
+    top3_config
+        .moe
+        .as_mut()
+        .expect("Shape C MoE geometry")
+        .top_k = 3;
+    let top3_fixture = moxie_cli::gemma::build_with_config(top3_config.clone())
+        .expect("build top-3 Gemma C fixture");
+    let mut tied_fixture = moxie_cli::gemma::build_with_config(top3_config.clone())
+        .expect("build tied Gemma C fixture");
+    let router_weights: Vec<_> = tied_fixture
+        .graph
+        .weights()
+        .iter()
+        .copied()
+        .filter(|weight| {
+            tied_fixture
+                .graph
+                .name(*weight)
+                .is_some_and(|name| name.starts_with("router_proj."))
+        })
+        .collect();
+    assert!(!router_weights.is_empty(), "Shape C has router projections");
+    for weight in router_weights {
+        let zero_projection = {
+            let tensor = tied_fixture
+                .weights
+                .get(weight)
+                .unwrap()
+                .as_float()
+                .unwrap();
+            HostTensor::bf16(vec![0.0; tensor.data().len()], tensor.shape().to_vec())
+                .expect("zero BF16 router projection")
+        };
+        tied_fixture
+            .weights
+            .set(weight, Value::Float(zero_projection));
+    }
+    cases.push(("gemma-c-tied", top3_config.clone(), tied_fixture));
+    cases.push(("gemma-c-top3", top3_config, top3_fixture));
 
     for ordinal in 0..count {
         let context = RankContext::acquire(RankId(59_000 + ordinal), ordinal)
@@ -308,9 +363,7 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
         let capability = query_device(ordinal).expect("query GPU capability");
         assert_eq!(context.uuid(), capability.uuid);
         let stream = Stream::new(&context).expect("create stream");
-        for shape in [moxie_cli::gemma::Shape::A, moxie_cli::gemma::Shape::B] {
-            let config = shape.config();
-            let fixture = moxie_cli::gemma::build(shape).expect("build dense fixture");
+        for (label, config, fixture) in &cases {
             let prompt: Vec<u64> = (0..5).map(|row| row % config.vocab).collect();
             let decode = vec![5 % config.vocab];
             let prefill_positions: Vec<u64> = (0..prompt.len() as u64).collect();
@@ -321,27 +374,27 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
                 KvCache::for_branch(config.layers as usize, &host_state, moxie_state::ROOT)
                     .expect("host cache");
             let host_prefill = host_step(
-                &fixture,
+                fixture,
                 &mut host_state,
                 &mut host_cache,
                 &prompt,
                 &prefill_positions,
             );
             let host_decode = host_step(
-                &fixture,
+                fixture,
                 &mut host_state,
                 &mut host_cache,
                 &decode,
                 &decode_positions,
             );
 
-            let kv = geometry(&config, 4, 64, prompt.len() + 1);
+            let kv = geometry(config, 4, 64, prompt.len() + 1);
             let mut device_state = DeviceKvSequence::new(kv).expect("device state");
             let mut ledger = measured_ledger(&context);
             let mut runs = admit_runs(
                 &mut ledger,
                 &context,
-                &config,
+                config,
                 &device_state,
                 prompt.len() as u64,
             );
@@ -440,7 +493,7 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
                     state: &mut device_state,
                     transaction: prefill_txn,
                     runs: &mut runs,
-                    bindings: owned_bindings(&fixture, &prompt, &prefill_positions, &capability),
+                    bindings: owned_bindings(fixture, &prompt, &prefill_positions, &capability),
                 })
                 .map_err(|refused| refused.error)
                 .expect("prefill device execution")
@@ -450,7 +503,7 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
             assert_logits(
                 &format!(
                     "{} {} prefill {} sm_{}{}",
-                    shape.name(),
+                    label,
                     capability.uuid,
                     ordinal,
                     capability.compute_major,
@@ -521,7 +574,7 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
                     state: &mut device_state,
                     transaction: decode_txn,
                     runs: &mut runs,
-                    bindings: owned_bindings(&fixture, &decode, &decode_positions, &capability),
+                    bindings: owned_bindings(fixture, &decode, &decode_positions, &capability),
                 })
                 .map_err(|refused| refused.error)
                 .expect("decode device execution")
@@ -531,7 +584,7 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
             assert_logits(
                 &format!(
                     "{} {} decode {} sm_{}{}",
-                    shape.name(),
+                    label,
                     capability.uuid,
                     ordinal,
                     capability.compute_major,
@@ -558,10 +611,7 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
             );
             eprintln!(
                 "PASS dense Gemma {} on UUID {} (SM{}{}) prefill+decode",
-                shape.name(),
-                capability.uuid,
-                capability.compute_major,
-                capability.compute_minor
+                label, capability.uuid, capability.compute_major, capability.compute_minor
             );
         }
     }
@@ -649,4 +699,70 @@ fn angle_copy_sync_failure_retains_its_host_source() {
     // The injected CUDA error is quarantined as device loss; dropping this
     // refused lease intentionally withholds its device ranges and source.
     drop(refused);
+}
+
+#[test]
+fn routed_gemma_lowers_through_the_dense_package() {
+    let fixture =
+        moxie_cli::gemma::build(moxie_cli::gemma::Shape::C).expect("build routed Gemma fixture");
+    let capability = DeviceCapability {
+        ordinal: 0,
+        uuid: DeviceUuid::from_bytes([1u8; 16]),
+        name: "fixture".into(),
+        compute_major: 8,
+        compute_minor: 6,
+        total_memory_bytes: 1 << 30,
+        multiprocessor_count: 1,
+        pci_bus_id: "0000:00:00.0".into(),
+        peer_access: Vec::new(),
+        max_grid: (2_147_483_647, 65_535, 65_535),
+    };
+    let rows = 5;
+    let workload = ResourceWorkload {
+        phase: Phase::Prefill,
+        rows,
+        visible_tokens: rows,
+        branch_rows: rows,
+        output: fixture.graph.output(),
+        device: capability.uuid,
+        paged_state_capacity: None,
+    };
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+    let candidate = lower_selected(&fixture.graph, workload, &capability, &catalogue)
+        .expect("routed graph lowers through the dense package");
+    let route_nodes: Vec<_> = fixture
+        .graph
+        .nodes()
+        .iter()
+        .filter(|node| matches!(node.params, moxie_graph::OpParams::Route { .. }))
+        .collect();
+    let routed_layers = route_nodes.len();
+    assert!(routed_layers > 0, "Shape C has routed layers");
+    for operation in [
+        moxie_types::SemanticKernelOp::Route,
+        moxie_types::SemanticKernelOp::ExpertMlp(moxie_types::GateTransform::GeluTanh),
+        moxie_types::SemanticKernelOp::Combine,
+    ] {
+        assert_eq!(
+            candidate
+                .nodes()
+                .iter()
+                .filter(|node| node.descriptor.operation == operation)
+                .count(),
+            routed_layers,
+            "one {operation:?} descriptor per routed layer"
+        );
+    }
+    for node in route_nodes {
+        let moxie_graph::OpParams::Route { top_k, .. } = node.params else {
+            unreachable!("filtered route node")
+        };
+        assert_eq!(
+            candidate
+                .value(node.output)
+                .expect("planned route value")
+                .logical_bytes,
+            rows * top_k * 8
+        );
+    }
 }

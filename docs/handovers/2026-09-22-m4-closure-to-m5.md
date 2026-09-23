@@ -79,7 +79,7 @@ comparison) are **not** deferred; they stay in M5. Slice 4 began with
 [task 0064](../tasks/0064-m5-host-expert-owner-lowering.md), **accepted**
 2026-09-23: a host expert-owner lowering of the routed block, bit-identical at
 2 and 4 ranks, covering duplicate-owner, cross-owner and empty-owner routes.
-Still open in slice 4: device execution of the expert-partitioned plan (the
+[Task 0065](../tasks/0065-m5-routed-gemma-single-gpu.md), **accepted** 2026-09-23: the routed Gemma graph runs on one GPU (Route, ExpertMlp and Combine device kernels), matching the host on all three GPUs. It also fixed a latent softcap defect in task 0059's vocabulary kernel. Still open in slice 4: device execution of the expert-partitioned plan (the
 exit gate's resource and cancellation tests), host-owned experts, a scaled
 combine (Laguna 2.5), and MLA per-weight partitioning.
 

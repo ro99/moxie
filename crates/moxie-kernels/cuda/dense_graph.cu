@@ -4,3 +4,5 @@
 #include "bf16_chain.cu"
 #include "paged_attention.cu"
 #include "dense_ops.cu"
+#include "expert_mlp.cu"
+#include "routed_ops.cu"

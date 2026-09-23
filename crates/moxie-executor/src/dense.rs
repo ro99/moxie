@@ -767,6 +767,200 @@ fn enqueue_dense<'ctx>(
                 )?;
                 push_launch(lease, "vocab-projection");
             }
+            OpParams::Route {
+                hidden,
+                experts,
+                top_k,
+                input: moxie_graph::RouterInput::Normalized { eps, input_scale },
+                score: moxie_graph::RouteScore::Softmax,
+                per_expert_scale: true,
+                selection_bias: false,
+                coefficient: moxie_graph::RouteCoefficient::Fp32,
+            } => {
+                let mut x_address = address(lease.resource(), node.inputs[0])?;
+                let mut projection_address = address(lease.resource(), node.inputs[1])?;
+                let mut gain_address = address(lease.resource(), node.inputs[2])?;
+                let mut per_expert_address = address(lease.resource(), node.inputs[3])?;
+                // The route value's arena range holds rows * top_k u32 ids at
+                // offset 0, then rows * top_k f32 coefficients at byte offset
+                // rows * top_k * 4. The planner charges rows * top_k * 8 bytes;
+                // ExpertMlp and Combine read both halves from this one range.
+                let mut ids_address = address(lease.resource(), node.output)?;
+                let coefficient_offset = rows
+                    .checked_mul(top_k)
+                    .and_then(|entries| entries.checked_mul(4))
+                    .ok_or_else(|| invalid("route", "coefficient offset overflowed"))?;
+                let mut coefficients_address = ids_address
+                    .checked_add(coefficient_offset)
+                    .ok_or_else(|| invalid("route", "coefficient address overflowed"))?;
+                let mut launch_rows = rows;
+                let mut launch_hidden = hidden;
+                let mut launch_experts = experts;
+                let mut launch_top_k = top_k;
+                let mut launch_eps = eps;
+                let mut launch_input_scale = input_scale;
+                let mut params: [*mut c_void; 12] = [
+                    (&raw mut x_address).cast(),
+                    (&raw mut projection_address).cast(),
+                    (&raw mut gain_address).cast(),
+                    (&raw mut per_expert_address).cast(),
+                    (&raw mut ids_address).cast(),
+                    (&raw mut coefficients_address).cast(),
+                    (&raw mut launch_rows).cast(),
+                    (&raw mut launch_hidden).cast(),
+                    (&raw mut launch_experts).cast(),
+                    (&raw mut launch_top_k).cast(),
+                    (&raw mut launch_eps).cast(),
+                    (&raw mut launch_input_scale).cast(),
+                ];
+                let blocks = u32::try_from(rows.div_ceil(64))
+                    .map_err(|_| invalid("route", "launch grid overflowed"))?;
+                launch(
+                    lease,
+                    base,
+                    stream,
+                    (blocks, 1, 1),
+                    (64, 1, 1),
+                    &mut params,
+                    selected,
+                    moxie_kernels::DENSE_ROUTE,
+                )?;
+                push_launch(lease, "route");
+            }
+            OpParams::Route { .. } => {
+                return Err(invalid("route", "unsupported route reached the executor"));
+            }
+            OpParams::ExpertMlp {
+                hidden,
+                intermediate,
+                top_k,
+                activation: moxie_graph::ExpertActivation::GeGlu,
+                ..
+            } => {
+                let assignments = rows
+                    .checked_mul(top_k)
+                    .ok_or_else(|| invalid("expert-mlp", "assignment count overflowed"))?;
+                let mut input_address = address(lease.resource(), node.inputs[0])?;
+                let mut ids_address = address(lease.resource(), node.inputs[1])?;
+                let mut gate_up_address = address(lease.resource(), node.inputs[2])?;
+                let mut activated_address = workspace_address(lease.resource())?;
+                let mut launch_assignments = assignments;
+                let mut launch_top_k = top_k;
+                let mut launch_hidden = hidden;
+                let mut launch_intermediate = intermediate;
+                let project_elements = assignments
+                    .checked_mul(intermediate)
+                    .ok_or_else(|| invalid("expert-mlp", "project grid overflowed"))?;
+                let project_blocks = u32::try_from(project_elements.div_ceil(256))
+                    .map_err(|_| invalid("expert-mlp", "project launch grid overflowed"))?;
+                let mut project_params: [*mut c_void; 8] = [
+                    (&raw mut input_address).cast(),
+                    (&raw mut ids_address).cast(),
+                    (&raw mut gate_up_address).cast(),
+                    (&raw mut activated_address).cast(),
+                    (&raw mut launch_assignments).cast(),
+                    (&raw mut launch_top_k).cast(),
+                    (&raw mut launch_hidden).cast(),
+                    (&raw mut launch_intermediate).cast(),
+                ];
+                launch(
+                    lease,
+                    base,
+                    stream,
+                    (project_blocks, 1, 1),
+                    (256, 1, 1),
+                    &mut project_params,
+                    selected,
+                    moxie_kernels::DENSE_EXPERT_PROJECT_GELU,
+                )?;
+
+                let mut down_address = address(lease.resource(), node.inputs[3])?;
+                let mut slots_address = address(lease.resource(), node.output)?;
+                let down_elements = assignments
+                    .checked_mul(hidden)
+                    .ok_or_else(|| invalid("expert-mlp", "down grid overflowed"))?;
+                let down_blocks = u32::try_from(down_elements.div_ceil(256))
+                    .map_err(|_| invalid("expert-mlp", "down launch grid overflowed"))?;
+                let mut down_params: [*mut c_void; 7] = [
+                    (&raw mut activated_address).cast(),
+                    (&raw mut ids_address).cast(),
+                    (&raw mut down_address).cast(),
+                    (&raw mut slots_address).cast(),
+                    (&raw mut launch_assignments).cast(),
+                    (&raw mut launch_hidden).cast(),
+                    (&raw mut launch_intermediate).cast(),
+                ];
+                launch(
+                    lease,
+                    base + 1,
+                    stream,
+                    (down_blocks, 1, 1),
+                    (256, 1, 1),
+                    &mut down_params,
+                    selected,
+                    moxie_kernels::DENSE_EXPERT_DOWN,
+                )?;
+                push_launch(lease, "expert-mlp");
+            }
+            OpParams::ExpertMlp { .. } => {
+                return Err(invalid(
+                    "expert-mlp",
+                    "unsupported expert activation reached the executor",
+                ));
+            }
+            OpParams::Combine {
+                hidden,
+                top_k,
+                order: moxie_graph::CombineOrder::AscendingExpertId,
+                output_scale,
+            } => {
+                let mut ids_address = address(lease.resource(), node.inputs[0])?;
+                let coefficient_offset = rows
+                    .checked_mul(top_k)
+                    .and_then(|entries| entries.checked_mul(4))
+                    .ok_or_else(|| invalid("combine", "coefficient offset overflowed"))?;
+                let mut coefficients_address = ids_address
+                    .checked_add(coefficient_offset)
+                    .ok_or_else(|| invalid("combine", "coefficient address overflowed"))?;
+                let mut slots_address = address(lease.resource(), node.inputs[1])?;
+                let mut output_address = address(lease.resource(), node.output)?;
+                let elements = rows
+                    .checked_mul(hidden)
+                    .ok_or_else(|| invalid("combine", "launch grid overflowed"))?;
+                let blocks = u32::try_from(elements.div_ceil(256))
+                    .map_err(|_| invalid("combine", "launch grid overflowed"))?;
+                let mut launch_rows = rows;
+                let mut launch_top_k = top_k;
+                let mut launch_hidden = hidden;
+                let mut launch_scale = output_scale;
+                let mut params: [*mut c_void; 8] = [
+                    (&raw mut ids_address).cast(),
+                    (&raw mut coefficients_address).cast(),
+                    (&raw mut slots_address).cast(),
+                    (&raw mut output_address).cast(),
+                    (&raw mut launch_rows).cast(),
+                    (&raw mut launch_top_k).cast(),
+                    (&raw mut launch_hidden).cast(),
+                    (&raw mut launch_scale).cast(),
+                ];
+                launch(
+                    lease,
+                    base,
+                    stream,
+                    (blocks, 1, 1),
+                    (256, 1, 1),
+                    &mut params,
+                    selected,
+                    moxie_kernels::DENSE_COMBINE,
+                )?;
+                push_launch(lease, "combine");
+            }
+            OpParams::Combine { .. } => {
+                return Err(invalid(
+                    "combine",
+                    "unsupported combine reached the executor",
+                ));
+            }
             _ => {
                 return Err(Error::UnsupportedKernel {
                     operation: node.params.op().name(),
@@ -1177,10 +1371,16 @@ fn invalid(field: &'static str, detail: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use moxie_graph::RopeLayout;
-    use moxie_oracles::rope::{Rotation, rope_head};
+    use core::ffi::c_void;
 
-    use super::{IndexView, angle_table};
+    use moxie_graph::RopeLayout;
+    use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSpan};
+    use moxie_oracles::rope::{Rotation, rope_head};
+    use moxie_types::{DeviceTier, RankId, Scope, Tier};
+
+    use crate::arena::DeviceArena;
+
+    use super::{IndexView, Module, ModuleImage, RankContext, Stream, TrustedImage, angle_table};
 
     #[test]
     fn uploaded_angles_match_the_host_rope_oracle() {
@@ -1224,5 +1424,108 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn combine_kernel_sums_in_ascending_expert_order() {
+        let _guard = crate::DRIVER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let context = RankContext::acquire(RankId(65_012), 0).unwrap();
+        let stream = Stream::new(&context).unwrap();
+        let scope = Scope::Device(context.uuid());
+        let capacity = 1 << 20;
+        let mut ledger = Ledger::new([
+            CapacitySnapshot::new(Scope::Host, capacity, 4096).unwrap(),
+            CapacitySnapshot::new(scope, capacity, 0).unwrap(),
+        ])
+        .unwrap();
+        let mut request = PlanRequest::new("dense combine order test", ["combine"]).unwrap();
+        request
+            .buffer(
+                BufferRequest::try_new(
+                    "combine inputs and output",
+                    scope,
+                    Tier::Device(DeviceTier::Activations),
+                    256,
+                    StageSpan { first: 0, last: 0 },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let reservation = ledger.admit(&request).unwrap();
+        let mut arena = DeviceArena::create(
+            &ledger,
+            reservation,
+            &context,
+            DeviceTier::Activations,
+            256,
+            "dense combine order test",
+        )
+        .unwrap();
+        let range = arena.allocate(256, 256, "combine fixture").unwrap();
+
+        const COEFFICIENTS: u64 = 16;
+        const SLOTS: u64 = 32;
+        const OUTPUT: u64 = 40;
+        let mut upload = [0; 48];
+        for (slot, id) in [2u32, 0, 1].into_iter().enumerate() {
+            upload[slot * 4..slot * 4 + 4].copy_from_slice(&id.to_le_bytes());
+            upload[COEFFICIENTS as usize + slot * 4..COEFFICIENTS as usize + slot * 4 + 4]
+                .copy_from_slice(&1.0f32.to_le_bytes());
+        }
+        for (slot, value) in [-1.0f32, 1.0, 2.0f32.powi(-30)].into_iter().enumerate() {
+            upload[SLOTS as usize + slot * 2..SLOTS as usize + slot * 2 + 2]
+                .copy_from_slice(&moxie_kernels::cpu_expert::to_bf16_bits(value).to_le_bytes());
+        }
+        // SAFETY: `upload` and the admitted destination range stay alive until the stream sync.
+        unsafe { range.copy_from_host_async_at(0, &upload, &stream).unwrap() };
+        stream.synchronize().unwrap();
+
+        // SAFETY: the image is this build's pinned nvcc output.
+        let image =
+            unsafe { TrustedImage::from_build_output(moxie_kernels::DENSE_GRAPH_FATBIN).unwrap() };
+        let module = Module::load(&context, ModuleImage::Binary(image))
+            .unwrap()
+            .resolve_all(&[moxie_kernels::DENSE_COMBINE.to_string()])
+            .unwrap();
+        let mut ids = range.device_address().unwrap();
+        let mut coefficients = ids + COEFFICIENTS;
+        let mut slots = ids + SLOTS;
+        let mut output = ids + OUTPUT;
+        let mut rows = 1u64;
+        let mut top_k = 3u64;
+        let mut hidden = 1u64;
+        let mut output_scale = 1.0f32;
+        let mut params: [*mut c_void; 8] = [
+            (&raw mut ids).cast(),
+            (&raw mut coefficients).cast(),
+            (&raw mut slots).cast(),
+            (&raw mut output).cast(),
+            (&raw mut rows).cast(),
+            (&raw mut top_k).cast(),
+            (&raw mut hidden).cast(),
+            (&raw mut output_scale).cast(),
+        ];
+        // SAFETY: these addresses and dimensions match the Combine ABI and fit the admitted range.
+        unsafe {
+            module
+                .launch_async(0, &stream, (1, 1, 1), (256, 1, 1), 0, &mut params)
+                .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mut actual = [0; 2];
+        range.copy_to_host_at(OUTPUT, &mut actual).unwrap();
+        // Ascending ids yield 1 + 2^-30 -> 1, then -1 -> 0.
+        // Selection order yields -1 + 1 -> 0, then BF16 2^-30.
+        assert_eq!(
+            u16::from_le_bytes(actual),
+            moxie_kernels::cpu_expert::to_bf16_bits(0.0)
+        );
+
+        arena.release(range).unwrap();
+        drop(module);
+        arena.close(&mut ledger).unwrap();
+        assert!(ledger.outstanding().is_empty());
     }
 }

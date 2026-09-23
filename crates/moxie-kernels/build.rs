@@ -37,6 +37,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cuda/smoke.cu");
     println!("cargo:rerun-if-changed=cuda/bf16_chain.cu");
     println!("cargo:rerun-if-changed=cuda/expert_mlp.cu");
+    println!("cargo:rerun-if-changed=cuda/routed_ops.cu");
     println!("cargo:rerun-if-changed=cuda/affine_linear.cu");
     println!("cargo:rerun-if-changed=cuda/paged_attention.cu");
     println!("cargo:rerun-if-changed=cuda/dense_graph.cu");

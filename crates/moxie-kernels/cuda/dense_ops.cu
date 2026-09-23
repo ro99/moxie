@@ -239,8 +239,8 @@ extern "C" __global__ void moxie_dense_vocab_projection_v1(
             __bfloat162float(weight[column * hidden + k])));
     }
     if (softcap > 0.0F) {
-        const float scaled = __fdiv_rn(moxie_dense_bf16_v1(sum), softcap);
-        const float bent = moxie_dense_bf16_v1(tanhf(scaled));
+        const float scaled = moxie_dense_bf16_v1(__fdiv_rn(moxie_dense_bf16_v1(sum), softcap));
+        const float bent = moxie_dense_bf16_v1(static_cast<float>(tanh(static_cast<double>(scaled))));
         sum = moxie_dense_bf16_v1(__fmul_rn(bent, softcap));
     }
     output[index] = sum;

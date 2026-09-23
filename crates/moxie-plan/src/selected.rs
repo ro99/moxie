@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use moxie_graph::{LinearReductionOrder, NodeId, Op, ValueId, ValueRole};
+use moxie_graph::{LinearReductionOrder, NodeId, Op, OpParams, ValueId, ValueRole};
 use moxie_types::{
     DeviceCapability, Error, KernelCatalogue, KernelOperand, SemanticKernelDescriptor,
     SemanticKernelOp, TensorLayout,
@@ -649,6 +649,95 @@ fn lower_dense(
     )
 }
 
+fn check_routed_edges(graph: &Graph) -> Result<(), Error> {
+    let unsupported = |detail| Error::UnsupportedKernel {
+        operation: "route",
+        detail,
+    };
+    for node in graph.nodes() {
+        match node.params {
+            OpParams::ExpertMlp { experts, top_k, .. } => {
+                let Some(route_value) = node.inputs.get(1).copied() else {
+                    return Err(unsupported("ExpertMlp is missing input[1] route".into()));
+                };
+                let Some(route_node) = graph.nodes().iter().find(|n| n.output == route_value)
+                else {
+                    return Err(unsupported(
+                        "ExpertMlp input[1] has no Route producer".into(),
+                    ));
+                };
+                let OpParams::Route {
+                    experts: route_experts,
+                    top_k: route_top_k,
+                    ..
+                } = route_node.params
+                else {
+                    return Err(unsupported(
+                        "ExpertMlp input[1] is not produced by Route".into(),
+                    ));
+                };
+                if experts != route_experts || top_k != route_top_k {
+                    return Err(unsupported(format!(
+                        "ExpertMlp declares experts={experts}, top_k={top_k}; its Route producer declares experts={route_experts}, top_k={route_top_k}"
+                    )));
+                }
+            }
+            OpParams::Combine { top_k, .. } => {
+                let (Some(route_value), Some(slots_value)) =
+                    (node.inputs.first().copied(), node.inputs.get(1).copied())
+                else {
+                    return Err(unsupported(
+                        "Combine is missing its route or slots input".into(),
+                    ));
+                };
+                let Some(route_node) = graph.nodes().iter().find(|n| n.output == route_value)
+                else {
+                    return Err(unsupported("Combine input[0] has no Route producer".into()));
+                };
+                match route_node.params {
+                    OpParams::Route {
+                        top_k: route_top_k, ..
+                    } if route_top_k == top_k => {}
+                    OpParams::Route {
+                        top_k: route_top_k, ..
+                    } => {
+                        return Err(unsupported(format!(
+                            "Combine declares top_k={top_k}; its Route producer declares top_k={route_top_k}"
+                        )));
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            "Combine input[0] is not produced by Route".into(),
+                        ));
+                    }
+                }
+                let Some(expert_node) = graph.nodes().iter().find(|n| n.output == slots_value)
+                else {
+                    return Err(unsupported(
+                        "Combine input[1] has no ExpertMlp producer".into(),
+                    ));
+                };
+                match expert_node.params {
+                    OpParams::ExpertMlp { .. }
+                        if expert_node.inputs.get(1) == Some(&route_value) => {}
+                    OpParams::ExpertMlp { .. } => {
+                        return Err(unsupported(
+                            "Combine slots were produced from a different Route input".into(),
+                        ));
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            "Combine input[1] is not produced by ExpertMlp".into(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn lower_dense_mode(
     graph: &Graph,
     workload: ResourceWorkload,
@@ -657,6 +746,7 @@ fn lower_dense_mode(
     require_complete_graph: bool,
     orders: &BTreeMap<NodeId, LinearReductionOrder>,
 ) -> Result<SelectedPlanCandidate, Error> {
+    check_routed_edges(graph)?;
     if require_complete_graph
         && (graph.nodes().is_empty()
             || !graph
@@ -702,7 +792,10 @@ fn lower_dense_mode(
                 descriptor.operation == operation
                     && descriptor.inputs == roles
                     && descriptor.output
-                        == if operation == SemanticKernelOp::LinearPartial {
+                        == if matches!(
+                            operation,
+                            SemanticKernelOp::LinearPartial | SemanticKernelOp::Route
+                        ) {
                             moxie_types::ActivationPrecision::expect(moxie_types::Precision::F32)
                         } else {
                             node.contract.output
@@ -711,7 +804,9 @@ fn lower_dense_mode(
                     && descriptor.rounding
                         == if matches!(
                             operation,
-                            SemanticKernelOp::VocabProjection | SemanticKernelOp::LinearPartial
+                            SemanticKernelOp::VocabProjection
+                                | SemanticKernelOp::LinearPartial
+                                | SemanticKernelOp::Route
                         ) {
                             moxie_types::RoundingProfile::Unrounded
                         } else {
@@ -954,6 +1049,45 @@ fn dense_semantic(node: &moxie_graph::Node) -> Result<SemanticKernelOp, Error> {
         moxie_graph::OpParams::Residual { scale: 1.0 } => Ok(SemanticKernelOp::Residual),
         moxie_graph::OpParams::Residual { .. } => Ok(SemanticKernelOp::ScaledResidual),
         moxie_graph::OpParams::VocabProjection { .. } => Ok(SemanticKernelOp::VocabProjection),
+        moxie_graph::OpParams::Route {
+            input: moxie_graph::RouterInput::Normalized { .. },
+            score: moxie_graph::RouteScore::Softmax,
+            per_expert_scale: true,
+            selection_bias: false,
+            coefficient: moxie_graph::RouteCoefficient::Fp32,
+            ..
+        } => Ok(SemanticKernelOp::Route),
+        moxie_graph::OpParams::Route {
+            input,
+            score,
+            per_expert_scale,
+            selection_bias,
+            coefficient,
+            ..
+        } => Err(Error::UnsupportedKernel {
+            operation: "route",
+            detail: format!(
+                "unsupported input={input:?}, score={score:?}, per_expert_scale={per_expert_scale}, selection_bias={selection_bias}, coefficient={coefficient:?}"
+            ),
+        }),
+        moxie_graph::OpParams::ExpertMlp {
+            activation: moxie_graph::ExpertActivation::GeGlu,
+            ..
+        } => Ok(SemanticKernelOp::ExpertMlp(
+            moxie_types::GateTransform::GeluTanh,
+        )),
+        moxie_graph::OpParams::ExpertMlp { activation, .. } => Err(Error::UnsupportedKernel {
+            operation: "expert_mlp",
+            detail: format!("unsupported activation={activation:?}"),
+        }),
+        moxie_graph::OpParams::Combine {
+            order: moxie_graph::CombineOrder::AscendingExpertId,
+            ..
+        } => Ok(SemanticKernelOp::Combine),
+        moxie_graph::OpParams::Combine { order, .. } => Err(Error::UnsupportedKernel {
+            operation: "combine",
+            detail: format!("unsupported order={order:?}"),
+        }),
         _ => Err(Error::UnsupportedKernel {
             operation: node.params.op().name(),
             detail: "operation is outside the reduced dense device package".into(),
@@ -993,6 +1127,7 @@ fn dense_operands(
                         KernelOperand::PositionIndex
                     })
                 }
+                ValueRole::Route { .. } => Ok(KernelOperand::RouteIndex),
                 other => operand(other),
             }
         })
@@ -1030,6 +1165,15 @@ fn dense_shape(node: &moxie_graph::Node) -> Result<(u64, u64), Error> {
         }
         moxie_graph::OpParams::GeGlu { width } => Ok((width, width)),
         moxie_graph::OpParams::Residual { .. } => Ok((1, 1)),
+        moxie_graph::OpParams::Route {
+            hidden, experts, ..
+        } => Ok((hidden, experts)),
+        moxie_graph::OpParams::ExpertMlp {
+            hidden,
+            intermediate,
+            ..
+        } => Ok((hidden, intermediate)),
+        moxie_graph::OpParams::Combine { hidden, .. } => Ok((hidden, hidden)),
         _ => Err(Error::UnsupportedKernel {
             operation: node.params.op().name(),
             detail: "operation has no dense descriptor shape".into(),
@@ -1077,6 +1221,26 @@ fn dense_workspace(
                 .and_then(|v| v.checked_mul(4))
                 .ok_or_else(|| invalid("host_workspace", "attention K/V staging overflowed"))?;
             Ok((moxie_types::WorkspaceExpression::Zero, 0, bytes))
+        }
+        SemanticKernelOp::ExpertMlp(_) => {
+            let moxie_graph::OpParams::ExpertMlp {
+                intermediate,
+                top_k,
+                ..
+            } = node.params
+            else {
+                unreachable!("dense ExpertMlp operation")
+            };
+            let bytes = rows
+                .checked_mul(top_k)
+                .and_then(|v| v.checked_mul(intermediate))
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(|| invalid("workspace", "expert workspace overflowed"))?;
+            Ok((
+                moxie_types::WorkspaceExpression::RowsTimesIntermediateF32,
+                bytes,
+                0,
+            ))
         }
         _ => Ok((moxie_types::WorkspaceExpression::Zero, 0, 0)),
     }
@@ -1371,7 +1535,9 @@ mod tests {
             | SemanticKernelOp::Rope
             | SemanticKernelOp::GeGlu
             | SemanticKernelOp::ScaledResidual
-            | SemanticKernelOp::VocabProjection => Vec::new(),
+            | SemanticKernelOp::VocabProjection
+            | SemanticKernelOp::Route
+            | SemanticKernelOp::Combine => Vec::new(),
         };
         SemanticKernelDescriptor {
             id: KernelId(format!("{}-{}", op.name(), sm.name())),
@@ -1712,7 +1878,7 @@ mod tests {
     }
 
     /// A graph whose feed-forward is routed, for the refusal below.
-    fn routed_graph(hidden: u64) -> Graph {
+    fn routed_graph(hidden: u64, route_experts: u64, expert_experts: u64) -> Graph {
         let mut registry = OracleRegistry::new();
         for op in [Op::Linear, Op::Route, Op::ExpertMlp, Op::Combine] {
             registry
@@ -1738,7 +1904,6 @@ mod tests {
                 shape,
             )
         };
-        const EXPERTS: u64 = 2;
         const TOP_K: u64 = 1;
         const INTERMEDIATE: u64 = 3;
         let mut builder = GraphBuilder::new(ORACLE, ROWS);
@@ -1752,14 +1917,14 @@ mod tests {
         let proj = builder
             .weight(
                 "router projection",
-                weight(vec![Dim::constant(EXPERTS), Dim::constant(hidden)]),
+                weight(vec![Dim::constant(route_experts), Dim::constant(hidden)]),
             )
             .unwrap();
         let route = builder
             .node(
                 OpParams::Route {
                     hidden,
-                    experts: EXPERTS,
+                    experts: route_experts,
                     top_k: TOP_K,
                     input: moxie_graph::RouterInput::Normalized {
                         eps: 1e-6,
@@ -1777,7 +1942,7 @@ mod tests {
             .weight(
                 "fused gate/up",
                 weight(vec![
-                    Dim::constant(EXPERTS),
+                    Dim::constant(expert_experts),
                     Dim::constant(2 * INTERMEDIATE),
                     Dim::constant(hidden),
                 ]),
@@ -1787,7 +1952,7 @@ mod tests {
             .weight(
                 "fused down",
                 weight(vec![
-                    Dim::constant(EXPERTS),
+                    Dim::constant(expert_experts),
                     Dim::constant(hidden),
                     Dim::constant(INTERMEDIATE),
                 ]),
@@ -1798,7 +1963,7 @@ mod tests {
                 OpParams::ExpertMlp {
                     hidden,
                     intermediate: INTERMEDIATE,
-                    experts: EXPERTS,
+                    experts: expert_experts,
                     top_k: TOP_K,
                     activation: moxie_graph::ExpertActivation::GeGlu,
                 },
@@ -1826,7 +1991,7 @@ mod tests {
         // acquire a routed path by falling through: a routed step that
         // "succeeded" on a chain with no expert dispatch would be a silent
         // wrong answer, not a fallback.
-        let graph = routed_graph(8);
+        let graph = routed_graph(8, 2, 2);
         let cap = capability(SmVersion::SM86);
         let catalogue = catalogue(SmVersion::SM86);
         let error = lower_selected(&graph, workload(&graph, 1), &cap, &catalogue).unwrap_err();
@@ -1870,6 +2035,21 @@ mod tests {
                 "{} must fail closed until M5",
                 params.op().name()
             );
+        }
+    }
+
+    #[test]
+    fn routed_edges_must_agree_on_the_route() {
+        let graph = routed_graph(8, 5, 4);
+        let cap = capability(SmVersion::SM86);
+        let catalogue = catalogue(SmVersion::SM86);
+        let error = lower_selected(&graph, workload(&graph, 1), &cap, &catalogue).unwrap_err();
+        match error {
+            Error::UnsupportedKernel { operation, detail } => {
+                assert_eq!(operation, "route");
+                assert!(detail.contains("experts=4") && detail.contains("experts=5"));
+            }
+            other => panic!("expected a typed route refusal, got {other:?}"),
         }
     }
 

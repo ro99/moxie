@@ -115,6 +115,10 @@ pub const DENSE_ROPE: &str = "moxie_dense_rope_v1";
 pub const DENSE_GEGLU: &str = "moxie_dense_geglu_v1";
 pub const DENSE_RESIDUAL_SCALED: &str = "moxie_dense_residual_scaled_v1";
 pub const DENSE_VOCAB_PROJECTION: &str = "moxie_dense_vocab_projection_v1";
+pub const DENSE_ROUTE: &str = "moxie_dense_route_v1";
+pub const DENSE_EXPERT_PROJECT_GELU: &str = "moxie_dense_expert_project_gelu_v1";
+pub const DENSE_EXPERT_DOWN: &str = "moxie_dense_expert_down_v1";
+pub const DENSE_COMBINE: &str = "moxie_dense_combine_v1";
 pub const DENSE_GRAPH_ABI: u32 = 1;
 
 /// The catalogue identity this build publishes for one architecture.
@@ -175,9 +179,10 @@ pub fn paged_attention_declares(descriptor: &moxie_types::SemanticKernelDescript
 #[cfg(feature = "fatbin")]
 mod images {
     use super::{
-        BF16_LINEAR, BF16_RESIDUAL, BF16_RMS_APPLY, BF16_RMS_SUM, DENSE_EMBEDDING, DENSE_GEGLU,
-        DENSE_GRAPH_ABI, DENSE_GROUPED_RMS, DENSE_LINEAR_PARTIAL, DENSE_LINEAR_SPLIT,
-        DENSE_RESIDUAL_SCALED, DENSE_ROPE, DENSE_VOCAB_PROJECTION,
+        BF16_LINEAR, BF16_RESIDUAL, BF16_RMS_APPLY, BF16_RMS_SUM, DENSE_COMBINE, DENSE_EMBEDDING,
+        DENSE_EXPERT_DOWN, DENSE_EXPERT_PROJECT_GELU, DENSE_GEGLU, DENSE_GRAPH_ABI,
+        DENSE_GROUPED_RMS, DENSE_LINEAR_PARTIAL, DENSE_LINEAR_SPLIT, DENSE_RESIDUAL_SCALED,
+        DENSE_ROPE, DENSE_ROUTE, DENSE_VOCAB_PROJECTION,
     };
     use moxie_types::{
         AccumulationPolicy, ActivationPrecision, GateTransform, KernelCapability, KernelCatalogue,
@@ -499,9 +504,9 @@ mod images {
         KernelCatalogue::new(descriptors).expect("built-in descriptors are unique")
     }
 
-    /// The shared dense graph package. Existing Linear, whole-row RMSNorm and
-    /// unit Residual symbols are included in this image so one module can run
-    /// a graph containing old and new operations. Paged attention keeps the
+    /// The shared dense graph package. Existing Linear, whole-row RMSNorm,
+    /// routed expert and unit Residual symbols are included in this image so
+    /// one module can run the full selected graph. Paged attention keeps the
     /// already-qualified descriptor and image identity; its state run owns the
     /// separate module load.
     pub fn dense_graph_catalogue() -> KernelCatalogue {
@@ -669,6 +674,54 @@ mod images {
                 workspace: WorkspaceExpression::Zero,
                 image_sha256: hash,
                 symbols: vec![KernelSymbol(DENSE_VOCAB_PROJECTION.to_string())],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-route-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::Route,
+                inputs: vec![bf16, weight, weight, weight],
+                output: ActivationPrecision::expect(Precision::F32),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::Unrounded,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(DENSE_ROUTE.to_string())],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-expert-mlp-gelu-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::ExpertMlp(GateTransform::GeluTanh),
+                inputs: vec![bf16, KernelOperand::RouteIndex, weight, weight],
+                output: ActivationPrecision::expect(Precision::Bf16),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::FinalBf16Rne,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::RowsTimesIntermediateF32,
+                image_sha256: hash,
+                symbols: vec![
+                    KernelSymbol(DENSE_EXPERT_PROJECT_GELU.to_string()),
+                    KernelSymbol(DENSE_EXPERT_DOWN.to_string()),
+                ],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-combine-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::Combine,
+                inputs: vec![KernelOperand::RouteIndex, bf16],
+                output: ActivationPrecision::expect(Precision::Bf16),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::FinalBf16Rne,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(DENSE_COMBINE.to_string())],
             });
             descriptors.push(SemanticKernelDescriptor {
                 id: KernelId(format!("dense-residual-v1-{suffix}")),
