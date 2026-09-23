@@ -3,7 +3,7 @@
 Status: **active** (resumed 2026-09-23 on `519bdb9`, task 0062's acceptance).
 The paused patch was re-applied cleanly. The coordinator searched task 0062's
 code and found no struct literal or exhaustive match that the frozen API
-delta breaks. `luna2` is now the only builder.
+delta breaks. `luna2` was closed; `luna` continues as the only builder.
 
 **Amendment, 2026-09-23 (coordinator).**
 - *Old premise:* change 4 adds `scale: f32` to `Join::Reduce`.
