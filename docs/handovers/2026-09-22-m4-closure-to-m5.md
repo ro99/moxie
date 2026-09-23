@@ -91,6 +91,9 @@ task is recorded as "code-complete, GPU gates pending" rather than
 accepted. The coordinator batches the pending GPU runs and asks the owner to
 release the GPUs, naming the devices, commands and expected duration.
 
+**GPUs released (owner, 2026-09-23):** the reservation above is lifted.
+GPU gates run again inside each task. Only one agent uses the GPUs at a time.
+
 ## Route to M5 closure (owner-agreed plan, 2026-09-22)
 
 Accepted so far: tasks 0053–0057. This covers the attention partition rule,

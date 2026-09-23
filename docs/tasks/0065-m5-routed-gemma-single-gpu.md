@@ -3,14 +3,12 @@
 Status: **open** (coordinator, 2026-09-23, under the owner's auto-mode
 delegation). Builder Codex `luna`; reviewer Codex `sol`.
 
-**GPU reservation (owner, 2026-09-23).** The owner is using the GPUs. Run
-only host and compile-only gates: `fmt`, `clippy` (with and without the
-driver features), `cargo test --workspace`, `arch-check`, `spec-check`, and
-the one filtered host test named in change 9. Never run a test that opens a
-CUDA device, `xtask test-gpu`, or a benchmark. The GPU gates below stay
-**pending**. The task can be code-complete and reviewed, but it is not
-accepted until the coordinator has run them in a GPU window the owner
-releases.
+**GPUs released (owner, 2026-09-23).** The reservation below is lifted. The
+builder now runs the GPU gates too: the end-to-end test and the mutations.
+Only one agent uses the GPUs at a time; during this task that agent is the
+builder. Always set `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
+
+~~GPU reservation (owner, 2026-09-23): host and compile-only gates only.~~
 
 ## Identity and authority
 
@@ -311,7 +309,7 @@ releases.
 - `cargo xtask arch-check` and `cargo xtask spec-check`.
 - Change 9's filtered host test.
 
-**GPU gates (pending the owner's GPU release; the coordinator runs them):**
+**GPU gates (the builder runs them; GPUs released 2026-09-23):**
 - Change 7's end-to-end test on both 3090s and the 5060 Ti. Shape C
   prefill plus decode must be within the task 0012 gate (bit-exact on
   exactly representable values, otherwise at most one BF16 ulp). Shapes A
@@ -335,4 +333,54 @@ releases.
 
 ## Result, filled after work
 
-- Pending.
+- Implemented changes 1–6: the dense catalogue now selects Route,
+  ExpertMlp(GeGlu) and Combine; lowering admits only Gemma's declared route,
+  expert and combine parameters; the CUDA image contains the routed kernels
+  and the already-qualified expert helpers; the executor binds the shared
+  route-value range and admitted expert workspace. Change 7 adds Shape C to
+  the existing prefill/decode comparison. Change 9 adds the exact host-only
+  lowering assertion for five rows, one descriptor of each routed operation
+  per routed layer, and `rows * top_k * 8` route bytes.
+- Change 8: no stale dense-catalogue count or refusal expectation was found.
+  `selected_chain_refuses_routed_operations` remains valid: it exercises the
+  separate reduced BF16 chain catalogue, not the dense graph package.
+- Host gates passed: `cargo fmt --all -- --check`; workspace clippy with
+  `-D warnings`; driver/paged-attention clippy with `-D warnings` (nvcc image
+  compiled; no device opened); `cargo test --workspace --locked`; `cargo xtask
+  arch-check` (79 rejected fixtures, 21 accepted, 13 rules); `cargo xtask
+  spec-check` (10 specification documents unchanged); and the required exact
+  filtered test (`1 passed`, `2 filtered out`).
+- GPU gate pending: the Shape A/B/C prefill/decode test on both 3090s and the
+  5060 Ti, the four runtime mutations below, and `cargo xtask-cuda test-gpu`.
+  They were not run because the owner's GPU reservation forbids device work.
+
+### Mutation patches for the GPU batch
+
+These are unapplied, one-line substitutions; apply and restore each in the
+GPU window.
+
+1. Combine by selection slot: `const unsigned int expert = row_ids[slot];` → `const unsigned int expert = static_cast<unsigned int>(slot);`
+2. Break equal route probabilities toward the higher id: `|| (probability == best_probability && expert < best_expert)) {` → `|| (probability == best_probability && expert > best_expert)) {`
+3. Drop per-expert scaling: `__fdiv_rn(probability, mass), __bfloat162float(per_expert[expert]));` → `__fdiv_rn(probability, mass), 1.0F);`
+4. Use slot `j` for the gate/up expert weights: `gate_up + static_cast<unsigned long long>(ids[slot]) * 2 * intermediate * hidden;` → `gate_up + static_cast<unsigned long long>(slot % top_k) * 2 * intermediate * hidden;`
+
+### Review map
+
+The code changes are confined to the allowed implementation and test files;
+this task record contains the Result. The carried `.gitignore`,
+`specification-version.md`, and ADRs 0034/0035 remain untouched.
+
+| File | Change |
+|---|---|
+| `crates/moxie-types/src/capability.rs` | +6 / −0; add Route and Combine semantic operation identities. |
+| `crates/moxie-kernels/cuda/routed_ops.cu` | +214 / −0; route, expert project/down, and combine kernels. |
+| `crates/moxie-kernels/cuda/dense_graph.cu` | +2 / −0; include expert helpers and routed kernels. |
+| `crates/moxie-kernels/build.rs` | +1 / −0; track the new source. |
+| `crates/moxie-kernels/src/lib.rs` | +59 / −6; routed symbols and per-SM descriptors. |
+| `crates/moxie-plan/src/selected.rs` | +79 / −3; supported lowering, route operands/shapes, and checked workspace charge. |
+| `crates/moxie-executor/src/dense.rs` | +194 / −0; bind routed operations and document route-range layout. |
+| `crates/moxie-executor/tests/dense_gemma_device.rs` | +91 / −6; extend the pending device gate and add the host lowering test. |
+| `docs/tasks/0065-m5-routed-gemma-single-gpu.md` | +50 / −1; record results and unapplied GPU mutation patches. |
+
+No model code, lease/ledger semantics, or files outside this set were changed;
+no commit was created.
