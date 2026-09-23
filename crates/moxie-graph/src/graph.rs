@@ -718,10 +718,11 @@ impl OpParams {
             // weights have to be resident. The router is three small tensors,
             // so replicating them costs almost nothing.
             OpParams::Route { .. } => PartitionRule::Replicated,
-            // Expert partitioning is M5. Failing closed here is what keeps that
-            // a lowering decision rather than something this task pre-empted:
-            // sharding experts also decides where `Combine`'s reduction happens.
-            OpParams::ExpertMlp { .. } | OpParams::Combine { .. } => PartitionRule::NotDetermined,
+            // Whole experts are assigned to one rank. The lowering owns the
+            // coupled ExpertMlp/Combine stage and declares its ordered sum.
+            OpParams::ExpertMlp { .. } | OpParams::Combine { .. } => {
+                PartitionRule::ExpertOwnerShardable
+            }
         }
     }
 

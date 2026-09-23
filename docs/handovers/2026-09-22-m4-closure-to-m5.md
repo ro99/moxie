@@ -75,9 +75,13 @@ wrong. Rows M5.1-c and M5.1-d record what it missed.
 
 Owner direction, 2026-09-23: a second builder starts slice 4 in parallel
 with task 0062. MLA partitioning and M5.5 (topology probes and plan
-comparison) are **not** deferred; they stay in M5. Slice 4 begins with
-[task 0064](../tasks/0064-m5-host-expert-owner-lowering.md), a host
-expert-owner lowering designed by the coordinator and built by `luna2`.
+comparison) are **not** deferred; they stay in M5. Slice 4 began with
+[task 0064](../tasks/0064-m5-host-expert-owner-lowering.md), **accepted**
+2026-09-23: a host expert-owner lowering of the routed block, bit-identical at
+2 and 4 ranks, covering duplicate-owner, cross-owner and empty-owner routes.
+Still open in slice 4: device execution of the expert-partitioned plan (the
+exit gate's resource and cancellation tests), host-owned experts, a scaled
+combine (Laguna 2.5), and MLA per-weight partitioning.
 
 ## Route to M5 closure (owner-agreed plan, 2026-09-22)
 

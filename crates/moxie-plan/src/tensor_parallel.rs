@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 use moxie_graph::{
-    Graph, GraphBuilder, LinearInputSlice, LinearReductionOrder, NodeId, Op, OpParams, OracleId,
-    OracleRegistry, PartitionRule, ValueId,
+    CombineReductionOrder, ExpertOwnership, Graph, GraphBuilder, LinearInputSlice,
+    LinearReductionOrder, NodeId, Op, OpParams, OracleId, OracleRegistry, PartitionRule, ValueId,
 };
 use moxie_types::{Dim, Error};
 
@@ -40,13 +40,17 @@ pub enum Join {
 pub struct RankPart {
     /// Rewritten parameters for every local node.
     pub params: BTreeMap<NodeId, OpParams>,
-    /// Contiguous rows of a row-major `[out, in]` weight this rank owns.
+    /// Contiguous outer-axis range of a row-major weight this rank owns.
     pub rows: BTreeMap<ValueId, Range<u64>>,
     /// One compact contiguous input-axis slice used in every row of a weight
     /// and in the corresponding activation.
     pub slices: BTreeMap<ValueId, LinearInputSlice>,
     /// The local view of each input-axis-split linear's declared order.
     pub linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
+    /// Rank-local ordered reductions for `Combine` nodes.
+    pub combine_orders: BTreeMap<NodeId, CombineReductionOrder>,
+    /// Rank-local whole-expert ownership for `ExpertMlp` nodes.
+    pub expert_ownership: BTreeMap<NodeId, ExpertOwnership>,
 }
 
 /// One boundary value read by a production stage graph. `original` is the
@@ -81,6 +85,8 @@ pub struct StageGraph {
     pub weights: Vec<StageWeight>,
     pub produces: Vec<(ValueId, ValueId)>,
     pub linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
+    pub combine_orders: BTreeMap<NodeId, CombineReductionOrder>,
+    pub expert_ownership: BTreeMap<NodeId, ExpertOwnership>,
     /// Stage-local attention nodes use layer zero so the standalone graph's
     /// state schema remains valid; the device consumer restores this original
     /// layer when it appends to the rank's full KV authority.
@@ -108,6 +114,8 @@ pub fn build_stage_graph(
     let mut weights = Vec::new();
     let mut produces = Vec::new();
     let mut linear_orders = BTreeMap::new();
+    let mut combine_orders = BTreeMap::new();
+    let mut expert_ownership = BTreeMap::new();
     let mut state_layers = BTreeMap::new();
     let mut last = None;
 
@@ -130,8 +138,8 @@ pub fn build_stage_graph(
                     .cloned()
                     .ok_or_else(|| invalid("stage", "stage input has no tensor spec"))?;
                 if let Some(rows) = part.and_then(|p| p.rows.get(&input)) {
-                    if spec.shape.len() != 2 {
-                        return Err(invalid("stage", "row-sharded weight is not rank two"));
+                    if spec.shape.is_empty() {
+                        return Err(invalid("stage", "outer-axis-sharded weight is rank zero"));
                     }
                     spec.shape[0] = Dim::constant(rows.end - rows.start);
                 } else if let Some(slice) = slice {
@@ -192,6 +200,12 @@ pub fn build_stage_graph(
         if let Some(order) = part.and_then(|p| p.linear_orders.get(&node.id)).copied() {
             linear_orders.insert(NodeId(local_index as u32), order);
         }
+        if let Some(order) = part.and_then(|p| p.combine_orders.get(&node.id)).copied() {
+            combine_orders.insert(NodeId(local_index as u32), order);
+        }
+        if let Some(ownership) = part.and_then(|p| p.expert_ownership.get(&node.id)).copied() {
+            expert_ownership.insert(NodeId(local_index as u32), ownership);
+        }
         map.insert(node.output, local_output);
         produces.push((node.output, local_output));
         last = Some(local_output);
@@ -211,6 +225,8 @@ pub fn build_stage_graph(
         weights,
         produces,
         linear_orders,
+        combine_orders,
+        expert_ownership,
         state_layers,
     })
 }
@@ -221,6 +237,8 @@ pub struct TensorParallelLowering {
     pub ranks: Vec<RankPart>,
     /// Node-keyed declaration consumed by the full host reference path.
     pub linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
+    /// Reference declaration for the ordered cross-owner `Combine` reduction.
+    pub combine_orders: BTreeMap<NodeId, CombineReductionOrder>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +275,15 @@ pub enum TensorParallelRefused {
     },
     /// A head chain or dense local pattern this lowering cannot follow.
     HeadChain {
+        node: NodeId,
+    },
+    /// An expert slot tensor must feed exactly one adjacent `Combine` node.
+    ExpertSlots {
+        node: NodeId,
+    },
+    /// A routed combine with non-unit output scale needs a scaled join that this
+    /// slice does not declare.
+    ScaledCombine {
         node: NodeId,
     },
 }
@@ -308,6 +335,16 @@ impl core::fmt::Display for TensorParallelRefused {
                 "node {}: not part of a legal tensor-parallel local stage",
                 node.0
             ),
+            Self::ExpertSlots { node } => write!(
+                f,
+                "node {}: expert slots must feed exactly one adjacent combine",
+                node.0
+            ),
+            Self::ScaledCombine { node } => write!(
+                f,
+                "node {}: routed combine output scale must be 1.0 for this lowering",
+                node.0
+            ),
         }
     }
 }
@@ -337,6 +374,13 @@ struct Mlp {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct ExpertStage {
+    mlp: usize,
+    combine: usize,
+    experts: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct Span {
     end: usize,
     join: Join,
@@ -361,9 +405,8 @@ pub fn lower_tensor_parallel(
     let mut chain: BTreeMap<usize, (usize, Axis)> = BTreeMap::new();
     for (index, node) in nodes.iter().enumerate() {
         match node.params {
-            OpParams::MlaAttention { .. } | OpParams::Route { .. } => {
-                return Err(refuse_op(node));
-            }
+            OpParams::MlaAttention { .. } => return Err(refuse_op(node)),
+            OpParams::Route { .. } => continue,
             _ if node.params.partition_rule() == PartitionRule::NotDetermined => {
                 return Err(refuse_op(node));
             }
@@ -507,6 +550,87 @@ pub fn lower_tensor_parallel(
         });
     }
 
+    // Route, ExpertMlp and their consuming Combine form one rank-local stage.
+    // Every rank runs the unchanged Route over identical inputs and weights.
+    let mut expert_stages = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let OpParams::ExpertMlp { experts, .. } = node.params else {
+            continue;
+        };
+        let route_index = producer
+            .get(&node.inputs[1])
+            .copied()
+            .ok_or(TensorParallelRefused::ExpertSlots { node: node.id })?;
+        if route_index >= index || !matches!(nodes[route_index].params, OpParams::Route { .. }) {
+            return Err(TensorParallelRefused::ExpertSlots { node: node.id });
+        }
+        let consumers: Vec<usize> = nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(consumer, candidate)| {
+                candidate.inputs.contains(&node.output).then_some(consumer)
+            })
+            .collect();
+        if consumers.len() != 1 {
+            return Err(TensorParallelRefused::ExpertSlots { node: node.id });
+        }
+        let combine_index = consumers[0];
+        let OpParams::Combine { output_scale, .. } = nodes[combine_index].params else {
+            return Err(TensorParallelRefused::ExpertSlots { node: node.id });
+        };
+        if combine_index != index + 1 || nodes[combine_index].inputs[0] != node.inputs[1] {
+            return Err(TensorParallelRefused::ExpertSlots { node: node.id });
+        }
+        if output_scale != 1.0 {
+            return Err(TensorParallelRefused::ScaledCombine {
+                node: nodes[combine_index].id,
+            });
+        }
+        if !experts.is_multiple_of(u64::from(ranks)) {
+            return Err(TensorParallelRefused::Dimension {
+                node: node.id,
+                axis: "experts",
+                value: experts,
+                ranks,
+            });
+        }
+        let start = route_index;
+        let end = combine_index + 1;
+        if (start..end).any(|i| claimed[i]) {
+            return Err(TensorParallelRefused::HeadChain { node: node.id });
+        }
+        for claimed in claimed.iter_mut().take(end).skip(start) {
+            *claimed = true;
+        }
+        let combine = &nodes[combine_index];
+        if spans
+            .insert(
+                start,
+                Span {
+                    end,
+                    join: Join::Reduce {
+                        output: combine.output,
+                    },
+                },
+            )
+            .is_some()
+        {
+            return Err(TensorParallelRefused::HeadChain { node: node.id });
+        }
+        expert_stages.push(ExpertStage {
+            mlp: index,
+            combine: combine_index,
+            experts,
+        });
+    }
+    for (index, node) in nodes.iter().enumerate() {
+        if matches!(node.params, OpParams::Combine { .. })
+            && !expert_stages.iter().any(|stage| stage.combine == index)
+        {
+            return Err(refuse_op(node));
+        }
+    }
+
     let mut output_linears = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
         let OpParams::Linear {
@@ -612,6 +736,68 @@ pub fn lower_tensor_parallel(
     let r = u64::from(ranks);
     let mut parts = vec![RankPart::default(); ranks as usize];
     let mut linear_orders = BTreeMap::new();
+    let mut combine_orders = BTreeMap::new();
+
+    for stage in expert_stages {
+        let expert = &nodes[stage.mlp];
+        let combine = &nodes[stage.combine];
+        let experts_per_rank = stage.experts / r;
+        let OpParams::ExpertMlp {
+            hidden,
+            intermediate,
+            top_k,
+            activation,
+            ..
+        } = expert.params
+        else {
+            unreachable!("expert stages are indexed by ExpertMlp");
+        };
+        combine_orders.insert(
+            combine.id,
+            CombineReductionOrder {
+                groups: ranks,
+                owned: None,
+            },
+        );
+        for (rank, part) in parts.iter_mut().enumerate() {
+            let owned = rank as u32;
+            let first = u64::from(owned) * experts_per_rank;
+            let rows = first..first + experts_per_rank;
+            for weight in [expert.inputs[2], expert.inputs[3]] {
+                if part
+                    .rows
+                    .insert(weight, rows.clone())
+                    .is_some_and(|seen| seen != rows)
+                {
+                    return Err(TensorParallelRefused::HeadChain { node: expert.id });
+                }
+            }
+            part.params.insert(
+                expert.id,
+                OpParams::ExpertMlp {
+                    hidden,
+                    intermediate,
+                    experts: experts_per_rank,
+                    top_k,
+                    activation,
+                },
+            );
+            part.expert_ownership.insert(
+                expert.id,
+                ExpertOwnership {
+                    groups: ranks,
+                    owned,
+                },
+            );
+            part.combine_orders.insert(
+                combine.id,
+                CombineReductionOrder {
+                    groups: ranks,
+                    owned: Some(owned),
+                },
+            );
+        }
+    }
 
     // Attention head-local parameters.
     for (&index, &(attention, axis)) in &chain {
@@ -899,6 +1085,7 @@ pub fn lower_tensor_parallel(
         stages,
         ranks: parts,
         linear_orders,
+        combine_orders,
     })
 }
 

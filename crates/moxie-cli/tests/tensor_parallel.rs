@@ -39,6 +39,8 @@ struct StageGraph {
     reads: Vec<(ValueId, ValueId, Option<LinearInputSlice>)>,
     produces: Vec<(ValueId, ValueId)>,
     linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
+    combine_orders: BTreeMap<NodeId, moxie_graph::CombineReductionOrder>,
+    expert_ownership: BTreeMap<NodeId, moxie_graph::ExpertOwnership>,
 }
 
 /// Rebuild a consecutive stage as a standalone graph. A local stage supplies
@@ -69,7 +71,9 @@ fn stage_graph(
             let cols = whole.cols();
             let (start, end) = (rows.start as usize, rows.end as usize);
             let data = whole.data()[start * cols..end * cols].to_vec();
-            value = Value::Float(HostTensor::bf16(data, vec![end - start, cols]).unwrap());
+            let mut shape = whole.shape().to_vec();
+            shape[0] = end - start;
+            value = Value::Float(HostTensor::bf16(data, shape).unwrap());
         } else if let Some(slice) = weight.slice {
             let whole = value.as_float().unwrap();
             let rows = whole.rows();
@@ -94,6 +98,8 @@ fn stage_graph(
             .collect(),
         produces: built.produces,
         linear_orders: built.linear_orders,
+        combine_orders: built.combine_orders,
+        expert_ownership: built.expert_ownership,
     }
 }
 
@@ -160,11 +166,7 @@ fn tokens(rows: &Range<u64>, vocab: u64) -> Vec<u64> {
     rows.clone().map(|i| (i * 3 + 1) % vocab).collect()
 }
 
-fn unsplit_logits(
-    f: &Fixture,
-    vocab: u64,
-    orders: Option<&BTreeMap<NodeId, LinearReductionOrder>>,
-) -> Vec<Vec<u32>> {
+fn unsplit_logits(f: &Fixture, vocab: u64, lowering: &TensorParallelLowering) -> Vec<Vec<u32>> {
     let layers = f.graph.attention_layers().len();
     let mut state = SequenceState::new([StateKind::KvPages]);
     let mut cache = KvCache::for_branch(layers, &state, ROOT).unwrap();
@@ -175,36 +177,36 @@ fn unsplit_logits(
             let mut bindings = f.weights.clone();
             bindings.set(f.tokens, Value::Index(tokens(rows, vocab)));
             bindings.set(f.positions, Value::Index(rows.clone().collect()));
-            let out = match orders {
-                Some(orders) => Interpreter::new()
-                    .run_with_linear_orders(
-                        &f.graph,
-                        &bindings,
-                        &mut state,
-                        ROOT,
-                        &mut cache,
-                        &Cancel::never(),
-                        orders,
-                    )
-                    .unwrap(),
-                None => Interpreter::new()
-                    .run(
-                        &f.graph,
-                        &bindings,
-                        &mut state,
-                        ROOT,
-                        &mut cache,
-                        &Cancel::never(),
-                    )
-                    .unwrap(),
-            };
+            let out = Interpreter::new()
+                .run_with_partition_orders(
+                    &f.graph,
+                    &bindings,
+                    &mut state,
+                    ROOT,
+                    &mut cache,
+                    &Cancel::never(),
+                    &lowering.linear_orders,
+                    &lowering.combine_orders,
+                    &BTreeMap::new(),
+                )
+                .unwrap();
             bits(&out.logits)
         })
         .collect()
 }
 
-fn split_logits(f: &Fixture, lowering: &TensorParallelLowering, vocab: u64) -> Vec<Vec<u32>> {
+fn split_logits(
+    f: &Fixture,
+    lowering: &TensorParallelLowering,
+    vocab: u64,
+) -> (Vec<Vec<u32>>, Vec<Vec<Vec<u32>>>) {
     let ranks = lowering.ranks.len();
+    let first_route = f
+        .graph
+        .nodes()
+        .iter()
+        .find(|node| matches!(node.params, OpParams::Route { .. }))
+        .map(|node| node.output);
     let stages: Vec<(Join, Vec<StageGraph>)> = lowering
         .stages
         .iter()
@@ -245,9 +247,11 @@ fn split_logits(f: &Fixture, lowering: &TensorParallelLowering, vocab: u64) -> V
         }
     }
     let interpreter = Interpreter::new();
-    STEPS
+    let mut routes_by_step = Vec::new();
+    let logits = STEPS
         .iter()
         .map(|rows| {
+            let mut route_rows = Vec::new();
             let mut tables: Vec<BTreeMap<ValueId, Value>> = (0..ranks)
                 .map(|_| {
                     BTreeMap::from([
@@ -269,8 +273,8 @@ fn split_logits(f: &Fixture, lowering: &TensorParallelLowering, vocab: u64) -> V
                                 .run_stateless(&graph.graph, &bind(graph, &tables[rank]))
                                 .unwrap();
                             for (original, id) in &graph.produces {
-                                tables[rank]
-                                    .insert(*original, trace.node_output(*id).unwrap().clone());
+                                let value = trace.node_output(*id).unwrap().clone();
+                                tables[rank].insert(*original, value);
                             }
                         }
                         for table in &tables[1..] {
@@ -308,12 +312,25 @@ fn split_logits(f: &Fixture, lowering: &TensorParallelLowering, vocab: u64) -> V
                         } else {
                             for (rank, graph) in graphs.iter().enumerate() {
                                 let trace = interpreter
-                                    .run_stateless_with_linear_orders(
+                                    .run_stateless_with_partition_orders(
                                         &graph.graph,
                                         &bind(graph, &tables[rank]),
                                         &graph.linear_orders,
+                                        &graph.combine_orders,
+                                        &graph.expert_ownership,
                                     )
                                     .unwrap();
+                                if rank == 0 {
+                                    for (original, id) in &graph.produces {
+                                        if Some(*original) == first_route {
+                                            let route =
+                                                trace.node_output(*id).unwrap().as_route().unwrap();
+                                            route_rows.extend((0..route.rows()).map(|row| {
+                                                route.row_experts(row).unwrap().to_vec()
+                                            }));
+                                        }
+                                    }
+                                }
                                 outputs.push(trace.output().as_float().unwrap().clone());
                             }
                         }
@@ -331,9 +348,11 @@ fn split_logits(f: &Fixture, lowering: &TensorParallelLowering, vocab: u64) -> V
                     }
                 }
             }
+            routes_by_step.push(route_rows);
             bits(tables[0][&f.graph.output()].as_float().unwrap())
         })
-        .collect()
+        .collect();
+    (logits, routes_by_step)
 }
 
 #[test]
@@ -342,19 +361,94 @@ fn dense_tp_is_bit_identical_to_the_unsplit_graph_at_prefill_and_decode() {
     let vocab = 12;
     for ranks in [2, 4] {
         let lowering = lower_tensor_parallel(&f.graph, ranks).unwrap();
-        let declared = unsplit_logits(&f, vocab, Some(&lowering.linear_orders));
-        assert_eq!(
-            split_logits(&f, &lowering, vocab),
-            declared,
-            "{ranks} ranks"
+        let declared = unsplit_logits(&f, vocab, &lowering);
+        let (actual, _) = split_logits(&f, &lowering, vocab);
+        assert_eq!(actual, declared, "{ranks} ranks");
+    }
+}
+
+#[test]
+fn routed_expert_owners_are_bit_identical_at_prefill_and_decode() {
+    let mut config = gemma::Shape::C.config();
+    config.moe.as_mut().unwrap().experts = 8;
+    config.vocab = 12;
+    let mut f = gemma::build_with_config(config).unwrap();
+    let weight = |name: &str| {
+        *f.graph
+            .weights()
+            .iter()
+            .find(|id| {
+                f.graph
+                    .name(**id)
+                    .is_some_and(|label| label.starts_with(&format!("{name}.")))
+            })
+            .unwrap()
+    };
+    let projection_id = weight("router_proj");
+    let width = f
+        .weights
+        .get(projection_id)
+        .unwrap()
+        .as_float()
+        .unwrap()
+        .cols();
+    let mut projection = vec![0.0; 8 * width];
+    projection[0] = 1.0;
+    projection[4 * width] = -1.0;
+    f.weights.set(
+        projection_id,
+        Value::Float(HostTensor::bf16(projection, vec![8, width]).unwrap()),
+    );
+    let scale_id = weight("router_scale");
+    f.weights.set(
+        scale_id,
+        Value::Float(HostTensor::bf16(vec![1.0; width], vec![width]).unwrap()),
+    );
+    let vocab = 12;
+
+    for ranks in [2, 4] {
+        let lowering = lower_tensor_parallel(&f.graph, ranks).unwrap();
+        let declared = unsplit_logits(&f, vocab, &lowering);
+        let (actual, routes_by_step) = split_logits(&f, &lowering, vocab);
+        assert_eq!(actual, declared, "{ranks} ranks");
+
+        let prefill_routes = &routes_by_step[0];
+        let group_width = 8 / ranks;
+        let owners = |row: &[u32]| {
+            row.iter()
+                .map(|expert| *expert / group_width)
+                .collect::<Vec<_>>()
+        };
+        let same_owner = prefill_routes
+            .iter()
+            .enumerate()
+            .find(|(_, row)| owners(row).windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(
+            same_owner.is_some(),
+            "{ranks} ranks had no duplicate destination in prefill routes {prefill_routes:?}"
         );
+        let different_owners = prefill_routes
+            .iter()
+            .enumerate()
+            .find(|(_, row)| owners(row).windows(2).any(|pair| pair[0] != pair[1]));
+        assert!(
+            different_owners.is_some(),
+            "{ranks} ranks had no cross-owner route in prefill routes {prefill_routes:?}"
+        );
+        if ranks == 4 {
+            let selected: Vec<u32> = prefill_routes.iter().flat_map(|row| owners(row)).collect();
+            assert!(
+                (0..ranks).any(|owner| !selected.contains(&owner)),
+                "every owner received a prefill route: {prefill_routes:?}"
+            );
+        }
     }
 }
 
 #[test]
 fn unsupported_partitions_are_refused() {
     type Expect = fn(&TensorParallelRefused) -> bool;
-    let cases: [(&str, Graph, u32, Expect); 6] = [
+    let cases: [(&str, Graph, u32, Expect); 8] = [
         (
             "4 query heads over 3 ranks",
             gemma::build(gemma::Shape::A).unwrap().graph,
@@ -368,10 +462,30 @@ fn unsupported_partitions_are_refused() {
             |r| matches!(r, TensorParallelRefused::KvHeads { .. }),
         ),
         (
-            "a routed graph",
+            "five experts over two ranks",
             gemma::build(gemma::Shape::C).unwrap().graph,
             2,
-            |r| matches!(r, TensorParallelRefused::Op { .. }),
+            |r| {
+                matches!(
+                    r,
+                    TensorParallelRefused::Dimension {
+                        axis: "experts",
+                        ..
+                    }
+                )
+            },
+        ),
+        (
+            "expert slots escaping their local stage",
+            routed_graph(4, 1.0, true),
+            2,
+            |r| matches!(r, TensorParallelRefused::HeadChain { .. }),
+        ),
+        (
+            "a non-unit routed combine scale",
+            routed_graph(4, 2.0, false),
+            2,
+            |r| matches!(r, TensorParallelRefused::ScaledCombine { .. }),
         ),
         ("a biased query projection", biased_query_graph(), 2, |r| {
             matches!(r, TensorParallelRefused::HeadChain { .. })
@@ -464,6 +578,70 @@ fn mlp_boundary_graph(output_gate: bool) -> Graph {
         .unwrap()
     };
     g.finish(output, &oracles).unwrap()
+}
+
+fn routed_graph(experts: u64, output_scale: f32, slots_escape: bool) -> Graph {
+    let (hidden, intermediate, top_k) = (4u64, 2u64, 2u64);
+    let mut oracles = OracleRegistry::new();
+    moxie_oracles::register(&mut oracles).unwrap();
+    let mut g = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(0));
+    let x = g.input(
+        "x",
+        TensorSpec::new(
+            ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
+            vec![Dim::symbol(SymbolId(0)), Dim::constant(hidden)],
+        ),
+    );
+    let weight = |g: &mut GraphBuilder, name: &str, shape: Vec<u64>| {
+        let spec = TensorSpec::new(
+            ValueRole::Weight(WeightPrecision::new(Precision::Bf16).unwrap()),
+            shape.into_iter().map(Dim::constant).collect(),
+        );
+        g.weight(name, spec).unwrap()
+    };
+    let router = weight(&mut g, "router", vec![experts, hidden]);
+    let gate_up = weight(&mut g, "gate_up", vec![experts, 2 * intermediate, hidden]);
+    let down = weight(&mut g, "down", vec![experts, hidden, intermediate]);
+    let route = g
+        .node(
+            OpParams::Route {
+                hidden,
+                experts,
+                top_k,
+                input: moxie_graph::RouterInput::Raw,
+                score: moxie_graph::RouteScore::Softmax,
+                per_expert_scale: false,
+                selection_bias: false,
+                coefficient: moxie_graph::RouteCoefficient::Fp32,
+            },
+            &[x, router],
+        )
+        .unwrap();
+    let slots = g
+        .node(
+            OpParams::ExpertMlp {
+                hidden,
+                intermediate,
+                experts,
+                top_k,
+                activation: moxie_graph::ExpertActivation::GeGlu,
+            },
+            &[x, route, gate_up, down],
+        )
+        .unwrap();
+    let combined = g
+        .node(
+            OpParams::Combine {
+                hidden,
+                top_k,
+                order: moxie_graph::CombineOrder::AscendingExpertId,
+                output_scale,
+            },
+            &[route, slots],
+        )
+        .unwrap();
+    g.finish(if slots_escape { slots } else { combined }, &oracles)
+        .unwrap()
 }
 
 /// One attention layer whose query projection carries a bias.

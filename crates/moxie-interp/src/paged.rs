@@ -348,11 +348,14 @@ impl Interpreter {
         for node in graph.nodes() {
             cancel.check(node.params.op().name())?;
             let value = self.eval(
+                graph,
                 node,
                 &values,
                 sequence,
                 &mut staged,
                 &positions,
+                &std::collections::BTreeMap::new(),
+                &std::collections::BTreeMap::new(),
                 &std::collections::BTreeMap::new(),
             )?;
             if let Value::Float(t) = &value

@@ -1,9 +1,10 @@
 # Task 0064 — host expert-owner partitioning of the routed MoE block
 
-Status: **active** (resumed 2026-09-23 on `519bdb9`, task 0062's acceptance).
-The paused patch was re-applied cleanly. The coordinator searched task 0062's
-code and found no struct literal or exhaustive match that the frozen API
-delta breaks. `luna2` was closed; `luna` continues as the only builder.
+Status: **accepted** (coordinator, 2026-09-23, under the owner's auto-mode
+delegation). Started by Codex `luna2` (paused, then closed); completed by
+Codex `luna` from the coordinator's numbered design with three amendments.
+Sol accepted on round 1 with no findings. The coordinator re-ran `fmt`,
+workspace `clippy`, `arch-check`, `spec-check` and the host TP tests.
 
 **Amendment, 2026-09-23 (coordinator).**
 - *Old premise:* change 4 adds `scale: f32` to `Join::Reduce`.
@@ -211,8 +212,58 @@ model edits.
 
 ## Result, filled after work
 
-- Changed files (+/-); source identity:
-- Commands; passed / failed / skipped:
-- Route cases observed (row, experts, owners):
+- Source identity: the synthetic Shape C graph built by
+  `moxie_cli::gemma::build_with_config`, with experts 8, top_k 2 and vocab 12;
+  all other Shape C fields stay unchanged. The test sets the first routed
+  projection to select cross-owner and duplicate-owner rows, and uses a unit
+  router gain. Reference and split runs use the same fixture weights and token
+  rows. This is not checkpoint or model support.
+- The local stage spans Route through Combine, including Gemma's unchanged
+  routed-input RMSNorm between Route and ExpertMlp; `Stage` represents a
+  contiguous node range.
+- Review map (added / removed lines):
+
+  | File | + | - |
+  |---|---:|---:|
+  | `crates/moxie-cli/tests/tensor_parallel.rs` | 221 | 43 |
+  | `crates/moxie-graph/src/graph.rs` | 5 | 4 |
+  | `crates/moxie-graph/src/lib.rs` | 20 | 0 |
+  | `crates/moxie-interp/src/lib.rs` | 215 | 32 |
+  | `crates/moxie-interp/src/paged.rs` | 3 | 0 |
+  | `crates/moxie-interp/tests/reference_graphs.rs` | 1 | 1 |
+  | `crates/moxie-oracles/src/route.rs` | 266 | 0 |
+  | `crates/moxie-plan/src/selected.rs` | 1 | 1 |
+  | `crates/moxie-plan/src/tensor_parallel.rs` | 195 | 8 |
+  | `docs/tasks/0064-m5-host-expert-owner-lowering.md` | 54 | 4 |
+  | `docs/evidence/specification-version.md` (carried) | 1 | 1 |
+
+  `docs/evidence/specification-version.md` and carried ADRs 0034 and 0035 were
+  preserved; the existing specification-version delta was not part of this
+  task's edits.
+- Commands; passed / failed / skipped: `cargo fmt --all -- --check`, workspace
+  clippy with `-D warnings`, `cargo test --workspace --locked`,
+  `cargo xtask arch-check` (79 rejected fixtures, 21 accepted, 13 rules), and
+  `cargo xtask spec-check` (10 documents) passed. Also passed
+  `cargo test -p moxie-cli --test tensor_parallel --locked` and
+  `cargo test -p moxie-oracles --locked`. No acceptance gate was skipped.
+  Clippy first identified
+  the specified nine-argument oracle and the interpreter's expanded private
+  evaluator; the API was kept as contracted with narrow argument-count allows,
+  and the workspace clippy rerun passed.
+- Route cases observed in the five-row prefill (row indexes are zero-based):
+  - Both rank counts observed `[[4, 1], [4, 1], [0, 1], [0, 1], [4, 1]]`.
+    At R=2, row 0 selected experts `[4, 1]` owned by `[1, 0]` (cross-owner);
+    row 2 selected `[0, 1]` owned by `[0, 0]` (duplicate destination).
+  - R=4: row 0 selected `[4, 1]` owned by `[2, 0]`; row 2 selected `[0, 1]`
+    owned by `[0, 0]`. Only owners 0 and 2 were selected, so owners 1 and 3
+    had empty partials. Both rank counts were bit-identical to their declared
+    reference at prefill and decode.
 - Mutation results and restoration:
-- Remaining obligations:
+  - Adding non-owned slots as zero contributions failed the ordered-combine
+    test (`NaN` instead of `8.0`); restored skip behavior.
+  - Descending group accumulation at R=4 failed (`0.0` instead of `4.0`);
+    restored ascending group order.
+  - Making the reference run one group failed (`5.0` instead of `4.0`);
+    restored the declared group reduction.
+- Remaining obligations: none for task 0064. Device execution, host-owned
+  experts and uneven ownership remain outside this task's scope.

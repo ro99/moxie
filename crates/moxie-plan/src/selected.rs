@@ -1866,7 +1866,7 @@ mod tests {
         ] {
             assert_eq!(
                 params.partition_rule(),
-                moxie_graph::PartitionRule::NotDetermined,
+                moxie_graph::PartitionRule::ExpertOwnerShardable,
                 "{} must fail closed until M5",
                 params.op().name()
             );

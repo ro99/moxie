@@ -41,8 +41,8 @@ pub mod paged;
 pub mod tensor;
 
 use moxie_graph::{
-    Bindings, Graph, LinearInputSlice, LinearReductionOrder, MlaAttentionDescriptor, Node, NodeId,
-    OpParams, ValueId,
+    Bindings, CombineReductionOrder, ExpertOwnership, Graph, LinearInputSlice,
+    LinearReductionOrder, MlaAttentionDescriptor, Node, NodeId, OpParams, ValueId,
 };
 use moxie_oracles::{activation, attention, linear, mla, norm, residual, rope, route};
 use moxie_state::{LogitsHandle, MlaLatentDescriptor, SequenceState};
@@ -258,6 +258,25 @@ impl Interpreter {
         bindings: &Bindings<Value>,
         orders: &BTreeMap<NodeId, LinearReductionOrder>,
     ) -> Result<StatelessTrace> {
+        self.run_stateless_with_partition_orders(
+            graph,
+            bindings,
+            orders,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+    }
+
+    /// Stateless execution with plan-declared linear, combine, and expert
+    /// partition orders. Missing entries preserve the ordinary operation.
+    pub fn run_stateless_with_partition_orders(
+        &self,
+        graph: &Graph,
+        bindings: &Bindings<Value>,
+        linear_orders: &BTreeMap<NodeId, LinearReductionOrder>,
+        combine_orders: &BTreeMap<NodeId, CombineReductionOrder>,
+        expert_ownership: &BTreeMap<NodeId, ExpertOwnership>,
+    ) -> Result<StatelessTrace> {
         if !graph.state_effects().is_empty() {
             return Err(Error::InvalidRequest {
                 field: "graph",
@@ -335,7 +354,17 @@ impl Interpreter {
         let mut staged = Vec::new();
         let mut node_outputs = Vec::with_capacity(graph.nodes().len());
         for node in graph.nodes() {
-            let output = self.eval(node, &values, &kv, &mut staged, &[], orders)?;
+            let output = self.eval(
+                graph,
+                node,
+                &values,
+                &kv,
+                &mut staged,
+                &[],
+                linear_orders,
+                combine_orders,
+                expert_ownership,
+            )?;
             if let Value::Float(tensor) = &output
                 && tensor.data().iter().any(|element| !element.is_finite())
             {
@@ -393,6 +422,34 @@ impl Interpreter {
         kv: &mut KvCache,
         cancel: &Cancel,
         orders: &BTreeMap<NodeId, LinearReductionOrder>,
+    ) -> Result<StepOutput> {
+        self.run_with_partition_orders(
+            graph,
+            bindings,
+            state,
+            branch,
+            kv,
+            cancel,
+            orders,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+    }
+
+    /// Execute one step with plan-declared linear, combine, and expert
+    /// partition orders. Missing entries preserve the ordinary operation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_partition_orders(
+        &self,
+        graph: &Graph,
+        bindings: &Bindings<Value>,
+        state: &mut SequenceState,
+        branch: BranchId,
+        kv: &mut KvCache,
+        cancel: &Cancel,
+        linear_orders: &BTreeMap<NodeId, LinearReductionOrder>,
+        combine_orders: &BTreeMap<NodeId, CombineReductionOrder>,
+        expert_ownership: &BTreeMap<NodeId, ExpertOwnership>,
     ) -> Result<StepOutput> {
         let before = state.frontiers(branch)?;
         // The cache must be this branch's, at this prefix, holding this version
@@ -584,7 +641,17 @@ impl Interpreter {
 
         for node in graph.nodes() {
             cancel.check(node.params.op().name())?;
-            let out = self.eval(node, &values, kv, &mut staged, &positions, orders)?;
+            let out = self.eval(
+                graph,
+                node,
+                &values,
+                kv,
+                &mut staged,
+                &positions,
+                linear_orders,
+                combine_orders,
+                expert_ownership,
+            )?;
             // Checked per node, not only at the output: attributing a NaN to the
             // operation that produced it is the difference between a defect
             // report and a puzzle.
@@ -759,14 +826,18 @@ impl Interpreter {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn eval(
         &self,
+        graph: &Graph,
         node: &Node,
         values: &[Option<Value>],
         kv: &impl paged::HistorySource,
         staged: &mut Vec<StagedAppend>,
         positions: &[u64],
-        orders: &BTreeMap<NodeId, LinearReductionOrder>,
+        linear_orders: &BTreeMap<NodeId, LinearReductionOrder>,
+        combine_orders: &BTreeMap<NodeId, CombineReductionOrder>,
+        expert_ownership: &BTreeMap<NodeId, ExpertOwnership>,
     ) -> Result<Value> {
         let input = |i: usize| -> Result<&Value> {
             values[node.inputs[i].0 as usize]
@@ -828,7 +899,7 @@ impl Interpreter {
                     None
                 };
                 let mut out = try_vec(x.rows() * out_features as usize)?;
-                let order = orders.get(&node.id).copied();
+                let order = linear_orders.get(&node.id).copied();
                 if let Some(LinearReductionOrder {
                     blocks,
                     slice: Some(slice),
@@ -1204,25 +1275,85 @@ impl Interpreter {
                     intermediate: intermediate as usize,
                     activation,
                 };
-                let mut out = try_vec(x.rows() * top_k as usize * hidden as usize)?;
-                for r in 0..x.rows() {
-                    // Slot-major, in the row's own selection order. A grouped
-                    // kernel is free to visit the same work expert-major -- that
-                    // is exactly what `route::dispatch` describes -- but it owes
-                    // this scatter, because slot `j` belongs to the expert the
-                    // route chose at position `j`.
-                    for e in table.row_experts(r)? {
-                        out.extend(route::expert_row(
-                            x.row(r)?,
-                            gate_up.data(),
-                            down.data(),
-                            *e,
-                            spec,
-                        )?);
+                if let Some(ownership) = expert_ownership.get(&node.id).copied() {
+                    if ownership.groups == 0 || ownership.owned >= ownership.groups {
+                        return Err(Error::InvalidRequest {
+                            field: "expert_ownership",
+                            detail: "the owned group must be inside a positive group count".into(),
+                        });
                     }
+                    let total = experts
+                        .checked_mul(u64::from(ownership.groups))
+                        .ok_or(moxie_types::DimError::Overflow)?;
+                    let first = experts
+                        .checked_mul(u64::from(ownership.owned))
+                        .ok_or(moxie_types::DimError::Overflow)?;
+                    let total =
+                        usize::try_from(total).map_err(|_| moxie_types::DimError::Overflow)?;
+                    let first =
+                        usize::try_from(first).map_err(|_| moxie_types::DimError::Overflow)?;
+                    if table
+                        .experts()
+                        .iter()
+                        .any(|expert| *expert as usize >= total)
+                    {
+                        return Err(Error::InvalidArtifact {
+                            detail: "the route selected an expert outside the declared ownership"
+                                .into(),
+                        });
+                    }
+                    let width = hidden as usize;
+                    let top_k = top_k as usize;
+                    let length = x
+                        .rows()
+                        .checked_mul(top_k)
+                        .and_then(|n| n.checked_mul(width))
+                        .ok_or(moxie_types::DimError::Overflow)?;
+                    let mut out = try_vec(length)?;
+                    out.resize(length, 0.0);
+                    for r in 0..x.rows() {
+                        for (slot, &expert) in table.row_experts(r)?.iter().enumerate() {
+                            let expert = expert as usize;
+                            if (first..first + spec.experts).contains(&expert) {
+                                let value = route::expert_row(
+                                    x.row(r)?,
+                                    gate_up.data(),
+                                    down.data(),
+                                    (expert - first) as u32,
+                                    spec,
+                                )?;
+                                let start = (r * top_k + slot) * width;
+                                out[start..start + width].copy_from_slice(&value);
+                            }
+                        }
+                    }
+                    Value::Float(HostTensor::round_to_bf16(
+                        out,
+                        try_shape2(x.rows() * top_k, width)?,
+                    )?)
+                } else {
+                    let mut out = try_vec(x.rows() * top_k as usize * hidden as usize)?;
+                    for r in 0..x.rows() {
+                        // Slot-major, in the row's own selection order. A grouped
+                        // kernel is free to visit the same work expert-major -- that
+                        // is exactly what `route::dispatch` describes -- but it owes
+                        // this scatter, because slot `j` belongs to the expert the
+                        // route chose at position `j`.
+                        for e in table.row_experts(r)? {
+                            out.extend(route::expert_row(
+                                x.row(r)?,
+                                gate_up.data(),
+                                down.data(),
+                                *e,
+                                spec,
+                            )?);
+                        }
+                    }
+                    Value::Float(HostTensor::round_to_bf16(
+                        out,
+                        try_shape2(x.rows() * top_k as usize, hidden as usize)?,
+                    )?)
                 }
-                let shape = try_shape2(x.rows() * top_k as usize, hidden as usize)?;
-                Value::Float(HostTensor::round_to_bf16(out, shape)?)
             }
             OpParams::Combine {
                 hidden,
@@ -1244,19 +1375,71 @@ impl Interpreter {
                 }
                 let width = hidden as usize;
                 let mut out = try_vec(table.rows() * width)?;
+                let reduction = combine_orders.get(&node.id).copied();
+                let experts_total = if let Some(reduction) = reduction {
+                    let producer = graph
+                        .nodes()
+                        .iter()
+                        .find(|candidate| candidate.output == node.inputs[1])
+                        .ok_or_else(|| Error::InvalidArtifact {
+                            detail: "combine slots have no producing node".into(),
+                        })?;
+                    let OpParams::ExpertMlp { experts, .. } = producer.params else {
+                        return Err(Error::InvalidArtifact {
+                            detail: "combine slots are not produced by ExpertMlp".into(),
+                        });
+                    };
+                    let ownership = expert_ownership.get(&producer.id).copied();
+                    if ownership.is_some_and(|owner| {
+                        owner.groups != reduction.groups || reduction.owned != Some(owner.owned)
+                    }) {
+                        return Err(Error::InvalidRequest {
+                            field: "combine_groups",
+                            detail: "ExpertMlp ownership and Combine order disagree".into(),
+                        });
+                    }
+                    let groups = ownership.map_or(1, |owner| owner.groups);
+                    let total = experts
+                        .checked_mul(u64::from(groups))
+                        .ok_or(moxie_types::DimError::Overflow)?;
+                    usize::try_from(total).map_err(|_| moxie_types::DimError::Overflow)?
+                } else {
+                    0
+                };
                 for r in 0..table.rows() {
                     let base = r * top_k as usize * width;
-                    out.extend(route::combine_row(
-                        table.row_experts(r)?,
-                        table.row_weights(r)?,
-                        &slots.data()[base..base + top_k as usize * width],
-                        width,
-                        order,
-                        output_scale,
-                    )?);
+                    let row_experts = table.row_experts(r)?;
+                    let row_weights = table.row_weights(r)?;
+                    let row_slots = &slots.data()[base..base + top_k as usize * width];
+                    if let Some(reduction) = reduction {
+                        out.extend(route::combine_row_ordered(
+                            row_experts,
+                            row_weights,
+                            row_slots,
+                            width,
+                            order,
+                            output_scale,
+                            experts_total,
+                            reduction.groups,
+                            reduction.owned,
+                        )?);
+                    } else {
+                        out.extend(route::combine_row(
+                            row_experts,
+                            row_weights,
+                            row_slots,
+                            width,
+                            order,
+                            output_scale,
+                        )?);
+                    }
                 }
                 let shape = try_shape2(table.rows(), width)?;
-                Value::Float(HostTensor::round_to_bf16(out, shape)?)
+                if reduction.is_some_and(|order| order.owned.is_some()) {
+                    Value::Float(HostTensor::f32(out, shape)?)
+                } else {
+                    Value::Float(HostTensor::round_to_bf16(out, shape)?)
+                }
             }
         };
         Ok(out)

@@ -2322,7 +2322,7 @@ fn the_routing_operations_declare_their_partition_and_state_contracts() {
                 assert_eq!(node.contract.state_effect, StateEffect::None);
             }
             OpParams::ExpertMlp { .. } | OpParams::Combine { .. } => {
-                assert_eq!(node.contract.partition, PartitionRule::NotDetermined);
+                assert_eq!(node.contract.partition, PartitionRule::ExpertOwnerShardable);
                 assert_eq!(node.contract.state_effect, StateEffect::None);
             }
             _ => {}

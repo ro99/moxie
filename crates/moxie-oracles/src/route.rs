@@ -909,6 +909,136 @@ pub fn combine_row(
     Ok(acc)
 }
 
+/// The rank ordered form of [`combine_row`] for contiguous expert owners.
+/// Each owner's FP32 partial starts at zero; the reference combines those
+/// partials in ascending group order and applies the output scale once.
+#[allow(clippy::too_many_arguments)]
+pub fn combine_row_ordered(
+    experts: &[u32],
+    weights: &[f32],
+    slots: &[f32],
+    width: usize,
+    order: moxie_graph::CombineOrder,
+    output_scale: f32,
+    experts_total: usize,
+    groups: u32,
+    owned: Option<u32>,
+) -> Result<Vec<f32>> {
+    if groups == 0 {
+        return Err(Error::InvalidRequest {
+            field: "combine_groups",
+            detail: "the declared owner group count must be positive".into(),
+        });
+    }
+    let groups = groups as usize;
+    if experts_total == 0 || !experts_total.is_multiple_of(groups) {
+        return Err(Error::InvalidRequest {
+            field: "combine_experts",
+            detail: format!("{experts_total} experts cannot be divided among {groups} groups"),
+        });
+    }
+    if owned.is_some_and(|group| group as usize >= groups) {
+        return Err(Error::InvalidRequest {
+            field: "combine_owner",
+            detail: format!("owner {:?} is outside 0..{groups}", owned),
+        });
+    }
+    if !output_scale.is_finite() {
+        return Err(Error::Numerical {
+            detail: format!("combine output scale is {output_scale}"),
+        });
+    }
+    if width == 0 {
+        return Err(Error::InvalidRequest {
+            field: "combine",
+            detail: "a combination over zero features".into(),
+        });
+    }
+    if experts.len() != weights.len() {
+        return Err(Error::InvalidArtifact {
+            detail: format!(
+                "route has {} experts and {} coefficients",
+                experts.len(),
+                weights.len()
+            )
+            .into(),
+        });
+    }
+    let expected_slots = experts
+        .len()
+        .checked_mul(width)
+        .ok_or(moxie_types::DimError::Overflow)?;
+    if slots.len() != expected_slots {
+        return Err(Error::InvalidArtifact {
+            detail: format!(
+                "slot tensor has {} elements, expected {}x{width}",
+                slots.len(),
+                experts.len()
+            )
+            .into(),
+        });
+    }
+
+    let experts_per_group = experts_total / groups;
+    let order = combine_order(experts, order)?;
+    if let Some(expert) = experts
+        .iter()
+        .find(|expert| **expert as usize >= experts_total)
+    {
+        return Err(Error::InvalidArtifact {
+            detail: format!("route selected expert {expert} outside 0..{experts_total}").into(),
+        });
+    }
+
+    let mut partial = crate::try_vec(width)?;
+    partial.resize(width, 0.0f32);
+    let Some(owned) = owned else {
+        let mut total = crate::try_vec(width)?;
+        total.resize(width, 0.0f32);
+        for group in 0..groups {
+            partial.fill(0.0);
+            for &slot in &order {
+                if experts[slot] as usize / experts_per_group != group {
+                    continue;
+                }
+                for (sum, value) in partial
+                    .iter_mut()
+                    .zip(&slots[slot * width..(slot + 1) * width])
+                {
+                    *sum += weights[slot] * value;
+                }
+            }
+            if group == 0 {
+                total.copy_from_slice(&partial);
+            } else {
+                for (sum, value) in total.iter_mut().zip(&partial) {
+                    *sum += value;
+                }
+            }
+        }
+        if output_scale != 1.0 {
+            for value in &mut total {
+                *value *= output_scale;
+            }
+        }
+        return Ok(total);
+    };
+
+    let owned = owned as usize;
+    for &slot in &order {
+        if experts[slot] as usize / experts_per_group != owned {
+            continue;
+        }
+        for (sum, value) in partial
+            .iter_mut()
+            .zip(&slots[slot * width..(slot + 1) * width])
+        {
+            *sum += weights[slot] * value;
+        }
+    }
+    Ok(partial)
+}
+
 /// The scale a [`combine_row`] error bound is stated against: `Σ_j |w_j · y_j|`
 /// per output component, reduced to its maximum.
 ///
@@ -1640,6 +1770,142 @@ mod tests {
         assert_ne!(
             ascending, selection,
             "the reduction order made no difference, so the fixture is not testing it"
+        );
+    }
+
+    #[test]
+    fn ordered_combine_uses_group_order_and_skips_other_owners() {
+        let experts: Vec<u32> = (0..8).collect();
+        let weights = [1.0; 8];
+        let slots = [1.0e20, 1.0, -1.0e20, 1.0, 1.0, 0.0, 3.0, 0.0];
+        let sum = combine_row_ordered(
+            &experts,
+            &weights,
+            &slots,
+            1,
+            CombineOrder::AscendingExpertId,
+            1.0,
+            8,
+            4,
+            None,
+        )
+        .unwrap();
+        assert_eq!(sum, [4.0]);
+
+        for (owner, expected) in [(0, 1.0e20), (1, -1.0e20), (2, 1.0), (3, 3.0)] {
+            assert_eq!(
+                combine_row_ordered(
+                    &experts,
+                    &weights,
+                    &slots,
+                    1,
+                    CombineOrder::AscendingExpertId,
+                    9.0,
+                    8,
+                    4,
+                    Some(owner),
+                )
+                .unwrap(),
+                [expected],
+                "owner {owner}"
+            );
+        }
+
+        // A non-owned slot with a nonfinite coefficient must not contaminate a
+        // rank-local partial through a nominal zero contribution.
+        assert_eq!(
+            combine_row_ordered(
+                &[0, 2],
+                &[2.0, f32::NAN],
+                &[4.0, 0.0],
+                1,
+                CombineOrder::AscendingExpertId,
+                1.0,
+                4,
+                2,
+                Some(0),
+            )
+            .unwrap(),
+            [8.0]
+        );
+    }
+
+    #[test]
+    fn one_group_ordered_combine_matches_the_existing_combine() {
+        let experts = [2, 0, 1];
+        let weights = [0.5, 0.25, 0.25];
+        let slots = [1.0e20, 1.0, -1.0e20, 1.0, 2.0, -3.0];
+        let existing = combine_row(
+            &experts,
+            &weights,
+            &slots,
+            2,
+            CombineOrder::AscendingExpertId,
+            0.75,
+        )
+        .unwrap();
+        let ordered = combine_row_ordered(
+            &experts,
+            &weights,
+            &slots,
+            2,
+            CombineOrder::AscendingExpertId,
+            0.75,
+            3,
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(ordered, existing);
+    }
+
+    #[test]
+    fn ordered_combine_refuses_invalid_ownership_geometry() {
+        let args = (&[0][..], &[1.0][..], &[1.0][..]);
+        assert!(matches!(
+            combine_row_ordered(
+                args.0,
+                args.1,
+                args.2,
+                1,
+                CombineOrder::AscendingExpertId,
+                1.0,
+                1,
+                0,
+                None,
+            ),
+            Err(Error::InvalidRequest {
+                field: "combine_groups",
+                ..
+            })
+        ));
+        assert!(
+            combine_row_ordered(
+                args.0,
+                args.1,
+                args.2,
+                1,
+                CombineOrder::AscendingExpertId,
+                1.0,
+                3,
+                2,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            combine_row_ordered(
+                args.0,
+                args.1,
+                args.2,
+                1,
+                CombineOrder::AscendingExpertId,
+                1.0,
+                1,
+                1,
+                Some(1),
+            )
+            .is_err()
         );
     }
 

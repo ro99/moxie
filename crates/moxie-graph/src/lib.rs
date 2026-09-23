@@ -435,6 +435,9 @@ pub enum PartitionRule {
         kv: KvHeadPartition,
         output: AttentionOutputReduction,
     },
+    /// Routed experts are assigned as contiguous whole-expert groups, and
+    /// their slot outputs are reduced in the declared group order.
+    ExpertOwnerShardable,
 }
 
 /// How key/value state follows query-head ownership.
@@ -494,6 +497,23 @@ pub struct LinearInputSlice {
 pub struct LinearReductionOrder {
     pub blocks: u32,
     pub slice: Option<LinearInputSlice>,
+}
+
+/// Declared order for one `Combine` node split across expert owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CombineReductionOrder {
+    /// Number of contiguous, equal expert-owner groups.
+    pub groups: u32,
+    /// `None` is the reference over every group; `Some(g)` is group `g`'s
+    /// unscaled FP32 partial.
+    pub owned: Option<u32>,
+}
+
+/// One rank's ownership of the outer expert axis for an `ExpertMlp` node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertOwnership {
+    pub groups: u32,
+    pub owned: u32,
 }
 
 /// What an operation does to sequence state.
