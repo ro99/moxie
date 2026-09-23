@@ -2,6 +2,18 @@
 
 Status: **proposed**.
 
+**Amendment, 2026-09-23 (coordinator).**
+- *Old premise:* change 4 adds `scale: f32` to `Join::Reduce`.
+- *Evidence (builder):* that breaks exhaustive destructuring in
+  `moxie-executor/src/dense_tp.rs`, which task 0062 owns.
+- *Replacement:* `Join::Reduce` is unchanged. The lowering refuses, with a
+  typed error, any routed `Combine` whose `output_scale != 1.0`, and the
+  refusal table gains that row. Gemma uses 1.0.
+- *Carried to a later slice-4 task,* after task 0062 lands: a scaled combine
+  (Laguna 2.5) applied once after the cross-rank sum.
+- *Consequence:* the "`output_scale` per partial" mutation is dropped.
+- *Authority:* coordinator.
+
 ## Identity and authority
 
 - Task0064, M5 plan slice 4, first task. It runs in parallel with task 0062
