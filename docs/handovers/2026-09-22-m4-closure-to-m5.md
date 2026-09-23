@@ -83,6 +83,14 @@ Still open in slice 4: device execution of the expert-partitioned plan (the
 exit gate's resource and cancellation tests), host-owned experts, a scaled
 combine (Laguna 2.5), and MLA per-weight partitioning.
 
+**GPU reservation (owner, 2026-09-23):** the owner is using the GPUs. No
+agent runs GPU work (no `--features driver` device tests, no `xtask-cuda
+test-gpu`, no CUDA benchmark) until the owner releases them. Builders and
+the reviewer run host gates only. A task's GPU gates stay pending, and the
+task is recorded as "code-complete, GPU gates pending" rather than
+accepted. The coordinator batches the pending GPU runs and asks the owner to
+release the GPUs, naming the devices, commands and expected duration.
+
 ## Route to M5 closure (owner-agreed plan, 2026-09-22)
 
 Accepted so far: tasks 0053–0057. This covers the attention partition rule,
