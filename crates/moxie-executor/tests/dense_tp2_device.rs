@@ -1,23 +1,21 @@
-//! Task 0060's TP2 device gate.
+//! Task 0062's per-rank-thread TP2 device gate.
 //!
 //! The fixture is deliberately small and synthetic.  It runs the full dense
 //! graph on one 3090 through the split-aware ordinary linear kernel, then runs
-//! the lowered stage graph on both 3090s and joins the rank-local boundaries.
+//! the lowered stage graph on persistent workers that own the 3090 pair.
 #![cfg(feature = "paged-attention-binding")]
 
 use core::ffi::{c_int, c_void};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use moxie_cuda::{RankContext, Stream, device_count, query_device};
 use moxie_engine::{HostTensor, Value};
-use moxie_executor::paged_attention::device::{
-    PagedKvRows, append_paged_layer, commit_paged_state,
-};
+use moxie_executor::paged_attention::device::commit_paged_state;
 use moxie_executor::{
-    DenseGraphStep, DenseRank, DenseTensorParallelStep, PageGeometry, PagedAttentionRun, RankGroup,
+    DenseGraphStep, DenseRankWorkerConfig, DenseRankWorkers, PageGeometry, PagedAttentionRun,
     SelectedReservedPlan, Staging,
 };
 use moxie_format::bf16::{bf16_bits_to_f32, f32_to_bf16_bits};
@@ -46,24 +44,18 @@ const NO_FAULT: u8 = 0;
 /// The second peer copy after arming fails: a collective fails after its
 /// first copy is enqueued (F2).
 const PEER_COPY_FAULT: u8 = 1;
-/// The first peer copy after arming arms `EVENT_QUERY_FAULT` (F5).
-const DRAIN_FAULT: u8 = 2;
-/// The next event query fails: rank 0's drain cannot be observed.
-const EVENT_QUERY_FAULT: u8 = 3;
 /// The next kernel launch is refused as an invalid value (N2).
-const LAUNCH_FAULT: u8 = 4;
-/// The next device free fails, so a plan cannot close (N1).
-const FREE_FAULT: u8 = 5;
+const LAUNCH_FAULT: u8 = 2;
 /// The next paged-attention kernel launch is refused, quarantining its run
 /// with the stage's query and output ranges (R3-2).
-const ATTENTION_LAUNCH_FAULT: u8 = 6;
+const ATTENTION_LAUNCH_FAULT: u8 = 3;
 /// The next host-to-device copy fails.
-const UPLOAD_FAULT: u8 = 7;
+const UPLOAD_FAULT: u8 = 4;
 /// The next device-to-host copy (an attention stage reading its keys back
 /// before the append) arms `UPLOAD_FAULT`. The append's first upload is then
 /// the page-table publication, whose failure holds the run's admitted
 /// upload buffer (R5-1).
-const TABLE_UPLOAD_FAULT: u8 = 8;
+const TABLE_UPLOAD_FAULT: u8 = 5;
 
 static DRIVER_FAULT: AtomicU8 = AtomicU8::new(NO_FAULT);
 static PEER_COPIES: AtomicU32 = AtomicU32::new(0);
@@ -94,7 +86,6 @@ unsafe extern "C" fn cuMemcpyPeerAsync(
             DRIVER_FAULT.store(NO_FAULT, Ordering::SeqCst);
             return 1;
         }
-        DRAIN_FAULT => DRIVER_FAULT.store(EVENT_QUERY_FAULT, Ordering::SeqCst),
         _ => {}
     }
     type Copy =
@@ -197,31 +188,6 @@ unsafe extern "C" fn cuMemcpyDtoH_v2(destination: *mut c_void, source: u64, byte
         let copy: unsafe extern "C" fn(*mut c_void, u64, usize) -> c_int =
             std::mem::transmute(real(c"cuMemcpyDtoH_v2"));
         copy(destination, source, bytes)
-    }
-}
-
-#[unsafe(no_mangle)]
-unsafe extern "C" fn cuMemFree_v2(pointer: u64) -> c_int {
-    if fires(FREE_FAULT) {
-        return 1;
-    }
-    // SAFETY: as above.
-    unsafe {
-        let free: unsafe extern "C" fn(u64) -> c_int = std::mem::transmute(real(c"cuMemFree_v2"));
-        free(pointer)
-    }
-}
-
-#[unsafe(no_mangle)]
-unsafe extern "C" fn cuEventQuery(event: *mut c_void) -> c_int {
-    if fires(EVENT_QUERY_FAULT) {
-        return 700;
-    }
-    // SAFETY: as above.
-    unsafe {
-        let query: unsafe extern "C" fn(*mut c_void) -> c_int =
-            std::mem::transmute(real(c"cuEventQuery"));
-        query(event)
     }
 }
 
@@ -712,19 +678,6 @@ impl<'c> Rank<'c> {
         }
     }
 
-    fn split(&mut self) -> (DenseRank<'_, 'c>, &mut [PagedAttentionRun<'c>]) {
-        (
-            DenseRank {
-                ctx: self.ctx,
-                capability: &self.capability,
-                stream: &self.stream,
-                ledger: &mut self.ledger,
-                state: &mut self.state,
-            },
-            &mut self.runs,
-        )
-    }
-
     fn close(mut self) {
         for run in self.runs.drain(..) {
             run.close(&mut self.ledger).expect("close run");
@@ -830,14 +783,10 @@ enum Fault {
     PeerCopy,
     /// Rank 1's commit refuses while preparing, after rank 0 prepared (C2).
     Commit,
-    /// Rank 0's drain cannot be observed (F5): the group is lost.
-    Drain,
     /// The executed step is dropped uncommitted (F11).
     Drop,
     /// Rank 1's stage launch is refused after its uploads (N2): recoverable.
     Launch,
-    /// A plan cannot close after the drain (N1): the group is lost.
-    Close,
     /// Rank 1's paged-attention launch is refused (R3-2): recoverable.
     AttentionLaunch,
     /// A row count whose aligned boundary size overflows (R3-1): refused
@@ -846,22 +795,31 @@ enum Fault {
     /// Rank 1's in-step page-table upload fails (R5-1): recoverable, with
     /// the run's admitted upload buffer restored.
     TableUpload,
+    /// Rank 1 stalls before the first stage rendezvous after Begin.
+    Stall,
 }
 
-fn tp_step<'c>(
-    group: &mut RankGroup<'c>,
-    ranks: &mut [Rank<'c>; 2],
+fn tp_worker_step(
+    workers: &mut DenseRankWorkers,
     fixture: &moxie_cli::fixture::Fixture,
     lowering: &TensorParallelLowering,
+    capabilities: &[DeviceCapability; 2],
     tokens: &[u64],
     positions: &[u64],
     fault: Fault,
 ) -> Result<Vec<u8>, Error> {
+    if fault == Fault::Collective {
+        workers.inject_collective_mismatch_once();
+    }
+    if fault == Fault::Commit {
+        workers.refuse_next_commit_prepare(1);
+    }
+    if fault == Fault::Stall {
+        workers.stall_before_next_rendezvous(1);
+    }
     let mut oracles = OracleRegistry::new();
     moxie_oracles::register(&mut oracles).expect("oracles");
     let catalogue = moxie_kernels::dense_graph_catalogue();
-    let cancel = AtomicBool::new(false);
-    let capabilities = [ranks[0].capability.clone(), ranks[1].capability.clone()];
     let mut bindings = |rank: usize, stage: &StageGraph| {
         if rank == 1 && stage.state_layers.values().next() == Some(&1) {
             match fault {
@@ -871,19 +829,17 @@ fn tp_step<'c>(
                         detail: "injected rank-1 stage failure".into(),
                     });
                 }
-                Fault::Collective => cancel.store(true, Ordering::Release),
+                Fault::Collective => {}
                 Fault::PeerCopy => {
                     PEER_COPIES.store(0, Ordering::SeqCst);
                     DRIVER_FAULT.store(PEER_COPY_FAULT, Ordering::SeqCst);
                 }
-                Fault::Drain => DRIVER_FAULT.store(DRAIN_FAULT, Ordering::SeqCst),
                 Fault::Launch => DRIVER_FAULT.store(LAUNCH_FAULT, Ordering::SeqCst),
-                Fault::Close => DRIVER_FAULT.store(FREE_FAULT, Ordering::SeqCst),
                 Fault::TableUpload => DRIVER_FAULT.store(TABLE_UPLOAD_FAULT, Ordering::SeqCst),
                 Fault::AttentionLaunch => {
                     DRIVER_FAULT.store(ATTENTION_LAUNCH_FAULT, Ordering::SeqCst)
                 }
-                Fault::None | Fault::Commit | Fault::Drop | Fault::Oversized => {}
+                Fault::None | Fault::Commit | Fault::Drop | Fault::Oversized | Fault::Stall => {}
             }
         }
         Ok(stage_host_bindings(
@@ -894,46 +850,286 @@ fn tp_step<'c>(
             &capabilities[rank],
         ))
     };
-    let [r0, r1] = ranks;
-    let ((d0, runs0), (d1, runs1)) = (r0.split(), r1.split());
-    let step = group.execute_dense(
-        [d0, d1],
-        [&mut *runs0, &mut *runs1],
-        DenseTensorParallelStep {
-            graph: &fixture.graph,
-            lowering,
-            oracle: moxie_oracles::HOST_REFERENCE,
-            oracles: &oracles,
-            catalogue: &catalogue,
-            rows: if fault == Fault::Oversized {
-                192_153_584_101_141_162
-            } else {
-                tokens.len() as u64
-            },
-            visible_tokens: positions.last().copied().unwrap_or(0) + 1,
-            bindings: &mut bindings,
-            cancel: &cancel,
+    let step = workers.execute_dense(
+        &fixture.graph,
+        lowering,
+        moxie_oracles::HOST_REFERENCE,
+        &oracles,
+        &catalogue,
+        if fault == Fault::Oversized {
+            192_153_584_101_141_162
+        } else {
+            tokens.len() as u64
         },
+        positions.last().copied().unwrap_or(0) + 1,
+        &mut bindings,
     )?;
     if fault == Fault::Drop {
         drop(step);
         return Err(Error::Cancelled { at: "dropped" });
     }
-    // One run short of the layer count: rank 1's prepare refuses, after
-    // rank 0 has prepared.
-    let runs1 = if fault == Fault::Commit {
-        &mut runs1[..1]
-    } else {
-        runs1
-    };
-    // The caller samples from the logits before deciding to commit.
     let sampled = step.logits().to_vec();
-    let committed = step.commit([runs0, runs1])?;
-    assert_eq!(
-        committed, sampled,
-        "commit returns the logits it was sampled from"
-    );
+    let committed = step.commit()?;
+    assert_eq!(committed, sampled, "commit returns the sampled logits");
     Ok(committed)
+}
+
+fn tp2_dense_worker_gate() {
+    let _guard = one_at_a_time();
+    let (fixture, lowering, config) = order_sensitive_fixture();
+    let tokens = [1, 4, 7, 2, 9];
+    let positions = [0, 1, 2, 3, 4];
+    let host_s2 = host_logits(&fixture, &tokens, &positions, &lowering.linear_orders);
+    assert_ne!(
+        host_logits(
+            &fixture,
+            &tokens,
+            &positions,
+            &one_block_orders(&lowering.linear_orders)
+        ),
+        host_s2,
+        "the fixture must make the declared S=2 order load-bearing"
+    );
+    let ordinals = pair_ordinals();
+    let local = local_config(&config);
+    let (
+        reference_prefill,
+        reference_decode,
+        reference_after_rank_failure,
+        reference_after_mismatch,
+        reference_after_remaining_faults,
+    ) = {
+        let context = RankContext::acquire(RankId(61_000), ordinals[0]).expect("reference context");
+        let mut reference = Rank::new(&context, &config);
+        let prefill = reference_step(
+            &fixture,
+            &lowering.linear_orders,
+            &mut reference,
+            &tokens,
+            &positions,
+        );
+        let decode = reference_step(
+            &fixture,
+            &lowering.linear_orders,
+            &mut reference,
+            &[6],
+            &[5],
+        );
+        let after_rank_failure = reference_step(
+            &fixture,
+            &lowering.linear_orders,
+            &mut reference,
+            &[7],
+            &[6],
+        );
+        let after_mismatch = reference_step(
+            &fixture,
+            &lowering.linear_orders,
+            &mut reference,
+            &[8],
+            &[7],
+        );
+        let after_remaining_faults = reference_step(
+            &fixture,
+            &lowering.linear_orders,
+            &mut reference,
+            &[9],
+            &[8],
+        );
+        for (word, expected) in prefill.chunks_exact(4).zip(&host_s2) {
+            let (actual, expected) = (
+                f32::from_le_bytes(word.try_into().unwrap()),
+                f32::from_bits(*expected),
+            );
+            assert!(
+                (actual - expected).abs() <= bf16_ulp(expected),
+                "reference {actual} vs host {expected}"
+            );
+        }
+        reference.close();
+        (
+            prefill,
+            decode,
+            after_rank_failure,
+            after_mismatch,
+            after_remaining_faults,
+        )
+    };
+    let host_capacity =
+        CapacitySnapshot::measured_host(&moxie_host::read().expect("measure host"), 1 << 20)
+            .expect("host capacity");
+    let mut workers = DenseRankWorkers::spawn(DenseRankWorkerConfig {
+        ranks: [RankId(61_001), RankId(61_002)],
+        ordinals,
+        geometry: geometry(&local, 4, 64, 6),
+        heads: local.heads,
+        max_rows: 5,
+        host_capacity,
+        deadline: DEADLINE,
+    })
+    .expect("persistent rank workers");
+    let capabilities = [
+        query_device(ordinals[0]).expect("rank 0 capability"),
+        query_device(ordinals[1]).expect("rank 1 capability"),
+    ];
+    let prefill = tp_worker_step(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &tokens,
+        &positions,
+        Fault::None,
+    )
+    .expect("worker TP2 prefill");
+    assert_eq!(
+        prefill, reference_prefill,
+        "worker prefill is bit-identical"
+    );
+    let decode = tp_worker_step(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &[6],
+        &[5],
+        Fault::None,
+    )
+    .expect("worker TP2 decode");
+    assert_eq!(decode, reference_decode, "worker decode is bit-identical");
+
+    let rank_error = tp_worker_step(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &[7],
+        &[6],
+        Fault::Rank,
+    )
+    .expect_err("an injected rank failure refuses");
+    assert!(matches!(rank_error, Error::InvalidRequest { .. }));
+    let after_rank_failure = tp_worker_step(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &[7],
+        &[6],
+        Fault::None,
+    )
+    .expect("clean step immediately after rank refusal");
+    assert_eq!(after_rank_failure, reference_after_rank_failure);
+    let mismatch = tp_worker_step(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &[8],
+        &[7],
+        Fault::Collective,
+    )
+    .expect_err("the unequal rank declaration is refused");
+    assert!(
+        matches!(
+            &mismatch,
+            Error::InvalidRequest { field: "collective", detail }
+                if detail.contains("rendezvous declarations differ")
+        ),
+        "the rendezvous must reject the unequal declaration: {mismatch}"
+    );
+    let after_mismatch = tp_worker_step(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &[8],
+        &[7],
+        Fault::None,
+    )
+    .expect("clean step immediately after declaration mismatch");
+    assert_eq!(after_mismatch, reference_after_mismatch);
+    let before = workers.stats().expect("stats after mismatch recovery");
+
+    for fault in [
+        Fault::PeerCopy,
+        Fault::Launch,
+        Fault::AttentionLaunch,
+        Fault::Oversized,
+        Fault::TableUpload,
+        Fault::Commit,
+        Fault::Drop,
+    ] {
+        tp_worker_step(
+            &mut workers,
+            &fixture,
+            &lowering,
+            &capabilities,
+            &[9],
+            &[8],
+            fault,
+        )
+        .expect_err("an injected rank failure refuses");
+        assert_eq!(
+            workers.stats().expect("recoverable worker stats"),
+            before,
+            "a recoverable refusal returns both frontiers and reservations"
+        );
+    }
+    let recovered = tp_worker_step(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &[9],
+        &[8],
+        Fault::None,
+    )
+    .expect("clean step after recoverable refusals");
+    assert_eq!(
+        recovered, reference_after_remaining_faults,
+        "recovered step is bit-identical"
+    );
+
+    let before_stall = workers.stats().expect("worker stats before stall");
+    let published_before_stall = workers.published_frontiers();
+    assert_eq!(
+        published_before_stall,
+        [before_stall[0].0, before_stall[1].0],
+        "published frontier mirror agrees with stats before stall"
+    );
+    let committed_before_stall = workers.committed_frontiers();
+    assert_eq!(
+        committed_before_stall,
+        [before_stall[0].1, before_stall[1].1],
+        "committed frontier mirror agrees with stats before stall"
+    );
+    workers.set_deadline_for_test(Duration::from_millis(500));
+    let lost = tp_worker_step(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &[10],
+        &[9],
+        Fault::Stall,
+    )
+    .expect_err("a stalled rank returns no logits");
+    assert!(matches!(lost, Error::DeviceLost { .. }), "{lost}");
+    assert_eq!(
+        workers.committed_frontiers(),
+        committed_before_stall,
+        "stall leaves both committed KV frontiers unchanged"
+    );
+    assert_eq!(
+        workers.published_frontiers(),
+        published_before_stall,
+        "stall leaves both published KV frontiers unchanged"
+    );
+    assert!(
+        workers.stats().is_err_and(|error| error == lost),
+        "the next same-group call reports the sticky loss"
+    );
 }
 
 fn bf16_ulp(value: f32) -> f32 {
@@ -947,244 +1143,5 @@ fn bf16_ulp(value: f32) -> f32 {
 
 #[test]
 fn tp2_dense_prefill_decode_is_exact_and_rank_step_is_atomic() {
-    let _guard = one_at_a_time();
-    let (fixture, lowering, config) = order_sensitive_fixture();
-    let (tokens, positions) = ([1, 4, 7, 2, 9], [0, 1, 2, 3, 4]);
-    let host_s2 = host_logits(&fixture, &tokens, &positions, &lowering.linear_orders);
-    assert_ne!(
-        host_logits(
-            &fixture,
-            &tokens,
-            &positions,
-            &one_block_orders(&lowering.linear_orders)
-        ),
-        host_s2,
-        "the fixture must make the declared S=2 order load-bearing"
-    );
-
-    let ordinals = pair_ordinals();
-    let contexts = [
-        RankContext::acquire(RankId(60_000), ordinals[0]).expect("rank 0 context"),
-        RankContext::acquire(RankId(60_001), ordinals[1]).expect("rank 1 context"),
-    ];
-    let mut group = RankGroup::form([&contexts[0], &contexts[1]], DEADLINE).expect("rank group");
-    eprintln!(
-        "task0060 TP2 pair: {} + {}",
-        group.uuids()[0],
-        group.uuids()[1]
-    );
-    let local = local_config(&config);
-    let mut ranks = [
-        Rank::new(&contexts[0], &local),
-        Rank::new(&contexts[1], &local),
-    ];
-    let mut reference = Rank::new(&contexts[0], &config);
-
-    // C1: the reference agrees with task 0058's host interpreter at S=2
-    // within task 0012's one-BF16-ULP gate.
-    let reference_prefill = reference_step(
-        &fixture,
-        &lowering.linear_orders,
-        &mut reference,
-        &tokens,
-        &positions,
-    );
-    for (word, expected) in reference_prefill.chunks_exact(4).zip(&host_s2) {
-        let (actual, expected) = (
-            f32::from_le_bytes(word.try_into().unwrap()),
-            f32::from_bits(*expected),
-        );
-        assert!(
-            (actual - expected).abs() <= bf16_ulp(expected),
-            "reference {actual} vs host {expected}"
-        );
-    }
-
-    let prefill = tp_step(
-        &mut group,
-        &mut ranks,
-        &fixture,
-        &lowering,
-        &tokens,
-        &positions,
-        Fault::None,
-    )
-    .expect("TP2 prefill");
-    assert_eq!(prefill, reference_prefill, "TP2 prefill is bit-identical");
-    let (decode, decode_positions) = ([6], [5]);
-    let reference_decode = reference_step(
-        &fixture,
-        &lowering.linear_orders,
-        &mut reference,
-        &decode,
-        &decode_positions,
-    );
-    let frontier =
-        |ranks: &[Rank<'_>; 2]| ranks.each_ref().map(|r| r.state.published_rows().unwrap());
-    let reservations =
-        |ranks: &[Rank<'_>; 2]| ranks.each_ref().map(|r| r.ledger.outstanding().len());
-    let before = frontier(&ranks);
-    let balanced = reservations(&ranks);
-    for fault in [
-        Fault::Rank,
-        Fault::Collective,
-        Fault::PeerCopy,
-        Fault::Launch,
-        Fault::AttentionLaunch,
-        Fault::Oversized,
-        Fault::TableUpload,
-        Fault::Commit,
-        Fault::Drop,
-    ] {
-        tp_step(
-            &mut group,
-            &mut ranks,
-            &fixture,
-            &lowering,
-            &decode,
-            &decode_positions,
-            fault,
-        )
-        .expect_err("an injected fault refuses");
-        assert_eq!(
-            frontier(&ranks),
-            before,
-            "a refused step publishes no KV on either rank"
-        );
-        assert_eq!(
-            reservations(&ranks),
-            balanced,
-            "a recoverable refusal returns every reservation"
-        );
-    }
-    let decoded = tp_step(
-        &mut group,
-        &mut ranks,
-        &fixture,
-        &lowering,
-        &decode,
-        &decode_positions,
-        Fault::None,
-    )
-    .expect("TP2 decode");
-    assert_eq!(
-        decoded, reference_decode,
-        "the next clean step is bit-identical"
-    );
-
-    // A drain that cannot be observed is terminal: the step is withheld,
-    // the group records why, and every later step refuses. The pair's
-    // ledgers keep the withheld reservations, so the pair is not closed.
-    let lost = tp_step(
-        &mut group,
-        &mut ranks,
-        &fixture,
-        &lowering,
-        &decode,
-        &decode_positions,
-        Fault::Drain,
-    )
-    .expect_err("an unobserved drain refuses");
-    assert!(matches!(lost, Error::DeviceLost { .. }), "{lost}");
-    assert!(
-        tp_step(
-            &mut group,
-            &mut ranks,
-            &fixture,
-            &lowering,
-            &decode,
-            &decode_positions,
-            Fault::None,
-        )
-        .is_err_and(|refused| refused == lost),
-        "a lost group refuses with its recorded reason"
-    );
-
-    // A step accepts only idle runs. Rank 1's first run is quarantined by a
-    // page-table upload that failed on another stream, holding the upload
-    // bytes that copy may still read. The step refuses before either
-    // transaction begins and leaves the quarantine and held bytes alone.
-    let mut group = RankGroup::form([&contexts[0], &contexts[1]], DEADLINE).expect("rank group");
-    let mut dirty = [
-        Rank::new(&contexts[0], &local),
-        Rank::new(&contexts[1], &local),
-    ];
-    let side = Stream::new(&contexts[1]).expect("side stream");
-    {
-        let rank = &mut dirty[1];
-        let layer = local.layer_geometry(0);
-        let bytes = (layer.kv_heads * layer.head_dim * 2) as usize;
-        let txn = rank.state.begin().expect("side transaction");
-        DRIVER_FAULT.store(UPLOAD_FAULT, Ordering::SeqCst);
-        let refused = append_paged_layer(
-            &mut rank.state,
-            txn,
-            0,
-            1,
-            &mut rank.runs[0],
-            &side,
-            PagedKvRows {
-                keys: vec![0; bytes],
-                values: vec![0; bytes],
-            },
-        )
-        .expect_err("the injected page-table upload refuses");
-        assert!(
-            refused.error.to_string().contains("cuMemcpyHtoD"),
-            "{}",
-            refused.error
-        );
-        rank.state.abort(txn).expect("abort the side transaction");
-    }
-    let (published, idle) = (frontier(&dirty), reservations(&dirty));
-    let refused = tp_step(
-        &mut group,
-        &mut dirty,
-        &fixture,
-        &lowering,
-        &tokens,
-        &positions,
-        Fault::None,
-    )
-    .expect_err("a quarantined run is refused");
-    assert!(
-        matches!(refused, Error::InvalidRequest { field: "runs", .. }),
-        "{refused}"
-    );
-    assert_eq!((frontier(&dirty), reservations(&dirty)), (published, idle));
-    for rank in &mut dirty {
-        let txn = rank.state.begin().expect("no transaction was left open");
-        rank.state.abort(txn).expect("abort");
-    }
-    let [_, dirty_one] = &mut dirty;
-    let run = dirty_one.runs.remove(0);
-    assert!(
-        run.close(&mut dirty_one.ledger).is_err(),
-        "the run is still quarantined"
-    );
-
-    // A plan that cannot close after the drain is terminal too, on a fresh
-    // pair: the group is lost and the plan's reservation stays withheld.
-    let mut ranks = [
-        Rank::new(&contexts[0], &local),
-        Rank::new(&contexts[1], &local),
-    ];
-    let idle = reservations(&ranks);
-    let lost = tp_step(
-        &mut group,
-        &mut ranks,
-        &fixture,
-        &lowering,
-        &tokens,
-        &positions,
-        Fault::Close,
-    )
-    .expect_err("a plan that cannot close refuses");
-    assert!(matches!(lost, Error::DeviceLost { .. }), "{lost}");
-    assert_eq!(group.lost(), Some(&lost));
-    assert!(
-        reservations(&ranks)[0] > idle[0],
-        "the unclosable plan is withheld, not dropped"
-    );
-    reference.close();
+    tp2_dense_worker_gate();
 }

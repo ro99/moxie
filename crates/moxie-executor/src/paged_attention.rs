@@ -1398,8 +1398,8 @@ pub mod device {
         }
 
         /// Clear a quarantine this caller caused and has since observed
-        /// drained. Only the tensor-parallel step calls this, from its settle
-        /// after `RankGroup::drain`, and only for runs it accepted idle
+        /// drained. Only the tensor-parallel workers call this, from cleanup
+        /// after their rank streams drain, and only for runs they accepted idle
         /// ([`Self::is_idle`]) and then used on the drained rank stream alone.
         /// So everything held here was created by that step's own work on
         /// that stream. Every other owner keeps the quarantine, and `close`'s
@@ -4292,7 +4292,7 @@ pub mod device {
     /// Performs one state authority's page writes for one layer.
     #[derive(Debug)]
     #[cfg(feature = "paged-attention-binding")]
-    struct PagedKvWriterAdapter<'run, 'ctx> {
+    pub(crate) struct PagedKvWriterAdapter<'run, 'ctx> {
         layer: usize,
         run: &'run mut PagedAttentionRun<'ctx>,
         stream: &'run Stream<'ctx>,
@@ -4304,7 +4304,7 @@ pub mod device {
 
     #[cfg(feature = "paged-attention-binding")]
     impl<'run, 'ctx> PagedKvWriterAdapter<'run, 'ctx> {
-        fn new(
+        pub(crate) fn new(
             layer: usize,
             run: &'run mut PagedAttentionRun<'ctx>,
             stream: &'run Stream<'ctx>,
@@ -4530,71 +4530,6 @@ pub mod device {
     ) -> Result<()> {
         let mut writer = PagedKvWriterAdapter::new(0, run, stream, Vec::new(), Vec::new());
         branch.commit(txn, accept, &mut [&mut writer])
-    }
-
-    /// Why [`commit_paged_pair`] did not commit.
-    #[cfg(feature = "paged-attention-binding")]
-    #[derive(Debug)]
-    pub(crate) enum PairCommitRefused {
-        /// A rank refused while preparing. Neither rank changed.
-        Prepare(Error),
-        /// A rank's device publication failed after both prepared. That rank
-        /// is poisoned and the other may have committed: terminal.
-        Apply(Error),
-    }
-
-    /// Commit two ranks' transactions as one step, in two phases. Every
-    /// fallible host step of both ranks runs first, with no visible change:
-    /// each sequence's `prepare_commit`, the writer adapters and the writer
-    /// slices. Only then does each rank apply, where the one refusal left is a
-    /// device publication failure.
-    #[cfg(feature = "paged-attention-binding")]
-    pub(crate) fn commit_paged_pair<'ctx>(
-        states: [&mut DeviceKvSequence; 2],
-        transactions: [moxie_types::StateTransactionId; 2],
-        runs: [&mut [PagedAttentionRun<'ctx>]; 2],
-        streams: [&Stream<'ctx>; 2],
-    ) -> std::result::Result<(), PairCommitRefused> {
-        let prepare = PairCommitRefused::Prepare;
-        let mut prepared = [None, None];
-        let mut adapters = [Vec::new(), Vec::new()];
-        for (rank, (state, runs)) in states.iter().zip(runs).enumerate() {
-            if runs.len() != state.layer_count().map_err(prepare)? {
-                return Err(prepare(invalid(
-                    "runs",
-                    "commit needs exactly one device run per state layer",
-                )));
-            }
-            prepared[rank] = Some(
-                state
-                    .prepare_commit(transactions[rank], 0)
-                    .map_err(prepare)?,
-            );
-            adapters[rank] = moxie_memory::fallible::with_capacity(runs.len()).map_err(prepare)?;
-            for (layer, run) in runs.iter_mut().enumerate() {
-                adapters[rank].push(PagedKvWriterAdapter::new(
-                    layer,
-                    run,
-                    streams[rank],
-                    Vec::new(),
-                    Vec::new(),
-                ));
-            }
-        }
-        let mut writers: [Vec<&mut dyn PagedKvWriter>; 2] = [
-            moxie_memory::fallible::with_capacity(adapters[0].len()).map_err(prepare)?,
-            moxie_memory::fallible::with_capacity(adapters[1].len()).map_err(prepare)?,
-        ];
-        for (writers, adapters) in writers.iter_mut().zip(adapters.iter_mut()) {
-            // Within the reserved capacity: no allocation.
-            writers.extend(adapters.iter_mut().map(|a| a as &mut dyn PagedKvWriter));
-        }
-        for ((state, prepared), writers) in states.into_iter().zip(prepared).zip(&mut writers) {
-            state
-                .apply_commit(prepared.expect("both ranks prepared"), writers)
-                .map_err(PairCommitRefused::Apply)?;
-        }
-        Ok(())
     }
 
     /// Commit a completed batch and publish page-table transitions through the

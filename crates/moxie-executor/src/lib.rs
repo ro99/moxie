@@ -142,7 +142,7 @@ pub use dense::{DenseGraphResult, DenseGraphStep, DensePlanRunRefused};
 #[cfg(feature = "paged-attention-binding")]
 mod dense_tp;
 #[cfg(feature = "paged-attention-binding")]
-pub use dense_tp::{DenseRank, DenseStep, DenseTensorParallelStep};
+pub use dense_tp::{DenseRankWorkerConfig, DenseRankWorkers, DenseWorkerStep};
 
 #[cfg(feature = "driver")]
 pub use lease::{PrepareRefused, Upload};

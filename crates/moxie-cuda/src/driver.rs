@@ -14,6 +14,8 @@
 
 use core::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::ffi::CString;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::time::Instant;
 
 use moxie_types::{DeviceCapability, DeviceUuid, Error, MeasuredDevice, RankId, Result};
 
@@ -202,7 +204,133 @@ pub struct RankContext {
     /// Acquisitions whose memory this context has been granted direct access
     /// to. A peer copy is refused unless its source is listed here: without
     /// the grant, `cuMemcpyPeerAsync` silently stages through host memory.
-    peers: core::cell::RefCell<Vec<u64>>,
+    peers: core::cell::RefCell<Vec<PeerGrant>>,
+}
+
+/// Opaque identity for a peer context, exchanged only while its owner thread
+/// remains alive. The integer handle is passed to driver calls as a context
+/// parameter; it is never made current on the receiving thread.
+#[derive(Debug, Clone)]
+pub struct PeerContextToken {
+    context: usize,
+    device: ffi::CUdevice,
+    uuid: DeviceUuid,
+    generation: u64,
+}
+
+impl PeerContextToken {
+    /// Acquisition generation used to reject stale peer grants.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Debug)]
+struct PeerGrant {
+    context: usize,
+    generation: u64,
+}
+
+/// Sendable, non-owning description of a source byte span. Its private
+/// one-shot channels establish producer readiness and consumer completion.
+#[derive(Debug)]
+pub struct PeerReadHandle {
+    address: u64,
+    bytes: usize,
+    generation: u64,
+    ready: Receiver<()>,
+    completed: SyncSender<()>,
+}
+
+/// Source-thread half of a peer read. It owns the exported range until the
+/// destination acknowledges completion; an unfinished owner leaks that range.
+#[derive(Debug)]
+pub struct PeerReadOwner<T> {
+    source: Option<T>,
+    ready: Option<SyncSender<()>>,
+    completed: Receiver<()>,
+    ordinal: u32,
+}
+
+impl<T> PeerReadOwner<T> {
+    /// Publish the source only after its producer event has completed.
+    pub fn signal_ready(&mut self, producer: &Event<'_>) -> Result<()> {
+        if !producer.is_complete()? {
+            return Err(Error::InvalidRequest {
+                field: "peer_read",
+                detail: "producer event is not complete".into(),
+            });
+        }
+        self.ready
+            .take()
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "peer_read",
+                detail: "producer readiness was already signalled".into(),
+            })?
+            .send(())
+            .map_err(|_| Error::InvalidRequest {
+                field: "peer_read",
+                detail: "consumer dropped the peer read before it became ready".into(),
+            })
+    }
+
+    /// Return the source only after the destination reports observed completion.
+    pub fn finish(mut self, deadline: Instant) -> Result<T> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match self.completed.recv_timeout(remaining) {
+            Ok(()) => self.source.take().ok_or_else(|| Error::InvalidRequest {
+                field: "peer_read",
+                detail: "source range was already returned".into(),
+            }),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(Error::DeviceLost {
+                device: self.ordinal,
+                detail: "peer copy completion was not acknowledged before the group deadline"
+                    .into(),
+            }),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(Error::InvalidRequest {
+                field: "peer_read",
+                detail: "consumer did not acknowledge peer copy completion".into(),
+            }),
+        }
+    }
+}
+
+impl<T> Drop for PeerReadOwner<T> {
+    fn drop(&mut self) {
+        if let Some(source) = self.source.take() {
+            // An unacknowledged source may still be read by the peer GPU.
+            std::mem::forget(source);
+        }
+    }
+}
+
+#[cfg(test)]
+mod peer_read_owner_tests {
+    use super::PeerReadOwner;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc::sync_channel};
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn dropping_an_unfinished_owner_leaks_its_source_range() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (ready, _) = sync_channel(1);
+        let (_, completed) = sync_channel(1);
+        drop(PeerReadOwner {
+            source: Some(DropProbe(Arc::clone(&dropped))),
+            ready: Some(ready),
+            completed,
+            ordinal: 0,
+        });
+        assert!(!dropped.load(Ordering::SeqCst));
+    }
 }
 
 /// How a failed `attach` left the rank claim.
@@ -415,15 +543,126 @@ impl RankContext {
         if code != 704 {
             check(code, "cuCtxEnablePeerAccess")?;
         }
-        let mut peers = self.peers.borrow_mut();
-        if !peers.contains(&peer.generation) {
-            peers.push(peer.generation);
-        }
+        self.remember_peer(PeerGrant {
+            context: peer.ctx as usize,
+            generation: peer.generation,
+        });
         Ok(())
     }
 
+    /// A Send identity for installing peer access from another rank worker.
+    /// The rank group must keep this context owner alive while the token can
+    /// be used; it is an identity, not an owning context reference.
+    pub fn peer_context_token(&self) -> PeerContextToken {
+        PeerContextToken {
+            context: self.ctx as usize,
+            device: self.device,
+            uuid: self.uuid(),
+            generation: self.generation,
+        }
+    }
+
+    /// Install a generation-keyed peer grant on this context's owner thread.
+    /// The rank group pins the token's owner thread until the grant is no
+    /// longer used.
+    pub fn enable_peer_access_to(&self, peer: &PeerContextToken) -> Result<()> {
+        if peer.uuid == self.uuid() {
+            return Err(Error::InvalidRequest {
+                field: "peer",
+                detail: "a device is not its own peer".into(),
+            });
+        }
+        let mut can: c_int = 0;
+        check(
+            // SAFETY: both device handles were returned by `cuDeviceGet`.
+            unsafe { ffi::cuDeviceCanAccessPeer(&mut can, self.device, peer.device) },
+            "cuDeviceCanAccessPeer",
+        )?;
+        if can == 0 {
+            return Err(Error::Unsupported {
+                capability: "peer_access",
+                reason: format!("{} cannot access {}", self.uuid(), peer.uuid),
+            });
+        }
+        self.make_current()?;
+        // SAFETY: this rank context is current. `peer.context` is supplied by
+        // its live owner, and the group retains that owner through every peer
+        // copy acknowledgement. CUDA's driver API takes the source context as
+        // an explicit handle here; it is not made current on this thread.
+        let code = unsafe { ffi::cuCtxEnablePeerAccess(peer.context as ffi::CUcontext, 0) };
+        if code != 704 {
+            check(code, "cuCtxEnablePeerAccess")?;
+        }
+        self.remember_peer(PeerGrant {
+            context: peer.context,
+            generation: peer.generation,
+        });
+        Ok(())
+    }
+
+    /// Disable a generation-keyed peer grant on this context's owner thread.
+    pub fn disable_peer_access_to(&self, peer: &PeerContextToken) -> Result<()> {
+        let grant = self
+            .peer_grant(peer.generation)
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "peer",
+                detail: "this context has no grant for the peer acquisition".into(),
+            })?;
+        if grant.context != peer.context {
+            return Err(Error::InvalidRequest {
+                field: "peer",
+                detail: "peer generation resolves to a different context".into(),
+            });
+        }
+        self.make_current()?;
+        // SAFETY: this rank's context is current and the peer handle is pinned
+        // by the startup group until the grant is disabled.
+        let code = unsafe { ffi::cuCtxDisablePeerAccess(peer.context as ffi::CUcontext) };
+        // CUDA_ERROR_PEER_ACCESS_NOT_ENABLED means the desired state already
+        // holds; either way, forget the generation-keyed grant.
+        if code != 705 {
+            check(code, "cuCtxDisablePeerAccess")?;
+        }
+        self.forget_peer(peer.generation);
+        Ok(())
+    }
+
+    fn remember_peer(&self, grant: PeerGrant) {
+        let mut peers = self.peers.borrow_mut();
+        if let Some(existing) = peers
+            .iter_mut()
+            .find(|existing| existing.generation == grant.generation)
+        {
+            *existing = grant;
+        } else {
+            peers.push(grant);
+        }
+    }
+
+    fn forget_peer(&self, generation: u64) {
+        self.peers
+            .borrow_mut()
+            .retain(|grant| grant.generation != generation);
+    }
+
+    fn peer_grant(&self, generation: u64) -> Option<PeerGrant> {
+        self.peers
+            .borrow()
+            .iter()
+            .find(|peer| peer.generation == generation)
+            .map(|peer| PeerGrant {
+                context: peer.context,
+                generation: peer.generation,
+            })
+    }
+
     fn can_address(&self, other: &RankContext) -> bool {
-        other.generation == self.generation || self.peers.borrow().contains(&other.generation)
+        other.generation == self.generation
+            || self
+                .peers
+                .borrow()
+                .iter()
+                .any(|peer| peer.generation == other.generation)
     }
 }
 
@@ -912,6 +1151,152 @@ impl<'ctx> DeviceBuffer<'ctx> {
             },
             "cuMemcpyPeerAsync",
         )
+    }
+
+    /// Export one checked source span to the other rank thread, transferring
+    /// its owner into the returned guard. The guard leaks an unfinished source.
+    ///
+    /// # Safety
+    /// `source` must own the device memory at `[address, address+len)` and keep it alive for as long as it is held.
+    pub unsafe fn export_peer_read_at<T>(
+        &self,
+        offset: usize,
+        byte_count: usize,
+        source: T,
+    ) -> Result<(PeerReadHandle, PeerReadOwner<T>)> {
+        let address = span(self, offset, byte_count, "src")?;
+        let (ready_tx, ready_rx) = sync_channel(1);
+        let (completed_tx, completed_rx) = sync_channel(1);
+        Ok((
+            PeerReadHandle {
+                address,
+                bytes: byte_count,
+                generation: self.ctx.generation,
+                ready: ready_rx,
+                completed: completed_tx,
+            },
+            PeerReadOwner {
+                source: Some(source),
+                ready: Some(ready_tx),
+                completed: completed_rx,
+                ordinal: self.ctx.ordinal(),
+            },
+        ))
+    }
+
+    /// Copy a source-thread handle into this allocation and acknowledge it
+    /// only after an event on the destination stream proves completion.
+    pub fn copy_from_peer_read_at(
+        &self,
+        offset: usize,
+        handle: PeerReadHandle,
+        source_offset: usize,
+        byte_count: usize,
+        stream: &Stream<'ctx>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let ready_timeout = deadline.saturating_duration_since(Instant::now());
+        handle
+            .ready
+            .recv_timeout(ready_timeout)
+            .map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => Error::DeviceLost {
+                    device: self.ctx.ordinal(),
+                    detail: "peer producer readiness missed the group deadline".into(),
+                },
+                std::sync::mpsc::RecvTimeoutError::Disconnected => Error::InvalidRequest {
+                    field: "peer_read",
+                    detail: "source owner dropped the peer read before publishing readiness".into(),
+                },
+            })?;
+        let source_end =
+            source_offset
+                .checked_add(byte_count)
+                .ok_or_else(|| Error::InvalidRequest {
+                    field: "src",
+                    detail: "peer copy extent overflowed".into(),
+                })?;
+        if source_end > handle.bytes {
+            return Err(Error::InvalidRequest {
+                field: "src",
+                detail: "peer copy exceeds the exported source span".into(),
+            });
+        }
+        let destination = span(self, offset, byte_count, "dst")?;
+        if stream.device_uuid() != self.device_uuid() {
+            return Err(Error::InvalidRequest {
+                field: "stream",
+                detail: "a peer copy is enqueued on the destination device stream".into(),
+            });
+        }
+        let grant = self
+            .ctx
+            .peer_grant(handle.generation)
+            .ok_or_else(|| Error::Unsupported {
+                capability: "peer_access",
+                reason: "this context has no grant for the source acquisition".into(),
+            })?;
+        let source = handle
+            .address
+            .checked_add(source_offset as u64)
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "src",
+                detail: "peer source address overflowed".into(),
+            })?;
+        if byte_count != 0 {
+            self.ctx.make_current()?;
+            // SAFETY: `destination` is checked against this allocation;
+            // `source` and `byte_count` are within the exported span. The
+            // generation-keyed grant supplies the live source CUcontext, and
+            // the source owner remains borrowed until the completion message.
+            // CUDA Driver API 12.9 `cuMemcpyPeerAsync` takes `dstContext` and
+            // `srcContext` explicitly; only the destination stream's context
+            // is current on this thread. The source handle is not made current.
+            let copied = check(
+                unsafe {
+                    ffi::cuMemcpyPeerAsync(
+                        destination,
+                        self.ctx.raw(),
+                        source,
+                        grant.context as ffi::CUcontext,
+                        byte_count,
+                        stream.raw(),
+                    )
+                },
+                "cuMemcpyPeerAsync",
+            );
+            if let Err(error) = copied {
+                // A refused enqueue did not establish completion. Record a
+                // later event on the same stream before acknowledging; this
+                // also settles any earlier local work in the operation.
+                if Self::observe_stream(stream, deadline).is_ok() {
+                    let _ = handle.completed.send(());
+                }
+                return Err(error);
+            }
+            Self::observe_stream(stream, deadline)?;
+        }
+        handle.completed.send(()).map_err(|_| Error::DeviceLost {
+            device: self.ctx.ordinal(),
+            detail: "source owner disappeared before peer copy acknowledgement".into(),
+        })
+    }
+
+    fn observe_stream(stream: &Stream<'_>, deadline: Instant) -> Result<()> {
+        let complete = Event::new(stream.ctx)?;
+        complete.record(stream)?;
+        loop {
+            if complete.is_complete()? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::DeviceLost {
+                    device: stream.ctx.ordinal(),
+                    detail: "peer copy completion missed the group deadline".into(),
+                });
+            }
+            std::thread::yield_now();
+        }
     }
 
     pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<()> {

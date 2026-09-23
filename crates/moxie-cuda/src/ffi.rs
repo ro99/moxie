@@ -75,6 +75,7 @@ unsafe extern "C" {
     pub fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult;
     pub fn cuCtxSynchronize() -> CUresult;
     pub fn cuCtxEnablePeerAccess(peer_context: CUcontext, flags: c_uint) -> CUresult;
+    pub fn cuCtxDisablePeerAccess(peer_context: CUcontext) -> CUresult;
 
     pub fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;

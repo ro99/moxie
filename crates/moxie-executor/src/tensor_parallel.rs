@@ -1,29 +1,8 @@
-//! Two-rank tensor parallelism over a peer-connected GPU pair (task 0057, M5.2).
-//!
-//! A [`RankGroup`] is formed from two rank contexts whose devices grant each
-//! other peer access; forming it enables that access, and a pair the driver
-//! does not grant is refused. There is no host-staged fallback: `moxie-cuda`
-//! refuses a peer copy the destination context has no grant for.
-//!
-//! The one collective is an ordered all-gather of column shards. Every call
-//! consumes the group's next sequence number, and both ranks must declare that
-//! number and the same shape and precision before any byte moves. Each rank
-//! then pulls every rank's shard into its own full-width output, on its own
-//! stream, after waiting on the event that recorded the shard. Rank order is
-//! global column order, so the gather concatenates and never sums.
-//!
-//! A collective refused before its first copy settles each shard's producer
-//! and returns every range to its arena. Once copies are enqueued, a source is
-//! read by both destination streams, so no range is released until both
-//! streams are drained within the group's deadline; if either cannot be, every
-//! range of the collective is withheld and the error is device loss naming the
-//! collective and its deadline. No rank ever holds a partial result.
-//!
-//! One host thread drives both ranks. Document 01's one execution thread per
-//! GPU is not met yet: a device range is `!Send`, and a rank thread would need
-//! a cross-thread handle to its peer's range.
+//! Task 0057 low-level all-gather declarations and the shared worker rendezvous.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "paged-attention-binding")]
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use core::ffi::c_void;
@@ -38,6 +17,246 @@ use crate::lease::LeaseState;
 
 const ALIGNMENT: u64 = 256;
 const BF16_BYTES: u64 = 2;
+
+/// Fixed-size collective declaration shared by the two rank workers.
+#[cfg(feature = "paged-attention-binding")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RankDeclaration {
+    pub sequence: u64,
+    pub operation: u16,
+    pub rank: u8,
+    pub shape: [u64; 4],
+    pub precision: Precision,
+}
+
+#[cfg(feature = "paged-attention-binding")]
+#[derive(Debug, Clone)]
+struct RankSubmission {
+    declaration: RankDeclaration,
+    status: u32,
+    error: Option<Error>,
+}
+
+#[cfg(feature = "paged-attention-binding")]
+#[derive(Debug, Clone)]
+struct RankRoundResult {
+    status: u32,
+    error: Option<Error>,
+}
+
+#[cfg(feature = "paged-attention-binding")]
+#[derive(Debug)]
+struct RankRendezvousState {
+    sequence: u64,
+    submissions: [Option<RankSubmission>; 2],
+    arrived: u8,
+    departed: u8,
+    result: Option<RankRoundResult>,
+    lost: Option<Error>,
+}
+
+/// Two-party host rendezvous. A rank cannot leave a failed operation without
+/// submitting its status, and a missing worker makes the group loss sticky.
+#[cfg(feature = "paged-attention-binding")]
+#[derive(Debug)]
+pub(crate) struct RankRendezvous {
+    device: u32,
+    state: Mutex<RankRendezvousState>,
+    changed: Condvar,
+}
+
+#[cfg(feature = "paged-attention-binding")]
+impl RankRendezvous {
+    pub(crate) fn new(device: u32) -> Self {
+        Self {
+            device,
+            state: Mutex::new(RankRendezvousState {
+                sequence: 0,
+                submissions: [None, None],
+                arrived: 0,
+                departed: 0,
+                result: None,
+                lost: None,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn lose(&self, detail: impl Into<String>) -> Error {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.lose_locked(&mut state, detail.into())
+    }
+
+    fn lose_locked(&self, state: &mut RankRendezvousState, detail: String) -> Error {
+        let lost = state.lost.get_or_insert(Error::DeviceLost {
+            device: self.device,
+            detail,
+        });
+        self.changed.notify_all();
+        lost.clone()
+    }
+
+    pub(crate) fn lost(&self) -> Option<Error> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lost
+            .clone()
+    }
+
+    pub(crate) fn enter(
+        &self,
+        rank: usize,
+        declaration: RankDeclaration,
+        local: Result<()>,
+        deadline: Instant,
+    ) -> Result<()> {
+        if rank >= 2 {
+            return Err(Error::InvalidRequest {
+                field: "rank",
+                detail: "a two-rank rendezvous received an invalid rank".into(),
+            });
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(lost) = &state.lost {
+                return Err(lost.clone());
+            }
+            if state.result.is_none() {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(self.lose_locked(
+                    &mut state,
+                    "a rank did not leave the prior rendezvous before the deadline".into(),
+                ));
+            }
+            let (next, wait) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if wait.timed_out() && state.result.is_some() {
+                return Err(self.lose_locked(
+                    &mut state,
+                    "a rank did not leave the prior rendezvous before the deadline".into(),
+                ));
+            }
+        }
+        if state.submissions[rank].is_some() {
+            let sequence = state.sequence;
+            return Err(self.lose_locked(
+                &mut state,
+                format!("rank {rank} entered rendezvous {sequence} twice"),
+            ));
+        }
+        state.submissions[rank] = Some(RankSubmission {
+            declaration,
+            status: u32::from(local.is_err()),
+            error: local.err(),
+        });
+        state.arrived += 1;
+        if state.arrived == 2 {
+            let [Some(first), Some(second)] = &state.submissions else {
+                return Err(self.lose_locked(
+                    &mut state,
+                    "rendezvous arrival count disagrees with rank slots".into(),
+                ));
+            };
+            let declarations_match = first.declaration.sequence == state.sequence
+                && second.declaration.sequence == state.sequence
+                && first.declaration.rank == 0
+                && second.declaration.rank == 1
+                && first.declaration.operation == second.declaration.operation
+                && first.declaration.shape == second.declaration.shape
+                && first.declaration.precision == second.declaration.precision;
+            let status = first
+                .status
+                .max(second.status)
+                .max(u32::from(!declarations_match));
+            let lost_error = [&first.error, &second.error]
+                .into_iter()
+                .flatten()
+                .find(|error| matches!(error, Error::DeviceLost { .. }))
+                .cloned();
+            let error = lost_error
+                .or_else(|| first.error.clone())
+                .or_else(|| second.error.clone())
+                .or_else(|| {
+                    (!declarations_match).then(|| Error::InvalidRequest {
+                        field: "collective",
+                        detail: format!(
+                            "rendezvous declarations differ at sequence {}",
+                            state.sequence
+                        ),
+                    })
+                });
+            if matches!(error, Some(Error::DeviceLost { .. })) {
+                state.lost = error.clone();
+            }
+            state.result = Some(RankRoundResult { status, error });
+            self.changed.notify_all();
+        }
+
+        loop {
+            if let Some(lost) = &state.lost {
+                return Err(lost.clone());
+            }
+            if let Some(result) = &state.result {
+                let result = result.clone();
+                state.departed += 1;
+                if state.departed == 2 {
+                    let Some(next_sequence) = state.sequence.checked_add(1) else {
+                        return Err(
+                            self.lose_locked(&mut state, "rendezvous sequence overflowed".into())
+                        );
+                    };
+                    state.sequence = next_sequence;
+                    state.submissions = [None, None];
+                    state.arrived = 0;
+                    state.departed = 0;
+                    state.result = None;
+                    self.changed.notify_all();
+                }
+                return if result.status == 0 {
+                    Ok(())
+                } else {
+                    Err(result.error.unwrap_or_else(|| Error::InvalidRequest {
+                        field: "collective",
+                        detail: "a rank reported failure".into(),
+                    }))
+                };
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let sequence = state.sequence;
+                return Err(self.lose_locked(
+                    &mut state,
+                    format!("rank did not arrive at rendezvous {sequence} before the deadline"),
+                ));
+            }
+            let (next, wait) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if wait.timed_out() && state.result.is_none() {
+                let sequence = state.sequence;
+                return Err(self.lose_locked(
+                    &mut state,
+                    format!("rank did not arrive at rendezvous {sequence} before the deadline"),
+                ));
+            }
+        }
+    }
+}
 
 /// What every rank must agree on before a collective moves bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,9 +282,6 @@ pub struct RankGroup<'ctx> {
     ranks: [&'ctx RankContext; 2],
     sequence: u64,
     deadline: Duration,
-    /// Why the group can no longer be used, once a drain could not be
-    /// observed or a commit's device publication failed.
-    lost: Option<Error>,
 }
 
 /// A refused collective: the typed error each rank receives.
@@ -122,7 +338,6 @@ impl<'ctx> RankGroup<'ctx> {
             ranks,
             sequence: 0,
             deadline,
-            lost: None,
         })
     }
 
@@ -148,12 +363,6 @@ impl<'ctx> RankGroup<'ctx> {
         streams: [&Stream<'ctx>; 2],
         cancel: &AtomicBool,
     ) -> std::result::Result<[Gathered<'ctx>; 2], GatherRefused> {
-        if let Some(lost) = &self.lost {
-            // Dropping the shards withholds them, as the group already has.
-            return Err(GatherRefused {
-                errors: [lost.clone(), lost.clone()],
-            });
-        }
         let sequence = self.sequence;
         self.sequence += 1;
         let deadline = Instant::now() + self.deadline;
@@ -274,293 +483,6 @@ impl<'ctx> RankGroup<'ctx> {
             gathered.next().expect("two ranks"),
             gathered.next().expect("two ranks"),
         ])
-    }
-
-    /// Gather two completed rank-local stage outputs by column, in rank order.
-    ///
-    /// Unlike [`Self::all_gather`] the sources are borrowed and carry no
-    /// event: the one caller, the dense tensor-parallel step, has already
-    /// observed their producing stage complete. Each rank receives its own
-    /// full-width output in `arenas[r]`.
-    #[cfg(feature = "paged-attention-binding")]
-    #[allow(clippy::result_large_err)]
-    pub(crate) fn gather(
-        &mut self,
-        declarations: [GatherDeclaration; 2],
-        sources: [&DeviceRange<'ctx>; 2],
-        arenas: [&mut DeviceArena<'ctx>; 2],
-        streams: [&Stream<'ctx>; 2],
-        cancel: &AtomicBool,
-    ) -> std::result::Result<[DeviceRange<'ctx>; 2], GatherRefused> {
-        self.join(false, declarations, sources, arenas, streams, cancel)
-    }
-
-    /// Reduce two completed FP32 row-parallel partials exactly (ADR 0036).
-    ///
-    /// Each rank pulls its peer's partial, then adds rank 0's partial to rank
-    /// 1's in FP32 and rounds once to BF16, so both ranks hold the same bits.
-    /// `declarations` name the partial: its full output width and `F32`.
-    #[cfg(feature = "paged-attention-binding")]
-    #[allow(clippy::result_large_err)]
-    pub(crate) fn reduce(
-        &mut self,
-        declarations: [GatherDeclaration; 2],
-        partials: [&DeviceRange<'ctx>; 2],
-        arenas: [&mut DeviceArena<'ctx>; 2],
-        streams: [&Stream<'ctx>; 2],
-        cancel: &AtomicBool,
-    ) -> std::result::Result<[DeviceRange<'ctx>; 2], GatherRefused> {
-        self.join(true, declarations, partials, arenas, streams, cancel)
-    }
-
-    /// The shared body of [`Self::gather`] and [`Self::reduce`]: agreement,
-    /// every fallible allocation, then the copies. Whatever happens once a
-    /// copy may be enqueued, both streams go through [`Self::drain`] before
-    /// any range is released; if that fails, every range is withheld.
-    #[cfg(feature = "paged-attention-binding")]
-    #[allow(clippy::result_large_err)]
-    fn join(
-        &mut self,
-        reduce: bool,
-        declarations: [GatherDeclaration; 2],
-        sources: [&DeviceRange<'ctx>; 2],
-        arenas: [&mut DeviceArena<'ctx>; 2],
-        streams: [&Stream<'ctx>; 2],
-        cancel: &AtomicBool,
-    ) -> std::result::Result<[DeviceRange<'ctx>; 2], GatherRefused> {
-        let refuse = |error: Error| GatherRefused {
-            errors: [error.clone(), error],
-        };
-        if let Some(lost) = &self.lost {
-            return Err(refuse(lost.clone()));
-        }
-        let sequence = self.sequence;
-        self.sequence += 1;
-        self.agree(sequence, declarations, sources, streams, cancel)
-            .map_err(refuse)?;
-        let declaration = declarations[0];
-        let element = match (reduce, declaration.precision) {
-            (_, Precision::F32) => 4,
-            (false, Precision::Bf16) => BF16_BYTES,
-            (_, precision) => {
-                return Err(refuse(collective(format!(
-                    "no {} of {precision:?}",
-                    if reduce { "reduce" } else { "gather" }
-                ))));
-            }
-        };
-        let overflow = || refuse(collective("collective extent overflowed".into()));
-        let elements = declaration
-            .rows
-            .checked_mul(declaration.columns)
-            .ok_or_else(overflow)?;
-        let part = elements.checked_mul(element).ok_or_else(overflow)?;
-        let [output_bytes, scratch_bytes] = if reduce {
-            [elements.checked_mul(BF16_BYTES).ok_or_else(overflow)?, part]
-        } else {
-            [part.checked_mul(2).ok_or_else(overflow)?, 0]
-        };
-        let grid = u32::try_from(elements.div_ceil(256)).map_err(|_| overflow())?;
-        if sources.iter().any(|source| source.bytes() < part) {
-            return Err(refuse(collective(format!(
-                "a source is smaller than the declared {part} bytes"
-            ))));
-        }
-        // ponytail: the reduce image is loaded per call; hold it in the group
-        // if the per-step load ever shows up.
-        let mut kernels = Vec::new();
-        if reduce {
-            // SAFETY: the build's own `include_bytes!` of the pinned nvcc output.
-            let image =
-                unsafe { TrustedImage::from_build_output(moxie_kernels::DENSE_GRAPH_FATBIN) }
-                    .map_err(refuse)?;
-            for rank in self.ranks {
-                kernels.push(
-                    Module::load(rank, ModuleImage::Binary(image))
-                        .and_then(|module| {
-                            module.resolve_all(&[moxie_kernels::TP_REDUCE_F32.to_string()])
-                        })
-                        .map_err(refuse)?,
-                );
-            }
-        }
-
-        // Output first, then the reduce's peer-partial scratch.
-        let mut arenas = arenas;
-        let mut ranges: Vec<Vec<DeviceRange<'ctx>>> = Vec::new();
-        let mut unallocated = None;
-        'allocate: for arena in arenas.iter_mut() {
-            let mut held = Vec::new();
-            for (bytes, owner) in [
-                (output_bytes, "collective output"),
-                (scratch_bytes, "reduce peer partial"),
-            ] {
-                if bytes == 0 {
-                    continue;
-                }
-                match arena.allocate(bytes, ALIGNMENT, owner) {
-                    Ok(range) => held.push(range),
-                    Err(refused) => {
-                        ranges.push(held);
-                        unallocated = Some(refused.error);
-                        break 'allocate;
-                    }
-                }
-            }
-            ranges.push(held);
-        }
-        if let Some(error) = unallocated {
-            // Nothing is enqueued yet.
-            self.release_all(&mut arenas, ranges).map_err(refuse)?;
-            return Err(refuse(error));
-        }
-
-        let mut enqueued = Ok(());
-        for rank in 0..2 {
-            enqueued = if reduce {
-                self.enqueue_reduce(
-                    rank,
-                    [elements, part],
-                    grid,
-                    sources,
-                    &ranges[rank],
-                    &kernels[rank],
-                    streams[rank],
-                )
-            } else {
-                copy_columns(declaration, sources, &ranges[rank][0], streams[rank])
-            };
-            if enqueued.is_err() {
-                break;
-            }
-        }
-        // Dropping an unreleased range withholds it.
-        self.drain(streams).map_err(refuse)?;
-        if let Err(error) = enqueued {
-            self.release_all(&mut arenas, ranges).map_err(refuse)?;
-            return Err(refuse(error));
-        }
-        let mut outputs = Vec::new();
-        let mut scratch = Vec::new();
-        for mut held in ranges {
-            scratch.push(held.split_off(1));
-            outputs.push(held.pop().expect("one output range"));
-        }
-        self.release_all(&mut arenas, scratch).map_err(refuse)?;
-        let mut outputs = outputs.into_iter();
-        Ok([
-            outputs.next().expect("two ranks"),
-            outputs.next().expect("two ranks"),
-        ])
-    }
-
-    /// Observe both ranks' streams complete, each on its own, within the
-    /// group's deadline. Every failure path of a tensor-parallel step settles
-    /// here before releasing anything its streams may touch. If either rank
-    /// cannot be observed, the group is lost: the caller withholds
-    /// everything, and every later collective or step refuses with the
-    /// recorded reason.
-    #[cfg(feature = "paged-attention-binding")]
-    pub(crate) fn drain(&mut self, streams: [&Stream<'ctx>; 2]) -> Result<()> {
-        if let Some(lost) = &self.lost {
-            return Err(lost.clone());
-        }
-        let deadline = Instant::now() + self.deadline;
-        let mut failures = Vec::new();
-        for (rank, (ctx, stream)) in self.ranks.into_iter().zip(streams).enumerate() {
-            let observed = Event::new(ctx).and_then(|done| {
-                done.record(stream)?;
-                while !done.is_complete()? {
-                    if Instant::now() >= deadline {
-                        return Err(collective("completion not observed".into()));
-                    }
-                    std::thread::yield_now();
-                }
-                Ok(())
-            });
-            if let Err(error) = observed {
-                failures.push(format!("rank {rank}: {error}"));
-            }
-        }
-        if failures.is_empty() {
-            return Ok(());
-        }
-        Err(self.lose(format!(
-            "a rank stream was not observed drained within {} ms ({}); every range of \
-             the step is withheld",
-            self.deadline.as_millis(),
-            failures.join("; ")
-        )))
-    }
-
-    /// Return each rank's ranges to its arena. A range that cannot be
-    /// released stays allocated and charged, so the group is lost.
-    #[cfg(feature = "paged-attention-binding")]
-    fn release_all(
-        &mut self,
-        arenas: &mut [&mut DeviceArena<'ctx>; 2],
-        ranges: Vec<Vec<DeviceRange<'ctx>>>,
-    ) -> Result<()> {
-        for (arena, ranges) in arenas.iter_mut().zip(ranges) {
-            if let Err(error) = release(arena, ranges) {
-                return Err(self.lose(format!(
-                    "a collective range could not be released ({error}); it is withheld"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Mark the group unusable and record why. The first reason is kept.
-    #[cfg(feature = "paged-attention-binding")]
-    pub(crate) fn lose(&mut self, detail: String) -> Error {
-        let lost = Error::DeviceLost {
-            device: self.ranks[0].ordinal(),
-            detail,
-        };
-        self.lost.get_or_insert(lost).clone()
-    }
-
-    /// The reason the group is unusable, if it is.
-    pub fn lost(&self) -> Option<&Error> {
-        self.lost.as_ref()
-    }
-
-    /// Pull the peer's partial into `buffers[1]`, then add rank 0's partial
-    /// to rank 1's and round once into `buffers[0]`.
-    #[cfg(feature = "paged-attention-binding")]
-    #[allow(clippy::too_many_arguments)]
-    fn enqueue_reduce(
-        &self,
-        rank: usize,
-        [elements, bytes]: [u64; 2],
-        grid: u32,
-        partials: [&DeviceRange<'ctx>; 2],
-        buffers: &[DeviceRange<'ctx>],
-        kernel: &ResolvedModule<'ctx>,
-        stream: &Stream<'ctx>,
-    ) -> Result<()> {
-        let [output, scratch] = [&buffers[0], &buffers[1]];
-        let peer = partials[1 - rank];
-        // SAFETY: the caller's lease retains `scratch` until its event is
-        // observed or it is withheld; the completed peer partial is the
-        // caller's until this collective returns.
-        unsafe { scratch.copy_from_peer_async_at(0, peer, 0, bytes, stream)? };
-        let mut operands = [partials[0], partials[1]];
-        operands[1 - rank] = scratch;
-        let mut rank_zero = operands[0].device_address()?;
-        let mut rank_one = operands[1].device_address()?;
-        let mut sum = output.device_address()?;
-        let mut count = elements;
-        let mut params: [*mut c_void; 4] = [
-            (&raw mut rank_zero).cast(),
-            (&raw mut rank_one).cast(),
-            (&raw mut sum).cast(),
-            (&raw mut count).cast(),
-        ];
-        // SAFETY: four arguments matching `moxie_tp_reduce_f32_v1`, all
-        // within ranges this collective retains.
-        unsafe { kernel.launch_async(0, stream, (grid, 1, 1), (256, 1, 1), 0, &mut params) }
     }
 
     /// Refuse a collective that moved no byte. A source's only reader is its
@@ -927,5 +849,66 @@ fn invalid(field: &'static str, detail: &str) -> Error {
     Error::InvalidRequest {
         field,
         detail: detail.into(),
+    }
+}
+
+#[cfg(all(test, feature = "paged-attention-binding"))]
+mod tests {
+    use super::{RankDeclaration, RankRendezvous};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use moxie_types::{Error, Precision};
+
+    #[test]
+    fn rank_one_device_loss_dominates_rank_zero_ordinary_error() {
+        let rendezvous = Arc::new(RankRendezvous::new(1));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let rank_zero = {
+            let rendezvous = Arc::clone(&rendezvous);
+            thread::spawn(move || {
+                rendezvous.enter(
+                    0,
+                    RankDeclaration {
+                        sequence: 0,
+                        operation: 1,
+                        rank: 0,
+                        shape: [0; 4],
+                        precision: Precision::F32,
+                    },
+                    Err(Error::InvalidRequest {
+                        field: "rank",
+                        detail: "ordinary rank error".into(),
+                    }),
+                    deadline,
+                )
+            })
+        };
+        let rank_one = {
+            let rendezvous = Arc::clone(&rendezvous);
+            thread::spawn(move || {
+                rendezvous.enter(
+                    1,
+                    RankDeclaration {
+                        sequence: 0,
+                        operation: 1,
+                        rank: 1,
+                        shape: [0; 4],
+                        precision: Precision::F32,
+                    },
+                    Err(Error::DeviceLost {
+                        device: 1,
+                        detail: "rank one lost".into(),
+                    }),
+                    deadline,
+                )
+            })
+        };
+        let zero = rank_zero.join().unwrap().unwrap_err();
+        let one = rank_one.join().unwrap().unwrap_err();
+        assert!(matches!(zero, Error::DeviceLost { .. }));
+        assert_eq!(one, zero);
+        assert_eq!(rendezvous.lost(), Some(zero));
     }
 }
