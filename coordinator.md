@@ -61,6 +61,31 @@ delivers the next required capability. Explain the critical path in plain
 language. Do not expand tooling, packaging or an optimization campaign beyond
 its authorized outcome merely because that is where the last task ended.
 
+### Own the pace and the scope
+
+The coordinator is accountable for the milestone advancing. Do not wait for
+the owner to notice a stall; catch it and act (owner direction, 2026-09-23,
+after slice 3 of M5 grew from two tasks to three without being flagged).
+
+- **Tie every task to the exit gate.** Before opening a task, name the
+  milestone exit-gate or roadmap clause it serves. If it serves none, it is
+  a ledger follow-up, not milestone work, unless the owner says otherwise.
+- **Review findings do not grow the milestone by default.** When a review
+  surfaces pre-existing debt that the exit gate does not require, record it
+  in the ledger with an owner and a revisit trigger, and close the task on
+  its own contract. Pull it in only if it blocks a required clause, and say
+  why.
+- **Watch the tripwires.** Stop and re-scope, and tell the owner with a
+  recommendation, when:
+  - a slice needs more tasks than planned;
+  - a task passes three review rounds;
+  - a finding class recurs across tasks.
+
+  Do this before the next assignment, not after being asked.
+- **Report progress against the exit gate.** A status update lists which
+  exit-gate clauses are met, which remain, and whether the current slice is
+  still bounded. Tasks closed is not the measure.
+
 Respect owner-required ordering and existing exceptions. Do not invent a global
 rule that every earlier task must be accepted before any independent work can
 proceed. Likewise, an experiment requiring later integration cannot silently
