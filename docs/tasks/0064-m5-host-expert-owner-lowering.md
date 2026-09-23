@@ -183,7 +183,6 @@ model edits.
 - **Mutations,** each run and restored:
   - Add non-owned slots as zeros instead of skipping them.
   - Combine the partials in descending group order (at R=4).
-  - Apply `output_scale` per partial instead of once.
   - The reference ignores `groups` (runs 1).
 
   Each must fail a test. At R=2 descending equals ascending (a+b == b+a),
