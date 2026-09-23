@@ -1337,7 +1337,8 @@ pub mod device {
         partial_sum: Option<DeviceRange<'ctx>>,
         partial_weighted: Option<DeviceRange<'ctx>>,
         /// Prefix-lineage entries the run reserves for one branch fork; zero
-        /// means this run was not admitted as a fork destination.
+        /// means this run was not admitted as a fork destination. The matching
+        /// request also charges SequenceState's branch and transaction nodes.
         #[cfg(feature = "paged-attention-binding")]
         fork_lineage_capacity: u64,
         /// The published mapping, and the absolute row its logical page zero
@@ -1442,8 +1443,46 @@ pub mod device {
             max_rows: u64,
             staging: Staging,
         ) -> std::result::Result<Self, PagedAdmitRefused<'ctx>> {
-            Self::admit_with_fork_lineage_capacity(
-                ledger, ctx, descriptor, geometry, heads, max_rows, 0, staging,
+            Self::admit_with_lineage_capacities(
+                ledger, ctx, descriptor, geometry, heads, max_rows, 0, 0, staging,
+            )
+        }
+
+        /// Admit the root lineage and transaction slot owned by a
+        /// `DeviceKvSequence`. Raw paged runs without that state authority keep
+        /// using [`Self::admit`] and do not charge or impose a lineage limit.
+        #[allow(clippy::result_large_err)]
+        #[allow(clippy::too_many_arguments)]
+        pub fn admit_for_sequence(
+            ledger: &mut Ledger,
+            ctx: &'ctx RankContext,
+            descriptor: SemanticKernelDescriptor,
+            geometry: PageGeometry,
+            heads: u64,
+            max_rows: u64,
+            root_lineage_capacity: u64,
+            staging: Staging,
+        ) -> std::result::Result<Self, PagedAdmitRefused<'ctx>> {
+            if root_lineage_capacity == 0 {
+                return Err(PagedAdmitRefused {
+                    error: invalid("root_lineage_capacity", "a sequence needs lineage entries"),
+                    reservation: None,
+                    rejection: None,
+                    arena: None,
+                    ranges: Vec::new(),
+                    cleanup: None,
+                });
+            }
+            Self::admit_with_lineage_capacities(
+                ledger,
+                ctx,
+                descriptor,
+                geometry,
+                heads,
+                max_rows,
+                root_lineage_capacity,
+                0,
+                staging,
             )
         }
 
@@ -1471,13 +1510,14 @@ pub mod device {
                     cleanup: None,
                 });
             }
-            Self::admit_with_fork_lineage_capacity(
+            Self::admit_with_lineage_capacities(
                 ledger,
                 ctx,
                 descriptor,
                 geometry,
                 heads,
                 max_rows,
+                0,
                 fork_lineage_capacity,
                 staging,
             )
@@ -1485,13 +1525,14 @@ pub mod device {
 
         #[allow(clippy::result_large_err)]
         #[allow(clippy::too_many_arguments)]
-        fn admit_with_fork_lineage_capacity(
+        fn admit_with_lineage_capacities(
             ledger: &mut Ledger,
             ctx: &'ctx RankContext,
             descriptor: SemanticKernelDescriptor,
             geometry: PageGeometry,
             heads: u64,
             max_rows: u64,
+            root_lineage_capacity: u64,
             fork_lineage_capacity: u64,
             staging: Staging,
         ) -> std::result::Result<Self, PagedAdmitRefused<'ctx>> {
@@ -1611,15 +1652,22 @@ pub mod device {
             if let Err(error) = check_grid(&widest, ctx) {
                 return Err(fail(error));
             }
-            let extents =
-                match Extents::derive(&geometry, heads, max_rows, fork_lineage_capacity, staging) {
-                    Ok(extents) => extents,
-                    Err(error) => return Err(fail(error)),
-                };
-            let request = match resource_request_with_fork_lineage_capacity(
+            let extents = match Extents::derive(
                 &geometry,
                 heads,
                 max_rows,
+                root_lineage_capacity,
+                fork_lineage_capacity,
+                staging,
+            ) {
+                Ok(extents) => extents,
+                Err(error) => return Err(fail(error)),
+            };
+            let request = match resource_request_with_lineage_capacities(
+                &geometry,
+                heads,
+                max_rows,
+                root_lineage_capacity,
                 fork_lineage_capacity,
                 staging,
                 ctx,
@@ -4713,6 +4761,7 @@ pub mod device {
         page_view_host: u64,
         placements_host: u64,
         commit_host: u64,
+        root_lineage_host: u64,
         fork_host: u64,
         partials_host: u64,
         query: u64,
@@ -4732,6 +4781,7 @@ pub mod device {
             geometry: &PageGeometry,
             heads: u64,
             max_rows: u64,
+            root_lineage_capacity: u64,
             fork_lineage_capacity: u64,
             staging: Staging,
         ) -> Result<Self> {
@@ -4754,6 +4804,22 @@ pub mod device {
                 .checked_mul(core::mem::size_of::<PagePlacement>() as u64)
                 .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
             let commit_host = commit_host_metadata_bytes();
+            #[cfg(feature = "paged-attention-binding")]
+            let root_lineage_host = if root_lineage_capacity == 0 {
+                0
+            } else {
+                moxie_state::DeviceKvSequence::root_host_metadata_bytes(root_lineage_capacity)?
+            };
+            #[cfg(not(feature = "paged-attention-binding"))]
+            let root_lineage_host = if root_lineage_capacity == 0 {
+                0
+            } else {
+                return Err(Error::Unsupported {
+                    capability: "paged_attention_sequence_metadata",
+                    reason: "sequence metadata admission requires the paged-attention binding"
+                        .into(),
+                });
+            };
             #[cfg(feature = "paged-attention-binding")]
             let fork_host = if fork_lineage_capacity == 0 {
                 0
@@ -4882,6 +4948,7 @@ pub mod device {
                 page_view_host,
                 placements_host,
                 commit_host,
+                root_lineage_host,
                 fork_host,
                 partials_host,
                 query,
@@ -4918,12 +4985,41 @@ pub mod device {
         staging: Staging,
         ctx: &RankContext,
     ) -> Result<PlanRequest> {
-        resource_request_with_fork_lineage_capacity(geometry, heads, max_rows, 0, staging, ctx)
+        resource_request_with_lineage_capacities(geometry, heads, max_rows, 0, 0, staging, ctx)
+    }
+
+    /// The resource request for a root `DeviceKvSequence` run. The logical
+    /// lineage capacity and possible transaction node are independent of the
+    /// run's physical page count and append-row bound.
+    pub fn resource_request_for_sequence(
+        geometry: &PageGeometry,
+        heads: u64,
+        max_rows: u64,
+        root_lineage_capacity: u64,
+        staging: Staging,
+        ctx: &RankContext,
+    ) -> Result<PlanRequest> {
+        if root_lineage_capacity == 0 {
+            return Err(invalid(
+                "root_lineage_capacity",
+                "a sequence needs lineage entries",
+            ));
+        }
+        resource_request_with_lineage_capacities(
+            geometry,
+            heads,
+            max_rows,
+            root_lineage_capacity,
+            0,
+            staging,
+            ctx,
+        )
     }
 
     /// The resource request for a run admitted to receive a branch fork.
     /// `fork_lineage_capacity` is the reserved number of logical prefix entries,
-    /// independent of the run's physical page count.
+    /// independent of the run's physical page count. It charges the child
+    /// lineage, both state-map nodes, and per-layer device branch vectors.
     pub fn resource_request_for_fork(
         geometry: &PageGeometry,
         heads: u64,
@@ -4938,25 +5034,34 @@ pub mod device {
                 "a fork needs lineage entries",
             ));
         }
-        resource_request_with_fork_lineage_capacity(
+        resource_request_with_lineage_capacities(
             geometry,
             heads,
             max_rows,
+            0,
             fork_lineage_capacity,
             staging,
             ctx,
         )
     }
 
-    fn resource_request_with_fork_lineage_capacity(
+    fn resource_request_with_lineage_capacities(
         geometry: &PageGeometry,
         heads: u64,
         max_rows: u64,
+        root_lineage_capacity: u64,
         fork_lineage_capacity: u64,
         staging: Staging,
         ctx: &RankContext,
     ) -> Result<PlanRequest> {
-        let extents = Extents::derive(geometry, heads, max_rows, fork_lineage_capacity, staging)?;
+        let extents = Extents::derive(
+            geometry,
+            heads,
+            max_rows,
+            root_lineage_capacity,
+            fork_lineage_capacity,
+            staging,
+        )?;
         let mut request = PlanRequest::new(
             moxie_memory::fallible::text(format_args!(
                 "paged-attention-{}x{}",
@@ -5003,6 +5108,15 @@ pub mod device {
             extents.page_table_host,
             StageSpan::inclusive(0, 4),
         ))?;
+        if extents.root_lineage_host != 0 {
+            request.buffer(BufferRequest::new(
+                "device-kv-root-host-metadata",
+                Scope::Host,
+                Tier::Host(HostTier::Pageable),
+                extents.root_lineage_host,
+                StageSpan::inclusive(0, 4),
+            ))?;
+        }
         if extents.fork_host != 0 {
             request.buffer(BufferRequest::new(
                 "device-kv-fork-host-metadata",

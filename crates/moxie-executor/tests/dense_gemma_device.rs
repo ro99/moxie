@@ -250,26 +250,45 @@ fn admit_runs<'ctx>(
     max_rows: u64,
 ) -> Vec<PagedAttentionRun<'ctx>> {
     let descriptor = paged_descriptor(context.capability());
+    let lineage_capacity = u64::try_from(state.geometry().expect("device geometry").max_tokens)
+        .expect("lineage capacity fits u64")
+        .checked_add(1)
+        .expect("lineage entry count fits u64");
     (0..config.layers)
         .map(|layer| {
             let declared = config.layer_geometry(layer);
             let layout = state.layout(layer as usize).expect("device layer layout");
-            PagedAttentionRun::admit(
-                ledger,
-                context,
-                descriptor.clone(),
-                PageGeometry {
-                    kv_heads: declared.kv_heads,
-                    head_dim: declared.head_dim,
-                    page_tokens: state.geometry().expect("device geometry").page_tokens as u64,
-                    pages: layout.pages,
-                },
-                config.heads,
-                max_rows,
-                Staging::DeviceHandles,
-            )
-            .map_err(|refused| refused.error)
-            .expect("paged attention run admission")
+            let geometry = PageGeometry {
+                kv_heads: declared.kv_heads,
+                head_dim: declared.head_dim,
+                page_tokens: state.geometry().expect("device geometry").page_tokens as u64,
+                pages: layout.pages,
+            };
+            let admit = if layer == 0 {
+                PagedAttentionRun::admit_for_sequence(
+                    ledger,
+                    context,
+                    descriptor.clone(),
+                    geometry,
+                    config.heads,
+                    max_rows,
+                    lineage_capacity,
+                    Staging::DeviceHandles,
+                )
+            } else {
+                PagedAttentionRun::admit(
+                    ledger,
+                    context,
+                    descriptor.clone(),
+                    geometry,
+                    config.heads,
+                    max_rows,
+                    Staging::DeviceHandles,
+                )
+            };
+            admit
+                .map_err(|refused| refused.error)
+                .expect("paged attention run admission")
         })
         .collect()
 }

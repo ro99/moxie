@@ -66,7 +66,9 @@ pub use paged::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use moxie_types::{BranchId, CachePrecision, Error, Precision, Result, StateTransactionId};
+use moxie_types::{
+    BranchId, CachePrecision, Error, HostTier, Precision, Result, StateTransactionId, Tier,
+};
 
 // `BTreeMap`'s current standard-library node holds eleven key/value slots and,
 // for internal nodes, twelve child pointers. Charge that full node shape for a
@@ -74,6 +76,21 @@ use moxie_types::{BranchId, CachePrecision, Error, Precision, Result, StateTrans
 fn btree_node_host_bytes<K, V>() -> Result<u64> {
     u64::try_from(paged::btree_node_bound(core::mem::size_of::<(K, V)>()))
         .map_err(|_| Error::Dim(moxie_types::DimError::Overflow))
+}
+
+fn lineage_host_bytes(entries: usize) -> Result<u64> {
+    u64::try_from(entries)
+        .map_err(|_| Error::Dim(moxie_types::DimError::Overflow))?
+        .checked_mul(core::mem::size_of::<PrefixLineage>() as u64)
+        .ok_or(Error::Dim(moxie_types::DimError::Overflow))
+}
+
+fn lineage_capacity_error(requested: usize, available: usize) -> Result<Error> {
+    Ok(Error::CapacityExceeded {
+        tier: Some(Tier::Host(HostTier::Pageable)),
+        requested_bytes: lineage_host_bytes(requested)?,
+        available_bytes: lineage_host_bytes(available)?,
+    })
 }
 
 /// The kinds of state a schema can declare (document 04).
@@ -476,6 +493,9 @@ struct Branch {
     /// `lineage[n]` is the lineage of prefix `n` on this branch. Its length is
     /// always `max(accepted, executed) + 1`.
     lineage: Vec<PrefixLineage>,
+    /// `Some` only for a branch whose lineage was admitted by its device
+    /// sequence. Other SequenceState consumers retain their unbounded policy.
+    lineage_limit: Option<usize>,
     /// Bumped on every rollback, so positions written afterwards differ from the
     /// ones they replaced.
     epoch: u64,
@@ -486,6 +506,21 @@ struct Branch {
 impl Branch {
     fn high_water(&self) -> u64 {
         self.frontiers.accepted.max(self.frontiers.executed)
+    }
+
+    fn check_lineage_limit(&self, accepted: u64, executed: u64) -> Result<()> {
+        let Some(limit) = self.lineage_limit else {
+            return Ok(());
+        };
+        let requested = accepted
+            .max(executed)
+            .checked_add(1)
+            .and_then(|entries| usize::try_from(entries).ok())
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+        if requested > limit {
+            return Err(lineage_capacity_error(requested, limit)?);
+        }
+        Ok(())
     }
 
     /// Give every occupied position a lineage entry.
@@ -596,6 +631,7 @@ impl SequenceState {
                 frontiers: Frontiers::default(),
                 parent: None,
                 lineage: vec![PrefixLineage::root(id, ROOT)],
+                lineage_limit: None,
                 epoch: 0,
                 logits: None,
             },
@@ -642,6 +678,42 @@ impl SequenceState {
         Ok(self.get(branch)?.lineage.get(prefix as usize).copied())
     }
 
+    /// The current allocation capacity of a branch's lineage vector.
+    ///
+    /// Exposed so the device integration gate can prove its admitted vector
+    /// does not grow while a long run executes.
+    pub fn lineage_capacity(&self, branch: BranchId) -> Result<usize> {
+        Ok(self.get(branch)?.lineage.capacity())
+    }
+
+    /// Reserve the branch lineage to an admitted maximum. Only the device KV
+    /// authority calls this; an absent limit preserves SequenceState's
+    /// historical unbounded behavior for host and standalone consumers.
+    pub(crate) fn reserve_lineage_to(&mut self, branch: BranchId, capacity: usize) -> Result<()> {
+        let b = self.get_mut(branch)?;
+        let bytes = lineage_host_bytes(capacity)?;
+        if capacity < b.lineage.len() || b.lineage_limit.is_some() {
+            return Err(Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::Pageable)),
+                requested_bytes: bytes,
+                available_bytes: 0,
+            });
+        }
+        if b.lineage
+            .try_reserve_exact(capacity - b.lineage.len())
+            .is_err()
+            || b.lineage.capacity() != capacity
+        {
+            return Err(Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::Pageable)),
+                requested_bytes: bytes,
+                available_bytes: 0,
+            });
+        }
+        b.lineage_limit = Some(capacity);
+        Ok(())
+    }
+
     /// The result `branch` is currently continuing from, if it is still valid.
     pub fn retained_logits(&self, branch: BranchId) -> Result<Option<LogitsHandle>> {
         let b = self.get(branch)?;
@@ -684,8 +756,11 @@ impl SequenceState {
                 ),
             });
         }
-        b.frontiers.prompt = add(b.frontiers.prompt, n, "prompt")?;
-        b.frontiers.accepted = add(b.frontiers.accepted, n, "accepted")?;
+        let prompt = add(b.frontiers.prompt, n, "prompt")?;
+        let accepted = add(b.frontiers.accepted, n, "accepted")?;
+        b.check_lineage_limit(accepted, b.frontiers.executed)?;
+        b.frontiers.prompt = prompt;
+        b.frontiers.accepted = accepted;
         b.extend_lineage();
         Ok(())
     }
@@ -699,7 +774,9 @@ impl SequenceState {
     /// 04 forbids.
     pub fn execute(&mut self, branch: BranchId, n: u64) -> Result<()> {
         let b = self.get_mut(branch)?;
-        b.frontiers.executed = add(b.frontiers.executed, n, "executed")?;
+        let executed = add(b.frontiers.executed, n, "executed")?;
+        b.check_lineage_limit(b.frontiers.accepted, executed)?;
+        b.frontiers.executed = executed;
         b.extend_lineage();
         Ok(())
     }
@@ -710,7 +787,9 @@ impl SequenceState {
     /// chain has no state yet, and `pending_execution` will report it.
     pub fn accept(&mut self, branch: BranchId, n: u64) -> Result<()> {
         let b = self.get_mut(branch)?;
-        b.frontiers.accepted = add(b.frontiers.accepted, n, "accepted")?;
+        let accepted = add(b.frontiers.accepted, n, "accepted")?;
+        b.check_lineage_limit(accepted, b.frontiers.executed)?;
+        b.frontiers.accepted = accepted;
         b.extend_lineage();
         Ok(())
     }
@@ -984,13 +1063,15 @@ impl SequenceState {
             // Accepting can overflow, and a failed commit must not close the
             // transaction -- the caller can still abort it.
             let b = self.get(journal.branch)?;
-            b.frontiers
-                .accepted
-                .checked_add(accept)
-                .ok_or(Error::InvalidRequest {
-                    field: "accepted",
-                    detail: "token counter overflow".into(),
-                })?;
+            let accepted =
+                b.frontiers
+                    .accepted
+                    .checked_add(accept)
+                    .ok_or(Error::InvalidRequest {
+                        field: "accepted",
+                        detail: "token counter overflow".into(),
+                    })?;
+            b.check_lineage_limit(accepted, b.frontiers.executed)?;
             self.accept(journal.branch, accept)?;
         }
         self.open.remove(&txn);
@@ -1287,14 +1368,29 @@ impl SequenceState {
         Ok(())
     }
 
-    /// Host bytes reserved for this logical fork's lineage clone and branch map
-    /// insertion. `lineage_entries` is the admitted prefix length plus one.
+    /// Host bytes reserved for this logical fork's full-capacity lineage clone,
+    /// branch-map node and possible open-transaction node. `lineage_entries` is
+    /// the admitted maximum position count plus one.
     pub fn fork_host_metadata_bytes(lineage_entries: u64) -> Result<u64> {
         let lineage = lineage_entries
             .checked_mul(core::mem::size_of::<PrefixLineage>() as u64)
             .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+        let branch_node = btree_node_host_bytes::<BranchId, Branch>()?;
+        let transaction_node = btree_node_host_bytes::<StateTransactionId, Journal>()?;
         lineage
-            .checked_add(btree_node_host_bytes::<BranchId, Branch>()?)
+            .checked_add(branch_node)
+            .and_then(|bytes| bytes.checked_add(transaction_node))
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))
+    }
+
+    /// Host bytes reserved for the root lineage and its one possible open
+    /// transaction-map node.
+    pub fn root_host_metadata_bytes(lineage_entries: u64) -> Result<u64> {
+        let lineage = lineage_entries
+            .checked_mul(core::mem::size_of::<PrefixLineage>() as u64)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+        lineage
+            .checked_add(btree_node_host_bytes::<StateTransactionId, Journal>()?)
             .ok_or(Error::Dim(moxie_types::DimError::Overflow))
     }
 
@@ -1324,7 +1420,29 @@ impl SequenceState {
             emitted: 0,
             executed: p.frontiers.executed.min(at),
         };
-        let lineage = p.lineage[..=at as usize].to_vec();
+        let lineage_limit = p.lineage_limit;
+        let lineage = if let Some(capacity) = lineage_limit {
+            let entries = usize::try_from(
+                at.checked_add(1)
+                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
+            )
+            .map_err(|_| Error::Dim(moxie_types::DimError::Overflow))?;
+            if entries > capacity {
+                return Err(lineage_capacity_error(entries, capacity)?);
+            }
+            let mut lineage = Vec::new();
+            if lineage.try_reserve_exact(capacity).is_err() || lineage.capacity() != capacity {
+                return Err(Error::CapacityExceeded {
+                    tier: Some(Tier::Host(HostTier::Pageable)),
+                    requested_bytes: lineage_host_bytes(capacity)?,
+                    available_bytes: 0,
+                });
+            }
+            lineage.extend_from_slice(&p.lineage[..=at as usize]);
+            lineage
+        } else {
+            p.lineage[..=at as usize].to_vec()
+        };
         let epoch = p.epoch;
         let child = BranchId(self.next_branch);
         self.next_branch += 1;
@@ -1334,6 +1452,7 @@ impl SequenceState {
                 frontiers,
                 parent: Some(parent),
                 lineage,
+                lineage_limit,
                 epoch,
                 logits: None,
             },
@@ -2456,5 +2575,61 @@ mod tests {
         s.append_prompt(ROOT, 4).unwrap();
         s.accept(ROOT, 1).unwrap();
         assert!(s.append_prompt(ROOT, 1).is_err());
+    }
+
+    #[test]
+    fn admitted_lineage_limit_is_reserved_inherited_and_preflighted() {
+        let mut unbounded = kv_only();
+        unbounded.execute(ROOT, 3).unwrap();
+        assert!(unbounded.lineage_at(ROOT, 3).unwrap().is_some());
+
+        let mut state = kv_only();
+        state.reserve_lineage_to(ROOT, 3).unwrap();
+        assert_eq!(state.lineage_capacity(ROOT).unwrap(), 3);
+
+        let full_frontier = state.frontiers(ROOT).unwrap();
+        for result in [
+            state.execute(ROOT, 3),
+            state.accept(ROOT, 3),
+            state.append_prompt(ROOT, 3),
+        ] {
+            assert!(matches!(
+                result,
+                Err(Error::CapacityExceeded {
+                    tier: Some(Tier::Host(HostTier::Pageable)),
+                    ..
+                })
+            ));
+        }
+        assert_eq!(state.frontiers(ROOT).unwrap(), full_frontier);
+
+        state.append_prompt(ROOT, 2).unwrap();
+        let child = state.fork(ROOT, 1).unwrap();
+        assert_eq!(state.lineage_capacity(child).unwrap(), 3);
+        let txn = state.begin(child).unwrap();
+        state.execute(child, 2).unwrap();
+        assert_eq!(state.lineage_capacity(child).unwrap(), 3);
+        let tentative = state.frontiers(child).unwrap();
+        assert!(matches!(
+            state.commit_prefix(txn, 2),
+            Err(Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::Pageable)),
+                ..
+            })
+        ));
+        assert_eq!(state.frontiers(child).unwrap(), tentative);
+        state.abort(txn).unwrap();
+
+        let committed = state.frontiers(child).unwrap();
+        for result in [state.execute(child, 3), state.accept(child, 2)] {
+            assert!(matches!(
+                result,
+                Err(Error::CapacityExceeded {
+                    tier: Some(Tier::Host(HostTier::Pageable)),
+                    ..
+                })
+            ));
+        }
+        assert_eq!(state.frontiers(child).unwrap(), committed);
     }
 }

@@ -256,13 +256,18 @@ fn prepared<'ctx>(
     stream: &Stream<'ctx>,
     rows: u64,
 ) -> (PagedAttentionRun<'ctx>, DeviceKvSequence) {
-    let mut run = PagedAttentionRun::admit(
+    let lineage_capacity = u64::try_from(kv_geometry().max_tokens)
+        .expect("lineage capacity fits u64")
+        .checked_add(1)
+        .expect("lineage entry count fits u64");
+    let mut run = PagedAttentionRun::admit_for_sequence(
         ledger,
         ctx,
         descriptor_for(ctx),
         geometry(),
         HEADS,
         MAX_ROWS.max(rows),
+        lineage_capacity,
         Staging::Host,
     )
     .map_err(|r| r.error)
@@ -1051,6 +1056,10 @@ fn a_wrapped_ring_answers_exactly_as_an_unwrapped_one() {
             },
             tentative_rows: 8,
         };
+        let lineage_capacity = u64::try_from(kv.max_tokens)
+            .expect("lineage capacity fits u64")
+            .checked_add(1)
+            .expect("lineage entry count fits u64");
         let mut sequence = DeviceKvSequence::new(kv).expect("a device sequence");
         assert_eq!(
             sequence.layout(0).expect("one layer").pages,
@@ -1070,10 +1079,18 @@ fn a_wrapped_ring_answers_exactly_as_an_unwrapped_one() {
             &PagedAttentionLaunch::new(layer, 1, 0, 0, 1).expect("a launch"),
         )
         .expect("a descriptor");
-        let mut run =
-            PagedAttentionRun::admit(ledger, &ctx, descriptor, geometry, HEADS, 8, Staging::Host)
-                .map_err(|r| r.error)
-                .expect("admission fits");
+        let mut run = PagedAttentionRun::admit_for_sequence(
+            ledger,
+            &ctx,
+            descriptor,
+            geometry,
+            HEADS,
+            8,
+            lineage_capacity,
+            Staging::Host,
+        )
+        .map_err(|r| r.error)
+        .expect("admission fits");
 
         // The same bytes at the same positions in both cases: the row's seed is
         // its absolute position, so nothing about the physical layout can

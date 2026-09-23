@@ -188,12 +188,19 @@ pub struct DeviceBranch<'a> {
 }
 
 impl DeviceKvSequence {
+    /// Host bytes reserved for this device sequence's root lineage and its
+    /// one possible open transaction-map node.
+    pub fn root_host_metadata_bytes(lineage_entries: u64) -> Result<u64> {
+        SequenceState::root_host_metadata_bytes(lineage_entries)
+    }
+
     /// Host bytes reserved for one device branch fork.
     ///
-    /// `lineage_entries` is the prefix length plus one. The charge includes
-    /// the two per-layer vectors, `SequenceState`'s cloned lineage and branch
-    /// map node, and this device authority's branch map node. Each map charge
-    /// is a full internal-node upper bound.
+    /// `lineage_entries` is the admitted maximum position count plus one. The
+    /// charge includes the two per-layer vectors, `SequenceState`'s reserved
+    /// lineage, its branch-map node and one possible transaction-map node,
+    /// plus this device authority's branch-map node. Each map charge is a full
+    /// internal-node upper bound.
     pub fn fork_host_metadata_bytes(lineage_entries: u64, layers: usize) -> Result<u64> {
         if lineage_entries == 0 || layers == 0 {
             return Err(invalid("fork_metadata", "a fork needs lineage and layers"));
@@ -324,10 +331,16 @@ impl DeviceKvSequence {
                 retained_floor: vec![0; layout.len()],
             },
         );
+        let lineage_capacity = geometry
+            .max_tokens
+            .checked_add(1)
+            .ok_or(Error::Dim(DimError::Overflow))?;
+        let mut state = SequenceState::new([StateKind::KvPages, StateKind::PositionCounter]);
+        state.reserve_lineage_to(ROOT, lineage_capacity)?;
         Ok(Self {
             geometry,
             layout,
-            state: SequenceState::new([StateKind::KvPages, StateKind::PositionCounter]),
+            state,
             branches,
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(0);

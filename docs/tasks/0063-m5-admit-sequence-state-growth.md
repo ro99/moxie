@@ -1,6 +1,9 @@
 # Task 0063 — admit SequenceState transaction and lineage growth on the device step
 
-Status: **proposed**.
+Status: **accepted** (coordinator, 2026-09-23, under the owner's auto-mode
+delegation). Built by Codex `luna`; reviewed by Codex `sol`, round 1 ACCEPT.
+The builder ran the full test-gpu at 63/63; the coordinator re-ran `fmt`,
+driver-only `clippy`, `arch-check` and `spec-check`.
 
 ## Identity and authority
 
@@ -114,9 +117,119 @@ wrong, say so.
 
 ## Result, filled after work
 
-- Design decision (phase 1) and coordinator answer:
-- Changed owners; source commit:
-- Commands, GPU UUIDs; passed / failed / skipped:
-- Mutation results and restoration:
-- Review map and allocation inventory:
-- Remaining obligations:
+- **Design decision and coordinator answer:** Approved. `DeviceKvSequence` takes
+  its admitted maximum position count from `KvGeometry.max_tokens`, already
+  enforced in `moxie-state/src/device.rs:883`. Strata makes the same split:
+  `src/models/deepseek/deepseek_admission.cpp:113` validates
+  `maximum_context_tokens`, while
+  `src/models/deepseek/detail/runtime_public.inc.cpp:503` sets the separate
+  `sliding_window_rows` retention bound. Every device root and
+  child reserves `L = checked(max_tokens + 1)` lineage entries. The optional
+  limit is per branch and is set only by `DeviceKvSequence`; `None` keeps
+  existing `SequenceState` consumers on their historical unbounded path. A
+  preflight in `append_prompt`, `execute`, `accept` and `commit_prefix` rejects
+  over-capacity growth as `Error::CapacityExceeded` at
+  `Host(Pageable)`, before changing a frontier, lineage or transaction. One
+  transaction-map node is charged for each admitted open branch.
+- **Changed owners; source commit:** `moxie-state` owns branch-local lineage
+  limits, reservation, typed preflight refusal and metadata formulas;
+  `moxie-executor::PagedAttentionRun` attaches root/fork metadata to the
+  existing ledger requests; GPU fixtures and `xtask` pass geometry-derived
+  capacities and extend the existing 32K proof. The accepted code baseline
+  was `6f5a261`; work began at HEAD `7d2bf3d` (the task-opening commit). No
+  commit created. Carried `specification-version.md` and ADRs 0034/0035 are
+  preserved.
+- **Commands, devices; passed / failed / skipped:** Final restored-tree gates:
+  ```text
+  cargo fmt --all -- --check
+  cargo clippy --workspace --all-targets --locked -- -D warnings
+  cargo clippy -p moxie-executor --all-targets --features driver --locked -- -D warnings
+  cargo test --workspace --locked
+  cargo xtask arch-check
+  cargo xtask spec-check
+  CUDA_DEVICE_ORDER=PCI_BUS_ID cargo test -p moxie-executor --test paged_attention_device --features driver,paged-attention-binding,paged-attention-test-hooks --locked
+  CUDA_DEVICE_ORDER=PCI_BUS_ID cargo test -p moxie-executor --test dense_gemma_device --features driver,paged-attention-binding,paged-attention-test-hooks --locked
+  CUDA_DEVICE_ORDER=PCI_BUS_ID cargo test -p moxie-executor --test dense_tp2_device --features driver,paged-attention-binding,paged-attention-test-hooks --locked
+  CUDA_DEVICE_ORDER=PCI_BUS_ID cargo test -p moxie-executor --test tensor_parallel_device --features driver,paged-attention-binding,paged-attention-test-hooks --locked
+  CUDA_DEVICE_ORDER=PCI_BUS_ID cargo xtask-cuda test-gpu
+  ```
+  All passed. Focused lanes were `paged_attention_device` (7/7),
+  `dense_gemma_device` (2/2), `dense_tp2_device` (1/1), and
+  `tensor_parallel_device` (4/4). The full GPU matrix passed 63/63, zero
+  skipped. Devices were SM120 `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` and
+  SM86 `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9`,
+  `GPU-81fe4578-59b2-37c4-421e-287cdac78704`. Existing `moxie-state`,
+  `moxie-interp` and engine tests pass unmodified; the one new focused state
+  unit test is in `moxie-state/src/lib.rs`. Mutation runs below intentionally
+  failed their target assertions; no gate was skipped.
+- **Mutation results and restoration:** Each mutation was restored before the
+  final gates. Removing root reservation failed the 32K root-capacity
+  assertion on all three GPUs. Reserving a child only to `at + 1` failed the
+  32K full-child-capacity assertion on all three GPUs. Removing the refusal
+  failed `admitted_lineage_limit_is_reserved_inherited_and_preflighted` at the
+  root over-capacity check. The expected failures were observed and the
+  production checks restored.
+- **Review map:**
+  - `docs/tasks/0063-m5-admit-sequence-state-growth.md`: records the approved
+    maximum, optional per-branch compatibility rule, test and mutation results,
+    allocation formulas and review map.
+  - `crates/moxie-state/src/lib.rs`: optional per-branch limit; checked exact
+    reservation; preflight for prompt, execute, accept and commit; bounded
+    fork inheritance/full-capacity clone; root/fork formulas; one focused unit
+    test covers unbounded compatibility, reservation/inheritance, typed
+    refusal, unchanged frontiers and an abortable refused commit.
+  - `crates/moxie-state/src/device.rs`: `DeviceKvSequence::new` reserves root
+    to `max_tokens + 1`; helpers expose the root and full-child host charges.
+  - `crates/moxie-executor/src/paged_attention.rs`: root/fork admission and
+    preview requests include the pageable lineage and transaction metadata.
+    The shared lineage buffer request is retained for the run's phases.
+  - `crates/moxie-executor/tests/paged_attention_device.rs`,
+    `dense_gemma_device.rs`, and `dense_tp2_device.rs`: existing setup paths
+    use the admitted sequence request; no new per-method GPU tests.
+  - `xtask/src/gpu.rs`: production-shaped run fixtures use the geometry bound;
+    the existing 32K gate checks exact root/fork request deltas and verifies
+    root, whole-child and chunked-child capacities before and after long
+    appends.
+- **Allocation inventory:** Let `M = KvGeometry.max_tokens`, `L = checked(M +
+  1)`, `S = size_of::<PrefixLineage>()`, and `T(E) =
+  btree_node_bound(E) = 11 * (E + size_of::<usize>()) + 16 *
+  size_of::<usize>()`. Capacity products and totals use checked arithmetic;
+  `T` reuses the existing bound for fixed tuple sizes.
+  - `DeviceKvSequence` root lineage `Vec`: charged in the root request as
+    `L*S`; pre-reserved exactly to `L` before append growth.
+  - Root `SequenceState::open` BTreeMap node from `begin`: charged once as
+    `T(size_of::<(StateTransactionId, Journal)>())` in the same root request.
+    At most one transaction is open per branch.
+  - `SequenceState::fork` lineage `Vec`: charged and reserved as `L*S`, not
+    the current prefix length; the child inherits the same optional limit.
+  - Fork `SequenceState::branches` node: charged as
+    `T(size_of::<(BranchId, Branch)>())`; fork `open` transaction node:
+    charged as `T(size_of::<(StateTransactionId, Journal)>())` for that
+    branch's possible open transaction.
+  - Fork `DeviceKvSequence::branches` node and its `retained_floor` and
+    `completed_layers` vectors: charged as
+    `T(size_of::<(BranchId, DeviceBranchStorage)>()) + layers *
+    (size_of::<u64>() + size_of::<bool>())`.
+  - `execute` / `accept` lineage pushes, `commit_prefix` acceptance and
+    `append_prompt` lineage pushes: no further allocation while within `L`;
+    checked preflight refuses before mutation when the requested high-water
+    position needs more than `L` entries.
+  - Existing consumers leave this optional limit absent: the host interpreter
+    (`moxie-interp`), host/engine consumers and direct tests construct
+    `SequenceState` without `reserve_lineage_to`; they retain its unbounded
+    behavior. `PagedSequence` in `moxie-state/src/paged.rs` also leaves this
+    limit absent and keeps its own existing geometry reservation and append
+    bound. The new unit test explicitly exercises the absent-limit behavior;
+    existing `moxie-state`, interpreter and engine tests pass unchanged.
+  - **(c) Carried ledger follow-up:** `SequenceState::new`'s schema/root branch
+    scaffolding (`moxie-state/src/lib.rs:623-638`) and
+    `DeviceKvSequence::new`'s layout, root branch map, and per-layer vectors
+    (`moxie-state/src/device.rs:307-339`) are allocated during construction,
+    before a paged-run request exists; the task 0061 ledger records this
+    follow-up. Standalone `DeviceKvSequence` consumers have no paged-run
+    request to attach their existing append/commit/fork charges to and remain
+    the same ledger follow-up. The new root lineage and transaction charges
+    are covered by the root request described above.
+- **Remaining obligations:** Those construction-scaffolding and standalone
+  consumer ledger follow-ups remain open. No product limit, lease, or other
+  `SequenceState` semantics changed.

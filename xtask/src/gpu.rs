@@ -3253,13 +3253,16 @@ fn paged_attention_host_streaming(cap: &DeviceCapability) -> Result<Outcome, Err
     }
     host.commit_prefix(host_txn, 0)?;
 
-    let mut streamed_run = PagedAttentionRun::admit(
+    let mut streamed_run = PagedAttentionRun::admit_for_sequence(
         &mut ledger,
         &ctx,
         stream_descriptor,
         stream_geometry,
         HEADS,
         RESIDENT_ROWS,
+        RESIDENT_ROWS
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::TwoBlock,
     )
     .map_err(|refused| refused.error)?;
@@ -3328,13 +3331,16 @@ fn paged_attention_host_streaming(cap: &DeviceCapability) -> Result<Outcome, Err
     };
     let full_launch = PagedAttentionLaunch::new(full_layer, 1, TOTAL_ROWS - 1, 0, TOTAL_ROWS)?;
     let full_descriptor = select_paged_attention_kernel(&catalogue, cap, &full_launch)?;
-    let mut full_run = PagedAttentionRun::admit(
+    let mut full_run = PagedAttentionRun::admit_for_sequence(
         &mut ledger,
         &ctx,
         full_descriptor,
         geometry,
         HEADS,
         TOTAL_ROWS,
+        TOTAL_ROWS
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
     )
     .map_err(|refused| refused.error)?;
@@ -3427,13 +3433,16 @@ fn paged_attention_host_streaming(cap: &DeviceCapability) -> Result<Outcome, Err
     // The run is deliberately quarantined: submitted work may still read the
     // retained host vectors, so it cannot be reused or closed as successful.
     let mut fault_ledger = measured_ledger(&ctx)?;
-    let mut fault_run = PagedAttentionRun::admit(
+    let mut fault_run = PagedAttentionRun::admit_for_sequence(
         &mut fault_ledger,
         &ctx,
         select_paged_attention_kernel(&catalogue, cap, &stream_probe)?,
         stream_geometry,
         HEADS,
         RESIDENT_ROWS,
+        RESIDENT_ROWS
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::TwoBlock,
     )
     .map_err(|refused| refused.error)?;
@@ -3545,13 +3554,16 @@ fn paged_attention_host_streaming_n3(cap: &DeviceCapability) -> Result<Outcome, 
     }
     host.commit_prefix(host_txn, 0)?;
 
-    let mut streamed_run = PagedAttentionRun::admit(
+    let mut streamed_run = PagedAttentionRun::admit_for_sequence(
         &mut ledger,
         &ctx,
         stream_descriptor,
         stream_geometry,
         HEADS,
         RESIDENT_ROWS,
+        RESIDENT_ROWS
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::HostBacked {
             max_staged_blocks: STAGED_BLOCKS,
         },
@@ -3737,13 +3749,16 @@ fn paged_attention_host_streaming_n3(cap: &DeviceCapability) -> Result<Outcome, 
     };
     let full_launch = PagedAttentionLaunch::new(full_layer, 1, TOTAL_ROWS - 1, 0, TOTAL_ROWS)?;
     let full_descriptor = select_paged_attention_kernel(&catalogue, cap, &full_launch)?;
-    let mut full_run = PagedAttentionRun::admit(
+    let mut full_run = PagedAttentionRun::admit_for_sequence(
         &mut ledger,
         &ctx,
         full_descriptor,
         geometry,
         HEADS,
         TOTAL_ROWS,
+        TOTAL_ROWS
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
     )
     .map_err(|refused| refused.error)?;
@@ -3829,13 +3844,16 @@ fn paged_attention_host_streaming_n3(cap: &DeviceCapability) -> Result<Outcome, 
     // refuses. The partial from the first block never escapes this operation,
     // and the currently copied block remains owned by the quarantined run.
     let mut fault_ledger = measured_ledger(&ctx)?;
-    let mut fault_run = PagedAttentionRun::admit(
+    let mut fault_run = PagedAttentionRun::admit_for_sequence(
         &mut fault_ledger,
         &ctx,
         select_paged_attention_kernel(&catalogue, cap, &stream_probe)?,
         stream_geometry,
         HEADS,
         RESIDENT_ROWS,
+        RESIDENT_ROWS
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::HostBacked {
             max_staged_blocks: STAGED_BLOCKS,
         },
@@ -4296,21 +4314,45 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let descriptor =
         select_paged_attention_kernel(&catalogue, cap, &decode(0, 1, Visibility::Causal)?)?;
 
+    let root_lineage_capacity = geometry
+        .pages
+        .checked_mul(geometry.page_tokens)
+        .and_then(|positions| positions.checked_add(1))
+        .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+
     // Build A: the whole history in one append.
     let mut ledger = measured_ledger(&ctx)?;
-    let mut whole = PagedAttentionRun::admit(
+    let host_before_root_admission = ledger.scope_committed(Scope::Host);
+    let mut whole = PagedAttentionRun::admit_for_sequence(
         &mut ledger,
         &ctx,
         descriptor.try_clone()?,
         geometry,
         heads,
         CONTEXT,
+        root_lineage_capacity,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
+    let root_admitted_host_bytes = ledger
+        .scope_committed(Scope::Host)
+        .checked_sub(host_before_root_admission)
+        .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+    let expected_root_host_bytes =
+        moxie_state::DeviceKvSequence::root_host_metadata_bytes(root_lineage_capacity)?;
     let mut whole_state = authority()?;
+    let root_capacity = usize::try_from(root_lineage_capacity)
+        .map_err(|_| Error::Dim(moxie_types::DimError::Overflow))?;
+    if whole_state.state()?.lineage_capacity(moxie_state::ROOT)? != root_capacity {
+        return Ok(Outcome::Failed(
+            "the 32K root lineage was not reserved to the admitted maximum".into(),
+        ));
+    }
     append_authority_rows(&mut whole_state, &mut whole, &stream, &fixture, CONTEXT)?;
-    if whole_state.committed_rows()? != CONTEXT || whole.written_rows() != CONTEXT {
+    if whole_state.committed_rows()? != CONTEXT
+        || whole.written_rows() != CONTEXT
+        || whole_state.state()?.lineage_capacity(moxie_state::ROOT)? != root_capacity
+    {
         return Ok(Outcome::Failed(format!(
             "the authority committed {} row(s) and the run wrote {}, not {CONTEXT}",
             whole_state.committed_rows()?,
@@ -4320,13 +4362,14 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
 
     // Build B: the same rows, appended in uneven chunks that cross pages and
     // leave a partial page open in the middle.
-    let mut chunked = PagedAttentionRun::admit(
+    let mut chunked = PagedAttentionRun::admit_for_sequence(
         &mut ledger,
         &ctx,
         descriptor.try_clone()?,
         geometry,
         heads,
         CONTEXT,
+        root_lineage_capacity,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -4438,13 +4481,19 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let prefill_tail_position = CONTEXT + SECOND_TURN_PREFILL_ROWS - 1;
 
     // First second-turn construction: one whole append in the forked child.
-    let fork_lineage_capacity = CONTEXT
-        .checked_add(1)
-        .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+    let fork_lineage_capacity = root_lineage_capacity;
     let without_fork = moxie_executor::paged_attention::device::resource_request(
         &geometry,
         heads,
         CONTEXT,
+        Staging::Host,
+        &ctx,
+    )?;
+    let with_root = moxie_executor::paged_attention::device::resource_request_for_sequence(
+        &geometry,
+        heads,
+        CONTEXT,
+        root_lineage_capacity,
         Staging::Host,
         &ctx,
     )?;
@@ -4460,15 +4509,29 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         .preview(&without_fork)?
         .scope(Scope::Host)
         .map(|report| report.request_peak_bytes);
+    let root_host_peak = ledger
+        .preview(&with_root)?
+        .scope(Scope::Host)
+        .map(|report| report.request_peak_bytes);
     let fork_host_peak = ledger
         .preview(&with_fork)?
         .scope(Scope::Host)
         .map(|report| report.request_peak_bytes);
-    let (Some(base_host_peak), Some(fork_host_peak)) = (base_host_peak, fork_host_peak) else {
+    let (Some(base_host_peak), Some(root_host_peak), Some(fork_host_peak)) =
+        (base_host_peak, root_host_peak, fork_host_peak)
+    else {
         return Ok(Outcome::Failed(
-            "the 32K fork request omitted its pageable host scope".into(),
+            "the 32K root or fork request omitted its pageable host scope".into(),
         ));
     };
+    if root_host_peak.checked_sub(base_host_peak) != Some(expected_root_host_bytes)
+        || root_admitted_host_bytes != root_host_peak
+    {
+        return Ok(Outcome::Failed(format!(
+            "the 32K root request charged {:?} B beyond base metadata and reserved {root_admitted_host_bytes} B, expected {expected_root_host_bytes} B and {root_host_peak} B",
+            root_host_peak.checked_sub(base_host_peak),
+        )));
+    }
     let expected_fork_bytes =
         moxie_state::DeviceKvSequence::fork_host_metadata_bytes(fork_lineage_capacity, 1)?;
     if fork_host_peak.checked_sub(base_host_peak) != Some(expected_fork_bytes) {
@@ -4505,6 +4568,11 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         &mut whole_turn,
         &stream,
     )?;
+    if whole_state.state()?.lineage_capacity(whole_child_id)? != root_capacity {
+        return Ok(Outcome::Failed(
+            "the 32K child lineage was not reserved to the admitted maximum".into(),
+        ));
+    }
     {
         let branch = whole_state.branch(whole_child_id)?;
         let inherited =
@@ -4579,6 +4647,11 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
                 "the whole second-turn child did not commit its prefill".into(),
             ));
         }
+    }
+    if whole_state.state()?.lineage_capacity(whole_child_id)? != root_capacity {
+        return Ok(Outcome::Failed(
+            "the 32K child lineage reallocated during its second-turn append".into(),
+        ));
     }
     let mut whole_prefill_output =
         Vec::with_capacity(SECOND_TURN_PREFILL_ROWS as usize * lane_bytes);
@@ -4712,6 +4785,11 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         }
     }
     let whole_turn_arena_bytes = whole_turn.arena_bytes();
+    if whole_state.state()?.lineage_capacity(whole_child_id)? != root_capacity {
+        return Ok(Outcome::Failed(
+            "the 32K child lineage reallocated during the later-turn steps".into(),
+        ));
+    }
     if whole.read_rows(&parent_placements)? != parent_before
         || whole_state.committed_rows()? != parent_frontier_before_turn
         || whole_state.retained(0)? != parent_retained_before_turn
@@ -4755,6 +4833,11 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         &mut chunked_turn,
         &stream,
     )?;
+    if whole_state.state()?.lineage_capacity(chunked_child_id)? != root_capacity {
+        return Ok(Outcome::Failed(
+            "the chunked 32K child lineage was not reserved to the admitted maximum".into(),
+        ));
+    }
     {
         let branch = whole_state.branch(chunked_child_id)?;
         if chunked_turn.read_rows(&device_branch_row_placements(&branch, 0, CONTEXT)?)?
@@ -4788,6 +4871,11 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
             &mut chunked_turn,
             &stream,
         )?;
+    }
+    if whole_state.state()?.lineage_capacity(chunked_child_id)? != root_capacity {
+        return Ok(Outcome::Failed(
+            "the chunked 32K child lineage reallocated during append".into(),
+        ));
     }
     {
         let branch = whole_state.branch(chunked_child_id)?;
@@ -5002,13 +5090,16 @@ fn paged_attention_state_lifecycle(cap: &DeviceCapability) -> Result<Outcome, Er
     let probe = PagedAttentionLaunch::new(layer, 1, 0, 0, 1)?;
     let descriptor = select_paged_attention_kernel(&catalogue, cap, &probe)?;
     let mut ledger = measured_ledger(&ctx)?;
-    let mut run = PagedAttentionRun::admit(
+    let mut run = PagedAttentionRun::admit_for_sequence(
         &mut ledger,
         &ctx,
         descriptor,
         geometry,
         heads,
         TENTATIVE as u64,
+        (MAX_ROWS as u64)
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -5292,13 +5383,16 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
     let probe = PagedAttentionLaunch::new(layer, 1, 0, 0, 1)?;
     let descriptor = select_paged_attention_kernel(&catalogue, cap, &probe)?;
     let mut ledger = measured_ledger(&ctx)?;
-    let mut parent = PagedAttentionRun::admit(
+    let mut parent = PagedAttentionRun::admit_for_sequence(
         &mut ledger,
         &ctx,
         descriptor.try_clone()?,
         geometry,
         heads,
         FORK_AT,
+        (MAX_ROWS as u64)
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -5328,7 +5422,7 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
         geometry,
         heads,
         FORK_AT,
-        FORK_AT
+        (MAX_ROWS as u64)
             .checked_add(1)
             .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
@@ -5463,13 +5557,16 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
         cap,
         &PagedAttentionLaunch::new(window_layer, 1, 0, 0, 1)?,
     )?;
-    let mut window_parent = PagedAttentionRun::admit(
+    let mut window_parent = PagedAttentionRun::admit_for_sequence(
         &mut ledger,
         &ctx,
         window_descriptor.try_clone()?,
         window_geometry,
         heads,
         4,
+        16u64
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -5513,7 +5610,7 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
         window_geometry,
         heads,
         4,
-        12u64
+        16u64
             .checked_add(1)
             .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
@@ -5552,13 +5649,16 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
     // Fault after the first physical page copy. The logical branch has
     // already been created at this point; a passing cleanup assertion must
     // therefore cover both SequenceState and the child run's allocation.
-    let mut fault_parent = PagedAttentionRun::admit(
+    let mut fault_parent = PagedAttentionRun::admit_for_sequence(
         &mut ledger,
         &ctx,
         descriptor.try_clone()?,
         geometry,
         heads,
         PAGE_TOKENS,
+        (MAX_ROWS as u64)
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -5593,7 +5693,7 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
         geometry,
         heads,
         PAGE_TOKENS,
-        PAGE_TOKENS
+        (MAX_ROWS as u64)
             .checked_add(1)
             .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
