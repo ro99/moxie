@@ -119,9 +119,16 @@ delta breaks. `luna2` was closed; `luna` continues as the only builder.
      the usual single BF16 rounding.
 4. **`crates/moxie-plan/src/tensor_parallel.rs`:** extend
    `lower_tensor_parallel`:
-   - `Route` stays in a replicated stage.
-   - The pair `ExpertMlp`, then its consuming `Combine`, becomes
-     `Stage::Local { nodes: [expert_mlp, combine], join: Reduce }`:
+   - (Amended 2026-09-23.) `Route`, its `ExpertMlp` and the consuming
+     `Combine` together become
+     `Stage::Local { nodes: [route, expert_mlp, combine], join: Reduce }`.
+     Every rank runs `Route` with its unchanged, full params on the
+     replicated input and router weights, so every rank reaches the same
+     selection, as document 04 requires. The route table therefore never
+     crosses a stage boundary, and the existing refusal of an externally
+     supplied route table is unchanged. Router weights are whole on every
+     rank (no `RankPart.rows` entry).
+   - Per rank:
      - per rank: `ExpertOwnership { groups: R, owned: r }` and
        `CombineReductionOrder { groups: R, owned: Some(r) }`;
      - `RankPart.rows` for `experts_gate_up` and `experts_down`: the outer
