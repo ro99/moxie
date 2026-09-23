@@ -1,6 +1,10 @@
 # Task 0061 — admit host control metadata and dedupe the test event gate
 
-Status: **ready for review**.
+Status: **accepted** (coordinator, 2026-09-23, under the owner's auto-mode
+delegation). Built by Codex `luna`; reviewed by Codex `sol` over four rounds,
+round 4 ACCEPT. The builder ran the full test-gpu at 63/63; the coordinator
+re-ran `fmt`, driver-only `clippy`, `arch-check`, `spec-check` and the
+`moxie-state` tests.
 
 **Amendment, 2026-09-23 (coordinator, coordinator.md §3).** Old premise:
 "every host allocation on the paged-attention and device-KV paths" was
@@ -119,13 +123,15 @@ accepted. Authority: coordinator.
   lineage-entry capacity, independent of query rows and physical pages;
   `fork_paged_layer` checks that bound before calling the state authority. The
   child request charges the lineage clone, per-layer vectors and branch-map
-  metadata. Commit update/adaptor/reference vectors and partial-stream host
+  metadata using the existing conservative node bound from `paged.rs`.
+  Commit update/adaptor/reference vectors and partial-stream host
   readback results are also charged by phase. Pair commit's two-element
   `PreparedCommit` vector is now a stack array. The
   `cuEventRecord` test gate remains one shared source. No lease, ledger
   algorithm, or `SequenceState` semantic change was made. No builder commit;
   round 1 began at `09fb1dd`, with coordinator-only commits `ed45551` and
-  `c6a08c2`; rounds 2 and 3 began at `c6a08c2`. The carried
+  `c6a08c2`; rounds 2 and 3 began at `c6a08c2`, and round 4 began at
+  `5018b8`. The carried
   `docs/evidence/specification-version.md` and ADRs 0034/0035 remain preserved.
 - **Admission proof:** `page_table_host` and `page_view_host` now reuse
   `page_table_upload_bytes()` (P1); all byte arithmetic is checked. At append
@@ -157,9 +163,9 @@ accepted. Authority: coordinator.
 
   | Classification | Hits and accounting |
   |---|---|
-  | **(a) charged** | `paged_attention.rs`: `try_zeroed` (99) call sites charge page-table upload (1844) as `page_table_upload_bytes()`, ordinary attention output readback (3379) as `extents.query`, and partial readback (3222–24) by `2*S + W + N*O`; page-table `try_reserve_exact` (1818) is `pages * size_of::<u32>()`; partial result outer/nested reserves (3245, 3265) are `P * size_of::<DevicePartial>()` and `P * head_dim * size_of::<f32>()`. `moxie-state/src/device.rs`: `placements_for` (603) uses the preflight-bounded `(ceil(max_rows / page_tokens) + 1) * size_of::<PagePlacement>()`; `page_view_for` (679) and commit `updates` (1052) use per-layer `pages * size_of::<u32>()` and the commit formula above. Executor commit `with_capacity` sites (4525, 4537–38, 4568, 4578) reserve one adapter and writer-reference slot per layer; both slots and the state update slot are charged at commit phase 4. Fork admission uses `L = fork_at + 1` lineage entries, checked before state mutation. It charges `L * size_of::<PrefixLineage>()` for `SequenceState::fork`'s `to_vec()` (lib.rs 1344) and `layers * (size_of::<u64>() + size_of::<bool>())` for `retained_floor` and `completed_layers` (device.rs 1252, 1272). It also charges a full BTreeMap internal-node upper bound for each branch-map insertion at device.rs 1266 and lib.rs 1348. For `M(K,V) = align_up(14 * size_of::<usize>() + 11 * (size_of::<K>() + size_of::<V>()), max_align(K,V,usize))`, the fork charge is the checked sum `L * size_of::<PrefixLineage>() + layers * (size_of::<u64>() + size_of::<bool>()) + M(BranchId, Branch) + M(BranchId, DeviceBranchStorage)`. |
+  | **(a) charged** | `paged_attention.rs`: `try_zeroed` (99) call sites charge page-table upload (1844) as `page_table_upload_bytes()`, ordinary attention output readback (3379) as `extents.query`, and partial readback (3222–24) by `2*S + W + N*O`; page-table `try_reserve_exact` (1818) is `pages * size_of::<u32>()`; partial result outer/nested reserves (3245, 3265) are `P * size_of::<DevicePartial>()` and `P * head_dim * size_of::<f32>()`. `moxie-state/src/device.rs`: `placements_for` (603) uses the preflight-bounded `(ceil(max_rows / page_tokens) + 1) * size_of::<PagePlacement>()`; `page_view_for` (679) and commit `updates` (1052) use per-layer `pages * size_of::<u32>()` and the commit formula above. Executor commit `with_capacity` sites (4525, 4537–38, 4568, 4578) reserve one adapter and writer-reference slot per layer; both slots and the state update slot are charged at commit phase 4. Fork admission uses `L = fork_at + 1` lineage entries, checked before state mutation. It charges `L * size_of::<PrefixLineage>()` for `SequenceState::fork`'s `to_vec()` (lib.rs 1327) and `layers * (size_of::<u64>() + size_of::<bool>())` for `retained_floor` and `completed_layers` (device.rs 1252, 1272). It also charges a full BTreeMap internal-node upper bound for each branch-map insertion at device.rs 1266 and lib.rs 1331. The shared `paged.rs::btree_node_bound(E) = 11 * (E + size_of::<usize>()) + 16 * size_of::<usize>()`, for `E = size_of::<(K, V)>`, supplies each node bound. The checked fork sum is `L * size_of::<PrefixLineage>() + layers * (size_of::<u64>() + size_of::<bool>()) + B(size_of::<(BranchId, Branch)>()) + B(size_of::<(BranchId, DeviceBranchStorage)>())`. |
   | **(b) eliminated** | The run mapping uses `clear` plus `extend_from_slice` after admission instead of replacing `page_table`; the page-view clone mutation remains absent. Pair commit's growable `prepared` vector is a two-slot stack array. Commit adapters' empty key/value `Vec::new()` values have zero capacity and allocate nothing. |
-  | **(c) out of scope** | `paged_attention.rs` admission scaffolding: the 2/3-entry partition-region vector (1660), staging-sized range holder (1703), 3–10 allocation descriptor vector (1721), and descriptor-sized symbol vector (1759) exist only while building/loading one admitted run, before a production step; these remain ledger follow-ups. `read_rows`'s `try_zeroed` (2712) is diagnostic/test readback only, never a production step. `moxie-state/src/device.rs` sequence construction hits (250, 308, 324, 315–26) happen before a device run request exists; SequenceState construction scaffolding in lib.rs (605, 609–19) likewise predates a run request. Stand-alone `DeviceKvSequence` callers using their own writer have no paged-run reservation to attach append/commit/fork charges to; that consumer path remains a ledger follow-up. Executor GPU/admission helpers (5281, 5379, 5441, 5509, 5515, 5533, 5579) and state unit-test fixture/assertion allocations (1413, 1428, 1527, 1534, 1621, 1636, 1651, 1868–69, 2081, 2087) are test-only. |
+  | **(c) carried to task 0063 (amendment 2026-09-23)** | `SequenceState::begin` can allocate an open-transaction BTreeMap node at lib.rs:966 — carried to task 0063 (amendment 2026-09-23). `SequenceState::execute` calls `Branch::extend_lineage`, whose `PrefixLineage::push` may reallocate at lib.rs:700, :703, :491–497 — carried to task 0063 (amendment 2026-09-23). `commit_prefix` can extend lineage through `accept` at lib.rs:978–995, :711–715, :491–497 — carried to task 0063 (amendment 2026-09-23). `paged_attention.rs` admission scaffolding: the 2/3-entry partition-region vector (1660), staging-sized range holder (1703), 3–10 allocation descriptor vector (1721), and descriptor-sized symbol vector (1759) exist only while building/loading one admitted run, before a production step; these remain ledger follow-ups. `read_rows`'s `try_zeroed` (2712) is diagnostic/test readback only, never a production step. `moxie-state/src/device.rs` sequence construction hits (250, 308, 324, 315–26) happen before a device run request exists; SequenceState construction scaffolding in lib.rs (586, 590–600) likewise predates a run request. Stand-alone `DeviceKvSequence` callers using their own writer have no paged-run reservation to attach append/commit/fork charges to; that consumer path remains a ledger follow-up. Executor GPU/admission helpers (5281, 5379, 5441, 5509, 5515, 5533, 5579) and state unit-test fixture/assertion allocations (1413, 1428, 1527, 1534, 1621, 1636, 1651, 1868–69, 2081, 2087) are test-only. |
 
   The request uses distinct append and commit phases so their vectors are not
   summed as if simultaneously live. Fork metadata is live throughout the
@@ -187,7 +193,11 @@ accepted. Authority: coordinator.
   harness admissions were raised to each scenario's existing append maximum.
   The second attempt had three N=3 arena-comparison failures because its
   one-block control still admitted one row; that bound was aligned. The final
-  matrix rerun passed. No timing was taken.
+  matrix rerun passed. Round 4 reused the conservative `paged.rs` node bound,
+  increasing the fork map charge; fmt, workspace and driver-only clippy,
+  workspace tests, arch/spec checks, `paged_attention_device` 7/7,
+  `dense_gemma_device` 2/2 on all GPUs, and the full GPU matrix were rerun and
+  passed (63/63, zero skipped/unmeasured). No timing was taken.
 - **Mutation results and restoration:** Round 1's placement-charge deletion
   failed the existing direct-admission assertion (`24` charged versus `88`
   required) and was restored. The page-view re-clone mutation passed dense
@@ -205,14 +215,15 @@ accepted. Authority: coordinator.
   |---|---:|---|
   | `crates/moxie-executor/src/paged_attention.rs` | 410 / 52 | Reuse page-table storage; bound append and fork lineage before state allocation; admit append, fork, commit, and partial-readback peaks; eliminate pair-commit vector. B1, B2, P1. |
   | `crates/moxie-state/src/device.rs` | 25 / 0 | Calculate checked fork vector and device branch-map upper bounds. B2. |
-  | `crates/moxie-state/src/lib.rs` | 36 / 0 | Calculate checked SequenceState lineage-clone and branch-map upper bounds. B2. |
+  | `crates/moxie-state/src/lib.rs` | 19 / 0 | Calculate checked fork-lineage bytes and reuse the shared map bound; record transaction and lineage growth for task 0063. B2 and amendment. |
+  | `crates/moxie-state/src/paged.rs` | 1 / 1 | Expose its conservative BTreeMap node bound to the parent for reuse. B2. |
   | `crates/moxie-executor/tests/dense_gemma_device.rs` | 32 / 14 | Prove append metadata is admitted in selected execution and reservation release remains exact. Admission proof. |
   | `crates/moxie-executor/tests/device_arena.rs` | 4 / 77 | Include the common event-gate module. Shared test-gate acceptance. |
   | `crates/moxie-executor/tests/tensor_parallel_device.rs` | 3 / 75 | Include the common event-gate module. Shared test-gate acceptance. |
   | `crates/moxie-executor/tests/support/event_gate.rs` | 81 / 0 | Hold the single `cuEventRecord` interposer and unchanged controls. Shared test-gate acceptance. |
   | `crates/moxie-executor/tests/paged_attention_device.rs` | 4 / 6 | Admit existing multi-row append fixtures to their tested append bounds. B1 behavior compatibility. |
   | `xtask/src/gpu.rs` | 83 / 23 | Admit explicit lineage capacity for 32K, all-device COW, windowed and fault forks; assert the 32K request and reservation charge. B2; keep append bounds. |
-  | `docs/tasks/0061-m5-admit-host-control-metadata.md` | 112 / 6 | Record round-3 fork admission, mechanical inventory, gate evidence, and review map. Result requirement. |
+  | `docs/tasks/0061-m5-admit-host-control-metadata.md` | 14 / 7 | Record the task 0063 carry-forward, reused node-bound formula, and round-4 gate results. Result requirement. |
 - **Remaining obligations:** the production `(c)` allocation inventory above
   is reported for the coordinator's ledger. In particular, admission
   scaffolding, state construction, and stand-alone `DeviceKvSequence` callers

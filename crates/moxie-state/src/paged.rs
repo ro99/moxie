@@ -168,7 +168,7 @@ fn truncate_storage(
     }
 }
 
-fn btree_node_bound(entry: usize) -> usize {
+pub(super) fn btree_node_bound(entry: usize) -> usize {
     // The pinned Rust BTreeMap (11 entries, 12 edges) needs this conservative
     // bound for one node, including padding and the edge array.
     11 * (entry + size_of::<usize>()) + 16 * size_of::<usize>()

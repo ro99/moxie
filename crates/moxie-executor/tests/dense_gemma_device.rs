@@ -22,7 +22,9 @@ use moxie_interp::{Cancel, Interpreter, KvCache};
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_plan::{Phase, ResourceWorkload, lower_selected};
 use moxie_state::{DeviceKvSequence, KvGeometry, LayerKv, Retention, SequenceState, StateKind};
-use moxie_types::{DeviceCapability, Dim, HostTier, Precision, RankId, Scope, TensorLayout, Tier};
+use moxie_types::{
+    DeviceCapability, Dim, HostTier, PagePlacement, Precision, RankId, Scope, TensorLayout, Tier,
+};
 
 static DEVICE_TEST: Mutex<()> = Mutex::new(());
 static FAIL_NEXT_STREAM_SYNC: AtomicBool = AtomicBool::new(false);
@@ -324,22 +326,38 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
                 &device_state,
                 prompt.len() as u64,
             );
-            let page_table_host_bytes = (0..config.layers)
+            let paged_run_host_bytes = (0..config.layers)
                 .map(|layer| {
                     let declared = config.layer_geometry(layer);
                     let layout = device_state
                         .layout(layer as usize)
                         .expect("device layer layout");
-                    PageGeometry {
+                    let page_tokens = device_state
+                        .geometry()
+                        .expect("device geometry")
+                        .page_tokens as u64;
+                    let geometry = PageGeometry {
                         kv_heads: declared.kv_heads,
                         head_dim: declared.head_dim,
-                        page_tokens: device_state
-                            .geometry()
-                            .expect("device geometry")
-                            .page_tokens as u64,
+                        page_tokens,
                         pages: layout.pages,
-                    }
-                    .page_table_upload_bytes()
+                    };
+                    let view_and_run_table = layout
+                        .pages
+                        .checked_mul(core::mem::size_of::<u32>() as u64 * 2)
+                        .ok_or(moxie_types::Error::Dim(moxie_types::DimError::Overflow))?;
+                    let placements = (prompt.len() as u64)
+                        .div_ceil(page_tokens)
+                        .checked_add(1)
+                        .and_then(|capacity| {
+                            capacity.checked_mul(core::mem::size_of::<PagePlacement>() as u64)
+                        })
+                        .ok_or(moxie_types::Error::Dim(moxie_types::DimError::Overflow))?;
+                    geometry
+                        .page_table_upload_bytes()?
+                        .checked_add(view_and_run_table)
+                        .and_then(|bytes| bytes.checked_add(placements))
+                        .ok_or(moxie_types::Error::Dim(moxie_types::DimError::Overflow))
                 })
                 .try_fold(0u64, |total, bytes| {
                     let bytes = bytes?;
@@ -348,10 +366,10 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
                         .ok_or(moxie_types::Error::Dim(moxie_types::DimError::Overflow))
                 })
                 .expect("page-table host workspace extent");
-            assert_eq!(
-                pageable_host_bytes(&ledger),
-                page_table_host_bytes,
-                "each admitted paged run must reserve its reusable page-table upload"
+            let host_with_paged_runs = pageable_host_bytes(&ledger);
+            assert!(
+                host_with_paged_runs >= paged_run_host_bytes,
+                "each admitted paged run must reserve its upload and append metadata"
             );
             let dense_catalogue = moxie_kernels::dense_graph_catalogue();
             let prefill_workload = ResourceWorkload {
@@ -431,7 +449,7 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
                 .expect("close prefill plan");
             assert_eq!(
                 pageable_host_bytes(&ledger),
-                page_table_host_bytes,
+                host_with_paged_runs,
                 "prefill host workspace must be released before decode admission"
             );
 

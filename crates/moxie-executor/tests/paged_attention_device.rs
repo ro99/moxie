@@ -262,7 +262,7 @@ fn prepared<'ctx>(
         descriptor_for(ctx),
         geometry(),
         HEADS,
-        MAX_ROWS,
+        MAX_ROWS.max(rows),
         Staging::Host,
     )
     .map_err(|r| r.error)
@@ -795,10 +795,8 @@ fn a_refused_append_moves_nothing_and_hands_the_rows_back() {
             "{label}: the authority published rows the run refused"
         );
     }
-    // The authority refuses to stage rows past its own admitted context, which
-    // is the other half: the run bounds bytes, the authority bounds history.
-    // `append` refuses inside its own staging step, before the writer -- an
-    // empty one here -- is ever driven.
+    // The executor rejects a request larger than this run admitted before it
+    // reaches the authority's own context bound or allocates its placements.
     let txn = sequence.begin().expect("a transaction");
     assert!(
         append_paged_layer(
@@ -1073,7 +1071,7 @@ fn a_wrapped_ring_answers_exactly_as_an_unwrapped_one() {
         )
         .expect("a descriptor");
         let mut run =
-            PagedAttentionRun::admit(ledger, &ctx, descriptor, geometry, HEADS, 1, Staging::Host)
+            PagedAttentionRun::admit(ledger, &ctx, descriptor, geometry, HEADS, 8, Staging::Host)
                 .map_err(|r| r.error)
                 .expect("admission fits");
 

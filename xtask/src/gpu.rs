@@ -3259,7 +3259,7 @@ fn paged_attention_host_streaming(cap: &DeviceCapability) -> Result<Outcome, Err
         stream_descriptor,
         stream_geometry,
         HEADS,
-        1,
+        RESIDENT_ROWS,
         Staging::TwoBlock,
     )
     .map_err(|refused| refused.error)?;
@@ -3334,7 +3334,7 @@ fn paged_attention_host_streaming(cap: &DeviceCapability) -> Result<Outcome, Err
         full_descriptor,
         geometry,
         HEADS,
-        1,
+        TOTAL_ROWS,
         Staging::Host,
     )
     .map_err(|refused| refused.error)?;
@@ -3433,7 +3433,7 @@ fn paged_attention_host_streaming(cap: &DeviceCapability) -> Result<Outcome, Err
         select_paged_attention_kernel(&catalogue, cap, &stream_probe)?,
         stream_geometry,
         HEADS,
-        1,
+        RESIDENT_ROWS,
         Staging::TwoBlock,
     )
     .map_err(|refused| refused.error)?;
@@ -3551,7 +3551,7 @@ fn paged_attention_host_streaming_n3(cap: &DeviceCapability) -> Result<Outcome, 
         stream_descriptor,
         stream_geometry,
         HEADS,
-        1,
+        RESIDENT_ROWS,
         Staging::HostBacked {
             max_staged_blocks: STAGED_BLOCKS,
         },
@@ -3714,7 +3714,7 @@ fn paged_attention_host_streaming_n3(cap: &DeviceCapability) -> Result<Outcome, 
         select_paged_attention_kernel(&catalogue, cap, &stream_probe)?,
         stream_geometry,
         HEADS,
-        1,
+        RESIDENT_ROWS,
         Staging::TwoBlock,
     )
     .map_err(|refused| refused.error)?;
@@ -3743,7 +3743,7 @@ fn paged_attention_host_streaming_n3(cap: &DeviceCapability) -> Result<Outcome, 
         full_descriptor,
         geometry,
         HEADS,
-        1,
+        TOTAL_ROWS,
         Staging::Host,
     )
     .map_err(|refused| refused.error)?;
@@ -3835,7 +3835,7 @@ fn paged_attention_host_streaming_n3(cap: &DeviceCapability) -> Result<Outcome, 
         select_paged_attention_kernel(&catalogue, cap, &stream_probe)?,
         stream_geometry,
         HEADS,
-        1,
+        RESIDENT_ROWS,
         Staging::HostBacked {
             max_staged_blocks: STAGED_BLOCKS,
         },
@@ -4304,7 +4304,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         descriptor.try_clone()?,
         geometry,
         heads,
-        chunk_rows,
+        CONTEXT,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -4326,7 +4326,7 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
         descriptor.try_clone()?,
         geometry,
         heads,
-        chunk_rows,
+        CONTEXT,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -4438,16 +4438,66 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let prefill_tail_position = CONTEXT + SECOND_TURN_PREFILL_ROWS - 1;
 
     // First second-turn construction: one whole append in the forked child.
-    let mut whole_turn = PagedAttentionRun::admit(
+    let fork_lineage_capacity = CONTEXT
+        .checked_add(1)
+        .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+    let without_fork = moxie_executor::paged_attention::device::resource_request(
+        &geometry,
+        heads,
+        CONTEXT,
+        Staging::Host,
+        &ctx,
+    )?;
+    let with_fork = moxie_executor::paged_attention::device::resource_request_for_fork(
+        &geometry,
+        heads,
+        CONTEXT,
+        fork_lineage_capacity,
+        Staging::Host,
+        &ctx,
+    )?;
+    let base_host_peak = ledger
+        .preview(&without_fork)?
+        .scope(Scope::Host)
+        .map(|report| report.request_peak_bytes);
+    let fork_host_peak = ledger
+        .preview(&with_fork)?
+        .scope(Scope::Host)
+        .map(|report| report.request_peak_bytes);
+    let (Some(base_host_peak), Some(fork_host_peak)) = (base_host_peak, fork_host_peak) else {
+        return Ok(Outcome::Failed(
+            "the 32K fork request omitted its pageable host scope".into(),
+        ));
+    };
+    let expected_fork_bytes =
+        moxie_state::DeviceKvSequence::fork_host_metadata_bytes(fork_lineage_capacity, 1)?;
+    if fork_host_peak.checked_sub(base_host_peak) != Some(expected_fork_bytes) {
+        return Ok(Outcome::Failed(format!(
+            "the 32K fork request charged {:?} B beyond base metadata, expected {expected_fork_bytes} B",
+            fork_host_peak.checked_sub(base_host_peak)
+        )));
+    }
+    let host_before_fork_admission = ledger.scope_committed(Scope::Host);
+    let mut whole_turn = PagedAttentionRun::admit_for_fork(
         &mut ledger,
         &ctx,
         descriptor.try_clone()?,
         geometry,
         heads,
-        chunk_rows,
+        CONTEXT,
+        fork_lineage_capacity,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
+    if ledger
+        .scope_committed(Scope::Host)
+        .checked_sub(host_before_fork_admission)
+        != Some(fork_host_peak)
+    {
+        return Ok(Outcome::Failed(
+            "the admitted 32K child reservation disagreed with its fork request".into(),
+        ));
+    }
     let whole_child_id = moxie_executor::paged_attention::device::fork_paged_layer(
         &mut whole_state,
         CONTEXT,
@@ -4687,13 +4737,14 @@ fn paged_attention_32k(cap: &DeviceCapability) -> Result<Outcome, Error> {
     // the identical page in uneven chunks. Exact output parity with the whole
     // append catches a chunk-boundary mistake; the parent readback below
     // keeps this branch's existence and cleanup in the same isolation proof.
-    let mut chunked_turn = PagedAttentionRun::admit(
+    let mut chunked_turn = PagedAttentionRun::admit_for_fork(
         &mut ledger,
         &ctx,
         descriptor.try_clone()?,
         geometry,
         heads,
-        chunk_rows,
+        CONTEXT,
+        fork_lineage_capacity,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -4957,7 +5008,7 @@ fn paged_attention_state_lifecycle(cap: &DeviceCapability) -> Result<Outcome, Er
         descriptor,
         geometry,
         heads,
-        1,
+        TENTATIVE as u64,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -5247,7 +5298,7 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
         descriptor.try_clone()?,
         geometry,
         heads,
-        1,
+        FORK_AT,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -5270,13 +5321,16 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
     let parent_placements = device_state_row_placements(&state, 0, FORK_AT)?;
     let parent_before = parent.read_rows(&parent_placements)?;
 
-    let mut child = PagedAttentionRun::admit(
+    let mut child = PagedAttentionRun::admit_for_fork(
         &mut ledger,
         &ctx,
         descriptor.try_clone()?,
         geometry,
         heads,
-        1,
+        FORK_AT,
+        FORK_AT
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -5415,7 +5469,7 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
         window_descriptor.try_clone()?,
         window_geometry,
         heads,
-        1,
+        4,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -5452,13 +5506,16 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
         window_retained.start,
         window_retained.end - window_retained.start,
     )?)?;
-    let mut window_child = PagedAttentionRun::admit(
+    let mut window_child = PagedAttentionRun::admit_for_fork(
         &mut ledger,
         &ctx,
         window_descriptor,
         window_geometry,
         heads,
-        1,
+        4,
+        12u64
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -5501,7 +5558,7 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
         descriptor.try_clone()?,
         geometry,
         heads,
-        1,
+        PAGE_TOKENS,
         Staging::Host,
     )
     .map_err(|r| r.error)?;
@@ -5529,13 +5586,16 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
     let fault_root_frontier = fault_state.committed_rows()?;
     let fault_root_retained = fault_state.retained(0)?;
     let parent_charge = ledger.outstanding_count();
-    let mut fault_child = PagedAttentionRun::admit(
+    let mut fault_child = PagedAttentionRun::admit_for_fork(
         &mut ledger,
         &ctx,
         descriptor,
         geometry,
         heads,
-        1,
+        PAGE_TOKENS,
+        PAGE_TOKENS
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
     )
     .map_err(|r| r.error)?;

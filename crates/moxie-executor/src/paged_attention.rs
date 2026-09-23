@@ -18,8 +18,9 @@
 //! implementation may say only once the copy it drives has been observed
 //! complete. There is no value this module hands back that would let a caller
 //! make publication happen some other way. Admission is `moxie-memory`'s
-//! throughout: every byte this module names was charged before it was
-//! allocated.
+//! throughout: runtime payload and metadata buffers are charged before they
+//! are allocated. The short-lived vectors used to construct an admission are
+//! control bookkeeping, not run resources.
 //!
 //! **The device-handle path document 04 requires.** `attend_into` takes device
 //! query and output ranges and launches directly, with no host round trip;
@@ -1101,8 +1102,9 @@ pub mod device {
     };
     #[cfg(feature = "paged-attention-binding")]
     use moxie_state::{DeviceBranch, DeviceKvSequence};
+    use moxie_types::PageView;
     #[cfg(feature = "paged-attention-binding")]
-    use moxie_types::{BatchId, BranchId, PageView, PagedKvWriter};
+    use moxie_types::{BatchId, BranchId, PagedKvWriter};
     use moxie_types::{
         DeviceTier, DimError, Error, HostTier, PagePlacement, Result, Scope,
         SemanticKernelDescriptor, Tier,
@@ -1334,6 +1336,10 @@ pub mod device {
         partial_max: Option<DeviceRange<'ctx>>,
         partial_sum: Option<DeviceRange<'ctx>>,
         partial_weighted: Option<DeviceRange<'ctx>>,
+        /// Prefix-lineage entries the run reserves for one branch fork; zero
+        /// means this run was not admitted as a fork destination.
+        #[cfg(feature = "paged-attention-binding")]
+        fork_lineage_capacity: u64,
         /// The published mapping, and the absolute row its logical page zero
         /// names.
         ///
@@ -1434,6 +1440,59 @@ pub mod device {
             geometry: PageGeometry,
             heads: u64,
             max_rows: u64,
+            staging: Staging,
+        ) -> std::result::Result<Self, PagedAdmitRefused<'ctx>> {
+            Self::admit_with_fork_lineage_capacity(
+                ledger, ctx, descriptor, geometry, heads, max_rows, 0, staging,
+            )
+        }
+
+        /// Admit this run as the destination of one branch fork, reserving the
+        /// full logical lineage capacity separately from physical page count.
+        #[allow(clippy::result_large_err)]
+        #[allow(clippy::too_many_arguments)]
+        pub fn admit_for_fork(
+            ledger: &mut Ledger,
+            ctx: &'ctx RankContext,
+            descriptor: SemanticKernelDescriptor,
+            geometry: PageGeometry,
+            heads: u64,
+            max_rows: u64,
+            fork_lineage_capacity: u64,
+            staging: Staging,
+        ) -> std::result::Result<Self, PagedAdmitRefused<'ctx>> {
+            if fork_lineage_capacity == 0 {
+                return Err(PagedAdmitRefused {
+                    error: invalid("fork_lineage_capacity", "a fork needs lineage entries"),
+                    reservation: None,
+                    rejection: None,
+                    arena: None,
+                    ranges: Vec::new(),
+                    cleanup: None,
+                });
+            }
+            Self::admit_with_fork_lineage_capacity(
+                ledger,
+                ctx,
+                descriptor,
+                geometry,
+                heads,
+                max_rows,
+                fork_lineage_capacity,
+                staging,
+            )
+        }
+
+        #[allow(clippy::result_large_err)]
+        #[allow(clippy::too_many_arguments)]
+        fn admit_with_fork_lineage_capacity(
+            ledger: &mut Ledger,
+            ctx: &'ctx RankContext,
+            descriptor: SemanticKernelDescriptor,
+            geometry: PageGeometry,
+            heads: u64,
+            max_rows: u64,
+            fork_lineage_capacity: u64,
             staging: Staging,
         ) -> std::result::Result<Self, PagedAdmitRefused<'ctx>> {
             let fail = |error| PagedAdmitRefused {
@@ -1552,11 +1611,19 @@ pub mod device {
             if let Err(error) = check_grid(&widest, ctx) {
                 return Err(fail(error));
             }
-            let extents = match Extents::derive(&geometry, heads, max_rows, staging) {
-                Ok(extents) => extents,
-                Err(error) => return Err(fail(error)),
-            };
-            let request = match resource_request(&geometry, heads, max_rows, staging, ctx) {
+            let extents =
+                match Extents::derive(&geometry, heads, max_rows, fork_lineage_capacity, staging) {
+                    Ok(extents) => extents,
+                    Err(error) => return Err(fail(error)),
+                };
+            let request = match resource_request_with_fork_lineage_capacity(
+                &geometry,
+                heads,
+                max_rows,
+                fork_lineage_capacity,
+                staging,
+                ctx,
+            ) {
                 Ok(request) => request,
                 Err(error) => return Err(fail(error)),
             };
@@ -1844,6 +1911,8 @@ pub mod device {
                 partial_max,
                 partial_sum,
                 partial_weighted,
+                #[cfg(feature = "paged-attention-binding")]
+                fork_lineage_capacity,
                 staging,
                 page_table,
                 page_table_base: 0,
@@ -1885,6 +1954,23 @@ pub mod device {
         /// Rows the admitted pages can physically hold.
         pub fn capacity_rows(&self) -> Result<u64> {
             self.geometry.capacity_rows()
+        }
+
+        /// Check the append size against the geometry this run admitted.
+        /// This must run before handing the call to `DeviceKvSequence`, which
+        /// allocates its page view and placement list from the requested rows.
+        #[cfg_attr(not(feature = "paged-attention-binding"), allow(dead_code))]
+        pub(super) fn check_append_rows(&self, rows: u64) -> Result<()> {
+            if rows > self.max_rows {
+                return Err(invalid_fmt(
+                    "rows",
+                    format_args!(
+                        "append of {rows} rows exceeds this run's admitted maximum of {}",
+                        self.max_rows
+                    ),
+                ));
+            }
+            Ok(())
         }
 
         pub const fn geometry(&self) -> &PageGeometry {
@@ -1988,6 +2074,15 @@ pub mod device {
                             "{} logical page(s) over {pages} admitted page(s)",
                             table.len()
                         ),
+                    ),
+                    table,
+                ));
+            }
+            if table.len() > self.page_table.capacity() {
+                return Err(give_back(
+                    invalid(
+                        "page_table",
+                        "the mapping exceeds the admitted host table capacity",
                     ),
                     table,
                 ));
@@ -2143,7 +2238,8 @@ pub mod device {
                 unreachable!("page-table upload source is still held after settlement")
             };
             self.page_table_upload = bytes;
-            self.page_table = table;
+            self.page_table.clear();
+            self.page_table.extend_from_slice(&table);
             self.page_table_base = base;
             Ok(())
         }
@@ -2269,7 +2365,8 @@ pub mod device {
                 )?
             };
             self.settle(Ok(()), stream)?;
-            self.page_table = view.table;
+            self.page_table.clear();
+            self.page_table.extend_from_slice(&view.table);
             self.page_table_base = view.base;
             self.written = rows;
             Ok(())
@@ -4292,6 +4389,12 @@ pub mod device {
         stream: &Stream<'ctx>,
         source: PagedKvRows,
     ) -> std::result::Result<(), PagedStateAppendRefused> {
+        if let Err(error) = run.check_append_rows(count) {
+            return Err(PagedStateAppendRefused {
+                error,
+                source: Some(source),
+            });
+        }
         let mut writer = PagedKvWriterAdapter::new(layer, run, stream, source.keys, source.values);
         match state.append_layer(txn, layer, count, &mut writer) {
             Ok(()) => Ok(()),
@@ -4321,6 +4424,18 @@ pub mod device {
                 "single-layer device fork requires a one-layer state authority",
             ));
         }
+        let lineage_entries = at
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+        if lineage_entries > child.fork_lineage_capacity {
+            return Err(invalid_fmt(
+                "fork_lineage_capacity",
+                format_args!(
+                    "fork at {at} needs {lineage_entries} lineage entries; the child run admitted {}",
+                    child.fork_lineage_capacity
+                ),
+            ));
+        }
         let mut writer = PagedKvWriterAdapter::for_branch(0, parent, child, stream);
         state.fork(at, &mut [&mut writer])
     }
@@ -4338,6 +4453,12 @@ pub mod device {
         stream: &Stream<'ctx>,
         source: PagedKvRows,
     ) -> std::result::Result<(), PagedStateAppendRefused> {
+        if let Err(error) = run.check_append_rows(count) {
+            return Err(PagedStateAppendRefused {
+                error,
+                source: Some(source),
+            });
+        }
         let mut writer = PagedKvWriterAdapter::new(layer, run, stream, source.keys, source.values);
         match branch.append_layer(txn, layer, count, &mut writer) {
             Ok(()) => Ok(()),
@@ -4387,7 +4508,7 @@ pub mod device {
         streams: [&Stream<'ctx>; 2],
     ) -> std::result::Result<(), PairCommitRefused> {
         let prepare = PairCommitRefused::Prepare;
-        let mut prepared = Vec::new();
+        let mut prepared = [None, None];
         let mut adapters = [Vec::new(), Vec::new()];
         for (rank, (state, runs)) in states.iter().zip(runs).enumerate() {
             if runs.len() != state.layer_count().map_err(prepare)? {
@@ -4396,7 +4517,7 @@ pub mod device {
                     "commit needs exactly one device run per state layer",
                 )));
             }
-            prepared.push(
+            prepared[rank] = Some(
                 state
                     .prepare_commit(transactions[rank], 0)
                     .map_err(prepare)?,
@@ -4422,7 +4543,7 @@ pub mod device {
         }
         for ((state, prepared), writers) in states.into_iter().zip(prepared).zip(&mut writers) {
             state
-                .apply_commit(prepared, writers)
+                .apply_commit(prepared.expect("both ranks prepared"), writers)
                 .map_err(PairCommitRefused::Apply)?;
         }
         Ok(())
@@ -4570,11 +4691,30 @@ pub mod device {
         grid: (u32, u32, u32),
     }
 
+    /// Host bytes used by one layer's commit vectors. The state `updates`
+    /// vector, executor adapter vector and writer-reference vector all reserve
+    /// one entry per admitted layer.
+    pub(super) fn commit_host_metadata_bytes() -> u64 {
+        let state_updates = core::mem::size_of::<(usize, PageView)>() as u64;
+        #[cfg(feature = "paged-attention-binding")]
+        let wrappers = core::mem::size_of::<PagedKvWriterAdapter<'static, 'static>>() as u64
+            + core::mem::size_of::<&mut dyn PagedKvWriter>() as u64;
+        #[cfg(not(feature = "paged-attention-binding"))]
+        let wrappers = 0;
+        state_updates + wrappers
+    }
+
     /// The aligned extents one run admits.
     struct Extents {
         payload: u64,
         table: u64,
         page_table_upload: u64,
+        page_table_host: u64,
+        page_view_host: u64,
+        placements_host: u64,
+        commit_host: u64,
+        fork_host: u64,
+        partials_host: u64,
         query: u64,
         persistent: u64,
         per_step: u64,
@@ -4592,8 +4732,10 @@ pub mod device {
             geometry: &PageGeometry,
             heads: u64,
             max_rows: u64,
+            fork_lineage_capacity: u64,
             staging: Staging,
         ) -> Result<Self> {
+            geometry.check()?;
             let payload = align_up(geometry.payload_bytes()?)?;
             let table = align_up(
                 geometry
@@ -4602,6 +4744,59 @@ pub mod device {
                     .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
             )?;
             let page_table_upload = geometry.page_table_upload_bytes()?;
+            let page_table_host = page_table_upload;
+            let page_view_host = page_table_upload;
+            let placement_capacity = max_rows
+                .div_ceil(geometry.page_tokens)
+                .checked_add(1)
+                .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+            let placements_host = placement_capacity
+                .checked_mul(core::mem::size_of::<PagePlacement>() as u64)
+                .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+            let commit_host = commit_host_metadata_bytes();
+            #[cfg(feature = "paged-attention-binding")]
+            let fork_host = if fork_lineage_capacity == 0 {
+                0
+            } else {
+                moxie_state::DeviceKvSequence::fork_host_metadata_bytes(fork_lineage_capacity, 1)?
+            };
+            #[cfg(not(feature = "paged-attention-binding"))]
+            let fork_host = if fork_lineage_capacity == 0 {
+                0
+            } else {
+                return Err(Error::Unsupported {
+                    capability: "paged_attention_fork",
+                    reason: "fork metadata admission requires the paged-attention binding".into(),
+                });
+            };
+            let partials_host = if staging.partial_buffers() {
+                let partial_count = max_rows
+                    .checked_mul(heads)
+                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+                let scalar_bytes = partial_count
+                    .checked_mul(core::mem::size_of::<f32>() as u64)
+                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+                let weighted_bytes = partial_count
+                    .checked_mul(geometry.head_dim)
+                    .and_then(|bytes| bytes.checked_mul(core::mem::size_of::<f32>() as u64))
+                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+                let partial_vector_bytes = partial_count
+                    .checked_mul(core::mem::size_of::<DevicePartial>() as u64)
+                    .and_then(|bytes| bytes.checked_add(weighted_bytes))
+                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+                partial_vector_bytes
+                    .checked_mul(
+                        staging
+                            .max_staged_blocks()
+                            .checked_add(1)
+                            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
+                    )
+                    .and_then(|bytes| bytes.checked_add(scalar_bytes.checked_mul(2)?))
+                    .and_then(|bytes| bytes.checked_add(weighted_bytes))
+                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))?
+            } else {
+                0
+            };
             let query = align_up(
                 max_rows
                     .checked_mul(heads)
@@ -4683,6 +4878,12 @@ pub mod device {
                 payload,
                 table,
                 page_table_upload,
+                page_table_host,
+                page_view_host,
+                placements_host,
+                commit_host,
+                fork_host,
+                partials_host,
                 query,
                 persistent,
                 per_step,
@@ -4700,13 +4901,16 @@ pub mod device {
     /// The admission request one paged attention run makes.
     ///
     /// Three device buffers always: keys, values and the page table, each
-    /// named for what it is and charged as `KvStatePages`. `Staging::Host`
-    /// adds two more device buffers (query and output, charged as
-    /// `Activations`) and one host readback. Every staging mode also admits
-    /// the reusable host page-table upload buffer; validation is in place and
-    /// needs no second host allocation. `Staging::TwoBlock` adds one bounded
-    /// page pair in `TransferStaging`, the query and FP32 partials in
-    /// `Activations`, and no unbounded history buffer.
+    /// named for what it is and charged as `KvStatePages`. Host metadata is
+    /// charged by phase: the reused upload and run mapping persist, append
+    /// admits one state view and placement list, and commit admits its state
+    /// views plus bounded adapter/update vectors. A fork destination also
+    /// admits its explicit logical-lineage capacity and branch metadata.
+    /// `Staging::Host` adds two device buffers (query and output, charged as
+    /// `Activations`) and one host readback. Partial-stream modes also admit
+    /// their bounded host readback results. `Staging::TwoBlock` adds one bounded page pair in
+    /// `TransferStaging`, the query and FP32 partials in `Activations`, and no
+    /// unbounded history buffer.
     pub fn resource_request(
         geometry: &PageGeometry,
         heads: u64,
@@ -4714,13 +4918,51 @@ pub mod device {
         staging: Staging,
         ctx: &RankContext,
     ) -> Result<PlanRequest> {
-        let extents = Extents::derive(geometry, heads, max_rows, staging)?;
+        resource_request_with_fork_lineage_capacity(geometry, heads, max_rows, 0, staging, ctx)
+    }
+
+    /// The resource request for a run admitted to receive a branch fork.
+    /// `fork_lineage_capacity` is the reserved number of logical prefix entries,
+    /// independent of the run's physical page count.
+    pub fn resource_request_for_fork(
+        geometry: &PageGeometry,
+        heads: u64,
+        max_rows: u64,
+        fork_lineage_capacity: u64,
+        staging: Staging,
+        ctx: &RankContext,
+    ) -> Result<PlanRequest> {
+        if fork_lineage_capacity == 0 {
+            return Err(invalid(
+                "fork_lineage_capacity",
+                "a fork needs lineage entries",
+            ));
+        }
+        resource_request_with_fork_lineage_capacity(
+            geometry,
+            heads,
+            max_rows,
+            fork_lineage_capacity,
+            staging,
+            ctx,
+        )
+    }
+
+    fn resource_request_with_fork_lineage_capacity(
+        geometry: &PageGeometry,
+        heads: u64,
+        max_rows: u64,
+        fork_lineage_capacity: u64,
+        staging: Staging,
+        ctx: &RankContext,
+    ) -> Result<PlanRequest> {
+        let extents = Extents::derive(geometry, heads, max_rows, fork_lineage_capacity, staging)?;
         let mut request = PlanRequest::new(
             moxie_memory::fallible::text(format_args!(
                 "paged-attention-{}x{}",
                 geometry.kv_heads, geometry.head_dim
             ))?,
-            ["append", "launch", "read"],
+            ["fork", "append", "launch", "read", "commit"],
         )?;
         if let Staging::HostBacked { max_staged_blocks } = staging {
             request.host_backed_blocks(max_staged_blocks)?;
@@ -4731,28 +4973,72 @@ pub mod device {
             scope,
             Tier::Device(DeviceTier::KvStatePages),
             extents.payload,
-            StageSpan::inclusive(0, 2),
+            StageSpan::inclusive(0, 4),
         ))?;
         request.buffer(BufferRequest::new(
             "kv-pages-values",
             scope,
             Tier::Device(DeviceTier::KvStatePages),
             extents.payload,
-            StageSpan::inclusive(0, 2),
+            StageSpan::inclusive(0, 4),
         ))?;
         request.buffer(BufferRequest::new(
             "kv-page-table",
             scope,
             Tier::Device(DeviceTier::KvStatePages),
             extents.table,
-            StageSpan::inclusive(0, 2),
+            StageSpan::inclusive(0, 4),
         ))?;
         request.buffer(BufferRequest::new(
             "page-table-upload-workspace",
             Scope::Host,
             Tier::Host(HostTier::Pageable),
             extents.page_table_upload,
-            StageSpan::inclusive(0, 2),
+            StageSpan::inclusive(0, 4),
+        ))?;
+        request.buffer(BufferRequest::new(
+            "paged-run-page-table-host",
+            Scope::Host,
+            Tier::Host(HostTier::Pageable),
+            extents.page_table_host,
+            StageSpan::inclusive(0, 4),
+        ))?;
+        if extents.fork_host != 0 {
+            request.buffer(BufferRequest::new(
+                "device-kv-fork-host-metadata",
+                Scope::Host,
+                Tier::Host(HostTier::Pageable),
+                extents.fork_host,
+                StageSpan::inclusive(0, 4),
+            ))?;
+        }
+        request.buffer(BufferRequest::new(
+            "device-kv-page-view-host",
+            Scope::Host,
+            Tier::Host(HostTier::Pageable),
+            extents.page_view_host,
+            StageSpan::at(1),
+        ))?;
+        request.buffer(BufferRequest::new(
+            "device-kv-commit-page-view-host",
+            Scope::Host,
+            Tier::Host(HostTier::Pageable),
+            extents.page_view_host,
+            StageSpan::at(4),
+        ))?;
+        request.buffer(BufferRequest::new(
+            "device-kv-placements-host",
+            Scope::Host,
+            Tier::Host(HostTier::Pageable),
+            extents.placements_host,
+            StageSpan::at(1),
+        ))?;
+        request.buffer(BufferRequest::new(
+            "device-kv-commit-host-metadata",
+            Scope::Host,
+            Tier::Host(HostTier::Pageable),
+            extents.commit_host,
+            StageSpan::at(4),
         ))?;
         // Host staging only: a direct-device run's query and output are the
         // caller's own arena slots, and charging this ledger for a device
@@ -4765,29 +5051,36 @@ pub mod device {
                 scope,
                 Tier::Device(DeviceTier::Activations),
                 extents.query,
-                StageSpan::inclusive(1, 2),
+                StageSpan::inclusive(2, 3),
             ))?;
             request.buffer(BufferRequest::new(
                 "attention-output",
                 scope,
                 Tier::Device(DeviceTier::Activations),
                 extents.query,
-                StageSpan::inclusive(1, 2),
+                StageSpan::inclusive(2, 3),
             ))?;
             request.buffer(BufferRequest::new(
                 "attention-output-readback",
                 Scope::Host,
                 Tier::Host(HostTier::Pageable),
                 extents.query,
-                StageSpan::at(2),
+                StageSpan::at(3),
             ))?;
         } else if staging.partial_buffers() {
+            request.buffer(BufferRequest::new(
+                "attention-stream-partial-readback-host",
+                Scope::Host,
+                Tier::Host(HostTier::Pageable),
+                extents.partials_host,
+                StageSpan::at(3),
+            ))?;
             request.buffer(BufferRequest::new(
                 "attention-stream-query",
                 scope,
                 Tier::Device(DeviceTier::Activations),
                 extents.query,
-                StageSpan::inclusive(1, 2),
+                StageSpan::inclusive(2, 3),
             ))?;
             request.buffer(BufferRequest::new(
                 "attention-stream-partial-max",
@@ -4798,42 +5091,42 @@ pub mod device {
                 // reusable partial slots live across staging as well as
                 // readback so ledger admission covers that real allocation,
                 // not only the non-overlapping kernel lifetimes.
-                StageSpan::inclusive(1, 2),
+                StageSpan::inclusive(2, 3),
             ))?;
             request.buffer(BufferRequest::new(
                 "attention-stream-partial-sum",
                 scope,
                 Tier::Device(DeviceTier::Activations),
                 extents.partial_scalars,
-                StageSpan::inclusive(1, 2),
+                StageSpan::inclusive(2, 3),
             ))?;
             request.buffer(BufferRequest::new(
                 "attention-stream-partial-weighted",
                 scope,
                 Tier::Device(DeviceTier::Activations),
                 extents.partial_weighted,
-                StageSpan::inclusive(1, 2),
+                StageSpan::inclusive(2, 3),
             ))?;
             request.buffer(BufferRequest::new(
                 "attention-stream-staged-keys",
                 scope,
                 Tier::Device(DeviceTier::TransferStaging),
                 extents.staged_payload,
-                StageSpan::at(1),
+                StageSpan::at(2),
             ))?;
             request.buffer(BufferRequest::new(
                 "attention-stream-staged-values",
                 scope,
                 Tier::Device(DeviceTier::TransferStaging),
                 extents.staged_payload,
-                StageSpan::at(1),
+                StageSpan::at(2),
             ))?;
             request.buffer(BufferRequest::new(
                 "attention-stream-staged-table",
                 scope,
                 Tier::Device(DeviceTier::TransferStaging),
                 extents.staged_table,
-                StageSpan::at(1),
+                StageSpan::at(2),
             ))?;
         }
         Ok(request)
@@ -4961,9 +5254,13 @@ mod device_tests {
     use moxie_cuda::{RankContext, Stream};
     use moxie_memory::{CapacitySnapshot, Ledger};
     use moxie_plan::Visibility;
+    #[cfg(feature = "paged-attention-binding")]
+    use moxie_types::Error;
     use moxie_types::{PagePlacement, RankId, Scope};
 
     use super::device::{PagedAttentionRun, Staging};
+    #[cfg(feature = "paged-attention-binding")]
+    use super::device::{PagedKvRows, append_paged_layer};
     use super::{AttentionLayer, PageGeometry, PagedAttentionLaunch};
     use crate::arena::DeviceArena;
 
@@ -4992,15 +5289,17 @@ mod device_tests {
         out
     }
 
-    /// A direct-device run is charged for its admitted page-table upload, but
+    /// A direct-device run is charged for its complete host metadata peak, but
     /// not for query/output staging it never uses.
     ///
     /// Proved through the ledger's own admission, not the physical arena's
-    /// byte counter: a ledger with exactly the page-table upload's host
-    /// capacity must admit `Staging::DeviceHandles`, and must refuse
-    /// `Staging::Host` because that request adds query/output staging. A
-    /// byte-count comparison of two admitted arenas cannot tell "the ledger
-    /// was never asked" from "it was asked and happened to fit."
+    /// byte counter: a ledger with exactly the direct path's host-metadata
+    /// capacity must admit `Staging::DeviceHandles`, and the ledger's charged
+    /// host bytes must cover the page table, page view, and placements live at
+    /// append peak. It must refuse `Staging::Host` because that request adds
+    /// query/output staging. A byte-count comparison of two admitted arenas
+    /// cannot tell "the ledger was never asked" from "it was asked and
+    /// happened to fit."
     #[test]
     fn a_direct_device_run_is_not_charged_for_staging_it_never_uses() {
         let _guard = crate::DRIVER_TEST_LOCK
@@ -5029,27 +5328,86 @@ mod device_tests {
         };
 
         let measurement = ctx.measure().expect("measure");
-        let page_table_upload = geometry()
+        let geometry = geometry();
+        let max_rows = 1u64;
+        let page_table_upload = geometry
             .page_table_upload_bytes()
             .expect("page-table upload extent");
+        let table_bytes = page_table_upload
+            .checked_mul(2)
+            .expect("run and state page-table extents");
+        let placements = max_rows
+            .div_ceil(geometry.page_tokens)
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(core::mem::size_of::<PagePlacement>() as u64))
+            .expect("placement extent");
+        let append_metadata = table_bytes
+            .checked_add(placements)
+            .expect("append metadata extent");
+        let commit_metadata = table_bytes
+            .checked_add(super::device::commit_host_metadata_bytes())
+            .expect("commit metadata extent");
+        let metadata_bytes = append_metadata.max(commit_metadata);
+        let host_charge = page_table_upload
+            .checked_add(metadata_bytes)
+            .expect("host admission extent");
+        let host_capacity = host_charge.checked_add(1).expect("host capacity");
         let mut ledger = Ledger::new([
             CapacitySnapshot::measured(&measurement, 1 << 20).expect("device capacity"),
-            CapacitySnapshot::new(Scope::Host, page_table_upload + 1, 1)
-                .expect("exact page-table host capacity"),
+            CapacitySnapshot::new(Scope::Host, host_capacity, 1)
+                .expect("exact paged host metadata capacity"),
         ])
-        .expect("a ledger with device and exact page-table host capacity");
+        .expect("a ledger with device and exact paged host metadata capacity");
 
         let mut direct = PagedAttentionRun::admit(
             &mut ledger,
             &ctx,
             descriptor(),
-            geometry(),
+            geometry,
             HEADS,
-            4,
+            max_rows,
             Staging::DeviceHandles,
         )
         .map_err(|r| r.error)
-        .expect("a direct-device run needs its page-table host capacity to admit");
+        .expect("a direct-device run needs its host metadata capacity to admit");
+        let charged_host = ledger.scope_committed(Scope::Host);
+        assert_eq!(charged_host, host_charge);
+        assert!(charged_host >= metadata_bytes);
+        #[cfg(feature = "paged-attention-binding")]
+        {
+            let mut state = moxie_state::DeviceKvSequence::new(moxie_state::KvGeometry {
+                layers: vec![moxie_state::LayerKv {
+                    kv_heads: geometry.kv_heads as usize,
+                    key_dim: geometry.head_dim as usize,
+                    value_dim: geometry.head_dim as usize,
+                    retention: moxie_state::Retention::All,
+                }],
+                precision: moxie_types::Precision::Bf16,
+                page_tokens: geometry.page_tokens as usize,
+                max_tokens: 64,
+                tentative_rows: 64,
+            })
+            .expect("a state whose own capacity can hold the oversized append");
+            let txn = state.begin().expect("a transaction");
+            let refused = append_paged_layer(
+                &mut state,
+                txn,
+                0,
+                17,
+                &mut direct,
+                &stream,
+                PagedKvRows {
+                    keys: Vec::new(),
+                    values: Vec::new(),
+                },
+            )
+            .expect_err("an append past the run's admitted maximum was accepted");
+            assert!(matches!(
+                refused.error,
+                Error::InvalidRequest { field: "rows", .. }
+            ));
+            state.abort(txn).expect("abort the untouched transaction");
+        }
         // `direct` itself is outstanding from here on -- the assertion below
         // is about whether the *failed* admission changes that count, not
         // about the ledger being empty, which it never is while `direct`
@@ -5060,12 +5418,12 @@ mod device_tests {
             &mut ledger,
             &ctx,
             descriptor(),
-            geometry(),
+            geometry,
             HEADS,
-            4,
+            max_rows,
             Staging::Host,
         )
-        .expect_err("a host-staged run exceeded the page-table-only host capacity")
+        .expect_err("a host-staged run exceeded the metadata-only host capacity")
         .error;
         assert!(
             matches!(staged_error, moxie_types::Error::CapacityExceeded { .. }),

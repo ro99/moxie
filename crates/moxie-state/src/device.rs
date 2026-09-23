@@ -188,6 +188,31 @@ pub struct DeviceBranch<'a> {
 }
 
 impl DeviceKvSequence {
+    /// Host bytes reserved for one device branch fork.
+    ///
+    /// `lineage_entries` is the prefix length plus one. The charge includes
+    /// the two per-layer vectors, `SequenceState`'s cloned lineage and branch
+    /// map node, and this device authority's branch map node. Each map charge
+    /// is a full internal-node upper bound.
+    pub fn fork_host_metadata_bytes(lineage_entries: u64, layers: usize) -> Result<u64> {
+        if lineage_entries == 0 || layers == 0 {
+            return Err(invalid("fork_metadata", "a fork needs lineage and layers"));
+        }
+        let layers = u64::try_from(layers).map_err(|_| Error::Dim(DimError::Overflow))?;
+        let per_layer = (core::mem::size_of::<u64>() as u64)
+            .checked_add(core::mem::size_of::<bool>() as u64)
+            .ok_or(Error::Dim(DimError::Overflow))?;
+        let vectors = layers
+            .checked_mul(per_layer)
+            .ok_or(Error::Dim(DimError::Overflow))?;
+        let logical = SequenceState::fork_host_metadata_bytes(lineage_entries)?;
+        let device_node = super::btree_node_host_bytes::<BranchId, DeviceBranchStorage>()?;
+        vectors
+            .checked_add(logical)
+            .and_then(|bytes| bytes.checked_add(device_node))
+            .ok_or(Error::Dim(DimError::Overflow))
+    }
+
     /// Resolve a geometry into device page layouts.
     ///
     /// The admitted capacity is `window + tentative_rows` rounded up to whole

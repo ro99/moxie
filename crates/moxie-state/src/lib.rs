@@ -68,6 +68,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use moxie_types::{BranchId, CachePrecision, Error, Precision, Result, StateTransactionId};
 
+// `BTreeMap`'s current standard-library node holds eleven key/value slots and,
+// for internal nodes, twelve child pointers. Charge that full node shape for a
+// branch insertion, including its header and alignment padding.
+fn btree_node_host_bytes<K, V>() -> Result<u64> {
+    u64::try_from(paged::btree_node_bound(core::mem::size_of::<(K, V)>()))
+        .map_err(|_| Error::Dim(moxie_types::DimError::Overflow))
+}
+
 /// The kinds of state a schema can declare (document 04).
 ///
 /// Listed so that a rollback test can enumerate them: "A rejection rolls back
@@ -1277,6 +1285,17 @@ impl SequenceState {
             b.logits = None;
         }
         Ok(())
+    }
+
+    /// Host bytes reserved for this logical fork's lineage clone and branch map
+    /// insertion. `lineage_entries` is the admitted prefix length plus one.
+    pub fn fork_host_metadata_bytes(lineage_entries: u64) -> Result<u64> {
+        let lineage = lineage_entries
+            .checked_mul(core::mem::size_of::<PrefixLineage>() as u64)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+        lineage
+            .checked_add(btree_node_host_bytes::<BranchId, Branch>()?)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))
     }
 
     /// Fork a copy-on-write branch sharing the prefix `at`.
