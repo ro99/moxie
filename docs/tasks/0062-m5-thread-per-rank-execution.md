@@ -2,6 +2,21 @@
 
 Status: **proposed**.
 
+**Amendment, 2026-09-23 (coordinator, coordinator.md §3).**
+- *Old premise:* all three fault injections end with both ranks aborting, KV
+  unchanged, and a later exact clean step.
+- *Evidence (builder, phase 1):* a stalled rank cannot enter an abort, and
+  task 0060's rule already makes a missed drain `DeviceLost`, with resources
+  withheld and transactions untouched.
+- *Replacement criterion:* the rank-error and collective-mismatch injections
+  prove a bilateral abort, reuse of the same group, and an exact next step.
+  The stall injection proves that published KV and frontiers are unchanged,
+  that no output is published, and that the loss is sticky: the next call on
+  the same group returns `DeviceLost`. It does not require an abort or a
+  clean step on the lost group. "KV unchanged" means published state; pages
+  withheld after a drain timeout are not inspected.
+- *Authority:* coordinator. The rule is unchanged from task 0060.
+
 ## Identity and authority
 
 - Task0062, second half of M5 plan slice 3 ("Robust rank execution").
