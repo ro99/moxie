@@ -126,9 +126,8 @@ Status: **proposed**.
      - the reference (unsplit) plan carries
        `CombineReductionOrder { groups: R, owned: None }` for that
        `Combine`.
-   - The `Reduce` join must apply `Combine.output_scale` once after the
-     cross-rank FP32 sum and before rounding. Add a `scale: f32` field to
-     that join. Task 0058's existing reduces use `1.0`.
+   - `Join::Reduce` is unchanged (see the amendment). Refuse, with a typed
+     error, any routed `Combine` whose `output_scale != 1.0`.
    - Refuse with a typed error: `experts % R != 0`; an `ExpertMlp` whose
      slots feed anything other than exactly one `Combine`; any local-stage
      value escaping, under task 0058's generic boundary check.
