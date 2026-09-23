@@ -1,6 +1,12 @@
 # Task 0064 — host expert-owner partitioning of the routed MoE block
 
-Status: **proposed**.
+Status: **paused** (coordinator, 2026-09-23). Parallel building broke task
+0062's build. Task 0064's partial work is saved as a patch (5 files, +384/-14:
+`moxie-graph` lib.rs and graph.rs, `moxie-interp` lib.rs, `moxie-oracles`
+route.rs, `moxie-plan` tensor_parallel.rs) and was removed from the tree.
+It resumes by applying that patch on top of task 0062's acceptance commit.
+Copies: the coordinator scratchpad and
+`/home/rodrigo/Developer/moxie-luna2-0064-wip.patch`.
 
 **Amendment, 2026-09-23 (coordinator).**
 - *Old premise:* change 4 adds `scale: f32` to `Join::Reduce`.
