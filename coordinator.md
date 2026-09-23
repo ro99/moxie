@@ -82,6 +82,14 @@ after slice 3 of M5 grew from two tasks to three without being flagged).
   - a finding class recurs across tasks.
 
   Do this before the next assignment, not after being asked.
+- **Match the assignment to the worker.** Codex `luna` executes precise,
+  file-level instructions very well, but open design work turns into large,
+  low-value code. For luna, the coordinator (or the Claude Opus `builder`)
+  settles the design first and hands over exact changes: which files, which
+  functions, what behaviour, which tests. Open design, concurrency or
+  unsafe-ownership work goes to the Opus builder or is designed by the
+  coordinator (owner direction, 2026-09-23). A builder silent for more than
+  30 minutes with a growing diff is a tripwire: check it and re-scope.
 - **Report progress against the exit gate.** A status update lists which
   exit-gate clauses are met, which remain, and whether the current slice is
   still bounded. Tasks closed is not the measure.
