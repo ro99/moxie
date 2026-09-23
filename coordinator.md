@@ -214,6 +214,28 @@ One writer owns each shared contract change. Dependent consumers wait for the
 agreed contract. Reserve shared GPUs and mutation targets explicitly; independent
 work is useful only if it cannot invalidate another assignment's evidence.
 
+Disjoint file lists are not enough. Task 0064's `moxie-plan` fields broke task
+0062's executor build on 2026-09-23, although the two tasks shared no file.
+Before starting two builders on one tree:
+
+1. **Compare what the tasks will change against what the other task uses.**
+   List every public type, field, variant and function each task will add or
+   change. Grep the other task's crates for their construction and
+   exhaustive-match sites (struct literals, `match` without a wildcard,
+   destructuring patterns). Any hit is a collision.
+2. **Resolve each collision before either builder starts.** Either serialize
+   the tasks, or write the exact public API delta into the owning task's
+   contract up front and tell the other builder which mechanical adaptation
+   it must make. Prefer changes that do not break consumers: constructors or
+   `Default` instead of literals, and new optional sidecar maps instead of
+   new fields on structs constructed elsewhere.
+3. **Freeze the owner's public API** for the duration of the parallel work.
+   Any change goes through the coordinator first.
+4. **Run workspace-wide gates in sequence.** Each builder runs only its
+   focused checks while the other's code is in progress. The coordinator
+   sequences the final gates, so neither task's evidence depends on the
+   other's half-finished code.
+
 A builder's completion report must provide changed paths, source identity,
 results and log locations, remaining obligations, and all background jobs still
 running. Ask for missing facts once after checking the available output.
