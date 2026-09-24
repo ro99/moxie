@@ -105,14 +105,14 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
    `lib.rs`:
    ```rust
    /// Two expert-owner groups: group 0 on the device, group 1 on the host.
-   pub struct HostExpertJoin { pub first_host_expert: u32, pub host_experts: u32 }
+   pub struct HostExpertJoin { first_host_expert: u32, host_experts: u32 }
    pub struct HostExpertLowering {
        /// Applied to the whole graph with `build_stage_graph`.
-       pub device: RankPart,
+       device: RankPart,
        /// The full-device reference's declaration: `{ groups: 2, owned: None }`.
-       pub reference_orders: BTreeMap<NodeId, CombineReductionOrder>,
+       reference_orders: BTreeMap<NodeId, CombineReductionOrder>,
        /// Keyed by the routed `Combine` node.
-       pub joins: BTreeMap<NodeId, HostExpertJoin>,
+       joins: BTreeMap<NodeId, HostExpertJoin>,
    }
    pub fn lower_host_experts(graph: &Graph) -> Result<HostExpertLowering, TensorParallelRefused>
    ```

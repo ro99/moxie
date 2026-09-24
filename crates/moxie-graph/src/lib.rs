@@ -499,7 +499,8 @@ pub struct LinearReductionOrder {
     pub slice: Option<LinearInputSlice>,
 }
 
-/// Declared order for one `Combine` node split across expert owners.
+/// Declared order for one `Combine` node split across expert owners. It also
+/// declares an `MlaAttention` node's `o_proj` reduction across head groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CombineReductionOrder {
     /// Number of contiguous, equal expert-owner groups.
