@@ -10,5 +10,9 @@ publish = false
 moxie-types.workspace = true
 moxie-graph.workspace = true
 
+[dev-dependencies]
+moxie-models.workspace = true
+moxie-oracles.workspace = true
+
 [lints]
 workspace = true

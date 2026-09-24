@@ -20,6 +20,8 @@ mod archcheck;
 #[cfg(feature = "cuda")]
 mod capacity;
 #[cfg(feature = "cuda")]
+mod compare;
+#[cfg(feature = "cuda")]
 mod gpu;
 mod mutationcheck;
 #[cfg(feature = "cuda")]
@@ -54,6 +56,8 @@ Device lane (needs `cargo xtask-cuda`):
                           Hardware/topology inventory; --costs writes measured planner costs
   capacity                Measure every device and admit a plan against the ledger;
                           allocates nothing
+  compare-plans --costs <toml> --model <name> --prompt <n> --generate <n>
+                          Compare measured-cost plans for a dense Gemma graph
 
 Not an `xtask` command -- a user program, built by this workspace:
   moxie-repack inspect|repack|verify
@@ -117,9 +121,18 @@ fn main() -> std::process::ExitCode {
         "probe" => probe::run(flag("--out"), flag("--costs")),
         #[cfg(feature = "cuda")]
         "capacity" => capacity::run(),
+        #[cfg(feature = "cuda")]
+        "compare-plans" => compare::run(
+            flag("--costs"),
+            flag("--model"),
+            flag("--prompt"),
+            flag("--generate"),
+        ),
 
         #[cfg(not(feature = "cuda"))]
-        "test-gpu" | "test-bf16-chain" | "probe" | "capacity" => device_command_unavailable(cmd),
+        "test-gpu" | "test-bf16-chain" | "probe" | "capacity" | "compare-plans" => {
+            device_command_unavailable(cmd)
+        }
 
         "index" | "help" | "-h" | "--help" => {
             print!("{USAGE}");

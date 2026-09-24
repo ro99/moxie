@@ -17,6 +17,7 @@ cuda = [
     "dep:moxie-executor",
     "dep:moxie-graph",
     "dep:moxie-plan",
+    "dep:moxie-models",
     "dep:moxie-interp",
     # Task 0021: the grouped expert case is checked against task 0019's
     # accepted oracle. The composition root may reach it; no production crate
@@ -41,6 +42,7 @@ moxie-kernels = { workspace = true, optional = true }
 moxie-executor = { workspace = true, optional = true }
 moxie-graph = { workspace = true, optional = true }
 moxie-plan = { workspace = true, optional = true }
+moxie-models = { workspace = true, optional = true }
 moxie-interp = { workspace = true, optional = true }
 moxie-oracles = { workspace = true, optional = true }
 moxie-state = { workspace = true, optional = true }

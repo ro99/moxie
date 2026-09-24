@@ -1,7 +1,20 @@
 # Task 0074 — a deterministic plan comparison tool
 
-Status: **open** (coordinator, 2026-09-24, under the owner's auto-mode
-delegation). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-24, under the owner's auto-mode
+delegation), after sol's review rounds R1 and R2. Builder Codex `luna`;
+reviewer Codex `sol`.
+- Three amendments came from the builder's DECISIONs: the `HostExperts`
+  variant, tuple stage bounds, and oracle parameters. All three were gaps in
+  the contract, where API details were not checked against the code before
+  writing.
+- R1 (HIGH): the KV read was multiplied by rows, which inflated every
+  prefill estimate (a single 3090 showed about 36 s at a 32k prompt).
+  Fixed, and all four evidence runs were regenerated.
+- R2 (LOW): a units label (ms, not s). The coordinator fixed it.
+- The owner flagged task numbers in code names. The labels were renamed,
+  and a sweep of the older occurrences goes to the milestone-end audit.
+- **Size, carried to the milestone-end ponytail audit:** `compare.rs` is 832
+  lines, against an estimate of 250–350.
 
 ## Identity and authority
 
@@ -270,4 +283,75 @@ Each run twice gives byte-identical output (show `cmp` in the Result).
 
 ## Result, filled after work
 
-- Pending.
+- Implemented deterministic single, TP2, pipeline and routed-host-rejection
+  candidates. Stage and rank bytes still come from validated
+  `build_stage_graph` results; TP2-first pipeline lowering remains
+  stage-local, including when the full graph's odd vocabulary refuses TP2.
+
+### R1 fixes
+
+- Stage compute now uses `(weight_bytes + kv_read_bytes(context)) / memory_rate`
+  once per step. Prompt rows scale only handoffs and collectives. The full
+  context fit is explicitly a **resident-bytes fit** for weights plus KV; it
+  excludes activation and peer scratch, so it is not full execution admission.
+- Legal cuts are exactly the internal indices where
+  `lower_pipeline(graph, &[i])` succeeds. Stage ranges are derived once from
+  `CandidateKind`; there is no second candidate-stage copy or dummy `0..0`
+  range. Greedy cut selection uses a direct iterator minimum. Decode summation
+  now handles a stage's one or two rank lines directly, splitting at sliding
+  window caps and the pair's arithmetic crossing.
+- `compare.rs` is now **832 lines**, down from the previous 964-line draft.
+  This is still above the 700-line aim; the final size includes candidate
+  enumeration, checked capacity balancing, graph/rank metering, and the
+  measured link calculations.
+- All four tool outputs were regenerated twice with
+  `CARGO_PROFILE_DEV_OPT_LEVEL=2 CUDA_DEVICE_ORDER=PCI_BUS_ID`; all four
+  `cmp` checks passed. The short large-fixture output also matched the earlier
+  unoptimized run byte-for-byte. No GPU device was opened.
+- Corrected task 0072 Shape A fixed-placement estimate (layers 0–2 on the
+  3090 pair; layers 3–5 plus the head on the 5060 Ti), prompt 7 / generate 8:
+  prefill **0.108713 ms**, first decode at context 7 **0.106523 ms**, and total
+  **0.960903 ms**. Resident bytes remain **33,696 / 33,696 / 74,928**. Task
+  0072 measured **35.880 ms** per decode on one 3090 and **184.975 ms** for
+  the combined plan. The fixture is launch-bound, not weight-bound; this model
+  has no launch or dispatch term.
+- All three mutations were applied, failed their focused test, and were
+  restored: omitting KV from resident-byte fit failed
+  `the_joint_workload_changes_the_winner`; admitting a pair without both peer
+  links failed `no_tp2_without_both_peer_links` on the missing path; and using
+  input-device order for ties failed
+  `the_ranking_is_deterministic_and_input_order_free` with reversed costs.
+- Updated evidence results: `gemma-dense-fits` ranks TP2 first at prompt 512
+  (**1.680 s**) and one 3090 first at prompt 32,768 (**2.238 s**, versus
+  **13.811 s** for TP2). `gemma-dense-large` ranks TP2 first at prompt 512
+  (**8.551 s**); at prompt 32,768 the pipeline with the 5060 Ti first ranks
+  first (**15.122 s**, versus **69.826 s** for TP2). Single-device candidates
+  fail the resident-bytes fit at 32.693 GB short context and 37.106 GB long
+  context. Evidence explains that prompt rows scale transfers and collectives,
+  and identifies the fit's omitted activation and peer scratch bytes.
+
+### Verification and review map
+
+- Passed `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `cargo test --workspace --locked`, and `cargo xtask spec-check` (10
+  documents). `cargo xtask arch-check` passed with 79 rejected fixtures, 21
+  accepted fixtures, and all 13 rules exercised.
+- Review map (lines added / removed relative to HEAD):
+
+  | File | + / − |
+  |---|---:|
+  | `Cargo.lock` | 3 / 0 |
+  | `crates/moxie-plan/Cargo.toml` | 4 / 0 |
+  | `crates/moxie-plan/src/compare.rs` | 832 / 0 (final file: 832 lines) |
+  | `crates/moxie-plan/src/lib.rs` | 2 / 0 |
+  | `crates/moxie-plan/tests/plan_comparison.rs` | 260 / 0 |
+  | `docs/evidence/plan-comparison.md` | 119 / 0 |
+  | `docs/tasks/0074-m5-plan-comparison-tool.md` | 72 / 1 |
+  | `xtask/Cargo.toml` | 2 / 0 |
+  | `xtask/src/archcheck.rs` | 2 / 0 |
+  | `xtask/src/compare.rs` | 176 / 0 |
+  | `xtask/src/main.rs` | 14 / 1 |
+
+  The carried `.gitignore`, `docs/evidence/specification-version.md`, and ADRs
+  0034/0035 remain untouched and unstaged. No commit was created.

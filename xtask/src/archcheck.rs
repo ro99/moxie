@@ -343,6 +343,8 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                     "moxie-cuda",
                     "moxie-kernels",
                     "moxie-plan",
+                    // task 0074: the plan-comparison tool composes model graphs without weights
+                    "moxie-models",
                     "moxie-executor",
                 ],
                 // What this checker needs to read manifests and to parse model

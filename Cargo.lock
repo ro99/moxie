@@ -188,6 +188,8 @@ name = "moxie-plan"
 version = "0.0.0"
 dependencies = [
  "moxie-graph",
+ "moxie-models",
+ "moxie-oracles",
  "moxie-types",
 ]
 
@@ -412,6 +414,7 @@ dependencies = [
  "moxie-interp",
  "moxie-kernels",
  "moxie-memory",
+ "moxie-models",
  "moxie-oracles",
  "moxie-plan",
  "moxie-state",
