@@ -1797,6 +1797,7 @@ impl<'ctx> WorkerState<'ctx> {
                 transaction,
                 runs,
                 bindings,
+                host_experts: &[],
             },
             &resident,
             &stage.state_layers,

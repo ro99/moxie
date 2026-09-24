@@ -183,7 +183,7 @@ mod images {
         BF16_LINEAR, BF16_RESIDUAL, BF16_RMS_APPLY, BF16_RMS_SUM, DENSE_COMBINE,
         DENSE_COMBINE_PARTIAL, DENSE_EMBEDDING, DENSE_EXPERT_DOWN, DENSE_EXPERT_PROJECT_GELU,
         DENSE_GEGLU, DENSE_GRAPH_ABI, DENSE_GROUPED_RMS, DENSE_LINEAR_PARTIAL, DENSE_LINEAR_SPLIT,
-        DENSE_RESIDUAL_SCALED, DENSE_ROPE, DENSE_ROUTE, DENSE_VOCAB_PROJECTION,
+        DENSE_RESIDUAL_SCALED, DENSE_ROPE, DENSE_ROUTE, DENSE_VOCAB_PROJECTION, TP_REDUCE_F32,
     };
     use moxie_types::{
         AccumulationPolicy, ActivationPrecision, GateTransform, KernelCapability, KernelCatalogue,
@@ -738,6 +738,24 @@ mod images {
                 workspace: WorkspaceExpression::Zero,
                 image_sha256: hash,
                 symbols: vec![KernelSymbol(DENSE_COMBINE_PARTIAL.to_string())],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-combine-host-join-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::CombineHostJoin,
+                inputs: vec![KernelOperand::RouteIndex, bf16],
+                output: ActivationPrecision::expect(Precision::Bf16),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::FinalBf16Rne,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::RowsTimesHiddenTimesTwoF32,
+                image_sha256: hash,
+                symbols: vec![
+                    KernelSymbol(DENSE_COMBINE_PARTIAL.to_string()),
+                    KernelSymbol(TP_REDUCE_F32.to_string()),
+                ],
             });
             descriptors.push(SemanticKernelDescriptor {
                 id: KernelId(format!("dense-residual-v1-{suffix}")),

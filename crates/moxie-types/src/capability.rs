@@ -78,6 +78,8 @@ pub enum SemanticKernelOp {
     Combine,
     /// One expert-owner group's FP32 combine partial, unscaled and unrounded.
     CombinePartial,
+    /// group 0's device partial plus group 1's host partial, reduced in group order and rounded once.
+    CombineHostJoin,
     /// Attention over paged key/value state: prefill, append and decode.
     ///
     /// One operation rather than three, because whole prefill, a prefill chunk
@@ -108,6 +110,7 @@ impl SemanticKernelOp {
             Self::ExpertMlp(GateTransform::Silu) => "expert_mlp_silu",
             Self::Combine => "combine",
             Self::CombinePartial => "combine_partial",
+            Self::CombineHostJoin => "combine_host_join",
             Self::PagedAttention => "paged_attention",
         }
     }
@@ -193,6 +196,8 @@ pub enum WorkspaceExpression {
     /// parameter, and a catalogue entry per intermediate width would make
     /// kernel selection depend on a shape the kernel does not care about.
     RowsTimesIntermediateF32,
+    /// Two FP32 partials of shape `[rows, hidden]`; hidden is node metadata.
+    RowsTimesHiddenTimesTwoF32,
 }
 
 impl WorkspaceExpression {
@@ -206,7 +211,9 @@ impl WorkspaceExpression {
         match self {
             Self::Zero => Some(0),
             Self::RowsTimesF32 => rows.checked_mul(4),
-            Self::RowsTimesRopeAnglesF32 | Self::RowsTimesIntermediateF32 => None,
+            Self::RowsTimesRopeAnglesF32
+            | Self::RowsTimesIntermediateF32
+            | Self::RowsTimesHiddenTimesTwoF32 => None,
         }
     }
 

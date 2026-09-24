@@ -91,9 +91,8 @@ pub struct StageGraph {
     pub linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
     pub combine_orders: BTreeMap<NodeId, CombineReductionOrder>,
     pub expert_ownership: BTreeMap<NodeId, ExpertOwnership>,
-    /// Stage-local attention nodes use layer zero so the standalone graph's
-    /// state schema remains valid; the device consumer restores this original
-    /// layer when it appends to the rank's full KV authority.
+    /// Stage-local attention nodes use dense local layers; the device consumer
+    /// restores each original layer when appending to the full KV authority.
     pub state_layers: BTreeMap<NodeId, u32>,
 }
 
@@ -183,6 +182,7 @@ pub fn build_stage_graph(
             .cloned()
             .unwrap_or_else(|| node.params.clone());
         if let OpParams::MlaAttention { descriptor: source } = &node.params {
+            let local_layer = state_layers.len() as u32;
             state_layers.insert(NodeId(local_index as u32), source.layer);
             if let Some(part) = part {
                 let Some(order) = part.combine_orders.get(&node.id) else {
@@ -218,9 +218,10 @@ pub fn build_stage_graph(
                 unreachable!("an MLA source and its admitted rank params are MLA");
             };
             let mut descriptor = descriptor;
-            descriptor.layer = 0;
+            descriptor.layer = local_layer;
             params = OpParams::MlaAttention { descriptor };
         } else if let OpParams::Attention { layer, .. } = &params {
+            let local_layer = state_layers.len() as u32;
             state_layers.insert(NodeId(local_index as u32), *layer);
             if let OpParams::Attention {
                 heads,
@@ -237,7 +238,7 @@ pub fn build_stage_graph(
                     head_dim,
                     scale,
                     visibility,
-                    layer: 0,
+                    layer: local_layer,
                 };
             }
         }
@@ -331,6 +332,10 @@ pub enum TensorParallelRefused {
     ScaledCombine {
         node: NodeId,
     },
+    /// Rebuilding the admitted device-owned host-expert stage failed.
+    StageGraph {
+        error: Error,
+    },
 }
 
 impl core::fmt::Display for TensorParallelRefused {
@@ -390,6 +395,9 @@ impl core::fmt::Display for TensorParallelRefused {
                 "node {}: routed combine output scale must be 1.0 for this lowering",
                 node.0
             ),
+            Self::StageGraph { error } => {
+                write!(f, "host-expert device stage could not be built: {error}")
+            }
         }
     }
 }

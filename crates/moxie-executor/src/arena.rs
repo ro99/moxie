@@ -619,6 +619,37 @@ mod driver_binding {
             self.core.buffer.copy_to_host_at(offset, destination)
         }
 
+        pub(crate) fn copy_from_host(&self, source: &[u8]) -> moxie_types::Result<()> {
+            if source.len() as u64 > self.bytes() {
+                return Err(invalid("source", "upload exceeds its admitted range"));
+            }
+            let offset = usize::try_from(self.offset())
+                .map_err(|_| invalid("range", "range offset is not addressable"))?;
+            self.core.buffer.copy_from_host_at(offset, source)
+        }
+
+        pub(crate) fn copy_from_host_at(
+            &self,
+            offset: u64,
+            source: &[u8],
+        ) -> moxie_types::Result<()> {
+            if offset == 0 {
+                return self.copy_from_host(source);
+            }
+            let end = offset
+                .checked_add(source.len() as u64)
+                .ok_or_else(|| invalid("source", "upload extent overflowed"))?;
+            if end > self.bytes() {
+                return Err(invalid("source", "upload exceeds its admitted range"));
+            }
+            let start = self
+                .offset()
+                .checked_add(offset)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| invalid("range", "range offset is not addressable"))?;
+            self.core.buffer.copy_from_host_at(start, source)
+        }
+
         #[allow(clippy::result_large_err)]
         pub fn prepare_upload(
             self,

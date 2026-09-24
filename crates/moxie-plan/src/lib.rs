@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod expert;
+mod host_experts;
 mod selected;
 pub mod tensor_parallel;
 pub use expert::{
@@ -20,9 +21,10 @@ pub use expert::{
     ExpertEnvelope, ExpertGroup, ExpertPlan, ExpertPlanRefused, ExpertPolicy, ExpertShape,
     GroupDecision, Placement, RejectionReason, ResidentChunks, compile_experts,
 };
+pub use host_experts::{HostExpertJoin, HostExpertLowering, lower_host_experts};
 pub use selected::{
     PlannedValue, PlannedWorkspace, SelectedNode, SelectedPlanCandidate, StorageRegion,
-    lower_selected, lower_selected_ordered,
+    lower_selected, lower_selected_host_experts, lower_selected_ordered,
 };
 pub use tensor_parallel::{
     Join, RankPart, Stage, StageGraph, StageRead, StageWeight, TensorParallelLowering,

@@ -12,6 +12,7 @@ use moxie_types::{
 };
 
 use crate::{Graph, PlanCandidate, ResourceWorkload, ValueBinding, lower};
+use crate::{HostExpertJoin, HostExpertLowering};
 
 const ALIGNMENT: u64 = 256;
 
@@ -79,6 +80,7 @@ pub struct SelectedPlanCandidate {
     linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
     combine_orders: BTreeMap<NodeId, CombineReductionOrder>,
     expert_ownership: BTreeMap<NodeId, ExpertOwnership>,
+    host_expert_joins: BTreeMap<NodeId, HostExpertJoin>,
 }
 
 impl SelectedPlanCandidate {
@@ -135,6 +137,9 @@ impl SelectedPlanCandidate {
     }
     pub fn expert_ownership(&self) -> &BTreeMap<NodeId, ExpertOwnership> {
         &self.expert_ownership
+    }
+    pub fn host_expert_joins(&self) -> &BTreeMap<NodeId, HostExpertJoin> {
+        &self.host_expert_joins
     }
     pub fn is_paged_attention(&self) -> bool {
         matches!(self.nodes.as_slice(), [node] if node.descriptor.operation == SemanticKernelOp::PagedAttention)
@@ -444,6 +449,7 @@ pub fn lower_selected(
         linear_orders: BTreeMap::new(),
         combine_orders: BTreeMap::new(),
         expert_ownership: BTreeMap::new(),
+        host_expert_joins: BTreeMap::new(),
     })
 }
 
@@ -549,6 +555,80 @@ pub fn lower_selected_ordered(
         orders,
         combine_orders,
         expert_ownership,
+        &BTreeMap::new(),
+    )
+}
+
+/// Select the device half of a host-owned expert graph and its ordered host join.
+pub fn lower_selected_host_experts(
+    workload: ResourceWorkload,
+    capability: &DeviceCapability,
+    catalogue: &KernelCatalogue,
+    lowering: &HostExpertLowering,
+) -> Result<SelectedPlanCandidate, Error> {
+    if capability.uuid != workload.device {
+        return Err(invalid(
+            "device",
+            "workload UUID and measured capability differ",
+        ));
+    }
+    let graph = &lowering.device_stage().graph;
+    let part = lowering.device();
+    for (combine_id, join) in lowering.joins() {
+        let Some(combine) = graph
+            .nodes()
+            .get(combine_id.0 as usize)
+            .filter(|node| node.id == *combine_id)
+            .filter(|node| matches!(node.params, OpParams::Combine { .. }))
+        else {
+            return Err(invalid("host_experts", "a host join names no Combine node"));
+        };
+        if part.combine_orders.get(combine_id)
+            != Some(&CombineReductionOrder {
+                groups: 2,
+                owned: Some(0),
+            })
+        {
+            return Err(invalid(
+                "host_experts",
+                "a host join disagrees with its device combine order",
+            ));
+        }
+        let Some(expert_node) = combine
+            .inputs
+            .get(1)
+            .and_then(|slots| graph.nodes().iter().find(|node| node.output == *slots))
+        else {
+            return Err(invalid(
+                "host_experts",
+                "a host join has no ExpertMlp producer",
+            ));
+        };
+        let OpParams::ExpertMlp { experts, .. } = expert_node.params else {
+            return Err(invalid(
+                "host_experts",
+                "a host join's slots are not produced by ExpertMlp",
+            ));
+        };
+        if experts != u64::from(join.host_experts())
+            || experts != u64::from(join.first_host_expert())
+        {
+            return Err(invalid(
+                "host_experts",
+                "a host join disagrees with its local ExpertMlp extent",
+            ));
+        }
+    }
+    lower_dense_mode(
+        graph,
+        workload,
+        capability,
+        catalogue,
+        true,
+        &BTreeMap::new(),
+        &part.combine_orders,
+        &part.expert_ownership,
+        lowering.joins(),
     )
 }
 
@@ -690,6 +770,7 @@ fn lower_attention(
         linear_orders: BTreeMap::new(),
         combine_orders: BTreeMap::new(),
         expert_ownership: BTreeMap::new(),
+        host_expert_joins: BTreeMap::new(),
     })
 }
 
@@ -705,6 +786,7 @@ fn lower_dense(
         capability,
         catalogue,
         true,
+        &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
@@ -830,6 +912,7 @@ fn lower_dense_mode(
     orders: &BTreeMap<NodeId, LinearReductionOrder>,
     combine_orders: &BTreeMap<NodeId, CombineReductionOrder>,
     expert_ownership: &BTreeMap<NodeId, ExpertOwnership>,
+    joins: &BTreeMap<NodeId, HostExpertJoin>,
 ) -> Result<SelectedPlanCandidate, Error> {
     check_routed_edges(graph, combine_orders, expert_ownership)?;
     if require_complete_graph
@@ -868,7 +951,9 @@ fn lower_dense_mode(
                 SemanticKernelOp::LinearSplit
             };
         }
-        if combine_orders
+        if joins.contains_key(&node.id) {
+            operation = SemanticKernelOp::CombineHostJoin;
+        } else if combine_orders
             .get(&node.id)
             .is_some_and(|order| order.owned.is_some())
         {
@@ -936,7 +1021,7 @@ fn lower_dense_mode(
             });
         }
         let (workspace, workspace_bytes, host_bytes) =
-            dense_workspace(node, operation, workload.rows)?;
+            dense_workspace(graph, node, operation, workload.rows, joins)?;
         if descriptor.workspace != workspace {
             return Err(Error::UnsupportedKernel {
                 operation: node.params.op().name(),
@@ -964,9 +1049,10 @@ fn lower_dense_mode(
             orders
                 .get(&node.id)
                 .is_some_and(|order| order.slice.is_some())
-                || combine_orders
+                || (combine_orders
                     .get(&node.id)
                     .is_some_and(|order| order.owned.is_some())
+                    && !joins.contains_key(&node.id))
         })
         .map(|node| node.output)
         .collect();
@@ -1129,6 +1215,7 @@ fn lower_dense_mode(
         linear_orders: orders.clone(),
         combine_orders: combine_orders.clone(),
         expert_ownership: expert_ownership.clone(),
+        host_expert_joins: joins.clone(),
     })
 }
 
@@ -1281,9 +1368,11 @@ fn dense_shape(node: &moxie_graph::Node) -> Result<(u64, u64), Error> {
 }
 
 fn dense_workspace(
+    graph: &Graph,
     node: &moxie_graph::Node,
     operation: SemanticKernelOp,
     rows: u64,
+    joins: &BTreeMap<NodeId, HostExpertJoin>,
 ) -> Result<(moxie_types::WorkspaceExpression, u64, u64), Error> {
     match operation {
         SemanticKernelOp::RmsNorm => {
@@ -1339,6 +1428,71 @@ fn dense_workspace(
                 moxie_types::WorkspaceExpression::RowsTimesIntermediateF32,
                 bytes,
                 0,
+            ))
+        }
+        SemanticKernelOp::CombineHostJoin => {
+            let moxie_graph::OpParams::Combine { hidden, top_k, .. } = node.params else {
+                unreachable!("host join descriptor belongs to Combine")
+            };
+            let join = joins
+                .get(&node.id)
+                .ok_or_else(|| invalid("host_experts", "host join has no owner metadata"))?;
+            let expert = node
+                .inputs
+                .get(1)
+                .and_then(|slots| {
+                    graph
+                        .nodes()
+                        .iter()
+                        .find(|candidate| candidate.output == *slots)
+                })
+                .ok_or_else(|| invalid("host_experts", "host join has no ExpertMlp producer"))?;
+            let moxie_graph::OpParams::ExpertMlp { intermediate, .. } = expert.params else {
+                return Err(invalid(
+                    "host_experts",
+                    "host join slots are not produced by ExpertMlp",
+                ));
+            };
+            if join.host_experts() == 0 {
+                return Err(invalid("host_experts", "host owner group is empty"));
+            }
+            let device_bytes = rows
+                .checked_mul(hidden)
+                .and_then(|bytes| bytes.checked_mul(2))
+                .and_then(|bytes| bytes.checked_mul(4))
+                .ok_or_else(|| invalid("workspace", "host join device workspace overflowed"))?;
+            let routed_input = rows
+                .checked_mul(hidden)
+                .and_then(|bytes| bytes.checked_mul(2))
+                .ok_or_else(|| invalid("host_workspace", "host input extent overflowed"))?;
+            let route = rows
+                .checked_mul(top_k)
+                .and_then(|bytes| bytes.checked_mul(8))
+                .ok_or_else(|| invalid("host_workspace", "host route extent overflowed"))?;
+            let host_slots = rows
+                .checked_mul(top_k)
+                .and_then(|bytes| bytes.checked_mul(hidden))
+                .and_then(|bytes| bytes.checked_mul(2))
+                .ok_or_else(|| invalid("host_workspace", "host slot extent overflowed"))?;
+            let host_partial = rows
+                .checked_mul(hidden)
+                .and_then(|bytes| bytes.checked_mul(4))
+                .ok_or_else(|| invalid("host_workspace", "host partial extent overflowed"))?;
+            // `lanes(intermediate)` clamps to `intermediate`, so the CPU
+            // ExpertShape workspace is intermediate + 2 * intermediate floats.
+            let cpu_workspace = intermediate
+                .checked_mul(2)
+                .and_then(|tiles| intermediate.checked_add(tiles))
+                .and_then(|floats| floats.checked_mul(4))
+                .ok_or_else(|| invalid("host_workspace", "CPU expert workspace overflowed"))?;
+            let host_bytes = [routed_input, route, host_slots, host_partial, cpu_workspace]
+                .into_iter()
+                .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+                .ok_or_else(|| invalid("host_workspace", "host join workspace overflowed"))?;
+            Ok((
+                moxie_types::WorkspaceExpression::RowsTimesHiddenTimesTwoF32,
+                device_bytes,
+                host_bytes,
             ))
         }
         _ => Ok((moxie_types::WorkspaceExpression::Zero, 0, 0)),
@@ -1629,6 +1783,10 @@ mod tests {
                 KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
                 KernelOperand::PageIndex,
             ],
+            SemanticKernelOp::CombineHostJoin => vec![
+                KernelOperand::RouteIndex,
+                KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16)),
+            ],
             SemanticKernelOp::Embedding
             | SemanticKernelOp::GroupedRmsNorm
             | SemanticKernelOp::Rope
@@ -1665,10 +1823,12 @@ mod tests {
                 max_output: 1024,
             },
             sm,
-            workspace: if op == SemanticKernelOp::RmsNorm {
-                WorkspaceExpression::RowsTimesF32
-            } else {
-                WorkspaceExpression::Zero
+            workspace: match op {
+                SemanticKernelOp::RmsNorm => WorkspaceExpression::RowsTimesF32,
+                SemanticKernelOp::CombineHostJoin => {
+                    WorkspaceExpression::RowsTimesHiddenTimesTwoF32
+                }
+                _ => WorkspaceExpression::Zero,
             },
             image_sha256: [7; 32],
             symbols: vec![KernelSymbol(op.name().to_string())],

@@ -1,7 +1,26 @@
 # Task 0068 — host-owned experts beside one GPU
 
-Status: **open** (coordinator, 2026-09-23, under the owner's auto-mode
-delegation). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-24, under the owner's auto-mode
+delegation). Built by Codex `luna` from the coordinator's design, with two
+Allowed-files amendments (the `lib.rs` re-export and the `StageGraph`
+refusal variant). Sol returned REVISE in round 1 (lowering provenance; exact
+host capacity; size), then ACCEPT in round 2. The coordinator re-ran `fmt`,
+workspace and driver `clippy`, `arch-check`, `spec-check`, the `moxie-plan`
+tests, `dense_gemma_device` (all three GPUs) and `dense_tp2_device`.
+
+**Size is carried to the milestone-end ponytail audit, not fixed here.** The
+round-1 targets were missed: `dense.rs` is +507/-23 and
+`dense_gemma_device.rs` is +515/-22. Sol's mechanical duplication list:
+- `dense.rs`:
+  - the producer/shape lookup and checks at about lines 1382–1450 repeat
+    lines 973–1015 and `selected.rs` 575–617;
+  - `HostJoinExtents` (about 1452–1526) restates the planner's workspace
+    formulas (`selected.rs`, about 1429–1493).
+- `dense_gemma_device.rs`:
+  - `run_prefill_decode` (about 243–359) repeats the step lifecycle at about
+    642–793;
+  - the host-weight row encoding (about 1066–1083) repeats `stage_bindings`
+    (about 210–225).
 
 ## Identity and authority
 
@@ -261,9 +280,53 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
    - **Refusal:** one assertion that an empty `host_experts` slice is
      refused with `InvalidRequest` before any launch.
 
+**Review round 1 fixes (sol REVISE, 2026-09-24; coordinator's design):**
+
+9. **Provenance by construction (sol finding 1).** The lowering must carry
+   its own device graph, so no second graph can be paired with it.
+   - `lower_host_experts(graph, oracle, oracles)` also calls
+     `build_stage_graph(graph, Some(&device), 0..n, Some(graph.output()),
+     oracle, oracles)` and stores the resulting `StageGraph` in a private
+     field, read through a getter `device_stage()`.
+   - `lower_selected_host_experts(lowering, workload, capability,
+     catalogue)` drops its `graph` parameter and lowers
+     `lowering.device_stage().graph`.
+   - `lower_host_experts` already refuses `output_scale != 1`
+     (`ScaledCombine`), so sol's scale-2 repro can no longer be expressed.
+   - The test takes the device graph and its weights from
+     `device_stage()`. Add **one** assertion: lowering a scale-2 routed graph
+     is refused with `ScaledCombine`.
+10. **Exact host capacity (sol finding 2).** After each `try_reserve_exact`
+    in the host-join arm, refuse with the same `capacity(...)` error unless
+    `vec.capacity() == len`, as the existing state and admission paths do.
+    The five buffers' charged sum is then a physical bound.
+11. **`dense.rs` size (sol finding 4):**
+    - Delete the second join-count scan: length, uniqueness and membership
+      imply it.
+    - Factor the `CombinePartial` launch into one helper, used by both the
+      `CombinePartial` arm and the host-join arm's step 1.
+    - Centralize the checked-extent arithmetic the arm repeats in one small
+      function.
+    - Keep the synchronize-before-readback boundary and the host
+      accumulation exactly as they are.
+    - Target: about 80–110 lines fewer.
+12. **Test size (sol finding 3):**
+    - Replace the four near-identical admit/execute/commit/close blocks
+      with **one** runner, called for the reference and for the host run.
+      It takes the candidate, bindings and host weights, and runs prefill
+      then decode.
+    - Use one stage-binding/row-slice helper instead of the duplicated
+      `host_stage_bindings`.
+    - Keep every assertion the contract requires: bit-identity,
+      `"combine-host-join"` per routed layer, half bytes, the pre-launch
+      refusal, change 9's scale refusal, and both mutation catches.
+    - Target: about 170–220 lines fewer.
+
+    Re-run both mutations after the refactor.
+
 ## Allowed files
 
-- `crates/moxie-plan/src/tensor_parallel.rs` (change 1 only)
+- `crates/moxie-plan/src/tensor_parallel.rs` (change 1; plus, amended 2026-09-24 after the builder's DECISION, one variant `TensorParallelRefused::StageGraph { error: moxie_types::Error }` with its `Display` arm, which `lower_host_experts` uses to wrap a `build_stage_graph` failure without misattributing it)
 - `crates/moxie-plan/src/host_experts.rs` (new)
 - `crates/moxie-plan/src/lib.rs` (exports)
 - `crates/moxie-plan/src/selected.rs`
@@ -314,4 +377,60 @@ observable.
 
 ## Result, filled after work
 
-- Pending.
+- Implemented changes 1–8: stage-local attention/MLA layers are dense;
+  host-expert lowering owns private join metadata; `CombineHostJoin` is
+  catalogued and charged; host BF16 weights are validated before launch; and
+  the executor runs device group 0, then synchronous host group 1, then one
+  BF16 rounding through the declared group-order reduction. `HostExpertWeights`
+  is re-exported beside `DenseGraphStep`.
+- Change 9 makes provenance structural: `lower_host_experts` builds and stores
+  its private device `StageGraph`, and `lower_selected_host_experts` accepts no
+  separate graph. A stage-build failure is preserved as
+  `TensorParallelRefused::StageGraph { error }`. The scale-2 routed graph has
+  one refusal assertion.
+- Change 10 checks each host vector's capacity immediately after
+  `try_reserve_exact`; the host capacity charge is the physical allocation
+  extent. Change 11 removes the second join-count scan, shares one
+  `CombinePartial` launch helper between both call sites, and centralizes
+  checked host extents. The host-join arm is about 76 lines shorter than its
+  pre-review version (roughly 303 to 227 lines). Change 12 uses one
+  prefill/decode runner for reference and host runs and one stage-binding/row
+  slice helper; the test retains every required assertion.
+- Host workspace is admitted as routed input (`rows·H·2`), route (`rows·K·8`),
+  host slots (`rows·K·H·2`), FP32 partial (`rows·H·4`) and CPU expert workspace
+  (`4·(I+2I)`) bytes. The device workspace is `2·rows·H·4` bytes. The partial
+  upload uses `DeviceRange::copy_from_host_at` at the second-partial offset;
+  there was no range-slicing helper. HtoD uses synchronous `cuMemcpyHtoD_v2`;
+  the device partial is drained before synchronous DtoH readbacks. No
+  asynchronous host-expert copy was added.
+- The Shape C eight-expert host path matched the all-device `groups=2`
+  reference bit-for-bit for prefill and decode on all three GPUs. Device
+  expert-weight bytes were exactly half the reference; launch order contained
+  one `combine-host-join` per routed layer; empty host weights produced
+  `InvalidRequest { field: "host_experts", .. }` before a launch.
+- Both mutations were applied, run, caught and restored. (1) Using the global
+  expert ID instead of the host-local weight offset failed with
+  `InvalidRequest { field: "host_experts", detail: "gate/up weight slice is
+  absent" }`. (2) Reducing A against A failed prefill on GPU
+  `GPU-97fe4889-4874-a378-198e-955d2e72c4a3`, row 0, element 0 (got
+  `[00, 00, 89, bf]`, expected `[00, 00, 8b, bf]`). Both mutations were
+  restored before the gates.
+- Host gates passed: `cargo fmt --all -- --check`; workspace clippy and
+  driver-feature clippy with `-D warnings`; `cargo test --workspace --locked`;
+  `cargo xtask arch-check` (79 rejected, 21 accepted fixtures); and
+  `cargo xtask spec-check` (10 documents).
+- GPU gates passed with `CUDA_DEVICE_ORDER=PCI_BUS_ID`: unfiltered
+  `dense_gemma_device` (four test functions, including its five Gemma fixture
+  cases, on all three GPUs); `dense_tp2_device` with test hooks on the 3090
+  pair; and `cargo xtask-cuda test-gpu` (63/63, both SM86 and SM120 qualified).
+- Review map (cumulative code diff vs HEAD; carried files excluded):
+  `driver.rs` +39; `arena.rs` +31; `dense.rs` +507/-23;
+  `dense_tp_workers.rs` +1; executor `lib.rs` +1/-1;
+  `dense_gemma_device.rs` +515/-22; `dense_tp2_device.rs` +1;
+  kernels `lib.rs` +19/-1; plan `lib.rs` +3/-1; new `host_experts.rs` +195;
+  `selected.rs` +167/-7; `tensor_parallel.rs` +13/-5; types `capability.rs`
+  +8/-1. These totals include the complete task implementation and the
+  coordinator's amendments, not only review round 1.
+- This proves the declared synthetic routed fixture path only. No model-quality
+  or performance claim is made. Nothing was committed; the carried `.gitignore`,
+  `specification-version.md` and ADRs 0034/0035 remain untouched by this task.

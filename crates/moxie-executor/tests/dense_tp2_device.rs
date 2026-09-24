@@ -977,6 +977,7 @@ fn reference_step(
             transaction,
             runs: &mut rank.runs,
             bindings: owned_full_bindings(fixture, tokens, positions, &rank.capability),
+            host_experts: &[],
         })
         .map_err(|refused| refused.error)
         .expect("reference execution")

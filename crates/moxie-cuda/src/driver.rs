@@ -944,6 +944,45 @@ impl<'ctx> DeviceBuffer<'ctx> {
         )
     }
 
+    /// Synchronously copy host bytes into a checked byte range.
+    pub fn copy_from_host_at(&self, offset: usize, src: &[u8]) -> Result<()> {
+        let end = offset
+            .checked_add(src.len())
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "src",
+                detail: "copy range overflowed".into(),
+            })?;
+        if end > self.len {
+            return Err(Error::InvalidRequest {
+                field: "src",
+                detail: format!(
+                    "{} bytes at offset {offset} into a {}-byte buffer",
+                    src.len(),
+                    self.len
+                ),
+            });
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        let destination =
+            self.ptr
+                .checked_add(offset as u64)
+                .ok_or_else(|| Error::InvalidRequest {
+                    field: "src",
+                    detail: "device address overflowed".into(),
+                })?;
+        self.ctx.make_current()?;
+        check(
+            // SAFETY: `src` is a valid readable slice of `src.len()` bytes and
+            // the destination holds at least that many, checked above. The
+            // synchronous form returns only once the copy completed, so `src`
+            // needs no lifetime extension -- the asynchronous form would (R07).
+            unsafe { ffi::cuMemcpyHtoD_v2(destination, src.as_ptr() as *const c_void, src.len()) },
+            "cuMemcpyHtoD",
+        )
+    }
+
     /// Enqueue a host-to-device copy on `stream`.
     ///
     /// # Safety

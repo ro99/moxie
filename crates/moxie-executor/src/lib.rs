@@ -138,7 +138,7 @@ pub use selected_attention::{PagedAttentionInputs, PagedAttentionStep, PagedPlan
 #[cfg(feature = "paged-attention-binding")]
 mod dense;
 #[cfg(feature = "paged-attention-binding")]
-pub use dense::{DenseGraphResult, DenseGraphStep, DensePlanRunRefused};
+pub use dense::{DenseGraphResult, DenseGraphStep, DensePlanRunRefused, HostExpertWeights};
 #[cfg(feature = "paged-attention-binding")]
 mod dense_tp;
 #[cfg(feature = "paged-attention-binding")]

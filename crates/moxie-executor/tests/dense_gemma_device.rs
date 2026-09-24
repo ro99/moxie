@@ -6,6 +6,7 @@
 //! compares both outputs with the host interpreter on every visible GPU.
 #![cfg(feature = "paged-attention-binding")]
 
+use std::collections::BTreeMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Mutex, MutexGuard};
@@ -14,13 +15,17 @@ use moxie_cuda::{RankContext, Stream, device_count, query_device};
 use moxie_engine::{HostTensor, Value};
 use moxie_executor::paged_attention::device::commit_paged_state;
 use moxie_executor::{
-    DenseGraphStep, PageGeometry, PagedAttentionRun, SelectedReservedPlan, Staging,
+    DenseGraphStep, HostExpertWeights, PageGeometry, PagedAttentionRun, SelectedReservedPlan,
+    Staging,
 };
 use moxie_format::bf16::f32_to_bf16_bits;
-use moxie_graph::{Graph, ValueId};
+use moxie_graph::{Graph, GraphBuilder, OpParams, OracleRegistry, ValueId};
 use moxie_interp::{Cancel, Interpreter, KvCache};
 use moxie_memory::{CapacitySnapshot, Ledger};
-use moxie_plan::{Phase, ResourceWorkload, lower_selected};
+use moxie_plan::{
+    Phase, ResourceWorkload, SelectedPlanCandidate, StageGraph, lower_host_experts, lower_selected,
+    lower_selected_host_experts, lower_selected_ordered,
+};
 use moxie_state::{DeviceKvSequence, KvGeometry, LayerKv, Retention, SequenceState, StateKind};
 use moxie_types::{
     DeviceCapability, DeviceUuid, Dim, HostTier, PagePlacement, Precision, RankId, Scope,
@@ -142,42 +147,214 @@ fn encode_value(value: &Value) -> Vec<u8> {
     }
 }
 
-fn owned_bindings(
+fn stage_bindings(
     fixture: &moxie_cli::fixture::Fixture,
-    rows: &[u64],
+    stage: Option<&StageGraph>,
+    tokens: &[u64],
     positions: &[u64],
     capability: &DeviceCapability,
 ) -> Vec<moxie_executor::OwnedBinding> {
+    let graph = stage.map_or(&fixture.graph, |stage| &stage.graph);
     let mut bindings = Vec::new();
-    for value in fixture.graph.inputs() {
-        let source = if *value == fixture.tokens {
-            Value::Index(rows.to_vec())
-        } else if *value == fixture.positions {
+    let reads: Vec<_> = stage.map_or_else(
+        || {
+            fixture
+                .graph
+                .inputs()
+                .iter()
+                .map(|value| (*value, *value))
+                .collect()
+        },
+        |stage| {
+            stage
+                .reads
+                .iter()
+                .map(|read| (read.original, read.local))
+                .collect()
+        },
+    );
+    for (original, local) in reads {
+        let source = if original == fixture.tokens {
+            Value::Index(tokens.to_vec())
+        } else if original == fixture.positions {
             Value::Index(positions.to_vec())
         } else {
-            panic!("unexpected dense input {}", value.0)
+            panic!("unexpected graph input {}", original.0)
         };
         bindings.push(moxie_executor::OwnedBinding {
-            value: *value,
-            role: fixture.graph.spec(*value).expect("input spec").role,
-            shape: concrete_shape(&fixture.graph, *value, rows.len()),
+            value: local,
+            role: graph.spec(local).expect("read spec").role,
+            shape: concrete_shape(graph, local, tokens.len()),
             layout: TensorLayout::ContiguousRowMajorV1,
             device: capability.uuid,
             bytes: encode_value(&source),
         });
     }
-    for value in fixture.graph.weights() {
-        let source = fixture.weights.get(*value).expect("weight binding");
+    let weights: Vec<_> = stage.map_or_else(
+        || {
+            fixture
+                .graph
+                .weights()
+                .iter()
+                .map(|value| (*value, *value, None))
+                .collect()
+        },
+        |stage| {
+            stage
+                .weights
+                .iter()
+                .map(|weight| {
+                    assert!(
+                        weight.slice.is_none(),
+                        "the whole graph has no input-axis weight slices"
+                    );
+                    (weight.original, weight.local, weight.rows.clone())
+                })
+                .collect()
+        },
+    );
+    for (original, local, rows) in weights {
+        let source = fixture.weights.get(original).expect("weight binding");
+        let bytes = if let Some(rows) = rows {
+            let tensor = source.as_float().expect("BF16 expert weight");
+            let row_elements = tensor.shape()[1..].iter().product::<usize>();
+            let start = usize::try_from(rows.start).expect("row start fits usize") * row_elements;
+            let end = usize::try_from(rows.end).expect("row end fits usize") * row_elements;
+            tensor.data()[start..end]
+                .iter()
+                .flat_map(|value| f32_to_bf16_bits(*value).to_le_bytes())
+                .collect()
+        } else {
+            encode_value(source)
+        };
         bindings.push(moxie_executor::OwnedBinding {
-            value: *value,
-            role: fixture.graph.spec(*value).expect("weight spec").role,
-            shape: concrete_shape(&fixture.graph, *value, rows.len()),
+            value: local,
+            role: graph.spec(local).expect("weight spec").role,
+            shape: concrete_shape(graph, local, tokens.len()),
             layout: TensorLayout::ContiguousRowMajorV1,
             device: capability.uuid,
-            bytes: encode_value(source),
+            bytes,
         });
     }
     bindings
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_prefill_decode(
+    prefill_candidate: SelectedPlanCandidate,
+    decode_candidate: SelectedPlanCandidate,
+    graph: &Graph,
+    capability: &DeviceCapability,
+    catalogue: &moxie_types::KernelCatalogue,
+    config: &moxie_models::gemma4::TextConfig,
+    context: &RankContext,
+    stream: &Stream<'_>,
+    prompt_rows: usize,
+    prefill_bindings: Vec<moxie_executor::OwnedBinding>,
+    decode_bindings: Vec<moxie_executor::OwnedBinding>,
+    host_experts: &[HostExpertWeights<'_>],
+    check_empty_refusal: bool,
+    expected_joins: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut state =
+        DeviceKvSequence::new(geometry(config, 4, 64, prompt_rows)).expect("device state");
+    let mut ledger = measured_ledger(context);
+    let mut runs = admit_runs(&mut ledger, context, config, &state, prompt_rows as u64);
+    let (prefill, decode) = {
+        let mut execute = |candidate, bindings, check_empty| {
+            let plan = SelectedReservedPlan::admit(
+                candidate,
+                graph,
+                capability,
+                catalogue,
+                &mut ledger,
+                context,
+            )
+            .unwrap_or_else(|refused| panic!("step admission: {refused:?}"));
+            let transaction = state.begin().expect("step transaction");
+            let (plan, bindings) = if check_empty {
+                let refused = plan
+                    .execute_dense(DenseGraphStep {
+                        graph,
+                        capability,
+                        catalogue,
+                        ctx: context,
+                        stream,
+                        state: &mut state,
+                        transaction,
+                        runs: &mut runs,
+                        bindings,
+                        host_experts: &[],
+                    })
+                    .expect_err("empty host weights must be refused before launch");
+                assert!(
+                    matches!(
+                        &refused.error,
+                        moxie_types::Error::InvalidRequest {
+                            field: "host_experts",
+                            ..
+                        }
+                    ) && refused.held.is_none()
+                        && refused.plan.is_some(),
+                    "empty host weights must produce a pre-launch typed refusal"
+                );
+                (
+                    refused.plan.expect("refusal returns admitted plan"),
+                    refused.bindings,
+                )
+            } else {
+                (plan, bindings)
+            };
+            let result = plan
+                .execute_dense(DenseGraphStep {
+                    graph,
+                    capability,
+                    catalogue,
+                    ctx: context,
+                    stream,
+                    state: &mut state,
+                    transaction,
+                    runs: &mut runs,
+                    bindings,
+                    host_experts,
+                })
+                .map_err(|refused| refused.error)
+                .expect("step execution")
+                .finish()
+                .map_err(|refused| refused.error)
+                .expect("step finish");
+            if !host_experts.is_empty() {
+                assert_eq!(
+                    result
+                        .launch_order
+                        .iter()
+                        .filter(|name| name.as_str() == "combine-host-join")
+                        .count(),
+                    expected_joins,
+                    "one visible host join per routed layer on {}",
+                    capability.uuid
+                );
+            }
+            let output = result.output;
+            commit_paged_state(&mut state, transaction, 0, &mut runs, stream).expect("commit step");
+            result
+                .plan
+                .close(&mut ledger)
+                .map_err(|refused| refused.error)
+                .expect("close step plan");
+            output
+        };
+        let prefill = execute(prefill_candidate, prefill_bindings, check_empty_refusal);
+        let decode = execute(decode_candidate, decode_bindings, false);
+        (prefill, decode)
+    };
+    for run in runs.drain(..) {
+        run.close(&mut ledger)
+            .map_err(|refused| refused.error)
+            .expect("close attention run");
+    }
+    assert!(ledger.outstanding().is_empty());
+    (prefill, decode)
 }
 
 fn host_step(
@@ -493,7 +670,14 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
                     state: &mut device_state,
                     transaction: prefill_txn,
                     runs: &mut runs,
-                    bindings: owned_bindings(fixture, &prompt, &prefill_positions, &capability),
+                    bindings: stage_bindings(
+                        fixture,
+                        None,
+                        &prompt,
+                        &prefill_positions,
+                        &capability,
+                    ),
+                    host_experts: &[],
                 })
                 .map_err(|refused| refused.error)
                 .expect("prefill device execution")
@@ -574,7 +758,14 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
                     state: &mut device_state,
                     transaction: decode_txn,
                     runs: &mut runs,
-                    bindings: owned_bindings(fixture, &decode, &decode_positions, &capability),
+                    bindings: stage_bindings(
+                        fixture,
+                        None,
+                        &decode,
+                        &decode_positions,
+                        &capability,
+                    ),
+                    host_experts: &[],
                 })
                 .map_err(|refused| refused.error)
                 .expect("decode device execution")
@@ -687,7 +878,8 @@ fn angle_copy_sync_failure_retains_its_host_source() {
             state: &mut device_state,
             transaction,
             runs: &mut runs,
-            bindings: owned_bindings(&fixture, &prompt, &positions, &capability),
+            bindings: stage_bindings(&fixture, None, &prompt, &positions, &capability),
+            host_experts: &[],
         })
         .expect_err("the injected angle-copy synchronization must refuse");
     assert_eq!(
@@ -763,6 +955,307 @@ fn routed_gemma_lowers_through_the_dense_package() {
                 .expect("planned route value")
                 .logical_bytes,
             rows * top_k * 8
+        );
+    }
+}
+
+#[test]
+fn routed_gemma_host_experts_match_the_grouped_reference_on_every_gpu() {
+    let _guard = one_at_a_time();
+    let count = device_count().expect("enumerate CUDA devices");
+    assert!(
+        count >= 3,
+        "host expert gate requires all three GPUs; saw {count}"
+    );
+
+    let mut config = moxie_cli::gemma::Shape::C.config();
+    config.moe.as_mut().expect("Shape C MoE").experts = 8;
+    let mut fixture = moxie_cli::gemma::build_with_config(config.clone())
+        .expect("build eight-expert Shape C fixture");
+    for weight in fixture.graph.weights() {
+        let Some(name) = fixture.graph.name(*weight) else {
+            continue;
+        };
+        let tensor = fixture
+            .weights
+            .get(*weight)
+            .expect("router weight")
+            .as_float()
+            .expect("router BF16 weight");
+        let shape = tensor.shape().to_vec();
+        let len = tensor.data().len();
+        if name.starts_with("router_proj.") {
+            let width = shape[1];
+            let mut values = vec![0.0; len];
+            values[0] = 1.0;
+            values[4 * width] = -1.0;
+            fixture.weights.set(
+                *weight,
+                Value::Float(HostTensor::bf16(values, shape).expect("router projection")),
+            );
+        } else if name.starts_with("router_scale.") {
+            fixture.weights.set(
+                *weight,
+                Value::Float(HostTensor::bf16(vec![1.0; len], shape).expect("router scale")),
+            );
+        }
+    }
+
+    let mut oracles = OracleRegistry::new();
+    moxie_oracles::register(&mut oracles).expect("register graph oracles");
+    let scaled_graph = {
+        let source = &fixture.graph;
+        let mut builder =
+            GraphBuilder::new(source.nodes()[0].contract.oracle, source.rows_symbol());
+        let mut values = BTreeMap::new();
+        for value in source.inputs() {
+            values.insert(
+                *value,
+                builder.input(
+                    source.name(*value).expect("input name"),
+                    source.spec(*value).expect("input spec").clone(),
+                ),
+            );
+        }
+        for value in source.weights() {
+            values.insert(
+                *value,
+                builder
+                    .weight(
+                        source.name(*value).expect("weight name"),
+                        source.spec(*value).expect("weight spec").clone(),
+                    )
+                    .expect("copy weight"),
+            );
+        }
+        for node in source.nodes() {
+            let mut params = node.params.clone();
+            if let OpParams::Combine { output_scale, .. } = &mut params {
+                *output_scale = 2.0;
+            }
+            let inputs: Vec<_> = node.inputs.iter().map(|value| values[value]).collect();
+            values.insert(
+                node.output,
+                builder.node(params, &inputs).expect("copy graph node"),
+            );
+        }
+        builder
+            .finish(values[&source.output()], &oracles)
+            .expect("finish scaled graph")
+    };
+    assert!(matches!(
+        lower_host_experts(&scaled_graph, moxie_oracles::HOST_REFERENCE, &oracles),
+        Err(moxie_plan::TensorParallelRefused::ScaledCombine { .. })
+    ));
+
+    let lowering = lower_host_experts(&fixture.graph, moxie_oracles::HOST_REFERENCE, &oracles)
+        .expect("host expert lowering");
+    let stage = lowering.device_stage();
+    let expected_joins = lowering.joins().len();
+    assert!(expected_joins > 0, "Shape C has routed expert layers");
+    let mut host_storage = Vec::new();
+    for (combine, join) in lowering.joins() {
+        let source_combine = &fixture.graph.nodes()[combine.0 as usize];
+        let source_expert = fixture
+            .graph
+            .nodes()
+            .iter()
+            .find(|node| node.output == source_combine.inputs[1])
+            .expect("source ExpertMlp");
+        let local_combine = stage.graph.nodes()[combine.0 as usize].id;
+        let host_slice = |value: ValueId| {
+            let tensor = fixture
+                .weights
+                .get(value)
+                .expect("host expert weight")
+                .as_float()
+                .expect("BF16 expert weight");
+            let row_elements = tensor.shape()[1..].iter().product::<usize>();
+            let start =
+                usize::try_from(join.first_host_expert()).expect("host row start") * row_elements;
+            let end = usize::try_from(join.first_host_expert() + join.host_experts())
+                .expect("host row end")
+                * row_elements;
+            tensor.data()[start..end]
+                .iter()
+                .flat_map(|value| f32_to_bf16_bits(*value).to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        host_storage.push((
+            local_combine,
+            host_slice(source_expert.inputs[2]),
+            host_slice(source_expert.inputs[3]),
+        ));
+    }
+    let host_weights: Vec<_> = host_storage
+        .iter()
+        .map(|(combine, gate_up, down)| HostExpertWeights {
+            combine: *combine,
+            gate_up,
+            down,
+        })
+        .collect();
+
+    let prompt: Vec<u64> = (0..5).map(|row| row % config.vocab).collect();
+    let decode = vec![5 % config.vocab];
+    let prefill_positions: Vec<u64> = (0..prompt.len() as u64).collect();
+    let decode_positions = vec![prompt.len() as u64];
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+
+    for ordinal in 0..count {
+        let context = RankContext::acquire(RankId(68_000 + ordinal), ordinal)
+            .expect("acquire GPU rank context");
+        let capability = query_device(ordinal).expect("query GPU capability");
+        assert_eq!(context.uuid(), capability.uuid);
+        let stream = Stream::new(&context).expect("create stream");
+        let prefill_workload = ResourceWorkload {
+            phase: Phase::Prefill,
+            rows: prompt.len() as u64,
+            visible_tokens: prompt.len() as u64,
+            branch_rows: prompt.len() as u64,
+            output: fixture.graph.output(),
+            device: capability.uuid,
+            paged_state_capacity: None,
+        };
+        let decode_workload = ResourceWorkload {
+            phase: Phase::Decode,
+            rows: 1,
+            visible_tokens: prompt.len() as u64 + 1,
+            branch_rows: 1,
+            ..prefill_workload
+        };
+        let reference_prefill = lower_selected_ordered(
+            &fixture.graph,
+            prefill_workload,
+            &capability,
+            &catalogue,
+            &BTreeMap::new(),
+            lowering.reference_orders(),
+            &BTreeMap::new(),
+        )
+        .expect("full-device grouped reference lowering");
+        let host_prefill =
+            lower_selected_host_experts(prefill_workload, &capability, &catalogue, &lowering)
+                .expect("host-expert selected lowering");
+        for combine in lowering.joins().keys() {
+            let slots = fixture.graph.nodes()[combine.0 as usize].inputs[1];
+            let expert = fixture
+                .graph
+                .nodes()
+                .iter()
+                .find(|node| node.output == slots)
+                .expect("source ExpertMlp");
+            for original_weight in [expert.inputs[2], expert.inputs[3]] {
+                let local_weight = stage
+                    .weights
+                    .iter()
+                    .find(|weight| weight.original == original_weight)
+                    .expect("device-owned expert weight")
+                    .local;
+                let device_bytes = host_prefill
+                    .value(local_weight)
+                    .expect("planned device-owned expert bytes")
+                    .logical_bytes;
+                let reference_bytes = reference_prefill
+                    .value(original_weight)
+                    .expect("planned reference expert bytes")
+                    .logical_bytes;
+                assert_eq!(device_bytes.checked_mul(2), Some(reference_bytes));
+            }
+        }
+        let reference_decode = lower_selected_ordered(
+            &fixture.graph,
+            decode_workload,
+            &capability,
+            &catalogue,
+            &BTreeMap::new(),
+            lowering.reference_orders(),
+            &BTreeMap::new(),
+        )
+        .expect("reference decode lowering");
+        let host_decode =
+            lower_selected_host_experts(decode_workload, &capability, &catalogue, &lowering)
+                .expect("host decode lowering");
+        let reference_outputs = run_prefill_decode(
+            reference_prefill,
+            reference_decode,
+            &fixture.graph,
+            &capability,
+            &catalogue,
+            &config,
+            &context,
+            &stream,
+            prompt.len(),
+            stage_bindings(&fixture, None, &prompt, &prefill_positions, &capability),
+            stage_bindings(&fixture, None, &decode, &decode_positions, &capability),
+            &[],
+            false,
+            expected_joins,
+        );
+        let host_outputs = run_prefill_decode(
+            host_prefill,
+            host_decode,
+            &stage.graph,
+            &capability,
+            &catalogue,
+            &config,
+            &context,
+            &stream,
+            prompt.len(),
+            stage_bindings(
+                &fixture,
+                Some(stage),
+                &prompt,
+                &prefill_positions,
+                &capability,
+            ),
+            stage_bindings(
+                &fixture,
+                Some(stage),
+                &decode,
+                &decode_positions,
+                &capability,
+            ),
+            &host_weights,
+            true,
+            expected_joins,
+        );
+        for (phase, got, want) in [
+            (
+                "prefill",
+                host_outputs.0.as_slice(),
+                reference_outputs.0.as_slice(),
+            ),
+            (
+                "decode",
+                host_outputs.1.as_slice(),
+                reference_outputs.1.as_slice(),
+            ),
+        ] {
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "{phase} bytes on {}",
+                capability.uuid
+            );
+            for (index, (actual, expected)) in
+                got.chunks_exact(4).zip(want.chunks_exact(4)).enumerate()
+            {
+                if actual != expected {
+                    panic!(
+                        "host expert {phase} differs from grouped reference on GPU {} at row {}, element {}: got {:02x?}, expected {:02x?}",
+                        capability.uuid,
+                        index / config.vocab as usize,
+                        index % config.vocab as usize,
+                        actual,
+                        expected
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "PASS host-owned routed Gemma on UUID {} (SM{}{}) prefill+decode",
+            capability.uuid, capability.compute_major, capability.compute_minor
         );
     }
 }

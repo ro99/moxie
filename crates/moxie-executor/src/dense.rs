@@ -12,10 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use moxie_cuda::{Event, Module, ModuleImage, RankContext, ResolvedModule, Stream, TrustedImage};
 use moxie_graph::{Graph, NodeId, OpParams, RopeLayout, ValueId, ValueRole};
-use moxie_plan::{SelectedNode, Visibility};
+use moxie_kernels::cpu_expert::{ExpertAssignment, ExpertShape, ExpertTiling};
+use moxie_plan::{HostExpertJoin, SelectedNode, Visibility};
 use moxie_state::DeviceKvSequence;
 use moxie_types::{
-    DeviceCapability, Error, KernelCatalogue, Precision, Result, SemanticKernelOp,
+    DeviceCapability, Error, GateTransform, KernelCatalogue, Precision, Result, SemanticKernelOp,
     StateTransactionId,
 };
 
@@ -39,6 +40,15 @@ pub struct DenseGraphStep<'step, 'ctx> {
     pub transaction: StateTransactionId,
     pub runs: &'step mut [PagedAttentionRun<'ctx>],
     pub bindings: Vec<OwnedBinding>,
+    pub host_experts: &'step [HostExpertWeights<'step>],
+}
+
+/// Host-owned BF16 expert weights for one routed Combine.
+#[derive(Debug)]
+pub struct HostExpertWeights<'a> {
+    pub combine: NodeId,
+    pub gate_up: &'a [u8],
+    pub down: &'a [u8],
 }
 
 /// A completed dense step.  The returned non-weight bindings are the caller's
@@ -126,6 +136,7 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             transaction,
             runs,
             bindings,
+            host_experts,
         } = step;
         let reject = |plan, bindings, error| DensePlanRunRefused {
             plan: Some(plan),
@@ -144,6 +155,11 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                 bindings,
                 invalid("execution", "admitted dense graph identity changed"),
             ));
+        }
+        if let Err(error) =
+            validate_host_expert_weights(graph, self.candidate().host_expert_joins(), host_experts)
+        {
+            return Err(reject(self, bindings, error));
         }
         if let Err(error) = validate_bindings_except(&self, graph, &bindings, resident) {
             return Err(reject(self, bindings, error));
@@ -182,9 +198,16 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         };
         let mut lease = OperationLease::new("selected reduced dense graph", operation)
             .expect("static label is nonempty");
-        if let Err(error) =
-            enqueue_dense(&mut lease, graph, state, transaction, runs, layers, stream)
-        {
+        if let Err(error) = enqueue_dense(
+            &mut lease,
+            graph,
+            state,
+            transaction,
+            runs,
+            layers,
+            host_experts,
+            stream,
+        ) {
             lease.mark_lost(
                 ctx.ordinal(),
                 format!("selected dense graph submission failed: {error}"),
@@ -333,6 +356,7 @@ impl<'ctx> OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enqueue_dense<'ctx>(
     lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
     graph: &Graph,
@@ -340,6 +364,7 @@ fn enqueue_dense<'ctx>(
     transaction: StateTransactionId,
     runs: &mut [PagedAttentionRun<'ctx>],
     layers: &BTreeMap<NodeId, u32>,
+    host_experts: &[HostExpertWeights<'_>],
     stream: &Stream<'ctx>,
 ) -> Result<()> {
     let rows = lease
@@ -948,7 +973,12 @@ fn enqueue_dense<'ctx>(
                     .iter()
                     .find(|producer| producer.output == slots_value)
                     .ok_or_else(|| invalid("combine", "expert slots have no producer"))?;
-                let OpParams::ExpertMlp { experts, .. } = expert_node.params else {
+                let OpParams::ExpertMlp {
+                    experts,
+                    intermediate,
+                    ..
+                } = expert_node.params
+                else {
                     return Err(invalid(
                         "combine",
                         "expert slots are not produced by ExpertMlp",
@@ -985,6 +1015,40 @@ fn enqueue_dense<'ctx>(
                     .ok_or_else(|| invalid("combine", "launch grid overflowed"))?;
                 let blocks = u32::try_from(elements.div_ceil(256))
                     .map_err(|_| invalid("combine", "launch grid overflowed"))?;
+                if selected.descriptor.operation == SemanticKernelOp::CombineHostJoin {
+                    let join = *candidate
+                        .host_expert_joins()
+                        .get(&node.id)
+                        .expect("planner selects host join only with join metadata");
+                    let weights = host_experts
+                        .iter()
+                        .find(|weights| weights.combine == node.id)
+                        .expect("host join weights were validated at step entry");
+                    enqueue_host_join(
+                        lease,
+                        base,
+                        stream,
+                        selected,
+                        rows,
+                        hidden,
+                        top_k,
+                        experts_per_group,
+                        intermediate,
+                        &join,
+                        node.inputs[0],
+                        expert_node.inputs[0],
+                        node.inputs[1],
+                        node.output,
+                        ids_address,
+                        coefficients_address,
+                        slots_address,
+                        output_address,
+                        blocks,
+                        weights,
+                    )?;
+                    push_launch(lease, "combine-host-join");
+                    continue;
+                }
                 let mut launch_rows = rows;
                 let mut launch_top_k = top_k;
                 let mut launch_hidden = hidden;
@@ -994,27 +1058,19 @@ fn enqueue_dense<'ctx>(
                     let owned = order
                         .and_then(|order| order.owned)
                         .expect("planner selects CombinePartial only for an owned group");
-                    let mut launch_owned = u64::from(owned);
-                    let mut params: [*mut c_void; 9] = [
-                        (&raw mut ids_address).cast(),
-                        (&raw mut coefficients_address).cast(),
-                        (&raw mut slots_address).cast(),
-                        (&raw mut output_address).cast(),
-                        (&raw mut launch_rows).cast(),
-                        (&raw mut launch_top_k).cast(),
-                        (&raw mut launch_hidden).cast(),
-                        (&raw mut launch_experts_per_group).cast(),
-                        (&raw mut launch_owned).cast(),
-                    ];
-                    launch(
+                    launch_combine_partial(
                         lease,
                         base,
                         stream,
-                        (blocks, 1, 1),
-                        (256, 1, 1),
-                        &mut params,
                         selected,
-                        moxie_kernels::DENSE_COMBINE_PARTIAL,
+                        blocks,
+                        [
+                            ids_address,
+                            coefficients_address,
+                            slots_address,
+                            output_address,
+                        ],
+                        [rows, top_k, hidden, experts_per_group, u64::from(owned)],
                     )?;
                     push_launch(lease, "combine-partial");
                 } else if selected.descriptor.operation == SemanticKernelOp::Combine {
@@ -1287,6 +1343,434 @@ fn push_launch<'ctx>(
     name: &str,
 ) {
     lease.resource_mut().launch_order.push(name.into());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_combine_partial<'ctx>(
+    lease: &OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    base: usize,
+    stream: &Stream<'ctx>,
+    selected: &SelectedNode,
+    blocks: u32,
+    addresses: [u64; 4],
+    values: [u64; 5],
+) -> Result<()> {
+    let mut args = [
+        addresses[0],
+        addresses[1],
+        addresses[2],
+        addresses[3],
+        values[0],
+        values[1],
+        values[2],
+        values[3],
+        values[4],
+    ];
+    let mut params: [*mut c_void; 9] = std::array::from_fn(|index| (&raw mut args[index]).cast());
+    launch(
+        lease,
+        base,
+        stream,
+        (blocks, 1, 1),
+        (256, 1, 1),
+        &mut params,
+        selected,
+        moxie_kernels::DENSE_COMBINE_PARTIAL,
+    )
+}
+
+fn validate_host_expert_weights(
+    graph: &Graph,
+    joins: &BTreeMap<NodeId, HostExpertJoin>,
+    host_experts: &[HostExpertWeights<'_>],
+) -> Result<()> {
+    if host_experts.len() != joins.len() {
+        return Err(invalid(
+            "host_experts",
+            "each selected host join needs exactly one weight entry",
+        ));
+    }
+    for (index, weights) in host_experts.iter().enumerate() {
+        let Some(join) = joins.get(&weights.combine) else {
+            return Err(invalid(
+                "host_experts",
+                "host weights name no selected join",
+            ));
+        };
+        if host_experts[..index]
+            .iter()
+            .any(|previous| previous.combine == weights.combine)
+        {
+            return Err(invalid(
+                "host_experts",
+                "a selected host join has duplicate weight entries",
+            ));
+        }
+        let combine = graph
+            .nodes()
+            .get(weights.combine.0 as usize)
+            .filter(|node| node.id == weights.combine)
+            .ok_or_else(|| invalid("host_experts", "host join node is absent"))?;
+        let expert = combine
+            .inputs
+            .get(1)
+            .and_then(|slots| graph.nodes().iter().find(|node| node.output == *slots))
+            .ok_or_else(|| invalid("host_experts", "host join has no ExpertMlp producer"))?;
+        let moxie_graph::OpParams::ExpertMlp {
+            hidden,
+            intermediate,
+            ..
+        } = expert.params
+        else {
+            return Err(invalid(
+                "host_experts",
+                "host join slots are not produced by ExpertMlp",
+            ));
+        };
+        let expected = |widths: &[u64]| -> Result<usize> {
+            let bytes = widths
+                .iter()
+                .try_fold(1u64, |size, width| size.checked_mul(*width))
+                .and_then(|elements| elements.checked_mul(2))
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .ok_or_else(|| invalid("host_experts", "host weight extent overflowed"))?;
+            Ok(bytes)
+        };
+        let host_count = u64::from(join.host_experts());
+        let gate_up_bytes = expected(&[host_count, 2, intermediate, hidden])?;
+        let down_bytes = expected(&[host_count, hidden, intermediate])?;
+        if weights.gate_up.len() != gate_up_bytes || weights.down.len() != down_bytes {
+            return Err(invalid(
+                "host_experts",
+                "host BF16 expert weights do not match the selected join extent",
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct HostJoinExtents {
+    rows: usize,
+    hidden: usize,
+    top_k: usize,
+    entries: usize,
+    route_words: usize,
+    route_bytes: usize,
+    input_bytes: usize,
+    slot_bytes: usize,
+    partial_bytes: usize,
+    workspace_bytes: usize,
+    output_bytes: usize,
+    elements: u64,
+    hidden_u32: u32,
+    intermediate_u32: u32,
+    workspace_floats: usize,
+    gate_up_expert_bytes: usize,
+    down_expert_bytes: usize,
+}
+
+fn host_join_extents(
+    rows: u64,
+    hidden: u64,
+    top_k: u64,
+    intermediate: u64,
+) -> Result<HostJoinExtents> {
+    let invalid_extent = || {
+        invalid(
+            "host_experts",
+            "host join extent overflowed or is not addressable",
+        )
+    };
+    let fit = |value| usize::try_from(value).map_err(|_| invalid_extent());
+    let mul = |left: usize, right: usize| left.checked_mul(right).ok_or_else(invalid_extent);
+    let (rows, hidden, top_k, intermediate) =
+        (fit(rows)?, fit(hidden)?, fit(top_k)?, fit(intermediate)?);
+    let (entries, elements) = (mul(rows, top_k)?, mul(rows, hidden)?);
+    let (route_words, route_bytes) = (mul(entries, 2)?, mul(entries, 8)?);
+    let (input_bytes, slot_bytes) = (mul(elements, 2)?, mul(mul(entries, hidden)?, 2)?);
+    let partial_bytes = mul(elements, 4)?;
+    let workspace_bytes = mul(partial_bytes, 2)?;
+    let output_bytes = input_bytes;
+    let (hidden_u32, intermediate_u32) = (
+        u32::try_from(hidden).map_err(|_| invalid_extent())?,
+        u32::try_from(intermediate).map_err(|_| invalid_extent())?,
+    );
+    let shape = ExpertShape {
+        hidden: hidden_u32,
+        intermediate: intermediate_u32,
+    };
+    let workspace_floats = shape
+        .workspace_f32(ExpertTiling::lanes(intermediate_u32))
+        .ok_or_else(invalid_extent)?;
+    let gate_up_expert_bytes = mul(mul(intermediate, hidden)?, 4)?;
+    let down_expert_bytes = mul(mul(hidden, intermediate)?, 2)?;
+    Ok(HostJoinExtents {
+        rows,
+        hidden,
+        top_k,
+        entries,
+        route_words,
+        route_bytes,
+        input_bytes,
+        slot_bytes,
+        partial_bytes,
+        workspace_bytes,
+        output_bytes,
+        elements: u64::try_from(elements).map_err(|_| invalid_extent())?,
+        hidden_u32,
+        intermediate_u32,
+        workspace_floats,
+        gate_up_expert_bytes,
+        down_expert_bytes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_host_join<'ctx>(
+    lease: &OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    base: usize,
+    stream: &Stream<'ctx>,
+    selected: &SelectedNode,
+    rows: u64,
+    hidden: u64,
+    top_k: u64,
+    experts_per_group: u64,
+    intermediate: u64,
+    join: &HostExpertJoin,
+    route_value: ValueId,
+    input_value: ValueId,
+    slots_value: ValueId,
+    output_value: ValueId,
+    ids_address: u64,
+    coefficients_address: u64,
+    slots_address: u64,
+    output_address: u64,
+    blocks: u32,
+    weights: &HostExpertWeights<'_>,
+) -> Result<()> {
+    let extents = host_join_extents(rows, hidden, top_k, intermediate)?;
+    let workspace = lease
+        .resource()
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan")
+        .workspace_range()?;
+    if workspace.bytes()
+        < u64::try_from(extents.workspace_bytes)
+            .map_err(|_| invalid("host_experts", "workspace extent exceeds u64"))?
+    {
+        return Err(invalid(
+            "host_experts",
+            "admitted device workspace is smaller than the host join extent",
+        ));
+    }
+    for (value, required) in [
+        (route_value, extents.route_bytes),
+        (input_value, extents.input_bytes),
+        (slots_value, extents.slot_bytes),
+        (output_value, extents.output_bytes),
+    ] {
+        if address_range(lease.resource(), value)?.bytes()
+            < u64::try_from(required)
+                .map_err(|_| invalid("host_experts", "host extent exceeds u64"))?
+        {
+            return Err(invalid(
+                "host_experts",
+                "graph range is smaller than its admitted host join extent",
+            ));
+        }
+    }
+
+    // Group zero is the device partial A. The synchronous stream drain below
+    // makes both its bytes and the route/input readbacks safe to consume.
+    let partial_a = workspace.device_address()?;
+    launch_combine_partial(
+        lease,
+        base,
+        stream,
+        selected,
+        blocks,
+        [ids_address, coefficients_address, slots_address, partial_a],
+        [rows, top_k, hidden, experts_per_group, 0],
+    )?;
+    stream.synchronize()?;
+
+    let mut route = host_zeroed::<u32>(extents.route_words)?;
+    let mut input = host_zeroed::<u8>(extents.input_bytes)?;
+    let mut slots = host_zeroed::<u8>(extents.slot_bytes)?;
+    let mut host_partial = host_zeroed::<u8>(extents.partial_bytes)?;
+    {
+        let operation = lease.resource();
+        address_range(operation, route_value)?.copy_to_host(u32_bytes_mut(&mut route))?;
+        address_range(operation, input_value)?.copy_to_host(&mut input)?;
+    }
+
+    let shape = ExpertShape {
+        hidden: extents.hidden_u32,
+        intermediate: extents.intermediate_u32,
+    };
+    let tiling = ExpertTiling::lanes(extents.intermediate_u32);
+    let mut cpu_workspace = host_zeroed::<f32>(extents.workspace_floats)?;
+    let host_count = usize::try_from(join.host_experts())
+        .map_err(|_| invalid("host_experts", "host expert count is not addressable"))?;
+    let first_host = join.first_host_expert();
+    let mut route_dirty = false;
+    for local_expert in 0..host_count {
+        if route_dirty {
+            address_range(lease.resource(), route_value)?
+                .copy_to_host(u32_bytes_mut(&mut route))?;
+            route_dirty = false;
+        }
+        let expert_id = first_host
+            .checked_add(local_expert as u32)
+            .ok_or_else(|| invalid("host_experts", "host expert id overflowed"))?;
+        let assigned = route[..extents.entries]
+            .iter()
+            .filter(|id| u32::from_le(**id) == expert_id)
+            .count();
+        if assigned == 0 {
+            continue;
+        }
+        let mut seen = 0usize;
+        for index in (0..extents.entries).rev() {
+            if u32::from_le(route[index]) != expert_id {
+                continue;
+            }
+            let destination = extents.entries - 1 - seen;
+            let row = u32::try_from(index as u64 / top_k)
+                .map_err(|_| invalid("host_experts", "row index exceeds CPU expert ABI"))?;
+            let slot = u32::try_from(index)
+                .map_err(|_| invalid("host_experts", "slot index exceeds CPU expert ABI"))?;
+            route[destination] = row;
+            route[extents.entries + destination] = slot;
+            seen += 1;
+        }
+        let first = extents.entries - assigned;
+        let gate_start = local_expert
+            .checked_mul(extents.gate_up_expert_bytes)
+            .ok_or_else(|| invalid("host_experts", "gate/up weight offset overflowed"))?;
+        let down_start = local_expert
+            .checked_mul(extents.down_expert_bytes)
+            .ok_or_else(|| invalid("host_experts", "down weight offset overflowed"))?;
+        let gate_up = weights
+            .gate_up
+            .get(gate_start..gate_start + extents.gate_up_expert_bytes)
+            .ok_or_else(|| invalid("host_experts", "gate/up weight slice is absent"))?;
+        let down = weights
+            .down
+            .get(down_start..down_start + extents.down_expert_bytes)
+            .ok_or_else(|| invalid("host_experts", "down weight slice is absent"))?;
+        moxie_kernels::cpu_expert::expert_group_bf16(
+            &input,
+            ExpertAssignment {
+                rows: &route[first..extents.entries],
+                slots: &route[extents.entries + first..],
+            },
+            gate_up,
+            down,
+            GateTransform::GeluTanh,
+            shape,
+            tiling,
+            &mut cpu_workspace,
+            &mut slots,
+        )?;
+        route_dirty = true;
+    }
+    if route_dirty {
+        address_range(lease.resource(), route_value)?.copy_to_host(u32_bytes_mut(&mut route))?;
+    }
+
+    for row in 0..extents.rows {
+        for column in 0..extents.hidden {
+            let mut accumulated = 0.0f32;
+            let mut previous: Option<(u32, usize)> = None;
+            for _ in 0..extents.top_k {
+                let mut next: Option<(u32, usize)> = None;
+                for slot in 0..extents.top_k {
+                    let index = row * extents.top_k + slot;
+                    let expert = u32::from_le(route[index]);
+                    let pair = (expert, slot);
+                    if expert >= first_host
+                        && previous.is_none_or(|prior| pair > prior)
+                        && next.is_none_or(|current| pair < current)
+                    {
+                        next = Some(pair);
+                    }
+                }
+                let Some((expert, slot)) = next else {
+                    break;
+                };
+                let route_index = row * extents.top_k + slot;
+                let coefficient =
+                    f32::from_bits(u32::from_le(route[extents.entries + route_index]));
+                let slot_index = route_index
+                    .checked_mul(extents.hidden)
+                    .and_then(|offset| offset.checked_add(column))
+                    .ok_or_else(|| invalid("host_experts", "host slot offset overflowed"))?;
+                let byte_offset = slot_index
+                    .checked_mul(2)
+                    .ok_or_else(|| invalid("host_experts", "host slot byte offset overflowed"))?;
+                let value = f32::from_bits(
+                    (u16::from_le_bytes([slots[byte_offset], slots[byte_offset + 1]]) as u32) << 16,
+                );
+                accumulated += coefficient * value;
+                previous = Some((expert, slot));
+            }
+            let output_index = row
+                .checked_mul(extents.hidden)
+                .and_then(|offset| offset.checked_add(column))
+                .ok_or_else(|| invalid("host_experts", "host partial offset overflowed"))?;
+            host_partial[output_index * 4..output_index * 4 + 4]
+                .copy_from_slice(&accumulated.to_le_bytes());
+        }
+    }
+
+    let partial_offset = u64::try_from(extents.partial_bytes)
+        .map_err(|_| invalid("workspace", "host partial extent exceeds u64"))?;
+    workspace.copy_from_host_at(partial_offset, &host_partial)?;
+    let mut rank_zero = partial_a;
+    let mut rank_one = partial_a
+        .checked_add(partial_offset)
+        .ok_or_else(|| invalid("workspace", "second partial address overflowed"))?;
+    let mut output = output_address;
+    let mut elements = extents.elements;
+    let mut reduce_params: [*mut c_void; 4] = [
+        (&raw mut rank_zero).cast(),
+        (&raw mut rank_one).cast(),
+        (&raw mut output).cast(),
+        (&raw mut elements).cast(),
+    ];
+    launch(
+        lease,
+        base + 1,
+        stream,
+        (blocks, 1, 1),
+        (256, 1, 1),
+        &mut reduce_params,
+        selected,
+        moxie_kernels::TP_REDUCE_F32,
+    )?;
+    Ok(())
+}
+
+fn host_zeroed<T: Default + Clone>(len: usize) -> Result<Vec<T>> {
+    let bytes = len
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| invalid("host_workspace", "host allocation extent overflowed"))?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|_| capacity(bytes))?;
+    if values.capacity() != len {
+        return Err(capacity(bytes));
+    }
+    values.resize(len, T::default());
+    Ok(values)
+}
+
+fn u32_bytes_mut(words: &mut [u32]) -> &mut [u8] {
+    let bytes = std::mem::size_of_val(words);
+    // SAFETY: `u32` has no padding, every element is initialized, and the
+    // returned byte slice has exactly the same allocation and lifetime.
+    unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast(), bytes) }
 }
 
 fn address<'ctx>(operation: &DenseOperation<'ctx>, value: ValueId) -> Result<u64> {
