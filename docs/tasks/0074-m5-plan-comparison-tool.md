@@ -93,6 +93,8 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
        Tp2 { devices: [DeviceUuid; 2] },
        /// One stage per entry; a stage is one device, or two for a TP2 stage.
        Pipeline { stages: Vec<(Vec<DeviceUuid>, Range<usize>)> },
+       /// Routed experts on the host beside one device (amended after the builder's DECISION).
+       HostExperts { device: DeviceUuid },
    }
    #[derive(Debug, Clone, PartialEq)]
    pub struct Estimate {
@@ -157,7 +159,8 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
      The output is identical for identical inputs.
    - **Routed graph:** if it contains `ExpertMlp` nodes, also emit one
      `Rejected` "host-owned experts: no measured host compute cost (M6)"
-     entry for the host-expert plan. The device candidates are still
+     entry per device, as `HostExperts { device }`. These come after the
+     other candidates, in device order. Display it as `host-experts+<uuid8>`. The device candidates are still
      costed.
    - Size: about 250–350 lines.
 
