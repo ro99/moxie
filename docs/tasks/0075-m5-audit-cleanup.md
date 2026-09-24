@@ -20,7 +20,7 @@ Codex `luna`; reviewer Codex `sol`.
   explicit paths only.**
 - **GPUs are free.** Always set `CUDA_DEVICE_ORDER=PCI_BUS_ID`. The builder
   is the only agent using the GPUs.
-- **Every change is behaviour-preserving.** No assertion is removed or
+- **Every change except change 8 is behaviour-preserving.** No assertion is removed or
   weakened. If a change cannot be made without changing behaviour, skip it
   and say why in the Result.
 - **Naming rule** (the owner's): no task numbers in code identifiers,
@@ -131,6 +131,22 @@ Codex `luna`; reviewer Codex `sol`.
    - Comments that cite a task for provenance may stay. Code, identifiers
      and runtime strings may not.
    - Report the before and after grep counts.
+
+8. **Correctness fix, added 2026-09-24 after sol's run-close answer** (the
+   only intended behaviour change in this task).
+   - The bug: `dense_tp_workers.rs` `close_runs` (about 2155–2177) drops a
+     `PagedAttentionRun` whose `close` was refused. The run owns a
+     `ResolvedModule`, and `Module::Drop` calls `cuModuleUnload`
+     unconditionally (`driver.rs` about 1766–1773). On a quarantine refusal
+     an attention kernel may still be running. `drain(..)` also drops the
+     remaining runs on an early return.
+   - The fix: mirror `rank_worker.rs` `close` (about 505–513). Use `while
+     let Some(run) = self.runs.pop()`, and on `Err(refused)` build the
+     `DeviceLost`, call `std::mem::forget(refused.run)`, and return the
+     error, leaving the unprocessed runs held.
+   - No existing test reaches this path. Add a test only if an existing
+     test hook can quarantine or refuse a run close; otherwise say in the
+     Result that none exists.
 
 ## Allowed files
 
