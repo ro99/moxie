@@ -67,7 +67,7 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
     and anything else is refused);
   - routed Gemma in the combined plan (one combined plan meets the exit
     clause; expert-owner TP is already gated by task 0066);
-  - any change to `DenseRankWorkers` or `SoloRankWorker`;
+  - any change to `DenseRankWorkers` or `SoloRankWorker` beyond change 4;
   - overlap;
   - speed claims.
 
@@ -174,11 +174,24 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
    capacity, latency, both or neither. State that this is fixture scale and
    makes no speed guarantee (the M5 exit forbids a TP3 speed claim).
 
+4. **Amended 2026-09-24, after the builder's DECISION:**
+   **`crates/moxie-executor/src/dense_tp_workers.rs`**, `execute_dense`'s
+   output readback only.
+   - The problem: `value_bytes(graph, graph.output(), rows, 4)` assumes FP32
+     logits. A headless stage outputs a BF16 activation, and its admitted
+     output range is 2 bytes per element, so the readback is refused.
+   - The fix: take the element size from the output spec. It is
+     `ActivationPrecision::get().bits() / 8` for an `Activation` role, and 4
+     for any other role (so a full graph's output is unchanged).
+   - No other change to this file. The finalize declaration stays as it is.
+   - Stop if the existing TP2 gate's bytes change.
+
 ## Allowed files
 
 - `crates/moxie-executor/src/pipeline.rs`
 - `crates/moxie-executor/src/lib.rs` (re-exports)
 - `crates/moxie-executor/tests/dense_tp2_device.rs`
+- `crates/moxie-executor/src/dense_tp_workers.rs` (change 4 only)
 - `crates/moxie-executor/tests/dense_gemma_device.rs` (the mechanical
   `StageBindings` call-site update only)
 - This task's Result.
