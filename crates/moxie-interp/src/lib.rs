@@ -1091,6 +1091,18 @@ impl Interpreter {
                 Value::Float(HostTensor::round_to_bf16(out, try_clone_slice(q.shape())?)?)
             }
             OpParams::MlaAttention { descriptor } => {
+                if let Some(order) = combine_orders.get(&node.id)
+                    && (order.groups == 0
+                        || match order.owned {
+                            None => !descriptor.heads.is_multiple_of(u64::from(order.groups)),
+                            Some(owner) => owner >= order.groups,
+                        })
+                {
+                    return Err(Error::InvalidRequest {
+                        field: "mla_order",
+                        detail: "groups or owned head group do not match the MLA geometry".into(),
+                    });
+                }
                 let hidden = input(0)?.as_float()?;
                 let q_a_proj = widen(input(2)?.as_float()?.data())?;
                 let q_a_layernorm = widen(input(3)?.as_float()?.data())?;
@@ -1144,12 +1156,30 @@ impl Interpreter {
                     });
                     let result =
                         mla::attend(descriptor, &projection, &history, &kv_b_proj, &o_proj)?;
-                    out.extend(result.output.iter().map(|value| *value as f32));
+                    if let Some(order) = combine_orders.get(&node.id) {
+                        let groups = if order.owned.is_some() {
+                            1
+                        } else {
+                            order.groups as usize
+                        };
+                        out.extend(mla::o_proj_grouped(
+                            &o_proj,
+                            descriptor.hidden as usize,
+                            descriptor.heads as usize * descriptor.v_head_dim as usize,
+                            &result.head_output,
+                            groups,
+                        )?);
+                    } else {
+                        out.extend(result.output.iter().map(|value| *value as f32));
+                    }
                 }
-                Value::Float(HostTensor::round_to_bf16(
-                    out,
-                    try_shape2(hidden.rows(), descriptor.hidden as usize)?,
-                )?)
+                let shape = try_shape2(hidden.rows(), descriptor.hidden as usize)?;
+                match combine_orders.get(&node.id) {
+                    Some(order) if order.owned.is_some() => {
+                        Value::Float(HostTensor::f32(out, shape)?)
+                    }
+                    _ => Value::Float(HostTensor::round_to_bf16(out, shape)?),
+                }
             }
             OpParams::Residual { scale } => {
                 let a = input(0)?.as_float()?;

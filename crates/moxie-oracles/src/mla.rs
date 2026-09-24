@@ -196,6 +196,68 @@ fn matvec(
     Ok(output)
 }
 
+/// Apply `o_proj` in contiguous head groups, narrowing each FP64 partial to
+/// FP32 before adding the groups in order.
+pub fn o_proj_grouped(
+    o_proj: &[f64],
+    hidden: usize,
+    width: usize,
+    head_output: &[f64],
+    groups: usize,
+) -> Result<Vec<f32>> {
+    if groups == 0 {
+        return Err(invalid("groups", "must be nonzero"));
+    }
+    if !width.is_multiple_of(groups) {
+        return Err(invalid("width", "must divide evenly into head groups"));
+    }
+    let expected = hidden
+        .checked_mul(width)
+        .ok_or(moxie_types::DimError::Overflow)?;
+    exact_len(o_proj, expected, "o_proj")?;
+    exact_len(head_output, width, "mla_input")?;
+    finite(o_proj, "o_proj")?;
+    finite(head_output, "mla_input")?;
+
+    let group_width = width / groups;
+    let mut output = crate::try_vec(hidden)?;
+    for row in 0..hidden {
+        let weights = &o_proj[row * width..(row + 1) * width];
+        let mut total = 0.0f32;
+        for group in 0..groups {
+            let first = group * group_width;
+            let end = first + group_width;
+            let mut sum = 0.0f64;
+            for column in first..end {
+                sum += weights[column] * head_output[column];
+            }
+            if !sum.is_finite() {
+                return Err(Error::Numerical {
+                    detail: "o_proj produced a nonfinite FP64 partial".into(),
+                });
+            }
+            let partial = sum as f32;
+            if !partial.is_finite() {
+                return Err(Error::Numerical {
+                    detail: "o_proj produced a nonfinite FP32 partial".into(),
+                });
+            }
+            if group == 0 {
+                total = partial;
+            } else {
+                total += partial;
+            }
+        }
+        if !total.is_finite() {
+            return Err(Error::Numerical {
+                detail: "o_proj produced a nonfinite FP32 result".into(),
+            });
+        }
+        output.push(total);
+    }
+    Ok(output)
+}
+
 fn rms_norm(input: &[f64], gain: &[f64], eps: f32, field: &'static str) -> Result<Vec<f64>> {
     if input.is_empty() {
         return Err(invalid(field, "normalization width is zero"));
@@ -851,5 +913,22 @@ mod tests {
             decompress(d, &token, &w.kv_b_proj[..w.kv_b_proj.len() - 1]),
             Err(Error::InvalidRequest { .. })
         ));
+    }
+
+    #[test]
+    fn grouped_o_proj_matches_matvec_with_one_group() {
+        let matrix = values(15, 0.3);
+        let input = values(5, 0.9);
+        let expected = matvec(&matrix, 3, 5, &input, "o_proj")
+            .unwrap()
+            .into_iter()
+            .map(|value| (value as f32).to_bits())
+            .collect::<Vec<_>>();
+        let actual = o_proj_grouped(&matrix, 3, 5, &input, 1)
+            .unwrap()
+            .into_iter()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 }

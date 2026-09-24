@@ -11,7 +11,8 @@ use std::ops::Range;
 
 use moxie_graph::{
     CombineReductionOrder, ExpertOwnership, Graph, GraphBuilder, LinearInputSlice,
-    LinearReductionOrder, NodeId, Op, OpParams, OracleId, OracleRegistry, PartitionRule, ValueId,
+    LinearReductionOrder, Node, NodeId, Op, OpParams, OracleId, OracleRegistry, PartitionRule,
+    ValueId,
 };
 use moxie_types::{Dim, Error};
 
@@ -42,6 +43,9 @@ pub struct RankPart {
     pub params: BTreeMap<NodeId, OpParams>,
     /// Contiguous outer-axis range of a row-major weight this rank owns.
     pub rows: BTreeMap<ValueId, Range<u64>>,
+    /// An input-axis slice keyed by the weight itself, for fused operations
+    /// whose activation input is replicated.
+    pub weight_slices: BTreeMap<ValueId, LinearInputSlice>,
     /// One compact contiguous input-axis slice used in every row of a weight
     /// and in the corresponding activation.
     pub slices: BTreeMap<ValueId, LinearInputSlice>,
@@ -128,7 +132,10 @@ pub fn build_stage_graph(
                 let name = graph.name(input).unwrap_or("value");
                 let slice = part.and_then(|p| {
                     if graph.weights().contains(&input) {
-                        p.slices.get(&node.inputs[0]).copied()
+                        p.weight_slices
+                            .get(&input)
+                            .or_else(|| p.slices.get(&node.inputs[0]))
+                            .copied()
                     } else {
                         p.slices.get(&input).copied()
                     }
@@ -175,7 +182,45 @@ pub fn build_stage_graph(
             .and_then(|p| p.params.get(&node.id))
             .cloned()
             .unwrap_or_else(|| node.params.clone());
-        if let OpParams::Attention { layer, .. } = &params {
+        if let OpParams::MlaAttention { descriptor: source } = &node.params {
+            state_layers.insert(NodeId(local_index as u32), source.layer);
+            if let Some(part) = part {
+                let Some(order) = part.combine_orders.get(&node.id) else {
+                    return Err(invalid("stage", "MLA rank has no combine order"));
+                };
+                let Some(owner) = order.owned else {
+                    return Err(invalid("stage", "MLA rank has no owned head group"));
+                };
+                let rank = mla_rank(node, order.groups, owner)
+                    .map_err(|_| invalid("stage", "MLA rank order is invalid"))?;
+                let unpartitioned = [
+                    node.inputs[2],
+                    node.inputs[3],
+                    node.inputs[5],
+                    node.inputs[6],
+                ];
+                if part.params.get(&node.id) != Some(&rank.params)
+                    || part.rows.get(&node.inputs[4]) != Some(&rank.q_b_rows)
+                    || part.rows.get(&node.inputs[7]) != Some(&rank.kv_b_rows)
+                    || part.weight_slices.get(&node.inputs[8]) != Some(&rank.o_slice)
+                    || unpartitioned.iter().any(|weight| {
+                        part.rows.contains_key(weight) || part.weight_slices.contains_key(weight)
+                    })
+                {
+                    return Err(invalid(
+                        "stage",
+                        "MLA rank metadata disagrees with its source",
+                    ));
+                }
+                params = rank.params;
+            }
+            let OpParams::MlaAttention { descriptor } = params else {
+                unreachable!("an MLA source and its admitted rank params are MLA");
+            };
+            let mut descriptor = descriptor;
+            descriptor.layer = 0;
+            params = OpParams::MlaAttention { descriptor };
+        } else if let OpParams::Attention { layer, .. } = &params {
             state_layers.insert(NodeId(local_index as u32), *layer);
             if let OpParams::Attention {
                 heads,
@@ -363,6 +408,14 @@ struct Heads {
     count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct MlaRank {
+    params: OpParams,
+    q_b_rows: Range<u64>,
+    kv_b_rows: Range<u64>,
+    o_slice: LinearInputSlice,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Mlp {
     gate: usize,
@@ -386,6 +439,53 @@ struct Span {
     join: Join,
 }
 
+fn mla_rank(node: &Node, groups: u32, owned: u32) -> moxie_types::Result<MlaRank> {
+    let OpParams::MlaAttention { descriptor } = &node.params else {
+        return Err(invalid("mla_rank", "source node is not MLA"));
+    };
+    if groups == 0 || owned >= groups || descriptor.heads % u64::from(groups) != 0 {
+        return Err(invalid(
+            "mla_groups",
+            "MLA heads do not form this rank partition",
+        ));
+    }
+    let heads = descriptor.heads / u64::from(groups);
+    let mul = |a: u64, b: u64| {
+        a.checked_mul(b)
+            .ok_or_else(|| invalid("mla_rank", "MLA rank geometry overflows"))
+    };
+    let first_head = mul(u64::from(owned), heads)?;
+    let end_head = first_head
+        .checked_add(heads)
+        .ok_or_else(|| invalid("mla_rank", "MLA rank geometry overflows"))?;
+    let row_range = |width: u64| -> moxie_types::Result<Range<u64>> {
+        Ok(mul(first_head, width)?..mul(end_head, width)?)
+    };
+    let q_width = descriptor
+        .qk_nope_head_dim
+        .checked_add(descriptor.qk_rope_head_dim)
+        .ok_or_else(|| invalid("mla_rank", "MLA query-head width overflows"))?;
+    let kv_width = descriptor
+        .qk_nope_head_dim
+        .checked_add(descriptor.v_head_dim)
+        .ok_or_else(|| invalid("mla_rank", "MLA key/value-head width overflows"))?;
+    let q_b_rows = row_range(q_width)?;
+    let kv_b_rows = row_range(kv_width)?;
+    let o_slice = LinearInputSlice {
+        first: mul(first_head, descriptor.v_head_dim)?,
+        width: mul(heads, descriptor.v_head_dim)?,
+        full_width: mul(descriptor.heads, descriptor.v_head_dim)?,
+    };
+    let mut local = *descriptor;
+    local.heads = heads;
+    Ok(MlaRank {
+        params: OpParams::MlaAttention { descriptor: local },
+        q_b_rows,
+        kv_b_rows,
+        o_slice,
+    })
+}
+
 /// Lower `graph` over `ranks` ranks.
 pub fn lower_tensor_parallel(
     graph: &Graph,
@@ -405,7 +505,7 @@ pub fn lower_tensor_parallel(
     let mut chain: BTreeMap<usize, (usize, Axis)> = BTreeMap::new();
     for (index, node) in nodes.iter().enumerate() {
         match node.params {
-            OpParams::MlaAttention { .. } => return Err(refuse_op(node)),
+            OpParams::MlaAttention { .. } => continue,
             OpParams::Route { .. } => continue,
             _ if node.params.partition_rule() == PartitionRule::NotDetermined => {
                 return Err(refuse_op(node));
@@ -691,6 +791,27 @@ pub fn lower_tensor_parallel(
         }
     }
 
+    let mut mla_nodes = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let OpParams::MlaAttention { descriptor } = node.params else {
+            continue;
+        };
+        if claimed[index] {
+            return Err(TensorParallelRefused::HeadChain { node: node.id });
+        }
+        claimed[index] = true;
+        spans.insert(
+            index,
+            Span {
+                end: index + 1,
+                join: Join::Reduce {
+                    output: node.output,
+                },
+            },
+        );
+        mla_nodes.push((index, descriptor));
+    }
+
     // A value produced by a local stage may leave only through that stage's
     // declared join, whether the consumer is another stage or the graph
     // boundary itself.
@@ -794,6 +915,59 @@ pub fn lower_tensor_parallel(
                 CombineReductionOrder {
                     groups: ranks,
                     owned: Some(owned),
+                },
+            );
+        }
+    }
+
+    // MLA keeps the shared latent replicated and splits complete heads plus
+    // each rank's matching `o_proj` input columns.
+    for (index, descriptor) in mla_nodes {
+        let node = &nodes[index];
+        combine_orders.insert(
+            node.id,
+            CombineReductionOrder {
+                groups: ranks,
+                owned: None,
+            },
+        );
+        for (owned, part) in parts.iter_mut().enumerate() {
+            let local = mla_rank(node, ranks, owned as u32).map_err(|error| match error {
+                Error::InvalidRequest {
+                    field: "mla_groups",
+                    ..
+                } => TensorParallelRefused::Heads {
+                    layer: descriptor.layer,
+                    heads: descriptor.heads,
+                    ranks,
+                },
+                _ => TensorParallelRefused::HeadChain { node: node.id },
+            })?;
+            for (weight, rows) in [
+                (node.inputs[4], local.q_b_rows),
+                (node.inputs[7], local.kv_b_rows),
+            ] {
+                if part
+                    .rows
+                    .insert(weight, rows.clone())
+                    .is_some_and(|seen| seen != rows)
+                {
+                    return Err(TensorParallelRefused::HeadChain { node: node.id });
+                }
+            }
+            if part
+                .weight_slices
+                .insert(node.inputs[8], local.o_slice)
+                .is_some_and(|seen| seen != local.o_slice)
+            {
+                return Err(TensorParallelRefused::HeadChain { node: node.id });
+            }
+            part.params.insert(node.id, local.params);
+            part.combine_orders.insert(
+                node.id,
+                CombineReductionOrder {
+                    groups: ranks,
+                    owned: Some(owned as u32),
                 },
             );
         }

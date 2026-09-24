@@ -1781,3 +1781,33 @@ of production code the demanded test could catch. If the answer is none,
 the clause asks for a test the repository's one-test-per-invariant rule
 forbids. Review enforces the contract as written, so a wrong clause costs a
 round for every reviewer who reads it faithfully.
+
+## 2026-09-23 — tasks 0065–0067: a declaration checked field by field never closes
+
+Three consecutive M5 tasks each lost review rounds to the same finding
+class: a declared partition sidecar that the consumer did not check against
+its partner or its source.
+
+- **Task 0065:** a `Route`'s expert count against the `ExpertMlp` it
+  feeds. The mismatch produced an out-of-bounds device read.
+- **Task 0066:** a `Combine` order against its producer's expert ownership.
+  The mismatch produced a silent zero partial.
+- **Task 0067:** an MLA rank declaration against the source node. It took
+  four review rounds. Each round the contract checked the fields the last
+  finding named, and the reviewer found the next field: the owner, then a
+  self-consistent truncation, then shape-preserving descriptor fields
+  (`rms_norm_eps`, `rope_base`) and a missing order. The class closed only
+  when the per-field checks were deleted and replaced by one rule. A single
+  function (`mla_rank`) derives the rank's part from the source node and
+  the owner; the lowering uses it, and the stage builder requires the
+  declaration to **equal** it.
+
+Lesson: when one layer produces a declaration and another consumes it, do
+not validate its fields. Validate it in one of two ways:
+- **Derive it again at the consumer and compare it for equality.** That
+  covers every field, including ones added later.
+- **Make it constructible only by the derivation**, with private fields
+  and one constructor, as task 0068's `HostExpertLowering` does.
+
+A contract that lists fields to check is a contract for the next review
+round.
