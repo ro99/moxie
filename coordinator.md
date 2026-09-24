@@ -40,7 +40,7 @@ Keep a concise closure ledger in the current tracked milestone handover under
 `docs/handovers/`, using the handover template. Identify that handover from the
 active task record. Update it at meaningful transitions; avoid a second status
 system in chat or another root file. The owner's tsk board is not a second
-record; it is a view of this ledger (below). Tasks and experiments retain detailed
+record; it is a mirror of this ledger (below). Tasks and experiments retain detailed
 evidence; the ledger links to them.
 
 Use the roadmap's original item numbers. Split an item into explicit obligations
@@ -69,8 +69,9 @@ its authorized outcome merely because that is where the last task ended.
 
 The owner follows the current milestone on a tsk board (owner direction,
 2026-09-23), so that they do not have to ask where things stand. The ledger
-stays the record of evidence. The board is the owner's view of it, and it is
-updated at the same transitions, never instead of them. Use the `tsk-cli`
+stays the record of evidence and the authority. The board is only a mirror of
+it, for the owner to read quickly, and it is updated at the same transitions,
+never instead of them. Use the `tsk-cli`
 skill; read with `--json`; never open the TUI.
 
 - **Layout.** Project `moxie`, thread = the milestone (`m5`, `m6`, …).
