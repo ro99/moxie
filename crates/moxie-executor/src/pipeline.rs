@@ -4,55 +4,108 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use moxie_graph::{Graph, OracleRegistry, ValueId, ValueRole};
-use moxie_plan::{PipelineLowering, StageGraph, build_stage_graph, lower_pipeline, wavefront};
+use moxie_plan::{
+    PipelineLowering, StageGraph, build_stage_graph, lower_pipeline, lower_tensor_parallel,
+    wavefront,
+};
 use moxie_types::{Error, KernelCatalogue, Result, SymbolTable, TensorLayout};
 
-use crate::{OwnedBinding, SoloRankWorker};
+use crate::{DenseRankWorkers, DenseWorkerStep, OwnedBinding, SoloRankWorker};
+
+#[derive(Debug)]
+pub enum PipelineStageWorker {
+    Solo(SoloRankWorker),
+    Pair(DenseRankWorkers),
+}
 
 #[derive(Debug)]
 pub struct PipelineWorkers {
-    workers: Vec<SoloRankWorker>,
+    pair: Option<DenseRankWorkers>,
+    solos: Vec<SoloRankWorker>,
     lost: Option<Error>,
 }
 
 #[derive(Debug)]
+pub struct StageBindings<'a> {
+    pub stage: usize,
+    pub graph: &'a StageGraph,
+    pub rank: Option<(usize, &'a StageGraph)>,
+    pub rows: Range<u64>,
+}
+
+#[derive(Debug)]
 pub struct PipelineStep<'w> {
-    workers: &'w mut PipelineWorkers,
+    pair_step: Option<DenseWorkerStep<'w>>,
+    solos: &'w mut [SoloRankWorker],
+    lost: &'w mut Option<Error>,
     logits: Vec<u8>,
     handoff_bytes: Vec<u64>,
     open: bool,
 }
 
 impl PipelineWorkers {
-    /// Stage `i` runs on `workers[i]`.
-    pub fn new(workers: Vec<SoloRankWorker>) -> Result<Self> {
-        if workers.len() < 2 {
+    /// Stage `i` runs on the corresponding worker; a pair is allowed only at stage 0.
+    pub fn new(stages: Vec<PipelineStageWorker>) -> Result<Self> {
+        if stages.len() < 2 {
             return Err(invalid(
                 "pipeline",
                 "at least two stage workers are required",
             ));
         }
+        if stages
+            .iter()
+            .enumerate()
+            .any(|(index, stage)| index != 0 && matches!(stage, PipelineStageWorker::Pair(_)))
+        {
+            return Err(invalid("pipeline", "a pair is supported only at stage 0"));
+        }
+        let mut stages = stages.into_iter();
+        let (pair, first_solo) = match stages.next().expect("two or more stages") {
+            PipelineStageWorker::Pair(pair) => (Some(pair), None),
+            PipelineStageWorker::Solo(solo) => (None, Some(solo)),
+        };
+        let mut solos = Vec::with_capacity(stages.len() + usize::from(first_solo.is_some()));
+        if let Some(solo) = first_solo {
+            solos.push(solo);
+        }
+        solos.extend(stages.map(|stage| match stage {
+            PipelineStageWorker::Solo(solo) => solo,
+            PipelineStageWorker::Pair(_) => unreachable!("pair position was validated"),
+        }));
         Ok(Self {
-            workers,
+            pair,
+            solos,
             lost: None,
         })
     }
 
+    fn solo_index(&self, stage: usize) -> Result<usize> {
+        stage
+            .checked_sub(usize::from(self.pair.is_some()))
+            .filter(|index| *index < self.solos.len())
+            .ok_or_else(|| invalid("stage", "pipeline stage has no solo worker"))
+    }
+
     #[cfg(feature = "paged-attention-test-hooks")]
     pub fn fail_next_step(&mut self, stage: usize) -> Result<()> {
-        self.workers
-            .get_mut(stage)
-            .ok_or_else(|| invalid("stage", "pipeline stage index is out of range"))?
-            .fail_next_step();
+        let index = self.solo_index(stage)?;
+        self.solos[index].fail_next_step();
         Ok(())
     }
 
     #[cfg(feature = "paged-attention-test-hooks")]
     pub fn refuse_next_prepare(&mut self, stage: usize) -> Result<()> {
-        self.workers
-            .get_mut(stage)
-            .ok_or_else(|| invalid("stage", "pipeline stage index is out of range"))?
-            .refuse_next_prepare();
+        let index = self.solo_index(stage)?;
+        self.solos[index].refuse_next_prepare();
+        Ok(())
+    }
+
+    #[cfg(feature = "paged-attention-test-hooks")]
+    pub fn refuse_next_pair_commit(&mut self, rank: usize) -> Result<()> {
+        self.pair
+            .as_mut()
+            .ok_or_else(|| invalid("pipeline", "pipeline has no pair stage"))?
+            .refuse_next_commit_prepare(rank);
         Ok(())
     }
 
@@ -66,7 +119,7 @@ impl PipelineWorkers {
         oracles: &OracleRegistry,
         catalogue: &KernelCatalogue,
         microbatches: &[Range<u64>],
-        bindings: &mut dyn FnMut(usize, &StageGraph, Range<u64>) -> Result<Vec<OwnedBinding>>,
+        bindings: &mut dyn FnMut(StageBindings<'_>) -> Result<Vec<OwnedBinding>>,
         cancel: &AtomicBool,
     ) -> Result<PipelineStep<'_>> {
         if let Some(error) = &self.lost {
@@ -84,7 +137,7 @@ impl PipelineWorkers {
                 "lowering does not match the source graph",
             ));
         }
-        let stage_count = self.workers.len();
+        let stage_count = self.solos.len() + usize::from(self.pair.is_some());
         if lowering.stages().len() != stage_count || lowering.handoffs().len() + 1 != stage_count {
             return Err(invalid(
                 "pipeline",
@@ -102,6 +155,13 @@ impl PipelineWorkers {
                 "ranges must be nonempty, contiguous, and strictly increasing",
             ));
         }
+        if self.pair.is_some() && microbatches.len() != 1 {
+            return Err(invalid(
+                "microbatches",
+                "a pair stage requires exactly one microbatch",
+            ));
+        }
+
         let mut stage_graphs = Vec::with_capacity(stage_count);
         for (stage, nodes) in lowering.stages().iter().enumerate() {
             let output = lowering
@@ -118,82 +178,91 @@ impl PipelineWorkers {
                 oracles,
             )?);
         }
+        let tp_lowering = if self.pair.is_some() {
+            Some(
+                lower_tensor_parallel(&stage_graphs[0].graph, 2)
+                    .map_err(|_| invalid("pipeline", "stage 0 refuses TP2 lowering"))?,
+            )
+        } else {
+            None
+        };
 
         let mut intermediate: Vec<Option<Vec<u8>>> =
             (0..microbatches.len()).map(|_| None).collect();
         let mut logits = Vec::new();
         let mut handoff_bytes = vec![0u64; stage_count - 1];
+        let PipelineWorkers { pair, solos, lost } = self;
+        let has_pair = pair.is_some();
+        let mut pair_step = None;
+
+        if let (Some(pair), Some(tp)) = (pair.as_mut(), tp_lowering.as_ref()) {
+            if cancel.load(Ordering::SeqCst) {
+                return Err(abort_pipeline(
+                    &mut pair_step,
+                    solos,
+                    lost,
+                    Error::Cancelled {
+                        at: "pipeline stage",
+                    },
+                ));
+            }
+            let rows = microbatches[0].clone();
+            let count = rows.end - rows.start;
+            let mut pair_bindings = |rank, sub_stage: &StageGraph| {
+                bindings(StageBindings {
+                    stage: 0,
+                    graph: &stage_graphs[0],
+                    rank: Some((rank, sub_stage)),
+                    rows: rows.clone(),
+                })
+            };
+            let step = match pair.execute_dense(
+                &stage_graphs[0].graph,
+                tp,
+                oracle,
+                oracles,
+                catalogue,
+                count,
+                rows.end,
+                &mut pair_bindings,
+                cancel,
+            ) {
+                Ok(step) => step,
+                Err(error) => return Err(abort_pipeline(&mut pair_step, solos, lost, error)),
+            };
+            intermediate[0] = Some(step.logits().to_vec());
+            pair_step = Some(step);
+        }
 
         // ponytail: sequential wavefront keeps tentative KV causal. Overlap needs a split send/receive on SoloRankWorker.
-        for (stage, microbatch) in wavefront(stage_count, microbatches.len()) {
-            if cancel.load(Ordering::SeqCst) {
-                let error = Error::Cancelled {
-                    at: "pipeline stage",
-                };
-                return Err(self.abort_after(error));
-            }
-            let rows = microbatches[microbatch].clone();
-            let count = rows.end - rows.start;
-            let result = (|| {
-                let mut stage_bindings = bindings(stage, &stage_graphs[stage], rows.clone())?;
-                if stage > 0 {
-                    let handoff = lowering.handoffs()[stage - 1];
-                    let read = stage_graphs[stage]
-                        .reads
-                        .iter()
-                        .find(|read| read.original == handoff)
-                        .ok_or_else(|| {
-                            invalid("handoff", "stage graph has no declared handoff read")
-                        })?;
-                    if stage_bindings
-                        .iter()
-                        .any(|binding| binding.value == read.local)
-                    {
-                        return Err(invalid(
-                            "handoff",
-                            "caller supplied the pipeline-owned handoff binding",
-                        ));
-                    }
-                    let bytes = intermediate[microbatch].take().ok_or_else(|| {
-                        invalid(
-                            "handoff",
-                            "preceding stage has no output for this microbatch",
-                        )
-                    })?;
-                    let (role, shape, expected_bytes) =
-                        value_extent(&stage_graphs[stage].graph, read.local, count)?;
-                    if u64::try_from(bytes.len()).ok() != Some(expected_bytes) {
-                        return Err(invalid(
-                            "handoff",
-                            "preceding stage output does not match the declared read extent",
-                        ));
-                    }
-                    let device = stage_bindings
-                        .first()
-                        .map(|binding| binding.device)
-                        .ok_or_else(|| {
-                            invalid("handoff", "caller bindings do not identify a device")
-                        })?;
-                    stage_bindings.push(OwnedBinding {
-                        value: read.local,
-                        role,
-                        shape,
-                        layout: TensorLayout::ContiguousRowMajorV1,
-                        device,
-                        bytes,
+        let execution = (|| {
+            for (stage, microbatch) in wavefront(stage_count, microbatches.len()) {
+                if cancel.load(Ordering::SeqCst) {
+                    return Err(Error::Cancelled {
+                        at: "pipeline stage",
                     });
-                    handoff_bytes[stage - 1] = handoff_bytes[stage - 1]
-                        .checked_add(expected_bytes)
-                        .ok_or_else(|| invalid("handoff", "cumulative byte count overflowed"))?;
                 }
-
-                let output = self.workers[stage].step(
-                    stage_graphs[stage].graph.clone(),
-                    catalogue.clone(),
-                    stage_bindings,
-                    count,
-                    rows.end,
-                )?;
+                let rows = microbatches[microbatch].clone();
+                let count = rows.end - rows.start;
+                let output = if has_pair && stage == 0 {
+                    intermediate[microbatch]
+                        .take()
+                        .ok_or_else(|| invalid("handoff", "pair stage has no output"))?
+                } else {
+                    solo_stage(
+                        solos,
+                        has_pair,
+                        stage,
+                        &stage_graphs[stage],
+                        &rows,
+                        microbatch,
+                        &mut intermediate,
+                        lowering,
+                        bindings,
+                        count,
+                        catalogue,
+                    )?
+                };
                 let (_, _, expected_bytes) = value_extent(
                     &stage_graphs[stage].graph,
                     stage_graphs[stage].graph.output(),
@@ -205,42 +274,57 @@ impl PipelineWorkers {
                         "stage output does not match its declared role and shape",
                     ));
                 }
-                Ok(output)
-            })();
-
-            let output = match result {
-                Ok(output) => output,
-                Err(error) => return Err(self.abort_after(error)),
-            };
-            if stage + 1 == stage_count {
-                logits.extend(output);
-            } else {
+                if stage + 1 == stage_count {
+                    logits.extend(output);
+                    continue;
+                }
+                let next = &stage_graphs[stage + 1];
+                let handoff = lowering.handoffs()[stage];
+                let read = next
+                    .reads
+                    .iter()
+                    .find(|read| read.original == handoff)
+                    .ok_or_else(|| {
+                        invalid("handoff", "stage graph has no declared handoff read")
+                    })?;
+                let (_, _, expected) = value_extent(&next.graph, read.local, count)?;
+                if expected != expected_bytes {
+                    return Err(invalid("handoff", "adjacent stage extents do not match"));
+                }
+                handoff_bytes[stage] = handoff_bytes[stage]
+                    .checked_add(expected_bytes)
+                    .ok_or_else(|| invalid("handoff", "cumulative byte count overflowed"))?;
                 intermediate[microbatch] = Some(output);
             }
-        }
-
-        if cancel.load(Ordering::SeqCst) {
-            return Err(self.abort_after(Error::Cancelled {
-                at: "pipeline stage",
-            }));
+            if cancel.load(Ordering::SeqCst) {
+                return Err(Error::Cancelled {
+                    at: "pipeline stage",
+                });
+            }
+            Ok(())
+        })();
+        if let Err(error) = execution {
+            return Err(abort_pipeline(&mut pair_step, solos, lost, error));
         }
 
         Ok(PipelineStep {
-            workers: self,
+            pair_step,
+            solos,
+            lost,
             logits,
             handoff_bytes,
             open: true,
         })
     }
 
-    /// One entry per stage: published rows, committed rows, reservations.
+    /// One entry per solo stage: published rows, committed rows, reservations.
     pub fn stats(&mut self) -> Result<Vec<(u64, u64, usize)>> {
         if let Some(error) = &self.lost {
             return Err(error.clone());
         }
-        let mut stats = Vec::with_capacity(self.workers.len());
+        let mut stats = Vec::with_capacity(self.solos.len());
         let mut first_error = None;
-        for worker in &mut self.workers {
+        for worker in &mut self.solos {
             match worker.stats() {
                 Ok(value) => stats.push(value),
                 Err(error) => {
@@ -256,9 +340,21 @@ impl PipelineWorkers {
         first_error.map_or(Ok(stats), Err)
     }
 
+    pub fn pair_frontiers(&self) -> Option<([u64; 2], [u64; 2])> {
+        self.pair
+            .as_ref()
+            .map(|pair| (pair.published_frontiers(), pair.committed_frontiers()))
+    }
+
     pub fn close(mut self) -> Result<()> {
         let mut first_error = self.lost.take();
-        for worker in self.workers.drain(..) {
+        if let Some(pair) = self.pair.take()
+            && let Err(error) = pair.close()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        for worker in self.solos.drain(..) {
             if let Err(error) = worker.close()
                 && first_error.is_none()
             {
@@ -267,29 +363,102 @@ impl PipelineWorkers {
         }
         first_error.map_or(Ok(()), Err)
     }
+}
 
-    fn abort_after(&mut self, error: Error) -> Error {
-        if matches!(error, Error::DeviceLost { .. }) && self.lost.is_none() {
-            self.lost = Some(error.clone());
+#[allow(clippy::too_many_arguments)]
+fn solo_stage(
+    solos: &mut [SoloRankWorker],
+    has_pair: bool,
+    stage: usize,
+    stage_graph: &StageGraph,
+    rows: &Range<u64>,
+    microbatch: usize,
+    intermediate: &mut [Option<Vec<u8>>],
+    lowering: &PipelineLowering,
+    bindings: &mut dyn FnMut(StageBindings<'_>) -> Result<Vec<OwnedBinding>>,
+    count: u64,
+    catalogue: &KernelCatalogue,
+) -> Result<Vec<u8>> {
+    let mut stage_bindings = bindings(StageBindings {
+        stage,
+        graph: stage_graph,
+        rank: None,
+        rows: rows.clone(),
+    })?;
+    if stage > 0 {
+        let handoff = lowering.handoffs()[stage - 1];
+        let read = stage_graph
+            .reads
+            .iter()
+            .find(|read| read.original == handoff)
+            .ok_or_else(|| invalid("handoff", "stage graph has no declared handoff read"))?;
+        if stage_bindings
+            .iter()
+            .any(|binding| binding.value == read.local)
+        {
+            return Err(invalid(
+                "handoff",
+                "caller supplied the pipeline-owned handoff binding",
+            ));
         }
-        let _ = self.abort_all();
-        self.lost.clone().unwrap_or(error)
+        let bytes = intermediate[microbatch]
+            .take()
+            .ok_or_else(|| invalid("handoff", "preceding stage has no output"))?;
+        let (role, shape, expected_bytes) = value_extent(&stage_graph.graph, read.local, count)?;
+        if u64::try_from(bytes.len()).ok() != Some(expected_bytes) {
+            return Err(invalid(
+                "handoff",
+                "preceding stage output does not match the declared read extent",
+            ));
+        }
+        let device = stage_bindings
+            .first()
+            .map(|binding| binding.device)
+            .ok_or_else(|| invalid("handoff", "caller bindings do not identify a device"))?;
+        stage_bindings.push(OwnedBinding {
+            value: read.local,
+            role,
+            shape,
+            layout: TensorLayout::ContiguousRowMajorV1,
+            device,
+            bytes,
+        });
     }
+    let solo_index = stage
+        .checked_sub(usize::from(has_pair))
+        .ok_or_else(|| invalid("stage", "pipeline stage has no solo worker"))?;
+    solos[solo_index].step(
+        stage_graph.graph.clone(),
+        catalogue.clone(),
+        stage_bindings,
+        count,
+        rows.end,
+    )
+}
 
-    fn abort_all(&mut self) -> Option<Error> {
-        let mut first_error = None;
-        for worker in &mut self.workers {
-            if let Err(error) = worker.abort() {
-                if matches!(error, Error::DeviceLost { .. }) && self.lost.is_none() {
-                    self.lost = Some(error.clone());
-                }
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        first_error
+fn abort_pipeline(
+    pair_step: &mut Option<DenseWorkerStep<'_>>,
+    solos: &mut [SoloRankWorker],
+    lost: &mut Option<Error>,
+    error: Error,
+) -> Error {
+    drop(pair_step.take());
+    abort_solos(solos, lost, error)
+}
+
+fn abort_solos(solos: &mut [SoloRankWorker], lost: &mut Option<Error>, error: Error) -> Error {
+    if matches!(error, Error::DeviceLost { .. }) && lost.is_none() {
+        *lost = Some(error.clone());
     }
+    for solo in solos {
+        if let Err(abort_error) = solo.abort()
+            && matches!(abort_error, Error::DeviceLost { .. })
+            && lost.is_none()
+        {
+            *lost = Some(abort_error);
+        }
+    }
+    lost.clone().unwrap_or(error)
 }
 
 impl PipelineStep<'_> {
@@ -303,17 +472,28 @@ impl PipelineStep<'_> {
     }
 
     pub fn commit(mut self) -> Result<Vec<u8>> {
-        for stage in 0..self.workers.workers.len() {
-            if let Err(error) = self.workers.workers[stage].prepare_commit() {
-                let error = self.workers.abort_after(error);
+        for stage in 0..self.solos.len() {
+            if let Err(error) = self.solos[stage].prepare_commit() {
+                let error = abort_pipeline(&mut self.pair_step, self.solos, self.lost, error);
                 self.open = false;
                 return Err(error);
             }
         }
+        let pair_committed = if let Some(step) = self.pair_step.take() {
+            if let Err(error) = step.commit() {
+                let error = abort_solos(self.solos, self.lost, error);
+                self.open = false;
+                return Err(error);
+            }
+            true
+        } else {
+            false
+        };
         let mut applied = false;
-        for stage in 0..self.workers.workers.len() {
-            if let Err(error) = self.workers.workers[stage].apply_commit() {
-                let error = if applied {
+        for (index, solo) in self.solos.iter_mut().enumerate() {
+            if let Err(error) = solo.apply_commit() {
+                let stage = index + usize::from(pair_committed);
+                let error = if pair_committed || applied {
                     Error::DeviceLost {
                         device: stage as u32,
                         detail: format!(
@@ -323,7 +503,7 @@ impl PipelineStep<'_> {
                 } else {
                     error
                 };
-                let error = self.workers.abort_after(error);
+                let error = abort_solos(self.solos, self.lost, error);
                 self.open = false;
                 return Err(error);
             }
@@ -337,7 +517,15 @@ impl PipelineStep<'_> {
 impl Drop for PipelineStep<'_> {
     fn drop(&mut self) {
         if self.open {
-            let _ = self.workers.abort_all();
+            let error = abort_pipeline(
+                &mut self.pair_step,
+                self.solos,
+                self.lost,
+                Error::Cancelled {
+                    at: "dropped pipeline step",
+                },
+            );
+            let _ = error;
             self.open = false;
         }
     }

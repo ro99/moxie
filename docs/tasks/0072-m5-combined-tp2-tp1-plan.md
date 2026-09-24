@@ -1,7 +1,22 @@
 # Task 0072 — a combined TP2 + TP1 pipeline plan, and its report
 
-Status: **open** (coordinator, 2026-09-24, under the owner's auto-mode
-delegation). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-24, under the owner's auto-mode
+delegation), after sol's review rounds R1 and R2. Builder Codex `luna`;
+reviewer Codex `sol`.
+- Change 4 was added after the builder's DECISION: the TP output readback
+  is sized from the output's role.
+- R1 (HIGH, test harness): the TP2 gate's deliberate stall leaves lost pair
+  workers parked, and their context claims stay pinned for the rest of the
+  process (correct fail-closed behaviour). A combined test that runs after it
+  cannot claim the 3090s. Fixed by running the combined case first inside the
+  file's single `#[test]`.
+- **M5.3 verdict, at fixture scale:**
+  - **capacity improves**: the peak per-GPU weight bytes fall from 134,544
+    to 71,472;
+  - **latency worsens**: decode goes from about 35 ms to 184 ms, about 5×.
+- **Size, carried to the milestone-end ponytail audit:**
+  `dense_tp2_device.rs` grew by +717/−18 lines for one test. The R1
+  deduplication removed only about 11 lines net.
 
 ## Identity and authority
 
@@ -230,4 +245,57 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Result, filled after work
 
-- Pending.
+The combined Shape A plan ran layers 0–2 on the 3090 pair and layers 3–5
+plus the head on the 5060 Ti. Prefill and decode matched the host reference
+within the declared ULP gate; the declared handoff was 240 bytes per decode
+row set. The existing TP2 gate remained byte-exact after change 4.
+
+Capacity and latency report (fixture-scale weight-role binding bytes; GPU
+identity is by UUID):
+
+| GPU | One 3090, whole graph | Combined TP2+TP1 | Task 0071 three-stage PP |
+|---|---:|---:|---:|
+| RTX 3090, `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | 134,544 | 32,544 | 21,600 |
+| RTX 3090, `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | 0 | 32,544 | 63,072 |
+| RTX 5060 Ti, `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | 0 | 71,472 | 50,448 |
+
+The two R1 reruns measured these medians for eight decode steps including
+commit: **38.024 ms** and **35.880 ms** on one 3090; **186.418 ms** and
+**184.975 ms** for combined TP2+TP1. This fixture shows a lower peak per-GPU
+weight-binding footprint (134,544 to 71,472 bytes), so capacity improves;
+decode latency is about 5× slower. The measurements are fixture scale, make
+no speed guarantee, and do not support a TP3 speed claim.
+
+Acceptance:
+
+- Host: `cargo fmt --all -- --check`, workspace clippy, driver-feature
+  executor clippy, `cargo test --workspace --locked`, `cargo xtask arch-check`
+  (79 rejected fixtures, 21 accepted fixtures, 13 rules), and
+  `cargo xtask spec-check` all passed.
+- GPU (`CUDA_DEVICE_ORDER=PCI_BUS_ID`): full `dense_tp2_device` passed twice
+  with the default runner (one test, containing the combined case before the
+  two TP2 gates); `dense_gemma_device` passed 6/6 tests across all three GPUs; and
+  `cargo xtask-cuda test-gpu` passed all 63 cases on SM86 and SM120. An
+  earlier default-runner failure from R1 was resolved by running the combined
+  case before the sticky-stall gate. The existing TP2 gate's bytes remain
+  unchanged.
+- Mutations were applied, observed failing, and restored before the final
+  gates: skipping solo abort after pair-commit refusal failed the solo stats
+  invariant; committing the pair after solo-prepare refusal changed pair
+  frontiers; and allowing a pair at stage 1 failed the placement refusal.
+
+### R1 fixes (2026-09-24)
+
+- Moved the combined scenario into a plain function called first by the sole
+  `dense_tp2_device` test. The routed stall gate runs last because it pins the
+  pair's device claims for the process.
+- Folded TP sub-stage input and weight ID mapping into `stage_host_bindings`,
+  removed the one-use `CombinedRun`, and summed report bytes from the
+  weight-role bindings constructed by the same callback and stage helper.
+  The report rows now use one UUID-keyed loop. The two 3090 combined-plan
+  values are 32,544 bytes each after measuring those bindings.
+- Host gates passed again: format check, both Clippy gates and all workspace
+  tests. The full `dense_tp2_device` binary passed twice with default test
+  runner settings. No other GPU suites were rerun in R1.
+- R1 line-count delta: `dense_tp2_device.rs` **+251/-262** (net −11 lines).
+  Total task diff for that file is **+717/-18** from the task base.

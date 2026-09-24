@@ -17,8 +17,8 @@ use moxie_cuda::{RankContext, Stream, device_count, query_device};
 use moxie_engine::{HostTensor, Value};
 use moxie_executor::paged_attention::device::commit_paged_state;
 use moxie_executor::{
-    DenseGraphStep, HostExpertWeights, PageGeometry, PagedAttentionRun, PipelineWorkers,
-    SelectedReservedPlan, SoloRankWorker, SoloRankWorkerConfig, Staging,
+    DenseGraphStep, HostExpertWeights, PageGeometry, PagedAttentionRun, PipelineStageWorker,
+    PipelineWorkers, SelectedReservedPlan, SoloRankWorker, SoloRankWorkerConfig, Staging,
 };
 use moxie_format::bf16::f32_to_bf16_bits;
 use moxie_graph::{Graph, GraphBuilder, OpParams, OracleRegistry, ValueId, ValueRole};
@@ -517,7 +517,14 @@ impl PipelineRun<'_> {
     ) -> moxie_types::Result<moxie_executor::PipelineStep<'w>> {
         let mut oracles = OracleRegistry::new();
         moxie_oracles::register(&mut oracles).expect("register pipeline oracles");
-        let mut make_bindings = |stage: usize, graph: &StageGraph, rows: Range<u64>| {
+        let mut make_bindings = |request: moxie_executor::StageBindings<'_>| {
+            let stage = request.stage;
+            let graph = request.graph;
+            let rows = request.rows;
+            assert!(
+                request.rank.is_none(),
+                "solo pipeline has no rank sub-stage"
+            );
             if let Some((cancel_stage, cancel_batch)) = cancel_at {
                 let batch = microbatches.iter().position(|candidate| *candidate == rows);
                 if stage == cancel_stage && batch == Some(cancel_batch) {
@@ -1300,13 +1307,18 @@ fn pipeline_runs_dense_and_routed_gemma_on_three_gpus() {
             catalogue: &catalogue,
             devices: &three_devices,
         };
-        let mut workers = PipelineWorkers::new(spawn_stage_workers(
-            &stages,
-            &config,
-            &three_devices,
-            &host_capacity,
-            &mut rank_seed,
-        ))
+        let mut workers = PipelineWorkers::new(
+            spawn_stage_workers(
+                &stages,
+                &config,
+                &three_devices,
+                &host_capacity,
+                &mut rank_seed,
+            )
+            .into_iter()
+            .map(PipelineStageWorker::Solo)
+            .collect(),
+        )
         .expect("create three-stage pipeline");
         let spawned_stats = workers.stats().expect("stats after pipeline spawn");
         if label == "routed" {
@@ -1326,7 +1338,7 @@ fn pipeline_runs_dense_and_routed_gemma_on_three_gpus() {
                 &oracles,
                 &catalogue,
                 &prefill_batches,
-                &mut |_, _, _| {
+                &mut |_| {
                     called = true;
                     Err(moxie_types::Error::InvalidRequest {
                         field: "binding",
@@ -1484,13 +1496,18 @@ fn pipeline_runs_dense_and_routed_gemma_on_three_gpus() {
             catalogue: &catalogue,
             devices: &pair_devices,
         };
-        let mut pair = PipelineWorkers::new(spawn_stage_workers(
-            &pair_stages,
-            &config,
-            &pair_devices,
-            &host_capacity,
-            &mut rank_seed,
-        ))
+        let mut pair = PipelineWorkers::new(
+            spawn_stage_workers(
+                &pair_stages,
+                &config,
+                &pair_devices,
+                &host_capacity,
+                &mut rank_seed,
+            )
+            .into_iter()
+            .map(PipelineStageWorker::Solo)
+            .collect(),
+        )
         .expect("create two-stage 3090 pipeline");
         let pair_spawned = pair.stats().expect("stats after pair spawn");
         let pair_prefill = pair_run

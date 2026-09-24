@@ -646,7 +646,15 @@ impl DenseRankWorkers {
                     }
                 }
             }
-            let bytes = value_bytes(graph, graph.output(), rows, 4)?;
+            let element_bytes = match graph
+                .spec(graph.output())
+                .ok_or_else(|| invalid("logits", "the output has no tensor spec"))?
+                .role
+            {
+                ValueRole::Activation(precision) => u64::from(precision.get().bits() / 8),
+                _ => 4,
+            };
+            let bytes = value_bytes(graph, graph.output(), rows, element_bytes)?;
             let outputs = self.pair_command(
                 [
                     WorkerCommand::ReadOutput {
