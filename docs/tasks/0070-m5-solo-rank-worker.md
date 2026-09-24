@@ -1,7 +1,21 @@
 # Task 0070 — a single-GPU rank worker (one execution thread per GPU)
 
-Status: **open** (coordinator, 2026-09-24, under the owner's auto-mode
-delegation). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-24, under the owner's auto-mode
+delegation), after sol's review rounds R1 and R2. Builder Codex `luna`;
+reviewer Codex `sol`.
+- R1 (MEDIUM): teardown joined without a deadline. Fixed with a
+  deadline-bounded `join_until`; a sticky loss skips shutdown.
+- R2 (MEDIUM, from the coordinator's R1 design): the bounded join discarded
+  a worker panic. Fixed with a three-way `JoinOutcome`. The coordinator
+  checked the fix directly; a third review round was not needed.
+- **Size, carried to the milestone-end ponytail audit:** `rank_worker.rs` is
+  569 lines, against an estimate of 250–350. Sol counted about 40–65 lines
+  duplicated with `dense_tp_workers.rs`:
+  - workload construction and admission, around 260–294 (vs 1726–1763);
+  - writer-adapter assembly, around 389–410 (vs 1456–1496);
+  - stats and run close, around 433–464 (vs 2140–2169).
+  Removing them means editing accepted TP code, which this task did not
+  allow.
 
 ## Identity and authority
 
@@ -223,4 +237,81 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Result, filled after work
 
-- Pending.
+- Implemented `SoloRankWorker` as one named worker thread per GPU. Context,
+  stream, capability, ledger, device state, admitted runs, plans, prepared
+  commits and leases stay on that thread; commands carry owned host values.
+  Steps share an open transaction until apply or abort. Replies use bounded
+  waits and make `DeviceLost` sticky; a held resource/lease is forgotten and
+  the worker parks. `close` aborts, closes runs, checks the ledger and joins.
+- Reused `admit_worker_runs`, `recv_until`, `park_lost`, `device_lost` and
+  `commit_capacity_error` from `dense_tp_workers.rs`. All five helper
+  visibility changes are crate-private; `dense_tp.rs::workers` is also
+  crate-private under the authorized amendment. No TP worker behavior changed.
+- The prepared-then-abort stop condition is supported by `moxie-state`:
+  `DeviceKvSequence::prepare_commit` takes `&self` and builds a read-only
+  `PreparedCommit`; dropping it leaves the open transaction for `abort`.
+- `solo_rank_worker_matches_the_direct_path_on_every_gpu` passes prefill,
+  decode and retried-decode byte comparisons on all three GPUs. It also checks
+  two steps in one aborted transaction, unchanged stats after abort, injected
+  pre-admission refusal followed by a clean step, and close with no outstanding
+  reservations.
+
+### Gates
+
+- Passed `cargo fmt --all -- --check` and `git diff --check`.
+- Passed `cargo clippy --workspace --all-targets --locked -- -D warnings`.
+- Passed `cargo clippy -p moxie-executor --all-targets --features driver,paged-attention-binding,paged-attention-test-hooks --locked -- -D warnings`.
+- Passed `cargo test --workspace --locked`.
+- Passed `cargo xtask arch-check` (79 rejected fixtures, 21 accepted,
+  13 rules) and `cargo xtask spec-check` (10 documents unchanged).
+- With `CUDA_DEVICE_ORDER=PCI_BUS_ID`, passed the unfiltered
+  `dense_gemma_device` suite (5 tests), `dense_tp2_device` (1 test), and
+  `cargo xtask-cuda test-gpu` (63/63 cases on sm_120 and sm_86; all three
+  physical GPUs qualified).
+
+### Mutations
+
+1. Changed `WorkerState::step` to call `state.begin()` on every step and store
+   that transaction. The focused worker test failed on the second step of the
+   abort transaction with `InvalidRequest: a transaction is already open here`.
+   Restored transaction reuse.
+2. Removed `self.state.abort(transaction)?` from `WorkerState::abort`. The
+   focused worker test failed the stats check: published rows were 8 instead
+   of the pre-abort value 6. Restored the abort call.
+
+### Review map
+
+| File | Added | Removed | Change |
+|---|---:|---:|---|
+| `crates/moxie-executor/src/rank_worker.rs` | 597 | 0 | New solo worker implementation, including the R1/R2 bounded join. |
+| `crates/moxie-executor/src/dense_tp_workers.rs` | 5 | 5 | Made five shared helpers `pub(crate)`. |
+| `crates/moxie-executor/src/dense_tp.rs` | 1 | 1 | Authorized visibility change for `workers`. |
+| `crates/moxie-executor/src/lib.rs` | 4 | 0 | Module declaration and public re-exports. |
+| `crates/moxie-executor/tests/dense_gemma_device.rs` | 153 | 5 | One worker test; direct-reference helper returns an optional third decode. |
+| **Total** | **760** | **11** | The worker source is 597 lines, above the 250–350 line estimate; the added lines cover typed command replies, worker-owned CUDA lifetimes, bounded waits and held-resource failure paths. |
+
+The carried `.gitignore`, `docs/evidence/specification-version.md`, and ADRs
+0034/0035 were not staged. No single-thread path was changed or removed.
+
+### R1 fixes
+
+- Added `join_until`, which polls `JoinHandle::is_finished()` at 1 ms intervals
+  until the deadline, then joins if finished or detaches on timeout. `close`
+  returns an ordinal-specific `DeviceLost` if the worker misses that deadline;
+  `Drop` ignores the join result.
+- When loss is already sticky, `close` returns that error and `Drop` detaches
+  without sending `Shutdown` or waiting. A shutdown reply that reports loss also
+  causes `Drop` to detach immediately.
+- Inlined the former `StepCommand` fields into `WorkerCommand::Step`; its
+  `Graph` payload is boxed to keep the enum compact under clippy. Added no tests.
+- R1 gates passed: fmt, both clippy gates, `cargo test --workspace --locked`,
+  and the unfiltered `dense_gemma_device` suite on all three GPUs (5/5). The
+  full `xtask-cuda test-gpu` was not rerun in this review round, as directed.
+
+### R2 fixes
+
+- `join_until` now distinguishes a clean join, a panicked thread, and deadline
+  expiry with detachment. `close` maps panic and timeout to distinct
+  ordinal-specific `DeviceLost` details; `Drop` ignores each outcome.
+- R2 gates passed: fmt, both clippy gates, and `cargo test --workspace --locked`.
+  GPU suites were skipped because this teardown change is host-only.

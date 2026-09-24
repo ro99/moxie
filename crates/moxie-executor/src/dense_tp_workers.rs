@@ -1049,7 +1049,7 @@ impl Drop for DenseWorkerStep<'_> {
     }
 }
 
-fn recv_until<T>(receiver: &Receiver<T>, deadline: Instant, what: &str) -> Result<T> {
+pub(crate) fn recv_until<T>(receiver: &Receiver<T>, deadline: Instant, what: &str) -> Result<T> {
     receiver
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .map_err(|_| Error::DeviceLost {
@@ -1267,7 +1267,7 @@ fn rank_worker(
     );
 }
 
-fn admit_worker_runs<'ctx>(
+pub(crate) fn admit_worker_runs<'ctx>(
     context: &'ctx RankContext,
     mut ledger: Ledger,
     state: &DeviceKvSequence,
@@ -1416,7 +1416,7 @@ fn worker_loop<'ctx>(
     }
 }
 
-fn park_lost() -> ! {
+pub(crate) fn park_lost() -> ! {
     loop {
         thread::park();
     }
@@ -1535,7 +1535,7 @@ fn worker_commit<'ctx>(
     )
 }
 
-fn commit_capacity_error(count: usize) -> Error {
+pub(crate) fn commit_capacity_error(count: usize) -> Error {
     Error::CapacityExceeded {
         tier: Some(Tier::Host(moxie_types::HostTier::Pageable)),
         requested_bytes: count.saturating_mul(std::mem::size_of::<&mut dyn PagedKvWriter>()) as u64,
@@ -2249,7 +2249,7 @@ fn close_boundary_worker(
     })
 }
 
-fn device_lost(device: u32, detail: String) -> Error {
+pub(crate) fn device_lost(device: u32, detail: String) -> Error {
     Error::DeviceLost { device, detail }
 }
 

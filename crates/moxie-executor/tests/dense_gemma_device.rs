@@ -10,13 +10,14 @@ use std::collections::BTreeMap;
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 use moxie_cuda::{RankContext, Stream, device_count, query_device};
 use moxie_engine::{HostTensor, Value};
 use moxie_executor::paged_attention::device::commit_paged_state;
 use moxie_executor::{
     DenseGraphStep, HostExpertWeights, PageGeometry, PagedAttentionRun, SelectedReservedPlan,
-    Staging,
+    SoloRankWorker, SoloRankWorkerConfig, Staging,
 };
 use moxie_format::bf16::f32_to_bf16_bits;
 use moxie_graph::{Graph, GraphBuilder, OpParams, OracleRegistry, ValueId};
@@ -252,15 +253,16 @@ fn run_prefill_decode(
     prompt_rows: usize,
     prefill_bindings: Vec<moxie_executor::OwnedBinding>,
     decode_bindings: Vec<moxie_executor::OwnedBinding>,
+    third_decode: Option<(SelectedPlanCandidate, Vec<moxie_executor::OwnedBinding>)>,
     host_experts: &[HostExpertWeights<'_>],
     check_empty_refusal: bool,
     expected_joins: usize,
-) -> (Vec<u8>, Vec<u8>) {
+) -> (Vec<u8>, Vec<u8>, Option<Vec<u8>>) {
     let mut state =
         DeviceKvSequence::new(geometry(config, 4, 64, prompt_rows)).expect("device state");
     let mut ledger = measured_ledger(context);
     let mut runs = admit_runs(&mut ledger, context, config, &state, prompt_rows as u64);
-    let (prefill, decode) = {
+    let (prefill, decode, third) = {
         let mut execute = |candidate, bindings, check_empty| {
             let plan = SelectedReservedPlan::admit(
                 candidate,
@@ -346,7 +348,8 @@ fn run_prefill_decode(
         };
         let prefill = execute(prefill_candidate, prefill_bindings, check_empty_refusal);
         let decode = execute(decode_candidate, decode_bindings, false);
-        (prefill, decode)
+        let third = third_decode.map(|(candidate, bindings)| execute(candidate, bindings, false));
+        (prefill, decode, third)
     };
     for run in runs.drain(..) {
         run.close(&mut ledger)
@@ -354,7 +357,7 @@ fn run_prefill_decode(
             .expect("close attention run");
     }
     assert!(ledger.outstanding().is_empty());
-    (prefill, decode)
+    (prefill, decode, third)
 }
 
 fn host_step(
@@ -809,6 +812,149 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
 }
 
 #[test]
+fn solo_rank_worker_matches_the_direct_path_on_every_gpu() {
+    let _guard = one_at_a_time();
+    let count = device_count().expect("enumerate CUDA devices");
+    assert!(count >= 3, "task 0070 requires all three GPUs; saw {count}");
+    let shape = moxie_cli::gemma::Shape::A;
+    let config = shape.config();
+    let fixture = moxie_cli::gemma::build(shape).expect("build dense Gemma fixture");
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+    let prompt: Vec<u64> = (0..5).map(|row| row % config.vocab).collect();
+    let decode = vec![5 % config.vocab];
+    let next_decode = vec![6 % config.vocab];
+    let after_next_decode = vec![7 % config.vocab];
+    let prompt_positions: Vec<u64> = (0..5).collect();
+    let decode_position = [5];
+    let next_position = [6];
+    let after_next_position = [7];
+
+    for ordinal in 0..count {
+        let capability = query_device(ordinal).expect("query GPU capability");
+        let workload = |rows, visible_tokens| ResourceWorkload {
+            phase: if rows == 1 {
+                Phase::Decode
+            } else {
+                Phase::Prefill
+            },
+            rows,
+            visible_tokens,
+            branch_rows: rows,
+            output: fixture.graph.output(),
+            device: capability.uuid,
+            paged_state_capacity: None,
+        };
+        let prefill_candidate =
+            lower_selected(&fixture.graph, workload(5, 5), &capability, &catalogue)
+                .expect("prefill lowering");
+        let decode_candidate =
+            lower_selected(&fixture.graph, workload(1, 6), &capability, &catalogue)
+                .expect("decode lowering");
+        let third_candidate =
+            lower_selected(&fixture.graph, workload(1, 7), &capability, &catalogue)
+                .expect("third decode lowering");
+        let context = RankContext::acquire(RankId(70_000 + ordinal), ordinal)
+            .expect("acquire direct-path context");
+        let stream = Stream::new(&context).expect("create direct-path stream");
+        let reference = run_prefill_decode(
+            prefill_candidate,
+            decode_candidate,
+            &fixture.graph,
+            &capability,
+            &catalogue,
+            &config,
+            &context,
+            &stream,
+            prompt.len(),
+            stage_bindings(&fixture, None, &prompt, &prompt_positions, &capability),
+            stage_bindings(&fixture, None, &decode, &decode_position, &capability),
+            Some((
+                third_candidate,
+                stage_bindings(&fixture, None, &next_decode, &next_position, &capability),
+            )),
+            &[],
+            false,
+            0,
+        );
+        drop(stream);
+        drop(context);
+
+        let host_capacity =
+            CapacitySnapshot::measured_host(&moxie_host::read().expect("measure host"), 1 << 20)
+                .expect("host capacity");
+        let mut worker = SoloRankWorker::spawn(SoloRankWorkerConfig {
+            rank: RankId(70_000 + ordinal),
+            ordinal,
+            geometry: geometry(&config, 4, 64, prompt.len() + 2),
+            heads: config.heads,
+            max_rows: 5,
+            host_capacity,
+            deadline: Duration::from_secs(30),
+        })
+        .expect("start solo rank worker");
+        let step =
+            |worker: &mut SoloRankWorker, tokens: &[u64], positions: &[u64], rows, visible| {
+                worker.step(
+                    fixture.graph.clone(),
+                    catalogue.clone(),
+                    stage_bindings(&fixture, None, tokens, positions, &capability),
+                    rows,
+                    visible,
+                )
+            };
+        let prefill = step(&mut worker, &prompt, &prompt_positions, 5, 5).expect("worker prefill");
+        assert_eq!(prefill, reference.0, "prefill bytes on GPU {ordinal}");
+        worker.prepare_commit().expect("prepare prefill");
+        worker.apply_commit().expect("apply prefill");
+
+        let decoded = step(&mut worker, &decode, &decode_position, 1, 6).expect("worker decode");
+        assert_eq!(decoded, reference.1, "decode bytes on GPU {ordinal}");
+        worker.prepare_commit().expect("prepare decode");
+        worker.apply_commit().expect("apply decode");
+
+        let before_abort = worker.stats().expect("stats before abort");
+        let aborted =
+            step(&mut worker, &next_decode, &next_position, 1, 7).expect("first abort step");
+        assert_eq!(
+            aborted.as_slice(),
+            reference
+                .2
+                .as_ref()
+                .expect("third direct output")
+                .as_slice(),
+            "third decode bytes on GPU {ordinal}"
+        );
+        step(&mut worker, &after_next_decode, &after_next_position, 1, 8)
+            .expect("second step shares abort transaction");
+        worker.abort().expect("abort both decode rows");
+        assert_eq!(
+            worker.stats().expect("stats after abort"),
+            before_abort,
+            "abort restores frontiers and reservations on GPU {ordinal}"
+        );
+        let retried = step(&mut worker, &next_decode, &next_position, 1, 7)
+            .expect("retry decode after abort");
+        assert_eq!(
+            retried,
+            reference.2.expect("third direct output"),
+            "retried decode bytes on GPU {ordinal}"
+        );
+        worker.prepare_commit().expect("prepare retried decode");
+        worker.apply_commit().expect("apply retried decode");
+
+        worker.fail_next_step();
+        assert!(matches!(
+            step(&mut worker, &after_next_decode, &after_next_position, 1, 8),
+            Err(moxie_types::Error::InvalidRequest { field: "fault", .. })
+        ));
+        worker.abort().expect("abort after pre-admission refusal");
+        step(&mut worker, &after_next_decode, &after_next_position, 1, 8)
+            .expect("clean step after injected refusal");
+        worker.close().expect("close worker without reservations");
+    }
+}
+
+#[test]
 fn angle_copy_sync_failure_retains_its_host_source() {
     let _guard = one_at_a_time();
     let context = RankContext::acquire(RankId(59_090), 0).expect("acquire GPU rank context");
@@ -1188,6 +1334,7 @@ fn routed_gemma_host_experts_match_the_grouped_reference_on_every_gpu() {
             prompt.len(),
             stage_bindings(&fixture, None, &prompt, &prefill_positions, &capability),
             stage_bindings(&fixture, None, &decode, &decode_positions, &capability),
+            None,
             &[],
             false,
             expected_joins,
@@ -1216,6 +1363,7 @@ fn routed_gemma_host_experts_match_the_grouped_reference_on_every_gpu() {
                 &decode_positions,
                 &capability,
             ),
+            None,
             &host_weights,
             true,
             expected_joins,

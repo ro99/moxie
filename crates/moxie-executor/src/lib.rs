@@ -143,6 +143,10 @@ pub use dense::{DenseGraphResult, DenseGraphStep, DensePlanRunRefused, HostExper
 mod dense_tp;
 #[cfg(feature = "paged-attention-binding")]
 pub use dense_tp::{DenseRankWorkerConfig, DenseRankWorkers, DenseWorkerStep};
+#[cfg(feature = "paged-attention-binding")]
+mod rank_worker;
+#[cfg(feature = "paged-attention-binding")]
+pub use rank_worker::{SoloRankWorker, SoloRankWorkerConfig};
 
 #[cfg(feature = "driver")]
 pub use lease::{PrepareRefused, Upload};
