@@ -4532,22 +4532,12 @@ pub mod device {
         branch.commit(txn, accept, &mut [&mut writer])
     }
 
-    /// Commit a completed batch and publish page-table transitions through the
-    /// matching run for every layer.
     #[cfg(feature = "paged-attention-binding")]
-    pub fn commit_paged_state<'ctx>(
-        state: &mut DeviceKvSequence,
-        txn: moxie_types::StateTransactionId,
-        accept: u64,
+    pub(crate) fn with_paged_writers<'ctx, R>(
         runs: &mut [PagedAttentionRun<'ctx>],
         stream: &Stream<'ctx>,
-    ) -> Result<()> {
-        if state.layer_count()? != runs.len() {
-            return Err(invalid(
-                "runs",
-                "commit needs exactly one device run per state layer",
-            ));
-        }
+        f: impl FnOnce(&mut [&mut dyn PagedKvWriter]) -> Result<R>,
+    ) -> Result<R> {
         let mut adapters = moxie_memory::fallible::with_capacity(runs.len())?;
         for (layer, run) in runs.iter_mut().enumerate() {
             adapters.push(PagedKvWriterAdapter::new(
@@ -4564,7 +4554,26 @@ pub mod device {
                 .iter_mut()
                 .map(|writer| writer as &mut dyn PagedKvWriter),
         );
-        state.commit(txn, accept, &mut writers)
+        f(&mut writers)
+    }
+
+    /// Commit a completed batch and publish page-table transitions through the
+    /// matching run for every layer.
+    #[cfg(feature = "paged-attention-binding")]
+    pub fn commit_paged_state<'ctx>(
+        state: &mut DeviceKvSequence,
+        txn: moxie_types::StateTransactionId,
+        accept: u64,
+        runs: &mut [PagedAttentionRun<'ctx>],
+        stream: &Stream<'ctx>,
+    ) -> Result<()> {
+        if state.layer_count()? != runs.len() {
+            return Err(invalid(
+                "runs",
+                "commit needs exactly one device run per state layer",
+            ));
+        }
+        with_paged_writers(runs, stream, |writers| state.commit(txn, accept, writers))
     }
 
     /// Single-layer form used by a standalone attention plan.

@@ -451,7 +451,7 @@ fn rejected_admission_and_host_relocation_refuse_every_allocation() {
             "sweep must reach a non-firing complete rejection"
         );
         eprintln!(
-            "task0032: host {host_bytes}: {failures} rejected-admission/relocation allocation positions refused"
+            "host {host_bytes}: {failures} rejected-admission/relocation allocation positions refused"
         );
     }
 }

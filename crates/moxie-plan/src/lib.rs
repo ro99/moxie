@@ -834,6 +834,16 @@ fn tensor_bytes(role: ValueRole, shape: &[u64]) -> Result<u64> {
         .ok_or_else(|| invalid("shape", "tensor byte count overflowed"))
 }
 
+/// Return the declared byte extent of one graph value for a step with `rows` rows.
+pub fn value_bytes(graph: &Graph, value: ValueId, rows: u64) -> Result<u64> {
+    let spec = graph
+        .spec(value)
+        .ok_or_else(|| invalid("value", "value has no declared tensor spec"))?;
+    let mut symbols = SymbolTable::new();
+    symbols.bind(graph.rows_symbol(), rows);
+    tensor_bytes(spec.role, &spec.extent(&symbols)?)
+}
+
 fn tensor_elements(shape: &[u64]) -> Result<u64> {
     shape.iter().try_fold(1u64, |total, extent| {
         total

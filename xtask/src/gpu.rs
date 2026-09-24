@@ -810,9 +810,9 @@ fn admitted_device_arena(cap: &DeviceCapability) -> Result<Outcome, Error> {
 }
 
 const CHAIN_ROWS: SymbolId = SymbolId(1_212);
-const CHAIN_ORACLE: OracleId = OracleId("task-0012-device-chain");
+const CHAIN_ORACLE: OracleId = OracleId("device-chain");
 const ATTENTION_ROWS: SymbolId = SymbolId(3_038);
-const ATTENTION_ORACLE: OracleId = OracleId("task-0038-selected-attention");
+const ATTENTION_ORACLE: OracleId = OracleId("selected-attention");
 
 fn selected_attention_graph(
     heads: u64,
@@ -827,7 +827,7 @@ fn selected_attention_graph(
         ATTENTION_ORACLE,
         OracleEvidence {
             implementation: "moxie-oracles",
-            test_module: "task-0038-selected-attention",
+            test_module: "selected-attention",
         },
     )?;
     let activation = |width| {
@@ -876,7 +876,7 @@ fn chain_graph(hidden: u64, eps: f32) -> Result<ChainFixture, Error> {
             CHAIN_ORACLE,
             OracleEvidence {
                 implementation: "moxie-oracles",
-                test_module: "task-0012-device-chain",
+                test_module: "device-chain",
             },
         )?;
     }
@@ -5765,7 +5765,7 @@ fn numerical(error: Error) -> Error {
 }
 
 #[cfg(test)]
-mod task_0012_negative_fixtures {
+mod nonfinite_metric_fixtures {
     use super::*;
 
     #[test]

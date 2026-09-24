@@ -77,7 +77,7 @@ struct Destination {
 impl Destination {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!(
-            "moxie-task0025-real-{}-{}",
+            "moxie-repack-real-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -351,7 +351,7 @@ fn the_real_module_repacks_reopens_and_reconstructs_every_value() {
         .map(|e| e.metadata().expect("a file").len())
         .sum();
     eprintln!(
-        "task0025 real module {MODULE} of {REVISION}: published {EXPECTED_CANONICAL_BYTES} \
+        "real module {MODULE} of {REVISION}: published {EXPECTED_CANONICAL_BYTES} \
          canonical byte(s) in {staged} byte(s) of directory, checked {checked} reconstructed \
          value(s) against the canonical FP32 equation and against the source's own BF16 \
          arithmetic; the source's rounding boundary moves {narrowed} of them; codes span \

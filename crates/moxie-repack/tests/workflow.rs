@@ -299,7 +299,7 @@ fn every_injected_failure_leaves_the_ledger_empty() {
         }
     }
     eprintln!(
-        "task0025 ledger cleanup: {checked} of {} boundaries failed the run and released everything",
+        "ledger cleanup: {checked} of {} boundaries failed the run and released everything",
         Site::ALL.len()
     );
     assert!(

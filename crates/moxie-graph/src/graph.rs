@@ -1171,6 +1171,11 @@ impl Graph {
     pub fn nodes(&self) -> &[Node] {
         &self.nodes
     }
+
+    pub fn producer(&self, value: ValueId) -> Option<&Node> {
+        self.nodes.iter().find(|node| node.output == value)
+    }
+
     pub fn spec(&self, v: ValueId) -> Option<&TensorSpec> {
         self.values.get(v.0 as usize)
     }

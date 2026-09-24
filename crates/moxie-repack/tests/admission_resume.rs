@@ -191,7 +191,7 @@ fn a_resume_stays_inside_the_total_it_was_admitted_for() {
     let _ = second;
 
     eprintln!(
-        "task0026 resume admission: {units} journal record(s); peak live heap {peak}; admitted \
+        "resume admission: {units} journal record(s); peak live heap {peak}; admitted \
          {admitted} = metadata {metadata} + recovery {recovery} + tiles {tiles}"
     );
     assert!(

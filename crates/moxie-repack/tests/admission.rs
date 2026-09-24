@@ -151,7 +151,7 @@ fn an_inspection_stays_inside_the_total_it_was_admitted_for() {
 
     let old_floor = budgets.metadata_floor_bytes();
     eprintln!(
-        "task0026 admission: {tensors} tensor(s) at {role_len}-byte roles, selection {} byte(s); \
+        "admission: {tensors} tensor(s) at {role_len}-byte roles, selection {} byte(s); \
          peak live heap {peak}; the constant floor this replaced was {old_floor}; admitted \
          metadata bound {bound}",
         selection_text.len()

@@ -80,10 +80,7 @@ pub fn lower_pipeline(graph: &Graph, cuts: &[usize]) -> Result<PipelineLowering,
         let crossing: Vec<_> = producers
             .iter()
             .filter_map(|(value, producer)| {
-                if *producer >= cut
-                    || graph.inputs().contains(value)
-                    || graph.weights().contains(value)
-                {
+                if *producer >= cut {
                     return None;
                 }
                 let consumed_after = consumers

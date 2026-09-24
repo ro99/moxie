@@ -79,7 +79,7 @@ fn importing_allocates_a_bounded_number_of_times_regardless_of_row_count() {
         assert_eq!(tensor.descriptor().out_features, rows);
         counts.push((rows, used));
     }
-    eprintln!("task0018 import allocations: {counts:?}");
+    eprintln!("import allocations: {counts:?}");
     // Same count at every row count: nothing is allocated per row.
     let first = counts[0].1;
     for (rows, used) in &counts {

@@ -1705,7 +1705,7 @@ fn a_quantized_launch_that_cannot_prove_completion_keeps_its_operands() {
     let code_bytes = launch.code_bytes().unwrap();
     let scale_bytes = launch.scale_bytes().unwrap();
     let mut source = Fixture {
-        artifact: ArtifactId::new("sha256:task0028-fault-fixture").unwrap(),
+        artifact: ArtifactId::new("sha256:affine-linear-fault-fixture").unwrap(),
         codes: vec![1u8; code_bytes as usize],
         scales: (0..OUT).flat_map(|_| 1.0f32.to_le_bytes()).collect(),
     };
@@ -2004,7 +2004,7 @@ fn every_allocation_in_a_quantized_admission_refuses_rather_than_aborting() {
             "sweep must reach a non-firing admission"
         );
         eprintln!(
-            "task0032 {}: all {fired_positions} admission allocation positions refused; first non-firing run equals baseline",
+            "{}: all {fired_positions} admission allocation positions refused; first non-firing run equals baseline",
             ctx.uuid()
         );
     }

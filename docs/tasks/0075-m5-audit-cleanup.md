@@ -1,8 +1,17 @@
 # Task 0075 — M5 milestone-end audit cleanup
 
-Status: **open** (coordinator, 2026-09-24). The owner chose "cleanup task,
-then package" after the milestone-end `/ponytail:ponytail-audit`. Builder
-Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-24), after sol's review round R1.
+The coordinator verified the R1 fixes directly. Builder Codex `luna`; reviewer
+Codex `sol`.
+- R1 (MEDIUM): change 6 moved the logit assertions after the commit and the
+  plan close, and it saved no lines. It was reverted and is recorded as
+  skipped.
+- R1 (LOW): the close test's rank id encoded the task number; it is now
+  `RankId(1)`.
+- Net: +382 / −337 lines. Without change 8's close-path test, the cleanup
+  removed about 95 lines, far below the audit's estimate. Change 8 fixed a
+  real latent defect: the TP worker dropped a refused paged-attention run,
+  which unloaded its CUDA module while a kernel might still run.
 
 ## Identity and authority
 
@@ -194,4 +203,55 @@ compare them with `docs/evidence/plan-comparison.md`.
 
 ## Result, filled after work
 
-- Pending.
+- Implemented changes 1–5, 7 and 8. The shared byte sizing delegates to
+  `tensor_bytes`; the producer accessor replaces the ten duplicated lookups;
+  the three commit callers use one fallible paged-writer assembly; dead
+  pipeline membership checks are gone; and task-number strings were renamed.
+  No assertion was removed or weakened.
+- Change 6 was skipped. The refactor moved logit assertions after commit and
+  plan close, so it could not preserve the assert-before-commit boundary. The
+  dense Gemma test is restored to `HEAD` except for change 7's two string
+  renames. Change 6 contributes zero net lines.
+- Change 8 now pops runs individually. A refused run becomes `DeviceLost` and
+  is forgotten, while runs not yet visited remain in `self.runs`. The existing
+  `inject_staging_failure` hook can quarantine a live two-block run, so
+  `dense_tp::workers::close_tests::quarantined_run_close_keeps_unprocessed_runs`
+  exercises the refusal and verifies the remaining run stays held.
+  Its CUDA context uses neutral `RankId(1)`.
+- Line accounting by numbered change (additions / deletions / net):
+
+  | Change | Lines | Net |
+  |---:|---:|---:|
+  | 1 | +60 / −61 | −1 |
+  | 2 | +2 / −69 | −67 |
+  | 3 | +20 / −31 | −11 |
+  | 4 | +97 / −106 | −9 |
+  | 5 | +1 / −4 | −3 |
+  | 6 (skipped) | 0 / 0 | 0 |
+  | 7 | +57 / −61 | −4 |
+  | 8 | +145 / −5 | +140 |
+  | **Total** | **+382 / −337** | **+45** |
+
+  The audit's rough 250–350-line reduction estimate was not reached. The
+  required close-path test adds 138 lines, and the dense commit rendezvous
+  preserves its two-phase status ordering while moving allocations into the
+  shared helper. Counts exclude the carried `.gitignore` and
+  `specification-version.md` edits.
+- Change 7's required grep count is 394 lines before and 342 after. A scan of
+  non-comment Rust lines found no numbered task references; remaining grep
+  matches are comments documenting provenance.
+- All four `compare-plans` commands were run twice and each pair passed
+  `cmp`. Rankings and every printed figure match
+  `docs/evidence/plan-comparison.md`; no evidence update was needed.
+- Host gates passed: `cargo fmt --all -- --check`, workspace clippy with
+  `-D warnings`, driver-feature executor clippy with `-D warnings`,
+  `cargo test --workspace --locked`, `cargo xtask arch-check` (79 negative
+  fixtures, 21 positive fixtures), and `cargo xtask spec-check`.
+- GPU gates passed with `CUDA_DEVICE_ORDER=PCI_BUS_ID`: the focused quarantined
+  close test; the full `dense_gemma_device` suite (6/6); the full
+  `dense_tp2_device` suite (1/1); and `cargo xtask-cuda test-gpu` (63/63,
+  `sm_86` and `sm_120` qualified).
+- R1 fixes: restored `dense_gemma_device.rs` except for its two change 7 string
+  renames and changed the close-test ID to `RankId(1)`. The requested rerun of
+  fmt, both clippy gates, `cargo test --workspace --locked`, the focused close
+  test and `dense_gemma_device` passed.

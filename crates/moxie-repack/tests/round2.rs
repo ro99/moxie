@@ -865,7 +865,7 @@ fn repeated_recovery_does_not_grow_the_journal() {
         std::fs::write(&shard, &bytes).expect("corrupting it");
     }
 
-    eprintln!("task0026 recovery growth: journal bytes per round {sizes:?}");
+    eprintln!("recovery growth: journal bytes per round {sizes:?}");
     assert!(
         sizes[2] <= sizes[0],
         "repeated recovery grew the journal: {sizes:?}"

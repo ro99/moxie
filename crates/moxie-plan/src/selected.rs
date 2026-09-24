@@ -597,7 +597,7 @@ pub fn lower_selected_host_experts(
         let Some(expert_node) = combine
             .inputs
             .get(1)
-            .and_then(|slots| graph.nodes().iter().find(|node| node.output == *slots))
+            .and_then(|slots| graph.producer(*slots))
         else {
             return Err(invalid(
                 "host_experts",
@@ -808,8 +808,7 @@ fn check_routed_edges(
                 let Some(route_value) = node.inputs.get(1).copied() else {
                     return Err(unsupported("ExpertMlp is missing input[1] route".into()));
                 };
-                let Some(route_node) = graph.nodes().iter().find(|n| n.output == route_value)
-                else {
+                let Some(route_node) = graph.producer(route_value) else {
                     return Err(unsupported(
                         "ExpertMlp input[1] has no Route producer".into(),
                     ));
@@ -841,8 +840,7 @@ fn check_routed_edges(
                         "Combine is missing its route or slots input".into(),
                     ));
                 };
-                let Some(route_node) = graph.nodes().iter().find(|n| n.output == route_value)
-                else {
+                let Some(route_node) = graph.producer(route_value) else {
                     return Err(unsupported("Combine input[0] has no Route producer".into()));
                 };
                 match route_node.params {
@@ -862,8 +860,7 @@ fn check_routed_edges(
                         ));
                     }
                 }
-                let Some(expert_node) = graph.nodes().iter().find(|n| n.output == slots_value)
-                else {
+                let Some(expert_node) = graph.producer(slots_value) else {
                     return Err(unsupported(
                         "Combine input[1] has no ExpertMlp producer".into(),
                     ));
@@ -1440,12 +1437,7 @@ fn dense_workspace(
             let expert = node
                 .inputs
                 .get(1)
-                .and_then(|slots| {
-                    graph
-                        .nodes()
-                        .iter()
-                        .find(|candidate| candidate.output == *slots)
-                })
+                .and_then(|slots| graph.producer(*slots))
                 .ok_or_else(|| invalid("host_experts", "host join has no ExpertMlp producer"))?;
             let moxie_graph::OpParams::ExpertMlp { intermediate, .. } = expert.params else {
                 return Err(invalid(

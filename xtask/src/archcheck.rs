@@ -3544,7 +3544,7 @@ mod tests {
         for (dir, expected) in [
             ("crates/real", true),
             // Root scratch, as `docs/README.md` declares it.
-            ("results/task0020/probe", false),
+            ("results/example/probe", false),
             ("artifacts/scratch", false),
             ("target/debug/thing", false),
             // **Not** root scratch: a crate that merely lives under a directory

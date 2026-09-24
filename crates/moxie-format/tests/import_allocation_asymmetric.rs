@@ -129,7 +129,7 @@ fn an_asymmetric_import_adds_one_fixed_allocation_and_none_per_row() {
         );
         counts.push((rows, used));
     }
-    eprintln!("task0024 asymmetric import allocations: {counts:?} (symmetric {symmetric_cost})");
+    eprintln!("asymmetric import allocations: {counts:?} (symmetric {symmetric_cost})");
     let first = counts[0].1;
     for (rows, used) in &counts {
         assert_eq!(

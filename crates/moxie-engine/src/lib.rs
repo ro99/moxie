@@ -219,12 +219,7 @@ impl Program<'_> {
             }
             symbols.bind(self.graph.rows_symbol(), maximum_rows as u64);
         }
-        let Some(output) = self
-            .graph
-            .nodes()
-            .iter()
-            .find(|n| n.output == self.graph.output())
-        else {
+        let Some(output) = self.graph.producer(self.graph.output()) else {
             return Err(invalid("graph", "missing vocabulary projection"));
         };
         let OpParams::VocabProjection { vocab, .. } = output.params else {

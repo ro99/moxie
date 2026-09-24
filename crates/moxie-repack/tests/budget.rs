@@ -354,7 +354,7 @@ fn a_repack_holds_its_budget_and_gives_every_admitted_byte_back() {
     // the measurement against it.
     let admitted = budgets.total_bytes;
     eprintln!(
-        "task0025 budget: peak live heap {peak} B, admitted {admitted} B, \
+        "budget: peak live heap {peak} B, admitted {admitted} B, \
          payload scratch {} B, units {}, published {} B",
         budgets.scratch_bytes, report.units_written, report.bytes_written
     );
@@ -469,7 +469,7 @@ fn repeated_cancellation_and_resume_grow_neither_heap_nor_disk() {
             break;
         }
     }
-    eprintln!("task0025 resume peaks: {peaks:?} B; disk after each attempt: {disks:?} B");
+    eprintln!("resume peaks: {peaks:?} B; disk after each attempt: {disks:?} B");
     // No attempt holds materially more than the first: a resume that grew the
     // working set would be one that kept what it recovered.
     let first = peaks[0];

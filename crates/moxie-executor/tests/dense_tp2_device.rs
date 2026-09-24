@@ -2098,7 +2098,7 @@ fn combined_tp2_tp1_pipeline_matches_host_and_reports_capacity_latency() {
             first_node_of_layer(&fixture.graph, 4),
         ],
     )
-    .expect("lower task-0071 three-stage PP layout");
+    .expect("lower three-stage PP layout");
     let pp_stages = pipeline_stage_graphs(&fixture, &pp_lowering);
     let mut pci_pair = pair_capabilities.clone();
     pci_pair.sort_by(|left, right| left.pci_bus_id.cmp(&right.pci_bus_id));
@@ -2147,7 +2147,7 @@ fn combined_tp2_tp1_pipeline_matches_host_and_reports_capacity_latency() {
     solo.close().expect("close one-GPU reference");
 
     println!(
-        "TASK 0072 Shape A fixture: weight-role binding bytes per GPU\nGPU | one 3090 whole graph | combined TP2+TP1 | task 0071 three-stage PP"
+        "Shape A fixture: weight-role binding bytes per GPU\nGPU | one 3090 whole graph | combined TP2+TP1 | three-stage PP"
     );
     for device in &devices {
         println!(

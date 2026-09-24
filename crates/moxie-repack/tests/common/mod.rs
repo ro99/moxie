@@ -20,7 +20,7 @@ pub struct Scratch {
 impl Scratch {
     pub fn new(label: &str) -> Self {
         let path = std::env::temp_dir().join(format!(
-            "moxie-task0025-{label}-{}-{}",
+            "moxie-repack-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

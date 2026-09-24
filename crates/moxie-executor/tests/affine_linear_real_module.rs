@@ -64,7 +64,7 @@ impl Destination {
     fn new() -> Self {
         Self {
             path: std::env::temp_dir().join(format!(
-                "moxie-task0028-real-{}-{}",
+                "moxie-real-module-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -202,7 +202,7 @@ fn a_published_canonical_int4_module_executes_and_matches_its_decoder() {
     let root = Path::new(ROOT);
     if !root.join(SHARD).exists() {
         eprintln!(
-            "SKIP task0028's real-module case: {} is not present on this machine. \
+            "SKIP real-module case: {} is not present on this machine. \
              A missing source is a blocked real lane, never acceptance.",
             root.join(SHARD).display()
         );
@@ -462,7 +462,7 @@ fn a_published_canonical_int4_module_executes_and_matches_its_decoder() {
         }
 
         eprintln!(
-            "task0028 real module {MODULE} of {REVISION} on {} {}: {} output element(s) from \
+            "real module {MODULE} of {REVISION} on {} {}: {} output element(s) from \
              a {OUT_FEATURES}x{IN_FEATURES} group-32 asymmetric INT4 weight, worst \
              {worst_ulp:.3} ULP, {cancelled} covered by the cancellation clause; {footprint} \
              device byte(s) against {dequantized} for a BF16 copy. Synthetic activations: \
@@ -492,7 +492,7 @@ fn a_published_canonical_int4_module_executes_and_matches_its_decoder() {
         );
     }
     eprintln!(
-        "task0028 real module: published in {:.1}s and executed on {count} device(s).",
+        "real module: published in {:.1}s and executed on {count} device(s).",
         published_in.as_secs_f64()
     );
 }

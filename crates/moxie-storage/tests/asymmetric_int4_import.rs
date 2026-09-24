@@ -464,7 +464,7 @@ fn the_declared_packing_parameters_match_each_artifacts_own_config() {
             w["actorder"]
         );
         eprintln!(
-            "task0024 {}: int4 asymmetric group 32, compressor {}",
+            "{}: int4 asymmetric group 32, compressor {}",
             source.name, source.compressor
         );
         checked += 1;
@@ -598,7 +598,7 @@ fn real_asymmetric_tensors_import_and_match_the_sources_own_arithmetic() {
                 "{module} codes span [{low}, {high}], not the full INT4 range"
             );
             eprintln!(
-                "task0024 imported {}::{module}: logical={:?} groups={groups} \
+                "imported {}::{module}: logical={:?} groups={groups} \
                  zero_point={:?} scale={}",
                 source.name,
                 p.logical,
@@ -612,7 +612,7 @@ fn real_asymmetric_tensors_import_and_match_the_sources_own_arithmetic() {
         return eprintln!("SKIPPED: no asymmetric artifact is present on this machine");
     }
     eprintln!(
-        "task0024 imported {imported} module(s), read {bytes_read} artifact byte(s), \
+        "imported {imported} module(s), read {bytes_read} artifact byte(s), \
          checked {values_checked} reconstructed value(s) against the canonical FP32 \
          equation and against the source's own BF16 arithmetic; the source's rounding \
          boundary moves {narrowed} of them"
@@ -737,7 +737,7 @@ fn the_pinned_zero_point_lane_assignment_is_the_one_the_artifacts_bytes_support(
                 deviations.push((*name, total / n as f64));
             }
             eprintln!(
-                "task0024 {}::{module} zero-point assignment mean|mean_code - z|: {:?}",
+                "{}::{module} zero-point assignment mean|mean_code - z|: {:?}",
                 source.name, deviations
             );
             let pinned = deviations[0].1;
@@ -849,7 +849,7 @@ fn every_asymmetric_module_declares_a_packed_zero_point() {
             source.name
         );
         eprintln!(
-            "task0024 {}: {} asymmetric module(s), every one packing its zero points along \
+            "{}: {} asymmetric module(s), every one packing its zero points along \
              the output axis; {whole} of them have all four tensors in one shard",
             source.name,
             inventory.modules.len()
@@ -944,7 +944,7 @@ fn missing_companions_names_every_absent_tensor() {
 /// A scratch directory under the system temp root, named for this test.
 fn scratch_dir(what: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "moxie-task0024-{what}-{}-{}",
+        "moxie-import-{what}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

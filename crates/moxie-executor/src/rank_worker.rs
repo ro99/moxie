@@ -10,16 +10,14 @@ use moxie_graph::Graph;
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_plan::{Phase, ResourceWorkload, lower_selected_ordered};
 use moxie_state::{DeviceKvSequence, KvGeometry, PreparedCommit};
-use moxie_types::{
-    DeviceCapability, Error, KernelCatalogue, PagedKvWriter, RankId, Result, StateTransactionId,
-};
+use moxie_types::{DeviceCapability, Error, KernelCatalogue, RankId, Result, StateTransactionId};
 
 use crate::chain::{OwnedBinding, SelectedAdmitRefused, SelectedReservedPlan};
 use crate::dense::{DenseGraphStep, DensePlanRunRefused};
 use crate::dense_tp::workers::{
     admit_worker_runs, commit_capacity_error, device_lost, park_lost, recv_until,
 };
-use crate::paged_attention::device::{PagedAttentionRun, PagedKvWriterAdapter};
+use crate::paged_attention::device::{PagedAttentionRun, with_paged_writers};
 
 #[derive(Debug, Clone)]
 pub struct SoloRankWorkerConfig {
@@ -443,37 +441,26 @@ impl WorkerState<'_> {
                 "apply needs an open, prepared transaction",
             ));
         }
-        let mut adapters = Vec::<PagedKvWriterAdapter<'_, '_>>::new();
-        adapters
-            .try_reserve_exact(self.runs.len())
-            .map_err(|_| commit_capacity_error(self.runs.len()))?;
-        for (layer, run) in self.runs.iter_mut().enumerate() {
-            adapters.push(PagedKvWriterAdapter::new(
-                layer,
-                run,
-                self.stream,
-                Vec::new(),
-                Vec::new(),
-            ));
+        let run_count = self.runs.len();
+        let stream = self.stream;
+        let ordinal = self.context.ordinal();
+        let mut callback_entered = false;
+        let prepared_slot = &mut self.prepared;
+        let state = &mut self.state;
+        let result = with_paged_writers(&mut self.runs, stream, |writers| {
+            callback_entered = true;
+            let prepared = prepared_slot.take().expect("checked prepared commit");
+            state.apply_commit(prepared, writers)
+        });
+        if !callback_entered {
+            return Err(commit_capacity_error(run_count));
         }
-        let mut writers = Vec::<&mut dyn PagedKvWriter>::new();
-        writers
-            .try_reserve_exact(adapters.len())
-            .map_err(|_| commit_capacity_error(adapters.len()))?;
-        writers.extend(
-            adapters
-                .iter_mut()
-                .map(|adapter| adapter as &mut dyn PagedKvWriter),
-        );
-        let prepared = self.prepared.take().expect("checked prepared commit");
-        self.state
-            .apply_commit(prepared, &mut writers)
-            .map_err(|error| {
-                device_lost(
-                    self.context.ordinal(),
-                    format!("prepared commit publication failed ({error}); state may diverge"),
-                )
-            })?;
+        result.map_err(|error| {
+            device_lost(
+                ordinal,
+                format!("prepared commit publication failed ({error}); state may diverge"),
+            )
+        })?;
         self.transaction = None;
         Ok(())
     }

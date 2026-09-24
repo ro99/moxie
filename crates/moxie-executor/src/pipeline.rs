@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use moxie_graph::{Graph, OracleRegistry, ValueId, ValueRole};
 use moxie_plan::{
     PipelineLowering, StageGraph, build_stage_graph, lower_pipeline, lower_tensor_parallel,
-    wavefront,
+    value_bytes as plan_value_bytes, wavefront,
 };
 use moxie_types::{Error, KernelCatalogue, Result, SymbolTable, TensorLayout};
 
@@ -535,7 +535,7 @@ fn value_extent(graph: &Graph, value: ValueId, rows: u64) -> Result<(ValueRole, 
     let spec = graph
         .spec(value)
         .ok_or_else(|| invalid("pipeline value", "value has no declared tensor spec"))?;
-    let ValueRole::Activation(precision) = spec.role else {
+    let ValueRole::Activation(_) = spec.role else {
         return Err(invalid(
             "pipeline value",
             "pipeline output is not a declared activation",
@@ -544,22 +544,9 @@ fn value_extent(graph: &Graph, value: ValueId, rows: u64) -> Result<(ValueRole, 
     let mut symbols = SymbolTable::new();
     symbols.bind(graph.rows_symbol(), rows);
     let shape = spec
-        .shape
-        .iter()
-        .map(|dim| {
-            dim.eval(&symbols)
-                .map_err(|_| invalid("pipeline value", "unresolved dimension"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let elements = shape.iter().try_fold(1u64, |total, dim| {
-        total
-            .checked_mul(*dim)
-            .ok_or_else(|| invalid("pipeline value", "declared extent overflowed"))
-    })?;
-    let bytes_per_element = u64::from(precision.get().bits() / 8);
-    let bytes = elements
-        .checked_mul(bytes_per_element)
-        .ok_or_else(|| invalid("pipeline value", "declared byte extent overflowed"))?;
+        .extent(&symbols)
+        .map_err(|_| invalid("pipeline value", "unresolved dimension"))?;
+    let bytes = plan_value_bytes(graph, value, rows)?;
     Ok((spec.role, shape, bytes))
 }
 

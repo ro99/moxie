@@ -985,7 +985,7 @@ fn repeated_decode_admits_nothing_further() {
         );
     }
     eprintln!(
-        "task0038 decode allocation evidence: steps={STEPS} max_calls={max_calls} \
+        "decode allocation evidence: steps={STEPS} max_calls={max_calls} \
          max_peak={max_peak}B max_net={max_net}B max_live_growth={max_live_growth}B \
          metadata_bound={metadata_growth_bound}B"
     );

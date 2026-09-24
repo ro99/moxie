@@ -703,7 +703,7 @@ fn the_declared_geometry_matches_the_artifact_config() {
     assert_eq!(w["group_size"].as_u64().unwrap(), 32);
     assert!(
         !w["symmetric"].as_bool().unwrap(),
-        "asymmetric, which task 0024's importer reads through \
+        "asymmetric, which the importer reads through \
          `ZeroPointSource::PackedAlongOutput`"
     );
 }

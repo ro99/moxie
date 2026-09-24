@@ -969,9 +969,7 @@ fn enqueue_dense<'ctx>(
                     .candidate();
                 let slots_value = node.inputs[1];
                 let expert_node = graph
-                    .nodes()
-                    .iter()
-                    .find(|producer| producer.output == slots_value)
+                    .producer(slots_value)
                     .ok_or_else(|| invalid("combine", "expert slots have no producer"))?;
                 let OpParams::ExpertMlp {
                     experts,
@@ -1414,7 +1412,7 @@ fn validate_host_expert_weights(
         let expert = combine
             .inputs
             .get(1)
-            .and_then(|slots| graph.nodes().iter().find(|node| node.output == *slots))
+            .and_then(|slots| graph.producer(*slots))
             .ok_or_else(|| invalid("host_experts", "host join has no ExpertMlp producer"))?;
         let moxie_graph::OpParams::ExpertMlp {
             hidden,

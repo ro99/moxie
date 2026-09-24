@@ -209,9 +209,7 @@ fn seeded_statistical_bins_under_predeclared_bound() {
         for step in 0..100000 {
             counts[d.draw(33377335, step, false).unwrap() as usize] += 1;
         }
-        eprintln!(
-            "task0014 bins p={p:?} counts={counts:?} n=100000 epsilon={epsilon} seed=33377335"
-        );
+        eprintln!("bins p={p:?} counts={counts:?} n=100000 epsilon={epsilon} seed=33377335");
         for (&n, &want) in counts.iter().zip(&p) {
             assert!((n as f64 / 100000. - want).abs() <= epsilon);
         }

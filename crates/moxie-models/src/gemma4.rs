@@ -1588,7 +1588,7 @@ mod tests {
         let model = Gemma4Text::reduced(config, "synthetic-routed").unwrap();
         let composed = model.compose(&oracles_registry(), SymbolId(0)).unwrap();
         let nodes = composed.graph.nodes();
-        let producer = |v: ValueId| nodes.iter().find(|n| n.output == v);
+        let producer = |v: ValueId| composed.graph.producer(v);
 
         let ffn_norm_2: Vec<ValueId> = composed
             .weights

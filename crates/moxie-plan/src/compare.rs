@@ -7,6 +7,7 @@ use moxie_types::{DeviceUuid, Error, Result, SymbolTable};
 
 use crate::{
     Endpoint, Join, Stage, TopologyCosts, build_stage_graph, lower_pipeline, lower_tensor_parallel,
+    value_bytes,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,27 +350,13 @@ fn prefix_weight_bytes(graph: &Graph) -> Result<Vec<u64>> {
         for &weight in &node.inputs {
             if graph.weights().contains(&weight) && seen.insert(weight) {
                 total = total
-                    .checked_add(weight_bytes(graph, weight)?)
+                    .checked_add(value_bytes(graph, weight, 1)?)
                     .ok_or_else(|| invalid("weight-byte prefix overflowed"))?;
             }
         }
         prefixes.push(total);
     }
     Ok(prefixes)
-}
-
-fn weight_bytes(graph: &Graph, weight: moxie_graph::ValueId) -> Result<u64> {
-    let spec = graph
-        .spec(weight)
-        .ok_or_else(|| invalid("weight has no tensor spec"))?;
-    let elements = spec.shape.iter().try_fold(1_u64, |product, dim| {
-        product
-            .checked_mul(eval_dim(graph, dim)?)
-            .ok_or_else(|| invalid("weight element count overflowed"))
-    })?;
-    elements
-        .checked_mul(2)
-        .ok_or_else(|| invalid("BF16 weight-byte count overflowed"))
 }
 
 fn plan_stages(kind: &CandidateKind, node_count: usize) -> Vec<PlanStage> {
@@ -589,9 +576,20 @@ fn add_meter(target: &mut RankMeter, source: &RankMeter) -> std::result::Result<
 
 fn stage_meter(graph: &Graph, device: DeviceUuid, costs: &TopologyCosts) -> Result<RankMeter> {
     let weight_bytes = graph.weights().iter().try_fold(0_u64, |sum, &weight| {
-        sum.checked_add(weight_bytes(graph, weight)?)
+        sum.checked_add(value_bytes(graph, weight, 1)?)
             .ok_or_else(|| invalid("stage weight-byte total overflowed"))
     })?;
+    let mut symbols = SymbolTable::new();
+    symbols.bind(graph.rows_symbol(), 1);
+    let width_of = |value| -> Result<u64> {
+        graph
+            .spec(value)
+            .ok_or_else(|| invalid("activation has no width dimension"))?
+            .extent(&symbols)?
+            .last()
+            .copied()
+            .ok_or_else(|| invalid("activation has no width dimension"))
+    };
     let kv = graph
         .nodes()
         .iter()
@@ -600,8 +598,8 @@ fn stage_meter(graph: &Graph, device: DeviceUuid, costs: &TopologyCosts) -> Resu
             _ => None,
         })
         .map(|(node, visibility)| {
-            let width = last_width(graph, node.inputs[1])?
-                .checked_add(last_width(graph, node.inputs[2])?)
+            let width = width_of(node.inputs[1])?
+                .checked_add(width_of(node.inputs[2])?)
                 .and_then(|width| width.checked_mul(2))
                 .ok_or_else(|| invalid("KV bytes per row overflowed"))?;
             Ok(KvRead {
@@ -619,21 +617,6 @@ fn stage_meter(graph: &Graph, device: DeviceUuid, costs: &TopologyCosts) -> Resu
         memory_gbps: costs.device(device).unwrap().memory_gbps,
         kv,
     })
-}
-
-fn last_width(graph: &Graph, value: moxie_graph::ValueId) -> Result<u64> {
-    let dim = graph
-        .spec(value)
-        .and_then(|spec| spec.shape.last())
-        .ok_or_else(|| invalid("activation has no width dimension"))?;
-    eval_dim(graph, dim)
-}
-
-fn eval_dim(graph: &Graph, dim: &moxie_types::Dim) -> Result<u64> {
-    let mut symbols = SymbolTable::new();
-    symbols.bind(graph.rows_symbol(), 1);
-    dim.eval(&symbols)
-        .map_err(|error| invalid(error.to_string()))
 }
 
 fn kv_storage(kv: &[KvRead], context: u64) -> Result<u64> {
@@ -669,81 +652,16 @@ fn stage_time(stage: &StageMeter, context: u64) -> f64 {
 }
 
 fn sum_stage_decode(stage: &StageMeter, first: u64, count: u64) -> f64 {
-    let end = first.saturating_add(count);
-    if count == 0 {
-        return 0.0;
-    }
-    let mut boundaries = vec![first, end];
-    boundaries.extend(
-        stage
-            .meters
-            .iter()
-            .flat_map(|rank| &rank.kv)
-            .filter_map(|read| {
-                let after = read.window?.saturating_add(1);
-                (after > first && after < end).then_some(after)
-            }),
-    );
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    boundaries
-        .windows(2)
-        .map(|range| sum_stage_segment(stage, range[0], range[1]))
-        .sum()
-}
-
-fn rank_line(rank: &RankMeter, start: u64) -> (f64, f64) {
-    let (mut slope, mut intercept) = (0.0, rank.weight_bytes as f64);
-    for read in &rank.kv {
-        if let Some(window) = read.window.filter(|window| start > *window) {
-            intercept += read.bytes_per_row as f64 * window as f64;
-        } else {
-            slope += read.bytes_per_row as f64;
-        }
-    }
-    let scale = 1.0 / (rank.memory_gbps * 1_000_000.0);
-    (slope * scale, intercept * scale)
-}
-
-fn sum_stage_segment(stage: &StageMeter, lo: u64, hi: u64) -> f64 {
-    match stage.meters.as_slice() {
-        [rank] => sum_line(rank_line(rank, lo), lo, hi),
-        [a, b] => sum_max_pair(rank_line(a, lo), rank_line(b, lo), lo, hi),
-        _ => unreachable!("a stage has one device or a two-rank pair"),
-    }
-}
-
-fn sum_max_pair(a: (f64, f64), b: (f64, f64), lo: u64, hi: u64) -> f64 {
-    let value = |(slope, intercept): (f64, f64), at: u64| slope * at as f64 + intercept;
-    if a.0 == b.0 {
-        return sum_line(if value(a, lo) >= value(b, lo) { a } else { b }, lo, hi);
-    }
-    let a_grows = a.0 > b.0;
-    let crossing = (b.1 - a.1) / (a.0 - b.0);
-    let split = (if a_grows {
-        crossing.ceil()
-    } else {
-        crossing.floor() + 1.0
-    })
-    .max(lo as f64)
-    .min(hi as f64) as u64;
-    let (before, after) = if a_grows { (b, a) } else { (a, b) };
-    sum_line(before, lo, split) + sum_line(after, split, hi)
-}
-
-fn sum_line((slope, intercept): (f64, f64), lo: u64, hi: u64) -> f64 {
-    if lo == hi {
-        return 0.0;
-    }
-    let count = (hi - lo) as f64;
-    let sum_context = count * (lo as f64 + (hi - 1) as f64) / 2.0;
-    slope * sum_context + intercept * count
+    // ponytail: generated-token counts are small; direct summation is clearer.
+    (0..count).map(|step| stage_time(stage, first + step)).sum()
 }
 
 fn collective_widths(
     graph: &Graph,
     lowering: &crate::TensorParallelLowering,
 ) -> std::result::Result<Vec<u64>, String> {
+    let mut symbols = SymbolTable::new();
+    symbols.bind(graph.rows_symbol(), 1);
     lowering
         .stages
         .iter()
@@ -755,7 +673,14 @@ fn collective_widths(
             let output = match join {
                 Join::Gather { output } | Join::Reduce { output } => *output,
             };
-            let width = last_width(graph, output).map_err(|error| error.to_string())?;
+            let width = graph
+                .spec(output)
+                .ok_or_else(|| "activation has no width dimension".to_string())?
+                .extent(&symbols)
+                .map_err(|error| error.to_string())?
+                .last()
+                .copied()
+                .ok_or_else(|| "activation has no width dimension".to_string())?;
             Ok(match join {
                 Join::Gather { .. } if width % 2 == 0 => width / 2,
                 Join::Gather { .. } => return Err("gather width does not divide over TP2".into()),
@@ -802,10 +727,19 @@ fn transfer_time(
     rows: u64,
 ) -> std::result::Result<f64, String> {
     let mut total = 0.0;
+    let mut symbols = SymbolTable::new();
+    symbols.bind(graph.rows_symbol(), 1);
     for (source, destination) in stages.windows(2).map(|pair| (&pair[0], &pair[1])) {
         let (src, dst) = (source.devices[0], destination.devices[0]);
         let output = graph.nodes()[source.nodes.end - 1].output;
-        let width = last_width(graph, output).map_err(|error| error.to_string())?;
+        let width = graph
+            .spec(output)
+            .ok_or_else(|| "activation has no width dimension".to_string())?
+            .extent(&symbols)
+            .map_err(|error| error.to_string())?
+            .last()
+            .copied()
+            .ok_or_else(|| "activation has no width dimension".to_string())?;
         let bytes = rows
             .checked_mul(width)
             .and_then(|value| value.checked_mul(2))

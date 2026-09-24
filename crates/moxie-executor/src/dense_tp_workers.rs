@@ -13,7 +13,10 @@ use moxie_cuda::{
 };
 use moxie_graph::{Graph, LinearInputSlice, OracleRegistry, ValueId, ValueRole};
 use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSpan};
-use moxie_plan::{Join, Stage, StageGraph, TensorParallelLowering, build_stage_graph};
+use moxie_plan::{
+    Join, Stage, StageGraph, TensorParallelLowering, build_stage_graph,
+    value_bytes as plan_value_bytes,
+};
 use moxie_state::{DeviceKvSequence, KvGeometry, PreparedCommit};
 use moxie_types::{
     DeviceCapability, DeviceTier, Error, KernelCatalogue, PagedKvWriter, Precision, RankId, Result,
@@ -23,7 +26,7 @@ use moxie_types::{
 use crate::arena::{DeviceArena, DeviceRange, OperationLease};
 use crate::chain::{OwnedBinding, SelectedAdmitRefused, SelectedCompletion, SelectedReservedPlan};
 use crate::dense::{DenseGraphStep, DenseOperation};
-use crate::paged_attention::device::{PagedAttentionRun, PagedKvWriterAdapter, Staging};
+use crate::paged_attention::device::{PagedAttentionRun, Staging, with_paged_writers};
 #[cfg(feature = "paged-attention-binding")]
 use crate::tensor_parallel::{RankDeclaration, RankRendezvous};
 
@@ -646,15 +649,13 @@ impl DenseRankWorkers {
                     }
                 }
             }
-            let element_bytes = match graph
+            let output_spec = graph
                 .spec(graph.output())
-                .ok_or_else(|| invalid("logits", "the output has no tensor spec"))?
-                .role
-            {
-                ValueRole::Activation(precision) => u64::from(precision.get().bits() / 8),
-                _ => 4,
+                .ok_or_else(|| invalid("logits", "the output has no tensor spec"))?;
+            let bytes = match output_spec.role {
+                ValueRole::Activation(_) => plan_value_bytes(graph, graph.output(), rows)?,
+                _ => value_bytes(graph, graph.output(), rows, 4)?,
             };
-            let bytes = value_bytes(graph, graph.output(), rows, element_bytes)?;
             let outputs = self.pair_command(
                 [
                     WorkerCommand::ReadOutput {
@@ -1466,35 +1467,6 @@ fn worker_commit<'ctx>(
         _ => {}
     }
 
-    let mut adapters = Vec::<PagedKvWriterAdapter<'_, 'ctx>>::new();
-    if preparation_error.is_none() {
-        if adapters.try_reserve_exact(worker.runs.len()).is_err() {
-            preparation_error = Some(commit_capacity_error(worker.runs.len()));
-        } else {
-            for (layer, run) in worker.runs.iter_mut().enumerate() {
-                adapters.push(PagedKvWriterAdapter::new(
-                    layer,
-                    run,
-                    worker.stream,
-                    Vec::new(),
-                    Vec::new(),
-                ));
-            }
-        }
-    }
-    let mut writers = Vec::<&mut dyn PagedKvWriter>::new();
-    if preparation_error.is_none() {
-        if writers.try_reserve_exact(adapters.len()).is_err() {
-            preparation_error = Some(commit_capacity_error(adapters.len()));
-        } else {
-            writers.extend(
-                adapters
-                    .iter_mut()
-                    .map(|adapter| adapter as &mut dyn PagedKvWriter),
-            );
-        }
-    }
-    let prepare_status = preparation_error.map_or(Ok(()), Err);
     let prepare_declaration = RankDeclaration {
         sequence,
         operation: OP_COMMIT_PREPARE,
@@ -1502,34 +1474,13 @@ fn worker_commit<'ctx>(
         shape: [0; 4],
         precision: Precision::F32,
     };
-    if let Err(error) = rendezvous.enter(rank, prepare_declaration, prepare_status, deadline) {
-        return (Err(error), 1);
-    }
-
-    let Some(prepared) = prepared else {
+    if let Some(error) = preparation_error {
         return (
-            Err(invalid(
-                "prepared_commit",
-                "commit prepare returned no handle",
-            )),
+            rendezvous.enter(rank, prepare_declaration, Err(error), deadline),
             1,
         );
-    };
-    let applied = worker
-        .state
-        .apply_commit(prepared, &mut writers)
-        .map_err(|error| {
-            device_lost(
-                worker.ctx.ordinal(),
-                format!("prepared commit publication failed ({error}); rank state may diverge"),
-            )
-        });
-    if applied.is_ok() {
-        worker.transaction = None;
-        if let Ok(rows) = worker.state.committed_rows() {
-            committed_frontier.store(rows, Ordering::Release);
-        }
     }
+
     let apply_declaration = RankDeclaration {
         sequence: sequence.saturating_add(1),
         operation: OP_COMMIT_APPLY,
@@ -1537,10 +1488,55 @@ fn worker_commit<'ctx>(
         shape: [0; 4],
         precision: Precision::F32,
     };
-    (
-        rendezvous.enter(rank, apply_declaration, applied, deadline),
-        2,
-    )
+    let run_count = worker.runs.len();
+    let stream = worker.stream;
+    let ordinal = worker.ctx.ordinal();
+    let state = &mut worker.state;
+    let transaction_slot = &mut worker.transaction;
+    let mut callback_entered = false;
+    let result = with_paged_writers(&mut worker.runs, stream, |writers| {
+        callback_entered = true;
+        if let Err(error) = rendezvous.enter(rank, prepare_declaration, Ok(()), deadline) {
+            return Ok((Err(error), 1));
+        }
+        let Some(prepared) = prepared else {
+            return Ok((
+                Err(invalid(
+                    "prepared_commit",
+                    "commit prepare returned no handle",
+                )),
+                1,
+            ));
+        };
+        let applied = state.apply_commit(prepared, writers).map_err(|error| {
+            device_lost(
+                ordinal,
+                format!("prepared commit publication failed ({error}); rank state may diverge"),
+            )
+        });
+        if applied.is_ok() {
+            *transaction_slot = None;
+            if let Ok(rows) = state.committed_rows() {
+                committed_frontier.store(rows, Ordering::Release);
+            }
+        }
+        Ok((
+            rendezvous.enter(rank, apply_declaration, applied, deadline),
+            2,
+        ))
+    });
+    if !callback_entered {
+        return (
+            rendezvous.enter(
+                rank,
+                prepare_declaration,
+                Err(commit_capacity_error(run_count)),
+                deadline,
+            ),
+            1,
+        );
+    }
+    result.expect("paged-writer callback returns its rendezvous result")
 }
 
 pub(crate) fn commit_capacity_error(count: usize) -> Error {
@@ -2160,13 +2156,15 @@ impl<'ctx> WorkerState<'ctx> {
                 "worker shutdown found an unsettled step".into(),
             ));
         }
-        for run in self.runs.drain(..) {
-            run.close(&mut self.ledger).map_err(|refused| {
-                device_lost(
+        while let Some(run) = self.runs.pop() {
+            if let Err(refused) = run.close(&mut self.ledger) {
+                let error = device_lost(
                     self.ctx.ordinal(),
                     format!("attention run could not close ({})", refused.error),
-                )
-            })?;
+                );
+                std::mem::forget(refused.run);
+                return Err(error);
+            }
         }
         if !self.ledger.outstanding().is_empty() {
             return Err(device_lost(
@@ -2376,5 +2374,143 @@ fn invalid(field: &'static str, detail: &str) -> Error {
     Error::InvalidRequest {
         field,
         detail: detail.into(),
+    }
+}
+
+#[cfg(feature = "paged-attention-test-hooks")]
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    #[test]
+    fn quarantined_run_close_keeps_unprocessed_runs() {
+        let ordinal = 0;
+        let context = RankContext::acquire(RankId(1), ordinal).expect("rank context");
+        let capability = moxie_cuda::query_device(ordinal).expect("device capability");
+        let stream = Stream::new(&context).expect("stream");
+        let device =
+            CapacitySnapshot::measured(&context.measure().expect("device measure"), 1 << 20)
+                .expect("device capacity");
+        let host =
+            CapacitySnapshot::measured_host(&moxie_host::read().expect("host measure"), 1 << 20)
+                .expect("host capacity");
+        let mut ledger = Ledger::new([device, host]).expect("ledger");
+        let geometry = crate::paged_attention::PageGeometry {
+            kv_heads: 2,
+            head_dim: 64,
+            page_tokens: 8,
+            pages: 1,
+        };
+        let layer = crate::paged_attention::AttentionLayer {
+            geometry,
+            heads: 4,
+            scale: moxie_plan::reciprocal_sqrt_scale(64),
+            visibility: moxie_graph::Visibility::Causal,
+        };
+        let probe = crate::paged_attention::PagedAttentionLaunch::new(layer, 1, 0, 0, 1)
+            .expect("kernel probe");
+        let catalogue = moxie_kernels::paged_attention_catalogue();
+        let descriptor = crate::select_paged_attention_kernel(&catalogue, &capability, &probe)
+            .expect("paged attention descriptor");
+        let mut state = DeviceKvSequence::new(KvGeometry {
+            layers: vec![moxie_state::LayerKv {
+                kv_heads: 2,
+                key_dim: 64,
+                value_dim: 64,
+                retention: moxie_state::Retention::All,
+            }],
+            precision: moxie_types::Precision::Bf16,
+            page_tokens: 8,
+            max_tokens: 8,
+            tentative_rows: 8,
+        })
+        .expect("device state");
+        let mut quarantined = PagedAttentionRun::admit_for_sequence(
+            &mut ledger,
+            &context,
+            descriptor.clone(),
+            geometry,
+            4,
+            8,
+            9,
+            Staging::TwoBlock,
+        )
+        .map_err(|refused| refused.error)
+        .expect("quarantine test run");
+        let normal = PagedAttentionRun::admit(
+            &mut ledger,
+            &context,
+            descriptor,
+            geometry,
+            4,
+            8,
+            Staging::DeviceHandles,
+        )
+        .map_err(|refused| refused.error)
+        .expect("remaining run");
+        let transaction = state.begin().expect("append transaction");
+        let row_bytes = 2 * 64 * 2;
+        crate::paged_attention::device::append_paged_layer(
+            &mut state,
+            transaction,
+            0,
+            8,
+            &mut quarantined,
+            &stream,
+            crate::paged_attention::device::PagedKvRows {
+                keys: vec![0; 8 * row_bytes],
+                values: vec![0; 8 * row_bytes],
+            },
+        )
+        .map_err(|refused| refused.error)
+        .expect("publish resident rows");
+        crate::paged_attention::device::commit_paged_layer(
+            &mut state,
+            transaction,
+            8,
+            &mut quarantined,
+            &stream,
+        )
+        .expect("commit resident rows");
+        quarantined.inject_staging_failure();
+        let launch =
+            crate::paged_attention::PagedAttentionLaunch::two_block_stream(layer, 1, 15, 0, 8)
+                .expect("two-block launch");
+        let refused = quarantined
+            .attend_two_block(
+                &stream,
+                &launch,
+                vec![0; 4 * 64 * 2],
+                vec![0; 8 * row_bytes],
+                vec![0; 8 * row_bytes],
+            )
+            .expect_err("injected staging failure was accepted");
+        assert!(refused.retained_source());
+
+        let mut worker = WorkerState {
+            ctx: &context,
+            capability,
+            stream: &stream,
+            ledger,
+            state,
+            runs: vec![normal, quarantined],
+            held: Held::default(),
+            transaction: None,
+            temp: None,
+            rank: 0,
+        };
+        assert!(matches!(worker.close_runs(), Err(Error::DeviceLost { .. })));
+        assert_eq!(worker.runs.len(), 1);
+        worker
+            .runs
+            .pop()
+            .expect("unprocessed run remains held")
+            .close(&mut worker.ledger)
+            .unwrap();
+        assert!(!worker.ledger.outstanding().is_empty());
+
+        std::mem::forget(worker);
+        std::mem::forget(stream);
+        std::mem::forget(context);
     }
 }

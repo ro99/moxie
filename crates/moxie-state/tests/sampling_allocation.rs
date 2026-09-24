@@ -135,6 +135,6 @@ fn admitted_history_has_no_token_allocations_and_complete_fault_cleanup() {
     assert!(ledger.outstanding().is_empty());
     assert_eq!(ledger.scope_committed(Scope::Host), 0);
     eprintln!(
-        "task0014 actual_history=32768 kv_rows=32769 history_bytes={history} workspace_bytes={workspace} backing_bytes={backing} admitted_bytes={total} token_allocations=0 abort_cycles=10000 retained_growth=0 close_live_delta=0 allocation_failures=2"
+        "actual_history=32768 kv_rows=32769 history_bytes={history} workspace_bytes={workspace} backing_bytes={backing} admitted_bytes={total} token_allocations=0 abort_cycles=10000 retained_growth=0 close_live_delta=0 allocation_failures=2"
     );
 }

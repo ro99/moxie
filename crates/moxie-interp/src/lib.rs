@@ -1407,13 +1407,12 @@ impl Interpreter {
                 let mut out = try_vec(table.rows() * width)?;
                 let reduction = combine_orders.get(&node.id).copied();
                 let experts_total = if let Some(reduction) = reduction {
-                    let producer = graph
-                        .nodes()
-                        .iter()
-                        .find(|candidate| candidate.output == node.inputs[1])
-                        .ok_or_else(|| Error::InvalidArtifact {
-                            detail: "combine slots have no producing node".into(),
-                        })?;
+                    let producer =
+                        graph
+                            .producer(node.inputs[1])
+                            .ok_or_else(|| Error::InvalidArtifact {
+                                detail: "combine slots have no producing node".into(),
+                            })?;
                     let OpParams::ExpertMlp { experts, .. } = producer.params else {
                         return Err(Error::InvalidArtifact {
                             detail: "combine slots are not produced by ExpertMlp".into(),

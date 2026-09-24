@@ -181,7 +181,7 @@ fn every_allocation_position_in_an_import_is_a_typed_error() {
             swept.push((width, zero_points, positions));
         }
     }
-    eprintln!("task0024 import allocation positions swept: {swept:?}");
+    eprintln!("import allocation positions swept: {swept:?}");
     // The asymmetric path must have strictly more positions than the symmetric
     // one, or the new collection is not on this path and the sweep is not
     // reaching it.
@@ -346,7 +346,7 @@ fn every_refusal_is_a_typed_error_with_every_allocation_refused() {
         }
     }
     eprintln!(
-        "task0024 refusal sweep: {} case(s), {swept} allocation position(s) refused",
+        "refusal sweep: {} case(s), {swept} allocation position(s) refused",
         cases.len()
     );
     assert!(
@@ -468,7 +468,7 @@ fn every_allocation_position_in_source_entries_is_a_typed_error() {
             swept += 1;
         }
     }
-    eprintln!("task0024 source_entries sweep: {swept} allocation position(s) refused");
+    eprintln!("source_entries sweep: {swept} allocation position(s) refused");
     assert!(swept >= 5, "every case must have had positions refused");
 }
 

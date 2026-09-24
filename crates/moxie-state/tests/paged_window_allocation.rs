@@ -136,7 +136,7 @@ fn a_windowed_layer_is_admitted_for_its_window_not_for_the_context() {
         "close frees payload and control storage"
     );
     eprintln!(
-        "task0017 storage evidence (windowed): actual_rows=32768 max_tokens={} window={window} \
+        "storage evidence (windowed): actual_rows=32768 max_tokens={} window={window} \
          tentative_rows={tentative} page_tokens={} backing_bytes={} full_retention_backing={} \
          table_bytes={} control_reserve_bytes={} append_allocations=0",
         geometry.max_tokens,

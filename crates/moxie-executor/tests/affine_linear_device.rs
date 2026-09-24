@@ -475,7 +475,7 @@ fn a_canonical_affine_weight_executes_on_every_visible_device() {
         exercised.push(format!("{} ({})", capability.uuid, capability.sm()));
     }
     eprintln!(
-        "task0028: {} case(s) on {} device(s): {}. Synthetic weights and activations; \
+        "affine linear: {} case(s) on {} device(s): {}. Synthetic weights and activations; \
          this is execution, not model support.",
         CASES.len(),
         count,
@@ -554,7 +554,7 @@ fn run_case<'ctx>(
     .unwrap();
     let mut residency = DeviceResidency::create(ctx, &mut authority).unwrap();
     let mut source = Fixture {
-        artifact: ArtifactId::new("sha256:task0028-synthetic-affine-fixture").unwrap(),
+        artifact: ArtifactId::new("sha256:synthetic-affine-fixture").unwrap(),
         components: components(&tensor),
     };
 
@@ -667,7 +667,7 @@ fn run_case<'ctx>(
     let measured =
         compare(&got, &want, &terms).unwrap_or_else(|why| panic!("{}: {why}", case.name));
     eprintln!(
-        "task0028 {} on {} {}: {} element(s), worst {:.3} ULP, {} covered by the \
+        "affine linear {} on {} {}: {} element(s), worst {:.3} ULP, {} covered by the \
          cancellation clause; {} device byte(s) against {} for a BF16 copy",
         case.name,
         capability.uuid,
@@ -863,7 +863,7 @@ fn a_component_resident_on_another_device_is_refused() {
     let host_residency = DeviceResidency::create(&host, &mut authority).unwrap();
     let mut other_residency = DeviceResidency::create(&other, &mut authority).unwrap();
     let mut source = Fixture {
-        artifact: ArtifactId::new("sha256:task0028-cross-device-fixture").unwrap(),
+        artifact: ArtifactId::new("sha256:cross-device-affine-fixture").unwrap(),
         components: components(&tensor),
     };
 
@@ -960,7 +960,7 @@ fn a_component_resident_on_another_device_is_refused() {
         ledger.outstanding()
     );
     eprintln!(
-        "task0028: a component resident on {} was refused by a launch on {}",
+        "affine linear: a component resident on {} was refused by a launch on {}",
         other.uuid(),
         host.uuid()
     );

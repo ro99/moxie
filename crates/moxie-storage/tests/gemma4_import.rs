@@ -86,7 +86,7 @@ fn all_seven_shard_headers_parse_and_account_for_their_payloads() {
     assert_eq!((bf16, i32s, i64s), (1188, 410, 410), "dtype census");
     assert_eq!(payload, 35_089_877_112, "total tensor payload");
     eprintln!(
-        "task0018 artifact evidence: shards=7 tensors={tensors} payload_bytes={payload} \
+        "artifact evidence: shards=7 tensors={tensors} payload_bytes={payload} \
          bf16={bf16} i32={i32s} i64={i64s}"
     );
 }
@@ -195,12 +195,12 @@ fn real_pack_quantized_tensors_import_to_canonical_affine_form() {
                 "{module} codes span only [{low}, {high}], which is not a quantized weight"
             );
             eprintln!(
-                "task0018 imported {module}: logical={logical:?} codes=[{low}, {high}] \
+                "imported {module}: logical={logical:?} codes=[{low}, {high}] \
                  scale=bf16 group=32"
             );
             imported += 1;
             if imported == wanted.len() {
-                eprintln!("task0018 artifact bytes read: {bytes_read}");
+                eprintln!("artifact bytes read: {bytes_read}");
                 return;
             }
         }

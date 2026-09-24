@@ -44,7 +44,7 @@ struct Scratch {
 impl Scratch {
     fn new(label: &str) -> Self {
         let base = std::env::temp_dir().join(format!(
-            "moxie-task0025-{label}-{}-{:?}",
+            "moxie-repack-{label}-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -579,7 +579,7 @@ fn every_failure_point_leaves_a_resumable_destination_that_publishes_the_same_ar
         }
     }
     eprintln!(
-        "task0025 failure-point coverage: {cases} case(s) across {} boundary/visit pair(s)",
+        "failure-point coverage: {cases} case(s) across {} boundary/visit pair(s)",
         cases
     );
     for (site, visits) in &coverage {
@@ -1415,7 +1415,7 @@ fn the_journal_cap_refuses_a_record_the_plan_allowed() {
         refusal.contains("read back on a resume"),
         "the refusal is not the journal's own cap, after {records} record(s): {refusal}"
     );
-    eprintln!("task0026 journal cap: refused after {records} record(s)");
+    eprintln!("journal cap: refused after {records} record(s)");
     run.abandon(&mut ledger).expect("it abandons");
 }
 

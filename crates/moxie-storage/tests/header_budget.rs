@@ -248,9 +248,7 @@ fn a_header_costs_no_more_peak_heap_than_its_admitted_estimate() {
             peak <= estimate,
             "{tag}: refusing cost {peak} B against {estimate} B"
         );
-        eprintln!(
-            "task0018 rank refusal: {tag} dims={n} serialized={serialized} refusal_peak={peak}"
-        );
+        eprintln!("rank refusal: {tag} dims={n} serialized={serialized} refusal_peak={peak}");
     }
 
     // **Rejection paths are budgeted too.** A header repeating `__metadata__`
@@ -295,7 +293,7 @@ fn a_header_costs_no_more_peak_heap_than_its_admitted_estimate() {
              declaration rather than grow with them"
         );
         eprintln!(
-            "task0018 repeated-metadata refusal: n={n} serialized={serialized} \
+            "repeated-metadata refusal: n={n} serialized={serialized} \
              refusal_peak={peak} beyond_input={excess}"
         );
         std::fs::remove_file(&path).ok();
@@ -303,7 +301,7 @@ fn a_header_costs_no_more_peak_heap_than_its_admitted_estimate() {
 
     for (tag, serialized, peak, retained, estimate) in &rows {
         eprintln!(
-            "task0018 header cost: {tag} serialized={serialized} peak={peak} \
+            "header cost: {tag} serialized={serialized} peak={peak} \
              retained={retained} admitted_estimate={estimate} peak_ratio={:.2}",
             *peak as f64 / *serialized as f64
         );

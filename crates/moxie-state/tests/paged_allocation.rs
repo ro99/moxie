@@ -111,7 +111,7 @@ fn actual_32768_rows_have_no_append_allocations_and_repeated_abort_retains_no_hi
         "close frees payload and control storage"
     );
     eprintln!(
-        "task0017 storage evidence (full retention): actual_rows=32768 max_tokens={} \
+        "storage evidence (full retention): actual_rows=32768 max_tokens={} \
          page_tokens={} backing_bytes={} table_bytes={} control_reserve_bytes={} \
          append_allocations=0 abort_cycles=10000 retained_growth=0 close_live_delta=0",
         geometry.max_tokens,

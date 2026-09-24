@@ -716,7 +716,7 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
     let count = device_count().expect("enumerate CUDA devices");
     assert!(
         count >= 3,
-        "task 0059 requires both 3090s and the 5060 Ti; saw {count}"
+        "requires both 3090s and the 5060 Ti; saw {count}"
     );
     let mut cases: Vec<_> = [
         moxie_cli::gemma::Shape::A,
@@ -1051,7 +1051,7 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
 fn solo_rank_worker_matches_the_direct_path_on_every_gpu() {
     let _guard = one_at_a_time();
     let count = device_count().expect("enumerate CUDA devices");
-    assert!(count >= 3, "task 0070 requires all three GPUs; saw {count}");
+    assert!(count >= 3, "requires all three GPUs; saw {count}");
     let shape = moxie_cli::gemma::Shape::A;
     let config = shape.config();
     let fixture = moxie_cli::gemma::build(shape).expect("build dense Gemma fixture");
