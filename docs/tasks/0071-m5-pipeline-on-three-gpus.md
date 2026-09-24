@@ -151,7 +151,21 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
    `pub fn fail_next_step(&mut self, stage: usize)` and
    `pub fn refuse_next_prepare(&mut self, stage: usize)` on
    `PipelineWorkers` under the same feature, forwarding to that stage's
-   worker. There is no other change to `rank_worker.rs`.
+   worker.
+   - **Amended 2026-09-24, after the builder's DECISION:**
+     `SoloRankWorker`'s step lowers with
+     `moxie_plan::lower_selected_ordered(&graph, workload, &capability,
+     &catalogue, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())` in
+     place of `lower_selected`.
+     - Why: `lower_selected` requires a complete graph (Embedding, paged
+       Attention and VocabProjection). The ordered entry, which the TP
+       workers use for their stage graphs, does not. A stage graph's
+       attention layers are already dense and local, and `execute_dense`
+       uses those local layers (its `layers` map is empty), so each worker's
+       stage-local `KvGeometry` is indexed directly.
+     - There is no other change to `rank_worker.rs`.
+     - Stop if task 0070's `solo_rank_worker_matches_the_direct_path_on_every_gpu`
+       is no longer bytewise equal after the swap.
 
 3. **`crates/moxie-executor/tests/dense_gemma_device.rs`:** add **one**
    test, `pipeline_runs_dense_and_routed_gemma_on_three_gpus`, reusing the
