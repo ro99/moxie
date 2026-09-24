@@ -80,6 +80,11 @@ skill; read with `--json`; never open the TUI.
     it.
   - Every other task is one **slice** of the route to closure: one step per
     task number, ticked when that task is accepted.
+- **The thread names the milestone that owns the work**, not the milestone
+  in progress. A follow-up found during M5 that belongs to M7 goes on `m7`.
+  Later-milestone work that the current exit gate needs is pulled in and
+  goes on the current thread. tsk cannot change a thread, so for a misfiled
+  task, add it again on the right thread and archive the stray.
 - **At session start** (section 1), read the board beside the ledger. If they
   disagree, the ledger and the task records win; correct the board and say
   so.
