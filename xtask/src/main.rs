@@ -50,7 +50,8 @@ Device lane (needs `cargo xtask-cuda`):
                           Real CUDA launches on every visible device; a required
                           architecture with no passing case fails the gate
   test-bf16-chain         Reduced H8/H17 semantic chain for CUDA sanitizers
-  probe [--out <path>]    Hardware/topology inventory; writes markdown when --out given
+  probe [--out <path>] [--costs <path>]
+                          Hardware/topology inventory; --costs writes measured planner costs
   capacity                Measure every device and admit a plan against the ledger;
                           allocates nothing
 
@@ -113,7 +114,7 @@ fn main() -> std::process::ExitCode {
         #[cfg(feature = "cuda")]
         "test-bf16-chain" => gpu::run_chain(),
         #[cfg(feature = "cuda")]
-        "probe" => probe::run(flag("--out")),
+        "probe" => probe::run(flag("--out"), flag("--costs")),
         #[cfg(feature = "cuda")]
         "capacity" => capacity::run(),
 

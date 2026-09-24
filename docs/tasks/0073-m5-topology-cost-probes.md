@@ -1,7 +1,22 @@
 # Task 0073 — topology cost probes
 
-Status: **open** (coordinator, 2026-09-24, under the owner's auto-mode
-delegation). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-24, under the owner's auto-mode
+delegation), after sol's review rounds R1 and R2. The coordinator verified
+the R2 fix directly. Builder Codex `luna`; reviewer Codex `sol`.
+- Change 3 was amended after the builder's DECISION: the TOML is written
+  and read through `toml::Table`, with no serde (`arch-check` forbids
+  `xtask -> serde`).
+- R1 (HIGH): the isolated peer samples were taken inside the grant loop,
+  which confounded them with setup order. Fixed: all grants, then all
+  warm-ups, then the isolated samples, then the concurrent ones.
+- R2 (MEDIUM): a typed setup error could be masked by a peer's generic
+  cancel error. Fixed with a first-error slot.
+- Forward 3090 peer: about 6.58 GB/s isolated and about 2.92 GB/s with both
+  directions running, stable over three runs. That is consistent with
+  bidirectional contention; the one-sided magnitude is unexplained and
+  recorded as such.
+- **Size, carried to the milestone-end ponytail audit:**
+  `topology_probe.rs` is 406 lines, against an estimate of 200–260.
 
 ## Identity and authority
 
@@ -239,4 +254,56 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Result, filled after work
 
-- Pending.
+- Implemented `TopologyCosts`, the driver-gated probe, the `probe --costs`
+  writer/reader and one device test. TOML is built with `toml::Table` and
+  `toml::to_string`; the reader parses a table and reports missing or mistyped
+  fields by name. No serde dependency was added; `xtask/Cargo.toml` and
+  `Cargo.lock` are unchanged. The round-trip test passes.
+
+### R1 fixes
+
+- Built one list of permitted ordered peer pairs. The probe enables every
+  grant, warms every pair in both sizes, takes all isolated samples, then
+  takes concurrent samples from that same list. The worker setup now uses one
+  `Result` closure and one failure store before the pre-sample barrier;
+  host and event measurements share the checked median conversion helper.
+- Replaced the evidence tables and TOML with the primary R1 run in
+  [topology-costs.md](../evidence/topology-costs.md). It reports 5060 Ti
+  concurrent H2D of 5.053 GB/s versus 6.586 isolated, host-to-5060 latency of
+  9.025 us for 16 KiB, and both direct/staged 3090 peer directions using the
+  newly measured host legs. The reverse staged rate derives to 2.82 GB/s from
+  this run's D2H/H2D values (5.566/5.734 GB/s); the new table does not support
+  the earlier approximate 4.03 GB/s figure.
+- Stability check: two more probe runs gave forward peer isolated/concurrent
+  bulk of 6.583886/2.924808 and 6.585354/2.923887 GB/s; the primary was
+  6.583886/2.924547. Each ratio is about 2.25×. As required, the evidence
+  labels this difference unexplained and draws no performance conclusion.
+- R1 gates passed: fmt, both clippy gates, `cargo test --workspace --locked`,
+  `cargo xtask arch-check` (79 rejected, 21 accepted fixtures; 13 rules),
+  `cargo xtask spec-check`, and the focused `topology_probe_device` test with
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID`. The primary probe and both stability probes
+  completed. The round-trip test passed. The full `cargo xtask-cuda test-gpu`
+  passed 63/63 on SM86 and SM120 in the original task round; it was skipped
+  for R1 as directed.
+- Original task mutations were applied, checked and restored: removing the
+  peer-access filter made the device test fail with typed `Unsupported`
+  (`3032cfa3` cannot access `97fe4889`); sequential concurrent-H2D values
+  versus barrier values (GB/s) were 6.521/4.003 for `97fe`, 5.655/3.009 for
+  `3032`, and 6.528/3.757 for `81fe`. The current evidence run also has
+  concurrent H2D below isolated on the 5060 Ti. No ungranted peer copy
+  succeeded.
+- No pinned/mapped path or new unsafe FFI was needed. The revised
+  `topology_probe.rs` is 406 lines.
+
+### R2 fixes
+
+- Concurrent host setup stores the first typed setup error before the barrier;
+  peers canceled by it return a placeholder. All workers are joined, and the
+  original setup error takes precedence over a join error. Reworded the
+  forward-peer observation as consistent with bidirectional contention, with
+  the one-sided magnitude unexplained. No probe rerun. No new test was added:
+  injecting a per-worker setup failure would require new fault-injection
+  support, while the stored-error and post-join ordering enforce precedence.
+- R2 gates passed: fmt, workspace clippy, driver-feature clippy,
+  `cargo test --workspace --locked`, and the PCI-ordered
+  `topology_probe_device` test.

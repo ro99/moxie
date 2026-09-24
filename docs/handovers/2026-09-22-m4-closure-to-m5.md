@@ -103,9 +103,9 @@ GPU gates run again inside each task. Only one agent uses the GPUs at a time.
 Strata has no microbatch overlap: it uses a contiguous pipeline schedule on PCIe, and its wavefront design is documented as not implemented. The ordering rule therefore comes from document 04.
 
 Slice 6 plan (coordinator, 2026-09-24):
-- [task 0073](../tasks/0073-m5-topology-cost-probes.md), **open**: topology cost probes. A pure `TopologyCosts` record in `moxie-plan`; a probe in `moxie-executor` measuring small-copy latency, bulk bandwidth and bandwidth under simultaneous traffic for host↔device and peer links, plus on-device memory bandwidth; `cargo xtask-cuda probe --costs`; and a measured evidence file. Strata has no bandwidth probe (only a boolean peer matrix). Pinned memory is left to M6.3, because no M5 path uses it.
+- [task 0073](../tasks/0073-m5-topology-cost-probes.md), **accepted** 2026-09-24 (evidence in `docs/evidence/topology-costs.md`; the size goes to the milestone-end audit): topology cost probes. A pure `TopologyCosts` record in `moxie-plan`; a probe in `moxie-executor` measuring small-copy latency, bulk bandwidth and bandwidth under simultaneous traffic for host↔device and peer links, plus on-device memory bandwidth; `cargo xtask-cuda probe --costs`; and a measured evidence file. Strata has no bandwidth probe (only a boolean peer matrix). Pinned memory is left to M6.3, because no M5 path uses it.
 - task 0074: the deterministic plan comparison tool. It ranks the candidates (single GPU, TP2, PP, TP2 + TP1, host experts) by the joint user workload, from the measured costs and each plan's bytes, and reports rejected alternatives with their reasons.
-- The milestone-end `/ponytail:ponytail-audit`. The carried items: task 0068's size duplication, task 0069's dead check, and the size overruns of tasks 0070–0072.
+- The milestone-end `/ponytail:ponytail-audit`. The carried items: task 0068's size duplication, task 0069's dead check, and the size overruns of tasks 0070–0073.
 - The M5 acceptance package.
 
 ## Route to M5 closure (owner-agreed plan, 2026-09-22)

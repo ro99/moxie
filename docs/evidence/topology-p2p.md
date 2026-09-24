@@ -103,3 +103,4 @@ separately.
 - Inherited from legacy Strata project notes and **not** re-run here: every figure in the measurements
   table, the NCCL crossover, and the patch commit identity. Their original context limitations apply;
   document 08's rule holds — historical measurements are not predictions.
+- Current measured topology costs: [topology-costs.md](topology-costs.md).

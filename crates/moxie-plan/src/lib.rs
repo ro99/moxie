@@ -12,11 +12,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod costs;
 pub mod expert;
 mod host_experts;
 pub mod pipeline;
 mod selected;
 pub mod tensor_parallel;
+pub use costs::{DeviceCost, Endpoint, LinkCost, TopologyCosts};
 pub use expert::{
     BoundOn, Candidate, ChunkResidency, EnvelopePrediction, Exactness, ExpertBudget,
     ExpertEnvelope, ExpertGroup, ExpertPlan, ExpertPlanRefused, ExpertPolicy, ExpertShape,
