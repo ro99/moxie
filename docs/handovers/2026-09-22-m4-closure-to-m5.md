@@ -95,7 +95,7 @@ release the GPUs, naming the devices, commands and expected duration.
 GPU gates run again inside each task. Only one agent uses the GPUs at a time.
 
 **Slice 5 plan (coordinator, 2026-09-24):**
-- [task 0069](../tasks/0069-m5-host-pipeline-lowering.md): host pipeline lowering, with microbatched prefill in wavefront order; opened 2026-09-24;
+- [task 0069](../tasks/0069-m5-host-pipeline-lowering.md): host pipeline lowering, with microbatched prefill in wavefront order; **accepted** 2026-09-24. Dense and routed Gemma through uneven 3-stage pipelines are bit-identical to the unsplit graph;
 - task 0070: pipeline on the three GPUs. The 3090 pair uses a peer handoff; the 5060 Ti gets a declared, reported host-staged handoff. With resource and cancellation tests;
 - task 0071: the combined TP2 (3090 pair) + TP1 (5060 Ti) plan, with correctness, resource and cancellation tests, and the capacity and latency report.
 

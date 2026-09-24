@@ -1,7 +1,12 @@
 # Task 0069 — host pipeline lowering with microbatched prefill
 
-Status: **open** (coordinator, 2026-09-24, under the owner's auto-mode
-delegation). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-24, under the owner's auto-mode
+delegation). Built by Codex `luna` from the coordinator's design; sol
+returned ACCEPT in round 1. The coordinator re-ran `fmt`, `clippy`,
+`arch-check`, `spec-check`, the host TP and pipeline tests and the
+`moxie-plan` tests. Carried to the milestone-end ponytail audit: sol's LOW
+note that the input/weight membership checks in `pipeline.rs` (about lines
+83–85) are dead code, because `producers` holds only node outputs.
 
 ## Identity and authority
 
@@ -189,4 +194,33 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Result, filled after work
 
-- Pending.
+- Added `PipelineLowering`, whose private stage ranges and handoffs are
+  constructed only by `lower_pipeline`. It rejects invalid cuts, non-activation
+  boundary values, and boundaries that do not carry exactly the previous
+  stage's final output; `PipelineRefused` implements `Display` and `Error`.
+  `wavefront` emits each stage/microbatch pair once in dependency order.
+- The requested layer cuts in dense Shape A and routed Shape C (8 experts,
+  vocab 12) each cross exactly one activation at each boundary. The first
+  Attention cut is refused with `Handoffs` for its multiple crossing values;
+  cutting after Route is refused as `NonActivation` before a stage graph is
+  built. Empty, zero, and unsorted cuts are refused as `Cuts`.
+- Added one end-to-end host test using the existing stage, binding and bit
+  helpers. It runs microbatches `0..2` and `2..5` in `wavefront(3, 2)` order,
+  then decode steps `5..6` and `6..7`. Both Gemma fixtures are bit-identical
+  to the unsplit reference at all three steps. The reference uses plain
+  `Interpreter::run`, without TP lowering or reduction orders. Each stage has
+  its own `SequenceState` and KV cache; tokens and positions are bound directly
+  at every stage.
+- Both mutations were applied, run, caught, and restored. (1) Descending stage
+  and microbatch order failed the wavefront dependency assertion; the host test
+  also failed because stage 0 appended absolute position 2 while its frontier
+  was still 0. (2) Removing the handoff-count check made the multi-value
+  `Handoffs` refusal assertion fail.
+- Host gates passed: `cargo fmt --all -- --check`, workspace clippy with
+  `-D warnings`, `cargo test --workspace --locked`, `cargo xtask arch-check`
+  (79 rejected and 21 accepted fixtures), and `cargo xtask spec-check` (10
+  documents). No GPU command or device test was run.
+- Staged only the four task paths: `pipeline.rs`, plan `lib.rs`, the CLI
+  `tensor_parallel.rs` test, and this Result. The carried `.gitignore`,
+  `specification-version.md` and ADRs 0034/0035 were left unstaged and
+  unchanged. No commit was created.

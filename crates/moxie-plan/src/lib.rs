@@ -14,6 +14,7 @@
 
 pub mod expert;
 mod host_experts;
+pub mod pipeline;
 mod selected;
 pub mod tensor_parallel;
 pub use expert::{
@@ -22,6 +23,7 @@ pub use expert::{
     GroupDecision, Placement, RejectionReason, ResidentChunks, compile_experts,
 };
 pub use host_experts::{HostExpertJoin, HostExpertLowering, lower_host_experts};
+pub use pipeline::{PipelineLowering, PipelineRefused, lower_pipeline, wavefront};
 pub use selected::{
     PlannedValue, PlannedWorkspace, SelectedNode, SelectedPlanCandidate, StorageRegion,
     lower_selected, lower_selected_host_experts, lower_selected_ordered,

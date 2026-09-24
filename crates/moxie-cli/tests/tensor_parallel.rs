@@ -16,7 +16,8 @@ use moxie_graph::{
 };
 use moxie_interp::{Interpreter, KvCache};
 use moxie_plan::{
-    Join, RankPart, Stage, TensorParallelLowering, TensorParallelRefused, lower_tensor_parallel,
+    Join, PipelineRefused, RankPart, Stage, TensorParallelLowering, TensorParallelRefused,
+    lower_pipeline, lower_tensor_parallel, wavefront,
 };
 use moxie_state::{MlaLatentDescriptor, ROOT, SequenceState, StateKind};
 use moxie_types::{ActivationPrecision, CachePrecision, Dim, Precision, SymbolId, WeightPrecision};
@@ -31,6 +32,22 @@ fn fixture() -> Fixture {
     config.global_kv_heads = 1;
     config.vocab = 12;
     gemma::build_with_config(config).unwrap()
+}
+
+fn first_node_of_layer(graph: &Graph, layer: usize) -> usize {
+    let suffix = format!(".{layer}");
+    graph
+        .nodes()
+        .iter()
+        .position(|node| {
+            node.inputs.iter().any(|input| {
+                graph.weights().contains(input)
+                    && graph
+                        .name(*input)
+                        .is_some_and(|name| name.ends_with(&suffix))
+            })
+        })
+        .expect("layer has a weight-consuming node")
 }
 
 /// One stage as a graph of its own, with original value ids for its boundary.
@@ -776,6 +793,140 @@ fn routed_expert_owners_are_bit_identical_at_prefill_and_decode() {
 }
 
 #[test]
+fn pipeline_stages_are_bit_identical_with_microbatched_prefill() {
+    let dense = fixture();
+    let mut config = gemma::Shape::C.config();
+    config.moe.as_mut().unwrap().experts = 8;
+    config.vocab = 12;
+    let routed = gemma::build_with_config(config).unwrap();
+    let interpreter = Interpreter::new();
+
+    for (label, f) in [("dense", &dense), ("routed", &routed)] {
+        let cuts = [
+            first_node_of_layer(&f.graph, 1),
+            first_node_of_layer(&f.graph, 4),
+        ];
+        let lowering = lower_pipeline(&f.graph, &cuts).unwrap_or_else(|refused| {
+            panic!("{label} Gemma layer boundary violates the one-handoff contract: {refused:?}")
+        });
+        let stages: Vec<_> = lowering
+            .stages()
+            .iter()
+            .cloned()
+            .map(|nodes| stage_graph(&f.graph, &f.weights, nodes, None, None))
+            .collect();
+
+        let mut reference_state = SequenceState::new([StateKind::KvPages]);
+        let mut reference_cache =
+            KvCache::for_branch(f.graph.attention_layers().len(), &reference_state, ROOT).unwrap();
+        let reference: Vec<_> = STEPS
+            .iter()
+            .map(|rows| {
+                reference_state
+                    .append_prompt(ROOT, rows.end - rows.start)
+                    .unwrap();
+                let mut bindings = f.weights.clone();
+                bindings.set(f.tokens, Value::Index(tokens(rows, 12)));
+                bindings.set(f.positions, Value::Index(rows.clone().collect()));
+                let output = interpreter
+                    .run(
+                        &f.graph,
+                        &bindings,
+                        &mut reference_state,
+                        ROOT,
+                        &mut reference_cache,
+                        &Cancel::never(),
+                    )
+                    .unwrap();
+                bits(&output.logits)
+            })
+            .collect();
+
+        let mut states: Vec<_> = stages
+            .iter()
+            .map(|_| SequenceState::new([StateKind::KvPages]))
+            .collect();
+        let mut caches: Vec<_> = stages
+            .iter()
+            .enumerate()
+            .map(|(index, stage)| {
+                KvCache::for_branch(stage.graph.attention_layers().len(), &states[index], ROOT)
+                    .unwrap()
+            })
+            .collect();
+        let microbatches: [Range<u64>; 2] = [0..2, 2..5];
+        let mut tables: Vec<_> = microbatches
+            .iter()
+            .map(|rows| {
+                let mut table = BTreeMap::new();
+                table.insert(f.tokens, Value::Index(tokens(rows, 12)));
+                table.insert(f.positions, Value::Index(rows.clone().collect()));
+                table
+            })
+            .collect();
+        let mut actual = Vec::with_capacity(STEPS.len());
+        let mut prefill = Vec::new();
+        for (stage_index, microbatch) in wavefront(3, 2) {
+            let rows = &microbatches[microbatch];
+            states[stage_index]
+                .append_prompt(ROOT, rows.end - rows.start)
+                .unwrap();
+            let output = interpreter
+                .run(
+                    &stages[stage_index].graph,
+                    &bind(&stages[stage_index], &tables[microbatch]),
+                    &mut states[stage_index],
+                    ROOT,
+                    &mut caches[stage_index],
+                    &Cancel::never(),
+                )
+                .unwrap();
+            if stage_index + 1 < stages.len() {
+                tables[microbatch].insert(
+                    lowering.handoffs()[stage_index],
+                    Value::Float(output.logits),
+                );
+            } else {
+                prefill.extend(bits(&output.logits));
+            }
+        }
+        actual.push(prefill);
+
+        for rows in STEPS.iter().skip(1) {
+            let mut table = BTreeMap::new();
+            table.insert(f.tokens, Value::Index(tokens(rows, 12)));
+            table.insert(f.positions, Value::Index(rows.clone().collect()));
+            let mut logits = Vec::new();
+            for stage_index in 0..stages.len() {
+                states[stage_index]
+                    .append_prompt(ROOT, rows.end - rows.start)
+                    .unwrap();
+                let output = interpreter
+                    .run(
+                        &stages[stage_index].graph,
+                        &bind(&stages[stage_index], &table),
+                        &mut states[stage_index],
+                        ROOT,
+                        &mut caches[stage_index],
+                        &Cancel::never(),
+                    )
+                    .unwrap();
+                if stage_index + 1 < stages.len() {
+                    table.insert(
+                        lowering.handoffs()[stage_index],
+                        Value::Float(output.logits),
+                    );
+                } else {
+                    logits = bits(&output.logits);
+                }
+            }
+            actual.push(logits);
+        }
+        assert_eq!(actual, reference, "{label} pipeline");
+    }
+}
+
+#[test]
 fn unsupported_partitions_are_refused() {
     type Expect = fn(&TensorParallelRefused) -> bool;
     let cases: [(&str, Graph, u32, Expect); 9] = [
@@ -847,6 +998,39 @@ fn unsupported_partitions_are_refused() {
         let refused = lower_tensor_parallel(&graph, ranks).unwrap_err();
         assert!(expected(&refused), "{what}: {refused}");
     }
+
+    let dense = fixture();
+    for cuts in [&[][..], &[0][..], &[2, 1][..]] {
+        assert!(matches!(
+            lower_pipeline(&dense.graph, cuts),
+            Err(PipelineRefused::Cuts)
+        ));
+    }
+    let mut config = gemma::Shape::C.config();
+    config.moe.as_mut().unwrap().experts = 8;
+    config.vocab = 12;
+    let routed = gemma::build_with_config(config).unwrap();
+    let route = routed
+        .graph
+        .nodes()
+        .iter()
+        .enumerate()
+        .find(|(_, node)| matches!(node.params, OpParams::Route { .. }))
+        .unwrap();
+    assert!(matches!(
+        lower_pipeline(&routed.graph, &[route.0 + 1]),
+        Err(PipelineRefused::NonActivation { value }) if value == route.1.output
+    ));
+    let attention = dense
+        .graph
+        .nodes()
+        .iter()
+        .position(|node| matches!(node.params, OpParams::Attention { .. }))
+        .unwrap();
+    assert!(matches!(
+        lower_pipeline(&dense.graph, &[attention]),
+        Err(PipelineRefused::Handoffs { boundary: 0, values }) if values.len() > 1
+    ));
 }
 
 /// A dense GLU whose gate output escapes the local stage through another
