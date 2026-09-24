@@ -42,9 +42,6 @@ pub struct RankPart {
     pub params: BTreeMap<NodeId, OpParams>,
     /// Contiguous outer-axis range of a row-major weight this rank owns.
     pub rows: BTreeMap<ValueId, Range<u64>>,
-    /// An input-axis slice keyed by the weight itself, for fused operations
-    /// whose activation input is replicated.
-    pub weight_slices: BTreeMap<ValueId, LinearInputSlice>,
     /// One compact contiguous input-axis slice used in every row of a weight
     /// and in the corresponding activation.
     pub slices: BTreeMap<ValueId, LinearInputSlice>,
@@ -131,10 +128,7 @@ pub fn build_stage_graph(
                 let name = graph.name(input).unwrap_or("value");
                 let slice = part.and_then(|p| {
                     if graph.weights().contains(&input) {
-                        p.weight_slices
-                            .get(&input)
-                            .or_else(|| p.slices.get(&node.inputs[0]))
-                            .copied()
+                        p.slices.get(&node.inputs[0]).copied()
                     } else {
                         p.slices.get(&input).copied()
                     }
@@ -201,57 +195,6 @@ pub fn build_stage_graph(
                     layer: 0,
                 };
             }
-        } else if let OpParams::MlaAttention { descriptor } = &params {
-            state_layers.insert(NodeId(local_index as u32), descriptor.layer);
-            if let Some(part) = part
-                && let Some(order) = part.combine_orders.get(&node.id).copied()
-                && let Some(owner) = order.owned
-            {
-                let OpParams::MlaAttention { descriptor: source } = &node.params else {
-                    return Err(invalid("stage", "MLA rank parameters lack a source node"));
-                };
-                let Some((slice, q_rows, kv_rows)) = part
-                    .weight_slices
-                    .get(&node.inputs[8])
-                    .zip(part.rows.get(&node.inputs[4]))
-                    .zip(part.rows.get(&node.inputs[7]))
-                    .map(|((slice, q_rows), kv_rows)| (slice, q_rows, kv_rows))
-                else {
-                    return Err(invalid("stage", "MLA owner is missing its weight slices"));
-                };
-                let hp = descriptor.heads;
-                let v = source.v_head_dim;
-                let first_head = u64::from(owner).checked_mul(hp);
-                let end_head = u64::from(owner)
-                    .checked_add(1)
-                    .and_then(|owner| owner.checked_mul(hp));
-                let row_range = |width: Option<u64>| {
-                    first_head
-                        .zip(end_head)
-                        .zip(width)
-                        .and_then(|((first, end), width)| {
-                            Some((first.checked_mul(width)?, end.checked_mul(width)?))
-                        })
-                };
-                let q_width = source.qk_nope_head_dim.checked_add(source.qk_rope_head_dim);
-                let kv_width = source.qk_nope_head_dim.checked_add(v);
-                if owner >= order.groups
-                    || hp.checked_mul(u64::from(order.groups)) != Some(source.heads)
-                    || source.heads.checked_mul(v) != Some(slice.full_width)
-                    || hp.checked_mul(v) != Some(slice.width)
-                    || first_head.and_then(|head| head.checked_mul(v)) != Some(slice.first)
-                    || !row_range(q_width).is_some_and(|(start, end)| *q_rows == (start..end))
-                    || !row_range(kv_width).is_some_and(|(start, end)| *kv_rows == (start..end))
-                {
-                    return Err(invalid(
-                        "stage",
-                        "MLA owner disagrees with its weight slices",
-                    ));
-                }
-            }
-            let mut descriptor = *descriptor;
-            descriptor.layer = 0;
-            params = OpParams::MlaAttention { descriptor };
         }
         let local_output = builder.node(params, &inputs)?;
         if let Some(order) = part.and_then(|p| p.linear_orders.get(&node.id)).copied() {
@@ -462,7 +405,7 @@ pub fn lower_tensor_parallel(
     let mut chain: BTreeMap<usize, (usize, Axis)> = BTreeMap::new();
     for (index, node) in nodes.iter().enumerate() {
         match node.params {
-            OpParams::MlaAttention { .. } => continue,
+            OpParams::MlaAttention { .. } => return Err(refuse_op(node)),
             OpParams::Route { .. } => continue,
             _ if node.params.partition_rule() == PartitionRule::NotDetermined => {
                 return Err(refuse_op(node));
@@ -748,34 +691,6 @@ pub fn lower_tensor_parallel(
         }
     }
 
-    let mut mla_nodes = Vec::new();
-    for (index, node) in nodes.iter().enumerate() {
-        let OpParams::MlaAttention { descriptor } = node.params else {
-            continue;
-        };
-        if descriptor.heads % u64::from(ranks) != 0 {
-            return Err(TensorParallelRefused::Heads {
-                layer: descriptor.layer,
-                heads: descriptor.heads,
-                ranks,
-            });
-        }
-        if claimed[index] {
-            return Err(TensorParallelRefused::HeadChain { node: node.id });
-        }
-        claimed[index] = true;
-        spans.insert(
-            index,
-            Span {
-                end: index + 1,
-                join: Join::Reduce {
-                    output: node.output,
-                },
-            },
-        );
-        mla_nodes.push((index, descriptor));
-    }
-
     // A value produced by a local stage may leave only through that stage's
     // declared join, whether the consumer is another stage or the graph
     // boundary itself.
@@ -879,64 +794,6 @@ pub fn lower_tensor_parallel(
                 CombineReductionOrder {
                     groups: ranks,
                     owned: Some(owned),
-                },
-            );
-        }
-    }
-
-    // MLA keeps the shared latent replicated and splits complete heads plus
-    // each rank's matching `o_proj` input columns.
-    for (index, descriptor) in mla_nodes {
-        let node = &nodes[index];
-        let heads_per_rank = descriptor.heads / r;
-        let query_head = descriptor.qk_nope_head_dim + descriptor.qk_rope_head_dim;
-        let kv_head = descriptor.qk_nope_head_dim + descriptor.v_head_dim;
-        let full_width = descriptor.heads * descriptor.v_head_dim;
-        combine_orders.insert(
-            node.id,
-            CombineReductionOrder {
-                groups: ranks,
-                owned: None,
-            },
-        );
-        for (rank, part) in parts.iter_mut().enumerate() {
-            let first_head = rank as u64 * heads_per_rank;
-            let q_rows = first_head * query_head..(first_head + heads_per_rank) * query_head;
-            let kv_rows = first_head * kv_head..(first_head + heads_per_rank) * kv_head;
-            for (weight, rows) in [(node.inputs[4], q_rows), (node.inputs[7], kv_rows)] {
-                if part
-                    .rows
-                    .insert(weight, rows.clone())
-                    .is_some_and(|seen| seen != rows)
-                {
-                    return Err(TensorParallelRefused::HeadChain { node: node.id });
-                }
-            }
-            let slice = LinearInputSlice {
-                first: first_head * descriptor.v_head_dim,
-                width: heads_per_rank * descriptor.v_head_dim,
-                full_width,
-            };
-            if part
-                .weight_slices
-                .insert(node.inputs[8], slice)
-                .is_some_and(|seen| seen != slice)
-            {
-                return Err(TensorParallelRefused::HeadChain { node: node.id });
-            }
-            let mut local_descriptor = descriptor;
-            local_descriptor.heads = heads_per_rank;
-            part.params.insert(
-                node.id,
-                OpParams::MlaAttention {
-                    descriptor: local_descriptor,
-                },
-            );
-            part.combine_orders.insert(
-                node.id,
-                CombineReductionOrder {
-                    groups: ranks,
-                    owned: Some(rank as u32),
                 },
             );
         }

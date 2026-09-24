@@ -10,16 +10,15 @@ use std::ops::Range;
 use moxie_cli::{fixture::Fixture, gemma};
 use moxie_engine::{Cancel, HostTensor, Value};
 use moxie_graph::{
-    Bindings, Graph, GraphBuilder, IndexEncoding, LinearInputSlice, LinearReductionOrder,
-    MlaAttentionDescriptor, NodeId, OpParams, OracleRegistry, RopeLayout, TensorSpec, ValueId,
-    ValueRole, Visibility,
+    Bindings, Graph, GraphBuilder, IndexEncoding, LinearInputSlice, LinearReductionOrder, NodeId,
+    OpParams, OracleRegistry, TensorSpec, ValueId, ValueRole, Visibility,
 };
 use moxie_interp::{Interpreter, KvCache};
 use moxie_plan::{
     Join, RankPart, Stage, TensorParallelLowering, TensorParallelRefused, lower_tensor_parallel,
 };
-use moxie_state::{MlaLatentDescriptor, ROOT, SequenceState, StateKind};
-use moxie_types::{ActivationPrecision, CachePrecision, Dim, Precision, SymbolId, WeightPrecision};
+use moxie_state::{ROOT, SequenceState, StateKind};
+use moxie_types::{ActivationPrecision, Dim, Precision, SymbolId, WeightPrecision};
 
 /// Shape A's geometry with 8 query heads over 4 sliding and 1 global
 /// key/value heads. The vocabulary is made divisible by both accepted dense
@@ -126,303 +125,6 @@ fn bind(stage: &StageGraph, table: &BTreeMap<ValueId, Value>) -> Bindings<Value>
 
 fn bits(tensor: &HostTensor) -> Vec<u32> {
     tensor.data().iter().map(|x| x.to_bits()).collect()
-}
-
-fn mla_graph(heads: u64) -> (Graph, Bindings<Value>) {
-    let hidden = 8;
-    let q_lora = 4;
-    let kv_lora = 4;
-    let nope = 2;
-    let rope = 2;
-    let value = 2;
-    let descriptor = MlaAttentionDescriptor {
-        hidden,
-        q_lora_rank: q_lora,
-        kv_lora_rank: kv_lora,
-        qk_nope_head_dim: nope,
-        qk_rope_head_dim: rope,
-        v_head_dim: value,
-        heads,
-        rms_norm_eps: 1e-5,
-        rope_base: 10_000.0,
-        rope_layout: RopeLayout::Interleaved,
-        visibility: Visibility::Causal,
-        layer: 0,
-        cache_precision: CachePrecision::expect(Precision::Bf16),
-    };
-    let mut oracles = OracleRegistry::new();
-    moxie_oracles::register(&mut oracles).unwrap();
-    let mut builder = GraphBuilder::new(moxie_oracles::HOST_REFERENCE, SymbolId(88));
-    let rows = Dim::symbol(SymbolId(88));
-    let hidden_input = builder.input(
-        "hidden",
-        TensorSpec::new(
-            ValueRole::Activation(ActivationPrecision::expect(Precision::Bf16)),
-            vec![rows.clone(), Dim::constant(hidden)],
-        ),
-    );
-    let positions = builder.input(
-        "positions",
-        TensorSpec::new(ValueRole::Index(IndexEncoding::U64), vec![rows]),
-    );
-    let values = |len: usize, seed: usize| {
-        (0..len)
-            .map(|i| {
-                let raw = ((i * 11 + seed * 7) % 31) as f32 / 31.0 - 0.5;
-                moxie_interp::tensor::to_bf16(raw * 0.5)
-            })
-            .collect::<Vec<_>>()
-    };
-    let mut weight_bindings = Vec::new();
-    let weight_ids: Vec<_> = [
-        ("q_a_proj", vec![4, 8], values(4 * 8, 1)),
-        ("q_a_layernorm", vec![4], vec![1.0; 4]),
-        (
-            "q_b_proj",
-            vec![heads * 4, 4],
-            values(heads as usize * 4 * 4, 2),
-        ),
-        ("kv_a_proj_with_mqa", vec![6, 8], values(6 * 8, 3)),
-        ("kv_a_layernorm", vec![4], vec![1.0; 4]),
-        (
-            "kv_b_proj",
-            vec![heads * 4, 4],
-            values(heads as usize * 4 * 4, 4),
-        ),
-        (
-            "o_proj",
-            vec![hidden, heads * value],
-            values(hidden as usize * heads as usize * value as usize, 5),
-        ),
-    ]
-    .into_iter()
-    .map(|(name, shape, data)| {
-        let spec = TensorSpec::new(
-            ValueRole::Weight(WeightPrecision::expect(Precision::Bf16)),
-            shape.iter().copied().map(Dim::constant).collect(),
-        );
-        let id = builder.weight(name, spec).unwrap();
-        weight_bindings.push((
-            id,
-            data,
-            shape.iter().map(|dimension| *dimension as usize).collect(),
-        ));
-        id
-    })
-    .collect();
-    let [
-        q_a_proj,
-        q_a_layernorm,
-        q_b_proj,
-        kv_a_proj,
-        kv_a_layernorm,
-        kv_b_proj,
-        o_proj,
-    ] = weight_ids.try_into().unwrap();
-    let output = builder
-        .node(
-            OpParams::MlaAttention { descriptor },
-            &[
-                hidden_input,
-                positions,
-                q_a_proj,
-                q_a_layernorm,
-                q_b_proj,
-                kv_a_proj,
-                kv_a_layernorm,
-                kv_b_proj,
-                o_proj,
-            ],
-        )
-        .unwrap();
-    let graph = builder.finish(output, &oracles).unwrap();
-    let mut bindings = Bindings::new();
-    bindings.set(
-        hidden_input,
-        Value::Float(HostTensor::bf16(values(3 * hidden as usize, 6), vec![3, 8]).unwrap()),
-    );
-    bindings.set(positions, Value::Index(vec![0, 1, 2]));
-    for (id, data, shape) in weight_bindings {
-        bindings.set(id, Value::Float(HostTensor::bf16(data, shape).unwrap()));
-    }
-    (graph, bindings)
-}
-
-#[test]
-fn mla_heads_split_is_bit_identical_at_prefill_and_decode() {
-    let interpreter = Interpreter::new();
-    let mla_cache =
-        MlaLatentDescriptor::new(4, 2, CachePrecision::expect(Precision::Bf16)).unwrap();
-    for ranks in [2, 4] {
-        let (graph, mut bindings) = mla_graph(4);
-        let lowering = lower_tensor_parallel(&graph, ranks).unwrap();
-        assert_eq!(
-            lowering.stages,
-            vec![Stage::Local {
-                nodes: 0..1,
-                join: Join::Reduce {
-                    output: graph.output(),
-                },
-            }]
-        );
-
-        let mut reference_state = SequenceState::new([StateKind::MlaLatent]);
-        reference_state.append_prompt(ROOT, 3).unwrap();
-        let mut reference_cache =
-            KvCache::for_mla_branch(1, mla_cache, &reference_state, ROOT).unwrap();
-        let mut rank_states = Vec::new();
-        let mut stages = Vec::new();
-        for part in &lowering.ranks {
-            let mut state = SequenceState::new([StateKind::MlaLatent]);
-            state.append_prompt(ROOT, 3).unwrap();
-            let cache = KvCache::for_mla_branch(1, mla_cache, &state, ROOT).unwrap();
-            rank_states.push((state, cache));
-            stages.push(stage_graph(
-                &graph,
-                &bindings,
-                0..1,
-                Some(part),
-                Some(graph.output()),
-            ));
-        }
-        let hidden = graph.inputs()[0];
-        let positions = graph.inputs()[1];
-        for (hidden_data, positions_data, label) in [
-            (None, vec![0, 1, 2], "prefill"),
-            (
-                Some(vec![0.375, -0.25, 0.125, 0.5, -0.125, 0.25, -0.5, 0.375]),
-                vec![3],
-                "decode",
-            ),
-        ] {
-            if let Some(data) = hidden_data {
-                bindings.set(
-                    hidden,
-                    Value::Float(HostTensor::bf16(data, vec![1, 8]).unwrap()),
-                );
-            }
-            bindings.set(positions, Value::Index(positions_data));
-            let table: BTreeMap<ValueId, Value> = graph
-                .inputs()
-                .iter()
-                .map(|input| (*input, bindings.get(*input).unwrap().clone()))
-                .collect();
-            let reference = interpreter
-                .run_with_partition_orders(
-                    &graph,
-                    &bindings,
-                    &mut reference_state,
-                    ROOT,
-                    &mut reference_cache,
-                    &Cancel::never(),
-                    &lowering.linear_orders,
-                    &lowering.combine_orders,
-                    &BTreeMap::new(),
-                )
-                .unwrap();
-            let partials = stages
-                .iter()
-                .zip(&mut rank_states)
-                .map(|(stage, (state, cache))| {
-                    interpreter
-                        .run_with_partition_orders(
-                            &stage.graph,
-                            &bind(stage, &table),
-                            state,
-                            ROOT,
-                            cache,
-                            &Cancel::never(),
-                            &stage.linear_orders,
-                            &stage.combine_orders,
-                            &stage.expert_ownership,
-                        )
-                        .unwrap()
-                        .logits
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                bits(&reduce_rows(&partials)),
-                bits(&reference.logits),
-                "{ranks} ranks {label}"
-            );
-        }
-    }
-
-    let (graph, _) = mla_graph(4);
-    let lowering = lower_tensor_parallel(&graph, 2).unwrap();
-    let mut rank_zero = lowering.ranks[0].clone();
-    let node = &graph.nodes()[0];
-    rank_zero.combine_orders.insert(
-        node.id,
-        moxie_graph::CombineReductionOrder {
-            groups: 2,
-            owned: Some(1),
-        },
-    );
-    let mut oracles = OracleRegistry::new();
-    moxie_oracles::register(&mut oracles).unwrap();
-    assert!(matches!(
-        moxie_plan::build_stage_graph(
-            &graph,
-            Some(&rank_zero),
-            0..1,
-            Some(graph.output()),
-            moxie_oracles::HOST_REFERENCE,
-            &oracles,
-        ),
-        Err(moxie_types::Error::InvalidRequest { field: "stage", .. })
-    ));
-
-    let mut truncated = lowering.ranks[0].clone();
-    let OpParams::MlaAttention { descriptor } = truncated.params.get_mut(&node.id).unwrap() else {
-        unreachable!();
-    };
-    descriptor.heads = 1;
-    let slice = truncated.weight_slices.get_mut(&node.inputs[8]).unwrap();
-    slice.width = 2;
-    slice.full_width = 4;
-    truncated.rows.insert(node.inputs[4], 0..4);
-    truncated.rows.insert(node.inputs[7], 0..4);
-    assert!(matches!(
-        moxie_plan::build_stage_graph(
-            &graph,
-            Some(&truncated),
-            0..1,
-            Some(graph.output()),
-            moxie_oracles::HOST_REFERENCE,
-            &oracles,
-        ),
-        Err(moxie_types::Error::InvalidRequest { field: "stage", .. })
-    ));
-
-    let (graph, bindings) = mla_graph(3);
-    let mut state = SequenceState::new([StateKind::MlaLatent]);
-    state.append_prompt(ROOT, 3).unwrap();
-    let mut cache = KvCache::for_mla_branch(1, mla_cache, &state, ROOT).unwrap();
-    let orders = BTreeMap::from([(
-        graph.nodes()[0].id,
-        moxie_graph::CombineReductionOrder {
-            groups: 2,
-            owned: None,
-        },
-    )]);
-    assert!(matches!(
-        interpreter.run_with_partition_orders(
-            &graph,
-            &bindings,
-            &mut state,
-            ROOT,
-            &mut cache,
-            &Cancel::never(),
-            &BTreeMap::new(),
-            &orders,
-            &BTreeMap::new(),
-        ),
-        Err(moxie_types::Error::InvalidRequest {
-            field: "mla_order",
-            ..
-        })
-    ));
 }
 
 /// Concatenate row-major tensors along columns, preserving FP32 vocabulary
@@ -746,23 +448,13 @@ fn routed_expert_owners_are_bit_identical_at_prefill_and_decode() {
 #[test]
 fn unsupported_partitions_are_refused() {
     type Expect = fn(&TensorParallelRefused) -> bool;
-    let cases: [(&str, Graph, u32, Expect); 9] = [
+    let cases: [(&str, Graph, u32, Expect); 8] = [
         (
             "4 query heads over 3 ranks",
             gemma::build(gemma::Shape::A).unwrap().graph,
             3,
             |r| matches!(r, TensorParallelRefused::Heads { .. }),
         ),
-        ("2 MLA heads over 4 ranks", mla_graph(2).0, 4, |r| {
-            matches!(
-                r,
-                TensorParallelRefused::Heads {
-                    heads: 2,
-                    ranks: 4,
-                    ..
-                }
-            )
-        }),
         (
             "3 global kv heads over 2 ranks",
             gemma::build(gemma::Shape::B).unwrap().graph,
