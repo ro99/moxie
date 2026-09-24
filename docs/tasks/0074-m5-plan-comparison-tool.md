@@ -92,7 +92,8 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
        Single { device: DeviceUuid },
        Tp2 { devices: [DeviceUuid; 2] },
        /// One stage per entry; a stage is one device, or two for a TP2 stage.
-       Pipeline { stages: Vec<(Vec<DeviceUuid>, Range<usize>)> },
+       /// `(start, end)` node indices, not `Range`, so `Ord` derives (amended after the builder's DECISION).
+       Pipeline { stages: Vec<(Vec<DeviceUuid>, (usize, usize))> },
        /// Routed experts on the host beside one device (amended after the builder's DECISION).
        HostExperts { device: DeviceUuid },
    }
