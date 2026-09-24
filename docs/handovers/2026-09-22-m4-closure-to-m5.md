@@ -106,6 +106,15 @@ Slice 6 plan (coordinator, 2026-09-24):
 - [task 0073](../tasks/0073-m5-topology-cost-probes.md), **accepted** 2026-09-24 (evidence in `docs/evidence/topology-costs.md`; the size goes to the milestone-end audit): topology cost probes. A pure `TopologyCosts` record in `moxie-plan`; a probe in `moxie-executor` measuring small-copy latency, bulk bandwidth and bandwidth under simultaneous traffic for host↔device and peer links, plus on-device memory bandwidth; `cargo xtask-cuda probe --costs`; and a measured evidence file. Strata has no bandwidth probe (only a boolean peer matrix). Pinned memory is left to M6.3, because no M5 path uses it.
 - [task 0074](../tasks/0074-m5-plan-comparison-tool.md), **accepted** 2026-09-24 (evidence in `docs/evidence/plan-comparison.md`: the winner changes with the workload; the size goes to the milestone-end audit): the deterministic plan comparison tool. `xtask`'s arch-check allowlist gains `moxie-models`, as an optional dependency under `cuda` (a coordinator-approved edit). The model-import rule already names `xtask` a composition root. It ranks the candidates (single GPU, TP2, PP, TP2 + TP1, host experts) by the joint user workload, from the measured costs and each plan's bytes, and reports rejected alternatives with their reasons.
 - The milestone-end `/ponytail:ponytail-audit`. The carried items: task 0068's size duplication, task 0069's dead check, the size overruns of tasks 0070–0074, and a sweep of task-numbered names in code (for example `xtask/src/gpu.rs`'s `task_0012_negative_fixtures`, and the `taskNNNN` labels and fixture ids in about 25 test files).
+- The milestone-end `/ponytail:ponytail-audit` ran on 2026-09-24 and found about −330 to −430 lines, and no dependencies to remove. The owner chose to run a cleanup task before the package. [Task 0075](../tasks/0075-m5-audit-cleanup.md), **open**, covers:
+  - one byte-sizing helper;
+  - the plan comparison's decode total as a loop;
+  - `Graph::producer`;
+  - one paged-writer assembly;
+  - the dead check in `lower_pipeline`;
+  - the test duplication in `dense_gemma_device`;
+  - removing task numbers from code names.
+  Left out on purpose: `HostJoinExtents` (it is the consumer-side kernel check). The difference in run-close behaviour between the solo and TP workers is routed to review.
 - The M5 acceptance package.
 
 ## Route to M5 closure (owner-agreed plan, 2026-09-22)
