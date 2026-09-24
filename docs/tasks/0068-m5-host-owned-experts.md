@@ -272,6 +272,7 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
 - `crates/moxie-cuda/src/driver.rs`
 - `crates/moxie-executor/src/arena.rs`
 - `crates/moxie-executor/src/dense.rs`
+- `crates/moxie-executor/src/lib.rs`: re-export `HostExpertWeights` beside `DenseGraphStep` only (amended 2026-09-23 after the builder's DECISION).
 - `crates/moxie-executor/src/dense_tp_workers.rs` (struct literal only)
 - `crates/moxie-executor/tests/dense_gemma_device.rs`
 - `crates/moxie-executor/tests/dense_tp2_device.rs` (struct literal only)
