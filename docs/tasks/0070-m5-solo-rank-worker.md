@@ -181,6 +181,7 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
   re-export)
 - `crates/moxie-executor/src/dense_tp_workers.rs` (visibility changes
   only)
+- `crates/moxie-executor/src/dense_tp.rs`: visibility only, `mod workers` becomes `pub(crate) mod workers` (amended 2026-09-24 after the builder's DECISION)
 - `crates/moxie-executor/tests/dense_gemma_device.rs`
 - This task's Result.
 
