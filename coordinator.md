@@ -25,6 +25,9 @@ read their output before issuing assignments. Do not infer job completion from
 agent status alone: an idle agent can have a test running in a background shell.
 Conversely, a busy coordinator display does not mean implementation is running.
 
+Read the owner's tsk board for the current milestone (section 2) and reconcile
+it with the ledger before assigning anything.
+
 Reconcile disagreements using source identity, actual results and recorded
 rulings. A task header, handover or panel summary can be stale. Preserve dated
 historical evidence, but correct current summaries that contradict it. Do not
@@ -36,7 +39,8 @@ already running.
 Keep a concise closure ledger in the current tracked milestone handover under
 `docs/handovers/`, using the handover template. Identify that handover from the
 active task record. Update it at meaningful transitions; avoid a second status
-system in chat or another root file. Tasks and experiments retain detailed
+system in chat or another root file. The owner's tsk board is not a second
+record; it is a view of this ledger (below). Tasks and experiments retain detailed
 evidence; the ledger links to them.
 
 Use the roadmap's original item numbers. Split an item into explicit obligations
@@ -60,6 +64,36 @@ Build the work queue from this ledger. Choose work that removes a dependency or
 delivers the next required capability. Explain the critical path in plain
 language. Do not expand tooling, packaging or an optimization campaign beyond
 its authorized outcome merely because that is where the last task ended.
+
+### Keep the owner's tsk board in step with the ledger
+
+The owner follows the current milestone on a tsk board (owner direction,
+2026-09-23), so that they do not have to ask where things stand. The ledger
+stays the record of evidence. The board is the owner's view of it, and it is
+updated at the same transitions, never instead of them. Use the `tsk-cli`
+skill; read with `--json`; never open the TUI.
+
+- **Layout.** Project `moxie`, thread = the milestone (`m5`, `m6`, …).
+  - Task 1 is the **exit gate**: one step per exit-gate clause (and per
+    roadmap item the gate names), ticked only when an accepted task meets
+    it.
+  - Every other task is one **slice** of the route to closure: one step per
+    task number, ticked when that task is accepted.
+- **At session start** (section 1), read the board beside the ledger. If they
+  disagree, the ledger and the task records win; correct the board and say
+  so.
+- **At milestone start**, only document 06 and the specs are known. Seed the
+  board with the exit-gate task and one task per slice of the agreed route.
+  The slices may have no steps yet.
+- **As the route becomes clear**, add task steps when a slice is designed.
+  Rename or re-scope the board as the ledger does, in the same turn. A slice
+  that grows beyond its plan is a tripwire (below), and the board shows it.
+- **Status is the owner's to close.** A slice is `started` while it has an
+  open task, and `review` once every task in it is accepted. Only the owner
+  sets `done`. A slice not yet started stays `open`.
+- **Updates land in the same turn** as the event: opening a task, accepting
+  it, re-scoping a slice, or meeting an exit-gate clause. A stale board is a
+  status report the owner can't trust.
 
 ### Own the pace and the scope
 
