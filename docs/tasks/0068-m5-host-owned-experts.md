@@ -14,8 +14,7 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
 - The **design below is the coordinator's**, including every lifetime and
   cross-check rule. Implement the numbered changes exactly. If one conflicts
   with the code, stop and send a `DECISION` report; do not redesign.
-- Root `/home/rodrigo/Developer/moxie`, branch `main`, base: the commit that
-  accepts task 0067. Preserve the carried `.gitignore`,
+- Root `/home/rodrigo/Developer/moxie`, branch `main`, base `3f864be` (task 0067 accepted). Preserve the carried `.gitignore`,
   `docs/evidence/specification-version.md` and ADRs 0034 and 0035.
 - **GPUs are free.** Always set `CUDA_DEVICE_ORDER=PCI_BUS_ID`. The builder
   is the only agent using the GPUs during this task.
@@ -97,7 +96,8 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
      `state_layers.insert(local id, original)`, and set the param's layer
      to `local_layer`.
    - A stage with one attention node still gets layer 0, so current
-     behaviour is unchanged.
+     behaviour is unchanged. Task 0067's MLA check compares against the
+     source **before** this rewrite; keep that order.
    - For the whole Gemma graph, whose layers are 0..L in node order, the
      numbering is the identity.
 
