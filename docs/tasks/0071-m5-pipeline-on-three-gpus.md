@@ -1,7 +1,19 @@
 # Task 0071 — pipeline execution on the three GPUs
 
-Status: **open** (coordinator, 2026-09-24, under the owner's auto-mode
-delegation). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-24, under the owner's auto-mode
+delegation), after sol's review rounds R1 and R2. Builder Codex `luna`;
+reviewer Codex `sol`.
+- R1: two MEDIUM findings.
+  - A cancel raised at the last wavefront item was missed. Fixed with a
+    check after the loop, plus failure (d).
+  - The lowering was checked against the graph field by field (counts
+    only). Fixed by re-deriving the lowering with `lower_pipeline` and
+    requiring equality, plus a mismatch test and mutation 4.
+- **Size, carried to the milestone-end ponytail audit:**
+  - `pipeline.rs` is +383 lines, against a 200–300 estimate;
+  - `dense_gemma_device.rs` grew by about +644 lines for one test (with
+    fault and mismatch cases). The R1 deduplication was outweighed by the
+    new cases.
 
 ## Identity and authority
 
@@ -253,4 +265,67 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Result, filled after work
 
-- Pending.
+- Implemented `PipelineWorkers` and `PipelineStep` with sequential wavefront
+  execution, one host-staged activation per declared boundary, whole-pipeline
+  abort on failure, two-phase commit across stages, and sticky loss after a
+  partial apply. `SoloRankWorker` now admits ordered stage graphs with
+  `lower_selected_ordered`; its existing direct-path GPU equality test still
+  passes bytewise.
+- The three-GPU test passed for dense Shape A and routed Shape C. Both printed
+  `handoff bytes [240, 240]`; prefill and decode outputs matched the host
+  reference within the existing ULP gate. On the 3090 pair, both fixtures were
+  bytewise equal to the single-worker 3090 reference across microbatched
+  prefill and two decodes. Reservation counts returned to their spawn values
+  after each commit and injected failure.
+- Mutations, each restored after a failing run:
+  1. Aborting only the failing stage failed the all-stage stats assertion:
+     stage 0 reported `(5, 0, 1)` instead of `(0, 0, 1)`.
+  2. Leaving prepared stages un-aborted failed the same assertion: an earlier
+     stage retained `published_rows=5` instead of `0`.
+  3. Reusing microbatch 0's handoff failed the declared extent check with
+     `preceding stage output does not match the declared read extent`.
+- Gates passed: `cargo fmt --all -- --check`; workspace clippy with `-D
+  warnings`; driver/paged-attention executor clippy with test hooks and `-D
+  warnings`; `cargo test --workspace --locked`; `cargo xtask arch-check` (79
+  rejected fixtures, 21 accepted, 13 rules); and `cargo xtask spec-check` (10
+  documents unchanged).
+- GPU gates passed with `CUDA_DEVICE_ORDER=PCI_BUS_ID`: the unfiltered
+  `dense_gemma_device` suite (6 passed, including the new pipeline test and
+  the task 0070 solo-worker equality test), and `cargo xtask-cuda test-gpu`
+  (63 passed, 0 failed, 0 skipped/unmeasured; SM86 and SM120 qualified).
+- Review map (added/removed lines against task base):
+  - `crates/moxie-executor/src/pipeline.rs`: +383 / -0.
+  - `crates/moxie-executor/src/lib.rs`: +4 / -0.
+  - `crates/moxie-executor/src/rank_worker.rs`: +28 / -2.
+  - `crates/moxie-executor/tests/dense_gemma_device.rs`: +638 / -11.
+
+### Review round 1 fixes
+
+- `execute` now derives cuts from `lowering.stages()[1..]`, calls
+  `lower_pipeline(graph, &cuts)`, and refuses any refusal or unequal lowering
+  as `InvalidRequest { field: "pipeline", .. }` before stage work. The test
+  passes a routed Shape C graph and a distinct dense Shape A lowering; shared
+  cuts `[14, 41]` lower successfully for both graphs, but produce unequal
+  plans. The binding callback is not called and every stage's stats stay
+  unchanged.
+- `execute` checks cancellation after the final wavefront item. Fault (d)
+  sets cancel from the binding closure at stage 2, the final microbatch; it
+  returns `Cancelled`, preserves every stage's stats, then retries to the
+  first clean logits byte for byte. Faults (a)–(d) now use one fault loop.
+- Flattened intermediate handoffs to one slot per microbatch. The test factors
+  selected-layer geometry through `geometry_for_layers`, reuses
+  `solo_worker_step`, and shares the decode iteration through `decode_outputs`.
+- Mutation 4 changed the derived-plan predicate from
+  `|derived| derived == *lowering` to `|_| true`. The focused GPU test failed
+  at the required `InvalidRequest { field: "pipeline" }` assertion; the
+  equality check was restored.
+- R1 gates passed: fmt, both clippy gates, `cargo test --workspace --locked`,
+  and the unfiltered `dense_gemma_device` suite (6 passed). The full
+  `cargo xtask-cuda test-gpu` was not repeated in R1 as requested; it passed
+  63/63 on SM86 and SM120 in the initial round.
+- Updated review map against the task base:
+  - `crates/moxie-executor/src/pipeline.rs`: +383 / -0.
+  - `crates/moxie-executor/src/lib.rs`: +4 / -0.
+  - `crates/moxie-executor/src/rank_worker.rs`: +28 / -2.
+  - `crates/moxie-executor/tests/dense_gemma_device.rs`: +638 / -11.
+  - `docs/tasks/0071-m5-pipeline-on-three-gpus.md`: +64 / -1 (Result).

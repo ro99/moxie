@@ -1,5 +1,6 @@
 #![cfg(feature = "paged-attention-binding")]
 
+use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -7,7 +8,7 @@ use std::time::{Duration, Instant};
 use moxie_cuda::{RankContext, Stream};
 use moxie_graph::Graph;
 use moxie_memory::{CapacitySnapshot, Ledger};
-use moxie_plan::{Phase, ResourceWorkload, lower_selected};
+use moxie_plan::{Phase, ResourceWorkload, lower_selected_ordered};
 use moxie_state::{DeviceKvSequence, KvGeometry, PreparedCommit};
 use moxie_types::{
     DeviceCapability, Error, KernelCatalogue, PagedKvWriter, RankId, Result, StateTransactionId,
@@ -58,6 +59,8 @@ pub struct SoloRankWorker {
     closed: bool,
     #[cfg(feature = "paged-attention-test-hooks")]
     fail_next_step: bool,
+    #[cfg(feature = "paged-attention-test-hooks")]
+    refuse_next_prepare: bool,
 }
 
 impl SoloRankWorker {
@@ -89,6 +92,8 @@ impl SoloRankWorker {
             closed: false,
             #[cfg(feature = "paged-attention-test-hooks")]
             fail_next_step: false,
+            #[cfg(feature = "paged-attention-test-hooks")]
+            refuse_next_prepare: false,
         })
     }
 
@@ -120,6 +125,14 @@ impl SoloRankWorker {
     }
 
     pub fn prepare_commit(&mut self) -> Result<()> {
+        self.check_live()?;
+        #[cfg(feature = "paged-attention-test-hooks")]
+        if std::mem::take(&mut self.refuse_next_prepare) {
+            return Err(Error::InvalidRequest {
+                field: "fault",
+                detail: "injected prepare refusal before admission".into(),
+            });
+        }
         self.request(WorkerCommand::PrepareCommit)
     }
 
@@ -140,6 +153,11 @@ impl SoloRankWorker {
     #[cfg(feature = "paged-attention-test-hooks")]
     pub fn fail_next_step(&mut self) {
         self.fail_next_step = true;
+    }
+
+    #[cfg(feature = "paged-attention-test-hooks")]
+    pub fn refuse_next_prepare(&mut self) {
+        self.refuse_next_prepare = true;
     }
 
     pub fn close(mut self) -> Result<()> {
@@ -301,7 +319,15 @@ impl WorkerState<'_> {
             device: self.capability.uuid,
             paged_state_capacity: None,
         };
-        let candidate = lower_selected(&graph, workload, &self.capability, &catalogue)?;
+        let candidate = lower_selected_ordered(
+            &graph,
+            workload,
+            &self.capability,
+            &catalogue,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )?;
         let plan = SelectedReservedPlan::admit(
             candidate,
             &graph,

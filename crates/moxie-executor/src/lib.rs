@@ -147,6 +147,10 @@ pub use dense_tp::{DenseRankWorkerConfig, DenseRankWorkers, DenseWorkerStep};
 mod rank_worker;
 #[cfg(feature = "paged-attention-binding")]
 pub use rank_worker::{SoloRankWorker, SoloRankWorkerConfig};
+#[cfg(feature = "paged-attention-binding")]
+mod pipeline;
+#[cfg(feature = "paged-attention-binding")]
+pub use pipeline::{PipelineStep, PipelineWorkers};
 
 #[cfg(feature = "driver")]
 pub use lease::{PrepareRefused, Upload};

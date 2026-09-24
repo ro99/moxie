@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{c_char, c_int, c_void};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -16,18 +17,21 @@ use moxie_cuda::{RankContext, Stream, device_count, query_device};
 use moxie_engine::{HostTensor, Value};
 use moxie_executor::paged_attention::device::commit_paged_state;
 use moxie_executor::{
-    DenseGraphStep, HostExpertWeights, PageGeometry, PagedAttentionRun, SelectedReservedPlan,
-    SoloRankWorker, SoloRankWorkerConfig, Staging,
+    DenseGraphStep, HostExpertWeights, PageGeometry, PagedAttentionRun, PipelineWorkers,
+    SelectedReservedPlan, SoloRankWorker, SoloRankWorkerConfig, Staging,
 };
 use moxie_format::bf16::f32_to_bf16_bits;
-use moxie_graph::{Graph, GraphBuilder, OpParams, OracleRegistry, ValueId};
+use moxie_graph::{Graph, GraphBuilder, OpParams, OracleRegistry, ValueId, ValueRole};
 use moxie_interp::{Cancel, Interpreter, KvCache};
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_plan::{
-    Phase, ResourceWorkload, SelectedPlanCandidate, StageGraph, lower_host_experts, lower_selected,
+    Phase, PipelineLowering, ResourceWorkload, SelectedPlanCandidate, StageGraph,
+    build_stage_graph, lower_host_experts, lower_pipeline, lower_selected,
     lower_selected_host_experts, lower_selected_ordered,
 };
-use moxie_state::{DeviceKvSequence, KvGeometry, LayerKv, Retention, SequenceState, StateKind};
+use moxie_state::{
+    DeviceKvSequence, KvGeometry, LayerKv, ROOT, Retention, SequenceState, StateKind,
+};
 use moxie_types::{
     DeviceCapability, DeviceUuid, Dim, HostTier, PagePlacement, Precision, RankId, Scope,
     TensorLayout, Tier,
@@ -83,8 +87,25 @@ fn geometry(
     max_tokens: usize,
     tentative_rows: usize,
 ) -> KvGeometry {
+    geometry_for_layers(
+        config,
+        0..config.layers,
+        page_tokens,
+        max_tokens,
+        tentative_rows,
+    )
+}
+
+fn geometry_for_layers(
+    config: &moxie_models::gemma4::TextConfig,
+    layers: impl IntoIterator<Item = u32>,
+    page_tokens: usize,
+    max_tokens: usize,
+    tentative_rows: usize,
+) -> KvGeometry {
     KvGeometry {
-        layers: (0..config.layers)
+        layers: layers
+            .into_iter()
             .map(|layer| {
                 let layer = config.layer_geometry(layer);
                 LayerKv {
@@ -155,6 +176,17 @@ fn stage_bindings(
     positions: &[u64],
     capability: &DeviceCapability,
 ) -> Vec<moxie_executor::OwnedBinding> {
+    stage_bindings_omitting(fixture, stage, tokens, positions, capability, None)
+}
+
+fn stage_bindings_omitting(
+    fixture: &moxie_cli::fixture::Fixture,
+    stage: Option<&StageGraph>,
+    tokens: &[u64],
+    positions: &[u64],
+    capability: &DeviceCapability,
+    omit_read: Option<ValueId>,
+) -> Vec<moxie_executor::OwnedBinding> {
     let graph = stage.map_or(&fixture.graph, |stage| &stage.graph);
     let mut bindings = Vec::new();
     let reads: Vec<_> = stage.map_or_else(
@@ -175,6 +207,9 @@ fn stage_bindings(
         },
     );
     for (original, local) in reads {
+        if Some(original) == omit_read {
+            continue;
+        }
         let source = if original == fixture.tokens {
             Value::Index(tokens.to_vec())
         } else if original == fixture.positions {
@@ -383,6 +418,200 @@ fn host_step(
         .logits
         .data()
         .to_vec()
+}
+
+fn first_node_of_layer(graph: &Graph, layer: usize) -> usize {
+    let suffix = format!(".{layer}");
+    graph
+        .nodes()
+        .iter()
+        .position(|node| {
+            node.inputs.iter().any(|input| {
+                graph.weights().contains(input)
+                    && graph
+                        .name(*input)
+                        .is_some_and(|name| name.ends_with(&suffix))
+            })
+        })
+        .expect("layer has a weight-consuming node")
+}
+
+fn pipeline_stage_graphs(
+    fixture: &moxie_cli::fixture::Fixture,
+    lowering: &PipelineLowering,
+) -> Vec<StageGraph> {
+    let mut oracles = OracleRegistry::new();
+    moxie_oracles::register(&mut oracles).expect("register pipeline oracles");
+    lowering
+        .stages()
+        .iter()
+        .enumerate()
+        .map(|(stage, nodes)| {
+            let output = lowering
+                .handoffs()
+                .get(stage)
+                .copied()
+                .unwrap_or_else(|| fixture.graph.output());
+            build_stage_graph(
+                &fixture.graph,
+                None,
+                nodes.clone(),
+                Some(output),
+                moxie_oracles::HOST_REFERENCE,
+                &oracles,
+            )
+            .expect("build stage graph for worker geometry")
+        })
+        .collect()
+}
+
+fn spawn_stage_workers(
+    stages: &[StageGraph],
+    config: &moxie_models::gemma4::TextConfig,
+    devices: &[DeviceCapability],
+    host_capacity: &CapacitySnapshot,
+    rank_seed: &mut u32,
+) -> Vec<SoloRankWorker> {
+    assert_eq!(stages.len(), devices.len());
+    stages
+        .iter()
+        .zip(devices)
+        .map(|(stage, device)| {
+            let rank = RankId(*rank_seed);
+            *rank_seed += 1;
+            SoloRankWorker::spawn(SoloRankWorkerConfig {
+                rank,
+                ordinal: device.ordinal,
+                geometry: geometry_for_layers(
+                    config,
+                    stage.state_layers.values().copied(),
+                    4,
+                    64,
+                    5,
+                ),
+                heads: config.heads,
+                max_rows: 5,
+                host_capacity: host_capacity.clone(),
+                deadline: Duration::from_secs(60),
+            })
+            .unwrap_or_else(|error| panic!("spawn stage worker on {}: {error}", device.uuid))
+        })
+        .collect()
+}
+
+struct PipelineRun<'a> {
+    fixture: &'a moxie_cli::fixture::Fixture,
+    config: &'a moxie_models::gemma4::TextConfig,
+    lowering: &'a PipelineLowering,
+    catalogue: &'a moxie_types::KernelCatalogue,
+    devices: &'a [DeviceCapability],
+}
+
+impl PipelineRun<'_> {
+    fn execute<'w>(
+        &self,
+        workers: &'w mut PipelineWorkers,
+        microbatches: &[Range<u64>],
+        cancel: &AtomicBool,
+        cancel_at: Option<(usize, usize)>,
+    ) -> moxie_types::Result<moxie_executor::PipelineStep<'w>> {
+        let mut oracles = OracleRegistry::new();
+        moxie_oracles::register(&mut oracles).expect("register pipeline oracles");
+        let mut make_bindings = |stage: usize, graph: &StageGraph, rows: Range<u64>| {
+            if let Some((cancel_stage, cancel_batch)) = cancel_at {
+                let batch = microbatches.iter().position(|candidate| *candidate == rows);
+                if stage == cancel_stage && batch == Some(cancel_batch) {
+                    cancel.store(true, SeqCst);
+                }
+            }
+            let tokens: Vec<_> = rows.clone().map(|row| row % self.config.vocab).collect();
+            let positions: Vec<_> = rows.clone().collect();
+            let incoming = if stage > 0 {
+                Some(self.lowering.handoffs()[stage - 1])
+            } else {
+                None
+            };
+            Ok(stage_bindings_omitting(
+                self.fixture,
+                Some(graph),
+                &tokens,
+                &positions,
+                &self.devices[stage],
+                incoming,
+            ))
+        };
+        workers.execute(
+            &self.fixture.graph,
+            self.lowering,
+            moxie_oracles::HOST_REFERENCE,
+            &oracles,
+            self.catalogue,
+            microbatches,
+            &mut make_bindings,
+            cancel,
+        )
+    }
+}
+
+fn assert_pipeline_reservations(
+    workers: &mut PipelineWorkers,
+    spawned: &[(u64, u64, usize)],
+    label: &str,
+) {
+    let current = workers.stats().expect("pipeline stage stats");
+    assert!(
+        current
+            .iter()
+            .zip(spawned)
+            .all(|(actual, initial)| actual.2 == initial.2),
+        "{label}: outstanding reservations changed"
+    );
+}
+
+fn host_prefill_and_decodes(
+    fixture: &moxie_cli::fixture::Fixture,
+    config: &moxie_models::gemma4::TextConfig,
+) -> [Vec<f32>; 3] {
+    let mut state = SequenceState::new([StateKind::KvPages]);
+    let mut cache =
+        KvCache::for_branch(config.layers as usize, &state, ROOT).expect("host pipeline cache");
+    let tokens: Vec<_> = (0..5).map(|row| row % config.vocab).collect();
+    state
+        .append_prompt(ROOT, tokens.len() as u64)
+        .expect("append host prefill");
+    let prefill = host_step(fixture, &mut state, &mut cache, &tokens, &[0, 1, 2, 3, 4]);
+    state.append_prompt(ROOT, 1).expect("append host decode");
+    let decode_5 = host_step(fixture, &mut state, &mut cache, &[5 % config.vocab], &[5]);
+    state
+        .append_prompt(ROOT, 1)
+        .expect("append host second decode");
+    let decode_6 = host_step(fixture, &mut state, &mut cache, &[6 % config.vocab], &[6]);
+    [prefill, decode_5, decode_6]
+}
+
+fn solo_worker_step(
+    worker: &mut SoloRankWorker,
+    fixture: &moxie_cli::fixture::Fixture,
+    catalogue: &moxie_types::KernelCatalogue,
+    capability: &DeviceCapability,
+    tokens: &[u64],
+    positions: &[u64],
+    visible_tokens: u64,
+) -> moxie_types::Result<Vec<u8>> {
+    worker.step(
+        fixture.graph.clone(),
+        catalogue.clone(),
+        stage_bindings(fixture, None, tokens, positions, capability),
+        tokens.len() as u64,
+        visible_tokens,
+    )
+}
+
+fn decode_outputs(
+    batches: &[Range<u64>],
+    execute: impl FnMut(&Range<u64>) -> Vec<u8>,
+) -> Vec<Vec<u8>> {
+    batches.iter().map(execute).collect()
 }
 
 fn bf16_ulp(value: f32) -> f32 {
@@ -894,11 +1123,14 @@ fn solo_rank_worker_matches_the_direct_path_on_every_gpu() {
         .expect("start solo rank worker");
         let step =
             |worker: &mut SoloRankWorker, tokens: &[u64], positions: &[u64], rows, visible| {
-                worker.step(
-                    fixture.graph.clone(),
-                    catalogue.clone(),
-                    stage_bindings(&fixture, None, tokens, positions, &capability),
-                    rows,
+                debug_assert_eq!(rows, tokens.len() as u64);
+                solo_worker_step(
+                    worker,
+                    &fixture,
+                    &catalogue,
+                    &capability,
+                    tokens,
+                    positions,
                     visible,
                 )
             };
@@ -951,6 +1183,401 @@ fn solo_rank_worker_matches_the_direct_path_on_every_gpu() {
         step(&mut worker, &after_next_decode, &after_next_position, 1, 8)
             .expect("clean step after injected refusal");
         worker.close().expect("close worker without reservations");
+    }
+}
+
+#[test]
+fn pipeline_runs_dense_and_routed_gemma_on_three_gpus() {
+    let _guard = one_at_a_time();
+    let count = match device_count() {
+        Ok(count) => count,
+        Err(error) => {
+            eprintln!("SKIP pipeline Gemma: could not enumerate GPUs: {error}");
+            return;
+        }
+    };
+    let mut devices = Vec::new();
+    for ordinal in 0..count {
+        match query_device(ordinal) {
+            Ok(device) => devices.push(device),
+            Err(error) => {
+                eprintln!("SKIP pipeline Gemma: could not query GPU {ordinal}: {error}");
+                return;
+            }
+        }
+    }
+    let mut rtx3090s: Vec<_> = devices
+        .iter()
+        .filter(|device| device.name.contains("3090"))
+        .cloned()
+        .collect();
+    rtx3090s.sort_by(|left, right| left.pci_bus_id.cmp(&right.pci_bus_id));
+    let Some(rtx5060) = devices
+        .iter()
+        .find(|device| device.name.contains("5060 Ti"))
+        .cloned()
+    else {
+        eprintln!("SKIP pipeline Gemma: an RTX 5060 Ti is not visible");
+        return;
+    };
+    if rtx3090s.len() < 2 {
+        eprintln!(
+            "SKIP pipeline Gemma: need two RTX 3090s and one RTX 5060 Ti; found {} RTX 3090s",
+            rtx3090s.len()
+        );
+        return;
+    }
+    let pair_devices = [rtx3090s[0].clone(), rtx3090s[1].clone()];
+    let three_devices = [
+        pair_devices[0].clone(),
+        pair_devices[1].clone(),
+        rtx5060.clone(),
+    ];
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+    let host_capacity = CapacitySnapshot::measured_host(
+        &moxie_host::read().expect("measure host capacity"),
+        1 << 20,
+    )
+    .expect("host capacity snapshot");
+    let prefill_batches = [0..2, 2..5];
+    let decode_batches = [5..6, 6..7];
+    let mut rank_seed = 71_000;
+
+    let mut routed_config = moxie_cli::gemma::Shape::C.config();
+    routed_config.moe.as_mut().expect("Shape C MoE").experts = 8;
+    routed_config.vocab = 12;
+    let dense_config = moxie_cli::gemma::Shape::A.config();
+    let dense_fixture =
+        moxie_cli::gemma::build(moxie_cli::gemma::Shape::A).expect("build dense Shape A fixture");
+    let dense_graph = dense_fixture.graph.clone();
+    // Shared activation cuts make the wrong graph yield a distinct valid plan.
+    let mismatch_cuts = [14, 41];
+    let dense_mismatch_lowering = lower_pipeline(&dense_graph, &mismatch_cuts)
+        .expect("lower dense graph at shared mismatch cuts");
+    let dense_cuts = [
+        first_node_of_layer(&dense_fixture.graph, 1),
+        first_node_of_layer(&dense_fixture.graph, 4),
+    ];
+    let dense_lowering = lower_pipeline(&dense_fixture.graph, &dense_cuts)
+        .expect("lower dense Shape A for mismatched-lowering refusal");
+    let cases = [
+        ("dense", dense_config, dense_fixture),
+        (
+            "routed",
+            routed_config.clone(),
+            moxie_cli::gemma::build_with_config(routed_config)
+                .expect("build routed Shape C fixture"),
+        ),
+    ];
+
+    for (label, config, fixture) in cases {
+        let cuts = [
+            first_node_of_layer(&fixture.graph, 1),
+            first_node_of_layer(&fixture.graph, 4),
+        ];
+        let lowering = if label == "dense" {
+            dense_lowering.clone()
+        } else {
+            lower_pipeline(&fixture.graph, &cuts)
+                .unwrap_or_else(|error| panic!("{label} Gemma layer handoff refused: {error}"))
+        };
+        let stages = pipeline_stage_graphs(&fixture, &lowering);
+        assert_eq!(stages.len(), 3);
+        assert_eq!(
+            stages
+                .iter()
+                .map(|stage| stage.state_layers.values().copied().collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            [vec![0], vec![1, 2, 3], vec![4, 5]],
+            "each worker's state geometry follows its original attention layers"
+        );
+        let host = host_prefill_and_decodes(&fixture, &config);
+        let host_cancel = AtomicBool::new(false);
+        let run = PipelineRun {
+            fixture: &fixture,
+            config: &config,
+            lowering: &lowering,
+            catalogue: &catalogue,
+            devices: &three_devices,
+        };
+        let mut workers = PipelineWorkers::new(spawn_stage_workers(
+            &stages,
+            &config,
+            &three_devices,
+            &host_capacity,
+            &mut rank_seed,
+        ))
+        .expect("create three-stage pipeline");
+        let spawned_stats = workers.stats().expect("stats after pipeline spawn");
+        if label == "routed" {
+            assert_ne!(
+                lower_pipeline(&fixture.graph, &mismatch_cuts)
+                    .expect("same cuts lower the routed graph"),
+                dense_mismatch_lowering,
+                "the mismatched graph must produce a distinct valid lowering"
+            );
+            let mut oracles = OracleRegistry::new();
+            moxie_oracles::register(&mut oracles).expect("register mismatch-test oracles");
+            let mut called = false;
+            let mismatched = workers.execute(
+                &fixture.graph,
+                &dense_mismatch_lowering,
+                moxie_oracles::HOST_REFERENCE,
+                &oracles,
+                &catalogue,
+                &prefill_batches,
+                &mut |_, _, _| {
+                    called = true;
+                    Err(moxie_types::Error::InvalidRequest {
+                        field: "binding",
+                        detail: "mismatched lowering reached bindings".into(),
+                    })
+                },
+                &host_cancel,
+            );
+            assert!(matches!(
+                mismatched,
+                Err(moxie_types::Error::InvalidRequest {
+                    field: "pipeline",
+                    ..
+                })
+            ));
+            drop(mismatched);
+            assert!(!called, "invalid lowering must be refused before bindings");
+            assert_eq!(
+                workers.stats().expect("stats after mismatched lowering"),
+                spawned_stats
+            );
+        }
+        let first_clean = run
+            .execute(&mut workers, &prefill_batches, &host_cancel, None)
+            .expect("first clean pipeline prefill");
+        let first_clean_logits = first_clean.logits().to_vec();
+        let expected_handoff_bytes: Vec<_> = lowering
+            .handoffs()
+            .iter()
+            .map(|handoff| {
+                let ValueRole::Activation(precision) = fixture.graph.spec(*handoff).unwrap().role
+                else {
+                    panic!("pipeline handoff is not an activation");
+                };
+                5 * config.hidden * u64::from(precision.get().bits() / 8)
+            })
+            .collect();
+        assert_eq!(first_clean.handoff_bytes(), expected_handoff_bytes);
+        assert_logits(
+            &format!("{label} first clean pipeline prefill"),
+            &first_clean_logits,
+            &host[0],
+        );
+        drop(first_clean);
+        assert_eq!(
+            workers.stats().expect("stats after clean abort"),
+            spawned_stats
+        );
+
+        #[derive(Clone, Copy)]
+        enum Fault {
+            Step,
+            Cancel(usize, usize),
+            Prepare,
+        }
+        for fault in [
+            Fault::Step,
+            Fault::Cancel(1, 0),
+            Fault::Prepare,
+            Fault::Cancel(2, prefill_batches.len() - 1),
+        ] {
+            host_cancel.store(false, SeqCst);
+            let error = match fault {
+                Fault::Step => {
+                    workers.fail_next_step(1).expect("inject stage-one failure");
+                    run.execute(&mut workers, &prefill_batches, &host_cancel, None)
+                        .expect_err("injected stage failure")
+                }
+                Fault::Cancel(stage, batch) => run
+                    .execute(
+                        &mut workers,
+                        &prefill_batches,
+                        &host_cancel,
+                        Some((stage, batch)),
+                    )
+                    .expect_err("injected pipeline cancellation"),
+                Fault::Prepare => {
+                    workers
+                        .refuse_next_prepare(2)
+                        .expect("inject stage-two prepare refusal");
+                    let step = run
+                        .execute(&mut workers, &prefill_batches, &host_cancel, None)
+                        .expect("pipeline prefill before prepare refusal");
+                    assert_eq!(step.logits(), first_clean_logits);
+                    step.commit().expect_err("injected prepare refusal")
+                }
+            };
+            if matches!(fault, Fault::Step | Fault::Prepare) {
+                assert!(matches!(
+                    error,
+                    moxie_types::Error::InvalidRequest { field: "fault", .. }
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    moxie_types::Error::Cancelled {
+                        at: "pipeline stage"
+                    }
+                ));
+            }
+            host_cancel.store(false, SeqCst);
+            assert_eq!(
+                workers.stats().expect("stats after pipeline fault"),
+                spawned_stats
+            );
+            let retry = run
+                .execute(&mut workers, &prefill_batches, &host_cancel, None)
+                .expect("clean retry after pipeline fault");
+            assert_eq!(retry.logits(), first_clean_logits);
+            drop(retry);
+            assert_eq!(
+                workers.stats().expect("stats after pipeline retry"),
+                spawned_stats
+            );
+        }
+
+        let prefill = run
+            .execute(&mut workers, &prefill_batches, &host_cancel, None)
+            .expect("three-GPU microbatched prefill");
+        assert_eq!(prefill.handoff_bytes(), expected_handoff_bytes);
+        let prefill_logits = prefill.commit().expect("commit three-GPU prefill");
+        assert_logits(
+            &format!("{label} three-GPU prefill"),
+            &prefill_logits,
+            &host[0],
+        );
+        assert_pipeline_reservations(&mut workers, &spawned_stats, "three-stage prefill");
+
+        let three_stage_decodes = decode_outputs(&decode_batches, |rows| {
+            let step = run
+                .execute(&mut workers, std::slice::from_ref(rows), &host_cancel, None)
+                .expect("three-GPU decode");
+            let decode_bytes: Vec<_> = expected_handoff_bytes
+                .iter()
+                .map(|bytes| bytes / 5)
+                .collect();
+            assert_eq!(step.handoff_bytes(), decode_bytes);
+            let logits = step.commit().expect("commit three-GPU decode");
+            assert_pipeline_reservations(&mut workers, &spawned_stats, "three-stage decode");
+            logits
+        });
+        for (logits, expected) in three_stage_decodes.iter().zip(&host[1..]) {
+            assert_logits(&format!("{label} three-GPU decode"), logits, expected);
+        }
+        workers.close().expect("close three-stage workers");
+
+        let pair_lowering =
+            lower_pipeline(&fixture.graph, &[first_node_of_layer(&fixture.graph, 3)])
+                .expect("lower two-stage 3090 pipeline");
+        let pair_stages = pipeline_stage_graphs(&fixture, &pair_lowering);
+        let pair_run = PipelineRun {
+            fixture: &fixture,
+            config: &config,
+            lowering: &pair_lowering,
+            catalogue: &catalogue,
+            devices: &pair_devices,
+        };
+        let mut pair = PipelineWorkers::new(spawn_stage_workers(
+            &pair_stages,
+            &config,
+            &pair_devices,
+            &host_capacity,
+            &mut rank_seed,
+        ))
+        .expect("create two-stage 3090 pipeline");
+        let pair_spawned = pair.stats().expect("stats after pair spawn");
+        let pair_prefill = pair_run
+            .execute(&mut pair, &prefill_batches, &host_cancel, None)
+            .expect("pair microbatched prefill");
+        let pair_prefill_handoff = pair_prefill.handoff_bytes().to_vec();
+        let pair_prefill_logits = pair_prefill.commit().expect("commit pair prefill");
+        assert_eq!(pair_prefill_handoff, expected_handoff_bytes[..1]);
+        assert_pipeline_reservations(&mut pair, &pair_spawned, "pair prefill");
+        let pair_decodes = decode_outputs(&decode_batches, |rows| {
+            let pair_step = pair_run
+                .execute(&mut pair, std::slice::from_ref(rows), &host_cancel, None)
+                .expect("pair decode");
+            assert_eq!(pair_step.handoff_bytes(), &[pair_prefill_handoff[0] / 5]);
+            let pair_logits = pair_step.commit().expect("commit pair decode");
+            assert_pipeline_reservations(&mut pair, &pair_spawned, "pair decode");
+            pair_logits
+        });
+        pair.close().expect("close two-stage pipeline");
+
+        let mut whole_worker = SoloRankWorker::spawn(SoloRankWorkerConfig {
+            rank: RankId(rank_seed),
+            ordinal: pair_devices[0].ordinal,
+            geometry: geometry(&config, 4, 64, 5),
+            heads: config.heads,
+            max_rows: 5,
+            host_capacity: host_capacity.clone(),
+            deadline: Duration::from_secs(60),
+        })
+        .expect("spawn whole-graph 3090 worker");
+        rank_seed += 1;
+        let mut whole_prefill = Vec::new();
+        for rows in &prefill_batches {
+            let tokens: Vec<_> = rows.clone().map(|row| row % config.vocab).collect();
+            let positions: Vec<_> = rows.clone().collect();
+            whole_prefill.extend(
+                solo_worker_step(
+                    &mut whole_worker,
+                    &fixture,
+                    &catalogue,
+                    &pair_devices[0],
+                    &tokens,
+                    &positions,
+                    rows.end,
+                )
+                .expect("whole-graph microbatch"),
+            );
+        }
+        whole_worker
+            .prepare_commit()
+            .expect("prepare whole prefill");
+        whole_worker.apply_commit().expect("apply whole prefill");
+        assert_logits(
+            &format!("{label} one-GPU microbatched reference"),
+            &whole_prefill,
+            &host[0],
+        );
+        assert_eq!(
+            pair_prefill_logits, whole_prefill,
+            "{label} pair prefill bits"
+        );
+        let whole_decodes = decode_outputs(&decode_batches, |rows| {
+            let tokens: Vec<_> = rows.clone().map(|row| row % config.vocab).collect();
+            let positions: Vec<_> = rows.clone().collect();
+            let whole_logits = solo_worker_step(
+                &mut whole_worker,
+                &fixture,
+                &catalogue,
+                &pair_devices[0],
+                &tokens,
+                &positions,
+                rows.end,
+            )
+            .expect("whole-graph decode");
+            whole_worker.prepare_commit().expect("prepare whole decode");
+            whole_worker.apply_commit().expect("apply whole decode");
+            whole_logits
+        });
+        for ((pair, whole), expected) in pair_decodes.iter().zip(&whole_decodes).zip(&host[1..]) {
+            assert_eq!(pair, whole, "{label} pair decode bits");
+            assert_logits(&format!("{label} one-GPU decode"), whole, expected);
+        }
+        whole_worker.close().expect("close whole-graph worker");
+        eprintln!(
+            "PASS pipeline {label} on 3090 pair + 5060 Ti; handoff bytes {:?}",
+            expected_handoff_bytes
+        );
     }
 }
 
