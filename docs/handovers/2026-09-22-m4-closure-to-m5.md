@@ -94,6 +94,13 @@ release the GPUs, naming the devices, commands and expected duration.
 **GPUs released (owner, 2026-09-23):** the reservation above is lifted.
 GPU gates run again inside each task. Only one agent uses the GPUs at a time.
 
+**Slice 5 plan (coordinator, 2026-09-24):**
+- [task 0069](../tasks/0069-m5-host-pipeline-lowering.md): host pipeline lowering, with microbatched prefill in wavefront order; opened 2026-09-24;
+- task 0070: pipeline on the three GPUs. The 3090 pair uses a peer handoff; the 5060 Ti gets a declared, reported host-staged handoff. With resource and cancellation tests;
+- task 0071: the combined TP2 (3090 pair) + TP1 (5060 Ti) plan, with correctness, resource and cancellation tests, and the capacity and latency report.
+
+Strata has no microbatch overlap: it uses a contiguous pipeline schedule on PCIe, and its wavefront design is documented as not implemented. The ordering rule therefore comes from document 04.
+
 ## Route to M5 closure (owner-agreed plan, 2026-09-22)
 
 Accepted so far: tasks 0053–0057. This covers the attention partition rule,
