@@ -1,6 +1,6 @@
 # PCIe peer-to-peer: enabled, and not a speedup by itself
 
-Status: **enabled between the two 3090s only, verified 2026-09-07.** Performance figures below are **inherited,
+Status: **enabled between the two 3090s only, verified 2026-09-07 and re-verified 2026-09-24 on driver 610.57.04.** Performance figures below are **inherited,
 not re-measured in this repository** — see Provenance. Nothing here is a benchmark result for Moxie.
 
 ## Verified here
@@ -39,11 +39,19 @@ and must never derive peer availability from `nvidia-smi`.
 P2P over PCIe is not available on stock GeForce drivers. It is present here because the NVIDIA **open**
 kernel module is built from patched source:
 
-- Driver `610.43.02`, `NVIDIA UNIX Open Kernel Module`, locally built (`rodrigo@ubuntu2`, 2026-09-07).
-- Patch source per prior project notes: `aikitoria/open-gpu-kernel-modules`, branch `610.43.02-p2p`,
-  commit `14de73d818f98eba82f753132bfed8f6ed6314b7`.
-- Both installed kernels carry the same module `srcversion` `5133AA53FEA92ECFF8E5016`
+- **Current pin (re-verified 2026-09-24):** driver `610.57.04`, `NVIDIA UNIX Open Kernel Module`,
+  locally built (`rodrigo@ubuntu2`, 2026-09-11).
+- Patch source: `aikitoria/open-gpu-kernel-modules`, local checkout `~/src/open-gpu-kernel-modules`,
+  branch `p2p-610.57.04-p2p-v2`, commit `e54604100f54c3b17ca04f4230dfe10a49480d68`.
+- Both installed module trees carry the same `srcversion` `8C9DB5D610ABCC6245B2266`
   (`6.8.0-100-generic`, currently running, and `6.8.0-138-generic`), so a reboot into either keeps P2P.
+  `dkms status` lists `nvidia/610.57.04` for both.
+- `cuDeviceCanAccessPeer` still grants peer access within the 3090 pair only (task 0073's probe).
+  On this driver `nvidia-smi topo -p2p r` now reports `NS` for every 5060 Ti pair and `OK` only for
+  the 3090 pair, so it agrees with CUDA here. The rule below stands anyway: CUDA is the authority.
+- Superseded pin (2026-09-07): driver `610.43.02`, branch `610.43.02-p2p`, commit
+  `14de73d818f98eba82f753132bfed8f6ed6314b7`, `srcversion` `5133AA53FEA92ECFF8E5016`. The upgrade
+  to 610.57.04 kept P2P because it was rebuilt from the patched branch. A stock rebuild would not.
 
 **This is a fragile dependency and M0 must pin it.** A driver package upgrade, a new kernel, or a DKMS
 rebuild from stock source removes P2P silently — no error, just a changed `topo -p2p` matrix and a

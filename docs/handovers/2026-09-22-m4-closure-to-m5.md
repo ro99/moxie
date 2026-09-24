@@ -146,7 +146,9 @@ group axis and graph wiring a contract depends on before writing its acceptance
 clauses. Task 0053's shape-proof clause and task 0054's two amendments all came
 from skipping that step.
 
-## M5 acceptance package (coordinator, 2026-09-24): ready for the owner
+## M5 acceptance package (coordinator, 2026-09-24): **accepted by the owner, 2026-09-24**
+
+Owner instruction, 2026-09-24: "fix the driver pin. then close m5. then document and push." The driver pin was corrected in `docs/evidence/topology-p2p.md` (610.57.04, commit `e546041` of the patched branch). M5 is accepted within the scope and exclusions below. The boundary continues in the [M5 closure handover](2026-09-24-m5-closure-to-m6.md).
 
 Candidate: `main` at the commit that records this package (code at
 `ad09f9b`). Every exit clause below was re-read on its own, against its
@@ -198,13 +200,9 @@ Still open, and not blocking the milestone:
   fail-closed until then.
 
 **For the owner:**
-1. **Accept M5**, within this scope. Only the owner can.
-2. **Driver pin.** `docs/evidence/topology-p2p.md` pins the patched open
-   module at 610.43.02. The machine now runs a locally built 610.57.04
-   (2026-09-11), with peer access still granted. The evidence file should be
-   corrected, and the pin re-stated.
-3. The board's slices T2–T8 are in `review`, waiting for you to mark them
-   `done`.
+1. Accept M5: **done** (owner, 2026-09-24).
+2. Driver pin: **done**. It is re-pinned to 610.57.04 in `topology-p2p.md`.
+3. Board: T1–T8 are marked `done` on the owner's instruction to close M5.
 
 ## Remaining hypotheses and blockers
 
@@ -214,7 +212,7 @@ abstraction; whether TP2 needs a rank-group type is M5.2's question. Document
 
 ## Next task
 
-None inside M5. The acceptance package above is ready for the owner. The first M6 task is opened only on the owner's authorization.
+None inside M5, which is accepted. See the [M5 closure handover](2026-09-24-m5-closure-to-m6.md). M6 opens only on the owner's authorization.
 
 ## Slice history (earlier next-task notes, kept for provenance)
 

@@ -152,23 +152,23 @@ path are explicitly out of M4.2's scope and are not opened by its acceptance.
 The [M4 closure ledger](docs/handovers/2026-09-20-m4.2-mla-descriptors.md)
 tracks this milestone's obligations.
 
-**M5 is open** (owner, 2026-09-22: "open M5 for luna to work"). [Task
-0053](docs/tasks/0053-m5-attention-partition-semantics.md) is accepted:
-`Attention` and `MlaAttention` declare `PartitionRule::HeadShardable`.
-[Task 0054](docs/tasks/0054-m5-weight-shard-addressing.md) is accepted: it maps a
-column-sharded weight to the byte range each rank owns. Partition rules
-have no production reader yet, so head alignment and MLA's per-weight
-partition are proven by lowering rather than by more labels. [Task
-0056](docs/tasks/0056-m5-host-tp-attention-lowering.md) (accepted, M5.2 slice 1)
-is a host-only TP lowering of the attention sublayer, bit-identical to the
-unsplit graph at 2, 4 and 8 ranks. [Task 0058](docs/tasks/0058-m5-dense-tp-host-lowering.md)
-(accepted) extends it to the MLP and the vocabulary projection, with exact
-reductions (ADR 0036) and strided input-axis weight addressing. The M5 route
-is six slices, listed in the ledger; slice 2, dense TP2 on the 3090 pair, is
-next. `ExpertMlp`/`Combine` stay
-`NotDetermined` for M5.4. The [M5
-ledger](docs/handovers/2026-09-22-m4-closure-to-m5.md) carries each open
-obligation and the queue.
+**M5 is accepted and complete** (owner, 2026-09-24; tasks 0053–0075). Every
+exit clause is met with evidence, on reduced fixtures:
+- the same dense and routed Gemma graphs run on one GPU, TP2 on the 3090 pair,
+  and a three-GPU pipeline, with no model edits;
+- a combined TP2 + TP1 plan and an expert-partitioned plan each have
+  correctness, resource and cancellation tests;
+- rank failure and collective mismatch are injected safely;
+- every host-staged transfer is declared, and a peer copy without a grant is
+  refused;
+- M5.5 measures topology costs and ranks plans deterministically by the joint
+  workload.
+
+**Not claimed:** any checkpoint-backed run or token, pipeline microbatch
+overlap, pinned transfers, a compute-cost model, automatic plan selection, and
+any speed guarantee. The [M5 closure
+handover](docs/handovers/2026-09-24-m5-closure-to-m6.md) carries the boundary
+and the acceptance package. M6 is not yet authorized.
 
 | | |
 |---|---|
