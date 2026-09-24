@@ -3,7 +3,7 @@
 use core::ffi::c_void;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -16,8 +16,8 @@ use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSp
 use moxie_plan::{Join, Stage, StageGraph, TensorParallelLowering, build_stage_graph};
 use moxie_state::{DeviceKvSequence, KvGeometry, PreparedCommit};
 use moxie_types::{
-    DeviceCapability, DeviceTier, Dim, Error, KernelCatalogue, PagedKvWriter, Precision, RankId,
-    Result, Scope, StateTransactionId, Tier,
+    DeviceCapability, DeviceTier, Error, KernelCatalogue, PagedKvWriter, Precision, RankId, Result,
+    Scope, StateTransactionId, SymbolTable, Tier,
 };
 
 use crate::arena::{DeviceArena, DeviceRange, OperationLease};
@@ -478,6 +478,7 @@ impl DenseRankWorkers {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Cancellation is checked at stage boundaries, where both ranks have drained.
     pub fn execute_dense(
         &mut self,
         graph: &Graph,
@@ -488,6 +489,7 @@ impl DenseRankWorkers {
         rows: u64,
         visible_tokens: u64,
         bindings: &mut dyn FnMut(usize, &StageGraph) -> Result<Vec<OwnedBinding>>,
+        cancel: &AtomicBool,
     ) -> Result<DenseWorkerStep<'_>> {
         self.check_live()?;
         let bytes = boundary_bytes(graph, rows)?;
@@ -515,6 +517,11 @@ impl DenseRankWorkers {
         let transactions = [transaction_reply(&begin[0])?, transaction_reply(&begin[1])?];
         let execution = (|| {
             for declared in &lowering.stages {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(Error::Cancelled {
+                        at: "tensor-parallel stage",
+                    });
+                }
                 match declared {
                     Stage::Replicated(nodes) => {
                         for node in nodes.clone() {
@@ -1735,6 +1742,8 @@ impl<'ctx> WorkerState<'ctx> {
             &self.capability,
             &catalogue,
             &stage.linear_orders,
+            &stage.combine_orders,
+            &stage.expert_ownership,
         )?;
         let plan = SelectedReservedPlan::admit(
             candidate,
@@ -2322,15 +2331,15 @@ fn keep<'ctx>(
 }
 
 fn value_bytes(graph: &Graph, value: ValueId, rows: u64, element: u64) -> Result<u64> {
+    let mut table = SymbolTable::new();
+    table.bind(graph.rows_symbol(), rows);
     let spec = graph
         .spec(value)
         .ok_or_else(|| invalid("boundary", "a value has no tensor spec"))?;
     spec.shape.iter().try_fold(element, |bytes, dim| {
-        let extent = match dim {
-            Dim::Const(extent) => *extent,
-            Dim::Symbol(_) => rows,
-            _ => return Err(invalid("boundary", "unresolved dimension")),
-        };
+        let extent = dim
+            .eval(&table)
+            .map_err(|_| invalid("boundary", "unresolved dimension"))?;
         bytes
             .checked_mul(extent)
             .ok_or_else(|| invalid("boundary", "boundary extent overflowed"))

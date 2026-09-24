@@ -833,10 +833,26 @@ fn enqueue_dense<'ctx>(
             OpParams::ExpertMlp {
                 hidden,
                 intermediate,
+                experts,
                 top_k,
                 activation: moxie_graph::ExpertActivation::GeGlu,
                 ..
             } => {
+                let candidate = lease
+                    .resource()
+                    .plan
+                    .as_ref()
+                    .expect("dense operation retains plan")
+                    .candidate();
+                let first_expert =
+                    candidate
+                        .expert_ownership()
+                        .get(&node.id)
+                        .map_or(Ok(0), |ownership| {
+                            u64::from(ownership.owned)
+                                .checked_mul(experts)
+                                .ok_or_else(|| invalid("expert-mlp", "expert offset overflowed"))
+                        })?;
                 let assignments = rows
                     .checked_mul(top_k)
                     .ok_or_else(|| invalid("expert-mlp", "assignment count overflowed"))?;
@@ -848,12 +864,14 @@ fn enqueue_dense<'ctx>(
                 let mut launch_top_k = top_k;
                 let mut launch_hidden = hidden;
                 let mut launch_intermediate = intermediate;
+                let mut launch_first_expert = first_expert;
+                let mut launch_local_experts = experts;
                 let project_elements = assignments
                     .checked_mul(intermediate)
                     .ok_or_else(|| invalid("expert-mlp", "project grid overflowed"))?;
                 let project_blocks = u32::try_from(project_elements.div_ceil(256))
                     .map_err(|_| invalid("expert-mlp", "project launch grid overflowed"))?;
-                let mut project_params: [*mut c_void; 8] = [
+                let mut project_params: [*mut c_void; 10] = [
                     (&raw mut input_address).cast(),
                     (&raw mut ids_address).cast(),
                     (&raw mut gate_up_address).cast(),
@@ -862,6 +880,8 @@ fn enqueue_dense<'ctx>(
                     (&raw mut launch_top_k).cast(),
                     (&raw mut launch_hidden).cast(),
                     (&raw mut launch_intermediate).cast(),
+                    (&raw mut launch_first_expert).cast(),
+                    (&raw mut launch_local_experts).cast(),
                 ];
                 launch(
                     lease,
@@ -881,7 +901,7 @@ fn enqueue_dense<'ctx>(
                     .ok_or_else(|| invalid("expert-mlp", "down grid overflowed"))?;
                 let down_blocks = u32::try_from(down_elements.div_ceil(256))
                     .map_err(|_| invalid("expert-mlp", "down launch grid overflowed"))?;
-                let mut down_params: [*mut c_void; 7] = [
+                let mut down_params: [*mut c_void; 9] = [
                     (&raw mut activated_address).cast(),
                     (&raw mut ids_address).cast(),
                     (&raw mut down_address).cast(),
@@ -889,6 +909,8 @@ fn enqueue_dense<'ctx>(
                     (&raw mut launch_assignments).cast(),
                     (&raw mut launch_hidden).cast(),
                     (&raw mut launch_intermediate).cast(),
+                    (&raw mut launch_first_expert).cast(),
+                    (&raw mut launch_local_experts).cast(),
                 ];
                 launch(
                     lease,
@@ -914,6 +936,40 @@ fn enqueue_dense<'ctx>(
                 order: moxie_graph::CombineOrder::AscendingExpertId,
                 output_scale,
             } => {
+                let candidate = lease
+                    .resource()
+                    .plan
+                    .as_ref()
+                    .expect("dense operation retains plan")
+                    .candidate();
+                let slots_value = node.inputs[1];
+                let expert_node = graph
+                    .nodes()
+                    .iter()
+                    .find(|producer| producer.output == slots_value)
+                    .ok_or_else(|| invalid("combine", "expert slots have no producer"))?;
+                let OpParams::ExpertMlp { experts, .. } = expert_node.params else {
+                    return Err(invalid(
+                        "combine",
+                        "expert slots are not produced by ExpertMlp",
+                    ));
+                };
+                let ownership_groups = candidate
+                    .expert_ownership()
+                    .get(&expert_node.id)
+                    .map_or(1, |ownership| u64::from(ownership.groups));
+                let experts_total = experts
+                    .checked_mul(ownership_groups)
+                    .ok_or_else(|| invalid("combine", "expert count overflowed"))?;
+                let order = candidate.combine_orders().get(&node.id);
+                let groups = order.map_or(1, |order| u64::from(order.groups));
+                if groups == 0 || !experts_total.is_multiple_of(groups) {
+                    return Err(invalid(
+                        "combine",
+                        "expert count is not divisible by combine groups",
+                    ));
+                }
+                let experts_per_group = experts_total / groups;
                 let mut ids_address = address(lease.resource(), node.inputs[0])?;
                 let coefficient_offset = rows
                     .checked_mul(top_k)
@@ -933,27 +989,62 @@ fn enqueue_dense<'ctx>(
                 let mut launch_top_k = top_k;
                 let mut launch_hidden = hidden;
                 let mut launch_scale = output_scale;
-                let mut params: [*mut c_void; 8] = [
-                    (&raw mut ids_address).cast(),
-                    (&raw mut coefficients_address).cast(),
-                    (&raw mut slots_address).cast(),
-                    (&raw mut output_address).cast(),
-                    (&raw mut launch_rows).cast(),
-                    (&raw mut launch_top_k).cast(),
-                    (&raw mut launch_hidden).cast(),
-                    (&raw mut launch_scale).cast(),
-                ];
-                launch(
-                    lease,
-                    base,
-                    stream,
-                    (blocks, 1, 1),
-                    (256, 1, 1),
-                    &mut params,
-                    selected,
-                    moxie_kernels::DENSE_COMBINE,
-                )?;
-                push_launch(lease, "combine");
+                let mut launch_experts_per_group = experts_per_group;
+                if selected.descriptor.operation == SemanticKernelOp::CombinePartial {
+                    let owned = order
+                        .and_then(|order| order.owned)
+                        .expect("planner selects CombinePartial only for an owned group");
+                    let mut launch_owned = u64::from(owned);
+                    let mut params: [*mut c_void; 9] = [
+                        (&raw mut ids_address).cast(),
+                        (&raw mut coefficients_address).cast(),
+                        (&raw mut slots_address).cast(),
+                        (&raw mut output_address).cast(),
+                        (&raw mut launch_rows).cast(),
+                        (&raw mut launch_top_k).cast(),
+                        (&raw mut launch_hidden).cast(),
+                        (&raw mut launch_experts_per_group).cast(),
+                        (&raw mut launch_owned).cast(),
+                    ];
+                    launch(
+                        lease,
+                        base,
+                        stream,
+                        (blocks, 1, 1),
+                        (256, 1, 1),
+                        &mut params,
+                        selected,
+                        moxie_kernels::DENSE_COMBINE_PARTIAL,
+                    )?;
+                    push_launch(lease, "combine-partial");
+                } else if selected.descriptor.operation == SemanticKernelOp::Combine {
+                    let mut launch_groups = groups;
+                    let mut params: [*mut c_void; 10] = [
+                        (&raw mut ids_address).cast(),
+                        (&raw mut coefficients_address).cast(),
+                        (&raw mut slots_address).cast(),
+                        (&raw mut output_address).cast(),
+                        (&raw mut launch_rows).cast(),
+                        (&raw mut launch_top_k).cast(),
+                        (&raw mut launch_hidden).cast(),
+                        (&raw mut launch_scale).cast(),
+                        (&raw mut launch_experts_per_group).cast(),
+                        (&raw mut launch_groups).cast(),
+                    ];
+                    launch(
+                        lease,
+                        base,
+                        stream,
+                        (blocks, 1, 1),
+                        (256, 1, 1),
+                        &mut params,
+                        selected,
+                        moxie_kernels::DENSE_COMBINE,
+                    )?;
+                    push_launch(lease, "combine");
+                } else {
+                    return Err(invalid("combine", "descriptor is not a combine kernel"));
+                }
             }
             OpParams::Combine { .. } => {
                 return Err(invalid(
@@ -1487,7 +1578,10 @@ mod tests {
             unsafe { TrustedImage::from_build_output(moxie_kernels::DENSE_GRAPH_FATBIN).unwrap() };
         let module = Module::load(&context, ModuleImage::Binary(image))
             .unwrap()
-            .resolve_all(&[moxie_kernels::DENSE_COMBINE.to_string()])
+            .resolve_all(&[
+                moxie_kernels::DENSE_COMBINE.to_string(),
+                moxie_kernels::DENSE_COMBINE_PARTIAL.to_string(),
+            ])
             .unwrap();
         let mut ids = range.device_address().unwrap();
         let mut coefficients = ids + COEFFICIENTS;
@@ -1497,7 +1591,9 @@ mod tests {
         let mut top_k = 3u64;
         let mut hidden = 1u64;
         let mut output_scale = 1.0f32;
-        let mut params: [*mut c_void; 8] = [
+        let mut experts_per_group = 4u64;
+        let mut groups = 1u64;
+        let mut params: [*mut c_void; 10] = [
             (&raw mut ids).cast(),
             (&raw mut coefficients).cast(),
             (&raw mut slots).cast(),
@@ -1506,6 +1602,8 @@ mod tests {
             (&raw mut top_k).cast(),
             (&raw mut hidden).cast(),
             (&raw mut output_scale).cast(),
+            (&raw mut experts_per_group).cast(),
+            (&raw mut groups).cast(),
         ];
         // SAFETY: these addresses and dimensions match the Combine ABI and fit the admitted range.
         unsafe {
@@ -1521,6 +1619,78 @@ mod tests {
         assert_eq!(
             u16::from_le_bytes(actual),
             moxie_kernels::cpu_expert::to_bf16_bits(0.0)
+        );
+
+        upload = [0; 48];
+        for (slot, id) in [3u32, 0, 2].into_iter().enumerate() {
+            upload[slot * 4..slot * 4 + 4].copy_from_slice(&id.to_le_bytes());
+            upload[COEFFICIENTS as usize + slot * 4..COEFFICIENTS as usize + slot * 4 + 4]
+                .copy_from_slice(&1.0f32.to_le_bytes());
+        }
+        for (slot, value) in [2.0f32.powi(-30), -1.0, 1.0].into_iter().enumerate() {
+            upload[SLOTS as usize + slot * 2..SLOTS as usize + slot * 2 + 2]
+                .copy_from_slice(&moxie_kernels::cpu_expert::to_bf16_bits(value).to_le_bytes());
+        }
+        // SAFETY: the same admitted input range stays alive through the next stream sync.
+        unsafe { range.copy_from_host_async_at(0, &upload, &stream).unwrap() };
+        stream.synchronize().unwrap();
+        let mut grouped_experts_per_group = 2u64;
+        let mut grouped_groups = 2u64;
+        let mut grouped_params: [*mut c_void; 10] = [
+            (&raw mut ids).cast(),
+            (&raw mut coefficients).cast(),
+            (&raw mut slots).cast(),
+            (&raw mut output).cast(),
+            (&raw mut rows).cast(),
+            (&raw mut top_k).cast(),
+            (&raw mut hidden).cast(),
+            (&raw mut output_scale).cast(),
+            (&raw mut grouped_experts_per_group).cast(),
+            (&raw mut grouped_groups).cast(),
+        ];
+        // SAFETY: these addresses and dimensions match the grouped Combine ABI and admitted range.
+        unsafe {
+            module
+                .launch_async(0, &stream, (1, 1, 1), (256, 1, 1), 0, &mut grouped_params)
+                .unwrap();
+        }
+        stream.synchronize().unwrap();
+        range.copy_to_host_at(OUTPUT, &mut actual).unwrap();
+        // Ungrouped: -1 + 1 = 0, then +2^-30 gives 2^-30.
+        // Grouped: group 0 is -1; group 1 is 1 + 2^-30 = 1 (absorbed), total 0.
+        assert_eq!(
+            u16::from_le_bytes(actual),
+            moxie_kernels::cpu_expert::to_bf16_bits(0.0)
+        );
+
+        let mut partial_experts_per_group = 2u64;
+        let mut owned = 0u64;
+        let mut partial_params: [*mut c_void; 9] = [
+            (&raw mut ids).cast(),
+            (&raw mut coefficients).cast(),
+            (&raw mut slots).cast(),
+            (&raw mut output).cast(),
+            (&raw mut rows).cast(),
+            (&raw mut top_k).cast(),
+            (&raw mut hidden).cast(),
+            (&raw mut partial_experts_per_group).cast(),
+            (&raw mut owned).cast(),
+        ];
+        // SAFETY: these addresses and dimensions match the partial Combine ABI and admitted range.
+        unsafe {
+            module
+                .launch_async(1, &stream, (1, 1, 1), (256, 1, 1), 0, &mut partial_params)
+                .unwrap();
+        }
+        stream.synchronize().unwrap();
+        let mut actual_partial = [0; 4];
+        range.copy_to_host_at(OUTPUT, &mut actual_partial).unwrap();
+        // Owned group 0 visits only expert 0, yielding exactly -1.0.
+        // Without the owner filter, ascending ids sum -1 + 1 + 2^-30 = 2^-30.
+        assert_eq!(
+            u32::from_le_bytes(actual_partial),
+            (-1.0f32).to_bits(),
+            "partial combine includes only the owned expert group"
         );
 
         arena.release(range).unwrap();

@@ -127,15 +127,18 @@ extern "C" __global__ void moxie_dense_expert_project_gelu_v1(
     const __nv_bfloat16* x, const unsigned int* ids,
     const __nv_bfloat16* gate_up, float* activated,
     unsigned long long assignments, unsigned long long top_k,
-    unsigned long long hidden, unsigned long long intermediate) {
+    unsigned long long hidden, unsigned long long intermediate,
+    unsigned long long first_expert, unsigned long long local_experts) {
     const unsigned long long index =
         static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= assignments * intermediate || top_k == 0) return;
     const unsigned long long slot = index / intermediate;
     const unsigned long long lane = index % intermediate;
+    const unsigned long long expert = ids[slot];
+    if (expert < first_expert || expert >= first_expert + local_experts) return;
     const __nv_bfloat16* x_row = x + (slot / top_k) * hidden;
     const __nv_bfloat16* expert_gate_up =
-        gate_up + static_cast<unsigned long long>(ids[slot]) * 2 * intermediate * hidden;
+        gate_up + (expert - first_expert) * 2 * intermediate * hidden;
     float gate = 0.0F;
     float up = 0.0F;
     moxie_expert_lanes_v1(
@@ -150,15 +153,21 @@ extern "C" __global__ void moxie_dense_expert_down_v1(
     const float* activated, const unsigned int* ids,
     const __nv_bfloat16* down, __nv_bfloat16* slots,
     unsigned long long assignments, unsigned long long hidden,
-    unsigned long long intermediate) {
+    unsigned long long intermediate, unsigned long long first_expert,
+    unsigned long long local_experts) {
     const unsigned long long index =
         static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= assignments * hidden) return;
     const unsigned long long slot = index / hidden;
     const unsigned long long component = index % hidden;
+    const unsigned long long expert = ids[slot];
+    if (expert < first_expert || expert >= first_expert + local_experts) {
+        slots[index] = __float2bfloat16_rn(0.0F);
+        return;
+    }
     const float* h = activated + slot * intermediate;
     const __nv_bfloat16* row =
-        down + static_cast<unsigned long long>(ids[slot]) * hidden * intermediate
+        down + (expert - first_expert) * hidden * intermediate
         + component * intermediate;
     float acc = 0.0F;
     for (unsigned long long i = 0; i < intermediate; ++i) {
@@ -171,7 +180,60 @@ extern "C" __global__ void moxie_dense_combine_v1(
     const unsigned int* ids, const float* coefficients,
     const __nv_bfloat16* slots, __nv_bfloat16* out,
     unsigned long long rows, unsigned long long top_k,
-    unsigned long long hidden, float output_scale) {
+    unsigned long long hidden, float output_scale,
+    unsigned long long experts_per_group, unsigned long long groups) {
+    const unsigned long long index =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= rows * hidden || top_k == 0) return;
+    const unsigned long long row = index / hidden;
+    const unsigned long long component = index % hidden;
+    const unsigned int* row_ids = ids + row * top_k;
+    const float* row_coefficients = coefficients + row * top_k;
+    float total = 0.0F;
+    for (unsigned long long group = 0; group < groups; ++group) {
+        float partial = 0.0F;
+        bool has_previous = false;
+        unsigned int previous_id = 0;
+        unsigned long long previous_slot = 0;
+        for (unsigned long long visit = 0; visit < top_k; ++visit) {
+            bool found = false;
+            unsigned int best_id = 0xffffffffU;
+            unsigned long long best_slot = 0;
+            for (unsigned long long slot = 0; slot < top_k; ++slot) {
+                const unsigned int expert = row_ids[slot];
+                const bool after_previous = !has_previous || expert > previous_id
+                    || (expert == previous_id && slot > previous_slot);
+                if (after_previous && expert / experts_per_group == group
+                    && (!found || expert < best_id
+                        || (expert == best_id && slot < best_slot))) {
+                    found = true;
+                    best_id = expert;
+                    best_slot = slot;
+                }
+            }
+            if (!found) break;
+            const unsigned long long slot_index = row * top_k + best_slot;
+            partial = __fadd_rn(
+                partial,
+                __fmul_rn(
+                    row_coefficients[best_slot],
+                    __bfloat162float(slots[slot_index * hidden + component])));
+            previous_id = best_id;
+            previous_slot = best_slot;
+            has_previous = true;
+        }
+        total = group == 0 ? partial : __fadd_rn(total, partial);
+    }
+    if (output_scale != 1.0F) total = __fmul_rn(total, output_scale);
+    out[index] = __float2bfloat16_rn(total);
+}
+
+extern "C" __global__ void moxie_dense_combine_partial_v1(
+    const unsigned int* ids, const float* coefficients,
+    const __nv_bfloat16* slots, float* out,
+    unsigned long long rows, unsigned long long top_k,
+    unsigned long long hidden, unsigned long long experts_per_group,
+    unsigned long long owned) {
     const unsigned long long index =
         static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= rows * hidden || top_k == 0) return;
@@ -191,7 +253,7 @@ extern "C" __global__ void moxie_dense_combine_v1(
             const unsigned int expert = row_ids[slot];
             const bool after_previous = !has_previous || expert > previous_id
                 || (expert == previous_id && slot > previous_slot);
-            if (after_previous
+            if (after_previous && expert / experts_per_group == owned
                 && (!found || expert < best_id
                     || (expert == best_id && slot < best_slot))) {
                 found = true;
@@ -199,6 +261,7 @@ extern "C" __global__ void moxie_dense_combine_v1(
                 best_slot = slot;
             }
         }
+        if (!found) break;
         const unsigned long long slot_index = row * top_k + best_slot;
         acc = __fadd_rn(
             acc,
@@ -209,6 +272,5 @@ extern "C" __global__ void moxie_dense_combine_v1(
         previous_slot = best_slot;
         has_previous = true;
     }
-    if (output_scale != 1.0F) acc = __fmul_rn(acc, output_scale);
-    out[index] = __float2bfloat16_rn(acc);
+    out[index] = acc;
 }

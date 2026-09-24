@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use moxie_graph::{LinearReductionOrder, NodeId, Op, OpParams, ValueId, ValueRole};
+use moxie_graph::{
+    CombineReductionOrder, ExpertOwnership, LinearReductionOrder, NodeId, Op, OpParams, ValueId,
+    ValueRole,
+};
 use moxie_types::{
     DeviceCapability, Error, KernelCatalogue, KernelOperand, SemanticKernelDescriptor,
     SemanticKernelOp, TensorLayout,
@@ -74,6 +77,8 @@ pub struct SelectedPlanCandidate {
     package: SelectedPackage,
     host_workspace_bytes: u64,
     linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
+    combine_orders: BTreeMap<NodeId, CombineReductionOrder>,
+    expert_ownership: BTreeMap<NodeId, ExpertOwnership>,
 }
 
 impl SelectedPlanCandidate {
@@ -124,6 +129,12 @@ impl SelectedPlanCandidate {
     }
     pub fn linear_orders(&self) -> &BTreeMap<NodeId, LinearReductionOrder> {
         &self.linear_orders
+    }
+    pub fn combine_orders(&self) -> &BTreeMap<NodeId, CombineReductionOrder> {
+        &self.combine_orders
+    }
+    pub fn expert_ownership(&self) -> &BTreeMap<NodeId, ExpertOwnership> {
+        &self.expert_ownership
     }
     pub fn is_paged_attention(&self) -> bool {
         matches!(self.nodes.as_slice(), [node] if node.descriptor.operation == SemanticKernelOp::PagedAttention)
@@ -431,6 +442,8 @@ pub fn lower_selected(
         package: SelectedPackage::Chain,
         host_workspace_bytes: 0,
         linear_orders: BTreeMap::new(),
+        combine_orders: BTreeMap::new(),
+        expert_ownership: BTreeMap::new(),
     })
 }
 
@@ -446,6 +459,8 @@ pub fn lower_selected_ordered(
     capability: &DeviceCapability,
     catalogue: &KernelCatalogue,
     orders: &BTreeMap<NodeId, LinearReductionOrder>,
+    combine_orders: &BTreeMap<NodeId, CombineReductionOrder>,
+    expert_ownership: &BTreeMap<NodeId, ExpertOwnership>,
 ) -> Result<SelectedPlanCandidate, Error> {
     if capability.uuid != workload.device {
         return Err(invalid(
@@ -491,7 +506,50 @@ pub fn lower_selected_ordered(
             ));
         }
     }
-    lower_dense_mode(graph, workload, capability, catalogue, false, orders)
+    for (id, order) in combine_orders {
+        if !matches!(
+            graph
+                .nodes()
+                .get(id.0 as usize)
+                .filter(|node| node.id == *id)
+                .map(|node| &node.params),
+            Some(OpParams::Combine { .. })
+        ) || order.groups == 0
+            || order.owned.is_some_and(|owned| owned >= order.groups)
+        {
+            return Err(invalid(
+                "combine_order",
+                "combine order names no Combine or has an invalid owner group",
+            ));
+        }
+    }
+    for (id, ownership) in expert_ownership {
+        if !matches!(
+            graph
+                .nodes()
+                .get(id.0 as usize)
+                .filter(|node| node.id == *id)
+                .map(|node| &node.params),
+            Some(OpParams::ExpertMlp { .. })
+        ) || ownership.groups == 0
+            || ownership.owned >= ownership.groups
+        {
+            return Err(invalid(
+                "expert_ownership",
+                "expert ownership names no ExpertMlp or has an invalid owner group",
+            ));
+        }
+    }
+    lower_dense_mode(
+        graph,
+        workload,
+        capability,
+        catalogue,
+        false,
+        orders,
+        combine_orders,
+        expert_ownership,
+    )
 }
 
 fn lower_attention(
@@ -630,6 +688,8 @@ fn lower_attention(
         package: SelectedPackage::Attention,
         host_workspace_bytes: 0,
         linear_orders: BTreeMap::new(),
+        combine_orders: BTreeMap::new(),
+        expert_ownership: BTreeMap::new(),
     })
 }
 
@@ -646,10 +706,16 @@ fn lower_dense(
         catalogue,
         true,
         &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
     )
 }
 
-fn check_routed_edges(graph: &Graph) -> Result<(), Error> {
+fn check_routed_edges(
+    graph: &Graph,
+    combine_orders: &BTreeMap<NodeId, CombineReductionOrder>,
+    expert_ownership: &BTreeMap<NodeId, ExpertOwnership>,
+) -> Result<(), Error> {
     let unsupported = |detail| Error::UnsupportedKernel {
         operation: "route",
         detail,
@@ -676,9 +742,12 @@ fn check_routed_edges(graph: &Graph) -> Result<(), Error> {
                         "ExpertMlp input[1] is not produced by Route".into(),
                     ));
                 };
-                if experts != route_experts || top_k != route_top_k {
+                let groups = expert_ownership
+                    .get(&node.id)
+                    .map_or(1, |ownership| u64::from(ownership.groups));
+                if experts.checked_mul(groups) != Some(route_experts) || top_k != route_top_k {
                     return Err(unsupported(format!(
-                        "ExpertMlp declares experts={experts}, top_k={top_k}; its Route producer declares experts={route_experts}, top_k={route_top_k}"
+                        "ExpertMlp declares experts={experts} across {groups} owner group(s), top_k={top_k}; its Route producer declares experts={route_experts}, top_k={route_top_k}"
                     )));
                 }
             }
@@ -717,19 +786,32 @@ fn check_routed_edges(graph: &Graph) -> Result<(), Error> {
                         "Combine input[1] has no ExpertMlp producer".into(),
                     ));
                 };
-                match expert_node.params {
-                    OpParams::ExpertMlp { .. }
-                        if expert_node.inputs.get(1) == Some(&route_value) => {}
-                    OpParams::ExpertMlp { .. } => {
-                        return Err(unsupported(
-                            "Combine slots were produced from a different Route input".into(),
-                        ));
+                let OpParams::ExpertMlp { experts, .. } = expert_node.params else {
+                    return Err(unsupported(
+                        "Combine input[1] is not produced by ExpertMlp".into(),
+                    ));
+                };
+                if expert_node.inputs.get(1) != Some(&route_value) {
+                    return Err(unsupported(
+                        "Combine slots were produced from a different Route input".into(),
+                    ));
+                }
+                let order = combine_orders.get(&node.id);
+                let own = expert_ownership.get(&expert_node.id);
+                let ownership_matches = match (order, own) {
+                    (None, None) => true,
+                    (Some(order), None) if order.owned.is_none() => {
+                        order.groups > 0 && experts.is_multiple_of(u64::from(order.groups))
                     }
-                    _ => {
-                        return Err(unsupported(
-                            "Combine input[1] is not produced by ExpertMlp".into(),
-                        ));
+                    (Some(order), Some(own)) => {
+                        order.owned == Some(own.owned) && order.groups == own.groups
                     }
+                    _ => false,
+                };
+                if !ownership_matches {
+                    return Err(unsupported(
+                        "Combine reduction order disagrees with its ExpertMlp ownership".into(),
+                    ));
                 }
             }
             _ => {}
@@ -738,6 +820,7 @@ fn check_routed_edges(graph: &Graph) -> Result<(), Error> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // These are the graph's separate declared order maps.
 fn lower_dense_mode(
     graph: &Graph,
     workload: ResourceWorkload,
@@ -745,8 +828,10 @@ fn lower_dense_mode(
     catalogue: &KernelCatalogue,
     require_complete_graph: bool,
     orders: &BTreeMap<NodeId, LinearReductionOrder>,
+    combine_orders: &BTreeMap<NodeId, CombineReductionOrder>,
+    expert_ownership: &BTreeMap<NodeId, ExpertOwnership>,
 ) -> Result<SelectedPlanCandidate, Error> {
-    check_routed_edges(graph)?;
+    check_routed_edges(graph, combine_orders, expert_ownership)?;
     if require_complete_graph
         && (graph.nodes().is_empty()
             || !graph
@@ -783,6 +868,12 @@ fn lower_dense_mode(
                 SemanticKernelOp::LinearSplit
             };
         }
+        if combine_orders
+            .get(&node.id)
+            .is_some_and(|order| order.owned.is_some())
+        {
+            operation = SemanticKernelOp::CombinePartial;
+        }
         let roles = dense_operands(operation, node, graph)?;
         let (input, output) = dense_shape(node)?;
         let matches: Vec<_> = catalogue
@@ -794,7 +885,9 @@ fn lower_dense_mode(
                     && descriptor.output
                         == if matches!(
                             operation,
-                            SemanticKernelOp::LinearPartial | SemanticKernelOp::Route
+                            SemanticKernelOp::LinearPartial
+                                | SemanticKernelOp::CombinePartial
+                                | SemanticKernelOp::Route
                         ) {
                             moxie_types::ActivationPrecision::expect(moxie_types::Precision::F32)
                         } else {
@@ -806,6 +899,7 @@ fn lower_dense_mode(
                             operation,
                             SemanticKernelOp::VocabProjection
                                 | SemanticKernelOp::LinearPartial
+                                | SemanticKernelOp::CombinePartial
                                 | SemanticKernelOp::Route
                         ) {
                             moxie_types::RoundingProfile::Unrounded
@@ -870,6 +964,9 @@ fn lower_dense_mode(
             orders
                 .get(&node.id)
                 .is_some_and(|order| order.slice.is_some())
+                || combine_orders
+                    .get(&node.id)
+                    .is_some_and(|order| order.owned.is_some())
         })
         .map(|node| node.output)
         .collect();
@@ -1030,6 +1127,8 @@ fn lower_dense_mode(
         package: SelectedPackage::Dense,
         host_workspace_bytes,
         linear_orders: orders.clone(),
+        combine_orders: combine_orders.clone(),
+        expert_ownership: expert_ownership.clone(),
     })
 }
 
@@ -1537,16 +1636,28 @@ mod tests {
             | SemanticKernelOp::ScaledResidual
             | SemanticKernelOp::VocabProjection
             | SemanticKernelOp::Route
-            | SemanticKernelOp::Combine => Vec::new(),
+            | SemanticKernelOp::Combine
+            | SemanticKernelOp::CombinePartial => Vec::new(),
         };
         SemanticKernelDescriptor {
             id: KernelId(format!("{}-{}", op.name(), sm.name())),
             abi_version: 1,
             operation: op,
             inputs,
-            output: ActivationPrecision::expect(Precision::Bf16),
+            output: ActivationPrecision::expect(if op == SemanticKernelOp::CombinePartial {
+                Precision::F32
+            } else {
+                Precision::Bf16
+            }),
             accumulation: AccumulationPolicy::Bf16InF32Acc,
-            rounding: RoundingProfile::FinalBf16Rne,
+            rounding: if matches!(
+                op,
+                SemanticKernelOp::LinearPartial | SemanticKernelOp::CombinePartial
+            ) {
+                RoundingProfile::Unrounded
+            } else {
+                RoundingProfile::FinalBf16Rne
+            },
             layout: TensorLayout::ContiguousRowMajorV1,
             shape: KernelShapeBounds {
                 max_rows: 64,
@@ -1763,6 +1874,8 @@ mod tests {
                 &cap,
                 &catalogue(SmVersion::SM86),
                 &BTreeMap::from([(id, declared)]),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
             )
             .unwrap_err();
             assert!(
@@ -2051,6 +2164,47 @@ mod tests {
             }
             other => panic!("expected a typed route refusal, got {other:?}"),
         }
+
+        let graph = routed_graph(8, 8, 4);
+        let expert = graph
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.params, OpParams::ExpertMlp { .. }))
+            .unwrap();
+        let combine = graph
+            .nodes()
+            .iter()
+            .find(|node| matches!(node.params, OpParams::Combine { .. }))
+            .unwrap();
+        let ownership = BTreeMap::from([(
+            expert.id,
+            ExpertOwnership {
+                groups: 2,
+                owned: 0,
+            },
+        )]);
+        let combine_orders = BTreeMap::from([(
+            combine.id,
+            CombineReductionOrder {
+                groups: 2,
+                owned: Some(1),
+            },
+        )]);
+        assert!(matches!(
+            lower_selected_ordered(
+                &graph,
+                workload(&graph, 1),
+                &cap,
+                &catalogue,
+                &BTreeMap::new(),
+                &combine_orders,
+                &ownership,
+            ),
+            Err(Error::UnsupportedKernel {
+                operation: "route",
+                ..
+            })
+        ));
     }
 
     #[test]

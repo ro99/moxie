@@ -119,6 +119,7 @@ pub const DENSE_ROUTE: &str = "moxie_dense_route_v1";
 pub const DENSE_EXPERT_PROJECT_GELU: &str = "moxie_dense_expert_project_gelu_v1";
 pub const DENSE_EXPERT_DOWN: &str = "moxie_dense_expert_down_v1";
 pub const DENSE_COMBINE: &str = "moxie_dense_combine_v1";
+pub const DENSE_COMBINE_PARTIAL: &str = "moxie_dense_combine_partial_v1";
 pub const DENSE_GRAPH_ABI: u32 = 1;
 
 /// The catalogue identity this build publishes for one architecture.
@@ -179,10 +180,10 @@ pub fn paged_attention_declares(descriptor: &moxie_types::SemanticKernelDescript
 #[cfg(feature = "fatbin")]
 mod images {
     use super::{
-        BF16_LINEAR, BF16_RESIDUAL, BF16_RMS_APPLY, BF16_RMS_SUM, DENSE_COMBINE, DENSE_EMBEDDING,
-        DENSE_EXPERT_DOWN, DENSE_EXPERT_PROJECT_GELU, DENSE_GEGLU, DENSE_GRAPH_ABI,
-        DENSE_GROUPED_RMS, DENSE_LINEAR_PARTIAL, DENSE_LINEAR_SPLIT, DENSE_RESIDUAL_SCALED,
-        DENSE_ROPE, DENSE_ROUTE, DENSE_VOCAB_PROJECTION,
+        BF16_LINEAR, BF16_RESIDUAL, BF16_RMS_APPLY, BF16_RMS_SUM, DENSE_COMBINE,
+        DENSE_COMBINE_PARTIAL, DENSE_EMBEDDING, DENSE_EXPERT_DOWN, DENSE_EXPERT_PROJECT_GELU,
+        DENSE_GEGLU, DENSE_GRAPH_ABI, DENSE_GROUPED_RMS, DENSE_LINEAR_PARTIAL, DENSE_LINEAR_SPLIT,
+        DENSE_RESIDUAL_SCALED, DENSE_ROPE, DENSE_ROUTE, DENSE_VOCAB_PROJECTION,
     };
     use moxie_types::{
         AccumulationPolicy, ActivationPrecision, GateTransform, KernelCapability, KernelCatalogue,
@@ -722,6 +723,21 @@ mod images {
                 workspace: WorkspaceExpression::Zero,
                 image_sha256: hash,
                 symbols: vec![KernelSymbol(DENSE_COMBINE.to_string())],
+            });
+            descriptors.push(SemanticKernelDescriptor {
+                id: KernelId(format!("dense-combine-partial-v1-{suffix}")),
+                abi_version: DENSE_GRAPH_ABI,
+                operation: SemanticKernelOp::CombinePartial,
+                inputs: vec![KernelOperand::RouteIndex, bf16],
+                output: ActivationPrecision::expect(Precision::F32),
+                accumulation: AccumulationPolicy::Bf16InF32Acc,
+                rounding: RoundingProfile::Unrounded,
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape,
+                sm,
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: hash,
+                symbols: vec![KernelSymbol(DENSE_COMBINE_PARTIAL.to_string())],
             });
             descriptors.push(SemanticKernelDescriptor {
                 id: KernelId(format!("dense-residual-v1-{suffix}")),

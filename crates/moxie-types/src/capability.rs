@@ -76,6 +76,8 @@ pub enum SemanticKernelOp {
     ExpertMlp(GateTransform),
     /// Combines routed expert slots in the declared expert order.
     Combine,
+    /// One expert-owner group's FP32 combine partial, unscaled and unrounded.
+    CombinePartial,
     /// Attention over paged key/value state: prefill, append and decode.
     ///
     /// One operation rather than three, because whole prefill, a prefill chunk
@@ -105,6 +107,7 @@ impl SemanticKernelOp {
             Self::ExpertMlp(GateTransform::GeluTanh) => "expert_mlp_gelu_tanh",
             Self::ExpertMlp(GateTransform::Silu) => "expert_mlp_silu",
             Self::Combine => "combine",
+            Self::CombinePartial => "combine_partial",
             Self::PagedAttention => "paged_attention",
         }
     }

@@ -7,7 +7,7 @@
 
 use core::ffi::{c_int, c_void};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -19,7 +19,10 @@ use moxie_executor::{
     SelectedReservedPlan, Staging,
 };
 use moxie_format::bf16::{bf16_bits_to_f32, f32_to_bf16_bits};
-use moxie_graph::{Bindings, Graph, LinearReductionOrder, NodeId, OracleRegistry, ValueId};
+use moxie_graph::{
+    Bindings, CombineReductionOrder, ExpertOwnership, Graph, LinearReductionOrder, NodeId,
+    OracleRegistry, ValueId,
+};
 use moxie_interp::{Cancel, Interpreter, KvCache};
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_plan::{
@@ -197,7 +200,9 @@ fn one_at_a_time() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn fixture() -> (
+fn fixture(
+    routed: bool,
+) -> (
     moxie_cli::fixture::Fixture,
     moxie_models::gemma4::TextConfig,
 ) {
@@ -206,10 +211,46 @@ fn fixture() -> (
     config.local_kv_heads = 4;
     config.global_kv_heads = 1;
     config.vocab = 12;
-    (
-        moxie_cli::gemma::build_with_config(config.clone()).expect("TP2 fixture"),
-        config,
-    )
+    if routed {
+        let mut moe = moxie_cli::gemma::Shape::C
+            .config()
+            .moe
+            .expect("Shape C MoE config");
+        moe.experts = 8;
+        config.moe = Some(moe);
+    }
+    let mut fixture = moxie_cli::gemma::build_with_config(config.clone()).expect("TP2 fixture");
+    if routed {
+        for weight in fixture.graph.weights() {
+            let Some(name) = fixture.graph.name(*weight) else {
+                continue;
+            };
+            let tensor = fixture
+                .weights
+                .get(*weight)
+                .expect("router weight")
+                .as_float()
+                .expect("router BF16 weight");
+            let shape = tensor.shape().to_vec();
+            let len = tensor.data().len();
+            if name.starts_with("router_proj.") {
+                let width = shape[1];
+                let mut values = vec![0.0; len];
+                values[0] = 1.0;
+                values[4 * width] = -1.0;
+                fixture.weights.set(
+                    *weight,
+                    Value::Float(HostTensor::bf16(values, shape).expect("router projection")),
+                );
+            } else if name.starts_with("router_scale.") {
+                fixture.weights.set(
+                    *weight,
+                    Value::Float(HostTensor::bf16(vec![1.0; len], shape).expect("router scale")),
+                );
+            }
+        }
+    }
+    (fixture, config)
 }
 
 fn pair_ordinals() -> [u32; 2] {
@@ -302,6 +343,7 @@ fn host_logits(
     tokens: &[u64],
     positions: &[u64],
     orders: &BTreeMap<NodeId, LinearReductionOrder>,
+    combine_orders: &BTreeMap<NodeId, CombineReductionOrder>,
 ) -> Vec<u32> {
     let mut state = SequenceState::new([StateKind::KvPages]);
     let mut cache = KvCache::for_branch(
@@ -314,7 +356,7 @@ fn host_logits(
     bindings.set(fixture.tokens, Value::Index(tokens.to_vec()));
     bindings.set(fixture.positions, Value::Index(positions.to_vec()));
     let output = Interpreter::new()
-        .run_with_linear_orders(
+        .run_with_partition_orders(
             &fixture.graph,
             &bindings,
             &mut state,
@@ -322,10 +364,172 @@ fn host_logits(
             &mut cache,
             &Cancel::never(),
             orders,
+            combine_orders,
+            &BTreeMap::new(),
         )
         .expect("host declared split")
         .logits;
     output.data().iter().map(|value| value.to_bits()).collect()
+}
+
+fn host_route_ids(
+    fixture: &moxie_cli::fixture::Fixture,
+    tokens: &[u64],
+    positions: &[u64],
+    linear_orders: &BTreeMap<NodeId, LinearReductionOrder>,
+) -> Vec<Vec<u32>> {
+    let node = fixture
+        .graph
+        .nodes()
+        .iter()
+        .find(|node| matches!(node.params, moxie_graph::OpParams::Route { .. }))
+        .expect("routed fixture has a Route node");
+    let moxie_graph::OpParams::Route {
+        hidden,
+        experts,
+        top_k,
+        input,
+        score,
+        per_expert_scale,
+        coefficient,
+        selection_bias,
+    } = node.params
+    else {
+        unreachable!();
+    };
+    let x = prefix_activation(
+        fixture,
+        node.id.0 as usize,
+        node.inputs[0],
+        tokens,
+        positions,
+        linear_orders,
+    );
+    let weights = |index: usize| {
+        fixture
+            .weights
+            .get(node.inputs[index])
+            .expect("router weight")
+            .as_float()
+            .expect("BF16 router weight")
+    };
+    let projection = weights(1);
+    let gain = weights(2);
+    let per_expert = weights(3);
+    let selection_bias = selection_bias.then(|| weights(4));
+    let spec = moxie_oracles::route::RouterSpec {
+        experts: experts as usize,
+        top_k: top_k as usize,
+        input,
+        score,
+        coefficient,
+    };
+    (0..tokens.len())
+        .map(|row| {
+            let start = row * hidden as usize;
+            let activation = &x[start..start + hidden as usize];
+            moxie_oracles::route::router_route_row(
+                activation,
+                matches!(input, moxie_graph::RouterInput::Normalized { .. }).then_some(gain.data()),
+                projection.data(),
+                per_expert_scale.then_some(per_expert.data()),
+                selection_bias.as_ref().map(|scale| scale.data()),
+                spec,
+            )
+            .expect("host router row")
+            .experts
+        })
+        .collect()
+}
+
+fn assert_expert_owner_resource(
+    fixture: &moxie_cli::fixture::Fixture,
+    lowering: &TensorParallelLowering,
+    capabilities: &[DeviceCapability; 2],
+) {
+    let mut oracles = OracleRegistry::new();
+    moxie_oracles::register(&mut oracles).expect("oracles");
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+    let rows = 5;
+    let reference_workload = ResourceWorkload {
+        phase: Phase::Prefill,
+        rows,
+        visible_tokens: rows,
+        branch_rows: rows,
+        output: fixture.graph.output(),
+        device: capabilities[0].uuid,
+        paged_state_capacity: None,
+    };
+    let reference_candidate = lower_selected_ordered(
+        &fixture.graph,
+        reference_workload,
+        &capabilities[0],
+        &catalogue,
+        &lowering.linear_orders,
+        &lowering.combine_orders,
+        &BTreeMap::new(),
+    )
+    .expect("full-graph reference plan");
+    for stage in &lowering.stages {
+        let moxie_plan::Stage::Local { nodes, join } = stage else {
+            continue;
+        };
+        let Some(expert) = fixture.graph.nodes()[nodes.clone()]
+            .iter()
+            .find(|node| matches!(node.params, moxie_graph::OpParams::ExpertMlp { .. }))
+        else {
+            continue;
+        };
+        let output = match join {
+            moxie_plan::Join::Gather { output } | moxie_plan::Join::Reduce { output } => *output,
+        };
+        for (rank, capability) in capabilities.iter().enumerate() {
+            let local = build_stage_graph(
+                &fixture.graph,
+                Some(&lowering.ranks[rank]),
+                nodes.clone(),
+                Some(output),
+                moxie_oracles::HOST_REFERENCE,
+                &oracles,
+            )
+            .expect("rank expert stage");
+            let candidate = lower_selected_ordered(
+                &local.graph,
+                ResourceWorkload {
+                    device: capability.uuid,
+                    output: local.graph.output(),
+                    ..reference_workload
+                },
+                capability,
+                &catalogue,
+                &local.linear_orders,
+                &local.combine_orders,
+                &local.expert_ownership,
+            )
+            .expect("rank expert-stage plan");
+            for original in [expert.inputs[2], expert.inputs[3]] {
+                let local_value = local
+                    .weights
+                    .iter()
+                    .find(|weight| weight.original == original)
+                    .expect("rank sharded expert weight")
+                    .local;
+                assert_eq!(
+                    candidate
+                        .value(local_value)
+                        .expect("rank weight bytes")
+                        .logical_bytes
+                        * 2,
+                    reference_candidate
+                        .value(original)
+                        .expect("reference weight bytes")
+                        .logical_bytes,
+                    "rank {rank} owns half of expert weight {}",
+                    fixture.graph.name(original).unwrap_or("<unnamed>")
+                );
+            }
+        }
+    }
 }
 
 fn one_block_orders(
@@ -352,6 +556,7 @@ fn prefix_activation(
     output: ValueId,
     tokens: &[u64],
     positions: &[u64],
+    linear_orders: &BTreeMap<NodeId, LinearReductionOrder>,
 ) -> Vec<f32> {
     let mut oracles = OracleRegistry::new();
     moxie_oracles::register(&mut oracles).expect("prefix oracle");
@@ -364,6 +569,11 @@ fn prefix_activation(
         &oracles,
     )
     .expect("prefix graph");
+    let prefix_orders = linear_orders
+        .iter()
+        .filter(|(id, _)| (id.0 as usize) < end)
+        .map(|(id, order)| (*id, *order))
+        .collect();
     let mut bindings = Bindings::new();
     for read in &stage.reads {
         let value = if read.original == fixture.tokens {
@@ -386,13 +596,16 @@ fn prefix_activation(
     )
     .expect("prefix cache");
     Interpreter::new()
-        .run(
+        .run_with_partition_orders(
             &stage.graph,
             &bindings,
             &mut state,
             moxie_state::ROOT,
             &mut cache,
             &Cancel::never(),
+            &prefix_orders,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
         )
         .expect("prefix activation")
         .logits
@@ -410,12 +623,14 @@ fn prefix_activation(
 ///   to 0.
 /// - Row 1, within block 0: `+Q`, `-Q`, `≈ 1` in ascending `k`. Ascending
 ///   sums to 1; descending sums to 0.
-fn order_sensitive_fixture() -> (
+fn order_sensitive_fixture(
+    routed: bool,
+) -> (
     moxie_cli::fixture::Fixture,
     TensorParallelLowering,
     moxie_models::gemma4::TextConfig,
 ) {
-    let (base, config) = fixture();
+    let (base, config) = fixture(routed);
     let lowering = lower_tensor_parallel(&base.graph, 2).expect("TP2 lowering");
     let node = &base.graph.nodes()[lowering
         .linear_orders
@@ -431,7 +646,14 @@ fn order_sensitive_fixture() -> (
         .as_float()
         .expect("BF16 weight");
     let (rows, columns) = (original.rows(), original.cols());
-    let x = prefix_activation(&base, node.id.0 as usize, node.inputs[0], &[1], &[0]);
+    let x = prefix_activation(
+        &base,
+        node.id.0 as usize,
+        node.inputs[0],
+        &[1],
+        &[0],
+        &BTreeMap::new(),
+    );
     let block = columns / 2;
     let nonzero = |range: std::ops::Range<usize>| range.into_iter().filter(|k| x[*k] != 0.0);
     let first: Vec<usize> = nonzero(0..block).take(3).collect();
@@ -582,11 +804,14 @@ fn stage_weight_value(
         .as_float()
         .expect("BF16 stage weight");
     if let Some(rows) = &weight.rows {
-        let columns = whole.cols();
+        let row_elements = whole.shape()[1..].iter().product::<usize>();
+        let mut shape = whole.shape().to_vec();
+        shape[0] = (rows.end - rows.start) as usize;
         return Value::Float(
             HostTensor::bf16(
-                whole.data()[rows.start as usize * columns..rows.end as usize * columns].to_vec(),
-                vec![(rows.end - rows.start) as usize, columns],
+                whole.data()[rows.start as usize * row_elements..rows.end as usize * row_elements]
+                    .to_vec(),
+                shape,
             )
             .expect("row-shard weight"),
         );
@@ -694,6 +919,7 @@ impl<'c> Rank<'c> {
 fn reference_step(
     fixture: &moxie_cli::fixture::Fixture,
     orders: &BTreeMap<NodeId, LinearReductionOrder>,
+    combine_orders: &BTreeMap<NodeId, CombineReductionOrder>,
     rank: &mut Rank<'_>,
     tokens: &[u64],
     positions: &[u64],
@@ -718,6 +944,8 @@ fn reference_step(
         &rank.capability,
         &catalogue,
         orders,
+        combine_orders,
+        &BTreeMap::<NodeId, ExpertOwnership>::new(),
     )
     .expect("split-aware reference selection");
     assert!(
@@ -777,6 +1005,8 @@ enum Fault {
     /// Rank 1 refuses its layer-1 attention stage, after layer 0 appended KV
     /// on both ranks.
     Rank,
+    /// Cancellation is requested at the layer-1 stage handoff.
+    Cancel,
     /// The collective after that stage is refused.
     Collective,
     /// A collective fails after its first peer copy is enqueued (F2).
@@ -820,6 +1050,7 @@ fn tp_worker_step(
     let mut oracles = OracleRegistry::new();
     moxie_oracles::register(&mut oracles).expect("oracles");
     let catalogue = moxie_kernels::dense_graph_catalogue();
+    let cancel = AtomicBool::new(false);
     let mut bindings = |rank: usize, stage: &StageGraph| {
         if rank == 1 && stage.state_layers.values().next() == Some(&1) {
             match fault {
@@ -829,6 +1060,7 @@ fn tp_worker_step(
                         detail: "injected rank-1 stage failure".into(),
                     });
                 }
+                Fault::Cancel => cancel.store(true, Ordering::Release),
                 Fault::Collective => {}
                 Fault::PeerCopy => {
                     PEER_COPIES.store(0, Ordering::SeqCst);
@@ -863,6 +1095,7 @@ fn tp_worker_step(
         },
         positions.last().copied().unwrap_or(0) + 1,
         &mut bindings,
+        &cancel,
     )?;
     if fault == Fault::Drop {
         drop(step);
@@ -874,18 +1107,27 @@ fn tp_worker_step(
     Ok(committed)
 }
 
-fn tp2_dense_worker_gate() {
+fn tp2_worker_gate(routed: bool) {
     let _guard = one_at_a_time();
-    let (fixture, lowering, config) = order_sensitive_fixture();
+    let (fixture, lowering, config) = order_sensitive_fixture(routed);
+    // Token 9 routes both selected experts to rank 0 for the routed decode.
+    let decode_token = if routed { 9 } else { 6 };
     let tokens = [1, 4, 7, 2, 9];
     let positions = [0, 1, 2, 3, 4];
-    let host_s2 = host_logits(&fixture, &tokens, &positions, &lowering.linear_orders);
+    let host_s2 = host_logits(
+        &fixture,
+        &tokens,
+        &positions,
+        &lowering.linear_orders,
+        &lowering.combine_orders,
+    );
     assert_ne!(
         host_logits(
             &fixture,
             &tokens,
             &positions,
-            &one_block_orders(&lowering.linear_orders)
+            &one_block_orders(&lowering.linear_orders),
+            &BTreeMap::new(),
         ),
         host_s2,
         "the fixture must make the declared S=2 order load-bearing"
@@ -896,6 +1138,7 @@ fn tp2_dense_worker_gate() {
         reference_prefill,
         reference_decode,
         reference_after_rank_failure,
+        reference_after_cancel,
         reference_after_mismatch,
         reference_after_remaining_faults,
     ) = {
@@ -904,6 +1147,7 @@ fn tp2_dense_worker_gate() {
         let prefill = reference_step(
             &fixture,
             &lowering.linear_orders,
+            &lowering.combine_orders,
             &mut reference,
             &tokens,
             &positions,
@@ -911,30 +1155,42 @@ fn tp2_dense_worker_gate() {
         let decode = reference_step(
             &fixture,
             &lowering.linear_orders,
+            &lowering.combine_orders,
             &mut reference,
-            &[6],
+            &[decode_token],
             &[5],
         );
         let after_rank_failure = reference_step(
             &fixture,
             &lowering.linear_orders,
+            &lowering.combine_orders,
             &mut reference,
             &[7],
             &[6],
         );
-        let after_mismatch = reference_step(
+        let after_cancel = reference_step(
             &fixture,
             &lowering.linear_orders,
+            &lowering.combine_orders,
             &mut reference,
             &[8],
             &[7],
         );
-        let after_remaining_faults = reference_step(
+        let after_mismatch = reference_step(
             &fixture,
             &lowering.linear_orders,
+            &lowering.combine_orders,
             &mut reference,
             &[9],
             &[8],
+        );
+        let after_remaining_faults = reference_step(
+            &fixture,
+            &lowering.linear_orders,
+            &lowering.combine_orders,
+            &mut reference,
+            &[10],
+            &[9],
         );
         for (word, expected) in prefill.chunks_exact(4).zip(&host_s2) {
             let (actual, expected) = (
@@ -951,6 +1207,7 @@ fn tp2_dense_worker_gate() {
             prefill,
             decode,
             after_rank_failure,
+            after_cancel,
             after_mismatch,
             after_remaining_faults,
         )
@@ -972,6 +1229,43 @@ fn tp2_dense_worker_gate() {
         query_device(ordinals[0]).expect("rank 0 capability"),
         query_device(ordinals[1]).expect("rank 1 capability"),
     ];
+    println!(
+        "TP2 device pair UUIDs: {} {}",
+        capabilities[0].uuid, capabilities[1].uuid
+    );
+    if routed {
+        let owners = |row: &[u32]| row.iter().map(|expert| expert / 4).collect::<Vec<_>>();
+        let routes = host_route_ids(&fixture, &tokens, &positions, &lowering.linear_orders);
+        assert!(
+            routes
+                .iter()
+                .any(|row| owners(row).windows(2).all(|pair| pair[0] == pair[1])),
+            "prefill must contain a same-owner route: {routes:?}"
+        );
+        assert!(
+            routes
+                .iter()
+                .any(|row| owners(row).windows(2).any(|pair| pair[0] != pair[1])),
+            "prefill must contain a cross-owner route: {routes:?}"
+        );
+        let mut decode_tokens = tokens.to_vec();
+        decode_tokens.push(decode_token);
+        let mut decode_positions = positions.to_vec();
+        decode_positions.push(5);
+        let decode_routes = host_route_ids(
+            &fixture,
+            &decode_tokens,
+            &decode_positions,
+            &lowering.linear_orders,
+        );
+        assert!(
+            owners(decode_routes.last().expect("decode route row"))
+                .windows(2)
+                .all(|pair| pair[0] == pair[1]),
+            "decode [{decode_token}]/[5] must route to one owner: {decode_routes:?}"
+        );
+        assert_expert_owner_resource(&fixture, &lowering, &capabilities);
+    }
     let prefill = tp_worker_step(
         &mut workers,
         &fixture,
@@ -991,7 +1285,7 @@ fn tp2_dense_worker_gate() {
         &fixture,
         &lowering,
         &capabilities,
-        &[6],
+        &[decode_token],
         &[5],
         Fault::None,
     )
@@ -1020,13 +1314,49 @@ fn tp2_dense_worker_gate() {
     )
     .expect("clean step immediately after rank refusal");
     assert_eq!(after_rank_failure, reference_after_rank_failure);
-    let mismatch = tp_worker_step(
+    let before_cancel = workers.stats().expect("worker stats before cancellation");
+    let cancelled = tp_worker_step(
         &mut workers,
         &fixture,
         &lowering,
         &capabilities,
         &[8],
         &[7],
+        Fault::Cancel,
+    )
+    .expect_err("stage-boundary cancellation refuses the step");
+    assert!(
+        matches!(
+            cancelled,
+            Error::Cancelled {
+                at: "tensor-parallel stage"
+            }
+        ),
+        "expected stage cancellation, got {cancelled}"
+    );
+    assert_eq!(
+        workers.stats().expect("worker stats after cancellation"),
+        before_cancel,
+        "cancellation leaves frontiers and reservations unchanged"
+    );
+    let after_cancel = tp_worker_step(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &[8],
+        &[7],
+        Fault::None,
+    )
+    .expect("clean step immediately after cancellation");
+    assert_eq!(after_cancel, reference_after_cancel);
+    let mismatch = tp_worker_step(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &[9],
+        &[8],
         Fault::Collective,
     )
     .expect_err("the unequal rank declaration is refused");
@@ -1043,8 +1373,8 @@ fn tp2_dense_worker_gate() {
         &fixture,
         &lowering,
         &capabilities,
+        &[9],
         &[8],
-        &[7],
         Fault::None,
     )
     .expect("clean step immediately after declaration mismatch");
@@ -1065,8 +1395,8 @@ fn tp2_dense_worker_gate() {
             &fixture,
             &lowering,
             &capabilities,
+            &[10],
             &[9],
-            &[8],
             fault,
         )
         .expect_err("an injected rank failure refuses");
@@ -1081,8 +1411,8 @@ fn tp2_dense_worker_gate() {
         &fixture,
         &lowering,
         &capabilities,
+        &[10],
         &[9],
-        &[8],
         Fault::None,
     )
     .expect("clean step after recoverable refusals");
@@ -1090,6 +1420,13 @@ fn tp2_dense_worker_gate() {
         recovered, reference_after_remaining_faults,
         "recovered step is bit-identical"
     );
+
+    if !routed {
+        workers
+            .close()
+            .expect("close dense workers before routed run");
+        return;
+    }
 
     let before_stall = workers.stats().expect("worker stats before stall");
     let published_before_stall = workers.published_frontiers();
@@ -1110,8 +1447,8 @@ fn tp2_dense_worker_gate() {
         &fixture,
         &lowering,
         &capabilities,
+        &[11],
         &[10],
-        &[9],
         Fault::Stall,
     )
     .expect_err("a stalled rank returns no logits");
@@ -1143,5 +1480,6 @@ fn bf16_ulp(value: f32) -> f32 {
 
 #[test]
 fn tp2_dense_prefill_decode_is_exact_and_rank_step_is_atomic() {
-    tp2_dense_worker_gate();
+    tp2_worker_gate(false);
+    tp2_worker_gate(true);
 }

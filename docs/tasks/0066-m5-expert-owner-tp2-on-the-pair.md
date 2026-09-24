@@ -1,7 +1,37 @@
 # Task 0066 — the expert-partitioned routed Gemma runs on the 3090 pair
 
-Status: **open** (coordinator, 2026-09-23, under the owner's auto-mode
-delegation). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-23, under the owner's auto-mode
+delegation). Built by Codex `luna` from the coordinator's design, with two
+amendments: the boundary `Dim` evaluation, and mutation 2 moved to a kernel
+case because zero-filled slots mask it end to end. Sol returned REVISE in
+round 1 (sidecar cross-check; route proof on S = 2; resource-test cut), then
+ACCEPT in round 2. The coordinator re-ran `fmt`, workspace and driver
+`clippy`, `arch-check`, `spec-check`, the `moxie-plan` tests,
+`dense_tp2_device` (dense and routed TP2 on the pair), `dense_gemma_device`
+and the combine kernel test.
+
+**Amendment, 2026-09-23 (coordinator), after the builder's DECISION.**
+- *Observation:* `dense_tp_workers.rs::value_bytes` resolves only
+  `Dim::Const` and `Dim::Symbol`. `ExpertMlp`'s output extent
+  `Mul(Symbol(rows), Const(top_k))` fails in `boundary_bytes` before any
+  routed stage runs. Separately, the `dense_tp2_device` gate command omits
+  `paged-attention-test-hooks`, which that target needs to compile.
+- *Replacement:*
+  - Change 6c (below): `value_bytes` evaluates the whole `Dim` expression.
+  - The `dense_tp2_device` command gains the `paged-attention-test-hooks`
+    feature.
+- *Authority:* coordinator.
+
+**Amendment 2, 2026-09-23 (coordinator), after the builder's STOP.**
+- *Observation:* mutation 2 (the partial combine sums every group) survived
+  the routed TP2 gate.
+- *Cause:* rank-local `ExpertMlp` writes exact zeros into non-owned slots.
+  Adding `w · (+0)` terms changes no bits, so end to end the owned-group
+  predicate is masked by the zero-fill. The predicate is still the kernel's
+  contract: the oracle skips non-owned slots and never adds them as zero.
+- *Replacement:* change 8b below. Mutation 2 is now expected to fail that
+  case, not the TP2 gate.
+- *Authority:* coordinator.
 
 ## Identity and authority
 
@@ -219,6 +249,13 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
      comment: the check sits at stage boundaries, which are the safe
      boundaries where both ranks have drained.
 
+   - c. `value_bytes`: bind the graph's rows symbol once, with
+     `let mut table = SymbolTable::new(); table.bind(graph.rows_symbol(), rows);`.
+     Replace the `match dim` with
+     `dim.eval(&table).map_err(|_| invalid("boundary", "unresolved dimension"))?`.
+     `Dim::eval` (`moxie-types/src/dim.rs`) already checks overflow. Any
+     unbound symbol still refuses, as before.
+
 7. **`crates/moxie-executor/tests/dense_tp2_device.rs`:**
    - a. **Fixture:** `order_sensitive_fixture` becomes
      `order_sensitive_fixture(routed: bool)`.
@@ -282,6 +319,56 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
    Assert `0.0` for `groups = 2`. The existing case passes
    `experts_per_group = 4`, `groups = 1`.
 
+8b. **The same test gains a third case: the partial kernel.** Launch
+    `DENSE_COMBINE_PARTIAL` with the same `ids = [3, 0, 2]`,
+    `coefficients = [1, 1, 1]`, `slots = [2^-30, -1.0, 1.0]`,
+    `experts_per_group = 2` and `owned = 0`.
+    - Group 0 holds only expert 0, so the result is **exactly `-1.0`**
+      (FP32 bits).
+    - With the owned predicate removed, the kernel sums every slot in
+      ascending id: `-1 + 1 + 2^-30 = 2^-30`.
+
+    Put both derivations in the comment. Load the module with both symbols,
+    or a second module; follow the existing case's mechanics.
+
+**Review round 1 fixes (sol REVISE, 2026-09-23; coordinator's design):**
+
+9. **`selected.rs`, `check_routed_edges`:** also take `&BTreeMap<NodeId,
+   CombineReductionOrder>`, and pass it from `lower_dense_mode`. For each
+   `Combine`, let `order` be its combine order (if any) and `own` be its
+   producer `ExpertMlp`'s ownership (if any). Refuse with the existing
+   `UnsupportedKernel { operation: "route", .. }` unless one of these holds:
+   - no `order` and no `own`;
+   - `order = { groups, owned: None }`, no `own`, and `mlp.experts % groups
+     == 0` (the single-device reference);
+   - `order = { groups, owned: Some(g) }` and `own = { groups: same,
+     owned: g }` (a rank).
+
+   Add **one** assertion to the existing `routed_edges_must_agree_on_the_route`
+   test, not a new test. Take a well-formed route / 4-expert `ExpertMlp` /
+   `Combine` graph (build one if the existing fixture does not have one),
+   with `ExpertOwnership { groups: 2, owned: 0 }` and
+   `CombineReductionOrder { groups: 2, owned: Some(1) }`. `lower_selected_ordered`
+   must refuse it. This is sol's repro.
+10. **`dense_tp2_device.rs`, route proof on the declared orders:**
+    - `prefix_activation` gains `linear_orders: &BTreeMap<NodeId,
+      LinearReductionOrder>`. The prefix stage is built with `part = None`
+      from `0..end`, so its local node ids equal the original ones. Call
+      `run_with_partition_orders` with the entries whose `id.0 < end`, and
+      empty combine and ownership maps.
+    - `host_route_ids` passes `&lowering.linear_orders`.
+    - The fixture-crafting caller passes `&BTreeMap::new()`, which is
+      unchanged behaviour.
+    - The same-owner, cross-owner and empty-owner-decode assertions then
+      inspect the routes the S = 2 reference actually takes. If one no
+      longer holds, STOP and report; do not re-craft.
+11. **`dense_tp2_device.rs`, resource check (sol's cut):** delete the
+    unsplit `StageGraph` construction and the Combine node-id remapping.
+    Take the reference expert-weight `logical_bytes` from
+    `lower_selected_ordered` on the full fixture graph at the original
+    weight ids, with the lowering's combine orders. Keep the per-rank stage
+    candidates and the exact half-bytes assertion.
+
 ## Allowed files
 
 - `crates/moxie-types/src/capability.rs`
@@ -309,8 +396,8 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
 - `cargo xtask arch-check` and `cargo xtask spec-check`.
 
 **GPU gates** (run by the builder, with `CUDA_DEVICE_ORDER=PCI_BUS_ID`):
-- `cargo test -p moxie-executor --features driver,paged-attention-binding
-  --test dense_tp2_device`. Both the dense and the routed runs must pass,
+- `cargo test -p moxie-executor --features
+  driver,paged-attention-binding,paged-attention-test-hooks --test dense_tp2_device`. Both the dense and the routed runs must pass,
   with the pair's UUIDs in the output.
 - `cargo test -p moxie-executor --features driver,paged-attention-binding
   --test dense_gemma_device`. Task 0065's five cases must still pass.
@@ -325,8 +412,8 @@ check that catches it; the fixture was chosen so that it does.
    `[first_expert, first_expert + local_experts)` range. Rank 1 then drops
    experts 4–7, and the routed TP2 prefill (cross-owner rows) fails.
 2. `moxie_dense_combine_partial_v1` sums every group, ignoring `owned`.
-   Cross-owner rows are then double-counted, and the routed TP2 prefill
-   fails.
+   Change 8b's partial case fails (Amendment 2: the TP2 gate cannot
+   see it, because non-owned slots are exact zeros).
 3. `moxie_dense_combine_v1` ignores `groups` (it sums ungrouped). Change 8's
    `groups = 2` case fails.
 4. The cancellation check in `execute_dense` is removed. The
@@ -341,4 +428,56 @@ check that catches it; the fixture was chosen so that it does.
 
 ## Result, filled after work
 
-- Pending.
+- **Complete after Review round 1 fixes.** No commit was made. The coordinator's
+  amendments and carried files are preserved.
+- The coordinator-authorized `value_bytes` change binds the graph rows symbol
+  once in a `SymbolTable` and evaluates each complete `Dim`, mapping evaluation
+  failures to the prescribed boundary error.
+- `check_routed_edges` cross-checks each Combine order with its producer
+  ExpertMlp ownership. The existing `routed_edges_must_agree_on_the_route`
+  test now includes sol's well-formed route-8 / local-expert-4 repro and
+  asserts typed refusal for ownership `{ groups: 2, owned: 0 }` versus combine
+  order `{ groups: 2, owned: Some(1) }`.
+- Route proofs evaluate prefix activations with the lowering's declared S=2
+  linear orders. The dense TP2 gate confirmed same-owner and cross-owner
+  prefill routes and a single-owner decode route; decode uses token 9 at
+  position 5 because the host oracle showed token 6 routes cross-owner there.
+  The resource check now compares each rank's stage candidate against a
+  full-fixture reference candidate using original weight ids and no unsplit
+  StageGraph or node-id remap. Both expert weight charges are exactly half.
+- Routed TP2 prefill and decode were bit-identical on UUIDs
+  `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` and
+  `GPU-81fe4578-59b2-37c4-421e-287cdac78704`. Cancellation/recovery and sticky
+  stall checks passed. The combine-order device test covers selection-order
+  cancellation, grouped accumulation and the owned FP32 partial, whose exact
+  result is `-1.0` for ids `[3,0,2]`, coefficients `[1,1,1]`, slots
+  `[2^-30,-1,1]`, `experts_per_group=2`, `owned=0`.
+- All four mutations were applied, observed failing at their intended check,
+  and restored: (1) replacing the expert range guard with `expert >=
+  local_experts` failed routed prefill bit identity; (2) removing the partial
+  owned-group predicate failed the partial case with FP32 `2^-30` bits
+  (`813694976`) instead of `-1.0` bits (`3212836864`); (3) making combine
+  process one ungrouped ascending traversal failed the `groups=2` case with
+  BF16 `2^-30` (`12416`) instead of zero; (4) deleting the stage cancellation
+  check made the `Fault::Cancel` call return logits instead of `Cancelled`.
+- Host gates passed: formatting, workspace clippy, driver-feature executor
+  clippy, `cargo test --workspace --locked`, `cargo xtask arch-check` (79
+  rejected and 21 accepted fixtures), and `cargo xtask spec-check` (10
+  documents). The focused `cargo test -p moxie-plan --locked` passed (22 unit
+  tests and 11 expert-plan matrix tests).
+- Review-round GPU gates passed with `CUDA_DEVICE_ORDER=PCI_BUS_ID`:
+  `dense_tp2_device` (dense and routed runs on the 3090 pair) and
+  `combine_kernel_sums_in_ascending_expert_order`. The prior round's
+  `dense_gemma_device` (five cases on all three GPUs) and full CUDA suite
+  (63/63, SM86 and SM120 qualified) remain recorded; they were not rerun for
+  this review round.
+- Review map (`+/-` lines from the current diff):
+  - `crates/moxie-types/src/capability.rs`: +3/-0.
+  - `crates/moxie-kernels/cuda/routed_ops.cu`: +70/-8.
+  - `crates/moxie-kernels/src/lib.rs`: +20/-4.
+  - `crates/moxie-plan/src/selected.rs`: +175/-21.
+  - `crates/moxie-executor/src/dense.rs`: +195/-25.
+  - `crates/moxie-executor/src/dense_tp_workers.rs`: +17/-8.
+  - `crates/moxie-executor/tests/dense_tp2_device.rs`: +367/-29.
+  - `docs/tasks/0066-m5-expert-owner-tp2-on-the-pair.md`: +137/-5, including
+    coordinator amendments and this Result.
