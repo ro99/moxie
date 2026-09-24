@@ -106,8 +106,15 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
    }
    #[derive(Debug, Clone, PartialEq)]
    pub enum Verdict { Ranked { rank: usize, estimate: Estimate }, Rejected { reason: String } }
-   pub fn compare_plans(graph: &Graph, workload: UserWorkload, costs: &TopologyCosts)
+   pub fn compare_plans(graph: &Graph, oracle: OracleId, oracles: &OracleRegistry,
+                        workload: UserWorkload, costs: &TopologyCosts)
        -> Result<Vec<(CandidateKind, Verdict)>>;
+   // Amended after the builder's DECISION: the composition root supplies
+   // the oracle registry, as `PipelineWorkers::execute` takes it, so stage
+   // graphs are built with `build_stage_graph` and a TP2 stage lowers with
+   // `lower_tensor_parallel(&stage.graph, 2)`. No new production dependency.
+   // A full-graph TP2 refusal (e.g. an odd vocabulary) is a `Rejected` Tp2
+   // entry and does not affect the TP2-first pipeline candidates.
    ```
    - **Candidates**, in this order:
      1. `Single` on each device.
