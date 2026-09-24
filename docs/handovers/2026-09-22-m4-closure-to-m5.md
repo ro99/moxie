@@ -60,18 +60,22 @@ coordinator review of task 0053 (2026-09-22) found that the earlier statement
 "attention was the only implemented-op gap M5.1 still has to close" was
 wrong. Rows M5.1-c and M5.1-d record what it missed.
 
-| Item | Outcome | State | Owner | Dependency | Evidence | Next action |
-|---|---|---|---|---|---|---|
-| M5.1-a | Attention/MLA op-level partition rule | **Accepted** (owner, 2026-09-22) | closed | none | [Task 0053](../tasks/0053-m5-attention-partition-semantics.md): `Attention` → `HeadShardable{GqaReplicateWhenOversubscribed, ConcatenateHeads}`, `MlaAttention` → `HeadShardable{SharedLatentReplicated, GlobalReduction}`. The semantics are correct. Most of its new test lines check fixture literals, re-test descriptor methods already pinned in `moxie-graph`, or check the fixture's own wiring (see M5.1-e) | none |
-| M5.1-b | Column-sharded weights addressed through the canonical format and residency authority (`LogicalRange` per component) | **Accepted** (owner, 2026-09-22) | closed | none | [Task 0054](../tasks/0054-m5-weight-shard-addressing.md), amended twice before any code: input-axis (row) shards are strided in row-major `[out, in]`, and quantization groups lie along `k`, so a column shard never splits a group. Three review rounds: a rank-dependent overflow verdict (fixed by validating the full extent first), hand-derived component widths (now `affine_components`), then redundant re-validation removed | none |
-| M5.1-c | Head-aligned partition across the head chain (`q/k/v` `Linear` → per-head `RmsNorm` → `Rope` → `Attention`) | **Moved into M5.2 task 0056** (owner, 2026-09-22) | luna / sol / coordinator | none | Partition rules have no production reader, so per-op labels could only be tested as constants. Head alignment is now proven by a host TP lowering whose split result must be bit-identical to the unsplit graph | see M5.2 |
-| M5.1-d | Per-weight partition inside `MlaAttention` (`q_a`/`kv_a` replicated, `q_b`/`kv_b` split by head, `o_proj` split along its input axis) | **Moved to a later M5.2 slice** (owner, 2026-09-22) | unassigned | task 0056's lowering; `o_proj` also needs strided addressing | task 0056 refuses `MlaAttention` explicitly | after task 0056 |
-| M5.1-e | Trim task 0053's redundant tests to one assertion per invariant (owner instruction, 2026-09-19) | **Accepted** (owner, 2026-09-22) | closed | none | Keep: the contract-table enum rows and the single `node.contract.partition` assertion on the real MLA node in `mla_reference.rs`. Remove: the GQA-literal block and the `cache_width`/`more_query_heads` block in `reference_graphs.rs`, the fixture-wiring assertions in `mla_reference.rs`, and the new `HeadShardable` line in `moxie-graph`'s `partition_semantics_fail_closed_until_defined` | [Task 0055](../tasks/0055-m5-trim-task-0053-tests.md) opened, 2026-09-22 |
-| M5.1-f | State (KV) shard addressing through the residency authority | Not started | unassigned | M5.1-c (which KV heads a rank owns) | named in task 0054's non-goals | after M5.1-c |
-| M5.2 | TP2 on the 3090 pair: column/row linears, head/KV ownership, global routing/vocabulary ops, collective ordering and failure handling | **Slice 1 accepted** (owner, 2026-09-22); M5.2 open | luna / sol / coordinator | M5.1-a/b accepted | [Task 0056](../tasks/0056-m5-host-tp-attention-lowering.md): host-only lowering of the dense Gemma 4 attention sublayer for R = 2 and 4, bit-identical to the unsplit graph; design proposal first. It also closes the carried non-divisible-head refusal | Later slices: thread-per-rank device execution (document 01's one execution thread per GPU; task 0057 drives both ranks from one host thread because `RankContext`/`DeviceRange` are `!Send`, so a cross-thread peer-range handle is needed; failure must reach every rank the way Strata's status collective did, MAX over a status word, with a failing rank still entering every collective); whole-rank-step atomicity (task 0056 harness runs each rank/layer as its own interpreter transaction; the device slice must make a rank step one transaction); MLA (M5.1-d); row-parallel `o_proj` plus strided addressing and group alignment (task 0054 amendments); state KV shard addressing (M5.1-f); device collectives on the 3090 pair, replacing task 0056's host harness |
-| M5.3 | PP with uneven stages, microbatch-aware prefill, mixed TP+PP stage groups | Not started | unassigned | M5.2 | none | after M5.2 |
-| M5.4 | Bounded expert-owner partitioning: shared dispatch/transport/reduction, duplicate destinations, host experts, route unions | Not started | unassigned | `ExpertMlp`/`Combine` partition rule (still `NotDetermined`) | none | its own task once expert-owner semantics are written |
-| M5.5 | Topology cost probes and a deterministic plan comparison tool | Not started | unassigned | M5.2/M5.3/M5.4 | none | not queued |
+| Item | Outcome | State | Evidence |
+|---|---|---|---|
+| M5.1-a | Attention and MLA op-level partition rule | **Accepted** (owner, 2026-09-22) | [0053](../tasks/0053-m5-attention-partition-semantics.md) |
+| M5.1-b | Column-sharded weights through the canonical format and residency authority | **Accepted** (owner, 2026-09-22) | [0054](../tasks/0054-m5-weight-shard-addressing.md) |
+| M5.1-c | Head-aligned partition across the head chain | **Accepted** (in M5.2) | [0056](../tasks/0056-m5-host-tp-attention-lowering.md), [0058](../tasks/0058-m5-dense-tp-host-lowering.md): host TP bit-identical to the unsplit graph |
+| M5.1-d | Per-weight MLA partition | **Accepted** 2026-09-23 | [0067](../tasks/0067-m5-mla-head-partition.md): bit-identical at R = 2 and 4 |
+| M5.1-e | Trim task 0053's redundant tests | **Accepted** (owner, 2026-09-22) | [0055](../tasks/0055-m5-trim-task-0053-tests.md) |
+| M5.1-f | Per-rank KV state through the residency authority | **Accepted** | [0060](../tasks/0060-m5-dense-tp2-on-the-pair.md): per-rank device KV, a whole rank step as one transaction, two-phase commit |
+| M5.2 | TP2 on the 3090 pair | **Accepted** | [0057](../tasks/0057-m5-tp2-rank-group-and-gather.md), [0060](../tasks/0060-m5-dense-tp2-on-the-pair.md), [0061](../tasks/0061-m5-admit-host-control-metadata.md), [0062](../tasks/0062-m5-thread-per-rank-execution.md) (thread per rank; status rendezvous; rank-failure and collective-mismatch injection), [0063](../tasks/0063-m5-admit-sequence-state-growth.md) |
+| M5.3 | PP with uneven stages, microbatch-aware prefill, TP2 + TP1 stage groups, capacity/latency report | **Accepted** 2026-09-24 | [0069](../tasks/0069-m5-host-pipeline-lowering.md), [0070](../tasks/0070-m5-solo-rank-worker.md), [0071](../tasks/0071-m5-pipeline-on-three-gpus.md), [0072](../tasks/0072-m5-combined-tp2-tp1-plan.md): at fixture scale, capacity improves and latency worsens about 5× |
+| M5.4 | Bounded expert-owner partitioning: duplicate destinations, host experts, route unions | **Accepted** 2026-09-24 | [0064](../tasks/0064-m5-host-expert-owner-lowering.md), [0065](../tasks/0065-m5-routed-gemma-single-gpu.md), [0066](../tasks/0066-m5-expert-owner-tp2-on-the-pair.md), [0068](../tasks/0068-m5-host-owned-experts.md) |
+| M5.5 | Topology cost probes and a deterministic plan comparison tool | **Accepted** 2026-09-24 | [0073](../tasks/0073-m5-topology-cost-probes.md), [0074](../tasks/0074-m5-plan-comparison-tool.md); `docs/evidence/topology-costs.md`, `docs/evidence/plan-comparison.md` |
+
+Rows marked "Accepted" without "(owner)" were accepted by the coordinator
+under the owner's auto-mode delegation. The history of each row is in its
+task records and in the sections below.
 
 Owner direction, 2026-09-23: a second builder starts slice 4 in parallel
 with task 0062. MLA partitioning and M5.5 (topology probes and plan
@@ -142,6 +146,66 @@ group axis and graph wiring a contract depends on before writing its acceptance
 clauses. Task 0053's shape-proof clause and task 0054's two amendments all came
 from skipping that step.
 
+## M5 acceptance package (coordinator, 2026-09-24): ready for the owner
+
+Candidate: `main` at the commit that records this package (code at
+`ad09f9b`). Every exit clause below was re-read on its own, against its
+evidence.
+
+| Exit clause (roadmap M5) | Evidence | Verdict |
+|---|---|---|
+| The same dense graph executes on a single GPU without model edits | [0059](../tasks/0059-m5-single-gpu-dense-gemma-device.md): reduced dense Gemma on both 3090s and the 5060 Ti within the task 0012 gate | met |
+| … dense TP | [0060](../tasks/0060-m5-dense-tp2-on-the-pair.md), [0062](../tasks/0062-m5-thread-per-rank-execution.md): TP2 on the pair, bit-identical to a one-3090 reference under the same declared split | met |
+| … dense PP | [0071](../tasks/0071-m5-pipeline-on-three-gpus.md): three stages on 3090, 3090 and 5060 Ti, within host tolerance; the 3090 pair bit-identical to one 3090 | met |
+| The same MoE graph on a single GPU | [0065](../tasks/0065-m5-routed-gemma-single-gpu.md): routed Gemma on all three GPUs | met |
+| … MoE TP (expert-partitioned) | [0066](../tasks/0066-m5-expert-owner-tp2-on-the-pair.md): expert-owner TP2, bit-identical | met |
+| … MoE PP | [0071](../tasks/0071-m5-pipeline-on-three-gpus.md): routed Shape C on three stages | met |
+| A combined TP/PP plan has correctness, resource and cancellation tests | [0072](../tasks/0072-m5-combined-tp2-tp1-plan.md): TP2 pair plus TP1 5060 Ti; four fault and retry cases (including cancellation); frontiers and stats unchanged; reservations returned | met |
+| An expert-partitioned plan has correctness, resource and cancellation tests | [0066](../tasks/0066-m5-expert-owner-tp2-on-the-pair.md): expert-owner resource test and mid-step cancellation | met |
+| Rank failure and collective mismatch are injected safely in the harness | [0062](../tasks/0062-m5-thread-per-rank-execution.md): rank failure mid-step, collective mismatch and stalls; lost is sticky; every rank drains | met |
+| No TP3 speed guarantee | No TP3 plan is claimed. The 0072 report and `plan-comparison.md` state fixture-scale estimates only, with no speed claim | met |
+| No hidden peer-to-host fallback | `moxie-cuda` refuses a peer copy without a grant ("refusing a host-staged copy"). Every host-staged transfer is declared: the pipeline handoffs and their bytes (0071, 0072), and host-expert staging (0068). The probe records a peer link only where CUDA grants it (0073) | met |
+| M5.5 probes and a deterministic plan comparison, ranked by the joint workload | [0073](../tasks/0073-m5-topology-cost-probes.md), [0074](../tasks/0074-m5-plan-comparison-tool.md): the winner changes with prompt length; the output is byte-identical across runs | met |
+
+Final gates at the candidate (task 0075): format, both clippy lanes, `cargo
+test --workspace`, arch-check (79/21/13) and spec-check pass. On the GPUs,
+`dense_gemma_device` is 6/6, `dense_tp2_device` passes and `cargo xtask-cuda
+test-gpu` is 63/63 (SM86 and SM120).
+
+**Milestone-end audit** (`/ponytail:ponytail-audit`, 2026-09-24): about −330
+to −430 lines were found. [Task 0075](../tasks/0075-m5-audit-cleanup.md)
+applied the behaviour-preserving subset (about −95 lines) and fixed one latent
+defect the audit exposed: the TP worker dropped a paged-attention run whose
+close was refused, unloading its CUDA module while a kernel might still run.
+Still open, and not blocking the milestone:
+- size overruns against the estimates of tasks 0070–0074 (`rank_worker.rs`,
+  the executor's `pipeline.rs`, `topology_probe.rs`, `compare.rs`, and the
+  device-test growth);
+- the `dense_gemma_device` step-runner duplication (skipped, because it moved
+  assertions).
+
+**Scope and exclusions.**
+- Every device result is on reduced fixtures. No checkpoint-backed model runs
+  or generates a token in M5.
+- There is no pipeline microbatch overlap: dispatch is sequential in
+  wavefront order, and overlap is M6.3.
+- There are no pinned transfers (M6.3) and no compute probe, so the plan
+  comparison is weight-traffic and transfer bound, and prefill is
+  underestimated. Automatic plan selection is M6.5.
+- A TP stage may only come first in a pipeline, and a pipeline with a TP
+  stage takes one microbatch.
+- The Laguna scaled combine under expert-owner TP is M7 work, refused
+  fail-closed until then.
+
+**For the owner:**
+1. **Accept M5**, within this scope. Only the owner can.
+2. **Driver pin.** `docs/evidence/topology-p2p.md` pins the patched open
+   module at 610.43.02. The machine now runs a locally built 610.57.04
+   (2026-09-11), with peer access still granted. The evidence file should be
+   corrected, and the pin re-stated.
+3. The board's slices T2–T8 are in `review`, waiting for you to mark them
+   `done`.
+
 ## Remaining hypotheses and blockers
 
 None blocking. `RankId`/`RankContext` exist as a single-rank-per-device
@@ -150,4 +214,4 @@ abstraction; whether TP2 needs a rank-group type is M5.2's question. Document
 
 ## Next task
 
-Slice 1 ([task 0058](../tasks/0058-m5-dense-tp-host-lowering.md)) is **accepted**: the dense layer and vocabulary lowered on the host, with exact reductions under ADR 0036 and strided weight addressing. Slice 2 is split in two: [task 0059](../tasks/0059-m5-single-gpu-dense-gemma-device.md) runs the reduced dense Gemma graph on one GPU (the missing device kernels; RoPE with a host-computed angle table, following Strata), and task 0060 splits it across the pair, bit-identical to one GPU. **Task 0059 accepted**: the reduced dense Gemma graph runs on one GPU (both 3090s and the 5060 Ti) within the task 0012 gate, observed at 0 ULP on this fixture. Full GPU suite 63/63. [Task 0060](../tasks/0060-m5-dense-tp2-on-the-pair.md) is **accepted (2026-09-23), closing slice 2**. The reduced dense Gemma graph runs TP2 on the 3090 pair, bit-identical to a one-3090 reference that uses the same declared split; the fixture is sensitive to summation order both between and within blocks. Commit is two-phase (`DeviceKvSequence::prepare_commit`/`apply_commit`). One settle routine drains both ranks with a deadline, following a written reusable-versus-lost rule. Every failure site is inventoried in the task Result. Slice 3 (robust rank execution) is split: [task 0061](../tasks/0061-m5-admit-host-control-metadata.md) (**accepted** 2026-09-23) admits host control metadata and dedupes the test event gate; task 0063 (**accepted** 2026-09-23) admits `SequenceState` transaction-map and prefix-lineage growth on the step (split from task 0061 by amendment on 2026-09-23, following `PagedSequence`'s reserve-and-charge precedent); task 0062 then adds thread-per-rank execution. **Task 0062 accepted (2026-09-23), closing slice 3.** Each 3090 rank runs on its own thread (document 01); peer reads use an owned, acknowledged `PeerRead`; every collective is a status rendezvous with a deadline, where lost is sticky; and the single-thread path of task 0060 is deleted. **Owner direction, 2026-09-23: task 0062 continues and is slice 3's last task.** Anything its reviews surface that the M5 exit gate does not require goes to the ledger rather than into slice 3 (coordinator.md, "Own the pace and the scope"). Task 0062 adds failure propagation (Strata drove both ranks from one host thread through grouped collectives, but document 01 requires one rank execution thread per GPU). Owner direction, 2026-09-22: luna went in circles on failing tests, so the task was handed to the Claude Opus session `builder` (rescue), continuing from luna's uncommitted work (a backup patch was taken first). Luna is stood down for this task.
+None inside M5. The acceptance package above is ready for the owner. The first M6 task is opened only on the owner's authorization.
