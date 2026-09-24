@@ -116,6 +116,10 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
    }
    pub fn lower_host_experts(graph: &Graph) -> Result<HostExpertLowering, TensorParallelRefused>
    ```
+   **The fields of `HostExpertLowering` and `HostExpertJoin` are private**
+   (read through getters). The only constructor is `lower_host_experts`,
+   so a hand-edited, malformed lowering cannot exist. This is the lesson
+   from task 0067's three review rounds: derive, do not trust a declaration.
    For every `ExpertMlp` node:
    - It must satisfy the **same routed-block checks** as task 0064's expert
      pass, with the same refusals: a `Route` producer; exactly one consumer,
