@@ -96,8 +96,9 @@ GPU gates run again inside each task. Only one agent uses the GPUs at a time.
 
 **Slice 5 plan (coordinator, 2026-09-24):**
 - [task 0069](../tasks/0069-m5-host-pipeline-lowering.md): host pipeline lowering, with microbatched prefill in wavefront order; **accepted** 2026-09-24. Dense and routed Gemma through uneven 3-stage pipelines are bit-identical to the unsplit graph;
-- task 0070: pipeline on the three GPUs. The 3090 pair uses a peer handoff; the 5060 Ti gets a declared, reported host-staged handoff. With resource and cancellation tests;
-- task 0071: the combined TP2 (3090 pair) + TP1 (5060 Ti) plan, with correctness, resource and cancellation tests, and the capacity and latency report.
+- **Re-scoped 2026-09-24 (coordinator), from three tasks to four.** Document 01 requires one execution thread per GPU, and the only worker is the pair-specific TP worker (task 0062). Generalizing it would reopen accepted failure-propagation code. So [task 0070](../tasks/0070-m5-solo-rank-worker.md) adds a single-GPU rank worker, and the rest shift by one: 0071 runs the pipeline on the three GPUs, and 0072 is the combined plan.
+- task 0071 (was 0070): pipeline on the three GPUs. The 3090 pair uses a peer handoff; the 5060 Ti gets a declared, reported host-staged handoff. With resource and cancellation tests;
+- task 0072 (was 0071): the combined TP2 (3090 pair) + TP1 (5060 Ti) plan, with correctness, resource and cancellation tests, and the capacity and latency report.
 
 Strata has no microbatch overlap: it uses a contiguous pipeline schedule on PCIe, and its wavefront design is documented as not implemented. The ordering rule therefore comes from document 04.
 
