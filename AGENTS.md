@@ -168,7 +168,12 @@ exit clause is met with evidence, on reduced fixtures:
 overlap, pinned transfers, a compute-cost model, automatic plan selection, and
 any speed guarantee. The [M5 closure
 handover](docs/handovers/2026-09-24-m5-closure-to-m6.md) carries the boundary
-and the acceptance package. M6 is not yet authorized.
+and the acceptance package.
+
+**M6 is active** (owner, 2026-09-24). Its closure ledger is in the [M5
+closure handover](docs/handovers/2026-09-24-m5-closure-to-m6.md). The first
+task is [0076](docs/tasks/0076-m6-device-kv-append.md), M6.1's device-side
+K/V append.
 
 | | |
 |---|---|

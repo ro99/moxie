@@ -105,7 +105,54 @@ accepted; the ledger maps each exit clause to its evidence. In short:
   contract, check every signature it names against the code (tasks 0074 and
   0075).
 
+## M6 closure ledger (coordinator, opened 2026-09-24)
+
+The owner opened M6 on 2026-09-24 ("open M6 for luna to work on"). This
+section is the coordinator's running ledger for M6 (coordinator.md §2); the
+tsk board thread `m6` mirrors it.
+
+### Milestone obligations (roadmap M6, original item numbers)
+
+| Item | Outcome | State | Owner | Evidence / next action |
+|---|---|---|---|---|
+| M6.1 | Device-resident layer chains, batched/grouped expert kernels, fused dequant/activation/reduction, output-minimizing transfers | **Active** | luna, [0076](../tasks/0076-m6-device-kv-append.md) | 0076 removes the per-layer K/V device→host→device copy. Remaining in slice 1: per-operation `settle` in `PagedAttentionRun`, the per-Rope `synchronize`, the routed-expert route readback, per-step module load |
+| M6.2 | Shape-bucket chunked prefill; stable decode graph capture with piecewise fallback; graph pools and workspaces admitted | Not started | — | After slice 1: capture needs a sync-free step |
+| M6.3 | Measured transfer overlap, bounded read-ahead, optional hot-expert tiers and route prediction, against no-overlap baselines | Not started | — | Carries M5's pipeline microbatch overlap and pinned transfers |
+| M6.4 | Joint prefill/decode placement and phase transitions; no host-cache or prepared-layout growth across many turns | Not started | — | — |
+| M6.5 | Automatic plan selection from measured topology/shape costs; fixed-plan mode | Not started | — | Builds on M5.5's `compare-plans`; needs a compute-cost term |
+| Exit | Paired prefill/decode/quality/memory benchmark for the dense and two MoE stress graphs, **plus actual available checkpoints**; defaults justified outside variance | Not started | coordinator | **Owner decision needed** (below) |
+
+### Route to M6 closure (proposed, coordinator, 2026-09-24)
+
+| Order | Slice | Delivers | Closes |
+|---|---|---|---|
+| 1 | Sync-free single-GPU dense step | K/V appended on the device (0076); event-retained instead of settled paged-attention operations; RoPE tables uploaded once per step; one host synchronization per step, at `finish` | M6.1 dense chain; prerequisite of M6.2 capture |
+| 2 | Device routing and grouped experts | Route kept on the device; batched/grouped expert launch; fused dequant/activation where the kernels support it | M6.1 MoE |
+| 3 | Benchmark harness | Fixed-plan paired prefill/decode/memory benchmark with repetitions and variance, base versus candidate | M6 exit method; every later slice measures with it |
+| 4 | Prefill buckets and decode capture | Shape buckets, captured decode with piecewise fallback, admitted pools | M6.2 |
+| 5 | Overlap and read-ahead | Measured overlap against no-overlap baselines, wasted work recorded | M6.3 |
+| 6 | Phase placement and many-turn growth | Joint placement; no growth across many turns | M6.4 |
+| 7 | Plan selection, benchmark package, close | Automatic and fixed-plan selection; exit benchmarks; milestone-end audit | M6.5; M6 closure |
+
+Slice 3 may move ahead of slice 2 if slice 1 needs timing evidence to choose
+between mechanisms.
+
+### Owner decision needed (batched)
+
+The exit gate requires benchmarks on "actual available checkpoints", and a
+quality column. Nothing in the repository yet runs a checkpoint to a token:
+model families are M7 and the tokenizer is M7/M8 (ADRs 0034, 0035). The
+coordinator recommends **keeping M6 on fixture-scale stress graphs and
+amending the exit gate by ADR so that checkpoint benchmarks run at M7, when
+the first family executes**. The alternative is pulling a minimal
+checkpoint-backed Gemma path into M6 as its closing slice, which moves M7
+work forward. This blocks only the exit package, not slices 1–6.
+
 ## Next task
+
+[Task 0076](../tasks/0076-m6-device-kv-append.md), assigned to luna on
+2026-09-24. The paragraph below is the pre-authorization note, kept for
+provenance.
 
 None is authorized. M6 ("shared performance paths and phase balance")
 opens only on the owner's instruction. When it does, the natural first bounded
