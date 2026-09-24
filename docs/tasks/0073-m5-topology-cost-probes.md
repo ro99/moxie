@@ -149,10 +149,15 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
      table to the existing report, and write the TOML file.
    - The TOML has one `[[device]]` per device (`uuid`, `memory_gbps`,
      `usable_bytes`) and one `[[link]]` per link (`from`, `to` as `"host"` or
-     a UUID string, and the three figures). Use a small private `serde` DTO
-     in `xtask` and add `serde = { version = "1", features = ["derive"] }`
-     to `xtask`'s `cuda` feature. **That must add no new package to
-     `Cargo.lock`**; show that in the Result.
+     a UUID string, and the three figures).
+     - **Amended 2026-09-24, after the builder's DECISION:** no `serde`
+       dependency. `arch-check` forbids `xtask -> serde`, and the checker's
+       policy is not changed for this.
+     - Build a `toml::Table` by hand and write it with `toml::to_string`.
+       Read it back with `str::parse::<toml::Table>()` and typed field
+       access. A missing or mistyped field is an `InvalidArtifact` or
+       `InvalidRequest` naming the field.
+     - `xtask/Cargo.toml` and `Cargo.lock` stay unchanged.
    - Add `pub fn read_costs(path) -> Result<TopologyCosts>` next to the
      writer, for task 0074, with a host unit test that a written file reads
      back equal.
@@ -192,10 +197,9 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
 - `crates/moxie-executor/tests/topology_probe_device.rs` (new), plus its
   `[[test]]` entry in `crates/moxie-executor/Cargo.toml` if the crate lists
   its tests
-- `xtask/src/probe.rs`, `xtask/src/main.rs`, `xtask/Cargo.toml`
+- `xtask/src/probe.rs`, `xtask/src/main.rs`
 - `docs/evidence/topology-costs.md` (new), and the one pointer line in
   `docs/evidence/topology-p2p.md`
-- `Cargo.lock`, only if its checksum section changes without a new package
 - This task's Result.
 
 ## Acceptance
@@ -230,7 +234,7 @@ delegation). Builder Codex `luna`; reviewer Codex `sol`.
 - A copy between devices without peer access succeeds (a hidden host
   staging path).
 - Any probe step needs pinned memory or a new unsafe FFI entry.
-- The TOML support needs a new package in `Cargo.lock`.
+- The TOML support needs any new dependency.
 - A numbered change conflicts with the code: send a `DECISION` report.
 
 ## Result, filled after work
