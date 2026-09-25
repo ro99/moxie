@@ -167,6 +167,20 @@ reviews):
 6. **Slice 7** Checkpoint route items 2–6, the exit benchmarks, default
    choices, the carried failure-path tests, and the milestone-end audit.
 
+### Naming (owner, 2026-09-25)
+
+Work is named by the roadmap item it serves (M6.1–M6.5), or "M6 exit" for
+exit-gate work, not by slice number. The slice numbers below are history.
+Mapping:
+- slice 1 → M6.1;
+- slice 2 → M6.1 (quantized weights);
+- slice 3 → M6 exit (benchmark harness);
+- slice 4 → M6.2;
+- slice 5 → M6.3;
+- slice 6 → M6.4;
+- slice 7 → M6.5 plus M6 exit (checkpoint benchmarks, closure);
+- slice 8 → M6 exit (Qwen hybrid attention for the Hemmingway-1 checkpoint).
+
 ### Route to M6 closure (proposed, coordinator, 2026-09-24)
 
 | Order | Slice | Delivers | Closes |

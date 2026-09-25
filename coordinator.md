@@ -78,8 +78,12 @@ skill; read with `--json`; never open the TUI.
   - Task 1 is the **exit gate**: one step per exit-gate clause (and per
     roadmap item the gate names), ticked only when an accepted task meets
     it.
-  - Every other task is one **slice** of the route to closure: one step per
-    task number, ticked when that task is accepted.
+  - Every other task is named by the **roadmap item it serves**, in document
+    06's own numbering (`M6.3: …`), or `M6 exit: …` for exit-gate work
+    that no single item owns. "Slice" is not used on the board (owner,
+    2026-09-25), because an item number shows where the work stands against
+    the roadmap. There is one step per task number, ticked when that task is
+    accepted.
 - **The thread names the milestone that owns the work**, not the milestone
   in progress. A follow-up found during M5 that belongs to M7 goes on `m7`.
   Later-milestone work that the current exit gate needs is pulled in and
