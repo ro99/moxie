@@ -114,4 +114,18 @@ code; a file outside the allowed list is needed.
 
 ## Result, filled after work
 
-(pending)
+Implemented the three requested changes: `SelectedReservedPlan` now owns the
+optional dense module; the first dense step loads and resolves it; and launch
+uses the module through the plan retained by the operation lease. Initial
+load/resolve failure returns the plan with the field still empty. No other
+module user changed.
+
+Host gates passed: fmt, workspace and driver-feature clippy, workspace tests,
+`arch-check` (79 rejected, 21 accepted) and `spec-check` (10 documents). GPU
+gates passed: dense Gemma (5 passed, timing test ignored), dense TP2 (1 passed)
+and `cargo xtask-cuda test-gpu` (63/63, SM86 and SM120). Three candidate timing
+runs and one Nsight profile completed; the profile recorded 8
+`cuModuleLoadData` and 8 `cuModuleUnload` calls, compared with 117 each in task
+0078. The samples and profiler artifact hashes are appended in [the timing
+evidence](../evidence/dense-step-timing.md#module-per-plan). They remain
+fixture-scale, O6-open evidence, not a performance claim.

@@ -101,3 +101,56 @@ ordinary temporary-file cleanup.
 These are synthetic Shape A fixtures measured to rank follow-up work. They do
 not measure a checkpoint-backed model and do not close O6 or claim a
 performance benefit.
+
+## Module per plan
+
+Task 0079 (`3aea3a4feee224d6421d7464299eab33bc22993c`) moves the resolved
+dense module into `SelectedReservedPlan`. The first dense step loads and
+resolves the candidate's symbols; later steps reuse that module. Launch reads
+the module through the plan retained by the operation lease. The failure path
+returns the plan with the field still `None` if initial load/resolve fails.
+
+Three unprofiled runs used the same command and GPU as task 0078: NVIDIA RTX
+3090 `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9`, driver `610.57.04`, with
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`.
+
+~~~sh
+CUDA_DEVICE_ORDER=PCI_BUS_ID cargo test --release -p moxie-executor --features driver,paged-attention-binding,paged-attention-test-hooks --test dense_gemma_device dense_step_timing -- --ignored --nocapture
+~~~
+
+| Phase | Run | 0078 candidate median (µs) | 0079 median (µs) | 0079 min (µs) | 0079 max (µs) |
+|---|---:|---:|---:|---:|---:|
+| prefill | 1 | 1665.271 | 1163.653 | 1132.633 | 1192.556 |
+| decode | 1 | 1604.944 | 1111.448 | 1090.396 | 1134.621 |
+| prefill | 2 | 1674.835 | 1148.774 | 1138.437 | 1193.031 |
+| decode | 2 | 1596.945 | 1118.419 | 1089.479 | 1157.108 |
+| prefill | 3 | 1614.220 | 1204.262 | 1172.659 | 1323.899 |
+| decode | 3 | 1562.666 | 1147.323 | 1117.923 | 1193.731 |
+
+One Nsight Systems `2025.3.2.474-253236389321v0` profile of the same filtered
+test reported these CUDA driver API calls for the whole process:
+
+~~~sh
+CUDA_DEVICE_ORDER=PCI_BUS_ID /usr/local/bin/nsys profile -t cuda --stats=true -o /tmp/task-0079-dense-module-per-plan-3aea3a4 cargo test --release -p moxie-executor --features driver,paged-attention-binding,paged-attention-test-hooks --test dense_gemma_device dense_step_timing -- --ignored --nocapture
+~~~
+
+| CUDA driver API | Calls | Total (ms) |
+|---|---:|---:|
+| `cuModuleLoadData` | 8 | 2.883046 |
+| `cuModuleUnload` | 8 | 0.297095 |
+
+The task 0078 profile recorded 117 calls to each API over the same 111 dense
+step invocations. This profile recorded eight of each, a small whole-process
+count consistent with module reuse across steps; the totals include other
+process setup/teardown modules and are not phase-attributed. Profiled timing
+output is not used in the unprofiled comparison above.
+
+Raw trace:
+`/tmp/task-0079-dense-module-per-plan-3aea3a4.nsys-rep` (1,848,440 bytes),
+SHA-256 `343da84bdf2e8e828fa1d2f5f5ccc4cb96291b4b5c51c2843a2945139ce2c128`.
+Derived SQLite report:
+`/tmp/task-0079-dense-module-per-plan-3aea3a4.sqlite` (4,050,944 bytes),
+SHA-256 `3e00d0bd7985419be5cb461385575f53ad253414a7e4f92ff8216ddf67d42e0a`.
+Both remain outside Git in `/tmp` for task review and follow ordinary
+temporary-file cleanup. These fixture-scale measurements do not close O6 or
+make a performance claim.
