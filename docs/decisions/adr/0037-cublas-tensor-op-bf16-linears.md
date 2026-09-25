@@ -59,7 +59,11 @@ hardware's order, so it cannot be bit-identical to that reference.
    `2^-8 · Σ|x·W|`.
 3. **ADR 0036 still holds.** A TP partial (`LinearPartial`, FP32 output) and
    the single-device `LinearSplit` reference both compute each declared
-   block with the same cuBLAS call shape. The blocks are combined in FP32 in
+   block with **identical cuBLAS call parameters**, meaning the same m, n,
+   k, leading dimensions, types, algorithm and math mode. The reference
+   therefore packs each block contiguously, as a TP rank holds it; a
+   strided view of the full matrix is a different call (sol's design
+   review, task 0096). The blocks are combined in FP32 in
    the declared order and rounded once. TP stays bit-identical to single-GPU
    on GPUs of one architecture and SM count, which is cuBLAS's documented
    reproducibility condition.
