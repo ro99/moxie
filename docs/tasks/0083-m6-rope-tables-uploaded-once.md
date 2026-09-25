@@ -1,7 +1,6 @@
 # Task 0083 — RoPE tables at fixed workspace offsets, uploaded once per step
 
-Status: **proposed** (coordinator, 2026-09-25); opens when task 0082 is
-accepted. Builder Codex `luna`; reviewer Codex `sol`.
+Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Identity and authority
 

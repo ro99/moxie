@@ -1,6 +1,14 @@
 # Task 0082 — the dense step's paged-attention work completes with the step
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-25), after sol's review rounds R1
+and R2 (R2 clean). Implementation `8d4fcc7`; R1 repair `0f7b81f`.
+- R1 (3 HIGH, 1 MEDIUM, 1 LOW; all gaps in the coordinator's contract):
+  pending work lost across streams, fork reading a parent's in-flight writes,
+  drop unloading a live module; an over-claimed "one synchronization"; a stale
+  comment. Repaired as changes 11–15; R2 confirmed each closed for its class.
+- Effect (fixture-scale, not a claim): step median about 1.15 → 1.0 ms;
+  `cuEventSynchronize` total 9.7 → 0.93 ms over 111 steps.
+- Coverage gap carried in the ledger (see R1 repairs). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Identity and authority
 
