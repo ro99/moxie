@@ -264,6 +264,21 @@ slice measures it. Available inputs, read-only:
 `/fast/models/google/gemma-4-26B-A4B-it` (49 GB); `torch 2.10` and
 `transformers 5.5.3` are installed as an external reference.
 
+### DeepSeek speed against Strata (owner, 2026-09-25)
+
+The owner's ruling: Moxie succeeds Strata, and Strata's main effort and
+success was DeepSeek (`Intel/DeepSeek-V4-Flash-0731-W4A16-AutoRound`, v1
+entry 5). Moxie must show DeepSeek speed at least equal to Strata's. The
+coordinator's assessment, which the owner accepted: the measured comparison
+cannot run in M6, because the DeepSeek adapter (compressed sparse attention,
+mHC, Engram) is M7 work, and the roadmap order stands. M6 instead delivers,
+through task 0093, a map of every Strata DeepSeek speed technique onto
+Moxie: present, planned, or gap. The map also records Strata's baseline
+figures (for example 26.231 prefill tok/s at 1,925 tokens and 8.627 decode
+tok/s, `docs/models/deepseek.md`). Gap rows feed slice 6, M6.5 and the
+closure. Carried to M7: a DeepSeek speed comparison against that baseline in
+M7's DeepSeek work. The roadmap text is amended at M6 closure.
+
 ## Next task
 
 [Task 0076](../tasks/0076-m6-device-kv-append.md), assigned to luna on
