@@ -138,18 +138,19 @@ Builder Claude Opus `builder`, 2026-09-25. Deliverable:
 - **Baseline.** Strata's accepted production result is 26.231 prefill tok/s at
   1,925 prompt tokens (median of three) and 8.627 decode tok/s (median), on two
   RTX 3090s with rank-local TP2 (`docs/models/deepseek.md:191-201`).
-- **Homes (after review round 2, five homes).** 12 present, 26 partial, 7 not
-  needed, 38 planned, 34 gap.
+- **Homes (after review round 3, five homes).** 11 present, 26 partial, 7 not
+  needed, 24 planned, 49 gap.
   - **Partial rows:** 1, 8, 9, 13, 16, 23, 26, 28, 31, 37, 39, 40, 44, 67,
-    68, 71, 75, 93, 95, 96, 97, 100, 107, 110, 115, 117.
+    68, 71, 75, 93, 95, 96, 97, 100, 107, 115, 116, 117.
   - **Not needed:** 41, 48, 61, 89, 90, 91, 102.
   - **Gap, forced by representation rules (13):** 6, 7, 15, 18, 36, 45, 46,
     77, 78, 79, 80, 81, 114.
   - **Gap, forced by ADR 0036:** 70.
   - **Gap, forced by the single-user rule:** 76.
-  - **Gap, rejected in Strata:** 10, 30, 69, 74, 104.
-  - **Gap, accepted in Strata with no place in Moxie:** 4, 5, 17, 24, 32,
-    33, 34, 35, 43, 49, 82, 87, 92, 94.
+  - **Gap, rejected in Strata:** 10, 22, 30, 58, 69, 74, 86, 103, 104.
+  - **Gap, accepted in Strata with no place in Moxie (25):** 4, 5, 17, 20,
+    24, 32, 33, 34, 35, 43, 49, 50, 55, 60, 64, 66, 82, 83, 87, 92, 94, 98,
+    105, 106, 110.
 - **Checks.**
   - `cargo xtask spec-check` passed: 10 documents present and unchanged.
   - The evidence file's relative links resolve.
@@ -211,4 +212,20 @@ Builder Claude Opus `builder`, 2026-09-25. Deliverable:
     - rows 61, 89, 90, 91 and 102 to not needed;
     - row 17 to gap (M6.1 does not name split-K shaping).
   - **Changed in round 2:** 34 rows.
+- **Round 3** (Codex `sol`, source `d58a039`, the final review round) found
+  2 high and 2 medium findings. All were home changes; no number changed.
+  - **Row 116:** now partial. No server entry point enforces
+    `CUDA_DEVICE_ORDER=PCI_BUS_ID`; `.cargo/config.toml:16` covers only
+    Cargo-launched processes.
+  - **Rows 50, 55, 58, 60, 64, 66, 98, 105, 106:** now gap. Roadmap line 120
+    names DeepSeek's semantic families, not these scheduling, storage or
+    kernel algorithms.
+  - **Row 110:** now gap. Neither named part exists; `chain.rs:220-223`
+    charges a different allocation.
+  - **Rows 20, 22, 83, 86, 103:** now gap. M6.2 and M6.3 name only the area,
+    and each Note keeps that relation.
+  - **Resulting counts:** 11 present, 26 partial, 7 not needed, 24 planned,
+    49 gap.
+  - **Closing the loop.** The coordinator closed the review loop after round
+    3 and verified this repair directly.
 
