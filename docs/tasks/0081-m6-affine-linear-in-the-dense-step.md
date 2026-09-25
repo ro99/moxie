@@ -125,3 +125,8 @@ Host gates passed: formatting, workspace and executor driver-feature clippy,
 workspace tests, architecture check and spec check. GPU gates passed: dense
 Gemma (8 passed, 1 ignored), dense TP2 (1 passed), and CUDA image suite
 (63/63 across SM86 and SM120).
+
+R1 repair: made the test rank ID task-neutral, asserted its affine fixture has
+no group map, and removed unused F32 fixture branches and explicit end-of-loop
+drops. Round-2 gates passed: formatting, workspace clippy, executor
+driver-feature clippy, and the full dense Gemma GPU suite.

@@ -1865,11 +1865,7 @@ fn synthetic_dense_affine_tensor(
                 .map(|index| f16_scales[(index + seed) % f16_scales.len()])
                 .collect(),
         ),
-        ScaleDtype::F32 => ScaleValues::F32(
-            (0..entries)
-                .map(|index| bf16_scales[(index + seed) % bf16_scales.len()])
-                .collect(),
-        ),
+        _ => unreachable!("fixture uses BF16 or F16 scales"),
     };
     let zero_points = if asymmetric {
         let values = [-3i16, 2, -1, 3];
@@ -1911,10 +1907,7 @@ fn dense_affine_payload(format: WeightFormat, tensor: &AffineTensor) -> Vec<u8> 
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>(),
-        ScaleValues::F32(values) => values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect(),
+        _ => unreachable!("fixture uses BF16 or F16 scales"),
     };
     copy_affine_component(&mut payload, sections.scales, &scales);
     match (sections.zero_points, tensor.zero_points()) {
@@ -1928,17 +1921,10 @@ fn dense_affine_payload(format: WeightFormat, tensor: &AffineTensor) -> Vec<u8> 
         }
         _ => panic!("zero-point section matches the affine tensor"),
     }
-    match (sections.group_index, descriptor.group_index.as_ref()) {
-        (None, None) => {}
-        (Some(section), Some(values)) => {
-            let bytes: Vec<_> = values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect();
-            copy_affine_component(&mut payload, section, &bytes);
-        }
-        _ => panic!("group-index section matches the affine tensor"),
-    }
+    assert!(
+        sections.group_index.is_none() && descriptor.group_index.is_none(),
+        "fixture uses unmapped affine weights"
+    );
     payload
 }
 
@@ -2098,8 +2084,8 @@ fn affine_linear_weights_match_host_on_every_gpu() {
             &formats,
         )
         .expect("affine replay lowering");
-        let context = RankContext::acquire(RankId(81_000 + ordinal), ordinal)
-            .expect("acquire affine dense context");
+        let context =
+            RankContext::acquire(RankId(ordinal), ordinal).expect("acquire affine dense context");
         let stream = Stream::new(&context).expect("create affine dense stream");
         let actual = run_prefill_decode(
             prefill,
@@ -2154,8 +2140,6 @@ fn affine_linear_weights_match_host_on_every_gpu() {
             actual.2.as_ref().expect("replay output"),
             &expected[2],
         );
-        drop(stream);
-        drop(context);
     }
 }
 
