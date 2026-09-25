@@ -134,4 +134,35 @@ the code; a file outside the allowed list is needed.
 
 ## Result, filled after work
 
-(pending)
+**Complete** (builder Codex `luna`, 2026-09-24; base `97a7281`). The dense
+operation now caches each distinct RoPE angle table for the operation lease and
+queues each workspace upload on the execution stream without synchronizing.
+The planner sums those retained table bytes by `(rotary_dim, frequency_dim,
+base.to_bits())`, then adds the peak non-RoPE host workspace. Device workspace
+and numerical behavior are unchanged.
+
+- **Workspace:** `gemma-a` prefill (5 rows) `host_workspace_bytes` changed
+  **320 → 480 B**: one 320 B sliding table plus one 160 B global table. Decode
+  (1 row) changed **64 → 96 B**. Before this task the planner took the larger
+  table only (320 B prefill, 64 B decode); the decode baseline is task 0076's
+  64 B. Query and key nodes share each layer's table, leaving two distinct keys.
+- **Mutation:** forcing reuse of the first cached table for every later key
+  failed as required. `reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu`
+  and `pipeline_runs_dense_and_routed_gemma_on_three_gpus` caught a 2 BF16 ULP
+  logit difference. The mutation was reverted before the clean gates.
+- **Synchronizations:** the RoPE arm no longer calls `stream.synchronize()`.
+  Six calls remain in `dense.rs`: one production call in the host expert join,
+  after its partial combine and before route/input readbacks, and five in
+  `combine_kernel_sums_in_ascending_expert_order`'s device unit test.
+- **Host gates:** fmt, workspace clippy, executor clippy with driver and
+  `paged-attention-binding,paged-attention-test-hooks` features, workspace
+  tests, `cargo xtask arch-check` (79 rejected and 21 accepted fixtures), and
+  `cargo xtask spec-check` (10 documents) passed.
+- **GPU gates** (`CUDA_DEVICE_ORDER=PCI_BUS_ID`): `dense_gemma_device` passed
+  5/5 with bit-identical output on both SM86 GPUs and SM120;
+  `dense_tp2_device` passed; and `cargo xtask-cuda test-gpu` passed 63/63 with
+  no skips across SM86 and SM120. No speed claim is made.
+- **Files and lines:** no tests were added. The obsolete sync-failure test and
+  interposer were removed. The three Rust files changed by this task have 46
+  insertions and 154 deletions, net **−108 lines** (production sources net
+  +14; removed device test and hook −122).

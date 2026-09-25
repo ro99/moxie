@@ -938,6 +938,8 @@ fn lower_dense_mode(
     let mut selected = Vec::new();
     let mut workspace_logical_bytes = 0u64;
     let mut host_workspace_bytes = 0u64;
+    let mut rope_host_bytes = 0u64;
+    let mut rope_keys = BTreeSet::new();
     for node in graph.nodes() {
         let mut operation = dense_semantic(node)?;
         // `lower_selected_ordered` validated every order against its node.
@@ -1026,13 +1028,30 @@ fn lower_dense_mode(
             });
         }
         workspace_logical_bytes = workspace_logical_bytes.max(workspace_bytes);
-        host_workspace_bytes = host_workspace_bytes.max(host_bytes);
+        match node.params {
+            OpParams::Rope {
+                rotary_dim,
+                frequency_dim,
+                base,
+                ..
+            } => {
+                if rope_keys.insert((rotary_dim, frequency_dim, base.to_bits())) {
+                    rope_host_bytes = rope_host_bytes
+                        .checked_add(host_bytes)
+                        .ok_or_else(|| invalid("host_workspace", "RoPE tables overflowed"))?;
+                }
+            }
+            _ => host_workspace_bytes = host_workspace_bytes.max(host_bytes),
+        }
         selected.push(SelectedNode {
             node: node.id,
             descriptor,
             workspace_logical_bytes: workspace_bytes,
         });
     }
+    host_workspace_bytes = host_workspace_bytes
+        .checked_add(rope_host_bytes)
+        .ok_or_else(|| invalid("host_workspace", "dense host workspace overflowed"))?;
 
     let base = lower(graph, workload)?;
     let last_stage = u32::try_from(graph.nodes().len())

@@ -7,7 +7,6 @@
 #![cfg(feature = "paged-attention-binding")]
 
 use std::collections::BTreeMap;
-use std::ffi::{c_char, c_int, c_void};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Mutex, MutexGuard};
@@ -38,42 +37,6 @@ use moxie_types::{
 };
 
 static DEVICE_TEST: Mutex<()> = Mutex::new(());
-static FAIL_NEXT_STREAM_SYNC: AtomicBool = AtomicBool::new(false);
-
-#[link(name = "dl")]
-unsafe extern "C" {
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-}
-
-#[unsafe(no_mangle)]
-unsafe extern "C" fn cuStreamSynchronize(stream: *mut c_void) -> c_int {
-    if FAIL_NEXT_STREAM_SYNC.swap(false, SeqCst) {
-        return 700;
-    }
-    // SAFETY: RTLD_NEXT resolves the real CUDA ABI symbol after this test
-    // executable; the stream handle is forwarded unchanged.
-    let symbol = unsafe { dlsym((-1isize) as *mut c_void, c"cuStreamSynchronize".as_ptr()) };
-    assert!(!symbol.is_null(), "missing real cuStreamSynchronize");
-    // SAFETY: the resolved symbol has the CUDA cuStreamSynchronize ABI.
-    let real: unsafe extern "C" fn(*mut c_void) -> c_int = unsafe { std::mem::transmute(symbol) };
-    // SAFETY: the function pointer and argument match the CUDA ABI.
-    unsafe { real(stream) }
-}
-
-struct FailNextStreamSynchronize;
-
-impl FailNextStreamSynchronize {
-    fn arm() -> Self {
-        FAIL_NEXT_STREAM_SYNC.store(true, SeqCst);
-        Self
-    }
-}
-
-impl Drop for FailNextStreamSynchronize {
-    fn drop(&mut self) {
-        FAIL_NEXT_STREAM_SYNC.store(false, SeqCst);
-    }
-}
 
 fn one_at_a_time() -> MutexGuard<'static, ()> {
     DEVICE_TEST
@@ -1596,91 +1559,6 @@ fn pipeline_runs_dense_and_routed_gemma_on_three_gpus() {
             expected_handoff_bytes
         );
     }
-}
-
-#[test]
-fn angle_copy_sync_failure_retains_its_host_source() {
-    let _guard = one_at_a_time();
-    let context = RankContext::acquire(RankId(59_090), 0).expect("acquire GPU rank context");
-    let capability = query_device(0).expect("query GPU capability");
-    let stream = Stream::new(&context).expect("create stream");
-    let shape = moxie_cli::gemma::Shape::A;
-    let config = shape.config();
-    let fixture = moxie_cli::gemma::build(shape).expect("build dense fixture");
-    let prompt: Vec<u64> = (0..5).map(|row| row % config.vocab).collect();
-    let positions: Vec<u64> = (0..prompt.len() as u64).collect();
-    let expected_angle_bytes = fixture
-        .graph
-        .nodes()
-        .iter()
-        .find_map(|node| match node.params {
-            moxie_graph::OpParams::Rope { rotary_dim, .. } => {
-                Some(prompt.len() * (rotary_dim as usize / 2) * 8)
-            }
-            _ => None,
-        })
-        .expect("dense fixture has a RoPE node");
-    let mut device_state =
-        DeviceKvSequence::new(geometry(&config, 4, 64, prompt.len())).expect("device state");
-    let mut ledger = measured_ledger(&context);
-    let mut runs = admit_runs(
-        &mut ledger,
-        &context,
-        &config,
-        &device_state,
-        prompt.len() as u64,
-    );
-    let catalogue = moxie_kernels::dense_graph_catalogue();
-    let workload = ResourceWorkload {
-        phase: Phase::Prefill,
-        rows: prompt.len() as u64,
-        visible_tokens: prompt.len() as u64,
-        branch_rows: prompt.len() as u64,
-        output: fixture.graph.output(),
-        device: capability.uuid,
-        paged_state_capacity: None,
-    };
-    let candidate = lower_selected(&fixture.graph, workload, &capability, &catalogue)
-        .expect("prefill lowering");
-    let plan = SelectedReservedPlan::admit(
-        candidate,
-        &fixture.graph,
-        &capability,
-        &catalogue,
-        &mut ledger,
-        &context,
-    )
-    .map_err(|refused| match refused {
-        moxie_executor::SelectedAdmitRefused::Invalid { error, .. }
-        | moxie_executor::SelectedAdmitRefused::Held { error, .. } => error,
-        moxie_executor::SelectedAdmitRefused::Rejected { rejection, .. } => rejection.into(),
-    })
-    .expect("prefill admission");
-    let transaction = device_state.begin().expect("prefill transaction");
-    let _fault = FailNextStreamSynchronize::arm();
-    let refused = plan
-        .execute_dense(DenseGraphStep {
-            graph: &fixture.graph,
-            capability: &capability,
-            catalogue: &catalogue,
-            ctx: &context,
-            stream: &stream,
-            state: &mut device_state,
-            transaction,
-            runs: &mut runs,
-            bindings: stage_bindings(&fixture, None, &prompt, &positions, &capability),
-            host_experts: &[],
-        })
-        .expect_err("the injected angle-copy synchronization must refuse");
-    assert_eq!(
-        refused.retained_host_upload_bytes(),
-        Some(expected_angle_bytes),
-        "the angle source must remain held after stream synchronization fails"
-    );
-    device_state.abort(transaction).expect("abort refused step");
-    // The injected CUDA error is quarantined as device loss; dropping this
-    // refused lease intentionally withholds its device ranges and source.
-    drop(refused);
 }
 
 #[test]

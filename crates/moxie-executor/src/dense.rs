@@ -71,27 +71,15 @@ pub struct DensePlanRunRefused<'ctx> {
     pub held: Option<OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>>,
 }
 
-impl DensePlanRunRefused<'_> {
-    /// Bytes of a host upload still retained after an asynchronous submission
-    /// error.  This is intentionally observable so the driver-boundary test can
-    /// prove the source was not dropped while the copy's completion is unknown.
-    pub fn retained_host_upload_bytes(&self) -> Option<usize> {
-        self.held
-            .as_ref()
-            .and_then(|lease| lease.resource().pending_host_upload.as_ref().map(Vec::len))
-    }
-}
-
 #[derive(Debug)]
 pub struct DenseOperation<'ctx> {
     pub(crate) plan: Option<SelectedReservedPlan<'ctx>>,
     /// Every source copied by `upload_sources` stays here until the graph's
     /// completion event is observed. This includes token and position indices.
     pub(crate) sources: Vec<OwnedBinding>,
-    /// The current angle-table source remains here until its copy's stream
-    /// synchronization succeeds. On either copy or synchronization failure the
-    /// operation lease retains it for quarantine.
-    pending_host_upload: Option<Vec<u8>>,
+    /// Every angle table uploaded by the step stays here until the lease retires
+    /// after the completion event, like `sources`.
+    rope_tables: Vec<((u64, u64, u32), Vec<u8>)>,
     pub(crate) package: ResolvedModule<'ctx>,
     pub(crate) launch_order: Vec<String>,
     pub(crate) device_ordinal: u32,
@@ -191,7 +179,7 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         let operation = DenseOperation {
             plan: Some(self),
             sources: bindings,
-            pending_host_upload: None,
+            rope_tables: Vec::new(),
             package,
             launch_order: Vec::new(),
             device_ordinal: ctx.ordinal(),
@@ -589,36 +577,43 @@ fn enqueue_dense<'ctx>(
                 layout: RopeLayout::HalfSplit,
             } => {
                 let positions = index_values(lease.resource(), positions()?, rows)?;
-                let angles = angle_table(positions, rotary_dim, frequency_dim, rope_base)?;
+                let key = (rotary_dim, frequency_dim, rope_base.to_bits());
+                let table_index = if let Some(index) = lease
+                    .resource()
+                    .rope_tables
+                    .iter()
+                    .position(|(cached_key, _)| *cached_key == key)
+                {
+                    index
+                } else {
+                    let angles = angle_table(positions, rotary_dim, frequency_dim, rope_base)?;
+                    lease
+                        .resource_mut()
+                        .rope_tables
+                        .try_reserve(1)
+                        .map_err(|_| capacity(std::mem::size_of::<((u64, u64, u32), Vec<u8>)>()))?;
+                    let operation = lease.resource_mut();
+                    operation.rope_tables.push((key, angles));
+                    operation.rope_tables.len() - 1
+                };
                 let mut input_address = address(lease.resource(), node.inputs[0])?;
                 let mut angle_address = workspace_address(lease.resource())?;
                 let mut output_address = address(lease.resource(), node.output)?;
-                lease.resource_mut().pending_host_upload = Some(angles);
-                // The table source is pageable host memory. Observe the copy
-                // before reusing the one bounded host workspace Vec for the
-                // next Rope node. The source lives in the operation so either
-                // copy or synchronization failure can quarantine it safely.
                 let workspace = lease
                     .resource()
                     .plan
                     .as_ref()
                     .expect("dense operation retains plan")
                     .workspace_range()?;
-                // SAFETY: the operation retains the source until the
-                // synchronous copy has completed; the destination is the
+                // SAFETY: the operation retains the source until the lease
+                // retires after the completion event; the destination is the
                 // admitted workspace range.
                 unsafe {
                     workspace.copy_from_host_async(
-                        lease
-                            .resource()
-                            .pending_host_upload
-                            .as_ref()
-                            .expect("angle source retained before copy"),
+                        &lease.resource().rope_tables[table_index].1,
                         stream,
                     )?
                 };
-                stream.synchronize()?;
-                lease.resource_mut().pending_host_upload = None;
                 let mut launch_rows = rows;
                 let mut launch_heads = heads;
                 let mut launch_head_dim = head_dim;
