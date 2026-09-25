@@ -1393,7 +1393,6 @@ fn dense_workspace(
                 bytes,
             ))
         }
-        SemanticKernelOp::PagedAttention => Ok((moxie_types::WorkspaceExpression::Zero, 0, 0)),
         SemanticKernelOp::ExpertMlp(_) => {
             let moxie_graph::OpParams::ExpertMlp {
                 intermediate,

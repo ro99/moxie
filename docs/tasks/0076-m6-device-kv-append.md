@@ -181,3 +181,4 @@ and after, for one `dense_gemma_device` fixture; net lines changed.
 - **GPU gates** (`CUDA_DEVICE_ORDER=PCI_BUS_ID`): `dense_gemma_device` passed 6/6, `dense_tp2_device` passed, and `cargo xtask-cuda test-gpu` passed 63/63 with no skips across SM86 and SM120. Dense outputs remained bit-identical.
 - **Files and lines:** no tests added or changed. Production Rust diff: 170 insertions, 153 deletions, net **+17 lines** across the three allowed source files.
 - **Reference:** persistent device KV follows R04 and Strata's BF16 KV request contract (`include/strata/device/cuda_backend.hpp:304-307`); no performance result is claimed.
+- **R1 review fix:** removed the redundant `PagedAttention` workspace arm; the wildcard already returns the same zero workspace.
