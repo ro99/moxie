@@ -86,6 +86,11 @@ Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Cod
    `self.observe_pending()?` (convert to that method's refusal type the way its
    existing quarantine refusal is built). **Exception:** `write_rows_from_device`
    and the two deferred entries of change 5 do not observe first.
+   **Amended (coordinator, 2026-09-25, on the builder's `DECISION`):** an
+   entry point that takes `&self` (for example `read_rows`, an evidence
+   readback whose callers only use settled paths) keeps `&self` and instead
+   refuses with `invalid("run", "this run has unobserved device work")` while
+   `pending` is `Some`.
 5. **Deferred mode for the dense step.** Add `pub(crate) fn
    publish_page_table_deferred(…)` and `pub(crate) fn attend_into_deferred(…)`
    with the same signatures as the settled versions. Implement by giving the
