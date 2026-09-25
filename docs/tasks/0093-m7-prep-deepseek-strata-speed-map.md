@@ -73,7 +73,7 @@ faster or cheaper in memory, or was tried and rejected. Columns:
 | Strata evidence | file:line and/or experiment file; the measured effect as recorded (numbers exactly, with unit); "not measured" if none |
 | Outcome in Strata | accepted, opt-in, rejected |
 | Generic or DeepSeek-only | whether the technique depends on DeepSeek's equations (sparse attention, mHC, Engram, routing) or is a general engine technique |
-| Moxie home | exactly one of: **present** (name the Moxie file/type/task that provides it), **planned** (name the roadmap item, e.g. M6.3, M7 DeepSeek row), **gap** (no place in Moxie's spec or code) |
+| Moxie home | exactly one of (amended by the coordinator after review round 2, 2026-09-25): **present** (the cited Moxie code does what the technique does, by the same or an equivalent mechanism with the same effect; name the file/type/task); **partial** (Moxie has part of it; the Note names the missing part); **not needed** (Moxie's design removes the cost the technique addressed, e.g. KV already device-resident so no transfer to optimize; cite the code); **planned** (a named roadmap item covers this exact technique, not merely its area); **gap** (none of the above, including a rule that forbids it) |
 | Note | at most two lines: what differs, or what a gap would need |
 
 Rules:
