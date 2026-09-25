@@ -1557,7 +1557,13 @@ impl<'ctx> WorkerState<'ctx> {
     ) -> Result<WorkerValue> {
         match command {
             WorkerCommand::Begin { boundary_bytes } => {
-                if self.runs.iter().any(|run| !run.is_idle()) {
+                let mut all_runs_observed = true;
+                for run in &mut self.runs {
+                    if run.observe_pending().is_err() {
+                        all_runs_observed = false;
+                    }
+                }
+                if !all_runs_observed || self.runs.iter().any(|run| !run.is_idle()) {
                     return Err(invalid(
                         "runs",
                         "a dense step accepts only idle attention runs",

@@ -1353,7 +1353,7 @@ fn execute_attention<'ctx>(
             return Err(error);
         }
     };
-    match run.attend_into(stream, &launch, query_range, output_range) {
+    match run.attend_into_deferred(stream, &launch, query_range, output_range) {
         Ok((query_range, output_range)) => {
             plan.restore_range(query_key, query_range)?;
             plan.restore_range(output_key, output_range)

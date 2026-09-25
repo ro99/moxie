@@ -1084,12 +1084,13 @@ mod tests {
 /// and decodes, because that is what "persistent device state" means
 /// physically: the pages are not restaged per step. What this module does *not*
 /// do is decide what those pages mean. The **written** high-water mark it
-/// tracks is the count of rows whose copy has been observed to complete — a
+/// tracks is the count of rows whose copy has been enqueued — a
 /// fact about bytes, not a retention policy, a transaction or a branch.
 /// `moxie-state` owns those, and it drives this module through
 /// [`moxie_types::PagedKvWriter`] rather than through a second authority grown
 /// here: `PagedKvWriterAdapter` is the bridge, `write_rows` the mechanism it
-/// calls.
+/// calls for host-backed rows; the dense device writer defers observation until
+/// a later run entry point.
 #[cfg(feature = "driver")]
 pub mod device {
     use core::ffi::c_void;
@@ -1354,14 +1355,15 @@ pub mod device {
         /// so publishing never creates an unaccounted host buffer.
         page_table_upload: Vec<u8>,
         staging: Staging,
-        /// Rows whose copy into the pages this run has **observed** complete.
+        /// Rows whose copy into the pages this run has enqueued.
         ///
         /// A physical high-water mark, not a frontier. What is history is the
         /// state authority's to say, and it says it by publishing rows this run
         /// has already returned successfully for. The two are checked against
         /// each other rather than one standing in for the other: this refuses a
         /// launch reading bytes it never wrote, and the authority refuses one
-        /// reading rows it never committed.
+        /// reading rows it never committed. With no pending event, these copies
+        /// have also been observed complete.
         written: u64,
         arena_bytes: u64,
         ledger: LedgerId,
@@ -1369,6 +1371,11 @@ pub mod device {
         /// What this run is holding across work whose completion it has not
         /// observed. An append holds two vectors and hands both back unjoined.
         held: Option<RefusedSource>,
+        /// The event recorded after this run's last deferred operation. Until
+        /// it is observed, `held` may still be read by the device, and
+        /// `written` counts rows whose copies are enqueued rather than
+        /// observed.
+        pending: Option<Event<'ctx>>,
         /// The query and output ranges of an `attend`/`attend_into` whose
         /// completion is unobserved.
         ///
@@ -1394,7 +1401,30 @@ pub mod device {
         /// operation of this run is outstanding.
         #[cfg(feature = "paged-attention-binding")]
         pub(crate) fn is_idle(&self) -> bool {
-            !self.quarantined && self.held.is_none() && self.held_ranges.is_none()
+            !self.quarantined
+                && self.held.is_none()
+                && self.held_ranges.is_none()
+                && self.pending.is_none()
+        }
+
+        /// Observe the last deferred operation and return any held page-table
+        /// upload buffer to this run.
+        pub(crate) fn observe_pending(&mut self) -> Result<()> {
+            let Some(pending) = self.pending.as_ref() else {
+                return Ok(());
+            };
+            if let Err(error) = pending.synchronize() {
+                self.quarantined = true;
+                return Err(self.attribute(error));
+            }
+            self.pending = None;
+            if let Some(held) = self.held.take() {
+                match held {
+                    RefusedSource::PageTableUpload(bytes) => self.page_table_upload = bytes,
+                    other => self.held = Some(other),
+                }
+            }
+            Ok(())
         }
 
         /// Clear a quarantine this caller caused and has since observed
@@ -1416,6 +1446,7 @@ pub mod device {
         pub(crate) fn reclaim_drained(
             &mut self,
         ) -> Result<Option<(DeviceRange<'ctx>, DeviceRange<'ctx>)>> {
+            self.observe_pending()?;
             match self.held.take() {
                 None | Some(RefusedSource::Rows { .. }) => {}
                 Some(RefusedSource::PageTableUpload(bytes)) => self.page_table_upload = bytes,
@@ -1970,6 +2001,7 @@ pub mod device {
                 ledger: ledger.id(),
                 ctx,
                 held: None,
+                pending: None,
                 held_ranges: None,
                 quarantined: false,
                 partial_symbol,
@@ -2079,6 +2111,29 @@ pub mod device {
             base: u64,
             table: Vec<u32>,
         ) -> std::result::Result<(), PagedRunRefused> {
+            self.publish_page_table_with_mode(stream, base, table, false)
+        }
+
+        /// Publish a mapping on the stream and defer observing its completion.
+        #[cfg_attr(not(feature = "paged-attention-binding"), allow(dead_code))]
+        #[allow(clippy::result_large_err)]
+        pub(crate) fn publish_page_table_deferred(
+            &mut self,
+            stream: &Stream<'ctx>,
+            base: u64,
+            table: Vec<u32>,
+        ) -> std::result::Result<(), PagedRunRefused> {
+            self.publish_page_table_with_mode(stream, base, table, true)
+        }
+
+        #[allow(clippy::result_large_err)]
+        fn publish_page_table_with_mode(
+            &mut self,
+            stream: &Stream<'ctx>,
+            base: u64,
+            table: Vec<u32>,
+            defer: bool,
+        ) -> std::result::Result<(), PagedRunRefused> {
             // The table goes back as the entries it arrived as. Re-encoding it
             // into bytes to report a refusal is an allocation on the refusal
             // path, which is where allocations fail.
@@ -2086,6 +2141,9 @@ pub mod device {
                 error,
                 source: Some(RefusedSource::PageTable(table)),
             };
+            if let Err(error) = self.observe_pending() {
+                return Err(give_back(error, table));
+            }
             if self.quarantined {
                 return Err(give_back(invalid("run", "this run is quarantined"), table));
             }
@@ -2276,16 +2334,23 @@ pub mod device {
                     source: None,
                 });
             }
-            if let Err(error) = self.settle(Ok(()), stream) {
+            let completion = if defer {
+                self.defer(Ok(()), stream)
+            } else {
+                self.settle(Ok(()), stream)
+            };
+            if let Err(error) = completion {
                 return Err(PagedRunRefused {
                     error,
                     source: None,
                 });
             }
-            let Some(RefusedSource::PageTableUpload(bytes)) = self.held.take() else {
-                unreachable!("page-table upload source is still held after settlement")
-            };
-            self.page_table_upload = bytes;
+            if !defer {
+                let Some(RefusedSource::PageTableUpload(bytes)) = self.held.take() else {
+                    unreachable!("page-table upload source is still held after settlement")
+                };
+                self.page_table_upload = bytes;
+            }
             self.page_table.clear();
             self.page_table.extend_from_slice(&table);
             self.page_table_base = base;
@@ -2305,6 +2370,7 @@ pub mod device {
             view: PageView,
             rows: u64,
         ) -> Result<()> {
+            self.observe_pending()?;
             if self.quarantined || source.quarantined {
                 return Err(invalid("run", "a branch copy names a quarantined run"));
             }
@@ -2572,6 +2638,9 @@ pub mod device {
                 error,
                 source: Some(RefusedSource::Rows { keys, values }),
             };
+            if let Err(error) = self.observe_pending() {
+                return Err(give_back(error, keys, values));
+            }
             let (row_bytes, rows, position_end) =
                 match self.check_write_placements(stream, placements) {
                     Ok(checked) => checked,
@@ -2665,7 +2734,7 @@ pub mod device {
                 }
                 done += placement.rows;
             }
-            self.settle(Ok(()), stream)?;
+            self.defer(Ok(()), stream)?;
             self.written = self.written.max(position_end);
             Ok(())
         }
@@ -2715,6 +2784,9 @@ pub mod device {
         /// to reconstruct, and a readback that computed its own would be able
         /// to agree with a write that was wrong.
         pub fn read_rows(&self, placements: &[PagePlacement]) -> Result<Vec<u8>> {
+            if self.pending.is_some() {
+                return Err(invalid("run", "this run has unobserved device work"));
+            }
             if self.quarantined {
                 return Err(invalid("run", "this run is quarantined"));
             }
@@ -2794,15 +2866,15 @@ pub mod device {
         /// lowered graph can use.
         ///
         /// **Taken and returned by value, never borrowed.** Launch is
-        /// asynchronous, and completion is only known once `settle` returns —
-        /// if event creation, recording or synchronization fails after the
-        /// kernel was enqueued, whether it is still reading these ranges is
-        /// unknowable. A borrowed `&DeviceRange` cannot stop the caller from
-        /// releasing or reusing them while that is true; owning them can. A
-        /// refusal before anything is enqueued hands them straight back
-        /// (`PagedAttendRefused::ranges` is `Some`); a refusal after enqueue
-        /// with completion unobserved keeps them here instead, and the run is
-        /// quarantined exactly then.
+        /// asynchronous, and the settled form's completion is known once it
+        /// returns. If event creation, recording or synchronization fails
+        /// after the kernel was enqueued, whether it is still reading these
+        /// ranges is unknowable. A borrowed `&DeviceRange` cannot stop the
+        /// caller from releasing or reusing them while that is true; owning
+        /// them can. A refusal before anything is enqueued hands them straight
+        /// back (`PagedAttendRefused::ranges` is `Some`); a refusal after
+        /// enqueue with completion unobserved keeps them here instead, and the
+        /// run is quarantined exactly then.
         #[allow(clippy::result_large_err)]
         pub fn attend_into(
             &mut self,
@@ -2812,6 +2884,34 @@ pub mod device {
             output: DeviceRange<'ctx>,
         ) -> std::result::Result<(DeviceRange<'ctx>, DeviceRange<'ctx>), PagedAttendRefused<'ctx>>
         {
+            self.attend_into_with_mode(stream, launch, query, output, false)
+        }
+
+        /// Enqueue attention and defer observing its completion. The caller
+        /// retains `query` and `output` until it observes a completion
+        /// recorded after this call on the same stream.
+        #[allow(clippy::result_large_err)]
+        pub(crate) fn attend_into_deferred(
+            &mut self,
+            stream: &Stream<'ctx>,
+            launch: &PagedAttentionLaunch,
+            query: DeviceRange<'ctx>,
+            output: DeviceRange<'ctx>,
+        ) -> std::result::Result<(DeviceRange<'ctx>, DeviceRange<'ctx>), PagedAttendRefused<'ctx>>
+        {
+            self.attend_into_with_mode(stream, launch, query, output, true)
+        }
+
+        #[allow(clippy::result_large_err)]
+        fn attend_into_with_mode(
+            &mut self,
+            stream: &Stream<'ctx>,
+            launch: &PagedAttentionLaunch,
+            query: DeviceRange<'ctx>,
+            output: DeviceRange<'ctx>,
+            defer: bool,
+        ) -> std::result::Result<(DeviceRange<'ctx>, DeviceRange<'ctx>), PagedAttendRefused<'ctx>>
+        {
             macro_rules! refuse {
                 ($error:expr) => {
                     return Err(PagedAttendRefused {
@@ -2819,6 +2919,9 @@ pub mod device {
                         ranges: Some((query, output)),
                     })
                 };
+            }
+            if !defer && let Err(error) = self.observe_pending() {
+                refuse!(error);
             }
             if let Err(error) = self.check_attend(stream, launch) {
                 refuse!(error);
@@ -2883,7 +2986,7 @@ pub mod device {
                 Ok(scalars) => scalars,
                 Err(error) => refuse!(error),
             };
-            match self.launch_with(stream, scalars, addresses) {
+            match self.launch_with(stream, scalars, addresses, defer) {
                 Ok(()) => Ok((query, output)),
                 Err(error) => {
                     self.held_ranges = Some((query, output));
@@ -3383,6 +3486,9 @@ pub mod device {
                 error,
                 source: Some(RefusedSource::Query(query)),
             };
+            if let Err(error) = self.observe_pending() {
+                return Err(give_back(error, query));
+            }
             // A run that admitted no staging buffers has nowhere to put a host
             // query, and that is the point of admitting none: a direct-device
             // caller is not charged for a path it does not use.
@@ -3526,6 +3632,9 @@ pub mod device {
                     table,
                 }),
             };
+            if let Err(error) = self.observe_pending() {
+                return Err(give_back(error, query, host_keys, host_values));
+            }
             if !launch.is_two_block_stream() {
                 return Err(give_back(
                     invalid(
@@ -3777,6 +3886,9 @@ pub mod device {
                     table: [0u8; 4],
                 }),
             };
+            if let Err(error) = self.observe_pending() {
+                return Err(give_back(error, query));
+            }
             if !launch.is_host_stream() || launch.is_two_block_stream() {
                 return Err(give_back(
                     invalid("launch", "an N-block launch must come from n_block_stream"),
@@ -3944,6 +4056,7 @@ pub mod device {
             stream: &Stream<'ctx>,
             scalars: AbiScalars,
             addresses: [u64; 5],
+            defer: bool,
         ) -> Result<()> {
             let [
                 mut query_address,
@@ -3996,7 +4109,11 @@ pub mod device {
                     &mut params,
                 )
             };
-            self.settle(launched, stream)
+            if defer {
+                self.defer(launched, stream)
+            } else {
+                self.settle(launched, stream)
+            }
         }
 
         fn settle(&mut self, launched: Result<()>, stream: &Stream<'ctx>) -> Result<()> {
@@ -4019,6 +4136,26 @@ pub mod device {
                 self.quarantined = true;
                 return Err(self.attribute(error));
             }
+            Ok(())
+        }
+
+        fn defer(&mut self, launched: Result<()>, stream: &Stream<'ctx>) -> Result<()> {
+            if let Err(error) = launched {
+                self.quarantined = true;
+                return Err(self.attribute(error));
+            }
+            let event = match Event::new(self.ctx) {
+                Ok(event) => event,
+                Err(error) => {
+                    self.quarantined = true;
+                    return Err(self.attribute(error));
+                }
+            };
+            if let Err(error) = event.record(stream) {
+                self.quarantined = true;
+                return Err(self.attribute(error));
+            }
+            self.pending = Some(event);
             Ok(())
         }
 
@@ -4051,6 +4188,9 @@ pub mod device {
             mut self,
             ledger: &mut Ledger,
         ) -> std::result::Result<(), PagedCloseRefused<'ctx>> {
+            if let Err(error) = self.observe_pending() {
+                return Err(PagedCloseRefused { run: self, error });
+            }
             if self.quarantined {
                 let error = invalid(
                     "close",
@@ -4140,6 +4280,9 @@ pub mod device {
                     table: [0u8; 4],
                 }),
             };
+            if let Err(error) = self.run.observe_pending() {
+                return Err(give_back(error, keys, values));
+            }
             if self.run.quarantined {
                 return Err(give_back(
                     invalid("run", "this run is quarantined"),
@@ -4251,7 +4394,7 @@ pub mod device {
 
     impl Drop for PagedAttentionRun<'_> {
         fn drop(&mut self) {
-            if !self.quarantined {
+            if !self.quarantined && self.pending.is_none() {
                 return;
             }
             // Host bytes a still-enqueued copy may be reading. Forgetting --
@@ -4374,9 +4517,14 @@ pub mod device {
                     format_args!("this writer serves layer {}, not {layer}", self.layer),
                 ));
             }
-            self.run
-                .publish_page_table(self.stream, view.base, view.table)
-                .map_err(|refused| refused.error)
+            let result = if self.device_rows.is_some() {
+                self.run
+                    .publish_page_table_deferred(self.stream, view.base, view.table)
+            } else {
+                self.run
+                    .publish_page_table(self.stream, view.base, view.table)
+            };
+            result.map_err(|refused| refused.error)
         }
     }
 

@@ -158,3 +158,62 @@ SHA-256 `3e00d0bd7985419be5cb461385575f53ad253414a7e4f92ff8216ddf67d42e0a`.
 Both remain outside Git in `/tmp` for task review and follow ordinary
 temporary-file cleanup. These fixture-scale measurements do not close O6 or
 make a performance claim.
+
+## Deferred paged-attention completion
+
+The task 0082 candidate defers the run's page-table publish, device row write,
+and dense attend observations to the next run operation or the dense step's
+`finish`. Three unprofiled runs used the same fixed-plan timing harness, target
+GPU, driver, warmups and repetitions as task 0079. The task 0079 candidate
+median is included for context; these fixture measurements make no speed claim.
+
+### Unprofiled runs
+
+Command for each run:
+
+~~~sh
+CUDA_DEVICE_ORDER=PCI_BUS_ID cargo test --release -p moxie-executor --features driver,paged-attention-binding,paged-attention-test-hooks --test dense_gemma_device dense_step_timing -- --ignored --nocapture
+~~~
+
+| Run | Phase | Task 0079 median (µs) | Median (µs) | Min (µs) | Max (µs) |
+|---:|---|---:|---:|---:|---:|
+| 1 | prefill | 1163.653 | 1042.890 | 1021.575 | 1143.519 |
+| 1 | decode | 1111.448 | 999.911 | 974.635 | 1080.219 |
+| 2 | prefill | 1148.774 | 1053.008 | 1028.031 | 1098.616 |
+| 2 | decode | 1118.419 | 1007.000 | 983.371 | 1104.810 |
+| 3 | prefill | 1204.262 | 1045.807 | 1025.015 | 1079.873 |
+| 3 | decode | 1147.323 | 993.226 | 973.646 | 1056.391 |
+
+### CUDA driver API counts
+
+One Nsight Systems `2025.3.2.474-253236389321v0` profile of the same filtered
+test used by task 0079:
+
+~~~sh
+CUDA_DEVICE_ORDER=PCI_BUS_ID /usr/local/bin/nsys profile -t cuda --stats=true -o /tmp/task-0082-deferred-paged-attention cargo test --release -p moxie-executor --features driver,paged-attention-binding,paged-attention-test-hooks --test dense_gemma_device dense_step_timing -- --ignored --nocapture
+~~~
+
+Counts cover the whole test process: 111 dense steps (55 prefill repetitions,
+one committed prefill, and 55 decode repetitions).
+
+| CUDA driver API | Calls | Total (ms) |
+|---|---:|---:|
+| `cuEventSynchronize` | 777 | 0.933027 |
+| `cuEventRecord` | 2109 | 5.126236 |
+
+Task 0079's profile table reported module load/unload counts, not event API
+counts. Its section uses the same 111-step harness; the preceding task 0078
+profile recorded 2109 calls to each event API. This profile records 777
+`cuEventSynchronize` calls and 2109 `cuEventRecord` calls. The profiled timing
+output (prefill `1515.608/1478.885/1623.580 µs`; decode
+`1439.385/1410.326/1518.060 µs`, median/min/max) is excluded from the
+unprofiled comparison.
+
+Raw trace: `/tmp/task-0082-deferred-paged-attention.nsys-rep` (1,765,722
+bytes), SHA-256
+`624fcd5706545a9fa95c24336d96ca60ce49c2cb1177643c1a85a164f1a45007`.
+Derived SQLite report: `/tmp/task-0082-deferred-paged-attention.sqlite`
+(3,895,296 bytes), SHA-256
+`6303dae615f8ffa85d53819397dee47fd25fa6c4f08261f0c8961dc203f0a3abb`.
+Both remain outside Git in `/tmp` for review. These fixture-scale measurements
+do not close O6 or make a performance claim.

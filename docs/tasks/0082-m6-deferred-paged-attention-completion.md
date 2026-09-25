@@ -156,4 +156,14 @@ changing its public signature; a file outside the allowed list is needed.
 
 ## Result, filled after work
 
-(pending)
+Implemented all ten changes. Existing output checks passed. Host gates passed:
+formatting, workspace clippy, executor driver-feature clippy, workspace tests,
+architecture check, and spec check. GPU gates passed: dense Gemma (8 passed,
+1 ignored), dense TP2 (1 passed), paged attention (7 passed), and the CUDA
+image matrix (63/63 across SM86 and SM120).
+
+Appended the three-run timing and Nsight evidence. On the target RTX 3090,
+prefill medians were 1042.890, 1053.008, and 1045.807 µs; decode medians were
+999.911, 1007.000, and 993.226 µs. The 111-step profile recorded 777
+`cuEventSynchronize` calls and 2109 `cuEventRecord` calls. This is fixture
+evidence only; O6 remains open and no performance claim is made.
