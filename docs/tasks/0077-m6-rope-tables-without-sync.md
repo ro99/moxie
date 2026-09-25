@@ -1,7 +1,7 @@
 # Task 0077 — dense step uploads RoPE tables without synchronizing
 
-Status: **active** (coordinator, 2026-09-24). Builder Codex `luna`; reviewer
-Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-24), sol's review round R1 clean.
+Builder Codex `luna`; reviewer Codex `sol`. Implementation `a9da4af`.
 
 ## Identity and authority
 
