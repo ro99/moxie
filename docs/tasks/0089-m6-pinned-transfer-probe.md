@@ -1,6 +1,17 @@
 # Task 0089 — measure pinned transfers and copy/compute overlap on this machine
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-25), after sol's review round R1.
+Implementation `ef28474`; R1 repair `d0f5657`.
+- R1 (MEDIUM): an error after an enqueued copy dropped the probe's buffers
+  and module before completion. All resources now live outside the fallible
+  closure and drop only after a successful context synchronization, or are
+  forgotten if it fails. Verified by the coordinator.
+- R1 (LOW, evidence): the pinned buffer's NUMA node was uncontrolled; the
+  evidence now says so (coordinator).
+- Reading: pinning gains little bandwidth, but a pageable async copy blocks
+  the host for the whole transfer (about 10–12 ms per 64 MiB) while a pinned
+  one returns in about 2.5 µs and overlaps compute (0.98–1.0). Overlap and
+  read-ahead therefore need admitted pinned staging. Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Identity and authority
 
