@@ -129,3 +129,8 @@ runs and one Nsight profile completed; the profile recorded 8
 0078. The samples and profiler artifact hashes are appended in [the timing
 evidence](../evidence/dense-step-timing.md#module-per-plan). They remain
 fixture-scale, O6-open evidence, not a performance claim.
+
+The checkout started at requested base `855e0cc`. During the assignment,
+`main` advanced through coordinator commit `102e1c8`, a handover-only M6 ledger
+update; it was preserved. The code commit `3aea3a4` therefore has parent
+`102e1c8`; that commit did not change the code baseline.

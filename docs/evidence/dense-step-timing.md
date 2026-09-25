@@ -109,6 +109,10 @@ dense module into `SelectedReservedPlan`. The first dense step loads and
 resolves the candidate's symbols; later steps reuse that module. Launch reads
 the module through the plan retained by the operation lease. The failure path
 returns the plan with the field still `None` if initial load/resolve fails.
+Work began at requested base `855e0cc`; during the assignment, `main` advanced
+through coordinator commit `102e1c8`, which changes only the M6 handover. It
+was preserved, so the code commit's parent is `102e1c8` and its code baseline
+is unchanged from the requested base.
 
 Three unprofiled runs used the same command and GPU as task 0078: NVIDIA RTX
 3090 `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9`, driver `610.57.04`, with
