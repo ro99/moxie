@@ -91,12 +91,14 @@ blocks (sol H4).
    - The unordered descriptor's `abi_version` is `DENSE_GRAPH_ABI` (1).
 3. **cuBLAS binding (`moxie-cuda`).**
    - Feature `cublas = ["driver"]`. `build.rs`: when it is on, add
-     `$CUDA_HOME/lib64` (default `/usr/local/cuda`) to the link search, link
-     `dylib=cublas`, and add an rpath. It panics loudly if
-     `libcublas.so.13` is absent.
+     `$CUDA_HOME/lib64` (default `/usr/local/cuda`) to the link search and
+     link `dylib=cublas`. It panics loudly if `libcublas.so.13` is absent,
+     records the resolved file version from its real name
+     `libcublas.so.13.X.Y.Z`, and relies on the system loader; the loaded
+     version is checked at handle creation.
    - `ffi.rs`: `cublasCreate_v2`, `cublasDestroy_v2`, `cublasSetStream_v2`,
-     `cublasSetWorkspace_v2`, `cublasSetMathMode`, `cublasGemmEx`, and their
-     constants.
+     `cublasSetWorkspace_v2`, `cublasSetMathMode`, `cublasGetProperty`,
+     `cublasGemmEx`, and their constants.
    - `blas.rs`, `pub struct Blas<'ctx>` (sol H1):
      - it owns the handle and records the `&'ctx Context`; it is not
        `Clone` and not `Send`;
@@ -108,11 +110,17 @@ blocks (sol H4).
      - `pub unsafe fn gemm_bf16(&self, m, n, k, a: u64, lda, b: u64, ldb,
        c: u64, ldc) -> Result<()>` uses `transa = T`, `transb = N`, α = 1,
        β = 0, BF16 A, B and C, compute `CUBLAS_COMPUTE_32F`,
-       `CUBLAS_GEMM_DEFAULT` and `CUBLAS_DEFAULT_MATH`.
+       `CUBLAS_GEMM_DEFAULT` and
+       `CUBLAS_DEFAULT_MATH | CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION`.
+     - At handle creation, compare the build-time file version's major,
+       minor and patch with `cublasGetProperty`'s `MAJOR_VERSION`,
+       `MINOR_VERSION` and `PATCH_LEVEL`. Refuse a mismatch with a typed
+       error naming both versions.
      - Every call makes the context current, as the module wrappers do.
        Status codes map to typed errors.
-     - `pub unsafe fn destroy(self) -> Result<()>` is the only destructor.
-       `Drop` does **not** call `cublasDestroy`; an undestroyed handle
+     - `pub unsafe fn destroy(self) -> Result<(), (Self, Error)>` is the
+       only destructor. A context or destroy refusal returns the handle for
+       retry. `Drop` does **not** call `cublasDestroy`; an undestroyed handle
        leaks (quarantine), like a live module.
    - If cuBLAS fails on Moxie's explicitly created contexts, stop and send
      `DECISION`.
@@ -255,12 +263,26 @@ ADR 0028's reduction-resolution clause.
 | `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` (5060 Ti) | `(1, 5376, 21504)` | 1 | 0 | 1 | 0 |
 | same | `(33, 1024, 3072)` | 1 | 0 | 10 | 1 |
 | same | `(512, 4096, 4096)` | 1 | 0 | 27976 | 173 |
-| `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` (3090) | `(1, 5376, 21504)` | 2 | 0 | 30522 | 703 |
+| `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` (3090) | `(1, 5376, 21504)` | 2 | 0 | 1 | 0 |
 | same | `(33, 1024, 3072)` | 1 | 0 | 4 | 1 |
 | same | `(512, 4096, 4096)` | 1 | 0 | 28051 | 171 |
-| `GPU-81fe4578-59b2-37c4-421e-287cdac78704` (3090) | `(1, 5376, 21504)` | 2 | 0 | 30522 | 703 |
+| `GPU-81fe4578-59b2-37c4-421e-287cdac78704` (3090) | `(1, 5376, 21504)` | 2 | 0 | 1 | 0 |
 | same | `(33, 1024, 3072)` | 1 | 0 | 4 | 1 |
 | same | `(512, 4096, 4096)` | 1 | 0 | 28051 | 171 |
+
+R2 set `CUBLAS_DEFAULT_MATH |
+CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION` (CUDA 13.1 defines the
+flag as 16). On both 3090s, `(1, 5376, 21504)` changed from 30,522 ULP and
+703 second-clause elements to 1 ULP and zero second-clause elements; capture
+remains two graph nodes.
+
+The `(512, 4096, 4096)` shape retained its large worst ULP. The worst
+element was row 139, output 1042: on the 5060 Ti, cuBLAS returned
+`5.811452866e-6`, the ordered oracle returned `-3.963708878e-6`, and
+`Σ|x·W|` was `2.575169101e2`; on both 3090s, the result was
+`8.463859558e-6` with the same oracle and `Σ|x·W|`. These elements pass the
+unchanged ADR 0028 reduction-resolution clause: the output discrepancy is
+about `1.24e-5` while the reduction magnitude is about 258.
 
 Every output element passed one of ADR 0028's two clauses. Shape A eager,
 capture and replay produced finite logits; the unordered path's measured
@@ -278,6 +300,13 @@ that requires the supplied workspace and verifies it remains bound after a
 stream change; a suitable test name is
 `cublas_workspace_binding_survives_stream_change`.
 
+R2 reran only `cublas_linear_holds_the_quantized_gate`,
+and `unordered_cublas_shape_a_matches_ordered_greedy_eager_and_capture`
+with `--exact` on all three GPUs; both passed. It also reran
+`cublas_plan_quarantines_unobserved_handle_and_closes_once` with `--exact`
+on the test's 3090; it passed. Shape A prefill and decode remained at zero
+measured BF16 ULP against the ordered path on all devices.
+
 Host gates passed: `cargo fmt --all -- --check`, workspace clippy,
 executor driver-feature clippy with and without `cublas`,
 `cargo test --workspace --locked`, `cargo xtask arch-check`, and
@@ -287,3 +316,5 @@ executor driver-feature clippy with and without `cublas`,
 (1 passed). The coordinator waived `cargo xtask-cuda test-gpu`, a second
 no-cublas suite run, and timing for this feature task. No CUDA kernel source
 was changed.
+
+R1: Added disallow-reduced-precision math mode, retained the cuBLAS handle on close refusal, and checked the loaded library version against the resolved build-time filename; the three requested exact GPU tests passed.

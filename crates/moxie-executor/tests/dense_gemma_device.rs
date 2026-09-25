@@ -3370,6 +3370,18 @@ struct CublasGraphMeasure {
 }
 
 #[cfg(feature = "cublas")]
+#[derive(Clone, Copy, Debug, Default)]
+struct CublasLinearGateMeasure {
+    worst_ulp: u32,
+    second_clause: usize,
+    row: usize,
+    output: usize,
+    result: f32,
+    oracle: f32,
+    absolute_sum: f64,
+}
+
+#[cfg(feature = "cublas")]
 fn check_bf16_linear_rows(
     input: &[f32],
     weights: &[f32],
@@ -3378,7 +3390,7 @@ fn check_bf16_linear_rows(
     in_features: usize,
     out_features: usize,
     device: moxie_types::DeviceUuid,
-) -> (u32, usize) {
+) -> CublasLinearGateMeasure {
     let workers = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
@@ -3394,8 +3406,7 @@ fn check_bf16_linear_rows(
                 continue;
             }
             jobs.push(scope.spawn(move || {
-                let mut worst_ulp = 0u32;
-                let mut second_clause = 0usize;
+                let mut measure = CublasLinearGateMeasure::default();
                 for row in start..end {
                     let x = &input[row * in_features..(row + 1) * in_features];
                     let ordered = moxie_oracles::linear::linear_row_ordered(
@@ -3414,16 +3425,18 @@ fn check_bf16_linear_rows(
                         assert!(observed.is_finite(), "cuBLAS output is finite");
                         let ulp = bf16_monotone(expected_bits)
                             .abs_diff(bf16_monotone(observed_bits));
-                        worst_ulp = worst_ulp.max(ulp);
-                        if ulp > 2 {
+                        let absolute_sum = if ulp > 2 || ulp > measure.worst_ulp {
                             let w = &weights[out * in_features..(out + 1) * in_features];
-                            let absolute_sum = x
-                                .iter()
+                            x.iter()
                                 .zip(w)
                                 .map(|(&x_value, &w_value)| {
                                     f64::from(x_value).abs() * f64::from(w_value).abs()
                                 })
-                                .sum::<f64>();
+                                .sum::<f64>()
+                        } else {
+                            0.0
+                        };
+                        if ulp > 2 {
                             let error =
                                 (f64::from(observed) - f64::from(expected)).abs();
                             let bound = absolute_sum * 2f64.powi(-8);
@@ -3431,19 +3444,35 @@ fn check_bf16_linear_rows(
                                 error <= bound,
                                 "BF16 linear gate failed on {device} at row {row}, output {out}: {ulp} ULP, error {error}, reduction bound {bound}"
                             );
-                            second_clause += 1;
+                            measure.second_clause += 1;
+                        }
+                        if ulp > measure.worst_ulp {
+                            measure.worst_ulp = ulp;
+                            measure.row = row;
+                            measure.output = out;
+                            measure.result = observed;
+                            measure.oracle = expected;
+                            measure.absolute_sum = absolute_sum;
                         }
                     }
                 }
-                (worst_ulp, second_clause)
+                measure
             }));
         }
-        jobs.into_iter().fold((0, 0), |mut total, job| {
-            let (worst, second) = job.join().expect("ordered host oracle worker");
-            total.0 = total.0.max(worst);
-            total.1 += second;
-            total
-        })
+        jobs.into_iter()
+            .fold(CublasLinearGateMeasure::default(), |mut total, job| {
+                let measure = job.join().expect("ordered host oracle worker");
+                if measure.worst_ulp > total.worst_ulp {
+                    total.worst_ulp = measure.worst_ulp;
+                    total.row = measure.row;
+                    total.output = measure.output;
+                    total.result = measure.result;
+                    total.oracle = measure.oracle;
+                    total.absolute_sum = measure.absolute_sum;
+                }
+                total.second_clause += measure.second_clause;
+                total
+            })
     })
 }
 
@@ -3679,7 +3708,7 @@ fn cublas_linear_holds_the_quantized_gate() {
                 .collect();
             let input_f32: Vec<_> = input_bits.iter().copied().map(bf16_bits_to_f32).collect();
             let weight_f32: Vec<_> = weight_bits.iter().copied().map(bf16_bits_to_f32).collect();
-            let (worst_ulp, second_clause) = check_bf16_linear_rows(
+            let gate = check_bf16_linear_rows(
                 &input_f32,
                 &weight_f32,
                 &outputs,
@@ -3705,14 +3734,20 @@ fn cublas_linear_holds_the_quantized_gate() {
             );
             // SAFETY: stream completion was observed and no graph launch remains.
             let destroyed = unsafe { blas.destroy() };
-            assert_eq!(
-                destroyed,
-                Ok(()),
-                "destroy cuBLAS after observed completion"
+            assert!(
+                destroyed.is_ok(),
+                "destroy cuBLAS after observed completion: {destroyed:?}"
             );
             println!(
-                "cublas-linear-gate gpu={} rows={rows} input={in_features} output={out_features} worst_ulp={worst_ulp} second_clause={second_clause}",
-                capability.uuid
+                "cublas-linear-gate gpu={} rows={rows} input={in_features} output={out_features} worst_ulp={} second_clause={} worst_row={} worst_output={} result={:.9e} oracle={:.9e} sum_abs={:.9e}",
+                capability.uuid,
+                gate.worst_ulp,
+                gate.second_clause,
+                gate.row,
+                gate.output,
+                gate.result,
+                gate.oracle,
+                gate.absolute_sum,
             );
         }
         drop(stream);

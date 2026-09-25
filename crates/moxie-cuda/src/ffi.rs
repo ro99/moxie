@@ -66,6 +66,14 @@ pub const CUBLAS_GEMM_DEFAULT: c_int = -1;
 #[cfg(feature = "cublas")]
 pub const CUBLAS_DEFAULT_MATH: c_int = 0;
 #[cfg(feature = "cublas")]
+pub const CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION: c_int = 16;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_PROPERTY_MAJOR_VERSION: c_int = 0;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_PROPERTY_MINOR_VERSION: c_int = 1;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_PROPERTY_PATCH_LEVEL: c_int = 2;
+#[cfg(feature = "cublas")]
 pub const CUBLAS_COMPUTE_32F: c_int = 68;
 #[cfg(feature = "cublas")]
 pub const CUDA_R_16BF: c_int = 14;
@@ -225,6 +233,8 @@ unsafe extern "C" {
     ) -> cublasStatus_t;
     #[cfg(feature = "cublas")]
     pub fn cublasSetMathMode(handle: cublasHandle_t, math_mode: c_int) -> cublasStatus_t;
+    #[cfg(feature = "cublas")]
+    pub fn cublasGetProperty(property_type: c_int, value: *mut c_int) -> cublasStatus_t;
     #[cfg(feature = "cublas")]
     pub fn cublasGemmEx(
         handle: cublasHandle_t,

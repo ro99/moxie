@@ -51,8 +51,26 @@ fn main() {
             );
         }
         println!("cargo:rerun-if-changed={}", library.display());
+        let resolved = std::fs::canonicalize(&library).unwrap_or_else(|error| {
+            panic!(
+                "failed to resolve cuBLAS library {}: {error}",
+                library.display()
+            )
+        });
+        println!("cargo:rerun-if-changed={}", resolved.display());
+        let filename = resolved
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_else(|| panic!("resolved cuBLAS library has no UTF-8 filename"));
+        let version = filename.strip_prefix("libcublas.so.").unwrap_or_else(|| {
+            panic!("resolved cuBLAS library filename {filename:?} has no version suffix")
+        });
+        let components: Vec<_> = version.split('.').collect();
+        if components.len() != 4 || components.iter().any(|part| part.parse::<u32>().is_err()) {
+            panic!("resolved cuBLAS filename has an unexpected version: {filename}");
+        }
         println!("cargo:rustc-link-search=native={}", lib_dir.display());
         println!("cargo:rustc-link-lib=dylib=cublas");
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+        println!("cargo:rustc-env=MOXIE_CUBLAS_FILE_VERSION={version}");
     }
 }

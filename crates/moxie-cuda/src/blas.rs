@@ -35,9 +35,47 @@ impl<'ctx> Blas<'ctx> {
                 detail: "cublasCreate_v2 succeeded without returning a handle".into(),
             });
         }
+        let loaded_version = match loaded_version(ctx) {
+            Ok(version) => version,
+            Err(error) => {
+                // SAFETY: no work has been submitted through this new handle.
+                unsafe {
+                    let _ = ffi::cublasDestroy_v2(handle);
+                }
+                return Err(error);
+            }
+        };
+        let built_version = env!("MOXIE_CUBLAS_FILE_VERSION");
+        let built_api_version = built_version
+            .split('.')
+            .take(3)
+            .map(str::parse::<i32>)
+            .collect::<core::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::Numerical {
+                detail: format!("invalid build-time cuBLAS version {built_version}"),
+            })?;
+        if built_api_version.as_slice() != loaded_version.as_slice() {
+            // SAFETY: no work has been submitted through this handle.
+            unsafe {
+                let _ = ffi::cublasDestroy_v2(handle);
+            }
+            return Err(Error::Unsupported {
+                capability: "cublas_version",
+                reason: format!(
+                    "build-time cuBLAS {built_version} does not match loaded cuBLAS {}.{}.{}",
+                    loaded_version[0], loaded_version[1], loaded_version[2]
+                ),
+            });
+        }
         if let Err(error) = check(
             // SAFETY: the new handle is live and its owning context is current.
-            unsafe { ffi::cublasSetMathMode(handle, ffi::CUBLAS_DEFAULT_MATH) },
+            unsafe {
+                ffi::cublasSetMathMode(
+                    handle,
+                    ffi::CUBLAS_DEFAULT_MATH
+                        | ffi::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
+                )
+            },
             "cublasSetMathMode",
             ctx,
         ) {
@@ -167,17 +205,50 @@ impl<'ctx> Blas<'ctx> {
     ///
     /// # Safety
     /// No asynchronous operation may still use this handle.
-    pub unsafe fn destroy(self) -> Result<()> {
-        self.ctx.make_current()?;
+    pub unsafe fn destroy(self) -> core::result::Result<(), (Self, Error)> {
+        if let Err(error) = self.ctx.make_current() {
+            return Err((self, error));
+        }
         #[cfg(feature = "test-hooks")]
         DESTROY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        check(
+        if let Err(error) = check(
             // SAFETY: this consumes the live handle while its context is current.
             unsafe { ffi::cublasDestroy_v2(self.handle) },
             "cublasDestroy_v2",
             self.ctx,
-        )
+        ) {
+            return Err((self, error));
+        }
+        Ok(())
     }
+}
+
+fn loaded_version(ctx: &RankContext) -> Result<[i32; 3]> {
+    ctx.make_current()?;
+    let property = |property, operation| -> Result<i32> {
+        let mut value = 0;
+        check(
+            // SAFETY: `value` points to a live integer output and the context is current.
+            unsafe { ffi::cublasGetProperty(property, &mut value) },
+            operation,
+            ctx,
+        )?;
+        Ok(value)
+    };
+    Ok([
+        property(
+            ffi::CUBLAS_PROPERTY_MAJOR_VERSION,
+            "cublasGetProperty(MAJOR_VERSION)",
+        )?,
+        property(
+            ffi::CUBLAS_PROPERTY_MINOR_VERSION,
+            "cublasGetProperty(MINOR_VERSION)",
+        )?,
+        property(
+            ffi::CUBLAS_PROPERTY_PATCH_LEVEL,
+            "cublasGetProperty(PATCH_LEVEL)",
+        )?,
+    ])
 }
 
 #[cfg(feature = "test-hooks")]

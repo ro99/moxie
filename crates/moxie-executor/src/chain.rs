@@ -795,7 +795,8 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         if let Some(blas) = self.blas.take() {
             // SAFETY: submitted dense work returns the plan only after its
             // completion event is observed; lost leases withhold the plan.
-            if let Err(error) = unsafe { blas.destroy() } {
+            if let Err((blas, error)) = unsafe { blas.destroy() } {
+                self.blas = Some(blas);
                 return Err(SelectedCloseRefused { plan: self, error });
             }
         }
