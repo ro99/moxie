@@ -1,7 +1,6 @@
 # Task 0085 — a reused dense plan captures and replays its segments
 
-Status: **proposed** (coordinator, 2026-09-25); opens when task 0084 is
-accepted. Builder Codex `luna`; reviewer Codex `sol`.
+Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Identity and authority
 

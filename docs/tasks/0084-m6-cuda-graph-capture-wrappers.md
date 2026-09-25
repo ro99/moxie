@@ -1,6 +1,11 @@
 # Task 0084 — `moxie-cuda` stream capture, instantiate and launch
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-25), after sol's review round R1.
+Implementation `bcbab23`; R1 repair `b65e677`.
+- R1 (MEDIUM, coverage): the invalidation check captured nothing and ignored
+  `synchronize`'s result, so an empty graph could explain the failure. The
+  case now captures a launch, asserts `synchronize` fails, `end_capture`
+  fails, and ordinary work then runs correctly. Verified by the coordinator. Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Identity and authority
 
