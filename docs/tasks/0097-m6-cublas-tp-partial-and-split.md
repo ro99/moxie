@@ -61,7 +61,10 @@ Codex `sol`. Asynchronous-ownership work: the escape inventory is in change 5.
   On the 3090 pair, TP2 output is byte-identical to the single-GPU
   reference.
 - **Allowed files:**
-  - `crates/moxie-cuda/src/{ffi.rs,driver.rs,blas.rs}`;
+  - `crates/moxie-cuda/src/{ffi.rs,driver.rs,blas.rs,lib.rs}` (`lib.rs`
+    re-export only; amended after sol's early review);
+  - `crates/moxie-plan/src/lib.rs` (re-export of the workspace type only;
+    amended);
   - `crates/moxie-kernels/src/lib.rs`;
   - `crates/moxie-plan/src/selected.rs`;
   - `crates/moxie-executor/src/{dense.rs,chain.rs}`;
