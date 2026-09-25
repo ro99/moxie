@@ -281,13 +281,14 @@ DeepSeek row gains the speed comparison when M6 closes.
 
 **Accepted 2026-09-25** ([map](../evidence/deepseek-strata-speed-map.md)):
 of 117 Strata DeepSeek techniques, 11 are present in Moxie, 26 partial, 7
-not needed, 24 planned and 49 gaps. 14 of the gaps are deliberate (formats
-Moxie does not admit, the exact-reduction and single-user rules). The
-accepted Strata techniques with no Moxie home cluster in two places. One is
-load time. The other is the host expert path: Strata's decode rate is set by
+not needed, 24 planned and 49 gaps. Of the gaps, 15 are deliberate (formats
+Moxie does not admit, the exact-reduction and single-user rules), and 9 were
+rejected in Strata. The other 25 were accepted in Strata and have no Moxie
+home. The largest cluster is the host expert path: Strata's decode rate is set by
 the host DRAM expert read, and it used an all-resident expert arena, NUMA
 binding and a worker pool, where Moxie's host expert kernel is
-single-threaded. M7's DeepSeek work starts from this map.
+single-threaded. Loading, page bookkeeping, kernels and launch, and admission
+make up the rest. M7's DeepSeek work starts from this map.
 
 ## Next task
 
