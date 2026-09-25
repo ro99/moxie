@@ -1,7 +1,13 @@
 # Task 0094 — rank prefill/decode placement pairs jointly
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer
-Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-25), sol's review round R1 clean.
+Implementation `6b72b22`. Builder Codex `luna`; reviewer Codex `sol`.
+- Reading (estimates, not a claim): at prompt 512, prefill on one 3090 and
+  decode on TP2 (26 MB KV move) estimates 1.496 s against 1.680 s for TP2
+  throughout. **Caveat:** the M5 cost model has no prefill compute term (one
+  3090 "prefills" 32,768 tokens in 8.7 ms), so split-pair wins are partly an
+  artifact. The device transition task waits for M6.5's compute-cost term
+  and a re-run of this ranking.
 
 ## Identity and authority
 
