@@ -39,4 +39,20 @@ fn main() {
         );
     }
     println!("cargo:rustc-link-lib=dylib=cuda");
+
+    if std::env::var_os("CARGO_FEATURE_CUBLAS").is_some() {
+        let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
+        let lib_dir = std::path::Path::new(&cuda_home).join("lib64");
+        let library = lib_dir.join("libcublas.so.13");
+        if !library.is_file() {
+            panic!(
+                "moxie-cuda/cublas was enabled but {} is absent",
+                library.display()
+            );
+        }
+        println!("cargo:rerun-if-changed={}", library.display());
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        println!("cargo:rustc-link-lib=dylib=cublas");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+    }
 }

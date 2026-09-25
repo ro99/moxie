@@ -236,3 +236,54 @@ lowering only; ABI 1; digest check extended), M3 (aligned, checked
 workspace placement).
 
 ## Result, filled after work
+
+Implemented the unordered BF16 Linear descriptor, dense-only admission,
+checked 32 MiB workspace placement, explicit node-to-module symbol mapping,
+and the cuBLAS wrapper with explicit teardown/quarantine. The executor binds
+the plan's stream and workspace before eager steps and capture, runs BF16
+Linear through `cublasGemmEx`, and keeps split/partial operations on the
+ordered kernels. The tests cover the two-clause ADR 0028 gate, Shape A
+eager/capture parity with the ordered path, and handle retention on an
+unobserved submission followed by explicit close and ledger recovery.
+
+The direct numerical and capture probe passed on all three GPUs. `pool` is
+the measured graph-pool byte delta; `second` counts elements accepted by
+ADR 0028's reduction-resolution clause.
+
+| GPU UUID | Shape `(rows, in, out)` | Graph nodes | Pool bytes | Worst BF16 ULP | Second clause |
+|---|---:|---:|---:|---:|---:|
+| `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` (5060 Ti) | `(1, 5376, 21504)` | 1 | 0 | 1 | 0 |
+| same | `(33, 1024, 3072)` | 1 | 0 | 10 | 1 |
+| same | `(512, 4096, 4096)` | 1 | 0 | 27976 | 173 |
+| `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` (3090) | `(1, 5376, 21504)` | 2 | 0 | 30522 | 703 |
+| same | `(33, 1024, 3072)` | 1 | 0 | 4 | 1 |
+| same | `(512, 4096, 4096)` | 1 | 0 | 28051 | 171 |
+| `GPU-81fe4578-59b2-37c4-421e-287cdac78704` (3090) | `(1, 5376, 21504)` | 2 | 0 | 30522 | 703 |
+| same | `(33, 1024, 3072)` | 1 | 0 | 4 | 1 |
+| same | `(512, 4096, 4096)` | 1 | 0 | 28051 | 171 |
+
+Every output element passed one of ADR 0028's two clauses. Shape A eager,
+capture and replay produced finite logits; the unordered path's measured
+logit ULP difference was zero, and greedy top tokens matched the ordered
+path. The ownership case observed no destroy after dropping the unobserved
+submission, then exactly one destroy per normally closed plan; the ledger
+returned to empty.
+
+The requested mutant was applied and reverted: workspace binding was moved
+before `cublasSetStream`. The exact captured Shape A test
+`unordered_cublas_shape_a_matches_ordered_greedy_eager_and_capture` passed
+with that mutant, so this call order is unobservable with the exercised
+operation and driver. A test that would distinguish it needs an operation
+that requires the supplied workspace and verifies it remains bound after a
+stream change; a suitable test name is
+`cublas_workspace_binding_survives_stream_change`.
+
+Host gates passed: `cargo fmt --all -- --check`, workspace clippy,
+executor driver-feature clippy with and without `cublas`,
+`cargo test --workspace --locked`, `cargo xtask arch-check`, and
+`cargo xtask spec-check`. GPU gates passed with
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`: full `dense_gemma_device` once with
+`cublas` (14 passed, 2 ignored), and `dense_tp2_device` with `cublas`
+(1 passed). The coordinator waived `cargo xtask-cuda test-gpu`, a second
+no-cublas suite run, and timing for this feature task. No CUDA kernel source
+was changed.

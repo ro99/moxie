@@ -50,6 +50,24 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDAHOSTCXX");
     println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
 
+    if std::env::var_os("CARGO_FEATURE_CUBLAS").is_some() {
+        let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
+        let library = Path::new(&cuda_home).join("lib64/libcublas.so.13");
+        if !library.is_file() {
+            panic!(
+                "moxie-kernels/cublas was enabled but {} is absent",
+                library.display()
+            );
+        }
+        println!("cargo:rerun-if-changed={}", library.display());
+        let bytes = std::fs::read(&library)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", library.display()));
+        println!(
+            "cargo:rustc-env=MOXIE_CUBLAS_SO_SHA256={}",
+            sha256_hex(&bytes)
+        );
+    }
+
     println!(
         "cargo:rustc-env=MOXIE_KERNEL_TARGET_ARCHS={}",
         ARCHS.join(",")

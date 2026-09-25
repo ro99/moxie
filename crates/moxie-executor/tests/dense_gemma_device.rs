@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+#[cfg(feature = "cublas")]
+use moxie_cuda::{Blas, DeviceBuffer, ffi};
 use moxie_cuda::{RankContext, Stream, device_count, query_device};
 use moxie_engine::{HostTensor, Value};
 use moxie_executor::paged_attention::device::commit_paged_state;
@@ -24,6 +26,8 @@ use moxie_executor::{
 use moxie_format::affine::{
     AffineDescriptor, AffineTensor, Grouping, IntWidth, ZeroPoints, pack_row,
 };
+#[cfg(feature = "cublas")]
+use moxie_format::bf16::bf16_bits_to_f32;
 use moxie_format::bf16::f32_to_bf16_bits;
 use moxie_format::scale::{ScaleDtype, ScaleValues};
 use moxie_graph::{Graph, GraphBuilder, OpParams, OracleRegistry, ValueId, ValueRole};
@@ -3324,6 +3328,651 @@ fn dense_step_timing() {
             .expect("close attention run");
     }
     assert!(ledger.outstanding().is_empty());
+}
+
+#[cfg(feature = "cublas")]
+fn bf16_test_values(len: usize, seed: u64) -> Vec<u16> {
+    let mut state = seed;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let signed = (state >> 48) as i16;
+            f32_to_bf16_bits(f32::from(signed) / 65_536.0)
+        })
+        .collect()
+}
+
+#[cfg(feature = "cublas")]
+fn bf16_le_bytes(values: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 2);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+#[cfg(feature = "cublas")]
+fn bf16_monotone(bits: u16) -> u32 {
+    if bits & 0x8000 == 0 {
+        u32::from(bits) + 0x8000
+    } else {
+        0x8000 - u32::from(bits & 0x7fff)
+    }
+}
+
+#[cfg(feature = "cublas")]
+#[derive(Debug)]
+struct CublasGraphMeasure {
+    nodes: usize,
+    pool_bytes: u64,
+}
+
+#[cfg(feature = "cublas")]
+fn check_bf16_linear_rows(
+    input: &[f32],
+    weights: &[f32],
+    outputs: &[u16],
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+    device: moxie_types::DeviceUuid,
+) -> (u32, usize) {
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(rows)
+        .min(16);
+    let rows_per_worker = rows.div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut jobs = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let start = worker * rows_per_worker;
+            let end = (start + rows_per_worker).min(rows);
+            if start == end {
+                continue;
+            }
+            jobs.push(scope.spawn(move || {
+                let mut worst_ulp = 0u32;
+                let mut second_clause = 0usize;
+                for row in start..end {
+                    let x = &input[row * in_features..(row + 1) * in_features];
+                    let ordered = moxie_oracles::linear::linear_row_ordered(
+                        x,
+                        weights,
+                        out_features,
+                        None,
+                        1,
+                    )
+                    .expect("ordered host linear oracle");
+                    for out in 0..out_features {
+                        let expected_bits = f32_to_bf16_bits(ordered[out]);
+                        let observed_bits = outputs[row * out_features + out];
+                        let expected = bf16_bits_to_f32(expected_bits);
+                        let observed = bf16_bits_to_f32(observed_bits);
+                        assert!(observed.is_finite(), "cuBLAS output is finite");
+                        let ulp = bf16_monotone(expected_bits)
+                            .abs_diff(bf16_monotone(observed_bits));
+                        worst_ulp = worst_ulp.max(ulp);
+                        if ulp > 2 {
+                            let w = &weights[out * in_features..(out + 1) * in_features];
+                            let absolute_sum = x
+                                .iter()
+                                .zip(w)
+                                .map(|(&x_value, &w_value)| {
+                                    f64::from(x_value).abs() * f64::from(w_value).abs()
+                                })
+                                .sum::<f64>();
+                            let error =
+                                (f64::from(observed) - f64::from(expected)).abs();
+                            let bound = absolute_sum * 2f64.powi(-8);
+                            assert!(
+                                error <= bound,
+                                "BF16 linear gate failed on {device} at row {row}, output {out}: {ulp} ULP, error {error}, reduction bound {bound}"
+                            );
+                            second_clause += 1;
+                        }
+                    }
+                }
+                (worst_ulp, second_clause)
+            }));
+        }
+        jobs.into_iter().fold((0, 0), |mut total, job| {
+            let (worst, second) = job.join().expect("ordered host oracle worker");
+            total.0 = total.0.max(worst);
+            total.1 += second;
+            total
+        })
+    })
+}
+
+#[cfg(feature = "cublas")]
+#[allow(clippy::too_many_arguments)]
+fn measure_cublas_graph(
+    context: &RankContext,
+    rows: u64,
+    in_features: u64,
+    out_features: u64,
+    weight: u64,
+    input: u64,
+    output: u64,
+    workspace: u64,
+    workspace_bytes: usize,
+) -> CublasGraphMeasure {
+    context
+        .make_current()
+        .expect("make measurement context current");
+    let mut stream = std::ptr::null_mut();
+    assert_eq!(
+        // SAFETY: `stream` is a valid out pointer and this context is current.
+        unsafe { ffi::cuStreamCreate(&mut stream, ffi::CU_STREAM_NON_BLOCKING) },
+        ffi::CUDA_SUCCESS,
+        "create cuBLAS measurement stream"
+    );
+    let mut handle = std::ptr::null_mut();
+    assert_eq!(
+        // SAFETY: `handle` is a valid out pointer and this context is current.
+        unsafe { ffi::cublasCreate_v2(&mut handle) },
+        ffi::CUBLAS_STATUS_SUCCESS,
+        "create cuBLAS measurement handle"
+    );
+    assert_eq!(
+        // SAFETY: handle creation succeeded and the owning context is current.
+        unsafe { ffi::cublasSetMathMode(handle, ffi::CUBLAS_DEFAULT_MATH) },
+        ffi::CUBLAS_STATUS_SUCCESS,
+        "set cuBLAS measurement math mode"
+    );
+    assert_eq!(
+        // SAFETY: the handle and stream were created in the current context.
+        unsafe { ffi::cublasSetStream_v2(handle, stream) },
+        ffi::CUBLAS_STATUS_SUCCESS,
+        "bind cuBLAS measurement stream"
+    );
+    assert_eq!(
+        // SAFETY: this live workspace belongs to the current context.
+        unsafe {
+            ffi::cublasSetWorkspace_v2(
+                handle,
+                workspace as usize as *mut std::ffi::c_void,
+                workspace_bytes,
+            )
+        },
+        ffi::CUBLAS_STATUS_SUCCESS,
+        "bind cuBLAS measurement workspace"
+    );
+    let (alpha, beta) = (1.0f32, 0.0f32);
+    let gemm = || {
+        // SAFETY: all buffers and scalar pointers are live, and the dimensions
+        // describe their contiguous BF16 matrices.
+        unsafe {
+            ffi::cublasGemmEx(
+                handle,
+                ffi::CUBLAS_OP_T,
+                ffi::CUBLAS_OP_N,
+                out_features as i32,
+                rows as i32,
+                in_features as i32,
+                (&alpha as *const f32).cast(),
+                weight as usize as *const std::ffi::c_void,
+                ffi::CUDA_R_16BF,
+                in_features as i32,
+                input as usize as *const std::ffi::c_void,
+                ffi::CUDA_R_16BF,
+                in_features as i32,
+                (&beta as *const f32).cast(),
+                output as usize as *mut std::ffi::c_void,
+                ffi::CUDA_R_16BF,
+                out_features as i32,
+                ffi::CUBLAS_COMPUTE_32F,
+                ffi::CUBLAS_GEMM_DEFAULT,
+            )
+        }
+    };
+    assert_eq!(gemm(), ffi::CUBLAS_STATUS_SUCCESS, "cuBLAS warmup GEMM");
+    assert_eq!(
+        // SAFETY: this stream is live and carries the warmup just submitted.
+        unsafe { ffi::cuStreamSynchronize(stream) },
+        ffi::CUDA_SUCCESS,
+        "synchronize cuBLAS warmup"
+    );
+
+    let free_before = context.memory_info().expect("free memory before capture").0;
+    assert_eq!(
+        // SAFETY: this stream belongs to the current context and is idle.
+        unsafe { ffi::cuStreamBeginCapture_v2(stream, ffi::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,) },
+        ffi::CUDA_SUCCESS,
+        "begin cuBLAS graph capture"
+    );
+    let gemm_status = gemm();
+    let mut graph = std::ptr::null_mut();
+    // SAFETY: capture began on this live stream and `graph` is a valid out pointer.
+    let end_status = unsafe { ffi::cuStreamEndCapture(stream, &mut graph) };
+    if gemm_status != ffi::CUBLAS_STATUS_SUCCESS || end_status != ffi::CUDA_SUCCESS {
+        // SAFETY: capture has ended or was invalidated; the stream is still live.
+        let sync_status = unsafe { ffi::cuStreamSynchronize(stream) };
+        panic!(
+            "cuBLAS graph capture failed: GEMM status {gemm_status}, end status {end_status}, stream sync {sync_status}"
+        );
+    }
+    assert!(!graph.is_null(), "cuBLAS capture returns a graph");
+    let mut nodes = 0usize;
+    assert_eq!(
+        // SAFETY: graph is live; null nodes with zero capacity queries its node count.
+        unsafe { ffi::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut nodes) },
+        ffi::CUDA_SUCCESS,
+        "count cuBLAS graph nodes"
+    );
+    assert!(nodes > 0, "cuBLAS GEMM capture contains graph nodes");
+    let mut node_handles = vec![std::ptr::null_mut(); nodes];
+    assert_eq!(
+        // SAFETY: the vector has exactly the graph's node count capacity.
+        unsafe { ffi::cuGraphGetNodes(graph, node_handles.as_mut_ptr(), &mut nodes) },
+        ffi::CUDA_SUCCESS,
+        "read cuBLAS graph nodes"
+    );
+    let mut graph_exec = std::ptr::null_mut();
+    assert_eq!(
+        // SAFETY: both graph handles are valid and the output pointer is writable.
+        unsafe { ffi::cuGraphInstantiateWithFlags(&mut graph_exec, graph, 0) },
+        ffi::CUDA_SUCCESS,
+        "instantiate cuBLAS graph"
+    );
+    let free_after = context.memory_info().expect("free memory after capture").0;
+    let pool_bytes = free_before.saturating_sub(free_after);
+
+    assert_eq!(
+        // SAFETY: graph execution was never launched and the executable is live.
+        unsafe { ffi::cuGraphExecDestroy(graph_exec) },
+        ffi::CUDA_SUCCESS,
+        "destroy cuBLAS graph executable"
+    );
+    assert_eq!(
+        // SAFETY: the graph is live and its executable was destroyed first.
+        unsafe { ffi::cuGraphDestroy(graph) },
+        ffi::CUDA_SUCCESS,
+        "destroy cuBLAS graph"
+    );
+    assert_eq!(
+        // SAFETY: no operation is in flight through this handle.
+        unsafe { ffi::cublasDestroy_v2(handle) },
+        ffi::CUBLAS_STATUS_SUCCESS,
+        "destroy cuBLAS measurement handle"
+    );
+    assert_eq!(
+        // SAFETY: no graph capture or work remains on this stream.
+        unsafe { ffi::cuStreamDestroy_v2(stream) },
+        ffi::CUDA_SUCCESS,
+        "destroy cuBLAS measurement stream"
+    );
+    CublasGraphMeasure { nodes, pool_bytes }
+}
+
+#[cfg(feature = "cublas")]
+#[test]
+fn cublas_linear_holds_the_quantized_gate() {
+    let _guard = one_at_a_time();
+    let count = device_count().expect("enumerate CUDA devices");
+    assert!(
+        count >= 3,
+        "requires both 3090s and the 5060 Ti; saw {count}"
+    );
+    for ordinal in 0..count {
+        let context = RankContext::acquire(RankId(ordinal), ordinal)
+            .expect("acquire cuBLAS qualification context");
+        let capability = query_device(ordinal).expect("query cuBLAS qualification GPU");
+        let stream = Stream::new(&context).expect("create cuBLAS qualification stream");
+        for (rows, in_features, out_features, seed) in [
+            (1u64, 5_376u64, 21_504u64, 0x518f_53a9),
+            (33, 1_024, 3_072, 0xc4d2_81b7),
+            (512, 4_096, 4_096, 0x3a9e_74c1),
+        ] {
+            let input_bits = bf16_test_values((rows * in_features) as usize, seed);
+            let weight_bits =
+                bf16_test_values((out_features * in_features) as usize, seed ^ 0x7f4a);
+            let mut weight =
+                DeviceBuffer::alloc(&context, weight_bits.len() * std::mem::size_of::<u16>())
+                    .expect("allocate BF16 weight");
+            let mut input =
+                DeviceBuffer::alloc(&context, input_bits.len() * std::mem::size_of::<u16>())
+                    .expect("allocate BF16 input");
+            let output_len = (rows * out_features) as usize;
+            let output = DeviceBuffer::alloc(&context, output_len * 2).expect("allocate output");
+            let workspace =
+                DeviceBuffer::alloc(&context, 32 * 1024 * 1024).expect("allocate cuBLAS workspace");
+            weight
+                .copy_from_host(&bf16_le_bytes(&weight_bits))
+                .expect("upload BF16 weight");
+            input
+                .copy_from_host(&bf16_le_bytes(&input_bits))
+                .expect("upload BF16 input");
+            let mut blas = Blas::new(&context).expect("create cuBLAS handle");
+            // SAFETY: the stream and 32 MiB range were allocated by this context.
+            unsafe {
+                blas.bind(&stream, workspace.device_ptr(), workspace.len())
+                    .expect("bind cuBLAS stream and workspace");
+            }
+            // SAFETY: admitted scratch buffers hold the stated contiguous BF16 matrices.
+            unsafe {
+                blas.gemm_bf16(
+                    out_features,
+                    rows,
+                    in_features,
+                    weight.device_ptr(),
+                    in_features,
+                    input.device_ptr(),
+                    in_features,
+                    output.device_ptr(),
+                    out_features,
+                )
+                .expect("submit BF16 GEMM");
+            }
+            stream.synchronize().expect("synchronize BF16 GEMM");
+
+            let mut output_bytes = vec![0u8; output_len * 2];
+            output
+                .copy_to_host(&mut output_bytes)
+                .expect("read BF16 output");
+            let outputs: Vec<_> = output_bytes
+                .chunks_exact(2)
+                .map(|word| u16::from_le_bytes([word[0], word[1]]))
+                .collect();
+            let input_f32: Vec<_> = input_bits.iter().copied().map(bf16_bits_to_f32).collect();
+            let weight_f32: Vec<_> = weight_bits.iter().copied().map(bf16_bits_to_f32).collect();
+            let (worst_ulp, second_clause) = check_bf16_linear_rows(
+                &input_f32,
+                &weight_f32,
+                &outputs,
+                rows as usize,
+                in_features as usize,
+                out_features as usize,
+                capability.uuid,
+            );
+            let capture = measure_cublas_graph(
+                &context,
+                rows,
+                in_features,
+                out_features,
+                weight.device_ptr(),
+                input.device_ptr(),
+                output.device_ptr(),
+                workspace.device_ptr(),
+                workspace.len(),
+            );
+            println!(
+                "cublas-capture gpu={} rows={rows} input={in_features} output={out_features} nodes={} pool_bytes={}",
+                capability.uuid, capture.nodes, capture.pool_bytes
+            );
+            // SAFETY: stream completion was observed and no graph launch remains.
+            let destroyed = unsafe { blas.destroy() };
+            assert_eq!(
+                destroyed,
+                Ok(()),
+                "destroy cuBLAS after observed completion"
+            );
+            println!(
+                "cublas-linear-gate gpu={} rows={rows} input={in_features} output={out_features} worst_ulp={worst_ulp} second_clause={second_clause}",
+                capability.uuid
+            );
+        }
+        drop(stream);
+        drop(context);
+    }
+}
+
+#[cfg(feature = "cublas")]
+fn logits_from_bytes(bytes: &[u8]) -> Vec<f32> {
+    assert_eq!(bytes.len() % 4, 0, "FP32 logits use whole words");
+    bytes
+        .chunks_exact(4)
+        .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .collect()
+}
+
+#[cfg(feature = "cublas")]
+fn greedy_rows(logits: &[f32], rows: usize, vocabulary: usize) -> Vec<usize> {
+    (0..rows)
+        .map(|row| {
+            let start = row * vocabulary;
+            (0..vocabulary)
+                .max_by(|&left, &right| {
+                    logits[start + left]
+                        .partial_cmp(&logits[start + right])
+                        .expect("finite logits compare")
+                })
+                .expect("nonempty vocabulary")
+        })
+        .collect()
+}
+
+#[cfg(feature = "cublas")]
+fn bf16_output_worst_ulp(expected: &[f32], actual: &[f32]) -> u32 {
+    assert_eq!(expected.len(), actual.len());
+    expected
+        .iter()
+        .zip(actual)
+        .map(|(&expected, &actual)| {
+            bf16_monotone(f32_to_bf16_bits(expected))
+                .abs_diff(bf16_monotone(f32_to_bf16_bits(actual)))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "cublas")]
+#[test]
+fn unordered_cublas_shape_a_matches_ordered_greedy_eager_and_capture() {
+    let _guard = one_at_a_time();
+    let count = device_count().expect("enumerate CUDA devices");
+    assert!(
+        count >= 3,
+        "requires both 3090s and the 5060 Ti; saw {count}"
+    );
+    let shape = moxie_cli::gemma::Shape::A;
+    let config = shape.config();
+    let fixture = moxie_cli::gemma::build(shape).expect("build dense Gemma Shape A");
+    let prompt: Vec<_> = (0..5).map(|row| row % config.vocab).collect();
+    let decode = [5 % config.vocab];
+    let positions: Vec<_> = (0..prompt.len() as u64).collect();
+    let decode_position = [prompt.len() as u64];
+
+    for ordinal in 0..count {
+        let capability = query_device(ordinal).expect("query dense GPU");
+        let context =
+            RankContext::acquire(RankId(ordinal), ordinal).expect("acquire dense GPU context");
+        let stream = Stream::new(&context).expect("create dense GPU stream");
+        let workload = |rows, visible_tokens| ResourceWorkload {
+            phase: if rows == 1 {
+                Phase::Decode
+            } else {
+                Phase::Prefill
+            },
+            rows,
+            visible_tokens,
+            branch_rows: rows,
+            output: fixture.graph.output(),
+            device: capability.uuid,
+            paged_state_capacity: None,
+        };
+        let ordered_catalogue = moxie_kernels::dense_graph_catalogue();
+        let sm = moxie_types::SmVersion {
+            major: capability.compute_major,
+            minor: capability.compute_minor,
+        };
+        let unordered_catalogue = moxie_kernels::dense_graph_catalogue_unordered(sm);
+        let run = |catalogue: &moxie_types::KernelCatalogue| {
+            let prefill = lower_selected(
+                &fixture.graph,
+                workload(prompt.len() as u64, prompt.len() as u64),
+                &capability,
+                catalogue,
+            )
+            .expect("lower Shape A prefill");
+            let decode_plan = lower_selected(
+                &fixture.graph,
+                workload(1, prompt.len() as u64 + 1),
+                &capability,
+                catalogue,
+            )
+            .expect("lower Shape A decode");
+            run_prefill_decode(
+                prefill,
+                decode_plan,
+                &fixture.graph,
+                &capability,
+                catalogue,
+                &config,
+                &context,
+                &stream,
+                prompt.len(),
+                stage_bindings(&fixture, None, &prompt, &positions, &capability),
+                stage_bindings(&fixture, None, &decode, &decode_position, &capability),
+                None,
+                &[],
+                false,
+                0,
+            )
+        };
+        let ordered = run(&ordered_catalogue);
+        let unordered = run(&unordered_catalogue);
+        let vocabulary = config.vocab as usize;
+        for (phase, rows, expected_bytes, actual_bytes) in [
+            ("prefill", prompt.len(), &ordered.0, &unordered.0),
+            ("decode", 1usize, &ordered.1, &unordered.1),
+        ] {
+            let expected = logits_from_bytes(expected_bytes);
+            let actual = logits_from_bytes(actual_bytes);
+            assert!(expected.iter().all(|value| value.is_finite()));
+            assert!(actual.iter().all(|value| value.is_finite()));
+            assert_eq!(
+                greedy_rows(&expected, rows, vocabulary),
+                greedy_rows(&actual, rows, vocabulary),
+                "ordered and cuBLAS greedy tokens match for {phase} on {}",
+                capability.uuid
+            );
+            println!(
+                "cublas-shape-a gpu={} phase={phase} worst_bf16_ulp={}",
+                capability.uuid,
+                bf16_output_worst_ulp(&expected, &actual)
+            );
+        }
+        drop(stream);
+        drop(context);
+    }
+}
+
+#[cfg(all(feature = "cublas", feature = "paged-attention-test-hooks"))]
+#[test]
+fn cublas_plan_quarantines_unobserved_handle_and_closes_once() {
+    let _guard = one_at_a_time();
+    let count = device_count().expect("enumerate CUDA devices");
+    assert!(count >= 2, "requires a 3090; saw {count}");
+    let ordinal = 1;
+    let capability = query_device(ordinal).expect("query 3090");
+    let context =
+        RankContext::acquire(RankId(ordinal), ordinal).expect("acquire cuBLAS ownership context");
+    let stream = Stream::new(&context).expect("create ownership stream");
+    let shape = moxie_cli::gemma::Shape::A;
+    let config = shape.config();
+    let fixture = moxie_cli::gemma::build(shape).expect("build ownership fixture");
+    let catalogue = moxie_kernels::dense_graph_catalogue_unordered(moxie_types::SmVersion {
+        major: capability.compute_major,
+        minor: capability.compute_minor,
+    });
+    let tokens = [0u64];
+    let positions = [0u64];
+    let workload = ResourceWorkload {
+        phase: Phase::Prefill,
+        rows: 1,
+        visible_tokens: 1,
+        branch_rows: 1,
+        output: fixture.graph.output(),
+        device: capability.uuid,
+        paged_state_capacity: None,
+    };
+    let destroyed_before = moxie_cuda::blas::destroy_calls();
+    {
+        let state = DeviceKvSequence::new(geometry(&config, 4, 8, 1)).expect("device state");
+        let mut ledger = measured_ledger(&context);
+        let mut runs = admit_runs(&mut ledger, &context, &config, &state, 1);
+        let candidate = lower_selected(&fixture.graph, workload, &capability, &catalogue)
+            .expect("lower unobserved step");
+        let plan = SelectedReservedPlan::admit(
+            candidate,
+            &fixture.graph,
+            &capability,
+            &catalogue,
+            &mut ledger,
+            &context,
+        )
+        .unwrap_or_else(|refused| panic!("admit unobserved plan: {refused:?}"));
+        let mut state = state;
+        let transaction = state.begin().expect("begin unobserved transaction");
+        let lease = plan
+            .execute_dense(DenseGraphStep {
+                graph: &fixture.graph,
+                capability: &capability,
+                catalogue: &catalogue,
+                ctx: &context,
+                stream: &stream,
+                state: &mut state,
+                transaction,
+                runs: &mut runs,
+                bindings: stage_bindings(&fixture, None, &tokens, &positions, &capability),
+                host_experts: &[],
+            })
+            .unwrap_or_else(|refused| panic!("submit unobserved step: {}", refused.error));
+        drop(lease);
+        assert_eq!(
+            moxie_cuda::blas::destroy_calls(),
+            destroyed_before,
+            "dropping an unobserved plan does not destroy cuBLAS"
+        );
+        std::mem::forget((state, runs, ledger));
+    }
+
+    let prompt = [0u64];
+    let decode = [1u64];
+    let prompt_positions = [0u64];
+    let decode_positions = [1u64];
+    let prefill_candidate = lower_selected(&fixture.graph, workload, &capability, &catalogue)
+        .expect("lower completed prefill");
+    let decode_candidate = lower_selected(
+        &fixture.graph,
+        ResourceWorkload {
+            phase: Phase::Decode,
+            rows: 1,
+            visible_tokens: 2,
+            branch_rows: 1,
+            ..workload
+        },
+        &capability,
+        &catalogue,
+    )
+    .expect("lower completed decode");
+    let before_close = moxie_cuda::blas::destroy_calls();
+    let _ = run_prefill_decode(
+        prefill_candidate,
+        decode_candidate,
+        &fixture.graph,
+        &capability,
+        &catalogue,
+        &config,
+        &context,
+        &stream,
+        1,
+        stage_bindings(&fixture, None, &prompt, &prompt_positions, &capability),
+        stage_bindings(&fixture, None, &decode, &decode_positions, &capability),
+        None,
+        &[],
+        false,
+        0,
+    );
+    assert_eq!(
+        moxie_cuda::blas::destroy_calls() - before_close,
+        2,
+        "two normally closed plans each destroy one cuBLAS handle"
+    );
 }
 
 #[test]

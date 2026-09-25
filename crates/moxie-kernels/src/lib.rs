@@ -223,6 +223,8 @@ mod images {
     pub const AFFINE_LINEAR_FATBIN_SHA256: &str = env!("MOXIE_AFFINE_LINEAR_FATBIN_SHA256");
     pub const PAGED_ATTENTION_FATBIN_SHA256: &str = env!("MOXIE_PAGED_ATTENTION_FATBIN_SHA256");
     pub const DENSE_GRAPH_FATBIN_SHA256: &str = env!("MOXIE_DENSE_GRAPH_FATBIN_SHA256");
+    #[cfg(feature = "cublas")]
+    pub const CUBLAS_SO_SHA256: &str = env!("MOXIE_CUBLAS_SO_SHA256");
     /// What `nvcc --version` reported, verified against the pin in `build.rs`.
     pub const NVCC_VERSION: &str = env!("MOXIE_NVCC_VERSION");
     /// The host compiler nvcc drove. Recorded, not pinned.
@@ -801,6 +803,42 @@ mod images {
         KernelCatalogue::new(descriptors).expect("built-in dense descriptors are unique")
     }
 
+    /// The dense package with this architecture's BF16 Linear backed by cuBLAS.
+    #[cfg(feature = "cublas")]
+    pub fn dense_graph_catalogue_unordered(sm: SmVersion) -> KernelCatalogue {
+        let bf16 = KernelOperand::Activation(ActivationPrecision::expect(Precision::Bf16));
+        let weight = KernelOperand::Weight(WeightPrecision::expect(Precision::Bf16));
+        let mut descriptors = dense_graph_catalogue().descriptors().to_vec();
+        let selected = descriptors
+            .iter_mut()
+            .find(|descriptor| {
+                descriptor.operation == SemanticKernelOp::Linear
+                    && descriptor.sm == sm
+                    && descriptor.inputs.as_slice() == [bf16, weight]
+            })
+            .expect("built-in dense catalogue has one BF16 Linear for each target SM");
+        *selected = SemanticKernelDescriptor {
+            id: KernelId(format!("bf16-linear-cublas-v1-{}", sm.name())),
+            abi_version: DENSE_GRAPH_ABI,
+            operation: SemanticKernelOp::Linear,
+            inputs: vec![bf16, weight],
+            output: ActivationPrecision::expect(Precision::Bf16),
+            accumulation: AccumulationPolicy::Bf16InF32AccUnordered,
+            rounding: RoundingProfile::FinalBf16Rne,
+            layout: TensorLayout::ContiguousRowMajorV1,
+            shape: KernelShapeBounds {
+                max_rows: 65_536,
+                max_input: 65_536,
+                max_output: 262_144,
+            },
+            sm,
+            workspace: WorkspaceExpression::Zero,
+            image_sha256: cublas_sha256(),
+            symbols: vec![KernelSymbol("cublas:gemm_ex".to_string())],
+        };
+        KernelCatalogue::new(descriptors).expect("built-in unordered dense descriptors are unique")
+    }
+
     fn descriptor(
         id: String,
         operation: SemanticKernelOp,
@@ -839,6 +877,11 @@ mod images {
         parse_sha256(PAGED_ATTENTION_FATBIN_SHA256)
     }
 
+    #[cfg(feature = "cublas")]
+    pub fn cublas_sha256() -> [u8; 32] {
+        parse_sha256(CUBLAS_SO_SHA256)
+    }
+
     fn parse_sha256(value: &str) -> [u8; 32] {
         assert_eq!(value.len(), 64, "build emitted malformed SHA-256");
         let mut out = [0u8; 32];
@@ -870,6 +913,9 @@ pub use images::{
     SMOKE_FATBIN_SM86_SHA256, affine_linear_catalogue, axpy_capability, bf16_chain_catalogue,
     compiled_sm, dense_graph_catalogue, expert_mlp_catalogue, paged_attention_catalogue,
 };
+
+#[cfg(all(feature = "fatbin", feature = "cublas"))]
+pub use images::{CUBLAS_SO_SHA256, cublas_sha256, dense_graph_catalogue_unordered};
 
 #[cfg(test)]
 mod tests {

@@ -5,9 +5,13 @@
 use core::ffi::c_void;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(feature = "cublas")]
+use moxie_cuda::Blas;
 use moxie_cuda::{
     CapturedGraph, Event, Module, ModuleImage, RankContext, ResolvedModule, Stream, TrustedImage,
 };
+#[cfg(feature = "paged-attention-binding")]
+use moxie_graph::NodeId;
 use moxie_memory::{
     AdmitError, BufferRequest, Ledger, LedgerId, PlanRequest, Reservation, StageSpan,
 };
@@ -159,20 +163,32 @@ pub struct ChainResult<'ctx> {
 #[derive(Debug)]
 pub struct SelectedReservedPlan<'ctx> {
     candidate: SelectedPlanCandidate,
+    /// Ordinary Drop quarantines the arena; `close` tears it down explicitly.
     arena: Option<DeviceArena<'ctx>>,
+    /// Ordinary Drop forgets these ranges with their arena allocation.
     ranges: BTreeMap<(StorageRegion, u32), DeviceRange<'ctx>>,
     bound_weights: BTreeMap<ValueId, OwnedBinding>,
     resident_weights: BTreeMap<ValueId, u64>,
     /// Captured segments must be dropped before the module whose functions
     /// they reference.
+    /// Ordinary Drop forgets graphs; `close` clears them before module teardown.
     pub(crate) captured: Vec<CapturedGraph<'ctx>>,
     pub(crate) capture_enabled: bool,
     graph_reservation: Option<Reservation>,
     graph_pool_bytes: u64,
     /// The dense kernel module, loaded by the first dense step and dropped
     /// with the plan, so it is never unloaded while a step's kernels may still
-    /// run.
+    /// run. Ordinary Drop forgets it; `close` explicitly drops it after graphs.
     pub(crate) package: Option<ResolvedModule<'ctx>>,
+    /// CUDA symbols only; backend pseudo-symbols are omitted.
+    #[cfg(feature = "paged-attention-binding")]
+    pub(crate) module_symbols: Vec<String>,
+    /// First module-symbol index for each selected node.
+    #[cfg(feature = "paged-attention-binding")]
+    pub(crate) symbol_indices: BTreeMap<NodeId, usize>,
+    /// Ordinary Drop forgets the handle; close destroys it between graphs and module.
+    #[cfg(feature = "cublas")]
+    pub(crate) blas: Option<Blas<'ctx>>,
     ledger: LedgerId,
 }
 
@@ -468,6 +484,8 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                 }
             }
         }
+        #[cfg(feature = "paged-attention-binding")]
+        let (module_symbols, symbol_indices) = selected_module_symbols(&candidate);
         Ok(Self {
             candidate,
             arena: Some(arena),
@@ -479,6 +497,12 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             graph_reservation: None,
             graph_pool_bytes: 0,
             package: None,
+            #[cfg(feature = "paged-attention-binding")]
+            module_symbols,
+            #[cfg(feature = "paged-attention-binding")]
+            symbol_indices,
+            #[cfg(feature = "cublas")]
+            blas: None,
             ledger: ledger.id(),
         })
     }
@@ -767,6 +791,15 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             self.graph_pool_bytes = 0;
             self.capture_enabled = false;
         }
+        #[cfg(feature = "cublas")]
+        if let Some(blas) = self.blas.take() {
+            // SAFETY: submitted dense work returns the plan only after its
+            // completion event is observed; lost leases withhold the plan.
+            if let Err(error) = unsafe { blas.destroy() } {
+                return Err(SelectedCloseRefused { plan: self, error });
+            }
+        }
+        drop(self.package.take());
         while let Some((key, range)) = self.ranges.pop_last() {
             let arena = self.arena.as_mut().expect("open plan has arena");
             if let Err(RangeReleaseRefused { range, error }) = arena.release(range) {
@@ -799,6 +832,35 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         self.ranges
             .get(&(StorageRegion::Workspace, 0))
             .ok_or_else(|| invalid("workspace", "selected workspace range is absent"))
+    }
+
+    #[cfg(feature = "cublas")]
+    pub(crate) fn blas_workspace(&self) -> Result<(u64, usize)> {
+        let offset = self
+            .candidate
+            .blas_workspace_offset()
+            .ok_or_else(|| invalid("workspace", "selected plan has no cuBLAS workspace"))?;
+        let workspace_bytes = self
+            .candidate
+            .blas_workspace_bytes()
+            .ok_or_else(|| invalid("workspace", "selected plan has no cuBLAS workspace"))?;
+        let end = offset
+            .checked_add(workspace_bytes)
+            .ok_or_else(|| invalid("workspace", "cuBLAS workspace extent overflowed"))?;
+        let range = self.workspace_range()?;
+        if end > range.bytes() {
+            return Err(invalid(
+                "workspace",
+                "cuBLAS workspace exceeds the selected workspace range",
+            ));
+        }
+        let address = range
+            .device_address()?
+            .checked_add(offset)
+            .ok_or_else(|| invalid("workspace", "cuBLAS workspace address overflowed"))?;
+        let bytes = usize::try_from(workspace_bytes)
+            .map_err(|_| invalid("workspace", "cuBLAS workspace size is not addressable"))?;
+        Ok((address, bytes))
     }
 
     #[cfg_attr(not(feature = "paged-attention-binding"), allow(dead_code))]
@@ -855,6 +917,57 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         Ok(())
     }
 }
+
+impl Drop for SelectedReservedPlan<'_> {
+    fn drop(&mut self) {
+        // A plan dropped without `close` has no proof that submitted work is
+        // settled. Each field below is withheld or has an inert Drop so it
+        // cannot unload or free a resource still reachable by device work.
+        // CapturedGraph::drop destroys graph executables, so quarantine graphs.
+        std::mem::forget(std::mem::take(&mut self.captured));
+        #[cfg(feature = "cublas")]
+        // Blas deliberately has no Drop; dropping this wrapper leaks its handle.
+        let _ = self.blas.take();
+        if let Some(package) = self.package.take() {
+            // ResolvedModule::drop unloads the CUDA module.
+            std::mem::forget(package);
+        }
+        // DeviceRange and DeviceArena drop free device allocations; keep the
+        // ledger reservation below charged while their allocations are held.
+        std::mem::forget(std::mem::take(&mut self.ranges));
+        // Reservation has no releasing Drop; the ledger stays charged until
+        // explicit close releases this token.
+        self.graph_reservation.take();
+        if let Some(arena) = self.arena.take() {
+            std::mem::forget(arena);
+        }
+    }
+}
+
+#[cfg(feature = "paged-attention-binding")]
+fn selected_module_symbols(
+    candidate: &SelectedPlanCandidate,
+) -> (Vec<String>, BTreeMap<NodeId, usize>) {
+    let mut symbols = Vec::new();
+    let mut indices = BTreeMap::new();
+    for node in candidate.nodes() {
+        for symbol in &node.descriptor.symbols {
+            if symbol.0.starts_with("cublas:") {
+                continue;
+            }
+            indices.entry(node.node).or_insert(symbols.len());
+            symbols.push(symbol.0.clone());
+        }
+    }
+    (symbols, indices)
+}
+
+// CUDA 13.1 raw captures measured cublasGemmEx at (rows,in,out) 1x5376x21504,
+// 33x1024x3072 and 512x4096x4096: nodes were [1,1,1] on GPU-97fe4889-4874-a378-198e-955d2e72c4a3,
+// and [2,1,1] on both GPU-3032cfa3-19df-028f-5ebd-43314911e0b9 and
+// GPU-81fe4578-59b2-37c4-421e-287cdac78704; every cuMemGetInfo pool delta was 0 bytes.
+// Four nodes charges 32 KiB/call at the existing 8 KiB per-node graph bound.
+const CUBLAS_CAPTURE_NODE_BOUND: u64 = 4;
 
 impl<'ctx> OperationLease<SelectedCompletion<'ctx>, ChainOperation<'ctx>> {
     #[allow(clippy::result_large_err)]
@@ -964,8 +1077,17 @@ fn captured_graph_counts(candidate: &SelectedPlanCandidate) -> Result<(u64, u64)
                 .ok_or_else(|| invalid("capture", "segment count overflowed"))?;
             in_segment = true;
         }
-        let node_kernels = u64::try_from(node.descriptor.symbols.len())
-            .map_err(|_| invalid("capture", "kernel count exceeds u64"))?;
+        let node_kernels = if node
+            .descriptor
+            .symbols
+            .iter()
+            .any(|symbol| symbol.0.starts_with("cublas:"))
+        {
+            CUBLAS_CAPTURE_NODE_BOUND
+        } else {
+            u64::try_from(node.descriptor.symbols.len())
+                .map_err(|_| invalid("capture", "kernel count exceeds u64"))?
+        };
         kernels = kernels
             .checked_add(node_kernels)
             .ok_or_else(|| invalid("capture", "kernel count overflowed"))?;

@@ -15,6 +15,8 @@ use moxie_graph::{Graph, NodeId, OpParams, RopeLayout, ValueId, ValueRole};
 use moxie_kernels::cpu_expert::{ExpertAssignment, ExpertShape, ExpertTiling};
 use moxie_plan::{HostExpertJoin, SelectedNode, Visibility, WeightFormat};
 use moxie_state::DeviceKvSequence;
+#[cfg(feature = "cublas")]
+use moxie_types::{AccumulationPolicy, SmVersion};
 use moxie_types::{
     DeviceCapability, Error, GateTransform, KernelCatalogue, Precision, Result, SemanticKernelOp,
     StateTransactionId,
@@ -141,9 +143,18 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             error,
             held: None,
         };
+        #[cfg(feature = "cublas")]
+        let sm = SmVersion {
+            major: capability.compute_major,
+            minor: capability.compute_minor,
+        };
+        let known_catalogue = catalogue.digest() == moxie_kernels::dense_graph_catalogue().digest();
+        #[cfg(feature = "cublas")]
+        let known_catalogue = known_catalogue
+            || catalogue.digest() == moxie_kernels::dense_graph_catalogue_unordered(sm).digest();
         if !self.candidate().is_dense()
             || !self.candidate().matches(graph, capability, catalogue)
-            || catalogue.digest() != moxie_kernels::dense_graph_catalogue().digest()
+            || !known_catalogue
             || ctx.uuid() != capability.uuid
             || stream.device_uuid() != capability.uuid
         {
@@ -153,6 +164,10 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                 invalid("execution", "admitted dense graph identity changed"),
             ));
         }
+        #[cfg(feature = "cublas")]
+        if let Err(error) = validate_cublas_descriptors(self.candidate()) {
+            return Err(reject(self, bindings, error));
+        }
         if let Err(error) =
             validate_host_expert_weights(graph, self.candidate().host_expert_joins(), host_experts)
         {
@@ -161,18 +176,8 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         if let Err(error) = validate_bindings_except(&self, graph, &bindings, resident) {
             return Err(reject(self, bindings, error));
         }
-        if self.package.is_none() {
-            let symbols: Vec<String> = self
-                .candidate()
-                .nodes()
-                .iter()
-                .flat_map(|node| {
-                    node.descriptor
-                        .symbols
-                        .iter()
-                        .map(|symbol| symbol.0.clone())
-                })
-                .collect();
+        if self.package.is_none() && !self.module_symbols.is_empty() {
+            let symbols = self.module_symbols.clone();
             // SAFETY: this is the nvcc output embedded by this build, and selection
             // above binds the plan to the dense catalogue's image identity.
             let trusted =
@@ -188,6 +193,29 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                 Err(error) => return Err(reject(self, bindings, error)),
             };
             self.package = Some(package);
+        }
+        #[cfg(feature = "cublas")]
+        if self.candidate().nodes().iter().any(is_cublas_node) {
+            let (workspace, bytes) = match self.blas_workspace() {
+                Ok(value) => value,
+                Err(error) => return Err(reject(self, bindings, error)),
+            };
+            if self.blas.is_none() {
+                self.blas = match moxie_cuda::Blas::new(ctx) {
+                    Ok(blas) => Some(blas),
+                    Err(error) => return Err(reject(self, bindings, error)),
+                };
+            }
+            // SAFETY: the selected plan owns this workspace and the step's event
+            // retains it with the handle through observed completion.
+            if let Err(error) = unsafe {
+                self.blas
+                    .as_mut()
+                    .expect("cuBLAS handle was created")
+                    .bind(stream, workspace, bytes)
+            } {
+                return Err(reject(self, bindings, error));
+            }
         }
         let operation = DenseOperation {
             plan: Some(self),
@@ -462,7 +490,6 @@ fn enqueue_dense_segments<'ctx>(
     // A tensor-parallel stage without RoPE has no position input.
     let positions = || positions_value.ok_or_else(|| invalid("positions", "no position input"));
     let mut attention_index = 0usize;
-    let mut symbol_index = 0usize;
     upload_sources(lease, stream)?;
     upload_rope_tables(lease, graph, rows, stream)?;
     let selected_nodes = lease
@@ -475,10 +502,25 @@ fn enqueue_dense_segments<'ctx>(
         .to_vec();
 
     for (node, selected) in graph.nodes().iter().zip(selected_nodes.iter()) {
-        let base = symbol_index;
-        symbol_index = symbol_index
-            .checked_add(selected.descriptor.symbols.len())
-            .ok_or_else(|| invalid("symbols", "dense symbol index overflowed"))?;
+        let plan = lease
+            .resource()
+            .plan
+            .as_ref()
+            .expect("dense operation retains plan");
+        #[cfg(feature = "cublas")]
+        let cublas_node = is_cublas_node(selected);
+        #[cfg(not(feature = "cublas"))]
+        let cublas_node = false;
+        let base = match plan.symbol_indices.get(&node.id).copied() {
+            Some(index) => index,
+            None if cublas_node => 0,
+            None => {
+                return Err(invalid(
+                    "symbols",
+                    "selected node has no module symbol index",
+                ));
+            }
+        };
         match node.params {
             OpParams::Embedding {
                 vocab,
@@ -526,13 +568,31 @@ fn enqueue_dense_segments<'ctx>(
                 out_features,
                 bias: false,
             } => {
-                let candidate = lease
+                if cublas_node {
+                    #[cfg(feature = "cublas")]
+                    {
+                        launch_cublas_linear(
+                            lease,
+                            stream,
+                            rows,
+                            in_features,
+                            out_features,
+                            node,
+                            selected,
+                        )?;
+                        push_launch(lease, "linear");
+                    }
+                    #[cfg(not(feature = "cublas"))]
+                    return Err(invalid("linear", "the cuBLAS backend is not enabled"));
+                } else if let Some(format) = lease
                     .resource()
                     .plan
                     .as_ref()
                     .expect("dense operation retains plan")
-                    .candidate();
-                if let Some(format) = candidate.weight_formats().get(&node.inputs[1]) {
+                    .candidate()
+                    .weight_formats()
+                    .get(&node.inputs[1])
+                {
                     let WeightFormat::Affine {
                         width,
                         group,
@@ -1668,6 +1728,79 @@ fn launch<'ctx>(
     }
 }
 
+#[cfg(feature = "cublas")]
+fn launch_cublas_linear<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    stream: &Stream<'ctx>,
+    rows: u64,
+    in_features: u64,
+    out_features: u64,
+    node: &moxie_graph::Node,
+    selected: &SelectedNode,
+) -> Result<()> {
+    let (mode, open, segment) = {
+        let operation = lease.resource();
+        (operation.mode, operation.open, operation.segment)
+    };
+    if mode == DenseStepMode::Replay {
+        if open {
+            return Ok(());
+        }
+        let captured = lease
+            .resource()
+            .plan
+            .as_ref()
+            .expect("dense operation retains plan")
+            .captured
+            .get(segment)
+            .ok_or_else(|| invalid("capture", "replay has no captured segment"))?;
+        // SAFETY: the plan retains graph, module, and all captured buffers
+        // through the completion event recorded by this dense step.
+        unsafe { captured.launch(stream)? };
+        lease.resource_mut().open = true;
+        return Ok(());
+    }
+    if mode == DenseStepMode::Capture && !open {
+        stream.begin_capture()?;
+        lease.resource_mut().open = true;
+    }
+    let plan = lease
+        .resource()
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan");
+    let input = address(lease.resource(), node.inputs[0])?;
+    let weight = address(lease.resource(), node.inputs[1])?;
+    let output = address(lease.resource(), node.output)?;
+    // Row-major Y = X * W^T is column-major Y^T = W * X^T.
+    // SAFETY: the plan owns all three admitted BF16 ranges and the bound
+    // workspace; its completion event retains the plan through GEMM completion.
+    unsafe {
+        plan.blas
+            .as_ref()
+            .expect("cuBLAS handle was bound before dense submission")
+            .gemm_bf16(
+                out_features,
+                rows,
+                in_features,
+                weight,
+                in_features,
+                input,
+                in_features,
+                output,
+                out_features,
+            )
+    }
+    .map_err(|error| {
+        attribute_node_error(
+            error,
+            lease.resource().device_ordinal,
+            selected,
+            "cublas:gemm_ex",
+        )
+    })
+}
+
 fn push_launch<'ctx>(
     lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
     name: &str,
@@ -2284,6 +2417,32 @@ fn capacity(bytes: usize) -> Error {
         requested_bytes: bytes as u64,
         available_bytes: 0,
     }
+}
+
+#[cfg(feature = "cublas")]
+fn is_cublas_node(node: &SelectedNode) -> bool {
+    node.descriptor
+        .symbols
+        .iter()
+        .any(|symbol| symbol.0.starts_with("cublas:"))
+}
+
+#[cfg(feature = "cublas")]
+fn validate_cublas_descriptors(candidate: &moxie_plan::SelectedPlanCandidate) -> Result<()> {
+    for node in candidate.nodes().iter().filter(|node| is_cublas_node(node)) {
+        if node.descriptor.operation != SemanticKernelOp::Linear
+            || node.descriptor.symbols.len() != 1
+            || node.descriptor.symbols[0].0 != "cublas:gemm_ex"
+            || node.descriptor.image_sha256 != moxie_kernels::cublas_sha256()
+            || node.descriptor.accumulation != AccumulationPolicy::Bf16InF32AccUnordered
+        {
+            return Err(invalid(
+                "catalogue",
+                "cuBLAS backend symbol, Linear operation, accumulation, or image identity changed",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn invalid(field: &'static str, detail: impl Into<String>) -> Error {

@@ -187,6 +187,8 @@ role_precision!(
 pub enum AccumulationPolicy {
     /// 16-bit inputs, FP32 accumulator. The default linear contract.
     Bf16InF32Acc,
+    /// 16-bit inputs, FP32 accumulator in hardware order (tensor-op); held to ADR 0028 against the ordered oracle (ADR 0037).
+    Bf16InF32AccUnordered,
     /// FP32 throughout, for sensitive tensors and model-required state.
     F32,
 }
@@ -194,7 +196,9 @@ pub enum AccumulationPolicy {
 impl AccumulationPolicy {
     pub const fn accumulator(self) -> Precision {
         match self {
-            AccumulationPolicy::Bf16InF32Acc | AccumulationPolicy::F32 => Precision::F32,
+            AccumulationPolicy::Bf16InF32Acc
+            | AccumulationPolicy::Bf16InF32AccUnordered
+            | AccumulationPolicy::F32 => Precision::F32,
         }
     }
 }

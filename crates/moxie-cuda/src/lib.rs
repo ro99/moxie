@@ -31,6 +31,9 @@ pub use status::{CUDA_SUCCESS, CUresult, classify};
 #[cfg(feature = "driver")]
 pub mod ffi;
 
+#[cfg(feature = "cublas")]
+pub mod blas;
+
 #[cfg(feature = "driver")]
 mod driver;
 
@@ -40,3 +43,6 @@ pub use driver::{
     PeerReadHandle, PeerReadOwner, PinnedHostBuffer, PtxSource, RankContext, ResolvedModule,
     Stream, TrustedImage, device_count, init, query_device,
 };
+
+#[cfg(feature = "cublas")]
+pub use blas::Blas;

@@ -28,6 +28,47 @@ pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 pub type CUgraph = *mut c_void;
 pub type CUgraphExec = *mut c_void;
+pub type CUgraphNode = *mut c_void;
+
+#[cfg(feature = "cublas")]
+pub type cublasHandle_t = *mut c_void;
+
+#[cfg(feature = "cublas")]
+pub type cublasStatus_t = c_int;
+
+#[cfg(feature = "cublas")]
+pub const CUBLAS_STATUS_SUCCESS: cublasStatus_t = 0;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_STATUS_NOT_INITIALIZED: cublasStatus_t = 1;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_STATUS_ALLOC_FAILED: cublasStatus_t = 3;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_STATUS_INVALID_VALUE: cublasStatus_t = 7;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_STATUS_ARCH_MISMATCH: cublasStatus_t = 8;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_STATUS_MAPPING_ERROR: cublasStatus_t = 11;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_STATUS_EXECUTION_FAILED: cublasStatus_t = 13;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_STATUS_INTERNAL_ERROR: cublasStatus_t = 14;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_STATUS_NOT_SUPPORTED: cublasStatus_t = 15;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_STATUS_LICENSE_ERROR: cublasStatus_t = 16;
+
+#[cfg(feature = "cublas")]
+pub const CUBLAS_OP_N: c_int = 0;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_OP_T: c_int = 1;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_GEMM_DEFAULT: c_int = -1;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_DEFAULT_MATH: c_int = 0;
+#[cfg(feature = "cublas")]
+pub const CUBLAS_COMPUTE_32F: c_int = 68;
+#[cfg(feature = "cublas")]
+pub const CUDA_R_16BF: c_int = 14;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -134,6 +175,11 @@ unsafe extern "C" {
     pub fn cuGraphLaunch(graph_exec: CUgraphExec, stream: CUstream) -> CUresult;
     pub fn cuGraphExecDestroy(graph_exec: CUgraphExec) -> CUresult;
     pub fn cuGraphDestroy(graph: CUgraph) -> CUresult;
+    pub fn cuGraphGetNodes(
+        graph: CUgraph,
+        nodes: *mut CUgraphNode,
+        num_nodes: *mut usize,
+    ) -> CUresult;
 
     pub fn cuEventCreate(event: *mut CUevent, flags: c_uint) -> CUresult;
     pub fn cuEventRecord(event: CUevent, stream: CUstream) -> CUresult;
@@ -164,4 +210,41 @@ unsafe extern "C" {
         kernel_params: *mut *mut c_void,
         extra: *mut *mut c_void,
     ) -> CUresult;
+
+    #[cfg(feature = "cublas")]
+    pub fn cublasCreate_v2(handle: *mut cublasHandle_t) -> cublasStatus_t;
+    #[cfg(feature = "cublas")]
+    pub fn cublasDestroy_v2(handle: cublasHandle_t) -> cublasStatus_t;
+    #[cfg(feature = "cublas")]
+    pub fn cublasSetStream_v2(handle: cublasHandle_t, stream: CUstream) -> cublasStatus_t;
+    #[cfg(feature = "cublas")]
+    pub fn cublasSetWorkspace_v2(
+        handle: cublasHandle_t,
+        workspace: *mut c_void,
+        workspace_bytes: usize,
+    ) -> cublasStatus_t;
+    #[cfg(feature = "cublas")]
+    pub fn cublasSetMathMode(handle: cublasHandle_t, math_mode: c_int) -> cublasStatus_t;
+    #[cfg(feature = "cublas")]
+    pub fn cublasGemmEx(
+        handle: cublasHandle_t,
+        transa: c_int,
+        transb: c_int,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        alpha: *const c_void,
+        a: *const c_void,
+        a_type: c_int,
+        lda: c_int,
+        b: *const c_void,
+        b_type: c_int,
+        ldb: c_int,
+        beta: *const c_void,
+        c: *mut c_void,
+        c_type: c_int,
+        ldc: c_int,
+        compute_type: c_int,
+        algo: c_int,
+    ) -> cublasStatus_t;
 }

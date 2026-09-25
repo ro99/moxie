@@ -12,6 +12,7 @@ publish = false
 # verifies its version against the pin and embeds the images.
 default = []
 fatbin = []
+cublas = ["fatbin"]
 
 [dependencies]
 moxie-types.workspace = true

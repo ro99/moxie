@@ -7,8 +7,8 @@ use moxie_graph::{
     ValueRole,
 };
 use moxie_types::{
-    DeviceCapability, Error, KernelCatalogue, KernelOperand, SemanticKernelDescriptor,
-    SemanticKernelOp, TensorLayout, WeightPrecision,
+    AccumulationPolicy, DeviceCapability, Error, KernelCatalogue, KernelOperand,
+    SemanticKernelDescriptor, SemanticKernelOp, TensorLayout, WeightPrecision,
 };
 
 use crate::expert::WeightFormat;
@@ -16,6 +16,7 @@ use crate::{Graph, PlanCandidate, ResourceWorkload, ValueBinding, lower};
 use crate::{HostExpertJoin, HostExpertLowering};
 
 const ALIGNMENT: u64 = 256;
+const BLAS_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StorageRegion {
@@ -79,6 +80,7 @@ pub struct SelectedPlanCandidate {
     package: SelectedPackage,
     host_workspace_bytes: u64,
     rope_table_offsets: BTreeMap<(u64, u64, u32), u64>,
+    blas_workspace_offset: Option<u64>,
     linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
     combine_orders: BTreeMap<NodeId, CombineReductionOrder>,
     expert_ownership: BTreeMap<NodeId, ExpertOwnership>,
@@ -134,6 +136,16 @@ impl SelectedPlanCandidate {
     }
     pub fn rope_table_offsets(&self) -> &BTreeMap<(u64, u64, u32), u64> {
         &self.rope_table_offsets
+    }
+    pub const fn blas_workspace_offset(&self) -> Option<u64> {
+        self.blas_workspace_offset
+    }
+    pub const fn blas_workspace_bytes(&self) -> Option<u64> {
+        if self.blas_workspace_offset.is_some() {
+            Some(BLAS_WORKSPACE_BYTES)
+        } else {
+            None
+        }
     }
     pub fn linear_orders(&self) -> &BTreeMap<NodeId, LinearReductionOrder> {
         &self.linear_orders
@@ -490,6 +502,7 @@ pub fn lower_selected(
         package: SelectedPackage::Chain,
         host_workspace_bytes: 0,
         rope_table_offsets: BTreeMap::new(),
+        blas_workspace_offset: None,
         linear_orders: BTreeMap::new(),
         combine_orders: BTreeMap::new(),
         expert_ownership: BTreeMap::new(),
@@ -815,6 +828,7 @@ fn lower_attention(
         package: SelectedPackage::Attention,
         host_workspace_bytes: 0,
         rope_table_offsets: BTreeMap::new(),
+        blas_workspace_offset: None,
         linear_orders: BTreeMap::new(),
         combine_orders: BTreeMap::new(),
         expert_ownership: BTreeMap::new(),
@@ -1126,7 +1140,11 @@ fn lower_dense_mode(
                         } else {
                             node.contract.output
                         }
-                    && descriptor.accumulation == node.contract.accumulation
+                    && (descriptor.accumulation == node.contract.accumulation
+                        || (operation == SemanticKernelOp::Linear
+                            && node.contract.accumulation == AccumulationPolicy::Bf16InF32Acc
+                            && descriptor.accumulation
+                                == AccumulationPolicy::Bf16InF32AccUnordered))
                     && descriptor.rounding
                         == if matches!(
                             operation,
@@ -1214,6 +1232,19 @@ fn lower_dense_mode(
         workspace_logical_bytes =
             checked_add(workspace_logical_bytes, align_up(table_bytes)?, "workspace")?;
     }
+    let has_cublas_node = selected.iter().any(|node| {
+        node.descriptor
+            .symbols
+            .iter()
+            .any(|symbol| symbol.0.starts_with("cublas:"))
+    });
+    let blas_workspace_offset = if has_cublas_node {
+        let offset = align_up(workspace_logical_bytes)?;
+        workspace_logical_bytes = checked_add(offset, BLAS_WORKSPACE_BYTES, "cuBLAS workspace")?;
+        Some(offset)
+    } else {
+        None
+    };
 
     let base = lower(graph, workload)?;
     let last_stage = u32::try_from(graph.nodes().len())
@@ -1395,6 +1426,7 @@ fn lower_dense_mode(
         package: SelectedPackage::Dense,
         host_workspace_bytes,
         rope_table_offsets,
+        blas_workspace_offset,
         linear_orders: orders.clone(),
         combine_orders: combine_orders.clone(),
         expert_ownership: expert_ownership.clone(),
