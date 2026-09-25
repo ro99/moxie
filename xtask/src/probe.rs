@@ -177,20 +177,20 @@ fn append_costs(md: &mut String, costs: &TopologyCosts) {
     let _ = writeln!(md, "\n### Topology costs\n");
     let _ = writeln!(
         md,
-        "| Kind | From | To | Small latency (us) | Isolated (GB/s) | Concurrent (GB/s) | Usable bytes |"
+        "| Kind | From | To | Small latency (us) | Isolated (GB/s) | Concurrent (GB/s) | Linear TFLOP/s | Usable bytes |"
     );
-    let _ = writeln!(md, "|---|---|---|---:|---:|---:|---:|");
+    let _ = writeln!(md, "|---|---|---|---:|---:|---:|---:|---:|");
     for device in &costs.devices {
         let _ = writeln!(
             md,
-            "| Device memory | `{}` | same device | — | {:.3} | — | {} |",
-            device.device, device.memory_gbps, device.usable_bytes
+            "| Device memory | `{}` | same device | — | {:.3} | — | {:.3} | {} |",
+            device.device, device.memory_gbps, device.linear_tflops, device.usable_bytes
         );
     }
     for link in &costs.links {
         let _ = writeln!(
             md,
-            "| Link | {} | {} | {:.3} | {:.3} | {:.3} | — |",
+            "| Link | {} | {} | {:.3} | {:.3} | {:.3} | — | — |",
             endpoint(link.from),
             endpoint(link.to),
             link.latency_us,
@@ -223,6 +223,10 @@ fn write_costs(path: impl AsRef<Path>, costs: &TopologyCosts) -> Result<()> {
                 toml::Value::String(device.device.to_string()),
             ),
             ("memory_gbps".into(), toml::Value::Float(device.memory_gbps)),
+            (
+                "linear_tflops".into(),
+                toml::Value::Float(device.linear_tflops),
+            ),
             ("usable_bytes".into(), toml::Value::Integer(usable_bytes)),
         ])));
     }
@@ -275,6 +279,11 @@ pub fn read_costs(path: impl AsRef<Path>) -> Result<TopologyCosts> {
                 })?;
                 let memory_gbps =
                     required_float(device, "memory_gbps", "topology_costs.device.memory_gbps")?;
+                let linear_tflops = required_float(
+                    device,
+                    "linear_tflops",
+                    "topology_costs.device.linear_tflops",
+                )?;
                 let usable_bytes =
                     required_integer(device, "usable_bytes", "topology_costs.device.usable_bytes")?;
                 let usable_bytes = u64::try_from(usable_bytes).map_err(|_| {
@@ -286,6 +295,7 @@ pub fn read_costs(path: impl AsRef<Path>) -> Result<TopologyCosts> {
                 Ok(DeviceCost {
                     device: uuid,
                     memory_gbps,
+                    linear_tflops,
                     usable_bytes,
                 })
             })
@@ -414,6 +424,7 @@ mod tests {
             devices: vec![DeviceCost {
                 device: uuid,
                 memory_gbps: 731.25,
+                linear_tflops: 17.5,
                 usable_bytes: 12_345,
             }],
             links: vec![LinkCost {
@@ -431,6 +442,22 @@ mod tests {
         ));
         write_costs(&path, &costs).unwrap();
         assert_eq!(read_costs(&path).unwrap(), costs);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let legacy = text
+            .lines()
+            .filter(|line| !line.starts_with("linear_tflops = "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let legacy_path = path.with_extension("legacy.toml");
+        std::fs::write(&legacy_path, legacy).unwrap();
+        assert!(matches!(
+            read_costs(&legacy_path),
+            Err(moxie_types::Error::InvalidRequest {
+                field: "topology_costs.device.linear_tflops",
+                ..
+            })
+        ));
+        std::fs::remove_file(legacy_path).unwrap();
         std::fs::remove_file(path).unwrap();
     }
 }

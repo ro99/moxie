@@ -15,6 +15,12 @@ use moxie_cuda::{
 use moxie_plan::{DeviceCost, Endpoint, LinkCost, TopologyCosts};
 use moxie_types::{DeviceCapability, Error, RankId, Result};
 
+const LINEAR_ROWS: u64 = 512;
+const LINEAR_INPUT_WIDTH: u64 = 4096;
+const LINEAR_OUTPUT_WIDTH: u64 = 4096;
+const LINEAR_THREADS: u32 = 256;
+const LINEAR_SPLIT_BLOCKS: u64 = 1;
+
 #[derive(Debug, Clone, Copy)]
 pub struct ProbeConfig {
     pub small_bytes: usize,
@@ -78,6 +84,119 @@ pub fn probe_topology(ordinals: &[u32], config: ProbeConfig) -> Result<TopologyC
     }
     links.sort_by_key(|link| (link.from, link.to));
     Ok(TopologyCosts { devices, links })
+}
+
+struct DenseLinearProbeResources<'ctx> {
+    package: ResolvedModule<'ctx>,
+    x: DeviceBuffer<'ctx>,
+    weight: DeviceBuffer<'ctx>,
+    output: DeviceBuffer<'ctx>,
+    start: Event<'ctx>,
+    end: Event<'ctx>,
+}
+
+fn probe_dense_linear(ctx: &RankContext, stream: &Stream<'_>, reps: usize) -> Result<f64> {
+    let x_elements = LINEAR_ROWS
+        .checked_mul(LINEAR_INPUT_WIDTH)
+        .ok_or_else(|| invalid("dense linear probe input extent overflowed"))?;
+    let weight_elements = LINEAR_INPUT_WIDTH
+        .checked_mul(LINEAR_OUTPUT_WIDTH)
+        .ok_or_else(|| invalid("dense linear probe weight extent overflowed"))?;
+    let output_elements = LINEAR_ROWS
+        .checked_mul(LINEAR_OUTPUT_WIDTH)
+        .ok_or_else(|| invalid("dense linear probe output extent overflowed"))?;
+    let x_bytes = bf16_bytes(x_elements)?;
+    let weight_bytes = bf16_bytes(weight_elements)?;
+    let output_bytes = bf16_bytes(output_elements)?;
+    let flops = LINEAR_ROWS
+        .checked_mul(LINEAR_INPUT_WIDTH)
+        .and_then(|value| value.checked_mul(LINEAR_OUTPUT_WIDTH))
+        .and_then(|value| value.checked_mul(2))
+        .ok_or_else(|| invalid("dense linear probe FLOP count overflowed"))?;
+    let grid = u32::try_from(output_elements.div_ceil(u64::from(LINEAR_THREADS)))
+        .map_err(|_| invalid("dense linear probe grid exceeds a u32"))?;
+
+    // SAFETY: the image is the immutable nvcc output embedded by this build.
+    let image = unsafe { TrustedImage::from_build_output(moxie_kernels::DENSE_GRAPH_FATBIN)? };
+    let package = Module::load(ctx, ModuleImage::Binary(image))?
+        .resolve_all(&[moxie_kernels::DENSE_LINEAR_SPLIT.to_owned()])?;
+    let mut resources = DenseLinearProbeResources {
+        package,
+        x: DeviceBuffer::alloc(ctx, x_bytes)?,
+        weight: DeviceBuffer::alloc(ctx, weight_bytes)?,
+        output: DeviceBuffer::alloc(ctx, output_bytes)?,
+        start: Event::new(ctx)?,
+        end: Event::new(ctx)?,
+    };
+    resources.x.copy_from_host(&zeroed(x_bytes)?)?;
+    resources.weight.copy_from_host(&zeroed(weight_bytes)?)?;
+    resources.output.copy_from_host(&zeroed(output_bytes)?)?;
+
+    let measurement = (|| {
+        launch_dense_linear(&resources, stream, grid)?;
+        stream.synchronize()?;
+        let samples = event_times(reps, stream, &resources.start, &resources.end, || {
+            launch_dense_linear(&resources, stream, grid)
+        })?;
+        median_metric(&samples, |seconds| flops as f64 / seconds / 1e12)
+    })();
+    match stream.synchronize() {
+        Ok(()) => measurement,
+        Err(sync_error) => {
+            // If completion is unknown, retain the module and buffers the kernel may still use.
+            std::mem::forget(resources);
+            match measurement {
+                Err(original_error) => Err(original_error),
+                Ok(_) => Err(sync_error),
+            }
+        }
+    }
+}
+
+fn bf16_bytes(elements: u64) -> Result<usize> {
+    let bytes = elements
+        .checked_mul(core::mem::size_of::<u16>() as u64)
+        .ok_or_else(|| invalid("dense linear probe byte extent overflowed"))?;
+    usize::try_from(bytes).map_err(|_| invalid("dense linear probe allocation is too large"))
+}
+
+fn launch_dense_linear(
+    resources: &DenseLinearProbeResources<'_>,
+    stream: &Stream<'_>,
+    grid: u32,
+) -> Result<()> {
+    let (mut x, mut weight, mut output) = (
+        resources.x.device_ptr(),
+        resources.weight.device_ptr(),
+        resources.output.device_ptr(),
+    );
+    let (mut rows, mut input_width, mut output_width, mut blocks) = (
+        LINEAR_ROWS,
+        LINEAR_INPUT_WIDTH,
+        LINEAR_OUTPUT_WIDTH,
+        LINEAR_SPLIT_BLOCKS,
+    );
+    let mut params = [
+        (&raw mut x).cast(),
+        (&raw mut weight).cast(),
+        (&raw mut output).cast(),
+        (&raw mut rows).cast(),
+        (&raw mut input_width).cast(),
+        (&raw mut output_width).cast(),
+        (&raw mut blocks).cast(),
+    ];
+    // SAFETY: arguments match the seven-argument dense split ABI; all BF16
+    // buffers cover the declared shape and remain live until stream completion.
+    unsafe {
+        resources.package.launch_async(
+            0,
+            stream,
+            (grid, 1, 1),
+            (LINEAR_THREADS, 1, 1),
+            0,
+            &mut params,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,9 +541,12 @@ fn isolated(
             .bulk_bytes
             .checked_mul(2)
             .ok_or_else(|| invalid("memory byte count overflowed"))?;
+        let memory_gbps = median_metric(&times, |seconds| memory_bytes as f64 / seconds / 1e9)?;
+        let linear_tflops = probe_dense_linear(&contexts[i], &streams[i], config.reps)?;
         devices.push(DeviceCost {
             device: contexts[i].uuid(),
-            memory_gbps: median_metric(&times, |seconds| memory_bytes as f64 / seconds / 1e9)?,
+            memory_gbps,
+            linear_tflops,
             usable_bytes: free[i],
         });
     }

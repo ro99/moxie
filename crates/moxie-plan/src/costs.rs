@@ -24,6 +24,8 @@ pub struct LinkCost {
 pub struct DeviceCost {
     pub device: DeviceUuid,
     pub memory_gbps: f64,
+    /// Median sustained rate of Moxie's dense BF16 linear kernel at the probe shape, in TFLOP/s.
+    pub linear_tflops: f64,
     pub usable_bytes: u64,
 }
 

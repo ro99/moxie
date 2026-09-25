@@ -1,12 +1,30 @@
 # Measured topology costs
 
-Measured on **2026-09-24** with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, NVIDIA driver
-`610.57.04`. The command used the default probe configuration: 16 KiB small
-copies, 64 MiB bulk copies, five samples per figure. Host transfers used
-synchronous pageable copies. Peer links appear only when the destination
-context is granted access to the source device. `usable_bytes` is the driver’s
-free-byte reading after context acquisition and before probe buffers were
-allocated. Device-memory bandwidth counts one read and one write per byte.
+Measured on **2026-09-25** with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, NVIDIA driver
+`610.57.04`. The default probe configuration uses 16 KiB small copies, 64 MiB
+bulk copies and five samples per figure. Host transfers use synchronous
+pageable copies. Peer links appear only when the destination context is granted
+access to the source device. `usable_bytes` is the driver's free-byte reading
+after context acquisition and before probe buffers were allocated. Device-memory
+bandwidth counts one read and one write per byte. `cargo xtask-cuda probe
+--costs` ran twice on all three devices; this block uses run 2.
+
+The dense BF16 linear rate uses `moxie_dense_linear_split_v1` from the dense
+graph fatbin with BF16 `x [512, 4096]`, `weight [4096, 4096]` and
+`output [512, 4096]`. The buffers contain finite zero values. Each device gets
+one untimed launch followed by five event-timed launches; the reported rate is
+the median of `2 * 512 * 4096 * 4096 / seconds / 1e12`. Per-device rates from
+both runs:
+
+| Device UUID | Run 1 TFLOP/s | Run 2 TFLOP/s |
+|---|---:|---:|
+| `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | 0.109458067 | 0.109209710 |
+| `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | 0.054985993 | 0.054965098 |
+| `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | 0.054764684 | 0.054943313 |
+
+The two linear-rate runs differ by at most 0.33% per device. These
+are rates for Moxie's correctness-first kernel at this shape, not GPU peak
+rates or a performance claim.
 
 | Ordinal | Device | UUID | Peer-access row |
 |---:|---|---|---|
@@ -14,112 +32,113 @@ allocated. Device-memory bandwidth counts one read and one write per byte.
 | 1 | RTX 3090 | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | can access ordinal 2 |
 | 2 | RTX 3090 | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | can access ordinal 1 |
 
-| Kind | From | To | Small latency (us) | Isolated (GB/s) | Concurrent (GB/s) | Usable bytes |
-|---|---|---|---:|---:|---:|---:|
-| Device memory | `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | same device | — | 383.462 | — | 16,512,122,880 |
-| Device memory | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | same device | — | 809.086 | — | 25,017,319,424 |
-| Device memory | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | same device | — | 814.112 | — | 25,017,319,424 |
-| Link | host | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | 9.196 | 5.734 | 4.534 | — |
-| Link | host | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | 8.765 | 6.711 | 7.313 | — |
-| Link | host | `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | 9.025 | 6.586 | 5.053 | — |
-| Link | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | host | 13.181 | 5.531 | 3.586 | — |
-| Link | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | 9.216 | 6.584 | 2.925 | — |
-| Link | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | host | 13.320 | 5.566 | 2.808 | — |
-| Link | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | 9.312 | 5.202 | 5.205 | — |
-| Link | `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | host | 9.532 | 7.060 | 6.879 | — |
+| Kind | From | To | Small latency (us) | Isolated (GB/s) | Concurrent (GB/s) | Linear TFLOP/s | Usable bytes |
+|---|---|---|---:|---:|---:|---:|---:|
+| Device memory | `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | same device | — | 385.896 | — | 0.109 | 16,512,122,880 |
+| Device memory | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | same device | — | 794.376 | — | 0.055 | 25,017,319,424 |
+| Device memory | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | same device | — | 799.220 | — | 0.055 | 25,017,319,424 |
+| Link | host | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | 9.180 | 5.692 | 1.938 | — | — |
+| Link | host | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | 8.514 | 6.542 | 2.661 | — | — |
+| Link | host | `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | 9.178 | 6.568 | 5.590 | — | — |
+| Link | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | host | 13.367 | 5.263 | 5.284 | — | — |
+| Link | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | 9.984 | 6.584 | 2.924 | — | — |
+| Link | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | host | 13.190 | 5.528 | 12.128 | — | — |
+| Link | `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | 10.240 | 5.201 | 5.205 | — | — |
+| Link | `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | host | 9.829 | 7.072 | 6.977 | — | — |
 
-Observations from the primary run:
+Observations from run 2:
 
-- For `3032cfa3 → 81fe4578`, isolated direct peer bulk was **6.584 GB/s** and
-  concurrent peer was **2.925 GB/s**. The sequential host path implies about
-  **3.03 GB/s**, from D2H 5.531 GB/s and H2D 6.711 GB/s. In reverse, peer was
-  **5.202 GB/s** versus about **2.82 GB/s** staged from D2H 5.566 GB/s and
-  H2D 5.734 GB/s.
-- On the 5060 Ti, concurrent pageable H2D was **5.053 GB/s** versus **6.586
-  GB/s** isolated, 23.3% lower. This is a machine and load measurement, not a
+- For `3032cfa3 → 81fe4578`, isolated direct peer bulk was **6.584 GB/s**
+  and concurrent peer was **2.924 GB/s**. The sequential host path implies
+  about **2.92 GB/s**, from D2H 5.263 GB/s and H2D 6.542 GB/s. In reverse,
+  peer was **5.201 GB/s** versus about **2.80 GB/s** staged from D2H 5.528
+  GB/s and H2D 5.692 GB/s.
+- On the 5060 Ti, concurrent pageable H2D was **5.590 GB/s** versus **6.568
+  GB/s** isolated, 14.9% lower. This is a machine and load measurement, not a
   fixed ratio.
-- The measured host-to-5060 small copy was **16 KiB** and took **9.025 us**.
+- The measured host-to-5060 small copy was **16 KiB** and took **9.178 us**.
   The combined decode handoff in task 0072 is 240 bytes, so this probe extent
-  is about 68 times larger; 9.025 us is not a 240-byte latency estimate.
+  is about 68 times larger; 9.178 us is not a 240-byte latency estimate.
 
-Forward-peer stability check (`GPU-3032cfa3` → `GPU-81fe4578`): isolated and
-concurrent bulk figures were **6.583886 / 2.924547 GB/s** in the primary run,
-**6.583886 / 2.924808 GB/s** in repeat 1, and **6.585354 / 2.923887 GB/s** in
-repeat 2. The isolated value is about **2.25×** the concurrent value in all
-three runs, exceeding the 2× check. This is consistent with bidirectional contention (the concurrent phase runs both directions of the pair at once); the one-sided magnitude (the reverse direction stays about 5.2 GB/s) is unexplained.
+Forward-peer repeatability (`GPU-3032cfa3` → `GPU-81fe4578`): isolated and
+concurrent bulk figures were **6.585871 / 2.924931 GB/s** in run 1 and
+**6.583886 / 2.923626 GB/s** in run 2.
 
-The TOML written by the primary run:
+The TOML written by run 2:
 
 ```toml
 [[device]]
-memory_gbps = 383.4616954950226
+linear_tflops = 0.10920970990145071
+memory_gbps = 385.8960307930676
 usable_bytes = 16512122880
 uuid = "GPU-97fe4889-4874-a378-198e-955d2e72c4a3"
 
 [[device]]
-memory_gbps = 809.0864365584532
+linear_tflops = 0.05496509829925133
+memory_gbps = 794.3757338566783
 usable_bytes = 25017319424
 uuid = "GPU-3032cfa3-19df-028f-5ebd-43314911e0b9"
 
 [[device]]
-memory_gbps = 814.1117831772806
+linear_tflops = 0.05494331292357321
+memory_gbps = 799.2195252935354
 usable_bytes = 25017319424
 uuid = "GPU-81fe4578-59b2-37c4-421e-287cdac78704"
 
 [[link]]
-bandwidth_gbps = 5.733936077535134
-concurrent_gbps = 4.533633734156757
+bandwidth_gbps = 5.6915420353912864
+concurrent_gbps = 1.9378956170706572
 from = "host"
-latency_us = 9.196
+latency_us = 9.18
 to = "GPU-3032cfa3-19df-028f-5ebd-43314911e0b9"
 
 [[link]]
-bandwidth_gbps = 6.710539465109654
-concurrent_gbps = 7.31294268924916
+bandwidth_gbps = 6.542413367611961
+concurrent_gbps = 2.660640906157238
 from = "host"
-latency_us = 8.765
+latency_us = 8.514
 to = "GPU-81fe4578-59b2-37c4-421e-287cdac78704"
 
 [[link]]
-bandwidth_gbps = 6.586107974154069
-concurrent_gbps = 5.053083803699995
+bandwidth_gbps = 6.567847225627232
+concurrent_gbps = 5.590088241757125
 from = "host"
-latency_us = 9.025
+latency_us = 9.177999999999999
 to = "GPU-97fe4889-4874-a378-198e-955d2e72c4a3"
 
 [[link]]
-bandwidth_gbps = 5.530575344506862
-concurrent_gbps = 3.5855128297120786
+bandwidth_gbps = 5.262697757390938
+concurrent_gbps = 5.283974460121577
 from = "GPU-3032cfa3-19df-028f-5ebd-43314911e0b9"
-latency_us = 13.181
+latency_us = 13.366999999999999
 to = "host"
 
 [[link]]
 bandwidth_gbps = 6.583885946540923
-concurrent_gbps = 2.924547334485995
+concurrent_gbps = 2.923626069723224
 from = "GPU-3032cfa3-19df-028f-5ebd-43314911e0b9"
-latency_us = 9.216000325977802
+latency_us = 9.983999654650688
 to = "GPU-81fe4578-59b2-37c4-421e-287cdac78704"
 
 [[link]]
-bandwidth_gbps = 5.566225519307523
-concurrent_gbps = 2.8083857952948805
+bandwidth_gbps = 5.528357469266063
+concurrent_gbps = 12.128220466623608
 from = "GPU-81fe4578-59b2-37c4-421e-287cdac78704"
-latency_us = 13.32
+latency_us = 13.190000000000001
 to = "host"
 
 [[link]]
-bandwidth_gbps = 5.201747364256623
-concurrent_gbps = 5.205414036246958
+bandwidth_gbps = 5.200856968830295
+concurrent_gbps = 5.205400944169026
 from = "GPU-81fe4578-59b2-37c4-421e-287cdac78704"
-latency_us = 9.312000125646591
+latency_us = 10.239999741315842
 to = "GPU-3032cfa3-19df-028f-5ebd-43314911e0b9"
 
 [[link]]
-bandwidth_gbps = 7.060340048818275
-concurrent_gbps = 6.879155355401879
+bandwidth_gbps = 7.072129352921351
+concurrent_gbps = 6.977076521142273
 from = "GPU-97fe4889-4874-a378-198e-955d2e72c4a3"
-latency_us = 9.532
+latency_us = 9.829
 to = "host"
 ```
 

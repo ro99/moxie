@@ -155,3 +155,17 @@ Host gates: `cargo fmt --all -- --check`; `cargo clippy --workspace
 from `rank_time`; the new test must fail.
 
 ## Result, filled after work
+
+Implemented the measured `linear_tflops` cost field, dense BF16 probe, and
+per-rank compute estimate. The one-mutant check (memory-only `rank_time`)
+failed `compute_term_prices_long_prefill` as required, and the mutant was
+reverted. Two probe runs completed on all three GPUs; linear rates differed by
+at most 0.33% per device. All four plan-comparison commands ran twice with
+matching output. The regenerated estimates show the prompt-512 and prompt-
+32,768 winner changes and phase-pair comparison recorded in
+`docs/evidence/plan-comparison.md`.
+
+Gates passed: fmt, workspace clippy, executor driver-feature clippy, workspace
+tests, `cargo xtask arch-check`, and `cargo xtask spec-check`. The two all-GPU
+probe runs passed. The updated evidence contains run 2 costs, both measured
+linear rates per device, and the regenerated plan and phase-pair tables.

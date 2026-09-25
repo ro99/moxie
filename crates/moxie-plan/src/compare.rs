@@ -499,6 +499,8 @@ struct KvRead {
     layer: u32,
     heads: Range<u64>,
     bytes_per_row: u64,
+    head_dim: u64,
+    query_heads: u64,
     window: Option<u64>,
 }
 
@@ -506,6 +508,8 @@ struct RankMeter {
     device: DeviceUuid,
     weight_bytes: u64,
     memory_gbps: f64,
+    linear_flops_per_row: u64,
+    tflops: f64,
     kv: Vec<KvRead>,
 }
 
@@ -522,11 +526,13 @@ fn sorted_devices(costs: &TopologyCosts) -> Result<Vec<DeviceUuid>> {
         return Err(invalid("topology contains a duplicate device UUID"));
     }
     if costs.devices.iter().any(|cost| {
-        !cost.memory_gbps.is_finite() || cost.memory_gbps <= 0.0 || cost.usable_bytes == 0
+        !cost.memory_gbps.is_finite()
+            || cost.memory_gbps <= 0.0
+            || !cost.linear_tflops.is_finite()
+            || cost.linear_tflops <= 0.0
+            || cost.usable_bytes == 0
     }) {
-        return Err(invalid(
-            "device memory rates and usable bytes must be positive",
-        ));
+        return Err(invalid("device rates and usable bytes must be positive"));
     }
     let mut links = BTreeSet::new();
     for link in &costs.links {
@@ -782,14 +788,17 @@ fn estimate(
         }
     }
 
-    let compute_ms: f64 = meters
-        .iter()
-        .map(|stage| stage_time(stage, workload.prompt_tokens))
-        .sum();
-    let total_decode_ms: f64 = meters
-        .iter()
-        .map(|stage| sum_stage_decode(stage, workload.prompt_tokens, workload.generated_tokens))
-        .sum();
+    let compute_ms = meters.iter().try_fold(0.0, |sum, stage| {
+        Ok::<_, Error>(sum + stage_time(stage, workload.prompt_tokens, workload.prompt_tokens)?)
+    })?;
+    let first_decode_compute_ms = meters.iter().try_fold(0.0, |sum, stage| {
+        Ok::<_, Error>(sum + stage_time(stage, 1, workload.prompt_tokens)?)
+    })?;
+    let total_decode_ms = meters.iter().try_fold(0.0, |sum, stage| {
+        Ok::<_, Error>(
+            sum + sum_stage_decode(stage, workload.prompt_tokens, workload.generated_tokens)?,
+        )
+    })?;
     let prefill_transfer = match transfer_time(graph, &stages, costs, workload.prompt_tokens) {
         Ok(time) => time,
         Err(reason) => return Ok(Err(reason)),
@@ -810,7 +819,7 @@ fn estimate(
         .map_err(invalid)?;
     let decode_copy_ms = decode_transfer + first_collectives;
     let prefill_ms = compute_ms + prefill_transfer + prefill_collectives;
-    let first_decode_ms = compute_ms + decode_copy_ms;
+    let first_decode_ms = first_decode_compute_ms + decode_copy_ms;
     let total_ms = prefill_ms + total_decode_ms + decode_copy_ms * workload.generated_tokens as f64;
     if !prefill_ms.is_finite() || !first_decode_ms.is_finite() || !total_ms.is_finite() {
         return Err(invalid("estimated time is not finite"));
@@ -847,6 +856,8 @@ fn tensor_parallel_meter(
             device,
             weight_bytes: 0,
             memory_gbps: costs.device(device).unwrap().memory_gbps,
+            linear_flops_per_row: 0,
+            tflops: costs.device(device).unwrap().linear_tflops,
             kv: Vec::new(),
         })
         .collect();
@@ -915,6 +926,10 @@ fn add_meter(target: &mut RankMeter, source: &RankMeter) -> std::result::Result<
         .weight_bytes
         .checked_add(source.weight_bytes)
         .ok_or_else(|| "rank-local weight-byte total overflowed".to_string())?;
+    target.linear_flops_per_row = target
+        .linear_flops_per_row
+        .checked_add(source.linear_flops_per_row)
+        .ok_or_else(|| "rank-local FLOP total overflowed".to_string())?;
     target.kv.extend_from_slice(&source.kv);
     Ok(())
 }
@@ -935,38 +950,98 @@ fn stage_meter(graph: &Graph, device: DeviceUuid, costs: &TopologyCosts) -> Resu
             .copied()
             .ok_or_else(|| invalid("activation has no width dimension"))
     };
+    let linear_flops_per_row = graph.nodes().iter().try_fold(0_u64, |sum, node| {
+        let flops = match node.params {
+            OpParams::Linear {
+                in_features,
+                out_features,
+                ..
+            } => in_features
+                .checked_mul(out_features)
+                .and_then(|elements| elements.checked_mul(2))
+                .ok_or_else(|| invalid("linear FLOP count overflowed"))?,
+            OpParams::VocabProjection { vocab, hidden, .. } => vocab
+                .checked_mul(hidden)
+                .and_then(|elements| elements.checked_mul(2))
+                .ok_or_else(|| invalid("vocabulary projection FLOP count overflowed"))?,
+            OpParams::ExpertMlp { experts, top_k, .. } => {
+                if experts == 0 {
+                    return Err(invalid("expert count is zero while metering FLOPs"));
+                }
+                let expert_weight_elements = node
+                    .inputs
+                    .iter()
+                    .copied()
+                    .filter(|input| graph.weights().contains(input))
+                    .try_fold(0_u64, |total, input| {
+                        let shape = graph
+                            .spec(input)
+                            .ok_or_else(|| invalid("expert weight has no tensor shape"))?
+                            .extent(&symbols)?;
+                        let elements = shape.into_iter().try_fold(1_u64, |product, extent| {
+                            product
+                                .checked_mul(extent)
+                                .ok_or_else(|| invalid("expert weight element count overflowed"))
+                        })?;
+                        total
+                            .checked_add(elements)
+                            .ok_or_else(|| invalid("expert weight element total overflowed"))
+                    })?;
+                let per_expert = expert_weight_elements
+                    .checked_div(experts)
+                    .filter(|_| expert_weight_elements % experts == 0)
+                    .ok_or_else(|| invalid("expert weights do not divide evenly by experts"))?;
+                per_expert
+                    .checked_mul(top_k)
+                    .and_then(|elements| elements.checked_mul(2))
+                    .ok_or_else(|| invalid("expert FLOP count overflowed"))?
+            }
+            _ => 0,
+        };
+        sum.checked_add(flops)
+            .ok_or_else(|| invalid("linear FLOPs per row overflowed"))
+    })?;
     let kv = graph
         .nodes()
         .iter()
         .filter_map(|node| match node.params {
             OpParams::Attention {
+                heads,
+                head_dim,
                 visibility,
                 layer,
                 kv_heads,
                 ..
-            } => Some((node, visibility, layer, kv_heads)),
+            } => Some((node, visibility, layer, kv_heads, heads, head_dim)),
             _ => None,
         })
-        .map(|(node, visibility, layer, kv_heads)| {
-            let width = width_of(node.inputs[1])?
-                .checked_add(width_of(node.inputs[2])?)
-                .and_then(|width| width.checked_mul(2))
-                .ok_or_else(|| invalid("KV bytes per row overflowed"))?;
-            Ok(KvRead {
-                layer,
-                heads: 0..kv_heads,
-                bytes_per_row: width,
-                window: match visibility {
-                    Visibility::SlidingWindow { window } => Some(window),
-                    Visibility::Causal => None,
-                },
-            })
-        })
+        .map(
+            |(node, visibility, layer, kv_heads, query_heads, head_dim)| {
+                let width = width_of(node.inputs[1])?
+                    .checked_add(width_of(node.inputs[2])?)
+                    .and_then(|width| width.checked_mul(2))
+                    .ok_or_else(|| invalid("KV bytes per row overflowed"))?;
+                Ok(KvRead {
+                    layer,
+                    heads: 0..kv_heads,
+                    bytes_per_row: width,
+                    head_dim,
+                    query_heads,
+                    window: match visibility {
+                        Visibility::SlidingWindow { window } => Some(window),
+                        Visibility::Causal => None,
+                    },
+                })
+            },
+        )
         .collect::<Result<Vec<_>>>()?;
+    let device_cost = costs.device(device).unwrap();
     Ok(RankMeter {
         device,
         weight_bytes,
-        memory_gbps: costs.device(device).unwrap().memory_gbps,
+        memory_gbps: device_cost.memory_gbps,
+        linear_flops_per_row,
+        tflops: device_cost.linear_tflops,
         kv,
     })
 }
@@ -1049,21 +1124,112 @@ fn kv_read(kv: &[KvRead], context: u64) -> f64 {
         .sum()
 }
 
-fn rank_time(rank: &RankMeter, context: u64) -> f64 {
-    (rank.weight_bytes as f64 + kv_read(&rank.kv, context)) / (rank.memory_gbps * 1_000_000.0)
+fn rank_time(rank: &RankMeter, rows: u64, context: u64) -> Result<f64> {
+    let memory_ms =
+        (rank.weight_bytes as f64 + kv_read(&rank.kv, context)) / (rank.memory_gbps * 1_000_000.0);
+    let linear_flops = rows
+        .checked_mul(rank.linear_flops_per_row)
+        .ok_or_else(|| invalid("step linear FLOP count overflowed"))?;
+    let attention_flops = rank.kv.iter().try_fold(0_u64, |sum, read| {
+        let keys = sum_capped_keys(rows, context, read.window)?;
+        let flops = read
+            .query_heads
+            .checked_mul(read.head_dim)
+            .and_then(|value| value.checked_mul(keys))
+            .and_then(|value| value.checked_mul(4))
+            .ok_or_else(|| invalid("attention FLOP count overflowed"))?;
+        sum.checked_add(flops)
+            .ok_or_else(|| invalid("attention FLOP total overflowed"))
+    })?;
+    let flops = linear_flops
+        .checked_add(attention_flops)
+        .ok_or_else(|| invalid("step FLOP total overflowed"))?;
+    let compute_ms = flops as f64 / (rank.tflops * 1e9);
+    if !memory_ms.is_finite() || !compute_ms.is_finite() {
+        return Err(invalid("step time estimate is not finite"));
+    }
+    // ponytail: max assumes perfect overlap between memory traffic and compute.
+    Ok(memory_ms.max(compute_ms))
 }
 
-fn stage_time(stage: &StageMeter, context: u64) -> f64 {
-    stage
-        .meters
-        .iter()
-        .map(|rank| rank_time(rank, context))
-        .fold(0.0, f64::max)
+fn sum_capped_keys(rows: u64, context: u64, window: Option<u64>) -> Result<u64> {
+    if rows == 0 {
+        return Ok(0);
+    }
+    let first = context
+        .checked_sub(rows)
+        .and_then(|position| position.checked_add(1))
+        .ok_or_else(|| invalid("attention row range is outside its context"))?;
+    let Some(window) = window else {
+        return sum_positions(first, context);
+    };
+    let uncapped_end = context.min(window);
+    let uncapped = if first <= uncapped_end {
+        sum_positions(first, uncapped_end)?
+    } else {
+        0
+    };
+    let capped = if context > window {
+        let capped_first = first.max(
+            window
+                .checked_add(1)
+                .ok_or_else(|| invalid("attention window position overflowed"))?,
+        );
+        let count = context
+            .checked_sub(capped_first)
+            .and_then(|positions| positions.checked_add(1))
+            .ok_or_else(|| invalid("attention capped row count overflowed"))?;
+        window
+            .checked_mul(count)
+            .ok_or_else(|| invalid("attention capped key total overflowed"))?
+    } else {
+        0
+    };
+    uncapped
+        .checked_add(capped)
+        .ok_or_else(|| invalid("attention key total overflowed"))
 }
 
-fn sum_stage_decode(stage: &StageMeter, first: u64, count: u64) -> f64 {
+fn sum_positions(first: u64, last: u64) -> Result<u64> {
+    if first > last {
+        return Ok(0);
+    }
+    let count = u128::from(
+        last.checked_sub(first)
+            .and_then(|distance| distance.checked_add(1))
+            .ok_or_else(|| invalid("attention row count overflowed"))?,
+    );
+    let endpoints = u128::from(first) + u128::from(last);
+    let (left, right) = if count.is_multiple_of(2) {
+        (count / 2, endpoints)
+    } else {
+        (count, endpoints / 2)
+    };
+    let sum = left
+        .checked_mul(right)
+        .ok_or_else(|| invalid("attention key sum overflowed"))?;
+    u64::try_from(sum).map_err(|_| invalid("attention key sum exceeds u64"))
+}
+
+fn stage_time(stage: &StageMeter, rows: u64, context: u64) -> Result<f64> {
+    stage.meters.iter().try_fold(0.0_f64, |maximum, rank| {
+        Ok(maximum.max(rank_time(rank, rows, context)?))
+    })
+}
+
+fn sum_stage_decode(stage: &StageMeter, first: u64, count: u64) -> Result<f64> {
     // ponytail: generated-token counts are small; direct summation is clearer.
-    (0..count).map(|step| stage_time(stage, first + step)).sum()
+    (0..count).try_fold(0.0, |sum, step| {
+        let context = first
+            .checked_add(step)
+            .ok_or_else(|| invalid("decode context overflowed"))?;
+        let total = sum + stage_time(stage, 1, context)?;
+        if total.is_finite() {
+            Ok(total)
+        } else {
+            Err(invalid("total decode estimate is not finite"))
+        }
+    })
 }
 
 fn collective_widths(

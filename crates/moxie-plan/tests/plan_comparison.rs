@@ -1,4 +1,4 @@
-use moxie_graph::OracleRegistry;
+use moxie_graph::{OpParams, OracleRegistry, Visibility};
 use moxie_models::gemma4::{Fraction, Gemma4Text, TextConfig, embedding_scale};
 use moxie_plan::{
     CandidateKind, DeviceCost, Endpoint, LinkCost, PairVerdict, TopologyCosts, UserWorkload,
@@ -75,16 +75,19 @@ fn costs() -> TopologyCosts {
             DeviceCost {
                 device: a,
                 memory_gbps: 800.0,
+                linear_tflops: 1e9,
                 usable_bytes: 3_000_000,
             },
             DeviceCost {
                 device: b,
                 memory_gbps: 800.0,
+                linear_tflops: 1e9,
                 usable_bytes: 3_000_000,
             },
             DeviceCost {
                 device: c,
                 memory_gbps: 380.0,
+                linear_tflops: 1e9,
                 usable_bytes: 3_000_000,
             },
         ],
@@ -99,6 +102,7 @@ fn tie_costs() -> TopologyCosts {
             .map(|device| DeviceCost {
                 device,
                 memory_gbps: 800.0,
+                linear_tflops: 1e9,
                 usable_bytes: 3_000_000,
             })
             .into(),
@@ -363,5 +367,118 @@ fn split_phase_pairs_price_the_kv_move() {
             &reversed_costs,
         )
         .unwrap()
+    );
+}
+
+#[test]
+fn compute_term_prices_long_prefill() {
+    const PROMPT: u64 = 10_000;
+    const LOW_TFLOPS: f64 = 1e-6;
+
+    let (graph, oracles) = graph();
+    let baseline = compare_plans(
+        &graph,
+        moxie_oracles::HOST_REFERENCE,
+        &oracles,
+        UserWorkload {
+            prompt_tokens: 8,
+            generated_tokens: 2,
+        },
+        &costs(),
+    )
+    .unwrap();
+    let memory_only = [
+        (0.000_114_6, 0.000_114_6, 0.000_344_28),
+        (0.000_114_6, 0.000_114_6, 0.000_344_28),
+        (0.000_241_263_158, 0.000_241_263_158, 0.000_724_8),
+        (0.032_221_347_368, 0.032_165_347_368, 0.096_552_698_947),
+        (0.032_221_347_368, 0.032_165_347_368, 0.096_552_698_947),
+        (0.032_222_32, 0.032_166_32, 0.096_555_616_842),
+        (0.032_222_32, 0.032_166_32, 0.096_555_616_842),
+        (0.032_222_408_421, 0.032_166_408_421, 0.096_555_882_105),
+        (0.032_222_408_421, 0.032_166_408_421, 0.096_555_882_105),
+        (0.076_166_088_421, 0.076_126_888_421, 0.228_420_362_105),
+    ];
+    let mut ranked = 0;
+    for (_, verdict) in baseline {
+        if let Verdict::Ranked { estimate, .. } = verdict {
+            let (prefill, first_decode, total) = memory_only[ranked];
+            assert!((estimate.prefill_ms - prefill).abs() < 1e-12);
+            assert!((estimate.first_decode_ms - first_decode).abs() < 1e-12);
+            assert!((estimate.total_ms - total).abs() < 1e-12);
+            ranked += 1;
+        }
+    }
+    assert_eq!(ranked, memory_only.len());
+
+    let mut slow_costs = costs();
+    for device in &mut slow_costs.devices {
+        device.linear_tflops = LOW_TFLOPS;
+        device.usable_bytes = 100_000_000;
+    }
+    let estimates = compare_plans(
+        &graph,
+        moxie_oracles::HOST_REFERENCE,
+        &oracles,
+        UserWorkload {
+            prompt_tokens: PROMPT,
+            generated_tokens: 0,
+        },
+        &slow_costs,
+    )
+    .unwrap();
+    let device = devices()[0];
+    let estimate = estimates
+        .iter()
+        .find_map(|(kind, verdict)| match (kind, verdict) {
+            (CandidateKind::Single { device: candidate }, Verdict::Ranked { estimate, .. })
+                if *candidate == device =>
+            {
+                Some(estimate)
+            }
+            _ => None,
+        })
+        .expect("the fixture fits on one device");
+
+    let linear_flops_per_row: u64 = graph
+        .nodes()
+        .iter()
+        .map(|node| match node.params {
+            OpParams::Linear {
+                in_features,
+                out_features,
+                ..
+            } => 2 * in_features * out_features,
+            OpParams::VocabProjection { vocab, hidden, .. } => 2 * vocab * hidden,
+            OpParams::ExpertMlp { .. } => unreachable!("the fixture is dense"),
+            _ => 0,
+        })
+        .sum();
+    let attention_flops: u64 = graph
+        .nodes()
+        .iter()
+        .map(|node| match node.params {
+            OpParams::Attention {
+                heads,
+                head_dim,
+                visibility,
+                ..
+            } => {
+                let keys: u64 = (1..=PROMPT)
+                    .map(|position| match visibility {
+                        Visibility::Causal => position,
+                        Visibility::SlidingWindow { window } => position.min(window),
+                    })
+                    .sum();
+                4 * heads * head_dim * keys
+            }
+            _ => 0,
+        })
+        .sum();
+    let expected_ms = (PROMPT * linear_flops_per_row + attention_flops) as f64 / (LOW_TFLOPS * 1e9);
+    assert!(
+        (estimate.prefill_ms - expected_ms).abs() <= expected_ms * 1e-12,
+        "long prefill should be compute-limited at {LOW_TFLOPS} TFLOP/s: actual={}, expected={expected_ms}",
+        estimate.prefill_ms
     );
 }
