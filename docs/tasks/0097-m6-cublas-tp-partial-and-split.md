@@ -145,7 +145,11 @@ Codex `sol`. Asynchronous-ownership work: the escape inventory is in change 5.
        single-GPU `lower_selected_ordered` reference (with
        `lowering.linear_orders`), on the fixture the existing
        TP-versus-single comparison uses;
-     - assert the output **bytes** are equal, eager and captured.
+     - assert the output **bytes** are equal, **eager only**. Coordinator,
+       answering luna's DECISION: `set_segment_capture` refuses candidates
+       with linear orders (`chain.rs` about 524–537). Capturing ordered-
+       reduction plans (TP ranks, the split reference) moves to the M6.2
+       full-step capture task.
 7. **Coverage check (one mutant, reverted after; run only test (b) with
    `--exact`).** In `LinearSplit`, call the GEMM on the strided full-width
    view (`lda = ldb = in`, no packing). Test (b) must fail, or the Result
