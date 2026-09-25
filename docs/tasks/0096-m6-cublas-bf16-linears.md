@@ -2,7 +2,10 @@
 
 Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer
 Codex `sol`. Asynchronous-ownership work: the escape inventory below is part
-of the contract.
+of the contract. **Revised after sol's design review** (4 high, 3 medium, all
+adopted) before any implementation. The TP partial, the split reference and
+ADR 0036 bit-identity moved to task 0097, because they need packed weight
+blocks (sol H4).
 
 ## Identity and authority
 
@@ -50,31 +53,29 @@ of the contract.
 
 ## Bounded deliverable
 
-- **Outcome:** a dense plan built from the unordered catalogue runs every
-  BF16 `Linear`, `LinearSplit` (blocks ≤ 2) and `LinearPartial` through
-  `cublasGemmEx`, captured or eager. It holds ADR 0028's rule per element
-  against the ordered path. TP2 on the 3090 pair stays bit-identical to the
-  single-GPU `LinearSplit` on the unordered path. The ordered path is
-  unchanged.
+- **Outcome:** a dense plan lowered from the unordered catalogue runs every
+  BF16 `Linear` through `cublasGemmEx`, eager and captured. It holds ADR
+  0028's rule per element against the ordered host oracle. The ordered path
+  is unchanged. `LinearSplit` and `LinearPartial` stay ordered in this task:
+  the unordered catalogue does not replace them, so TP plans keep their
+  present kernels until task 0097.
 - **Allowed files:**
   - `crates/moxie-cuda/{build.rs,Cargo.toml,src/lib.rs,src/ffi.rs}`, plus a
     new `src/blas.rs`;
-  - `crates/moxie-types/src/precision.rs` (the new policy);
-  - `crates/moxie-kernels/{build.rs,Cargo.toml,src/lib.rs}` (the unordered
-    catalogue);
+  - `crates/moxie-types/src/precision.rs`;
+  - `crates/moxie-kernels/{build.rs,Cargo.toml,src/lib.rs}`;
   - `crates/moxie-plan/src/selected.rs`;
   - `crates/moxie-executor/src/{dense.rs,chain.rs}`;
   - the executor `Cargo.toml` feature line;
   - `crates/moxie-executor/tests/dense_gemma_device.rs` (new tests);
-  - `crates/moxie-executor/tests/dense_tp2_device.rs` (one new test);
   - `xtask/src/archcheck.rs`, only if it must name the link;
   - this task's Result.
 - **Non-goals:**
-  - `Route`, `VocabProjection`, attention, the affine kernel;
-  - `chain.rs`'s older BF16 chain path (except where the dense plan admits);
-  - `LinearSplit` with more than 2 blocks (refuse);
+  - `LinearSplit`, `LinearPartial`, TP (task 0097);
+  - `Route`, `VocabProjection`, attention, the affine kernel, the older
+    chain path;
   - changing any default catalogue;
-  - speed claims (O6 open; one timing line is allowed, see change 7).
+  - speed claims (one timing line allowed, change 8).
 
 ## Numbered changes
 
@@ -82,118 +83,150 @@ of the contract.
    with the doc comment: "16-bit inputs, FP32 accumulator in hardware order
    (tensor-op); held to ADR 0028 against the ordered oracle (ADR 0037)."
    `accumulator()` returns `F32`.
-2. **Selection (`selected.rs`).** Add one helper `fn admits(required:
-   AccumulationPolicy, declared: AccumulationPolicy, operation) -> bool`:
-   - equality as today;
-   - additionally, `Bf16InF32Acc` admits `Bf16InF32AccUnordered` **only**
-     for `Linear`, `LinearSplit` and `LinearPartial`.
-
-   Use it at the three matching sites. Two matches is today's "expected
-   exactly one" refusal. `Route` and `VocabProjection` therefore never match
-   an unordered descriptor.
+2. **Selection (`selected.rs`), dense lowering only (sol M2).**
+   - In the dense lowering's matching site only, `Bf16InF32Acc` admits
+     `Bf16InF32AccUnordered` for `SemanticKernelOp::Linear`.
+   - The chain and paged matching sites stay exact equality.
+   - Two matches is today's "expected exactly one" refusal.
+   - The unordered descriptor's `abi_version` is `DENSE_GRAPH_ABI` (1).
 3. **cuBLAS binding (`moxie-cuda`).**
    - Feature `cublas = ["driver"]`. `build.rs`: when it is on, add
      `$CUDA_HOME/lib64` (default `/usr/local/cuda`) to the link search, link
-     `dylib=cublas`, and add an rpath to that directory. It panics loudly,
-     like the driver branch, if `libcublas.so.13` is absent.
+     `dylib=cublas`, and add an rpath. It panics loudly if
+     `libcublas.so.13` is absent.
    - `ffi.rs`: `cublasCreate_v2`, `cublasDestroy_v2`, `cublasSetStream_v2`,
-     `cublasSetWorkspace_v2`, `cublasSetMathMode`, `cublasGemmEx`, and the
-     enum constants they need.
-   - `blas.rs`: `pub struct Blas<'ctx>`, created for one `Context` with a
-     borrowed `DeviceBuffer` workspace of fixed size `BLAS_WORKSPACE_BYTES =
-     32 MiB` and bound to one `Stream`. Make the context current on the
-     calling thread for every call, as the module wrappers do.
-   - `pub unsafe fn gemm_bf16(&self, transa_t: bool, m, n, k, a: u64, lda, b:
-     u64, ldb, c: u64, ldc, c_is_f32: bool) -> Result<()>` with α = 1 and
-     β = 0, compute `CUBLAS_COMPUTE_32F`, algorithm `CUBLAS_GEMM_DEFAULT`,
-     and math mode `CUBLAS_DEFAULT_MATH`.
-   - Status codes map to typed errors through the existing status
-     machinery.
-   - If cuBLAS does not work with Moxie's explicitly created (non-primary)
-     contexts, stop and send `DECISION` with the error.
-4. **Descriptors (`moxie-kernels`).** Under a `cublas` feature,
+     `cublasSetWorkspace_v2`, `cublasSetMathMode`, `cublasGemmEx`, and their
+     constants.
+   - `blas.rs`, `pub struct Blas<'ctx>` (sol H1):
+     - it owns the handle and records the `&'ctx Context`; it is not
+       `Clone` and not `Send`;
+     - it holds no borrow of a workspace or stream.
+     - `pub unsafe fn bind(&mut self, stream: &Stream<'ctx>, workspace: u64,
+       bytes: usize) -> Result<()>` calls `cublasSetStream`, then
+       `cublasSetWorkspace` (SetStream resets the user workspace). The
+       caller guarantees the range is valid device memory of this context.
+     - `pub unsafe fn gemm_bf16(&self, m, n, k, a: u64, lda, b: u64, ldb,
+       c: u64, ldc) -> Result<()>` uses `transa = T`, `transb = N`, α = 1,
+       β = 0, BF16 A, B and C, compute `CUBLAS_COMPUTE_32F`,
+       `CUBLAS_GEMM_DEFAULT` and `CUBLAS_DEFAULT_MATH`.
+     - Every call makes the context current, as the module wrappers do.
+       Status codes map to typed errors.
+     - `pub unsafe fn destroy(self) -> Result<()>` is the only destructor.
+       `Drop` does **not** call `cublasDestroy`; an undestroyed handle
+       leaks (quarantine), like a live module.
+   - If cuBLAS fails on Moxie's explicitly created contexts, stop and send
+     `DECISION`.
+4. **Descriptor (`moxie-kernels`).** Under a `cublas` feature, add
    `pub fn dense_graph_catalogue_unordered(sm) -> KernelCatalogue`. It is
-   the dense-graph catalogue with the three BF16 linear descriptors replaced
-   by unordered ones:
-   - ids `bf16-linear-cublas-v1-sm_XX` (and `…-split-…`, `…-partial-…`);
+   `dense_graph_catalogue(sm)` with the one BF16 `Linear` descriptor
+   replaced:
+   - id `bf16-linear-cublas-v1-sm_XX`;
    - accumulation `Bf16InF32AccUnordered`;
-   - workspace `Zero`, because the plan charges the fixed BLAS workspace
-     itself (change 5);
-   - one symbol each: `cublas:gemm_ex`, `cublas:gemm_ex_split` and
-     `cublas:gemm_ex_partial`;
-   - `image_sha256` = SHA-256 of `libcublas.so.13`, computed in `build.rs`;
-   - shape bounds `max_rows 65_536`, `max_input 65_536`, `max_output
-     262_144`.
-5. **Execution (`dense.rs`, plan admission).**
-   - A plan whose selected nodes include a `cublas:` symbol:
-     - excludes those symbols from module symbol resolution;
-     - adds `BLAS_WORKSPACE_BYTES` plus, for `LinearSplit`, `2 × rows ×
-       out_features × 4` FP32 block partials to its admitted workspace
-       region;
-     - creates one `Blas` bound to the plan stream and that workspace.
-   - `Linear`: `gemm_bf16(transa_t=true, m=out, n=rows, k=in, a=weight,
-     lda=in, b=input, ldb=in, c=output, ldc=out, c_is_f32=false)`.
-   - `LinearPartial`: the same, with FP32 `c`.
-   - `LinearSplit` with `blocks = 2` and block width `bw = in/2`:
-     1. for `b` in 0, 1, call `gemm_bf16(true, out, rows, bw, weight + b·bw·2,
-        in, input + b·bw·2, in, partial_b, out, true)`;
-     2. launch `TP_REDUCE_F32` on the two partials to produce the BF16
-        output.
+   - `abi_version` 1;
+   - workspace `Zero`, because the plan places its own BLAS range (change 6);
+   - one symbol, `cublas:gemm_ex`;
+   - `image_sha256` = SHA-256 of `libcublas.so.13` from `build.rs`;
+   - bounds `max_rows 65_536`, `max_input 65_536`, `max_output 262_144`.
+5. **Symbols and identity (`dense.rs`, sol H3).**
+   - At admission, build an explicit map from each selected node to its
+     module symbol index, for real CUDA symbols only.
+   - `launch()` looks up the index through that map, never by position in
+     the descriptor list.
+   - A `cublas:` node resolves nothing in the module. At execution it
+     validates the descriptor's operation, its backend symbol and the
+     catalogue's image identity.
+   - Extend dense execution's known-catalogue digest check (about 144–146)
+     to accept `dense_graph_catalogue_unordered(sm)` for the device's SM,
+     keeping the candidate, catalogue and UUID identity checks.
+6. **Workspace placement (`selected.rs` workspace layout, sol M3).** When a
+   candidate holds a `cublas:` node, place one 256-byte-aligned range of
+   `BLAS_WORKSPACE_BYTES = 32 MiB` after the last RoPE table. Use checked
+   offsets and include its end in `workspace_region_bytes`, the arena ranges
+   and the ledger request. The candidate exposes the range's offset.
+7. **Ownership and teardown (`chain.rs`/`dense.rs`, sol H1, H2, M1).**
+   - **Creation:** the plan creates its `Blas` lazily, before its first
+     dense submission. It calls `bind(stream, workspace range)` before
+     every step and before `begin_capture`, never inside a capture. A step
+     on a different stream rebinds before any launch.
+   - **Teardown, explicit, not by field order:**
+     1. launched work is observed complete;
+     2. captured graphs are destroyed;
+     3. `Blas::destroy`;
+     4. the module;
+     5. the arena and workspace are released.
+   - **Exit paths:**
 
-     Block count 1 is `Linear`'s call; more than 2 refuses (`invalid`).
-   - Record launch-order labels `linear` exactly as today.
-6. **Escape inventory (the `Blas` handle and its workspace).** The owner is
-   the plan (`SelectedReservedPlan`).
-   - The handle is destroyed only in the plan's close, after the plan's
-     stream is observed complete. Declare it before the captured graphs and
-     the module in field order, so that graphs drop first.
-   - On a failed completion or a close refusal, the plan keeps the handle
-     and the workspace (quarantine), as it keeps its module today.
-   - On drop without close, the handle is not destroyed while work may be
-     pending: use the same `ManuallyDrop` rule the module uses.
-   - `Blas` is not `Clone`, not `Send`, and never leaves the plan through a
-     public type or refusal.
-7. **Tests.**
-   - (a) `cublas_linear_holds_the_quantized_gate` in
-     `dense_gemma_device.rs`, on the 3090 and the 5060 Ti. For each of
-     `Linear`, `LinearSplit` (2 blocks) and `LinearPartial`, at `(rows, in,
-     out)` ∈ `{(1, 5376, 21504), (33, 1024, 3072), (512, 4096, 4096)}` with
-     random BF16 data from a fixed seed, compare against the host ordered
-     oracle with ADR 0028's two clauses. Report the worst ULP and how often
-     the second clause fired.
+     | Path | Rule |
+     |---|---|
+     | Pre-launch refusal | Returns the whole plan unchanged. |
+     | Post-submission, capture or event-record failure, or failed completion | Returns the held lease, or withholds the plan. Nothing is torn down. |
+     | Close refusal | Keeps every surviving resource in the returned plan. |
+     | `Drop` of a plan whose work was not observed | Destroys none of Blas, graphs, module or arena. It leaks them (quarantine). |
+
+     State the `Drop`/`ManuallyDrop` behaviour of each such field in code
+     comments, and test it (change 8c).
+   - **Capture:** a cuBLAS `Linear` inside a captured segment is allowed.
+     Graph-pool admission counts graph nodes, and cuBLAS may emit more than
+     one kernel per call. Measure the node count and pool bytes of
+     `cublasGemmEx` at each test shape once. Charge a conservative per-call
+     bound (a named constant with its measurement in a comment), as task
+     0086 did for kernels. A capture failure ends capture, and it
+     quarantines if work is unobserved.
+8. **Tests (`dense_gemma_device.rs`).**
+   - (a) `cublas_linear_holds_the_quantized_gate`, on the 3090 and the 5060
+     Ti:
+     - at `(rows, in, out)` ∈ `{(1, 5376, 21504), (33, 1024, 3072), (512,
+       4096, 4096)}`, with fixed-seed random BF16;
+     - apply ADR 0028's two clauses against the ordered host oracle;
+     - print the worst ULP and how often the second clause fired.
    - (b) Shape A end-to-end with the unordered catalogue, eager and
-     captured: logits are finite, and the greedy top token per row equals
-     the ordered path's. Report the worst ULP; don't assert it.
-   - (c) `dense_tp2_device.rs`: on the 3090 pair, TP2 with the unordered
-     catalogue is bit-identical to single-GPU `LinearSplit` with the
-     unordered catalogue.
-   - (d) One printed timing line of (a)'s 512×4096×4096 on a 3090: median
-     of 20, as `cublas-linear tflops=…`. It is recorded in the Result, and
-     it is not a gate.
-8. **Coverage check (one mutant, reverted after).** In `LinearSplit`, pass
-   the whole `in` as `k` for block 0 and skip block 1. Test (c) or (a) must
-   fail.
+     captured:
+     - assert finite logits and the same greedy top token per row as the
+       ordered path;
+     - print the worst ULP.
+   - (c) Ownership:
+     - a plan dropped after submission without `finish` leaks rather than
+       destroys: the handle is still valid, checked by a test hook counter
+       of `destroy` calls under `paged-attention-test-hooks`, or the
+       nearest existing test-hooks feature;
+     - a normal close destroys exactly once;
+     - the ledger returns to empty after close.
+   - (d) One printed line on a 3090, for (a)'s 512×4096×4096: `cublas-linear
+     tflops=…`, the median of 20. Recorded in the Result; not a gate.
+9. **Coverage check (one mutant, reverted after).** Bind the workspace
+   before `cublasSetStream` instead of after; test (b)'s captured case, or
+   (a), must fail or report a cuBLAS error. If it does not, report that the
+   order is unobservable here and name the test that would catch it.
 
 ## Acceptance
 
 Host gates:
 - `cargo fmt --all -- --check`;
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`;
-- the executor driver-feature clippy, plus the same clippy with `cublas`;
+- the executor driver-feature clippy, plus the same with `cublas`;
 - `cargo test --workspace --locked`;
 - `cargo xtask arch-check`;
 - `cargo xtask spec-check`.
 
 GPU gates (`CUDA_DEVICE_ORDER=PCI_BUS_ID`):
-- the full `dense_gemma_device` and `dense_tp2_device`, with and without
-  the `cublas` feature;
+- the full `dense_gemma_device`, with and without `cublas`;
+- `dense_tp2_device`;
 - `cargo xtask-cuda test-gpu`.
 
 **Stop conditions:**
 - cuBLAS fails on Moxie's contexts;
-- capture of a cuBLAS call fails;
-- a `LinearSplit` reference and a TP rank select different cuBLAS results
-  (the bit-identity test fails and the cause is inside cuBLAS);
+- capture of `cublasGemmEx` fails;
 - a file outside the allowed list is needed.
+
+## Design review (sol, 2026-09-25, before implementation)
+
+Adopted: H1 (the Blas handle borrows nothing; bind per step before capture),
+H2 (explicit teardown order and quarantine on every path), H3 (map from each
+node to its module symbol index; `TP_REDUCE_F32` moves with the split to
+0097), H4 (single-GPU split and TP partial are different call shapes, so ADR
+0036 identity needs packed blocks: task 0097), M1 (bind before capture;
+charge measured cuBLAS graph nodes), M2 (unordered admission in dense
+lowering only; ABI 1; digest check extended), M3 (aligned, checked
+workspace placement).
 
 ## Result, filled after work
