@@ -53,7 +53,10 @@ Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Cod
 - **Outcome:** in a dense step, a run's publish, device write and attend
   record their completion instead of waiting for it; the run observes that
   completion the next time anything needs it. A single-GPU dense step then
-  has one blocking wait, at `finish` (see R1 repair 14).
+  has one blocking wait per step, at `finish`; each later deferred publish
+  observes the previous step's event, which `finish` already completed, so
+  that call does not wait. Those observations sit on the eager attention path,
+  outside any future captured segment.
 - **Allowed files:** `crates/moxie-executor/src/paged_attention.rs`,
   `crates/moxie-executor/src/dense.rs`,
   `crates/moxie-executor/src/dense_tp_workers.rs`, this task's Result,
@@ -197,3 +200,16 @@ prefill medians were 1042.890, 1053.008, and 1045.807 µs; decode medians were
 999.911, 1007.000, and 993.226 µs. The 111-step profile recorded 777
 `cuEventSynchronize` calls and 2109 `cuEventRecord` calls. This is fixture
 evidence only; O6 remains open and no performance claim is made.
+
+### R1
+
+Applied changes 11–15: deferred operations and branch-source copies are
+ordered after pending events; Drop observes pending work and preserves the
+resolved module on quarantine or synchronization failure; the outcome and
+`written_rows` comments now match the implemented ordering. Existing dense,
+TP2 and paged-attention output checks passed with bit-identical results.
+
+Host gates passed: formatting, workspace clippy, executor driver-feature
+clippy, and workspace tests. GPU gates passed: dense Gemma (8 passed,
+1 ignored), dense TP2 (1 passed), paged attention (7 passed), and the CUDA
+image matrix (63/63 across SM86 and SM120).

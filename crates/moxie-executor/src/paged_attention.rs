@@ -1093,7 +1093,7 @@ mod tests {
 /// a later run entry point.
 #[cfg(feature = "driver")]
 pub mod device {
-    use core::ffi::c_void;
+    use core::{ffi::c_void, mem::ManuallyDrop};
 
     use moxie_cuda::{
         Event, Module, ModuleImage, RankContext, ResolvedModule, Stream, TrustedImage,
@@ -1318,7 +1318,7 @@ pub mod device {
     #[derive(Debug)]
     #[must_use = "an unclosed run keeps its arena and its reservation"]
     pub struct PagedAttentionRun<'ctx> {
-        module: ResolvedModule<'ctx>,
+        module: ManuallyDrop<ResolvedModule<'ctx>>,
         descriptor: SemanticKernelDescriptor,
         geometry: PageGeometry,
         heads: u64,
@@ -1371,10 +1371,11 @@ pub mod device {
         /// What this run is holding across work whose completion it has not
         /// observed. An append holds two vectors and hands both back unjoined.
         held: Option<RefusedSource>,
-        /// The event recorded after this run's last deferred operation. Until
-        /// it is observed, `held` may still be read by the device, and
-        /// `written` counts rows whose copies are enqueued rather than
-        /// observed.
+        /// The event recorded after this run's last deferred operation. Every
+        /// later deferred operation waits on it before enqueueing, preserving
+        /// order when operations use different streams. Until it is observed,
+        /// `held` may still be read by the device, and `written` counts rows
+        /// whose copies are enqueued rather than observed.
         pending: Option<Event<'ctx>>,
         /// The query and output ranges of an `attend`/`attend_into` whose
         /// completion is unobserved.
@@ -1423,6 +1424,13 @@ pub mod device {
                     RefusedSource::PageTableUpload(bytes) => self.page_table_upload = bytes,
                     other => self.held = Some(other),
                 }
+            }
+            Ok(())
+        }
+
+        fn order_after_pending(&self, stream: &Stream<'ctx>) -> Result<()> {
+            if let Some(pending) = self.pending.as_ref() {
+                stream.wait_event(pending)?;
             }
             Ok(())
         }
@@ -1973,7 +1981,7 @@ pub mod device {
             let values = hold.pop().expect("value range");
             let keys = hold.pop().expect("key range");
             Ok(Self {
-                module,
+                module: ManuallyDrop::new(module),
                 descriptor,
                 geometry,
                 heads,
@@ -2020,7 +2028,7 @@ pub mod device {
             self.arena_bytes
         }
 
-        /// Rows this run has observed copied into its pages.
+        /// Rows whose copies are enqueued on this run's stream order, not observed.
         ///
         /// Reported separately from the admitted capacity and from what a launch
         /// declares visible, because the three are different numbers and
@@ -2142,6 +2150,9 @@ pub mod device {
                 source: Some(RefusedSource::PageTable(table)),
             };
             if let Err(error) = self.observe_pending() {
+                return Err(give_back(error, table));
+            }
+            if defer && let Err(error) = self.order_after_pending(stream) {
                 return Err(give_back(error, table));
             }
             if self.quarantined {
@@ -2410,6 +2421,7 @@ pub mod device {
                     "the child fork view does not match the parent's published mapping",
                 ));
             }
+            source.order_after_pending(stream)?;
             let page_bytes = self.geometry.page_bytes()?;
             for physical_page in 0..self.geometry.pages {
                 let within = physical_page
@@ -2705,6 +2717,8 @@ pub mod device {
                 ));
             }
 
+            self.order_after_pending(stream)?;
+
             let page_bytes = self.geometry.page_bytes()?;
             let mut done = 0u64;
             for placement in placements {
@@ -2921,6 +2935,9 @@ pub mod device {
                 };
             }
             if !defer && let Err(error) = self.observe_pending() {
+                refuse!(error);
+            }
+            if defer && let Err(error) = self.order_after_pending(stream) {
                 refuse!(error);
             }
             if let Err(error) = self.check_attend(stream, launch) {
@@ -4394,34 +4411,44 @@ pub mod device {
 
     impl Drop for PagedAttentionRun<'_> {
         fn drop(&mut self) {
-            if !self.quarantined && self.pending.is_none() {
-                return;
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.synchronize().is_err())
+            {
+                self.quarantined = true;
             }
-            // Host bytes a still-enqueued copy may be reading. Forgetting --
-            // not dropping -- is the point: freeing this allocation while a
-            // DMA transfer is in flight would let the allocator hand the same
-            // bytes to something else while the device is still reading them.
-            if let Some(held) = self.held.take() {
-                match held {
-                    RefusedSource::Rows { keys, values } => {
-                        core::mem::forget(keys);
-                        core::mem::forget(values);
-                    }
-                    RefusedSource::PageTable(table) => core::mem::forget(table),
-                    RefusedSource::Query(bytes) | RefusedSource::PageTableUpload(bytes) => {
-                        core::mem::forget(bytes)
-                    }
-                    RefusedSource::Stream {
-                        query,
-                        keys,
-                        values,
-                        table: _,
-                    } => {
-                        core::mem::forget(query);
-                        core::mem::forget(keys);
-                        core::mem::forget(values);
+            if self.quarantined {
+                // Host bytes a still-enqueued copy may be reading. Forgetting
+                // -- not dropping -- prevents reuse while the device may read.
+                if let Some(held) = self.held.take() {
+                    match held {
+                        RefusedSource::Rows { keys, values } => {
+                            core::mem::forget(keys);
+                            core::mem::forget(values);
+                        }
+                        RefusedSource::PageTable(table) => core::mem::forget(table),
+                        RefusedSource::Query(bytes) | RefusedSource::PageTableUpload(bytes) => {
+                            core::mem::forget(bytes)
+                        }
+                        RefusedSource::Stream {
+                            query,
+                            keys,
+                            values,
+                            table: _,
+                        } => {
+                            core::mem::forget(query);
+                            core::mem::forget(keys);
+                            core::mem::forget(values);
+                        }
                     }
                 }
+            } else {
+                // A pending event was observed above, so unloading the module
+                // cannot race work from this run.
+                // SAFETY: the field is created once and otherwise never
+                // dropped; all normal-path work is settled or observed here.
+                unsafe { ManuallyDrop::drop(&mut self.module) };
             }
             // `held_ranges` needs no such rescue: a `DeviceRange` has no
             // `Drop` of its own, so an ordinary drop here does not release its
