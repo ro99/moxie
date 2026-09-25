@@ -64,6 +64,18 @@ pub fn classify(code: CUresult, detail: String) -> Result<()> {
             capability: "peer_access",
             reason: detail,
         }),
+        // STREAM_CAPTURE_UNSUPPORTED: this device/API combination cannot
+        // capture the requested operation.
+        900 => Err(Error::Unsupported {
+            capability: "cuda_stream_capture",
+            reason: detail,
+        }),
+        // INVALIDATED, MERGE, UNMATCHED, UNJOINED, ISOLATION, IMPLICIT,
+        // CAPTURED_EVENT, WRONG_THREAD: the caller violated the capture rules.
+        901..=908 => Err(Error::InvalidRequest {
+            field: "cuda_stream_capture",
+            detail,
+        }),
         // NOT_FOUND, INVALID_PTX, UNSUPPORTED_PTX_VERSION, NO_BINARY_FOR_GPU,
         // INVALID_IMAGE, INVALID_SOURCE. The last two are what a truncated or
         // non-image byte buffer produces, and they belong with the other
@@ -156,6 +168,25 @@ mod tests {
             classify(101, "cuDeviceGet".into()).unwrap_err().kind(),
             "unsupported"
         );
+    }
+
+    #[test]
+    fn stream_capture_errors_keep_their_typed_classification() {
+        assert_eq!(
+            classify(900, "cuStreamBeginCapture".into())
+                .unwrap_err()
+                .kind(),
+            "unsupported"
+        );
+        for code in 901..=908 {
+            assert_eq!(
+                classify(code, "cuStreamEndCapture".into())
+                    .unwrap_err()
+                    .kind(),
+                "invalid_request",
+                "code {code}"
+            );
+        }
     }
 
     #[test]

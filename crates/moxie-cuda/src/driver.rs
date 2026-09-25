@@ -685,6 +685,51 @@ impl Drop for RankContext {
     }
 }
 
+/// An instantiated CUDA graph bound to its owning context.
+///
+/// The owner must not drop a graph while a launch of it may still run; whoever
+/// holds the kernels' buffers holds the graph with them.
+#[derive(Debug)]
+pub struct CapturedGraph<'ctx> {
+    graph_exec: ffi::CUgraphExec,
+    ctx: &'ctx RankContext,
+}
+
+impl<'ctx> CapturedGraph<'ctx> {
+    /// Enqueue this graph on a stream from the same device.
+    ///
+    /// # Safety
+    /// Every buffer a captured kernel or copy names must be live and not
+    /// concurrently written until a completion recorded after this launch is
+    /// observed.
+    pub unsafe fn launch(&self, stream: &Stream<'ctx>) -> Result<()> {
+        if stream.device_uuid() != self.ctx.uuid() {
+            return Err(Error::InvalidRequest {
+                field: "stream",
+                detail: "captured graph and stream belong to different devices".into(),
+            });
+        }
+        self.ctx.make_current()?;
+        check(
+            // SAFETY: the graph and stream are live, belong to this device,
+            // and the buffer lifetime obligation is forwarded to the caller.
+            unsafe { ffi::cuGraphLaunch(self.graph_exec, stream.raw()) },
+            "cuGraphLaunch",
+        )
+    }
+}
+
+impl Drop for CapturedGraph<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the owning context is made current before destroying the
+        // executable graph. Teardown errors are not actionable.
+        unsafe {
+            let _ = ffi::cuCtxSetCurrent(self.ctx.raw());
+            let _ = ffi::cuGraphExecDestroy(self.graph_exec);
+        }
+    }
+}
+
 /// A non-blocking stream owned by one context.
 ///
 /// M0 scope: enough to record and wait on an event, which is the bounded
@@ -716,6 +761,76 @@ impl<'ctx> Stream<'ctx> {
 
     pub(crate) fn raw(&self) -> ffi::CUstream {
         self.stream
+    }
+
+    /// Begin capturing kernel and copy work enqueued on this stream.
+    pub fn begin_capture(&self) -> Result<()> {
+        self.ctx.make_current()?;
+        check(
+            // SAFETY: the stream is live on the current context, and the
+            // thread-local mode keeps unrelated rank threads out of this
+            // capture's validity rules.
+            unsafe {
+                ffi::cuStreamBeginCapture_v2(self.stream, ffi::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            },
+            "cuStreamBeginCapture_v2",
+        )
+    }
+
+    /// End capture and instantiate the captured graph for replay.
+    pub fn end_capture(&self) -> Result<CapturedGraph<'ctx>> {
+        self.ctx.make_current()?;
+        let mut graph = core::ptr::null_mut();
+        // SAFETY: the stream is live on the current context and `graph` is a
+        // valid out-parameter; failure may leave it null.
+        let ended = unsafe { ffi::cuStreamEndCapture(self.stream, &mut graph) };
+        if let Err(error) = check(ended, "cuStreamEndCapture") {
+            if !graph.is_null() {
+                // SAFETY: a non-null graph was returned by this stream's
+                // capture; it belongs to the current context.
+                let _ = unsafe { ffi::cuGraphDestroy(graph) };
+            }
+            return Err(error);
+        }
+        if graph.is_null() {
+            return Err(Error::InvalidRequest {
+                field: "cuda_graph",
+                detail: "capture succeeded without returning a graph".into(),
+            });
+        }
+
+        let mut graph_exec = core::ptr::null_mut();
+        // SAFETY: `graph` is the live graph returned by this stream, and
+        // `graph_exec` is a valid out-parameter on the current context.
+        let instantiated = unsafe { ffi::cuGraphInstantiateWithFlags(&mut graph_exec, graph, 0) };
+        // The original graph is no longer needed after instantiation, even if
+        // instantiation failed.
+        // SAFETY: `graph` is a live graph in the current context.
+        let destroyed = unsafe { ffi::cuGraphDestroy(graph) };
+        if let Err(error) = check(instantiated, "cuGraphInstantiateWithFlags") {
+            if !graph_exec.is_null() {
+                // SAFETY: the failed call nevertheless returned a graph exec.
+                let _ = unsafe { ffi::cuGraphExecDestroy(graph_exec) };
+            }
+            let _ = destroyed;
+            return Err(error);
+        }
+        if let Err(error) = check(destroyed, "cuGraphDestroy") {
+            // SAFETY: the just-instantiated executable graph is live in the
+            // current context and cannot be returned after this error.
+            let _ = unsafe { ffi::cuGraphExecDestroy(graph_exec) };
+            return Err(error);
+        }
+        if graph_exec.is_null() {
+            return Err(Error::InvalidRequest {
+                field: "cuda_graph_exec",
+                detail: "instantiation succeeded without returning an executable graph".into(),
+            });
+        }
+        Ok(CapturedGraph {
+            graph_exec,
+            ctx: self.ctx,
+        })
     }
 
     pub fn synchronize(&self) -> Result<()> {

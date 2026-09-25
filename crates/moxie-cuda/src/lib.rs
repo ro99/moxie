@@ -36,7 +36,7 @@ mod driver;
 
 #[cfg(feature = "driver")]
 pub use driver::{
-    DeviceBuffer, Event, Function, Module, ModuleImage, PeerContextToken, PeerReadHandle,
-    PeerReadOwner, PtxSource, RankContext, ResolvedModule, Stream, TrustedImage, device_count,
-    init, query_device,
+    CapturedGraph, DeviceBuffer, Event, Function, Module, ModuleImage, PeerContextToken,
+    PeerReadHandle, PeerReadOwner, PtxSource, RankContext, ResolvedModule, Stream, TrustedImage,
+    device_count, init, query_device,
 };

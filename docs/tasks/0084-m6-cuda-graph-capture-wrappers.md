@@ -112,4 +112,27 @@ conflicts with the code; a file outside the allowed list is needed.
 
 ## Result, filled after work
 
-(pending)
+Verified the new FFI declarations against `/usr/local/cuda/include/cuda.h`.
+The header maps `cuGraphInstantiate` to `cuGraphInstantiateWithFlags`; its
+`unsigned long long` flags parameter matches `u64`. The capture-mode enum is
+represented by the requested `c_uint`, with thread-local mode set to 1.
+
+Added the graph and executable-graph handles, capture/instantiate/launch/
+destroy FFI, and typed classification for CUDA stream-capture errors. Added
+`CapturedGraph<'ctx>` with context-bound cleanup, thread-local
+`Stream::begin_capture`, `Stream::end_capture` cleanup on failed capture and
+instantiation, and unsafe same-device graph launch with the required buffer
+lifetime contract. Exported the wrapper.
+
+Added the `graph_capture_replay` GPU case beside `stream_event`: it captures
+two async AXPY launches, replays them twice, verifies the result against four
+host AXPYs, then verifies invalidated capture returns an error and the stream
+accepts ordinary work afterward.
+
+The launch-once mutant failed only `graph_capture_replay` on all three GPUs:
+63 passed and 3 failed, each with output 5 instead of 9. The mutant was
+reverted. Host gates passed: `cargo fmt --all -- --check`, workspace clippy,
+driver-feature executor clippy, `cargo test --workspace --locked`,
+`cargo xtask arch-check`, and `cargo xtask spec-check`. With
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`, `cargo xtask-cuda test-gpu` passed 66/66 across
+the three GPUs and qualified SM86 and SM120.

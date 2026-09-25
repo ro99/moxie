@@ -26,6 +26,8 @@ pub type CUstream = *mut c_void;
 pub type CUevent = *mut c_void;
 pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
+pub type CUgraph = *mut c_void;
+pub type CUgraphExec = *mut c_void;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -43,6 +45,7 @@ pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 
 // Stream creation flags.
 pub const CU_STREAM_NON_BLOCKING: c_uint = 1;
+pub const CU_STREAM_CAPTURE_MODE_THREAD_LOCAL: c_uint = 1;
 
 // Event creation flags.
 pub const CU_EVENT_DEFAULT: c_uint = 0;
@@ -113,6 +116,17 @@ unsafe extern "C" {
     pub fn cuStreamSynchronize(stream: CUstream) -> CUresult;
     pub fn cuStreamWaitEvent(stream: CUstream, event: CUevent, flags: c_uint) -> CUresult;
     pub fn cuStreamDestroy_v2(stream: CUstream) -> CUresult;
+    pub fn cuStreamBeginCapture_v2(stream: CUstream, mode: c_uint) -> CUresult;
+    pub fn cuStreamEndCapture(stream: CUstream, graph: *mut CUgraph) -> CUresult;
+
+    pub fn cuGraphInstantiateWithFlags(
+        graph_exec: *mut CUgraphExec,
+        graph: CUgraph,
+        flags: u64,
+    ) -> CUresult;
+    pub fn cuGraphLaunch(graph_exec: CUgraphExec, stream: CUstream) -> CUresult;
+    pub fn cuGraphExecDestroy(graph_exec: CUgraphExec) -> CUresult;
+    pub fn cuGraphDestroy(graph: CUgraph) -> CUresult;
 
     pub fn cuEventCreate(event: *mut CUevent, flags: c_uint) -> CUresult;
     pub fn cuEventRecord(event: CUevent, stream: CUstream) -> CUresult;

@@ -82,6 +82,7 @@ const CASES: &[&str] = &[
     "bf16_round_trip",
     "arch_mismatch_is_typed",
     "stream_event_completion",
+    "graph_capture_replay",
     "event_backed_lease",
     "admitted_device_arena",
     "selected_bf16_device_chain",
@@ -196,6 +197,11 @@ pub fn run(profile: Option<&str>) -> i32 {
         results.push(case(&cap, "bf16_round_trip", bf16(&cap)));
         results.push(case(&cap, "arch_mismatch_is_typed", arch_mismatch(&cap)));
         results.push(case(&cap, "stream_event_completion", stream_event(&cap)));
+        results.push(case(
+            &cap,
+            "graph_capture_replay",
+            graph_capture_replay(&cap),
+        ));
         results.push(case(&cap, "event_backed_lease", backed_lease(&cap)));
         results.push(case(
             &cap,
@@ -615,6 +621,105 @@ fn stream_event(cap: &DeviceCapability) -> Result<Outcome, Error> {
             )));
         }
     }
+    Ok(Outcome::Passed)
+}
+
+/// Captured launches replay in order and an invalidated capture releases its stream.
+fn graph_capture_replay(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    const N: usize = 1024;
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let package = Module::load(
+        &ctx,
+        ModuleImage::Binary(smoke_image(moxie_kernels::SMOKE_FATBIN)?),
+    )?
+    .resolve_all(&[moxie_kernels::AXPY_F32.to_string()])?;
+    let stream = Stream::new(&ctx)?;
+
+    let x: Vec<f32> = (0..N).map(|i| i as f32).collect();
+    let y_initial = vec![1.0f32; N];
+    let a = 2.0f32;
+    let mut dx = DeviceBuffer::alloc(&ctx, N * 4)?;
+    let mut dy = DeviceBuffer::alloc(&ctx, N * 4)?;
+    dx.copy_from_host(bytemuck_f32(&x))?;
+    dy.copy_from_host(bytemuck_f32(&y_initial))?;
+
+    let mut px = dx.device_ptr();
+    let mut py = dy.device_ptr();
+    let mut pa = a;
+    let mut pn = N as u32;
+    let mut params: [*mut c_void; 4] = [
+        (&raw mut px).cast(),
+        (&raw mut py).cast(),
+        (&raw mut pa).cast(),
+        (&raw mut pn).cast(),
+    ];
+    stream.begin_capture()?;
+    // SAFETY: the parameters match the AXPY symbol; both device buffers and
+    // the module stay live through the graph's launches and synchronization.
+    unsafe {
+        package.launch_async(
+            0,
+            &stream,
+            (N.div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &mut params,
+        )?;
+        package.launch_async(
+            0,
+            &stream,
+            (N.div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &mut params,
+        )?;
+    }
+    let graph = stream.end_capture()?;
+    // SAFETY: this graph names only the live buffers above, neither of which
+    // the host accesses until the following stream synchronization completes.
+    unsafe {
+        graph.launch(&stream)?;
+        graph.launch(&stream)?;
+    }
+    stream.synchronize()?;
+
+    let mut expected = y_initial;
+    for _ in 0..4 {
+        for (y, &x) in expected.iter_mut().zip(&x) {
+            *y = a * x + *y;
+        }
+    }
+    let mut output = vec![0.0f32; N];
+    dy.copy_to_host(bytemuck_f32_mut(&mut output))?;
+    for (index, (&got, &want)) in output.iter().zip(&expected).enumerate() {
+        if got != want {
+            return Ok(Outcome::Failed(format!(
+                "index {index}: graph replay got {got}, want {want} after four AXPY launches"
+            )));
+        }
+    }
+
+    stream.begin_capture()?;
+    let _ = stream.synchronize();
+    if let Ok(unexpected_graph) = stream.end_capture() {
+        drop(unexpected_graph);
+        return Ok(Outcome::Failed(
+            "end_capture succeeded after capture was invalidated by synchronize".into(),
+        ));
+    }
+    // SAFETY: the same live buffers and package are used; the failed capture
+    // has ended, and the work is observed before the function returns.
+    unsafe {
+        package.launch_async(
+            0,
+            &stream,
+            (N.div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &mut params,
+        )?;
+    }
+    stream.synchronize()?;
     Ok(Outcome::Passed)
 }
 
