@@ -1,6 +1,6 @@
 # Task 0080 — dense plans admit quantized (affine) linear weights
 
-Status: **proposed** (coordinator, 2026-09-24). Builder Codex `luna`;
+Status: **active** (coordinator, 2026-09-24). Builder Codex `luna`;
 reviewer Codex `sol`.
 
 ## Identity and authority
