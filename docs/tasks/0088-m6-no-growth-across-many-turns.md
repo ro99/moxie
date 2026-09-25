@@ -82,7 +82,7 @@ fix production code in this task.
 ## Result, filled after work
 
 - Added `many_turns_hold_every_resource_steady` on the specified 3090. It
-  admits and captures the `[1, 2, 4, 8]` plans once, then runs one 168-token
+  admits the `[1, 2, 4, 8]` plans once with capture enabled (buckets 4 and 1 run, so those two are captured and then replayed; corrected by the coordinator after review), then runs one 168-token
   device sequence through 24 turns of five prefill tokens and two decode
   steps. The measured ledger charges, outstanding count and device free bytes
   stayed exactly constant; process RSS stayed within the 4 MiB allowance.
