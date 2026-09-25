@@ -78,6 +78,7 @@ pub struct SelectedPlanCandidate {
     stages: Vec<String>,
     package: SelectedPackage,
     host_workspace_bytes: u64,
+    rope_table_offsets: BTreeMap<(u64, u64, u32), u64>,
     linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
     combine_orders: BTreeMap<NodeId, CombineReductionOrder>,
     expert_ownership: BTreeMap<NodeId, ExpertOwnership>,
@@ -130,6 +131,9 @@ impl SelectedPlanCandidate {
     }
     pub const fn host_workspace_bytes(&self) -> u64 {
         self.host_workspace_bytes
+    }
+    pub fn rope_table_offsets(&self) -> &BTreeMap<(u64, u64, u32), u64> {
+        &self.rope_table_offsets
     }
     pub fn linear_orders(&self) -> &BTreeMap<NodeId, LinearReductionOrder> {
         &self.linear_orders
@@ -451,6 +455,7 @@ pub fn lower_selected(
         stages,
         package: SelectedPackage::Chain,
         host_workspace_bytes: 0,
+        rope_table_offsets: BTreeMap::new(),
         linear_orders: BTreeMap::new(),
         combine_orders: BTreeMap::new(),
         expert_ownership: BTreeMap::new(),
@@ -775,6 +780,7 @@ fn lower_attention(
         stages: vec!["attention".into(), "terminal-output".into()],
         package: SelectedPackage::Attention,
         host_workspace_bytes: 0,
+        rope_table_offsets: BTreeMap::new(),
         linear_orders: BTreeMap::new(),
         combine_orders: BTreeMap::new(),
         expert_ownership: BTreeMap::new(),
@@ -1037,10 +1043,10 @@ fn lower_dense_mode(
     }
 
     let mut selected = Vec::new();
-    let mut workspace_logical_bytes = 0u64;
+    let mut workspace_shared_bytes = 0u64;
     let mut host_workspace_bytes = 0u64;
     let mut rope_host_bytes = 0u64;
-    let mut rope_keys = BTreeSet::new();
+    let mut rope_table_bytes = BTreeMap::new();
     for node in graph.nodes() {
         let mut operation = dense_semantic(node)?;
         // `lower_selected_ordered` validated every order against its node.
@@ -1136,7 +1142,6 @@ fn lower_dense_mode(
                 detail: "dense descriptor workspace differs from the operation contract".into(),
             });
         }
-        workspace_logical_bytes = workspace_logical_bytes.max(workspace_bytes);
         match node.params {
             OpParams::Rope {
                 rotary_dim,
@@ -1144,13 +1149,20 @@ fn lower_dense_mode(
                 base,
                 ..
             } => {
-                if rope_keys.insert((rotary_dim, frequency_dim, base.to_bits())) {
+                let key = (rotary_dim, frequency_dim, base.to_bits());
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    rope_table_bytes.entry(key)
+                {
+                    entry.insert(workspace_bytes);
                     rope_host_bytes = rope_host_bytes
                         .checked_add(host_bytes)
                         .ok_or_else(|| invalid("host_workspace", "RoPE tables overflowed"))?;
                 }
             }
-            _ => host_workspace_bytes = host_workspace_bytes.max(host_bytes),
+            _ => {
+                workspace_shared_bytes = workspace_shared_bytes.max(workspace_bytes);
+                host_workspace_bytes = host_workspace_bytes.max(host_bytes);
+            }
         }
         selected.push(SelectedNode {
             node: node.id,
@@ -1161,6 +1173,13 @@ fn lower_dense_mode(
     host_workspace_bytes = host_workspace_bytes
         .checked_add(rope_host_bytes)
         .ok_or_else(|| invalid("host_workspace", "dense host workspace overflowed"))?;
+    let mut rope_table_offsets = BTreeMap::new();
+    let mut workspace_logical_bytes = align_up(workspace_shared_bytes)?;
+    for (key, table_bytes) in rope_table_bytes {
+        rope_table_offsets.insert(key, workspace_logical_bytes);
+        workspace_logical_bytes =
+            checked_add(workspace_logical_bytes, align_up(table_bytes)?, "workspace")?;
+    }
 
     let base = lower(graph, workload)?;
     let last_stage = u32::try_from(graph.nodes().len())
@@ -1341,6 +1360,7 @@ fn lower_dense_mode(
             .collect(),
         package: SelectedPackage::Dense,
         host_workspace_bytes,
+        rope_table_offsets,
         linear_orders: orders.clone(),
         combine_orders: combine_orders.clone(),
         expert_ownership: expert_ownership.clone(),

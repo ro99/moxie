@@ -217,3 +217,65 @@ Derived SQLite report: `/tmp/task-0082-deferred-paged-attention.sqlite`
 `6303dae615f8ffa85d53819397dee47fd25fa6c4f08261f0c8961dc203f0a3abb`.
 Both remain outside Git in `/tmp` for review. These fixture-scale measurements
 do not close O6 or make a performance claim.
+
+## Fixed-offset RoPE table uploads
+
+Three unprofiled runs of the fixed-plan `dense_step_timing` harness measured
+the task 0083 candidate against the preceding task 0082 section. Each phase
+uses five warmups and 50 measured executions. The table reports each run's
+median, minimum and maximum in microseconds; timing brackets `execute_dense`
+plus `finish`. The output checks remained bit-identical.
+
+### Unprofiled runs
+
+Command for each run:
+
+~~~sh
+CUDA_DEVICE_ORDER=PCI_BUS_ID cargo test --release -p moxie-executor --features driver,paged-attention-binding,paged-attention-test-hooks --test dense_gemma_device dense_step_timing -- --ignored --nocapture
+~~~
+
+| Run | Phase | Task 0082 median (µs) | Task 0083 median (µs) | Min (µs) | Max (µs) |
+|---:|---|---:|---:|---:|---:|
+| 1 | prefill | 1042.890 | 1026.100 | 1013.667 | 1133.152 |
+| 1 | decode | 999.911 | 967.851 | 962.730 | 1050.561 |
+| 2 | prefill | 1053.008 | 1033.775 | 1024.168 | 1152.446 |
+| 2 | decode | 1007.000 | 989.883 | 983.172 | 1088.056 |
+| 3 | prefill | 1045.807 | 1027.483 | 1017.995 | 1177.223 |
+| 3 | decode | 993.226 | 978.188 | 968.204 | 1012.549 |
+
+### CUDA driver API count
+
+One Nsight Systems `2025.3.2.474-253236389321v0` profile used the same
+filtered test:
+
+~~~sh
+CUDA_DEVICE_ORDER=PCI_BUS_ID /usr/local/bin/nsys profile -t cuda --stats=true -o /tmp/task-0083-rope-tables cargo test --release -p moxie-executor --features driver,paged-attention-binding,paged-attention-test-hooks --test dense_gemma_device dense_step_timing -- --ignored --nocapture
+~~~
+
+The whole process covered 111 dense steps (55 prefill repetitions, one
+committed prefill, and 55 decode repetitions). `cuMemcpyHtoDAsync_v2` was
+called 1,280 times (5.767713 ms total), or 11.53 calls per step. The preceding
+task 0082 section's GPU memcpy summary also counted 1,280 host-to-device
+copies over the same 111 steps. These process-wide counts include source and
+other host-to-device copies; they do not attribute calls to individual RoPE
+tables. Profiled timing output (prefill `1466.310/1427.100/1528.030 µs`;
+decode `1375.438/1355.453/1489.847 µs`, median/min/max) is excluded from the
+unprofiled comparison.
+
+### Decode workspace
+
+The `gemma-a` decode plan's logical workspace grew from 64 bytes to 768 bytes.
+Its admitted workspace region grew from 256 bytes to 768 bytes: the shared
+part and each of the two distinct RoPE tables occupy their own 256-byte
+aligned range.
+
+The target was an NVIDIA GeForce RTX 3090, UUID
+`GPU-3032cfa3-19df-028f-5ebd-43314911e0b9`, driver `610.57.04`, with
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`.
+
+Raw trace: `/tmp/task-0083-rope-tables.nsys-rep`, 1,774,307 bytes, SHA-256
+`51709652aa6c319886d6c38349b99ae286f46f24a6003554194fc4fa86d070c5`.
+Derived SQLite report: `/tmp/task-0083-rope-tables.sqlite`, 3,911,680 bytes,
+SHA-256 `7a2e871f71d84e164ba25a0d3495e24fe6ebcb75c48d3ce6f4e17fa0e39e54bf`.
+Both remain outside Git for review. These fixture-scale measurements do not
+close O6 or make a performance claim.

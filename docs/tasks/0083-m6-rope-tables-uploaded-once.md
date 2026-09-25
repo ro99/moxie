@@ -111,4 +111,28 @@ code; a file outside the allowed list is needed.
 
 ## Result, filled after work
 
-(pending)
+Implemented the planner's aligned fixed-offset layout for distinct RoPE tables,
+exposed the offsets on dense selected candidates, uploaded and retained each
+table once immediately after source uploads, and changed RoPE launches to use
+the selected table offset. Other lowerings expose an empty offset map; per-node
+workspace metadata and host-byte accounting are unchanged. No test was added.
+
+The one-mutant coverage check set every table offset to the shared first-table
+offset. `dense_gemma_device` failed its existing output checks in
+`affine_linear_weights_match_host_on_every_gpu`,
+`pipeline_runs_dense_and_routed_gemma_on_three_gpus`, and
+`reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu`. Each reported
+2 BF16 ULP mismatches. The mutation was reverted before the passing gates.
+
+Host gates passed: `cargo fmt --all -- --check`, workspace clippy,
+driver-feature executor clippy, `cargo test --workspace --locked`,
+`cargo xtask arch-check`, and `cargo xtask spec-check`. GPU gates passed with
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`: full `dense_gemma_device` (8 passed, 1 ignored),
+`dense_tp2_device` (1 passed), and `cargo xtask-cuda test-gpu` (63/63 on SM86
+and SM120). Dense output comparisons remained bit-identical.
+
+The three timing runs, process-wide Nsight `cuMemcpyHtoDAsync_v2` count (1,280
+over 111 steps, 11.53 per step), and `gemma-a` decode workspace comparison
+(logical 64→768 bytes; admitted region 256→768 bytes) are recorded in
+[dense-step-timing.md](../evidence/dense-step-timing.md). These fixture
+measurements do not close O6 or make a speed claim.

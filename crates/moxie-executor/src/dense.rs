@@ -374,6 +374,7 @@ fn enqueue_dense<'ctx>(
     let mut attention_index = 0usize;
     let mut symbol_index = 0usize;
     upload_sources(lease, stream)?;
+    upload_rope_tables(lease, graph, rows, stream)?;
     let selected_nodes = lease
         .resource()
         .plan
@@ -675,44 +676,27 @@ fn enqueue_dense<'ctx>(
                 base: rope_base,
                 layout: RopeLayout::HalfSplit,
             } => {
-                let positions = index_values(lease.resource(), positions()?, rows)?;
                 let key = (rotary_dim, frequency_dim, rope_base.to_bits());
-                let table_index = if let Some(index) = lease
-                    .resource()
-                    .rope_tables
-                    .iter()
-                    .position(|(cached_key, _)| *cached_key == key)
-                {
-                    index
-                } else {
-                    let angles = angle_table(positions, rotary_dim, frequency_dim, rope_base)?;
-                    lease
-                        .resource_mut()
-                        .rope_tables
-                        .try_reserve(1)
-                        .map_err(|_| capacity(std::mem::size_of::<((u64, u64, u32), Vec<u8>)>()))?;
-                    let operation = lease.resource_mut();
-                    operation.rope_tables.push((key, angles));
-                    operation.rope_tables.len() - 1
-                };
-                let mut input_address = address(lease.resource(), node.inputs[0])?;
-                let mut angle_address = workspace_address(lease.resource())?;
-                let mut output_address = address(lease.resource(), node.output)?;
-                let workspace = lease
+                let offset = lease
                     .resource()
                     .plan
                     .as_ref()
                     .expect("dense operation retains plan")
-                    .workspace_range()?;
-                // SAFETY: the operation retains the source until the lease
-                // retires after the completion event; the destination is the
-                // admitted workspace range.
-                unsafe {
-                    workspace.copy_from_host_async(
-                        &lease.resource().rope_tables[table_index].1,
-                        stream,
-                    )?
-                };
+                    .candidate()
+                    .rope_table_offsets()
+                    .get(&key)
+                    .copied()
+                    .ok_or_else(|| {
+                        invalid(
+                            "rope_table_offsets",
+                            "the selected plan has no table for this RoPE node",
+                        )
+                    })?;
+                let mut input_address = address(lease.resource(), node.inputs[0])?;
+                let mut angle_address = workspace_address(lease.resource())?
+                    .checked_add(offset)
+                    .ok_or_else(|| invalid("workspace", "RoPE table address overflowed"))?;
+                let mut output_address = address(lease.resource(), node.output)?;
                 let mut launch_rows = rows;
                 let mut launch_heads = heads;
                 let mut launch_head_dim = head_dim;
@@ -1388,6 +1372,62 @@ fn upload_sources<'ctx>(
     Ok(())
 }
 
+fn upload_rope_tables<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    graph: &Graph,
+    rows: u64,
+    stream: &Stream<'ctx>,
+) -> Result<()> {
+    let DenseOperation {
+        plan,
+        sources,
+        rope_tables,
+        ..
+    } = lease.resource_mut();
+    let plan = plan.as_ref().expect("dense operation retains plan");
+    let offsets = plan.candidate().rope_table_offsets();
+    if offsets.is_empty() {
+        return Ok(());
+    }
+    let workspace = plan.workspace_range()?;
+    for (key, &offset) in offsets {
+        let key = *key;
+        let (rotary_dim, frequency_dim, _) = key;
+        let Some(node) = graph.nodes().iter().find(|node| {
+            matches!(node.params, OpParams::Rope { rotary_dim: dim, frequency_dim: freq, base, .. }
+                if (dim, freq, base.to_bits()) == key)
+        }) else {
+            return Err(invalid(
+                "rope_table_offsets",
+                "the selected plan contains a RoPE table absent from the graph",
+            ));
+        };
+        let Some(positions_value) = node.inputs.get(1).copied() else {
+            return Err(invalid("positions", "a RoPE node has no position input"));
+        };
+        let OpParams::Rope { base, .. } = node.params else {
+            unreachable!("matched RoPE node")
+        };
+        let positions = index_values_from_sources(sources, positions_value, rows)?;
+        let angles = angle_table(positions, rotary_dim, frequency_dim, base)?;
+        rope_tables
+            .try_reserve(1)
+            .map_err(|_| capacity(std::mem::size_of::<((u64, u64, u32), Vec<u8>)>()))?;
+        rope_tables.push((key, angles));
+        // SAFETY: the operation retains the table until the lease retires
+        // after its completion event; the offset and destination are admitted
+        // by the selected plan.
+        unsafe {
+            workspace.copy_from_host_async_at(
+                offset,
+                &rope_tables.last().expect("just retained").1,
+                stream,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch<'ctx>(
     lease: &OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
@@ -1936,8 +1976,15 @@ fn index_values<'a, 'ctx>(
     value: ValueId,
     rows: u64,
 ) -> Result<IndexView<'a>> {
-    let source = operation
-        .sources
+    index_values_from_sources(&operation.sources, value, rows)
+}
+
+fn index_values_from_sources<'a>(
+    sources: &'a [OwnedBinding],
+    value: ValueId,
+    rows: u64,
+) -> Result<IndexView<'a>> {
+    let source = sources
         .iter()
         .find(|binding| binding.value == value)
         .ok_or_else(|| {
