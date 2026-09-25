@@ -204,3 +204,35 @@ no executor code changes.
   step's copy event before rewriting.
 
 ## Result, filled after work
+
+Implemented the shared v1 attention body, the step-indirect attention entry
+point and the byte-offset KV append entry point. Added only the two symbol
+constants; the catalogue, v1 symbol/ABI, partial kernel and executor remain
+unchanged. The GPU case checks v1 bytes against the pre-refactor capture,
+compares both indirect attention launch shapes byte-for-byte, checks untouched
+rows past `step[0]`, and compares aligned and misaligned append page images
+against the existing D2D copy path.
+
+Before editing `paged_attention.cu`, captured the v1 output bytes on all three
+devices. Each device produced the same hashes:
+
+| Geometry | SHA-256 |
+|---|---|
+| GQA head dimension 128, decode row | `1469fabdc480f04b00e5edb73aff3efebe102d55b298e4bfc860d12df1e7d8bd` |
+| GQA head dimension 128, 8-row chunk at position 92 | `01022cb71c03d274ab38d44e79a5b4ae642c123843b540d5dbd75ecbe803707c` |
+| Sliding window 20, head dimension 64 | `60c641071b498e5771677b69be0f3b5159b6c66750a2c99e24b938b028d0d716` |
+
+The required mutant (`step[2]` for `first_position`) was caught by
+`paged_attention_indirect` on all three devices and reverted.
+
+Gates passed:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- `cargo test --workspace --locked`
+- `cargo xtask arch-check` — 79 rejected and 21 accepted fixtures, 13 rules
+- `cargo xtask spec-check` — all 10 documents unchanged
+- `CUDA_DEVICE_ORDER=PCI_BUS_ID cargo xtask-cuda test-gpu` — 72/72 cases,
+  including the new case, across both SM86 devices and SM120
+
+No dense suites were run.

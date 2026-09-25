@@ -96,6 +96,7 @@ const CASES: &[&str] = &[
     "grouped_expert_mlp",
     "affine_linear_w4a16_w8a16",
     "paged_attention",
+    "paged_attention_indirect",
     "paged_attention_host_streaming",
     "paged_attention_host_streaming_n3",
     "paged_attention_32k",
@@ -244,6 +245,11 @@ pub fn run(profile: Option<&str>) -> i32 {
         results.push(case(&cap, "grouped_expert_mlp", grouped_expert_mlp(&cap)));
         results.push(case(&cap, "affine_linear_w4a16_w8a16", affine_linear(&cap)));
         results.push(case(&cap, "paged_attention", paged_attention(&cap)));
+        results.push(case(
+            &cap,
+            "paged_attention_indirect",
+            paged_attention_indirect(&cap),
+        ));
         results.push(case(
             &cap,
             "paged_attention_host_streaming",
@@ -3441,6 +3447,473 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
     }
     if checked == 0 {
         return Ok(Outcome::Failed("no component was compared".into()));
+    }
+    Ok(Outcome::Passed)
+}
+
+#[derive(Clone, Copy)]
+struct IndirectAttentionCase {
+    label: &'static str,
+    geometry: PageGeometry,
+    heads: u64,
+    scale: f32,
+    window: u32,
+    rows: u64,
+    history: u64,
+    first_position: u64,
+}
+
+fn attention_page_images(
+    fixture: &AttentionFixture,
+    table: &[u32],
+    history: u64,
+) -> (Vec<u8>, Vec<u8>) {
+    let row_bytes = (fixture.geometry.kv_heads * fixture.geometry.head_dim * 2) as usize;
+    let page_bytes = fixture.geometry.page_tokens as usize * row_bytes;
+    let image_bytes = fixture.geometry.pages as usize * page_bytes;
+    let mut key_pages = vec![0; image_bytes];
+    let mut value_pages = vec![0; image_bytes];
+    let (keys, values) = fixture.payload(0, history);
+    for row in 0..history as usize {
+        let physical = table[row / fixture.geometry.page_tokens as usize] as usize;
+        let slot = row % fixture.geometry.page_tokens as usize;
+        let source = row * row_bytes;
+        let destination = physical * page_bytes + slot * row_bytes;
+        key_pages[destination..destination + row_bytes]
+            .copy_from_slice(&keys[source..source + row_bytes]);
+        value_pages[destination..destination + row_bytes]
+            .copy_from_slice(&values[source..source + row_bytes]);
+    }
+    (key_pages, value_pages)
+}
+
+fn words_u64_bytes(words: &[u64]) -> Vec<u8> {
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+fn words_u32_bytes(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+fn paged_attention_indirect(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    const BASELINE_SHA256: [(&str, &str); 3] = [
+        (
+            "gqa-128-decode",
+            "1469fabdc480f04b00e5edb73aff3efebe102d55b298e4bfc860d12df1e7d8bd",
+        ),
+        (
+            "gqa-128-prefill-chunk",
+            "01022cb71c03d274ab38d44e79a5b4ae642c123843b540d5dbd75ecbe803707c",
+        ),
+        (
+            "sliding-20-scale-one",
+            "60c641071b498e5771677b69be0f3b5159b6c66750a2c99e24b938b028d0d716",
+        ),
+    ];
+    const APPEND_MAX_ROWS: u32 = 16;
+
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let stream = Stream::new(&ctx)?;
+    let module = Module::load(
+        &ctx,
+        ModuleImage::Binary(smoke_image(moxie_kernels::PAGED_ATTENTION_FATBIN)?),
+    )?;
+    let v1 = module.function(moxie_kernels::PAGED_ATTENTION)?;
+    let indirect = module.function(moxie_kernels::PAGED_ATTENTION_INDIRECT)?;
+    let append = module.function(moxie_kernels::KV_APPEND_INDIRECT)?;
+
+    let cases = [
+        IndirectAttentionCase {
+            label: "gqa-128-decode",
+            geometry: PageGeometry {
+                kv_heads: 2,
+                head_dim: 128,
+                page_tokens: 32,
+                pages: 4,
+            },
+            heads: 8,
+            scale: moxie_plan::reciprocal_sqrt_scale(128),
+            window: 0,
+            rows: 1,
+            history: 100,
+            first_position: 99,
+        },
+        IndirectAttentionCase {
+            label: "gqa-128-prefill-chunk",
+            geometry: PageGeometry {
+                kv_heads: 2,
+                head_dim: 128,
+                page_tokens: 32,
+                pages: 4,
+            },
+            heads: 8,
+            scale: moxie_plan::reciprocal_sqrt_scale(128),
+            window: 0,
+            rows: 8,
+            history: 100,
+            first_position: 92,
+        },
+        IndirectAttentionCase {
+            label: "sliding-20-scale-one",
+            geometry: PageGeometry {
+                kv_heads: 1,
+                head_dim: 64,
+                page_tokens: 8,
+                pages: 9,
+            },
+            heads: 4,
+            scale: 1.0,
+            window: 20,
+            rows: 5,
+            history: 71,
+            first_position: 66,
+        },
+    ];
+
+    for case in &cases {
+        let fixture = AttentionFixture::build(case.geometry, case.heads, case.history, 0x0037_0001);
+        let table = shuffled_pages(case.geometry.pages);
+        let (key_bytes, value_bytes) = attention_page_images(&fixture, &table, case.history);
+        let table_bytes = words_u32_bytes(&table);
+        let query_bytes = fixture.query_bytes(case.first_position, case.rows);
+        let output_bytes = (case.rows * case.heads * case.geometry.head_dim * 2) as usize;
+        let padded_bytes =
+            (u64::from(APPEND_MAX_ROWS) * case.heads * case.geometry.head_dim * 2) as usize;
+
+        let mut query = DeviceBuffer::alloc(&ctx, query_bytes.len())?;
+        query.copy_from_host(&query_bytes)?;
+        let mut key_pages = DeviceBuffer::alloc(&ctx, key_bytes.len())?;
+        key_pages.copy_from_host(&key_bytes)?;
+        let mut value_pages = DeviceBuffer::alloc(&ctx, value_bytes.len())?;
+        value_pages.copy_from_host(&value_bytes)?;
+        let mut page_table = DeviceBuffer::alloc(&ctx, table_bytes.len())?;
+        page_table.copy_from_host(&table_bytes)?;
+        let reference_output = DeviceBuffer::alloc(&ctx, output_bytes)?;
+        let mut reference_ptr = reference_output.device_ptr();
+        let mut query_ptr = query.device_ptr();
+        let mut key_ptr = key_pages.device_ptr();
+        let mut value_ptr = value_pages.device_ptr();
+        let mut table_ptr = page_table.device_ptr();
+        let mut rows = case.rows;
+        let mut first_position = case.first_position;
+        let mut history_base = 0u64;
+        let mut history_rows = case.history;
+        let mut heads = case.heads as u32;
+        let mut kv_heads = case.geometry.kv_heads as u32;
+        let mut head_dim = case.geometry.head_dim as u32;
+        let mut page_tokens = case.geometry.page_tokens as u32;
+        let mut window = case.window;
+        let mut scale = case.scale;
+        let mut reference_params: [*mut c_void; 15] = [
+            (&raw mut query_ptr).cast(),
+            (&raw mut key_ptr).cast(),
+            (&raw mut value_ptr).cast(),
+            (&raw mut table_ptr).cast(),
+            (&raw mut reference_ptr).cast(),
+            (&raw mut rows).cast(),
+            (&raw mut first_position).cast(),
+            (&raw mut history_base).cast(),
+            (&raw mut history_rows).cast(),
+            (&raw mut heads).cast(),
+            (&raw mut kv_heads).cast(),
+            (&raw mut head_dim).cast(),
+            (&raw mut page_tokens).cast(),
+            (&raw mut window).cast(),
+            (&raw mut scale).cast(),
+        ];
+        // SAFETY: the parameter order and types match the unchanged v1 ABI;
+        // every buffer covers the declared geometry and the blocking launch
+        // observes completion before any buffer can drop.
+        unsafe {
+            v1.launch_blocking(
+                (case.rows as u32, case.heads as u32, 1),
+                (moxie_kernels::PAGED_ATTENTION_THREADS, 1, 1),
+                0,
+                &mut reference_params,
+            )?;
+        }
+        let mut reference = vec![0; output_bytes];
+        reference_output.copy_to_host(&mut reference)?;
+        let hash = moxie_format::sha256_hex(&reference);
+        let expected = BASELINE_SHA256
+            .iter()
+            .find(|(label, _)| *label == case.label)
+            .map(|(_, hash)| *hash)
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "baseline",
+                detail: format!("no pre-refactor bytes recorded for {}", case.label),
+            })?;
+        if hash != expected {
+            return Ok(Outcome::Failed(format!(
+                "{}: v1 output SHA-256 {hash} differs from captured {expected}",
+                case.label
+            )));
+        }
+
+        let step_values = [case.rows, case.first_position, 0, case.history];
+        let step_bytes = words_u64_bytes(&step_values);
+        let mut step = DeviceBuffer::alloc(&ctx, step_bytes.len())?;
+        step.copy_from_host(&step_bytes)?;
+        let indirect_output = DeviceBuffer::alloc(&ctx, output_bytes)?;
+        let mut output_ptr = indirect_output.device_ptr();
+        let mut step_ptr = step.device_ptr();
+        let mut indirect_params: [*mut c_void; 12] = [
+            (&raw mut query_ptr).cast(),
+            (&raw mut key_ptr).cast(),
+            (&raw mut value_ptr).cast(),
+            (&raw mut table_ptr).cast(),
+            (&raw mut output_ptr).cast(),
+            (&raw mut step_ptr).cast(),
+            (&raw mut heads).cast(),
+            (&raw mut kv_heads).cast(),
+            (&raw mut head_dim).cast(),
+            (&raw mut page_tokens).cast(),
+            (&raw mut window).cast(),
+            (&raw mut scale).cast(),
+        ];
+        // SAFETY: the parameter order matches the indirect ABI, step contains
+        // four u64 values, and the exact-row grid covers every query block.
+        unsafe {
+            indirect.launch_blocking(
+                (case.rows as u32, case.heads as u32, 1),
+                (moxie_kernels::PAGED_ATTENTION_THREADS, 1, 1),
+                0,
+                &mut indirect_params,
+            )?;
+        }
+        let mut got = vec![0; output_bytes];
+        indirect_output.copy_to_host(&mut got)?;
+        if got != reference {
+            return Ok(Outcome::Failed(format!(
+                "{}: indirect output differs from v1",
+                case.label
+            )));
+        }
+
+        let sentinel = vec![0xa5; padded_bytes];
+        let mut padded_output = DeviceBuffer::alloc(&ctx, padded_bytes)?;
+        padded_output.copy_from_host(&sentinel)?;
+        let mut padded_ptr = padded_output.device_ptr();
+        let mut padded_params: [*mut c_void; 12] = [
+            (&raw mut query_ptr).cast(),
+            (&raw mut key_ptr).cast(),
+            (&raw mut value_ptr).cast(),
+            (&raw mut table_ptr).cast(),
+            (&raw mut padded_ptr).cast(),
+            (&raw mut step_ptr).cast(),
+            (&raw mut heads).cast(),
+            (&raw mut kv_heads).cast(),
+            (&raw mut head_dim).cast(),
+            (&raw mut page_tokens).cast(),
+            (&raw mut window).cast(),
+            (&raw mut scale).cast(),
+        ];
+        // SAFETY: as above, with a max_rows grid; the kernel returns before
+        // reading query/output rows at or beyond step[0].
+        unsafe {
+            indirect.launch_blocking(
+                (APPEND_MAX_ROWS, case.heads as u32, 1),
+                (moxie_kernels::PAGED_ATTENTION_THREADS, 1, 1),
+                0,
+                &mut padded_params,
+            )?;
+        }
+        let mut padded = vec![0; padded_bytes];
+        padded_output.copy_to_host(&mut padded)?;
+        if padded[..output_bytes] != reference || padded[output_bytes..] != sentinel[output_bytes..]
+        {
+            return Ok(Outcome::Failed(format!(
+                "{}: max_rows launch changed output bytes or rows beyond step[0]",
+                case.label
+            )));
+        }
+        println!(
+            "    {} {} v1_sha256={} indirect=byte-identical max_rows={APPEND_MAX_ROWS}",
+            cap.uuid, case.label, hash
+        );
+    }
+
+    struct AppendCase {
+        label: &'static str,
+        geometry: PageGeometry,
+        first: u64,
+        rows: u64,
+        aligned: bool,
+    }
+    let append_cases = [
+        AppendCase {
+            label: "aligned-row",
+            geometry: PageGeometry {
+                kv_heads: 2,
+                head_dim: 128,
+                page_tokens: 32,
+                pages: 4,
+            },
+            first: 0,
+            rows: 3,
+            aligned: true,
+        },
+        AppendCase {
+            label: "misaligned-row",
+            geometry: PageGeometry {
+                kv_heads: 1,
+                head_dim: 70,
+                page_tokens: 4,
+                pages: 3,
+            },
+            first: 2,
+            rows: 3,
+            aligned: false,
+        },
+    ];
+    for case in &append_cases {
+        let fixture = AttentionFixture::build(
+            case.geometry,
+            case.geometry.kv_heads,
+            case.first + case.rows,
+            0x0037_0001,
+        );
+        let table = shuffled_pages(case.geometry.pages);
+        let placements =
+            placements_through(&table, case.geometry.page_tokens, case.first, case.rows)?;
+        let (keys, values) = fixture.payload(case.first, case.rows);
+        let row_bytes = case.geometry.kv_heads * case.geometry.head_dim * 2;
+        let page_bytes = case.geometry.page_tokens * row_bytes;
+        let image_bytes = (case.geometry.pages * page_bytes) as usize;
+        if (row_bytes % 16 == 0) != case.aligned {
+            return Ok(Outcome::Failed(format!(
+                "{}: row_bytes={row_bytes} does not match the alignment fixture",
+                case.label
+            )));
+        }
+
+        let mut source_keys = DeviceBuffer::alloc(&ctx, keys.len())?;
+        source_keys.copy_from_host(&keys)?;
+        let mut source_values = DeviceBuffer::alloc(&ctx, values.len())?;
+        source_values.copy_from_host(&values)?;
+        let zeros = vec![0; image_bytes];
+        let mut reference_keys = DeviceBuffer::alloc(&ctx, image_bytes)?;
+        reference_keys.copy_from_host(&zeros)?;
+        let mut reference_values = DeviceBuffer::alloc(&ctx, image_bytes)?;
+        reference_values.copy_from_host(&zeros)?;
+        let mut indirect_keys = DeviceBuffer::alloc(&ctx, image_bytes)?;
+        indirect_keys.copy_from_host(&zeros)?;
+        let mut indirect_values = DeviceBuffer::alloc(&ctx, image_bytes)?;
+        indirect_values.copy_from_host(&zeros)?;
+
+        let mut done = 0u64;
+        let mut offsets = Vec::with_capacity((case.rows * 2) as usize);
+        for placement in &placements {
+            let destination =
+                (placement.physical_page * case.geometry.page_tokens + placement.slot) * row_bytes;
+            let source = done * row_bytes;
+            let bytes = placement.rows * row_bytes;
+            // SAFETY: all source/destination ranges are within their allocations;
+            // both allocations and the stream stay live through synchronization.
+            let key_copy = unsafe {
+                reference_keys.copy_from_device_async_at(
+                    destination as usize,
+                    &source_keys,
+                    source as usize,
+                    bytes as usize,
+                    &stream,
+                )
+            };
+            let value_copy = unsafe {
+                reference_values.copy_from_device_async_at(
+                    destination as usize,
+                    &source_values,
+                    source as usize,
+                    bytes as usize,
+                    &stream,
+                )
+            };
+            if let Err(error) = key_copy.and(value_copy) {
+                let _ = stream.synchronize();
+                return Err(error);
+            }
+            for offset in 0..placement.rows {
+                let row_offset = destination + offset * row_bytes;
+                offsets.push(row_offset);
+                offsets.push(row_offset);
+            }
+            done += placement.rows;
+        }
+        stream.synchronize()?;
+
+        let step_values = [case.rows, 0, 0, 0];
+        let step_bytes = words_u64_bytes(&step_values);
+        let offset_bytes = words_u64_bytes(&offsets);
+        let mut step = DeviceBuffer::alloc(&ctx, step_bytes.len())?;
+        step.copy_from_host(&step_bytes)?;
+        let mut device_offsets = DeviceBuffer::alloc(&ctx, offset_bytes.len())?;
+        device_offsets.copy_from_host(&offset_bytes)?;
+        if case.aligned {
+            if row_bytes % 16 != 0
+                || source_keys.device_ptr() % 16 != 0
+                || source_values.device_ptr() % 16 != 0
+                || offsets.iter().any(|offset| offset % 16 != 0)
+            {
+                return Ok(Outcome::Failed(format!(
+                    "{}: the aligned fixture did not align every row address",
+                    case.label
+                )));
+            }
+        } else if row_bytes % 16 == 0
+            || (source_keys.device_ptr() + row_bytes) % 16 == 0
+            || (source_values.device_ptr() + row_bytes) % 16 == 0
+            || (indirect_keys.device_ptr() + offsets[0]) % 16 == 0
+        {
+            return Ok(Outcome::Failed(format!(
+                "{}: the fixture failed to exercise an unaligned row address",
+                case.label
+            )));
+        }
+
+        let mut key_source_ptr = source_keys.device_ptr();
+        let mut value_source_ptr = source_values.device_ptr();
+        let mut key_pages_ptr = indirect_keys.device_ptr();
+        let mut value_pages_ptr = indirect_values.device_ptr();
+        let mut step_ptr = step.device_ptr();
+        let mut offsets_ptr = device_offsets.device_ptr();
+        let mut row_bytes_arg = row_bytes;
+        let mut params: [*mut c_void; 7] = [
+            (&raw mut key_source_ptr).cast(),
+            (&raw mut value_source_ptr).cast(),
+            (&raw mut key_pages_ptr).cast(),
+            (&raw mut value_pages_ptr).cast(),
+            (&raw mut step_ptr).cast(),
+            (&raw mut offsets_ptr).cast(),
+            (&raw mut row_bytes_arg).cast(),
+        ];
+        // SAFETY: the launch follows the completed D2D reference copies; source,
+        // offset and page buffers cover every row selected by step[0].
+        unsafe {
+            append.launch_blocking(
+                (APPEND_MAX_ROWS, 1, 1),
+                (moxie_kernels::PAGED_ATTENTION_THREADS, 1, 1),
+                0,
+                &mut params,
+            )?;
+        }
+        let mut expected_keys = vec![0; image_bytes];
+        let mut expected_values = vec![0; image_bytes];
+        let mut got_keys = vec![0; image_bytes];
+        let mut got_values = vec![0; image_bytes];
+        reference_keys.copy_to_host(&mut expected_keys)?;
+        reference_values.copy_to_host(&mut expected_values)?;
+        indirect_keys.copy_to_host(&mut got_keys)?;
+        indirect_values.copy_to_host(&mut got_values)?;
+        if expected_keys != got_keys || expected_values != got_values {
+            return Ok(Outcome::Failed(format!(
+                "{}: indirect append changed page bytes",
+                case.label
+            )));
+        }
+        println!(
+            "    {} {} row_bytes={row_bytes} pages=byte-identical",
+            cap.uuid, case.label
+        );
     }
     Ok(Outcome::Passed)
 }

@@ -82,7 +82,7 @@ static __device__ __forceinline__ float moxie_attn_failure_v1() {
 // quiet NaN in every component: the host oracle refuses that case with a typed
 // error, and the device says the same thing the only way it can. It is never a
 // uniform draw over the cache and never a zero row.
-extern "C" __global__ void moxie_bf16_paged_attention_v1(
+static __device__ __forceinline__ void moxie_bf16_paged_attention_body_v1(
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ key_pages,
     const __nv_bfloat16* __restrict__ value_pages,
@@ -293,6 +293,129 @@ extern "C" __global__ void moxie_bf16_paged_attention_v1(
         const float value = acc[s] / run_sum;
         output[row_head_base + d] =
             __float2bfloat16_rn(isfinite(value) ? value : moxie_attn_failure_v1());
+    }
+}
+
+extern "C" __global__ void moxie_bf16_paged_attention_v1(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ key_pages,
+    const __nv_bfloat16* __restrict__ value_pages,
+    const unsigned int* __restrict__ page_table,
+    __nv_bfloat16* __restrict__ output,
+    unsigned long long rows,
+    unsigned long long first_position,
+    unsigned long long history_base,
+    unsigned long long history_rows,
+    unsigned int heads,
+    unsigned int kv_heads,
+    unsigned int head_dim,
+    unsigned int page_tokens,
+    unsigned int window,
+    float scale) {
+    moxie_bf16_paged_attention_body_v1(
+        query,
+        key_pages,
+        value_pages,
+        page_table,
+        output,
+        rows,
+        first_position,
+        history_base,
+        history_rows,
+        heads,
+        kv_heads,
+        head_dim,
+        page_tokens,
+        window,
+        scale);
+}
+
+extern "C" __global__ void moxie_bf16_paged_attention_indirect_v1(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ key_pages,
+    const __nv_bfloat16* __restrict__ value_pages,
+    const unsigned int* __restrict__ page_table,
+    __nv_bfloat16* __restrict__ output,
+    const unsigned long long* __restrict__ step,
+    unsigned int heads,
+    unsigned int kv_heads,
+    unsigned int head_dim,
+    unsigned int page_tokens,
+    unsigned int window,
+    float scale) {
+    __shared__ unsigned long long step_values[4];
+    if (threadIdx.x == 0U) {
+        step_values[0] = step[0];
+        step_values[1] = step[1];
+        step_values[2] = step[2];
+        step_values[3] = step[3];
+    }
+    __syncthreads();
+    moxie_bf16_paged_attention_body_v1(
+        query,
+        key_pages,
+        value_pages,
+        page_table,
+        output,
+        step_values[0],
+        step_values[1],
+        step_values[2],
+        step_values[3],
+        heads,
+        kv_heads,
+        head_dim,
+        page_tokens,
+        window,
+        scale);
+}
+
+extern "C" __global__ void moxie_kv_append_indirect_v1(
+    const unsigned char* __restrict__ keys,
+    const unsigned char* __restrict__ values,
+    unsigned char* __restrict__ key_pages,
+    unsigned char* __restrict__ value_pages,
+    const unsigned long long* __restrict__ step,
+    const unsigned long long* __restrict__ offsets,
+    unsigned long long row_bytes) {
+    const unsigned long long row = blockIdx.x;
+    __shared__ unsigned long long rows;
+    __shared__ unsigned long long key_offset;
+    __shared__ unsigned long long value_offset;
+    if (threadIdx.x == 0U) {
+        rows = step[0];
+    }
+    __syncthreads();
+    if (row >= rows) return;
+    if (threadIdx.x == 0U) {
+        key_offset = offsets[2ULL * row];
+        value_offset = offsets[2ULL * row + 1ULL];
+    }
+    __syncthreads();
+
+    const unsigned char* key_source = keys + row * row_bytes;
+    const unsigned char* value_source = values + row * row_bytes;
+    unsigned char* key_destination = key_pages + key_offset;
+    unsigned char* value_destination = value_pages + value_offset;
+    const bool aligned =
+        (row_bytes & 15ULL) == 0ULL &&
+        ((reinterpret_cast<unsigned long long>(key_source) |
+          reinterpret_cast<unsigned long long>(value_source) |
+          reinterpret_cast<unsigned long long>(key_destination) |
+          reinterpret_cast<unsigned long long>(value_destination)) &
+         15ULL) == 0ULL;
+    if (aligned) {
+        const unsigned long long vectors = row_bytes / 16ULL;
+        for (unsigned long long i = threadIdx.x; i < vectors; i += blockDim.x) {
+            const uint4 key = reinterpret_cast<const uint4*>(key_source)[i];
+            const uint4 value = reinterpret_cast<const uint4*>(value_source)[i];
+            reinterpret_cast<uint4*>(key_destination)[i] = key;
+            reinterpret_cast<uint4*>(value_destination)[i] = value;
+        }
+    } else {
+        for (unsigned long long i = threadIdx.x; i < row_bytes; i += blockDim.x) {
+            key_destination[i] = key_source[i];
+            value_destination[i] = value_source[i];
+        }
     }
 }
 

@@ -88,6 +88,8 @@ pub const AFFINE_LINEAR_TILE: u64 = 16;
 /// which is the failure document 02 names. Visibility, head counts, head
 /// dimension, page width and the score scale are runtime parameters.
 pub const PAGED_ATTENTION: &str = "moxie_bf16_paged_attention_v1";
+pub const PAGED_ATTENTION_INDIRECT: &str = "moxie_bf16_paged_attention_indirect_v1";
+pub const KV_APPEND_INDIRECT: &str = "moxie_kv_append_indirect_v1";
 pub const PAGED_ATTENTION_ABI: u32 = 1;
 /// The separately qualified partial-producing entry point used by the bounded
 /// two-block host-backed path. Its ABI is intentionally not the single-shot
