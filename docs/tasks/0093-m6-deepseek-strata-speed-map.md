@@ -1,7 +1,7 @@
 # Task 0093 — map every Strata DeepSeek speed technique onto Moxie
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer
-Codex `sol`. Documentation only: no code, no GPU runs.
+Status: **active** (coordinator, 2026-09-25). Builder Claude Opus `builder`
+(owner direction, 2026-09-25); reviewer Codex `sol`. Documentation only: no code, no GPU runs.
 
 ## Identity and authority
 
@@ -15,7 +15,7 @@ Codex `sol`. Documentation only: no code, no GPU runs.
   in M7.
 - M6 connection: roadmap M6 "shared performance paths"; this map tells slice
   6, M6.5 and the M6 closure which shared paths DeepSeek will need.
-- Builder: Codex `luna` (`gpt-6-luna`, max, `/ponytail:ponytail`).
+- Builder: Claude Opus `builder`, in its own Herdr tab (owner direction).
   Reviewer: Codex `sol` (read-only, `/ponytail:ponytail-review`).
   Coordinator: Claude Opus `coordinator`.
 - Root `/home/rodrigo/Developer/moxie`, branch `main`. Strata checkout
