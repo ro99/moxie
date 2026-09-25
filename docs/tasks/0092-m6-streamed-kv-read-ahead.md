@@ -184,7 +184,7 @@ Exit paths, each required:
   ledger empty.
 - **One ignored timing test**: the same history on one 3090, `W = 5`, `R =
   30`, median per-query time for `stage_next` versus read-ahead, plus the
-  `copied`-to-`consumed` overlap if measurable from events.
+  the copy-versus-kernel overlap if measurable from events.
 
 ## Acceptance
 
