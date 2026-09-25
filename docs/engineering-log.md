@@ -48,10 +48,27 @@ Each links into the entries below.
 | Work that exists on one disk and nowhere else | 24 commits, four tasks and five review rounds, unpushed for thirty hours |
 | A repair that satisfies the test rather than the property | task 0029, four rounds: an owned label the fixture never used, a prefix measured on a warmed ledger, a mutant that panicked before it mutated, an aggregate standing in for a state |
 | A harness with no tests of its own | the mutation guard, after three rounds of guard bugs: the self-test covers verdicts, selectors and anchors, and never touched restoration |
+| A decision framed from the current code instead of from how the problem is solved | the M6 BF16 matrix-multiply choice, offered as "exact tiled or own tensor-core kernel" while Strata's cuBLAS/Marlin route and its per-operation exactness went unmentioned |
 | A resource that leaves its owner on a refusal or cleanup path while device work may still use it | task 0082's pending event dropped across streams and drop unloading a live module; task 0085's graphs cleared after a failed drain; task 0089's probe buffers dropped on an error path; task 0091's admission refusal handing out plans apart from their weight leases |
 | A measurement that shares its instrument with whatever runs beside it | task 0025's budget lane, whose global allocator counted the other test's fixtures for two tasks, and was serialised rather than fixed |
 
 ## Entries, newest first
+
+**A decision framed from the current code instead of from how the problem is
+solved (2026-09-25, M6).** Task 0095 measured Moxie's BF16 dense linear at
+0.055 TFLOP/s on a 3090. The coordinator then asked the owner to choose
+between two kernels grown out of that code: an exact tiled kernel or its own
+tensor-core kernel. The table carried speed ratios nobody had measured. Strata
+had already answered the question on this hardware. Ordinary matrix
+multiplies ran on cuBLAS in tensor-op mode and on the vendored Marlin kernel.
+The exact fixed-order sum was kept only where last-bit noise changes a
+decision, as the DeepSeek indexer's selection did
+(`strata/docs/dsv4-rank-local-architecture.md` 891–897). The owner had to ask
+"what does Strata do?", and then whether the framing still held. It did not.
+The sentence to remember: **before framing a choice, look at how Strata (then
+the field) solved it; if every option is a variation of the current code, the
+frame is too narrow. Ask where a property is needed, not whether to have it
+everywhere, and put no unmeasured number in a decision table.**
 
 **A resource that leaves its owner on the failure path (2026-09-25, M6).**
 Four M6 tasks in a row drew review findings of one shape: the success path
