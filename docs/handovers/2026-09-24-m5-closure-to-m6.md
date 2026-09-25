@@ -241,8 +241,9 @@ it. Command: `moxie-repack plan`, then `moxie-repack repack`. The plan lists
 **Published (2026-09-25):** outcome `published`, artifact identity
 `f99f370e7b1af3ce2e34f70b21157b11071381dc8a0507e00460daf60739fdcb`,
 35,090,087,216 B in 9 shards plus `manifest.toml`, 2,362 units written, not
-resumed. The source shard digests are recorded in the run's output. `/` now
-has 35 GB free (99% used).
+resumed. The source shard digests are recorded in the run's output. `/`
+had 35 GB free (99% used) right after the run. The owner then freed space: 321 GB
+free (82% used), and the artifact is unaffected (2026-09-25).
 
 ### Known bound for slice 7 (coordinator, 2026-09-24)
 
