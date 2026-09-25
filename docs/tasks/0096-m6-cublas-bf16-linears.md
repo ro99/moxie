@@ -191,9 +191,10 @@ blocks (sol H4).
        nearest existing test-hooks feature;
      - a normal close destroys exactly once;
      - the ledger returns to empty after close.
-   - (d) One printed line on a 3090, for (a)'s 512×4096×4096: `cublas-linear
-     tflops=…`, the median of 20. Recorded in the Result; not a gate.
-9. **Coverage check (one mutant, reverted after).** Bind the workspace
+   - (d) Dropped (coordinator, 2026-09-25): no timing in feature tasks;
+     measurement belongs to the exit benchmarks.
+9. **Coverage check (one mutant, reverted after; run only the named test
+   with `--exact`).** Bind the workspace
    before `cublasSetStream` instead of after; test (b)'s captured case, or
    (a), must fail or report a cuBLAS error. If it does not, report that the
    order is unobservable here and name the test that would catch it.
@@ -209,7 +210,9 @@ Host gates:
 - `cargo xtask spec-check`.
 
 GPU gates (`CUDA_DEVICE_ORDER=PCI_BUS_ID`):
-- the full `dense_gemma_device`, with and without `cublas`;
+- the full `dense_gemma_device` **once, with `cublas`** (the feature is
+  additive and the ordered tests live in the same binary); without `cublas`,
+  only the build and clippy gate;
 - `dense_tp2_device`.
 
 `cargo xtask-cuda test-gpu` is **not** required here: no CUDA kernel
