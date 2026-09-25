@@ -148,6 +148,15 @@ synchronizations per fixture step. Revisit when decode capture (slice 4)
 needs a sync-free step, or when a checkpoint-scale profile shows them
 material.
 
+### Coverage gap carried (coordinator, 2026-09-25)
+
+Task 0082's asynchronous-ownership repairs (cross-stream ordering, fork from
+a parent with pending writes, dropping a run with pending work) are made by
+construction and verified in review; no test separates the defects from the
+repairs, because the test support can only gate an event record, not a copy.
+Owner: coordinator. Revisit: when capture work (tasks 0084–0085) adds stream
+gating to the test support, or at M6 closure at the latest.
+
 ### Known bound for slice 7 (coordinator, 2026-09-24)
 
 `gemma-4-31B-it-AWQ-8bit` is INT8, group 32, symmetric, which the affine

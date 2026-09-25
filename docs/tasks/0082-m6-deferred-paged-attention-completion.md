@@ -53,7 +53,7 @@ Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Cod
 - **Outcome:** in a dense step, a run's publish, device write and attend
   record their completion instead of waiting for it; the run observes that
   completion the next time anything needs it. A single-GPU dense step then
-  has one blocking synchronization, at `finish`.
+  has one blocking wait, at `finish` (see R1 repair 14).
 - **Allowed files:** `crates/moxie-executor/src/paged_attention.rs`,
   `crates/moxie-executor/src/dense.rs`,
   `crates/moxie-executor/src/dense_tp_workers.rs`, this task's Result,
@@ -120,6 +120,36 @@ No new test: every GPU test drives prefill, decode, replay (task 0079 R1),
 commit and close through these paths, and a missing observation that returned
 a buffer early would show up as corrupted page tables in their output
 comparisons.
+
+## R1 repairs (coordinator, 2026-09-25, from sol's review; all were contract gaps)
+
+11. **Order, don't wait (H1).** Add `fn order_after_pending(&self, stream) ->
+    Result<()>`: if `pending` is `Some`, `stream.wait_event(pending)` (a device
+    wait, no host synchronization). Every deferred entry point
+    (`write_rows_from_device`, `publish_page_table_deferred`,
+    `attend_into_deferred`) calls it **before enqueuing anything**. `defer`
+    then replaces `pending` safely: the new event is ordered after the old one
+    on either stream. Doc the invariant on `pending`.
+12. **Fork source (H2).** `copy_branch_from` calls `stream.wait_event` on the
+    **source** run's `pending` (if `Some`) before its first copy.
+13. **Drop (H3, and the older quarantined case, task 0075's class).** In
+    `Drop`, if `pending` is `Some`, synchronize it; on success continue as a
+    normal drop. If that fails, or the run is quarantined, the run's
+    `ResolvedModule` is **never unloaded**: hold it as
+    `ManuallyDrop<ResolvedModule<'ctx>>` and drop it explicitly only on the
+    normal path. `held` host sources keep their existing forget rule.
+14. **Record (M1, the coordinator's wording).** The Outcome above over-claimed
+    "one blocking synchronization". Correct statement: one blocking wait per
+    step, at `finish`; each later deferred publish observes the previous
+    step's event, which `finish` already completed, so that call does not
+    wait. Those observations sit on the eager attention path, outside any
+    future captured segment. No code change.
+15. **Comment (L1).** `written_rows`' doc: rows whose copies are enqueued on
+    this run's stream order, not observed.
+
+**Coverage gap, recorded not waived:** no test separates H1–H3 from their
+repairs: that needs a stream gate *before* a copy, and the test support only
+gates an event record. The ledger carries it with a revisit trigger.
 
 ## Contract before implementation
 
