@@ -1,7 +1,11 @@
 # Task 0076 — dense step appends K/V on the device
 
-Status: **active** (coordinator, 2026-09-24). Builder Codex `luna`; reviewer
-Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-24), after sol's review round R1.
+Builder Codex `luna`; reviewer Codex `sol`. Implementation `1f64a92`; R1
+repair `0f5363f`.
+- R1 (LOW): the new `PagedAttention` workspace arm duplicated the wildcard
+  arm (contract change 6). Deleted; host gates rerun, GPU gates not needed
+  (no behaviour change).
 
 ## Identity and authority
 
