@@ -700,7 +700,24 @@ fn graph_capture_replay(cap: &DeviceCapability) -> Result<Outcome, Error> {
     }
 
     stream.begin_capture()?;
-    let _ = stream.synchronize();
+    // SAFETY: the same live buffers and package are used; this launch is
+    // intentionally enqueued during capture so synchronize invalidates a
+    // non-empty graph.
+    unsafe {
+        package.launch_async(
+            0,
+            &stream,
+            (N.div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            &mut params,
+        )?;
+    }
+    if stream.synchronize().is_ok() {
+        return Ok(Outcome::Failed(
+            "synchronize succeeded during stream capture".into(),
+        ));
+    }
     if let Ok(unexpected_graph) = stream.end_capture() {
         drop(unexpected_graph);
         return Ok(Outcome::Failed(
@@ -720,6 +737,19 @@ fn graph_capture_replay(cap: &DeviceCapability) -> Result<Outcome, Error> {
         )?;
     }
     stream.synchronize()?;
+
+    let mut expected_after_recovery = expected;
+    for (y, &x) in expected_after_recovery.iter_mut().zip(&x) {
+        *y = a * x + *y;
+    }
+    dy.copy_to_host(bytemuck_f32_mut(&mut output))?;
+    for (index, (&got, &want)) in output.iter().zip(&expected_after_recovery).enumerate() {
+        if got != want {
+            return Ok(Outcome::Failed(format!(
+                "index {index}: ordinary launch after invalidated capture got {got}, want {want}"
+            )));
+        }
+    }
     Ok(Outcome::Passed)
 }
 

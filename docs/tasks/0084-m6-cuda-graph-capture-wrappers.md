@@ -126,8 +126,9 @@ lifetime contract. Exported the wrapper.
 
 Added the `graph_capture_replay` GPU case beside `stream_event`: it captures
 two async AXPY launches, replays them twice, verifies the result against four
-host AXPYs, then verifies invalidated capture returns an error and the stream
-accepts ordinary work afterward.
+host AXPYs, then enqueues an AXPY during a second capture and verifies that
+`stream.synchronize()` and `end_capture()` both return errors. It then verifies
+an ordinary AXPY on the recovered stream against the host result.
 
 The launch-once mutant failed only `graph_capture_replay` on all three GPUs:
 63 passed and 3 failed, each with output 5 instead of 9. The mutant was
@@ -136,3 +137,9 @@ driver-feature executor clippy, `cargo test --workspace --locked`,
 `cargo xtask arch-check`, and `cargo xtask spec-check`. With
 `CUDA_DEVICE_ORDER=PCI_BUS_ID`, `cargo xtask-cuda test-gpu` passed 66/66 across
 the three GPUs and qualified SM86 and SM120.
+
+R1: Added a captured AXPY node before synchronizing. On all three GPUs,
+`stream.synchronize()` and `end_capture()` returned errors, and the subsequent
+ordinary AXPY matched the host result. Round-2 gates passed: fmt, workspace
+clippy, `cargo test --workspace --locked`, and `cargo xtask-cuda test-gpu`
+(66/66).
