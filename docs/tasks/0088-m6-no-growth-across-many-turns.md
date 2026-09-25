@@ -93,6 +93,10 @@ fix production code in this task.
   driver-feature executor clippy, and `cargo test --workspace --locked`.
   GPU gate passed with `CUDA_DEVICE_ORDER=PCI_BUS_ID`: full
   `dense_gemma_device` (10 passed, 1 ignored).
+- R1 test-only trim: prefill chunks and both decode steps now use one execution
+  body, reducing the test by 31 net lines with all assertions retained. Round 2
+  gates passed: fmt, both clippy commands, and full `dense_gemma_device` (10
+  passed, 1 ignored).
 
 Per-turn measurements from the full GPU gate (byte values, except outstanding
 count):

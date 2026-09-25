@@ -1471,17 +1471,21 @@ fn many_turns_hold_every_resource_steady() {
     let mut measurements = Vec::with_capacity(TURNS);
 
     for turn in 1..=TURNS {
-        for chunk_rows in chunks.iter().copied() {
-            let chunk_end = committed_rows
-                .checked_add(chunk_rows)
-                .expect("prefill position fits u64");
-            let positions: Vec<_> = (committed_rows..chunk_end).collect();
+        let steps = chunks
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(1, DECODE_STEPS));
+        for step_rows in steps {
+            let step_end = committed_rows
+                .checked_add(step_rows)
+                .expect("step position fits u64");
+            let positions: Vec<_> = (committed_rows..step_end).collect();
             let tokens: Vec<_> = positions
                 .iter()
                 .map(|position| position % config.vocab)
                 .collect();
-            let transaction = state.begin().expect("begin many-turn prefill");
-            let plan = plans.remove(&chunk_rows).expect("bucket plan is admitted");
+            let transaction = state.begin().expect("begin many-turn step");
+            let plan = plans.remove(&step_rows).expect("bucket plan is admitted");
             let mut bindings = stage_bindings(&fixture, None, &tokens, &positions, &capability);
             if plan.bound_weight_count() != 0 {
                 bindings.retain(|binding| !matches!(binding.role, ValueRole::Weight(_)));
@@ -1500,49 +1504,14 @@ fn many_turns_hold_every_resource_steady() {
                     host_experts: &[],
                 })
                 .map_err(|refused| refused.error)
-                .expect("execute many-turn prefill")
+                .expect("execute many-turn step")
                 .finish()
                 .map_err(|refused| refused.error)
-                .expect("finish many-turn prefill");
+                .expect("finish many-turn step");
             commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
-                .expect("commit many-turn prefill");
-            plans.insert(chunk_rows, result.plan);
-            committed_rows = chunk_end;
-        }
-
-        for _ in 0..DECODE_STEPS {
-            let positions = [committed_rows];
-            let tokens = [committed_rows % config.vocab];
-            let transaction = state.begin().expect("begin many-turn decode");
-            let plan = plans.remove(&1).expect("one-row bucket plan is admitted");
-            let mut bindings = stage_bindings(&fixture, None, &tokens, &positions, &capability);
-            if plan.bound_weight_count() != 0 {
-                bindings.retain(|binding| !matches!(binding.role, ValueRole::Weight(_)));
-            }
-            let result = plan
-                .execute_dense(DenseGraphStep {
-                    graph: &fixture.graph,
-                    capability: &capability,
-                    catalogue: &catalogue,
-                    ctx: &context,
-                    stream: &stream,
-                    state: &mut state,
-                    transaction,
-                    runs: &mut runs,
-                    bindings,
-                    host_experts: &[],
-                })
-                .map_err(|refused| refused.error)
-                .expect("execute many-turn decode")
-                .finish()
-                .map_err(|refused| refused.error)
-                .expect("finish many-turn decode");
-            commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
-                .expect("commit many-turn decode");
-            plans.insert(1, result.plan);
-            committed_rows = committed_rows
-                .checked_add(1)
-                .expect("decode position fits u64");
+                .expect("commit many-turn step");
+            plans.insert(step_rows, result.plan);
+            committed_rows = step_end;
         }
 
         let device_scope = Scope::Device(capability.uuid);
