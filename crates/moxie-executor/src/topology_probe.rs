@@ -123,116 +123,155 @@ pub fn probe_pinned(ordinals: &[u32], config: ProbeConfig) -> Result<Vec<PinnedL
     Ok(links)
 }
 
+struct PinnedProbeResources<'ctx> {
+    pinned: PinnedHostBuffer<'ctx>,
+    stream: Stream<'ctx>,
+    compute_stream: Stream<'ctx>,
+    transfer: DeviceBuffer<'ctx>,
+    x: DeviceBuffer<'ctx>,
+    y: DeviceBuffer<'ctx>,
+    pageable: Vec<u8>,
+    pageable_out: Vec<u8>,
+    package: ResolvedModule<'ctx>,
+    start: Event<'ctx>,
+    end: Event<'ctx>,
+    both_start: Event<'ctx>,
+    both_end: Event<'ctx>,
+    kernel_end: Event<'ctx>,
+}
+
 fn probe_pinned_device(
     capability: &DeviceCapability,
     config: ProbeConfig,
     float_count: u32,
 ) -> Result<[PinnedLink; 2]> {
     let ctx = RankContext::acquire(RankId(capability.ordinal), capability.ordinal)?;
-    let mut pinned = PinnedHostBuffer::alloc(&ctx, config.bulk_bytes)?;
+    // Everything is owned outside the fallible measurement closure. If any
+    // enqueue path fails, the final context sync runs before these resources
+    // can be dropped.
+    // SAFETY: the image is the immutable nvcc output embedded by this build.
+    let image = unsafe { TrustedImage::from_build_output(moxie_kernels::SMOKE_FATBIN)? };
+    let package = Module::load(&ctx, ModuleImage::Binary(image))?
+        .resolve_all(&[moxie_kernels::AXPY_F32.to_owned()])?;
+    let mut resources = PinnedProbeResources {
+        pinned: PinnedHostBuffer::alloc(&ctx, config.bulk_bytes)?,
+        stream: Stream::new(&ctx)?,
+        compute_stream: Stream::new(&ctx)?,
+        transfer: DeviceBuffer::alloc(&ctx, config.bulk_bytes)?,
+        x: DeviceBuffer::alloc(&ctx, config.bulk_bytes)?,
+        y: DeviceBuffer::alloc(&ctx, config.bulk_bytes)?,
+        pageable: zeroed(config.bulk_bytes)?,
+        pageable_out: zeroed(config.bulk_bytes)?,
+        package,
+        start: Event::new(&ctx)?,
+        end: Event::new(&ctx)?,
+        both_start: Event::new(&ctx)?,
+        both_end: Event::new(&ctx)?,
+        kernel_end: Event::new(&ctx)?,
+    };
+    resources.pinned.as_mut_slice().fill(0x5a);
+    resources.pageable.fill(0x5a);
+    resources.transfer.copy_from_host(&resources.pageable)?;
+    resources.x.copy_from_host(&resources.pageable)?;
+    resources.y.copy_from_host(&resources.pageable)?;
     let measurements = (|| {
-        let stream = Stream::new(&ctx)?;
-        let compute_stream = Stream::new(&ctx)?;
-        let mut transfer = DeviceBuffer::alloc(&ctx, config.bulk_bytes)?;
-        let mut x = DeviceBuffer::alloc(&ctx, config.bulk_bytes)?;
-        let mut y = DeviceBuffer::alloc(&ctx, config.bulk_bytes)?;
-        let mut pageable = zeroed(config.bulk_bytes)?;
-        let mut pageable_out = zeroed(config.bulk_bytes)?;
-        pinned.as_mut_slice().fill(0x5a);
-        pageable.fill(0x5a);
-        transfer.copy_from_host(&pageable)?;
-        x.copy_from_host(&pageable)?;
-        y.copy_from_host(&pageable)?;
-
-        // SAFETY: the image is the immutable nvcc output embedded by this build.
-        let image = unsafe { TrustedImage::from_build_output(moxie_kernels::SMOKE_FATBIN)? };
-        let package = Module::load(&ctx, ModuleImage::Binary(image))?
-            .resolve_all(&[moxie_kernels::AXPY_F32.to_owned()])?;
-
-        let (start, end) = (Event::new(&ctx)?, Event::new(&ctx)?);
+        let PinnedProbeResources {
+            pinned,
+            stream,
+            compute_stream,
+            transfer,
+            x,
+            y,
+            pageable,
+            pageable_out,
+            package,
+            start,
+            end,
+            both_start,
+            both_end,
+            kernel_end,
+        } = &mut resources;
         // Warm each transfer and kernel path before collecting samples.
         // SAFETY: host slices and the transfer allocation remain live until the
         // following stream synchronization observes all four copies.
         unsafe {
-            transfer.copy_from_host_async_at(0, &pageable, &stream)?;
-            transfer.copy_from_host_async_at(0, pinned.as_slice(), &stream)?;
-            transfer.copy_to_host_async(&mut pageable_out, &stream)?;
-            transfer.copy_to_host_async(pinned.as_mut_slice(), &stream)?;
+            transfer.copy_from_host_async_at(0, pageable, stream)?;
+            transfer.copy_from_host_async_at(0, pinned.as_slice(), stream)?;
+            transfer.copy_to_host_async(pageable_out, stream)?;
+            transfer.copy_to_host_async(pinned.as_mut_slice(), stream)?;
         }
         stream.synchronize()?;
-        launch_axpy(&package, &x, &y, float_count, &compute_stream)?;
+        launch_axpy(package, x, y, float_count, compute_stream)?;
         compute_stream.synchronize()?;
 
-        let pageable_h2d = event_times(config.reps, &stream, &start, &end, || {
+        let pageable_h2d = event_times(config.reps, stream, start, end, || {
             // SAFETY: the pageable source, device buffer and stream outlive the
             // measured operation, and `event_times` observes completion.
-            unsafe { transfer.copy_from_host_async_at(0, &pageable, &stream) }
+            unsafe { transfer.copy_from_host_async_at(0, pageable, stream) }
         })?;
-        let pageable_h2d_issue = issue_times(config.reps, &stream, || {
+        let pageable_h2d_issue = issue_times(config.reps, stream, || {
             // SAFETY: the source remains live until the stream is synchronized.
-            unsafe { transfer.copy_from_host_async_at(0, &pageable, &stream) }
+            unsafe { transfer.copy_from_host_async_at(0, pageable, stream) }
         })?;
-        let pinned_h2d = event_times(config.reps, &stream, &start, &end, || {
+        let pinned_h2d = event_times(config.reps, stream, start, end, || {
             // SAFETY: pinned host storage, destination and stream remain live;
             // `event_times` waits before the next sample.
-            unsafe { transfer.copy_from_host_async_at(0, pinned.as_slice(), &stream) }
+            unsafe { transfer.copy_from_host_async_at(0, pinned.as_slice(), stream) }
         })?;
-        let pinned_h2d_issue = issue_times(config.reps, &stream, || {
+        let pinned_h2d_issue = issue_times(config.reps, stream, || {
             // SAFETY: the pinned source remains live until stream synchronization.
-            unsafe { transfer.copy_from_host_async_at(0, pinned.as_slice(), &stream) }
+            unsafe { transfer.copy_from_host_async_at(0, pinned.as_slice(), stream) }
         })?;
-        let pageable_d2h = event_times(config.reps, &stream, &start, &end, || {
+        let pageable_d2h = event_times(config.reps, stream, start, end, || {
             // SAFETY: the destination, device buffer and stream outlive the
             // measured operation, and `event_times` observes completion.
-            unsafe { transfer.copy_to_host_async(&mut pageable_out, &stream) }
+            unsafe { transfer.copy_to_host_async(pageable_out, stream) }
         })?;
-        let pageable_d2h_issue = issue_times(config.reps, &stream, || {
+        let pageable_d2h_issue = issue_times(config.reps, stream, || {
             // SAFETY: the destination remains live until the stream is synchronized.
-            unsafe { transfer.copy_to_host_async(&mut pageable_out, &stream) }
+            unsafe { transfer.copy_to_host_async(pageable_out, stream) }
         })?;
-        let pinned_d2h = event_times(config.reps, &stream, &start, &end, || {
+        let pinned_d2h = event_times(config.reps, stream, start, end, || {
             // SAFETY: pinned host storage, source and stream remain live;
             // `event_times` waits before the next sample.
-            unsafe { transfer.copy_to_host_async(pinned.as_mut_slice(), &stream) }
+            unsafe { transfer.copy_to_host_async(pinned.as_mut_slice(), stream) }
         })?;
-        let pinned_d2h_issue = issue_times(config.reps, &stream, || {
+        let pinned_d2h_issue = issue_times(config.reps, stream, || {
             // SAFETY: the pinned destination remains live until synchronization.
-            unsafe { transfer.copy_to_host_async(pinned.as_mut_slice(), &stream) }
+            unsafe { transfer.copy_to_host_async(pinned.as_mut_slice(), stream) }
         })?;
 
-        let copy_calibration = event_times(1, &stream, &start, &end, || {
+        let copy_calibration = event_times(1, stream, start, end, || {
             // SAFETY: the pinned source remains live until event completion.
-            unsafe { transfer.copy_from_host_async_at(0, pinned.as_slice(), &stream) }
+            unsafe { transfer.copy_from_host_async_at(0, pinned.as_slice(), stream) }
         })?[0];
-        let kernel_calibration = event_times(1, &compute_stream, &start, &end, || {
-            launch_axpy(&package, &x, &y, float_count, &compute_stream)
+        let kernel_calibration = event_times(1, compute_stream, start, end, || {
+            launch_axpy(package, x, y, float_count, compute_stream)
         })?[0];
         let kernel_reps = (copy_calibration / kernel_calibration).ceil().max(1.0) as usize;
-        let kernel_alone = event_times(config.reps, &compute_stream, &start, &end, || {
+        let kernel_alone = event_times(config.reps, compute_stream, start, end, || {
             for _ in 0..kernel_reps {
-                launch_axpy(&package, &x, &y, float_count, &compute_stream)?;
+                launch_axpy(package, x, y, float_count, compute_stream)?;
             }
             Ok(())
         })?;
-        let (both_start, both_end, kernel_end) =
-            (Event::new(&ctx)?, Event::new(&ctx)?, Event::new(&ctx)?);
         let mut both = Vec::with_capacity(config.reps);
         for _ in 0..config.reps {
-            both_start.record(&stream)?;
-            compute_stream.wait_event(&both_start)?;
+            both_start.record(stream)?;
+            compute_stream.wait_event(both_start)?;
             // SAFETY: pinned host storage and destination remain live until the
             // end event, which is ordered after the copy and compute streams.
             unsafe {
-                transfer.copy_from_host_async_at(0, pinned.as_slice(), &stream)?;
+                transfer.copy_from_host_async_at(0, pinned.as_slice(), stream)?;
             }
             for _ in 0..kernel_reps {
-                launch_axpy(&package, &x, &y, float_count, &compute_stream)?;
+                launch_axpy(package, x, y, float_count, compute_stream)?;
             }
-            kernel_end.record(&compute_stream)?;
-            stream.wait_event(&kernel_end)?;
-            both_end.record(&stream)?;
+            kernel_end.record(compute_stream)?;
+            stream.wait_event(kernel_end)?;
+            both_end.record(stream)?;
             both_end.synchronize()?;
-            both.push(f64::from(Event::elapsed_ms(&both_start, &both_end)?) / 1e3);
+            both.push(f64::from(Event::elapsed_ms(both_start, both_end)?) / 1e3);
         }
 
         let copy_alone = median_metric(&pinned_h2d, |seconds| seconds)?;
@@ -269,11 +308,17 @@ fn probe_pinned_device(
             },
         ])
     })();
-    if let Err(error) = ctx.synchronize() {
-        core::mem::forget(pinned);
-        return Err(error);
+    match ctx.synchronize() {
+        Ok(()) => measurements,
+        Err(sync_error) => {
+            // If completion is unknown, withhold the resources the queued work may use.
+            std::mem::forget(resources);
+            match measurements {
+                Err(original_error) => Err(original_error),
+                Ok(_) => Err(sync_error),
+            }
+        }
     }
-    measurements
 }
 
 fn launch_axpy(

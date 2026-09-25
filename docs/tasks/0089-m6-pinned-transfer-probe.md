@@ -125,3 +125,9 @@ and two-run comparison are appended to `docs/evidence/topology-costs.md`.
   (69/69).
 - Both `CUDA_DEVICE_ORDER=PCI_BUS_ID cargo xtask-cuda probe` runs completed;
   every nonzero figure reproduced within 25% (largest change 15.8%).
+- R1: kept probe buffers and the smoke module alive through the final context
+  synchronization on every measurement exit; if synchronization fails, the
+  resources are forgotten and the original measurement error is returned.
+  Removed unused `PinnedHostBuffer::len` and `is_empty`. Format, workspace
+  clippy, driver-feature executor clippy, workspace tests, and one pinned
+  transfer probe passed.

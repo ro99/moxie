@@ -1007,14 +1007,6 @@ impl<'ctx> PinnedHostBuffer<'ctx> {
         })
     }
 
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        false
-    }
-
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: allocation succeeds only with a non-null pointer and nonzero
         // length, and the borrow is bounded by the live allocation.
