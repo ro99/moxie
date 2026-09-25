@@ -166,3 +166,12 @@ on the 5060 Ti and lower on both 3090s (3.533 vs 5.571 and 3.594 vs 5.623
 GB/s). Pageable issue calls take about **9.5–12.4 ms**; pinned calls take
 about **2.3–2.8 us**. The H2D overlap values range from **0.979 to 1.000** in
 both runs.
+
+**Uncontrolled (coordinator, after review):** the probe controls neither the
+pinned buffer's NUMA node nor the thread's CPU affinity. The 3090s sit on
+NUMA node 1 and the 5060 Ti on node 0 (AGENTS.md), so the lower pinned D2H
+rate on both 3090s may be a cross-node placement effect; these runs do not
+establish that pinned D2H is inherently slower on a 3090. The practical
+reading for staging design: pageable async copies block the host for the
+whole transfer, pinned ones return in microseconds and overlap compute; the
+bandwidth gain from pinning is small.
