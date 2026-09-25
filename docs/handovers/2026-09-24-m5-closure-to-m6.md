@@ -229,6 +229,16 @@ run, each a bounded task:
    makes inputs). Paired with the fixture-scale method of task 0090.
 **Owner decisions:** the checkpoint choice, and item 1.
 
+**Owner ruling (2026-09-25):** the checkpoint is confirmed. The owner
+authorized the coordinator to run the conversion under ADR 0020, with this
+scope. Artifact `cyankiwi/gemma-4-31B-it-AWQ-8bit`, at revision
+`34ca187d836de874b2c7e3edf48f439b9f583772`. Expected size is about 35 GB (the
+source payload is 35,089,877,112 B). The conversion writes under `/models`:
+plan `/models/gemma-4-31B-it-AWQ-8bit.plan.toml`, and output
+`/models/gemma-4-31B-it-AWQ-8bit-moxie`. Retention: until the owner removes
+it. Command: `moxie-repack plan`, then `moxie-repack repack`. The plan lists
+1,188 selected tensors and 0 skipped. `/` had 67 GB free before the run.
+
 ### Known bound for slice 7 (coordinator, 2026-09-24)
 
 `gemma-4-31B-it-AWQ-8bit` is INT8, group 32, symmetric, which the affine
