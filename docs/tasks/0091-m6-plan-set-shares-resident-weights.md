@@ -1,7 +1,7 @@
 # Task 0091 — a dense plan set shares one resident copy of the weights
 
-Status: **proposed** (coordinator, 2026-09-25); design option (B) from the
-ledger, pending the owner's morning review. Builder Codex `luna`; reviewer
+Status: **active** (coordinator, 2026-09-25); design option (B) from the
+ledger, assigned before the owner's morning review (redirectable). Builder Codex `luna`; reviewer
 Codex `sol`.
 
 ## Identity and authority
