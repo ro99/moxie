@@ -10,7 +10,7 @@
 use core::ffi::c_void;
 use std::collections::{BTreeMap, BTreeSet};
 
-use moxie_cuda::{Event, Module, ModuleImage, RankContext, ResolvedModule, Stream, TrustedImage};
+use moxie_cuda::{Event, Module, ModuleImage, RankContext, Stream, TrustedImage};
 use moxie_graph::{Graph, NodeId, OpParams, RopeLayout, ValueId, ValueRole};
 use moxie_kernels::cpu_expert::{ExpertAssignment, ExpertShape, ExpertTiling};
 use moxie_plan::{HostExpertJoin, SelectedNode, Visibility};
@@ -80,7 +80,6 @@ pub struct DenseOperation<'ctx> {
     /// Every angle table uploaded by the step stays here until the lease retires
     /// after the completion event, like `sources`.
     rope_tables: Vec<((u64, u64, u32), Vec<u8>)>,
-    pub(crate) package: ResolvedModule<'ctx>,
     pub(crate) launch_order: Vec<String>,
     pub(crate) device_ordinal: u32,
 }
@@ -106,7 +105,7 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
     /// attention node's layer in the rank's full KV authority.
     #[allow(clippy::result_large_err)]
     pub(crate) fn execute_dense_stage(
-        self,
+        mut self,
         step: DenseGraphStep<'_, 'ctx>,
         resident: &BTreeSet<ValueId>,
         layers: &BTreeMap<NodeId, u32>,
@@ -152,35 +151,38 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         if let Err(error) = validate_bindings_except(&self, graph, &bindings, resident) {
             return Err(reject(self, bindings, error));
         }
-        let symbols: Vec<String> = self
-            .candidate()
-            .nodes()
-            .iter()
-            .flat_map(|node| {
-                node.descriptor
-                    .symbols
-                    .iter()
-                    .map(|symbol| symbol.0.clone())
-            })
-            .collect();
-        // SAFETY: this is the nvcc output embedded by this build, and selection
-        // above binds the plan to the dense catalogue's image identity.
-        let trusted =
-            match unsafe { TrustedImage::from_build_output(moxie_kernels::DENSE_GRAPH_FATBIN) } {
-                Ok(image) => image,
+        if self.package.is_none() {
+            let symbols: Vec<String> = self
+                .candidate()
+                .nodes()
+                .iter()
+                .flat_map(|node| {
+                    node.descriptor
+                        .symbols
+                        .iter()
+                        .map(|symbol| symbol.0.clone())
+                })
+                .collect();
+            // SAFETY: this is the nvcc output embedded by this build, and selection
+            // above binds the plan to the dense catalogue's image identity.
+            let trusted =
+                match unsafe { TrustedImage::from_build_output(moxie_kernels::DENSE_GRAPH_FATBIN) }
+                {
+                    Ok(image) => image,
+                    Err(error) => return Err(reject(self, bindings, error)),
+                };
+            let package = match Module::load(ctx, ModuleImage::Binary(trusted))
+                .and_then(|module| module.resolve_all(&symbols))
+            {
+                Ok(package) => package,
                 Err(error) => return Err(reject(self, bindings, error)),
             };
-        let package = match Module::load(ctx, ModuleImage::Binary(trusted))
-            .and_then(|module| module.resolve_all(&symbols))
-        {
-            Ok(package) => package,
-            Err(error) => return Err(reject(self, bindings, error)),
-        };
+            self.package = Some(package);
+        }
         let operation = DenseOperation {
             plan: Some(self),
             sources: bindings,
             rope_tables: Vec::new(),
-            package,
             launch_order: Vec::new(),
             device_ordinal: ctx.ordinal(),
         };
@@ -1301,11 +1303,17 @@ fn launch<'ctx>(
     symbol: &str,
 ) -> Result<()> {
     let operation = lease.resource();
+    let package = operation
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan")
+        .package
+        .as_ref()
+        .ok_or_else(|| invalid("module", "dense kernel module is not loaded"))?;
     // SAFETY: descriptor selection fixes this ABI and the caller passed only
     // addresses within ranges admitted for this plan.
     unsafe {
-        operation
-            .package
+        package
             .launch_async(symbol_index, stream, grid, block, 0, params)
             .map_err(|error| attribute_node_error(error, operation.device_ordinal, node, symbol))
     }

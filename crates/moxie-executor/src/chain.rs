@@ -124,6 +124,10 @@ pub struct SelectedReservedPlan<'ctx> {
     arena: Option<DeviceArena<'ctx>>,
     ranges: BTreeMap<(StorageRegion, u32), DeviceRange<'ctx>>,
     bound_weights: BTreeMap<ValueId, OwnedBinding>,
+    /// The dense kernel module, loaded by the first dense step and dropped
+    /// with the plan, so it is never unloaded while a step's kernels may still
+    /// run.
+    pub(crate) package: Option<ResolvedModule<'ctx>>,
     ledger: LedgerId,
 }
 
@@ -297,6 +301,7 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             arena: Some(arena),
             ranges,
             bound_weights: BTreeMap::new(),
+            package: None,
             ledger: ledger.id(),
         })
     }
