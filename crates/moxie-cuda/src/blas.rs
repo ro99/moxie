@@ -128,12 +128,12 @@ impl<'ctx> Blas<'ctx> {
         )
     }
 
-    /// Enqueue one BF16 GEMM with FP32 accumulation in cuBLAS's order.
+    /// Enqueue one BF16 GEMM with FP32 accumulation and a selectable output type.
     ///
     /// # Safety
-    /// `a`, `b`, and `c` must name valid BF16 matrices of the dimensions and
-    /// leading dimensions supplied, and must remain live until work on the
-    /// bound stream completes.
+    /// `a` and `b` must name valid BF16 matrices, and `c` must name a valid
+    /// BF16 or FP32 matrix according to `c_f32`. All matrices must remain live
+    /// until work on the bound stream completes.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_bf16(
         &self,
@@ -146,6 +146,7 @@ impl<'ctx> Blas<'ctx> {
         ldb: u64,
         c: u64,
         ldc: u64,
+        c_f32: bool,
     ) -> Result<()> {
         let as_i32 = |value: u64, name| {
             i32::try_from(value).map_err(|_| Error::InvalidRequest {
@@ -190,7 +191,11 @@ impl<'ctx> Blas<'ctx> {
                     ldb,
                     (&beta as *const f32).cast(),
                     c as usize as *mut c_void,
-                    ffi::CUDA_R_16BF,
+                    if c_f32 {
+                        ffi::CUDA_R_32F
+                    } else {
+                        ffi::CUDA_R_16BF
+                    },
                     ldc,
                     ffi::CUBLAS_COMPUTE_32F,
                     ffi::CUBLAS_GEMM_DEFAULT,

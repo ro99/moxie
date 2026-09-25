@@ -742,6 +742,97 @@ pub struct Stream<'ctx> {
     ctx: &'ctx RankContext,
 }
 
+/// Enqueue a device-to-device rectangular copy on one stream.
+///
+/// # Safety
+/// Both device regions must remain allocated in `ctx` through completion, and
+/// each must cover `pitch * (height - 1) + width_bytes` bytes from its address.
+/// This copy is capturable during stream capture.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn copy_2d_async(
+    ctx: &RankContext,
+    dst: u64,
+    dst_pitch: u64,
+    src: u64,
+    src_pitch: u64,
+    width_bytes: u64,
+    height: u64,
+    stream: &Stream<'_>,
+) -> Result<()> {
+    if !core::ptr::eq(ctx, stream.ctx)
+        || dst == 0
+        || src == 0
+        || width_bytes == 0
+        || height == 0
+        || dst_pitch < width_bytes
+        || src_pitch < width_bytes
+    {
+        return Err(Error::InvalidRequest {
+            field: "copy_2d",
+            detail: "copy dimensions, pitches, addresses, and stream context must agree".into(),
+        });
+    }
+    let extent = |pitch: u64| {
+        pitch
+            .checked_mul(height - 1)
+            .and_then(|bytes| bytes.checked_add(width_bytes))
+            .ok_or_else(|| Error::InvalidRequest {
+                field: "copy_2d",
+                detail: "copy extent overflowed".into(),
+            })
+    };
+    let (dst_extent, src_extent) = (extent(dst_pitch)?, extent(src_pitch)?);
+    if dst.checked_add(dst_extent).is_none() || src.checked_add(src_extent).is_none() {
+        return Err(Error::InvalidRequest {
+            field: "copy_2d",
+            detail: "copy address extent overflowed".into(),
+        });
+    }
+    let (dst_pitch, src_pitch, width_bytes, height) = (
+        usize::try_from(dst_pitch).map_err(|_| Error::InvalidRequest {
+            field: "copy_2d",
+            detail: "destination pitch exceeds the host ABI".into(),
+        })?,
+        usize::try_from(src_pitch).map_err(|_| Error::InvalidRequest {
+            field: "copy_2d",
+            detail: "source pitch exceeds the host ABI".into(),
+        })?,
+        usize::try_from(width_bytes).map_err(|_| Error::InvalidRequest {
+            field: "copy_2d",
+            detail: "copy width exceeds the host ABI".into(),
+        })?,
+        usize::try_from(height).map_err(|_| Error::InvalidRequest {
+            field: "copy_2d",
+            detail: "copy height exceeds the host ABI".into(),
+        })?,
+    );
+    ctx.make_current()?;
+    let copy = ffi::CUDA_MEMCPY2D {
+        src_x_in_bytes: 0,
+        src_y: 0,
+        src_memory_type: ffi::CU_MEMORYTYPE_DEVICE,
+        src_host: core::ptr::null(),
+        src_device: src,
+        src_array: core::ptr::null_mut(),
+        src_pitch,
+        dst_x_in_bytes: 0,
+        dst_y: 0,
+        dst_memory_type: ffi::CU_MEMORYTYPE_DEVICE,
+        dst_host: core::ptr::null_mut(),
+        dst_device: dst,
+        dst_array: core::ptr::null_mut(),
+        dst_pitch,
+        width_in_bytes: width_bytes,
+        height,
+    };
+    check(
+        // SAFETY: callers guarantee the source and destination extents remain
+        // live through stream completion; dimensions and stream context were checked.
+        unsafe { ffi::cuMemcpy2DAsync_v2(&copy, stream.raw()) },
+        "cuMemcpy2DAsync",
+    )
+}
+
 impl<'ctx> Stream<'ctx> {
     /// Stable identity of the device owning this handle.
     pub fn device_uuid(&self) -> DeviceUuid {

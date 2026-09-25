@@ -33,8 +33,8 @@ pub use expert::{
 pub use host_experts::{HostExpertJoin, HostExpertLowering, lower_host_experts};
 pub use pipeline::{PipelineLowering, PipelineRefused, lower_pipeline, wavefront};
 pub use selected::{
-    PlannedValue, PlannedWorkspace, SelectedNode, SelectedPlanCandidate, StorageRegion,
-    lower_selected, lower_selected_host_experts, lower_selected_ordered,
+    LinearSplitWorkspace, PlannedValue, PlannedWorkspace, SelectedNode, SelectedPlanCandidate,
+    StorageRegion, lower_selected, lower_selected_host_experts, lower_selected_ordered,
     lower_selected_with_formats, prefill_chunks,
 };
 pub use tensor_parallel::{

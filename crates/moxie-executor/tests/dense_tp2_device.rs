@@ -33,8 +33,11 @@ use moxie_plan::{
     build_stage_graph, lower_pipeline, lower_selected_ordered, lower_tensor_parallel,
 };
 use moxie_state::{DeviceKvSequence, KvGeometry, LayerKv, Retention, SequenceState, StateKind};
+#[cfg(feature = "cublas")]
+use moxie_types::SmVersion;
 use moxie_types::{
-    DeviceCapability, DeviceUuid, Dim, Error, Precision, RankId, SemanticKernelOp, TensorLayout,
+    DeviceCapability, DeviceUuid, Dim, Error, KernelCatalogue, Precision, RankId, SemanticKernelOp,
+    TensorLayout,
 };
 
 const DEADLINE: Duration = Duration::from_secs(20);
@@ -1142,6 +1145,26 @@ fn reference_step(
     positions: &[u64],
 ) -> Vec<u8> {
     let catalogue = moxie_kernels::dense_graph_catalogue();
+    reference_step_with_catalogue(
+        fixture,
+        orders,
+        combine_orders,
+        &catalogue,
+        rank,
+        tokens,
+        positions,
+    )
+}
+
+fn reference_step_with_catalogue(
+    fixture: &moxie_cli::fixture::Fixture,
+    orders: &BTreeMap<NodeId, LinearReductionOrder>,
+    combine_orders: &BTreeMap<NodeId, CombineReductionOrder>,
+    catalogue: &KernelCatalogue,
+    rank: &mut Rank<'_>,
+    tokens: &[u64],
+    positions: &[u64],
+) -> Vec<u8> {
     let workload = ResourceWorkload {
         phase: if tokens.len() == 1 {
             Phase::Decode
@@ -1159,7 +1182,7 @@ fn reference_step(
         &fixture.graph,
         workload,
         &rank.capability,
-        &catalogue,
+        catalogue,
         orders,
         combine_orders,
         &BTreeMap::<NodeId, ExpertOwnership>::new(),
@@ -1176,7 +1199,7 @@ fn reference_step(
         candidate,
         &fixture.graph,
         &rank.capability,
-        &catalogue,
+        catalogue,
         &mut rank.ledger,
         rank.ctx,
     )
@@ -1187,7 +1210,7 @@ fn reference_step(
         .execute_dense(DenseGraphStep {
             graph: &fixture.graph,
             capability: &rank.capability,
-            catalogue: &catalogue,
+            catalogue,
             ctx: rank.ctx,
             stream: &rank.stream,
             state: &mut rank.state,
@@ -1256,6 +1279,30 @@ fn tp_worker_step(
     positions: &[u64],
     fault: Fault,
 ) -> Result<Vec<u8>, Error> {
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+    tp_worker_step_with_catalogue(
+        workers,
+        fixture,
+        lowering,
+        capabilities,
+        &catalogue,
+        tokens,
+        positions,
+        fault,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tp_worker_step_with_catalogue(
+    workers: &mut DenseRankWorkers,
+    fixture: &moxie_cli::fixture::Fixture,
+    lowering: &TensorParallelLowering,
+    capabilities: &[DeviceCapability; 2],
+    catalogue: &KernelCatalogue,
+    tokens: &[u64],
+    positions: &[u64],
+    fault: Fault,
+) -> Result<Vec<u8>, Error> {
     if fault == Fault::Collective {
         workers.inject_collective_mismatch_once();
     }
@@ -1267,7 +1314,6 @@ fn tp_worker_step(
     }
     let mut oracles = OracleRegistry::new();
     moxie_oracles::register(&mut oracles).expect("oracles");
-    let catalogue = moxie_kernels::dense_graph_catalogue();
     let cancel = AtomicBool::new(false);
     let mut bindings = |rank: usize, stage: &StageGraph| {
         if rank == 1 && stage.state_layers.values().next() == Some(&1) {
@@ -1306,7 +1352,7 @@ fn tp_worker_step(
         lowering,
         moxie_oracles::HOST_REFERENCE,
         &oracles,
-        &catalogue,
+        catalogue,
         if fault == Fault::Oversized {
             192_153_584_101_141_162
         } else {
@@ -1698,11 +1744,74 @@ fn bf16_ulp(value: f32) -> f32 {
 }
 
 #[test]
-fn tp2_dense_prefill_decode_is_exact_and_rank_step_is_atomic() {
+fn tp2_z_dense_prefill_decode_is_exact_and_rank_step_is_atomic() {
     // The stall case pins the pair's claims for this process, so run it last.
     combined_tp2_tp1_pipeline_matches_host_and_reports_capacity_latency();
     tp2_worker_gate(false);
     tp2_worker_gate(true);
+}
+
+#[test]
+#[cfg(feature = "cublas")]
+fn tp2_unordered_matches_the_packed_split_reference() {
+    let _guard = one_at_a_time();
+    let (fixture, lowering, config) = order_sensitive_fixture(false);
+    let ordinals = pair_ordinals();
+    let capabilities = [
+        query_device(ordinals[0]).expect("first 3090 capability"),
+        query_device(ordinals[1]).expect("second 3090 capability"),
+    ];
+    let catalogue = moxie_kernels::dense_graph_catalogue_unordered(SmVersion::SM86);
+    let tokens = [1, 4, 7, 2, 9];
+    let positions = [0, 1, 2, 3, 4];
+    let expected = {
+        let context = RankContext::acquire(RankId(0), ordinals[0])
+            .expect("acquire single-device reference context");
+        let mut reference = Rank::new(&context, &config);
+        let output = reference_step_with_catalogue(
+            &fixture,
+            &lowering.linear_orders,
+            &lowering.combine_orders,
+            &catalogue,
+            &mut reference,
+            &tokens,
+            &positions,
+        );
+        reference.close();
+        output
+    };
+    let host_capacity = CapacitySnapshot::measured_host(
+        &moxie_host::read().expect("measure host capacity"),
+        1 << 20,
+    )
+    .expect("host capacity snapshot");
+    let local = local_config(&config);
+    let mut workers = DenseRankWorkers::spawn(DenseRankWorkerConfig {
+        ranks: [RankId(1), RankId(2)],
+        ordinals,
+        geometry: geometry(&local, 4, 64, 6),
+        heads: local.heads,
+        max_rows: 5,
+        host_capacity,
+        deadline: DEADLINE,
+    })
+    .expect("spawn eager unordered TP2 pair");
+    let actual = tp_worker_step_with_catalogue(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &catalogue,
+        &tokens,
+        &positions,
+        Fault::None,
+    )
+    .expect("execute eager unordered TP2 prefill");
+    assert_eq!(
+        actual, expected,
+        "unordered TP2 output bytes equal the packed split reference"
+    );
+    workers.close().expect("close unordered TP2 workers");
 }
 
 fn combined_tp2_tp1_pipeline_matches_host_and_reports_capacity_latency() {

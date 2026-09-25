@@ -183,3 +183,37 @@ No `test-gpu` (no kernel source changes), and no timing.
 - a file outside the allowed list is needed.
 
 ## Result, filled after work
+
+Implemented cuBLAS FP32 `LinearPartial` and the packed two-block `LinearSplit`
+reference, admitted their scratch only for the `cublas:gemm_ex_split`
+descriptor, and added the eager TP2 byte comparison.
+
+R1 repairs: split scratch sizing now ignores ordered and non-cuBLAS plans;
+the device test checks each raw FP32 partial against its host FP32 oracle
+under ADR 0028's two clauses before checking the combined BF16 result; the
+two amended public re-exports remain. Removed the permanent strided control
+and its output bookkeeping, leaving compact and packed paths.
+
+| Shape `(rows, input, output)` | GPU UUID | Partial/split combined BF16 result: worst ULP / second-clause elements | Linear BF16 result: worst ULP / second-clause elements |
+|---|---|---:|---:|
+| `(1, 5376, 21504)` | `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | 1 / 0 | 1 / 0 |
+| `(1, 5376, 21504)` | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9`, `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | 1 / 0 | 1 / 0 |
+| `(33, 1024, 3072)` | `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | 5 / 5 | 10 / 1 |
+| `(33, 1024, 3072)` | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9`, `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | 4 / 3 | 4 / 1 |
+| `(512, 4096, 4096)` | `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | 80 / 88 | 27976 / 173 |
+| `(512, 4096, 4096)` | `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9`, `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | 70 / 92 | 28051 / 171 |
+
+The strided-layout mutant survived the fixture comparison: its output bytes
+matched the packed reference. The gate shapes also matched. Additional
+3090 probes at `(1, 8194, 8192)`, `(1, 4098, 16384)`, `(1, 16386, 4096)`,
+`(33, 1026, 8192)` and `(127, 258, 8192)` showed zero differing BF16 outputs
+and zero differing FP32 partial bits. No distinguishing shape was found on
+this cuBLAS driver; `(127, 258, 8192)` was the largest probe by output count.
+
+Host gates passed: fmt, workspace clippy, executor driver clippy with and
+without `cublas`, workspace tests, arch-check (79 rejected / 21 accepted
+fixtures, 13 rules), and spec-check (10 documents). The full
+`dense_gemma_device` suite passed before R1 and was not rerun; after R1,
+`cublas_linear_holds_the_quantized_gate --exact` passed on all three GPUs.
+The full `dense_tp2_device` suite passed (2 tests) with one test thread so
+the new eager comparison runs before the existing test's final rank stall.

@@ -13,7 +13,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 #[cfg(feature = "cublas")]
-use moxie_cuda::{Blas, DeviceBuffer, ffi};
+use moxie_cuda::{Blas, DeviceBuffer, copy_2d_async, ffi};
 use moxie_cuda::{RankContext, Stream, device_count, query_device};
 use moxie_engine::{HostTensor, Value};
 use moxie_executor::paged_attention::device::commit_paged_state;
@@ -3477,6 +3477,304 @@ fn check_bf16_linear_rows(
 }
 
 #[cfg(feature = "cublas")]
+fn packed_bf16_columns(
+    values: &[u16],
+    rows: usize,
+    columns: usize,
+    start: usize,
+    width: usize,
+) -> Vec<u16> {
+    (0..rows)
+        .flat_map(|row| {
+            let start = row * columns + start;
+            values[start..start + width].iter().copied()
+        })
+        .collect()
+}
+
+#[cfg(feature = "cublas")]
+#[allow(clippy::type_complexity)]
+fn host_bf16_partials(
+    input_bits: &[u16],
+    weight_bits: &[u16],
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+) -> ([Vec<u16>; 2], [Vec<u16>; 2], [Vec<f32>; 2]) {
+    let width = in_features / 2;
+    let packed_weights = std::array::from_fn(|block| {
+        packed_bf16_columns(weight_bits, out_features, in_features, block * width, width)
+    });
+    let packed_inputs = std::array::from_fn(|block| {
+        packed_bf16_columns(input_bits, rows, in_features, block * width, width)
+    });
+    let mut partials = [
+        vec![0.0; rows * out_features],
+        vec![0.0; rows * out_features],
+    ];
+    for block in 0..2 {
+        let weights: Vec<_> = packed_weights[block]
+            .iter()
+            .copied()
+            .map(bf16_bits_to_f32)
+            .collect();
+        for row in 0..rows {
+            let input: Vec<_> = packed_inputs[block][row * width..(row + 1) * width]
+                .iter()
+                .copied()
+                .map(bf16_bits_to_f32)
+                .collect();
+            let output =
+                moxie_oracles::linear::linear_row_ordered(&input, &weights, out_features, None, 1)
+                    .expect("host FP32 partial oracle");
+            partials[block][row * out_features..(row + 1) * out_features].copy_from_slice(&output);
+        }
+    }
+    (packed_weights, packed_inputs, partials)
+}
+
+#[cfg(feature = "cublas")]
+#[allow(clippy::too_many_arguments)]
+fn check_bf16_partial_gate(
+    input: &[f32],
+    weights: &[f32],
+    expected: &[Vec<f32>; 2],
+    partials: &[Vec<f32>; 2],
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+    device: moxie_types::DeviceUuid,
+) -> CublasLinearGateMeasure {
+    let width = in_features / 2;
+    for block in 0..2 {
+        for row in 0..rows {
+            let x =
+                &input[row * in_features + block * width..row * in_features + (block + 1) * width];
+            for out in 0..out_features {
+                let index = row * out_features + out;
+                let oracle = expected[block][index];
+                let result = partials[block][index];
+                assert!(result.is_finite(), "cuBLAS FP32 partial is finite");
+                let error = (f64::from(result) - f64::from(oracle)).abs();
+                let ulp_bound = f64::from(bf16_ulp(oracle)) * 2.0;
+                if error > ulp_bound {
+                    let weight_start = out * in_features + block * width;
+                    let w = &weights[weight_start..weight_start + width];
+                    let absolute_sum = x
+                        .iter()
+                        .zip(w)
+                        .map(|(&x_value, &w_value)| {
+                            f64::from(x_value).abs() * f64::from(w_value).abs()
+                        })
+                        .sum::<f64>();
+                    let reduction_bound = absolute_sum * 2f64.powi(-8);
+                    assert!(
+                        error <= reduction_bound,
+                        "FP32 partial block {block} gate failed on {device} at row {row}, output {out}: error {error}, two-BF16-ULP bound {ulp_bound}, reduction bound {reduction_bound}"
+                    );
+                }
+            }
+        }
+    }
+
+    let mut measure = CublasLinearGateMeasure::default();
+    for row in 0..rows {
+        let x = &input[row * in_features..(row + 1) * in_features];
+        for out in 0..out_features {
+            let index = row * out_features + out;
+            let expected_bits = f32_to_bf16_bits(expected[0][index] + expected[1][index]);
+            let result_bits = f32_to_bf16_bits(partials[0][index] + partials[1][index]);
+            let oracle = bf16_bits_to_f32(expected_bits);
+            let result = bf16_bits_to_f32(result_bits);
+            assert!(result.is_finite(), "cuBLAS partial output is finite");
+            let ulp = bf16_monotone(expected_bits).abs_diff(bf16_monotone(result_bits));
+            let absolute_sum = if ulp > 2 || ulp > measure.worst_ulp {
+                let w = &weights[out * in_features..(out + 1) * in_features];
+                x.iter()
+                    .zip(w)
+                    .map(|(&x_value, &w_value)| f64::from(x_value).abs() * f64::from(w_value).abs())
+                    .sum::<f64>()
+            } else {
+                0.0
+            };
+            if ulp > 2 {
+                let error = (f64::from(result) - f64::from(oracle)).abs();
+                let bound = absolute_sum * 2f64.powi(-8);
+                assert!(
+                    error <= bound,
+                    "BF16 partial gate failed on {device} at row {row}, output {out}: {ulp} ULP, error {error}, reduction bound {bound}"
+                );
+                measure.second_clause += 1;
+            }
+            if ulp > measure.worst_ulp {
+                measure.worst_ulp = ulp;
+                measure.row = row;
+                measure.output = out;
+                measure.result = result;
+                measure.oracle = oracle;
+                measure.absolute_sum = absolute_sum;
+            }
+        }
+    }
+    measure
+}
+
+#[cfg(feature = "cublas")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CublasPartialLayout {
+    Compact,
+    Packed,
+}
+
+#[cfg(feature = "cublas")]
+#[allow(clippy::too_many_arguments)]
+fn run_cublas_partials<'ctx>(
+    context: &'ctx RankContext,
+    stream: &Stream<'ctx>,
+    blas: &mut Blas<'ctx>,
+    workspace: &DeviceBuffer<'ctx>,
+    source_weight: &DeviceBuffer<'ctx>,
+    source_input: &DeviceBuffer<'ctx>,
+    packed_weights: &[Vec<u16>; 2],
+    packed_inputs: &[Vec<u16>; 2],
+    rows: u64,
+    in_features: u64,
+    out_features: u64,
+    layout: CublasPartialLayout,
+) -> [Vec<f32>; 2] {
+    let width = in_features / 2;
+    let packed_weight_bytes = out_features * width * 2;
+    let packed_input_bytes = rows * width * 2;
+    let partial_bytes = rows * out_features * 4;
+    let partial_0 =
+        DeviceBuffer::alloc(context, partial_bytes as usize).expect("allocate first FP32 partial");
+    let partial_1 =
+        DeviceBuffer::alloc(context, partial_bytes as usize).expect("allocate second FP32 partial");
+    let partial_outputs = [partial_0, partial_1];
+    // Keep each rank's packed inputs live through its cuBLAS call.
+    let mut rank_weights = Vec::new();
+    let mut rank_inputs = Vec::new();
+    if layout == CublasPartialLayout::Compact {
+        for block in 0..2 {
+            let mut weight = DeviceBuffer::alloc(context, packed_weight_bytes as usize)
+                .expect("allocate compact rank weight");
+            let mut input = DeviceBuffer::alloc(context, packed_input_bytes as usize)
+                .expect("allocate compact rank input");
+            weight
+                .copy_from_host(&bf16_le_bytes(&packed_weights[block]))
+                .expect("upload compact rank weight");
+            input
+                .copy_from_host(&bf16_le_bytes(&packed_inputs[block]))
+                .expect("upload compact rank input");
+            rank_weights.push(weight);
+            rank_inputs.push(input);
+        }
+    }
+    let packed_weight = (layout == CublasPartialLayout::Packed).then(|| {
+        DeviceBuffer::alloc(context, packed_weight_bytes as usize)
+            .expect("allocate split packed weight")
+    });
+    let packed_input = (layout == CublasPartialLayout::Packed).then(|| {
+        DeviceBuffer::alloc(context, packed_input_bytes as usize)
+            .expect("allocate split packed input")
+    });
+    // SAFETY: both paths use the stream and live workspace owned by this context.
+    unsafe {
+        blas.bind(stream, workspace.device_ptr(), workspace.len())
+            .expect("bind partial cuBLAS stream and workspace");
+    }
+    for block in 0..2 {
+        let offset = block as u64 * width * 2;
+        let (weight_address, input_address, leading_dimension) = match layout {
+            CublasPartialLayout::Compact => (
+                rank_weights[block].device_ptr(),
+                rank_inputs[block].device_ptr(),
+                width,
+            ),
+            CublasPartialLayout::Packed => {
+                // SAFETY: full row-major sources and admitted compact slots stay
+                // live through the following same-stream GEMM.
+                unsafe {
+                    copy_2d_async(
+                        context,
+                        packed_weight
+                            .as_ref()
+                            .expect("packed weight slot")
+                            .device_ptr(),
+                        width * 2,
+                        source_weight.device_ptr() + offset,
+                        in_features * 2,
+                        width * 2,
+                        out_features,
+                        stream,
+                    )
+                    .expect("pack split weight columns");
+                    copy_2d_async(
+                        context,
+                        packed_input
+                            .as_ref()
+                            .expect("packed input slot")
+                            .device_ptr(),
+                        width * 2,
+                        source_input.device_ptr() + offset,
+                        in_features * 2,
+                        width * 2,
+                        rows,
+                        stream,
+                    )
+                    .expect("pack split input columns");
+                }
+                (
+                    packed_weight
+                        .as_ref()
+                        .expect("packed weight slot")
+                        .device_ptr(),
+                    packed_input
+                        .as_ref()
+                        .expect("packed input slot")
+                        .device_ptr(),
+                    width,
+                )
+            }
+        };
+        // SAFETY: compact BF16 inputs and the FP32 output partial are live on the
+        // handle's bound stream through the synchronization below.
+        unsafe {
+            blas.gemm_bf16(
+                out_features,
+                rows,
+                width,
+                weight_address,
+                leading_dimension,
+                input_address,
+                leading_dimension,
+                partial_outputs[block].device_ptr(),
+                out_features,
+                true,
+            )
+            .expect("submit FP32 partial GEMM");
+        }
+    }
+    stream
+        .synchronize()
+        .expect("synchronize FP32 partial GEMMs");
+    let mut partials = [
+        vec![0.0; (rows * out_features) as usize],
+        vec![0.0; (rows * out_features) as usize],
+    ];
+    for block in 0..2 {
+        let mut bytes = vec![0u8; partial_bytes as usize];
+        partial_outputs[block]
+            .copy_to_host(&mut bytes)
+            .expect("read FP32 partial");
+        for (value, word) in partials[block].iter_mut().zip(bytes.chunks_exact(4)) {
+            *value = f32::from_le_bytes(word.try_into().expect("FP32 word"));
+        }
+    }
+    partials
+}
+
+#[cfg(feature = "cublas")]
 #[allow(clippy::too_many_arguments)]
 fn measure_cublas_graph(
     context: &RankContext,
@@ -3693,6 +3991,7 @@ fn cublas_linear_holds_the_quantized_gate() {
                     in_features,
                     output.device_ptr(),
                     out_features,
+                    false,
                 )
                 .expect("submit BF16 GEMM");
             }
@@ -3717,6 +4016,54 @@ fn cublas_linear_holds_the_quantized_gate() {
                 out_features as usize,
                 capability.uuid,
             );
+            let (packed_weights, packed_inputs, partial_oracle) = host_bf16_partials(
+                &input_bits,
+                &weight_bits,
+                rows as usize,
+                in_features as usize,
+                out_features as usize,
+            );
+            for layout in [CublasPartialLayout::Compact, CublasPartialLayout::Packed] {
+                let partials = run_cublas_partials(
+                    &context,
+                    &stream,
+                    &mut blas,
+                    &workspace,
+                    &weight,
+                    &input,
+                    &packed_weights,
+                    &packed_inputs,
+                    rows,
+                    in_features,
+                    out_features,
+                    layout,
+                );
+                let partial_gate = check_bf16_partial_gate(
+                    &input_f32,
+                    &weight_f32,
+                    &partial_oracle,
+                    &partials,
+                    rows as usize,
+                    in_features as usize,
+                    out_features as usize,
+                    capability.uuid,
+                );
+                println!(
+                    "cublas-linear-partial-gate gpu={} kind={} rows={rows} input={in_features} output={out_features} worst_ulp={} second_clause={} worst_row={} worst_output={} result={:.9e} oracle={:.9e} sum_abs={:.9e}",
+                    capability.uuid,
+                    match layout {
+                        CublasPartialLayout::Compact => "partial",
+                        CublasPartialLayout::Packed => "split",
+                    },
+                    partial_gate.worst_ulp,
+                    partial_gate.second_clause,
+                    partial_gate.row,
+                    partial_gate.output,
+                    partial_gate.result,
+                    partial_gate.oracle,
+                    partial_gate.absolute_sum,
+                );
+            }
             let capture = measure_cublas_graph(
                 &context,
                 rows,

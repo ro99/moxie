@@ -10,6 +10,8 @@
 use core::ffi::c_void;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(feature = "cublas")]
+use moxie_cuda::copy_2d_async;
 use moxie_cuda::{Event, Module, ModuleImage, RankContext, Stream, TrustedImage};
 use moxie_graph::{Graph, NodeId, OpParams, RopeLayout, ValueId, ValueRole};
 use moxie_kernels::cpu_expert::{ExpertAssignment, ExpertShape, ExpertTiling};
@@ -76,6 +78,8 @@ pub struct DensePlanRunRefused<'ctx> {
 #[derive(Debug)]
 pub struct DenseOperation<'ctx> {
     pub(crate) plan: Option<SelectedReservedPlan<'ctx>>,
+    #[cfg(feature = "cublas")]
+    ctx: &'ctx RankContext,
     /// Every source copied by `upload_sources` stays here until the graph's
     /// completion event is observed. This includes token and position indices.
     pub(crate) sources: Vec<OwnedBinding>,
@@ -219,6 +223,8 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         }
         let operation = DenseOperation {
             plan: Some(self),
+            #[cfg(feature = "cublas")]
+            ctx,
             sources: bindings,
             rope_tables: Vec::new(),
             launch_order: Vec::new(),
@@ -571,15 +577,44 @@ fn enqueue_dense_segments<'ctx>(
                 if cublas_node {
                     #[cfg(feature = "cublas")]
                     {
-                        launch_cublas_linear(
-                            lease,
-                            stream,
-                            rows,
-                            in_features,
-                            out_features,
-                            node,
-                            selected,
-                        )?;
+                        match selected.descriptor.operation {
+                            SemanticKernelOp::Linear => launch_cublas_linear(
+                                lease,
+                                stream,
+                                rows,
+                                in_features,
+                                out_features,
+                                false,
+                                node,
+                                selected,
+                            )?,
+                            SemanticKernelOp::LinearPartial => launch_cublas_linear(
+                                lease,
+                                stream,
+                                rows,
+                                in_features,
+                                out_features,
+                                true,
+                                node,
+                                selected,
+                            )?,
+                            SemanticKernelOp::LinearSplit => launch_cublas_split(
+                                lease,
+                                base,
+                                stream,
+                                rows,
+                                in_features,
+                                out_features,
+                                node,
+                                selected,
+                            )?,
+                            _ => {
+                                return Err(invalid(
+                                    "catalogue",
+                                    "cuBLAS symbol is attached to an unsupported linear operation",
+                                ));
+                            }
+                        }
                         push_launch(lease, "linear");
                     }
                     #[cfg(not(feature = "cublas"))]
@@ -1729,40 +1764,19 @@ fn launch<'ctx>(
 }
 
 #[cfg(feature = "cublas")]
+#[allow(clippy::too_many_arguments)]
 fn launch_cublas_linear<'ctx>(
     lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
     stream: &Stream<'ctx>,
     rows: u64,
     in_features: u64,
     out_features: u64,
+    c_f32: bool,
     node: &moxie_graph::Node,
     selected: &SelectedNode,
 ) -> Result<()> {
-    let (mode, open, segment) = {
-        let operation = lease.resource();
-        (operation.mode, operation.open, operation.segment)
-    };
-    if mode == DenseStepMode::Replay {
-        if open {
-            return Ok(());
-        }
-        let captured = lease
-            .resource()
-            .plan
-            .as_ref()
-            .expect("dense operation retains plan")
-            .captured
-            .get(segment)
-            .ok_or_else(|| invalid("capture", "replay has no captured segment"))?;
-        // SAFETY: the plan retains graph, module, and all captured buffers
-        // through the completion event recorded by this dense step.
-        unsafe { captured.launch(stream)? };
-        lease.resource_mut().open = true;
+    if !begin_cublas_work(lease, stream)? {
         return Ok(());
-    }
-    if mode == DenseStepMode::Capture && !open {
-        stream.begin_capture()?;
-        lease.resource_mut().open = true;
     }
     let plan = lease
         .resource()
@@ -1789,6 +1803,7 @@ fn launch_cublas_linear<'ctx>(
                 in_features,
                 output,
                 out_features,
+                c_f32,
             )
     }
     .map_err(|error| {
@@ -1796,9 +1811,225 @@ fn launch_cublas_linear<'ctx>(
             error,
             lease.resource().device_ordinal,
             selected,
-            "cublas:gemm_ex",
+            if c_f32 {
+                "cublas:gemm_ex_partial"
+            } else {
+                "cublas:gemm_ex"
+            },
         )
     })
+}
+
+#[cfg(feature = "cublas")]
+#[allow(clippy::too_many_arguments)]
+fn launch_cublas_split<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    symbol_index: usize,
+    stream: &Stream<'ctx>,
+    rows: u64,
+    in_features: u64,
+    out_features: u64,
+    node: &moxie_graph::Node,
+    selected: &SelectedNode,
+) -> Result<()> {
+    if !begin_cublas_work(lease, stream)? {
+        return Ok(());
+    }
+    let order = lease
+        .resource()
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan")
+        .candidate()
+        .linear_orders()
+        .get(&node.id)
+        .copied()
+        .ok_or_else(|| invalid("linear", "split linear has no declared reduction order"))?;
+    if order.blocks != 2 || in_features & 1 != 0 {
+        return Err(invalid(
+            "linear",
+            "cuBLAS split linear requires exactly two equal blocks",
+        ));
+    }
+    let width = in_features / 2;
+    let plan = lease
+        .resource()
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan");
+    let slots = *plan
+        .candidate()
+        .linear_split_workspace()
+        .ok_or_else(|| invalid("workspace", "split linear has no admitted scratch slots"))?;
+    let packed_weight_bytes = out_features
+        .checked_mul(width)
+        .and_then(|elements| elements.checked_mul(2))
+        .ok_or_else(|| invalid("workspace", "packed weight extent overflowed"))?;
+    let packed_input_bytes = rows
+        .checked_mul(width)
+        .and_then(|elements| elements.checked_mul(2))
+        .ok_or_else(|| invalid("workspace", "packed input extent overflowed"))?;
+    let partial_bytes = rows
+        .checked_mul(out_features)
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or_else(|| invalid("workspace", "FP32 partial extent overflowed"))?;
+    if packed_weight_bytes > slots.packed_weight_bytes()
+        || packed_input_bytes > slots.packed_input_bytes()
+        || partial_bytes > slots.partial_bytes()
+    {
+        return Err(invalid(
+            "workspace",
+            "split linear exceeds its admitted scratch slots",
+        ));
+    }
+    let workspace = plan.workspace_range()?.device_address()?;
+    let slot_address = |offset: u64| {
+        workspace
+            .checked_add(offset)
+            .ok_or_else(|| invalid("workspace", "split scratch address overflowed"))
+    };
+    let packed_weight = slot_address(slots.packed_weight_offset())?;
+    let packed_input = slot_address(slots.packed_input_offset())?;
+    let partial_0 = slot_address(slots.partial_0_offset())?;
+    let partial_1 = slot_address(slots.partial_1_offset())?;
+    let input = address(lease.resource(), node.inputs[0])?;
+    let weight = address(lease.resource(), node.inputs[1])?;
+    let output = address(lease.resource(), node.output)?;
+    let row_bytes = in_features
+        .checked_mul(2)
+        .ok_or_else(|| invalid("linear", "split source pitch overflowed"))?;
+    let packed_row_bytes = width
+        .checked_mul(2)
+        .ok_or_else(|| invalid("linear", "packed split pitch overflowed"))?;
+    let partials = [partial_0, partial_1];
+    let ctx = lease.resource().ctx;
+    let ordinal = lease.resource().device_ordinal;
+    let plan = lease
+        .resource()
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan");
+    for (block, partial) in partials.into_iter().enumerate() {
+        let source_offset = u64::try_from(block)
+            .ok()
+            .and_then(|block| block.checked_mul(width))
+            .and_then(|elements| elements.checked_mul(2))
+            .ok_or_else(|| invalid("linear", "split source offset overflowed"))?;
+        let weight_source = weight
+            .checked_add(source_offset)
+            .ok_or_else(|| invalid("linear", "split weight address overflowed"))?;
+        let input_source = input
+            .checked_add(source_offset)
+            .ok_or_else(|| invalid("linear", "split input address overflowed"))?;
+        // SAFETY: source values and admitted packed slots remain live with the
+        // plan until the step's completion event is observed.
+        unsafe {
+            copy_2d_async(
+                ctx,
+                packed_weight,
+                packed_row_bytes,
+                weight_source,
+                row_bytes,
+                packed_row_bytes,
+                out_features,
+                stream,
+            )
+        }
+        .map_err(|error| attribute_node_error(error, ordinal, selected, "cublas:gemm_ex_split"))?;
+        // SAFETY: as above; this input slot is reused only after this block's
+        // GEMM has been queued on the same stream.
+        unsafe {
+            copy_2d_async(
+                ctx,
+                packed_input,
+                packed_row_bytes,
+                input_source,
+                row_bytes,
+                packed_row_bytes,
+                rows,
+                stream,
+            )
+        }
+        .map_err(|error| attribute_node_error(error, ordinal, selected, "cublas:gemm_ex_split"))?;
+        // SAFETY: the two packed BF16 matrices and partial range are admitted
+        // workspace/source ranges, and their stream ordering retains them.
+        unsafe {
+            plan.blas
+                .as_ref()
+                .expect("cuBLAS handle was bound before dense submission")
+                .gemm_bf16(
+                    out_features,
+                    rows,
+                    width,
+                    packed_weight,
+                    width,
+                    packed_input,
+                    width,
+                    partial,
+                    out_features,
+                    true,
+                )
+        }
+        .map_err(|error| attribute_node_error(error, ordinal, selected, "cublas:gemm_ex_split"))?;
+    }
+    let mut rank_zero = partial_0;
+    let mut rank_one = partial_1;
+    let mut output = output;
+    let mut elements = rows
+        .checked_mul(out_features)
+        .ok_or_else(|| invalid("launch", "split reduction extent overflowed"))?;
+    let grid = u32::try_from(elements.div_ceil(256))
+        .map_err(|_| invalid("launch", "split reduction grid exceeds u32"))?;
+    let mut params: [*mut c_void; 4] = [
+        (&raw mut rank_zero).cast(),
+        (&raw mut rank_one).cast(),
+        (&raw mut output).cast(),
+        (&raw mut elements).cast(),
+    ];
+    launch(
+        lease,
+        symbol_index,
+        stream,
+        (grid, 1, 1),
+        (256, 1, 1),
+        &mut params,
+        selected,
+        moxie_kernels::TP_REDUCE_F32,
+    )
+}
+
+#[cfg(feature = "cublas")]
+fn begin_cublas_work<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    stream: &Stream<'ctx>,
+) -> Result<bool> {
+    let (mode, open, segment) = {
+        let operation = lease.resource();
+        (operation.mode, operation.open, operation.segment)
+    };
+    if mode == DenseStepMode::Replay {
+        if open {
+            return Ok(false);
+        }
+        let captured = lease
+            .resource()
+            .plan
+            .as_ref()
+            .expect("dense operation retains plan")
+            .captured
+            .get(segment)
+            .ok_or_else(|| invalid("capture", "replay has no captured segment"))?;
+        // SAFETY: the plan retains graph, module, and all captured buffers
+        // through the completion event recorded by this dense step.
+        unsafe { captured.launch(stream)? };
+        lease.resource_mut().open = true;
+        return Ok(false);
+    }
+    if mode == DenseStepMode::Capture && !open {
+        stream.begin_capture()?;
+        lease.resource_mut().open = true;
+    }
+    Ok(true)
 }
 
 fn push_launch<'ctx>(
@@ -2430,15 +2661,27 @@ fn is_cublas_node(node: &SelectedNode) -> bool {
 #[cfg(feature = "cublas")]
 fn validate_cublas_descriptors(candidate: &moxie_plan::SelectedPlanCandidate) -> Result<()> {
     for node in candidate.nodes().iter().filter(|node| is_cublas_node(node)) {
-        if node.descriptor.operation != SemanticKernelOp::Linear
-            || node.descriptor.symbols.len() != 1
-            || node.descriptor.symbols[0].0 != "cublas:gemm_ex"
+        let expected_symbols: &[&str] = match node.descriptor.operation {
+            SemanticKernelOp::Linear => &["cublas:gemm_ex"],
+            SemanticKernelOp::LinearPartial => &["cublas:gemm_ex_partial"],
+            SemanticKernelOp::LinearSplit => {
+                &["cublas:gemm_ex_split", moxie_kernels::TP_REDUCE_F32]
+            }
+            _ => &[],
+        };
+        if node.descriptor.abi_version != moxie_kernels::DENSE_GRAPH_ABI
+            || !node
+                .descriptor
+                .symbols
+                .iter()
+                .map(|symbol| symbol.0.as_str())
+                .eq(expected_symbols.iter().copied())
             || node.descriptor.image_sha256 != moxie_kernels::cublas_sha256()
             || node.descriptor.accumulation != AccumulationPolicy::Bf16InF32AccUnordered
         {
             return Err(invalid(
                 "catalogue",
-                "cuBLAS backend symbol, Linear operation, accumulation, or image identity changed",
+                "cuBLAS operation, symbols, accumulation, ABI, or image identity changed",
             ));
         }
     }

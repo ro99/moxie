@@ -56,6 +56,42 @@ pub struct PlannedWorkspace {
     pub last_stage: u32,
 }
 
+/// Admitted slots for the packed single-device linear-split reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinearSplitWorkspace {
+    packed_weight_offset: u64,
+    packed_weight_bytes: u64,
+    packed_input_offset: u64,
+    packed_input_bytes: u64,
+    partial_0_offset: u64,
+    partial_1_offset: u64,
+    partial_bytes: u64,
+}
+
+impl LinearSplitWorkspace {
+    pub const fn packed_weight_offset(self) -> u64 {
+        self.packed_weight_offset
+    }
+    pub const fn packed_weight_bytes(self) -> u64 {
+        self.packed_weight_bytes
+    }
+    pub const fn packed_input_offset(self) -> u64 {
+        self.packed_input_offset
+    }
+    pub const fn packed_input_bytes(self) -> u64 {
+        self.packed_input_bytes
+    }
+    pub const fn partial_0_offset(self) -> u64 {
+        self.partial_0_offset
+    }
+    pub const fn partial_1_offset(self) -> u64 {
+        self.partial_1_offset
+    }
+    pub const fn partial_bytes(self) -> u64 {
+        self.partial_bytes
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectedPackage {
     Chain,
@@ -81,6 +117,7 @@ pub struct SelectedPlanCandidate {
     host_workspace_bytes: u64,
     rope_table_offsets: BTreeMap<(u64, u64, u32), u64>,
     blas_workspace_offset: Option<u64>,
+    linear_split_workspace: Option<LinearSplitWorkspace>,
     linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
     combine_orders: BTreeMap<NodeId, CombineReductionOrder>,
     expert_ownership: BTreeMap<NodeId, ExpertOwnership>,
@@ -146,6 +183,9 @@ impl SelectedPlanCandidate {
         } else {
             None
         }
+    }
+    pub const fn linear_split_workspace(&self) -> Option<&LinearSplitWorkspace> {
+        self.linear_split_workspace.as_ref()
     }
     pub fn linear_orders(&self) -> &BTreeMap<NodeId, LinearReductionOrder> {
         &self.linear_orders
@@ -503,6 +543,7 @@ pub fn lower_selected(
         host_workspace_bytes: 0,
         rope_table_offsets: BTreeMap::new(),
         blas_workspace_offset: None,
+        linear_split_workspace: None,
         linear_orders: BTreeMap::new(),
         combine_orders: BTreeMap::new(),
         expert_ownership: BTreeMap::new(),
@@ -829,6 +870,7 @@ fn lower_attention(
         host_workspace_bytes: 0,
         rope_table_offsets: BTreeMap::new(),
         blas_workspace_offset: None,
+        linear_split_workspace: None,
         linear_orders: BTreeMap::new(),
         combine_orders: BTreeMap::new(),
         expert_ownership: BTreeMap::new(),
@@ -1141,8 +1183,12 @@ fn lower_dense_mode(
                             node.contract.output
                         }
                     && (descriptor.accumulation == node.contract.accumulation
-                        || (operation == SemanticKernelOp::Linear
-                            && node.contract.accumulation == AccumulationPolicy::Bf16InF32Acc
+                        || (matches!(
+                            operation,
+                            SemanticKernelOp::Linear
+                                | SemanticKernelOp::LinearPartial
+                                | SemanticKernelOp::LinearSplit
+                        ) && node.contract.accumulation == AccumulationPolicy::Bf16InF32Acc
                             && descriptor.accumulation
                                 == AccumulationPolicy::Bf16InF32AccUnordered))
                     && descriptor.rounding
@@ -1244,6 +1290,87 @@ fn lower_dense_mode(
         Some(offset)
     } else {
         None
+    };
+    let mut split_max_weight = 0u64;
+    let mut split_max_input = 0u64;
+    let mut split_max_partial = 0u64;
+    for selected_node in selected.iter().filter(|selected| {
+        selected
+            .descriptor
+            .symbols
+            .iter()
+            .any(|symbol| symbol.0 == "cublas:gemm_ex_split")
+    }) {
+        let node = graph
+            .nodes()
+            .get(selected_node.node.0 as usize)
+            .filter(|node| node.id == selected_node.node)
+            .ok_or_else(|| invalid("linear_split", "split node is absent from the graph"))?;
+        let (input, output) = dense_shape(node)?;
+        if input % 2 != 0 {
+            return Err(invalid(
+                "linear_split",
+                "two equal split blocks require an even input width",
+            ));
+        }
+        let width = input / 2;
+        split_max_weight = split_max_weight.max(
+            output
+                .checked_mul(width)
+                .and_then(|elements| elements.checked_mul(2))
+                .ok_or_else(|| invalid("linear_split", "packed weight extent overflowed"))?,
+        );
+        split_max_input = split_max_input.max(
+            workload
+                .rows
+                .checked_mul(width)
+                .and_then(|elements| elements.checked_mul(2))
+                .ok_or_else(|| invalid("linear_split", "packed input extent overflowed"))?,
+        );
+        split_max_partial = split_max_partial.max(
+            workload
+                .rows
+                .checked_mul(output)
+                .and_then(|elements| elements.checked_mul(4))
+                .ok_or_else(|| invalid("linear_split", "FP32 partial extent overflowed"))?,
+        );
+    }
+    let linear_split_workspace = if split_max_weight == 0 {
+        None
+    } else {
+        let packed_weight_offset = align_up(workspace_logical_bytes)?;
+        workspace_logical_bytes = checked_add(
+            packed_weight_offset,
+            align_up(split_max_weight)?,
+            "linear split workspace",
+        )?;
+        let packed_input_offset = align_up(workspace_logical_bytes)?;
+        workspace_logical_bytes = checked_add(
+            packed_input_offset,
+            align_up(split_max_input)?,
+            "linear split workspace",
+        )?;
+        let partial_0_offset = align_up(workspace_logical_bytes)?;
+        workspace_logical_bytes = checked_add(
+            partial_0_offset,
+            align_up(split_max_partial)?,
+            "linear split workspace",
+        )?;
+        let partial_1_offset = align_up(workspace_logical_bytes)?;
+        workspace_logical_bytes = checked_add(
+            partial_1_offset,
+            align_up(split_max_partial)?,
+            "linear split workspace",
+        )?;
+        Some(LinearSplitWorkspace {
+            packed_weight_offset,
+            packed_weight_bytes: split_max_weight,
+            packed_input_offset,
+            packed_input_bytes: split_max_input,
+            partial_0_offset,
+            partial_1_offset,
+            partial_bytes: split_max_partial,
+        })
     };
 
     let base = lower(graph, workload)?;
@@ -1427,6 +1554,7 @@ fn lower_dense_mode(
         host_workspace_bytes,
         rope_table_offsets,
         blas_workspace_offset,
+        linear_split_workspace,
         linear_orders: orders.clone(),
         combine_orders: combine_orders.clone(),
         expert_ownership: expert_ownership.clone(),

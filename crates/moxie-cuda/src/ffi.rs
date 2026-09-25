@@ -29,6 +29,8 @@ pub type CUfunction = *mut c_void;
 pub type CUgraph = *mut c_void;
 pub type CUgraphExec = *mut c_void;
 pub type CUgraphNode = *mut c_void;
+pub type CUarray = *mut c_void;
+pub type CUmemorytype = c_int;
 
 #[cfg(feature = "cublas")]
 pub type cublasHandle_t = *mut c_void;
@@ -77,6 +79,31 @@ pub const CUBLAS_PROPERTY_PATCH_LEVEL: c_int = 2;
 pub const CUBLAS_COMPUTE_32F: c_int = 68;
 #[cfg(feature = "cublas")]
 pub const CUDA_R_16BF: c_int = 14;
+#[cfg(feature = "cublas")]
+pub const CUDA_R_32F: c_int = 0;
+
+pub const CU_MEMORYTYPE_DEVICE: CUmemorytype = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CUDA_MEMCPY2D {
+    pub src_x_in_bytes: usize,
+    pub src_y: usize,
+    pub src_memory_type: CUmemorytype,
+    pub src_host: *const c_void,
+    pub src_device: CUdeviceptr,
+    pub src_array: CUarray,
+    pub src_pitch: usize,
+    pub dst_x_in_bytes: usize,
+    pub dst_y: usize,
+    pub dst_memory_type: CUmemorytype,
+    pub dst_host: *mut c_void,
+    pub dst_device: CUdeviceptr,
+    pub dst_array: CUarray,
+    pub dst_pitch: usize,
+    pub width_in_bytes: usize,
+    pub height: usize,
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -142,6 +169,7 @@ unsafe extern "C" {
         byte_count: usize,
         stream: CUstream,
     ) -> CUresult;
+    pub fn cuMemcpy2DAsync_v2(copy: *const CUDA_MEMCPY2D, stream: CUstream) -> CUresult;
     pub fn cuMemcpyPeerAsync(
         dst: CUdeviceptr,
         dst_context: CUcontext,

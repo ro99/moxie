@@ -836,6 +836,59 @@ mod images {
             image_sha256: cublas_sha256(),
             symbols: vec![KernelSymbol("cublas:gemm_ex".to_string())],
         };
+        for (operation, id, symbols) in [
+            (
+                SemanticKernelOp::LinearPartial,
+                format!("bf16-linear-partial-cublas-v1-{}", sm.name()),
+                vec![KernelSymbol("cublas:gemm_ex_partial".to_string())],
+            ),
+            (
+                SemanticKernelOp::LinearSplit,
+                format!("bf16-linear-split-cublas-v1-{}", sm.name()),
+                vec![
+                    KernelSymbol("cublas:gemm_ex_split".to_string()),
+                    KernelSymbol(TP_REDUCE_F32.to_string()),
+                ],
+            ),
+        ] {
+            let selected = descriptors
+                .iter_mut()
+                .find(|descriptor| {
+                    descriptor.operation == operation
+                        && descriptor.sm == sm
+                        && descriptor.inputs.as_slice() == [bf16, weight]
+                })
+                .expect("built-in dense catalogue has one row-linear descriptor per SM");
+            *selected = SemanticKernelDescriptor {
+                id: KernelId(id),
+                abi_version: DENSE_GRAPH_ABI,
+                operation,
+                inputs: vec![bf16, weight],
+                output: ActivationPrecision::expect(
+                    if operation == SemanticKernelOp::LinearPartial {
+                        Precision::F32
+                    } else {
+                        Precision::Bf16
+                    },
+                ),
+                accumulation: AccumulationPolicy::Bf16InF32AccUnordered,
+                rounding: if operation == SemanticKernelOp::LinearPartial {
+                    RoundingProfile::Unrounded
+                } else {
+                    RoundingProfile::FinalBf16Rne
+                },
+                layout: TensorLayout::ContiguousRowMajorV1,
+                shape: KernelShapeBounds {
+                    max_rows: 65_536,
+                    max_input: 65_536,
+                    max_output: 262_144,
+                },
+                sm,
+                workspace: WorkspaceExpression::Zero,
+                image_sha256: cublas_sha256(),
+                symbols,
+            };
+        }
         KernelCatalogue::new(descriptors).expect("built-in unordered dense descriptors are unique")
     }
 
