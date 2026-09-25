@@ -132,3 +132,23 @@ Host gates:
 No GPU gates; `moxie-state` has no device code.
 
 ## Result, filled after work
+
+- Added opaque `PreparedAppend` tokens with read-only per-layer page-view and
+  placement accessors. `prepare_append` performs staging checks without setting
+  pending state, rejects a partly completed batch, and captures each layer's
+  retained range, view and placements. Dropping a token leaves the sequence
+  usable.
+- Extracted the shared projected-batch calculation into `project`; ordinary
+  append and per-layer append use it. `apply_append` checks the token against
+  the open transaction and current ranges, publishes the lineage through
+  pre-reserved capacity, and poisons the sequence on any refusal.
+- Added tests for recording-writer equality at the first row, a page crossing,
+  and after a sliding-window base moved; 20-step equivalence; stale-token
+  poisoning; partial-batch refusal; and dropped-token state preservation.
+- Mutation check: skipping lineage execution made the 20-step equivalence test
+  fail on the first frontier comparison (expected executed 1, observed 0);
+  reverted the mutant.
+- Host gates passed: `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `cargo test --workspace --locked`, `cargo xtask arch-check` (79 rejected
+  fixtures, 21 accepted, 13 rules exercised), and `cargo xtask spec-check`.

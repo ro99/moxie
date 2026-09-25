@@ -180,6 +180,47 @@ pub struct PreparedCommit {
     updates: Vec<(usize, PageView)>,
 }
 
+#[derive(Debug)]
+struct PreparedLayerAppend {
+    retained: Range<u64>,
+    page_view: PageView,
+    placements: Vec<Placement>,
+}
+
+/// A KV append whose placements are ready before its device writes are issued.
+///
+/// The token changes no published state until [`DeviceKvSequence::apply_append`]
+/// consumes it. Its layer mappings and write placements are fixed at prepare
+/// time, so a captured launch and its later publication use the same rows.
+#[derive(Debug)]
+#[must_use = "a prepared append changes no state until it is applied"]
+pub struct PreparedAppend {
+    sequence: u64,
+    txn: StateTransactionId,
+    first: u64,
+    rows: u64,
+    layers: Vec<PreparedLayerAppend>,
+}
+
+impl PreparedAppend {
+    /// Number of layers represented by this append.
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// The page view prepared for `layer`, if it is in range.
+    pub fn page_view(&self, layer: usize) -> Option<&PageView> {
+        self.layers.get(layer).map(|prepared| &prepared.page_view)
+    }
+
+    /// The row placements prepared for `layer`, if it is in range.
+    pub fn placements(&self, layer: usize) -> Option<&[Placement]> {
+        self.layers
+            .get(layer)
+            .map(|prepared| prepared.placements.as_slice())
+    }
+}
+
 /// A mutable view of one child branch's device-state decisions.
 #[derive(Debug)]
 pub struct DeviceBranch<'a> {
@@ -579,27 +620,68 @@ impl DeviceKvSequence {
     ///
     /// The positions come from [`StagedRows`], not from an argument: they are
     /// the authority's to choose and they are always the frontier.
+    #[cfg(test)]
     fn placements_for(
         &self,
         branch: BranchId,
         staged: &StagedRows,
         layer: usize,
     ) -> Result<Vec<Placement>> {
+        self.project(branch, layer, staged)
+            .map(|(_, placements)| placements)
+    }
+
+    /// Resolve the page mapping and row runs for a checked projected batch.
+    fn project(
+        &self,
+        branch: BranchId,
+        layer: usize,
+        staged: &StagedRows,
+    ) -> Result<(PageView, Vec<Placement>)> {
         let layout = self
             .layout
             .get(layer)
             .copied()
             .ok_or_else(|| invalid("layer", "layer is outside this sequence"))?;
-        let open = self
-            .branch_storage(branch)?
+        let storage = self.branch_storage(branch)?;
+        let open = storage
             .open
             .ok_or_else(|| invalid("transaction", "no transaction is open"))?;
-        if open.id != staged.transaction || open.pending != Some((staged.first, staged.rows)) {
+        if open.id != staged.transaction
+            || storage.rows != staged.first
+            || open
+                .pending
+                .is_some_and(|pending| pending != (staged.first, staged.rows))
+        {
             return Err(invalid(
                 "staged",
-                "these rows are not the batch this transaction staged",
+                "these rows are not the next batch for this transaction",
             ));
         }
+        if staged.rows == 0 {
+            return Err(invalid("rows", "staging no row"));
+        }
+        let end = staged
+            .first
+            .checked_add(staged.rows)
+            .ok_or(Error::Dim(DimError::Overflow))?;
+        if end > self.geometry.max_tokens as u64 {
+            return Err(Error::CapacityExceeded {
+                tier: None,
+                requested_bytes: end,
+                available_bytes: self.geometry.max_tokens as u64,
+            });
+        }
+        if self.reclaims() && end - open.base > self.geometry.tentative_rows as u64 {
+            return Err(invalid(
+                "tentative_rows",
+                "this transaction would append more rows than the admitted undo headroom",
+            ));
+        }
+        let retained =
+            self.retained_at(branch, layer, storage.committed_high_water, storage.rows)?;
+        let view = self.page_view_for_end(layer, retained, end)?;
+
         let page_tokens = self.geometry.page_tokens as u64;
         let mut out = Vec::new();
         // One run per page boundary the staged rows cross, plus one: a batch
@@ -623,7 +705,7 @@ impl DeviceKvSequence {
             out.push(self.place(layout, position, run));
             done += run;
         }
-        Ok(out)
+        Ok((view, out))
     }
 
     #[cfg(test)]
@@ -665,17 +747,20 @@ impl DeviceKvSequence {
         layer: usize,
         retained: Range<u64>,
     ) -> Result<PageView> {
+        let storage = self.branch_storage(branch)?;
+        let staged_end = storage
+            .open
+            .and_then(|open| open.pending)
+            .map_or(0, |(first, rows)| first.saturating_add(rows));
+        self.page_view_for_end(layer, retained, storage.rows.max(staged_end))
+    }
+
+    fn page_view_for_end(&self, layer: usize, retained: Range<u64>, end: u64) -> Result<PageView> {
         let layout = self
             .layout
             .get(layer)
             .copied()
             .ok_or_else(|| invalid("layer", "layer is outside this sequence"))?;
-        let storage = self.branch_storage(branch)?;
-        let staged_end = storage
-            .open
-            .and_then(|o| o.pending)
-            .map_or(0, |(f, n)| f.saturating_add(n));
-        let end = storage.rows.max(staged_end);
         if end == 0 || retained.start >= end {
             return Err(invalid("retained", "this layer holds no row"));
         }
@@ -771,8 +856,7 @@ impl DeviceKvSequence {
         let staged = self.stage_for(branch, txn, rows)?;
         let batch = staged.id();
         for (layer, writer) in writers.iter_mut().enumerate() {
-            let view = self.page_view_for_branch(branch, layer)?;
-            let placements = self.placements_for(branch, &staged, layer)?;
+            let (view, placements) = self.project(branch, layer, &staged)?;
             writer.write_layer(layer, batch, view, &placements)?;
             self.branch_storage_mut(branch)?.completed_layers[layer] = true;
         }
@@ -839,14 +923,121 @@ impl DeviceKvSequence {
             }
             None => self.stage_for(branch, txn, rows)?,
         };
-        let view = self.page_view_for_branch(branch, layer)?;
-        let placements = self.placements_for(branch, &staged, layer)?;
+        let (view, placements) = self.project(branch, layer, &staged)?;
         writer.write_layer(layer, staged.id(), view, &placements)?;
         let storage = self.branch_storage_mut(branch)?;
         storage.completed_layers[layer] = true;
         if storage.completed_layers.iter().all(|done| *done) {
             self.publish_for(branch, txn, staged)?;
         }
+        Ok(())
+    }
+
+    /// Prepare a batch's page mappings and placements without staging or
+    /// publishing it.
+    pub fn prepare_append(&mut self, txn: StateTransactionId, rows: u64) -> Result<PreparedAppend> {
+        self.check_poisoned_on(ROOT)?;
+        if self
+            .branch_storage(ROOT)?
+            .completed_layers
+            .iter()
+            .any(|complete| *complete)
+        {
+            return Err(invalid(
+                "staged",
+                "the previous batch has completed only some layers",
+            ));
+        }
+        let staged = self.check_stage_for(ROOT, txn, rows)?;
+        let mut layers = Vec::new();
+        layers
+            .try_reserve_exact(self.layout.len())
+            .map_err(|_| Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::Pageable)),
+                requested_bytes: self
+                    .layout
+                    .len()
+                    .saturating_mul(core::mem::size_of::<PreparedLayerAppend>())
+                    as u64,
+                available_bytes: 0,
+            })?;
+        for layer in 0..self.layout.len() {
+            let retained = self.retained_for(ROOT, layer)?;
+            let (page_view, placements) = self.project(ROOT, layer, &staged)?;
+            layers.push(PreparedLayerAppend {
+                retained,
+                page_view,
+                placements,
+            });
+        }
+        self.state.prepare_execute(ROOT, rows)?;
+        Ok(PreparedAppend {
+            sequence: self.id,
+            txn,
+            first: staged.first,
+            rows,
+            layers,
+        })
+    }
+
+    /// Publish an append prepared before its device writes were submitted.
+    ///
+    /// Since device work may already have run, any refused application poisons
+    /// the sequence rather than allowing callers to continue with uncertain KV.
+    pub fn apply_append(&mut self, prepared: PreparedAppend) -> Result<()> {
+        let result = self.apply_append_inner(prepared);
+        if result.is_err()
+            && let Ok(storage) = self.branch_storage_mut(ROOT)
+        {
+            storage.poisoned = true;
+        }
+        result
+    }
+
+    fn apply_append_inner(&mut self, prepared: PreparedAppend) -> Result<()> {
+        if prepared.sequence != self.id {
+            return Err(invalid(
+                "prepared_append",
+                "this append belongs to another sequence",
+            ));
+        }
+        self.check_poisoned_on(ROOT)?;
+        let open = self.open_transaction_for(ROOT, prepared.txn)?;
+        if open.pending.is_some() {
+            return Err(invalid(
+                "prepared_append",
+                "the transaction already has a staged batch",
+            ));
+        }
+        let storage = self.branch_storage(ROOT)?;
+        if storage.rows != prepared.first {
+            return Err(invalid(
+                "prepared_append",
+                "the sequence frontier moved after this append was prepared",
+            ));
+        }
+        if prepared.layers.len() != self.layout.len() {
+            return Err(invalid(
+                "prepared_append",
+                "the prepared layer count no longer matches this sequence",
+            ));
+        }
+        for (layer, prepared_layer) in prepared.layers.iter().enumerate() {
+            if self.retained_for(ROOT, layer)? != prepared_layer.retained {
+                return Err(invalid(
+                    "prepared_append",
+                    "a layer's retained range changed after this append was prepared",
+                ));
+            }
+        }
+        let end = prepared
+            .first
+            .checked_add(prepared.rows)
+            .ok_or(Error::Dim(DimError::Overflow))?;
+        self.state.execute_reserved(ROOT, prepared.rows)?;
+        let storage = self.branch_storage_mut(ROOT)?;
+        storage.rows = end;
+        storage.completed_layers.fill(false);
         Ok(())
     }
 
@@ -861,6 +1052,21 @@ impl DeviceKvSequence {
     /// order, which would move the frontier over rows nothing had written.
     fn stage_for(
         &mut self,
+        branch: BranchId,
+        txn: StateTransactionId,
+        rows: u64,
+    ) -> Result<StagedRows> {
+        let staged = self.check_stage_for(branch, txn, rows)?;
+        self.branch_storage_mut(branch)?
+            .open
+            .as_mut()
+            .expect("a validated open transaction")
+            .pending = Some((staged.first, staged.rows));
+        Ok(staged)
+    }
+
+    fn check_stage_for(
+        &self,
         branch: BranchId,
         txn: StateTransactionId,
         rows: u64,
@@ -896,17 +1102,11 @@ impl DeviceKvSequence {
                 "this transaction would append more rows than the admitted undo headroom",
             ));
         }
-        let staged = StagedRows {
+        Ok(StagedRows {
             transaction: txn,
             first: self.branch_storage(branch)?.rows,
             rows,
-        };
-        self.branch_storage_mut(branch)?
-            .open
-            .as_mut()
-            .expect("a validated open transaction")
-            .pending = Some((staged.first, staged.rows));
-        Ok(staged)
+        })
     }
 
     #[cfg(test)]
@@ -1474,6 +1674,28 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<(usize, PageView, Vec<Placement>)>,
+    }
+
+    impl PagedKvWriter for RecordingWriter {
+        fn write_layer(
+            &mut self,
+            layer: usize,
+            _batch: BatchId,
+            view: PageView,
+            placements: &[PagePlacement],
+        ) -> Result<()> {
+            self.writes.push((layer, view, placements.to_vec()));
+            Ok(())
+        }
+
+        fn publish_view(&mut self, _layer: usize, _view: PageView) -> Result<()> {
+            Ok(())
+        }
+    }
+
     /// A writer that counts `publish_view` calls and can be told to refuse
     /// them, for exercising [`DeviceKvSequence::commit`]'s own
     /// view-transition invariant rather than a device.
@@ -1545,6 +1767,50 @@ mod tests {
             .iter_mut()
             .map(|w| w as &mut dyn PagedKvWriter)
             .collect()
+    }
+
+    fn assert_prepared_matches_append_layer(
+        prepared_sequence: &mut DeviceKvSequence,
+        appended_sequence: &mut DeviceKvSequence,
+        rows: u64,
+    ) {
+        let prepared_txn = prepared_sequence.begin().expect("prepared transaction");
+        let prepared = prepared_sequence
+            .prepare_append(prepared_txn, rows)
+            .expect("prepare append");
+        let append_txn = appended_sequence.begin().expect("append transaction");
+        let mut recorder = RecordingWriter::default();
+        for layer in 0..prepared.layer_count() {
+            appended_sequence
+                .append_layer(append_txn, layer, rows, &mut recorder)
+                .expect("append layer");
+        }
+        assert_eq!(recorder.writes.len(), prepared.layer_count());
+        for (layer, page_view, placements) in recorder.writes {
+            assert_eq!(prepared.page_view(layer), Some(&page_view));
+            assert_eq!(prepared.placements(layer), Some(placements.as_slice()));
+        }
+    }
+
+    fn assert_prepared_sequences_equal(left: &DeviceKvSequence, right: &DeviceKvSequence) {
+        assert_eq!(
+            left.published_rows().unwrap(),
+            right.published_rows().unwrap()
+        );
+        assert_eq!(
+            left.state().unwrap().frontiers(ROOT).unwrap(),
+            right.state().unwrap().frontiers(ROOT).unwrap()
+        );
+        for layer in 0..left.layout.len() {
+            assert_eq!(
+                left.layer_retained(layer).unwrap(),
+                right.layer_retained(layer).unwrap()
+            );
+            assert_eq!(
+                left.page_view(layer).unwrap(),
+                right.page_view(layer).unwrap()
+            );
+        }
     }
 
     /// Append `rows` rows through committed transactions.
@@ -1947,6 +2213,120 @@ mod tests {
         // Staged rows from an aborted transaction place nothing.
         assert!(sequence.placements(&staged, 0).is_err());
         assert!(sequence.stage(txn, 1).is_err(), "the transaction is closed");
+    }
+
+    #[test]
+    fn prepared_append_matches_append_layer_projection() {
+        let geometry = full(8, 64);
+        let mut prepared = DeviceKvSequence::new(geometry.clone()).expect("sequence");
+        let mut appended = DeviceKvSequence::new(geometry).expect("sequence");
+        assert_prepared_matches_append_layer(&mut prepared, &mut appended, 1);
+
+        let geometry = full(8, 64);
+        let mut prepared = DeviceKvSequence::new(geometry.clone()).expect("sequence");
+        let mut appended = DeviceKvSequence::new(geometry).expect("sequence");
+        fill(&mut prepared, 5);
+        fill(&mut appended, 5);
+        assert_prepared_matches_append_layer(&mut prepared, &mut appended, 6);
+
+        let geometry = windowed(24, 8, 8);
+        let mut prepared = DeviceKvSequence::new(geometry.clone()).expect("sequence");
+        let mut appended = DeviceKvSequence::new(geometry).expect("sequence");
+        fill(&mut prepared, 104);
+        fill(&mut appended, 104);
+        assert_eq!(prepared.retained(0).unwrap(), 72..104);
+        fill(&mut prepared, 8);
+        fill(&mut appended, 8);
+        assert_eq!(prepared.retained(0).unwrap(), 80..112);
+        assert_prepared_matches_append_layer(&mut prepared, &mut appended, 3);
+    }
+
+    #[test]
+    fn prepared_append_matches_append_layer_for_twenty_steps() {
+        let mut geometry = full(8, 128);
+        geometry.layers.push(geometry.layers[0]);
+        let mut prepared = DeviceKvSequence::new(geometry.clone()).expect("sequence");
+        let mut appended = DeviceKvSequence::new(geometry).expect("sequence");
+        let prepared_txn = prepared.begin().expect("prepared transaction");
+        let append_txn = appended.begin().expect("append transaction");
+        let step_rows = [1, 5, 2, 7, 3];
+        let mut total = 0;
+        for step in 0..20 {
+            let rows = step_rows[step % step_rows.len()];
+            let token = prepared
+                .prepare_append(prepared_txn, rows)
+                .expect("prepare append");
+            for layer in 0..appended.layout.len() {
+                appended
+                    .append_layer(append_txn, layer, rows, &mut NullWriter)
+                    .expect("append layer");
+            }
+            prepared.apply_append(token).expect("apply append");
+            total += rows;
+            assert_prepared_sequences_equal(&prepared, &appended);
+        }
+        let mut prepared_writers = null_writers(&prepared);
+        let mut appended_writers = null_writers(&appended);
+        prepared
+            .commit(prepared_txn, total, &mut writer_refs(&mut prepared_writers))
+            .expect("prepared commit");
+        appended
+            .commit(append_txn, total, &mut writer_refs(&mut appended_writers))
+            .expect("append commit");
+        assert_prepared_sequences_equal(&prepared, &appended);
+    }
+
+    #[test]
+    fn stale_prepared_append_refuses_and_poisons() {
+        let mut sequence = DeviceKvSequence::new(full(8, 64)).expect("sequence");
+        let txn = sequence.begin().expect("transaction");
+        let prepared = sequence.prepare_append(txn, 1).expect("prepare append");
+        sequence
+            .append_layer(txn, 0, 1, &mut NullWriter)
+            .expect("another append");
+        assert!(sequence.apply_append(prepared).is_err());
+        assert!(sequence.published_rows().is_err(), "refusal did not poison");
+    }
+
+    #[test]
+    fn prepare_append_refuses_a_partly_complete_batch() {
+        let mut geometry = full(8, 64);
+        geometry.layers.push(geometry.layers[0]);
+        let mut sequence = DeviceKvSequence::new(geometry).expect("sequence");
+        let txn = sequence.begin().expect("transaction");
+        sequence
+            .append_layer(txn, 0, 1, &mut NullWriter)
+            .expect("first layer");
+        assert!(sequence.prepare_append(txn, 1).is_err());
+    }
+
+    #[test]
+    fn dropping_prepared_append_leaves_sequence_unchanged() {
+        let mut sequence = DeviceKvSequence::new(full(8, 64)).expect("sequence");
+        fill(&mut sequence, 3);
+        let txn = sequence.begin().expect("transaction");
+        let before = (
+            sequence.published_rows().unwrap(),
+            sequence.retained(0).unwrap(),
+            sequence.page_view(0).unwrap(),
+            sequence.state().unwrap().frontiers(ROOT).unwrap(),
+            sequence.state().unwrap().lineage_capacity(ROOT).unwrap(),
+        );
+        drop(sequence.prepare_append(txn, 2).expect("prepare append"));
+        assert_eq!(
+            before,
+            (
+                sequence.published_rows().unwrap(),
+                sequence.retained(0).unwrap(),
+                sequence.page_view(0).unwrap(),
+                sequence.state().unwrap().frontiers(ROOT).unwrap(),
+                sequence.state().unwrap().lineage_capacity(ROOT).unwrap(),
+            )
+        );
+        sequence
+            .append_layer(txn, 0, 2, &mut NullWriter)
+            .expect("append after dropped preparation");
+        assert_eq!(sequence.published_rows().unwrap(), 5);
     }
 
     #[test]

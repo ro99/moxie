@@ -42,7 +42,8 @@
 
 pub mod device;
 pub use device::{
-    DeviceBranch, DeviceKvSequence, DeviceLayerLayout, PageView, Placement, PreparedCommit,
+    DeviceBranch, DeviceKvSequence, DeviceLayerLayout, PageView, Placement, PreparedAppend,
+    PreparedCommit,
 };
 
 pub mod accumulator;
@@ -776,6 +777,52 @@ impl SequenceState {
         let b = self.get_mut(branch)?;
         let executed = add(b.frontiers.executed, n, "executed")?;
         b.check_lineage_limit(b.frontiers.accepted, executed)?;
+        b.frontiers.executed = executed;
+        b.extend_lineage();
+        Ok(())
+    }
+
+    /// Reserve the lineage capacity a device KV append will need if applied.
+    ///
+    /// Device append preparation calls this before submitting work so its
+    /// later publication can extend the lineage without allocating.
+    pub(crate) fn prepare_execute(&mut self, branch: BranchId, n: u64) -> Result<()> {
+        let b = self.get_mut(branch)?;
+        let executed = add(b.frontiers.executed, n, "executed")?;
+        b.check_lineage_limit(b.frontiers.accepted, executed)?;
+        let requested = b
+            .frontiers
+            .accepted
+            .max(executed)
+            .checked_add(1)
+            .and_then(|entries| usize::try_from(entries).ok())
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+        if requested > b.lineage.len()
+            && b.lineage.try_reserve(requested - b.lineage.len()).is_err()
+        {
+            return Err(lineage_capacity_error(requested, b.lineage.capacity())?);
+        }
+        Ok(())
+    }
+
+    /// Execute using capacity reserved by [`Self::prepare_execute`].
+    ///
+    /// Refuse instead of allowing `Vec::push` to allocate if the reservation
+    /// was invalidated before this transition.
+    pub(crate) fn execute_reserved(&mut self, branch: BranchId, n: u64) -> Result<()> {
+        let b = self.get_mut(branch)?;
+        let executed = add(b.frontiers.executed, n, "executed")?;
+        b.check_lineage_limit(b.frontiers.accepted, executed)?;
+        let requested = b
+            .frontiers
+            .accepted
+            .max(executed)
+            .checked_add(1)
+            .and_then(|entries| usize::try_from(entries).ok())
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+        if requested > b.lineage.capacity() {
+            return Err(lineage_capacity_error(requested, b.lineage.capacity())?);
+        }
         b.frontiers.executed = executed;
         b.extend_lineage();
         Ok(())
