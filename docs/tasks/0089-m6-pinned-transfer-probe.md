@@ -1,7 +1,6 @@
 # Task 0089 — measure pinned transfers and copy/compute overlap on this machine
 
-Status: **proposed** (coordinator, 2026-09-25); opens when task 0088 is
-accepted. Builder Codex `luna`; reviewer Codex `sol`.
+Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Identity and authority
 

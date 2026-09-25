@@ -1,6 +1,14 @@
 # Task 0088 — no resource growth across many turns
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-25), after sol's review round R1.
+Builder Codex `luna`; reviewer Codex `sol`. Implementation `fe88613`; R1 trim
+`a58ccf2` (net −31 test lines).
+- R1 (LOW, record): the Result overstated which bucket plans are captured;
+  corrected by the coordinator. Sol traced every per-step host allocation and
+  found none retained; the 57 KB RSS drift is consistent with allocator or
+  driver residency and stays within the declared 4 MiB allowance.
+- Effect: over 24 turns, ledger charges, outstanding count and device free
+  bytes are exactly constant.
 
 ## Identity and authority
 
