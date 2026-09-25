@@ -138,17 +138,18 @@ Builder Claude Opus `builder`, 2026-09-25. Deliverable:
 - **Baseline.** Strata's accepted production result is 26.231 prefill tok/s at
   1,925 prompt tokens (median of three) and 8.627 decode tok/s (median), on two
   RTX 3090s with rank-local TP2 (`docs/models/deepseek.md:191-201`).
-- **Homes (after review round 1).** 28 present, 46 planned, 43 gap. The
-  gap rows fall into five groups:
-  - **13 forced by representation rules:** rows 6, 7, 15, 18, 36, 45, 46, 77,
-    78, 79, 80, 81, 114.
-  - **Forced by ADR 0036:** row 70.
-  - **Forced by the single-user rule:** row 76.
-  - **Rejected in Strata:** rows 10, 30, 69, 74, 104.
-  - **Host-attention tuning:** rows 89, 90, 91.
-  - **Accepted in Strata with no place in Moxie (20):** rows 4, 5, 24, 31,
-    32, 33, 34, 35, 40, 43, 49, 61, 67, 71, 82, 87, 92, 94, 107, 110. Most
-    of these are host expert execution and loading.
+- **Homes (after review round 2, five homes).** 12 present, 26 partial, 7 not
+  needed, 38 planned, 34 gap.
+  - **Partial rows:** 1, 8, 9, 13, 16, 23, 26, 28, 31, 37, 39, 40, 44, 67,
+    68, 71, 75, 93, 95, 96, 97, 100, 107, 110, 115, 117.
+  - **Not needed:** 41, 48, 61, 89, 90, 91, 102.
+  - **Gap, forced by representation rules (13):** 6, 7, 15, 18, 36, 45, 46,
+    77, 78, 79, 80, 81, 114.
+  - **Gap, forced by ADR 0036:** 70.
+  - **Gap, forced by the single-user rule:** 76.
+  - **Gap, rejected in Strata:** 10, 30, 69, 74, 104.
+  - **Gap, accepted in Strata with no place in Moxie:** 4, 5, 17, 24, 32,
+    33, 34, 35, 43, 49, 82, 87, 92, 94.
 - **Checks.**
   - `cargo xtask spec-check` passed: 10 documents present and unchanged.
   - The evidence file's relative links resolve.
@@ -188,4 +189,26 @@ Builder Claude Opus `builder`, 2026-09-25. Deliverable:
   differs.
 - **Net effect of round 2.** Present fell from 50 to 28, planned went from 42
   to 46, and gap went from 25 to 43.
+- **Round 2** (Codex `sol`, source `b6d4bb8`) found 9 high and 6 medium
+  findings. Most were rows where Moxie has part of a technique, or where its
+  design removes the need; neither could be expressed with three homes.
+  - **Contract amendment.** The coordinator added the `partial` and
+    `not needed` homes (`a349acd`).
+  - **Findings resolved:**
+    - Rows 1, 8, 9, 39, 44, 68, 95, 100, 96 and 97 are now partial, each
+      naming its missing part.
+    - Rows 41 and 48 are now not needed.
+    - Row 28 is partial: contiguous ranges, not round-robin.
+    - Row 115 is partial: fields are recorded, but there is no
+      characterization.
+    - Row 117 is partial: there is no host expert timing.
+    - Rows 13 and 37 were planned only by area, so they are now partial.
+  - **Full re-examination.** Every row was re-checked under the five homes.
+    Present rows must pass "same or equivalent mechanism, same effect".
+    Planned rows must name a roadmap item covering the exact technique.
+    Besides the findings, this moved:
+    - rows 16, 23, 26, 31, 40, 67, 71, 75, 93, 107 and 110 to partial;
+    - rows 61, 89, 90, 91 and 102 to not needed;
+    - row 17 to gap (M6.1 does not name split-K shaping).
+  - **Changed in round 2:** 34 rows.
 
