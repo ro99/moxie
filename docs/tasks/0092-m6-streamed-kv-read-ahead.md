@@ -1,8 +1,15 @@
 # Task 0092 — bounded read-ahead for host-backed KV streaming
 
-Status: **active** (coordinator, 2026-09-25). Revised after sol's design
+Status: **accepted** (coordinator, 2026-09-25). Revised after sol's design
 review (2 high, 3 medium, all adopted; see "Design review" below) before any
 implementation (engineering log, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
+Implementation `d67de0e`; R1 repair `a4248f7`.
+- R1 (sol): 0 high, 0 medium, 1 low. `is_idle` ignored an unobserved staged
+  copy after a stream dropped with an unused prefetch; the predicate now
+  includes it. Every escape-inventory path was traced clean. The design review
+  before implementation meant no ownership finding surfaced after it.
+- Reading (O6 open, not a claim): read-ahead and `stage_next` medians agree
+  within ±3 µs of about 347 µs per query on the 3090; overlap not measured.
 
 ## Identity and authority
 
