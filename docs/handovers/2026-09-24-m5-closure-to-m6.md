@@ -135,7 +135,11 @@ tsk board thread `m6` mirrors it.
 | 7 | Plan selection, benchmark package, close | Automatic and fixed-plan selection; exit benchmarks; milestone-end audit | M6.5; M6 closure |
 
 Slice 3 may move ahead of slice 2 if slice 1 needs timing evidence to choose
-between mechanisms.
+between mechanisms. **It did (coordinator, 2026-09-24):** after 0077, slice
+1's remaining candidates (per-operation `settle` in `PagedAttentionRun`, the
+per-step `Module::load`) are ranked by [task
+0078](../tasks/0078-m6-dense-step-timing.md)'s fixed-plan timing and CUDA API
+breakdown before either is opened.
 
 ### Owner decision needed (batched)
 
