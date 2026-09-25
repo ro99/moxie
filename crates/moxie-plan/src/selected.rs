@@ -166,6 +166,40 @@ impl SelectedPlanCandidate {
     }
 }
 
+/// Split a prefill into greedy chunks from a validated ascending bucket set.
+pub fn prefill_chunks(rows: u64, buckets: &[u64]) -> Result<Vec<u64>, Error> {
+    if buckets.is_empty()
+        || buckets.contains(&0)
+        || !buckets.contains(&1)
+        || buckets.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(invalid(
+            "buckets",
+            "buckets must be nonzero, strictly ascending, and contain one",
+        ));
+    }
+    if rows == 0 {
+        return Err(invalid("rows", "prefill rows must be nonzero"));
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = rows;
+    while remaining != 0 {
+        let chunk = buckets
+            .iter()
+            .rev()
+            .find(|&&bucket| bucket <= remaining)
+            .copied()
+            .ok_or_else(|| invalid("buckets", "no bucket fits the remaining rows"))?;
+        chunks
+            .try_reserve(1)
+            .map_err(|_| invalid("buckets", "chunk list could not be reserved"))?;
+        chunks.push(chunk);
+        remaining -= chunk;
+    }
+    Ok(chunks)
+}
+
 /// Select every node before allocating a plan identity or resource, then lower
 /// exact weight/activation/workspace regions into one physical arena.
 pub fn lower_selected(
@@ -1742,6 +1776,30 @@ mod tests {
 
     const ROWS: SymbolId = SymbolId(1200);
     const ORACLE: OracleId = OracleId("selected-plan-tests");
+
+    #[test]
+    fn prefill_chunks_greedily_uses_valid_buckets_and_refuses_bad_input() {
+        for (rows, buckets, expected) in [
+            (13, &[1, 2, 4, 8][..], &[8, 4, 1][..]),
+            (8, &[1, 2, 4, 8][..], &[8][..]),
+            (3, &[1, 4][..], &[1, 1, 1][..]),
+        ] {
+            assert_eq!(prefill_chunks(rows, buckets), Ok(expected.to_vec()));
+        }
+
+        for (rows, buckets, field) in [
+            (13, &[][..], "buckets"),
+            (13, &[1, 4, 2][..], "buckets"),
+            (13, &[2, 4][..], "buckets"),
+            (13, &[0, 1][..], "buckets"),
+            (0, &[1][..], "rows"),
+        ] {
+            assert!(matches!(
+                prefill_chunks(rows, buckets),
+                Err(Error::InvalidRequest { field: actual, .. }) if actual == field
+            ));
+        }
+    }
 
     fn graph(hidden: u64, eps: f32) -> Graph {
         graph_edges(hidden, eps, true)

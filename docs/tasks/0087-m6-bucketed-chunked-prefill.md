@@ -109,4 +109,21 @@ with the code; a file outside the allowed list is needed.
 
 ## Result, filled after work
 
-(pending)
+- Added `moxie_plan::prefill_chunks` with greedy bucket selection, typed
+  refusals, fallible allocation and one table-driven unit test.
+- Added `bucketed_prefill_reuses_plans_and_matches_host`: one captured plan per
+  bucket is admitted up front and reused for both fresh-state prompts (13 and
+  7 tokens), including decode. Last-prefill-row and decode comparisons matched
+  `host_step` on all three GPUs; every comparison reported `max_bf16_ulp=0.000`.
+  All plans and runs closed with an empty ledger.
+- The required mutant resetting chunk positions to zero was caught: a later
+  chunk refused position 0 because retained history started at 4. Restored the
+  absolute positions afterward.
+- Host gates passed: `cargo fmt --all -- --check`; workspace clippy;
+  driver-feature executor clippy; `cargo test --workspace --locked`;
+  `cargo xtask arch-check` (79 negative and 21 positive fixtures); and
+  `cargo xtask spec-check` (10 documents).
+- GPU gates passed with `CUDA_DEVICE_ORDER=PCI_BUS_ID`: full
+  `dense_gemma_device` (9 passed, 1 ignored), `dense_tp2_device` (1 passed),
+  and `cargo xtask-cuda test-gpu` (69 passed, 0 failed, 0 skipped/unmeasured;
+  SM86 and SM120 qualified).

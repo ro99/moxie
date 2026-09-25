@@ -32,6 +32,7 @@ use moxie_plan::{
     Phase, PipelineLowering, ResourceWorkload, SelectedPlanCandidate, StageGraph,
     build_stage_graph, lower_host_experts, lower_pipeline, lower_selected,
     lower_selected_host_experts, lower_selected_ordered, lower_selected_with_formats,
+    prefill_chunks,
 };
 use moxie_state::{
     DeviceKvSequence, KvGeometry, LayerKv, ROOT, Retention, SequenceState, StateKind,
@@ -1166,6 +1167,210 @@ fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
                 label, capability.uuid, capability.compute_major, capability.compute_minor
             );
         }
+    }
+}
+
+#[test]
+fn bucketed_prefill_reuses_plans_and_matches_host() {
+    let _guard = one_at_a_time();
+    let count = device_count().expect("enumerate CUDA devices");
+    assert!(count >= 3, "requires all three GPUs; saw {count}");
+
+    let shape = moxie_cli::gemma::Shape::A;
+    let config = shape.config();
+    let fixture = moxie_cli::gemma::build(shape).expect("build dense Gemma fixture");
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+    let buckets = [1_u64, 2, 4, 8];
+    let max_visible_rows = 13_u64.checked_add(1).expect("decode row fits u64");
+
+    for ordinal in 0..count {
+        let capability = query_device(ordinal).expect("query GPU capability");
+        let context = RankContext::acquire(RankId(ordinal), ordinal)
+            .expect("acquire bucketed-prefill context");
+        assert_eq!(context.uuid(), capability.uuid);
+        let stream = Stream::new(&context).expect("create bucketed-prefill stream");
+        let mut ledger = measured_ledger(&context);
+        let mut plans = BTreeMap::new();
+
+        for bucket in buckets.iter().copied() {
+            let workload = ResourceWorkload {
+                phase: Phase::Prefill,
+                rows: bucket,
+                visible_tokens: max_visible_rows,
+                branch_rows: bucket,
+                output: fixture.graph.output(),
+                device: capability.uuid,
+                paged_state_capacity: None,
+            };
+            let candidate = lower_selected(&fixture.graph, workload, &capability, &catalogue)
+                .expect("lower bucket plan");
+            let mut plan = SelectedReservedPlan::admit(
+                candidate,
+                &fixture.graph,
+                &capability,
+                &catalogue,
+                &mut ledger,
+                &context,
+            )
+            .unwrap_or_else(|refused| panic!("admit bucket {bucket}: {refused:?}"));
+            plan.set_segment_capture(true, &mut ledger)
+                .unwrap_or_else(|error| panic!("enable capture for bucket {bucket}: {error}"));
+            plans.insert(bucket, plan);
+        }
+
+        for (prompt_rows, expected_chunks) in [(13_usize, [8_u64, 4, 1]), (7_usize, [4_u64, 2, 1])]
+        {
+            let prompt_rows_u64 = u64::try_from(prompt_rows).expect("prompt rows fit u64");
+            let prompt: Vec<_> = (0..prompt_rows_u64)
+                .map(|position| position % config.vocab)
+                .collect();
+            let prompt_positions: Vec<_> = (0..prompt_rows_u64).collect();
+            let decode_tokens = [prompt_rows_u64 % config.vocab];
+            let decode_positions = [prompt_rows_u64];
+
+            let mut host_state = SequenceState::new([StateKind::KvPages]);
+            let mut host_cache =
+                KvCache::for_branch(config.layers as usize, &host_state, moxie_state::ROOT)
+                    .expect("host prompt cache");
+            let host_prefill = host_step(
+                &fixture,
+                &mut host_state,
+                &mut host_cache,
+                &prompt,
+                &prompt_positions,
+            );
+            let host_decode = host_step(
+                &fixture,
+                &mut host_state,
+                &mut host_cache,
+                &decode_tokens,
+                &decode_positions,
+            );
+
+            let mut state = DeviceKvSequence::new(geometry(&config, 4, 64, prompt_rows + 1))
+                .expect("fresh prompt device state");
+            let mut runs = admit_runs(&mut ledger, &context, &config, &state, buckets[3]);
+            let chunks = prefill_chunks(prompt_rows_u64, &buckets).expect("chunk prompt by bucket");
+            assert_eq!(chunks.as_slice(), expected_chunks.as_slice());
+
+            let mut offset = 0_u64;
+            let mut last_prefill = Vec::new();
+            for chunk_rows in chunks {
+                let chunk_end = offset.checked_add(chunk_rows).expect("chunk end fits u64");
+                let start = usize::try_from(offset).expect("chunk start fits usize");
+                let end = usize::try_from(chunk_end).expect("chunk end fits usize");
+                let chunk_tokens = &prompt[start..end];
+                let chunk_positions: Vec<_> = (offset..chunk_end).collect();
+                let transaction = state.begin().expect("bucket prefill transaction");
+                let plan = plans.remove(&chunk_rows).expect("admitted bucket plan");
+                let mut bindings =
+                    stage_bindings(&fixture, None, chunk_tokens, &chunk_positions, &capability);
+                if plan.bound_weight_count() != 0 {
+                    bindings.retain(|binding| !matches!(binding.role, ValueRole::Weight(_)));
+                }
+                let result = plan
+                    .execute_dense(DenseGraphStep {
+                        graph: &fixture.graph,
+                        capability: &capability,
+                        catalogue: &catalogue,
+                        ctx: &context,
+                        stream: &stream,
+                        state: &mut state,
+                        transaction,
+                        runs: &mut runs,
+                        bindings,
+                        host_experts: &[],
+                    })
+                    .map_err(|refused| refused.error)
+                    .expect("execute bucket prefill")
+                    .finish()
+                    .map_err(|refused| refused.error)
+                    .expect("finish bucket prefill");
+                commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
+                    .expect("commit bucket prefill");
+                last_prefill = result.output;
+                plans.insert(chunk_rows, result.plan);
+                offset = chunk_end;
+            }
+            assert_eq!(offset, prompt_rows_u64, "every prompt row was executed");
+
+            let vocabulary = usize::try_from(config.vocab).expect("vocabulary fits usize");
+            let row_bytes = vocabulary
+                .checked_mul(core::mem::size_of::<f32>())
+                .expect("logit row size fits usize");
+            assert_eq!(last_prefill.len(), row_bytes, "last chunk has one row");
+            let host_last_prefill = &host_prefill[(prompt_rows - 1) * vocabulary..];
+            assert_logits(
+                &format!(
+                    "bucketed prompt {prompt_rows} last prefill on {}",
+                    capability.uuid
+                ),
+                &last_prefill,
+                host_last_prefill,
+            );
+
+            let transaction = state.begin().expect("bucket decode transaction");
+            let plan = plans.remove(&1).expect("one-row decode plan");
+            let mut bindings = stage_bindings(
+                &fixture,
+                None,
+                &decode_tokens,
+                &decode_positions,
+                &capability,
+            );
+            if plan.bound_weight_count() != 0 {
+                bindings.retain(|binding| !matches!(binding.role, ValueRole::Weight(_)));
+            }
+            let result = plan
+                .execute_dense(DenseGraphStep {
+                    graph: &fixture.graph,
+                    capability: &capability,
+                    catalogue: &catalogue,
+                    ctx: &context,
+                    stream: &stream,
+                    state: &mut state,
+                    transaction,
+                    runs: &mut runs,
+                    bindings,
+                    host_experts: &[],
+                })
+                .map_err(|refused| refused.error)
+                .expect("execute bucket decode")
+                .finish()
+                .map_err(|refused| refused.error)
+                .expect("finish bucket decode");
+            commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
+                .expect("commit bucket decode");
+            assert_logits(
+                &format!(
+                    "bucketed prompt {prompt_rows} decode on {}",
+                    capability.uuid
+                ),
+                &result.output,
+                &host_decode,
+            );
+            plans.insert(1, result.plan);
+
+            for run in runs.drain(..) {
+                run.close(&mut ledger)
+                    .map_err(|refused| refused.error)
+                    .expect("close prompt attention run");
+            }
+        }
+
+        for bucket in buckets {
+            plans
+                .remove(&bucket)
+                .expect("all bucket plans remain admitted")
+                .close(&mut ledger)
+                .map_err(|refused| refused.error)
+                .unwrap_or_else(|error| panic!("close bucket {bucket}: {error}"));
+        }
+        assert!(plans.is_empty(), "every bucket plan was closed");
+        assert!(
+            ledger.outstanding().is_empty(),
+            "bucketed prefill leaked ledger resources"
+        );
     }
 }
 

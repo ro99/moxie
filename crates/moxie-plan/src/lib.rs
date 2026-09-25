@@ -32,7 +32,7 @@ pub use pipeline::{PipelineLowering, PipelineRefused, lower_pipeline, wavefront}
 pub use selected::{
     PlannedValue, PlannedWorkspace, SelectedNode, SelectedPlanCandidate, StorageRegion,
     lower_selected, lower_selected_host_experts, lower_selected_ordered,
-    lower_selected_with_formats,
+    lower_selected_with_formats, prefill_chunks,
 };
 pub use tensor_parallel::{
     Join, RankPart, Stage, StageGraph, StageRead, StageWeight, TensorParallelLowering,
