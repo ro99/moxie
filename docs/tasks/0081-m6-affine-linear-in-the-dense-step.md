@@ -1,7 +1,6 @@
 # Task 0081 — the single-GPU dense step executes affine linear weights
 
-Status: **proposed** (coordinator, 2026-09-24); opens when task 0080 is
-accepted. Builder Codex `luna`; reviewer Codex `sol`.
+Status: **active** (coordinator, 2026-09-24). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Identity and authority
 
@@ -70,8 +69,10 @@ accepted. Builder Codex `luna`; reviewer Codex `sol`.
    the affine symbol with the ABI above instead of the BF16 linear. Addresses:
    `x` = input 0, output = node output, and each component = the weight
    range's address plus its section offset. Use checked arithmetic and the
-   file's `invalid(…)` for every conversion. `push_launch(lease,
-   "affine-linear")`. Every other path is unchanged.
+   file's `invalid(…)` for every conversion. Call `launch(…)` with
+   `moxie_kernels::AFFINE_LINEAR` as its symbol argument: since task 0080's
+   R1 repair, `launch` refuses when the resolved symbol differs from the one
+   the arm prepared arguments for. `push_launch(lease, "affine-linear")`. Every other path is unchanged.
 3. **Test** (one, in `dense_gemma_device.rs`):
    `affine_linear_weights_match_host_on_every_gpu`. Shape A. Formats on one
    layer's attention projections (INT8, group 32, BF16 scales, symmetric) and

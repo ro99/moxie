@@ -1,7 +1,14 @@
 # Task 0080 — dense plans admit quantized (affine) linear weights
 
-Status: **active** (coordinator, 2026-09-24). Builder Codex `luna`;
-reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-24), after sol's review round R1.
+Builder Codex `luna`; reviewer Codex `sol`. Implementation `7876171`; R1
+repair `5cfde7a`.
+- R1 (HIGH, the coordinator's staging gap): a formatted plan could be admitted
+  and executed, and the dense `launch` called a symbol by index without
+  checking its identity, so the affine kernel would have received the BF16
+  linear's arguments. Repaired for the class: `launch` refuses unless the
+  resolved symbol is the one the arm prepared arguments for. Verified by the
+  coordinator; every GPU gate reran green.
 
 ## Identity and authority
 
