@@ -118,8 +118,16 @@ reviewed together).
      `rows` (fill the output with a sentinel beforehand);
    - (c) append `rows` K and V rows with the existing D2D path into one
      page set, and with `kv_append_indirect_v1` into a second page set at
-     the same offsets. Assert both page sets are byte-equal, including
-     misaligned `row_bytes` (for example `head_dim = 72`).
+     the same offsets. Assert both page sets are byte-equal, including a
+     misaligned fixture (for example `kv_heads = 1`, `head_dim = 70`,
+     `row_bytes = 140`). Assert that the fixture really is not 16-byte
+     aligned (sol M4).
+   - (d) **Against the pre-refactor kernel (sol M3).** Before changing the
+     `.cu`, run today's `v1` on (a)'s geometries and record the output
+     bytes' SHA-256 in the case as constants, or embed the pre-refactor
+     image. After the refactor, both `v1` and `indirect_v1` must reproduce
+     those exact bytes. Comparing the two rebuilt entry points only with
+     each other is circular.
 5. **Coverage check (one mutant, reverted after; run only the new case).**
    In `indirect_v1`, read `first_position` from `step[2]` instead of
    `step[1]`. Case (a) must fail.
@@ -136,6 +144,35 @@ Host gates:
 GPU: `cargo xtask-cuda test-gpu` (this task changes kernel source, so the
 suite is required), all cases passing on SM86 and SM120. No dense suites:
 no executor code changes.
+
+## Design review (sol, 2026-09-25, before implementation)
+
+- **0098:** M3 and M4 adopted into change 4.
+- **0099's outline:** H1–H4, M1, M2, M5 and L1 are recorded below. They
+  bind task 0099's contract when it is written:
+  - **H1:** a graph names specific runs' key, value and table addresses. A
+    fresh run (new prompt) recaptures, unless the ABI is extended to take
+    run pointers indirectly too. Captured runs, their arenas and the module
+    live until every graph naming them is destroyed.
+  - **H2:** a prepare/apply split through `DeviceKvSequence`. Before
+    capture or replay, validate the placements and page view, upload the
+    tables and fill the mirror. Inside the graph, only the indirect append
+    and attention. After submission, advance the bookkeeping. Never capture
+    the present publish/D2D path.
+  - **H3:** every indirect offset and extent is checked on the host, with
+    the existing placement, range and launch checks, before any enqueue.
+    Resources are kept until completion is observed. Bookkeeping updates
+    only after tracked submission. Quarantine on uncertain enqueue.
+  - **H4:** every replay also uploads the token and position bindings and
+    the RoPE angle tables, before the one graph launch.
+  - **M1:** the table extent is the run's admitted `geometry.pages`, not
+    `visible_tokens / page_tokens`.
+  - **M2:** the full-step graph-pool bound is computed and admitted before
+    capture.
+  - **M5:** the captured identity includes every launch pointer and fixed
+    scalar, and every replay is checked against it.
+  - **L1:** the dense lease's completion gates the mirror rewrite; no
+    separate event.
 
 ## Outline of task 0099 (for the design review, not for implementation)
 
