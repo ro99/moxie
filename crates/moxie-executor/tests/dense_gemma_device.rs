@@ -3320,3 +3320,374 @@ fn dense_step_timing() {
     }
     assert!(ledger.outstanding().is_empty());
 }
+
+#[test]
+#[ignore = "benchmark; run explicitly"]
+fn stress_graph_benchmark() {
+    const WARMUP: usize = 5;
+    const REPETITIONS: usize = 30;
+
+    #[allow(clippy::too_many_arguments)]
+    fn time_phase<'ctx>(
+        mut plan: SelectedReservedPlan<'ctx>,
+        mut bindings: Vec<moxie_executor::OwnedBinding>,
+        capture: bool,
+        warmup: usize,
+        repetitions: usize,
+        graph: &Graph,
+        capability: &DeviceCapability,
+        catalogue: &moxie_types::KernelCatalogue,
+        context: &'ctx RankContext,
+        stream: &Stream<'ctx>,
+        state: &mut DeviceKvSequence,
+        runs: &mut Vec<PagedAttentionRun<'ctx>>,
+        ledger: &mut Ledger,
+    ) -> (
+        SelectedReservedPlan<'ctx>,
+        Vec<moxie_executor::OwnedBinding>,
+        (f64, f64, f64),
+    ) {
+        if capture {
+            plan.set_segment_capture(true, ledger)
+                .expect("enable decode segment capture");
+            let transaction = state.begin().expect("decode capture transaction");
+            let captured = plan
+                .execute_dense(DenseGraphStep {
+                    graph,
+                    capability,
+                    catalogue,
+                    ctx: context,
+                    stream,
+                    state,
+                    transaction,
+                    runs,
+                    bindings,
+                    host_experts: &[],
+                })
+                .map_err(|refused| refused.error)
+                .expect("decode capture execution")
+                .finish()
+                .map_err(|refused| refused.error)
+                .expect("decode capture finish");
+            state
+                .abort(transaction)
+                .expect("abort decode capture transaction");
+            plan = captured.plan;
+            bindings = captured.returned_inputs;
+        }
+
+        let mut samples = Vec::with_capacity(repetitions);
+        for repetition in 0..warmup + repetitions {
+            let transaction = state.begin().expect("timed step transaction");
+            let start = std::time::Instant::now();
+            let result = plan
+                .execute_dense(DenseGraphStep {
+                    graph,
+                    capability,
+                    catalogue,
+                    ctx: context,
+                    stream,
+                    state,
+                    transaction,
+                    runs,
+                    bindings,
+                    host_experts: &[],
+                })
+                .map_err(|refused| refused.error)
+                .expect("timed step execution")
+                .finish()
+                .map_err(|refused| refused.error)
+                .expect("timed step finish");
+            let elapsed = start.elapsed();
+            state
+                .abort(transaction)
+                .expect("abort timed step transaction");
+            plan = result.plan;
+            bindings = result.returned_inputs;
+            if repetition >= warmup {
+                samples.push(elapsed.as_secs_f64() * 1e6);
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        let median = (samples[repetitions / 2 - 1] + samples[repetitions / 2]) / 2.0;
+        (
+            plan,
+            bindings,
+            (median, samples[0], samples[repetitions - 1]),
+        )
+    }
+
+    let _guard = one_at_a_time();
+    let (ordinal, capability) = (0..device_count().expect("enumerate CUDA devices"))
+        .find_map(|ordinal| {
+            let capability = query_device(ordinal).ok()?;
+            (capability.uuid.to_string() == "GPU-3032cfa3-19df-028f-5ebd-43314911e0b9")
+                .then_some((ordinal, capability))
+        })
+        .expect("the target RTX 3090 is visible");
+    let context =
+        RankContext::acquire(RankId(ordinal), ordinal).expect("acquire target GPU rank context");
+    let stream = Stream::new(&context).expect("create stream");
+
+    let mut cases = Vec::new();
+    let shape = moxie_cli::gemma::Shape::A;
+    let config = shape.config();
+    cases.push((
+        "a",
+        config,
+        moxie_cli::gemma::build(shape).expect("build dense fixture"),
+    ));
+    let shape = moxie_cli::gemma::Shape::C;
+    let config = shape.config();
+    cases.push((
+        "c-top2",
+        config,
+        moxie_cli::gemma::build(shape).expect("build top-2 routed fixture"),
+    ));
+    let mut config = moxie_cli::gemma::Shape::C.config();
+    config.moe.as_mut().expect("Shape C MoE geometry").top_k = 3;
+    let fixture =
+        moxie_cli::gemma::build_with_config(config.clone()).expect("build top-3 routed fixture");
+    cases.push(("c-top3", config, fixture));
+
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+    for (label, config, fixture) in cases {
+        let prompt: Vec<u64> = (0..5).map(|row| row % config.vocab).collect();
+        let decode = vec![5 % config.vocab];
+        let prefill_positions: Vec<u64> = (0..prompt.len() as u64).collect();
+        let decode_positions = vec![prompt.len() as u64];
+
+        let mut host_state = SequenceState::new([StateKind::KvPages]);
+        let mut host_cache =
+            KvCache::for_branch(config.layers as usize, &host_state, ROOT).expect("host KV cache");
+        let host_prefill = host_step(
+            &fixture,
+            &mut host_state,
+            &mut host_cache,
+            &prompt,
+            &prefill_positions,
+        );
+        let host_decode = host_step(
+            &fixture,
+            &mut host_state,
+            &mut host_cache,
+            &decode,
+            &decode_positions,
+        );
+
+        let mut state = DeviceKvSequence::new(geometry(&config, 4, 64, prompt.len() + 1))
+            .expect("device state");
+        let mut ledger = measured_ledger(&context);
+        let mut runs = admit_runs(&mut ledger, &context, &config, &state, prompt.len() as u64);
+        let paged_state_bytes = ledger.committed(
+            moxie_types::Scope::Device(capability.uuid),
+            moxie_types::Tier::Device(moxie_types::DeviceTier::KvStatePages),
+        );
+
+        let prefill_workload = ResourceWorkload {
+            phase: Phase::Prefill,
+            rows: prompt.len() as u64,
+            visible_tokens: prompt.len() as u64,
+            branch_rows: prompt.len() as u64,
+            output: fixture.graph.output(),
+            device: capability.uuid,
+            paged_state_capacity: None,
+        };
+        let prefill_candidate =
+            lower_selected(&fixture.graph, prefill_workload, &capability, &catalogue)
+                .expect("lower prefill plan");
+        let region_bytes = |candidate: &SelectedPlanCandidate| {
+            candidate
+                .weight_region_bytes()
+                .checked_add(candidate.activation_region_bytes())
+                .and_then(|bytes| bytes.checked_add(candidate.workspace_region_bytes()))
+                .expect("selected plan regions fit u64")
+        };
+        let prefill_plan_bytes = region_bytes(&prefill_candidate);
+        let prefill_plan = SelectedReservedPlan::admit(
+            prefill_candidate,
+            &fixture.graph,
+            &capability,
+            &catalogue,
+            &mut ledger,
+            &context,
+        )
+        .unwrap_or_else(|refused| panic!("prefill admission: {refused:?}"));
+
+        let decode_workload = ResourceWorkload {
+            phase: Phase::Decode,
+            rows: 1,
+            visible_tokens: prompt.len() as u64 + 1,
+            branch_rows: 1,
+            ..prefill_workload
+        };
+        let decode_candidate =
+            lower_selected(&fixture.graph, decode_workload, &capability, &catalogue)
+                .expect("lower decode plan");
+        let decode_plan_bytes = region_bytes(&decode_candidate);
+        let decode_plan = SelectedReservedPlan::admit(
+            decode_candidate,
+            &fixture.graph,
+            &capability,
+            &catalogue,
+            &mut ledger,
+            &context,
+        )
+        .unwrap_or_else(|refused| panic!("decode admission: {refused:?}"));
+
+        let prefill_bindings =
+            stage_bindings(&fixture, None, &prompt, &prefill_positions, &capability);
+        let decode_bindings =
+            stage_bindings(&fixture, None, &decode, &decode_positions, &capability);
+        let (mut prefill_plan, prefill_bindings, prefill_stats) = time_phase(
+            prefill_plan,
+            prefill_bindings,
+            false,
+            WARMUP,
+            REPETITIONS,
+            &fixture.graph,
+            &capability,
+            &catalogue,
+            &context,
+            &stream,
+            &mut state,
+            &mut runs,
+            &mut ledger,
+        );
+        let transaction = state.begin().expect("committed prefill transaction");
+        let prefill_result = prefill_plan
+            .execute_dense(DenseGraphStep {
+                graph: &fixture.graph,
+                capability: &capability,
+                catalogue: &catalogue,
+                ctx: &context,
+                stream: &stream,
+                state: &mut state,
+                transaction,
+                runs: &mut runs,
+                bindings: prefill_bindings,
+                host_experts: &[],
+            })
+            .map_err(|refused| refused.error)
+            .expect("committed prefill execution")
+            .finish()
+            .map_err(|refused| refused.error)
+            .expect("committed prefill finish");
+        commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
+            .expect("commit prefill state");
+        prefill_plan = prefill_result.plan;
+
+        let vocab = config.vocab as usize;
+        let last_row = prompt.len() - 1;
+        let prefill_output_start = last_row * vocab * 4;
+        let prefill_reference_start = last_row * vocab;
+        let prefill_output = &prefill_result.output[prefill_output_start..];
+        let prefill_reference = &host_prefill[prefill_reference_start..];
+        assert_logits("stress prefill", prefill_output, prefill_reference);
+        let prefill_worst_ulp = prefill_output
+            .chunks_exact(4)
+            .zip(prefill_reference)
+            .map(|(word, expected)| {
+                let actual = f32::from_le_bytes(word.try_into().expect("F32 logit"));
+                (actual - expected).abs() / bf16_ulp(*expected)
+            })
+            .fold(0.0f32, f32::max);
+
+        let (decode_plan, decode_bindings, decode_stats) = time_phase(
+            decode_plan,
+            decode_bindings,
+            false,
+            WARMUP,
+            REPETITIONS,
+            &fixture.graph,
+            &capability,
+            &catalogue,
+            &context,
+            &stream,
+            &mut state,
+            &mut runs,
+            &mut ledger,
+        );
+        let (mut decode_plan, decode_bindings, captured_stats) = time_phase(
+            decode_plan,
+            decode_bindings,
+            true,
+            WARMUP,
+            REPETITIONS,
+            &fixture.graph,
+            &capability,
+            &catalogue,
+            &context,
+            &stream,
+            &mut state,
+            &mut runs,
+            &mut ledger,
+        );
+        let graph_pool_bytes = decode_plan.graph_pool_bytes();
+        let transaction = state.begin().expect("committed decode transaction");
+        let decode_result = decode_plan
+            .execute_dense(DenseGraphStep {
+                graph: &fixture.graph,
+                capability: &capability,
+                catalogue: &catalogue,
+                ctx: &context,
+                stream: &stream,
+                state: &mut state,
+                transaction,
+                runs: &mut runs,
+                bindings: decode_bindings,
+                host_experts: &[],
+            })
+            .map_err(|refused| refused.error)
+            .expect("committed decode execution")
+            .finish()
+            .map_err(|refused| refused.error)
+            .expect("committed decode finish");
+        commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
+            .expect("commit decode state");
+        decode_plan = decode_result.plan;
+        assert_logits("stress decode", &decode_result.output, &host_decode);
+        let decode_worst_ulp = decode_result
+            .output
+            .chunks_exact(4)
+            .zip(&host_decode)
+            .map(|(word, expected)| {
+                let actual = f32::from_le_bytes(word.try_into().expect("F32 logit"));
+                (actual - expected).abs() / bf16_ulp(*expected)
+            })
+            .fold(0.0f32, f32::max);
+
+        let prefill_device_bytes = prefill_plan_bytes;
+        let decode_device_bytes = decode_plan_bytes;
+        let captured_device_bytes = decode_plan_bytes
+            .checked_add(graph_pool_bytes)
+            .expect("captured decode device bytes fit u64");
+        eprintln!(
+            "stress-benchmark graph={label} phase=prefill median_us={:.3} min_us={:.3} max_us={:.3} device_bytes={prefill_device_bytes} paged_state_bytes={paged_state_bytes} graph_pool_bytes=- worst_ulp={prefill_worst_ulp:.3}",
+            prefill_stats.0, prefill_stats.1, prefill_stats.2,
+        );
+        eprintln!(
+            "stress-benchmark graph={label} phase=decode median_us={:.3} min_us={:.3} max_us={:.3} device_bytes={decode_device_bytes} paged_state_bytes={paged_state_bytes} graph_pool_bytes=- worst_ulp=-",
+            decode_stats.0, decode_stats.1, decode_stats.2,
+        );
+        eprintln!(
+            "stress-benchmark graph={label} phase=decode-captured median_us={:.3} min_us={:.3} max_us={:.3} device_bytes={captured_device_bytes} paged_state_bytes={paged_state_bytes} graph_pool_bytes={graph_pool_bytes} worst_ulp={decode_worst_ulp:.3}",
+            captured_stats.0, captured_stats.1, captured_stats.2,
+        );
+
+        prefill_plan
+            .close(&mut ledger)
+            .map_err(|refused| refused.error)
+            .expect("close prefill plan");
+        decode_plan
+            .close(&mut ledger)
+            .map_err(|refused| refused.error)
+            .expect("close decode plan");
+        for run in runs.drain(..) {
+            run.close(&mut ledger)
+                .map_err(|refused| refused.error)
+                .expect("close paged run");
+        }
+        assert!(ledger.outstanding().is_empty());
+    }
+}
