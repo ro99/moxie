@@ -77,7 +77,9 @@ reviewer Codex `sol`.
   (lib only for re-exports), `crates/moxie-executor/src/{grouped_device.rs,
   grouped.rs,residency.rs}` and `crates/moxie-executor/tests/grouped_device.rs`
   (rename only), `crates/moxie-kernels/cuda/dense_graph.cu`,
-  `crates/moxie-kernels/src/lib.rs`, this task's Result.
+  `crates/moxie-kernels/src/lib.rs`,
+  `crates/moxie-executor/tests/dense_gemma_device.rs` (change 9 only), this
+  task's Result.
 - **Non-goals:** executing an affine node on the device (next task); TP/PP
   lowerings with formats (`lower_selected_ordered` and the pipeline reject a
   non-empty format map by not taking one); quantized experts in the dense
@@ -134,8 +136,12 @@ reviewer Codex `sol`.
    (`weight_formats: BTreeMap<ValueId, WeightFormat>`, empty for every other
    lowering) with `pub fn weight_formats(&self) -> &BTreeMap<ValueId,
    WeightFormat>`.
-9. **Tests (two, in `selected.rs`'s existing test module, using the reduced
-   Gemma fixture its tests already use):**
+9. **Tests (two, in `crates/moxie-executor/tests/dense_gemma_device.rs`,
+   beside `routed_gemma_lowers_through_the_dense_package`, built the same way:
+   `moxie_cli::gemma::build(Shape::A)`, a synthetic `DeviceCapability`, and
+   `moxie_kernels::dense_graph_catalogue()`)** (amended by the coordinator,
+   2026-09-24: the original text named a Gemma fixture in `selected.rs`'s
+   tests, which do not have one; the builder stopped correctly):
    - *Admission:* formats on every attention and MLP projection weight of one
      layer (INT8 group 32 BF16 scales symmetric on some, INT4 group 32 F16
      scales with zeros on others). Assert each formatted node selected an
