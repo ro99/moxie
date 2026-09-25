@@ -1929,3 +1929,201 @@ fn routed_gemma_host_experts_match_the_grouped_reference_on_every_gpu() {
         );
     }
 }
+
+#[test]
+#[ignore = "timing harness; run explicitly"]
+fn dense_step_timing() {
+    const WARMUP: usize = 5;
+    const REPETITIONS: usize = 50;
+
+    let _guard = one_at_a_time();
+    let (ordinal, capability) = (0..device_count().expect("enumerate CUDA devices"))
+        .find_map(|ordinal| {
+            let capability = query_device(ordinal).ok()?;
+            (capability.uuid.to_string() == "GPU-3032cfa3-19df-028f-5ebd-43314911e0b9")
+                .then_some((ordinal, capability))
+        })
+        .expect("the target RTX 3090 is visible");
+    let context = RankContext::acquire(RankId(59_000 + ordinal), ordinal)
+        .expect("acquire target GPU rank context");
+    let stream = Stream::new(&context).expect("create stream");
+    let shape = moxie_cli::gemma::Shape::A;
+    let config = shape.config();
+    let fixture = moxie_cli::gemma::build(shape).expect("build dense fixture");
+    let prompt: Vec<u64> = (0..5).map(|row| row % config.vocab).collect();
+    let decode = vec![5 % config.vocab];
+    let prefill_positions: Vec<u64> = (0..prompt.len() as u64).collect();
+    let decode_positions = vec![prompt.len() as u64];
+    let mut state =
+        DeviceKvSequence::new(geometry(&config, 4, 64, prompt.len() + 1)).expect("device state");
+    let mut ledger = measured_ledger(&context);
+    let mut runs = admit_runs(&mut ledger, &context, &config, &state, prompt.len() as u64);
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+    let prefill_workload = ResourceWorkload {
+        phase: Phase::Prefill,
+        rows: prompt.len() as u64,
+        visible_tokens: prompt.len() as u64,
+        branch_rows: prompt.len() as u64,
+        output: fixture.graph.output(),
+        device: capability.uuid,
+        paged_state_capacity: None,
+    };
+    let prefill_candidate =
+        lower_selected(&fixture.graph, prefill_workload, &capability, &catalogue)
+            .expect("prefill lowering");
+    let mut prefill_plan = SelectedReservedPlan::admit(
+        prefill_candidate,
+        &fixture.graph,
+        &capability,
+        &catalogue,
+        &mut ledger,
+        &context,
+    )
+    .unwrap_or_else(|refused| panic!("prefill admission: {refused:?}"));
+    let decode_workload = ResourceWorkload {
+        phase: Phase::Decode,
+        rows: 1,
+        visible_tokens: prompt.len() as u64 + 1,
+        branch_rows: 1,
+        output: fixture.graph.output(),
+        device: capability.uuid,
+        paged_state_capacity: None,
+    };
+    let decode_candidate = lower_selected(&fixture.graph, decode_workload, &capability, &catalogue)
+        .expect("decode lowering");
+    let mut decode_plan = SelectedReservedPlan::admit(
+        decode_candidate,
+        &fixture.graph,
+        &capability,
+        &catalogue,
+        &mut ledger,
+        &context,
+    )
+    .unwrap_or_else(|refused| panic!("decode admission: {refused:?}"));
+    let mut prefill_bindings =
+        stage_bindings(&fixture, None, &prompt, &prefill_positions, &capability);
+    let mut decode_bindings =
+        stage_bindings(&fixture, None, &decode, &decode_positions, &capability);
+
+    let mut prefill_samples = Vec::with_capacity(REPETITIONS);
+    for repetition in 0..WARMUP + REPETITIONS {
+        let transaction = state.begin().expect("prefill timing transaction");
+        let start = std::time::Instant::now();
+        let result = prefill_plan
+            .execute_dense(DenseGraphStep {
+                graph: &fixture.graph,
+                capability: &capability,
+                catalogue: &catalogue,
+                ctx: &context,
+                stream: &stream,
+                state: &mut state,
+                transaction,
+                runs: &mut runs,
+                bindings: prefill_bindings,
+                host_experts: &[],
+            })
+            .map_err(|refused| refused.error)
+            .expect("prefill timing execution")
+            .finish()
+            .map_err(|refused| refused.error)
+            .expect("prefill timing finish");
+        let elapsed = start.elapsed();
+        state
+            .abort(transaction)
+            .expect("abort prefill timing transaction");
+        prefill_plan = result.plan;
+        prefill_bindings = result.returned_inputs;
+        if repetition >= WARMUP {
+            prefill_samples.push(elapsed.as_nanos());
+        }
+    }
+    prefill_samples.sort_unstable();
+    eprintln!(
+        "dense-step-timing phase=prefill gpu={} warmup={WARMUP} reps={REPETITIONS} median_us={:.3} min_us={:.3} max_us={:.3}",
+        capability.uuid,
+        (prefill_samples[REPETITIONS / 2 - 1] as f64 + prefill_samples[REPETITIONS / 2] as f64)
+            / 2_000.0,
+        prefill_samples[0] as f64 / 1_000.0,
+        prefill_samples[REPETITIONS - 1] as f64 / 1_000.0,
+    );
+
+    let transaction = state.begin().expect("committed prefill transaction");
+    let result = prefill_plan
+        .execute_dense(DenseGraphStep {
+            graph: &fixture.graph,
+            capability: &capability,
+            catalogue: &catalogue,
+            ctx: &context,
+            stream: &stream,
+            state: &mut state,
+            transaction,
+            runs: &mut runs,
+            bindings: prefill_bindings,
+            host_experts: &[],
+        })
+        .map_err(|refused| refused.error)
+        .expect("committed prefill execution")
+        .finish()
+        .map_err(|refused| refused.error)
+        .expect("committed prefill finish");
+    commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
+        .expect("commit prefill state");
+    prefill_plan = result.plan;
+
+    let mut decode_samples = Vec::with_capacity(REPETITIONS);
+    for repetition in 0..WARMUP + REPETITIONS {
+        let transaction = state.begin().expect("decode timing transaction");
+        let start = std::time::Instant::now();
+        let result = decode_plan
+            .execute_dense(DenseGraphStep {
+                graph: &fixture.graph,
+                capability: &capability,
+                catalogue: &catalogue,
+                ctx: &context,
+                stream: &stream,
+                state: &mut state,
+                transaction,
+                runs: &mut runs,
+                bindings: decode_bindings,
+                host_experts: &[],
+            })
+            .map_err(|refused| refused.error)
+            .expect("decode timing execution")
+            .finish()
+            .map_err(|refused| refused.error)
+            .expect("decode timing finish");
+        let elapsed = start.elapsed();
+        state
+            .abort(transaction)
+            .expect("abort decode timing transaction");
+        decode_plan = result.plan;
+        decode_bindings = result.returned_inputs;
+        if repetition >= WARMUP {
+            decode_samples.push(elapsed.as_nanos());
+        }
+    }
+    decode_samples.sort_unstable();
+    eprintln!(
+        "dense-step-timing phase=decode gpu={} warmup={WARMUP} reps={REPETITIONS} median_us={:.3} min_us={:.3} max_us={:.3}",
+        capability.uuid,
+        (decode_samples[REPETITIONS / 2 - 1] as f64 + decode_samples[REPETITIONS / 2] as f64)
+            / 2_000.0,
+        decode_samples[0] as f64 / 1_000.0,
+        decode_samples[REPETITIONS - 1] as f64 / 1_000.0,
+    );
+
+    prefill_plan
+        .close(&mut ledger)
+        .map_err(|refused| refused.error)
+        .expect("close prefill plan");
+    decode_plan
+        .close(&mut ledger)
+        .map_err(|refused| refused.error)
+        .expect("close decode plan");
+    for run in runs.drain(..) {
+        run.close(&mut ledger)
+            .map_err(|refused| refused.error)
+            .expect("close attention run");
+    }
+    assert!(ledger.outstanding().is_empty());
+}
