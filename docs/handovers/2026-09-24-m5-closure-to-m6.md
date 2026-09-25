@@ -153,9 +153,13 @@ reviews):
    5060 Ti, about 1,000 times below the hardware.
 2. **M6.2** Full-step decode capture, attention included, with the piecewise
    path as the fallback. Route: [0098](../tasks/0098-m6-step-indirect-attention-kernels.md)
-   step-indirect attention and KV append kernels (bit-identical); 0099 the
-   executor's step-state buffer and full-step capture; 0100 capture of
-   ordered-reduction plans (TP ranks, split reference; moved from 0097).
+   step-indirect attention and KV append kernels (bit-identical);
+   [0099](../tasks/0099-m6-prepared-kv-append.md) the state authority's
+   prepared KV append (split out after sol's design review: 5 high, 4
+   medium); [0101](../tasks/0101-m6-full-step-decode-capture.md) the
+   executor's full-step capture, re-reviewed before implementation; 0100
+   capture of ordered-reduction plans (TP ranks, split reference; moved from
+   0097).
 3. **M6.3** Pipeline microbatch overlap (carried from M5); opt-in hot-expert
    tier; opt-in route prediction feeding the bounded prefetch class.
 4. **M6.4** Device KV transition between a prefill and a decode placement.

@@ -1,12 +1,16 @@
-# Task 0099 — full-step decode capture: step-state buffer, prepare/apply, one graph
+# Task 0101 — full-step decode capture: step-state buffer, prepare/apply, one graph
 
-Status: **proposed** (coordinator, 2026-09-25), awaiting sol's design review.
+Status: **proposed** (coordinator, 2026-09-25). This was drafted as 0099.
+Sol's design review found 5 high and 4 medium, recorded as binding below.
+The state authority's prepared-append token was split out as task 0099. This
+contract is revised against that token and re-reviewed before
+implementation.
 It builds on task 0098's kernels. Builder Codex `luna`; reviewer Codex
 `sol`. Asynchronous-ownership work: change 8 is the escape inventory.
 
 ## Identity and authority
 
-- Task0099, M6 roadmap **M6.2**, "stable decode … graph capture with
+- Task0101, M6 roadmap **M6.2**, "stable decode … graph capture with
   piecewise fallback" (owner ruling 2026-09-25: build every roadmap
   feature). Task 0098's step-indirect kernels exist and are bit-identical to
   the direct ones. This task captures a whole single-GPU decode step,
@@ -223,5 +227,47 @@ start at the candidate commit while the final gates run.
   a borrow conflict;
 - capture of any node fails;
 - a file outside the allowed list is needed.
+
+## Design review (sol, 2026-09-25) — binding amendments, to be folded into the changes before implementation
+
+- **H1 → task 0099.** The apply step is a prepared, non-allocating token,
+  not a `VerifyOnlyWriter` over `append_layer`. If a post-submission
+  invariant still fails, the state is poisoned and the plan and runs are
+  quarantined, never returned as reusable.
+- **H2.** Prepare derives `history_base` and `history_rows` from the
+  previewed (projected) view and runs the launch checks against that
+  projected range. After tracked submission, it updates each run's
+  `written` high-water mark and pending event atomically with the token's
+  apply.
+- **H3.** Captured indirect symbols come from the **plan-owned dense
+  module** (`dense_graph.cu` includes `paged_attention.cu`), not from a
+  run's module. A run may close after its pending work without invalidating
+  the plan. Run-address identity and recapture for fresh runs stay.
+- **H4.** Only failures before the first enqueue return the plan and
+  bindings. After any upload that may have been submitted, retain or
+  quarantine the plan, the mirror, the table sources and the affected runs
+  until a recorded completion or a drain. An unclosed plan's `Drop` forgets
+  its pinned mirror. A checked free on close returns the mirror to a
+  refused plan, and the `Host(Pinned)` charge is released only after a
+  successful free.
+- **H5 (coordinator decision).** No in-place recovery. After a full-step
+  launch or event failure, the direct run stays quarantined and charged,
+  as every other failure path does today. Test (d) expects a withheld plan,
+  quarantined runs, and the charge still held. In-place reclaim of a direct
+  run is not built here.
+- **M1 → task 0099** (shared projected view and placement calculation).
+- **M2.** When capture is enabled, with the `Ledger` available, admit the
+  maximum pool bound for the selected mode before any graph is made. A
+  transition or fallback must not double-charge. Old graphs are destroyed
+  before their reservation is released, and the reservation is retained if
+  the release refuses.
+- **M3.** Prepare reuses the existing table-publication and
+  `check_write_placements` predicates, plus the source-extent, device,
+  aliasing and descriptor/grid checks, against the projected frontier.
+  `upload_table_for` updates the run's host table and base only after
+  validation and a tracked copy.
+- **M4.** The pinned mirror is admitted and allocated only when full-step
+  capture is enabled. A pinned-cap refusal leaves the plan eligible for
+  eager or piecewise execution. Charge before allocating.
 
 ## Result, filled after work
