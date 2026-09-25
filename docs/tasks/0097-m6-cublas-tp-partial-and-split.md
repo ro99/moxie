@@ -68,7 +68,11 @@ Codex `sol`. Asynchronous-ownership work: the escape inventory is in change 5.
   - `crates/moxie-kernels/src/lib.rs`;
   - `crates/moxie-plan/src/selected.rs`;
   - `crates/moxie-executor/src/{dense.rs,chain.rs}`;
-  - `crates/moxie-executor/tests/dense_tp2_device.rs` (one new test);
+  - a new `crates/moxie-executor/tests/dense_tp2_cublas_device.rs` for
+    test (b), in its own process, because `dense_tp2_device`'s terminal
+    stall test leaves the pair claimed (sol, review round 2). Revert any
+    rename or change in `dense_tp2_device.rs`; move shared helpers only
+    by copying the minimum needed;
   - `crates/moxie-executor/tests/dense_gemma_device.rs` (extend 0096's gate
     test to the two new operations);
   - this task's Result.
