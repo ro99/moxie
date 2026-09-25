@@ -418,15 +418,18 @@ fn enqueue_dense<'ctx>(
                     .captured
                     .is_empty()
                 {
-                    let _ = stream.synchronize();
+                    // Keep the plan and graphs together unless synchronization proves
+                    // launches completed.
+                    if stream.synchronize().is_ok() {
+                        lease
+                            .resource_mut()
+                            .plan
+                            .as_mut()
+                            .expect("dense operation retains plan")
+                            .captured
+                            .clear();
+                    }
                 }
-                lease
-                    .resource_mut()
-                    .plan
-                    .as_mut()
-                    .expect("dense operation retains plan")
-                    .captured
-                    .clear();
             }
             Err(error)
         }

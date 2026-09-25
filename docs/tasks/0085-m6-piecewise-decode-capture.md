@@ -143,6 +143,8 @@ not plan-fixed (report which); a file outside the allowed list is needed.
 
 ## Result, filled after work
 
+R1: Sync failure retains graphs with the lost lease and returns the original error.
+
 Implemented the opt-in segment-capture state and eager/capture/replay modes
 in the selected dense plan. Captured graphs live before the module in plan
 field order, launch only through the plan's stream, and are cleared after a
