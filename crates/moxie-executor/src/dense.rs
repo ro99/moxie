@@ -1310,8 +1310,20 @@ fn launch<'ctx>(
         .package
         .as_ref()
         .ok_or_else(|| invalid("module", "dense kernel module is not loaded"))?;
-    // SAFETY: descriptor selection fixes this ABI and the caller passed only
-    // addresses within ranges admitted for this plan.
+    if package.symbols().get(symbol_index).map(String::as_str) != Some(symbol) {
+        return Err(attribute_node_error(
+            invalid(
+                "launch",
+                "the selected symbol is not the kernel this operation prepared arguments for",
+            ),
+            operation.device_ordinal,
+            node,
+            symbol,
+        ));
+    }
+    // SAFETY: descriptor selection fixes this ABI, the symbol identity is
+    // checked here, and the caller passed only addresses within ranges
+    // admitted for this plan.
     unsafe {
         package
             .launch_async(symbol_index, stream, grid, block, 0, params)

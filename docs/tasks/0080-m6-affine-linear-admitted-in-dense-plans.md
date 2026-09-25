@@ -186,3 +186,8 @@ admission test and reverted. Host gates passed: formatting, workspace and
 executor driver-feature clippy, workspace tests, architecture check and spec
 check. GPU gates passed: dense Gemma device (7 passed, 1 ignored), dense TP2
 (1 passed), and CUDA image suite (63/63 across SM86 and SM120).
+
+R1: `dense::launch` verifies the resolved symbol matches the prepared kernel
+before the unsafe launch and attributes mismatches to the node and symbol.
+Formatting, both clippy gates, workspace tests, dense Gemma, dense TP2 and
+CUDA image gates all passed.
