@@ -139,8 +139,14 @@ reviews):
 1. **M6.1** Fast BF16 linears. Owner ruling (2026-09-25,
    [ADR 0037](../decisions/adr/0037-cublas-tensor-op-bf16-linears.md)):
    cuBLAS tensor-op under ADR 0028's gate; selection projections keep the
-   declared order. [Task 0096](../tasks/0096-m6-cublas-bf16-linears.md). The
-   affine INT8/INT4 kernel is already tensor-core (ADR 0028). Task 0095
+   declared order. [Task 0096](../tasks/0096-m6-cublas-bf16-linears.md)
+   **accepted** 2026-09-25: single-GPU BF16 `Linear` on cuBLAS, eager and
+   captured, from the opt-in unordered catalogue. It is within ADR 0028 on
+   all three GPUs (1 ULP at the decode shape after disallowing
+   reduced-precision split-K) and matches the ordered path's greedy tokens.
+   Next: task 0097 (TP partial, packed split reference, ADR 0036
+   bit-identity). The affine INT8/INT4 kernel is already tensor-core (ADR
+   0028). Task 0095
    measured the current kernel at 0.055 TFLOP/s on a 3090 and 0.109 on the
    5060 Ti, about 1,000 times below the hardware.
 2. **M6.2** Full-step decode capture, attention included, with the piecewise

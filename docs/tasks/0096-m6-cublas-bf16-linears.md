@@ -1,11 +1,23 @@
 # Task 0096 — BF16 dense linears on cuBLAS tensor-op
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer
-Codex `sol`. Asynchronous-ownership work: the escape inventory below is part
-of the contract. **Revised after sol's design review** (4 high, 3 medium, all
-adopted) before any implementation. The TP partial, the split reference and
-ADR 0036 bit-identity moved to task 0097, because they need packed weight
-blocks (sol H4).
+Status: **accepted** (coordinator, 2026-09-25) after sol's design review
+and review round R1. Builder Codex `luna`; reviewer Codex `sol`.
+Implementation `f9dd170`; R1 repair `4af6916`.
+- R1 (coordinator): the 3090 one-row case produced 2 graph nodes (split-K)
+  and 703 elements passing only ADR 0028's second clause, worst 30,522 ULP.
+  The cause was cuBLAS's reduced-precision split-K reduction.
+  `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION` brought it to 1 ULP
+  and 0 second-clause elements.
+- R1 (sol, 2 medium): a failed `Blas::destroy` lost the handle; it now
+  returns it and close keeps it. The rpath did not propagate from an rlib;
+  it was replaced by a check that the loaded cuBLAS version equals the
+  build-time version.
+- The 512-row outlier (about 171 elements of 2.1 M) is genuine
+  cancellation: an error of 1.24e-5 on Σ|x·W| = 258, about 5e-8 relative.
+- **Known coverage gap:** the workspace-before-stream mutant was not caught.
+  The order is unobservable with this operation and driver; the test that
+  would catch it is `cublas_workspace_binding_survives_stream_change` (not
+  written).
 
 ## Identity and authority
 
