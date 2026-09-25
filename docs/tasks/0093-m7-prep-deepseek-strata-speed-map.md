@@ -138,17 +138,17 @@ Builder Claude Opus `builder`, 2026-09-25. Deliverable:
 - **Baseline.** Strata's accepted production result is 26.231 prefill tok/s at
   1,925 prompt tokens (median of three) and 8.627 decode tok/s (median), on two
   RTX 3090s with rank-local TP2 (`docs/models/deepseek.md:191-201`).
-- **Homes.** 50 present, 42 planned, 25 gap.
-  - **Gap rows:** 4, 5, 6, 7, 10, 15, 18, 32, 33, 34, 35, 36, 45, 46, 70,
-    76, 77, 78, 79, 80, 81, 82, 104, 114, 115.
-  - **Forced by representation rules (13):** FP4/FP8 weights, W8A8
-    activations, or a cache below 16 bits (rows 6, 7, 15, 18, 36, 45, 46, 77,
-    78, 79, 80, 81, 114).
+- **Homes (after review round 1).** 28 present, 46 planned, 43 gap. The
+  gap rows fall into five groups:
+  - **13 forced by representation rules:** rows 6, 7, 15, 18, 36, 45, 46, 77,
+    78, 79, 80, 81, 114.
   - **Forced by ADR 0036:** row 70.
   - **Forced by the single-user rule:** row 76.
-  - **No place in Moxie, though accepted in Strata:** rows 4 and 5 (load
-    time), 32–35 (Moxie has no host expert worker pool; `cpu_expert.rs` is
-    single-threaded), and 82.
+  - **Rejected in Strata:** rows 10, 30, 69, 74, 104.
+  - **Host-attention tuning:** rows 89, 90, 91.
+  - **Accepted in Strata with no place in Moxie (20):** rows 4, 5, 24, 31,
+    32, 33, 34, 35, 40, 43, 49, 61, 67, 71, 82, 87, 92, 94, 107, 110. Most
+    of these are host expert execution and loading.
 - **Checks.**
   - `cargo xtask spec-check` passed: 10 documents present and unchanged.
   - The evidence file's relative links resolve.
@@ -161,3 +161,31 @@ Builder Claude Opus `builder`, 2026-09-25. Deliverable:
   another agent's uncommitted `crates/moxie-plan` edits were left unstaged. One
   row cites `crates/moxie-plan/src/tensor_parallel.rs:498` at HEAD `60fc509`,
   because that file has uncommitted edits in the shared tree.
+
+**Review rounds.**
+- **Round 1** (Codex `sol`, source `080fedc`) found 7 high, 5 medium and 2
+  low findings.
+  - **Every high finding was one class:** a row marked present where Moxie
+    had only a related mechanism. These were rows 24, 31, 40, 61, 67, 75,
+    93, 94 and 107.
+  - **The medium findings:**
+    - Rows 69, 71 and 110 were also related mechanisms counted as present.
+    - Row 87 misread two GPUs' figures as a before/after pair.
+    - Row 78 used a slowdown as its gain, and that figure was also in the top
+      ten.
+    - Row 115's gap was contradicted by
+      `docs/evidence/benchmarks/schema.md:57-61`.
+  - **The low findings:** row 83 mapped to M6.3, not M6.1; rows 45 and 46
+    cite ADR 0019 as already settled.
+  - **All were fixed.**
+    - Row 78's gain is now 21.67 s → 4.02 s. It left the top ten, and row
+      60's recorded "228.7x fewer" physical page bytes entered it.
+    - Row 87 is now gap.
+    - Row 115 is now present.
+- **Re-audit.** The repair then re-audited every remaining present row
+  against the Moxie code. **11 more present rows changed**: 13, 37 and 86 to
+  planned; 30, 43, 49, 74, 89, 90, 91 and 92 to gap. Each Note says what
+  differs.
+- **Net effect of round 2.** Present fell from 50 to 28, planned went from 42
+  to 46, and gap went from 25 to 43.
+
