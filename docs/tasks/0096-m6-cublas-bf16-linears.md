@@ -210,8 +210,11 @@ Host gates:
 
 GPU gates (`CUDA_DEVICE_ORDER=PCI_BUS_ID`):
 - the full `dense_gemma_device`, with and without `cublas`;
-- `dense_tp2_device`;
-- `cargo xtask-cuda test-gpu`.
+- `dense_tp2_device`.
+
+`cargo xtask-cuda test-gpu` is **not** required here: no CUDA kernel
+source changes (coordinator, 2026-09-25; gates follow what the task
+touches).
 
 **Stop conditions:**
 - cuBLAS fails on Moxie's contexts;
