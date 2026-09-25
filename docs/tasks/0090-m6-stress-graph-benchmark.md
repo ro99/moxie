@@ -1,6 +1,12 @@
 # Task 0090 — paired benchmark of the dense and two MoE stress graphs (fixture scale)
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer
+Status: **accepted** (coordinator, 2026-09-25), sol's review round R1 clean.
+Test `bdd0990`, evidence `000984c`.
+- Reading (fixture-scale, not a claim): decode median against the M5 closure
+  `08a6fdb`: Shape A 1.77 → 0.97 ms eager, 0.86 ms captured; Shape C top-2
+  2.84 → 1.95 ms eager, 1.78 ms captured; logits 0.000 ULP from the host
+  reference throughout. Capture reserves about 2.1–2.6 MB of graph pools per
+  decode plan. Builder Codex `luna`; reviewer
 Codex `sol`.
 
 ## Identity and authority
