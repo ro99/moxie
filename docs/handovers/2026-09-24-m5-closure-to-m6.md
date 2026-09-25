@@ -297,6 +297,34 @@ coordinator removed `/models/gemma-4-31B-it-AWQ-8bit-moxie` and
 `/models/gemma-4-31B-it-AWQ-8bit.plan.toml`. `/` then had 349 GB free. The
 source checkpoint under `/fast/models` is untouched.
 
+### M6 exit checkpoints: both Gemmas and Qwen (owner, 2026-09-25)
+
+The owner's ruling: "we need to run qwen and both gemmas". M6's exit
+benchmarks run three real checkpoints, all read in place (ADR 0038):
+
+| Checkpoint | Kind | Precision | Size | New work before it runs |
+|---|---|---|---|---|
+| `/fast/models/cyankiwi/gemma-4-31B-it-AWQ-8bit` | dense, 60 layers | INT8 g32 | 35 GB | slice 7 route items 2–6 |
+| `/fast/models/google/gemma-4-26B-A4B-it` | MoE | BF16 | on disk | full-size MoE graph, loader, plan sets |
+| `/fast/models/Altworld/Hemmingway-1` (base `Qwen/Qwen3.8-27B`) | **dense hybrid**: 48 Gated DeltaNet linear-attention layers + 16 gated full-attention layers, MTP head | BF16 | 53.8 GB | new slice (below) |
+
+Hemmingway-1 is not MoE; the owner's exit list names it as the Qwen
+checkpoint. On 2026-09-25 its download was still in progress (shard 00011
+absent, about 48.5 of 53.8 GB present). Its README declares cc-by-nc-4.0.
+
+**New slice, Qwen hybrid attention** (roadmap M7's Qwen row, pulled into M6
+because the owner's exit names the checkpoint). It is built as shared
+operations, not a Qwen runtime:
+- device short convolution and gated delta rule, against the existing host
+  oracles in `moxie-oracles/src/recurrent.rs`;
+- recurrent state as a `moxie-state` schema, with FP32 state and a
+  snapshot/rollback rule (document 04);
+- gated full attention (output gate) and interleaved partial rotary;
+- the `Qwen3_5ForCausalLM` text graph in `moxie-models`;
+- a BF16 loader from the source shards.
+
+The MTP head is not run in M6 (speculative decoding is M9).
+
 ### Known bound for slice 7 (coordinator, 2026-09-24)
 
 `gemma-4-31B-it-AWQ-8bit` is INT8, group 32, symmetric, which the affine
