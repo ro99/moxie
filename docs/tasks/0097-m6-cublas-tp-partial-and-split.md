@@ -219,5 +219,11 @@ without `cublas`, workspace tests, arch-check (79 rejected / 21 accepted
 fixtures, 13 rules), and spec-check (10 documents). The full
 `dense_gemma_device` suite passed before R1 and was not rerun; after R1,
 `cublas_linear_holds_the_quantized_gate --exact` passed on all three GPUs.
-The full `dense_tp2_device` suite passed (2 tests) with one test thread so
-the new eager comparison runs before the existing test's final rank stall.
+R2 isolation: moved `tp2_unordered_matches_the_packed_split_reference` and
+its required helpers into the separate `dense_tp2_cublas_device` integration
+test binary, and restored `dense_tp2_device.rs` to its pre-task contents.
+The new comparison passed (1/1), and the full `dense_tp2_device` suite passed
+(1/1) with Cargo's default test-thread setting. R2 host gates passed again:
+fmt, workspace clippy, executor driver clippy with and without `cublas`,
+workspace tests, arch-check (79 rejected / 21 accepted fixtures, 13 rules),
+and spec-check (10 documents).
