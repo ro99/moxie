@@ -403,6 +403,19 @@ correction does not by itself require rerunning a product suite. New code,
 failures or changed assumptions determine what must be rerun, with the reason
 recorded. Never drop a required gate to save time.
 
+**Keep the wait proportional (owner, 2026-09-25).**
+- Gates follow what the task touches. For example, `cargo xtask-cuda
+  test-gpu` runs only when a CUDA kernel source or its build changes.
+- An additive feature is qualified by one suite run with the feature on.
+  Without the feature, only the build and clippy gate.
+- A mutant runs only the test named to catch it.
+- A feature task carries no timing runs; measurement belongs to the exit
+  benchmarks.
+- Output that a determinism test already covers is not run twice and
+  compared.
+- The reviewer may start at the candidate commit while the final gates run.
+  A gate failure sends back only the difference.
+
 For affected Rust/CUDA work, account for the distinct lanes: host build,
 executor driver feature, and `xtask`'s own CUDA feature. Passing one does not
 compile or qualify the others. Run architecture/spec checks and real hardware,
