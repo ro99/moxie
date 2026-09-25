@@ -267,8 +267,10 @@ run, each a bounded task:
    checkpoint's `down_proj` input (21,504): a qualification task (next
    section).
 4. Plan sets per pipeline stage (task 0091 is single-GPU), with formats.
-5. Weights loaded from the canonical artifact into the residency authority
-   (`CanonicalSource`/`ShardSource` exist from M2/M3).
+5. Weights loaded **from the downloaded checkpoint** into the residency
+   authority (`ShardSource` plus the `moxie-format` importers at load time;
+   [ADR 0038](../decisions/adr/0038-run-source-checkpoints-directly.md),
+   owner 2026-09-25). Item 1's canonical artifact no longer gates anything.
 6. Quality oracle: `transformers 5.5.3` + `torch 2.10` on the host produce
    reference logits for the same token ids (the reference tokenizer only
    makes inputs). Paired with the fixture-scale method of task 0090.
