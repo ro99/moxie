@@ -201,6 +201,34 @@ synchronization failure the suite does not have.
 Owner: coordinator. Revisit: when capture work (tasks 0084–0085) adds stream
 gating to the test support, or at M6 closure at the latest.
 
+### Slice 7 checkpoint route (coordinator, 2026-09-25; owner decisions marked)
+
+Proposed checkpoint for the exit's "actual available checkpoints" rows:
+`/fast/models/cyankiwi/gemma-4-31B-it-AWQ-8bit` (first in the v1 catalog;
+compressed-tensors `pack-quantized`, INT8, group 32, symmetric; 60 layers,
+hidden 5376, intermediate 21504, vocabulary 262144; 7 shards, 33 GB). It
+does not fit one 3090, so it runs as a pipeline over the three GPUs (64 GB
+total) or TP2 on the pair (48 GB) plus paged state. Known work before it can
+run, each a bounded task:
+1. **Canonical artifact (owner decision).** ADR 0020: conversion is
+   user-managed, and no agent may start one without a task naming artifact,
+   revision, expected size and retention. The M3 importer reads
+   `pack-quantized`; the owner either runs `moxie-repack` on this revision or
+   authorizes a task that names it.
+2. Full-size Gemma graph: `moxie-models` builds `Gemma4Text::reduced` only,
+   and its INT8 allowance is explicitly absent (`gemma4.rs` about 405). With
+   task 0080 the format is a planner input, so the graph can stay BF16-typed.
+3. The affine kernel's qualified `max_input` (16,384) is below this
+   checkpoint's `down_proj` input (21,504): a qualification task (next
+   section).
+4. Plan sets per pipeline stage (task 0091 is single-GPU), with formats.
+5. Weights loaded from the canonical artifact into the residency authority
+   (`CanonicalSource`/`ShardSource` exist from M2/M3).
+6. Quality oracle: `transformers 5.5.3` + `torch 2.10` on the host produce
+   reference logits for the same token ids (the reference tokenizer only
+   makes inputs). Paired with the fixture-scale method of task 0090.
+**Owner decisions:** the checkpoint choice, and item 1.
+
 ### Known bound for slice 7 (coordinator, 2026-09-24)
 
 `gemma-4-31B-it-AWQ-8bit` is INT8, group 32, symmetric, which the affine
