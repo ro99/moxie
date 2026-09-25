@@ -291,6 +291,11 @@ it. Command: `moxie-repack plan`, then `moxie-repack repack`. The plan lists
 resumed. The source shard digests are recorded in the run's output. `/`
 had 35 GB free (99% used) right after the run. The owner then freed space: 321 GB
 free (82% used), and the artifact is unaffected (2026-09-25).
+**Deleted (owner, 2026-09-25):** after ADR 0038 the canonical artifact and
+its plan file were no longer needed. On the owner's instruction the
+coordinator removed `/models/gemma-4-31B-it-AWQ-8bit-moxie` and
+`/models/gemma-4-31B-it-AWQ-8bit.plan.toml`. `/` then had 349 GB free. The
+source checkpoint under `/fast/models` is untouched.
 
 ### Known bound for slice 7 (coordinator, 2026-09-24)
 
