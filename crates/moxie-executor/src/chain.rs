@@ -5,7 +5,9 @@
 use core::ffi::c_void;
 use std::collections::{BTreeMap, BTreeSet};
 
-use moxie_cuda::{Event, Module, ModuleImage, RankContext, ResolvedModule, Stream, TrustedImage};
+use moxie_cuda::{
+    CapturedGraph, Event, Module, ModuleImage, RankContext, ResolvedModule, Stream, TrustedImage,
+};
 use moxie_memory::{
     AdmitError, BufferRequest, Ledger, LedgerId, PlanRequest, Reservation, StageSpan,
 };
@@ -125,6 +127,10 @@ pub struct SelectedReservedPlan<'ctx> {
     arena: Option<DeviceArena<'ctx>>,
     ranges: BTreeMap<(StorageRegion, u32), DeviceRange<'ctx>>,
     bound_weights: BTreeMap<ValueId, OwnedBinding>,
+    /// Captured segments must be dropped before the module whose functions
+    /// they reference.
+    pub(crate) captured: Vec<CapturedGraph<'ctx>>,
+    pub(crate) capture_enabled: bool,
     /// The dense kernel module, loaded by the first dense step and dropped
     /// with the plan, so it is never unloaded while a step's kernels may still
     /// run.
@@ -302,6 +308,8 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             arena: Some(arena),
             ranges,
             bound_weights: BTreeMap::new(),
+            captured: Vec::new(),
+            capture_enabled: false,
             package: None,
             ledger: ledger.id(),
         })
@@ -312,6 +320,23 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
     }
     pub fn bound_weight_count(&self) -> usize {
         self.bound_weights.len()
+    }
+
+    pub fn set_segment_capture(&mut self, enabled: bool) -> Result<()> {
+        self.captured.clear();
+        if !self.candidate.is_dense()
+            || !self.candidate.host_expert_joins().is_empty()
+            || !self.candidate.linear_orders().is_empty()
+            || !self.candidate.combine_orders().is_empty()
+            || !self.candidate.expert_ownership().is_empty()
+        {
+            return Err(invalid(
+                "capture",
+                "segment capture requires a dense plan without host joins, reduction orders, or expert ownership",
+            ));
+        }
+        self.capture_enabled = enabled;
+        Ok(())
     }
 
     #[cfg(feature = "paged-attention-binding")]

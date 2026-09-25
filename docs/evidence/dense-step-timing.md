@@ -282,3 +282,62 @@ Derived SQLite report: `/tmp/task-0083-rope-tables.sqlite`, 3,911,680 bytes,
 SHA-256 `7a2e871f71d84e164ba25a0d3495e24fe6ebcb75c48d3ce6f4e17fa0e39e54bf`.
 Both remain outside Git for review. These fixture-scale measurements do not
 close O6 or make a performance claim.
+
+## Piecewise capture
+
+Task 0085 adds opt-in piecewise capture to a reused dense plan. The first
+capture-enabled decode step captures and launches each kernel segment around
+the eager paged-attention work; later decode steps replay those graphs. The
+`dense_gemma_device` output checks were bit-identical on all three GPUs. Its
+capture-eligibility check reads the candidate's linear-order, combine-order,
+expert-ownership and host-join maps; candidates with any such metadata produce
+the typed `capture` refusal.
+
+Three unprofiled runs used the existing fixed-plan `dense_step_timing` harness
+on the NVIDIA GeForce RTX 3090, UUID
+`GPU-3032cfa3-19df-028f-5ebd-43314911e0b9`, driver `610.57.04`, with
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`. Each phase uses five warmups and 50 measured
+executions. Values are median/minimum/maximum microseconds; timings bracket
+`execute_dense` plus `finish`.
+
+~~~sh
+CUDA_DEVICE_ORDER=PCI_BUS_ID cargo test --release -p moxie-executor --features driver,paged-attention-binding,paged-attention-test-hooks --test dense_gemma_device dense_step_timing -- --ignored --nocapture
+~~~
+
+| Run | Phase | Median (µs) | Min (µs) | Max (µs) |
+|---:|---|---:|---:|---:|
+| 1 | prefill | 1363.282 | 1322.262 | 1389.131 |
+| 1 | decode | 999.390 | 970.480 | 1325.463 |
+| 1 | decode-captured | 875.282 | 858.754 | 907.689 |
+| 2 | prefill | 1037.381 | 1015.679 | 1128.077 |
+| 2 | decode | 990.886 | 970.143 | 1036.129 |
+| 2 | decode-captured | 871.839 | 850.950 | 934.303 |
+| 3 | prefill | 1018.194 | 1014.112 | 1113.110 |
+| 3 | decode | 973.029 | 962.637 | 1052.876 |
+| 3 | decode-captured | 858.650 | 850.798 | 929.325 |
+
+The test read `cuMemGetInfo` immediately before and after the capture step.
+Each unprofiled run reported 25,015,222,272 free bytes both before and after,
+for a 0-byte reported delta. The profiled run reported 24,985,796,608 free
+bytes before and after, also a 0-byte delta.
+
+One Nsight Systems `2025.3.2.474-253236389321v0` profile used the same test:
+
+~~~sh
+CUDA_DEVICE_ORDER=PCI_BUS_ID /usr/local/bin/nsys profile -t cuda --stats=true -o /tmp/task-0085-piecewise-decode-capture cargo test --release -p moxie-executor --features driver,paged-attention-binding,paged-attention-test-hooks --test dense_gemma_device dense_step_timing -- --ignored --nocapture
+~~~
+
+The whole process reported 17,018 `cuLaunchKernel` calls and 392
+`cuGraphLaunch` calls. The profiled timing output (prefill
+`1525.489/1481.148/1693.320 µs`, decode `1444.714/1411.998/1627.329 µs`,
+decode-captured `944.308/919.205/1007.416 µs`, median/minimum/maximum) is
+excluded from the unprofiled runs.
+
+Raw trace: `/tmp/task-0085-piecewise-decode-capture.nsys-rep` (2,104,950
+bytes), SHA-256
+`9c76ed217b2c4c98c91ed34d748c9d7ca47e601d39d7c316d0ac8a24f88ea796`.
+Derived SQLite report:
+`/tmp/task-0085-piecewise-decode-capture.sqlite` (4,526,080 bytes), SHA-256
+`262254f8755c4f461e72d2639d9efea131d5381353c7ab87f90433c999131995`.
+Both remain outside Git for review. These fixture-scale measurements do not
+close O6 or make a performance claim.

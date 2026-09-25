@@ -143,4 +143,24 @@ not plan-fixed (report which); a file outside the allowed list is needed.
 
 ## Result, filled after work
 
-(pending)
+Implemented the opt-in segment-capture state and eager/capture/replay modes
+in the selected dense plan. Captured graphs live before the module in plan
+field order, launch only through the plan's stream, and are cleared after a
+failed capture step. Candidate metadata gates capture; candidates with any
+linear order, combine order, expert ownership or host join return a typed
+`capture` refusal. The device test compares eager, captured and replayed
+outputs on eligible candidates, and checks that refusal on all others.
+
+The two requested replay mutants were each caught by the output check and
+reverted. Host gates passed: formatting, workspace clippy, executor
+driver-feature clippy, workspace tests, architecture check and spec check.
+GPU gates passed with `CUDA_DEVICE_ORDER=PCI_BUS_ID`: `dense_gemma_device`
+(8 passed, 1 ignored), `dense_tp2_device` (1 passed), and
+`cargo xtask-cuda test-gpu` (66/66 on SM86 and SM120). Outputs remained
+bit-identical.
+
+The three RTX 3090 timing runs, Nsight driver-call counts and reported
+capture-step free-memory deltas are in
+[`dense-step-timing.md`](../evidence/dense-step-timing.md#piecewise-capture).
+The measured free-memory delta was 0 bytes in all four samples. These
+fixture-scale timings do not close O6 or make a performance claim.

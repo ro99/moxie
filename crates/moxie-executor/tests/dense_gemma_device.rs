@@ -345,7 +345,7 @@ fn run_prefill_decode(
                 .abort(transaction)
                 .expect("abort first step transaction");
             let transaction = state.begin().expect("reused step transaction");
-            let result = result
+            let mut result = result
                 .plan
                 .execute_dense(DenseGraphStep {
                     graph,
@@ -370,13 +370,99 @@ fn run_prefill_decode(
                 "a reused plan and its cached module reproduce the step on {}",
                 capability.uuid
             );
-            commit_paged_state(&mut state, transaction, 0, &mut runs, stream)
-                .expect("commit reused step");
-            result
-                .plan
-                .close(&mut ledger)
-                .map_err(|refused| refused.error)
-                .expect("close step plan");
+            let capture_eligible = {
+                let candidate = result.plan.candidate();
+                candidate.linear_orders().is_empty()
+                    && candidate.combine_orders().is_empty()
+                    && candidate.expert_ownership().is_empty()
+                    && candidate.host_expert_joins().is_empty()
+            };
+            if capture_eligible {
+                state
+                    .abort(transaction)
+                    .expect("abort eager replay before capture");
+                let mut plan = result.plan;
+                plan.set_segment_capture(true)
+                    .expect("enable dense segment capture");
+                let transaction = state.begin().expect("capture step transaction");
+                let captured = plan
+                    .execute_dense(DenseGraphStep {
+                        graph,
+                        capability,
+                        catalogue,
+                        ctx: context,
+                        stream,
+                        state: &mut state,
+                        transaction,
+                        runs: &mut runs,
+                        bindings: result.returned_inputs,
+                        host_experts,
+                    })
+                    .map_err(|refused| refused.error)
+                    .expect("capture step execution")
+                    .finish()
+                    .map_err(|refused| refused.error)
+                    .expect("capture step finish");
+                assert_eq!(
+                    first_output, captured.output,
+                    "captured segments reproduce the eager step on {}",
+                    capability.uuid
+                );
+                state
+                    .abort(transaction)
+                    .expect("abort capture step transaction");
+                let transaction = state.begin().expect("captured replay transaction");
+                let replayed = captured
+                    .plan
+                    .execute_dense(DenseGraphStep {
+                        graph,
+                        capability,
+                        catalogue,
+                        ctx: context,
+                        stream,
+                        state: &mut state,
+                        transaction,
+                        runs: &mut runs,
+                        bindings: captured.returned_inputs,
+                        host_experts,
+                    })
+                    .map_err(|refused| refused.error)
+                    .expect("captured replay execution")
+                    .finish()
+                    .map_err(|refused| refused.error)
+                    .expect("captured replay finish");
+                assert_eq!(
+                    first_output, replayed.output,
+                    "replayed segments reproduce the eager step on {}",
+                    capability.uuid
+                );
+                commit_paged_state(&mut state, transaction, 0, &mut runs, stream)
+                    .expect("commit captured replay step");
+                replayed
+                    .plan
+                    .close(&mut ledger)
+                    .map_err(|refused| refused.error)
+                    .expect("close captured plan");
+            } else {
+                assert!(
+                    matches!(
+                        result.plan.set_segment_capture(true),
+                        Err(moxie_types::Error::InvalidRequest {
+                            field: "capture",
+                            ..
+                        })
+                    ),
+                    "candidate metadata must refuse segment capture on {}",
+                    capability.uuid
+                );
+                commit_paged_state(&mut state, transaction, 0, &mut runs, stream)
+                    .expect("commit reused step");
+                result
+                    .plan
+                    .close(&mut ledger)
+                    .map_err(|refused| refused.error)
+                    .expect("close step plan");
+            }
             first_output
         };
         let prefill = execute(prefill_candidate, prefill_bindings, check_empty_refusal);
@@ -2692,6 +2778,92 @@ fn dense_step_timing() {
             / 2_000.0,
         decode_samples[0] as f64 / 1_000.0,
         decode_samples[REPETITIONS - 1] as f64 / 1_000.0,
+    );
+
+    decode_plan
+        .set_segment_capture(true)
+        .expect("enable decode segment capture");
+    let free_before_capture = context
+        .memory_info()
+        .expect("read free memory before capture")
+        .0;
+    let transaction = state.begin().expect("decode capture transaction");
+    let captured = decode_plan
+        .execute_dense(DenseGraphStep {
+            graph: &fixture.graph,
+            capability: &capability,
+            catalogue: &catalogue,
+            ctx: &context,
+            stream: &stream,
+            state: &mut state,
+            transaction,
+            runs: &mut runs,
+            bindings: decode_bindings,
+            host_experts: &[],
+        })
+        .map_err(|refused| refused.error)
+        .expect("decode capture execution")
+        .finish()
+        .map_err(|refused| refused.error)
+        .expect("decode capture finish");
+    let free_after_capture = context
+        .memory_info()
+        .expect("read free memory after capture")
+        .0;
+    state
+        .abort(transaction)
+        .expect("abort decode capture transaction");
+    eprintln!(
+        "dense-step-timing phase=decode-capture-memory gpu={} free_before_bytes={} free_after_bytes={} delta_bytes={}",
+        capability.uuid,
+        free_before_capture,
+        free_after_capture,
+        i128::from(free_before_capture) - i128::from(free_after_capture),
+    );
+    let mut decode_plan = captured.plan;
+    let mut decode_bindings = captured.returned_inputs;
+
+    let mut captured_decode_samples = Vec::with_capacity(REPETITIONS);
+    for repetition in 0..WARMUP + REPETITIONS {
+        let transaction = state.begin().expect("captured decode timing transaction");
+        let start = std::time::Instant::now();
+        let result = decode_plan
+            .execute_dense(DenseGraphStep {
+                graph: &fixture.graph,
+                capability: &capability,
+                catalogue: &catalogue,
+                ctx: &context,
+                stream: &stream,
+                state: &mut state,
+                transaction,
+                runs: &mut runs,
+                bindings: decode_bindings,
+                host_experts: &[],
+            })
+            .map_err(|refused| refused.error)
+            .expect("captured decode timing execution")
+            .finish()
+            .map_err(|refused| refused.error)
+            .expect("captured decode timing finish");
+        let elapsed = start.elapsed();
+        state
+            .abort(transaction)
+            .expect("abort captured decode timing transaction");
+        decode_plan = result.plan;
+        decode_bindings = result.returned_inputs;
+        if repetition >= WARMUP {
+            captured_decode_samples.push(elapsed.as_nanos());
+        }
+    }
+    captured_decode_samples.sort_unstable();
+    eprintln!(
+        "dense-step-timing phase=decode-captured gpu={} warmup={WARMUP} reps={REPETITIONS} median_us={:.3} min_us={:.3} max_us={:.3}",
+        capability.uuid,
+        (captured_decode_samples[REPETITIONS / 2 - 1] as f64
+            + captured_decode_samples[REPETITIONS / 2] as f64)
+            / 2_000.0,
+        captured_decode_samples[0] as f64 / 1_000.0,
+        captured_decode_samples[REPETITIONS - 1] as f64 / 1_000.0,
     );
 
     prefill_plan

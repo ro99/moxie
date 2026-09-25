@@ -82,6 +82,16 @@ pub struct DenseOperation<'ctx> {
     rope_tables: Vec<((u64, u64, u32), Vec<u8>)>,
     pub(crate) launch_order: Vec<String>,
     pub(crate) device_ordinal: u32,
+    mode: DenseStepMode,
+    segment: usize,
+    open: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenseStepMode {
+    Eager,
+    Capture,
+    Replay,
 }
 
 impl<'ctx> SelectedReservedPlan<'ctx> {
@@ -185,6 +195,9 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             rope_tables: Vec::new(),
             launch_order: Vec::new(),
             device_ordinal: ctx.ordinal(),
+            mode: DenseStepMode::Eager,
+            segment: 0,
+            open: false,
         };
         let mut lease = OperationLease::new("selected reduced dense graph", operation)
             .expect("static label is nonempty");
@@ -348,6 +361,80 @@ impl<'ctx> OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>> {
 
 #[allow(clippy::too_many_arguments)]
 fn enqueue_dense<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    graph: &Graph,
+    state: &mut DeviceKvSequence,
+    transaction: StateTransactionId,
+    runs: &mut [PagedAttentionRun<'ctx>],
+    layers: &BTreeMap<NodeId, u32>,
+    host_experts: &[HostExpertWeights<'_>],
+    stream: &Stream<'ctx>,
+) -> Result<()> {
+    let mode = {
+        let operation = lease.resource();
+        let plan = operation
+            .plan
+            .as_ref()
+            .expect("dense operation retains plan");
+        if !plan.capture_enabled {
+            DenseStepMode::Eager
+        } else if plan.captured.is_empty() {
+            DenseStepMode::Capture
+        } else {
+            DenseStepMode::Replay
+        }
+    };
+    {
+        let operation = lease.resource_mut();
+        operation.mode = mode;
+        operation.segment = 0;
+        operation.open = false;
+    }
+
+    match enqueue_dense_segments(
+        lease,
+        graph,
+        state,
+        transaction,
+        runs,
+        layers,
+        host_experts,
+        stream,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if mode == DenseStepMode::Capture {
+                if lease.resource().open {
+                    if let Ok(graph) = stream.end_capture() {
+                        drop(graph);
+                    }
+                    lease.resource_mut().open = false;
+                }
+                if !lease
+                    .resource()
+                    .plan
+                    .as_ref()
+                    .expect("dense operation retains plan")
+                    .captured
+                    .is_empty()
+                {
+                    let _ = stream.synchronize();
+                }
+                lease
+                    .resource_mut()
+                    .plan
+                    .as_mut()
+                    .expect("dense operation retains plan")
+                    .captured
+                    .clear();
+            }
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_dense_segments<'ctx>(
     lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
     graph: &Graph,
     state: &mut DeviceKvSequence,
@@ -739,6 +826,7 @@ fn enqueue_dense<'ctx>(
                 visibility,
                 layer,
             } => {
+                close_segment(lease, stream)?;
                 execute_attention(
                     lease,
                     node,
@@ -1039,6 +1127,9 @@ fn enqueue_dense<'ctx>(
                 order: moxie_graph::CombineOrder::AscendingExpertId,
                 output_scale,
             } => {
+                if selected.descriptor.operation == SemanticKernelOp::CombineHostJoin {
+                    close_segment(lease, stream)?;
+                }
                 let candidate = lease
                     .resource()
                     .plan
@@ -1193,6 +1284,22 @@ fn enqueue_dense<'ctx>(
             }
         }
     }
+    close_segment(lease, stream)?;
+    if lease.resource().mode == DenseStepMode::Replay
+        && lease.resource().segment
+            != lease
+                .resource()
+                .plan
+                .as_ref()
+                .expect("dense operation retains plan")
+                .captured
+                .len()
+    {
+        return Err(invalid(
+            "capture",
+            "replay did not consume every captured segment",
+        ));
+    }
     // A stage graph's attention nodes each name their layer's run; only a
     // whole graph must use every run.
     if layers.is_empty() && attention_index != runs.len() {
@@ -1201,6 +1308,54 @@ fn enqueue_dense<'ctx>(
             "dense graph attention nodes and admitted device runs differ",
         ));
     }
+    Ok(())
+}
+
+fn close_segment<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    stream: &Stream<'ctx>,
+) -> Result<()> {
+    let (mode, open, segment) = {
+        let operation = lease.resource();
+        (operation.mode, operation.open, operation.segment)
+    };
+    if !open {
+        return Ok(());
+    }
+    match mode {
+        DenseStepMode::Eager => {
+            return Err(invalid("capture", "an eager step has an open segment"));
+        }
+        DenseStepMode::Capture => {
+            let graph = stream.end_capture();
+            lease.resource_mut().open = false;
+            let graph = graph?;
+            let plan = lease
+                .resource_mut()
+                .plan
+                .as_mut()
+                .expect("dense operation retains plan");
+            if plan.captured.len() != segment {
+                return Err(invalid(
+                    "capture",
+                    "captured segment index differs from the plan sequence",
+                ));
+            }
+            plan.captured.push(graph);
+            // SAFETY: the plan retains the graph, its module, and every
+            // admitted buffer until the completion event is observed.
+            unsafe {
+                plan.captured[segment].launch(stream)?;
+            }
+        }
+        DenseStepMode::Replay => {}
+    }
+    let operation = lease.resource_mut();
+    operation.segment = operation
+        .segment
+        .checked_add(1)
+        .ok_or_else(|| invalid("capture", "segment count overflowed"))?;
+    operation.open = false;
     Ok(())
 }
 
@@ -1430,7 +1585,7 @@ fn upload_rope_tables<'ctx>(
 
 #[allow(clippy::too_many_arguments)]
 fn launch<'ctx>(
-    lease: &OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
     symbol_index: usize,
     stream: &Stream<'ctx>,
     grid: (u32, u32, u32),
@@ -1439,6 +1594,59 @@ fn launch<'ctx>(
     node: &SelectedNode,
     symbol: &str,
 ) -> Result<()> {
+    let (mode, open, segment, symbol_matches) = {
+        let operation = lease.resource();
+        let package = operation
+            .plan
+            .as_ref()
+            .expect("dense operation retains plan")
+            .package
+            .as_ref()
+            .ok_or_else(|| invalid("module", "dense kernel module is not loaded"))?;
+        (
+            operation.mode,
+            operation.open,
+            operation.segment,
+            package.symbols().get(symbol_index).map(String::as_str) == Some(symbol),
+        )
+    };
+    if !symbol_matches {
+        return Err(attribute_node_error(
+            invalid(
+                "launch",
+                "the selected symbol is not the kernel this operation prepared arguments for",
+            ),
+            lease.resource().device_ordinal,
+            node,
+            symbol,
+        ));
+    }
+
+    if mode == DenseStepMode::Replay {
+        if open {
+            return Ok(());
+        }
+        let captured = lease
+            .resource()
+            .plan
+            .as_ref()
+            .expect("dense operation retains plan")
+            .captured
+            .get(segment)
+            .ok_or_else(|| invalid("capture", "replay has no captured segment"))?;
+        // SAFETY: the plan retains the graph, its module, and every admitted
+        // buffer until the completion event is observed.
+        unsafe {
+            captured.launch(stream)?;
+        }
+        lease.resource_mut().open = true;
+        return Ok(());
+    }
+
+    if mode == DenseStepMode::Capture && !open {
+        stream.begin_capture()?;
+        lease.resource_mut().open = true;
+    }
     let operation = lease.resource();
     let package = operation
         .plan
@@ -1447,17 +1655,6 @@ fn launch<'ctx>(
         .package
         .as_ref()
         .ok_or_else(|| invalid("module", "dense kernel module is not loaded"))?;
-    if package.symbols().get(symbol_index).map(String::as_str) != Some(symbol) {
-        return Err(attribute_node_error(
-            invalid(
-                "launch",
-                "the selected symbol is not the kernel this operation prepared arguments for",
-            ),
-            operation.device_ordinal,
-            node,
-            symbol,
-        ));
-    }
     // SAFETY: descriptor selection fixes this ABI, the symbol identity is
     // checked here, and the caller passed only addresses within ranges
     // admitted for this plan.
@@ -1477,7 +1674,7 @@ fn push_launch<'ctx>(
 
 #[allow(clippy::too_many_arguments)]
 fn launch_combine_partial<'ctx>(
-    lease: &OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
     base: usize,
     stream: &Stream<'ctx>,
     selected: &SelectedNode,
@@ -1657,7 +1854,7 @@ fn host_join_extents(
 
 #[allow(clippy::too_many_arguments)]
 fn enqueue_host_join<'ctx>(
-    lease: &OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
     base: usize,
     stream: &Stream<'ctx>,
     selected: &SelectedNode,
@@ -1679,13 +1876,14 @@ fn enqueue_host_join<'ctx>(
     weights: &HostExpertWeights<'_>,
 ) -> Result<()> {
     let extents = host_join_extents(rows, hidden, top_k, intermediate)?;
-    let workspace = lease
+    let workspace_bytes = lease
         .resource()
         .plan
         .as_ref()
         .expect("dense operation retains plan")
-        .workspace_range()?;
-    if workspace.bytes()
+        .workspace_range()?
+        .bytes();
+    if workspace_bytes
         < u64::try_from(extents.workspace_bytes)
             .map_err(|_| invalid("host_experts", "workspace extent exceeds u64"))?
     {
@@ -1713,7 +1911,13 @@ fn enqueue_host_join<'ctx>(
 
     // Group zero is the device partial A. The synchronous stream drain below
     // makes both its bytes and the route/input readbacks safe to consume.
-    let partial_a = workspace.device_address()?;
+    let partial_a = lease
+        .resource()
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan")
+        .workspace_range()?
+        .device_address()?;
     launch_combine_partial(
         lease,
         base,
@@ -1857,7 +2061,13 @@ fn enqueue_host_join<'ctx>(
 
     let partial_offset = u64::try_from(extents.partial_bytes)
         .map_err(|_| invalid("workspace", "host partial extent exceeds u64"))?;
-    workspace.copy_from_host_at(partial_offset, &host_partial)?;
+    lease
+        .resource()
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan")
+        .workspace_range()?
+        .copy_from_host_at(partial_offset, &host_partial)?;
     let mut rank_zero = partial_a;
     let mut rank_one = partial_a
         .checked_add(partial_offset)
