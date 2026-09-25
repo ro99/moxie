@@ -145,6 +145,12 @@ mod dense;
 #[cfg(feature = "paged-attention-binding")]
 pub use dense::{DenseGraphResult, DenseGraphStep, DensePlanRunRefused, HostExpertWeights};
 #[cfg(feature = "paged-attention-binding")]
+mod dense_set;
+#[cfg(feature = "paged-attention-binding")]
+pub use dense_set::{
+    DensePlanSet, DensePlanSetRefused, DenseSetCloseRefused, DenseSetOutput, DenseSetStep,
+};
+#[cfg(feature = "paged-attention-binding")]
 mod dense_tp;
 #[cfg(feature = "paged-attention-binding")]
 pub use dense_tp::{DenseRankWorkerConfig, DenseRankWorkers, DenseWorkerStep};

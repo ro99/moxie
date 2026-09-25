@@ -2121,8 +2121,7 @@ fn address<'ctx>(operation: &DenseOperation<'ctx>, value: ValueId) -> Result<u64
         .plan
         .as_ref()
         .expect("dense operation retains plan")
-        .range_for_value(value)
-        .and_then(|range| range.device_address())
+        .value_address(value)
 }
 
 fn address_range<'op, 'ctx>(

@@ -1201,10 +1201,10 @@ pub struct ResidencyRequest {
     pub label: String,
     /// The host cache, charged to `host.pageable`.
     pub host_cap_bytes: u64,
-    /// Per-device expert caches, charged to `device.expert_cache`, each against
-    /// its own device UUID. One cap per device, never one shared number:
-    /// AGENTS.md forbids assuming the three cards' memory is one allocation.
-    pub device_caps: Vec<(DeviceUuid, u64)>,
+    /// Per-device caches, each against its own device UUID. One cap and tier
+    /// per device, never one shared number: AGENTS.md forbids assuming the
+    /// three cards' memory is one allocation.
+    pub device_caps: Vec<(DeviceUuid, u64, DeviceTier)>,
     /// Bound on tracked placements. Its control cost is admitted up front.
     pub max_placements: u32,
     /// Bound on one chunk identity's heap: `artifact` plus `role`, in bytes.
@@ -1239,7 +1239,14 @@ impl ResidencyRequest {
     }
 
     pub fn device(mut self, uuid: DeviceUuid, cap_bytes: u64) -> Self {
-        self.device_caps.push((uuid, cap_bytes));
+        self.device_caps
+            .push((uuid, cap_bytes, DeviceTier::ExpertCache));
+        self
+    }
+
+    pub fn device_weights(mut self, uuid: DeviceUuid, cap_bytes: u64) -> Self {
+        self.device_caps
+            .push((uuid, cap_bytes, DeviceTier::PackedResidentWeights));
         self
     }
 
@@ -1340,7 +1347,7 @@ impl ResidencyAuthority {
             ));
         }
         let mut seen = std::collections::BTreeSet::new();
-        for (uuid, cap) in &request.device_caps {
+        for (uuid, cap, _) in &request.device_caps {
             if !seen.insert(*uuid) {
                 return Err(invalid("device_caps", "a device is declared twice"));
             }
@@ -1406,11 +1413,11 @@ impl ResidencyAuthority {
             None
         } else {
             let mut plan = PlanRequest::new(format!("{} device caches", request.label), ["live"])?;
-            for (uuid, cap) in &request.device_caps {
+            for (uuid, cap, tier) in &request.device_caps {
                 plan.buffer(BufferRequest::new(
-                    format!("expert cache on {uuid}"),
+                    format!("{} cache on {uuid}", tier.name()),
                     Scope::Device(*uuid),
-                    Tier::Device(DeviceTier::ExpertCache),
+                    Tier::Device(*tier),
                     *cap,
                     StageSpan::at(0),
                 ))?;
@@ -1490,7 +1497,7 @@ impl ResidencyAuthority {
             },
         );
 
-        for (uuid, cap) in &request.device_caps {
+        for (uuid, cap, tier) in &request.device_caps {
             match Arena::new(
                 format!("{} device cache", request.label),
                 *cap,
@@ -1500,7 +1507,7 @@ impl ResidencyAuthority {
                     caches.insert(
                         Scope::Device(*uuid),
                         ScopeCache {
-                            tier: Tier::Device(DeviceTier::ExpertCache),
+                            tier: Tier::Device(*tier),
                             cap_bytes: *cap,
                             arena,
                             committed: 0,

@@ -127,6 +127,7 @@ pub struct SelectedReservedPlan<'ctx> {
     arena: Option<DeviceArena<'ctx>>,
     ranges: BTreeMap<(StorageRegion, u32), DeviceRange<'ctx>>,
     bound_weights: BTreeMap<ValueId, OwnedBinding>,
+    resident_weights: BTreeMap<ValueId, u64>,
     /// Captured segments must be dropped before the module whose functions
     /// they reference.
     pub(crate) captured: Vec<CapturedGraph<'ctx>>,
@@ -194,25 +195,99 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         ledger: &mut Ledger,
         ctx: &'ctx RankContext,
     ) -> std::result::Result<Self, SelectedAdmitRefused<'ctx>> {
+        Self::admit_inner(
+            candidate,
+            graph,
+            capability,
+            catalogue,
+            ledger,
+            ctx,
+            BTreeMap::new(),
+            false,
+        )
+    }
+
+    pub(crate) fn admit_with_resident_weights(
+        candidate: SelectedPlanCandidate,
+        graph: &Graph,
+        capability: &DeviceCapability,
+        catalogue: &KernelCatalogue,
+        ledger: &mut Ledger,
+        ctx: &'ctx RankContext,
+        resident_weights: BTreeMap<ValueId, u64>,
+    ) -> std::result::Result<Self, SelectedAdmitRefused<'ctx>> {
+        Self::admit_inner(
+            candidate,
+            graph,
+            capability,
+            catalogue,
+            ledger,
+            ctx,
+            resident_weights,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_inner(
+        candidate: SelectedPlanCandidate,
+        graph: &Graph,
+        capability: &DeviceCapability,
+        catalogue: &KernelCatalogue,
+        ledger: &mut Ledger,
+        ctx: &'ctx RankContext,
+        resident_weights: BTreeMap<ValueId, u64>,
+        use_resident_weights: bool,
+    ) -> std::result::Result<Self, SelectedAdmitRefused<'ctx>> {
         let fail = |candidate, error| SelectedAdmitRefused::Invalid {
             candidate: Box::new(candidate),
             error,
         };
+        if use_resident_weights
+            && (resident_weights.len() != graph.weights().len()
+                || graph
+                    .weights()
+                    .iter()
+                    .any(|value| !resident_weights.contains_key(value)))
+        {
+            return Err(fail(
+                candidate,
+                invalid("weights", "resident addresses must name every graph weight"),
+            ));
+        }
         if !candidate.matches(graph, capability, catalogue) || ctx.uuid() != capability.uuid {
             return Err(fail(
                 candidate,
                 invalid("plan", "graph/catalogue/capability/UUID binding changed"),
             ));
         }
+        let arena_capacity = if use_resident_weights {
+            match candidate
+                .combined_arena_bytes()
+                .checked_sub(candidate.weight_region_bytes())
+            {
+                Some(bytes) => bytes,
+                None => {
+                    return Err(fail(
+                        candidate,
+                        invalid("range", "resident weight region exceeds arena size"),
+                    ));
+                }
+            }
+        } else {
+            candidate.combined_arena_bytes()
+        };
         let mut regions = match moxie_memory::fallible::with_capacity(3) {
             Ok(regions) => regions,
             Err(error) => return Err(fail(candidate, error)),
         };
-        for region in [
-            (
+        if !use_resident_weights && candidate.weight_region_bytes() != 0 {
+            regions.push((
                 DeviceTier::PackedResidentWeights,
                 candidate.weight_region_bytes(),
-            ),
+            ));
+        }
+        for region in [
             (DeviceTier::Activations, candidate.activation_region_bytes()),
             (
                 DeviceTier::KernelWorkspace,
@@ -223,10 +298,11 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                 regions.push(region);
             }
         }
-        let request = match selected_resource_request(&candidate) {
-            Ok(request) => request,
-            Err(error) => return Err(fail(candidate, error)),
-        };
+        let request =
+            match selected_resource_request_with_weights(&candidate, !use_resident_weights) {
+                Ok(request) => request,
+                Err(error) => return Err(fail(candidate, error)),
+            };
         let reservation = match ledger.admit(&request) {
             Ok(value) => value,
             Err(AdmitError::Invalid(error)) => return Err(fail(candidate, error)),
@@ -242,7 +318,7 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             reservation,
             ctx,
             &regions,
-            candidate.combined_arena_bytes(),
+            arena_capacity,
             format!("selected-plan-{}", candidate.base().id().get()),
         ) {
             Ok(value) => value,
@@ -260,17 +336,64 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         };
         let mut specs: BTreeMap<(StorageRegion, u32), (u64, u64)> = BTreeMap::new();
         for value in candidate.values() {
+            if use_resident_weights && value.region == StorageRegion::Weights {
+                continue;
+            }
+            let offset = if use_resident_weights {
+                match value.offset.checked_sub(candidate.weight_region_bytes()) {
+                    Some(offset) => offset,
+                    None => {
+                        let error = invalid("range", "resident weight region exceeds value offset");
+                        return match unwind_selected(arena, BTreeMap::new(), ledger) {
+                            Ok(()) => Err(fail(candidate, error)),
+                            Err(refused) => Err(SelectedAdmitRefused::Held {
+                                candidate: Box::new(candidate),
+                                resource: SelectedHeldResource::Arena {
+                                    arena: Box::new(refused.arena),
+                                    ranges: refused.ranges,
+                                },
+                                error: refused.error,
+                            }),
+                        };
+                    }
+                }
+            } else {
+                value.offset
+            };
             specs
                 .entry((value.region, value.slot))
-                .or_insert((value.offset, value.physical_bytes));
+                .or_insert((offset, value.physical_bytes));
         }
         if candidate.workspace().physical_bytes != 0 {
+            let offset = if use_resident_weights {
+                match candidate
+                    .workspace()
+                    .offset
+                    .checked_sub(candidate.weight_region_bytes())
+                {
+                    Some(offset) => offset,
+                    None => {
+                        let error =
+                            invalid("range", "resident weight region exceeds workspace offset");
+                        return match unwind_selected(arena, BTreeMap::new(), ledger) {
+                            Ok(()) => Err(fail(candidate, error)),
+                            Err(refused) => Err(SelectedAdmitRefused::Held {
+                                candidate: Box::new(candidate),
+                                resource: SelectedHeldResource::Arena {
+                                    arena: Box::new(refused.arena),
+                                    ranges: refused.ranges,
+                                },
+                                error: refused.error,
+                            }),
+                        };
+                    }
+                }
+            } else {
+                candidate.workspace().offset
+            };
             specs.insert(
                 (StorageRegion::Workspace, 0),
-                (
-                    candidate.workspace().offset,
-                    candidate.workspace().physical_bytes,
-                ),
+                (offset, candidate.workspace().physical_bytes),
             );
         }
         let mut ranges = BTreeMap::new();
@@ -315,6 +438,7 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             arena: Some(arena),
             ranges,
             bound_weights: BTreeMap::new(),
+            resident_weights,
             captured: Vec::new(),
             capture_enabled: false,
             graph_reservation: None,
@@ -329,6 +453,13 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
     }
     pub fn bound_weight_count(&self) -> usize {
         self.bound_weights.len()
+    }
+
+    pub(crate) fn value_address(&self, value: ValueId) -> Result<u64> {
+        if let Some(address) = self.resident_weights.get(&value) {
+            return Ok(*address);
+        }
+        self.range_for_value(value)?.device_address()
     }
 
     pub fn set_segment_capture(&mut self, enabled: bool, ledger: &mut Ledger) -> Result<()> {
@@ -812,6 +943,13 @@ fn captured_graph_counts(candidate: &SelectedPlanCandidate) -> Result<(u64, u64)
 /// This is public so validation and diagnostics can inspect the tier charges,
 /// real stage spans, and host-source retention without allocating a device.
 pub fn selected_resource_request(candidate: &SelectedPlanCandidate) -> Result<PlanRequest> {
+    selected_resource_request_with_weights(candidate, true)
+}
+
+fn selected_resource_request_with_weights(
+    candidate: &SelectedPlanCandidate,
+    include_weights: bool,
+) -> Result<PlanRequest> {
     // Both the label and the stage names are copied **fallibly**: the stages
     // borrow the candidate, which does not outlive the request, and `format!`
     // aborts where this has a refusal to return.
@@ -854,7 +992,7 @@ pub fn selected_resource_request(candidate: &SelectedPlanCandidate) -> Result<Pl
             ),
         ),
     ] {
-        if bytes == 0 {
+        if bytes == 0 || (!include_weights && tier == DeviceTier::PackedResidentWeights) {
             continue;
         }
         request.buffer(BufferRequest::new(
@@ -872,7 +1010,10 @@ pub fn selected_resource_request(candidate: &SelectedPlanCandidate) -> Result<Pl
         .try_fold(0u64, |sum, binding| {
             let bytes = match binding {
                 moxie_plan::ValueBinding::ExternalInput(value) => value.required_bytes,
-                moxie_plan::ValueBinding::ExternalWeight(value) => value.required_bytes,
+                moxie_plan::ValueBinding::ExternalWeight(value) if include_weights => {
+                    value.required_bytes
+                }
+                moxie_plan::ValueBinding::ExternalWeight(_) => 0,
                 moxie_plan::ValueBinding::ArenaTensor(_) => 0,
             };
             sum.checked_add(bytes)
@@ -922,6 +1063,9 @@ pub(crate) fn validate_bindings_except(
 ) -> Result<()> {
     let mut seen = BTreeSet::new();
     for binding in bindings {
+        if plan.resident_weights.contains_key(&binding.value) {
+            return Err(invalid("bindings", "this plan's weights are resident"));
+        }
         if !seen.insert(binding.value) {
             return Err(invalid("bindings", "duplicate value binding"));
         }
@@ -1028,7 +1172,10 @@ pub(crate) fn validate_bindings_except(
         }
     }
     for value in graph.weights() {
-        if !seen.contains(value) && !plan.bound_weights.contains_key(value) {
+        if !seen.contains(value)
+            && !plan.bound_weights.contains_key(value)
+            && !plan.resident_weights.contains_key(value)
+        {
             return Err(invalid(
                 "bindings",
                 format!("missing immutable weight {}", value.0),

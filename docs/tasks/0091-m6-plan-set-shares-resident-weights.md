@@ -174,4 +174,17 @@ definition; a file outside the allowed list is needed.
 
 ## Result, filled after work
 
-(pending)
+Implemented tier-aware device residency and `DensePlanSet`: resident-weight
+plans omit their own weight region, resolve weight addresses through the
+authority-backed leases, reject duplicate weight bindings, and retain plans
+and leases across refusals. Added
+`bucket_plans_share_one_resident_weight_copy` for Shape A buckets `[1, 2, 4,
+8]` on the specified 3090; captured prefill chunks and decode matched
+`host_step` at 0.000 BF16 ULP, with `PackedResidentWeights` charged once.
+
+The offset-zero mutant failed before launch at lease-range revalidation, then
+was reverted. Host gates passed: fmt, workspace and driver-feature clippy,
+workspace tests, `arch-check`, and `spec-check`. GPU gates passed with
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`: `dense_gemma_device` (11 passed, 2 ignored),
+`residency_device` (1 passed), `dense_tp2_device` (1 passed), and
+`cargo xtask-cuda test-gpu` (69/69).

@@ -15,9 +15,11 @@ use std::time::Duration;
 use moxie_cuda::{RankContext, Stream, device_count, query_device};
 use moxie_engine::{HostTensor, Value};
 use moxie_executor::paged_attention::device::commit_paged_state;
+use moxie_executor::residency::{ChunkSource, DeviceResidency, drain_reads};
 use moxie_executor::{
-    DenseGraphStep, HostExpertWeights, PageGeometry, PagedAttentionRun, PipelineStageWorker,
-    PipelineWorkers, SelectedReservedPlan, SoloRankWorker, SoloRankWorkerConfig, Staging,
+    DenseGraphStep, DensePlanSet, DenseSetStep, HostExpertWeights, PageGeometry, PagedAttentionRun,
+    PipelineStageWorker, PipelineWorkers, SelectedReservedPlan, SoloRankWorker,
+    SoloRankWorkerConfig, Staging,
 };
 use moxie_format::affine::{
     AffineDescriptor, AffineTensor, Grouping, IntWidth, ZeroPoints, pack_row,
@@ -26,7 +28,10 @@ use moxie_format::bf16::f32_to_bf16_bits;
 use moxie_format::scale::{ScaleDtype, ScaleValues};
 use moxie_graph::{Graph, GraphBuilder, OpParams, OracleRegistry, ValueId, ValueRole};
 use moxie_interp::{Cancel, Interpreter, KvCache};
-use moxie_memory::{CapacitySnapshot, Ledger};
+use moxie_memory::{
+    AcquireRequest, Acquired, ArtifactId, CapacitySnapshot, ChunkId, Content, Ledger, LogicalRange,
+    ResidencyAuthority, ResidencyRequest, TensorSlot, TurnId, UseClass,
+};
 use moxie_plan::WeightFormat;
 use moxie_plan::{
     Phase, PipelineLowering, ResourceWorkload, SelectedPlanCandidate, StageGraph,
@@ -38,8 +43,8 @@ use moxie_state::{
     DeviceKvSequence, KvGeometry, LayerKv, ROOT, Retention, SequenceState, StateKind,
 };
 use moxie_types::{
-    DeviceCapability, DeviceUuid, Dim, HostTier, PagePlacement, Precision, RankId, Scope,
-    SemanticKernelOp, TensorLayout, Tier,
+    DeviceCapability, DeviceTier, DeviceUuid, Dim, HostTier, PagePlacement, Precision, RankId,
+    Scope, SemanticKernelOp, TensorLayout, Tier,
 };
 
 static DEVICE_TEST: Mutex<()> = Mutex::new(());
@@ -3690,4 +3695,318 @@ fn stress_graph_benchmark() {
         }
         assert!(ledger.outstanding().is_empty());
     }
+}
+
+struct DenseFixtureSource<'a> {
+    fixture: &'a moxie_cli::fixture::Fixture,
+    artifact: ArtifactId,
+    roles: BTreeMap<String, ValueId>,
+}
+
+impl DenseFixtureSource<'_> {
+    fn new(fixture: &moxie_cli::fixture::Fixture, artifact: ArtifactId) -> DenseFixtureSource<'_> {
+        let roles = fixture
+            .graph
+            .weights()
+            .iter()
+            .map(|value| {
+                (
+                    fixture
+                        .graph
+                        .name(*value)
+                        .expect("fixture weight has a role")
+                        .to_owned(),
+                    *value,
+                )
+            })
+            .collect();
+        DenseFixtureSource {
+            fixture,
+            artifact,
+            roles,
+        }
+    }
+}
+
+impl ChunkSource for DenseFixtureSource<'_> {
+    fn read_chunk(&mut self, chunk: &ChunkId, into: &mut [u8]) -> moxie_types::Result<()> {
+        if chunk.artifact() != &self.artifact || chunk.range().len_bytes() != into.len() as u64 {
+            return Err(moxie_types::Error::InvalidArtifact {
+                detail: "fixture source received a different artifact or extent".into(),
+            });
+        }
+        let value = self.roles.get(chunk.slot().role()).ok_or_else(|| {
+            moxie_types::Error::InvalidArtifact {
+                detail: format!(
+                    "fixture source has no weight role {:?}",
+                    chunk.slot().role()
+                )
+                .into(),
+            }
+        })?;
+        let bytes = encode_value(self.fixture.weights.get(*value).ok_or_else(|| {
+            moxie_types::Error::InvalidArtifact {
+                detail: "fixture source has no weight value".into(),
+            }
+        })?);
+        let start = usize::try_from(chunk.range().offset_bytes()).map_err(|_| {
+            moxie_types::Error::InvalidArtifact {
+                detail: "fixture source range exceeds address space".into(),
+            }
+        })?;
+        let end =
+            start
+                .checked_add(into.len())
+                .ok_or_else(|| moxie_types::Error::InvalidArtifact {
+                    detail: "fixture source range overflows".into(),
+                })?;
+        let source = bytes
+            .get(start..end)
+            .ok_or_else(|| moxie_types::Error::InvalidArtifact {
+                detail: "fixture source range exceeds weight bytes".into(),
+            })?;
+        into.copy_from_slice(source);
+        Ok(())
+    }
+}
+
+#[test]
+fn bucket_plans_share_one_resident_weight_copy() {
+    let _guard = one_at_a_time();
+    let ordinal = (0..device_count().expect("enumerate CUDA devices"))
+        .find_map(|ordinal| {
+            let capability = query_device(ordinal).ok()?;
+            (capability.uuid.to_string() == "GPU-3032cfa3-19df-028f-5ebd-43314911e0b9")
+                .then_some(ordinal)
+        })
+        .expect("the target RTX 3090 is visible");
+    let context =
+        RankContext::acquire(RankId(ordinal), ordinal).expect("acquire target GPU rank context");
+    let stream = Stream::new(&context).expect("create resident-weight stream");
+    let capability = query_device(ordinal).expect("query target GPU capability");
+    let shape = moxie_cli::gemma::Shape::A;
+    let config = shape.config();
+    let fixture = moxie_cli::gemma::build(shape).expect("build dense Shape A fixture");
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+    let buckets = [1_u64, 2, 4, 8];
+    let prompt_rows = 13_u64;
+    let visible_tokens = prompt_rows + 1;
+
+    let candidates = buckets
+        .iter()
+        .copied()
+        .map(|rows| {
+            lower_selected(
+                &fixture.graph,
+                ResourceWorkload {
+                    phase: Phase::Prefill,
+                    rows,
+                    visible_tokens,
+                    branch_rows: rows,
+                    output: fixture.graph.output(),
+                    device: capability.uuid,
+                    paged_state_capacity: None,
+                },
+                &capability,
+                &catalogue,
+            )
+            .expect("lower resident-weight bucket")
+        })
+        .collect::<Vec<_>>();
+    let planned_weights = |candidate: &SelectedPlanCandidate| {
+        candidate
+            .values()
+            .iter()
+            .filter(|value| fixture.graph.weights().contains(&value.value))
+            .try_fold(0u64, |sum, value| sum.checked_add(value.physical_bytes))
+            .expect("planned weight bytes fit u64")
+    };
+    let total = planned_weights(candidates.first().expect("at least one bucket"));
+    assert!(total > 0, "Shape A has resident weights");
+    for candidate in &candidates {
+        assert_eq!(planned_weights(candidate), total);
+    }
+
+    let mut ledger = measured_ledger(&context);
+    let mut authority = ResidencyAuthority::open(
+        &mut ledger,
+        &ResidencyRequest::new("dense spine residency", total)
+            .device_weights(capability.uuid, total),
+    )
+    .expect("admit one packed resident-weight cache");
+    let scope = Scope::Device(capability.uuid);
+    assert_eq!(
+        ledger.committed(scope, Tier::Device(DeviceTier::PackedResidentWeights)),
+        total,
+        "residency charges the planned weight tier once"
+    );
+    let mut residency = DeviceResidency::create(&context, &mut authority)
+        .expect("back the one resident-weight allocation");
+    let artifact = ArtifactId::new("dense-shape-a").expect("fixture artifact identity");
+    let mut source = DenseFixtureSource::new(&fixture, artifact.clone());
+    let mut leases = BTreeMap::new();
+    let mut logical_bytes = 0u64;
+    for value in fixture.graph.weights() {
+        let planned = candidates[0].value(*value).expect("planned graph weight");
+        logical_bytes = logical_bytes
+            .checked_add(planned.logical_bytes)
+            .expect("logical weights fit u64");
+        let role = fixture.graph.name(*value).expect("weight role");
+        let chunk = ChunkId::new(
+            artifact.clone(),
+            TensorSlot::tensor(role).expect("weight tensor slot"),
+            LogicalRange::new(0, planned.logical_bytes).expect("whole weight range"),
+            1,
+        );
+        let Acquired::Pending { lease, work, .. } = authority
+            .acquire(AcquireRequest {
+                chunk: &chunk,
+                destination: scope,
+                now: 0,
+                deadline: u64::MAX,
+                class: UseClass::demand(Content::DenseSpine),
+                turn: TurnId::new(1),
+            })
+            .expect("acquire resident weight")
+        else {
+            panic!("fixture starts with an empty residency cache")
+        };
+        let uploads = drain_reads(&mut authority, &mut source, work)
+            .expect("read fixture weight through residency authority");
+        assert_eq!(uploads.len(), 1, "one upload follows each weight read");
+        for upload in &uploads {
+            residency
+                .perform_upload(&mut authority, &stream, upload)
+                .unwrap_or_else(|refused| panic!("upload {role}: {refused}"));
+        }
+        assert_eq!(
+            authority
+                .device_range(&lease)
+                .expect("uploaded weight range")
+                .1,
+            planned.logical_bytes,
+            "uploaded extent matches the planned logical weight"
+        );
+        leases.insert(*value, lease);
+    }
+    assert_eq!(authority.committed_bytes(scope).unwrap(), logical_bytes);
+
+    let mut set = DensePlanSet::admit(
+        &mut ledger,
+        &context,
+        &fixture.graph,
+        &capability,
+        &catalogue,
+        &residency,
+        &authority,
+        leases,
+        candidates,
+    )
+    .unwrap_or_else(|refused| panic!("admit shared-weight buckets: {refused:?}"));
+    for bucket in buckets {
+        set.set_segment_capture(bucket, true, &mut ledger)
+            .unwrap_or_else(|error| panic!("capture bucket {bucket}: {error}"));
+    }
+    assert_eq!(
+        ledger.committed(scope, Tier::Device(DeviceTier::PackedResidentWeights)),
+        total,
+        "all four plans share the one authority-owned weight copy"
+    );
+
+    let prompt: Vec<_> = (0..prompt_rows)
+        .map(|position| position % config.vocab)
+        .collect();
+    let prompt_positions: Vec<_> = (0..prompt_rows).collect();
+    let decode_tokens = [prompt_rows % config.vocab];
+    let decode_positions = [prompt_rows];
+    let mut host_state = SequenceState::new([StateKind::KvPages]);
+    let mut host_cache =
+        KvCache::for_branch(config.layers as usize, &host_state, ROOT).expect("host cache");
+    let host_prefill = host_step(
+        &fixture,
+        &mut host_state,
+        &mut host_cache,
+        &prompt,
+        &prompt_positions,
+    );
+    let host_decode = host_step(
+        &fixture,
+        &mut host_state,
+        &mut host_cache,
+        &decode_tokens,
+        &decode_positions,
+    );
+    let mut state = DeviceKvSequence::new(geometry(&config, 4, 64, prompt.len() + 1))
+        .expect("device paged state");
+    let mut runs = admit_runs(&mut ledger, &context, &config, &state, buckets[3]);
+    let chunks = prefill_chunks(prompt_rows, &buckets).expect("chunk the prompt");
+    assert_eq!(chunks.as_slice(), &[8, 4, 1]);
+
+    let (last_prefill, decode_output) = {
+        let mut execute = |tokens: &[u64], positions: &[u64], rows: u64| {
+            let transaction = state.begin().expect("plan-set transaction");
+            let mut bindings = stage_bindings(&fixture, None, tokens, positions, &capability);
+            bindings.retain(|binding| !matches!(binding.role, ValueRole::Weight(_)));
+            let output = set
+                .step(
+                    rows,
+                    DenseSetStep {
+                        capability: &capability,
+                        catalogue: &catalogue,
+                        ctx: &context,
+                        stream: &stream,
+                        state: &mut state,
+                        transaction,
+                        runs: &mut runs,
+                        bindings,
+                        authority: &authority,
+                    },
+                )
+                .unwrap_or_else(|error| panic!("execute {rows}-row resident step: {error}"));
+            commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
+                .expect("commit plan-set paged state");
+            output
+        };
+        let mut offset = 0usize;
+        let mut last_prefill = Vec::new();
+        for rows in chunks {
+            let end = offset + rows as usize;
+            let chunk_positions: Vec<_> = (offset as u64..end as u64).collect();
+            let output = execute(&prompt[offset..end], &chunk_positions, rows);
+            last_prefill = output.output;
+            offset = end;
+        }
+        assert_eq!(offset, prompt.len(), "every prompt row was executed");
+        let decode_output = execute(&decode_tokens, &decode_positions, 1).output;
+        (last_prefill, decode_output)
+    };
+
+    let vocabulary = usize::try_from(config.vocab).expect("vocabulary fits usize");
+    assert_logits(
+        &format!("resident bucket prompt on {}", capability.uuid),
+        &last_prefill,
+        &host_prefill[(prompt.len() - 1) * vocabulary..],
+    );
+    assert_logits(
+        &format!("resident bucket decode on {}", capability.uuid),
+        &decode_output,
+        &host_decode,
+    );
+
+    for run in runs.drain(..) {
+        run.close(&mut ledger)
+            .map_err(|refused| refused.error)
+            .expect("close paged run");
+    }
+    set.close(&mut ledger, &mut authority)
+        .unwrap_or_else(|refused| panic!("close resident plan set: {refused:?}"));
+    assert_eq!(authority.retire_all(scope), 0);
+    residency
+        .close(&mut authority)
+        .map_err(|(_, error)| error)
+        .expect("close device residency");
+    authority
+        .close(&mut ledger)
+        .expect("close residency authority");
+    assert!(ledger.outstanding().is_empty());
 }
