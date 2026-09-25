@@ -1,7 +1,13 @@
 # Task 0093 — M7 preparation: map every Strata DeepSeek speed technique onto Moxie
 
-Status: **active** (coordinator, 2026-09-25). Builder Claude Opus `builder`
-(owner direction, 2026-09-25); reviewer Codex `sol`. Documentation only: no code, no GPU runs.
+Status: **accepted** (coordinator, 2026-09-25) after three sol review rounds
+and a coordinator-verified fourth repair. Builder Claude Opus `builder`
+(owner direction, 2026-09-25); reviewer Codex `sol`. Commits `080fedc`,
+`b6d4bb8`, `d58a039`, `746ce0e`.
+- Final homes for 117 techniques: present 11, partial 26, not needed 7,
+  planned 24, gap 49. The first pass had 50 present; every review finding
+  was a related mechanism counted as the technique itself. Part of that was
+  the contract's three-home scheme, amended to five homes in `a349acd`. Documentation only: no code, no GPU runs.
 
 ## Identity and authority
 
