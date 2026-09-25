@@ -115,4 +115,16 @@ performance claim".
 
 ## Result, filled after work
 
-(pending)
+Implemented the single ignored fixed-plan timing test, appended at the end of
+`dense_gemma_device.rs`; no production code changed. The test measures Shape A
+prefill and decode on the specified RTX 3090. Three candidate runs and three
+runs at each paired base (`6b8239c`, `97a7281`) completed after clean test-only
+patch application on detached bases. The `nsys` API breakdown and all raw
+samples are recorded in [dense-step-timing.md](../evidence/dense-step-timing.md).
+
+Host gates passed: fmt check, workspace clippy, executor clippy with driver,
+`paged-attention-binding` and `paged-attention-test-hooks`, and
+`cargo test --workspace --locked`. The full dense Gemma device suite passed
+(5 passed, timing test ignored). The working tree was returned to `main` after
+the paired runs; each before/after status showed only the carried files.
+Evidence remains fixture-scale with O6 open and is not a performance claim.
