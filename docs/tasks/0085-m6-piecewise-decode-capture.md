@@ -88,8 +88,13 @@ Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Cod
    capture and discard its result before returning the error, and clear the
    plan's `captured` whenever a `Capture`-mode step fails, so a later step
    recaptures from scratch. The lease handling of the error is unchanged.
-7. **Test.** In `run_prefill_decode`'s execute closure, when `host_experts`
-   is empty: after the existing replay step (task 0079 R1) and its assertion,
+7. **Test.** In `run_prefill_decode`'s execute closure, **when the plan's
+   candidate has empty linear orders, combine orders, expert ownership and
+   host expert joins** (amended by the coordinator, 2026-09-25, on the
+   builder's `DECISION`: a routed reference candidate has an empty
+   `host_experts` slice but carries ordering metadata; for every other
+   candidate, assert `set_segment_capture(true)` returns the typed `capture`
+   refusal): after the existing replay step (task 0079 R1) and its assertion,
    abort that transaction, `set_segment_capture(true)`, run the step again
    (captures), assert its output equals the first; abort, run again
    (replays), assert equal; commit that transaction. Keep the existing
