@@ -64,6 +64,16 @@ debug = 1
 [profile.dev.package.moxie-format]
 opt-level = 2
 
+# The host reference every GPU test compares against: the interpreter and the
+# oracles it dispatches to. Unoptimized, a 512x4096x4096 reference linear stalled
+# task 0096's gate. Rust never reassociates floating point at any opt-level (no
+# fast-math), so the reference computes the same bits; only the wait changes.
+[profile.dev.package.moxie-interp]
+opt-level = 2
+
+[profile.dev.package.moxie-oracles]
+opt-level = 2
+
 # Third-party dependencies in dev builds. `"*"` covers dependencies only, never
 # a workspace crate, so nothing in this repository is compiled differently by
 # it. The manifest cap fixture parses a document with 1,048,577 tables in it to
