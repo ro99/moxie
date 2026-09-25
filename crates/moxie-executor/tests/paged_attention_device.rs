@@ -32,7 +32,7 @@ use moxie_kernels::cpu_expert::to_bf16_bits;
 use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_plan::Visibility;
 use moxie_state::{DeviceKvSequence, KvGeometry, LayerKv, PrefixLineage, Retention};
-use moxie_types::{Error, PagePlacement, Precision, RankId, Scope};
+use moxie_types::{Error, HostTier, PagePlacement, Precision, RankId, Scope, Tier};
 
 /// A `RankContext` is exclusive per device and `cargo test` runs a binary's
 /// tests in parallel threads. Serialising them is the property task 0007
@@ -237,6 +237,131 @@ fn measured_ledger(ctx: &RankContext) -> Ledger {
     let host = moxie_host::read().expect("host capacity");
     let host = CapacitySnapshot::measured_host(&host, 1 << 20).expect("host capacity");
     Ledger::new([device, host]).expect("one ledger")
+}
+
+fn pinned_ledger(ctx: &RankContext) -> Ledger {
+    let measurement = ctx.measure().expect("measure the device");
+    let device = CapacitySnapshot::measured(&measurement, 1 << 20).expect("device capacity");
+    let host = moxie_host::read().expect("host capacity");
+    let host = CapacitySnapshot::measured_host(&host, 1 << 20)
+        .expect("host capacity")
+        .with_tier_cap(Tier::Host(HostTier::Pinned), 1 << 20)
+        .expect("pinned budget");
+    Ledger::new([device, host]).expect("one ledger")
+}
+
+fn streamed_run<'ctx>(
+    ledger: &mut Ledger,
+    ctx: &'ctx RankContext,
+    stream: &Stream<'ctx>,
+    staging: Staging,
+) -> PagedAttentionRun<'ctx> {
+    let mut run = PagedAttentionRun::admit(
+        ledger,
+        ctx,
+        descriptor_for(ctx),
+        geometry(),
+        HEADS,
+        geometry().page_tokens,
+        staging,
+    )
+    .unwrap_or_else(|refused| {
+        panic!(
+            "streaming run admission failed: {:?}; rejection {:?}",
+            refused.error, refused.rejection
+        )
+    });
+    let mut sequence = authority();
+    append_through_authority(
+        &mut sequence,
+        &mut run,
+        stream,
+        geometry().page_tokens,
+        0x37_0003,
+    );
+    run
+}
+
+fn streamed_pages() -> [(Vec<u8>, Vec<u8>); 3] {
+    std::array::from_fn(|page| {
+        let elements =
+            (geometry().page_tokens * geometry().kv_heads * geometry().head_dim) as usize;
+        (
+            bf16_bytes(elements, 0x59_0001 + page as u64 * 2),
+            bf16_bytes(elements, 0x59_0002 + page as u64 * 2),
+        )
+    })
+}
+
+fn merged_partial_bits(blocks: &[Vec<moxie_executor::DevicePartial>]) -> Vec<u64> {
+    let mut output = Vec::with_capacity(HEADS as usize * geometry().head_dim as usize);
+    for head in 0..HEADS as usize {
+        let mut merged =
+            moxie_oracles::online_softmax::Partial::empty(geometry().head_dim as usize)
+                .expect("empty merge state");
+        for block in blocks {
+            let partial = &block[head];
+            merged = merged
+                .merge(&moxie_oracles::online_softmax::Partial {
+                    max: partial.max as f64,
+                    sum: partial.sum as f64,
+                    weighted: partial.weighted.iter().map(|value| *value as f64).collect(),
+                })
+                .expect("merge a device partial");
+        }
+        output.extend(
+            merged
+                .finish()
+                .expect("nonempty streamed attention")
+                .into_iter()
+                .map(f64::to_bits),
+        );
+    }
+    output
+}
+
+fn streamed_query_duration<'ctx>(
+    run: &mut PagedAttentionRun<'ctx>,
+    compute: &Stream<'ctx>,
+    attention: &PagedAttentionLaunch,
+    query: &[u8],
+    pages: &[(Vec<u8>, Vec<u8>); 3],
+    read_ahead: bool,
+) -> std::time::Duration {
+    let start = std::time::Instant::now();
+    let (mut stream, resident) = run
+        .start_n_block(compute, attention, query.to_vec())
+        .map_err(|refused| refused.error)
+        .expect("start timed streaming query");
+    std::hint::black_box(resident);
+    if read_ahead {
+        let mut next = 0;
+        while next < pages.len().min(2) {
+            stream
+                .prefetch(pages[next].0.clone(), pages[next].1.clone())
+                .expect("time prefetch");
+            next += 1;
+        }
+        for _ in 0..pages.len() {
+            std::hint::black_box(stream.fold_next().expect("time fold"));
+            if next < pages.len() {
+                stream
+                    .prefetch(pages[next].0.clone(), pages[next].1.clone())
+                    .expect("time next prefetch");
+                next += 1;
+            }
+        }
+    } else {
+        for (keys, values) in pages {
+            std::hint::black_box(
+                stream
+                    .stage_next(keys.clone(), values.clone())
+                    .expect("time sequential stage"),
+            );
+        }
+    }
+    drop(stream);
+    start.elapsed()
 }
 
 fn descriptor_for(ctx: &RankContext) -> moxie_types::SemanticKernelDescriptor {
@@ -1185,4 +1310,279 @@ fn a_wrapped_ring_answers_exactly_as_an_unwrapped_one() {
         "the same logical history gave different answers on two physical layouts"
     );
     assert!(ledger.outstanding().is_empty());
+}
+
+#[test]
+fn pinned_read_ahead_matches_staging_and_drains_a_dropped_stream() {
+    let _guard = one_at_a_time();
+    let devices = device_count().expect("enumerate CUDA devices");
+    if devices == 0 {
+        eprintln!("SKIPPED: no CUDA device");
+        return;
+    }
+    let pages = streamed_pages();
+    for ordinal in 0..devices {
+        let ctx = RankContext::acquire(RankId(ordinal), ordinal).expect("acquire CUDA device");
+        let stream = Stream::new(&ctx).expect("a compute stream");
+        let attention = PagedAttentionLaunch::n_block_stream(layer(), 1, 63, 0, 64)
+            .expect("one resident plus three staged pages");
+        let query = bf16_bytes((HEADS * geometry().head_dim) as usize, 0x6b_0011);
+
+        let mut missing_pinned_cap = measured_ledger(&ctx);
+        let refused = PagedAttentionRun::admit(
+            &mut missing_pinned_cap,
+            &ctx,
+            descriptor_for(&ctx),
+            geometry(),
+            HEADS,
+            geometry().page_tokens,
+            Staging::HostBackedReadAhead {
+                max_staged_blocks: 3,
+            },
+        )
+        .expect_err("read-ahead requires an explicit pinned tier cap");
+        assert!(
+            matches!(
+                refused.error,
+                Error::InvalidRequest { field: "pinned", ref detail }
+                    if detail == "no pinned cap is declared"
+            ),
+            "missing pinned cap refusal changed: {:?}",
+            refused.error
+        );
+        assert!(missing_pinned_cap.outstanding().is_empty());
+
+        let mut staged_ledger = measured_ledger(&ctx);
+        let mut staged_run = streamed_run(
+            &mut staged_ledger,
+            &ctx,
+            &stream,
+            Staging::HostBacked {
+                max_staged_blocks: 3,
+            },
+        );
+        let (mut staged_stream, resident) = staged_run
+            .start_n_block(&stream, &attention, query.clone())
+            .map_err(|refused| refused.error)
+            .expect("start sequential streaming");
+        let mut staged_partials = vec![resident];
+        for (keys, values) in &pages {
+            staged_partials.push(
+                staged_stream
+                    .stage_next(keys.clone(), values.clone())
+                    .map_err(|refused| refused.error)
+                    .expect("stage and fold one page"),
+            );
+        }
+        drop(staged_stream);
+        let staged_output = merged_partial_bits(&staged_partials);
+        staged_run
+            .close(&mut staged_ledger)
+            .map_err(|refused| refused.error)
+            .expect("close staged run");
+        assert!(staged_ledger.outstanding().is_empty());
+
+        let mut read_ahead_ledger = pinned_ledger(&ctx);
+        let mut read_ahead_run = streamed_run(
+            &mut read_ahead_ledger,
+            &ctx,
+            &stream,
+            Staging::HostBackedReadAhead {
+                max_staged_blocks: 3,
+            },
+        );
+        read_ahead_run.gate_next_prefetch_for_test();
+        let (mut read_ahead_stream, resident) = read_ahead_run
+            .start_n_block(&stream, &attention, query.clone())
+            .map_err(|refused| refused.error)
+            .expect("start read-ahead streaming");
+        let mut read_ahead_partials = vec![resident];
+        let mixed_protocol = read_ahead_stream
+            .stage_next(pages[0].0.clone(), pages[0].1.clone())
+            .expect_err("a read-ahead stream cannot use stage_next");
+        assert!(matches!(
+            mixed_protocol.source,
+            Some(moxie_executor::RefusedSource::Stream { keys, values, .. })
+                if keys == pages[0].0 && values == pages[0].1
+        ));
+        read_ahead_stream
+            .prefetch(pages[0].0.clone(), pages[0].1.clone())
+            .expect("prefetch first page");
+        read_ahead_stream
+            .prefetch(pages[1].0.clone(), pages[1].1.clone())
+            .expect("prefetch second page while first is pending");
+        let third = read_ahead_stream
+            .prefetch(pages[2].0.clone(), pages[2].1.clone())
+            .expect_err("two pages are the read-ahead limit");
+        assert!(matches!(
+            third.source,
+            Some(moxie_executor::RefusedSource::Stream { keys, values, .. })
+                if keys == pages[2].0 && values == pages[2].1
+        ));
+        let release = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            PagedAttentionRun::release_prefetch_gate_for_test();
+        });
+        read_ahead_partials.push(
+            read_ahead_stream
+                .fold_next()
+                .map_err(|refused| refused.error)
+                .expect("fold waits for the gated copy"),
+        );
+        release.join().expect("release the copy gate");
+        ctx.synchronize()
+            .expect("drain the copy stream after the gate");
+        read_ahead_stream
+            .prefetch(pages[2].0.clone(), pages[2].1.clone())
+            .expect("reuse the folded staging page");
+        read_ahead_partials.push(
+            read_ahead_stream
+                .fold_next()
+                .map_err(|refused| refused.error)
+                .expect("fold second page"),
+        );
+        read_ahead_partials.push(
+            read_ahead_stream
+                .fold_next()
+                .map_err(|refused| refused.error)
+                .expect("fold third page"),
+        );
+        drop(read_ahead_stream);
+        assert_eq!(read_ahead_run.prefetched_unused(), 0);
+        assert_eq!(
+            merged_partial_bits(&read_ahead_partials),
+            staged_output,
+            "read-ahead changed the merged attention output on {}",
+            ctx.uuid()
+        );
+        read_ahead_run
+            .close(&mut read_ahead_ledger)
+            .map_err(|refused| refused.error)
+            .expect("close read-ahead run");
+        assert!(read_ahead_ledger.outstanding().is_empty());
+
+        let mut dropped_ledger = pinned_ledger(&ctx);
+        let mut dropped_run = streamed_run(
+            &mut dropped_ledger,
+            &ctx,
+            &stream,
+            Staging::HostBackedReadAhead {
+                max_staged_blocks: 3,
+            },
+        );
+        let (mut dropped_stream, _) = dropped_run
+            .start_n_block(&stream, &attention, query)
+            .map_err(|refused| refused.error)
+            .expect("start the dropped-stream case");
+        dropped_stream
+            .prefetch(pages[0].0.clone(), pages[0].1.clone())
+            .expect("prefetch a page that remains unused");
+        dropped_stream
+            .prefetch(pages[1].0.clone(), pages[1].1.clone())
+            .expect("prefetch the page that will be folded");
+        dropped_stream
+            .fold_next()
+            .map_err(|refused| refused.error)
+            .expect("fold only the first page");
+        drop(dropped_stream);
+        assert_eq!(dropped_run.prefetched_unused(), 1);
+        dropped_run
+            .close(&mut dropped_ledger)
+            .map_err(|refused| refused.error)
+            .expect("close drains the unused prefetch");
+        assert!(dropped_ledger.outstanding().is_empty());
+    }
+}
+
+#[test]
+#[ignore = "manual host-backed transfer timing"]
+fn host_backed_read_ahead_timing() {
+    let _guard = one_at_a_time();
+    assert!(device_count().expect("enumerate CUDA devices") > 1);
+    let ctx = RankContext::acquire(RankId(1), 1).expect("acquire a 3090");
+    assert_eq!(
+        (
+            ctx.capability().compute_major,
+            ctx.capability().compute_minor
+        ),
+        (8, 6),
+        "ordinal 1 must be a 3090 under PCI bus ordering"
+    );
+    let compute = Stream::new(&ctx).expect("a compute stream");
+    let attention = PagedAttentionLaunch::n_block_stream(layer(), 1, 63, 0, 64)
+        .expect("one resident plus three staged pages");
+    let query = bf16_bytes((HEADS * geometry().head_dim) as usize, 0x6b_0021);
+    let pages = streamed_pages();
+
+    let mut staged_ledger = measured_ledger(&ctx);
+    let mut staged_run = streamed_run(
+        &mut staged_ledger,
+        &ctx,
+        &compute,
+        Staging::HostBacked {
+            max_staged_blocks: 3,
+        },
+    );
+    let mut read_ahead_ledger = pinned_ledger(&ctx);
+    let mut read_ahead_run = streamed_run(
+        &mut read_ahead_ledger,
+        &ctx,
+        &compute,
+        Staging::HostBackedReadAhead {
+            max_staged_blocks: 3,
+        },
+    );
+
+    for _ in 0..5 {
+        streamed_query_duration(&mut staged_run, &compute, &attention, &query, &pages, false);
+        streamed_query_duration(
+            &mut read_ahead_run,
+            &compute,
+            &attention,
+            &query,
+            &pages,
+            true,
+        );
+    }
+    let mut staged_us = Vec::with_capacity(30);
+    let mut read_ahead_us = Vec::with_capacity(30);
+    for _ in 0..30 {
+        staged_us.push(
+            streamed_query_duration(&mut staged_run, &compute, &attention, &query, &pages, false)
+                .as_secs_f64()
+                * 1_000_000.0,
+        );
+        read_ahead_us.push(
+            streamed_query_duration(
+                &mut read_ahead_run,
+                &compute,
+                &attention,
+                &query,
+                &pages,
+                true,
+            )
+            .as_secs_f64()
+                * 1_000_000.0,
+        );
+    }
+    staged_us.sort_by(f64::total_cmp);
+    read_ahead_us.sort_by(f64::total_cmp);
+    eprintln!(
+        "uuid={} W=5 R=30 stage_next_median_us={:.3} read_ahead_median_us={:.3}",
+        ctx.uuid(),
+        staged_us[staged_us.len() / 2],
+        read_ahead_us[read_ahead_us.len() / 2]
+    );
+    eprintln!("copy-versus-kernel overlap: not measured from event intervals");
+
+    staged_run
+        .close(&mut staged_ledger)
+        .map_err(|refused| refused.error)
+        .expect("close timed staged run");
+    read_ahead_run
+        .close(&mut read_ahead_ledger)
+        .map_err(|refused| refused.error)
+        .expect("close timed read-ahead run");
+    assert!(staged_ledger.outstanding().is_empty());
+    assert!(read_ahead_ledger.outstanding().is_empty());
 }

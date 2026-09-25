@@ -853,6 +853,26 @@ impl<'ctx> Stream<'ctx> {
             "cuStreamWaitEvent",
         )
     }
+
+    /// Enqueue a host callback after work already submitted to this stream.
+    ///
+    /// # Safety
+    /// The callback and `data` must remain valid until invocation. CUDA forbids
+    /// CUDA API calls from the callback; it must not call back into this
+    /// context or any stream.
+    pub unsafe fn launch_host_func(
+        &self,
+        callback: unsafe extern "C" fn(*mut c_void),
+        data: *mut c_void,
+    ) -> Result<()> {
+        self.ctx.make_current()?;
+        check(
+            // SAFETY: the caller guarantees the callback and data outlive the
+            // queued invocation and obey CUDA's callback restrictions.
+            unsafe { ffi::cuLaunchHostFunc(self.stream, callback, data) },
+            "cuLaunchHostFunc",
+        )
+    }
 }
 
 impl Drop for Stream<'_> {
@@ -1017,6 +1037,23 @@ impl<'ctx> PinnedHostBuffer<'ctx> {
         // SAFETY: allocation succeeds only with a non-null pointer and nonzero
         // length, and the mutable borrow is exclusive on the Rust side.
         unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    /// Free this allocation, returning it unchanged if the driver refuses.
+    pub fn free(mut self) -> std::result::Result<(), (Self, Error)> {
+        if let Err(error) = self.ctx.make_current() {
+            return Err((self, error));
+        }
+        if let Err(error) = check(
+            // SAFETY: this pointer is the live allocation returned by
+            // `cuMemHostAlloc`, and its asynchronous users have been drained.
+            unsafe { ffi::cuMemFreeHost(self.ptr.cast()) },
+            "cuMemFreeHost",
+        ) {
+            return Err((self, error));
+        }
+        self.ptr = core::ptr::null_mut();
+        Ok(())
     }
 }
 

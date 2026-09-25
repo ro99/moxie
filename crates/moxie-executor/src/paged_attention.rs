@@ -1093,10 +1093,13 @@ mod tests {
 /// a later run entry point.
 #[cfg(feature = "driver")]
 pub mod device {
+    #[cfg(feature = "paged-attention-test-hooks")]
+    use core::sync::atomic::{AtomicBool, Ordering};
     use core::{ffi::c_void, mem::ManuallyDrop};
 
     use moxie_cuda::{
-        Event, Module, ModuleImage, RankContext, ResolvedModule, Stream, TrustedImage,
+        Event, Module, ModuleImage, PinnedHostBuffer, RankContext, ResolvedModule, Stream,
+        TrustedImage,
     };
     use moxie_memory::{
         BufferRequest, Ledger, LedgerId, PlanRequest, Rejection, Reservation, StageSpan,
@@ -1119,6 +1122,19 @@ pub mod device {
 
     /// 256-byte alignment, as every other device range in this crate uses.
     const ALIGNMENT: u64 = 256;
+
+    #[cfg(feature = "paged-attention-test-hooks")]
+    static PREFETCH_GATE_RELEASED: AtomicBool = AtomicBool::new(false);
+
+    #[cfg(feature = "paged-attention-test-hooks")]
+    unsafe extern "C" fn wait_for_prefetch_release(_: *mut c_void) {
+        let start = std::time::Instant::now();
+        while !PREFETCH_GATE_RELEASED.load(Ordering::Acquire)
+            && start.elapsed() < std::time::Duration::from_secs(10)
+        {
+            std::thread::yield_now();
+        }
+    }
 
     /// Whether this run admits the buffers the host-staged path needs.
     ///
@@ -1147,17 +1163,24 @@ pub mod device {
         /// partial ranges are reused sequentially; the count is an execution
         /// bound, not a request for simultaneous device pages.
         HostBacked { max_staged_blocks: u64 },
+        /// Host-backed streaming with two pinned bounce pages and two device
+        /// staging pages, allowing one page to copy while the other is folded.
+        HostBackedReadAhead { max_staged_blocks: u64 },
     }
 
     impl Staging {
         const fn partial_buffers(self) -> bool {
-            matches!(self, Self::TwoBlock | Self::HostBacked { .. })
+            matches!(
+                self,
+                Self::TwoBlock | Self::HostBacked { .. } | Self::HostBackedReadAhead { .. }
+            )
         }
 
         const fn max_staged_blocks(self) -> u64 {
             match self {
                 Self::TwoBlock => 1,
-                Self::HostBacked { max_staged_blocks } => max_staged_blocks,
+                Self::HostBacked { max_staged_blocks }
+                | Self::HostBackedReadAhead { max_staged_blocks } => max_staged_blocks,
                 Self::Host | Self::DeviceHandles => 0,
             }
         }
@@ -1263,6 +1286,10 @@ pub mod device {
         remaining_rows: u64,
         remaining_blocks: u64,
         host_to_device_bytes: u64,
+        prefetched_total: u64,
+        folded_total: u64,
+        outstanding_rows: u64,
+        page_rows: [u64; 2],
     }
 
     impl NBlockStream<'_, '_> {
@@ -1329,14 +1356,20 @@ pub mod device {
         table: Option<DeviceRange<'ctx>>,
         query: Option<DeviceRange<'ctx>>,
         output: Option<DeviceRange<'ctx>>,
-        /// The one host-sourced page and reusable FP32 partial outputs used
-        /// only by [`Staging::TwoBlock`].
-        staged_keys: Option<DeviceRange<'ctx>>,
-        staged_values: Option<DeviceRange<'ctx>>,
-        staged_table: Option<DeviceRange<'ctx>>,
+        /// Host-sourced staging pages and reusable FP32 partial outputs.
+        staged_keys: [Option<DeviceRange<'ctx>>; 2],
+        staged_values: [Option<DeviceRange<'ctx>>; 2],
+        staged_table: [Option<DeviceRange<'ctx>>; 2],
         partial_max: Option<DeviceRange<'ctx>>,
         partial_sum: Option<DeviceRange<'ctx>>,
         partial_weighted: Option<DeviceRange<'ctx>>,
+        pinned_bounce: Option<PinnedHostBuffer<'ctx>>,
+        pinned_page_bytes: usize,
+        copy_stream: Option<Stream<'ctx>>,
+        copied: [Option<Event<'ctx>>; 2],
+        copied_pending: [bool; 2],
+        read_ahead_stream_active: bool,
+        prefetched_unused: u64,
         /// Prefix-lineage entries the run reserves for one branch fork; zero
         /// means this run was not admitted as a fork destination. The matching
         /// request also charges SequenceState's branch and transaction nodes.
@@ -1395,6 +1428,8 @@ pub mod device {
         staging_failure_after: Option<u64>,
         #[cfg(feature = "paged-attention-test-hooks")]
         branch_copy_failure_after: Option<u64>,
+        #[cfg(feature = "paged-attention-test-hooks")]
+        gate_next_prefetch: bool,
     }
 
     impl<'ctx> PagedAttentionRun<'ctx> {
@@ -1403,26 +1438,42 @@ pub mod device {
         #[cfg(feature = "paged-attention-binding")]
         pub(crate) fn is_idle(&self) -> bool {
             !self.quarantined
+                && !self.read_ahead_stream_active
                 && self.held.is_none()
                 && self.held_ranges.is_none()
                 && self.pending.is_none()
         }
 
-        /// Observe the last deferred operation and return any held page-table
-        /// upload buffer to this run.
+        /// Observe deferred work and return any held page-table upload buffer.
+        /// Unfolded copy events remain asynchronous while a stream pipelines.
         pub(crate) fn observe_pending(&mut self) -> Result<()> {
-            let Some(pending) = self.pending.as_ref() else {
-                return Ok(());
-            };
-            if let Err(error) = pending.synchronize() {
-                self.quarantined = true;
-                return Err(self.attribute(error));
+            if let Some(pending) = self.pending.as_ref() {
+                if let Err(error) = pending.synchronize() {
+                    self.quarantined = true;
+                    return Err(self.attribute(error));
+                }
+                self.pending = None;
+                if let Some(held) = self.held.take() {
+                    match held {
+                        RefusedSource::PageTableUpload(bytes) => self.page_table_upload = bytes,
+                        other => self.held = Some(other),
+                    }
+                }
             }
-            self.pending = None;
-            if let Some(held) = self.held.take() {
-                match held {
-                    RefusedSource::PageTableUpload(bytes) => self.page_table_upload = bytes,
-                    other => self.held = Some(other),
+            if !self.read_ahead_stream_active {
+                for page in 0..2 {
+                    if !self.copied_pending[page] {
+                        continue;
+                    }
+                    if let Err(error) = self.copied[page]
+                        .as_ref()
+                        .expect("a pending copy has its completion event")
+                        .synchronize()
+                    {
+                        self.quarantined = true;
+                        return Err(self.attribute(error));
+                    }
+                    self.copied_pending[page] = false;
                 }
             }
             Ok(())
@@ -1610,7 +1661,8 @@ pub mod device {
                     ),
                 )));
             }
-            if let Staging::HostBacked { max_staged_blocks } = staging
+            if let Staging::HostBacked { max_staged_blocks }
+            | Staging::HostBackedReadAhead { max_staged_blocks } = staging
                 && (max_staged_blocks == 0
                     || max_staged_blocks > moxie_memory::HostBackedPlan::MAX_STAGED_BLOCKS)
             {
@@ -1622,6 +1674,14 @@ pub mod device {
                         moxie_memory::HostBackedPlan::MAX_STAGED_BLOCKS
                     ),
                 )));
+            }
+            if matches!(staging, Staging::HostBackedReadAhead { .. })
+                && ledger
+                    .snapshot(Scope::Host)
+                    .and_then(|snapshot| snapshot.tier_cap(Tier::Host(HostTier::Pinned)))
+                    .is_none()
+            {
+                return Err(fail(invalid("pinned", "no pinned cap is declared")));
             }
             // Admission re-applies selection's predicate, on the widest launch
             // this run can serve. A descriptor that cannot serve that launch
@@ -1785,6 +1845,7 @@ pub mod device {
                 Staging::Host => 5,
                 Staging::DeviceHandles => 3,
                 Staging::TwoBlock | Staging::HostBacked { .. } => 10,
+                Staging::HostBackedReadAhead { .. } => 13,
             };
             let mut hold: Vec<DeviceRange<'ctx>> = Vec::new();
             if hold.try_reserve_exact(hold_count).is_err() {
@@ -1818,6 +1879,14 @@ pub mod device {
                 wanted.push((extents.staged_payload, "attention-stream-staged-keys"));
                 wanted.push((extents.staged_payload, "attention-stream-staged-values"));
                 wanted.push((extents.staged_table, "attention-stream-staged-table"));
+                if matches!(staging, Staging::HostBackedReadAhead { .. }) {
+                    wanted.push((extents.staged_payload, "attention-stream-staged-keys-next"));
+                    wanted.push((
+                        extents.staged_payload,
+                        "attention-stream-staged-values-next",
+                    ));
+                    wanted.push((extents.staged_table, "attention-stream-staged-table-next"));
+                }
                 wanted.push((extents.partial_scalars, "attention-stream-partial-max"));
                 wanted.push((extents.partial_scalars, "attention-stream-partial-sum"));
                 wanted.push((
@@ -1932,6 +2001,55 @@ pub mod device {
                 Ok(bytes) => bytes,
                 Err(error) => return Err(unwind(arena, hold, ledger, error)),
             };
+            let (copy_stream, copied, pinned_bounce, pinned_page_bytes) =
+                if matches!(staging, Staging::HostBackedReadAhead { .. }) {
+                    let copy_stream = match Stream::new(ctx) {
+                        Ok(stream) => stream,
+                        Err(error) => return Err(unwind(arena, hold, ledger, error)),
+                    };
+                    let first = match Event::new(ctx) {
+                        Ok(event) => event,
+                        Err(error) => return Err(unwind(arena, hold, ledger, error)),
+                    };
+                    let second = match Event::new(ctx) {
+                        Ok(event) => event,
+                        Err(error) => return Err(unwind(arena, hold, ledger, error)),
+                    };
+                    let pinned_page_bytes = match usize::try_from(extents.pinned_bounce / 2) {
+                        Ok(bytes) if bytes != 0 => bytes,
+                        _ => {
+                            return Err(unwind(
+                                arena,
+                                hold,
+                                ledger,
+                                invalid("pinned", "bounce page size exceeds host addressability"),
+                            ));
+                        }
+                    };
+                    let pinned_bytes = match usize::try_from(extents.pinned_bounce) {
+                        Ok(bytes) if bytes != 0 => bytes,
+                        _ => {
+                            return Err(unwind(
+                                arena,
+                                hold,
+                                ledger,
+                                invalid("pinned", "bounce allocation exceeds host addressability"),
+                            ));
+                        }
+                    };
+                    let pinned_bounce = match PinnedHostBuffer::alloc(ctx, pinned_bytes) {
+                        Ok(buffer) => buffer,
+                        Err(error) => return Err(unwind(arena, hold, ledger, error)),
+                    };
+                    (
+                        Some(copy_stream),
+                        [Some(first), Some(second)],
+                        Some(pinned_bounce),
+                        pinned_page_bytes,
+                    )
+                } else {
+                    (None, [None, None], None, 0)
+                };
             let (
                 query,
                 output,
@@ -1948,9 +2066,9 @@ pub mod device {
                     (
                         Some(query),
                         Some(output),
-                        None,
-                        None,
-                        None,
+                        [None, None],
+                        [None, None],
+                        [None, None],
                         None,
                         None,
                         None,
@@ -1967,15 +2085,46 @@ pub mod device {
                     (
                         Some(query),
                         None,
-                        Some(staged_keys),
-                        Some(staged_values),
-                        Some(staged_table),
+                        [Some(staged_keys), None],
+                        [Some(staged_values), None],
+                        [Some(staged_table), None],
                         Some(partial_max),
                         Some(partial_sum),
                         Some(partial_weighted),
                     )
                 }
-                Staging::DeviceHandles => (None, None, None, None, None, None, None, None),
+                Staging::HostBackedReadAhead { .. } => {
+                    let partial_weighted = hold.pop().expect("partial weighted range");
+                    let partial_sum = hold.pop().expect("partial sum range");
+                    let partial_max = hold.pop().expect("partial max range");
+                    let staged_table_next = hold.pop().expect("second staged table range");
+                    let staged_values_next = hold.pop().expect("second staged values range");
+                    let staged_keys_next = hold.pop().expect("second staged keys range");
+                    let staged_table = hold.pop().expect("first staged table range");
+                    let staged_values = hold.pop().expect("first staged values range");
+                    let staged_keys = hold.pop().expect("first staged keys range");
+                    let query = hold.pop().expect("query range");
+                    (
+                        Some(query),
+                        None,
+                        [Some(staged_keys), Some(staged_keys_next)],
+                        [Some(staged_values), Some(staged_values_next)],
+                        [Some(staged_table), Some(staged_table_next)],
+                        Some(partial_max),
+                        Some(partial_sum),
+                        Some(partial_weighted),
+                    )
+                }
+                Staging::DeviceHandles => (
+                    None,
+                    None,
+                    [None, None],
+                    [None, None],
+                    [None, None],
+                    None,
+                    None,
+                    None,
+                ),
             };
             let table = hold.pop().expect("page table range");
             let values = hold.pop().expect("value range");
@@ -1998,6 +2147,10 @@ pub mod device {
                 partial_max,
                 partial_sum,
                 partial_weighted,
+                pinned_bounce,
+                pinned_page_bytes,
+                copy_stream,
+                copied,
                 #[cfg(feature = "paged-attention-binding")]
                 fork_lineage_capacity,
                 staging,
@@ -2010,6 +2163,9 @@ pub mod device {
                 ctx,
                 held: None,
                 pending: None,
+                copied_pending: [false, false],
+                read_ahead_stream_active: false,
+                prefetched_unused: 0,
                 held_ranges: None,
                 quarantined: false,
                 partial_symbol,
@@ -2017,6 +2173,8 @@ pub mod device {
                 staging_failure_after: None,
                 #[cfg(feature = "paged-attention-test-hooks")]
                 branch_copy_failure_after: None,
+                #[cfg(feature = "paged-attention-test-hooks")]
+                gate_next_prefetch: false,
             })
         }
 
@@ -2026,6 +2184,11 @@ pub mod device {
         /// and nothing here is timed.
         pub const fn arena_bytes(&self) -> u64 {
             self.arena_bytes
+        }
+
+        /// Blocks prefetched by read-ahead streams and never folded.
+        pub const fn prefetched_unused(&self) -> u64 {
+            self.prefetched_unused
         }
 
         /// Rows whose copies are enqueued on this run's stream order, not observed.
@@ -2075,6 +2238,19 @@ pub mod device {
         #[cfg(feature = "paged-attention-test-hooks")]
         pub fn inject_staging_failure(&mut self) {
             self.staging_failure_after = Some(0);
+        }
+
+        /// Gate one prefetch copy for the deterministic ordering test.
+        #[cfg(feature = "paged-attention-test-hooks")]
+        pub fn gate_next_prefetch_for_test(&mut self) {
+            PREFETCH_GATE_RELEASED.store(false, Ordering::Release);
+            self.gate_next_prefetch = true;
+        }
+
+        /// Release a gated prefetch from the test's helper thread.
+        #[cfg(feature = "paged-attention-test-hooks")]
+        pub fn release_prefetch_gate_for_test() {
+            PREFETCH_GATE_RELEASED.store(true, Ordering::Release);
         }
 
         /// Cause the staging operation after `successful_blocks` completed
@@ -3184,15 +3360,18 @@ pub mod device {
             };
             let key_range = self
                 .staged_keys
-                .as_ref()
+                .first()
+                .and_then(Option::as_ref)
                 .expect("two-block admission has staged keys");
             let value_range = self
                 .staged_values
-                .as_ref()
+                .first()
+                .and_then(Option::as_ref)
                 .expect("two-block admission has staged values");
             let table_range = self
                 .staged_table
-                .as_ref()
+                .first()
+                .and_then(Option::as_ref)
                 .expect("two-block admission has a staged table");
             if keys.len() as u64 > key_range.bytes() || values.len() as u64 > value_range.bytes() {
                 return Err(invalid(
@@ -3248,16 +3427,17 @@ pub mod device {
             launch: &PagedAttentionLaunch,
             block_base: u64,
             block_rows: u64,
-            staged: bool,
+            staging_page: Option<usize>,
         ) -> Result<()> {
             let query_address = self
                 .query
                 .as_ref()
                 .expect("two-block admission has a query range")
                 .device_address()?;
-            let key_address = if staged {
+            let key_address = if let Some(page) = staging_page {
                 self.staged_keys
-                    .as_ref()
+                    .get(page)
+                    .and_then(Option::as_ref)
                     .expect("two-block admission has staged keys")
                     .device_address()?
             } else {
@@ -3266,9 +3446,10 @@ pub mod device {
                     .expect("live key range")
                     .device_address()?
             };
-            let value_address = if staged {
+            let value_address = if let Some(page) = staging_page {
                 self.staged_values
-                    .as_ref()
+                    .get(page)
+                    .and_then(Option::as_ref)
                     .expect("two-block admission has staged values")
                     .device_address()?
             } else {
@@ -3277,9 +3458,10 @@ pub mod device {
                     .expect("live value range")
                     .device_address()?
             };
-            let table_address = if staged {
+            let table_address = if let Some(page) = staging_page {
                 self.staged_table
-                    .as_ref()
+                    .get(page)
+                    .and_then(Option::as_ref)
                     .expect("two-block admission has a staged table")
                     .device_address()?
             } else {
@@ -3835,7 +4017,7 @@ pub mod device {
                 });
             }
             if let Err(error) =
-                self.launch_partial(stream, launch, launch.history_base(), resident_rows, false)
+                self.launch_partial(stream, launch, launch.history_base(), resident_rows, None)
             {
                 return Err(PagedRunRefused {
                     error,
@@ -3858,7 +4040,7 @@ pub mod device {
                     source: None,
                 });
             }
-            if let Err(error) = self.launch_partial(stream, launch, host_base, host_rows, true) {
+            if let Err(error) = self.launch_partial(stream, launch, host_base, host_rows, Some(0)) {
                 return Err(PagedRunRefused {
                     error,
                     source: None,
@@ -3998,7 +4180,7 @@ pub mod device {
                 });
             }
             if let Err(error) =
-                self.launch_partial(stream, launch, launch.history_base(), resident_rows, false)
+                self.launch_partial(stream, launch, launch.history_base(), resident_rows, None)
             {
                 return Err(PagedRunRefused {
                     error,
@@ -4020,6 +4202,8 @@ pub mod device {
                 .history_rows()
                 .checked_sub(resident_rows)
                 .expect("host stream has a resident page");
+            let read_ahead = matches!(self.staging, Staging::HostBackedReadAhead { .. });
+            self.read_ahead_stream_active = read_ahead;
             Ok((
                 NBlockStream {
                     run: self,
@@ -4029,6 +4213,10 @@ pub mod device {
                     remaining_rows,
                     remaining_blocks: staged_count,
                     host_to_device_bytes: 0,
+                    prefetched_total: 0,
+                    folded_total: 0,
+                    outstanding_rows: 0,
+                    page_rows: [0, 0],
                 },
                 resident,
             ))
@@ -4205,33 +4393,59 @@ pub mod device {
             mut self,
             ledger: &mut Ledger,
         ) -> std::result::Result<(), PagedCloseRefused<'ctx>> {
+            let read_ahead = matches!(self.staging, Staging::HostBackedReadAhead { .. });
             if let Err(error) = self.observe_pending() {
-                return Err(PagedCloseRefused { run: self, error });
+                if !read_ahead || self.ctx.synchronize().is_err() {
+                    return Err(PagedCloseRefused { run: self, error });
+                }
+                self.pending = None;
+                self.copied_pending = [false, false];
+                self.held = None;
+                self.quarantined = false;
             }
             if self.quarantined {
-                let error = invalid(
-                    "close",
-                    "this run is quarantined; its ranges may still be in flight",
-                );
-                return Err(PagedCloseRefused { run: self, error });
+                if read_ahead {
+                    if let Err(error) = self.ctx.synchronize() {
+                        return Err(PagedCloseRefused { run: self, error });
+                    }
+                    self.pending = None;
+                    self.copied_pending = [false, false];
+                    self.held = None;
+                    self.quarantined = false;
+                } else {
+                    let error = invalid(
+                        "close",
+                        "this run is quarantined; its ranges may still be in flight",
+                    );
+                    return Err(PagedCloseRefused { run: self, error });
+                }
             }
             if ledger.id() != self.ledger {
                 let error = invalid("ledger", "this run belongs to another ledger");
                 return Err(PagedCloseRefused { run: self, error });
             }
-            for slot in 0..11 {
+            if let Some(pinned) = self.pinned_bounce.take()
+                && let Err((pinned, error)) = pinned.free()
+            {
+                self.pinned_bounce = Some(pinned);
+                return Err(PagedCloseRefused { run: self, error });
+            }
+            for slot in 0..14 {
                 let taken = match slot {
                     0 => self.output.take(),
                     1 => self.query.take(),
                     2 => self.table.take(),
                     3 => self.values.take(),
                     4 => self.keys.take(),
-                    5 => self.staged_table.take(),
-                    6 => self.staged_values.take(),
-                    7 => self.staged_keys.take(),
+                    5 => self.staged_table[0].take(),
+                    6 => self.staged_values[0].take(),
+                    7 => self.staged_keys[0].take(),
                     8 => self.partial_weighted.take(),
                     9 => self.partial_sum.take(),
-                    _ => self.partial_max.take(),
+                    10 => self.partial_max.take(),
+                    11 => self.staged_table[1].take(),
+                    12 => self.staged_values[1].take(),
+                    _ => self.staged_keys[1].take(),
                 };
                 let Some(range) = taken else { continue };
                 let arena = self.arena.as_mut().expect("an open run has its arena");
@@ -4246,12 +4460,15 @@ pub mod device {
                         2 => self.table = Some(refused.range),
                         3 => self.values = Some(refused.range),
                         4 => self.keys = Some(refused.range),
-                        5 => self.staged_table = Some(refused.range),
-                        6 => self.staged_values = Some(refused.range),
-                        7 => self.staged_keys = Some(refused.range),
+                        5 => self.staged_table[0] = Some(refused.range),
+                        6 => self.staged_values[0] = Some(refused.range),
+                        7 => self.staged_keys[0] = Some(refused.range),
                         8 => self.partial_weighted = Some(refused.range),
                         9 => self.partial_sum = Some(refused.range),
-                        _ => self.partial_max = Some(refused.range),
+                        10 => self.partial_max = Some(refused.range),
+                        11 => self.staged_table[1] = Some(refused.range),
+                        12 => self.staged_values[1] = Some(refused.range),
+                        _ => self.staged_keys[1] = Some(refused.range),
                     }
                     let error = refused.error;
                     return Err(PagedCloseRefused { run: self, error });
@@ -4297,6 +4514,13 @@ pub mod device {
                     table: [0u8; 4],
                 }),
             };
+            if matches!(self.run.staging, Staging::HostBackedReadAhead { .. }) {
+                return Err(give_back(
+                    invalid("stream", "this stream was admitted for read-ahead prefetch"),
+                    keys,
+                    values,
+                ));
+            }
             if let Err(error) = self.run.observe_pending() {
                 return Err(give_back(error, keys, values));
             }
@@ -4382,7 +4606,7 @@ pub mod device {
             }
             if let Err(error) =
                 self.run
-                    .launch_partial(self.stream, &self.launch, self.next_base, rows, true)
+                    .launch_partial(self.stream, &self.launch, self.next_base, rows, Some(0))
             {
                 return Err(self.refused_current(error));
             }
@@ -4407,16 +4631,521 @@ pub mod device {
             self.host_to_device_bytes = total_transfer;
             Ok(partials)
         }
+
+        /// Copy one host page into a pinned bounce slot and enqueue its device
+        /// copies without waiting for the compute stream.
+        #[allow(clippy::result_large_err)]
+        pub fn prefetch(
+            &mut self,
+            keys: Vec<u8>,
+            values: Vec<u8>,
+        ) -> std::result::Result<(), PagedRunRefused> {
+            let give_back = |error, keys, values| PagedRunRefused {
+                error,
+                source: Some(RefusedSource::Stream {
+                    query: Vec::new(),
+                    keys,
+                    values,
+                    table: [0; 4],
+                }),
+            };
+            if !matches!(self.run.staging, Staging::HostBackedReadAhead { .. }) {
+                return Err(give_back(
+                    invalid("stream", "this stream was not admitted for read-ahead"),
+                    keys,
+                    values,
+                ));
+            }
+            let outstanding = self.prefetched_total - self.folded_total;
+            if self.remaining_blocks == 0
+                || self.remaining_rows <= self.outstanding_rows
+                || outstanding >= 2
+            {
+                return Err(give_back(
+                    invalid("stream", "no read-ahead slot is available"),
+                    keys,
+                    values,
+                ));
+            }
+            if let Err(error) = self.run.observe_pending() {
+                return Err(give_back(error, keys, values));
+            }
+            if self.run.quarantined {
+                return Err(give_back(
+                    invalid("run", "this run is quarantined"),
+                    keys,
+                    values,
+                ));
+            }
+            let row_bytes = match self.run.geometry.row_elements().and_then(|elements| {
+                elements
+                    .checked_mul(PAYLOAD_BYTES)
+                    .ok_or(Error::Dim(DimError::Overflow))
+            }) {
+                Ok(bytes) => bytes,
+                Err(error) => return Err(give_back(error, keys, values)),
+            };
+            let expected_rows = self.remaining_rows - self.outstanding_rows;
+            let expected_rows = expected_rows.min(self.run.geometry.page_tokens);
+            let rows = match u64::try_from(keys.len())
+                .ok()
+                .and_then(|len| len.checked_div(row_bytes))
+            {
+                Some(rows) if rows == expected_rows => rows,
+                _ => {
+                    return Err(give_back(
+                        invalid(
+                            "host_block",
+                            "each prefetched block must contain the next complete page or tail",
+                        ),
+                        keys,
+                        values,
+                    ));
+                }
+            };
+            let expected_bytes = match rows.checked_mul(row_bytes) {
+                Some(bytes) => bytes,
+                None => return Err(give_back(Error::Dim(DimError::Overflow), keys, values)),
+            };
+            if keys.len() as u64 != expected_bytes || values.len() as u64 != expected_bytes {
+                return Err(give_back(
+                    invalid(
+                        "host_block",
+                        "host key and value blocks must have equal complete row widths",
+                    ),
+                    keys,
+                    values,
+                ));
+            }
+            let transfer = match expected_bytes
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(PAGE_ENTRY_BYTES))
+            {
+                Some(bytes) => bytes,
+                None => return Err(give_back(Error::Dim(DimError::Overflow), keys, values)),
+            };
+            let outstanding_bytes = match transfer.checked_mul(outstanding + 1) {
+                Some(bytes) => bytes,
+                None => return Err(give_back(Error::Dim(DimError::Overflow), keys, values)),
+            };
+            if self
+                .host_to_device_bytes
+                .checked_add(outstanding_bytes)
+                .is_none()
+            {
+                return Err(give_back(Error::Dim(DimError::Overflow), keys, values));
+            }
+            let next_prefetched = match self.prefetched_total.checked_add(1) {
+                Some(total) => total,
+                None => return Err(give_back(Error::Dim(DimError::Overflow), keys, values)),
+            };
+            let next_outstanding_rows = match self.outstanding_rows.checked_add(rows) {
+                Some(total) => total,
+                None => return Err(give_back(Error::Dim(DimError::Overflow), keys, values)),
+            };
+            let block_base = match self.next_base.checked_add(self.outstanding_rows) {
+                Some(base) => base,
+                None => return Err(give_back(Error::Dim(DimError::Overflow), keys, values)),
+            };
+            let copy_stream = self
+                .run
+                .copy_stream
+                .as_ref()
+                .expect("read-ahead admission owns a copy stream");
+            if let Err(error) =
+                self.run
+                    .check_partial(copy_stream, &self.launch, block_base, rows, true)
+            {
+                return Err(give_back(error, keys, values));
+            }
+            let page =
+                usize::try_from(self.prefetched_total % 2).expect("two-page index fits usize");
+            let page_bytes = self.run.pinned_page_bytes;
+            let payload_bytes = match self.run.geometry.page_bytes().and_then(|bytes| {
+                usize::try_from(bytes)
+                    .map_err(|_| invalid("host_block", "page size exceeds host addressability"))
+            }) {
+                Ok(bytes) => bytes,
+                Err(error) => return Err(give_back(error, keys, values)),
+            };
+            let key_offset = match page.checked_mul(page_bytes) {
+                Some(offset) => offset,
+                None => return Err(give_back(Error::Dim(DimError::Overflow), keys, values)),
+            };
+            let value_offset = match key_offset.checked_add(payload_bytes) {
+                Some(offset) => offset,
+                None => return Err(give_back(Error::Dim(DimError::Overflow), keys, values)),
+            };
+            let table_offset = match value_offset.checked_add(payload_bytes) {
+                Some(offset) => offset,
+                None => return Err(give_back(Error::Dim(DimError::Overflow), keys, values)),
+            };
+            let slot_end = match key_offset.checked_add(page_bytes) {
+                Some(end) => end,
+                None => return Err(give_back(Error::Dim(DimError::Overflow), keys, values)),
+            };
+            let key_end = match key_offset.checked_add(keys.len()) {
+                Some(end) if end <= value_offset => end,
+                _ => {
+                    return Err(give_back(
+                        invalid("host_block", "key page exceeds its bounce slot"),
+                        keys,
+                        values,
+                    ));
+                }
+            };
+            let value_end = match value_offset.checked_add(values.len()) {
+                Some(end) if end <= table_offset => end,
+                _ => {
+                    return Err(give_back(
+                        invalid("host_block", "value page exceeds its bounce slot"),
+                        keys,
+                        values,
+                    ));
+                }
+            };
+            let table_end = match table_offset.checked_add(4) {
+                Some(end) if end <= slot_end => end,
+                _ => {
+                    return Err(give_back(
+                        invalid("host_block", "page-table entry exceeds its bounce slot"),
+                        keys,
+                        values,
+                    ));
+                }
+            };
+            let bounce = self
+                .run
+                .pinned_bounce
+                .as_mut()
+                .expect("read-ahead admission owns pinned bounce pages")
+                .as_mut_slice();
+            bounce[key_offset..key_end].copy_from_slice(&keys);
+            bounce[value_offset..value_end].copy_from_slice(&values);
+            bounce[table_offset..table_end].copy_from_slice(&[0; 4]);
+
+            #[cfg(feature = "paged-attention-test-hooks")]
+            let mut gate_enqueued = false;
+            #[cfg(feature = "paged-attention-test-hooks")]
+            if self.run.gate_next_prefetch {
+                // SAFETY: the callback is static, takes no borrowed data, and
+                // only reads the static release flag until its fixed deadline.
+                if let Err(error) = unsafe {
+                    copy_stream.launch_host_func(wait_for_prefetch_release, core::ptr::null_mut())
+                } {
+                    return Err(give_back(error, keys, values));
+                }
+                self.run.gate_next_prefetch = false;
+                gate_enqueued = true;
+            }
+
+            // SAFETY: the host slice is from the run-owned pinned bounce slot;
+            // it remains unchanged through the copy event and following fold.
+            let key_result = unsafe {
+                self.run.staged_keys[page]
+                    .as_ref()
+                    .expect("read-ahead admission owns both device key pages")
+                    .copy_from_host_async(
+                        &self
+                            .run
+                            .pinned_bounce
+                            .as_ref()
+                            .expect("pinned pages")
+                            .as_slice()[key_offset..key_end],
+                        copy_stream,
+                    )
+            };
+            if let Err(error) = key_result {
+                #[cfg(feature = "paged-attention-test-hooks")]
+                if gate_enqueued && copy_stream.synchronize().is_err() {
+                    self.run.quarantined = true;
+                }
+                return Err(give_back(self.run.attribute(error), keys, values));
+            }
+            self.prefetched_total = next_prefetched;
+            self.outstanding_rows = next_outstanding_rows;
+            self.page_rows[page] = rows;
+            drop(keys);
+            drop(values);
+
+            // SAFETY: the host slice is from the run-owned pinned bounce slot;
+            // it remains unchanged through the copy event and following fold.
+            let value_result = unsafe {
+                self.run.staged_values[page]
+                    .as_ref()
+                    .expect("read-ahead admission owns both device value pages")
+                    .copy_from_host_async(
+                        &self
+                            .run
+                            .pinned_bounce
+                            .as_ref()
+                            .expect("pinned pages")
+                            .as_slice()[value_offset..value_end],
+                        copy_stream,
+                    )
+            };
+            if let Err(error) = value_result {
+                self.run.quarantined = true;
+                return Err(PagedRunRefused {
+                    error: self.run.attribute(error),
+                    source: None,
+                });
+            }
+            // SAFETY: the host slice is from the run-owned pinned bounce slot;
+            // it remains unchanged through the copy event and following fold.
+            let table_result = unsafe {
+                self.run.staged_table[page]
+                    .as_ref()
+                    .expect("read-ahead admission owns both device table pages")
+                    .copy_from_host_async(
+                        &self
+                            .run
+                            .pinned_bounce
+                            .as_ref()
+                            .expect("pinned pages")
+                            .as_slice()[table_offset..table_end],
+                        copy_stream,
+                    )
+            };
+            if let Err(error) = table_result {
+                self.run.quarantined = true;
+                return Err(PagedRunRefused {
+                    error: self.run.attribute(error),
+                    source: None,
+                });
+            }
+            let copied = self.run.copied[page]
+                .as_ref()
+                .expect("read-ahead admission owns copy events")
+                .record(copy_stream);
+            if let Err(error) = copied {
+                self.run.quarantined = true;
+                return Err(PagedRunRefused {
+                    error: self.run.attribute(error),
+                    source: None,
+                });
+            }
+            self.run.copied_pending[page] = true;
+            Ok(())
+        }
+
+        /// Wait for the oldest prefetched page, fold it, and free its slots.
+        #[allow(clippy::result_large_err)]
+        pub fn fold_next(&mut self) -> std::result::Result<Vec<DevicePartial>, PagedRunRefused> {
+            let refuse = |error| PagedRunRefused {
+                error,
+                source: None,
+            };
+            if !matches!(self.run.staging, Staging::HostBackedReadAhead { .. }) {
+                return Err(refuse(invalid(
+                    "stream",
+                    "this stream was not admitted for read-ahead",
+                )));
+            }
+            if let Err(error) = self.run.observe_pending() {
+                return Err(refuse(error));
+            }
+            if self.run.quarantined {
+                return Err(refuse(invalid("run", "this run is quarantined")));
+            }
+            if self.folded_total == self.prefetched_total {
+                return Err(refuse(invalid(
+                    "stream",
+                    "no prefetched block is ready to fold",
+                )));
+            }
+            let page = usize::try_from(self.folded_total % 2).expect("two-page index fits usize");
+            let rows = self.page_rows[page];
+            if rows == 0 || !self.run.copied_pending[page] {
+                return Err(refuse(invalid(
+                    "stream",
+                    "the next prefetched page is incomplete",
+                )));
+            }
+            let row_bytes = match self.run.geometry.row_elements().and_then(|elements| {
+                elements
+                    .checked_mul(PAYLOAD_BYTES)
+                    .ok_or(Error::Dim(DimError::Overflow))
+            }) {
+                Ok(bytes) => bytes,
+                Err(error) => return Err(refuse(error)),
+            };
+            let transfer = match rows
+                .checked_mul(row_bytes)
+                .and_then(|bytes| bytes.checked_mul(2))
+                .and_then(|bytes| bytes.checked_add(PAGE_ENTRY_BYTES))
+            {
+                Some(bytes) => bytes,
+                None => return Err(refuse(Error::Dim(DimError::Overflow))),
+            };
+            let total_transfer = match self.host_to_device_bytes.checked_add(transfer) {
+                Some(total) => total,
+                None => return Err(refuse(Error::Dim(DimError::Overflow))),
+            };
+            let next_base = match self.next_base.checked_add(rows) {
+                Some(base) => base,
+                None => return Err(refuse(Error::Dim(DimError::Overflow))),
+            };
+            let next_folded = match self.folded_total.checked_add(1) {
+                Some(total) => total,
+                None => return Err(refuse(Error::Dim(DimError::Overflow))),
+            };
+            let next_outstanding_rows = match self.outstanding_rows.checked_sub(rows) {
+                Some(total) => total,
+                None => return Err(refuse(invalid("stream", "prefetched row count is invalid"))),
+            };
+            let next_remaining_rows = match self.remaining_rows.checked_sub(rows) {
+                Some(total) => total,
+                None => return Err(refuse(invalid("stream", "remaining row count is invalid"))),
+            };
+            let next_remaining_blocks = match self.remaining_blocks.checked_sub(1) {
+                Some(total) => total,
+                None => {
+                    return Err(refuse(invalid(
+                        "stream",
+                        "remaining block count is invalid",
+                    )));
+                }
+            };
+            if let Err(error) =
+                self.run
+                    .check_partial(self.stream, &self.launch, self.next_base, rows, true)
+            {
+                return Err(refuse(error));
+            }
+            let event = self.run.copied[page]
+                .as_ref()
+                .expect("read-ahead admission owns copy events");
+            if let Err(error) = self.stream.wait_event(event) {
+                self.run.quarantined = true;
+                return Err(refuse(self.run.attribute(error)));
+            }
+            if let Err(error) =
+                self.run
+                    .launch_partial(self.stream, &self.launch, self.next_base, rows, Some(page))
+            {
+                return Err(refuse(error));
+            }
+            let partials = match self.run.read_partials(self.launch.rows()) {
+                Ok(partials) => partials,
+                Err(error) => {
+                    self.run.quarantined = true;
+                    return Err(refuse(self.run.attribute(error)));
+                }
+            };
+            self.run.copied_pending[page] = false;
+            self.page_rows[page] = 0;
+            self.folded_total = next_folded;
+            self.outstanding_rows = next_outstanding_rows;
+            self.next_base = next_base;
+            self.remaining_rows = next_remaining_rows;
+            self.remaining_blocks = next_remaining_blocks;
+            self.host_to_device_bytes = total_transfer;
+            Ok(partials)
+        }
+    }
+
+    impl Drop for NBlockStream<'_, '_> {
+        fn drop(&mut self) {
+            self.run.prefetched_unused = self
+                .run
+                .prefetched_unused
+                .saturating_add(self.prefetched_total.saturating_sub(self.folded_total));
+            if matches!(self.run.staging, Staging::HostBackedReadAhead { .. }) {
+                self.run.read_ahead_stream_active = false;
+            }
+        }
     }
 
     impl Drop for PagedAttentionRun<'_> {
         fn drop(&mut self) {
-            if self
+            let read_ahead = matches!(self.staging, Staging::HostBackedReadAhead { .. });
+            let mut failed_context_drain = false;
+            if read_ahead {
+                if self.quarantined || self.observe_pending().is_err() {
+                    if self.ctx.synchronize().is_err() {
+                        self.quarantined = true;
+                        failed_context_drain = true;
+                    } else {
+                        self.pending = None;
+                        self.copied_pending = [false, false];
+                        self.held = None;
+                        self.quarantined = false;
+                    }
+                }
+            } else if self
                 .pending
                 .as_ref()
                 .is_some_and(|pending| pending.synchronize().is_err())
             {
                 self.quarantined = true;
+            }
+            if failed_context_drain {
+                if let Some(held) = self.held.take() {
+                    match held {
+                        RefusedSource::Rows { keys, values } => {
+                            core::mem::forget(keys);
+                            core::mem::forget(values);
+                        }
+                        RefusedSource::PageTable(table) => core::mem::forget(table),
+                        RefusedSource::Query(bytes) | RefusedSource::PageTableUpload(bytes) => {
+                            core::mem::forget(bytes)
+                        }
+                        RefusedSource::Stream {
+                            query,
+                            keys,
+                            values,
+                            table: _,
+                        } => {
+                            core::mem::forget(query);
+                            core::mem::forget(keys);
+                            core::mem::forget(values);
+                        }
+                    }
+                }
+                if let Some(pinned) = self.pinned_bounce.take() {
+                    core::mem::forget(pinned);
+                }
+                if let Some(stream) = self.copy_stream.take() {
+                    core::mem::forget(stream);
+                }
+                if let Some(pending) = self.pending.take() {
+                    core::mem::forget(pending);
+                }
+                let copied = core::mem::take(&mut self.copied);
+                core::mem::forget(copied);
+                if let Some(ranges) = self.held_ranges.take() {
+                    core::mem::forget(ranges);
+                }
+                for range in [
+                    &mut self.keys,
+                    &mut self.values,
+                    &mut self.table,
+                    &mut self.query,
+                    &mut self.output,
+                    &mut self.partial_max,
+                    &mut self.partial_sum,
+                    &mut self.partial_weighted,
+                ] {
+                    if let Some(range) = range.take() {
+                        core::mem::forget(range);
+                    }
+                }
+                for page in 0..2 {
+                    for range in [
+                        &mut self.staged_keys[page],
+                        &mut self.staged_values[page],
+                        &mut self.staged_table[page],
+                    ] {
+                        if let Some(range) = range.take() {
+                            core::mem::forget(range);
+                        }
+                    }
+                }
+                if let Some(arena) = self.arena.take() {
+                    core::mem::forget(arena);
+                }
+                return;
             }
             if self.quarantined {
                 // Host bytes a still-enqueued copy may be reading. Forgetting
@@ -4449,6 +5178,12 @@ pub mod device {
                 // SAFETY: the field is created once and otherwise never
                 // dropped; all normal-path work is settled or observed here.
                 unsafe { ManuallyDrop::drop(&mut self.module) };
+            }
+            if read_ahead
+                && let Some(pinned) = self.pinned_bounce.take()
+                && let Err((pinned, _)) = pinned.free()
+            {
+                core::mem::forget(pinned);
             }
             // `held_ranges` needs no such rescue: a `DeviceRange` has no
             // `Drop` of its own, so an ordinary drop here does not release its
@@ -4933,6 +5668,7 @@ pub mod device {
         root_lineage_host: u64,
         fork_host: u64,
         partials_host: u64,
+        pinned_bounce: u64,
         query: u64,
         persistent: u64,
         per_step: u64,
@@ -5032,6 +5768,16 @@ pub mod device {
             } else {
                 0
             };
+            let pinned_bounce = if matches!(staging, Staging::HostBackedReadAhead { .. }) {
+                geometry
+                    .page_bytes()?
+                    .checked_mul(2)
+                    .and_then(|bytes| bytes.checked_add(PAGE_ENTRY_BYTES))
+                    .and_then(|bytes| bytes.checked_mul(2))
+                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))?
+            } else {
+                0
+            };
             let query = align_up(
                 max_rows
                     .checked_mul(heads)
@@ -5066,9 +5812,17 @@ pub mod device {
                         .and_then(|v| v.checked_mul(4))
                         .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
                 )?;
-                let transfer = staged_payload
+                let single_page = staged_payload
                     .checked_mul(2)
                     .and_then(|v| v.checked_add(staged_table))
+                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+                let staging_pages = if matches!(staging, Staging::HostBackedReadAhead { .. }) {
+                    2
+                } else {
+                    1
+                };
+                let transfer = single_page
+                    .checked_mul(staging_pages)
                     .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
                 let per_step = query
                     .checked_add(
@@ -5120,6 +5874,7 @@ pub mod device {
                 root_lineage_host,
                 fork_host,
                 partials_host,
+                pinned_bounce,
                 query,
                 persistent,
                 per_step,
@@ -5238,7 +5993,9 @@ pub mod device {
             ))?,
             ["fork", "append", "launch", "read", "commit"],
         )?;
-        if let Staging::HostBacked { max_staged_blocks } = staging {
+        if let Staging::HostBacked { max_staged_blocks }
+        | Staging::HostBackedReadAhead { max_staged_blocks } = staging
+        {
             request.host_backed_blocks(max_staged_blocks)?;
         }
         let scope = Scope::Device(ctx.uuid());
@@ -5293,6 +6050,15 @@ pub mod device {
                 Tier::Host(HostTier::Pageable),
                 extents.fork_host,
                 StageSpan::inclusive(0, 4),
+            ))?;
+        }
+        if extents.pinned_bounce != 0 {
+            request.buffer(BufferRequest::new(
+                "attention-stream-pinned-bounce-pages",
+                Scope::Host,
+                Tier::Host(HostTier::Pinned),
+                extents.pinned_bounce,
+                StageSpan::at(2),
             ))?;
         }
         request.buffer(BufferRequest::new(
@@ -5411,6 +6177,29 @@ pub mod device {
                 extents.staged_table,
                 StageSpan::at(2),
             ))?;
+            if matches!(staging, Staging::HostBackedReadAhead { .. }) {
+                request.buffer(BufferRequest::new(
+                    "attention-stream-staged-keys-next",
+                    scope,
+                    Tier::Device(DeviceTier::TransferStaging),
+                    extents.staged_payload,
+                    StageSpan::at(2),
+                ))?;
+                request.buffer(BufferRequest::new(
+                    "attention-stream-staged-values-next",
+                    scope,
+                    Tier::Device(DeviceTier::TransferStaging),
+                    extents.staged_payload,
+                    StageSpan::at(2),
+                ))?;
+                request.buffer(BufferRequest::new(
+                    "attention-stream-staged-table-next",
+                    scope,
+                    Tier::Device(DeviceTier::TransferStaging),
+                    extents.staged_table,
+                    StageSpan::at(2),
+                ))?;
+            }
         }
         Ok(request)
     }

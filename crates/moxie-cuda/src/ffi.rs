@@ -117,6 +117,11 @@ unsafe extern "C" {
     pub fn cuStreamCreate(stream: *mut CUstream, flags: c_uint) -> CUresult;
     pub fn cuStreamSynchronize(stream: CUstream) -> CUresult;
     pub fn cuStreamWaitEvent(stream: CUstream, event: CUevent, flags: c_uint) -> CUresult;
+    pub fn cuLaunchHostFunc(
+        stream: CUstream,
+        callback: unsafe extern "C" fn(*mut c_void),
+        data: *mut c_void,
+    ) -> CUresult;
     pub fn cuStreamDestroy_v2(stream: CUstream) -> CUresult;
     pub fn cuStreamBeginCapture_v2(stream: CUstream, mode: c_uint) -> CUresult;
     pub fn cuStreamEndCapture(stream: CUstream, graph: *mut CUgraph) -> CUresult;

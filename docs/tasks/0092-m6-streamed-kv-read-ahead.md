@@ -211,4 +211,20 @@ is needed.
 
 ## Result, filled after work
 
-(pending)
+Implemented the two-page pinned and device staging path, the separate
+`prefetch`/`fold_next` protocol, checked pinned frees, copied-event waits,
+quarantine/drain behavior, unused-prefetch accounting, and the deterministic
+test hook. The every-GPU test confirmed bit-identical merged outputs and
+successful cleanup after a mid-stream drop. The wait-removal mutant failed
+the output comparison with the gate held; the wait was restored.
+
+Host gates passed: fmt, workspace clippy, executor driver-feature clippy,
+workspace tests, `arch-check`, and `spec-check`. GPU gates passed with
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`: `paged_attention_device` (8 passed, 1
+ignored), `dense_gemma_device` (11 passed, 2 ignored), and
+`cargo xtask-cuda test-gpu` (69/69 across SM86 and SM120).
+
+Recorded two timing runs in `docs/evidence/kv-read-ahead.md`. On the target
+RTX 3090, `stage_next` medians were 348.022 and 346.940 µs; read-ahead medians
+were 346.241 and 349.557 µs. The timing difference changed direction between
+runs, and overlap was not measurable from the available event intervals.
