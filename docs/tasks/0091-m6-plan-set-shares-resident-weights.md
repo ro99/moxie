@@ -188,3 +188,8 @@ workspace tests, `arch-check`, and `spec-check`. GPU gates passed with
 `CUDA_DEVICE_ORDER=PCI_BUS_ID`: `dense_gemma_device` (11 passed, 2 ignored),
 `residency_device` (1 passed), `dense_tp2_device` (1 passed), and
 `cargo xtask-cuda test-gpu` (69/69).
+
+**R1:** Made admission and close refusals opaque owners of the whole plan set;
+their close operation closes held plans (and any partial admission resource)
+before releasing leases, and a close refusal retains the set for retry. The
+GPU test now closes an admission refusal before reporting it.

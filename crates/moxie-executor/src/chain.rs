@@ -52,6 +52,41 @@ pub enum SelectedAdmitRefused<'ctx> {
     },
 }
 
+impl SelectedAdmitRefused<'_> {
+    pub(crate) fn close(self, ledger: &mut Ledger) -> std::result::Result<(), Self> {
+        match self {
+            Self::Invalid { .. } | Self::Rejected { .. } => Ok(()),
+            Self::Held {
+                candidate,
+                resource: SelectedHeldResource::Reservation(reservation),
+                ..
+            } => match ledger.release(reservation) {
+                Ok(()) => Ok(()),
+                Err(refused) => Err(Self::Held {
+                    candidate,
+                    resource: SelectedHeldResource::Reservation(refused.reservation),
+                    error: refused.error,
+                }),
+            },
+            Self::Held {
+                candidate,
+                resource: SelectedHeldResource::Arena { arena, ranges },
+                ..
+            } => match unwind_selected(*arena, ranges, ledger) {
+                Ok(()) => Ok(()),
+                Err(refused) => Err(Self::Held {
+                    candidate,
+                    resource: SelectedHeldResource::Arena {
+                        arena: Box::new(refused.arena),
+                        ranges: refused.ranges,
+                    },
+                    error: refused.error,
+                }),
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum SelectedHeldResource<'ctx> {
     Reservation(Reservation),

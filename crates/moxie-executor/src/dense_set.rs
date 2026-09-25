@@ -46,22 +46,40 @@ pub struct DenseSetOutput {
     pub launch_order: Vec<String>,
 }
 
-/// Admission refused while retaining every residency lease and any plan that
-/// could not be closed during unwind.
+/// Admission refused while retaining the incomplete set and every lease.
 #[derive(Debug)]
 pub struct DensePlanSetRefused<'r, 'ctx> {
-    pub residency: &'r DeviceResidency<'ctx>,
-    pub leases: BTreeMap<ValueId, ResidencyLease>,
-    pub plans: BTreeMap<u64, SelectedReservedPlan<'ctx>>,
-    pub admission: Option<SelectedAdmitRefused<'ctx>>,
     pub error: Error,
+    held: DensePlanSet<'r, 'ctx>,
+}
+
+impl<'r, 'ctx> DensePlanSetRefused<'r, 'ctx> {
+    #[allow(clippy::result_large_err)]
+    pub fn close(
+        self,
+        ledger: &mut Ledger,
+        authority: &mut ResidencyAuthority,
+    ) -> std::result::Result<(), DenseSetCloseRefused<'r, 'ctx>> {
+        self.held.close(ledger, authority)
+    }
 }
 
 /// A close refusal, with the plan set and its leases intact for retry.
 #[derive(Debug)]
 pub struct DenseSetCloseRefused<'r, 'ctx> {
-    pub set: DensePlanSet<'r, 'ctx>,
     pub error: Error,
+    held: DensePlanSet<'r, 'ctx>,
+}
+
+impl<'r, 'ctx> DenseSetCloseRefused<'r, 'ctx> {
+    #[allow(clippy::result_large_err)]
+    pub fn close(
+        self,
+        ledger: &mut Ledger,
+        authority: &mut ResidencyAuthority,
+    ) -> std::result::Result<(), Self> {
+        self.held.close(ledger, authority)
+    }
 }
 
 /// Several row buckets over one leased, device-resident copy of graph weights.
@@ -71,6 +89,7 @@ pub struct DensePlanSet<'r, 'ctx> {
     residency: &'r DeviceResidency<'ctx>,
     leases: BTreeMap<ValueId, ResidencyLease>,
     plans: BTreeMap<u64, SelectedReservedPlan<'ctx>>,
+    pending_admission: Option<SelectedAdmitRefused<'ctx>>,
     lost: Option<OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>>,
     ledger: LedgerId,
 }
@@ -88,12 +107,18 @@ impl<'r, 'ctx> DensePlanSet<'r, 'ctx> {
         leases: BTreeMap<ValueId, ResidencyLease>,
         candidates: Vec<SelectedPlanCandidate>,
     ) -> std::result::Result<Self, DensePlanSetRefused<'r, 'ctx>> {
+        let ledger_id = ledger.id();
         let refuse = |leases, error| DensePlanSetRefused {
-            residency,
-            leases,
-            plans: BTreeMap::new(),
-            admission: None,
             error,
+            held: Self {
+                graph,
+                residency,
+                leases,
+                plans: BTreeMap::new(),
+                pending_admission: None,
+                lost: None,
+                ledger: ledger_id,
+            },
         };
         if leases.len() != graph.weights().len()
             || graph
@@ -221,13 +246,19 @@ impl<'r, 'ctx> DensePlanSet<'r, 'ctx> {
                             Error::from(rejection.clone())
                         }
                     };
-                    let close_error = close_plans(&mut plans, ledger);
+                    let pending_admission =
+                        matches!(admission, SelectedAdmitRefused::Held { .. }).then_some(admission);
                     return Err(DensePlanSetRefused {
-                        residency,
-                        leases,
-                        plans,
-                        admission: Some(admission),
-                        error: close_error.unwrap_or(error),
+                        error,
+                        held: Self {
+                            graph,
+                            residency,
+                            leases,
+                            plans,
+                            pending_admission,
+                            lost: None,
+                            ledger: ledger_id,
+                        },
                     });
                 }
             }
@@ -238,8 +269,9 @@ impl<'r, 'ctx> DensePlanSet<'r, 'ctx> {
             residency,
             leases,
             plans,
+            pending_admission: None,
             lost: None,
-            ledger: ledger.id(),
+            ledger: ledger_id,
         })
     }
 
@@ -355,7 +387,7 @@ impl<'r, 'ctx> DensePlanSet<'r, 'ctx> {
         ledger: &mut Ledger,
         authority: &mut ResidencyAuthority,
     ) -> std::result::Result<(), DenseSetCloseRefused<'r, 'ctx>> {
-        let refuse = |set, error| DenseSetCloseRefused { set, error };
+        let refuse = |held, error| DenseSetCloseRefused { held, error };
         if self.ledger != ledger.id() {
             return Err(refuse(
                 self,
@@ -377,6 +409,17 @@ impl<'r, 'ctx> DensePlanSet<'r, 'ctx> {
                 return Err(refuse(self, refused.error));
             }
         }
+        if let Some(admission) = self.pending_admission.take()
+            && let Err(admission) = admission.close(ledger)
+        {
+            let error = match &admission {
+                SelectedAdmitRefused::Held { error, .. } => error.clone(),
+                SelectedAdmitRefused::Invalid { error, .. } => error.clone(),
+                SelectedAdmitRefused::Rejected { rejection, .. } => Error::from(rejection.clone()),
+            };
+            self.pending_admission = Some(admission);
+            return Err(refuse(self, error));
+        }
         while let Some((value, lease)) = self.leases.pop_first() {
             if let Err(refused) = authority.release(lease) {
                 self.leases.insert(value, refused.lease);
@@ -385,17 +428,4 @@ impl<'r, 'ctx> DensePlanSet<'r, 'ctx> {
         }
         Ok(())
     }
-}
-
-fn close_plans<'ctx>(
-    plans: &mut BTreeMap<u64, SelectedReservedPlan<'ctx>>,
-    ledger: &mut Ledger,
-) -> Option<Error> {
-    while let Some((rows, plan)) = plans.pop_first() {
-        if let Err(refused) = plan.close(ledger) {
-            plans.insert(rows, refused.plan);
-            return Some(refused.error);
-        }
-    }
-    None
 }

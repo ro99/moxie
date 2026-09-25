@@ -3891,7 +3891,7 @@ fn bucket_plans_share_one_resident_weight_copy() {
     }
     assert_eq!(authority.committed_bytes(scope).unwrap(), logical_bytes);
 
-    let mut set = DensePlanSet::admit(
+    let mut set = match DensePlanSet::admit(
         &mut ledger,
         &context,
         &fixture.graph,
@@ -3901,8 +3901,22 @@ fn bucket_plans_share_one_resident_weight_copy() {
         &authority,
         leases,
         candidates,
-    )
-    .unwrap_or_else(|refused| panic!("admit shared-weight buckets: {refused:?}"));
+    ) {
+        Ok(set) => set,
+        Err(refused) => {
+            let admission_error = refused.error.to_string();
+            match refused.close(&mut ledger, &mut authority) {
+                Ok(()) => panic!("admit shared-weight buckets: {admission_error}"),
+                Err(close_refused) => {
+                    let close_error = close_refused.error.to_string();
+                    std::mem::forget(close_refused);
+                    panic!(
+                        "admit shared-weight buckets: {admission_error}; cleanup failed: {close_error}"
+                    );
+                }
+            }
+        }
+    };
     for bucket in buckets {
         set.set_segment_capture(bucket, true, &mut ledger)
             .unwrap_or_else(|error| panic!("capture bucket {bucket}: {error}"));
