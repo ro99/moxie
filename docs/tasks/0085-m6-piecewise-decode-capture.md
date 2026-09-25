@@ -1,6 +1,14 @@
 # Task 0085 — a reused dense plan captures and replays its segments
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-25), after sol's review round R1.
+Implementation `b551619`; R1 repair `7907896`.
+- R1 (HIGH): after a failed capture step, cleanup cleared the plan's graphs
+  even when the stream drain failed, destroying execs with unobserved
+  launches. Now cleared only after a successful drain; otherwise the lost
+  lease withholds plan and graphs together. Verified by the coordinator.
+- Effect (fixture-scale, not a claim): decode step median about 990 → 870 µs
+  with replay; `cuMemGetInfo` showed no free-memory change across the capture
+  step, which does not establish a zero graph-memory charge. Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Identity and authority
 
