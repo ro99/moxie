@@ -1,6 +1,9 @@
 # Task 0101 — full-step decode capture: step-state buffer, prepare/apply, one graph
 
-Status: **proposed, revision 2** (coordinator, 2026-09-25). This was
+Status: **active, revision 3** (coordinator, 2026-09-25). The second design
+review (3 high, 1 medium) is adopted verbatim in "Design review 2" below.
+Where it conflicts with the numbered changes, **it overrides them**.
+Earlier revision history: This was
 drafted as 0099. Sol's design review found 5 high and 4 medium, and all nine
 are now folded into the numbered changes. The state authority's token was
 split out as task 0099 (`prepare_append`/`apply_append`, `19eea35`). It is
@@ -274,5 +277,56 @@ commit while the final gates run.
 - **M4.** The pinned mirror is admitted and allocated only when full-step
   capture is enabled. A pinned-cap refusal leaves the plan eligible for
   eager or piecewise execution. Charge before allocating.
+
+## Design review 2 (sol, 2026-09-25) — adopted verbatim; overrides the numbered changes
+
+- **H1 (change 1, transitions).** From piecewise mode:
+  1. First admit the pinned charge and allocate the mirror while the old
+     piecewise graph and reservation remain. If this fails, keep piecewise
+     unchanged.
+  2. Then destroy the old graphs and release the old pool reservation. If
+     the release refuses, retain that reservation and return a transition
+     refusal with the plan held.
+  3. Admit the new pool bound before capture, with no simultaneous pool
+     reservations.
+
+  A later admit or cleanup refusal may leave the plan in eager mode with
+  retained charges, and must not claim "unchanged". Reject
+  `set_segment_capture(true)` while full-step is active. A failed
+  graph-pool or pinned-charge cleanup cannot return a clean, unchanged plan.
+  Test (f) is read under this rule.
+- **H2 (changes 4, 5, 9, table sources).**
+  - Before writing any run's table bytes in prepare, observe its prior
+    pending completion and recover `page_table_upload`. On an observation
+    failure, quarantine and withhold the run and the plan.
+  - Keep the encoded source owned by the run from before the H2D call,
+    including a refused call, until a completion event or a drain. Only
+    then may the next prepare rewrite it.
+  - The escape inventory's pre-enqueue row splits in two: a prior-completion
+    failure quarantines; any other pre-enqueue failure returns the plan
+    unchanged.
+- **H3 (change 8, apply atomicity).**
+  - First, observe and retire the prior run events.
+  - After the graph launch, and **before** `state.apply_append`, create and
+    record one completion event per participating run, plus the lease's
+    completion event. Handle every creation or record failure as a
+    post-submission quarantine.
+  - Then apply the token, and transfer the already-recorded events to the
+    runs with infallible assignments of `pending` and `written`.
+  - If apply refuses, keep every event with the quarantined runs and the
+    withheld plan.
+
+  Each run owns its own `Event` (events are not `Clone`); the lease owns the
+  dense one.
+- **M1 (capture errors).** On every error after `begin_capture` and before a
+  graph is installed:
+  - attempt `end_capture` exactly once and destroy any returned graph;
+  - clear the open-capture flag;
+  - withhold the plan and runs, and keep the upload sources, if completion
+    is unknown.
+
+  An `end_capture` or `instantiate` refusal follows the same
+  post-enqueue rule. This also covers the stop condition where a node
+  cannot be captured.
 
 ## Result, filled after work
