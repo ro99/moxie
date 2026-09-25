@@ -136,8 +136,11 @@ stays idle unless the owner asks.
 
 Remaining build route, in roadmap order (each a bounded task, luna, sol
 reviews):
-1. **M6.1** Tiled tensor-core matrix multiply for BF16 and affine INT8/INT4
-   weights, replacing the one-thread-per-output dense linear. Task 0095
+1. **M6.1** Fast BF16 linears. Owner ruling (2026-09-25,
+   [ADR 0037](../decisions/adr/0037-cublas-tensor-op-bf16-linears.md)):
+   cuBLAS tensor-op under ADR 0028's gate; selection projections keep the
+   declared order. [Task 0096](../tasks/0096-m6-cublas-bf16-linears.md). The
+   affine INT8/INT4 kernel is already tensor-core (ADR 0028). Task 0095
    measured the current kernel at 0.055 TFLOP/s on a 3090 and 0.109 on the
    5060 Ti, about 1,000 times below the hardware.
 2. **M6.2** Full-step decode capture, attention included, with the piecewise
