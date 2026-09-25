@@ -1,8 +1,8 @@
 # Task 0092 — bounded read-ahead for host-backed KV streaming
 
-Status: **proposed** (coordinator, 2026-09-25); the contract goes to sol for a
-design review of its escape inventory before implementation (engineering
-log, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **active** (coordinator, 2026-09-25). Revised after sol's design
+review (2 high, 3 medium, all adopted; see "Design review" below) before any
+implementation (engineering log, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Identity and authority
 
@@ -56,7 +56,9 @@ log, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
   in a pinned bounce page and being copied to a second device staging page on
   a copy stream. Results are bit-identical to `stage_next`; a paired
   measurement compares both; unused prefetched blocks are counted.
-- **Allowed files:** `crates/moxie-executor/src/paged_attention.rs`,
+- **Allowed files:** `crates/moxie-cuda/src/{ffi.rs,status.rs,driver.rs}`
+  (checked pinned free; host-function launch for the test gate),
+  `crates/moxie-executor/src/paged_attention.rs`,
   `crates/moxie-memory/src/report.rs` only if the staging byte request lives
   there, `crates/moxie-executor/tests/paged_attention_device.rs` (one test and
   one ignored timing test), new `docs/evidence/kv-read-ahead.md`, this task's
@@ -81,53 +83,95 @@ log, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
    `prefetch` for block 0, then repeatedly `prefetch(i + 1)` (while blocks
    remain) and `fold_next()` for block `i`. At most **two** blocks are ever
    outstanding (one being folded, one prefetched); a third `prefetch` before
-   a `fold_next` is refused before touching anything.
+   a `fold_next` is refused before touching anything. **A stream uses exactly
+   one protocol:** `stage_next` refuses a run admitted with the read-ahead
+   variant before enqueuing anything, and `prefetch`/`fold_next` refuse the
+   other variants; `stage_next`'s behaviour for existing variants is
+   unchanged.
 3. **`prefetch`.** Validate the page exactly as `stage_next` does for its
-   position. **Copy the caller's `keys`/`values` synchronously (CPU memcpy)
-   into the free pinned bounce page, then drop or return the `Vec`s** — no
-   caller memory is ever referenced by device work. Then, on the run's copy
-   stream (a second `Stream` created at admission), make it wait on the event
-   of the last kernel that read the target device staging page, enqueue the
-   pinned→device copies, and record a per-page `copied` event.
+   position. Copy the caller's `keys`/`values` synchronously (CPU memcpy)
+   into the free pinned bounce page; device work never references caller
+   memory. **Keep the original `Vec`s until the first device-copy enqueue
+   succeeds and return them in `PagedRunRefused.source` on every earlier
+   refusal;** after that enqueue, drop them (the run retains the pinned
+   source). On the run's copy stream (a second `Stream` created at
+   admission), enqueue the pinned→device copies into the free device staging
+   page and record a per-page `copied` event. No wait on an earlier kernel is
+   needed: `fold_next` synchronizes before returning (change 4), so a page is
+   free whenever `prefetch` may target it.
 4. **`fold_next`.** On the compute stream, `wait_event(copied[page])`, launch
    the partial kernel on that page (existing `launch_partial`, with its table
-   entry), record a per-page `consumed` event, then `read_partials`
-   (synchronizes the compute stream; after it, the page's pinned bounce and
-   device staging are free). Advance `next_base`, `remaining_*`,
-   `host_to_device_bytes` exactly as `stage_next` does.
+   entry), then `read_partials` (synchronizes the compute stream; after it the
+   page's pinned bounce and device staging are free). Advance `next_base`,
+   `remaining_*`, `host_to_device_bytes` exactly as `stage_next` does.
+   `fold_next` has no caller vectors to return.
 5. **Wasted work.** Add `pub fn prefetched_unused(&self) -> u64` on the run:
    blocks prefetched and never folded (for example, a stream dropped after a
    prefetch), counted when the stream ends.
+6. **Checked pinned free (`moxie-cuda`).** `PinnedHostBuffer::free(self) ->
+   Result<(), (Self, Error)>`: makes the context current, calls
+   `cuMemFreeHost`, and on failure returns the buffer with the error (the
+   buffer is not freed, and `Drop` of the returned value keeps today's
+   behaviour). The run uses it on close; a failed free keeps the pages and
+   the charge in the returned refusal.
+7. **Deterministic test gate (`moxie-cuda`, test hooks only).** Add
+   `unsafe fn Stream::launch_host_func(&self, f: unsafe extern "C" fn(*mut
+   c_void), data: *mut c_void) -> Result<()>` (`cuLaunchHostFunc`, checked
+   against `cuda.h`). Under the `paged-attention-test-hooks` feature, a run
+   flag makes `prefetch` enqueue, on the copy stream **before** its copies, a
+   host function that blocks until a static release flag is set (bounded by a
+   10 s deadline, as `tests/support/event_gate.rs` does). The test releases it
+   after `fold_next` has been called from another thread, or after a short
+   sleep in a spawned thread; with the `copied` wait present the output is
+   still bit-identical.
 
 ## Escape inventory (what keeps each resource valid on every path)
 
 | Resource | Owner | Last device use | Kept valid by |
 |---|---|---|---|
-| Caller's `keys`/`values` `Vec`s | caller | none | copied to pinned before any enqueue; never referenced by device work |
-| Pinned bounce page | run | its pinned→device copy | reused only after its `copied` event is observed (by `fold_next`'s synchronize or by `observe_pending`) |
-| Device staging page | run | the partial kernel that reads it | the copy stream waits on its `consumed` event before overwriting it |
-| `copied` / `consumed` events | run | the stream wait / host observation | owned by the run; replaced only after observed |
-| Copy stream | run | last prefetch copy | dropped only after the run observes all its events |
-| Partial output buffer | run | `read_partials` | unchanged (synchronous readback) |
+| Caller's `keys`/`values` `Vec`s | caller | none | copied to pinned first; kept and returned on every refusal before the first device-copy enqueue; dropped after it |
+| Pinned bounce page | run | its pinned→device copy | reused only after `fold_next` has synchronized the compute stream that waited on its `copied` event |
+| Device staging page | run | the partial kernel that reads it | `fold_next` synchronizes before returning; `prefetch` can only target a page whose last kernel has completed |
+| Query, resident KV pages, page table, partial output | run | the resident and staged partial kernels | unchanged from `stage_next`: owned by the run; synchronous readback after each kernel |
+| `copied` events | run | the compute stream's wait | owned by the run; replaced only after the `fold_next` that waited on it has synchronized |
+| Copy stream | run | last prefetch copy | dropped only after a drain (below) |
+| CUDA module | run | every partial kernel | task 0082 R1 rule: never unloaded while work may run |
+| Pinned charge in the ledger | run | — | released only after a **checked** free of both pinned pages succeeds (change 6) |
 
 Exit paths, each required:
 
-- **Refusal before enqueue** (validation, third prefetch, wrong variant): the
-  caller's `Vec`s come back in `PagedRunRefused.source`; nothing changes.
-- **Refusal after enqueue** (copy, wait, launch or record failure): the run is
-  quarantined; the pinned pages and staging stay owned by the run; the
-  caller's `Vec`s were already copied, so `source` is `None` only if they
-  were not returned before the failure (state which in code).
-- **`NBlockStream` dropped mid-stream** (prefetched, not folded): the pending
-  `copied` event is left in the run (`pending` from task 0082, or an
-  equivalent per-page event the run observes first on its next use), and
-  `prefetched_unused` is incremented. Nothing is freed while a copy may run.
-- **Run close / drop:** `close` observes every event first (task 0082 rule:
-  every entry observes pending work); `Drop` with unobserved work follows
-  task 0082 R1 (never unloads the module or frees pinned pages while work may
-  run: forget them if observation fails).
-- **Ledger:** the pinned charge is released only after the pinned pages are
-  freed, which is only after every event naming them is observed.
+- **Refusal before the first device-copy enqueue** (validation, third
+  prefetch, wrong variant or protocol, event creation): the caller's `Vec`s
+  come back in `PagedRunRefused.source`; nothing else changes.
+- **Refusal after an enqueue** (copy, wait, launch failure): the run is
+  quarantined; every run-owned resource stays owned.
+- **An event that cannot be recorded or observed after a submission:** the
+  run is quarantined. `close` refuses unless a **context-wide drain**
+  (`RankContext` synchronize) has succeeded; `Drop` attempts that drain and,
+  if it fails, withholds (forgets) the pinned pages, device ranges, module and
+  copy stream, and keeps the ledger charge.
+- **`NBlockStream` dropped mid-stream** (prefetched, not folded): the run
+  keeps the unobserved `copied` event as pending work that its next entry
+  point observes first (task 0082 rule), and `prefetched_unused` is
+  incremented.
+- **Run close / drop:** as the event rule above; otherwise `close` observes
+  all pending work, frees the pinned pages with the checked free, then
+  releases their ledger charge.
+
+## Design review (sol, 2026-09-25; adopted by the coordinator)
+
+1. HIGH: mixing `stage_next` with `prefetch` could race a staging page →
+   one protocol per stream (change 2).
+2. HIGH: a failed event record leaves submitted work unobservable →
+   quarantine and context-wide drain before close; `Drop` withholds on drain
+   failure; query/resident/module added to the inventory.
+3. MEDIUM: `PinnedHostBuffer::drop` ignores `cuMemFreeHost` failure → checked
+   free (change 6); charge kept until it succeeds.
+4. MEDIUM: caller `Vec`s dropped before a fallible pre-enqueue step → kept
+   until the first device-copy enqueue succeeds (change 3).
+5. MEDIUM: the overwrite wait was redundant under the synchronous
+   `fold_next`, so its mutant could not fail → removed; the mutant targets the
+   compute stream's wait on `copied`, with a deterministic gate (change 7).
 
 ## Tests
 
@@ -156,10 +200,10 @@ spec-check`.
 one paragraph stating only what it shows. With only three staged blocks the
 gain may be small; report it as measured.
 
-**Coverage check (one mutant, reverted after):** skip the copy stream's wait
-on `consumed` before overwriting a staging page; the bit-identity test must
-fail on at least one GPU. If it passes everywhere, stop and report (the
-fixture cannot see the race; the coordinator will decide).
+**Coverage check (one mutant, reverted after):** with the change 7 gate held
+during `fold_next`, remove the compute stream's `wait_event(copied[page])`;
+the bit-identity test must fail (the kernel reads the page before its copy
+lands). If it passes, stop and report.
 
 **Stop conditions:** any path in the escape inventory cannot be implemented
 as written; a change conflicts with the code; a file outside the allowed list
