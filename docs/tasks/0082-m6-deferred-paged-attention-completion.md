@@ -1,7 +1,6 @@
 # Task 0082 — the dense step's paged-attention work completes with the step
 
-Status: **proposed** (coordinator, 2026-09-24); opens when task 0081 is
-accepted. Builder Codex `luna`; reviewer Codex `sol`.
+Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Identity and authority
 
@@ -22,7 +21,8 @@ accepted. Builder Codex `luna`; reviewer Codex `sol`.
   explicit paths only.**
 - **GPUs are free**; the builder is the only GPU user. Always set
   `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
-- **Naming rule:** no task numbers in code identifiers, labels or strings.
+- **Naming rule:** no task numbers in code identifiers, labels, strings **or
+  numeric literals** (a `RankId(81_000 + …)` was caught in tasks 0075 and 0081).
 - O6 is open: no speed claim.
 
 ## Facts established before writing (coordinator, 2026-09-24)

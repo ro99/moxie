@@ -1,6 +1,13 @@
 # Task 0081 — the single-GPU dense step executes affine linear weights
 
-Status: **active** (coordinator, 2026-09-24). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-25), after sol's review round R1.
+Implementation `694cf3f`; R1 repair `164f383`.
+- R1 (LOW, naming rule, recurring from task 0075): the test's rank id encoded
+  the task number. Replaced; sol's optional trims applied (net −11 test
+  lines). Verified by the coordinator.
+- Effect: a reduced dense Gemma step with INT8 and INT4 affine linears
+  matches its BF16-rounded host reference at 0.000 BF16 ULP on both 3090s
+  and the 5060 Ti. Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Identity and authority
 
