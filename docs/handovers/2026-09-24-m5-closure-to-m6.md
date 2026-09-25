@@ -127,7 +127,7 @@ tsk board thread `m6` mirrors it.
 | Order | Slice | Delivers | Closes |
 |---|---|---|---|
 | 1 | Sync-free single-GPU dense step | K/V appended on the device (0076); event-retained instead of settled paged-attention operations; RoPE tables uploaded once per step; one host synchronization per step, at `finish` | M6.1 dense chain; prerequisite of M6.2 capture |
-| 2 | Device routing and grouped experts | Route kept on the device; batched/grouped expert launch; fused dequant/activation where the kernels support it | M6.1 MoE |
+| 2 | Quantized weights in the dense step | **Re-scoped (coordinator, 2026-09-24)** from "device routing and grouped experts": device experts already route on the device (`DENSE_ROUTE`); the only route readback is the host-owned-expert join, whose overlap is M6.3. What the dense step lacks is any quantized weight. [0080](../tasks/0080-m6-affine-linear-admitted-in-dense-plans.md): plans admit affine INT4/INT8 `Linear` weights through a planner format map; next, the single-GPU step launches them. Grouped expert kernels and quantized experts in the graph follow only if the exit benchmarks need them | M6.1 fused dequantization; prerequisite of slice 7's quantized checkpoint benchmarks |
 | 3 | Benchmark harness | Fixed-plan paired prefill/decode/memory benchmark with repetitions and variance, base versus candidate | M6 exit method; every later slice measures with it |
 | 4 | Prefill buckets and decode capture | Shape buckets, captured decode with piecewise fallback, admitted pools | M6.2 |
 | 5 | Overlap and read-ahead | Measured overlap against no-overlap baselines, wasted work recorded | M6.3 |
@@ -142,11 +142,18 @@ per-step `Module::load`) are ranked by [task
 breakdown before either is opened. **0078 accepted** 2026-09-24
 ([evidence](../evidence/dense-step-timing.md)): module load/unload is 24% of
 per-step driver API time and event synchronization 7%, so module caching is
-next: [task 0079](../tasks/0079-m6-dense-module-per-plan.md) **active**. **Deferred** (coordinator, 2026-09-24): removing the per-operation
+next: [task 0079](../tasks/0079-m6-dense-module-per-plan.md) **accepted** 2026-09-24: module loaded once per plan; fixture step median about 1.6 → 1.15 ms. **Slice 1 is complete** except the deferred per-operation `settle`. **Deferred** (coordinator, 2026-09-24): removing the per-operation
 `settle` in `PagedAttentionRun`. Unfinished scope: about 19 event
 synchronizations per fixture step. Revisit when decode capture (slice 4)
 needs a sync-free step, or when a checkpoint-scale profile shows them
 material.
+
+### Known bound for slice 7 (coordinator, 2026-09-24)
+
+`gemma-4-31B-it-AWQ-8bit` is INT8, group 32, symmetric, which the affine
+format covers. Its `down_proj` has 21,504 inputs, above the affine kernel's
+qualified `max_input` of 16,384. Lifting that bound is a qualification task
+before the slice 7 checkpoint run.
 
 ### Checkpoints stay in M6's exit (owner, 2026-09-24)
 

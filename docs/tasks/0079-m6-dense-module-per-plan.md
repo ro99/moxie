@@ -1,7 +1,15 @@
 # Task 0079 — load the dense kernel module once per admitted plan
 
-Status: **active** (coordinator, 2026-09-24). Builder Codex `luna`; reviewer
-Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-24), after sol's review round R1.
+Builder Codex `luna`; reviewer Codex `sol`. Implementation `3aea3a4`,
+evidence `6606c01`, R1 repair `376e2ea`.
+- R1 (MEDIUM, coverage, the coordinator's contract error): no output-checked
+  test executed a plan twice, so the cached module was never compared with an
+  oracle. `run_prefill_decode` now replays every step on the same plan and
+  asserts identical output. Verified by the coordinator against the repair
+  instruction.
+- Effect (fixture-scale, not a claim): step median about 1.6 ms → 1.15 ms;
+  `cuModuleLoadData` 117 → 8 calls for the same 111 steps.
 
 ## Identity and authority
 
