@@ -81,4 +81,45 @@ fix production code in this task.
 
 ## Result, filled after work
 
-(pending)
+- Added `many_turns_hold_every_resource_steady` on the specified 3090. It
+  admits and captures the `[1, 2, 4, 8]` plans once, then runs one 168-token
+  device sequence through 24 turns of five prefill tokens and two decode
+  steps. The measured ledger charges, outstanding count and device free bytes
+  stayed exactly constant; process RSS stayed within the 4 MiB allowance.
+- The one mutant retained a 4 KiB pageable-host ledger reservation from turn
+  10. The check caught it at turn 10: host committed bytes rose by 4,096 and
+  outstanding count by one. The mutant was reverted.
+- Host gates passed: `cargo fmt --all -- --check`, workspace clippy,
+  driver-feature executor clippy, and `cargo test --workspace --locked`.
+  GPU gate passed with `CUDA_DEVICE_ORDER=PCI_BUS_ID`: full
+  `dense_gemma_device` (10 passed, 1 ignored).
+
+Per-turn measurements from the full GPU gate (byte values, except outstanding
+count):
+
+| Turn | Device committed | Host committed | Outstanding | Device free | RSS |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,200,832 |
+| 2 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,217,216 |
+| 3 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,229,504 |
+| 4 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,233,600 |
+| 5 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,233,600 |
+| 6 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,233,600 |
+| 7 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,249,984 |
+| 8 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,249,984 |
+| 9 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,249,984 |
+| 10 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,249,984 |
+| 11 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,249,984 |
+| 12 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,249,984 |
+| 13 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,249,984 |
+| 14 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,258,176 |
+| 15 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,266,368 |
+| 16 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,266,368 |
+| 17 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,266,368 |
+| 18 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,266,368 |
+| 19 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,266,368 |
+| 20 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,274,560 |
+| 21 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,274,560 |
+| 22 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,274,560 |
+| 23 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,274,560 |
+| 24 | 8,749,568 | 311,560 | 14 | 25,013,125,120 | 270,274,560 |

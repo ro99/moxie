@@ -122,6 +122,19 @@ fn measured_ledger(ctx: &RankContext) -> Ledger {
     Ledger::new([device, host]).expect("ledger")
 }
 
+fn process_resident_bytes(page_size: u64) -> u64 {
+    let statm = std::fs::read_to_string("/proc/self/statm").expect("read process statm");
+    let resident_pages = statm
+        .split_whitespace()
+        .nth(1)
+        .expect("statm resident page count")
+        .parse::<u64>()
+        .expect("parse statm resident page count");
+    resident_pages
+        .checked_mul(page_size)
+        .expect("resident byte count fits u64")
+}
+
 fn pageable_host_bytes(ledger: &Ledger) -> u64 {
     ledger.committed(Scope::Host, Tier::Host(HostTier::Pageable))
 }
@@ -1372,6 +1385,220 @@ fn bucketed_prefill_reuses_plans_and_matches_host() {
             "bucketed prefill leaked ledger resources"
         );
     }
+}
+
+#[test]
+fn many_turns_hold_every_resource_steady() {
+    const TARGET_UUID: &str = "GPU-3032cfa3-19df-028f-5ebd-43314911e0b9";
+    const TURNS: usize = 24;
+    const PROMPT_ROWS: usize = 5;
+    const DECODE_STEPS: usize = 2;
+    const PAGE_TOKENS: usize = 4;
+    const RSS_SLACK_BYTES: u64 = 4 * 1024 * 1024;
+
+    let _guard = one_at_a_time();
+    let count = device_count().expect("enumerate CUDA devices");
+    let (ordinal, capability) = (0..count)
+        .find_map(|ordinal| {
+            let capability = query_device(ordinal).expect("query GPU capability");
+            (capability.uuid.to_string() == TARGET_UUID).then_some((ordinal, capability))
+        })
+        .expect("the specified 3090 is visible");
+    let context =
+        RankContext::acquire(RankId(ordinal), ordinal).expect("acquire many-turn context");
+    let stream = Stream::new(&context).expect("create many-turn stream");
+    let shape = moxie_cli::gemma::Shape::A;
+    let config = shape.config();
+    let fixture = moxie_cli::gemma::build(shape).expect("build dense Gemma fixture");
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+    let buckets = [1_u64, 2, 4, 8];
+    let tokens_per_turn = PROMPT_ROWS + DECODE_STEPS;
+    let required_tokens = TURNS
+        .checked_mul(tokens_per_turn)
+        .expect("conversation length fits usize");
+    let max_tokens = required_tokens
+        .checked_add(PAGE_TOKENS - 1)
+        .expect("page rounding fits usize")
+        / PAGE_TOKENS
+        * PAGE_TOKENS;
+    let max_visible_tokens = u64::try_from(max_tokens).expect("context length fits u64");
+    let page_size_output = std::process::Command::new("getconf")
+        .arg("PAGESIZE")
+        .output()
+        .expect("query system page size");
+    assert!(page_size_output.status.success(), "getconf PAGESIZE failed");
+    let page_size = std::str::from_utf8(&page_size_output.stdout)
+        .expect("page size is UTF-8")
+        .trim()
+        .parse::<u64>()
+        .expect("parse system page size");
+
+    let mut ledger = measured_ledger(&context);
+    let mut plans = BTreeMap::new();
+    for bucket in buckets {
+        let workload = ResourceWorkload {
+            phase: Phase::Prefill,
+            rows: bucket,
+            visible_tokens: max_visible_tokens,
+            branch_rows: bucket,
+            output: fixture.graph.output(),
+            device: capability.uuid,
+            paged_state_capacity: None,
+        };
+        let candidate = lower_selected(&fixture.graph, workload, &capability, &catalogue)
+            .expect("lower many-turn bucket plan");
+        let mut plan = SelectedReservedPlan::admit(
+            candidate,
+            &fixture.graph,
+            &capability,
+            &catalogue,
+            &mut ledger,
+            &context,
+        )
+        .unwrap_or_else(|refused| panic!("admit bucket {bucket}: {refused:?}"));
+        plan.set_segment_capture(true, &mut ledger)
+            .unwrap_or_else(|error| panic!("enable capture for bucket {bucket}: {error}"));
+        plans.insert(bucket, plan);
+    }
+
+    let mut state = DeviceKvSequence::new(geometry(&config, PAGE_TOKENS, max_tokens, PAGE_TOKENS))
+        .expect("create conversation device state");
+    let chunks = prefill_chunks(PROMPT_ROWS as u64, &buckets).expect("chunk each prompt");
+    assert_eq!(chunks, [4, 1]);
+    let max_step_rows = *chunks.iter().max().expect("prompt has chunks");
+    let mut runs = admit_runs(&mut ledger, &context, &config, &state, max_step_rows);
+    let mut committed_rows = 0_u64;
+    let mut measurements = Vec::with_capacity(TURNS);
+
+    for turn in 1..=TURNS {
+        for chunk_rows in chunks.iter().copied() {
+            let chunk_end = committed_rows
+                .checked_add(chunk_rows)
+                .expect("prefill position fits u64");
+            let positions: Vec<_> = (committed_rows..chunk_end).collect();
+            let tokens: Vec<_> = positions
+                .iter()
+                .map(|position| position % config.vocab)
+                .collect();
+            let transaction = state.begin().expect("begin many-turn prefill");
+            let plan = plans.remove(&chunk_rows).expect("bucket plan is admitted");
+            let mut bindings = stage_bindings(&fixture, None, &tokens, &positions, &capability);
+            if plan.bound_weight_count() != 0 {
+                bindings.retain(|binding| !matches!(binding.role, ValueRole::Weight(_)));
+            }
+            let result = plan
+                .execute_dense(DenseGraphStep {
+                    graph: &fixture.graph,
+                    capability: &capability,
+                    catalogue: &catalogue,
+                    ctx: &context,
+                    stream: &stream,
+                    state: &mut state,
+                    transaction,
+                    runs: &mut runs,
+                    bindings,
+                    host_experts: &[],
+                })
+                .map_err(|refused| refused.error)
+                .expect("execute many-turn prefill")
+                .finish()
+                .map_err(|refused| refused.error)
+                .expect("finish many-turn prefill");
+            commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
+                .expect("commit many-turn prefill");
+            plans.insert(chunk_rows, result.plan);
+            committed_rows = chunk_end;
+        }
+
+        for _ in 0..DECODE_STEPS {
+            let positions = [committed_rows];
+            let tokens = [committed_rows % config.vocab];
+            let transaction = state.begin().expect("begin many-turn decode");
+            let plan = plans.remove(&1).expect("one-row bucket plan is admitted");
+            let mut bindings = stage_bindings(&fixture, None, &tokens, &positions, &capability);
+            if plan.bound_weight_count() != 0 {
+                bindings.retain(|binding| !matches!(binding.role, ValueRole::Weight(_)));
+            }
+            let result = plan
+                .execute_dense(DenseGraphStep {
+                    graph: &fixture.graph,
+                    capability: &capability,
+                    catalogue: &catalogue,
+                    ctx: &context,
+                    stream: &stream,
+                    state: &mut state,
+                    transaction,
+                    runs: &mut runs,
+                    bindings,
+                    host_experts: &[],
+                })
+                .map_err(|refused| refused.error)
+                .expect("execute many-turn decode")
+                .finish()
+                .map_err(|refused| refused.error)
+                .expect("finish many-turn decode");
+            commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
+                .expect("commit many-turn decode");
+            plans.insert(1, result.plan);
+            committed_rows = committed_rows
+                .checked_add(1)
+                .expect("decode position fits u64");
+        }
+
+        let device_scope = Scope::Device(capability.uuid);
+        let device_committed = ledger.scope_committed(device_scope);
+        let host_committed = ledger.scope_committed(Scope::Host);
+        let outstanding = ledger.outstanding_count();
+        let (device_free, _) = context.memory_info().expect("read device free memory");
+        let resident = process_resident_bytes(page_size);
+        eprintln!(
+            "turn={turn} device_committed={device_committed} host_committed={host_committed} outstanding={outstanding} device_free={device_free} rss={resident}"
+        );
+        measurements.push((
+            device_committed,
+            host_committed,
+            outstanding,
+            device_free,
+            resident,
+        ));
+    }
+
+    let baseline = measurements[1];
+    for (index, sample) in measurements.iter().enumerate().skip(2) {
+        let turn = index + 1;
+        assert_eq!(
+            (sample.0, sample.1, sample.2),
+            (baseline.0, baseline.1, baseline.2),
+            "ledger resources changed at turn {turn}"
+        );
+        assert_eq!(
+            sample.3, baseline.3,
+            "device free memory changed at turn {turn}"
+        );
+        assert!(
+            sample.4 <= baseline.4.saturating_add(RSS_SLACK_BYTES),
+            "process RSS exceeded its allowance at turn {turn}"
+        );
+    }
+
+    for bucket in buckets {
+        plans
+            .remove(&bucket)
+            .expect("all bucket plans remain admitted")
+            .close(&mut ledger)
+            .map_err(|refused| refused.error)
+            .unwrap_or_else(|error| panic!("close bucket {bucket}: {error}"));
+    }
+    for run in runs.drain(..) {
+        run.close(&mut ledger)
+            .map_err(|refused| refused.error)
+            .expect("close many-turn attention run");
+    }
+    assert!(plans.is_empty(), "all bucket plans were closed");
+    assert!(
+        ledger.outstanding().is_empty(),
+        "many-turn test leaked resources"
+    );
 }
 
 #[test]
