@@ -1,7 +1,16 @@
 # Task 0095 — a measured compute term in plan comparison
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer
-Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-25) after sol's review round R1.
+Implementation `e9b975f`. Builder Codex `luna`; reviewer Codex `sol`.
+- R1 (medium, the coordinator's contract gap): when the final
+  synchronization fails, the probe forgets its module, buffers and events
+  instead of freeing them. This is correct: kernel completion is unknown, and
+  freeing would risk use after free. The Resources clause is amended below
+  with this quarantine exception; the code is unchanged.
+- Reading (estimates, not a claim): Moxie's dense linear kernel measures
+  0.055 TFLOP/s on each 3090 and 0.109 on the 5060 Ti. With the compute
+  term, matrix multiply dominates every estimate, and split phase pairs no
+  longer differ from same-placement ones beyond ±0.04 s.
 
 ## Identity and authority
 
@@ -140,7 +149,9 @@ Codex `sol`.
 - **Semantics:** with compute never dominating, every estimate equals
   today's (the test's first case).
 - **Resources:** the probe allocates about 40 MiB per device and frees it;
-  failure frees before returning.
+  failure frees before returning, **except** when a synchronization fails:
+  then completion is unknown, and the resources are quarantined (leaked)
+  rather than freed (amended after R1).
 - **Failure:** a missing or invalid `linear_tflops` is a typed refusal;
   arithmetic overflow is `Err`.
 
