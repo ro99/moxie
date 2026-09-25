@@ -148,6 +148,25 @@ synchronizations per fixture step. Revisit when decode capture (slice 4)
 needs a sync-free step, or when a checkpoint-scale profile shows them
 material.
 
+### Finding: duplicate resident weights across plans (coordinator, 2026-09-25)
+
+Every `SelectedReservedPlan` admits its own `PackedResidentWeights` region and
+uploads the weights into it on its first step (`moxie-executor/src/chain.rs`
+`bound_weights`; `moxie-plan` `weight_region_bytes` per candidate). Task
+0087's reused bucket set of four plans therefore holds four full weight
+copies on one GPU. Harmless at fixture scale; impossible for any real
+checkpoint, and exactly M6.4's "eliminating duplicate resident
+representations". **This is on slice 7's critical path.**
+
+Direction (to be designed as slice 6's next task): a dense plan is admitted
+without a weights region, and its weight operands resolve to addresses of
+leases held from the one weight-residency owner (`moxie_memory::residency`,
+task 0020; M3's `affine_linear.rs` `resolve` already does this for the
+standalone linear). The leases must outlive every plan and captured graph
+that names their addresses. A new shared-weights object would be a second
+residency owner, which AGENTS.md and arch-check's `second-residency-owner`
+rule forbid.
+
 ### Coverage gap carried (coordinator, 2026-09-25)
 
 Task 0082's asynchronous-ownership repairs (cross-stream ordering, fork from
