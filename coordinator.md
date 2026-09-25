@@ -94,9 +94,11 @@ skill; read with `--json`; never open the TUI.
 - **As the route becomes clear**, add task steps when a slice is designed.
   Rename or re-scope the board as the ledger does, in the same turn. A slice
   that grows beyond its plan is a tripwire (below), and the board shows it.
-- **Status is the owner's to close.** A slice is `started` while it has an
-  open task, and `review` once every task in it is accepted. Only the owner
-  sets `done`. A slice not yet started stays `open`.
+- **Status is the owner's to close.** A slice is `started` only while one of
+  its tasks is assigned and being worked, so the board shows what is in
+  motion. A slice with remaining steps and nothing assigned is `open`, and
+  its ticked steps show what was done. It is `review` once every step is
+  done. Only the owner sets `done`.
 - **Updates land in the same turn** as the event: opening a task, accepting
   it, re-scoping a slice, or meeting an exit-gate clause. A stale board is a
   status report the owner can't trust.
