@@ -110,3 +110,54 @@ recorded number, with the number). No opinion on whether Moxie will be fast.
 - More than 150 rows: stop and send `DECISION` with the grouping you propose.
 
 ## Result, filled after work
+
+Builder Claude Opus `builder`, 2026-09-25. Deliverable:
+[deepseek-strata-speed-map.md](../evidence/deepseek-strata-speed-map.md).
+
+- **Row count and grouping.** The first pass found about 280 raw candidate
+  rows, about 200 after merging duplicates. The builder sent `DECISION`. The
+  coordinator's `ANSWER` approved the grouping: one row per technique; one
+  row per tuning campaign, with the accepted gain first and each rejected
+  variant cited by `file:line`; distinct accepted techniques split; and
+  techniques tied to FP4/FP8 weights or a KV cache below 16 bits made gap
+  rows, with the rule cited and what they bought in the Note. The evidence
+  file's introduction records this rule. **Result: 117 rows** under the
+  contract's eight headings.
+- **Sources read.**
+  - **Experiments:** all 133 DeepSeek experiment records, 0006–0195,
+    including the non-`dsv4`-named DeepSeek ones.
+  - **Docs:** the four Strata docs.
+  - **Code:** the 16 headers, the 21 source and `detail/` files, and 7
+    kernel files. They are listed in the evidence file.
+  - **History:** about 235 Strata commits, read with `git log` and
+    `git show` only.
+  - **Verification:** the builder re-opened every Section 1 figure, every
+    top-ten figure and every Moxie line cited.
+  - **Discrepancies:** three disagreements between Strata sources are
+    recorded, not resolved.
+- **Baseline.** Strata's accepted production result is 26.231 prefill tok/s at
+  1,925 prompt tokens (median of three) and 8.627 decode tok/s (median), on two
+  RTX 3090s with rank-local TP2 (`docs/models/deepseek.md:191-201`).
+- **Homes.** 50 present, 42 planned, 25 gap.
+  - **Gap rows:** 4, 5, 6, 7, 10, 15, 18, 32, 33, 34, 35, 36, 45, 46, 70,
+    76, 77, 78, 79, 80, 81, 82, 104, 114, 115.
+  - **Forced by representation rules (13):** FP4/FP8 weights, W8A8
+    activations, or a cache below 16 bits (rows 6, 7, 15, 18, 36, 45, 46, 77,
+    78, 79, 80, 81, 114).
+  - **Forced by ADR 0036:** row 70.
+  - **Forced by the single-user rule:** row 76.
+  - **No place in Moxie, though accepted in Strata:** rows 4 and 5 (load
+    time), 32–35 (Moxie has no host expert worker pool; `cpu_expert.rs` is
+    single-threaded), and 82.
+- **Checks.**
+  - `cargo xtask spec-check` passed: 10 documents present and unchanged.
+  - The evidence file's relative links resolve.
+  - `git -C /home/rodrigo/Developer/strata status --short` was identical
+    before and after: `?? .pi/` and `?? tests/p2p/`. HEAD stayed
+    `2dc566e`.
+  - Nothing was built or run, and no GPU was used.
+- **Committed.** Only this contract and the evidence file. The carried
+  `.gitignore`, `docs/evidence/specification-version.md`, ADRs 0034/0035, and
+  another agent's uncommitted `crates/moxie-plan` edits were left unstaged. One
+  row cites `crates/moxie-plan/src/tensor_parallel.rs:498` at HEAD `60fc509`,
+  because that file has uncommitted edits in the shared tree.
