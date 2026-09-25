@@ -1,6 +1,12 @@
 # Task 0083 — RoPE tables at fixed workspace offsets, uploaded once per step
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-25), after sol's review round R1.
+Implementation `074e983`.
+- R1 (MEDIUM, record): the evidence gave the previous host-to-device count as
+  1,280; the named trace records 2,390. Corrected by the coordinator; no code
+  defect found.
+- Effect: host-to-device copies per fixture step 21.5 → 11.5; decode
+  workspace 256 → 768 bytes (shared part plus both tables). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Identity and authority
 

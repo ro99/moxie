@@ -254,9 +254,12 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID /usr/local/bin/nsys profile -t cuda --stats=true -o
 
 The whole process covered 111 dense steps (55 prefill repetitions, one
 committed prefill, and 55 decode repetitions). `cuMemcpyHtoDAsync_v2` was
-called 1,280 times (5.767713 ms total), or 11.53 calls per step. The preceding
-task 0082 section's GPU memcpy summary also counted 1,280 host-to-device
-copies over the same 111 steps. These process-wide counts include source and
+called 1,280 times (5.767713 ms total), or 11.53 calls per step. The task 0082
+trace (`/tmp/task-0082-deferred-paged-attention.sqlite`) records 2,390 calls
+over the same 111 steps (21.53 per step), so this task removes 1,110 calls,
+10 per step: twelve per-node RoPE uploads (six layers, query and key) become
+two per-step uploads, one per distinct table. (Corrected by the coordinator
+after sol's review; the first version of this paragraph gave 1,280 for both.) These process-wide counts include source and
 other host-to-device copies; they do not attribute calls to individual RoPE
 tables. Profiled timing output (prefill `1466.310/1427.100/1528.030 µs`;
 decode `1375.438/1355.453/1489.847 µs`, median/min/max) is excluded from the
