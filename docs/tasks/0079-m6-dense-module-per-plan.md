@@ -73,10 +73,14 @@ Codex `sol`.
    takes the module from the operation's plan (`operation.plan.as_ref()
    .expect("dense operation retains plan").package.as_ref()`), returning the
    file's `invalid(…)` if it is `None`. Keep the attribution unchanged.
-4. Nothing else. No new test: every dense GPU test runs more than one step on
-   one plan or admits a new plan per step, so both the cached and the
-   first-load paths execute; a wrong module or symbol order fails their
-   output comparisons.
+4. In `dense_gemma_device.rs`'s existing `run_prefill_decode` execute closure,
+   after the first `finish()` and existing `launch_order` check, abort that
+   transaction and begin a new one. Re-execute the same plan
+   (`result.plan`) with `result.returned_inputs` and the same `host_experts`,
+   finish it, then assert the first and second outputs are bit-identical with
+   the UUID in the failure message. Commit the new transaction and close the
+   second result's plan as before. This is the existing test helper; no other
+   test or production change.
 
 ## Contract before implementation
 
@@ -129,6 +133,8 @@ runs and one Nsight profile completed; the profile recorded 8
 0078. The samples and profiler artifact hashes are appended in [the timing
 evidence](../evidence/dense-step-timing.md#module-per-plan). They remain
 fixture-scale, O6-open evidence, not a performance claim.
+
+R1: Added the missing output-checked second execution of the same admitted plan after abort; this exercises the cached module and compares the result bit-for-bit. Only the existing `run_prefill_decode` helper changed in the GPU test file; no production code or other test changed. Round-2 gates passed: fmt, workspace and driver-feature clippy, workspace tests, dense Gemma (5 passed, timing test ignored), and dense TP2 (1 passed).
 
 The checkout started at requested base `855e0cc`. During the assignment,
 `main` advanced through coordinator commit `102e1c8`, a handover-only M6 ledger

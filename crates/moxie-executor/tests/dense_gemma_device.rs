@@ -335,14 +335,44 @@ fn run_prefill_decode(
                     capability.uuid
                 );
             }
-            let output = result.output;
-            commit_paged_state(&mut state, transaction, 0, &mut runs, stream).expect("commit step");
+            let first_output = result.output;
+            state
+                .abort(transaction)
+                .expect("abort first step transaction");
+            let transaction = state.begin().expect("reused step transaction");
+            let result = result
+                .plan
+                .execute_dense(DenseGraphStep {
+                    graph,
+                    capability,
+                    catalogue,
+                    ctx: context,
+                    stream,
+                    state: &mut state,
+                    transaction,
+                    runs: &mut runs,
+                    bindings: result.returned_inputs,
+                    host_experts,
+                })
+                .map_err(|refused| refused.error)
+                .expect("reused plan execution")
+                .finish()
+                .map_err(|refused| refused.error)
+                .expect("reused plan finish");
+            let second_output = result.output;
+            assert_eq!(
+                first_output, second_output,
+                "a reused plan and its cached module reproduce the step on {}",
+                capability.uuid
+            );
+            commit_paged_state(&mut state, transaction, 0, &mut runs, stream)
+                .expect("commit reused step");
             result
                 .plan
                 .close(&mut ledger)
                 .map_err(|refused| refused.error)
                 .expect("close step plan");
-            output
+            first_output
         };
         let prefill = execute(prefill_candidate, prefill_bindings, check_empty_refusal);
         let decode = execute(decode_candidate, decode_bindings, false);
