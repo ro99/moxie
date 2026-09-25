@@ -19,10 +19,15 @@ use moxie_executor::{
     DenseGraphStep, HostExpertWeights, PageGeometry, PagedAttentionRun, PipelineStageWorker,
     PipelineWorkers, SelectedReservedPlan, SoloRankWorker, SoloRankWorkerConfig, Staging,
 };
+use moxie_format::affine::{
+    AffineDescriptor, AffineTensor, Grouping, IntWidth, ZeroPoints, pack_row,
+};
 use moxie_format::bf16::f32_to_bf16_bits;
+use moxie_format::scale::{ScaleDtype, ScaleValues};
 use moxie_graph::{Graph, GraphBuilder, OpParams, OracleRegistry, ValueId, ValueRole};
 use moxie_interp::{Cancel, Interpreter, KvCache};
 use moxie_memory::{CapacitySnapshot, Ledger};
+use moxie_plan::WeightFormat;
 use moxie_plan::{
     Phase, PipelineLowering, ResourceWorkload, SelectedPlanCandidate, StageGraph,
     build_stage_graph, lower_host_experts, lower_pipeline, lower_selected,
@@ -1814,6 +1819,343 @@ fn dense_gemma_affine_linear_refusals_name_weight_formats() {
             }
             other => panic!("{case}: expected typed weight_formats refusal, got {other}"),
         }
+    }
+}
+
+fn synthetic_dense_affine_tensor(
+    width: IntWidth,
+    scale_dtype: ScaleDtype,
+    asymmetric: bool,
+    outputs: usize,
+    inputs: usize,
+    seed: usize,
+) -> AffineTensor {
+    let descriptor = AffineDescriptor {
+        width,
+        out_features: outputs,
+        in_features: inputs,
+        grouping: Grouping::Contiguous { size: 32 },
+        group_index: None,
+        scale_dtype,
+    };
+    let mut codes = Vec::with_capacity(descriptor.code_bytes().expect("code extent"));
+    for output in 0..outputs {
+        let row: Vec<_> = (0..inputs)
+            .map(|input| {
+                let flat = output * inputs + input + seed;
+                match width {
+                    IntWidth::Int4 => (flat.wrapping_mul(13) % 16) as i32 - 8,
+                    IntWidth::Int8 => (flat.wrapping_mul(13) % 17) as i32 - 8,
+                }
+            })
+            .collect();
+        codes.extend_from_slice(&pack_row(width, &row).expect("pack affine row"));
+    }
+    let entries = descriptor.group_entries().expect("scale extent");
+    let bf16_scales = [0.0078125f32, -0.015625, 0.0234375, -0.03125];
+    let f16_scales = [0x2000u16, 0xa000, 0x2400, 0xa400];
+    let scales = match scale_dtype {
+        ScaleDtype::Bf16 => ScaleValues::Bf16(
+            (0..entries)
+                .map(|index| f32_to_bf16_bits(bf16_scales[(index + seed) % bf16_scales.len()]))
+                .collect(),
+        ),
+        ScaleDtype::F16 => ScaleValues::F16(
+            (0..entries)
+                .map(|index| f16_scales[(index + seed) % f16_scales.len()])
+                .collect(),
+        ),
+        ScaleDtype::F32 => ScaleValues::F32(
+            (0..entries)
+                .map(|index| bf16_scales[(index + seed) % bf16_scales.len()])
+                .collect(),
+        ),
+    };
+    let zero_points = if asymmetric {
+        let values = [-3i16, 2, -1, 3];
+        ZeroPoints::PerGroup(
+            (0..entries)
+                .map(|index| values[(index + seed) % values.len()])
+                .collect(),
+        )
+    } else {
+        ZeroPoints::Symmetric
+    };
+    AffineTensor::new(descriptor, codes, scales, zero_points)
+        .expect("valid synthetic affine tensor")
+}
+
+fn copy_affine_component(payload: &mut [u8], section: (u64, u64), bytes: &[u8]) {
+    let start = usize::try_from(section.0).expect("section offset fits usize");
+    let length = usize::try_from(section.1).expect("section length fits usize");
+    assert_eq!(length, bytes.len(), "component length matches its section");
+    let end = start.checked_add(length).expect("section end fits usize");
+    payload
+        .get_mut(start..end)
+        .expect("component section is within the formatted weight")
+        .copy_from_slice(bytes);
+}
+
+fn dense_affine_payload(format: WeightFormat, tensor: &AffineTensor) -> Vec<u8> {
+    let descriptor = tensor.descriptor();
+    let sections = format
+        .sections(
+            descriptor.out_features as u64,
+            descriptor.in_features as u64,
+        )
+        .expect("affine weight sections");
+    let mut payload = vec![0; usize::try_from(sections.bytes).expect("payload fits usize")];
+    copy_affine_component(&mut payload, sections.codes, tensor.codes());
+    let scales = match tensor.scales() {
+        ScaleValues::F16(values) | ScaleValues::Bf16(values) => values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>(),
+        ScaleValues::F32(values) => values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect(),
+    };
+    copy_affine_component(&mut payload, sections.scales, &scales);
+    match (sections.zero_points, tensor.zero_points()) {
+        (None, ZeroPoints::Symmetric) => {}
+        (Some(section), ZeroPoints::PerGroup(values)) => {
+            let bytes: Vec<_> = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            copy_affine_component(&mut payload, section, &bytes);
+        }
+        _ => panic!("zero-point section matches the affine tensor"),
+    }
+    match (sections.group_index, descriptor.group_index.as_ref()) {
+        (None, None) => {}
+        (Some(section), Some(values)) => {
+            let bytes: Vec<_> = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            copy_affine_component(&mut payload, section, &bytes);
+        }
+        _ => panic!("group-index section matches the affine tensor"),
+    }
+    payload
+}
+
+fn dense_affine_stage_bindings(
+    fixture: &moxie_cli::fixture::Fixture,
+    tokens: &[u64],
+    positions: &[u64],
+    capability: &DeviceCapability,
+    tensors: &BTreeMap<ValueId, (WeightFormat, AffineTensor)>,
+) -> Vec<moxie_executor::OwnedBinding> {
+    let mut bindings = stage_bindings(fixture, None, tokens, positions, capability);
+    let mut found = 0;
+    for binding in &mut bindings {
+        if let Some((format, tensor)) = tensors.get(&binding.value) {
+            binding.bytes = dense_affine_payload(*format, tensor);
+            found += 1;
+        }
+    }
+    assert_eq!(found, tensors.len(), "every affine weight is bound");
+    bindings
+}
+
+#[test]
+fn affine_linear_weights_match_host_on_every_gpu() {
+    let _guard = one_at_a_time();
+    let count = device_count().expect("enumerate CUDA devices");
+    assert!(
+        count >= 3,
+        "requires both 3090s and the 5060 Ti; saw {count}"
+    );
+    let shape = moxie_cli::gemma::Shape::A;
+    let config = shape.config();
+    let fixture = moxie_cli::gemma::build(shape).expect("build dense Gemma fixture");
+    let projection_names = [
+        "q_proj.0",
+        "k_proj.0",
+        "v_proj.0",
+        "o_proj.0",
+        "ffn_gate.0",
+        "ffn_up.0",
+        "ffn_down.0",
+    ];
+    let mut formats = BTreeMap::new();
+    let mut tensors = BTreeMap::new();
+    let mut reference_weights = fixture.weights.clone();
+    for node in fixture.graph.nodes() {
+        let OpParams::Linear {
+            in_features,
+            out_features,
+            bias: false,
+        } = node.params
+        else {
+            continue;
+        };
+        let weight = node.inputs[1];
+        let Some(name) = fixture.graph.name(weight) else {
+            continue;
+        };
+        let Some(index) = projection_names
+            .iter()
+            .position(|candidate| *candidate == name)
+        else {
+            continue;
+        };
+        let (width, scale, asymmetric, format) = if index < 4 {
+            (
+                IntWidth::Int8,
+                ScaleDtype::Bf16,
+                false,
+                WeightFormat::Affine {
+                    width: Precision::Int8,
+                    group: 32,
+                    scale: Precision::Bf16,
+                    zeros: false,
+                    mapped: false,
+                },
+            )
+        } else {
+            (
+                IntWidth::Int4,
+                ScaleDtype::F16,
+                true,
+                WeightFormat::Affine {
+                    width: Precision::Int4,
+                    group: 32,
+                    scale: Precision::F16,
+                    zeros: true,
+                    mapped: false,
+                },
+            )
+        };
+        let outputs = usize::try_from(out_features).expect("output width fits usize");
+        let inputs = usize::try_from(in_features).expect("input width fits usize");
+        let tensor =
+            synthetic_dense_affine_tensor(width, scale, asymmetric, outputs, inputs, index);
+        let reference = HostTensor::round_to_bf16(
+            tensor.reconstruct().expect("reconstruct affine weight"),
+            vec![outputs, inputs],
+        )
+        .expect("BF16-rounded reference weight");
+        reference_weights.set(weight, Value::Float(reference));
+        formats.insert(weight, format);
+        tensors.insert(weight, (format, tensor));
+    }
+    assert_eq!(
+        formats.len(),
+        projection_names.len(),
+        "all layer-zero projections are formatted"
+    );
+    let reference_fixture = moxie_cli::fixture::Fixture {
+        graph: fixture.graph.clone(),
+        weights: reference_weights,
+        tokens: fixture.tokens,
+        positions: fixture.positions,
+    };
+    let expected = host_prefill_and_decodes(&reference_fixture, &config);
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+    let prompt: Vec<u64> = (0..5).map(|row| row % config.vocab).collect();
+    let decode = [5 % config.vocab];
+    let replay = [6 % config.vocab];
+    let prompt_positions: Vec<u64> = (0..5).collect();
+    let decode_position = [5];
+    let replay_position = [6];
+
+    for ordinal in 0..count {
+        let capability = query_device(ordinal).expect("query GPU capability");
+        let workload = |phase, rows, visible_tokens| ResourceWorkload {
+            phase,
+            rows,
+            visible_tokens,
+            branch_rows: rows,
+            output: fixture.graph.output(),
+            device: capability.uuid,
+            paged_state_capacity: None,
+        };
+        let prefill = lower_selected_with_formats(
+            &fixture.graph,
+            workload(Phase::Prefill, 5, 5),
+            &capability,
+            &catalogue,
+            &formats,
+        )
+        .expect("affine prefill lowering");
+        let decode_candidate = lower_selected_with_formats(
+            &fixture.graph,
+            workload(Phase::Decode, 1, 6),
+            &capability,
+            &catalogue,
+            &formats,
+        )
+        .expect("affine decode lowering");
+        let replay_candidate = lower_selected_with_formats(
+            &fixture.graph,
+            workload(Phase::Decode, 1, 7),
+            &capability,
+            &catalogue,
+            &formats,
+        )
+        .expect("affine replay lowering");
+        let context = RankContext::acquire(RankId(81_000 + ordinal), ordinal)
+            .expect("acquire affine dense context");
+        let stream = Stream::new(&context).expect("create affine dense stream");
+        let actual = run_prefill_decode(
+            prefill,
+            decode_candidate,
+            &fixture.graph,
+            &capability,
+            &catalogue,
+            &config,
+            &context,
+            &stream,
+            prompt.len(),
+            dense_affine_stage_bindings(
+                &reference_fixture,
+                &prompt,
+                &prompt_positions,
+                &capability,
+                &tensors,
+            ),
+            dense_affine_stage_bindings(
+                &reference_fixture,
+                &decode,
+                &decode_position,
+                &capability,
+                &tensors,
+            ),
+            Some((
+                replay_candidate,
+                dense_affine_stage_bindings(
+                    &reference_fixture,
+                    &replay,
+                    &replay_position,
+                    &capability,
+                    &tensors,
+                ),
+            )),
+            &[],
+            false,
+            0,
+        );
+        assert_logits(
+            &format!("affine Gemma prefill on {}", capability.uuid),
+            &actual.0,
+            &expected[0],
+        );
+        assert_logits(
+            &format!("affine Gemma decode on {}", capability.uuid),
+            &actual.1,
+            &expected[1],
+        );
+        assert_logits(
+            &format!("affine Gemma replay on {}", capability.uuid),
+            actual.2.as_ref().expect("replay output"),
+            &expected[2],
+        );
+        drop(stream);
+        drop(context);
     }
 }
 

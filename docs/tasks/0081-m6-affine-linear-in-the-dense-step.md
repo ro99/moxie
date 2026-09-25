@@ -115,4 +115,13 @@ code; a file outside the allowed list is needed.
 
 ## Result, filled after work
 
-(pending)
+Implemented all three changes. Both coverage mutants were caught and
+reverted: forcing F16 scales to `scale_kind = 1` and omitting the zero-point
+address each failed at 3 BF16 ULP on the first GPU. The unmutated prefill,
+decode and replay matched the BF16-rounded host reference at 0.000 BF16 ULP on
+all three GPUs.
+
+Host gates passed: formatting, workspace and executor driver-feature clippy,
+workspace tests, architecture check and spec check. GPU gates passed: dense
+Gemma (8 passed, 1 ignored), dense TP2 (1 passed), and CUDA image suite
+(63/63 across SM86 and SM120).

@@ -11,6 +11,7 @@ use moxie_memory::{
 };
 use moxie_plan::{
     Graph, OpParams, SelectedNode, SelectedPlanCandidate, StorageRegion, ValueId, ValueRole,
+    WeightFormat,
 };
 use moxie_types::{
     DeviceCapability, DeviceTier, Error, HostTier, KernelCatalogue, Result, Scope, TensorLayout,
@@ -825,7 +826,56 @@ pub(crate) fn validate_bindings_except(
                 ),
             ));
         }
-        if matches!(
+        if let Some(format) = plan.candidate.weight_formats().get(&binding.value) {
+            let bad_scale = || {
+                invalid(
+                    "bindings",
+                    format!(
+                        "binding {} contains an invalid affine scale",
+                        binding.value.0
+                    ),
+                )
+            };
+            let WeightFormat::Affine { scale, .. } = format else {
+                return Err(bad_scale());
+            };
+            let [outputs, inputs] = planned.shape.as_slice() else {
+                return Err(bad_scale());
+            };
+            let sections = format.sections(*outputs, *inputs).ok_or_else(bad_scale)?;
+            let start = usize::try_from(sections.scales.0).map_err(|_| bad_scale())?;
+            let length = usize::try_from(sections.scales.1).map_err(|_| bad_scale())?;
+            let end = start.checked_add(length).ok_or_else(bad_scale)?;
+            let scales = binding.bytes.get(start..end).ok_or_else(bad_scale)?;
+            let valid = match scale {
+                moxie_types::Precision::F16 => {
+                    scales.len().is_multiple_of(2)
+                        && scales.chunks_exact(2).all(|word| {
+                            let bits = u16::from_le_bytes([word[0], word[1]]);
+                            bits & 0x7c00 != 0x7c00 && bits & 0x7fff != 0
+                        })
+                }
+                moxie_types::Precision::Bf16 => {
+                    scales.len().is_multiple_of(2)
+                        && scales.chunks_exact(2).all(|word| {
+                            let bits = u16::from_le_bytes([word[0], word[1]]);
+                            bf16_is_finite(bits) && bits & 0x7fff != 0
+                        })
+                }
+                moxie_types::Precision::F32 => {
+                    scales.len().is_multiple_of(4)
+                        && scales.chunks_exact(4).all(|word| {
+                            let value =
+                                f32::from_le_bytes(word.try_into().expect("four-byte word"));
+                            value.is_finite() && value != 0.0
+                        })
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(bad_scale());
+            }
+        } else if matches!(
             binding.role,
             ValueRole::Activation(_) | ValueRole::Weight(_)
         ) && binding

@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use moxie_cuda::{Event, Module, ModuleImage, RankContext, Stream, TrustedImage};
 use moxie_graph::{Graph, NodeId, OpParams, RopeLayout, ValueId, ValueRole};
 use moxie_kernels::cpu_expert::{ExpertAssignment, ExpertShape, ExpertTiling};
-use moxie_plan::{HostExpertJoin, SelectedNode, Visibility};
+use moxie_plan::{HostExpertJoin, SelectedNode, Visibility, WeightFormat};
 use moxie_state::DeviceKvSequence;
 use moxie_types::{
     DeviceCapability, Error, GateTransform, KernelCatalogue, Precision, Result, SemanticKernelOp,
@@ -435,56 +435,153 @@ fn enqueue_dense<'ctx>(
                 out_features,
                 bias: false,
             } => {
-                let mut input_address = address(lease.resource(), node.inputs[0])?;
-                let mut weight_address = address(lease.resource(), node.inputs[1])?;
-                let mut output_address = address(lease.resource(), node.output)?;
-                let mut launch_rows = rows;
-                let mut launch_input = in_features;
-                let mut launch_output = out_features;
-                // Only the split kernel reads the seventh argument, the
-                // declared block count.
-                let (symbol, arguments, mut blocks) = match selected.descriptor.operation {
-                    SemanticKernelOp::Linear => (moxie_kernels::BF16_LINEAR, 6, 1),
-                    SemanticKernelOp::LinearPartial => (moxie_kernels::DENSE_LINEAR_PARTIAL, 6, 1),
-                    SemanticKernelOp::LinearSplit => (
-                        moxie_kernels::DENSE_LINEAR_SPLIT,
-                        7,
-                        lease
-                            .resource()
-                            .plan
-                            .as_ref()
-                            .expect("dense operation retains plan")
-                            .candidate()
-                            .linear_orders()
-                            .get(&node.id)
-                            .map(|order| u64::from(order.blocks))
-                            .ok_or_else(|| invalid("linear", "split linear has no order"))?,
-                    ),
-                    _ => return Err(invalid("linear", "descriptor is not a linear kernel")),
-                };
-                let mut params: [*mut c_void; 7] = [
-                    (&raw mut input_address).cast(),
-                    (&raw mut weight_address).cast(),
-                    (&raw mut output_address).cast(),
-                    (&raw mut launch_rows).cast(),
-                    (&raw mut launch_input).cast(),
-                    (&raw mut launch_output).cast(),
-                    (&raw mut blocks).cast(),
-                ];
-                let elements = rows
-                    .checked_mul(out_features)
-                    .ok_or_else(|| invalid("launch", "linear grid overflowed"))?;
-                launch(
-                    lease,
-                    base,
-                    stream,
-                    (elements.div_ceil(256) as u32, 1, 1),
-                    (256, 1, 1),
-                    &mut params[..arguments],
-                    selected,
-                    symbol,
-                )?;
-                push_launch(lease, "linear");
+                let candidate = lease
+                    .resource()
+                    .plan
+                    .as_ref()
+                    .expect("dense operation retains plan")
+                    .candidate();
+                if let Some(format) = candidate.weight_formats().get(&node.inputs[1]) {
+                    let WeightFormat::Affine {
+                        width,
+                        group,
+                        scale,
+                        ..
+                    } = *format
+                    else {
+                        return Err(invalid("linear", "a formatted dense weight is not affine"));
+                    };
+                    let sections = format
+                        .sections(out_features, in_features)
+                        .ok_or_else(|| invalid("linear", "affine weight sections are invalid"))?;
+                    let weight_address = address(lease.resource(), node.inputs[1])?;
+                    let section_address = |offset: u64| {
+                        weight_address.checked_add(offset).ok_or_else(|| {
+                            invalid("linear", "affine weight section address overflowed")
+                        })
+                    };
+                    let mut input_address = address(lease.resource(), node.inputs[0])?;
+                    let mut codes_address = section_address(sections.codes.0)?;
+                    let mut scales_address = section_address(sections.scales.0)?;
+                    let mut zero_points_address = match sections.zero_points {
+                        Some((offset, _)) => section_address(offset)?,
+                        None => 0,
+                    };
+                    let mut group_index_address = match sections.group_index {
+                        Some((offset, _)) => section_address(offset)?,
+                        None => 0,
+                    };
+                    let mut output_address = address(lease.resource(), node.output)?;
+                    let mut launch_rows = rows;
+                    let mut launch_input = in_features;
+                    let mut launch_output = out_features;
+                    let mut row_stride = in_features
+                        .checked_mul(u64::from(width.bits()))
+                        .ok_or_else(|| invalid("linear", "affine row stride overflowed"))?
+                        .div_ceil(8);
+                    let mut groups_per_row = in_features
+                        .checked_add(u64::from(group) - 1)
+                        .ok_or_else(|| invalid("linear", "affine group count overflowed"))?
+                        / u64::from(group);
+                    let mut code_bits = width.bits();
+                    let mut group_size = group;
+                    let mut scale_kind = match scale {
+                        Precision::F16 => 0,
+                        Precision::Bf16 => 1,
+                        Precision::F32 => 2,
+                        _ => {
+                            return Err(invalid("linear", "affine scale precision is unsupported"));
+                        }
+                    };
+                    let mut params: [*mut c_void; 14] = [
+                        (&raw mut input_address).cast(),
+                        (&raw mut codes_address).cast(),
+                        (&raw mut scales_address).cast(),
+                        (&raw mut zero_points_address).cast(),
+                        (&raw mut group_index_address).cast(),
+                        (&raw mut output_address).cast(),
+                        (&raw mut launch_rows).cast(),
+                        (&raw mut launch_input).cast(),
+                        (&raw mut launch_output).cast(),
+                        (&raw mut row_stride).cast(),
+                        (&raw mut groups_per_row).cast(),
+                        (&raw mut code_bits).cast(),
+                        (&raw mut group_size).cast(),
+                        (&raw mut scale_kind).cast(),
+                    ];
+                    let tile = moxie_kernels::AFFINE_LINEAR_TILE;
+                    let grid = (
+                        u32::try_from(out_features.div_ceil(tile))
+                            .map_err(|_| invalid("linear", "affine output grid exceeds a u32"))?,
+                        u32::try_from(rows.div_ceil(tile))
+                            .map_err(|_| invalid("linear", "affine row grid exceeds a u32"))?,
+                        1,
+                    );
+                    launch(
+                        lease,
+                        base,
+                        stream,
+                        grid,
+                        (32, 1, 1),
+                        &mut params,
+                        selected,
+                        moxie_kernels::AFFINE_LINEAR,
+                    )?;
+                    push_launch(lease, "affine-linear");
+                } else {
+                    let mut input_address = address(lease.resource(), node.inputs[0])?;
+                    let mut weight_address = address(lease.resource(), node.inputs[1])?;
+                    let mut output_address = address(lease.resource(), node.output)?;
+                    let mut launch_rows = rows;
+                    let mut launch_input = in_features;
+                    let mut launch_output = out_features;
+                    // Only the split kernel reads the seventh argument, the
+                    // declared block count.
+                    let (symbol, arguments, mut blocks) = match selected.descriptor.operation {
+                        SemanticKernelOp::Linear => (moxie_kernels::BF16_LINEAR, 6, 1),
+                        SemanticKernelOp::LinearPartial => {
+                            (moxie_kernels::DENSE_LINEAR_PARTIAL, 6, 1)
+                        }
+                        SemanticKernelOp::LinearSplit => (
+                            moxie_kernels::DENSE_LINEAR_SPLIT,
+                            7,
+                            lease
+                                .resource()
+                                .plan
+                                .as_ref()
+                                .expect("dense operation retains plan")
+                                .candidate()
+                                .linear_orders()
+                                .get(&node.id)
+                                .map(|order| u64::from(order.blocks))
+                                .ok_or_else(|| invalid("linear", "split linear has no order"))?,
+                        ),
+                        _ => return Err(invalid("linear", "descriptor is not a linear kernel")),
+                    };
+                    let mut params: [*mut c_void; 7] = [
+                        (&raw mut input_address).cast(),
+                        (&raw mut weight_address).cast(),
+                        (&raw mut output_address).cast(),
+                        (&raw mut launch_rows).cast(),
+                        (&raw mut launch_input).cast(),
+                        (&raw mut launch_output).cast(),
+                        (&raw mut blocks).cast(),
+                    ];
+                    let elements = rows
+                        .checked_mul(out_features)
+                        .ok_or_else(|| invalid("launch", "linear grid overflowed"))?;
+                    launch(
+                        lease,
+                        base,
+                        stream,
+                        (elements.div_ceil(256) as u32, 1, 1),
+                        (256, 1, 1),
+                        &mut params[..arguments],
+                        selected,
+                        symbol,
+                    )?;
+                    push_launch(lease, "linear");
+                }
             }
             OpParams::RmsNorm {
                 hidden,
