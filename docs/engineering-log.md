@@ -48,9 +48,24 @@ Each links into the entries below.
 | Work that exists on one disk and nowhere else | 24 commits, four tasks and five review rounds, unpushed for thirty hours |
 | A repair that satisfies the test rather than the property | task 0029, four rounds: an owned label the fixture never used, a prefix measured on a warmed ledger, a mutant that panicked before it mutated, an aggregate standing in for a state |
 | A harness with no tests of its own | the mutation guard, after three rounds of guard bugs: the self-test covers verdicts, selectors and anchors, and never touched restoration |
+| A resource that leaves its owner on a refusal or cleanup path while device work may still use it | task 0082's pending event dropped across streams and drop unloading a live module; task 0085's graphs cleared after a failed drain; task 0089's probe buffers dropped on an error path; task 0091's admission refusal handing out plans apart from their weight leases |
 | A measurement that shares its instrument with whatever runs beside it | task 0025's budget lane, whose global allocator counted the other test's fixtures for two tasks, and was serialised rather than fixed |
 
 ## Entries, newest first
+
+**A resource that leaves its owner on the failure path (2026-09-25, M6).**
+Four M6 tasks in a row drew review findings of one shape: the success path
+kept a buffer, event, graph or lease alive exactly as long as the device
+could use it, and a refusal, cleanup or drop path did not. Each was a gap in
+the coordinator's contract, not a builder error: the contracts described the
+success path and the one failure the designer had in mind. From task 0092 on,
+a contract for asynchronous-ownership work carries an **escape inventory**:
+every public type and every exit path (success, pre-launch refusal,
+post-submission refusal, failed completion, close refusal, drop) that can
+carry a plan, lease, buffer, event or graph out of its owner, and for each,
+what keeps the resource valid until its last possible device use. Refusal
+types that would carry such a resource are opaque and clean up through the
+owner's own `close`.
 
 **A measurement that shares its instrument with whatever runs beside it
 (2026-09-16).** Task 0025's budget lane is the only gate in this repository that
