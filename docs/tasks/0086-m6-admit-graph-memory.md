@@ -1,6 +1,12 @@
 # Task 0086 — captured graphs are admitted in `GraphPools`
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer
+Status: **accepted** (coordinator, 2026-09-25), sol's review round R1 clean.
+Implementation `278c27e`.
+- Measured bound ([graph-memory.md](../evidence/graph-memory.md)): up to 7 KiB
+  per captured kernel node (3090) and 104 KiB per graph (5060 Ti), exact
+  repeats; charged as 8 KiB per kernel plus 128 KiB per segment in
+  `GraphPools`. The 0-byte reading in task 0085 was below `cuMemGetInfo`'s
+  granularity at fixture scale. Builder Codex `luna`; reviewer
 Codex `sol`.
 
 ## Identity and authority
