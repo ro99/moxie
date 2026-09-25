@@ -22,15 +22,17 @@ pub mod tensor_parallel;
 pub use compare::{CandidateKind, Estimate, UserWorkload, Verdict, compare_plans};
 pub use costs::{DeviceCost, Endpoint, LinkCost, TopologyCosts};
 pub use expert::{
-    BoundOn, Candidate, ChunkResidency, EnvelopePrediction, Exactness, ExpertBudget,
-    ExpertEnvelope, ExpertGroup, ExpertPlan, ExpertPlanRefused, ExpertPolicy, ExpertShape,
-    GroupDecision, Placement, RejectionReason, ResidentChunks, compile_experts,
+    AffineSections, BoundOn, Candidate, ChunkResidency, EnvelopePrediction, Exactness,
+    ExpertBudget, ExpertEnvelope, ExpertGroup, ExpertPlan, ExpertPlanRefused, ExpertPolicy,
+    ExpertShape, GroupDecision, Placement, RejectionReason, ResidentChunks, WeightFormat,
+    compile_experts,
 };
 pub use host_experts::{HostExpertJoin, HostExpertLowering, lower_host_experts};
 pub use pipeline::{PipelineLowering, PipelineRefused, lower_pipeline, wavefront};
 pub use selected::{
     PlannedValue, PlannedWorkspace, SelectedNode, SelectedPlanCandidate, StorageRegion,
     lower_selected, lower_selected_host_experts, lower_selected_ordered,
+    lower_selected_with_formats,
 };
 pub use tensor_parallel::{
     Join, RankPart, Stage, StageGraph, StageRead, StageWeight, TensorParallelLowering,

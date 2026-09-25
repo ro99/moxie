@@ -38,7 +38,7 @@ use moxie_memory::{
     ResidencyLease, StageSpan, TensorSlot, TurnId, UseClass, WorkOrder,
 };
 use moxie_plan::expert::{
-    Candidate, ExpertGroup, ExpertPlan, ExpertShape, ExpertWeightFormat, Placement,
+    Candidate, ExpertGroup, ExpertPlan, ExpertShape, Placement, WeightFormat,
 };
 use moxie_types::{
     DeviceTier, Error, HostPlacement, HostTier, NumaTopology, Result, Scope, StrategyControl, Tier,
@@ -306,14 +306,14 @@ impl ExpertRoles {
     /// the plan because a `ChunkId` is `moxie-memory`'s vocabulary and
     /// `moxie-plan` may not name it.
     pub fn chunks(&self, expert: u32, shape: ExpertShape) -> Result<(ChunkId, ChunkId)> {
-        self.chunks_with_formats(expert, shape, [ExpertWeightFormat::Bf16; 2])
+        self.chunks_with_formats(expert, shape, [WeightFormat::Bf16; 2])
     }
 
     pub fn chunks_with_formats(
         &self,
         expert: u32,
         shape: ExpertShape,
-        formats: [ExpertWeightFormat; 2],
+        formats: [WeightFormat; 2],
     ) -> Result<(ChunkId, ChunkId)> {
         if u64::from(expert) >= shape.experts {
             return Err(invalid(
@@ -352,7 +352,7 @@ impl ExpertRoles {
                 ),
             ));
         }
-        if formats != [ExpertWeightFormat::Bf16; 2] {
+        if formats != [WeightFormat::Bf16; 2] {
             return Err(invalid(
                 "roles",
                 "affine experts require explicit canonical role pairs".into(),
@@ -1208,8 +1208,7 @@ impl<'lane> GroupedRun<'lane> {
             .per_expert
             .as_ref()
             .is_some_and(|pairs| pairs.len() as u64 != plan.shape().experts)
-            || (roles.per_expert.is_none()
-                && plan.weight_formats() != [ExpertWeightFormat::Bf16; 2])
+            || (roles.per_expert.is_none() && plan.weight_formats() != [WeightFormat::Bf16; 2])
         {
             return Err(GroupedAdmitRefused::Invalid {
                 plan: Box::new(plan),
@@ -1620,7 +1619,7 @@ fn too_large(what: &'static str) -> Error {
 /// One group's acquire, as a single argument.
 #[derive(Debug, Clone, Copy)]
 struct GroupAcquire {
-    formats: [ExpertWeightFormat; 2],
+    formats: [WeightFormat; 2],
     shape: ExpertShape,
     expert: u32,
     scope: Scope,
@@ -1960,10 +1959,10 @@ impl<'lane> GroupedRun<'lane> {
                      format|
                      -> Result<moxie_kernels::cpu_expert::ExpertWeight<'_>> {
                         Ok(match format {
-                            ExpertWeightFormat::Bf16 => {
+                            WeightFormat::Bf16 => {
                                 moxie_kernels::cpu_expert::ExpertWeight::Bf16(bytes)
                             }
-                            ExpertWeightFormat::Affine {
+                            WeightFormat::Affine {
                                 width,
                                 group,
                                 scale,

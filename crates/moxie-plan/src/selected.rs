@@ -8,9 +8,10 @@ use moxie_graph::{
 };
 use moxie_types::{
     DeviceCapability, Error, KernelCatalogue, KernelOperand, SemanticKernelDescriptor,
-    SemanticKernelOp, TensorLayout,
+    SemanticKernelOp, TensorLayout, WeightPrecision,
 };
 
+use crate::expert::WeightFormat;
 use crate::{Graph, PlanCandidate, ResourceWorkload, ValueBinding, lower};
 use crate::{HostExpertJoin, HostExpertLowering};
 
@@ -81,6 +82,7 @@ pub struct SelectedPlanCandidate {
     combine_orders: BTreeMap<NodeId, CombineReductionOrder>,
     expert_ownership: BTreeMap<NodeId, ExpertOwnership>,
     host_expert_joins: BTreeMap<NodeId, HostExpertJoin>,
+    weight_formats: BTreeMap<ValueId, WeightFormat>,
 }
 
 impl SelectedPlanCandidate {
@@ -140,6 +142,9 @@ impl SelectedPlanCandidate {
     }
     pub fn host_expert_joins(&self) -> &BTreeMap<NodeId, HostExpertJoin> {
         &self.host_expert_joins
+    }
+    pub fn weight_formats(&self) -> &BTreeMap<ValueId, WeightFormat> {
+        &self.weight_formats
     }
     pub fn is_paged_attention(&self) -> bool {
         matches!(self.nodes.as_slice(), [node] if node.descriptor.operation == SemanticKernelOp::PagedAttention)
@@ -450,6 +455,7 @@ pub fn lower_selected(
         combine_orders: BTreeMap::new(),
         expert_ownership: BTreeMap::new(),
         host_expert_joins: BTreeMap::new(),
+        weight_formats: BTreeMap::new(),
     })
 }
 
@@ -556,6 +562,7 @@ pub fn lower_selected_ordered(
         combine_orders,
         expert_ownership,
         &BTreeMap::new(),
+        &BTreeMap::new(),
     )
 }
 
@@ -629,6 +636,7 @@ pub fn lower_selected_host_experts(
         &part.combine_orders,
         &part.expert_ownership,
         lowering.joins(),
+        &BTreeMap::new(),
     )
 }
 
@@ -771,7 +779,38 @@ fn lower_attention(
         combine_orders: BTreeMap::new(),
         expert_ownership: BTreeMap::new(),
         host_expert_joins: BTreeMap::new(),
+        weight_formats: BTreeMap::new(),
     })
+}
+
+/// Lower a complete dense graph with sidecar affine storage formats for its
+/// selected linear weights. The graph continues to describe logical BF16
+/// weights; formats affect kernel selection and the admitted byte extents.
+pub fn lower_selected_with_formats(
+    graph: &Graph,
+    workload: ResourceWorkload,
+    capability: &DeviceCapability,
+    catalogue: &KernelCatalogue,
+    formats: &BTreeMap<ValueId, WeightFormat>,
+) -> Result<SelectedPlanCandidate, Error> {
+    if capability.uuid != workload.device {
+        return Err(invalid(
+            "device",
+            "workload UUID and measured capability differ",
+        ));
+    }
+    lower_dense_mode(
+        graph,
+        workload,
+        capability,
+        catalogue,
+        true,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        formats,
+    )
 }
 
 fn lower_dense(
@@ -786,6 +825,7 @@ fn lower_dense(
         capability,
         catalogue,
         true,
+        &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
         &BTreeMap::new(),
@@ -910,6 +950,7 @@ fn lower_dense_mode(
     combine_orders: &BTreeMap<NodeId, CombineReductionOrder>,
     expert_ownership: &BTreeMap<NodeId, ExpertOwnership>,
     joins: &BTreeMap<NodeId, HostExpertJoin>,
+    weight_formats: &BTreeMap<ValueId, WeightFormat>,
 ) -> Result<SelectedPlanCandidate, Error> {
     check_routed_edges(graph, combine_orders, expert_ownership)?;
     if require_complete_graph
@@ -935,6 +976,66 @@ fn lower_dense_mode(
         });
     }
 
+    let mut formatted_weight_bytes = BTreeMap::new();
+    for (&value, format) in weight_formats {
+        if !graph.weights().contains(&value) {
+            return Err(invalid(
+                "weight_formats",
+                "a format names a value that is not a graph weight",
+            ));
+        }
+        if !matches!(
+            graph.spec(value).map(|spec| spec.role),
+            Some(ValueRole::Weight(precision))
+                if precision == WeightPrecision::expect(moxie_types::Precision::Bf16)
+        ) {
+            return Err(invalid(
+                "weight_formats",
+                "formatted graph weights must have logical BF16 role",
+            ));
+        }
+        if !matches!(format, WeightFormat::Affine { .. }) {
+            return Err(invalid(
+                "weight_formats",
+                "a BF16 storage format is meaningless in the sidecar map",
+            ));
+        }
+        let mut consumers = graph
+            .nodes()
+            .iter()
+            .filter(|node| node.inputs.contains(&value));
+        let Some(consumer) = consumers.next() else {
+            return Err(invalid(
+                "weight_formats",
+                "a formatted weight must be consumed by one unbiased Linear",
+            ));
+        };
+        if consumers.next().is_some() || consumer.inputs.get(1) != Some(&value) {
+            return Err(invalid(
+                "weight_formats",
+                "a formatted weight must be consumed by one unbiased Linear as input 1",
+            ));
+        }
+        let OpParams::Linear {
+            in_features,
+            out_features,
+            bias: false,
+        } = &consumer.params
+        else {
+            return Err(invalid(
+                "weight_formats",
+                "a formatted weight must be consumed by one unbiased Linear as input 1",
+            ));
+        };
+        let Some(sections) = format.sections(*out_features, *in_features) else {
+            return Err(invalid(
+                "weight_formats",
+                "the affine format is invalid for this Linear geometry",
+            ));
+        };
+        formatted_weight_bytes.insert(value, sections.bytes);
+    }
+
     let mut selected = Vec::new();
     let mut workspace_logical_bytes = 0u64;
     let mut host_workspace_bytes = 0u64;
@@ -958,7 +1059,15 @@ fn lower_dense_mode(
         {
             operation = SemanticKernelOp::CombinePartial;
         }
-        let roles = dense_operands(operation, node, graph)?;
+        let mut roles = dense_operands(operation, node, graph)?;
+        if matches!(node.params, OpParams::Linear { .. })
+            && let Some(format) = node
+                .inputs
+                .get(1)
+                .and_then(|weight| weight_formats.get(weight))
+        {
+            roles[1] = KernelOperand::Weight(WeightPrecision::expect(format.precision()));
+        }
         let (input, output) = dense_shape(node)?;
         let matches: Vec<_> = catalogue
             .descriptors()
@@ -1074,7 +1183,11 @@ fn lower_dense_mode(
         .collect();
     for binding in base.bindings() {
         if let ValueBinding::ExternalWeight(weight) = binding {
-            let physical = align_up(weight.required_bytes)?;
+            let logical_bytes = formatted_weight_bytes
+                .get(&weight.value)
+                .copied()
+                .unwrap_or(weight.required_bytes);
+            let physical = align_up(logical_bytes)?;
             let offset = weight_cursor;
             weight_cursor = checked_add(weight_cursor, physical, "weight region")?;
             values.push(PlannedValue {
@@ -1084,7 +1197,7 @@ fn lower_dense_mode(
                 region: StorageRegion::Weights,
                 slot: values.len() as u32,
                 offset,
-                logical_bytes: weight.required_bytes,
+                logical_bytes,
                 physical_bytes: physical,
                 first_stage: 0,
                 last_stage,
@@ -1232,6 +1345,7 @@ fn lower_dense_mode(
         combine_orders: combine_orders.clone(),
         expert_ownership: expert_ownership.clone(),
         host_expert_joins: joins.clone(),
+        weight_formats: weight_formats.clone(),
     })
 }
 

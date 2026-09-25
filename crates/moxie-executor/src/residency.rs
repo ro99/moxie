@@ -145,9 +145,9 @@ impl CanonicalSource {
         pairs: Vec<(String, String)>,
     ) -> Result<(
         crate::grouped::ExpertRoles,
-        [moxie_plan::expert::ExpertWeightFormat; 2],
+        [moxie_plan::expert::WeightFormat; 2],
     )> {
-        use moxie_plan::expert::ExpertWeightFormat;
+        use moxie_plan::expert::WeightFormat;
         if pairs.len() as u64 != shape.experts || pairs.is_empty() {
             return Err(Error::InvalidArtifact {
                 detail: "one canonical role pair is required per expert".into(),
@@ -160,7 +160,7 @@ impl CanonicalSource {
                 .ok_or_else(|| Error::InvalidArtifact {
                     detail: "expert gate shape overflows".into(),
                 })?;
-        let mut formats = [ExpertWeightFormat::Bf16; 2];
+        let mut formats = [WeightFormat::Bf16; 2];
         for (expert, pair) in pairs.iter().enumerate() {
             for (index, (role, rows, columns)) in [
                 (&pair.0, gate_rows, shape.hidden),
@@ -212,12 +212,12 @@ impl CanonicalSource {
 
 fn canonical_expert_format(
     tensor: &moxie_format::manifest::Tensor,
-) -> Result<moxie_plan::expert::ExpertWeightFormat> {
+) -> Result<moxie_plan::expert::WeightFormat> {
     use moxie_format::manifest::{GroupRule, ScaleDtype, TensorPrecision, ZeroPointMode};
-    use moxie_plan::expert::ExpertWeightFormat;
+    use moxie_plan::expert::WeightFormat;
     use moxie_types::Precision;
     if tensor.precision == TensorPrecision::Bf16V1 {
-        return Ok(ExpertWeightFormat::Bf16);
+        return Ok(WeightFormat::Bf16);
     }
     let fields = tensor
         .affine
@@ -235,7 +235,7 @@ fn canonical_expert_format(
             });
         }
     };
-    Ok(ExpertWeightFormat::Affine {
+    Ok(WeightFormat::Affine {
         width: if tensor.precision == TensorPrecision::AffineInt4V1 {
             Precision::Int4
         } else {
@@ -301,7 +301,7 @@ impl ChunkSource for CanonicalSource {
                 word.copy_from_slice(&group.to_le_bytes());
             }
         }
-        if let moxie_plan::expert::ExpertWeightFormat::Affine {
+        if let moxie_plan::expert::WeightFormat::Affine {
             width,
             group,
             scale,

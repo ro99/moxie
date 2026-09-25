@@ -6,3 +6,4 @@
 #include "dense_ops.cu"
 #include "expert_mlp.cu"
 #include "routed_ops.cu"
+#include "affine_linear.cu"

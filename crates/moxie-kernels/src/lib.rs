@@ -553,6 +553,30 @@ mod images {
                 image_sha256: hash,
                 symbols: vec![KernelSymbol(BF16_LINEAR.to_string())],
             });
+            for width in [Precision::Int4, Precision::Int8] {
+                descriptors.push(SemanticKernelDescriptor {
+                    id: KernelId(format!(
+                        "dense-affine-linear-{}-v1-{suffix}",
+                        super::profile_name(width)
+                    )),
+                    abi_version: DENSE_GRAPH_ABI,
+                    operation: SemanticKernelOp::Linear,
+                    inputs: vec![bf16, KernelOperand::Weight(WeightPrecision::expect(width))],
+                    output: ActivationPrecision::expect(Precision::Bf16),
+                    accumulation: AccumulationPolicy::Bf16InF32Acc,
+                    rounding: RoundingProfile::FinalBf16Rne,
+                    layout: TensorLayout::ContiguousRowMajorV1,
+                    shape: KernelShapeBounds {
+                        max_rows: 65_536,
+                        max_input: 16_384,
+                        max_output: 65_536,
+                    },
+                    sm,
+                    workspace: WorkspaceExpression::Zero,
+                    image_sha256: hash,
+                    symbols: vec![KernelSymbol(super::AFFINE_LINEAR.to_string())],
+                });
+            }
             descriptors.push(SemanticKernelDescriptor {
                 id: KernelId(format!("dense-linear-split-v1-{suffix}")),
                 abi_version: DENSE_GRAPH_ABI,

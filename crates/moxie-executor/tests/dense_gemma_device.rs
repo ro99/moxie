@@ -6,7 +6,7 @@
 //! compares both outputs with the host interpreter on every visible GPU.
 #![cfg(feature = "paged-attention-binding")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Mutex, MutexGuard};
@@ -26,7 +26,7 @@ use moxie_memory::{CapacitySnapshot, Ledger};
 use moxie_plan::{
     Phase, PipelineLowering, ResourceWorkload, SelectedPlanCandidate, StageGraph,
     build_stage_graph, lower_host_experts, lower_pipeline, lower_selected,
-    lower_selected_host_experts, lower_selected_ordered,
+    lower_selected_host_experts, lower_selected_ordered, lower_selected_with_formats,
 };
 use moxie_state::{
     DeviceKvSequence, KvGeometry, LayerKv, ROOT, Retention, SequenceState, StateKind,
@@ -1588,6 +1588,232 @@ fn pipeline_runs_dense_and_routed_gemma_on_three_gpus() {
             "PASS pipeline {label} on 3090 pair + 5060 Ti; handoff bytes {:?}",
             expected_handoff_bytes
         );
+    }
+}
+
+fn dense_affine_lowering_context(
+    graph: &Graph,
+) -> (
+    DeviceCapability,
+    ResourceWorkload,
+    moxie_types::KernelCatalogue,
+) {
+    let capability = DeviceCapability {
+        ordinal: 0,
+        uuid: DeviceUuid::from_bytes([1u8; 16]),
+        name: "fixture".into(),
+        compute_major: 8,
+        compute_minor: 6,
+        total_memory_bytes: 1 << 30,
+        multiprocessor_count: 1,
+        pci_bus_id: "0000:00:00.0".into(),
+        peer_access: Vec::new(),
+        max_grid: (2_147_483_647, 65_535, 65_535),
+    };
+    let rows = 5;
+    let workload = ResourceWorkload {
+        phase: Phase::Prefill,
+        rows,
+        visible_tokens: rows,
+        branch_rows: rows,
+        output: graph.output(),
+        device: capability.uuid,
+        paged_state_capacity: None,
+    };
+    (capability, workload, moxie_kernels::dense_graph_catalogue())
+}
+
+#[test]
+fn dense_gemma_affine_linear_admission_sizes_only_formatted_weights() {
+    let fixture =
+        moxie_cli::gemma::build(moxie_cli::gemma::Shape::A).expect("build dense Gemma fixture");
+    let (capability, workload, catalogue) = dense_affine_lowering_context(&fixture.graph);
+    let projection_names = [
+        "q_proj.0",
+        "k_proj.0",
+        "v_proj.0",
+        "o_proj.0",
+        "ffn_gate.0",
+        "ffn_up.0",
+        "ffn_down.0",
+    ];
+    let projection_weights: Vec<_> = projection_names
+        .iter()
+        .map(|name| {
+            fixture
+                .graph
+                .weights()
+                .iter()
+                .copied()
+                .find(|value| fixture.graph.name(*value) == Some(*name))
+                .unwrap_or_else(|| panic!("missing projection weight {name}"))
+        })
+        .collect();
+    let int8 = moxie_plan::WeightFormat::Affine {
+        width: Precision::Int8,
+        group: 32,
+        scale: Precision::Bf16,
+        zeros: false,
+        mapped: false,
+    };
+    let int4 = moxie_plan::WeightFormat::Affine {
+        width: Precision::Int4,
+        group: 32,
+        scale: Precision::F16,
+        zeros: true,
+        mapped: false,
+    };
+    let formats: BTreeMap<_, _> = projection_weights
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (*value, if index % 2 == 0 { int8 } else { int4 }))
+        .collect();
+    let formatted_weights: BTreeSet<_> = formats.keys().copied().collect();
+    let layer_zero_linear_weights: BTreeSet<_> = fixture
+        .graph
+        .nodes()
+        .iter()
+        .filter_map(|node| {
+            matches!(node.params, moxie_graph::OpParams::Linear { .. })
+                .then(|| node.inputs.get(1).copied())
+                .flatten()
+                .filter(|value| {
+                    fixture
+                        .graph
+                        .name(*value)
+                        .is_some_and(|name| name.ends_with(".0"))
+                })
+        })
+        .collect();
+    assert_eq!(formatted_weights, layer_zero_linear_weights);
+    let candidate =
+        lower_selected_with_formats(&fixture.graph, workload, &capability, &catalogue, &formats)
+            .expect("affine dense Gemma lowering");
+    let baseline = lower_selected(&fixture.graph, workload, &capability, &catalogue)
+        .expect("BF16 dense Gemma lowering");
+    assert_eq!(candidate.weight_formats(), &formats);
+
+    let mut formatted_nodes = Vec::new();
+    for (&value, &format) in &formats {
+        let node = fixture
+            .graph
+            .nodes()
+            .iter()
+            .find(|node| node.inputs.get(1) == Some(&value))
+            .expect("formatted projection has a Linear consumer");
+        let moxie_graph::OpParams::Linear {
+            in_features,
+            out_features,
+            bias: false,
+        } = &node.params
+        else {
+            panic!("formatted projection is an unbiased Linear");
+        };
+        formatted_nodes.push(node.id);
+        let selected = candidate
+            .nodes()
+            .iter()
+            .find(|selected| selected.node == node.id)
+            .expect("selected affine projection");
+        assert_eq!(
+            selected.descriptor.operation,
+            moxie_types::SemanticKernelOp::Linear
+        );
+        assert_eq!(
+            selected.descriptor.symbols,
+            [moxie_types::KernelSymbol(
+                moxie_kernels::AFFINE_LINEAR.to_string()
+            )]
+        );
+        assert_eq!(selected.workspace_logical_bytes, 0);
+
+        let sections = format
+            .sections(*out_features, *in_features)
+            .expect("valid affine sections");
+        let planned = candidate.value(value).expect("planned affine weight");
+        assert_eq!(planned.logical_bytes, sections.bytes);
+        assert_eq!(planned.role, fixture.graph.spec(value).unwrap().role);
+    }
+
+    for expected in baseline.nodes() {
+        if !formatted_nodes.contains(&expected.node) {
+            let actual = candidate
+                .nodes()
+                .iter()
+                .find(|node| node.node == expected.node)
+                .expect("same node in affine lowering");
+            assert_eq!(actual.descriptor, expected.descriptor);
+        }
+    }
+    for expected in baseline.values() {
+        if !formats.contains_key(&expected.value) {
+            let actual = candidate
+                .value(expected.value)
+                .expect("same value in affine lowering");
+            assert_eq!(actual.logical_bytes, expected.logical_bytes);
+            assert_eq!(actual.physical_bytes, expected.physical_bytes);
+        }
+    }
+}
+
+#[test]
+fn dense_gemma_affine_linear_refusals_name_weight_formats() {
+    let fixture =
+        moxie_cli::gemma::build(moxie_cli::gemma::Shape::A).expect("build dense Gemma fixture");
+    let (capability, workload, catalogue) = dense_affine_lowering_context(&fixture.graph);
+    let embedding = fixture
+        .graph
+        .weights()
+        .iter()
+        .copied()
+        .find(|value| fixture.graph.name(*value) == Some("embedding"))
+        .expect("embedding weight");
+    let linear_weight = fixture
+        .graph
+        .nodes()
+        .iter()
+        .find(|node| matches!(node.params, moxie_graph::OpParams::Linear { .. }))
+        .and_then(|node| node.inputs.get(1))
+        .copied()
+        .expect("linear weight");
+    let int8 = moxie_plan::WeightFormat::Affine {
+        width: Precision::Int8,
+        group: 32,
+        scale: Precision::Bf16,
+        zeros: false,
+        mapped: false,
+    };
+    let int4_group64 = moxie_plan::WeightFormat::Affine {
+        width: Precision::Int4,
+        group: 64,
+        scale: Precision::F16,
+        zeros: true,
+        mapped: false,
+    };
+    for (case, value, format) in [
+        ("embedding", embedding, int8),
+        (
+            "BF16 sidecar",
+            linear_weight,
+            moxie_plan::WeightFormat::Bf16,
+        ),
+        ("unsupported group", linear_weight, int4_group64),
+    ] {
+        let formats = BTreeMap::from([(value, format)]);
+        let error = lower_selected_with_formats(
+            &fixture.graph,
+            workload,
+            &capability,
+            &catalogue,
+            &formats,
+        )
+        .expect_err("invalid affine format is refused");
+        match error {
+            moxie_types::Error::InvalidRequest { field, .. } => {
+                assert_eq!(field, "weight_formats", "{case}");
+            }
+            other => panic!("{case}: expected typed weight_formats refusal, got {other}"),
+        }
     }
 }
 

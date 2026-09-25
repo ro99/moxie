@@ -1262,8 +1262,8 @@ impl moxie_executor::residency::ChunkSource for IntegerSource {
     }
 }
 
-fn integer_cases() -> Vec<([moxie_plan::expert::ExpertWeightFormat; 2], bool)> {
-    use moxie_plan::expert::ExpertWeightFormat::{Affine, Bf16};
+fn integer_cases() -> Vec<([moxie_plan::expert::WeightFormat; 2], bool)> {
+    use moxie_plan::expert::WeightFormat::{Affine, Bf16};
     use moxie_types::Precision;
     let a = Affine {
         width: Precision::Int4,
@@ -1293,17 +1293,17 @@ fn integer_cases() -> Vec<([moxie_plan::expert::ExpertWeightFormat; 2], bool)> {
 }
 
 fn integer_weights(
-    formats: [moxie_plan::expert::ExpertWeightFormat; 2],
+    formats: [moxie_plan::expert::WeightFormat; 2],
 ) -> (Weights, IntegerSource, Vec<(String, String)>) {
     integer_weights_dims(formats, HIDDEN, INTERMEDIATE)
 }
 
 fn integer_weights_dims(
-    formats: [moxie_plan::expert::ExpertWeightFormat; 2],
+    formats: [moxie_plan::expert::WeightFormat; 2],
     hidden: u64,
     intermediate: u64,
 ) -> (Weights, IntegerSource, Vec<(String, String)>) {
-    use moxie_plan::expert::ExpertWeightFormat;
+    use moxie_plan::expert::WeightFormat;
     use moxie_types::Precision;
     let mut w = weights(0x0035);
     w.x = Values::new(0x0035).block((ROWS * hidden) as usize);
@@ -1322,8 +1322,8 @@ fn integer_weights_dims(
         {
             let (outputs, inputs) = (outputs as usize, inputs as usize);
             let (bits, group, scale, zeros, mapped) = match formats[projection] {
-                ExpertWeightFormat::Bf16 => (16, 32, Precision::Bf16, false, false),
-                ExpertWeightFormat::Affine {
+                WeightFormat::Bf16 => (16, 32, Precision::Bf16, false, false),
+                WeightFormat::Affine {
                     width,
                     group,
                     scale,
@@ -1545,7 +1545,7 @@ fn canonical_integer_experts_use_the_shared_residency_and_reduction_on_every_dev
 /// This is fixture serialization, not quantization of floating-point weights.
 fn publish_integer_weights(
     dir: &Path,
-    formats: [moxie_plan::expert::ExpertWeightFormat; 2],
+    formats: [moxie_plan::expert::WeightFormat; 2],
     hidden: u64,
     intermediate: u64,
 ) -> (
@@ -1553,7 +1553,7 @@ fn publish_integer_weights(
     moxie_executor::residency::CanonicalSource,
     Vec<(String, String)>,
 ) {
-    use moxie_plan::expert::ExpertWeightFormat;
+    use moxie_plan::expert::WeightFormat;
     use moxie_types::Precision;
     let (weights, raw, pairs) = integer_weights_dims(formats, hidden, intermediate);
     let source_dir = dir.join("source");
@@ -1573,7 +1573,7 @@ fn publish_integer_weights(
         {
             let (outputs, inputs) = (outputs as usize, inputs as usize);
             let bytes = &raw.0[name];
-            let ExpertWeightFormat::Affine {
+            let WeightFormat::Affine {
                 width,
                 group,
                 scale,
@@ -1746,10 +1746,7 @@ fn published_gptq_experts_bind_and_execute_through_canonical_source() {
             };
             for (mut formats, on_device) in integer_cases().into_iter().take(2) {
                 for format in &mut formats {
-                    if let moxie_plan::expert::ExpertWeightFormat::Affine {
-                        mapped, group, ..
-                    } = format
-                    {
+                    if let moxie_plan::expert::WeightFormat::Affine { mapped, group, .. } = format {
                         *mapped = true;
                         *group = 32;
                     }
@@ -2028,7 +2025,7 @@ fn canonical_expert_binding_refuses_wrong_shapes_identities_and_unbudgeted_maps(
     let shape = moxie_plan::expert::shape_of(&mlp, &combine).unwrap().0;
     let mut formats = integer_cases().remove(0).0;
     for format in &mut formats {
-        if let moxie_plan::expert::ExpertWeightFormat::Affine { mapped, group, .. } = format {
+        if let moxie_plan::expert::WeightFormat::Affine { mapped, group, .. } = format {
             *mapped = true;
             *group = 32;
         }

@@ -181,4 +181,8 @@ any existing output changes; a file outside the allowed list is needed.
 
 ## Result, filled after work
 
-(pending)
+Implemented all nine changes. The BF16 sizing mutant was caught by the affine
+admission test and reverted. Host gates passed: formatting, workspace and
+executor driver-feature clippy, workspace tests, architecture check and spec
+check. GPU gates passed: dense Gemma device (7 passed, 1 ignored), dense TP2
+(1 passed), and CUDA image suite (63/63 across SM86 and SM120).

@@ -27,7 +27,7 @@ use core::ffi::c_void;
 
 use moxie_cuda::{Event, Module, ModuleImage, RankContext, ResolvedModule, Stream, TrustedImage};
 use moxie_memory::{Ledger, Reservation, ResidencyAuthority, ResidencyLease};
-use moxie_plan::expert::{ExpertGroup, ExpertPlan, ExpertWeightFormat};
+use moxie_plan::expert::{ExpertGroup, ExpertPlan, WeightFormat};
 use moxie_types::{DeviceTier, Error, Result, Scope, SemanticKernelDescriptor};
 
 use crate::arena::{DeviceArena, DeviceRange};
@@ -49,7 +49,7 @@ fn invalid(field: &'static str, detail: String) -> Error {
 #[derive(Debug)]
 #[must_use = "an unclosed device attachment keeps its arena and its reservation"]
 pub struct DeviceExperts<'ctx> {
-    weight_formats: [ExpertWeightFormat; 2],
+    weight_formats: [WeightFormat; 2],
     ctx: &'ctx RankContext,
     stream: Stream<'ctx>,
     module: ResolvedModule<'ctx>,
@@ -680,10 +680,10 @@ impl<'ctx> DeviceExperts<'ctx> {
             (&raw mut hidden).cast(),
             (&raw mut intermediate).cast(),
         ];
-        let integer = self.weight_formats != [ExpertWeightFormat::Bf16; 2];
+        let integer = self.weight_formats != [WeightFormat::Bf16; 2];
         let metadata = |format| match format {
-            ExpertWeightFormat::Bf16 => (16u32, 32u32, 1u32, 0u32),
-            ExpertWeightFormat::Affine {
+            WeightFormat::Bf16 => (16u32, 32u32, 1u32, 0u32),
+            WeightFormat::Affine {
                 width,
                 group,
                 scale,
@@ -704,7 +704,7 @@ impl<'ctx> DeviceExperts<'ctx> {
             metadata(self.weight_formats[0]);
         let mut map_ptr = if matches!(
             self.weight_formats[0],
-            ExpertWeightFormat::Affine { mapped: true, .. }
+            WeightFormat::Affine { mapped: true, .. }
         ) {
             gate_up_ptr
                 .checked_add(expected_gate_up - self.hidden * 4)
@@ -767,7 +767,7 @@ impl<'ctx> DeviceExperts<'ctx> {
             metadata(self.weight_formats[1]);
         let mut down_map_ptr = if matches!(
             self.weight_formats[1],
-            ExpertWeightFormat::Affine { mapped: true, .. }
+            WeightFormat::Affine { mapped: true, .. }
         ) {
             down_ptr
                 .checked_add(expected_down - self.intermediate * 4)

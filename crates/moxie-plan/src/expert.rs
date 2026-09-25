@@ -666,9 +666,10 @@ pub struct ExpertKernels<'a> {
     pub catalogue: &'a KernelCatalogue,
 }
 
-/// Byte interpretation of one expert projection, independent of checkpoint method.
+/// How a weight value is stored: BF16, or the document 03 affine descriptor.
+/// Shared by expert and dense linear plans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExpertWeightFormat {
+pub enum WeightFormat {
     Bf16,
     Affine {
         width: Precision,
@@ -679,13 +680,89 @@ pub enum ExpertWeightFormat {
     },
 }
 
-impl ExpertWeightFormat {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AffineSections {
+    pub codes: (u64, u64),
+    pub scales: (u64, u64),
+    pub zero_points: Option<(u64, u64)>,
+    pub group_index: Option<(u64, u64)>,
+    pub bytes: u64,
+}
+
+fn align_affine_section(bytes: u64) -> Option<u64> {
+    bytes.checked_add(15).map(|aligned| aligned & !15)
+}
+
+impl WeightFormat {
     pub const fn precision(self) -> Precision {
         match self {
             Self::Bf16 => Precision::Bf16,
             Self::Affine { width, .. } => width,
         }
     }
+
+    pub fn sections(self, outputs: u64, inputs: u64) -> Option<AffineSections> {
+        let Self::Affine {
+            width,
+            group,
+            scale,
+            zeros,
+            mapped,
+        } = self
+        else {
+            return None;
+        };
+        if outputs == 0
+            || inputs == 0
+            || !matches!(width, Precision::Int4 | Precision::Int8)
+            || !matches!(group, 32 | 128)
+            || !matches!(scale, Precision::F16 | Precision::Bf16 | Precision::F32)
+        {
+            return None;
+        }
+
+        let groups = inputs.div_ceil(u64::from(group));
+        let codes_len = outputs.checked_mul(inputs.div_ceil(u64::from(8 / width.bits())))?;
+        let scales_len = outputs
+            .checked_mul(groups)?
+            .checked_mul(u64::from(scale.bits() / 8))?;
+        let zero_points_len = if zeros {
+            Some(outputs.checked_mul(groups)?.checked_mul(2)?)
+        } else {
+            None
+        };
+        let group_index_len = if mapped {
+            Some(inputs.checked_mul(4)?)
+        } else {
+            None
+        };
+
+        let scales_offset = align_affine_section(codes_len)?;
+        let mut bytes = scales_offset.checked_add(scales_len)?;
+        let zero_points = if let Some(length) = zero_points_len {
+            let offset = align_affine_section(bytes)?;
+            bytes = offset.checked_add(length)?;
+            Some((offset, length))
+        } else {
+            None
+        };
+        let group_index = if let Some(length) = group_index_len {
+            let offset = align_affine_section(bytes)?;
+            bytes = offset.checked_add(length)?;
+            Some((offset, length))
+        } else {
+            None
+        };
+
+        Some(AffineSections {
+            codes: (0, codes_len),
+            scales: (scales_offset, scales_len),
+            zero_points,
+            group_index,
+            bytes,
+        })
+    }
+
     pub fn bytes(self, outputs: u64, inputs: u64) -> Option<u64> {
         let payload = self.payload_bytes(outputs, inputs)?;
         if matches!(self, Self::Affine { mapped: true, .. }) {
@@ -726,7 +803,7 @@ impl ExpertWeightFormat {
 // checkpoint's value rather than a canonicalised one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpertPlan {
-    weight_formats: [ExpertWeightFormat; 2],
+    weight_formats: [WeightFormat; 2],
     kernel: Option<SemanticKernelDescriptor>,
     shape: ExpertShape,
     rows: u64,
@@ -742,7 +819,7 @@ pub struct ExpertPlan {
 }
 
 impl ExpertPlan {
-    pub const fn weight_formats(&self) -> [ExpertWeightFormat; 2] {
+    pub const fn weight_formats(&self) -> [WeightFormat; 2] {
         self.weight_formats
     }
     pub const fn shape(&self) -> ExpertShape {
@@ -1100,7 +1177,7 @@ pub fn compile_experts(
         policy,
         topology,
         kernels,
-        [ExpertWeightFormat::Bf16; 2],
+        [WeightFormat::Bf16; 2],
     )
 }
 
@@ -1114,7 +1191,7 @@ pub fn compile_experts_with_weights(
     policy: &ExpertPolicy,
     topology: Option<&NumaTopology>,
     kernels: Option<ExpertKernels<'_>>,
-    weight_formats: [ExpertWeightFormat; 2],
+    weight_formats: [WeightFormat; 2],
 ) -> std::result::Result<ExpertPlan, ExpertPlanRefused> {
     let refuse = |error: Error| ExpertPlanRefused {
         error,
@@ -1780,14 +1857,14 @@ pub fn select_expert_kernel(
     rows: u64,
     kernels: ExpertKernels<'_>,
 ) -> Result<SemanticKernelDescriptor> {
-    select_expert_kernel_with_weights(shape, rows, kernels, [ExpertWeightFormat::Bf16; 2])
+    select_expert_kernel_with_weights(shape, rows, kernels, [WeightFormat::Bf16; 2])
 }
 
 pub fn select_expert_kernel_with_weights(
     shape: ExpertShape,
     rows: u64,
     kernels: ExpertKernels<'_>,
-    weights: [ExpertWeightFormat; 2],
+    weights: [WeightFormat; 2],
 ) -> Result<SemanticKernelDescriptor> {
     if shape.hidden == 0
         || shape.intermediate == 0
