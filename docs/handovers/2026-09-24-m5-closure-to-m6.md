@@ -167,6 +167,22 @@ that names their addresses. A new shared-weights object would be a second
 residency owner, which AGENTS.md and arch-check's `second-residency-owner`
 rule forbid.
 
+Design fork (coordinator, 2026-09-25; for the owner's morning review):
+- **(A)** a plan records resident weight addresses at admission and every
+  step revalidates the leases through a new `DenseGraphStep` field (about
+  twenty construction sites in tests). Hard part: an in-flight operation
+  (between `execute` and `finish`) does not borrow the weights, so the leases
+  could be released under a running step unless a separate in-use count
+  refuses it.
+- **(B, recommended)** a new executor type owns the weight leases **and**
+  every plan admitted against them (the bucket set), and drives steps itself;
+  plans cannot leave it, so no plan or captured graph outlives the weights by
+  construction, and no existing struct changes.
+Either is a new executor API on M6's critical path with asynchronous
+ownership at its core, the class coordinator.md assigns to the Opus
+`builder` or to a coordinator-designed contract; the coordinator will design
+(B) to file level unless the owner directs otherwise.
+
 ### Coverage gap carried (coordinator, 2026-09-25)
 
 Task 0082's asynchronous-ownership repairs (cross-stream ordering, fork from
