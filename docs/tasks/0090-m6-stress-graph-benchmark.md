@@ -110,4 +110,21 @@ base, memory, error).
 
 ## Result, filled after work
 
-(pending)
+Implemented the single ignored `stress_graph_benchmark` test at the end of
+`dense_gemma_device.rs`; no production code changed. It measures Shape A,
+Shape C top-2 and top-3 prefill, eager decode and captured decode on the
+specified 3090, including admitted plan regions, graph pools, paged state, and
+worst committed logit error against `host_step`.
+
+Two candidate runs completed at `bdd099065dabbfaba8a0e9c9191425ef3d6bfb92`.
+The full test-only diff did not apply at base `08a6fdb`, whose dense test file
+predates the appended M6 timing harness; the specified fallback with capture
+removed built and completed one paired prefill/decode run. The temporary base
+test edit was discarded and the tree returned to `main`, with only the
+carried files dirty before and after.
+
+Host gates passed: fmt check, workspace clippy, driver-feature executor
+clippy, and workspace tests. The full `dense_gemma_device` suite passed (10
+passed, 2 ignored). All committed prefill/decode comparisons were 0.000 BF16
+ULP. Tables, memory totals, paired latency readings and the base fallback are
+recorded in [m6-stress-benchmark.md](../evidence/m6-stress-benchmark.md).
