@@ -120,7 +120,7 @@ tsk board thread `m6` mirrors it.
 | M6.3 | Measured transfer overlap, bounded read-ahead, optional hot-expert tiers and route prediction, against no-overlap baselines | Not started | — | Carries M5's pipeline microbatch overlap and pinned transfers |
 | M6.4 | Joint prefill/decode placement and phase transitions; no host-cache or prepared-layout growth across many turns | Not started | — | — |
 | M6.5 | Automatic plan selection from measured topology/shape costs; fixed-plan mode | Not started | — | Builds on M5.5's `compare-plans`; needs a compute-cost term |
-| Exit | Paired prefill/decode/quality/memory benchmark for the dense and two MoE stress graphs, **plus actual available checkpoints**; defaults justified outside variance | Not started | coordinator | **Owner decision needed** (below) |
+| Exit | Paired prefill/decode/quality/memory benchmark for the dense and two MoE stress graphs, **plus actual available checkpoints**; defaults justified outside variance | Not started | coordinator | Slice 7; checkpoints stay in M6 (owner, below) |
 
 ### Route to M6 closure (proposed, coordinator, 2026-09-24)
 
@@ -148,16 +148,17 @@ synchronizations per fixture step. Revisit when decode capture (slice 4)
 needs a sync-free step, or when a checkpoint-scale profile shows them
 material.
 
-### Owner decision needed (batched)
+### Checkpoints stay in M6's exit (owner, 2026-09-24)
 
-The exit gate requires benchmarks on "actual available checkpoints", and a
-quality column. Nothing in the repository yet runs a checkpoint to a token:
-model families are M7 and the tokenizer is M7/M8 (ADRs 0034, 0035). The
-coordinator recommends **keeping M6 on fixture-scale stress graphs and
-amending the exit gate by ADR so that checkpoint benchmarks run at M7, when
-the first family executes**. The alternative is pulling a minimal
-checkpoint-backed Gemma path into M6 as its closing slice, which moves M7
-work forward. This blocks only the exit package, not slices 1–6.
+The coordinator first proposed deferring the exit gate's checkpoint benchmarks
+to M7, then pulling a real checkpoint forward as slice 2. The owner rejected
+both: checkpoints are not deferred to M7, and the route keeps roadmap order,
+with checkpoint benchmarks in slice 7's exit package. Where a slice's decision
+depends on real-scale bytes (likely M6.3's overlap and read-ahead), that
+slice measures it. Available inputs, read-only:
+`/fast/models/cyankiwi/gemma-4-31B-it-AWQ-8bit` (33 GB) and
+`/fast/models/google/gemma-4-26B-A4B-it` (49 GB); `torch 2.10` and
+`transformers 5.5.3` are installed as an external reference.
 
 ## Next task
 
