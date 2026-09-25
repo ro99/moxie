@@ -38,7 +38,7 @@ use moxie_state::{
 };
 use moxie_types::{
     DeviceCapability, DeviceUuid, Dim, HostTier, PagePlacement, Precision, RankId, Scope,
-    TensorLayout, Tier,
+    SemanticKernelOp, TensorLayout, Tier,
 };
 
 static DEVICE_TEST: Mutex<()> = Mutex::new(());
@@ -47,6 +47,23 @@ fn one_at_a_time() -> MutexGuard<'static, ()> {
     DEVICE_TEST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn expected_captured_segments(candidate: &SelectedPlanCandidate) -> usize {
+    let mut segments = 0;
+    let mut in_segment = false;
+    for node in candidate.nodes() {
+        if matches!(
+            node.descriptor.operation,
+            SemanticKernelOp::PagedAttention | SemanticKernelOp::CombineHostJoin
+        ) {
+            in_segment = false;
+        } else if !in_segment {
+            segments += 1;
+            in_segment = true;
+        }
+    }
+    segments
 }
 
 fn geometry(
@@ -381,9 +398,15 @@ fn run_prefill_decode(
                 state
                     .abort(transaction)
                     .expect("abort eager replay before capture");
+                let expected_segments = expected_captured_segments(result.plan.candidate());
                 let mut plan = result.plan;
-                plan.set_segment_capture(true)
+                plan.set_segment_capture(true, &mut ledger)
                     .expect("enable dense segment capture");
+                let graph_pool_bytes = plan.graph_pool_bytes();
+                let free_before_capture = context
+                    .memory_info()
+                    .expect("read free memory before capture")
+                    .0;
                 let transaction = state.begin().expect("capture step transaction");
                 let captured = plan
                     .execute_dense(DenseGraphStep {
@@ -403,6 +426,21 @@ fn run_prefill_decode(
                     .finish()
                     .map_err(|refused| refused.error)
                     .expect("capture step finish");
+                let free_after_capture = context
+                    .memory_info()
+                    .expect("read free memory after capture")
+                    .0;
+                assert!(
+                    free_before_capture.saturating_sub(free_after_capture) <= graph_pool_bytes,
+                    "captured graph memory exceeds its ledger reservation on {}",
+                    capability.uuid
+                );
+                assert_eq!(
+                    captured.plan.captured_segments(),
+                    expected_segments,
+                    "captured segment count matches the selected plan on {}",
+                    capability.uuid
+                );
                 assert_eq!(
                     first_output, captured.output,
                     "captured segments reproduce the eager step on {}",
@@ -446,7 +484,7 @@ fn run_prefill_decode(
             } else {
                 assert!(
                     matches!(
-                        result.plan.set_segment_capture(true),
+                        result.plan.set_segment_capture(true, &mut ledger),
                         Err(moxie_types::Error::InvalidRequest {
                             field: "capture",
                             ..
@@ -2781,7 +2819,7 @@ fn dense_step_timing() {
     );
 
     decode_plan
-        .set_segment_capture(true)
+        .set_segment_capture(true, &mut ledger)
         .expect("enable decode segment capture");
     let free_before_capture = context
         .memory_info()

@@ -83,6 +83,7 @@ const CASES: &[&str] = &[
     "arch_mismatch_is_typed",
     "stream_event_completion",
     "graph_capture_replay",
+    "graph_memory_within_bound",
     "event_backed_lease",
     "admitted_device_arena",
     "selected_bf16_device_chain",
@@ -201,6 +202,11 @@ pub fn run(profile: Option<&str>) -> i32 {
             &cap,
             "graph_capture_replay",
             graph_capture_replay(&cap),
+        ));
+        results.push(case(
+            &cap,
+            "graph_memory_within_bound",
+            graph_memory_within_bound(&cap),
         ));
         results.push(case(&cap, "event_backed_lease", backed_lease(&cap)));
         results.push(case(
@@ -749,6 +755,130 @@ fn graph_capture_replay(cap: &DeviceCapability) -> Result<Outcome, Error> {
                 "index {index}: ordinary launch after invalidated capture got {got}, want {want}"
             )));
         }
+    }
+    Ok(Outcome::Passed)
+}
+
+/// Measure CUDA graph-pool use for kernel nodes and executable graphs.
+fn graph_memory_within_bound(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    const ELEMENTS: usize = 256;
+    const KERNEL_NODES: u64 = 16_384;
+    const GRAPH_COUNT: usize = 256;
+
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let package = Module::load(
+        &ctx,
+        ModuleImage::Binary(smoke_image(moxie_kernels::SMOKE_FATBIN)?),
+    )?
+    .resolve_all(&[moxie_kernels::AXPY_F32.to_string()])?;
+    let stream = Stream::new(&ctx)?;
+    let x = vec![1.0f32; ELEMENTS];
+    let y = vec![1.0f32; ELEMENTS];
+    let a = 2.0f32;
+    let mut dx = DeviceBuffer::alloc(&ctx, ELEMENTS * size_of::<f32>())?;
+    let mut dy = DeviceBuffer::alloc(&ctx, ELEMENTS * size_of::<f32>())?;
+    dx.copy_from_host(bytemuck_f32(&x))?;
+    dy.copy_from_host(bytemuck_f32(&y))?;
+
+    let mut px = dx.device_ptr();
+    let mut py = dy.device_ptr();
+    let mut pa = a;
+    let mut pn = u32::try_from(ELEMENTS).expect("vector length fits kernel ABI");
+    let mut params: [*mut c_void; 4] = [
+        (&raw mut px).cast(),
+        (&raw mut py).cast(),
+        (&raw mut pa).cast(),
+        (&raw mut pn).cast(),
+    ];
+    let block = (pn, 1, 1);
+    let mut graphs = Vec::with_capacity(GRAPH_COUNT + 1);
+
+    stream.synchronize()?;
+    let node_free_before = ctx.memory_info()?.0;
+    stream.begin_capture()?;
+    // SAFETY: the arguments match AXPY; the module and both buffers stay live
+    // until every captured graph has been measured and dropped.
+    unsafe {
+        for _ in 0..KERNEL_NODES {
+            package.launch_async(0, &stream, (1, 1, 1), block, 0, &mut params)?;
+        }
+    }
+    graphs.push(stream.end_capture()?);
+    stream.synchronize()?;
+    let node_free_after = ctx.memory_info()?.0;
+    let node_delta = i128::from(node_free_before) - i128::from(node_free_after);
+
+    let graph_free_before = ctx.memory_info()?.0;
+    for _ in 0..GRAPH_COUNT {
+        stream.begin_capture()?;
+        // SAFETY: this uses the same live module, parameters, and buffers.
+        unsafe {
+            package.launch_async(0, &stream, (1, 1, 1), block, 0, &mut params)?;
+        }
+        graphs.push(stream.end_capture()?);
+    }
+    stream.synchronize()?;
+    let graph_free_after = ctx.memory_info()?.0;
+    let graph_delta = i128::from(graph_free_before) - i128::from(graph_free_after);
+
+    println!(
+        "graph-memory gpu={} node_free_before_bytes={} node_free_after_bytes={} node_delta_bytes={} graph_free_before_bytes={} graph_free_after_bytes={} graph_delta_bytes={}",
+        cap.uuid,
+        node_free_before,
+        node_free_after,
+        node_delta,
+        graph_free_before,
+        graph_free_after,
+        graph_delta,
+    );
+    if node_delta < 0 || graph_delta < 0 {
+        return Ok(Outcome::Failed(
+            "free memory increased during graph memory measurement".into(),
+        ));
+    }
+    let graph_count = u64::try_from(GRAPH_COUNT).map_err(|_| Error::InvalidRequest {
+        field: "graph_memory",
+        detail: "graph count exceeds u64".into(),
+    })?;
+    let node_delta = u64::try_from(node_delta).map_err(|_| Error::InvalidRequest {
+        field: "graph_memory",
+        detail: "node memory delta exceeds u64".into(),
+    })?;
+    let graph_delta = u64::try_from(graph_delta).map_err(|_| Error::InvalidRequest {
+        field: "graph_memory",
+        detail: "graph memory delta exceeds u64".into(),
+    })?;
+    let kernel_bound_bytes = SelectedReservedPlan::CAPTURED_KERNEL_BOUND_BYTES;
+    let graph_bound_bytes = SelectedReservedPlan::CAPTURED_GRAPH_BOUND_BYTES;
+    let node_bound = KERNEL_NODES
+        .checked_mul(kernel_bound_bytes)
+        .and_then(|bytes| bytes.checked_add(graph_bound_bytes))
+        .ok_or_else(|| Error::InvalidRequest {
+            field: "graph_memory",
+            detail: "kernel graph memory bound overflowed".into(),
+        })?;
+    let graph_bound = graph_count
+        .checked_mul(
+            kernel_bound_bytes
+                .checked_add(graph_bound_bytes)
+                .ok_or_else(|| Error::InvalidRequest {
+                    field: "graph_memory",
+                    detail: "per-graph memory bound overflowed".into(),
+                })?,
+        )
+        .ok_or_else(|| Error::InvalidRequest {
+            field: "graph_memory",
+            detail: "graph memory bound overflowed".into(),
+        })?;
+    if node_delta > node_bound {
+        return Ok(Outcome::Failed(format!(
+            "node delta {node_delta} exceeds bound {node_bound}"
+        )));
+    }
+    if graph_delta > graph_bound {
+        return Ok(Outcome::Failed(format!(
+            "graph delta {graph_delta} exceeds bound {graph_bound}"
+        )));
     }
     Ok(Outcome::Passed)
 }

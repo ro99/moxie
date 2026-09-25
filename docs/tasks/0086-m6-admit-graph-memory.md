@@ -128,4 +128,22 @@ file outside the allowed list is needed.
 
 ## Result, filled after work
 
-(pending)
+Implemented `graph_memory_within_bound` and admitted each plan's captured
+kernel nodes and segments through one `GraphPools` reservation. Disabling
+capture and closing the plan clear graphs before releasing the reservation;
+the dense device fixture checks both its measured memory drop and captured
+segment count.
+
+Two unconstrained all-GPU runs reproduced every node and graph delta exactly.
+The stated rule derives `CAPTURED_KERNEL_BOUND_BYTES = 8,192` and
+`CAPTURED_GRAPH_BOUND_BYTES = 131,072`; raw free-memory readings and the
+derivation are in [`graph-memory.md`](../evidence/graph-memory.md). The B=0
+mutant was caught on all three GPUs by node deltas of 41,943,040 bytes on the
+5060 Ti and 117,440,512 bytes on each 3090, against a 131,072-byte allowance;
+the mutant was reverted.
+
+Host gates passed: formatting, workspace clippy, executor driver-feature
+clippy, workspace tests, architecture check and spec check. With
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`, GPU gates passed: `dense_gemma_device` (8
+passed, 1 ignored), `dense_tp2_device` (1 passed), and `cargo xtask-cuda
+test-gpu` (69/69; all three devices passed, SM86 and SM120 qualified).

@@ -16,8 +16,8 @@ use moxie_plan::{
     WeightFormat,
 };
 use moxie_types::{
-    DeviceCapability, DeviceTier, Error, HostTier, KernelCatalogue, Result, Scope, TensorLayout,
-    Tier,
+    DeviceCapability, DeviceTier, Error, HostTier, KernelCatalogue, Result, Scope,
+    SemanticKernelOp, TensorLayout, Tier,
 };
 
 use crate::{
@@ -131,6 +131,8 @@ pub struct SelectedReservedPlan<'ctx> {
     /// they reference.
     pub(crate) captured: Vec<CapturedGraph<'ctx>>,
     pub(crate) capture_enabled: bool,
+    graph_reservation: Option<Reservation>,
+    graph_pool_bytes: u64,
     /// The dense kernel module, loaded by the first dense step and dropped
     /// with the plan, so it is never unloaded while a step's kernels may still
     /// run.
@@ -179,6 +181,11 @@ impl<'ctx> ChainOperation<'ctx> {
 }
 
 impl<'ctx> SelectedReservedPlan<'ctx> {
+    /// Per-node graph memory bound derived from `docs/evidence/graph-memory.md`.
+    pub const CAPTURED_KERNEL_BOUND_BYTES: u64 = 8_192;
+    /// Per-graph graph memory bound derived from `docs/evidence/graph-memory.md`.
+    pub const CAPTURED_GRAPH_BOUND_BYTES: u64 = 131_072;
+
     pub fn admit(
         candidate: SelectedPlanCandidate,
         graph: &Graph,
@@ -310,6 +317,8 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             bound_weights: BTreeMap::new(),
             captured: Vec::new(),
             capture_enabled: false,
+            graph_reservation: None,
+            graph_pool_bytes: 0,
             package: None,
             ledger: ledger.id(),
         })
@@ -322,21 +331,73 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         self.bound_weights.len()
     }
 
-    pub fn set_segment_capture(&mut self, enabled: bool) -> Result<()> {
-        self.captured.clear();
-        if !self.candidate.is_dense()
-            || !self.candidate.host_expert_joins().is_empty()
-            || !self.candidate.linear_orders().is_empty()
-            || !self.candidate.combine_orders().is_empty()
-            || !self.candidate.expert_ownership().is_empty()
-        {
-            return Err(invalid(
-                "capture",
-                "segment capture requires a dense plan without host joins, reduction orders, or expert ownership",
-            ));
+    pub fn set_segment_capture(&mut self, enabled: bool, ledger: &mut Ledger) -> Result<()> {
+        if enabled {
+            if !self.candidate.is_dense()
+                || !self.candidate.host_expert_joins().is_empty()
+                || !self.candidate.linear_orders().is_empty()
+                || !self.candidate.combine_orders().is_empty()
+                || !self.candidate.expert_ownership().is_empty()
+            {
+                return Err(invalid(
+                    "capture",
+                    "segment capture requires a dense plan without host joins, reduction orders, or expert ownership",
+                ));
+            }
+            if ledger.id() != self.ledger {
+                return Err(invalid("ledger", "selected plan belongs to another ledger"));
+            }
+            if self.capture_enabled {
+                return Ok(());
+            }
+            let (kernels, segments) = captured_graph_counts(&self.candidate)?;
+            let bytes = kernels
+                .checked_mul(Self::CAPTURED_KERNEL_BOUND_BYTES)
+                .and_then(|nodes| {
+                    segments
+                        .checked_mul(Self::CAPTURED_GRAPH_BOUND_BYTES)
+                        .and_then(|graphs| nodes.checked_add(graphs))
+                })
+                .ok_or_else(|| invalid("capture", "graph memory bound overflowed"))?;
+            let mut request = PlanRequest::new("selected-plan-graph-pools", ["capture"])?;
+            request.buffer(BufferRequest::new(
+                "captured-graph-pools",
+                Scope::Device(self.candidate.workload().device),
+                Tier::Device(DeviceTier::GraphPools),
+                bytes,
+                StageSpan::at(0),
+            ))?;
+            let reservation = ledger.admit(&request)?;
+            self.graph_reservation = Some(reservation);
+            self.graph_pool_bytes = bytes;
+            self.capture_enabled = true;
+        } else {
+            if ledger.id() != self.ledger {
+                return Err(invalid("ledger", "selected plan belongs to another ledger"));
+            }
+            self.captured.clear();
+            if let Some(reservation) = self.graph_reservation.take() {
+                match ledger.release(reservation) {
+                    Ok(()) => self.graph_pool_bytes = 0,
+                    Err(refused) => {
+                        self.graph_reservation = Some(refused.reservation);
+                        return Err(refused.error);
+                    }
+                }
+            } else {
+                self.graph_pool_bytes = 0;
+            }
+            self.capture_enabled = false;
         }
-        self.capture_enabled = enabled;
         Ok(())
+    }
+
+    pub fn captured_segments(&self) -> usize {
+        self.captured.len()
+    }
+
+    pub fn graph_pool_bytes(&self) -> u64 {
+        self.graph_pool_bytes
     }
 
     #[cfg(feature = "paged-attention-binding")]
@@ -528,6 +589,18 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                 error: invalid("ledger", "selected plan belongs to another ledger"),
             });
         }
+        self.captured.clear();
+        if let Some(reservation) = self.graph_reservation.take() {
+            if let Err(refused) = ledger.release(reservation) {
+                self.graph_reservation = Some(refused.reservation);
+                return Err(SelectedCloseRefused {
+                    plan: self,
+                    error: refused.error,
+                });
+            }
+            self.graph_pool_bytes = 0;
+            self.capture_enabled = false;
+        }
         while let Some((key, range)) = self.ranges.pop_last() {
             let arena = self.arena.as_mut().expect("open plan has arena");
             if let Err(RangeReleaseRefused { range, error }) = arena.release(range) {
@@ -705,6 +778,33 @@ impl<'ctx> OperationLease<SelectedCompletion<'ctx>, ChainOperation<'ctx>> {
             launch_order,
         })
     }
+}
+
+fn captured_graph_counts(candidate: &SelectedPlanCandidate) -> Result<(u64, u64)> {
+    let mut kernels = 0u64;
+    let mut segments = 0u64;
+    let mut in_segment = false;
+    for node in candidate.nodes() {
+        if matches!(
+            node.descriptor.operation,
+            SemanticKernelOp::PagedAttention | SemanticKernelOp::CombineHostJoin
+        ) {
+            in_segment = false;
+            continue;
+        }
+        if !in_segment {
+            segments = segments
+                .checked_add(1)
+                .ok_or_else(|| invalid("capture", "segment count overflowed"))?;
+            in_segment = true;
+        }
+        let node_kernels = u64::try_from(node.descriptor.symbols.len())
+            .map_err(|_| invalid("capture", "kernel count exceeds u64"))?;
+        kernels = kernels
+            .checked_add(node_kernels)
+            .ok_or_else(|| invalid("capture", "kernel count overflowed"))?;
+    }
+    Ok((kernels, segments))
 }
 
 /// Exact admission envelope derived from an immutable selected candidate.
