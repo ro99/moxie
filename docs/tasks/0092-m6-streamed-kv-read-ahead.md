@@ -228,3 +228,9 @@ Recorded two timing runs in `docs/evidence/kv-read-ahead.md`. On the target
 RTX 3090, `stage_next` medians were 348.022 and 346.940 µs; read-ahead medians
 were 346.241 and 349.557 µs. The timing difference changed direction between
 runs, and overlap was not measurable from the available event intervals.
+
+### R1
+
+Updated `is_idle` to return false while any staged copy remains unobserved,
+and named that condition in its doc comment. No new test was added; the
+existing TP worker observes pending work before checking idle.

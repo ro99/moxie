@@ -1433,12 +1433,13 @@ pub mod device {
     }
 
     impl<'ctx> PagedAttentionRun<'ctx> {
-        /// Neither quarantined nor holding a refused source or range: no
-        /// operation of this run is outstanding.
+        /// No operation is outstanding: the run is not quarantined, holds no
+        /// refused source or range, has no active stream or unobserved staged copy.
         #[cfg(feature = "paged-attention-binding")]
         pub(crate) fn is_idle(&self) -> bool {
             !self.quarantined
                 && !self.read_ahead_stream_active
+                && !self.copied_pending.contains(&true)
                 && self.held.is_none()
                 && self.held_ranges.is_none()
                 && self.pending.is_none()
