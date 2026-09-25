@@ -142,7 +142,7 @@ per-step `Module::load`) are ranked by [task
 breakdown before either is opened. **0078 accepted** 2026-09-24
 ([evidence](../evidence/dense-step-timing.md)): module load/unload is 24% of
 per-step driver API time and event synchronization 7%, so module caching is
-next. **Deferred** (coordinator, 2026-09-24): removing the per-operation
+next: [task 0079](../tasks/0079-m6-dense-module-per-plan.md) **active**. **Deferred** (coordinator, 2026-09-24): removing the per-operation
 `settle` in `PagedAttentionRun`. Unfinished scope: about 19 event
 synchronizations per fixture step. Revisit when decode capture (slice 4)
 needs a sync-free step, or when a checkpoint-scale profile shows them
