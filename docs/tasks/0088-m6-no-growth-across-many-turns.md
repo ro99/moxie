@@ -1,7 +1,6 @@
 # Task 0088 — no resource growth across many turns
 
-Status: **proposed** (coordinator, 2026-09-25); opens when task 0087 is
-accepted. Builder Codex `luna`; reviewer Codex `sol`.
+Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer Codex `sol`.
 
 ## Identity and authority
 

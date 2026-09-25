@@ -1,6 +1,11 @@
 # Task 0087 — chunked prefill through a fixed, reused set of bucket plans
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer
+Status: **accepted** (coordinator, 2026-09-25), after sol's review round R1.
+Implementation `d2e0fa3`.
+- R1 (LOW, record, the coordinator's contract): the `moxie-plan/src/lib.rs`
+  export is needed because `selected.rs` is a private module; the allowed
+  list named `lib.rs` only for the `bucket.rs` alternative. The list is
+  amended; no code change. An optional two-line simplification was declined. Builder Codex `luna`; reviewer
 Codex `sol`.
 
 ## Identity and authority
@@ -46,8 +51,8 @@ Codex `sol`.
   for every chunk of that size, across two different prompts; device logits
   match the host reference.
 - **Allowed files:** `crates/moxie-plan/src/selected.rs` (or a new
-  `crates/moxie-plan/src/bucket.rs` plus its `lib.rs` export, if
-  `selected.rs` has no natural place), `crates/moxie-executor/tests/
+  `crates/moxie-plan/src/bucket.rs`, if `selected.rs` has no natural place),
+  `crates/moxie-plan/src/lib.rs` for the export (amended after review), `crates/moxie-executor/tests/
   dense_gemma_device.rs`, this task's Result.
 - **Non-goals:** `moxie-engine` changes; padding rows; picking bucket sets
   from cost; TP/PP.
