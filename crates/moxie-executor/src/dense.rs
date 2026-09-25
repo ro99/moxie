@@ -25,7 +25,7 @@ use crate::chain::{
     OwnedBinding, SelectedCompletion, SelectedReservedPlan, attribute_chain_error,
     attribute_node_error, validate_bindings_except,
 };
-use crate::paged_attention::device::{PagedAttentionRun, PagedKvRows, append_paged_layer};
+use crate::paged_attention::device::{PagedAttentionRun, append_paged_layer_from_device};
 use crate::{AttentionLayer, PageGeometry, PagedAttentionLaunch};
 
 /// The inputs and state authorities needed for one selected dense graph step.
@@ -1177,44 +1177,24 @@ fn execute_attention<'ctx>(
         )
     })?;
     *attention_index += 1;
-    let key_value_width = kv_heads
-        .checked_mul(head_dim)
-        .ok_or_else(|| invalid("attention", "key/value width overflowed"))?;
-    let payload_bytes = rows
-        .checked_mul(key_value_width)
-        .and_then(|elements| elements.checked_mul(2))
-        .and_then(|bytes| usize::try_from(bytes).ok())
-        .ok_or_else(|| invalid("attention", "key/value staging extent is not addressable"))?;
     let key_range = address_range(lease.resource(), node.inputs[1])?;
     let value_range = address_range(lease.resource(), node.inputs[2])?;
-    let mut keys = Vec::new();
-    keys.try_reserve_exact(payload_bytes)
-        .map_err(|_| capacity(payload_bytes))?;
-    keys.resize(payload_bytes, 0);
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(payload_bytes)
-        .map_err(|_| capacity(payload_bytes))?;
-    values.resize(payload_bytes, 0);
-    key_range.copy_to_host(&mut keys)?;
-    value_range.copy_to_host(&mut values)?;
     if state.layer_count()? <= layer as usize || run_count != state.layer_count()? {
         return Err(invalid(
             "state",
             "dense attention state and admitted runs do not have one entry per layer",
         ));
     }
-    if let Err(refused) = append_paged_layer(
+    append_paged_layer_from_device(
         state,
         transaction,
         layer as usize,
         rows,
         run,
         stream,
-        PagedKvRows { keys, values },
-    ) {
-        return Err(refused.error);
-    }
+        key_range,
+        value_range,
+    )?;
     let retained = state.layer_retained(layer as usize)?;
     let geometry = PageGeometry {
         kv_heads,

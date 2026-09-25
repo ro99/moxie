@@ -1393,20 +1393,7 @@ fn dense_workspace(
                 bytes,
             ))
         }
-        SemanticKernelOp::PagedAttention => {
-            let moxie_graph::OpParams::Attention {
-                kv_heads, head_dim, ..
-            } = node.params
-            else {
-                unreachable!("dense paged-attention operation")
-            };
-            let bytes = rows
-                .checked_mul(kv_heads)
-                .and_then(|v| v.checked_mul(head_dim))
-                .and_then(|v| v.checked_mul(4))
-                .ok_or_else(|| invalid("host_workspace", "attention K/V staging overflowed"))?;
-            Ok((moxie_types::WorkspaceExpression::Zero, 0, bytes))
-        }
+        SemanticKernelOp::PagedAttention => Ok((moxie_types::WorkspaceExpression::Zero, 0, 0)),
         SemanticKernelOp::ExpertMlp(_) => {
             let moxie_graph::OpParams::ExpertMlp {
                 intermediate,

@@ -2470,31 +2470,95 @@ pub mod device {
                 })
         }
 
-        /// Write `rows` dense rows of keys and values where the **state
-        /// authority** says they go.
-        ///
-        /// `placements` comes from `moxie_state::DeviceKvSequence`, which owns
-        /// retention, the frontier and the ring. This run performs them: it
-        /// does not compute `position / page_tokens`, does not decide which
-        /// page may be overwritten, and does not publish anything as history.
-        /// Two implementations of one mapping is the failure that split is for.
-        ///
-        /// What it *does* own is a physical fact: which rows it has observed
-        /// copied. A refusal before anything is enqueued leaves that and every
-        /// prior byte untouched and hands the sources back; a failure after
-        /// enqueue quarantines the run, keeps the sources, and still does not
-        /// advance it. There is no state in between: a partially copied write
-        /// is never reported as written. This is the mechanism a
-        /// [`PagedKvWriter`] drives, not a value a caller can hold and use
-        /// later to assert that a write happened: an `Ok` here is only ever
-        /// true at the moment it is returned.
-        ///
-        /// `pub(crate)`, not `pub`: `placements` and `keys`/`values` are
-        /// publicly constructible values with nothing behind them, so a
-        /// caller reaching this directly could overwrite a live published row
-        /// without the state authority ever being involved. `RawPagedFixture`
-        /// is the one named exception, for a gate that has no authority to
-        /// begin with.
+        /// Validate the authority's placements and this run's physical extents
+        /// before either write path enqueues any payload bytes.
+        fn check_write_placements(
+            &self,
+            stream: &Stream<'ctx>,
+            placements: &[PagePlacement],
+        ) -> Result<(u64, u64, u64)> {
+            if self.quarantined {
+                return Err(invalid("run", "this run is quarantined"));
+            }
+            self.same_device(stream)?;
+            if placements.is_empty() {
+                return Err(invalid("placements", "a write with no placement"));
+            }
+            let row_bytes = self
+                .geometry
+                .row_elements()?
+                .checked_mul(2)
+                .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+
+            // The placements are checked, not trusted: the authority owns the
+            // mapping, and this run owns the extents. A page identity outside
+            // the admitted pages, a slot outside a page, a gap or a step
+            // backwards would each write somewhere nothing asked for.
+            let mut rows = 0u64;
+            let mut position = placements[0].position;
+            for placement in placements {
+                if placement.position != position {
+                    return Err(invalid(
+                        "placements",
+                        "the runs are not contiguous and ascending from the first",
+                    ));
+                }
+                if placement.rows == 0 {
+                    return Err(invalid("placements", "a run of no rows"));
+                }
+                // **Against the published mapping, not merely in range.** A
+                // placement names an absolute row, the table says where that
+                // row's page is, and a write that disagreed with it would put
+                // bytes somewhere no launch will ever look — while every
+                // bounds check passed. This is what binds the three operations
+                // into one view: writes go where the table says, launches read
+                // what the table says, and a republication may not contradict
+                // either.
+                match self.resolves_to(placement.position) {
+                    Ok(physical) if physical == placement.physical_page => {}
+                    Ok(physical) => {
+                        return Err(invalid_fmt(
+                            "placements",
+                            format_args!(
+                                "row {} is placed on physical page {} and the published \
+                                 mapping sends it to {physical}",
+                                placement.position, placement.physical_page
+                            ),
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+                if placement.slot != placement.position % self.geometry.page_tokens {
+                    return Err(invalid_fmt(
+                        "placements",
+                        format_args!(
+                            "row {} is placed at slot {} and its page holds it at {}",
+                            placement.position,
+                            placement.slot,
+                            placement.position % self.geometry.page_tokens
+                        ),
+                    ));
+                }
+                let slot_end = placement.slot.checked_add(placement.rows);
+                if slot_end.is_none_or(|end| end > self.geometry.page_tokens) {
+                    return Err(invalid(
+                        "placements",
+                        "a run crosses the end of the page it is placed on",
+                    ));
+                }
+                match placement.end() {
+                    Some(end) => position = end,
+                    None => return Err(Error::Dim(moxie_types::DimError::Overflow)),
+                }
+                rows += placement.rows;
+            }
+            rows.checked_mul(row_bytes)
+                .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+            Ok((row_bytes, rows, position))
+        }
+
+        /// Write host-backed dense K/V rows at placements from the state
+        /// authority, returning the sources on a refusal before enqueue.
         #[cfg_attr(not(feature = "paged-attention-binding"), allow(dead_code))]
         #[allow(clippy::result_large_err)]
         pub(crate) fn write_rows(
@@ -2508,129 +2572,12 @@ pub mod device {
                 error,
                 source: Some(RefusedSource::Rows { keys, values }),
             };
-            if self.quarantined {
-                return Err(give_back(
-                    invalid("run", "this run is quarantined"),
-                    keys,
-                    values,
-                ));
-            }
-            if let Err(error) = self.same_device(stream) {
-                return Err(give_back(error, keys, values));
-            }
-            if placements.is_empty() {
-                return Err(give_back(
-                    invalid("placements", "a write with no placement"),
-                    keys,
-                    values,
-                ));
-            }
-            let row_bytes = match self.geometry.row_elements().and_then(|e| {
-                e.checked_mul(2)
-                    .ok_or(Error::Dim(moxie_types::DimError::Overflow))
-            }) {
-                Ok(bytes) => bytes,
-                Err(error) => return Err(give_back(error, keys, values)),
-            };
-
-            // The placements are checked, not trusted: the authority owns the
-            // mapping, and this run owns the extents. A page identity outside
-            // the admitted pages, a slot outside a page, a gap or a step
-            // backwards would each write somewhere nothing asked for.
-            let mut rows = 0u64;
-            let mut position = placements[0].position;
-            for placement in placements {
-                if placement.position != position {
-                    return Err(give_back(
-                        invalid(
-                            "placements",
-                            "the runs are not contiguous and ascending from the first",
-                        ),
-                        keys,
-                        values,
-                    ));
-                }
-                if placement.rows == 0 {
-                    return Err(give_back(
-                        invalid("placements", "a run of no rows"),
-                        keys,
-                        values,
-                    ));
-                }
-                // **Against the published mapping, not merely in range.** A
-                // placement names an absolute row, the table says where that
-                // row's page is, and a write that disagreed with it would put
-                // bytes somewhere no launch will ever look — while every
-                // bounds check passed. This is what binds the three operations
-                // into one view: writes go where the table says, launches read
-                // what the table says, and a republication may not contradict
-                // either.
-                match self.resolves_to(placement.position) {
-                    Ok(physical) if physical == placement.physical_page => {}
-                    Ok(physical) => {
-                        return Err(give_back(
-                            invalid_fmt(
-                                "placements",
-                                format_args!(
-                                    "row {} is placed on physical page {} and the published \
-                                     mapping sends it to {physical}",
-                                    placement.position, placement.physical_page
-                                ),
-                            ),
-                            keys,
-                            values,
-                        ));
-                    }
+            let (row_bytes, rows, position_end) =
+                match self.check_write_placements(stream, placements) {
+                    Ok(checked) => checked,
                     Err(error) => return Err(give_back(error, keys, values)),
-                }
-                if placement.slot != placement.position % self.geometry.page_tokens {
-                    return Err(give_back(
-                        invalid_fmt(
-                            "placements",
-                            format_args!(
-                                "row {} is placed at slot {} and its page holds it at {}",
-                                placement.position,
-                                placement.slot,
-                                placement.position % self.geometry.page_tokens
-                            ),
-                        ),
-                        keys,
-                        values,
-                    ));
-                }
-                let slot_end = placement.slot.checked_add(placement.rows);
-                if slot_end.is_none_or(|end| end > self.geometry.page_tokens) {
-                    return Err(give_back(
-                        invalid(
-                            "placements",
-                            "a run crosses the end of the page it is placed on",
-                        ),
-                        keys,
-                        values,
-                    ));
-                }
-                match placement.end() {
-                    Some(end) => position = end,
-                    None => {
-                        return Err(give_back(
-                            Error::Dim(moxie_types::DimError::Overflow),
-                            keys,
-                            values,
-                        ));
-                    }
-                }
-                rows += placement.rows;
-            }
-            let want = match rows.checked_mul(row_bytes) {
-                Some(want) => want,
-                None => {
-                    return Err(give_back(
-                        Error::Dim(moxie_types::DimError::Overflow),
-                        keys,
-                        values,
-                    ));
-                }
-            };
+                };
+            let want = rows * row_bytes;
             if keys.len() as u64 != want || values.len() as u64 != want {
                 return Err(give_back(
                     invalid_fmt(
@@ -2665,7 +2612,61 @@ pub mod device {
             // physical high-water mark, not a frontier: a `PagedKvWriter`
             // publishes history through the authority, and only for a layer
             // whose write returned `Ok`.
-            self.written = self.written.max(position);
+            self.written = self.written.max(position_end);
+            Ok(())
+        }
+
+        #[cfg_attr(not(feature = "paged-attention-binding"), allow(dead_code))]
+        pub(crate) fn write_rows_from_device(
+            &mut self,
+            stream: &Stream<'ctx>,
+            placements: &[PagePlacement],
+            keys: &DeviceRange<'ctx>,
+            values: &DeviceRange<'ctx>,
+        ) -> Result<()> {
+            let (row_bytes, rows, position_end) =
+                self.check_write_placements(stream, placements)?;
+            let want = rows
+                .checked_mul(row_bytes)
+                .ok_or(Error::Dim(moxie_types::DimError::Overflow))?;
+            if keys.bytes() < want || values.bytes() < want {
+                return Err(invalid(
+                    "rows",
+                    "a device key or value range is shorter than the append",
+                ));
+            }
+
+            let page_bytes = self.geometry.page_bytes()?;
+            let mut done = 0u64;
+            for placement in placements {
+                let within = placement.physical_page * page_bytes + placement.slot * row_bytes;
+                let source_within = done * row_bytes;
+                let bytes = placement.rows * row_bytes;
+                for (range, source) in [
+                    (self.keys.as_ref().expect("live key range"), keys),
+                    (self.values.as_ref().expect("live value range"), values),
+                ] {
+                    // SAFETY: the dense operation lease retains each source
+                    // range through this method's completion event, and the
+                    // destination extent is checked against this run's range.
+                    let copied = unsafe {
+                        range.copy_from_device_async_at(
+                            within,
+                            source,
+                            source_within,
+                            bytes,
+                            stream,
+                        )
+                    };
+                    if let Err(error) = copied {
+                        self.quarantined = true;
+                        return Err(self.attribute(error));
+                    }
+                }
+                done += placement.rows;
+            }
+            self.settle(Ok(()), stream)?;
+            self.written = self.written.max(position_end);
             Ok(())
         }
 
@@ -4300,6 +4301,7 @@ pub mod device {
         values: Vec<u8>,
         retained: bool,
         source: Option<&'run PagedAttentionRun<'ctx>>,
+        device_rows: Option<(&'run DeviceRange<'ctx>, &'run DeviceRange<'ctx>)>,
     }
 
     #[cfg(feature = "paged-attention-binding")]
@@ -4319,6 +4321,26 @@ pub mod device {
                 values,
                 retained: false,
                 source: None,
+                device_rows: None,
+            }
+        }
+
+        pub(crate) fn from_device(
+            layer: usize,
+            run: &'run mut PagedAttentionRun<'ctx>,
+            stream: &'run Stream<'ctx>,
+            keys: &'run DeviceRange<'ctx>,
+            values: &'run DeviceRange<'ctx>,
+        ) -> Self {
+            Self {
+                layer,
+                run,
+                stream,
+                keys: Vec::new(),
+                values: Vec::new(),
+                retained: false,
+                source: None,
+                device_rows: Some((keys, values)),
             }
         }
 
@@ -4336,6 +4358,7 @@ pub mod device {
                 values: Vec::new(),
                 retained: false,
                 source: Some(source),
+                device_rows: None,
             }
         }
 
@@ -4367,6 +4390,11 @@ pub mod device {
             placements: &[PagePlacement],
         ) -> moxie_types::Result<()> {
             self.publish(layer, view)?;
+            if let Some((keys, values)) = self.device_rows {
+                return self
+                    .run
+                    .write_rows_from_device(self.stream, placements, keys, values);
+            }
             let keys = core::mem::take(&mut self.keys);
             let values = core::mem::take(&mut self.values);
             match self.run.write_rows(self.stream, placements, keys, values) {
@@ -4453,6 +4481,28 @@ pub mod device {
                     .map(|(keys, values)| PagedKvRows { keys, values }),
             }),
         }
+    }
+
+    /// Append device-resident K/V rows through the state authority.
+    #[cfg(feature = "paged-attention-binding")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_paged_layer_from_device<'ctx>(
+        state: &mut DeviceKvSequence,
+        txn: moxie_types::StateTransactionId,
+        layer: usize,
+        count: u64,
+        run: &mut PagedAttentionRun<'ctx>,
+        stream: &Stream<'ctx>,
+        keys: &DeviceRange<'ctx>,
+        values: &DeviceRange<'ctx>,
+    ) -> Result<()> {
+        run.check_append_rows(count)?;
+        state.append_layer(
+            txn,
+            layer,
+            count,
+            &mut PagedKvWriterAdapter::from_device(layer, run, stream, keys, values),
+        )
     }
 
     /// Fork one layer through the existing state-to-executor writer callback.

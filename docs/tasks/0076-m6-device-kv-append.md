@@ -173,4 +173,11 @@ and after, for one `dense_gemma_device` fixture; net lines changed.
 
 ## Result, filled after work
 
-(pending)
+**Complete** (builder Codex `luna`, 2026-09-24; base `6b8239c`). Dense K/V rows now copy from the selected operation's arena ranges directly into the authority's page placements. The device write settles before advancing `written`; dense attention no longer allocates or fills host K/V vectors, and the planner reports no attention K/V host workspace. Host-backed `append_paged_layer` remains unchanged.
+
+- **Workspace:** `reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu`, `gemma-a` decode candidate: `host_workspace_bytes` **128 → 64 bytes**. The old maximum was the two BF16 K/V row staging term; after removal, the remaining maximum is the local-layer RoPE angle table. This does not claim a speedup.
+- **Mutation:** changing the device source offset to `0` failed as required. Both `reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu` and `pipeline_runs_dense_and_routed_gemma_on_three_gpus` caught the wrong rows by their logit comparisons. The mutation was reverted to `done * row_bytes` before the clean gates.
+- **Host gates:** `cargo fmt --all -- --check`, both listed clippy commands, `cargo test --workspace --locked`, `cargo xtask arch-check` (79 rejected and 21 accepted fixtures), and `cargo xtask spec-check` (10 documents) passed.
+- **GPU gates** (`CUDA_DEVICE_ORDER=PCI_BUS_ID`): `dense_gemma_device` passed 6/6, `dense_tp2_device` passed, and `cargo xtask-cuda test-gpu` passed 63/63 with no skips across SM86 and SM120. Dense outputs remained bit-identical.
+- **Files and lines:** no tests added or changed. Production Rust diff: 170 insertions, 153 deletions, net **+17 lines** across the three allowed source files.
+- **Reference:** persistent device KV follows R04 and Strata's BF16 KV request contract (`include/strata/device/cuda_backend.hpp:304-307`); no performance result is claimed.
