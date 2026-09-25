@@ -139,7 +139,14 @@ between mechanisms. **It did (coordinator, 2026-09-24):** after 0077, slice
 1's remaining candidates (per-operation `settle` in `PagedAttentionRun`, the
 per-step `Module::load`) are ranked by [task
 0078](../tasks/0078-m6-dense-step-timing.md)'s fixed-plan timing and CUDA API
-breakdown before either is opened.
+breakdown before either is opened. **0078 accepted** 2026-09-24
+([evidence](../evidence/dense-step-timing.md)): module load/unload is 24% of
+per-step driver API time and event synchronization 7%, so module caching is
+next. **Deferred** (coordinator, 2026-09-24): removing the per-operation
+`settle` in `PagedAttentionRun`. Unfinished scope: about 19 event
+synchronizations per fixture step. Revisit when decode capture (slice 4)
+needs a sync-free step, or when a checkpoint-scale profile shows them
+material.
 
 ### Owner decision needed (batched)
 

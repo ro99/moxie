@@ -1,7 +1,16 @@
 # Task 0078 — fixed-plan timing of the single-GPU dense step
 
-Status: **active** (coordinator, 2026-09-24). Builder Codex `luna`; reviewer
-Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-24), after sol's review round R1.
+Builder Codex `luna`; reviewer Codex `sol`. Test `105b726`, evidence
+`de4400b`.
+- R1 (LOW, record): the Result said "all raw samples" were recorded; the
+  evidence holds per-run summaries. Corrected by the coordinator.
+- **Reading (coordinator):** 0076 + 0077 cut the fixture step by about 7–9%
+  (candidate and base run ranges do not overlap). Per step, CUDA driver API
+  time is dominated by about 149 kernel launches (44%) and the per-step module
+  load and unload (24%); event synchronizations are about 7%. Next in slice 1:
+  cache the loaded module per plan. The per-operation `settle` removal is
+  deferred to the ledger. Launch count is M6.2's capture work.
 
 ## Identity and authority
 
@@ -119,8 +128,8 @@ Implemented the single ignored fixed-plan timing test, appended at the end of
 `dense_gemma_device.rs`; no production code changed. The test measures Shape A
 prefill and decode on the specified RTX 3090. Three candidate runs and three
 runs at each paired base (`6b8239c`, `97a7281`) completed after clean test-only
-patch application on detached bases. The `nsys` API breakdown and all raw
-samples are recorded in [dense-step-timing.md](../evidence/dense-step-timing.md).
+patch application on detached bases. The `nsys` API breakdown and the per-run
+summary statistics (median, minimum, maximum) are recorded in [dense-step-timing.md](../evidence/dense-step-timing.md).
 
 Host gates passed: fmt check, workspace clippy, executor clippy with driver,
 `paged-attention-binding` and `paged-attention-test-hooks`, and
