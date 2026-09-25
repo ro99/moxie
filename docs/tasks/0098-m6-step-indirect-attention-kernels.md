@@ -1,8 +1,20 @@
 # Task 0098 — step-indirect paged attention and KV append kernels
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer
-Codex `sol`. Kernel-only; the executor wiring is task 0099 (outline below,
-reviewed together).
+Status: **accepted** (coordinator, 2026-09-25) after sol's review round R1
+(0 high, 1 medium, 1 low). Implementation `dad8c48`. Builder Codex `luna`;
+reviewer Codex `sol`. The executor wiring became tasks 0099 (prepared KV
+append) and 0101 (full-step capture).
+- **R1 M1 (provenance of the pre-refactor hashes), closed by the
+  coordinator with stronger evidence:** the compiled SASS of
+  `moxie_bf16_paged_attention_v1` is byte-identical between `dad8c48^` and
+  `dad8c48`, on sm_86 and sm_120. The coordinator compiled both sources with
+  the build's own nvcc 13.0.88 command (`-cubin -O3 --std=c++17 -gencode
+  arch=compute_NN,code=sm_NN`), then ran `cuobjdump -sass -fun
+  moxie_bf16_paged_attention_v1` and `cmp`. Identical machine code means
+  identical output by construction, so the recorded hashes are the
+  pre-refactor bytes whenever they were captured.
+- **R1 L1 (not taken now):** a duplicate 12-entry parameter array in the
+  test (`xtask/src/gpu.rs` about 3697–3719), carried as a small cleanup.
 
 ## Identity and authority
 
