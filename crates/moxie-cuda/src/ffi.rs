@@ -82,6 +82,8 @@ unsafe extern "C" {
 
     pub fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
+    pub fn cuMemHostAlloc(pp: *mut *mut c_void, bytesize: usize, flags: c_uint) -> CUresult;
+    pub fn cuMemFreeHost(p: *mut c_void) -> CUresult;
     pub fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult;
     pub fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, byte_count: usize) -> CUresult;
     pub fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CUdeviceptr, byte_count: usize) -> CUresult;

@@ -111,7 +111,7 @@ pub use grouped_device::{AttachRefused, DeviceExperts, DeviceExtents, ExpertLane
 #[cfg(feature = "driver")]
 pub mod topology_probe;
 #[cfg(feature = "driver")]
-pub use topology_probe::{ProbeConfig, probe_topology};
+pub use topology_probe::{Direction, PinnedLink, ProbeConfig, probe_pinned, probe_topology};
 
 #[cfg(feature = "driver")]
 pub use affine_linear::{

@@ -8,7 +8,10 @@ use std::{
     time::Instant,
 };
 
-use moxie_cuda::{DeviceBuffer, Event, RankContext, Stream, query_device};
+use moxie_cuda::{
+    DeviceBuffer, Event, Module, ModuleImage, PinnedHostBuffer, RankContext, ResolvedModule,
+    Stream, TrustedImage, query_device,
+};
 use moxie_plan::{DeviceCost, Endpoint, LinkCost, TopologyCosts};
 use moxie_types::{DeviceCapability, Error, RankId, Result};
 
@@ -31,8 +34,8 @@ impl Default for ProbeConfig {
 
 /// Measure pageable host links, granted peer links, simultaneous traffic and device memory.
 ///
-/// `ponytail:` pinned and mapped copies stay unmeasured until a pinned path
-/// exists (M6.3); neither is used by an M5 execution path.
+/// Mapped host memory remains unmeasured; neither mapped nor pinned memory is
+/// used by the admitted execution paths.
 pub fn probe_topology(ordinals: &[u32], config: ProbeConfig) -> Result<TopologyCosts> {
     if ordinals.is_empty()
         || config.small_bytes == 0
@@ -75,6 +78,231 @@ pub fn probe_topology(ordinals: &[u32], config: ProbeConfig) -> Result<TopologyC
     }
     links.sort_by_key(|link| (link.from, link.to));
     Ok(TopologyCosts { devices, links })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    H2d,
+    D2h,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PinnedLink {
+    pub device: moxie_types::DeviceUuid,
+    pub direction: Direction,
+    pub pageable_gbps: f64,
+    pub pinned_gbps: f64,
+    pub pageable_issue_us: f64,
+    pub pinned_issue_us: f64,
+    pub overlap: f64,
+}
+
+/// Measure pageable and pinned host transfers and pinned H2D copy/compute overlap.
+pub fn probe_pinned(ordinals: &[u32], config: ProbeConfig) -> Result<Vec<PinnedLink>> {
+    if ordinals.is_empty() || config.bulk_bytes < 4 || config.reps == 0 {
+        return Err(invalid(
+            "ordinals, at least four bulk bytes and positive repetitions are required",
+        ));
+    }
+    let mut ordinals = ordinals.to_vec();
+    ordinals.sort_unstable();
+    if ordinals.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(invalid("device ordinals must be unique"));
+    }
+    let float_count = config.bulk_bytes / core::mem::size_of::<f32>();
+    let float_count = u32::try_from(float_count)
+        .map_err(|_| invalid("bulk buffer is too large for the smoke kernel"))?;
+    let capabilities = ordinals
+        .iter()
+        .map(|ordinal| query_device(*ordinal))
+        .collect::<Result<Vec<_>>>()?;
+    let mut links = Vec::with_capacity(capabilities.len() * 2);
+    for capability in capabilities {
+        links.extend(probe_pinned_device(&capability, config, float_count)?);
+    }
+    Ok(links)
+}
+
+fn probe_pinned_device(
+    capability: &DeviceCapability,
+    config: ProbeConfig,
+    float_count: u32,
+) -> Result<[PinnedLink; 2]> {
+    let ctx = RankContext::acquire(RankId(capability.ordinal), capability.ordinal)?;
+    let mut pinned = PinnedHostBuffer::alloc(&ctx, config.bulk_bytes)?;
+    let measurements = (|| {
+        let stream = Stream::new(&ctx)?;
+        let compute_stream = Stream::new(&ctx)?;
+        let mut transfer = DeviceBuffer::alloc(&ctx, config.bulk_bytes)?;
+        let mut x = DeviceBuffer::alloc(&ctx, config.bulk_bytes)?;
+        let mut y = DeviceBuffer::alloc(&ctx, config.bulk_bytes)?;
+        let mut pageable = zeroed(config.bulk_bytes)?;
+        let mut pageable_out = zeroed(config.bulk_bytes)?;
+        pinned.as_mut_slice().fill(0x5a);
+        pageable.fill(0x5a);
+        transfer.copy_from_host(&pageable)?;
+        x.copy_from_host(&pageable)?;
+        y.copy_from_host(&pageable)?;
+
+        // SAFETY: the image is the immutable nvcc output embedded by this build.
+        let image = unsafe { TrustedImage::from_build_output(moxie_kernels::SMOKE_FATBIN)? };
+        let package = Module::load(&ctx, ModuleImage::Binary(image))?
+            .resolve_all(&[moxie_kernels::AXPY_F32.to_owned()])?;
+
+        let (start, end) = (Event::new(&ctx)?, Event::new(&ctx)?);
+        // Warm each transfer and kernel path before collecting samples.
+        // SAFETY: host slices and the transfer allocation remain live until the
+        // following stream synchronization observes all four copies.
+        unsafe {
+            transfer.copy_from_host_async_at(0, &pageable, &stream)?;
+            transfer.copy_from_host_async_at(0, pinned.as_slice(), &stream)?;
+            transfer.copy_to_host_async(&mut pageable_out, &stream)?;
+            transfer.copy_to_host_async(pinned.as_mut_slice(), &stream)?;
+        }
+        stream.synchronize()?;
+        launch_axpy(&package, &x, &y, float_count, &compute_stream)?;
+        compute_stream.synchronize()?;
+
+        let pageable_h2d = event_times(config.reps, &stream, &start, &end, || {
+            // SAFETY: the pageable source, device buffer and stream outlive the
+            // measured operation, and `event_times` observes completion.
+            unsafe { transfer.copy_from_host_async_at(0, &pageable, &stream) }
+        })?;
+        let pageable_h2d_issue = issue_times(config.reps, &stream, || {
+            // SAFETY: the source remains live until the stream is synchronized.
+            unsafe { transfer.copy_from_host_async_at(0, &pageable, &stream) }
+        })?;
+        let pinned_h2d = event_times(config.reps, &stream, &start, &end, || {
+            // SAFETY: pinned host storage, destination and stream remain live;
+            // `event_times` waits before the next sample.
+            unsafe { transfer.copy_from_host_async_at(0, pinned.as_slice(), &stream) }
+        })?;
+        let pinned_h2d_issue = issue_times(config.reps, &stream, || {
+            // SAFETY: the pinned source remains live until stream synchronization.
+            unsafe { transfer.copy_from_host_async_at(0, pinned.as_slice(), &stream) }
+        })?;
+        let pageable_d2h = event_times(config.reps, &stream, &start, &end, || {
+            // SAFETY: the destination, device buffer and stream outlive the
+            // measured operation, and `event_times` observes completion.
+            unsafe { transfer.copy_to_host_async(&mut pageable_out, &stream) }
+        })?;
+        let pageable_d2h_issue = issue_times(config.reps, &stream, || {
+            // SAFETY: the destination remains live until the stream is synchronized.
+            unsafe { transfer.copy_to_host_async(&mut pageable_out, &stream) }
+        })?;
+        let pinned_d2h = event_times(config.reps, &stream, &start, &end, || {
+            // SAFETY: pinned host storage, source and stream remain live;
+            // `event_times` waits before the next sample.
+            unsafe { transfer.copy_to_host_async(pinned.as_mut_slice(), &stream) }
+        })?;
+        let pinned_d2h_issue = issue_times(config.reps, &stream, || {
+            // SAFETY: the pinned destination remains live until synchronization.
+            unsafe { transfer.copy_to_host_async(pinned.as_mut_slice(), &stream) }
+        })?;
+
+        let copy_calibration = event_times(1, &stream, &start, &end, || {
+            // SAFETY: the pinned source remains live until event completion.
+            unsafe { transfer.copy_from_host_async_at(0, pinned.as_slice(), &stream) }
+        })?[0];
+        let kernel_calibration = event_times(1, &compute_stream, &start, &end, || {
+            launch_axpy(&package, &x, &y, float_count, &compute_stream)
+        })?[0];
+        let kernel_reps = (copy_calibration / kernel_calibration).ceil().max(1.0) as usize;
+        let kernel_alone = event_times(config.reps, &compute_stream, &start, &end, || {
+            for _ in 0..kernel_reps {
+                launch_axpy(&package, &x, &y, float_count, &compute_stream)?;
+            }
+            Ok(())
+        })?;
+        let (both_start, both_end, kernel_end) =
+            (Event::new(&ctx)?, Event::new(&ctx)?, Event::new(&ctx)?);
+        let mut both = Vec::with_capacity(config.reps);
+        for _ in 0..config.reps {
+            both_start.record(&stream)?;
+            compute_stream.wait_event(&both_start)?;
+            // SAFETY: pinned host storage and destination remain live until the
+            // end event, which is ordered after the copy and compute streams.
+            unsafe {
+                transfer.copy_from_host_async_at(0, pinned.as_slice(), &stream)?;
+            }
+            for _ in 0..kernel_reps {
+                launch_axpy(&package, &x, &y, float_count, &compute_stream)?;
+            }
+            kernel_end.record(&compute_stream)?;
+            stream.wait_event(&kernel_end)?;
+            both_end.record(&stream)?;
+            both_end.synchronize()?;
+            both.push(f64::from(Event::elapsed_ms(&both_start, &both_end)?) / 1e3);
+        }
+
+        let copy_alone = median_metric(&pinned_h2d, |seconds| seconds)?;
+        let kernel_alone = median_metric(&kernel_alone, |seconds| seconds)?;
+        let both = median_metric(&both, |seconds| seconds)?;
+        let overlap =
+            ((copy_alone + kernel_alone - both) / copy_alone.min(kernel_alone)).clamp(0.0, 1.0);
+        Ok([
+            PinnedLink {
+                device: ctx.uuid(),
+                direction: Direction::H2d,
+                pageable_gbps: median_metric(&pageable_h2d, |seconds| {
+                    config.bulk_bytes as f64 / seconds / 1e9
+                })?,
+                pinned_gbps: median_metric(&pinned_h2d, |seconds| {
+                    config.bulk_bytes as f64 / seconds / 1e9
+                })?,
+                pageable_issue_us: median_metric(&pageable_h2d_issue, |seconds| seconds * 1e6)?,
+                pinned_issue_us: median_metric(&pinned_h2d_issue, |seconds| seconds * 1e6)?,
+                overlap,
+            },
+            PinnedLink {
+                device: ctx.uuid(),
+                direction: Direction::D2h,
+                pageable_gbps: median_metric(&pageable_d2h, |seconds| {
+                    config.bulk_bytes as f64 / seconds / 1e9
+                })?,
+                pinned_gbps: median_metric(&pinned_d2h, |seconds| {
+                    config.bulk_bytes as f64 / seconds / 1e9
+                })?,
+                pageable_issue_us: median_metric(&pageable_d2h_issue, |seconds| seconds * 1e6)?,
+                pinned_issue_us: median_metric(&pinned_d2h_issue, |seconds| seconds * 1e6)?,
+                overlap: 0.0,
+            },
+        ])
+    })();
+    if let Err(error) = ctx.synchronize() {
+        core::mem::forget(pinned);
+        return Err(error);
+    }
+    measurements
+}
+
+fn launch_axpy(
+    package: &ResolvedModule<'_>,
+    x: &DeviceBuffer<'_>,
+    y: &DeviceBuffer<'_>,
+    elements: u32,
+    stream: &Stream<'_>,
+) -> Result<()> {
+    let (mut x_ptr, mut y_ptr, mut scale, mut count) =
+        (x.device_ptr(), y.device_ptr(), 1.0f32, elements);
+    let mut params = [
+        (&raw mut x_ptr).cast(),
+        (&raw mut y_ptr).cast(),
+        (&raw mut scale).cast(),
+        (&raw mut count).cast(),
+    ];
+    // SAFETY: arguments match the smoke AXPY ABI, both device buffers hold at
+    // least `elements` floats, and they remain live through event completion.
+    unsafe {
+        package.launch_async(
+            0,
+            stream,
+            (elements.div_ceil(256), 1, 1),
+            (256, 1, 1),
+            0,
+            &mut params,
+        )
+    }
 }
 
 fn isolated(
@@ -248,12 +476,6 @@ fn isolated(
     Ok((devices, links))
 }
 
-#[derive(Clone, Copy)]
-enum Direction {
-    H2d,
-    D2h,
-}
-
 fn concurrent_host(
     ordinals: &[u32],
     bytes: usize,
@@ -344,6 +566,22 @@ fn host_times(reps: usize, mut copy: impl FnMut() -> Result<()>) -> Result<Vec<f
             let now = Instant::now();
             copy()?;
             Ok(now.elapsed().as_secs_f64())
+        })
+        .collect()
+}
+
+fn issue_times(
+    reps: usize,
+    stream: &Stream<'_>,
+    mut enqueue: impl FnMut() -> Result<()>,
+) -> Result<Vec<f64>> {
+    (0..reps)
+        .map(|_| {
+            let start = Instant::now();
+            enqueue()?;
+            let elapsed = start.elapsed().as_secs_f64();
+            stream.synchronize()?;
+            Ok(elapsed)
         })
         .collect()
 }

@@ -113,4 +113,15 @@ file outside the allowed list is needed.
 
 ## Result, filled after work
 
-(pending)
+Implemented `PinnedHostBuffer` with the exact `cuMemHostAlloc` and
+`cuMemFreeHost` declarations from `/usr/local/cuda/include/cuda.h`; added the
+event-timed pageable/pinned bandwidth, async-call issue time and two-stream H2D
+overlap probe; exposed its table in `cargo xtask-cuda probe`. The measurements
+and two-run comparison are appended to `docs/evidence/topology-costs.md`.
+
+- Host gates passed: format check, workspace clippy, driver-feature executor
+  clippy, workspace tests, `arch-check` and `spec-check`.
+- GPU gate passed: `CUDA_DEVICE_ORDER=PCI_BUS_ID cargo xtask-cuda test-gpu`
+  (69/69).
+- Both `CUDA_DEVICE_ORDER=PCI_BUS_ID cargo xtask-cuda probe` runs completed;
+  every nonzero figure reproduced within 25% (largest change 15.8%).

@@ -31,6 +31,12 @@ pub fn classify(code: CUresult, detail: String) -> Result<()> {
         return Ok(());
     }
     match code {
+        // INVALID_VALUE. The driver rejected an argument supplied to an API
+        // call; it is a request error rather than a numerical/device failure.
+        1 => Err(Error::InvalidRequest {
+            field: "cuda_driver",
+            detail,
+        }),
         // CUDA_ERROR_OUT_OF_MEMORY. The byte counts and the tier are filled in
         // by the allocator, which knows what it asked for and what for. This
         // classifier sees a driver code and nothing else, so it attributes
@@ -40,9 +46,9 @@ pub fn classify(code: CUresult, detail: String) -> Result<()> {
             requested_bytes: 0,
             available_bytes: 0,
         }),
-        // DEINITIALIZED, LAUNCH_FAILED, ILLEGAL_ADDRESS, CONTEXT_IS_DESTROYED,
+        // DEINITIALIZED, INVALID_CONTEXT, LAUNCH_FAILED, ILLEGAL_ADDRESS, CONTEXT_IS_DESTROYED,
         // ECC_UNCORRECTABLE, HARDWARE_STACK_ERROR: the context is unusable.
-        4 | 700 | 709 | 719 | 214 | 714 => Err(Error::DeviceLost {
+        4 | 201 | 700 | 709 | 719 | 214 | 714 => Err(Error::DeviceLost {
             device: u32::MAX,
             detail,
         }),
@@ -108,6 +114,14 @@ mod tests {
     }
 
     #[test]
+    fn invalid_driver_value_maps_to_invalid_request() {
+        assert_eq!(
+            classify(1, "cuMemHostAlloc".into()).unwrap_err().kind(),
+            "invalid_request"
+        );
+    }
+
+    #[test]
     fn missing_binary_for_gpu_maps_to_unsupported_kernel() {
         // NO_BINARY_FOR_GPU is what a fatbin returns when it has no image for
         // the current architecture -- directly an M0 exit-gate case.
@@ -140,7 +154,7 @@ mod tests {
 
     #[test]
     fn fatal_device_codes_map_to_device_lost() {
-        for code in [4, 700, 709, 719, 214, 714] {
+        for code in [4, 201, 700, 709, 719, 214, 714] {
             assert_eq!(
                 classify(code, "ctx".into()).unwrap_err().kind(),
                 "device_lost",

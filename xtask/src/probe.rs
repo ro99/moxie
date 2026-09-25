@@ -7,7 +7,7 @@
 use std::{fmt::Write as _, path::Path};
 
 use moxie_cuda::{DeviceBuffer, RankContext, query_device};
-use moxie_executor::{ProbeConfig, probe_topology};
+use moxie_executor::{Direction, PinnedLink, ProbeConfig, probe_pinned, probe_topology};
 use moxie_plan::{DeviceCost, Endpoint, LinkCost, TopologyCosts};
 use moxie_types::{DeviceUuid, RankId, Result};
 
@@ -122,6 +122,16 @@ pub fn run(out: Option<&str>, costs_path: Option<&str>) -> i32 {
         eprintln!("wrote topology costs {path}");
     }
 
+    let ordinals: Vec<_> = caps.iter().map(|capability| capability.ordinal).collect();
+    let pinned = match probe_pinned(&ordinals, ProbeConfig::default()) {
+        Ok(pinned) => pinned,
+        Err(error) => {
+            eprintln!("pinned transfer probe failed: {error}");
+            return 1;
+        }
+    };
+    append_pinned(&mut md, &pinned);
+
     print!("{md}");
     if let Some(path) = out {
         if let Err(e) = std::fs::write(path, &md) {
@@ -131,6 +141,36 @@ pub fn run(out: Option<&str>, costs_path: Option<&str>) -> i32 {
         eprintln!("wrote {path}");
     }
     0
+}
+
+fn append_pinned(md: &mut String, links: &[PinnedLink]) {
+    let _ = writeln!(
+        md,
+        "\n### Pinned host transfers, {} MiB x {} reps\n",
+        XFER_BYTES / (1024 * 1024),
+        XFER_REPS
+    );
+    let _ = writeln!(
+        md,
+        "| Device UUID | Direction | Pageable GB/s | Pinned GB/s | Pageable issue us | Pinned issue us | Overlap |"
+    );
+    let _ = writeln!(md, "|---|---|---:|---:|---:|---:|---:|");
+    for link in links {
+        let direction = match link.direction {
+            Direction::H2d => "host-to-device",
+            Direction::D2h => "device-to-host",
+        };
+        let _ = writeln!(
+            md,
+            "| `{}` | {direction} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |",
+            link.device,
+            link.pageable_gbps,
+            link.pinned_gbps,
+            link.pageable_issue_us,
+            link.pinned_issue_us,
+            link.overlap,
+        );
+    }
 }
 
 fn append_costs(md: &mut String, costs: &TopologyCosts) {

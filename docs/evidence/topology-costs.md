@@ -122,3 +122,47 @@ from = "GPU-97fe4889-4874-a378-198e-955d2e72c4a3"
 latency_us = 9.532
 to = "host"
 ```
+
+## Pinned host transfers
+
+Measured on **2026-09-25** with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, NVIDIA driver
+`610.57.04`, using `CUDA_DEVICE_ORDER=PCI_BUS_ID cargo xtask-cuda probe`
+twice. Each row is the median of five event-timed 64 MiB samples per figure.
+Issue time is host wall time around the async copy call. The overlap value is
+for a pinned H2D copy and a calibrated smoke AXPY loop on separate streams;
+D2H overlap is reported as zero because it was not measured.
+
+Devices: `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` (RTX 5060 Ti),
+`GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` (RTX 3090), and
+`GPU-81fe4578-59b2-37c4-421e-287cdac78704` (RTX 3090).
+
+Run 1:
+
+| Device UUID | Direction | Pageable GB/s | Pinned GB/s | Pageable issue us | Pinned issue us | Overlap |
+|---|---|---:|---:|---:|---:|---:|
+| `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | host-to-device | 6.573 | 6.706 | 10047.768 | 2.411 | 0.980 |
+| `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | device-to-host | 7.078 | 7.146 | 9474.839 | 2.304 | 0.000 |
+| `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | host-to-device | 5.719 | 5.906 | 11478.332 | 2.569 | 0.998 |
+| `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | device-to-host | 5.571 | 3.533 | 12019.610 | 2.762 | 0.000 |
+| `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | host-to-device | 6.649 | 7.401 | 9929.823 | 2.834 | 1.000 |
+| `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | device-to-host | 5.623 | 3.594 | 12356.976 | 2.495 | 0.000 |
+
+Run 2:
+
+| Device UUID | Direction | Pageable GB/s | Pinned GB/s | Pageable issue us | Pinned issue us | Overlap |
+|---|---|---:|---:|---:|---:|---:|
+| `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | host-to-device | 6.546 | 6.722 | 10057.616 | 2.793 | 0.979 |
+| `GPU-97fe4889-4874-a378-198e-955d2e72c4a3` | device-to-host | 7.078 | 7.149 | 9481.528 | 2.384 | 0.000 |
+| `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | host-to-device | 5.742 | 5.904 | 11455.804 | 2.732 | 0.999 |
+| `GPU-3032cfa3-19df-028f-5ebd-43314911e0b9` | device-to-host | 5.601 | 3.517 | 11971.980 | 2.479 | 0.000 |
+| `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | host-to-device | 6.592 | 7.395 | 10015.204 | 2.685 | 1.000 |
+| `GPU-81fe4578-59b2-37c4-421e-287cdac78704` | device-to-host | 5.606 | 3.598 | 11952.012 | 2.567 | 0.000 |
+
+Every nonzero figure in run 2 is within 25% of run 1; the largest relative
+change is the 5060 Ti's H2D pinned issue time, **2.411 to 2.793 us (15.8%)**.
+The values show higher pinned H2D bandwidth on all three GPUs (6.706 vs 6.573,
+5.906 vs 5.719, and 7.401 vs 6.649 GB/s), while pinned D2H is slightly higher
+on the 5060 Ti and lower on both 3090s (3.533 vs 5.571 and 3.594 vs 5.623
+GB/s). Pageable issue calls take about **9.5–12.4 ms**; pinned calls take
+about **2.3–2.8 us**. The H2D overlap values range from **0.979 to 1.000** in
+both runs.

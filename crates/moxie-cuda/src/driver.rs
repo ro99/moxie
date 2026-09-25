@@ -956,6 +956,92 @@ impl Drop for Event<'_> {
     }
 }
 
+/// Page-locked host memory for asynchronous CUDA copies.
+///
+/// The caller must keep this buffer alive and must not mutate a source region
+/// while an asynchronous copy may still read it. Dropping it while an async
+/// copy may read it is the owner's error, as for any host source.
+#[derive(Debug)]
+pub struct PinnedHostBuffer<'ctx> {
+    ptr: *mut u8,
+    len: usize,
+    ctx: &'ctx RankContext,
+}
+
+impl<'ctx> PinnedHostBuffer<'ctx> {
+    /// Allocate page-locked host memory with the default CUDA allocation flags.
+    pub fn alloc(ctx: &'ctx RankContext, len: usize) -> Result<Self> {
+        if len == 0 {
+            return Err(Error::InvalidRequest {
+                field: "pinned_host_buffer",
+                detail: "zero-length allocations are not supported".into(),
+            });
+        }
+        ctx.make_current()?;
+        let mut ptr = core::ptr::null_mut();
+        if let Err(error) = check(
+            // SAFETY: `ptr` is a valid out-parameter, the current context is
+            // live, and the default allocation flags are zero.
+            unsafe { ffi::cuMemHostAlloc(&mut ptr, len, 0) },
+            "cuMemHostAlloc",
+        ) {
+            return Err(match error {
+                Error::CapacityExceeded { tier, .. } => Error::CapacityExceeded {
+                    tier,
+                    requested_bytes: len as u64,
+                    available_bytes: 0,
+                },
+                other => other,
+            });
+        }
+        if ptr.is_null() {
+            return Err(Error::InvalidRequest {
+                field: "pinned_host_buffer",
+                detail: "CUDA returned a null pointer for a nonzero allocation".into(),
+            });
+        }
+        Ok(Self {
+            ptr: ptr.cast(),
+            len,
+            ctx,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: allocation succeeds only with a non-null pointer and nonzero
+        // length, and the borrow is bounded by the live allocation.
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: allocation succeeds only with a non-null pointer and nonzero
+        // length, and the mutable borrow is exclusive on the Rust side.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for PinnedHostBuffer<'_> {
+    fn drop(&mut self) {
+        if self.ptr.is_null() || self.ctx.make_current().is_err() {
+            return;
+        }
+        // SAFETY: this pointer came from `cuMemHostAlloc` on the current
+        // context; the owner must have completed every asynchronous use first.
+        let _ = check(
+            unsafe { ffi::cuMemFreeHost(self.ptr.cast()) },
+            "cuMemFreeHost",
+        );
+    }
+}
+
 /// A device allocation.
 ///
 /// R07 and document 02: "A kernel launch leases its inputs/outputs/workspace
