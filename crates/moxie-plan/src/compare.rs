@@ -1,10 +1,14 @@
 //! Deterministic, measured-cost comparisons of single, TP2 and pipeline plans.
 
-use std::{collections::BTreeSet, ops::Range};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+};
 
 use moxie_graph::{Graph, OpParams, OracleId, OracleRegistry, Visibility};
 use moxie_types::{DeviceUuid, Error, Result, SymbolTable};
 
+use crate::tensor_parallel::kv_head_range;
 use crate::{
     Endpoint, Join, Stage, TopologyCosts, build_stage_graph, lower_pipeline, lower_tensor_parallel,
     value_bytes,
@@ -51,6 +55,29 @@ pub enum Verdict {
     Rejected { reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PhasePair {
+    pub prefill: CandidateKind,
+    pub decode: CandidateKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairEstimate {
+    pub device_bytes: Vec<(DeviceUuid, u64)>,
+    pub prefill_ms: f64,
+    pub transition_bytes: u64,
+    pub transition_ms: f64,
+    pub transition_via_host: bool,
+    pub first_decode_ms: f64,
+    pub total_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PairVerdict {
+    Ranked { rank: usize, estimate: PairEstimate },
+    Rejected { reason: String },
+}
+
 pub fn compare_plans(
     graph: &Graph,
     oracle: OracleId,
@@ -58,6 +85,19 @@ pub fn compare_plans(
     workload: UserWorkload,
     costs: &TopologyCosts,
 ) -> Result<Vec<(CandidateKind, Verdict)>> {
+    Ok(compare_candidates(graph, oracle, oracles, workload, costs)?
+        .into_iter()
+        .map(|candidate| (candidate.kind, candidate.verdict))
+        .collect())
+}
+
+fn compare_candidates(
+    graph: &Graph,
+    oracle: OracleId,
+    oracles: &OracleRegistry,
+    workload: UserWorkload,
+    costs: &TopologyCosts,
+) -> Result<Vec<EvaluatedCandidate>> {
     let full_context = workload
         .prompt_tokens
         .checked_add(workload.generated_tokens)
@@ -144,11 +184,11 @@ pub fn compare_plans(
             continue;
         }
         match estimate(graph, oracle, oracles, workload, full_context, costs, &kind)? {
-            Ok(estimate) => ranked.push((kind, estimate)),
+            Ok((estimate, meters)) => ranked.push((kind, estimate, meters)),
             Err(reason) => rejected.push((kind, Verdict::Rejected { reason })),
         }
     }
-    ranked.sort_by(|(left_kind, left), (right_kind, right)| {
+    ranked.sort_by(|(left_kind, left, _), (right_kind, right, _)| {
         left.total_ms
             .total_cmp(&right.total_ms)
             .then_with(|| left_kind.cmp(right_kind))
@@ -156,18 +196,296 @@ pub fn compare_plans(
     let mut output: Vec<_> = ranked
         .into_iter()
         .enumerate()
-        .map(|(index, (kind, estimate))| {
-            (
+        .map(|(index, (kind, estimate, meters))| EvaluatedCandidate {
+            kind,
+            verdict: Verdict::Ranked {
+                rank: index + 1,
+                estimate,
+            },
+            meters: Some(meters),
+        })
+        .collect();
+    output.extend(
+        rejected
+            .into_iter()
+            .map(|(kind, verdict)| EvaluatedCandidate {
                 kind,
-                Verdict::Ranked {
+                verdict,
+                meters: None,
+            }),
+    );
+    Ok(output)
+}
+
+struct EstimableCandidate {
+    kind: CandidateKind,
+    estimate: Estimate,
+    meters: Vec<RankMeter>,
+}
+
+/// Rank prefill/decode placement pairs for one turn.
+///
+/// A multi-turn pair also moves the new history back to the prefill placement
+/// each turn, which is not estimated. ponytail: add a turn sequence before
+/// pricing those return transfers.
+pub fn compare_phase_pairs(
+    graph: &Graph,
+    oracle: OracleId,
+    oracles: &OracleRegistry,
+    workload: UserWorkload,
+    costs: &TopologyCosts,
+) -> Result<Vec<(PhasePair, PairVerdict)>> {
+    let candidates = compare_candidates(graph, oracle, oracles, workload, costs)?;
+    let candidates: Vec<_> = candidates
+        .into_iter()
+        .filter_map(
+            |EvaluatedCandidate {
+                 kind,
+                 verdict,
+                 meters,
+             }| match (verdict, meters) {
+                (Verdict::Ranked { estimate, .. }, Some(meters)) => Some(EstimableCandidate {
+                    kind,
+                    estimate,
+                    meters,
+                }),
+                _ => None,
+            },
+        )
+        .collect();
+    let full_context = workload
+        .prompt_tokens
+        .checked_add(workload.generated_tokens)
+        .ok_or_else(|| invalid("prompt plus generated token count overflowed"))?;
+    let mut ranked = Vec::new();
+    let mut rejected = Vec::new();
+    for prefill in &candidates {
+        for decode in &candidates {
+            let pair = PhasePair {
+                prefill: prefill.kind.clone(),
+                decode: decode.kind.clone(),
+            };
+            if prefill.kind == decode.kind {
+                ranked.push((
+                    pair,
+                    PairEstimate {
+                        device_bytes: prefill.estimate.device_bytes.clone(),
+                        prefill_ms: prefill.estimate.prefill_ms,
+                        transition_bytes: 0,
+                        transition_ms: 0.0,
+                        transition_via_host: false,
+                        first_decode_ms: prefill.estimate.first_decode_ms,
+                        total_ms: prefill.estimate.total_ms,
+                    },
+                ));
+                continue;
+            }
+            match pair_estimate(prefill, decode, workload.prompt_tokens, full_context, costs)? {
+                Ok(estimate) => ranked.push((pair, estimate)),
+                Err(reason) => rejected.push((pair, reason)),
+            }
+        }
+    }
+    ranked.sort_by(|(left_pair, left), (right_pair, right)| {
+        left.total_ms
+            .total_cmp(&right.total_ms)
+            .then_with(|| left_pair.prefill.cmp(&right_pair.prefill))
+            .then_with(|| left_pair.decode.cmp(&right_pair.decode))
+    });
+    let mut output: Vec<_> = ranked
+        .into_iter()
+        .enumerate()
+        .map(|(index, (pair, estimate))| {
+            (
+                pair,
+                PairVerdict::Ranked {
                     rank: index + 1,
                     estimate,
                 },
             )
         })
         .collect();
-    output.extend(rejected);
+    output.extend(
+        rejected
+            .into_iter()
+            .map(|(pair, reason)| (pair, PairVerdict::Rejected { reason })),
+    );
     Ok(output)
+}
+
+#[derive(Default)]
+struct DeviceKvMeter {
+    weight_bytes: u64,
+    kv: Vec<KvRead>,
+}
+
+fn aggregate_meters(meters: &[RankMeter]) -> Result<BTreeMap<DeviceUuid, DeviceKvMeter>> {
+    let mut devices = BTreeMap::<DeviceUuid, DeviceKvMeter>::new();
+    for meter in meters {
+        let device = devices.entry(meter.device).or_default();
+        device.weight_bytes = device
+            .weight_bytes
+            .checked_add(meter.weight_bytes)
+            .ok_or_else(|| invalid("phase-pair weight-byte total overflowed"))?;
+        device.kv.extend_from_slice(&meter.kv);
+    }
+    Ok(devices)
+}
+
+fn pair_estimate(
+    prefill: &EstimableCandidate,
+    decode: &EstimableCandidate,
+    prompt_tokens: u64,
+    full_context: u64,
+    costs: &TopologyCosts,
+) -> Result<std::result::Result<PairEstimate, String>> {
+    let prefill_meters = aggregate_meters(&prefill.meters)?;
+    let decode_meters = aggregate_meters(&decode.meters)?;
+    let devices: BTreeSet<_> = prefill_meters
+        .keys()
+        .chain(decode_meters.keys())
+        .copied()
+        .collect();
+    let mut device_bytes = Vec::with_capacity(devices.len());
+    for device in devices {
+        let prefill_meter = prefill_meters.get(&device);
+        let decode_meter = decode_meters.get(&device);
+        let prefill_kv_bytes = kv_storage(
+            prefill_meter.map_or(&[], |meter| meter.kv.as_slice()),
+            prompt_tokens,
+        )?;
+        let decode_kv_bytes = kv_storage(
+            decode_meter.map_or(&[], |meter| meter.kv.as_slice()),
+            full_context,
+        )?;
+        let bytes = prefill_meter
+            .map_or(0, |meter| meter.weight_bytes)
+            .checked_add(decode_meter.map_or(0, |meter| meter.weight_bytes))
+            .and_then(|bytes| bytes.checked_add(prefill_kv_bytes))
+            .and_then(|bytes| bytes.checked_add(decode_kv_bytes))
+            .ok_or_else(|| invalid("phase-pair resident-byte total overflowed"))?;
+        let usable = costs.device(device).map_or(0, |cost| cost.usable_bytes);
+        if bytes > usable {
+            return Ok(Err(format!(
+                "resident-byte fit needs {bytes} bytes on {device}, which has {usable} usable"
+            )));
+        }
+        device_bytes.push((device, bytes));
+    }
+
+    let (transition_bytes, transition_ms, transition_via_host) =
+        match transition_cost(&prefill_meters, &decode_meters, prompt_tokens, costs)? {
+            Ok(cost) => cost,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    let first_decode_ms = decode.estimate.first_decode_ms;
+    let total_ms = prefill.estimate.prefill_ms
+        + transition_ms
+        + (decode.estimate.total_ms - decode.estimate.prefill_ms);
+    if !total_ms.is_finite() {
+        return Err(invalid("phase-pair time estimate is not finite"));
+    }
+    Ok(Ok(PairEstimate {
+        device_bytes,
+        prefill_ms: prefill.estimate.prefill_ms,
+        transition_bytes,
+        transition_ms,
+        transition_via_host,
+        first_decode_ms,
+        total_ms,
+    }))
+}
+
+fn transition_cost(
+    prefill: &BTreeMap<DeviceUuid, DeviceKvMeter>,
+    decode: &BTreeMap<DeviceUuid, DeviceKvMeter>,
+    prompt_tokens: u64,
+    costs: &TopologyCosts,
+) -> Result<std::result::Result<(u64, f64, bool), String>> {
+    let mut transfers = BTreeMap::<(DeviceUuid, DeviceUuid), u64>::new();
+    let mut total_bytes = 0_u64;
+    for (&destination, destination_meter) in decode {
+        for read in &destination_meter.kv {
+            let head_count = read
+                .heads
+                .end
+                .checked_sub(read.heads.start)
+                .filter(|count| *count != 0)
+                .ok_or_else(|| invalid("phase-pair KV head range is empty or reversed"))?;
+            if read.bytes_per_row % head_count != 0 {
+                return Err(invalid("KV bytes per row do not divide evenly by heads"));
+            }
+            let bytes_per_head = read.bytes_per_row / head_count;
+            let visible_rows = read
+                .window
+                .map_or(prompt_tokens, |window| prompt_tokens.min(window));
+            let bytes = bytes_per_head
+                .checked_mul(visible_rows)
+                .ok_or_else(|| invalid("phase-pair transition-byte count overflowed"))?;
+            for head in read.heads.clone() {
+                let stored_here = prefill.get(&destination).is_some_and(|meter| {
+                    meter
+                        .kv
+                        .iter()
+                        .any(|source| source.layer == read.layer && source.heads.contains(&head))
+                });
+                if stored_here {
+                    continue;
+                }
+                let Some(source) = prefill
+                    .iter()
+                    .filter(|(_, meter)| {
+                        meter.kv.iter().any(|source| {
+                            source.layer == read.layer && source.heads.contains(&head)
+                        })
+                    })
+                    .map(|(&device, _)| device)
+                    .min()
+                else {
+                    return Ok(Err(format!(
+                        "no prefill placement stores KV head {head} for layer {}",
+                        read.layer
+                    )));
+                };
+                total_bytes = total_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| invalid("phase-pair transition-byte total overflowed"))?;
+                let transfer = transfers.entry((source, destination)).or_default();
+                *transfer = transfer
+                    .checked_add(bytes)
+                    .ok_or_else(|| invalid("phase-pair grouped transition bytes overflowed"))?;
+            }
+        }
+    }
+
+    let mut total_ms = 0.0;
+    let mut via_host = false;
+    for ((source, destination), bytes) in transfers {
+        let copy_ms = |link: &crate::LinkCost| {
+            link.latency_us / 1_000.0 + bytes as f64 / (link.bandwidth_gbps * 1_000_000.0)
+        };
+        let time = if let Some(link) =
+            costs.link(Endpoint::Device(source), Endpoint::Device(destination))
+        {
+            copy_ms(link)
+        } else {
+            let Some(download) = costs.link(Endpoint::Device(source), Endpoint::Host) else {
+                return Ok(Err(format!("no measured device-to-host path for {source}")));
+            };
+            let Some(upload) = costs.link(Endpoint::Host, Endpoint::Device(destination)) else {
+                return Ok(Err(format!(
+                    "no measured host-to-device path for {destination}"
+                )));
+            };
+            via_host = true;
+            copy_ms(download) + copy_ms(upload)
+        };
+        total_ms += time;
+    }
+    if !total_ms.is_finite() {
+        return Err(invalid("phase-pair transition time is not finite"));
+    }
+    Ok(Ok((total_bytes, total_ms, via_host)))
 }
 
 struct PlanStage {
@@ -176,8 +494,10 @@ struct PlanStage {
     tp2: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct KvRead {
+    layer: u32,
+    heads: Range<u64>,
     bytes_per_row: u64,
     window: Option<u64>,
 }
@@ -187,6 +507,12 @@ struct RankMeter {
     weight_bytes: u64,
     memory_gbps: f64,
     kv: Vec<KvRead>,
+}
+
+struct EvaluatedCandidate {
+    kind: CandidateKind,
+    verdict: Verdict,
+    meters: Option<Vec<RankMeter>>,
 }
 
 fn sorted_devices(costs: &TopologyCosts) -> Result<Vec<DeviceUuid>> {
@@ -388,7 +714,7 @@ fn estimate(
     full_context: u64,
     costs: &TopologyCosts,
     kind: &CandidateKind,
-) -> Result<std::result::Result<Estimate, String>> {
+) -> Result<std::result::Result<(Estimate, Vec<RankMeter>), String>> {
     let stages = plan_stages(kind, graph.nodes().len());
     let mut meters = Vec::with_capacity(stages.len());
     let mut device_bytes = std::collections::BTreeMap::<DeviceUuid, u64>::new();
@@ -422,9 +748,13 @@ fn estimate(
                 Err(reason) => return Ok(Err(reason)),
             }
         } else {
+            let mut rank = stage_meter(&stage_graph.graph, stage.devices[0], costs)?;
+            if let Err(reason) = remap_kv_layers(&mut rank, &stage_graph, None) {
+                return Ok(Err(reason));
+            }
             StageMeter {
                 devices: stage.devices.clone(),
-                meters: vec![stage_meter(&stage_graph.graph, stage.devices[0], costs)?],
+                meters: vec![rank],
                 collectives: Vec::new(),
             }
         };
@@ -485,12 +815,16 @@ fn estimate(
     if !prefill_ms.is_finite() || !first_decode_ms.is_finite() || !total_ms.is_finite() {
         return Err(invalid("estimated time is not finite"));
     }
-    Ok(Ok(Estimate {
-        device_bytes: device_bytes.into_iter().collect(),
-        prefill_ms,
-        first_decode_ms,
-        total_ms,
-    }))
+    let rank_meters = meters.into_iter().flat_map(|stage| stage.meters).collect();
+    Ok(Ok((
+        Estimate {
+            device_bytes: device_bytes.into_iter().collect(),
+            prefill_ms,
+            first_decode_ms,
+            total_ms,
+        },
+        rank_meters,
+    )))
 }
 
 struct StageMeter {
@@ -529,8 +863,9 @@ fn tensor_parallel_meter(
                     oracles,
                 )
                 .map_err(|error| error.to_string())?;
-                let meter = stage_meter(&local.graph, devices[0], costs)
+                let mut meter = stage_meter(&local.graph, devices[0], costs)
                     .map_err(|error| error.to_string())?;
+                remap_kv_layers(&mut meter, &local, Some(stage))?;
                 for rank in &mut meters {
                     add_meter(rank, &meter)?;
                 }
@@ -539,7 +874,12 @@ fn tensor_parallel_meter(
                 let output = match join {
                     Join::Gather { output } | Join::Reduce { output } => *output,
                 };
-                for ((device, part), rank) in devices.iter().zip(&lowering.ranks).zip(&mut meters) {
+                for (rank_index, ((device, part), rank)) in devices
+                    .iter()
+                    .zip(&lowering.ranks)
+                    .zip(&mut meters)
+                    .enumerate()
+                {
                     let local = build_stage_graph(
                         &stage.graph,
                         Some(part),
@@ -549,10 +889,15 @@ fn tensor_parallel_meter(
                         oracles,
                     )
                     .map_err(|error| error.to_string())?;
-                    add_meter(
-                        rank,
-                        &stage_meter(&local.graph, *device, costs).map_err(|e| e.to_string())?,
-                    )?;
+                    let mut local_meter =
+                        stage_meter(&local.graph, *device, costs).map_err(|e| e.to_string())?;
+                    for read in &mut local_meter.kv {
+                        let (global_layer, global_kv_heads) =
+                            kv_read_metadata(&local, Some(stage), read.layer)?;
+                        read.layer = global_layer;
+                        read.heads = kv_head_range(global_kv_heads, 2, rank_index as u64);
+                    }
+                    add_meter(rank, &local_meter)?;
                 }
             }
         }
@@ -594,15 +939,22 @@ fn stage_meter(graph: &Graph, device: DeviceUuid, costs: &TopologyCosts) -> Resu
         .nodes()
         .iter()
         .filter_map(|node| match node.params {
-            OpParams::Attention { visibility, .. } => Some((node, visibility)),
+            OpParams::Attention {
+                visibility,
+                layer,
+                kv_heads,
+                ..
+            } => Some((node, visibility, layer, kv_heads)),
             _ => None,
         })
-        .map(|(node, visibility)| {
+        .map(|(node, visibility, layer, kv_heads)| {
             let width = width_of(node.inputs[1])?
                 .checked_add(width_of(node.inputs[2])?)
                 .and_then(|width| width.checked_mul(2))
                 .ok_or_else(|| invalid("KV bytes per row overflowed"))?;
             Ok(KvRead {
+                layer,
+                heads: 0..kv_heads,
                 bytes_per_row: width,
                 window: match visibility {
                     Visibility::SlidingWindow { window } => Some(window),
@@ -617,6 +969,64 @@ fn stage_meter(graph: &Graph, device: DeviceUuid, costs: &TopologyCosts) -> Resu
         memory_gbps: costs.device(device).unwrap().memory_gbps,
         kv,
     })
+}
+
+fn remap_kv_layers(
+    meter: &mut RankMeter,
+    stage: &crate::StageGraph,
+    parent: Option<&crate::StageGraph>,
+) -> std::result::Result<(), String> {
+    for read in &mut meter.kv {
+        read.layer = kv_read_metadata(stage, parent, read.layer)?.0;
+    }
+    Ok(())
+}
+
+fn kv_read_metadata(
+    stage: &crate::StageGraph,
+    parent: Option<&crate::StageGraph>,
+    local_layer: u32,
+) -> std::result::Result<(u32, u64), String> {
+    let local_node = stage
+        .graph
+        .nodes()
+        .iter()
+        .find(
+            |node| matches!(node.params, OpParams::Attention { layer, .. } if layer == local_layer),
+        )
+        .ok_or_else(|| format!("attention layer {local_layer} is missing from its stage graph"))?;
+    let source_layer = stage
+        .state_layers
+        .get(&local_node.id)
+        .copied()
+        .ok_or_else(|| format!("attention layer {local_layer} has no source-layer mapping"))?;
+    let (global_layer, kv_heads) = if let Some(parent) = parent {
+        let parent_node = parent
+            .graph
+            .nodes()
+            .iter()
+            .find(|node| {
+                matches!(node.params, OpParams::Attention { layer, .. } if layer == source_layer)
+            })
+            .ok_or_else(|| {
+                format!("attention layer {source_layer} is missing from its parent stage graph")
+            })?;
+        let global_layer = parent
+            .state_layers
+            .get(&parent_node.id)
+            .copied()
+            .ok_or_else(|| format!("attention layer {source_layer} has no global-layer mapping"))?;
+        let OpParams::Attention { kv_heads, .. } = parent_node.params else {
+            unreachable!("the matched parent node is attention");
+        };
+        (global_layer, kv_heads)
+    } else {
+        let OpParams::Attention { kv_heads, .. } = local_node.params else {
+            unreachable!("the matched stage node is attention");
+        };
+        (source_layer, kv_heads)
+    };
+    Ok((global_layer, kv_heads))
 }
 
 fn kv_storage(kv: &[KvRead], context: u64) -> Result<u64> {

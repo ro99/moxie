@@ -2,7 +2,9 @@
 
 use moxie_graph::OracleRegistry;
 use moxie_models::gemma4::{Fraction, Gemma4Text, TextConfig, embedding_scale};
-use moxie_plan::{CandidateKind, Estimate, UserWorkload, Verdict, compare_plans};
+use moxie_plan::{
+    CandidateKind, Estimate, PairVerdict, UserWorkload, Verdict, compare_phase_pairs, compare_plans,
+};
 use moxie_types::{DeviceUuid, SymbolId};
 
 pub fn run(
@@ -101,6 +103,59 @@ pub fn run(
                 reason.replace('|', "\\|")
             ),
         }
+    }
+
+    let phase_pairs = match compare_phase_pairs(
+        &graph,
+        moxie_oracles::HOST_REFERENCE,
+        &oracles,
+        UserWorkload {
+            prompt_tokens,
+            generated_tokens,
+        },
+        &topology,
+    ) {
+        Ok(pairs) => pairs,
+        Err(error) => {
+            eprintln!("cannot compare phase pairs: {error}");
+            return 1;
+        }
+    };
+    println!("phase pairs");
+    println!(
+        "| Rank | Prefill candidate | Decode candidate | Transition MB | Via host | Prefill ms | First decode ms | Total s |"
+    );
+    println!("|---:|---|---|---:|---|---:|---:|---:|");
+    let mut best_same_placement = None;
+    for (pair, verdict) in phase_pairs {
+        let PairVerdict::Ranked { rank, estimate } = verdict else {
+            continue;
+        };
+        if pair.prefill == pair.decode && best_same_placement.is_none() {
+            best_same_placement = Some((rank, candidate_name(&pair.prefill)));
+        }
+        if rank > 10 {
+            continue;
+        }
+        println!(
+            "| {rank} | {} | {} | {:.3} | {} | {:.3} | {:.3} | {:.3} |",
+            candidate_name(&pair.prefill),
+            candidate_name(&pair.decode),
+            estimate.transition_bytes as f64 / 1_000_000.0,
+            if estimate.transition_via_host {
+                "yes"
+            } else {
+                "no"
+            },
+            estimate.prefill_ms,
+            estimate.first_decode_ms,
+            estimate.total_ms / 1_000.0,
+        );
+    }
+    if let Some((rank, candidate)) = best_same_placement {
+        println!("best same-placement pair: rank {rank} ({candidate})");
+    } else {
+        println!("best same-placement pair: none");
     }
     0
 }

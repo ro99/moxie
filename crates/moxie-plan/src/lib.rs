@@ -19,7 +19,10 @@ mod host_experts;
 pub mod pipeline;
 mod selected;
 pub mod tensor_parallel;
-pub use compare::{CandidateKind, Estimate, UserWorkload, Verdict, compare_plans};
+pub use compare::{
+    CandidateKind, Estimate, PairEstimate, PairVerdict, PhasePair, UserWorkload, Verdict,
+    compare_phase_pairs, compare_plans,
+};
 pub use costs::{DeviceCost, Endpoint, LinkCost, TopologyCosts};
 pub use expert::{
     AffineSections, BoundOn, Candidate, ChunkResidency, EnvelopePrediction, Exactness,

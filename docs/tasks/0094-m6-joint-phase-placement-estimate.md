@@ -170,3 +170,18 @@ are run twice with identical output.
 every D head as moved (ignore P's ownership); the new test must fail.
 
 ## Result, filled after work
+
+Implemented KV head ownership metering and deterministic `compare_phase_pairs`
+ranking with two-placement fit and KV transition costs. `compare_plans` keeps
+its existing estimates and output. The CLI appends the phase-pair table and
+best same-placement rank; `split_phase_pairs_price_the_kv_move` checks exact
+same-placement values, the 3,072-byte direct and host-routed cases, partial KV
+reuse, and input-order independence.
+
+The ownership mutant failed the partial-reuse assertion and was reverted.
+Host gates passed: fmt, workspace clippy and tests, `arch-check`, and
+`spec-check`. Each requested `gemma-dense-fits` command (prompt 512 and
+prompt 32768, generate 256) was run twice with `cmp` confirming identical
+output. The rank-1 split estimate beats the best same-placement estimate by
+0.184 s at prompt 512 and 0.547 s at prompt 32768. These are estimates only;
+no GPU was used.

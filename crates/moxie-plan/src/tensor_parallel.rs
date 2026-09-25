@@ -416,6 +416,17 @@ struct Heads {
     count: u64,
 }
 
+pub(crate) fn kv_head_range(kv_heads: u64, ranks: u64, rank: u64) -> Range<u64> {
+    if kv_heads.is_multiple_of(ranks) {
+        let count = kv_heads / ranks;
+        let first = rank * count;
+        first..first + count
+    } else {
+        let first = rank * kv_heads / ranks;
+        first..first + 1
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct MlaRank {
     params: OpParams,
@@ -1018,16 +1029,10 @@ pub fn lower_tensor_parallel(
                 first: rank * (heads / r),
                 count: heads / r,
             };
-            let kv = if kv_heads % r == 0 {
-                Heads {
-                    first: rank * (kv_heads / r),
-                    count: kv_heads / r,
-                }
-            } else {
-                Heads {
-                    first: rank * kv_heads / r,
-                    count: 1,
-                }
+            let kv_range = kv_head_range(kv_heads, r, rank);
+            let kv = Heads {
+                first: kv_range.start,
+                count: kv_range.end - kv_range.start,
             };
             let local = match axis {
                 Axis::Query => query,

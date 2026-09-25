@@ -1,8 +1,8 @@
 use moxie_graph::OracleRegistry;
 use moxie_models::gemma4::{Fraction, Gemma4Text, TextConfig, embedding_scale};
 use moxie_plan::{
-    CandidateKind, DeviceCost, Endpoint, LinkCost, TopologyCosts, UserWorkload, Verdict,
-    compare_plans,
+    CandidateKind, DeviceCost, Endpoint, LinkCost, PairVerdict, TopologyCosts, UserWorkload,
+    Verdict, compare_phase_pairs, compare_plans,
 };
 use moxie_types::{DeviceUuid, SymbolId};
 
@@ -257,4 +257,111 @@ fn no_tp2_without_both_peer_links() {
         CandidateKind::Pipeline { stages } => stages.iter().all(|(devices, _)| devices.len() < 2),
         _ => true,
     }));
+}
+
+#[test]
+fn split_phase_pairs_price_the_kv_move() {
+    let (graph, oracles) = graph();
+    let costs = costs();
+    let workload = UserWorkload {
+        prompt_tokens: 8,
+        generated_tokens: 2,
+    };
+    let plans = compare_plans(
+        &graph,
+        moxie_oracles::HOST_REFERENCE,
+        &oracles,
+        workload,
+        &costs,
+    )
+    .unwrap();
+    let pairs = compare_phase_pairs(
+        &graph,
+        moxie_oracles::HOST_REFERENCE,
+        &oracles,
+        workload,
+        &costs,
+    )
+    .unwrap();
+
+    for (phase, verdict) in &pairs {
+        if phase.prefill != phase.decode {
+            continue;
+        }
+        let PairVerdict::Ranked { estimate, .. } = verdict else {
+            panic!("same-placement pair was not ranked: {phase:?}");
+        };
+        let (
+            _,
+            Verdict::Ranked {
+                estimate: plan_estimate,
+                ..
+            },
+        ) = plans
+            .iter()
+            .find(|(kind, _)| kind == &phase.prefill)
+            .expect("same-placement pair has an estimable plan")
+        else {
+            panic!("same-placement pair is not estimated by compare_plans: {phase:?}");
+        };
+        assert_eq!(estimate.device_bytes, plan_estimate.device_bytes);
+        assert_eq!(estimate.prefill_ms, plan_estimate.prefill_ms);
+        assert_eq!(estimate.first_decode_ms, plan_estimate.first_decode_ms);
+        assert_eq!(estimate.total_ms, plan_estimate.total_ms);
+        assert_eq!(estimate.transition_bytes, 0);
+        assert_eq!(estimate.transition_ms, 0.0);
+        assert!(!estimate.transition_via_host);
+    }
+
+    let [a, b, c] = devices();
+    let single = |device| CandidateKind::Single { device };
+    let pair_for = |prefill: CandidateKind, decode: CandidateKind| {
+        pairs
+            .iter()
+            .find(|(phase, _)| phase.prefill == prefill && phase.decode == decode)
+            .map(|(_, verdict)| verdict)
+            .expect("the requested estimable pair exists")
+    };
+    let PairVerdict::Ranked { estimate, .. } = pair_for(single(a), single(b)) else {
+        panic!("direct-link pair must be ranked");
+    };
+    assert_eq!(estimate.transition_bytes, 3_072);
+    assert!(!estimate.transition_via_host);
+
+    let PairVerdict::Ranked { estimate, .. } = pair_for(single(a), single(c)) else {
+        panic!("host-routed pair must be ranked");
+    };
+    assert_eq!(estimate.transition_bytes, 3_072);
+    assert!(estimate.transition_via_host);
+
+    let partially_shared = pairs.iter().find_map(|(phase, verdict)| {
+        if phase.prefill != single(a)
+            || !matches!(phase.decode, CandidateKind::Pipeline { ref stages }
+                if stages.iter().any(|(devices, _)| devices.contains(&a)))
+        {
+            return None;
+        }
+        match verdict {
+            PairVerdict::Ranked { estimate, .. } => Some(estimate),
+            PairVerdict::Rejected { .. } => None,
+        }
+    });
+    let partially_shared = partially_shared.expect("a split pair keeps part of KV on the source");
+    assert!(partially_shared.transition_bytes > 0);
+    assert!(partially_shared.transition_bytes < 3_072);
+
+    let mut reversed_costs = costs;
+    reversed_costs.devices.reverse();
+    reversed_costs.links.reverse();
+    assert_eq!(
+        pairs,
+        compare_phase_pairs(
+            &graph,
+            moxie_oracles::HOST_REFERENCE,
+            &oracles,
+            workload,
+            &reversed_costs,
+        )
+        .unwrap()
+    );
 }

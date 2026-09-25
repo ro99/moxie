@@ -117,3 +117,85 @@ Ceilings: there is no compute term, host transfers use pageable rather than
 pinned-copy measurements, and pipeline cuts use the greedy capacity-weighted
 rule rather than a search over cut sets. These are estimates, not performance
 claims.
+
+## Phase pairs
+
+The costs TOML was extracted from the committed code block in
+`docs/evidence/topology-costs.md` to `/tmp/task0094-topology-costs.toml`.
+Each command below was run twice; `cmp` reported identical output for both
+run pairs.
+
+### Prompt 512, generate 256
+
+```text
+$ cargo xtask-cuda compare-plans --costs /tmp/task0094-topology-costs.toml --model gemma-dense-fits --prompt 512 --generate 256
+gemma-dense-fits: prompt=512, generate=256
+| Rank | Candidate | Per-device GiB | Prefill ms | First decode ms | Total s | Rejection |
+|---:|---|---|---:|---:|---:|---|
+| 1 | tp2+3032cfa3+81fe4578 | 3032cfa3=3.045, 81fe4578=3.045 | 195.892 | 5.788 | 1.680 | |
+| 2 | single+81fe4578 | 81fe4578=5.845 | 7.676 | 7.676 | 1.977 | |
+| 3 | single+3032cfa3 | 3032cfa3=5.845 | 7.724 | 7.724 | 1.989 | |
+| 4 | pipeline+3032cfa3+81fe4578@0..748/97fe4889@748..995 | 3032cfa3=2.250, 81fe4578=2.250, 97fe4889=1.589 | 143.980 | 8.735 | 2.384 | |
+| 5 | pipeline+3032cfa3@0..371/97fe4889@371..616/81fe4578@616..995 | 3032cfa3=2.203, 81fe4578=2.297, 97fe4889=1.467 | 11.367 | 10.063 | 2.593 | |
+| 6 | pipeline+81fe4578@0..371/97fe4889@371..616/3032cfa3@616..995 | 3032cfa3=2.297, 81fe4578=2.203, 97fe4889=1.467 | 11.419 | 10.064 | 2.593 | |
+| 7 | pipeline+97fe4889@0..239/3032cfa3@239..616/81fe4578@616..995 | 3032cfa3=2.175, 81fe4578=2.297, 97fe4889=1.495 | 11.456 | 10.105 | 2.603 | |
+| 8 | pipeline+97fe4889@0..239/81fe4578@239..616/3032cfa3@616..995 | 3032cfa3=2.297, 81fe4578=2.175, 97fe4889=1.495 | 11.455 | 10.106 | 2.604 | |
+| 9 | pipeline+3032cfa3@0..371/81fe4578@371..748/97fe4889@748..995 | 3032cfa3=2.203, 81fe4578=2.175, 97fe4889=1.589 | 11.631 | 10.247 | 2.640 | |
+| 10 | pipeline+81fe4578@0..371/3032cfa3@371..748/97fe4889@748..995 | 3032cfa3=2.175, 81fe4578=2.203, 97fe4889=1.589 | 11.685 | 10.248 | 2.640 | |
+| 11 | single+97fe4889 | 97fe4889=5.845 | 16.297 | 16.297 | 4.197 | |
+phase pairs
+| Rank | Prefill candidate | Decode candidate | Transition MB | Via host | Prefill ms | First decode ms | Total s |
+|---:|---|---|---:|---|---:|---:|---:|
+| 1 | single+3032cfa3 | tp2+3032cfa3+81fe4578 | 26.214 | no | 7.724 | 5.788 | 1.496 |
+| 2 | single+81fe4578 | tp2+3032cfa3+81fe4578 | 26.214 | no | 7.676 | 5.788 | 1.497 |
+| 3 | pipeline+3032cfa3@0..371/97fe4889@371..616/81fe4578@616..995 | tp2+3032cfa3+81fe4578 | 32.506 | yes | 11.367 | 5.788 | 1.502 |
+| 4 | pipeline+81fe4578@0..371/97fe4889@371..616/3032cfa3@616..995 | tp2+3032cfa3+81fe4578 | 32.506 | yes | 11.419 | 5.788 | 1.503 |
+| 5 | pipeline+97fe4889@0..239/81fe4578@239..616/3032cfa3@616..995 | tp2+3032cfa3+81fe4578 | 32.506 | yes | 11.455 | 5.788 | 1.503 |
+| 6 | pipeline+97fe4889@0..239/3032cfa3@239..616/81fe4578@616..995 | tp2+3032cfa3+81fe4578 | 32.506 | yes | 11.456 | 5.788 | 1.503 |
+| 7 | pipeline+3032cfa3@0..371/81fe4578@371..748/97fe4889@748..995 | tp2+3032cfa3+81fe4578 | 32.506 | yes | 11.631 | 5.788 | 1.503 |
+| 8 | pipeline+81fe4578@0..371/3032cfa3@371..748/97fe4889@748..995 | tp2+3032cfa3+81fe4578 | 32.506 | yes | 11.685 | 5.788 | 1.503 |
+| 9 | single+97fe4889 | tp2+3032cfa3+81fe4578 | 52.429 | yes | 16.297 | 5.788 | 1.516 |
+| 10 | pipeline+3032cfa3+81fe4578@0..748/97fe4889@748..995 | tp2+3032cfa3+81fe4578 | 12.583 | yes | 143.980 | 5.788 | 1.632 |
+best same-placement pair: rank 11 (tp2+3032cfa3+81fe4578)
+```
+
+### Prompt 32768, generate 256
+
+```text
+$ cargo xtask-cuda compare-plans --costs /tmp/task0094-topology-costs.toml --model gemma-dense-fits --prompt 32768 --generate 256
+gemma-dense-fits: prompt=32768, generate=256
+| Rank | Candidate | Per-device GiB | Prefill ms | First decode ms | Total s | Rejection |
+|---:|---|---|---:|---:|---:|---|
+| 1 | single+81fe4578 | 81fe4578=6.603 | 8.704 | 8.704 | 2.238 | |
+| 2 | single+3032cfa3 | 3032cfa3=6.603 | 8.758 | 8.758 | 2.252 | |
+| 3 | pipeline+3032cfa3@0..371/97fe4889@371..616/81fe4578@616..995 | 3032cfa3=2.489, 81fe4578=2.583, 97fe4889=1.654 | 95.032 | 11.376 | 3.008 | |
+| 4 | pipeline+81fe4578@0..371/97fe4889@371..616/3032cfa3@616..995 | 3032cfa3=2.583, 81fe4578=2.489, 97fe4889=1.654 | 98.285 | 11.378 | 3.012 | |
+| 5 | pipeline+97fe4889@0..239/3032cfa3@239..616/81fe4578@616..995 | 3032cfa3=2.461, 81fe4578=2.583, 97fe4889=1.682 | 98.103 | 11.418 | 3.022 | |
+| 6 | pipeline+97fe4889@0..239/81fe4578@239..616/3032cfa3@616..995 | 3032cfa3=2.583, 81fe4578=2.461, 97fe4889=1.682 | 97.948 | 11.419 | 3.022 | |
+| 7 | pipeline+3032cfa3@0..371/81fe4578@371..748/97fe4889@748..995 | 3032cfa3=2.489, 81fe4578=2.461, 97fe4889=1.776 | 100.319 | 11.561 | 3.061 | |
+| 8 | pipeline+81fe4578@0..371/3032cfa3@371..748/97fe4889@748..995 | 3032cfa3=2.461, 81fe4578=2.489, 97fe4889=1.776 | 103.726 | 11.561 | 3.064 | |
+| 9 | single+97fe4889 | 97fe4889=6.603 | 18.479 | 18.479 | 4.751 | |
+| 10 | pipeline+3032cfa3+81fe4578@0..748/97fe4889@748..995 | 3032cfa3=2.536, 81fe4578=2.536, 97fe4889=1.776 | 8682.023 | 9.661 | 11.156 | |
+| 11 | tp2+3032cfa3+81fe4578 | 3032cfa3=3.424, 81fe4578=3.424 | 12196.396 | 6.305 | 13.811 | |
+phase pairs
+| Rank | Prefill candidate | Decode candidate | Transition MB | Via host | Prefill ms | First decode ms | Total s |
+|---:|---|---|---:|---|---:|---:|---:|
+| 1 | single+3032cfa3 | tp2+3032cfa3+81fe4578 | 444.596 | no | 8.758 | 6.305 | 1.691 |
+| 2 | single+81fe4578 | tp2+3032cfa3+81fe4578 | 444.596 | no | 8.704 | 6.305 | 1.709 |
+| 3 | pipeline+3032cfa3@0..371/97fe4889@371..616/81fe4578@616..995 | tp2+3032cfa3+81fe4578 | 553.648 | yes | 95.032 | 6.305 | 1.833 |
+| 4 | pipeline+97fe4889@0..239/81fe4578@239..616/3032cfa3@616..995 | tp2+3032cfa3+81fe4578 | 553.648 | yes | 97.948 | 6.305 | 1.836 |
+| 5 | pipeline+97fe4889@0..239/3032cfa3@239..616/81fe4578@616..995 | tp2+3032cfa3+81fe4578 | 553.648 | yes | 98.103 | 6.305 | 1.837 |
+| 6 | pipeline+81fe4578@0..371/97fe4889@371..616/3032cfa3@616..995 | tp2+3032cfa3+81fe4578 | 553.648 | yes | 98.285 | 6.305 | 1.837 |
+| 7 | pipeline+3032cfa3@0..371/81fe4578@371..748/97fe4889@748..995 | tp2+3032cfa3+81fe4578 | 553.648 | yes | 100.319 | 6.305 | 1.839 |
+| 8 | pipeline+81fe4578@0..371/3032cfa3@371..748/97fe4889@748..995 | tp2+3032cfa3+81fe4578 | 553.648 | yes | 103.726 | 6.305 | 1.842 |
+| 9 | single+97fe4889 | tp2+3032cfa3+81fe4578 | 889.192 | yes | 18.479 | 6.305 | 1.903 |
+| 10 | single+81fe4578 | single+81fe4578 | 0.000 | no | 8.704 | 8.704 | 2.238 |
+best same-placement pair: rank 10 (single+81fe4578)
+```
+
+For prompt 512 the rank-1 split pair estimates 1.496 s versus 1.680 s for the
+best same-placement pair at rank 11, a 0.184 s reduction; for prompt 32768 the
+rank-1 split pair estimates 1.691 s versus 2.238 s for the best same-placement
+pair at rank 10, a 0.547 s reduction. These are one-turn estimates from
+committed topology costs, not execution measurements; the next turn's
+transfer back to the prefill placement is outside this model.
