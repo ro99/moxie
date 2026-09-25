@@ -415,6 +415,10 @@ recorded. Never drop a required gate to save time.
   compared.
 - The reviewer may start at the candidate commit while the final gates run.
   A gate failure sends back only the difference.
+- A repair round still gets an independent review, of the repair delta only.
+  It runs in parallel with the builder's reruns. The coordinator checking
+  that the findings landed is not a review: it cannot see a new defect that
+  the repair introduced.
 
 For affected Rust/CUDA work, account for the distinct lanes: host build,
 executor driver feature, and `xtask`'s own CUDA feature. Passing one does not
