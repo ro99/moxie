@@ -1,7 +1,8 @@
 # Task 0099 — a prepared KV append: preview, then a non-allocating apply
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer
-Codex `sol`. Host-only (`moxie-state`). It is the foundation of task 0101
+Status: **accepted** (coordinator, 2026-09-25), sol's review R1 clean
+(0/0/0). Implementation `19eea35`. Builder Codex `luna`; reviewer Codex
+`sol`. Host-only (`moxie-state`). It is the foundation of task 0101
 (full-step decode capture).
 
 ## Identity and authority
