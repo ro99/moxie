@@ -1,8 +1,18 @@
 # Task 0091 — a dense plan set shares one resident copy of the weights
 
-Status: **active** (coordinator, 2026-09-25); design option (B) from the
-ledger, assigned before the owner's morning review (redirectable). Builder Codex `luna`; reviewer
-Codex `sol`.
+Status: **accepted** (coordinator, 2026-09-25), after sol's review round R1.
+Builder Codex `luna`; reviewer Codex `sol`. Implementation `bfb886a`; R1
+repair `da0ede8`. Assigned before the owner's morning review of the design
+fork (option B); redirectable.
+- R1 (HIGH, the coordinator's contract gap in change 5): an admission
+  refusal handed out admitted plans and weight leases as independent public
+  fields, so a plan could run after its leases were released. Both refusal
+  types are now opaque (`error` plus `close`, which closes plans before
+  releasing leases). Verified by the coordinator: no public path yields a
+  plan or a lease.
+- Effect: a four-bucket plan set charges `PackedResidentWeights` once and
+  matches the host reference at 0.000 ULP; the offset check is the set's
+  per-step lease revalidation (sol: the right owning check).
 
 ## Identity and authority
 
