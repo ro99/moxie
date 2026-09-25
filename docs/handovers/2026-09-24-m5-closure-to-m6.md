@@ -144,8 +144,10 @@ reviews):
    captured, from the opt-in unordered catalogue. It is within ADR 0028 on
    all three GPUs (1 ULP at the decode shape after disallowing
    reduced-precision split-K) and matches the ordered path's greedy tokens.
-   Next: task 0097 (TP partial, packed split reference, ADR 0036
-   bit-identity). The affine INT8/INT4 kernel is already tensor-core (ADR
+   [Task 0097](../tasks/0097-m6-cublas-tp-partial-and-split.md)
+   **accepted** 2026-09-25: TP partials and the packed split reference on
+   cuBLAS; TP2 is byte-identical to single-GPU (ADR 0036). Capture of
+   ordered-reduction plans moved to M6.2. The affine INT8/INT4 kernel is already tensor-core (ADR
    0028). Task 0095
    measured the current kernel at 0.055 TFLOP/s on a 3090 and 0.109 on the
    5060 Ti, about 1,000 times below the hardware.

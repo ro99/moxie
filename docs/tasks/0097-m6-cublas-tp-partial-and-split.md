@@ -1,7 +1,17 @@
 # Task 0097 — cuBLAS TP partials and a packed split reference, bit-identical
 
-Status: **active** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer
-Codex `sol`. Asynchronous-ownership work: the escape inventory is in change 5.
+Status: **accepted** (coordinator, 2026-09-25). Builder Codex `luna`;
+reviewer Codex `sol`. Candidate `24e470f`, isolation repair `5be7d06`.
+- TP2 on the 3090 pair is byte-identical to the packed single-GPU reference
+  on cuBLAS (ADR 0036 holds). All three GPUs are within ADR 0028, 1 ULP at
+  the decode shape.
+- Reviews: an early review of the working tree while the final suite ran
+  (3 medium, 1 low; fixed in the same round), then two delta reviews. The
+  second found test isolation: success depended on test order. It was fixed
+  with a separate test binary; the third delta review was clean.
+- The strided-layout mutant survived: on this driver cuBLAS gives the same
+  bits packed or strided at every shape tried. Packing is kept, because
+  cuBLAS guarantees reproducibility only for identical call parameters. Asynchronous-ownership work: the escape inventory is in change 5.
 
 ## Identity and authority
 
