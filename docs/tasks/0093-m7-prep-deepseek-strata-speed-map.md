@@ -1,4 +1,4 @@
-# Task 0093 — map every Strata DeepSeek speed technique onto Moxie
+# Task 0093 — M7 preparation: map every Strata DeepSeek speed technique onto Moxie
 
 Status: **active** (coordinator, 2026-09-25). Builder Claude Opus `builder`
 (owner direction, 2026-09-25); reviewer Codex `sol`. Documentation only: no code, no GPU runs.
@@ -9,12 +9,14 @@ Status: **active** (coordinator, 2026-09-25). Builder Claude Opus `builder`
   effort and success was DeepSeek (`Intel/DeepSeek-V4-Flash-0731-W4A16-AutoRound`,
   v1 catalog entry 5). Moxie must eventually show DeepSeek speed at least
   equal to Strata's. The comparison itself cannot run in M6 (the DeepSeek
-  adapter, compressed sparse attention, mHC and Engram arrive in M7). What M6
-  does now: list every technique that makes Strata's DeepSeek fast, and say
+  adapter, compressed sparse attention, mHC and Engram arrive in M7). What
+  this task does now: list every technique that makes Strata's DeepSeek fast, and say
   where each one lives in Moxie's generic design, so a gap is found now, not
   in M7.
-- M6 connection: roadmap M6 "shared performance paths"; this map tells slice
-  6, M6.5 and the M6 closure which shared paths DeepSeek will need.
+- **Milestone: M7 preparation** (owner, 2026-09-25), run ahead of time and
+  in parallel. It is not part of M6's exit, and M6 does not wait for it or
+  reorder around it. Its rows feed M7's DeepSeek work; gap rows are
+  registered for M7.
 - Builder: Claude Opus `builder`, in its own Herdr tab (owner direction).
   Reviewer: Codex `sol` (read-only, `/ponytail:ponytail-review`).
   Coordinator: Claude Opus `coordinator`.
