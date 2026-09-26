@@ -219,8 +219,8 @@ line.)
 
 ### Change 5 (M4) — coverage check, performed and reverted
 
-Substituted `#define MOXIE_ATTN_ACC_SLOTS (MOXIE_ATTN_MAX_HEAD_DIM /
-MOXIE_ATTN_THREADS)` for the literal `#define MOXIE_ATTN_ACC_SLOTS 2`.
+Substituted the literal `#define MOXIE_ATTN_ACC_SLOTS 2` for the derived
+`#define MOXIE_ATTN_ACC_SLOTS (MOXIE_ATTN_MAX_HEAD_DIM / MOXIE_ATTN_THREADS)`.
 `cargo xtask-cuda test-gpu --profile sm86` (which also exercised the
 present SM120 device): both `paged_attention`'s `mha-512-widest-declared`
 and `paged_attention_head_dim_512`'s `decode` shape **FAILED** on all
@@ -325,8 +325,9 @@ warnings` clean; `cargo clippy -p xtask --features cuda --all-targets
 driver,paged-attention-binding,paged-attention-test-hooks,nccl,cublas
 --locked -- -D warnings` clean (the executor driver lane, since this task
 touches an `#![cfg(feature = "driver")]` test file); `cargo test
---workspace --locked` passed; `cargo xtask arch-check` passed (79
-rejected / 21 accepted fixtures, 13 rules -- no allowlist change, matching
+--workspace --locked`: **PASS (0 failed)**, rerun to completion on
+`0777d84` after this Result was first drafted; `cargo xtask arch-check`
+passed (79 rejected / 21 accepted fixtures, 13 rules -- no allowlist change, matching
 the Allowed files list); `cargo xtask spec-check` passed (10 documents
 unchanged).
 

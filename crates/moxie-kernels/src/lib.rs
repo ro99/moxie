@@ -108,11 +108,10 @@ pub const PAGED_ATTENTION_TILE: u64 = 128;
 /// Threads per attention block, which is also the number of output components
 /// one block writes per pass.
 pub const PAGED_ATTENTION_THREADS: u32 = 128;
-/// The widest head dimension the image serves. The host refuses more rather
-/// than letting the kernel read past a row. Task 0105: raised to Gemma 31B's
-/// global-layer head dimension; the paged-attention catalogue, the host
-/// admission guard and the refusal tests all read this constant rather than
-/// restating 256, so this is the only edit their bound needed.
+/// The widest head dimension the image serves -- Gemma 31B's global-layer
+/// head dimension. The host refuses more rather than letting the kernel read
+/// past a row. The paged-attention catalogue, the host admission guard and
+/// the refusal tests all read this constant rather than restating the bound.
 pub const PAGED_ATTENTION_MAX_HEAD_DIM: u64 = 512;
 
 pub const DENSE_EMBEDDING: &str = "moxie_dense_embedding_v1";
@@ -439,12 +438,12 @@ mod images {
                     layout: TensorLayout::ContiguousRowMajorV1,
                     shape: KernelShapeBounds {
                         max_rows: 65_536,
-                        // Task 0105: Gemma 31B's dense MLP declares 21,504
+                        // Gemma 31B's dense MLP declares 21,504
                         // (`down_proj`'s input, `gate_proj`/`up_proj`'s
-                        // output). `max_output` stays 65,536 -- it was
-                        // already wide enough -- and `expert_mlp_catalogue`
-                        // is untouched: Gemma 31B is dense, and nothing here
-                        // qualifies a routed shape at this depth.
+                        // output). `max_output` is already wide enough at
+                        // 65,536. `expert_mlp_catalogue` is a separate,
+                        // untouched bound: Gemma 31B is dense, and nothing
+                        // here qualifies a routed shape at this depth.
                         max_input: 21_504,
                         max_output: 65_536,
                     },
