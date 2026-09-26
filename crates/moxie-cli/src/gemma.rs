@@ -52,6 +52,22 @@ pub fn from_checkpoint(dir: &Path) -> Result<CheckpointGraph> {
         checkpoint_config::MAX_CONFIG_BYTES,
     )?;
     let declaration = checkpoint_config::parse(&config_text)?;
+    if let Some(quantization) = &declaration.quantization
+        && let Some(pattern) = quantization.passthrough_patterns.first()
+    {
+        // An AutoRound 16-bit passthrough override marks a module as
+        // unquantized source, which the ignore-list check below does not
+        // see. Composing it INT8 anyway would be a wrong graph, not a
+        // refusal, so this is refused rather than matched: there is no
+        // consumer of the pattern yet.
+        return Err(Error::InvalidArtifact {
+            detail: format!(
+                "this checkpoint declares 16-bit passthrough override {pattern:?}; from_checkpoint \
+                 does not yet match passthrough patterns against composed roles"
+            )
+            .into(),
+        });
+    }
     let fields = checkpoint_config::declared_text_fields(&config_text)?;
 
     let index_text = read_text_capped(
@@ -105,7 +121,7 @@ pub fn from_checkpoint(dir: &Path) -> Result<CheckpointGraph> {
     }
 
     let config = text_config_from_declared(&fields, layer_scalars)?;
-    let revision = checkpoint_revision(dir);
+    let revision = checkpoint_revision(dir)?;
     let model = Gemma4Text::full(config.clone(), &revision)?;
 
     let mut oracles = OracleRegistry::new();
@@ -177,20 +193,31 @@ fn weight_label(role: &TensorRole) -> String {
     }
 }
 
-/// The checkpoint's own recorded revision, from the local Hub cache metadata
-/// beside `config.json`, or the directory name when there is no such cache
-/// (a checkpoint placed by hand, or a test fixture).
-fn checkpoint_revision(dir: &Path) -> String {
+/// The checkpoint's own recorded revision: the first line of the local Hub
+/// cache metadata beside `config.json`, which the hub's own download
+/// metadata format always writes as a 40-character lowercase hex commit id.
+/// There is no fallback -- a label that is not the checkpoint's actual
+/// revision is worse than a refusal naming the missing file.
+fn checkpoint_revision(dir: &Path) -> Result<String> {
     let metadata_path = dir.join(".cache/huggingface/download/config.json.metadata");
-    std::fs::read_to_string(&metadata_path)
-        .ok()
-        .and_then(|text| text.lines().next().map(str::trim).map(str::to_string))
-        .filter(|line| !line.is_empty())
-        .unwrap_or_else(|| {
-            dir.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| dir.display().to_string())
-        })
+    let text = std::fs::read_to_string(&metadata_path).map_err(|e| Error::InvalidArtifact {
+        detail: format!("{}: {e}", metadata_path.display()).into(),
+    })?;
+    let revision = text.lines().next().unwrap_or("").trim();
+    let is_revision_hex = revision.len() == 40
+        && revision
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !is_revision_hex {
+        return Err(Error::InvalidArtifact {
+            detail: format!(
+                "{}: first line {revision:?} is not a 40-character lowercase hex revision",
+                metadata_path.display()
+            )
+            .into(),
+        });
+    }
+    Ok(revision.to_string())
 }
 
 /// Which reduced geometry to build.

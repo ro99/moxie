@@ -195,7 +195,7 @@ No GPU and no timing.
 
 ## Result, filled after work
 
-Status: **implemented** (builder, Claude Opus, 2026-09-26), taking over an
+Status: **implemented** (builder, Claude Sonnet, 2026-09-26), taking over an
 in-progress build luna's session left uncommitted after its weekly Codex
 quota ran out. Luna's partial work (changes 1, 2 and most of 3/4) reviewed
 against the contract and completed; two defects fixed before continuing:
@@ -258,4 +258,55 @@ under `/fast/models` (host only, no GPU):
 
 Not claimed: loading any weight, running any token, Qwen, vision/audio, GPU
 execution, or any performance number -- all named non-goals or out of this
-task's scope.
+task's scope. `CheckpointGraph` also does not carry the checkpoint's
+declared quantization granularity or zero-point convention ("INT8 affine
+group 32 symmetric") -- only the precision. The loader (route item 5)
+re-parses `config.json` for those; this task's graph only needs to know
+which precision each linear composes at.
+
+### Round 2 (builder, Claude Sonnet, 2026-09-26)
+
+Reviewer's round-1 findings (1 high, 4 medium, 4 low;
+[record](../evidence/task-0104-review-round-1.md)), all applied as written:
+
+- **H1** — `gemma_checkpoints.rs`'s per-role loop now derives the expected
+  precision from the index itself (`.weight_packed` → INT8, otherwise the
+  header's own BF16 dtype, asserted) and checks it against
+  `spec.role`. Coverage check performed and reverted: deleting
+  `from_checkpoint`'s `precisions.insert(...)` made
+  `dense_checkpoint_composes_a_full_size_graph` fail on `q_proj.0`'s
+  precision (`Bf16` vs expected `Int8`), as required.
+- **M1** — test (d) no longer recomposes under a different `SymbolId`
+  (which only renames the same symbolic graph, since `SymbolId` is the
+  rows symbol's identity, not a count). It now binds
+  `graph.composition.graph.rows_symbol()` to 1 and to 8 in a `SymbolTable`
+  and evaluates every value's shape dims with `Dim::eval`, on
+  `graph.composition.graph` itself -- the checkpoint's actual INT8
+  composition, not a re-derived BF16-only one.
+- **M2** — added an independent `layer_scalar` check: each layer's tensor
+  is re-read through `Shard` in the test and compared bit-for-bit
+  (`to_bits()`) against `graph.config.layer_scalars[layer]`, plus a length
+  check against `artifact.layers`.
+- **M3** — `checkpoint_revision` now requires the metadata file's first
+  line to be exactly 40 lowercase hex characters, and returns
+  `Result<String>` instead of falling back to the directory name. Both
+  real checkpoints' `.cache/huggingface/download/config.json.metadata`
+  satisfy this (`34ca187d…` for the 31B, `4d7ae498…` for the A4B).
+- **M4** — `from_checkpoint` now refuses up front (before reading
+  `text_config`) when the checkpoint declares any AutoRound 16-bit
+  passthrough override, naming the pattern, instead of silently composing
+  a passthrough module as INT8.
+- **L1** — `flatten_declared`'s array arm removed; the catch-all arm already
+  calls `declared_value`, which recurses into an array's own items.
+- **L2** — the `layer_types` stride search is now a single `.find`; two
+  strides could never both match (their smallest full-attention layers
+  disagree), so the old second-iterator uniqueness check was dead.
+- **L3** — recorded above, in "Not claimed".
+- **L4** — the Status line's attribution corrected to Claude Sonnet.
+
+Reruns: `cargo fmt --check`, workspace clippy, `xtask` clippy with the
+`cuda` feature, `cargo xtask arch-check`, `cargo xtask spec-check`,
+`cargo test --workspace --locked`, and
+`cargo test -p moxie-cli --test gemma_checkpoints -- --ignored` (2 passed,
+against both real checkpoints) -- all clean. No GPU gate applies; this
+task touches no kernel or device path.

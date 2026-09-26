@@ -15,9 +15,11 @@ use std::path::Path;
 
 use moxie_cli::gemma::from_checkpoint;
 use moxie_format::checkpoint_config;
+use moxie_format::safetensors::Dtype;
+use moxie_graph::ValueRole;
 use moxie_models::gemma4::{ARTIFACT, ARTIFACT_A4B, ArtifactGeometry, TextConfig};
 use moxie_storage::Shard;
-use moxie_types::{Dim, SymbolId};
+use moxie_types::{Dim, Precision, SymbolTable, WeightPrecision};
 
 const DENSE: &str = "/fast/models/cyankiwi/gemma-4-31B-it-AWQ-8bit";
 const MOE: &str = "/fast/models/google/gemma-4-26B-A4B-it";
@@ -148,6 +150,27 @@ fn check_checkpoint(dir_str: &str, artifact: ArtifactGeometry) {
     let mut shards = BTreeMap::new();
     let mut bound_tensors = BTreeSet::new();
 
+    // Every `layer_scalar`, read straight from its own shard rather than
+    // through `from_checkpoint`: this only agrees with `graph.config` if
+    // both read the same bytes at the same layer.
+    assert_eq!(graph.config.layer_scalars.len(), artifact.layers as usize);
+    for (layer, scalar) in graph.config.layer_scalars.iter().enumerate() {
+        let name = format!("model.language_model.layers.{layer}.layer_scalar");
+        let file = map
+            .get(&name)
+            .unwrap_or_else(|| panic!("{name} is not in the index"));
+        let bytes = open_shard(dir, &mut shards, file)
+            .tensor_bytes(&name)
+            .unwrap_or_else(|e| panic!("read {name}: {e}"));
+        let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let expected = moxie_format::bf16::bf16_bits_to_f32(bits);
+        assert_eq!(
+            scalar.to_bits(),
+            expected.to_bits(),
+            "layer {layer} layer_scalar disagrees with the checkpoint's own bytes"
+        );
+    }
+
     for bound in &graph.composition.weights {
         let key = (bound.role.name.clone(), bound.role.layer, bound.role.expert);
         let source = graph
@@ -188,6 +211,33 @@ fn check_checkpoint(dir_str: &str, artifact: ArtifactGeometry) {
             graph_shape, source_shape,
             "{key:?} graph shape disagrees with {resolved}'s source shape"
         );
+
+        // The composed precision: `.weight_packed` is this checkpoint's only
+        // packed-INT8 suffix, and everything else must be the BF16 the
+        // safetensors header itself declares.
+        let expected_precision = if resolved.ends_with(".weight_packed") {
+            WeightPrecision::new(Precision::Int8).expect("Int8 is a valid weight precision")
+        } else {
+            let file = map
+                .get(&resolved)
+                .unwrap_or_else(|| panic!("{resolved} is not in the index"));
+            let dtype = open_shard(dir, &mut shards, file)
+                .header()
+                .get(&resolved)
+                .unwrap_or_else(|e| panic!("{resolved} header: {e}"))
+                .dtype;
+            assert_eq!(
+                dtype,
+                Dtype::Bf16,
+                "{resolved} is neither .weight_packed nor BF16"
+            );
+            WeightPrecision::new(Precision::Bf16).expect("Bf16 is a valid weight precision")
+        };
+        assert_eq!(
+            spec.role,
+            ValueRole::Weight(expected_precision),
+            "{key:?} composed at the wrong precision"
+        );
     }
 
     // (b): every text tensor the index declares is bound exactly once,
@@ -205,16 +255,20 @@ fn check_checkpoint(dir_str: &str, artifact: ArtifactGeometry) {
     assert_eq!(bound_tensors, expected);
 
     // (d): the graph validated during composition (`finish` refuses an
-    // unregistered operation or a shape mismatch), and composing again at
-    // both row counts the task names succeeds too.
-    let mut oracles = moxie_graph::OracleRegistry::new();
-    moxie_oracles::register(&mut oracles).unwrap();
-    let model = moxie_models::gemma4::Gemma4Text::full(graph.config.clone(), &graph.revision)
-        .expect("the derived config still builds a full-size model");
-    for rows in [1u32, 8] {
-        model
-            .compose(&oracles, SymbolId(rows))
-            .unwrap_or_else(|e| panic!("composition at rows {rows} failed: {e}"));
+    // unregistered operation or a shape mismatch). Checking it runs at the
+    // row counts the task names is binding the rows symbol -- `SymbolId` is
+    // the symbol's *identity*, not a count, so recomposing under a
+    // different `SymbolId` would only rename the same symbolic graph.
+    let rows_symbol = graph.composition.graph.rows_symbol();
+    for rows in [1u64, 8] {
+        let mut bindings = SymbolTable::new();
+        bindings.bind(rows_symbol, rows);
+        for spec in graph.composition.graph.values() {
+            for dim in &spec.shape {
+                dim.eval(&bindings)
+                    .unwrap_or_else(|e| panic!("rows {rows}: {dim:?} does not resolve: {e:?}"));
+            }
+        }
     }
 }
 

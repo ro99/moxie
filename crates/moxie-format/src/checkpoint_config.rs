@@ -77,13 +77,9 @@ fn flatten_declared(
                 flatten_declared(&dotted, value, fields)?;
             }
         }
-        serde_json::Value::Array(items) => {
-            let values = items
-                .iter()
-                .map(declared_value)
-                .collect::<Result<Vec<_>>>()?;
-            insert_declared(key, DeclaredValue::List(values), fields)?;
-        }
+        // Everything else, arrays included: `declared_value` already
+        // recurses into an array's own items, so restating that here would
+        // be a second copy of the same match.
         value => insert_declared(key, declared_value(value)?, fields)?,
     }
     Ok(())

@@ -949,17 +949,19 @@ pub fn text_config_from_declared(
             ));
         }
     }
-    let mut strides = (1..=layers).filter(|stride| {
-        let Ok(period) = usize::try_from(*stride) else {
-            return false;
-        };
-        layer_types.iter().enumerate().all(|(index, layer_type)| {
-            (layer_type == "full_attention") == (index.saturating_add(1) % period == 0)
+    // At most one stride can match: two different strides `s1 < s2` would
+    // both have to place their smallest full-attention layer at `s1 - 1`
+    // and `s2 - 1`, which disagree, so `find` needs no separate uniqueness
+    // check the way a duplicate hit would.
+    let global_stride = (1..=layers)
+        .find(|stride| {
+            let Ok(period) = usize::try_from(*stride) else {
+                return false;
+            };
+            layer_types.iter().enumerate().all(|(index, layer_type)| {
+                (layer_type == "full_attention") == (index.saturating_add(1) % period == 0)
+            })
         })
-    });
-    let global_stride = strides
-        .next()
-        .filter(|_| strides.next().is_none())
         .ok_or_else(|| {
             declared_error(
                 "layer_types",
