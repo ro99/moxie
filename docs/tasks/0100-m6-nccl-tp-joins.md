@@ -234,6 +234,11 @@ commit.
   fires once peer-copy joins are deleted. Replace only that injection with
   an NCCL enqueue or async failure, preserving its recovery assertions.
   Keep the host declaration-mismatch guard.
+  **Amended (coordinator, answering luna's DECISION):** replace the
+  peer-copy injection with the **post-prepare status-word failure**. It
+  still enters the NCCL collectives and keeps the same-group recovery
+  assertions. A real NCCL failure loses the communicator (H3), and the
+  existing stall/deadline test covers it as a lost group, not a hang.
 - **M2 (changes 1, 2, 7).**
   - Use `NCCL_CONFIG_INITIALIZER` (size, magic, version and the UNDEF
     fields) before setting `blocking = 0`.
