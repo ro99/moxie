@@ -87,9 +87,15 @@ Codex `sol`. Host-only. Queued after task 0100.
     changes;
   - `crates/moxie-format/src/checkpoint_config.rs`;
   - `crates/moxie-models/src/gemma4.rs`;
-  - `crates/moxie-cli/src/gemma.rs`, `crates/moxie-cli/Cargo.toml` (only
-    if a dependency on `moxie-format` or `moxie-storage` is missing and
-    allowed by arch-check);
+  - `crates/moxie-cli/src/gemma.rs` and `crates/moxie-cli/Cargo.toml`
+    (adding `moxie-format` and `moxie-storage`);
+  - `xtask/src/archcheck.rs`, only to add `moxie-format` and
+    `moxie-storage` to `moxie-cli`'s workspace allowlist, with this comment:
+    "the composition root reads a downloaded checkpoint's config and
+    metadata tensors to compose its model (ADR 0038)". This was authorized
+    by the coordinator, answering luna's DECISION: both are host-only, with
+    no device code and no third-party additions, and document 02 makes
+    `moxie-cli` the composition root;
   - `crates/moxie-cli/tests/` (one new test file);
   - this task's Result.
 - **Non-goals:**
