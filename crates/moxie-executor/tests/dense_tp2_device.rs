@@ -3,13 +3,13 @@
 //! The fixture is deliberately small and synthetic.  It runs the full dense
 //! graph on one 3090 through the split-aware ordinary linear kernel, then runs
 //! the lowered stage graph on persistent workers that own the 3090 pair.
-#![cfg(feature = "paged-attention-binding")]
+#![cfg(all(feature = "paged-attention-binding", feature = "nccl"))]
 
 use core::ffi::{c_int, c_void};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -47,24 +47,20 @@ static DEVICE_TEST: Mutex<()> = Mutex::new(());
 // Driver faults, by interposing two CUDA driver symbols in this test binary
 // (0059's pattern). Armed from the binding callback, so they land mid-step.
 const NO_FAULT: u8 = 0;
-/// The second peer copy after arming fails: a collective fails after its
-/// first copy is enqueued (F2).
-const PEER_COPY_FAULT: u8 = 1;
 /// The next kernel launch is refused as an invalid value (N2).
-const LAUNCH_FAULT: u8 = 2;
+const LAUNCH_FAULT: u8 = 1;
 /// The next paged-attention kernel launch is refused, quarantining its run
 /// with the stage's query and output ranges (R3-2).
-const ATTENTION_LAUNCH_FAULT: u8 = 3;
+const ATTENTION_LAUNCH_FAULT: u8 = 2;
 /// The next host-to-device copy fails.
-const UPLOAD_FAULT: u8 = 4;
+const UPLOAD_FAULT: u8 = 3;
 /// The next device-to-host copy (an attention stage reading its keys back
 /// before the append) arms `UPLOAD_FAULT`. The append's first upload is then
 /// the page-table publication, whose failure holds the run's admitted
 /// upload buffer (R5-1).
-const TABLE_UPLOAD_FAULT: u8 = 5;
+const TABLE_UPLOAD_FAULT: u8 = 4;
 
 static DRIVER_FAULT: AtomicU8 = AtomicU8::new(NO_FAULT);
-static PEER_COPIES: AtomicU32 = AtomicU32::new(0);
 
 #[link(name = "dl")]
 unsafe extern "C" {
@@ -76,31 +72,6 @@ fn real(symbol: &core::ffi::CStr) -> *mut c_void {
     let found = unsafe { dlsym((-1isize) as *mut c_void, symbol.as_ptr()) };
     assert!(!found.is_null(), "missing real {symbol:?}");
     found
-}
-
-#[unsafe(no_mangle)]
-unsafe extern "C" fn cuMemcpyPeerAsync(
-    dst: u64,
-    dst_ctx: *mut c_void,
-    src: u64,
-    src_ctx: *mut c_void,
-    bytes: usize,
-    stream: *mut c_void,
-) -> c_int {
-    match DRIVER_FAULT.load(Ordering::SeqCst) {
-        PEER_COPY_FAULT if PEER_COPIES.fetch_add(1, Ordering::SeqCst) == 1 => {
-            DRIVER_FAULT.store(NO_FAULT, Ordering::SeqCst);
-            return 1;
-        }
-        _ => {}
-    }
-    type Copy =
-        unsafe extern "C" fn(u64, *mut c_void, u64, *mut c_void, usize, *mut c_void) -> c_int;
-    // SAFETY: the resolved symbol has this CUDA ABI; arguments pass unchanged.
-    unsafe {
-        let copy: Copy = std::mem::transmute(real(c"cuMemcpyPeerAsync"));
-        copy(dst, dst_ctx, src, src_ctx, bytes, stream)
-    }
 }
 
 /// One-shot: consume `fault` if it is armed.
@@ -1227,8 +1198,8 @@ enum Fault {
     Cancel,
     /// The collective after that stage is refused.
     Collective,
-    /// A collective fails after its first peer copy is enqueued (F2).
-    PeerCopy,
+    /// Rank 1 reports a post-prepare status failure through NCCL.
+    JoinStatus,
     /// Rank 1's commit refuses while preparing, after rank 0 prepared (C2).
     Commit,
     /// The executed step is dropped uncommitted (F11).
@@ -1265,6 +1236,9 @@ fn tp_worker_step(
     if fault == Fault::Stall {
         workers.stall_before_next_rendezvous(1);
     }
+    if fault == Fault::JoinStatus {
+        workers.fail_next_join_after_prepare(1);
+    }
     let mut oracles = OracleRegistry::new();
     moxie_oracles::register(&mut oracles).expect("oracles");
     let catalogue = moxie_kernels::dense_graph_catalogue();
@@ -1280,16 +1254,17 @@ fn tp_worker_step(
                 }
                 Fault::Cancel => cancel.store(true, Ordering::Release),
                 Fault::Collective => {}
-                Fault::PeerCopy => {
-                    PEER_COPIES.store(0, Ordering::SeqCst);
-                    DRIVER_FAULT.store(PEER_COPY_FAULT, Ordering::SeqCst);
-                }
                 Fault::Launch => DRIVER_FAULT.store(LAUNCH_FAULT, Ordering::SeqCst),
                 Fault::TableUpload => DRIVER_FAULT.store(TABLE_UPLOAD_FAULT, Ordering::SeqCst),
                 Fault::AttentionLaunch => {
                     DRIVER_FAULT.store(ATTENTION_LAUNCH_FAULT, Ordering::SeqCst)
                 }
-                Fault::None | Fault::Commit | Fault::Drop | Fault::Oversized | Fault::Stall => {}
+                Fault::None
+                | Fault::Commit
+                | Fault::Drop
+                | Fault::JoinStatus
+                | Fault::Oversized
+                | Fault::Stall => {}
             }
         }
         Ok(stage_host_bindings(
@@ -1601,7 +1576,7 @@ fn tp2_worker_gate(routed: bool) {
     let before = workers.stats().expect("stats after mismatch recovery");
 
     for fault in [
-        Fault::PeerCopy,
+        Fault::JoinStatus,
         Fault::Launch,
         Fault::AttentionLaunch,
         Fault::Oversized,
@@ -1695,6 +1670,104 @@ fn bf16_ulp(value: f32) -> f32 {
         1..=7 => f32::from_bits(1 << (15 + exponent)),
         _ => f32::from_bits((exponent - 7) << 23),
     }
+}
+
+#[test]
+fn nccl_status_poisons_both_ranks() {
+    let _guard = one_at_a_time();
+    let (fixture, lowering, config) = order_sensitive_fixture(false);
+    let ordinals = pair_ordinals();
+    let local = local_config(&config);
+    let (reference_prefill, reference_after_refusal) = {
+        let context = RankContext::acquire(RankId(61_003), ordinals[0]).expect("reference context");
+        let mut reference = Rank::new(&context, &config);
+        let prefill = reference_step(
+            &fixture,
+            &lowering.linear_orders,
+            &lowering.combine_orders,
+            &mut reference,
+            &[1, 4],
+            &[0, 1],
+        );
+        let after_refusal = reference_step(
+            &fixture,
+            &lowering.linear_orders,
+            &lowering.combine_orders,
+            &mut reference,
+            &[7],
+            &[2],
+        );
+        reference.close();
+        (prefill, after_refusal)
+    };
+    let host_capacity =
+        CapacitySnapshot::measured_host(&moxie_host::read().expect("measure host"), 1 << 20)
+            .expect("host capacity");
+    let mut workers = DenseRankWorkers::spawn(DenseRankWorkerConfig {
+        ranks: [RankId(61_004), RankId(61_005)],
+        ordinals,
+        geometry: geometry(&local, 4, 64, 6),
+        heads: local.heads,
+        max_rows: 5,
+        host_capacity,
+        deadline: DEADLINE,
+    })
+    .expect("persistent rank workers");
+    let capabilities = [
+        query_device(ordinals[0]).expect("rank 0 capability"),
+        query_device(ordinals[1]).expect("rank 1 capability"),
+    ];
+    let prefill = tp_worker_step(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &[1, 4],
+        &[0, 1],
+        Fault::None,
+    )
+    .expect("prefill before injected status failure");
+    assert_eq!(prefill, reference_prefill);
+    let before = workers
+        .stats()
+        .expect("stats before injected status failure");
+    let refused = tp_worker_step(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &[7],
+        &[2],
+        Fault::JoinStatus,
+    )
+    .expect_err("the post-prepare status failure refuses both ranks");
+    assert!(
+        matches!(
+            &refused,
+            Error::InvalidRequest { field: "collective", detail }
+                if detail == "a rank failed after join preparation"
+        ),
+        "both ranks report the same typed status error: {refused}"
+    );
+    assert_eq!(
+        workers
+            .stats()
+            .expect("stats after injected status failure"),
+        before,
+        "the failed transactions leave published and committed state unchanged"
+    );
+    let recovered = tp_worker_step(
+        &mut workers,
+        &fixture,
+        &lowering,
+        &capabilities,
+        &[7],
+        &[2],
+        Fault::None,
+    )
+    .expect("same group recovers after the status failure");
+    assert_eq!(recovered, reference_after_refusal);
+    workers.close().expect("close workers after recovery");
 }
 
 #[test]

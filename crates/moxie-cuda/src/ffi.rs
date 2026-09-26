@@ -32,6 +32,105 @@ pub type CUgraphNode = *mut c_void;
 pub type CUarray = *mut c_void;
 pub type CUmemorytype = c_int;
 
+#[cfg(feature = "nccl")]
+pub type ncclComm_t = *mut c_void;
+#[cfg(feature = "nccl")]
+pub type ncclResult_t = c_int;
+#[cfg(feature = "nccl")]
+pub type ncclDataType_t = c_int;
+#[cfg(feature = "nccl")]
+pub type ncclRedOp_t = c_int;
+
+#[cfg(feature = "nccl")]
+pub const NCCL_SUCCESS: ncclResult_t = 0;
+#[cfg(feature = "nccl")]
+pub const NCCL_IN_PROGRESS: ncclResult_t = 7;
+#[cfg(feature = "nccl")]
+pub const NCCL_SUM: ncclRedOp_t = 0;
+#[cfg(feature = "nccl")]
+pub const NCCL_MAX: ncclRedOp_t = 2;
+#[cfg(feature = "nccl")]
+pub const NCCL_UINT32: ncclDataType_t = 3;
+#[cfg(feature = "nccl")]
+pub const NCCL_FLOAT32: ncclDataType_t = 7;
+#[cfg(feature = "nccl")]
+pub const NCCL_BFLOAT16: ncclDataType_t = 9;
+#[cfg(feature = "nccl")]
+pub const NCCL_CONFIG_UNDEF_INT: c_int = c_int::MIN;
+#[cfg(feature = "nccl")]
+pub const NCCL_API_MAGIC: c_uint = 0xcafe_beef;
+
+#[cfg(feature = "nccl")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ncclUniqueId {
+    pub internal: [c_char; 128],
+}
+
+#[cfg(feature = "nccl")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ncclConfig_t {
+    pub size: usize,
+    pub magic: c_uint,
+    pub version: c_uint,
+    pub blocking: c_int,
+    pub cga_cluster_size: c_int,
+    pub min_ctas: c_int,
+    pub max_ctas: c_int,
+    pub net_name: *const c_char,
+    pub split_share: c_int,
+    pub traffic_class: c_int,
+    pub comm_name: *const c_char,
+    pub collnet_enable: c_int,
+    pub cta_policy: c_int,
+    pub shrink_share: c_int,
+    pub nvls_ctas: c_int,
+    pub channels_per_net_peer: c_int,
+    pub nvlink_centric_sched: c_int,
+    pub graph_usage_mode: c_int,
+    pub num_rma_ctx: c_int,
+    pub max_p2p_peers: c_int,
+    pub graph_stream_ordering: c_int,
+    pub launch_order_implicit: c_int,
+    pub num_rma_sig: c_int,
+    pub rma_eager_init: c_int,
+    pub host_cft_mode: c_int,
+}
+
+#[cfg(feature = "nccl")]
+impl ncclConfig_t {
+    pub const fn initializer(version: c_uint) -> Self {
+        Self {
+            size: core::mem::size_of::<Self>(),
+            magic: NCCL_API_MAGIC,
+            version,
+            blocking: NCCL_CONFIG_UNDEF_INT,
+            cga_cluster_size: NCCL_CONFIG_UNDEF_INT,
+            min_ctas: NCCL_CONFIG_UNDEF_INT,
+            max_ctas: NCCL_CONFIG_UNDEF_INT,
+            net_name: core::ptr::null(),
+            split_share: NCCL_CONFIG_UNDEF_INT,
+            traffic_class: NCCL_CONFIG_UNDEF_INT,
+            comm_name: core::ptr::null(),
+            collnet_enable: NCCL_CONFIG_UNDEF_INT,
+            cta_policy: NCCL_CONFIG_UNDEF_INT,
+            shrink_share: NCCL_CONFIG_UNDEF_INT,
+            nvls_ctas: NCCL_CONFIG_UNDEF_INT,
+            channels_per_net_peer: NCCL_CONFIG_UNDEF_INT,
+            nvlink_centric_sched: NCCL_CONFIG_UNDEF_INT,
+            graph_usage_mode: NCCL_CONFIG_UNDEF_INT,
+            num_rma_ctx: NCCL_CONFIG_UNDEF_INT,
+            max_p2p_peers: NCCL_CONFIG_UNDEF_INT,
+            graph_stream_ordering: NCCL_CONFIG_UNDEF_INT,
+            launch_order_implicit: NCCL_CONFIG_UNDEF_INT,
+            num_rma_sig: NCCL_CONFIG_UNDEF_INT,
+            rma_eager_init: NCCL_CONFIG_UNDEF_INT,
+            host_cft_mode: NCCL_CONFIG_UNDEF_INT,
+        }
+    }
+}
+
 #[cfg(feature = "cublas")]
 pub type cublasHandle_t = *mut c_void;
 
@@ -158,6 +257,12 @@ unsafe extern "C" {
 
     pub fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
+    pub fn cuMemsetD32Async(
+        dst_device: CUdeviceptr,
+        value: c_uint,
+        count: usize,
+        stream: CUstream,
+    ) -> CUresult;
     pub fn cuMemHostAlloc(pp: *mut *mut c_void, bytesize: usize, flags: c_uint) -> CUresult;
     pub fn cuMemFreeHost(p: *mut c_void) -> CUresult;
     pub fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult;
@@ -216,6 +321,52 @@ unsafe extern "C" {
         nodes: *mut CUgraphNode,
         num_nodes: *mut usize,
     ) -> CUresult;
+
+    #[cfg(feature = "nccl")]
+    pub fn ncclGetVersion(version: *mut c_int) -> ncclResult_t;
+    #[cfg(feature = "nccl")]
+    pub fn ncclGetUniqueId(unique_id: *mut ncclUniqueId) -> ncclResult_t;
+    #[cfg(feature = "nccl")]
+    pub fn ncclCommInitRankConfig(
+        comm: *mut ncclComm_t,
+        nranks: c_int,
+        unique_id: ncclUniqueId,
+        rank: c_int,
+        config: *mut ncclConfig_t,
+    ) -> ncclResult_t;
+    #[cfg(feature = "nccl")]
+    pub fn ncclCommGetAsyncError(comm: ncclComm_t, async_error: *mut ncclResult_t) -> ncclResult_t;
+    #[cfg(feature = "nccl")]
+    pub fn ncclCommFinalize(comm: ncclComm_t) -> ncclResult_t;
+    #[cfg(feature = "nccl")]
+    pub fn ncclCommAbort(comm: ncclComm_t) -> ncclResult_t;
+    #[cfg(feature = "nccl")]
+    pub fn ncclCommDestroy(comm: ncclComm_t) -> ncclResult_t;
+    #[cfg(feature = "nccl")]
+    pub fn ncclAllReduce(
+        send_buffer: *const c_void,
+        receive_buffer: *mut c_void,
+        count: usize,
+        data_type: ncclDataType_t,
+        operation: ncclRedOp_t,
+        comm: ncclComm_t,
+        stream: CUstream,
+    ) -> ncclResult_t;
+    #[cfg(feature = "nccl")]
+    pub fn ncclAllGather(
+        send_buffer: *const c_void,
+        receive_buffer: *mut c_void,
+        send_count: usize,
+        data_type: ncclDataType_t,
+        comm: ncclComm_t,
+        stream: CUstream,
+    ) -> ncclResult_t;
+    #[cfg(feature = "nccl")]
+    pub fn ncclGetErrorString(result: ncclResult_t) -> *const c_char;
+    #[cfg(feature = "nccl")]
+    pub fn ncclGroupStart() -> ncclResult_t;
+    #[cfg(feature = "nccl")]
+    pub fn ncclGroupEnd() -> ncclResult_t;
 
     pub fn cuEventCreate(event: *mut CUevent, flags: c_uint) -> CUresult;
     pub fn cuEventRecord(event: CUevent, stream: CUstream) -> CUresult;

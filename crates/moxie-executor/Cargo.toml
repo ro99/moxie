@@ -16,7 +16,8 @@ driver = ["moxie-cuda/driver", "moxie-kernels/fatbin"]
 # Raw page mutation remains available only to the qualification harness.
 paged-attention-binding = ["driver", "dep:moxie-state"]
 paged-attention-test-hooks = ["paged-attention-binding", "moxie-cuda/test-hooks"]
-cublas = ["paged-attention-binding", "moxie-cuda/cublas", "moxie-kernels/cublas"]
+nccl = ["driver", "moxie-cuda/nccl"]
+cublas = ["paged-attention-binding", "moxie-cuda/cublas", "moxie-kernels/cublas", "nccl"]
 # NUMA-aware host placement (task 0021, roadmap M2 item 3). One audited glibc
 # FFI block for thread affinity; on by default because the benchmark machine has
 # two nodes and the GPUs are split across them, and `HostPlacementControl`'s

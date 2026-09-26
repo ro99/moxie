@@ -50,6 +50,7 @@ pub const BF16_LINEAR: &str = "moxie_bf16_linear_v1";
 pub const DENSE_LINEAR_SPLIT: &str = "moxie_dense_linear_split_v1";
 pub const DENSE_LINEAR_PARTIAL: &str = "moxie_dense_linear_partial_v1";
 pub const TP_REDUCE_F32: &str = "moxie_tp_reduce_f32_v1";
+pub const TP_F32_TO_BF16: &str = "moxie_tp_f32_to_bf16_v1";
 pub const BF16_RMS_SUM: &str = "moxie_bf16_rms_sum_v1";
 pub const BF16_RMS_APPLY: &str = "moxie_bf16_rms_apply_v1";
 pub const BF16_RESIDUAL: &str = "moxie_bf16_residual_v1";

@@ -35,13 +35,16 @@ pub mod ffi;
 pub mod blas;
 
 #[cfg(feature = "driver")]
+pub mod nccl;
+
+#[cfg(feature = "driver")]
 mod driver;
 
 #[cfg(feature = "driver")]
 pub use driver::{
     CapturedGraph, DeviceBuffer, Event, Function, Module, ModuleImage, PeerContextToken,
-    PeerReadHandle, PeerReadOwner, PinnedHostBuffer, PtxSource, RankContext, ResolvedModule,
-    Stream, TrustedImage, copy_2d_async, device_count, init, query_device,
+    PinnedHostBuffer, PtxSource, RankContext, ResolvedModule, Stream, TrustedImage, copy_2d_async,
+    device_count, init, query_device,
 };
 
 #[cfg(feature = "cublas")]

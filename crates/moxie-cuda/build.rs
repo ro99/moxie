@@ -40,6 +40,45 @@ fn main() {
     }
     println!("cargo:rustc-link-lib=dylib=cuda");
 
+    if std::env::var_os("CARGO_FEATURE_NCCL").is_some() {
+        let library = std::path::Path::new("/usr/lib/x86_64-linux-gnu/libnccl.so");
+        if !library.is_file() {
+            panic!(
+                "moxie-cuda/nccl was enabled but {} is absent",
+                library.display()
+            );
+        }
+        let header = std::path::Path::new("/usr/include/nccl.h");
+        if !header.is_file() {
+            panic!(
+                "moxie-cuda/nccl was enabled but {} is absent",
+                header.display()
+            );
+        }
+        println!("cargo:rerun-if-changed={}", library.display());
+        println!("cargo:rerun-if-changed={}", header.display());
+        let header = std::fs::read_to_string(header)
+            .unwrap_or_else(|error| panic!("failed to read /usr/include/nccl.h: {error}"));
+        let version = ["NCCL_MAJOR", "NCCL_MINOR", "NCCL_PATCH"].map(|name| {
+            header
+                .lines()
+                .find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    (fields.next() == Some("#define") && fields.next() == Some(name))
+                        .then(|| fields.next())
+                        .flatten()
+                        .and_then(|value| value.parse::<u32>().ok())
+                })
+                .unwrap_or_else(|| panic!("{name} is absent or invalid in /usr/include/nccl.h"))
+        });
+        println!("cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu");
+        println!("cargo:rustc-link-lib=dylib=nccl");
+        println!(
+            "cargo:rustc-env=MOXIE_NCCL_HEADER_VERSION={}.{}.{}",
+            version[0], version[1], version[2]
+        );
+    }
+
     if std::env::var_os("CARGO_FEATURE_CUBLAS").is_some() {
         let cuda_home = std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
         let lib_dir = std::path::Path::new(&cuda_home).join("lib64");

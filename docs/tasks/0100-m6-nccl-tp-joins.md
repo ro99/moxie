@@ -275,3 +275,31 @@ commit.
   match.
 
 ## Result, filled after work
+
+- Added the opt-in `moxie-cuda/nccl` communicator binding, runtime/header
+  version check, per-rank initialization, async readiness polling, abort and
+  checked finalize/destroy lifecycle. NCCL 2.31.2 matched the installed
+  headers on the two 3090 contexts.
+- Replaced peer joins with grouped status plus data collectives on each rank
+  stream. `JoinDrain` waits for both the CUDA event and `CommState::Ready`,
+  reads the in-place status, performs the one-rounding BF16 conversion or
+  gather interleave, drains that work, then releases the join resources and
+  stage plans. Removed the authorized peer-read wrappers and types while
+  preserving peer-access grants.
+- Reserve measurement: on each 3090, free device bytes moved from
+  `25,013,125,120` to `24,866,324,480` across NCCL initialization plus a
+  1 MiB FP32 all-reduce: `146,800,640` bytes (140 MiB). Both ranks measured
+  the same values. The full TP2 run's largest admitted join was a 5×128 BF16
+  Gather with a 2,560-byte collective range; its free-memory delta after
+  warm-up was 0 bytes on both ranks. The first 2×64 Gather allocated a lazy
+  27,262,976-byte NCCL workspace; the 1 MiB probe already included it. The
+  reserve is `ceil(146,800,640 / 16,777,216) × 16,777,216 = 150,994,944`
+  bytes (144 MiB) per rank, charged in `CollectiveBuffers` before init.
+- The status-word mutation (rank skips all collectives) made only
+  `nccl_status_poisons_both_ranks` fail by rendezvous deadline/loss; it was
+  reverted. The unmutated test passed and verified the typed status refusal,
+  unchanged frontiers and same-group byte-identical recovery.
+- Gates: `fmt`, workspace clippy, executor driver clippy without NCCL, with
+  NCCL, and with cuBLAS, xtask CUDA-feature clippy, arch-check, spec-check,
+  and the full `dense_tp2_device` suite with `nccl,cublas` passed. Workspace
+  tests, `test-gpu`, and `dense_tp2_cublas_device` are pending.

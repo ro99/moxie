@@ -79,6 +79,14 @@ extern "C" __global__ void moxie_tp_reduce_f32_v1(
     output[index] = __float2bfloat16_rn(__fadd_rn(rank_zero[index], rank_one[index]));
 }
 
+extern "C" __global__ void moxie_tp_f32_to_bf16_v1(
+    const float* input, __nv_bfloat16* output, unsigned long long elements) {
+    const unsigned long long index =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    output[index] = __float2bfloat16_rn(input[index]);
+}
+
 extern "C" __global__ void moxie_dense_embedding_v1(
     const unsigned long long* token_ids, const __nv_bfloat16* table,
     __nv_bfloat16* output, unsigned long long rows, unsigned long long vocab,

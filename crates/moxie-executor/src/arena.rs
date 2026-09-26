@@ -272,8 +272,6 @@ mod driver_binding {
     use std::cell::Cell;
 
     use moxie_cuda::{DeviceBuffer, Event, RankContext, Stream};
-    #[cfg(feature = "paged-attention-binding")]
-    use moxie_cuda::{PeerReadHandle, PeerReadOwner};
     use moxie_memory::{
         AllocateRefused, Allocation, Arena, ArenaOccupancy, Ledger, LedgerId,
         OutstandingAllocation, Reservation,
@@ -360,65 +358,6 @@ mod driver_binding {
                 .device_ptr()
                 .checked_add(self.offset())
                 .ok_or_else(|| invalid("range", "device address overflowed"))
-        }
-
-        /// Export a checked subrange to the peer worker, moving this range
-        /// into the owner guard until acknowledgement.
-        #[cfg(feature = "paged-attention-binding")]
-        pub(crate) fn export_peer_read_at(
-            self,
-            within: u64,
-            bytes: u64,
-        ) -> moxie_types::Result<(PeerReadHandle, PeerReadOwner<Self>)> {
-            let end = within
-                .checked_add(bytes)
-                .ok_or_else(|| invalid("source", "peer source extent overflowed"))?;
-            if end > self.bytes() {
-                return Err(invalid("source", "peer source exceeds its admitted range"));
-            }
-            let offset = self
-                .offset()
-                .checked_add(within)
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| invalid("source", "peer source offset is not addressable"))?;
-            let bytes = usize::try_from(bytes)
-                .map_err(|_| invalid("source", "peer source size is not addressable"))?;
-            let core = Rc::clone(&self.core);
-            // SAFETY: DeviceRange owns that range.
-            unsafe { core.buffer.export_peer_read_at(offset, bytes, self) }
-        }
-
-        /// Copy a peer worker's source handle into this checked destination
-        /// span. `moxie-cuda` acknowledges only after a destination event has
-        /// observed the copy complete.
-        #[cfg(feature = "paged-attention-binding")]
-        pub(crate) fn copy_from_peer_read_at(
-            &self,
-            within: u64,
-            handle: PeerReadHandle,
-            bytes: u64,
-            stream: &Stream<'ctx>,
-            deadline: std::time::Instant,
-        ) -> moxie_types::Result<()> {
-            let end = within
-                .checked_add(bytes)
-                .ok_or_else(|| invalid("destination", "peer destination extent overflowed"))?;
-            if end > self.bytes() {
-                return Err(invalid(
-                    "destination",
-                    "peer destination exceeds its admitted range",
-                ));
-            }
-            let offset = self
-                .offset()
-                .checked_add(within)
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| invalid("destination", "peer destination is not addressable"))?;
-            let bytes = usize::try_from(bytes)
-                .map_err(|_| invalid("destination", "peer destination size is not addressable"))?;
-            self.core
-                .buffer
-                .copy_from_peer_read_at(offset, handle, 0, bytes, stream, deadline)
         }
 
         /// Enqueue a checked copy while a higher-level operation lease owns

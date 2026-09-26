@@ -8,11 +8,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use moxie_cuda::{
-    Event, Module, ModuleImage, PeerContextToken, PeerReadHandle, RankContext, Stream, TrustedImage,
-};
+use moxie_cuda::{Event, Module, ModuleImage, PeerContextToken, RankContext, Stream, TrustedImage};
 use moxie_graph::{Graph, LinearInputSlice, OracleRegistry, ValueId, ValueRole};
-use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, StageSpan};
+use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, Reservation, StageSpan};
 use moxie_plan::{
     Join, Stage, StageGraph, TensorParallelLowering, build_stage_graph,
     value_bytes as plan_value_bytes,
@@ -23,6 +21,8 @@ use moxie_types::{
     Scope, StateTransactionId, SymbolTable, Tier,
 };
 
+use moxie_cuda::nccl::{CommState, Communicator, DataType as NcclDataType, NcclId};
+
 use crate::arena::{DeviceArena, DeviceRange, OperationLease};
 use crate::chain::{OwnedBinding, SelectedAdmitRefused, SelectedCompletion, SelectedReservedPlan};
 use crate::dense::{DenseGraphStep, DenseOperation};
@@ -31,6 +31,14 @@ use crate::paged_attention::device::{PagedAttentionRun, Staging, with_paged_writ
 use crate::tensor_parallel::{RankDeclaration, RankRendezvous};
 
 const ALIGNMENT: u64 = 256;
+// Per-rank delta: 146,800,640 bytes for NCCL init plus a 1 MiB all-reduce on
+// both 3090s (25,013,125,120 → 24,866,324,480 free bytes). The largest
+// admitted Gather was 5×128 BF16 values (2,560-byte collective range); after
+// the first-join 27,262,976-byte lazy allocation, it added 0 bytes. The 1 MiB
+// probe already includes that lazy allocation. 146,800,640 rounded up to the
+// next 16 MiB is 150,994,944 bytes.
+const NCCL_DEVICE_RESERVE_BYTES: u64 = 144 * 1024 * 1024;
+const JOIN_STATUS_BYTES: u64 = 4;
 
 /// Per-rank boundary values and their admitted device arena.
 #[derive(Debug)]
@@ -60,6 +68,10 @@ const OP_COMMIT_PREPARE: u16 = 10;
 const OP_COMMIT_APPLY: u16 = 11;
 const OP_SHUTDOWN: u16 = 12;
 const OP_STATS: u16 = 13;
+const OP_JOIN_DRAIN: u16 = 14;
+const OP_CLOSE_PREPARE: u16 = 15;
+const OP_CLOSE_DESTROY: u16 = 16;
+const OP_CLOSE_RELEASE: u16 = 17;
 
 /// Inputs used to initialize both workers. Device capacity is measured after
 /// each worker has acquired its own context; the shared host snapshot is only
@@ -108,6 +120,11 @@ enum WorkerCommand {
     JoinCopy {
         join: Join,
         declaration: crate::GatherDeclaration,
+        fail_after_prepare: bool,
+    },
+    JoinDrain {
+        join: Join,
+        declaration: crate::GatherDeclaration,
     },
     Cleanup,
     Abort(Option<StateTransactionId>),
@@ -121,7 +138,15 @@ enum WorkerCommand {
         fail_prepare: bool,
     },
     Stats,
+    ClosePrepare,
+    CloseDestroy,
+    CloseRelease,
     Shutdown,
+}
+
+enum StartupIdChannel {
+    Generate(Sender<Result<NcclId>>),
+    Receive(Receiver<Result<NcclId>>),
 }
 
 #[derive(Debug)]
@@ -177,8 +202,11 @@ enum StartupExit {
 #[derive(Debug)]
 struct CollectiveTemp<'ctx> {
     source: ValueId,
-    output: Option<crate::DeviceRange<'ctx>>,
-    scratch: Option<crate::DeviceRange<'ctx>>,
+    arena: Option<DeviceArena<'ctx>>,
+    status: Option<DeviceRange<'ctx>>,
+    data: Option<DeviceRange<'ctx>>,
+    dummy: Option<DeviceRange<'ctx>>,
+    joined_output: Option<DeviceRange<'ctx>>,
     local_source: Option<crate::DeviceRange<'ctx>>,
     module: Option<moxie_cuda::ResolvedModule<'ctx>>,
 }
@@ -194,7 +222,9 @@ struct WorkerState<'ctx> {
     held: Held<'ctx>,
     transaction: Option<StateTransactionId>,
     temp: Option<CollectiveTemp<'ctx>>,
-    rank: usize,
+    communicator: Option<Communicator<'ctx>>,
+    nccl_reservation: Option<Reservation>,
+    preserve_communicator_on_loss: bool,
 }
 
 /// Owns the rank threads and their command channels. CUDA values never leave
@@ -203,9 +233,6 @@ struct WorkerState<'ctx> {
 pub struct DenseRankWorkers {
     commands: [Sender<WorkerEnvelope>; 2],
     threads: [Option<JoinHandle<()>>; 2],
-    /// Kept until shutdown so neither peer-read channel can disconnect while
-    /// a destination worker is waiting for its owner's one-shot handle.
-    _peer_reads: [Sender<PeerReadHandle>; 2],
     rendezvous: Arc<RankRendezvous>,
     committed_frontiers: Arc<[AtomicU64; 2]>,
     published_frontiers: Arc<[AtomicU64; 2]>,
@@ -219,6 +246,8 @@ pub struct DenseRankWorkers {
     stall_next: Option<usize>,
     #[cfg(feature = "paged-attention-test-hooks")]
     fail_commit_next: Option<usize>,
+    #[cfg(feature = "paged-attention-test-hooks")]
+    fail_join_next: Option<usize>,
 }
 
 impl DenseRankWorkers {
@@ -235,8 +264,7 @@ impl DenseRankWorkers {
         let published_frontiers = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
         let (commands0, receiver0) = mpsc::channel();
         let (commands1, receiver1) = mpsc::channel();
-        let (peer_read0, peer_read_rx0) = mpsc::channel();
-        let (peer_read1, peer_read_rx1) = mpsc::channel();
+        let (startup_id_tx, startup_id_rx) = mpsc::channel();
         let (startup_context_tx0, startup_context_rx0) = mpsc::channel();
         let (startup_context_tx1, startup_context_rx1) = mpsc::channel();
         let (peer_context_tx0, peer_context_rx0) = mpsc::channel();
@@ -261,8 +289,7 @@ impl DenseRankWorkers {
                            startup_outcome: Receiver<StartupOutcome>,
                            startup_disabled: Sender<StartupDisabled>,
                            startup_exit: Receiver<StartupExit>,
-                           peer_send: Sender<PeerReadHandle>,
-                           peer_receive: Receiver<PeerReadHandle>,
+                           startup_id: StartupIdChannel,
                            ready: Sender<Result<()>>,
                            startup_deadline: Instant| {
             let worker_config = config.clone();
@@ -282,8 +309,7 @@ impl DenseRankWorkers {
                         startup_outcome,
                         startup_disabled,
                         startup_exit,
-                        peer_send,
-                        peer_receive,
+                        startup_id,
                         ready,
                         startup_deadline,
                         shared,
@@ -306,8 +332,7 @@ impl DenseRankWorkers {
             startup_outcome_rx0,
             startup_disabled_tx0,
             startup_exit_rx0,
-            peer_read0.clone(),
-            peer_read_rx1,
+            StartupIdChannel::Generate(startup_id_tx),
             ready0,
             deadline,
         )?;
@@ -320,8 +345,7 @@ impl DenseRankWorkers {
             startup_outcome_rx1,
             startup_disabled_tx1,
             startup_exit_rx1,
-            peer_read1.clone(),
-            peer_read_rx0,
+            StartupIdChannel::Receive(startup_id_rx),
             ready1,
             deadline,
         ) {
@@ -426,7 +450,6 @@ impl DenseRankWorkers {
         Ok(Self {
             commands: [commands0, commands1],
             threads: [Some(first), Some(second)],
-            _peer_reads: [peer_read0, peer_read1],
             rendezvous,
             committed_frontiers,
             published_frontiers,
@@ -440,6 +463,8 @@ impl DenseRankWorkers {
             stall_next: None,
             #[cfg(feature = "paged-attention-test-hooks")]
             fail_commit_next: None,
+            #[cfg(feature = "paged-attention-test-hooks")]
+            fail_join_next: None,
         })
     }
 
@@ -478,6 +503,11 @@ impl DenseRankWorkers {
     #[cfg(feature = "paged-attention-test-hooks")]
     pub fn refuse_next_commit_prepare(&mut self, rank: usize) {
         self.fail_commit_next = Some(rank);
+    }
+
+    #[cfg(feature = "paged-attention-test-hooks")]
+    pub fn fail_next_join_after_prepare(&mut self, rank: usize) {
+        self.fail_join_next = Some(rank);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -632,18 +662,35 @@ impl DenseRankWorkers {
                             OP_JOIN_PREPARE,
                             join_declarations,
                         )?;
+                        let fail_after_prepare = [self.take_join_fault(0), self.take_join_fault(1)];
                         self.pair_command(
                             [
                                 WorkerCommand::JoinCopy {
                                     join: *join,
                                     declaration: d0,
+                                    fail_after_prepare: fail_after_prepare[0],
                                 },
                                 WorkerCommand::JoinCopy {
                                     join: *join,
                                     declaration: d1,
+                                    fail_after_prepare: fail_after_prepare[1],
                                 },
                             ],
                             OP_JOIN_COPY,
+                            join_declarations,
+                        )?;
+                        self.pair_command(
+                            [
+                                WorkerCommand::JoinDrain {
+                                    join: *join,
+                                    declaration: d0,
+                                },
+                                WorkerCommand::JoinDrain {
+                                    join: *join,
+                                    declaration: d1,
+                                },
+                            ],
+                            OP_JOIN_DRAIN,
                             join_declarations,
                         )?;
                     }
@@ -844,15 +891,39 @@ impl DenseRankWorkers {
     /// Stop both workers on their owner threads after returning every run and
     /// reservation. A lost group remains parked with its contexts and grants.
     pub fn close(mut self) -> Result<()> {
-        self.shutdown_inner()?;
-        self.closed = true;
-        Ok(())
+        match self.shutdown_inner() {
+            Ok(()) => {
+                self.closed = true;
+                Ok(())
+            }
+            Err(error) => {
+                // A refused close retains rank contexts, communicators and
+                // their charges; do not let Drop retry or release the group.
+                core::mem::forget(self);
+                Err(error)
+            }
+        }
     }
 
     fn shutdown_inner(&mut self) -> Result<()> {
         if self.closed {
             return Ok(());
         }
+        self.pair_command(
+            [WorkerCommand::ClosePrepare, WorkerCommand::ClosePrepare],
+            OP_CLOSE_PREPARE,
+            [([0; 4], Precision::F32); 2],
+        )?;
+        self.pair_command(
+            [WorkerCommand::CloseDestroy, WorkerCommand::CloseDestroy],
+            OP_CLOSE_DESTROY,
+            [([0; 4], Precision::F32); 2],
+        )?;
+        self.pair_command(
+            [WorkerCommand::CloseRelease, WorkerCommand::CloseRelease],
+            OP_CLOSE_RELEASE,
+            [([0; 4], Precision::F32); 2],
+        )?;
         let values = self.pair_command(
             [WorkerCommand::Shutdown, WorkerCommand::Shutdown],
             OP_SHUTDOWN,
@@ -1009,6 +1080,21 @@ impl DenseRankWorkers {
     fn take_commit_fault(&mut self, _rank: usize) -> bool {
         false
     }
+
+    #[cfg(feature = "paged-attention-test-hooks")]
+    fn take_join_fault(&mut self, rank: usize) -> bool {
+        if self.fail_join_next == Some(rank) {
+            self.fail_join_next = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(not(feature = "paged-attention-test-hooks"))]
+    fn take_join_fault(&mut self, _rank: usize) -> bool {
+        false
+    }
 }
 
 impl Drop for DenseRankWorkers {
@@ -1138,8 +1224,7 @@ fn rank_worker(
     startup_outcome: Receiver<StartupOutcome>,
     startup_disabled: Sender<StartupDisabled>,
     startup_exit: Receiver<StartupExit>,
-    peer_send: Sender<PeerReadHandle>,
-    peer_receive: Receiver<PeerReadHandle>,
+    startup_id: StartupIdChannel,
     ready: Sender<Result<()>>,
     startup_deadline: Instant,
     rendezvous: Arc<RankRendezvous>,
@@ -1223,27 +1308,112 @@ fn rank_worker(
         StartupOutcome::Proceed => park_lost(),
     }
 
-    let initialized: Result<_> = (|| {
-        let stream = Stream::new(&context)?;
-        let capability = context.capability().clone();
-        let device = CapacitySnapshot::measured(&context.measure()?, 1 << 20)?;
-        let ledger = Ledger::new([device, config.host_capacity.clone()])?;
-        let state = DeviceKvSequence::new(config.geometry.clone())?;
-        let (ledger, runs) = admit_worker_runs(
-            &context,
-            ledger,
-            &state,
-            &config.geometry,
-            config.heads,
-            config.max_rows,
-        )?;
-        Ok((stream, capability, state, ledger, runs))
-    })();
-    let (stream, capability, state, ledger, runs) = match initialized {
-        Ok(initialized) => initialized,
+    let nccl_id = match startup_id {
+        StartupIdChannel::Generate(sender) => match NcclId::generate(&context) {
+            Ok(id) => {
+                if sender.send(Ok(id)).is_err() {
+                    let lost = rendezvous.lose("rank 1 did not receive the NCCL unique id");
+                    let _ = ready.send(Err(lost));
+                    park_lost();
+                }
+                id
+            }
+            Err(error) => {
+                let _ = sender.send(Err(error.clone()));
+                let lost =
+                    rendezvous.lose(format!("rank {rank} could not create an NCCL id: {error}"));
+                let _ = ready.send(Err(lost));
+                park_lost();
+            }
+        },
+        StartupIdChannel::Receive(receiver) => match receiver
+            .recv_timeout(startup_deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(Ok(id)) => id,
+            Ok(Err(error)) => {
+                let lost = rendezvous.lose(format!("rank 0 could not create an NCCL id: {error}"));
+                let _ = ready.send(Err(lost));
+                park_lost();
+            }
+            Err(_) => {
+                let lost = rendezvous
+                    .lose("rank 1 did not receive the NCCL unique id before startup deadline");
+                let _ = ready.send(Err(lost));
+                park_lost();
+            }
+        },
+    };
+
+    let stream = match Stream::new(&context) {
+        Ok(stream) => stream,
         Err(error) => {
             let lost = rendezvous.lose(format!(
-                "rank {rank} startup after peer grant failed: {error}"
+                "rank {rank} startup could not create a stream: {error}"
+            ));
+            let _ = ready.send(Err(lost));
+            park_lost();
+        }
+    };
+    let capability = context.capability().clone();
+    let measurement = match context.measure() {
+        Ok(measurement) => measurement,
+        Err(error) => {
+            let lost = rendezvous.lose(format!("rank {rank} startup measurement failed: {error}"));
+            let _ = ready.send(Err(lost));
+            park_lost();
+        }
+    };
+    let device = match CapacitySnapshot::measured(&measurement, 1 << 20) {
+        Ok(device) => device,
+        Err(error) => {
+            let lost = rendezvous.lose(format!("rank {rank} startup capacity failed: {error}"));
+            let _ = ready.send(Err(lost));
+            park_lost();
+        }
+    };
+    let ledger = match Ledger::new([device, config.host_capacity.clone()]) {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            let lost = rendezvous.lose(format!("rank {rank} startup ledger failed: {error}"));
+            let _ = ready.send(Err(lost));
+            park_lost();
+        }
+    };
+    let state = match DeviceKvSequence::new(config.geometry.clone()) {
+        Ok(state) => state,
+        Err(error) => {
+            let lost = rendezvous.lose(format!("rank {rank} startup state failed: {error}"));
+            let _ = ready.send(Err(lost));
+            park_lost();
+        }
+    };
+    let (mut ledger, runs) = match admit_worker_runs(
+        &context,
+        ledger,
+        &state,
+        &config.geometry,
+        config.heads,
+        config.max_rows,
+    ) {
+        Ok((ledger, runs)) => (ledger, runs),
+        Err(error) => {
+            let lost =
+                rendezvous.lose(format!("rank {rank} startup run admission failed: {error}"));
+            let _ = ready.send(Err(lost));
+            park_lost();
+        }
+    };
+    let nccl_reservation = match admit_nccl_reserve(&mut ledger, context.uuid()) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            for run in runs {
+                if let Err(refused) = run.close(&mut ledger) {
+                    let _ = refused;
+                    break;
+                }
+            }
+            let lost = rendezvous.lose(format!(
+                "rank {rank} NCCL reserve admission failed: {error}"
             ));
             let _ = ready.send(Err(lost));
             park_lost();
@@ -1259,16 +1429,25 @@ fn rank_worker(
         held: Held::default(),
         transaction: None,
         temp: None,
-        rank,
+        communicator: None,
+        nccl_reservation: Some(nccl_reservation),
+        preserve_communicator_on_loss: false,
     };
+    match Communicator::init(&context, 2, nccl_id, rank as i32, startup_deadline) {
+        Ok(communicator) => worker.communicator = Some(communicator),
+        Err(error) => {
+            let lost = rendezvous.lose(format!("rank {rank} NCCL initialization failed: {error}"));
+            let _ = ready.send(Err(lost));
+            park_lost();
+        }
+    }
     if ready.send(Ok(())).is_err() {
+        worker.abort_communicator();
         park_lost();
     }
     worker_loop(
         rank,
         commands,
-        peer_send,
-        peer_receive,
         &mut worker,
         &rendezvous,
         committed_frontiers,
@@ -1345,12 +1524,22 @@ pub(crate) fn admit_worker_runs<'ctx>(
     Ok((ledger, runs))
 }
 
+fn admit_nccl_reserve(ledger: &mut Ledger, device: moxie_types::DeviceUuid) -> Result<Reservation> {
+    let mut request = PlanRequest::new("NCCL communicator reserve", ["startup"])?;
+    request.buffer(BufferRequest::try_new(
+        "NCCL communicator device reserve",
+        Scope::Device(device),
+        Tier::Device(DeviceTier::CollectiveBuffers),
+        NCCL_DEVICE_RESERVE_BYTES,
+        StageSpan::at(0),
+    )?)?;
+    ledger.admit(&request).map_err(Into::into)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker_loop<'ctx>(
     rank: usize,
     commands: Receiver<WorkerEnvelope>,
-    peer_send: Sender<PeerReadHandle>,
-    peer_receive: Receiver<PeerReadHandle>,
     worker: &mut WorkerState<'ctx>,
     rendezvous: &RankRendezvous,
     committed_frontiers: Arc<[AtomicU64; 2]>,
@@ -1363,6 +1552,7 @@ fn worker_loop<'ctx>(
                 rendezvous.lose(format!(
                     "rank {rank} command channel closed before shutdown"
                 ));
+                worker.abort_communicator();
                 park_lost();
             }
         };
@@ -1371,6 +1561,7 @@ fn worker_loop<'ctx>(
                 result: Err(error),
                 rounds: 0,
             });
+            worker.abort_communicator();
             park_lost();
         }
         if envelope.stall {
@@ -1400,13 +1591,14 @@ fn worker_loop<'ctx>(
                     rounds,
                 });
                 if rendezvous.lost().is_some() {
+                    worker.abort_communicator();
                     park_lost();
                 }
             }
             command => {
                 let shutdown = matches!(&command, WorkerCommand::Shutdown);
                 let deadline = envelope.deadline;
-                let local = worker.execute(command, &peer_send, &peer_receive, deadline);
+                let local = worker.execute(command, deadline);
                 if let Ok(rows) = worker.state.published_rows() {
                     published_frontiers[rank].store(rows, Ordering::Release);
                 }
@@ -1415,6 +1607,7 @@ fn worker_loop<'ctx>(
                 let result = agreed.map(|()| local).and_then(core::convert::identity);
                 let _ = envelope.reply.send(WorkerReply { result, rounds: 1 });
                 if rendezvous.lost().is_some() {
+                    worker.abort_communicator();
                     park_lost();
                 }
                 if shutdown {
@@ -1548,13 +1741,130 @@ pub(crate) fn commit_capacity_error(count: usize) -> Error {
 }
 
 impl<'ctx> WorkerState<'ctx> {
-    fn execute(
-        &mut self,
-        command: WorkerCommand,
-        peer_send: &Sender<PeerReadHandle>,
-        peer_receive: &Receiver<PeerReadHandle>,
-        deadline: Instant,
-    ) -> Result<WorkerValue> {
+    fn abort_communicator(&mut self) {
+        if self.preserve_communicator_on_loss {
+            return;
+        }
+        if let Some(communicator) = self.communicator.take() {
+            let _ = communicator.abort();
+        }
+    }
+
+    fn drain(&mut self, deadline: Instant) -> Result<()> {
+        let event = match Event::new(self.ctx) {
+            Ok(event) => event,
+            Err(error) => {
+                self.abort_communicator();
+                return Err(device_lost(
+                    self.ctx.ordinal(),
+                    format!("NCCL stream completion event could not be created ({error})"),
+                ));
+            }
+        };
+        if let Err(error) = event.record(self.stream) {
+            self.abort_communicator();
+            return Err(device_lost(
+                self.ctx.ordinal(),
+                format!("NCCL stream completion event could not be recorded ({error})"),
+            ));
+        }
+        loop {
+            let communicator_ready = if let Some(communicator) = &self.communicator {
+                match communicator.poll() {
+                    Ok(CommState::Ready) => true,
+                    Ok(CommState::InProgress) => false,
+                    Err(error) => {
+                        self.abort_communicator();
+                        return Err(device_lost(
+                            self.ctx.ordinal(),
+                            format!("NCCL asynchronous operation failed ({error})"),
+                        ));
+                    }
+                }
+            } else {
+                return Err(device_lost(
+                    self.ctx.ordinal(),
+                    "rank stream drain has no NCCL communicator".into(),
+                ));
+            };
+            match event.is_complete() {
+                Ok(true) if communicator_ready => return Ok(()),
+                Ok(true) | Ok(false) => {}
+                Err(error) => {
+                    self.abort_communicator();
+                    return Err(device_lost(
+                        self.ctx.ordinal(),
+                        format!("NCCL stream completion could not be queried ({error})"),
+                    ));
+                }
+            }
+            if Instant::now() >= deadline {
+                self.abort_communicator();
+                return Err(device_lost(
+                    self.ctx.ordinal(),
+                    "rank stream carrying NCCL work missed the group deadline".into(),
+                ));
+            }
+            thread::yield_now();
+        }
+    }
+
+    fn prepare_close(&mut self, deadline: Instant) -> Result<()> {
+        self.drain(deadline)?;
+        self.close_runs()?;
+        let Some(communicator) = self.communicator.as_mut() else {
+            return Err(device_lost(
+                self.ctx.ordinal(),
+                "worker close found no NCCL communicator".into(),
+            ));
+        };
+        if let Err(error) = communicator.finalize(deadline) {
+            self.abort_communicator();
+            return Err(device_lost(
+                self.ctx.ordinal(),
+                format!("NCCL communicator could not finalize ({error})"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn destroy_communicator(&mut self) -> Result<()> {
+        let Some(communicator) = self.communicator.take() else {
+            return Err(device_lost(
+                self.ctx.ordinal(),
+                "worker close found no NCCL communicator to destroy".into(),
+            ));
+        };
+        // SAFETY: ClosePrepare drained the stream and completed communicator
+        // finalization before the paired destroy command.
+        match unsafe { communicator.destroy() } {
+            Ok(()) => Ok(()),
+            Err((communicator, error)) => {
+                self.communicator = Some(communicator);
+                self.preserve_communicator_on_loss = true;
+                Err(error)
+            }
+        }
+    }
+
+    fn release_nccl_reservation(&mut self) -> Result<()> {
+        let Some(reservation) = self.nccl_reservation.take() else {
+            return Err(device_lost(
+                self.ctx.ordinal(),
+                "worker close found no NCCL reservation".into(),
+            ));
+        };
+        if let Err(refused) = self.ledger.release(reservation) {
+            self.nccl_reservation = Some(refused.reservation);
+            return Err(device_lost(
+                self.ctx.ordinal(),
+                format!("NCCL reservation could not be released ({})", refused.error),
+            ));
+        }
+        Ok(())
+    }
+
+    fn execute(&mut self, command: WorkerCommand, deadline: Instant) -> Result<WorkerValue> {
         match command {
             WorkerCommand::Begin { boundary_bytes } => {
                 let mut all_runs_observed = true;
@@ -1607,7 +1917,7 @@ impl<'ctx> WorkerState<'ctx> {
                 Ok(WorkerValue::Stage(declaration))
             }
             WorkerCommand::Drain => {
-                drain_rank(self.ctx, self.stream, deadline)?;
+                self.drain(deadline)?;
                 Ok(WorkerValue::Unit)
             }
             WorkerCommand::ClosePlans => {
@@ -1622,8 +1932,16 @@ impl<'ctx> WorkerState<'ctx> {
                 self.prepare_join(join, declaration, source)?;
                 Ok(WorkerValue::Unit)
             }
-            WorkerCommand::JoinCopy { join, declaration } => {
-                self.copy_join(join, declaration, peer_send, peer_receive, deadline)?;
+            WorkerCommand::JoinCopy {
+                join,
+                declaration,
+                fail_after_prepare,
+            } => {
+                self.copy_join(join, declaration, fail_after_prepare)?;
+                Ok(WorkerValue::Unit)
+            }
+            WorkerCommand::JoinDrain { join, declaration } => {
+                self.drain_join(join, declaration, deadline)?;
                 Ok(WorkerValue::Unit)
             }
             WorkerCommand::Cleanup => {
@@ -1672,8 +1990,28 @@ impl<'ctx> WorkerState<'ctx> {
                     })
             }
             WorkerCommand::Commit { .. } => unreachable!("commit handled by worker loop"),
+            WorkerCommand::ClosePrepare => {
+                self.prepare_close(deadline)?;
+                Ok(WorkerValue::Unit)
+            }
+            WorkerCommand::CloseDestroy => {
+                self.destroy_communicator()?;
+                Ok(WorkerValue::Unit)
+            }
+            WorkerCommand::CloseRelease => {
+                self.release_nccl_reservation()?;
+                Ok(WorkerValue::Unit)
+            }
             WorkerCommand::Shutdown => {
-                self.close_runs()?;
+                if self.communicator.is_some()
+                    || self.nccl_reservation.is_some()
+                    || !self.ledger.outstanding().is_empty()
+                {
+                    return Err(device_lost(
+                        self.ctx.ordinal(),
+                        "worker shutdown retains an NCCL resource".into(),
+                    ));
+                }
                 Ok(WorkerValue::Closed)
             }
         }
@@ -1860,6 +2198,14 @@ impl<'ctx> WorkerState<'ctx> {
         let part_bytes = elements
             .checked_mul(element)
             .ok_or_else(|| invalid("collective", "join byte count overflowed"))?;
+        let collective_bytes = match join {
+            Join::Gather { .. } => part_bytes
+                .checked_mul(2)
+                .ok_or_else(|| invalid("collective", "gather buffer size overflowed"))?,
+            Join::Reduce { .. } => elements
+                .checked_mul(4)
+                .ok_or_else(|| invalid("collective", "reduce buffer size overflowed"))?,
+        };
         let output_bytes = match join {
             Join::Gather { .. } => part_bytes
                 .checked_mul(2)
@@ -1868,10 +2214,52 @@ impl<'ctx> WorkerState<'ctx> {
                 .checked_mul(2)
                 .ok_or_else(|| invalid("collective", "reduce output size overflowed"))?,
         };
+        let capacity = [JOIN_STATUS_BYTES, collective_bytes, part_bytes]
+            .into_iter()
+            .try_fold(0u64, |total, bytes| {
+                let aligned = bytes
+                    .checked_add(ALIGNMENT - 1)
+                    .map(|value| value / ALIGNMENT * ALIGNMENT)
+                    .ok_or_else(|| invalid("collective", "temporary size overflowed"))?;
+                total
+                    .checked_add(aligned)
+                    .ok_or_else(|| invalid("collective", "temporary size overflowed"))
+            })?;
+        let mut request = PlanRequest::new("tensor-parallel join buffers", ["join"])?;
+        request.buffer(BufferRequest::try_new(
+            "status, collective and dummy buffers",
+            Scope::Device(self.ctx.uuid()),
+            Tier::Device(DeviceTier::CollectiveBuffers),
+            capacity,
+            StageSpan::at(0),
+        )?)?;
+        let reservation = self.ledger.admit(&request)?;
+        let arena = match DeviceArena::create(
+            &self.ledger,
+            reservation,
+            self.ctx,
+            DeviceTier::CollectiveBuffers,
+            capacity,
+            "tensor-parallel join buffers",
+        ) {
+            Ok(arena) => arena,
+            Err(refused) => {
+                return match self.ledger.release(refused.reservation) {
+                    Ok(()) => Err(refused.error),
+                    Err(held) => Err(device_lost(
+                        self.ctx.ordinal(),
+                        format!("join reservation could not be released ({})", held.error),
+                    )),
+                };
+            }
+        };
         self.temp = Some(CollectiveTemp {
             source,
-            output: None,
-            scratch: None,
+            arena: Some(arena),
+            status: None,
+            data: None,
+            dummy: None,
+            joined_output: None,
             local_source: None,
             module: None,
         });
@@ -1880,18 +2268,33 @@ impl<'ctx> WorkerState<'ctx> {
             .arena
             .allocate(output_bytes, ALIGNMENT, "collective output")
             .map_err(|refused| refused.error)?;
-        self.temp.as_mut().expect("temporary is installed").output = Some(output);
-        let scratch = boundary
-            .arena
-            .allocate(part_bytes, ALIGNMENT, "collective peer partial")
-            .map_err(|refused| refused.error)?;
-        self.temp.as_mut().expect("temporary is installed").scratch = Some(scratch);
+        self.temp
+            .as_mut()
+            .expect("temporary is installed")
+            .joined_output = Some(output);
+        let temp = self.temp.as_mut().expect("temporary is installed");
+        let arena = temp.arena.as_mut().expect("temporary arena is open");
+        temp.status = Some(
+            arena
+                .allocate(JOIN_STATUS_BYTES, ALIGNMENT, "join status")
+                .map_err(|refused| refused.error)?,
+        );
+        temp.data = Some(
+            arena
+                .allocate(collective_bytes, ALIGNMENT, "join collective")
+                .map_err(|refused| refused.error)?,
+        );
+        temp.dummy = Some(
+            arena
+                .allocate(part_bytes, ALIGNMENT, "join dummy source")
+                .map_err(|refused| refused.error)?,
+        );
         if matches!(join, Join::Reduce { .. }) {
             // SAFETY: the image is this build's pinned nvcc output.
             let image =
                 unsafe { TrustedImage::from_build_output(moxie_kernels::DENSE_GRAPH_FATBIN) }?;
             let module = Module::load(self.ctx, ModuleImage::Binary(image))?;
-            let module = module.resolve_all(&[moxie_kernels::TP_REDUCE_F32.to_string()])?;
+            let module = module.resolve_all(&[moxie_kernels::TP_F32_TO_BF16.to_string()])?;
             self.temp.as_mut().expect("temporary is installed").module = Some(module);
         }
         Ok(())
@@ -1901,25 +2304,10 @@ impl<'ctx> WorkerState<'ctx> {
         &mut self,
         join: Join,
         declaration: crate::GatherDeclaration,
-        peer_send: &Sender<PeerReadHandle>,
-        peer_receive: &Receiver<PeerReadHandle>,
-        deadline: Instant,
+        fail_after_prepare: bool,
     ) -> Result<()> {
-        let context = self.ctx;
         let stream = self.stream;
-        let rank = self.rank;
-        let ordinal = context.ordinal();
-        let temp = self
-            .temp
-            .as_mut()
-            .ok_or_else(|| invalid("collective", "join was not prepared"))?;
-        let source_value = temp.source;
-        let (_, source) = self
-            .held
-            .plans
-            .last_mut()
-            .ok_or_else(|| invalid("collective", "join has no live stage plan"))?
-            .take_range_for_value(source_value)?;
+        let mut failed = fail_after_prepare;
         let elements = declaration
             .rows
             .checked_mul(declaration.columns)
@@ -1932,167 +2320,296 @@ impl<'ctx> WorkerState<'ctx> {
         let part_bytes = elements
             .checked_mul(element_bytes)
             .ok_or_else(|| invalid("collective", "join source size overflowed"))?;
-        if source.bytes() < part_bytes {
-            return Err(invalid(
-                "collective",
-                "stage output is shorter than its declaration",
-            ));
-        }
-        let (handle, mut owner) = source.export_peer_read_at(0, part_bytes)?;
-        peer_send
-            .send(handle)
-            .map_err(|_| device_lost(ordinal, "peer worker stopped receiving ranges".into()))?;
-        let producer = Event::new(context)?;
-        producer.record(stream)?;
-        loop {
-            if producer.is_complete()? {
-                break;
+        let source_value = self
+            .temp
+            .as_ref()
+            .ok_or_else(|| invalid("collective", "join was not prepared"))?
+            .source;
+        if !failed {
+            let source = self
+                .held
+                .plans
+                .last_mut()
+                .ok_or_else(|| invalid("collective", "join has no live stage plan"))?
+                .take_range_for_value(source_value);
+            match source {
+                Ok((_, source)) => {
+                    if source.bytes() < part_bytes {
+                        failed = true;
+                    }
+                    self.temp
+                        .as_mut()
+                        .expect("join temporary remains")
+                        .local_source = Some(source);
+                }
+                Err(_) => failed = true,
             }
-            if Instant::now() >= deadline {
-                return Err(device_lost(
-                    ordinal,
-                    "join producer event missed the group deadline".into(),
-                ));
-            }
-            thread::yield_now();
         }
-        owner.signal_ready(&producer)?;
-        let peer = peer_receive
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| device_lost(ordinal, "peer range missed the group deadline".into()))?;
-        let boundary = self.held.boundary.as_mut().expect("step boundary is open");
-        let output = temp.output.as_ref().expect("output is allocated");
-        let scratch = temp.scratch.as_ref().expect("peer scratch is allocated");
-        let copied = scratch.copy_from_peer_read_at(0, peer, part_bytes, stream, deadline);
-        let source = owner.finish(deadline)?;
-        temp.local_source = Some(source);
-        copied?;
-        match join {
-            Join::Gather { output: original } => {
-                let row_bytes = declaration
-                    .columns
-                    .checked_mul(element_bytes)
-                    .ok_or_else(|| invalid("collective", "gather row size overflowed"))?;
-                let output_row = row_bytes
-                    .checked_mul(2)
-                    .ok_or_else(|| invalid("collective", "gather output row overflowed"))?;
-                for row in 0..declaration.rows {
-                    let row_offset = row
-                        .checked_mul(row_bytes)
-                        .ok_or_else(|| invalid("collective", "gather row offset overflowed"))?;
-                    let output_offset = row
-                        .checked_mul(output_row)
-                        .ok_or_else(|| invalid("collective", "gather output offset overflowed"))?;
-                    let local_offset = output_offset
-                        .checked_add(if rank == 0 { 0 } else { row_bytes })
-                        .ok_or_else(|| invalid("collective", "gather local offset overflowed"))?;
-                    let peer_offset = output_offset
-                        .checked_add(if rank == 0 { row_bytes } else { 0 })
-                        .ok_or_else(|| invalid("collective", "gather peer offset overflowed"))?;
-                    let source = temp
-                        .local_source
+        let temp = self.temp.as_mut().expect("join temporary remains");
+        let dummy = temp.dummy.as_ref().expect("dummy source is allocated");
+        let source_address = if failed {
+            dummy.device_address()?
+        } else {
+            match temp
+                .local_source
+                .as_ref()
+                .expect("successful join retains its local source")
+                .device_address()
+            {
+                Ok(address) => address,
+                Err(_) => {
+                    failed = true;
+                    dummy.device_address()?
+                }
+            }
+        };
+        let status_address = temp
+            .status
+            .as_ref()
+            .expect("join status is allocated")
+            .device_address()?;
+        let data_address = temp
+            .data
+            .as_ref()
+            .expect("join data is allocated")
+            .device_address()?;
+        let communicator = self.communicator.as_ref().ok_or_else(|| {
+            device_lost(
+                self.ctx.ordinal(),
+                "join has no live NCCL communicator".into(),
+            )
+        })?;
+        // SAFETY: the status word is an admitted device range retained through
+        // JoinDrain, and this rank's stream owns the ordered write.
+        unsafe { communicator.set_u32_async(status_address, u32::from(failed), stream)? };
+        communicator.group_start()?;
+        let enqueued = (|| {
+            // SAFETY: all ranges are admitted, large enough for these counts,
+            // and retained through the paired JoinDrain.
+            unsafe {
+                communicator.all_reduce_u32_max(status_address, status_address, 1, stream)?;
+                match join {
+                    Join::Reduce { .. } => communicator.all_reduce_f32_sum(
+                        source_address,
+                        data_address,
+                        usize::try_from(elements).map_err(|_| {
+                            invalid("collective", "join element count is too large")
+                        })?,
+                        stream,
+                    ),
+                    Join::Gather { .. } => communicator.all_gather(
+                        source_address,
+                        data_address,
+                        usize::try_from(elements).map_err(|_| {
+                            invalid("collective", "join element count is too large")
+                        })?,
+                        match declaration.precision {
+                            Precision::Bf16 => NcclDataType::Bf16,
+                            Precision::F32 => NcclDataType::F32,
+                            _ => unreachable!("prepare_join validates the join precision"),
+                        },
+                        stream,
+                    ),
+                }
+            }
+        })();
+        let ended = communicator.group_end();
+        enqueued?;
+        ended?;
+        Ok(())
+    }
+
+    fn drain_join(
+        &mut self,
+        join: Join,
+        _declaration: crate::GatherDeclaration,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.drain(deadline)?;
+        let status = self
+            .temp
+            .as_ref()
+            .and_then(|temp| temp.status.as_ref())
+            .ok_or_else(|| invalid("collective", "join status is absent"))?;
+        let mut status_bytes = [0u8; 4];
+        status.copy_to_host(&mut status_bytes).map_err(|error| {
+            device_lost(
+                self.ctx.ordinal(),
+                format!("join status could not be observed ({error})"),
+            )
+        })?;
+        let failed = u32::from_le_bytes(status_bytes) != 0;
+        if !failed {
+            let stream = self.stream;
+            let temp = self.temp.as_ref().expect("join temporary remains");
+            match join {
+                Join::Reduce { .. } => {
+                    let module = temp.module.as_ref().expect("conversion kernel is loaded");
+                    let input = temp
+                        .data
                         .as_ref()
-                        .expect("peer source acknowledgement returned its range");
-                    // SAFETY: output and scratch stay in `self.temp`; the
-                    // source is retained there after peer acknowledgement, and
-                    // the caller drains this stream before releasing the ranges.
+                        .expect("reduce output is allocated")
+                        .device_address()?;
+                    let mut input = input;
+                    let mut output = temp
+                        .joined_output
+                        .as_ref()
+                        .expect("joined output is allocated")
+                        .device_address()?;
+                    let mut count = _declaration
+                        .rows
+                        .checked_mul(_declaration.columns)
+                        .ok_or_else(|| invalid("collective", "join element count overflowed"))?;
+                    let mut params: [*mut c_void; 3] = [
+                        (&raw mut input).cast(),
+                        (&raw mut output).cast(),
+                        (&raw mut count).cast(),
+                    ];
+                    let grid = u32::try_from(count.div_ceil(256))
+                        .map_err(|_| invalid("collective", "reduce grid is too large"))?;
+                    // SAFETY: the one-input conversion ABI matches the admitted
+                    // FP32 sum and BF16 output ranges, retained through JoinDrain.
                     unsafe {
-                        output.copy_from_device_async_at(
-                            local_offset,
-                            source,
-                            row_offset,
-                            row_bytes,
+                        module.launch_async(
+                            0,
                             stream,
-                        )?;
-                        output.copy_from_device_async_at(
-                            peer_offset,
-                            scratch,
-                            row_offset,
-                            row_bytes,
-                            stream,
+                            (grid, 1, 1),
+                            (256, 1, 1),
+                            0,
+                            &mut params,
                         )?;
                     }
                 }
-                drain_rank(context, stream, deadline)?;
-                let source = temp
-                    .local_source
-                    .take()
-                    .expect("peer source acknowledgement returned its range");
-                release_join_source(&mut self.held.plans, source, ordinal)?;
-                let output_range = self
-                    .temp
-                    .as_mut()
-                    .expect("join temporary remains")
-                    .output
-                    .take()
-                    .unwrap();
-                boundary.values.insert(original, output_range);
-            }
-            Join::Reduce { output: original } => {
-                let module = temp.module.as_ref().expect("reduce kernel is loaded");
-                let source = temp
-                    .local_source
-                    .as_ref()
-                    .expect("peer source acknowledgement returned its range");
-                let mut rank_zero = if rank == 0 {
-                    source.device_address()?
-                } else {
-                    scratch.device_address()?
-                };
-                let mut rank_one = if rank == 0 {
-                    scratch.device_address()?
-                } else {
-                    source.device_address()?
-                };
-                let mut sum = output.device_address()?;
-                let mut count = elements;
-                let mut params: [*mut c_void; 4] = [
-                    (&raw mut rank_zero).cast(),
-                    (&raw mut rank_one).cast(),
-                    (&raw mut sum).cast(),
-                    (&raw mut count).cast(),
-                ];
-                let grid = u32::try_from(elements.div_ceil(256))
-                    .map_err(|_| invalid("collective", "reduce grid is too large"))?;
-                // SAFETY: the kernel arguments and their exact extents match
-                // moxie_tp_reduce_f32_v1; both sources remain held to drain.
-                unsafe {
-                    module.launch_async(0, stream, (grid, 1, 1), (256, 1, 1), 0, &mut params)?;
+                Join::Gather { .. } => {
+                    let gathered = temp.data.as_ref().expect("gather output is allocated");
+                    let output = temp
+                        .joined_output
+                        .as_ref()
+                        .expect("joined output is allocated");
+                    let element_bytes = match _declaration.precision {
+                        Precision::Bf16 => 2,
+                        Precision::F32 => 4,
+                        _ => return Err(invalid("collective", "join precision is unsupported")),
+                    };
+                    let source_row_bytes = _declaration
+                        .columns
+                        .checked_mul(element_bytes)
+                        .ok_or_else(|| invalid("collective", "gather row size overflowed"))?;
+                    let output_row_bytes = source_row_bytes
+                        .checked_mul(2)
+                        .ok_or_else(|| invalid("collective", "gather output row overflowed"))?;
+                    let gathered_rank_bytes = _declaration
+                        .rows
+                        .checked_mul(source_row_bytes)
+                        .ok_or_else(|| invalid("collective", "gather source size overflowed"))?;
+                    for row in 0.._declaration.rows {
+                        let source_row = row
+                            .checked_mul(source_row_bytes)
+                            .ok_or_else(|| invalid("collective", "gather row offset overflowed"))?;
+                        let output_row = row.checked_mul(output_row_bytes).ok_or_else(|| {
+                            invalid("collective", "gather output offset overflowed")
+                        })?;
+                        let second_output =
+                            output_row.checked_add(source_row_bytes).ok_or_else(|| {
+                                invalid("collective", "gather output offset overflowed")
+                            })?;
+                        let second_source =
+                            gathered_rank_bytes.checked_add(source_row).ok_or_else(|| {
+                                invalid("collective", "gather source offset overflowed")
+                            })?;
+                        // SAFETY: all-gather is Ready and its stream completion
+                        // was observed; all ranges remain admitted through the
+                        // second drain below.
+                        unsafe {
+                            output.copy_from_device_async_at(
+                                output_row,
+                                gathered,
+                                source_row,
+                                source_row_bytes,
+                                stream,
+                            )?;
+                            output.copy_from_device_async_at(
+                                second_output,
+                                gathered,
+                                second_source,
+                                source_row_bytes,
+                                stream,
+                            )?;
+                        }
+                    }
                 }
-                drain_rank(context, stream, deadline)?;
-                let source = temp
-                    .local_source
-                    .take()
-                    .expect("peer source acknowledgement returned its range");
-                release_join_source(&mut self.held.plans, source, ordinal)?;
-                let output_range = self
-                    .temp
-                    .as_mut()
-                    .expect("join temporary remains")
-                    .output
-                    .take()
-                    .unwrap();
-                boundary.values.insert(original, output_range);
             }
+            self.drain(deadline)?;
         }
-        boundary
-            .arena
-            .release(
-                self.temp
-                    .as_mut()
-                    .expect("join temporary remains")
-                    .scratch
-                    .take()
-                    .unwrap(),
-            )
-            .map_err(|refused| {
+        let mut temp = self.temp.take().expect("join temporary remains");
+        if let Some(source) = temp.local_source.take() {
+            release_join_source(&mut self.held.plans, source, self.ctx.ordinal())?;
+        }
+        let output_id = match join {
+            Join::Gather { output } | Join::Reduce { output } => output,
+        };
+        let output = temp
+            .joined_output
+            .take()
+            .expect("joined output is allocated");
+        let boundary = self.held.boundary.as_mut().expect("step boundary is open");
+        if failed {
+            boundary.arena.release(output).map_err(|refused| {
                 device_lost(
-                    ordinal,
-                    format!("peer scratch could not be released ({})", refused.error),
+                    self.ctx.ordinal(),
+                    format!(
+                        "failed join output could not be released ({})",
+                        refused.error
+                    ),
                 )
             })?;
-        self.temp.take();
+        } else {
+            boundary.values.insert(output_id, output);
+        }
+        for index in 0..3 {
+            let range = match index {
+                0 => temp.status.take(),
+                1 => temp.data.take(),
+                _ => temp.dummy.take(),
+            };
+            if let Some(range) = range {
+                let result = temp
+                    .arena
+                    .as_mut()
+                    .expect("join arena is open")
+                    .release(range);
+                if let Err(refused) = result {
+                    match index {
+                        0 => temp.status = Some(refused.range),
+                        1 => temp.data = Some(refused.range),
+                        _ => temp.dummy = Some(refused.range),
+                    }
+                    self.temp = Some(temp);
+                    return Err(device_lost(
+                        self.ctx.ordinal(),
+                        format!("join temporary could not be released ({})", refused.error),
+                    ));
+                }
+            }
+        }
+        temp.module.take();
+        if let Some(arena) = temp.arena.take()
+            && let Err(refused) = arena.close(&mut self.ledger)
+        {
+            temp.arena = Some(refused.arena);
+            self.temp = Some(temp);
+            return Err(device_lost(
+                self.ctx.ordinal(),
+                format!("join arena could not close ({})", refused.error),
+            ));
+        }
         close_plans(self.ctx, &mut self.ledger, &mut self.held.plans)?;
+        if failed {
+            return Err(invalid(
+                "collective",
+                "a rank failed after join preparation",
+            ));
+        }
         Ok(())
     }
 
@@ -2126,18 +2643,70 @@ impl<'ctx> WorkerState<'ctx> {
             }
         }
         if let Some(temp) = self.temp.take() {
-            if let Some(source) = temp.local_source {
+            let mut temp = temp;
+            if let Some(source) = temp.local_source.take() {
                 return_worker_range(self.ctx, &mut plans, source)?;
             }
-            if let Some(boundary) = boundary.as_mut() {
-                for range in [temp.output, temp.scratch].into_iter().flatten() {
-                    boundary.arena.release(range).map_err(|refused| {
-                        device_lost(
+            if let Some(output) = temp.joined_output.take() {
+                let released = boundary
+                    .as_mut()
+                    .expect("step boundary is open")
+                    .arena
+                    .release(output);
+                if let Err(refused) = released {
+                    temp.joined_output = Some(refused.range);
+                    self.temp = Some(temp);
+                    self.held.plans = plans;
+                    self.held.boundary = boundary;
+                    return Err(device_lost(
+                        self.ctx.ordinal(),
+                        format!(
+                            "collective output could not be released ({})",
+                            refused.error
+                        ),
+                    ));
+                }
+            }
+            for index in 0..3 {
+                let range = match index {
+                    0 => temp.status.take(),
+                    1 => temp.data.take(),
+                    _ => temp.dummy.take(),
+                };
+                if let Some(range) = range {
+                    let result = temp
+                        .arena
+                        .as_mut()
+                        .expect("temporary range has an arena")
+                        .release(range);
+                    if let Err(refused) = result {
+                        match index {
+                            0 => temp.status = Some(refused.range),
+                            1 => temp.data = Some(refused.range),
+                            _ => temp.dummy = Some(refused.range),
+                        }
+                        self.temp = Some(temp);
+                        self.held.plans = plans;
+                        self.held.boundary = boundary;
+                        return Err(device_lost(
                             self.ctx.ordinal(),
                             format!("collective range could not be released ({})", refused.error),
-                        )
-                    })?;
+                        ));
+                    }
                 }
+            }
+            temp.module.take();
+            if let Some(arena) = temp.arena.take()
+                && let Err(refused) = arena.close(&mut self.ledger)
+            {
+                temp.arena = Some(refused.arena);
+                self.temp = Some(temp);
+                self.held.plans = plans;
+                self.held.boundary = boundary;
+                return Err(device_lost(
+                    self.ctx.ordinal(),
+                    format!("collective arena could not close ({})", refused.error),
+                ));
             }
         }
         close_plans(self.ctx, &mut self.ledger, &mut plans)?;
@@ -2173,6 +2742,9 @@ impl<'ctx> WorkerState<'ctx> {
             }
         }
         if !self.ledger.outstanding().is_empty() {
+            if self.ledger.outstanding().len() == usize::from(self.nccl_reservation.is_some()) {
+                return Ok(());
+            }
             return Err(device_lost(
                 self.ctx.ordinal(),
                 "worker shutdown left charged reservations".into(),
@@ -2263,23 +2835,6 @@ fn close_boundary_worker(
 
 pub(crate) fn device_lost(device: u32, detail: String) -> Error {
     Error::DeviceLost { device, detail }
-}
-
-fn drain_rank(context: &RankContext, stream: &Stream<'_>, deadline: Instant) -> Result<()> {
-    let event = moxie_cuda::Event::new(context)?;
-    event.record(stream)?;
-    loop {
-        if event.is_complete()? {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(device_lost(
-                context.ordinal(),
-                "rank stream did not drain before the group deadline".into(),
-            ));
-        }
-        thread::yield_now();
-    }
 }
 
 fn copy_boundary<'ctx>(
@@ -2503,7 +3058,9 @@ mod close_tests {
             held: Held::default(),
             transaction: None,
             temp: None,
-            rank: 0,
+            communicator: None,
+            nccl_reservation: None,
+            preserve_communicator_on_loss: false,
         };
         assert!(matches!(worker.close_runs(), Err(Error::DeviceLost { .. })));
         assert_eq!(worker.runs.len(), 1);

@@ -95,6 +95,7 @@ const CASES: &[&str] = &[
     "measurement_is_live",
     "grouped_expert_mlp",
     "affine_linear_w4a16_w8a16",
+    "tp_f32_to_bf16_rounding",
     "paged_attention",
     "paged_attention_indirect",
     "paged_attention_host_streaming",
@@ -244,6 +245,11 @@ pub fn run(profile: Option<&str>) -> i32 {
         results.push(case(&cap, "measurement_is_live", measurement_is_live(&cap)));
         results.push(case(&cap, "grouped_expert_mlp", grouped_expert_mlp(&cap)));
         results.push(case(&cap, "affine_linear_w4a16_w8a16", affine_linear(&cap)));
+        results.push(case(
+            &cap,
+            "tp_f32_to_bf16_rounding",
+            tp_f32_to_bf16_rounding(&cap),
+        ));
         results.push(case(&cap, "paged_attention", paged_attention(&cap)));
         results.push(case(
             &cap,
@@ -500,6 +506,79 @@ fn bf16(cap: &DeviceCapability) -> Result<Outcome, Error> {
                 "input {v:e} (0x{:08x}): device 0x{:04x}, host oracle 0x{want:04x}",
                 v.to_bits(),
                 got[i]
+            )));
+        }
+    }
+    Ok(Outcome::Passed)
+}
+
+/// Qualify the single-input conversion used after NCCL has summed TP partials.
+fn tp_f32_to_bf16_rounding(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    let mut inputs = vec![
+        0.0,
+        -0.0,
+        f32::from_bits(0x0000_0001),
+        f32::from_bits(0x0000_8000),
+        f32::from_bits(0x0000_8001),
+        f32::from_bits(0x8000_0001),
+        f32::from_bits(0x8000_8000),
+        f32::from_bits(0x8000_8001),
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::from_bits(0x7f80_0001),
+        f32::from_bits(0xffa1_2345),
+        f32::MAX,
+        -f32::MAX,
+    ];
+    for high in 0x3e00u32..=0x4080 {
+        for sign in [0, 0x8000_0000] {
+            let upper = sign | (high << 16);
+            inputs.extend([
+                f32::from_bits(upper | 0x7fff),
+                f32::from_bits(upper | 0x8000),
+                f32::from_bits(upper | 0x8001),
+            ]);
+        }
+    }
+    let count = inputs.len();
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    // SAFETY: this byte slice is the complete dense fatbin embedded by this
+    // build from the pinned nvcc output.
+    let image = unsafe { TrustedImage::from_build_output(moxie_kernels::DENSE_GRAPH_FATBIN)? };
+    let module = Module::load(&ctx, ModuleImage::Binary(image))?;
+    let function = module.function(moxie_kernels::TP_F32_TO_BF16)?;
+    let mut source = DeviceBuffer::alloc(&ctx, count * std::mem::size_of::<f32>())?;
+    let destination = DeviceBuffer::alloc(&ctx, count * std::mem::size_of::<u16>())?;
+    source.copy_from_host(bytemuck_f32(&inputs))?;
+
+    let mut source_pointer = source.device_ptr();
+    let mut destination_pointer = destination.device_ptr();
+    let mut elements = count as u64;
+    let mut params: [*mut c_void; 3] = [
+        (&raw mut source_pointer).cast(),
+        (&raw mut destination_pointer).cast(),
+        (&raw mut elements).cast(),
+    ];
+    let grid = u32::try_from(count.div_ceil(256)).map_err(|_| Error::InvalidRequest {
+        field: "elements",
+        detail: "the conversion qualification grid is too large".into(),
+    })?;
+    // SAFETY: the three arguments match the kernel ABI; source and destination
+    // hold `count` FP32 and BF16 values, respectively.
+    unsafe {
+        function.launch_blocking((grid, 1, 1), (256, 1, 1), 0, &mut params)?;
+    }
+    let mut got = vec![0u16; count];
+    destination.copy_to_host(bytemuck_u16_mut(&mut got))?;
+    for (index, value) in inputs.iter().enumerate() {
+        let expected = host_f32_to_bf16_bits(*value);
+        if got[index] != expected {
+            return Ok(Outcome::Failed(format!(
+                "input {index} (0x{:08x}): device 0x{:04x}, host round-to-nearest-even 0x{expected:04x}",
+                value.to_bits(),
+                got[index]
             )));
         }
     }
