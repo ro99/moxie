@@ -39,6 +39,12 @@ numbered changes win.
   change 6);
 - `crates/moxie-executor/tests/dense_tp2_device.rs` and
   `crates/moxie-executor/tests/dense_tp2_cublas_device.rs`;
+- **Amended (coordinator, confirming the builder's checkpoint deviations):**
+  - a one-line `pub use` of `ChainBucket` and `ChainCounters` through
+    `crates/moxie-executor/src/{lib.rs,dense_tp.rs}`;
+  - a new `crates/moxie-executor/tests/dense_tp2_chain_stall_device.rs`
+    that isolates test (e). A permanent stall parks its GPU pair for the
+    life of the process, the same reason as task 0097's separate binary.
 - this task's Result.
 
 ## Outcome
