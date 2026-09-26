@@ -457,9 +457,9 @@ These rest on the reviewer's research
   joins to pipeline hand-offs.
 - **The draft:** the reviewer's paste-ready contract is in
   [persistent-pipeline-research-and-draft.md](../evidence/persistent-pipeline-research-and-draft.md),
-  Part 3. It is **not yet a task file**. Next action: write it as task
-  0107, amend ADR 0039's scope, and assign it once 0102 is accepted (it
-  reuses 0102's pieces).
+  Part 3. It is now [task 0107](../tasks/0107-m6-persistent-pipeline.md),
+  and ADR 0039 has decision 7 for pipeline hand-offs. It is assigned once
+  0102 is accepted.
 
 ### Known bound for slice 7 (coordinator, 2026-09-24)
 

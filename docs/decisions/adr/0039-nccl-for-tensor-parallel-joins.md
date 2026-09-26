@@ -65,6 +65,13 @@ and rollback", and `kernels/cuda/deepseek_rank_local_layer_executor.cu`:
    catalogues stays byte-identical to the single-GPU split reference (ADR
    0036).
 
+7. **Pipeline hand-offs (owner, 2026-09-26, "yes, use NCCL").** NCCL
+   point-to-point `ncclSend`/`ncclRecv` also carries activations between
+   pipeline stage GPUs. The 5060 Ti has no peer access to the 3090s. Each
+   stage pair gets its own communicator, created and admitted as in
+   decisions 2 and 5, with the failure rules of decision 4. Bit copies
+   only; no reduction.
+
 ## Consequences and costs
 
 - A new dependency with its own threads and memory, managed through
