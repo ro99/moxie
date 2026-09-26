@@ -339,7 +339,10 @@ commit while the final gates run.
 - The replay-mirror mutant was caught: omitting the mirror upload made test
   (a) fail on the second decode step. The mutant was reverted.
 - Targeted GPU checks passed on all three devices for tests (a), (b)/(e)/(f).
-- Host gates: fmt, workspace clippy, executor driver clippy with and without
-  cublas, arch-check, and spec-check pass. The final workspace test run is
-  running. Full `dense_gemma_device` and `paged_attention_device` suites remain
-  pending.
+- Host gates pass: `cargo fmt --all -- --check`, workspace clippy,
+  executor driver clippy with and without cublas, `cargo test --workspace
+  --locked`, arch-check, and spec-check.
+- GPU gates pass with `CUDA_DEVICE_ORDER=PCI_BUS_ID` and cublas enabled:
+  `dense_gemma_device` (17 passed, 2 ignored timing/benchmark tests) and
+  `paged_attention_device` (8 passed, 1 ignored timing test). No timing or
+  `test-gpu` gate was run, per contract.
