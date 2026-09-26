@@ -1,7 +1,12 @@
 # Task 0104 — full-size Gemma 4 text graphs from the downloaded checkpoints
 
-Status: **proposed** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer
-Codex `sol`. Host-only. Queued after task 0100.
+Status: **accepted** (coordinator, 2026-09-26). Implementation `bb2f7f9`
+(Claude Sonnet `builder`, taking over luna's uncommitted work). Review R1
+by Claude Opus `reviewer` (1 high, 4 medium, 4 low;
+[record](../evidence/task-0104-review-round-1.md)). Repair `da08cad`, and
+the R2 delta review was clean. Both full-size graphs compose from the
+downloaded checkpoints, and every role's shape, precision and
+`layer_scalar` is checked against the files.
 
 ## Identity and authority
 
