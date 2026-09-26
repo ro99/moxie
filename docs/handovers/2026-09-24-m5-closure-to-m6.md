@@ -450,6 +450,17 @@ These rest on the reviewer's research
   stages: the 5060 Ti takes layers 0–7, 3090 #1 layers 8–18 and 3090 #2
   layers 19–29. Memory is accounted at a 32K context.
 
+### Persistent pipeline (2026-09-26)
+
+- **P1 (owner):** NCCL also carries pipeline stage hand-offs. The 5060 Ti
+  has no peer access to the 3090s. This widens ADR 0039's scope from TP
+  joins to pipeline hand-offs.
+- **The draft:** the reviewer's paste-ready contract is in
+  [persistent-pipeline-research-and-draft.md](../evidence/persistent-pipeline-research-and-draft.md),
+  Part 3. It is **not yet a task file**. Next action: write it as task
+  0107, amend ADR 0039's scope, and assign it once 0102 is accepted (it
+  reuses 0102's pieces).
+
 ### Known bound for slice 7 (coordinator, 2026-09-24)
 
 `gemma-4-31B-it-AWQ-8bit` is INT8, group 32, symmetric, which the affine
