@@ -60,6 +60,7 @@ dependencies = [
  "moxie-oracles",
  "moxie-plan",
  "moxie-state",
+ "moxie-storage",
  "moxie-types",
  "serde_json",
 ]

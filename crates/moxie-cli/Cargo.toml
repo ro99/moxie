@@ -19,11 +19,12 @@ moxie-host.workspace = true
 moxie-oracles.workspace = true
 moxie-model-api.workspace = true
 moxie-models.workspace = true
+moxie-format.workspace = true
+moxie-storage.workspace = true
 
 [dev-dependencies]
 moxie-interp.workspace = true
 moxie-state.workspace = true
-moxie-format.workspace = true
 # Task 0056's temporary host tensor-parallel harness reads the lowering.
 moxie-plan.workspace = true
 # Test-only, for reading a checkpoint's `config.json` and comparing it against

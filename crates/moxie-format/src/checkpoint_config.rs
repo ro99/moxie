@@ -16,7 +16,7 @@
 use serde::Deserialize;
 
 use crate::compressed_tensors::{Granularity, ZeroPointSource};
-use moxie_types::{Error, Result};
+use moxie_types::{Error, Result, declared_value::DeclaredValue};
 
 use crate::invalid_static;
 
@@ -29,6 +29,114 @@ fn invalid(detail: core::fmt::Arguments<'_>) -> Error {
 
 /// The largest `config.json` this will read, before reading it.
 pub const MAX_CONFIG_BYTES: usize = 8 * 1024 * 1024;
+
+/// Decode the checkpoint's text configuration into architecture-neutral
+/// dotted fields. Model crates consume the plain values without depending on
+/// JSON parsing.
+pub fn declared_text_fields(
+    text: &str,
+) -> Result<std::collections::BTreeMap<String, DeclaredValue>> {
+    use serde_json::Value;
+
+    if text.len() > MAX_CONFIG_BYTES {
+        return Err(invalid(format_args!(
+            "config.json is {} byte(s), above the {MAX_CONFIG_BYTES} cap checked before parsing",
+            text.len()
+        )));
+    }
+    let root: Value = serde_json::from_str(text)
+        .map_err(|e| invalid(format_args!("config.json does not parse: {e}")))?;
+    let object = root.as_object().ok_or_else(|| {
+        invalid_static("config.json root must be an object to read declared text fields")
+    })?;
+    let source = match object.get("text_config") {
+        Some(Value::Object(text_config)) => text_config,
+        Some(other) => {
+            return Err(invalid(format_args!(
+                "config.json text_config must be an object, found {other}"
+            )));
+        }
+        None => object,
+    };
+    let mut fields = std::collections::BTreeMap::new();
+    for (key, value) in source {
+        flatten_declared(key, value, &mut fields)?;
+    }
+    Ok(fields)
+}
+
+fn flatten_declared(
+    key: &str,
+    value: &serde_json::Value,
+    fields: &mut std::collections::BTreeMap<String, DeclaredValue>,
+) -> Result<()> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (child, value) in object {
+                let dotted = format!("{key}.{child}");
+                flatten_declared(&dotted, value, fields)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let values = items
+                .iter()
+                .map(declared_value)
+                .collect::<Result<Vec<_>>>()?;
+            insert_declared(key, DeclaredValue::List(values), fields)?;
+        }
+        value => insert_declared(key, declared_value(value)?, fields)?,
+    }
+    Ok(())
+}
+
+fn declared_value(value: &serde_json::Value) -> Result<DeclaredValue> {
+    use serde_json::Value;
+
+    Ok(match value {
+        Value::Null => DeclaredValue::Null,
+        Value::Bool(value) => DeclaredValue::Bool(*value),
+        Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                DeclaredValue::Int(value)
+            } else if value.is_u64() {
+                return Err(invalid(format_args!(
+                    "declared unsigned integer {value} does not fit Int(i64)"
+                )));
+            } else if let Some(value) = value.as_f64() {
+                DeclaredValue::Float(value)
+            } else {
+                return Err(invalid(format_args!(
+                    "declared number {value} cannot be represented"
+                )));
+            }
+        }
+        Value::String(value) => DeclaredValue::Str(value.clone()),
+        Value::Array(items) => DeclaredValue::List(
+            items
+                .iter()
+                .map(declared_value)
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Value::Object(_) => {
+            return Err(invalid_static(
+                "object values inside declared lists cannot be represented",
+            ));
+        }
+    })
+}
+
+fn insert_declared(
+    key: &str,
+    value: DeclaredValue,
+    fields: &mut std::collections::BTreeMap<String, DeclaredValue>,
+) -> Result<()> {
+    if fields.insert(key.to_string(), value).is_some() {
+        return Err(invalid(format_args!(
+            "nested config keys flatten to the duplicate field {key:?}"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegerSerialization {
@@ -366,5 +474,35 @@ mod tests {
                     .contains("actorder")
             );
         }
+    }
+
+    #[test]
+    fn declared_text_fields_flatten_values_without_interpreting_them() {
+        let fields = declared_text_fields(
+            r#"{"outside":7,"text_config":{"hidden_size":12,"active":true,"name":"Gemma","unset":null,"layer_types":["sliding_attention","full_attention"],"rope_parameters":{"full_attention":{"rope_theta":1000000.0}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(fields.len(), 6);
+        assert_eq!(fields["hidden_size"], DeclaredValue::Int(12));
+        assert_eq!(fields["active"], DeclaredValue::Bool(true));
+        assert_eq!(fields["name"], DeclaredValue::Str("Gemma".into()));
+        assert_eq!(fields["unset"], DeclaredValue::Null);
+        assert_eq!(
+            fields["layer_types"],
+            DeclaredValue::List(vec![
+                DeclaredValue::Str("sliding_attention".into()),
+                DeclaredValue::Str("full_attention".into()),
+            ])
+        );
+        assert_eq!(
+            fields["rope_parameters.full_attention.rope_theta"],
+            DeclaredValue::Float(1_000_000.0)
+        );
+        assert_eq!(
+            declared_text_fields(r#"{"root":1,"nested":{"leaf":2}}"#).unwrap()["nested.leaf"],
+            DeclaredValue::Int(2)
+        );
+        assert!(declared_text_fields("[]").is_err());
+        assert!(declared_text_fields(r#"{"text_config":null}"#).is_err());
     }
 }

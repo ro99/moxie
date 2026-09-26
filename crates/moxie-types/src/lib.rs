@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capability;
+pub mod declared_value;
 pub mod dim;
 pub mod error;
 pub mod ids;

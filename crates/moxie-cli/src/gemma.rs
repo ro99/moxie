@@ -9,13 +9,189 @@
 //! Executing the real artifact needs M3's INT8 importer; see
 //! `docs/models/gemma4.md`.
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
 use crate::fixture::Fixture;
 use moxie_engine::{HostTensor, Value};
+use moxie_format::checkpoint_config;
+use moxie_format::safetensors::Dtype;
 use moxie_graph::{Bindings, OracleRegistry};
+use moxie_model_api::{ModelDefinition, TensorRole};
 use moxie_models::gemma4::{
-    Fraction, Gemma4Text, MoeGeometry, Reduction, TextConfig, embedding_scale, router_input_scale,
+    Composition, Fraction, Gemma4Text, MoeGeometry, Reduction, TextConfig, embedding_scale,
+    gemma4_source_tensor, router_input_scale, text_config_from_declared,
 };
-use moxie_types::{Dim, Error, Result, SymbolId};
+use moxie_storage::{Shard, read_text_capped};
+use moxie_types::{
+    Dim, Error, Precision, Result, SymbolId, WeightPrecision, declared_value::DeclaredValue,
+};
+
+/// A deterministic tensor role key, including the fields that distinguish
+/// routed or future expert roles without requiring an ordering on TensorRole.
+pub type TensorRoleKey = (String, Option<u32>, Option<u32>);
+
+/// A full-size checkpoint graph and its source identities.
+#[derive(Debug)]
+pub struct CheckpointGraph {
+    pub composition: Composition,
+    pub role_to_source_tensor: BTreeMap<TensorRoleKey, Option<String>>,
+    pub revision: String,
+    pub config: TextConfig,
+}
+
+/// Build a full-size Gemma 4 text graph from a downloaded checkpoint
+/// directory (ADR 0038: run source checkpoints directly).
+///
+/// Reads `config.json`, the safetensors index and every `layer_scalar`
+/// tensor, and composes the graph with the checkpoint's own declared
+/// precisions. It loads no other weight -- loading is route item 5.
+pub fn from_checkpoint(dir: &Path) -> Result<CheckpointGraph> {
+    let config_text = read_text_capped(
+        &dir.join("config.json"),
+        checkpoint_config::MAX_CONFIG_BYTES,
+    )?;
+    let declaration = checkpoint_config::parse(&config_text)?;
+    let fields = checkpoint_config::declared_text_fields(&config_text)?;
+
+    let index_text = read_text_capped(
+        &dir.join("model.safetensors.index.json"),
+        checkpoint_config::MAX_INDEX_BYTES,
+    )?;
+    let weight_map = checkpoint_config::parse_index(&index_text)?;
+
+    let layers = match fields.get("num_hidden_layers") {
+        Some(DeclaredValue::Int(n)) if *n > 0 => {
+            u32::try_from(*n).map_err(|_| Error::InvalidArtifact {
+                detail: format!("num_hidden_layers {n} does not fit a u32").into(),
+            })?
+        }
+        other => {
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "num_hidden_layers is {other:?}; expected a positive declared integer"
+                )
+                .into(),
+            });
+        }
+    };
+
+    let mut shards: BTreeMap<String, Shard> = BTreeMap::new();
+    let mut layer_scalars = Vec::with_capacity(layers as usize);
+    for layer in 0..layers {
+        let name = format!("model.language_model.layers.{layer}.layer_scalar");
+        let file = weight_map
+            .get(&name)
+            .ok_or_else(|| Error::InvalidArtifact {
+                detail: format!("the index does not declare {name}").into(),
+            })?;
+        if !shards.contains_key(file) {
+            shards.insert(file.clone(), Shard::open(&dir.join(file))?);
+        }
+        let shard = &shards[file];
+        let entry = shard.header().get(&name)?;
+        if entry.dtype != Dtype::Bf16 || entry.shape != [1] {
+            return Err(Error::InvalidArtifact {
+                detail: format!(
+                    "{name} is {:?} with shape {:?}; expected one BF16 scalar",
+                    entry.dtype, entry.shape
+                )
+                .into(),
+            });
+        }
+        let bytes = shard.tensor_bytes(&name)?;
+        let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+        layer_scalars.push(moxie_format::bf16::bf16_bits_to_f32(bits));
+    }
+
+    let config = text_config_from_declared(&fields, layer_scalars)?;
+    let revision = checkpoint_revision(dir);
+    let model = Gemma4Text::full(config.clone(), &revision)?;
+
+    let mut oracles = OracleRegistry::new();
+    moxie_oracles::register(&mut oracles)?;
+    moxie_model_api::admit(&model, &oracles)?;
+
+    // The precision each linear composes at: the checkpoint's declared
+    // integer width when it is quantized and not in the `ignore` list, BF16
+    // otherwise -- `weight()` already defaults every value to BF16, so only
+    // the deviations need an entry.
+    let mut precisions = BTreeMap::new();
+    let mut role_to_source_tensor = BTreeMap::new();
+    for tensor in model.tensors() {
+        let source = gemma4_source_tensor(&tensor.role);
+        let key = (
+            tensor.role.name.clone(),
+            tensor.role.layer,
+            tensor.role.expert,
+        );
+        role_to_source_tensor.insert(key, source.clone());
+
+        let Some(source) = &source else { continue };
+        let is_linear = tensor
+            .allowed
+            .iter()
+            .any(|precision| precision.get() == Precision::Int8);
+        if !is_linear {
+            continue;
+        }
+        let Some(quantization) = &declaration.quantization else {
+            continue;
+        };
+        if quantization.ignored.iter().any(|module| module == source) {
+            continue;
+        }
+        let quantized = match quantization.bits {
+            8 => Precision::Int8,
+            4 => Precision::Int4,
+            bits => {
+                return Err(Error::InvalidArtifact {
+                    detail: format!(
+                        "{source} declares {bits}-bit weights; only 4 and 8 compose here"
+                    )
+                    .into(),
+                });
+            }
+        };
+        precisions.insert(weight_label(&tensor.role), WeightPrecision::new(quantized)?);
+    }
+
+    let composition = model.compose_with_weight_precisions(&oracles, SymbolId(0), precisions)?;
+
+    Ok(CheckpointGraph {
+        composition,
+        role_to_source_tensor,
+        revision,
+        config,
+    })
+}
+
+/// The name a composed graph gives a role's weight value. Mirrors
+/// `Gemma4Text`'s own private `weight()` helper -- there is one labelling
+/// rule, and this is the composition root's copy of it, needed to key the
+/// precision map `compose_with_weight_precisions` reads by name.
+fn weight_label(role: &TensorRole) -> String {
+    match role.layer {
+        Some(layer) => format!("{}.{layer}", role.name),
+        None => role.name.clone(),
+    }
+}
+
+/// The checkpoint's own recorded revision, from the local Hub cache metadata
+/// beside `config.json`, or the directory name when there is no such cache
+/// (a checkpoint placed by hand, or a test fixture).
+fn checkpoint_revision(dir: &Path) -> String {
+    let metadata_path = dir.join(".cache/huggingface/download/config.json.metadata");
+    std::fs::read_to_string(&metadata_path)
+        .ok()
+        .and_then(|text| text.lines().next().map(str::trim).map(str::to_string))
+        .filter(|line| !line.is_empty())
+        .unwrap_or_else(|| {
+            dir.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.display().to_string())
+        })
+}
 
 /// Which reduced geometry to build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

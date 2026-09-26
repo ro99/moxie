@@ -194,3 +194,68 @@ Host gates:
 No GPU and no timing.
 
 ## Result, filled after work
+
+Status: **implemented** (builder, Claude Opus, 2026-09-26), taking over an
+in-progress build luna's session left uncommitted after its weekly Codex
+quota ran out. Luna's partial work (changes 1, 2 and most of 3/4) reviewed
+against the contract and completed; two defects fixed before continuing:
+`Gemma4Text::full` did not compile (`Vec<WeightPrecision>` vs a fixed-size
+array literal), and the format-crate imports it had staged
+(`compressed_tensors::{Granularity, ZeroPointSource}`, the `checkpoint_config`
+declaration types) were unused once `checkpoint_config::parse`'s own
+validation was relied on instead of re-checking granularity here.
+
+1. `DeclaredValue` in `moxie-types::declared_value`;
+   `moxie_format::checkpoint_config::declared_text_fields` (luna).
+2. `moxie_models::gemma4::text_config_from_declared`, with the
+   `global_stride`/`global_partial_rotary`/fixed-fact refusals and the MoE
+   branch (luna).
+3. `Gemma4Text::full` (luna; the `Vec` fix above was this builder's).
+4. `gemma4_source_tensor` (luna).
+5. `moxie_cli::gemma::from_checkpoint` and `CheckpointGraph` (this builder,
+   on luna's struct skeleton): reads `config.json` and the safetensors
+   index, reads every `layer_scalar` through `Shard`, builds the config and
+   the full graph, and maps the checkpoint's declared quantization
+   (`bits: 4 | 8`, via `checkpoint_config::parse`'s own `ignored` list) onto
+   each linear's precision -- everything else stays the graph's BF16
+   default. The revision is read from the local Hub cache metadata beside
+   `config.json` (`.cache/huggingface/download/config.json.metadata`),
+   falling back to the directory name when that cache is absent.
+6. `crates/moxie-cli/tests/gemma_checkpoints.rs` (this builder): one
+   `#[ignore]`d test per checkpoint, each independently re-reading the
+   index and safetensors headers (not reusing `from_checkpoint`'s own
+   reading) to check (a) the derived config against `ARTIFACT`/
+   `ARTIFACT_A4B`, (b) every bound role resolves to an index tensor and
+   every non-excluded `model.language_model.*` index tensor is bound
+   exactly once, (c) each bound role's graph shape equals the source's
+   logical shape (the safetensors header, or `weight_shape`'s declared
+   value for a packed INT8 tensor), and (d) the derived config composes
+   again at `SymbolId(1)` and `SymbolId(8)`. The refusal unit test change 6
+   asks for (wrong `rope_type`, irregular `layer_types`, wrong scalar
+   count) is luna's existing
+   `gemma4::tests::declared_config_maps_and_refuses_unsupported_values`;
+   not duplicated.
+7. Coverage check performed and reverted: mapped `ffn_out_norm`'s
+   `post_feedforward_layernorm` to `pre_feedforward_layernorm` in
+   `gemma4_source_tensor`; `dense_checkpoint_composes_a_full_size_graph`
+   failed (`... is bound by more than one role`), confirming test (b) is
+   load-bearing. Reverted; both checkpoint tests pass again.
+
+Gates, run on `/home/rodrigo/Developer/moxie` against both real checkpoints
+under `/fast/models` (host only, no GPU):
+- `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
+- `cargo clippy -p xtask --features cuda --all-targets --locked -- -D warnings`: clean.
+- `cargo test --workspace --locked`: passed (default run; the two checkpoint
+  tests skip as `ignored`).
+- `cargo xtask arch-check`: passed (79 rejected fixtures, 21 accepted, 13
+  rules exercised) -- confirms the `moxie-cli` allowlist addition is the
+  only workspace-dependency change.
+- `cargo xtask spec-check`: passed (10 documents unchanged).
+- `cargo test -p moxie-cli --test gemma_checkpoints -- --ignored`: 2 passed,
+  against `/fast/models/cyankiwi/gemma-4-31B-it-AWQ-8bit` (INT8, dense) and
+  `/fast/models/google/gemma-4-26B-A4B-it` (BF16, MoE).
+
+Not claimed: loading any weight, running any token, Qwen, vision/audio, GPU
+execution, or any performance number -- all named non-goals or out of this
+task's scope.

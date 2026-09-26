@@ -41,7 +41,9 @@ use moxie_graph::{
 use moxie_model_api::{
     GraphRequirements, ModelDefinition, ModelMetadata, TensorRequirement, TensorRole,
 };
-use moxie_types::{Dim, Error, Precision, Result, SymbolId, WeightPrecision};
+use moxie_types::{
+    Dim, Error, Precision, Result, SymbolId, WeightPrecision, declared_value::DeclaredValue,
+};
 
 /// The constants the artifact's `config.json` declares, at whatever size the
 /// caller asks for.
@@ -388,6 +390,7 @@ pub struct Gemma4Text {
     config: TextConfig,
     metadata: ModelMetadata,
     tensors: Vec<TensorRequirement>,
+    reduction: Reduction,
 }
 
 fn role(name: &str, layer: Option<u32>) -> TensorRole {
@@ -473,7 +476,29 @@ impl Gemma4Text {
             config,
             metadata,
             tensors,
+            reduction: Reduction::ALL,
         })
+    }
+
+    /// A full-size Gemma 4 text graph over checkpoint-declared roles.
+    pub fn full(config: TextConfig, revision: &str) -> Result<Self> {
+        let mut model = Self::reduced(config, revision)?;
+        model.metadata.family = "gemma4-text".into();
+        model.reduction = Reduction {
+            synthetic_weights: false,
+            text_only: true,
+        };
+        let linear_precisions = vec![
+            WeightPrecision::new(Precision::Bf16)?,
+            WeightPrecision::new(Precision::Int8)?,
+            WeightPrecision::new(Precision::Int4)?,
+        ];
+        for tensor in &mut model.tensors {
+            if is_linear_role(&tensor.role.name) {
+                tensor.allowed.clone_from(&linear_precisions);
+            }
+        }
+        Ok(model)
     }
 
     pub fn config(&self) -> &TextConfig {
@@ -482,7 +507,7 @@ impl Gemma4Text {
 
     /// What this graph is not. See [`Reduction`].
     pub const fn reduction(&self) -> Reduction {
-        Reduction::ALL
+        self.reduction
     }
 
     /// Whether layer `l` uses full causal attention rather than a window.
@@ -831,6 +856,325 @@ impl Gemma4Text {
     }
 }
 
+/// Map a Gemma 4 tensor role to its checkpoint name. Linear names omit the
+/// `.weight` suffix because a source may store `.weight_packed` instead.
+pub fn gemma4_source_tensor(role: &TensorRole) -> Option<String> {
+    let layer = role.layer;
+    let base = match (role.name.as_str(), layer) {
+        ("embedding", None) => "model.language_model.embed_tokens.weight".to_string(),
+        ("final_norm", None) => "model.language_model.norm.weight".to_string(),
+        ("attn_norm", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.input_layernorm.weight")
+        }
+        ("q_proj", Some(layer)) => format!("model.language_model.layers.{layer}.self_attn.q_proj"),
+        ("k_proj", Some(layer)) => format!("model.language_model.layers.{layer}.self_attn.k_proj"),
+        ("v_proj", Some(layer)) => format!("model.language_model.layers.{layer}.self_attn.v_proj"),
+        ("q_norm", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.self_attn.q_norm.weight")
+        }
+        ("k_norm", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.self_attn.k_norm.weight")
+        }
+        ("v_norm_unit_gain", Some(_)) => return None,
+        ("o_proj", Some(layer)) => format!("model.language_model.layers.{layer}.self_attn.o_proj"),
+        ("attn_out_norm", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.post_attention_layernorm.weight")
+        }
+        ("ffn_norm", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.pre_feedforward_layernorm.weight")
+        }
+        ("ffn_gate", Some(layer)) => format!("model.language_model.layers.{layer}.mlp.gate_proj"),
+        ("ffn_up", Some(layer)) => format!("model.language_model.layers.{layer}.mlp.up_proj"),
+        ("ffn_down", Some(layer)) => format!("model.language_model.layers.{layer}.mlp.down_proj"),
+        ("ffn_out_norm", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.post_feedforward_layernorm.weight")
+        }
+        ("router_scale", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.router.scale")
+        }
+        ("router_proj", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.router.proj.weight")
+        }
+        ("router_per_expert_scale", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.router.per_expert_scale")
+        }
+        ("experts_gate_up", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.experts.gate_up_proj")
+        }
+        ("experts_down", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.experts.down_proj")
+        }
+        ("ffn_norm_2", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.pre_feedforward_layernorm_2.weight")
+        }
+        ("ffn_out_norm_1", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.post_feedforward_layernorm_1.weight")
+        }
+        ("ffn_out_norm_2", Some(layer)) => {
+            format!("model.language_model.layers.{layer}.post_feedforward_layernorm_2.weight")
+        }
+        _ => return None,
+    };
+    Some(base)
+}
+
+fn is_linear_role(name: &str) -> bool {
+    matches!(
+        name,
+        "q_proj" | "k_proj" | "v_proj" | "o_proj" | "ffn_gate" | "ffn_up" | "ffn_down"
+    )
+}
+
+/// Build the text geometry from architecture-neutral declared fields.
+pub fn text_config_from_declared(
+    fields: &std::collections::BTreeMap<String, DeclaredValue>,
+    layer_scalars: Vec<f32>,
+) -> Result<TextConfig> {
+    let hidden = declared_u64(fields, "hidden_size")?;
+    let layers = declared_u32(fields, "num_hidden_layers")?;
+    let layer_types = declared_strings(fields, "layer_types")?;
+    if layer_types.len() != usize::try_from(layers).unwrap_or(usize::MAX) {
+        return Err(declared_error(
+            "layer_types",
+            fields.get("layer_types"),
+            "one sliding_attention/full_attention value per configured layer",
+        ));
+    }
+    for value in &layer_types {
+        if !matches!(value.as_str(), "sliding_attention" | "full_attention") {
+            return Err(declared_error(
+                "layer_types",
+                fields.get("layer_types"),
+                "only sliding_attention and full_attention",
+            ));
+        }
+    }
+    let mut strides = (1..=layers).filter(|stride| {
+        let Ok(period) = usize::try_from(*stride) else {
+            return false;
+        };
+        layer_types.iter().enumerate().all(|(index, layer_type)| {
+            (layer_type == "full_attention") == (index.saturating_add(1) % period == 0)
+        })
+    });
+    let global_stride = strides
+        .next()
+        .filter(|_| strides.next().is_none())
+        .ok_or_else(|| {
+            declared_error(
+                "layer_types",
+                fields.get("layer_types"),
+                "a periodic full_attention pattern with one unique stride",
+            )
+        })?;
+
+    require_bool(fields, "attention_k_eq_v", true)?;
+    require_bool(fields, "tie_word_embeddings", true)?;
+    require_string(fields, "hidden_activation", "gelu_pytorch_tanh")?;
+    require_int(fields, "num_kv_shared_layers", 0)?;
+    require_int(fields, "hidden_size_per_layer_input", 0)?;
+    require_bool(fields, "use_double_wide_mlp", false)?;
+    require_bool(fields, "attention_bias", false)?;
+    require_string(
+        fields,
+        "rope_parameters.full_attention.rope_type",
+        "proportional",
+    )?;
+    require_string(
+        fields,
+        "rope_parameters.sliding_attention.rope_type",
+        "default",
+    )?;
+    let partial_rotary = declared_float(
+        fields,
+        "rope_parameters.full_attention.partial_rotary_factor",
+    )?;
+    if partial_rotary != 0.25 {
+        return Err(declared_error(
+            "rope_parameters.full_attention.partial_rotary_factor",
+            fields.get("rope_parameters.full_attention.partial_rotary_factor"),
+            "0.25",
+        ));
+    }
+    if layer_scalars.len() != usize::try_from(layers).unwrap_or(usize::MAX) {
+        return Err(Error::InvalidArtifact {
+            detail: format!(
+                "layer_scalars has {} BF16 value(s) for num_hidden_layers={layers}",
+                layer_scalars.len()
+            )
+            .into(),
+        });
+    }
+    let moe = if declared_bool(fields, "enable_moe_block")? {
+        Some(MoeGeometry {
+            experts: declared_u64(fields, "num_experts")?,
+            top_k: declared_u64(fields, "top_k_experts")?,
+            moe_intermediate: declared_u64(fields, "moe_intermediate_size")?,
+            router_input_scale: router_input_scale(hidden),
+        })
+    } else {
+        None
+    };
+    let config = TextConfig {
+        hidden,
+        layers,
+        heads: declared_u64(fields, "num_attention_heads")?,
+        local_kv_heads: declared_u64(fields, "num_key_value_heads")?,
+        local_head_dim: declared_u64(fields, "head_dim")?,
+        global_kv_heads: declared_u64(fields, "num_global_key_value_heads")?,
+        global_head_dim: declared_u64(fields, "global_head_dim")?,
+        intermediate: declared_u64(fields, "intermediate_size")?,
+        vocab: declared_u64(fields, "vocab_size")?,
+        global_stride,
+        sliding_window: declared_u64(fields, "sliding_window")?,
+        rms_eps: declared_f32(fields, "rms_norm_eps")?,
+        sliding_rope_theta: declared_f32(fields, "rope_parameters.sliding_attention.rope_theta")?,
+        global_rope_theta: declared_f32(fields, "rope_parameters.full_attention.rope_theta")?,
+        global_partial_rotary: Fraction::QUARTER,
+        final_logit_softcap: declared_f32(fields, "final_logit_softcapping")?,
+        layer_scalars,
+        embedding_scale: embedding_scale(hidden),
+        max_trained_position: declared_u64(fields, "max_position_embeddings")?,
+        moe,
+    };
+    config.check()?;
+    Ok(config)
+}
+
+fn declared_value<'a>(
+    fields: &'a std::collections::BTreeMap<String, DeclaredValue>,
+    key: &str,
+) -> Result<&'a DeclaredValue> {
+    fields
+        .get(key)
+        .ok_or_else(|| declared_error(key, None, "a declared value"))
+}
+
+fn declared_error(key: &str, value: Option<&DeclaredValue>, expected: &str) -> Error {
+    Error::InvalidArtifact {
+        detail: format!("Gemma 4 config key {key:?} has value {value:?}; expected {expected}")
+            .into(),
+    }
+}
+
+fn declared_bool(
+    fields: &std::collections::BTreeMap<String, DeclaredValue>,
+    key: &str,
+) -> Result<bool> {
+    match declared_value(fields, key)? {
+        DeclaredValue::Bool(value) => Ok(*value),
+        value => Err(declared_error(key, Some(value), "a boolean")),
+    }
+}
+
+fn declared_int(
+    fields: &std::collections::BTreeMap<String, DeclaredValue>,
+    key: &str,
+) -> Result<i64> {
+    match declared_value(fields, key)? {
+        DeclaredValue::Int(value) => Ok(*value),
+        value => Err(declared_error(key, Some(value), "an integer")),
+    }
+}
+
+fn declared_u64(
+    fields: &std::collections::BTreeMap<String, DeclaredValue>,
+    key: &str,
+) -> Result<u64> {
+    let value = declared_int(fields, key)?;
+    u64::try_from(value).map_err(|_| declared_error(key, fields.get(key), "a nonnegative integer"))
+}
+
+fn declared_u32(
+    fields: &std::collections::BTreeMap<String, DeclaredValue>,
+    key: &str,
+) -> Result<u32> {
+    let value = declared_int(fields, key)?;
+    u32::try_from(value).map_err(|_| declared_error(key, fields.get(key), "a u32 layer count"))
+}
+
+fn declared_float(
+    fields: &std::collections::BTreeMap<String, DeclaredValue>,
+    key: &str,
+) -> Result<f64> {
+    match declared_value(fields, key)? {
+        DeclaredValue::Float(value) if value.is_finite() => Ok(*value),
+        value => Err(declared_error(key, Some(value), "a finite float")),
+    }
+}
+
+fn declared_f32(
+    fields: &std::collections::BTreeMap<String, DeclaredValue>,
+    key: &str,
+) -> Result<f32> {
+    let value = declared_float(fields, key)?;
+    let narrowed = value as f32;
+    if narrowed.is_finite() {
+        Ok(narrowed)
+    } else {
+        Err(declared_error(key, fields.get(key), "a finite f32 value"))
+    }
+}
+
+fn declared_strings(
+    fields: &std::collections::BTreeMap<String, DeclaredValue>,
+    key: &str,
+) -> Result<Vec<String>> {
+    match declared_value(fields, key)? {
+        DeclaredValue::List(values) => values
+            .iter()
+            .map(|value| match value {
+                DeclaredValue::Str(value) => Ok(value.clone()),
+                _ => Err(declared_error(key, fields.get(key), "a list of strings")),
+            })
+            .collect(),
+        value => Err(declared_error(key, Some(value), "a list of strings")),
+    }
+}
+
+fn require_bool(
+    fields: &std::collections::BTreeMap<String, DeclaredValue>,
+    key: &str,
+    expected: bool,
+) -> Result<()> {
+    if declared_bool(fields, key)? == expected {
+        Ok(())
+    } else {
+        Err(declared_error(
+            key,
+            fields.get(key),
+            if expected { "true" } else { "false" },
+        ))
+    }
+}
+
+fn require_int(
+    fields: &std::collections::BTreeMap<String, DeclaredValue>,
+    key: &str,
+    expected: i64,
+) -> Result<()> {
+    if declared_int(fields, key)? == expected {
+        Ok(())
+    } else {
+        Err(declared_error(
+            key,
+            fields.get(key),
+            "the required fixed integer",
+        ))
+    }
+}
+
+fn require_string(
+    fields: &std::collections::BTreeMap<String, DeclaredValue>,
+    key: &str,
+    expected: &str,
+) -> Result<()> {
+    match declared_value(fields, key)? {
+        DeclaredValue::Str(value) if value == expected => Ok(()),
+        value => Err(declared_error(key, Some(value), expected)),
+    }
+}
+
 /// A head-count times head-dimension product, as a checked tensor extent.
 fn width(what: &'static str, heads: u64, head_dim: u64) -> Result<u64> {
     heads
@@ -1125,6 +1469,70 @@ impl ModelDefinition for Gemma4Text {
 mod tests {
     use super::*;
     use moxie_graph::Op;
+
+    fn declared_fixture() -> std::collections::BTreeMap<String, DeclaredValue> {
+        use DeclaredValue::{Bool, Float, Int, List, Str};
+
+        let mut fields = std::collections::BTreeMap::from([
+            ("hidden_size".into(), Int(24)),
+            ("num_hidden_layers".into(), Int(6)),
+            ("num_attention_heads".into(), Int(4)),
+            ("num_key_value_heads".into(), Int(2)),
+            ("num_global_key_value_heads".into(), Int(1)),
+            ("head_dim".into(), Int(16)),
+            ("global_head_dim".into(), Int(32)),
+            ("intermediate_size".into(), Int(16)),
+            ("vocab_size".into(), Int(11)),
+            ("sliding_window".into(), Int(3)),
+            ("rms_norm_eps".into(), Float(1e-6)),
+            ("final_logit_softcapping".into(), Float(30.0)),
+            ("max_position_embeddings".into(), Int(256)),
+            (
+                "rope_parameters.sliding_attention.rope_theta".into(),
+                Float(10_000.0),
+            ),
+            (
+                "rope_parameters.sliding_attention.rope_type".into(),
+                Str("default".into()),
+            ),
+            (
+                "rope_parameters.full_attention.rope_theta".into(),
+                Float(1_000_000.0),
+            ),
+            (
+                "rope_parameters.full_attention.partial_rotary_factor".into(),
+                Float(0.25),
+            ),
+            (
+                "rope_parameters.full_attention.rope_type".into(),
+                Str("proportional".into()),
+            ),
+            ("attention_k_eq_v".into(), Bool(true)),
+            ("tie_word_embeddings".into(), Bool(true)),
+            ("hidden_activation".into(), Str("gelu_pytorch_tanh".into())),
+            ("num_kv_shared_layers".into(), Int(0)),
+            ("hidden_size_per_layer_input".into(), Int(0)),
+            ("use_double_wide_mlp".into(), Bool(false)),
+            ("attention_bias".into(), Bool(false)),
+            ("enable_moe_block".into(), Bool(false)),
+        ]);
+        fields.insert(
+            "layer_types".into(),
+            List(
+                (0..6)
+                    .map(|i| {
+                        Str(if i == 5 {
+                            "full_attention"
+                        } else {
+                            "sliding_attention"
+                        }
+                        .into())
+                    })
+                    .collect(),
+            ),
+        );
+        fields
+    }
 
     /// A configuration small enough for the host-reference profile.
     fn reduced_config() -> TextConfig {
@@ -1638,5 +2046,75 @@ mod tests {
         assert_ne!(s, (5376f64).sqrt() as f32);
         // A perfect square still lands on itself.
         assert_eq!(embedding_scale(64), 8.0);
+    }
+
+    #[test]
+    fn declared_config_maps_and_refuses_unsupported_values() {
+        let fields = declared_fixture();
+        let config =
+            text_config_from_declared(&fields, reduced_config().layer_scalars.clone()).unwrap();
+        assert_eq!(config, reduced_config());
+
+        let full = Gemma4Text::full(config, "fixture-revision").unwrap();
+        assert_eq!(full.metadata.family, "gemma4-text");
+        assert_eq!(
+            full.reduction(),
+            Reduction {
+                synthetic_weights: false,
+                text_only: true,
+            }
+        );
+        for tensor in full.tensors() {
+            let allowed = tensor
+                .allowed
+                .iter()
+                .map(|precision| precision.get())
+                .collect::<Vec<_>>();
+            if is_linear_role(&tensor.role.name) {
+                assert_eq!(
+                    allowed,
+                    vec![Precision::Bf16, Precision::Int8, Precision::Int4]
+                );
+            } else {
+                assert_eq!(allowed, vec![Precision::Bf16]);
+            }
+        }
+
+        let mut wrong_rope = fields.clone();
+        wrong_rope.insert(
+            "rope_parameters.full_attention.rope_type".into(),
+            DeclaredValue::Str("default".into()),
+        );
+        let error = text_config_from_declared(&wrong_rope, vec![1.0; 6])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rope_parameters.full_attention.rope_type"));
+        assert!(error.contains("default"));
+
+        let mut irregular_layers = fields.clone();
+        irregular_layers.insert(
+            "layer_types".into(),
+            DeclaredValue::List(vec![
+                DeclaredValue::Str("full_attention".into()),
+                DeclaredValue::Str("sliding_attention".into()),
+                DeclaredValue::Str("sliding_attention".into()),
+                DeclaredValue::Str("sliding_attention".into()),
+                DeclaredValue::Str("sliding_attention".into()),
+                DeclaredValue::Str("full_attention".into()),
+            ]),
+        );
+        assert!(
+            text_config_from_declared(&irregular_layers, vec![1.0; 6])
+                .unwrap_err()
+                .to_string()
+                .contains("layer_types")
+        );
+
+        assert!(
+            text_config_from_declared(&fields, vec![1.0; 5])
+                .unwrap_err()
+                .to_string()
+                .contains("layer_scalars")
+        );
     }
 }

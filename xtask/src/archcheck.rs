@@ -239,10 +239,13 @@ fn allowlist() -> BTreeMap<&'static str, Allowed> {
                 // may" import concrete models, and this is a composition root
                 // -- which is why `moxie-models` is here and in no other
                 // production row.
+                // the composition root reads a downloaded checkpoint's config and metadata tensors to compose its model (ADR 0038)
                 workspace: &[
                     "moxie-engine",
                     "moxie-graph",
                     "moxie-types",
+                    "moxie-format",
+                    "moxie-storage",
                     "moxie-memory",
                     "moxie-host",
                     "moxie-oracles",
