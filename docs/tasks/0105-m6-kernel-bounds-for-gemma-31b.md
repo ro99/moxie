@@ -154,3 +154,184 @@ summary, in the order to apply them:
   reviewer.
 
 ## Result, filled after work
+
+Status: **implemented** (builder, Claude Sonnet, 2026-09-26). Applied the
+design review in full, in its stated order. Root
+`/home/rodrigo/Developer/moxie`, host and GPU work on all three visible
+GPUs (`GPU-97fe4889…` SM120 5060 Ti, `GPU-3032cfa3…` and `GPU-81fe4578…`
+SM86 3090s).
+
+### 3a (H3) — pinned before any kernel edit, committed separately (`debf248`)
+
+Added `gqa-256-decode` (kv_heads 2, head_dim 256, two full accumulator
+slots) and `gqa-200-chunk` (kv_heads 2, head_dim 200, a partly-used second
+slot) to `paged_attention_indirect`. Captured on the unchanged kernel, all
+three GPUs agreed:
+- `gqa-256-decode`: `50a65b949de6c90123077955814097e03581a1a99d35db6ca5d3d0b6e8ef559e`
+- `gqa-200-chunk`: `c1ac5bf245a6753c2833b2ff703f8edd974c3a17de2762d709d04778c3667673`
+
+The partial kernel has no pinned hash; it is covered only by the FP64
+oracle (see change 4 below).
+
+### Change 3 — attention bound
+
+`MOXIE_ATTN_MAX_HEAD_DIM` (`paged_attention.cu`) and
+`PAGED_ATTENTION_MAX_HEAD_DIM` (`kernels/src/lib.rs`) raised 256 → 512.
+Per L2, no other edit: `paged_attention_declares`, the paged-attention
+catalogue descriptor, the host admission guard
+(`moxie-executor/src/paged_attention.rs:146`) and the refusal tests
+(`paged_attention.rs:995`, `paged_attention_device.rs`'s narrowed-descriptor
+test) all already read the constant -- confirmed by grep, no hit outside
+those. Every accumulator-slot loop stays guarded by the runtime `head_dim`
+(`if (d >= head_dim) continue;`), so widening the constant only grows how
+many *unused, guarded* slots a thread can own at a smaller runtime
+`head_dim`; the order of operations for an existing shape is unchanged.
+
+### Change 4 (H2, M4) — attention qualification
+
+- `mha-256-widest-declared` renamed `mha-256-two-full-slots`, with a
+  literal `head_dim: 256` (no longer tracks the constant).
+- New sibling `mha-512-widest-declared`, at `PAGED_ATTENTION_MAX_HEAD_DIM`.
+- New case `paged_attention_head_dim_512`, registered in both the
+  case-name list and the dispatch (after `paged_attention_indirect`): GQA
+  32 query heads over 4 KV heads, head_dim 512. Three shapes -- `decode`
+  (rows 1), `chunk-8` (rows 8), `sliding-window` (window 40, rows 5) --
+  each checked two ways: the direct kernel's raw output against the FP64
+  oracle (`check_attention`, the same bound `paged_attention` uses), and
+  the step-indirect kernel's raw output checked byte-identical against
+  that same direct output (the same cross-check `paged_attention_indirect`
+  makes at smaller heads). The two-block partial-plus-merge path
+  (`Staging::TwoBlock`/`attend_two_block`) is checked for the `decode`
+  shape only -- `attend_two_block` refuses `rows() != 1`, so decode is the
+  only shape the production path actually serves, the same shape
+  `paged_attention_host_streaming` already qualifies it at.
+
+`cargo xtask-cuda test-gpu` (all cases, all three GPUs): **78 passed, 0
+failed**; sm_86 and sm_120 both QUALIFIED. Printed summary lines:
+```
+decode direct=oracle-checked(max=4.877e-4) indirect=byte-identical
+chunk-8 direct=oracle-checked(max=5.664e-4) indirect=byte-identical
+sliding-window direct=oracle-checked(max=9.757e-4) indirect=byte-identical
+decode-merge transfer=262148 B max=6.746e-8
+```
+(SM86 values shown; SM120 was within the same order of magnitude on every
+line.)
+
+### Change 5 (M4) — coverage check, performed and reverted
+
+Substituted `#define MOXIE_ATTN_ACC_SLOTS (MOXIE_ATTN_MAX_HEAD_DIM /
+MOXIE_ATTN_THREADS)` for the literal `#define MOXIE_ATTN_ACC_SLOTS 2`.
+`cargo xtask-cuda test-gpu --profile sm86` (which also exercised the
+present SM120 device): both `paged_attention`'s `mha-512-widest-declared`
+and `paged_attention_head_dim_512`'s `decode` shape **FAILED** on all
+three GPUs (`device 0 against oracle ...`, off by whole tenths, far past
+the declared bound) -- the mutant is caught. Reverted; `git diff` on
+`paged_attention.cu` afterward showed only change 3's legitimate edit, the
+`MOXIE_ATTN_ACC_SLOTS` line itself unchanged (context, not a diff line).
+Full suite rerun clean: 78 passed, 0 failed, both architectures QUALIFIED.
+
+### Change 1 (H1, M1, M2) — affine bounds
+
+`max_input` raised 16,384 → 21,504 in exactly two descriptors:
+`affine_linear_catalogue` (`lib.rs`, INT4/INT8 × SM86/SM120) and
+`dense_graph_catalogue`'s `dense-affine-linear-*`. `max_output` (65,536)
+and `max_rows` (65,536) untouched. `expert_mlp_catalogue`'s two descriptors
+(BF16 and affine expert MLP) are untouched -- Gemma 31B is dense, and
+nothing here qualifies a routed shape at this depth.
+
+No kernel edit (M2). Audit, copied here as required:
+- `affine_linear.cu`: every index touching `in_features`/`out_features` is
+  `unsigned long long` -- `n0`/`m0` (~59-61), the `k0`/`k`/`m`/`n`/`group`/
+  `entry` family through the tile loop (~78-122), and the output write
+  `m * out_features + n` (~151-155).
+- `affine_decode.cuh` (38 lines total): `moxie_affine_scale_v1`'s `entry`
+  parameter and `moxie_affine_code_v1`'s `row_base` parameter are both
+  `unsigned long long`, and `entry * 4`/`entry * 2`/`row_base + k`/
+  `row_base + (k >> 1)` all operate on that type.
+- Host grid: `affine_linear.rs:1628-1635` checks both grid dimensions fit
+  `u32` before launch; at `max_rows`/`max_output` 65,536 and a 16-wide
+  tile, grid.y and grid.x are both ≤ 4,096, under CUDA's 65,535 limit.
+
+No 32-bit index was found; the stop condition did not fire.
+
+### Change 2 (H4, L1, M3) — affine qualification
+
+`affine_linear_device.rs` `run_case`: both `CapacitySnapshot` totals
+raised `64 << 20` → `256 << 20` (the 21,504×5,376 INT8 codes alone are
+115,605,504 B). No other edit to that file, per H4.
+
+Five new `Case`s added to `CASES`, all `Grouping::Contiguous { size: 32 }`,
+`mapped: false` (L1):
+- `g`/`h`: INT8 symmetric, BF16 scales, `(out, in) = (5,376, 21,504)`
+  (`down_proj`'s shape), rows 1 and 33.
+- `i`/`j`: INT8 symmetric, BF16 scales, `(out, in) = (21,504, 5,376)`
+  (`gate_proj`/`up_proj`'s shape), rows 1 and 8.
+- `k` (M3): INT4 symmetric, BF16 scales, `(out, in) = (5,376, 21,504)`,
+  row 1 -- qualifies the INT4 code path (`k >> 1` in `affine_decode.cuh`)
+  at the same depth.
+
+`cargo test -p moxie-executor --features driver --test affine_linear_device
+--locked -- --nocapture` (H5): **4 passed, 0 failed**, 572.15 s, on all
+three visible devices. Per-case worst ULP and cancellation-clause count
+(SM86 3090; SM120 was the same order of magnitude):
+
+| Case | elements | worst ULP | 2nd-clause count |
+|---|---|---|---|
+| g (INT8, down-shape, row 1) | 5,376 | 9.0 | 4 |
+| h (INT8, down-shape, 33 rows) | 177,408 | 15,288.0 | 109 |
+| i (INT8, gate-shape, row 1) | 21,504 | 7.0 | 1 |
+| j (INT8, gate-shape, 8 rows) | 172,032 | 140.5 | 23 |
+| k (INT4, down-shape, row 1) | 5,376 | 7.0 | 2 |
+
+Every element that missed ADR 0028's 2-ULP clause passed the reduction's
+own `2^-8 · Σ|x·W|` clause instead (L4's stop condition never fired); `h`,
+the deepest reduction (21,504) at the most rows (33), has the largest
+misses and the most clause-2 elements, matching the clause's own
+rationale. No timing is claimed -- device/BF16-copy byte counts printed
+alongside are a memory-footprint assertion (`footprint < dequantized`),
+not a speed measurement.
+
+### L3 — resource usage
+
+`cuobjdump -res-usage` on the built `paged_attention.fatbin`:
+
+| Symbol | SM86 REG / SHARED | SM120 REG / SHARED |
+|---|---|---|
+| `moxie_bf16_paged_attention_v1` (direct) | 40 / 3,608 B | 40 / 4,632 B |
+| `moxie_bf16_paged_attention_indirect_v1` | 40 / 3,640 B | 42 / 4,664 B |
+| `moxie_bf16_paged_attention_partial_v1` | 42 / 3,608 B | 42 / 4,632 B |
+
+Matches the design review's estimate (3,608 B on SM86) exactly. Well
+under any per-block shared-memory or register limit at a 128-thread
+block; the 512 stop condition ("does not fit... without restructuring")
+did not fire.
+
+### GPU acceptance gate: `dense_gemma_device` with `cublas`
+
+`cargo test -p moxie-executor --features
+driver,paged-attention-binding,paged-attention-test-hooks,nccl,cublas
+--test dense_gemma_device --locked -- --nocapture`: **18 passed, 0
+failed, 2 ignored** (`dense_step_timing`, `stress_graph_benchmark` --
+timing/benchmark harnesses, correctly not run here), 188.5 s. The
+descriptor-bound change does not change what selection admits for this
+suite's shapes.
+
+### Host gates
+
+fmt clean; `cargo clippy --workspace --all-targets --locked -- -D
+warnings` clean; `cargo clippy -p xtask --features cuda --all-targets
+--locked -- -D warnings` clean; `cargo clippy -p moxie-executor
+--all-targets --features
+driver,paged-attention-binding,paged-attention-test-hooks,nccl,cublas
+--locked -- -D warnings` clean (the executor driver lane, since this task
+touches an `#![cfg(feature = "driver")]` test file); `cargo test
+--workspace --locked` passed; `cargo xtask arch-check` passed (79
+rejected / 21 accepted fixtures, 13 rules -- no allowlist change, matching
+the Allowed files list); `cargo xtask spec-check` passed (10 documents
+unchanged).
+
+### Not claimed
+
+No arithmetic order changed in either kernel (task's own non-goal); no
+performance tuning or timing; nothing about a routed (expert-MLP) shape at
+21,504 -- `expert_mlp_catalogue` is untouched and Gemma 31B is dense.

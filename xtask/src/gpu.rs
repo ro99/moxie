@@ -98,6 +98,7 @@ const CASES: &[&str] = &[
     "tp_f32_to_bf16_rounding",
     "paged_attention",
     "paged_attention_indirect",
+    "paged_attention_head_dim_512",
     "paged_attention_host_streaming",
     "paged_attention_host_streaming_n3",
     "paged_attention_32k",
@@ -255,6 +256,11 @@ pub fn run(profile: Option<&str>) -> i32 {
             &cap,
             "paged_attention_indirect",
             paged_attention_indirect(&cap),
+        ));
+        results.push(case(
+            &cap,
+            "paged_attention_head_dim_512",
+            paged_attention_head_dim_512(&cap),
         ));
         results.push(case(
             &cap,
@@ -3283,12 +3289,32 @@ fn paged_attention(cap: &DeviceCapability) -> Result<Outcome, Error> {
             first_position: 99,
             appends: &[1, 63, 36],
         },
-        // The widest head dimension the catalogue advertises. Declaring a
-        // shape domain and qualifying a subset of it is the gap document 07
+        // Two full accumulator slots -- the widest head dimension the
+        // catalogue advertised before task 0105 widened it further, kept as
+        // a literal so raising `PAGED_ATTENTION_MAX_HEAD_DIM` again cannot
+        // silently stop testing this shape.
+        Case {
+            label: "mha-256-two-full-slots",
+            geometry: PageGeometry {
+                kv_heads: 1,
+                head_dim: 256,
+                page_tokens: 8,
+                pages: 4,
+            },
+            heads: 2,
+            scale: moxie_plan::reciprocal_sqrt_scale(256),
+            visibility: Visibility::Causal,
+            rows: 3,
+            history: 29,
+            first_position: 26,
+            appends: &[8, 12, 9],
+        },
+        // The widest head dimension the catalogue advertises today. Declaring
+        // a shape domain and qualifying a subset of it is the gap document 07
         // calls out by name, so the boundary of the claim is measured rather
         // than assumed.
         Case {
-            label: "mha-256-widest-declared",
+            label: "mha-512-widest-declared",
             geometry: PageGeometry {
                 kv_heads: 1,
                 head_dim: moxie_kernels::PAGED_ATTENTION_MAX_HEAD_DIM,
@@ -4045,6 +4071,331 @@ fn paged_attention_indirect(cap: &DeviceCapability) -> Result<Outcome, Error> {
             "    {} {} row_bytes={row_bytes} pages=byte-identical",
             cap.uuid, case.label
         );
+    }
+    Ok(Outcome::Passed)
+}
+
+/// Task 0105 change 4: Gemma 31B's global-layer shape, GQA 32 query heads
+/// over 4 KV heads at head_dim 512 -- the width `MOXIE_ATTN_MAX_HEAD_DIM`
+/// widened to.
+///
+/// Three shapes (a decode row, an 8-row chunk, a sliding window), each
+/// checked against the independent FP64 oracle through the direct kernel
+/// and cross-checked byte-identical against the step-indirect kernel, the
+/// same two-kernel comparison `paged_attention_indirect` makes at smaller
+/// heads. The two-block partial-plus-merge path (`Staging::TwoBlock`,
+/// `attend_two_block`) serves one query row only (`PagedAttentionRun::
+/// attend_two_block` refuses more), so it is checked for the decode shape,
+/// the same shape `paged_attention_host_streaming` qualifies it at.
+fn paged_attention_head_dim_512(cap: &DeviceCapability) -> Result<Outcome, Error> {
+    const HEADS: u64 = 32;
+    const KV_HEADS: u64 = 4;
+    const HEAD_DIM: u64 = 512;
+    const PAGE_TOKENS: u64 = 32;
+    let scale = moxie_plan::reciprocal_sqrt_scale(HEAD_DIM);
+
+    let ctx = RankContext::acquire(RankId(cap.ordinal), cap.ordinal)?;
+    let stream = Stream::new(&ctx)?;
+    let module = Module::load(
+        &ctx,
+        ModuleImage::Binary(smoke_image(moxie_kernels::PAGED_ATTENTION_FATBIN)?),
+    )?;
+    let v1 = module.function(moxie_kernels::PAGED_ATTENTION)?;
+    let indirect = module.function(moxie_kernels::PAGED_ATTENTION_INDIRECT)?;
+
+    struct Shape {
+        label: &'static str,
+        pages: u64,
+        visibility: Visibility,
+        rows: u64,
+        history: u64,
+        first_position: u64,
+    }
+    let shapes = [
+        Shape {
+            label: "decode",
+            pages: 4,
+            visibility: Visibility::Causal,
+            rows: 1,
+            history: 100,
+            first_position: 99,
+        },
+        Shape {
+            label: "chunk-8",
+            pages: 4,
+            visibility: Visibility::Causal,
+            rows: 8,
+            history: 100,
+            first_position: 92,
+        },
+        Shape {
+            label: "sliding-window",
+            pages: 3,
+            visibility: Visibility::SlidingWindow { window: 40 },
+            rows: 5,
+            history: 71,
+            first_position: 66,
+        },
+    ];
+
+    for shape in &shapes {
+        let geometry = PageGeometry {
+            kv_heads: KV_HEADS,
+            head_dim: HEAD_DIM,
+            page_tokens: PAGE_TOKENS,
+            pages: shape.pages,
+        };
+        let layer = AttentionLayer {
+            geometry,
+            heads: HEADS,
+            scale,
+            visibility: shape.visibility,
+        };
+        let launch =
+            PagedAttentionLaunch::new(layer, shape.rows, shape.first_position, 0, shape.history)?;
+        let fixture = AttentionFixture::build(geometry, HEADS, shape.history, 0x0105_0512);
+        let table = shuffled_pages(geometry.pages);
+        let (key_bytes, value_bytes) = attention_page_images(&fixture, &table, shape.history);
+        let table_bytes = words_u32_bytes(&table);
+        let query_bytes = fixture.query_bytes(shape.first_position, shape.rows);
+        let output_bytes = (shape.rows * HEADS * HEAD_DIM * 2) as usize;
+        let window: u32 = match shape.visibility {
+            Visibility::Causal => 0,
+            Visibility::SlidingWindow { window } => window as u32,
+        };
+
+        let mut query = DeviceBuffer::alloc(&ctx, query_bytes.len())?;
+        query.copy_from_host(&query_bytes)?;
+        let mut key_pages = DeviceBuffer::alloc(&ctx, key_bytes.len())?;
+        key_pages.copy_from_host(&key_bytes)?;
+        let mut value_pages = DeviceBuffer::alloc(&ctx, value_bytes.len())?;
+        value_pages.copy_from_host(&value_bytes)?;
+        let mut page_table = DeviceBuffer::alloc(&ctx, table_bytes.len())?;
+        page_table.copy_from_host(&table_bytes)?;
+        let reference_output = DeviceBuffer::alloc(&ctx, output_bytes)?;
+
+        let mut reference_ptr = reference_output.device_ptr();
+        let mut query_ptr = query.device_ptr();
+        let mut key_ptr = key_pages.device_ptr();
+        let mut value_ptr = value_pages.device_ptr();
+        let mut table_ptr = page_table.device_ptr();
+        let mut rows = shape.rows;
+        let mut first_position = shape.first_position;
+        let mut history_base = 0u64;
+        let mut history_rows = shape.history;
+        let mut heads = HEADS as u32;
+        let mut kv_heads = KV_HEADS as u32;
+        let mut head_dim = HEAD_DIM as u32;
+        let mut page_tokens = PAGE_TOKENS as u32;
+        let mut window_param = window;
+        let mut scale_param = scale;
+        let mut reference_params: [*mut c_void; 15] = [
+            (&raw mut query_ptr).cast(),
+            (&raw mut key_ptr).cast(),
+            (&raw mut value_ptr).cast(),
+            (&raw mut table_ptr).cast(),
+            (&raw mut reference_ptr).cast(),
+            (&raw mut rows).cast(),
+            (&raw mut first_position).cast(),
+            (&raw mut history_base).cast(),
+            (&raw mut history_rows).cast(),
+            (&raw mut heads).cast(),
+            (&raw mut kv_heads).cast(),
+            (&raw mut head_dim).cast(),
+            (&raw mut page_tokens).cast(),
+            (&raw mut window_param).cast(),
+            (&raw mut scale_param).cast(),
+        ];
+        // SAFETY: the parameter order and types match the unchanged v1 ABI;
+        // every buffer covers the declared geometry and the blocking launch
+        // observes completion before any buffer can drop.
+        unsafe {
+            v1.launch_blocking(
+                (shape.rows as u32, HEADS as u32, 1),
+                (moxie_kernels::PAGED_ATTENTION_THREADS, 1, 1),
+                0,
+                &mut reference_params,
+            )?;
+        }
+        let mut reference = vec![0; output_bytes];
+        reference_output.copy_to_host(&mut reference)?;
+
+        // The direct kernel's own output against the independent FP64
+        // equation -- this is the check `paged_attention` makes at smaller
+        // heads, at the same declared bound.
+        let summary = check_attention(&fixture, &launch, &reference, shape.label)?;
+
+        let step_values = [shape.rows, shape.first_position, 0, shape.history];
+        let step_bytes = words_u64_bytes(&step_values);
+        let mut step = DeviceBuffer::alloc(&ctx, step_bytes.len())?;
+        step.copy_from_host(&step_bytes)?;
+        let indirect_output = DeviceBuffer::alloc(&ctx, output_bytes)?;
+        let mut output_ptr = indirect_output.device_ptr();
+        let mut step_ptr = step.device_ptr();
+        let mut indirect_params: [*mut c_void; 12] = [
+            (&raw mut query_ptr).cast(),
+            (&raw mut key_ptr).cast(),
+            (&raw mut value_ptr).cast(),
+            (&raw mut table_ptr).cast(),
+            (&raw mut output_ptr).cast(),
+            (&raw mut step_ptr).cast(),
+            (&raw mut heads).cast(),
+            (&raw mut kv_heads).cast(),
+            (&raw mut head_dim).cast(),
+            (&raw mut page_tokens).cast(),
+            (&raw mut window_param).cast(),
+            (&raw mut scale_param).cast(),
+        ];
+        // SAFETY: the parameter order matches the indirect ABI, step contains
+        // four u64 values, and the exact-row grid covers every query block.
+        unsafe {
+            indirect.launch_blocking(
+                (shape.rows as u32, HEADS as u32, 1),
+                (moxie_kernels::PAGED_ATTENTION_THREADS, 1, 1),
+                0,
+                &mut indirect_params,
+            )?;
+        }
+        let mut got = vec![0; output_bytes];
+        indirect_output.copy_to_host(&mut got)?;
+        if got != reference {
+            return Ok(Outcome::Failed(format!(
+                "{}: step-indirect output differs from the direct kernel",
+                shape.label
+            )));
+        }
+        println!(
+            "    {} {} direct=oracle-checked(max={:.3e}) indirect=byte-identical",
+            cap.sm(),
+            shape.label,
+            summary.max
+        );
+    }
+
+    // The two-block partial-plus-merge path, for the decode shape only:
+    // `attend_two_block` refuses more than one query row, so this is the one
+    // shape the production path actually serves.
+    const RESIDENT_ROWS: u64 = PAGE_TOKENS;
+    const STAGED_ROWS: u64 = PAGE_TOKENS;
+    const TOTAL_ROWS: u64 = RESIDENT_ROWS + STAGED_ROWS;
+    let geometry = PageGeometry {
+        kv_heads: KV_HEADS,
+        head_dim: HEAD_DIM,
+        page_tokens: PAGE_TOKENS,
+        pages: 2,
+    };
+    let fixture = AttentionFixture::build(geometry, HEADS, TOTAL_ROWS, 0x0105_0513);
+    let catalogue = moxie_kernels::paged_attention_catalogue();
+    let stream_geometry = PageGeometry {
+        pages: 1,
+        ..geometry
+    };
+    let stream_layer = AttentionLayer {
+        geometry: stream_geometry,
+        heads: HEADS,
+        scale,
+        visibility: Visibility::Causal,
+    };
+    let stream_probe = PagedAttentionLaunch::new(stream_layer, 1, 0, 0, 1)?;
+    let stream_descriptor = select_paged_attention_kernel(&catalogue, cap, &stream_probe)?;
+
+    let mut ledger = measured_ledger(&ctx)?;
+    let host_geometry = moxie_state::KvGeometry {
+        layers: vec![moxie_state::LayerKv {
+            kv_heads: geometry.kv_heads as usize,
+            key_dim: geometry.head_dim as usize,
+            value_dim: geometry.head_dim as usize,
+            retention: moxie_state::Retention::All,
+        }],
+        precision: Precision::Bf16,
+        page_tokens: PAGE_TOKENS as usize,
+        max_tokens: TOTAL_ROWS as usize,
+        tentative_rows: TOTAL_ROWS as usize,
+    };
+    let mut host = moxie_state::PagedSequence::new(&mut ledger, host_geometry)?;
+    let host_txn = host.begin()?;
+    host.append_prompt(TOTAL_ROWS)?;
+    for position in 0..TOTAL_ROWS {
+        let (keys, values) = fixture.payload(position, 1);
+        let rows = [moxie_state::KvRow {
+            key: &keys,
+            value: &values,
+        }];
+        host.append(
+            host_txn,
+            position,
+            &rows,
+            &std::sync::atomic::AtomicBool::new(false),
+        )?;
+    }
+    host.commit_prefix(host_txn, 0)?;
+
+    let mut streamed_run = PagedAttentionRun::admit_for_sequence(
+        &mut ledger,
+        &ctx,
+        stream_descriptor,
+        stream_geometry,
+        HEADS,
+        RESIDENT_ROWS,
+        RESIDENT_ROWS
+            .checked_add(1)
+            .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
+        Staging::TwoBlock,
+    )
+    .map_err(|refused| refused.error)?;
+    let mut resident_state = moxie_state::DeviceKvSequence::new(moxie_state::KvGeometry {
+        layers: vec![moxie_state::LayerKv {
+            kv_heads: geometry.kv_heads as usize,
+            key_dim: geometry.head_dim as usize,
+            value_dim: geometry.head_dim as usize,
+            retention: moxie_state::Retention::All,
+        }],
+        precision: Precision::Bf16,
+        page_tokens: PAGE_TOKENS as usize,
+        max_tokens: RESIDENT_ROWS as usize,
+        tentative_rows: RESIDENT_ROWS as usize,
+    })?;
+    append_authority_rows(
+        &mut resident_state,
+        &mut streamed_run,
+        &stream,
+        &fixture,
+        RESIDENT_ROWS,
+    )?;
+    let (host_keys, host_values) = host.read_block(0, RESIDENT_ROWS, STAGED_ROWS)?;
+    let stream_launch =
+        PagedAttentionLaunch::two_block_stream(stream_layer, 1, TOTAL_ROWS - 1, 0, STAGED_ROWS)?;
+    let streamed = streamed_run
+        .attend_two_block(
+            &stream,
+            &stream_launch,
+            fixture.query_bytes(TOTAL_ROWS - 1, 1),
+            host_keys,
+            host_values,
+        )
+        .map_err(|refused| refused.error)?;
+
+    // The merged raw partials against the independent FP64 equation, with no
+    // BF16 allowance: this is the same bound `paged_attention_host_streaming`
+    // holds its merge to at head_dim 64, now at 512.
+    let streamed_output = merge_device_partials(&streamed, HEADS, HEAD_DIM)?;
+    let (merge_summary, _) =
+        check_streamed_attention(&fixture, &stream_launch, &streamed_output, "decode-merge")?;
+    println!(
+        "    {} decode-merge transfer={} B max={:.3e}",
+        cap.sm(),
+        streamed.host_to_device_bytes,
+        merge_summary.max
+    );
+
+    streamed_run
+        .close(&mut ledger)
+        .map_err(|refused| refused.error)?;
+    host.close(&mut ledger).map_err(|refused| refused.error)?;
+    if !ledger.outstanding().is_empty() {
+        return Ok(Outcome::Failed(
+            "decode-merge left outstanding ledger reservations".into(),
+        ));
     }
     Ok(Outcome::Passed)
 }

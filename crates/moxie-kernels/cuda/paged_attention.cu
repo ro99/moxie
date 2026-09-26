@@ -55,8 +55,12 @@
 // output component.
 #define MOXIE_ATTN_THREADS 128
 // The largest head dimension this build serves. The host refuses anything wider
-// rather than this kernel reading past the end of a row.
-#define MOXIE_ATTN_MAX_HEAD_DIM 256
+// rather than this kernel reading past the end of a row. Task 0105: Gemma
+// 31B's global layers declare 512; every loop over the head dimension stays
+// bounded by the runtime `head_dim` (never this constant directly) with the
+// slot guard below, so widening it changes no order of operations, only how
+// many accumulator slots a thread owns.
+#define MOXIE_ATTN_MAX_HEAD_DIM 512
 #define MOXIE_ATTN_ACC_SLOTS (MOXIE_ATTN_MAX_HEAD_DIM / MOXIE_ATTN_THREADS)
 #define MOXIE_ATTN_WARPS (MOXIE_ATTN_THREADS / 32)
 

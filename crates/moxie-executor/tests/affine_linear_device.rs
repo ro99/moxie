@@ -456,6 +456,68 @@ const CASES: &[Case] = &[
         in_features: 100,
         rows: 5,
     },
+    // Task 0105: Gemma 31B's own affine-linear shapes at the raised
+    // 21,504 bound, in the checkpoint's own declared encoding -- INT8
+    // group-32 symmetric with BF16 scales
+    // (`down_proj.weight_scale` is BF16 [5376, 672]).
+    Case {
+        name: "g: int8 group-32 symmetric, 21504-wide input, a decode row",
+        width: IntWidth::Int8,
+        grouping: Grouping::Contiguous { size: 32 },
+        asymmetric: false,
+        scale_dtype: ScaleDtype::Bf16,
+        mapped: false,
+        out_features: 5376,
+        in_features: 21504,
+        rows: 1,
+    },
+    Case {
+        name: "h: int8 group-32 symmetric, 21504-wide input, a prefill chunk",
+        width: IntWidth::Int8,
+        grouping: Grouping::Contiguous { size: 32 },
+        asymmetric: false,
+        scale_dtype: ScaleDtype::Bf16,
+        mapped: false,
+        out_features: 5376,
+        in_features: 21504,
+        rows: 33,
+    },
+    Case {
+        name: "i: int8 group-32 symmetric, 21504-wide output, a decode row",
+        width: IntWidth::Int8,
+        grouping: Grouping::Contiguous { size: 32 },
+        asymmetric: false,
+        scale_dtype: ScaleDtype::Bf16,
+        mapped: false,
+        out_features: 21504,
+        in_features: 5376,
+        rows: 1,
+    },
+    Case {
+        name: "j: int8 group-32 symmetric, 21504-wide output, a prefill chunk",
+        width: IntWidth::Int8,
+        grouping: Grouping::Contiguous { size: 32 },
+        asymmetric: false,
+        scale_dtype: ScaleDtype::Bf16,
+        mapped: false,
+        out_features: 21504,
+        in_features: 5376,
+        rows: 8,
+    },
+    // M3: the affine loop sets both widths' bound from one literal, but only
+    // INT8 is qualified above -- this qualifies the INT4 code path
+    // (`k >> 1` in `affine_decode.cuh`) at the same depth.
+    Case {
+        name: "k: int4 group-32 symmetric, 21504-wide input, a decode row",
+        width: IntWidth::Int4,
+        grouping: Grouping::Contiguous { size: 32 },
+        asymmetric: false,
+        scale_dtype: ScaleDtype::Bf16,
+        mapped: false,
+        out_features: 5376,
+        in_features: 21504,
+        rows: 1,
+    },
 ];
 
 #[test]
@@ -541,9 +603,12 @@ fn run_case<'ctx>(
         + align(scale_bytes_len)
         + align(zero_bytes.unwrap_or(0))
         + align(group_index_bytes.unwrap_or(0));
+    // Task 0105: 256 MiB, not 64 -- the 21,504x5,376 INT8 codes alone are
+    // 115,605,504 B, plus 7,225,344 B of BF16 scales, and 64 MiB refused to
+    // open at that size.
     let mut ledger = Ledger::new([
-        CapacitySnapshot::new(Scope::Host, 64 << 20, 1 << 20).unwrap(),
-        CapacitySnapshot::new(scope, 64 << 20, 1 << 20).unwrap(),
+        CapacitySnapshot::new(Scope::Host, 256 << 20, 1 << 20).unwrap(),
+        CapacitySnapshot::new(scope, 256 << 20, 1 << 20).unwrap(),
     ])
     .unwrap();
     let mut authority = ResidencyAuthority::open(

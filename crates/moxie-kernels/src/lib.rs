@@ -109,8 +109,11 @@ pub const PAGED_ATTENTION_TILE: u64 = 128;
 /// one block writes per pass.
 pub const PAGED_ATTENTION_THREADS: u32 = 128;
 /// The widest head dimension the image serves. The host refuses more rather
-/// than letting the kernel read past a row.
-pub const PAGED_ATTENTION_MAX_HEAD_DIM: u64 = 256;
+/// than letting the kernel read past a row. Task 0105: raised to Gemma 31B's
+/// global-layer head dimension; the paged-attention catalogue, the host
+/// admission guard and the refusal tests all read this constant rather than
+/// restating 256, so this is the only edit their bound needed.
+pub const PAGED_ATTENTION_MAX_HEAD_DIM: u64 = 512;
 
 pub const DENSE_EMBEDDING: &str = "moxie_dense_embedding_v1";
 pub const DENSE_GROUPED_RMS: &str = "moxie_dense_grouped_rms_v1";
@@ -436,7 +439,13 @@ mod images {
                     layout: TensorLayout::ContiguousRowMajorV1,
                     shape: KernelShapeBounds {
                         max_rows: 65_536,
-                        max_input: 16_384,
+                        // Task 0105: Gemma 31B's dense MLP declares 21,504
+                        // (`down_proj`'s input, `gate_proj`/`up_proj`'s
+                        // output). `max_output` stays 65,536 -- it was
+                        // already wide enough -- and `expert_mlp_catalogue`
+                        // is untouched: Gemma 31B is dense, and nothing here
+                        // qualifies a routed shape at this depth.
+                        max_input: 21_504,
                         max_output: 65_536,
                     },
                     sm,
@@ -573,7 +582,10 @@ mod images {
                     layout: TensorLayout::ContiguousRowMajorV1,
                     shape: KernelShapeBounds {
                         max_rows: 65_536,
-                        max_input: 16_384,
+                        // Same bound and the same reason as
+                        // `affine_linear_catalogue`: the dense graph's own
+                        // affine linear is the same kernel and symbol.
+                        max_input: 21_504,
                         max_output: 65_536,
                     },
                     sm,
