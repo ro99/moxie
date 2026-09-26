@@ -1,6 +1,18 @@
 # Task 0101 — full-step decode capture: step-state buffer, prepare/apply, one graph
 
-Status: **active, revision 3** (coordinator, 2026-09-25). The second design
+Status: **accepted** (coordinator, 2026-09-25) after two design reviews (13
+findings, all closed in code) and review rounds R1 (1 high, 1 low) and R2
+(clean). Implementation `3684d5d`/`f263f39`; R1 repair `3065441`. Builder
+Codex `luna`; reviewer Codex `sol`.
+- A single-GPU dense decode step runs as one graph launch. Eager,
+  piecewise, full-step and host logits are byte-identical over 8 decode
+  steps, with the ordered and the cuBLAS catalogues.
+- R1 H1: replay skipped host validation (token ids). It was fixed, and every
+  eager host-side check was audited into `prepare_full_step`. The lesson: a
+  replayed graph skips all host code, so every host check must run before
+  each replay.
+
+Revision history: Status: **active, revision 3** (coordinator, 2026-09-25). The second design
 review (3 high, 1 medium) is adopted verbatim in "Design review 2" below.
 Where it conflicts with the numbered changes, **it overrides them**.
 Earlier revision history: This was

@@ -156,8 +156,9 @@ reviews):
    step-indirect attention and KV append kernels (bit-identical);
    [0099](../tasks/0099-m6-prepared-kv-append.md) the state authority's
    prepared KV append (split out after sol's design review: 5 high, 4
-   medium); [0101](../tasks/0101-m6-full-step-decode-capture.md) the
-   executor's full-step capture, re-reviewed before implementation; 0100
+   medium); [0101](../tasks/0101-m6-full-step-decode-capture.md) **accepted**
+   2026-09-25: whole single-GPU decode step as one graph, byte-identical to
+   eager; 0100
    capture of ordered-reduction plans (TP ranks, split reference; moved from
    0097).
 3. **M6.3** Pipeline microbatch overlap (carried from M5); opt-in hot-expert

@@ -48,11 +48,23 @@ Each links into the entries below.
 | Work that exists on one disk and nowhere else | 24 commits, four tasks and five review rounds, unpushed for thirty hours |
 | A repair that satisfies the test rather than the property | task 0029, four rounds: an owned label the fixture never used, a prefix measured on a warmed ledger, a mutant that panicked before it mutated, an aggregate standing in for a state |
 | A harness with no tests of its own | the mutation guard, after three rounds of guard bugs: the self-test covers verdicts, selectors and anchors, and never touched restoration |
+| A replayed graph that skips the host checks its eager step makes | task 0101's full-step replay launched with an out-of-vocabulary token, and the state authority published the KV row before any error |
 | A decision framed from the current code instead of from how the problem is solved | the M6 BF16 matrix-multiply choice, offered as "exact tiled or own tensor-core kernel" while Strata's cuBLAS/Marlin route and its per-operation exactness went unmentioned |
 | A resource that leaves its owner on a refusal or cleanup path while device work may still use it | task 0082's pending event dropped across streams and drop unloading a live module; task 0085's graphs cleared after a failed drain; task 0089's probe buffers dropped on an error path; task 0091's admission refusal handing out plans apart from their weight leases |
 | A measurement that shares its instrument with whatever runs beside it | task 0025's budget lane, whose global allocator counted the other test's fixtures for two tasks, and was serialised rather than fixed |
 
 ## Entries, newest first
+
+**A replayed graph skips every host check (2026-09-25, M6).** Task 0101
+captured a whole decode step as one CUDA graph. The eager step validates
+per-step host values (token ids against the vocabulary, positions,
+bindings) inside the code that enqueues each node. A replay skips all of
+that code by design: it uploads inputs and launches the graph. The first
+implementation therefore replayed an out-of-range token, and the state
+authority then published a KV row computed from it. The sentence to
+remember: **when execution becomes a replay, every host-side check the
+eager path makes must move into a pre-replay step and run before the first
+upload; audit the eager path and list the checks in the task record.**
 
 **A decision framed from the current code instead of from how the problem is
 solved (2026-09-25, M6).** Task 0095 measured Moxie's BF16 dense linear at
