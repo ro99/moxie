@@ -159,14 +159,30 @@ reviews):
    medium); [0101](../tasks/0101-m6-full-step-decode-capture.md) **accepted**
    2026-09-25: whole single-GPU decode step as one graph, byte-identical to
    eager; 0100
-   capture of ordered-reduction plans (TP ranks, split reference; moved from
-   0097).
+   is re-scoped (below).
 3. **M6.3** Pipeline microbatch overlap (carried from M5); opt-in hot-expert
    tier; opt-in route prediction feeding the bounded prefetch class.
 4. **M6.4** Device KV transition between a prefill and a decode placement.
 5. **M6.5** Automatic selection wired into plan choice, and fixed-plan mode.
 6. **Slice 7** Checkpoint route items 2–6, the exit benchmarks, default
    choices, the carried failure-path tests, and the milestone-end audit.
+
+### Finding: multi-GPU execution is still M5's per-step reference (coordinator, 2026-09-25)
+
+TP (`dense_tp_workers.rs`) and PP (`pipeline.rs`) re-lower the stage graphs
+on every step. They admit, drain and close a plan per stage per rank
+(`WorkerCommand::Stage`, `Drain`, `ClosePlans`), and join through host
+handshakes. M6 gave the single-GPU path persistent plans, shared weights and
+capture, and gave the multi-GPU path none of it. All three exit checkpoints
+need more than one GPU. Route, owner-approved NCCL
+([ADR 0039](../decisions/adr/0039-nccl-for-tensor-parallel-joins.md)):
+- **0100 (M6.1):** NCCL communicators and joins (FP32 sum, BF16/FP32
+  gather, status max), admitted buffers, and M5's fault tests re-qualified,
+  inside the existing orchestration.
+- **0102 (M6.1):** persistent multi-GPU execution. Per-rank and per-stage
+  plan sets are admitted once and reused, with weights resident once per
+  rank, as `DensePlanSet` (0091) does on one GPU.
+- **0103 (M6.2):** per-rank capture of TP and PP decode steps.
 
 ### Naming (owner, 2026-09-25)
 
