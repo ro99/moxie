@@ -1201,6 +1201,165 @@ fn full_step_decode_capture_matches_eager_piecewise_and_host() {
     }
 }
 
+#[cfg(feature = "cublas")]
+#[test]
+fn full_step_replay_refuses_invalid_embedding_token_before_submission() {
+    let _guard = one_at_a_time();
+    let count = device_count().expect("enumerate CUDA devices");
+    assert!(count >= 3, "requires all three GPUs; saw {count}");
+    let shape = moxie_cli::gemma::Shape::A;
+    let config = shape.config();
+    let fixture = moxie_cli::gemma::build(shape).expect("build dense Gemma fixture");
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+
+    for ordinal in 0..count {
+        let capability = query_device(ordinal).expect("query full-step GPU");
+        let context =
+            RankContext::acquire(RankId(ordinal), ordinal).expect("acquire full-step GPU context");
+        let stream = Stream::new(&context).expect("create full-step stream");
+        let mut ledger = dense_test_ledger(&context, None);
+        let mut state =
+            DeviceKvSequence::new(geometry(&config, 4, 32, 1)).expect("create decode state");
+        let mut runs = admit_runs(&mut ledger, &context, &config, &state, 1);
+        let candidate = lower_selected(
+            &fixture.graph,
+            ResourceWorkload {
+                phase: Phase::Decode,
+                rows: 1,
+                visible_tokens: 32,
+                branch_rows: 1,
+                output: fixture.graph.output(),
+                device: capability.uuid,
+                paged_state_capacity: None,
+            },
+            &capability,
+            &catalogue,
+        )
+        .expect("lower full-step token validation plan");
+        let mut plan = admit_dense_candidate(
+            candidate,
+            &fixture,
+            &capability,
+            &catalogue,
+            &mut ledger,
+            &context,
+        );
+        plan.set_full_step_capture(true, &mut ledger)
+            .expect("enable full-step capture");
+
+        let first_token = [0];
+        let first_position = [0];
+        let transaction = state.begin().expect("begin capture transaction");
+        let bindings =
+            dense_test_bindings(&fixture, &plan, &first_token, &first_position, &capability);
+        let captured = execute_dense_test_step(
+            plan,
+            &fixture,
+            &capability,
+            &catalogue,
+            &context,
+            &stream,
+            &mut state,
+            transaction,
+            &mut runs,
+            bindings,
+        );
+        assert_eq!(captured.plan.captured_segments(), 1);
+        commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
+            .expect("commit captured decode");
+        plan = captured.plan;
+
+        let frontier_before = (0..config.layers as usize)
+            .map(|layer| state.layer_retained(layer).expect("layer frontier"))
+            .collect::<Vec<_>>();
+        let invalid_token = [config.vocab];
+        let next_position = [1];
+        let bad_bindings =
+            dense_test_bindings(&fixture, &plan, &invalid_token, &next_position, &capability);
+        let bad_binding_count = bad_bindings.len();
+        let expected_token_bytes = config.vocab.to_le_bytes();
+        let token_value = fixture
+            .graph
+            .nodes()
+            .iter()
+            .find_map(|node| {
+                matches!(node.params, OpParams::Embedding { .. }).then_some(node.inputs[0])
+            })
+            .expect("embedding token input");
+        let transaction = state.begin().expect("begin invalid replay transaction");
+        let refused = plan
+            .execute_dense(DenseGraphStep {
+                graph: &fixture.graph,
+                capability: &capability,
+                catalogue: &catalogue,
+                ctx: &context,
+                stream: &stream,
+                state: &mut state,
+                transaction,
+                runs: &mut runs,
+                bindings: bad_bindings,
+                host_experts: &[],
+            })
+            .expect_err("an out-of-vocabulary token is refused before replay");
+        assert!(matches!(
+            &refused.error,
+            moxie_types::Error::InvalidRequest { field: "token", .. }
+        ));
+        assert!(refused.plan.is_some(), "preflight returns the usable plan");
+        assert!(refused.held.is_none(), "no operation lease was submitted");
+        assert_eq!(refused.bindings.len(), bad_binding_count);
+        assert!(refused.bindings.iter().any(|binding| {
+            binding.value == token_value
+                && binding.bytes.as_slice() == expected_token_bytes.as_slice()
+        }));
+        let frontier_after = (0..config.layers as usize)
+            .map(|layer| state.layer_retained(layer).expect("layer frontier"))
+            .collect::<Vec<_>>();
+        assert_eq!(frontier_after, frontier_before);
+        state
+            .abort(transaction)
+            .expect("abort refused replay transaction");
+        plan = refused.plan.expect("plan remains usable after refusal");
+
+        let valid_token = [1];
+        let transaction = state.begin().expect("begin valid replay transaction");
+        let bindings =
+            dense_test_bindings(&fixture, &plan, &valid_token, &next_position, &capability);
+        let replay = execute_dense_test_step(
+            plan,
+            &fixture,
+            &capability,
+            &catalogue,
+            &context,
+            &stream,
+            &mut state,
+            transaction,
+            &mut runs,
+            bindings,
+        );
+        assert!(
+            replay
+                .launch_order
+                .iter()
+                .any(|entry| entry == "full-step-replay")
+        );
+        assert_eq!(replay.plan.captured_segments(), 1);
+        commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
+            .expect("commit usable replay");
+        replay
+            .plan
+            .close(&mut ledger)
+            .map_err(|refused| refused.error)
+            .expect("close full-step plan");
+        for run in runs.drain(..) {
+            run.close(&mut ledger)
+                .map_err(|refused| refused.error)
+                .expect("close full-step test run");
+        }
+        assert!(ledger.outstanding().is_empty());
+    }
+}
+
 #[cfg(feature = "paged-attention-test-hooks")]
 #[test]
 fn full_step_capture_recaptures_for_fresh_runs_and_pinned_refusal_falls_back() {

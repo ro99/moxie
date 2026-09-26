@@ -113,7 +113,7 @@ struct FullStepLayer {
     launch: PagedAttentionLaunch,
     storage: DenseRunStorage,
     projected_end: u64,
-    offsets: Vec<u64>,
+    offsets: [u64; 2],
 }
 
 #[derive(Debug)]
@@ -191,16 +191,22 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                 invalid("execution", "admitted dense graph identity changed"),
             ));
         }
-        #[cfg(feature = "cublas")]
-        if let Err(error) = validate_cublas_descriptors(self.candidate()) {
-            return Err(reject(self, bindings, error));
+        if !self.full_step_capture {
+            #[cfg(feature = "cublas")]
+            if let Err(error) = validate_cublas_descriptors(self.candidate()) {
+                return Err(reject(self, bindings, error));
+            }
+            if let Err(error) = validate_host_expert_weights(
+                graph,
+                self.candidate().host_expert_joins(),
+                host_experts,
+            ) {
+                return Err(reject(self, bindings, error));
+            }
         }
-        if let Err(error) =
-            validate_host_expert_weights(graph, self.candidate().host_expert_joins(), host_experts)
+        if !self.full_step_capture
+            && let Err(error) = validate_bindings_except(&self, graph, &bindings, resident)
         {
-            return Err(reject(self, bindings, error));
-        }
-        if let Err(error) = validate_bindings_except(&self, graph, &bindings, resident) {
             return Err(reject(self, bindings, error));
         }
         if self.package.is_none() && !self.module_symbols.is_empty() {
@@ -267,6 +273,7 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             transaction,
             runs,
             layers,
+            resident,
             host_experts,
             stream,
         ) {
@@ -453,6 +460,7 @@ fn enqueue_dense<'ctx>(
     transaction: StateTransactionId,
     runs: &mut [PagedAttentionRun<'ctx>],
     layers: &BTreeMap<NodeId, u32>,
+    resident: &BTreeSet<ValueId>,
     host_experts: &[HostExpertWeights<'_>],
     stream: &Stream<'ctx>,
 ) -> Result<Option<Event<'ctx>>> {
@@ -463,8 +471,18 @@ fn enqueue_dense<'ctx>(
         .expect("dense operation retains plan")
         .full_step_capture
     {
-        return enqueue_dense_full_step(lease, graph, state, transaction, runs, layers, stream)
-            .map(Some);
+        return enqueue_dense_full_step(
+            lease,
+            graph,
+            state,
+            transaction,
+            runs,
+            layers,
+            resident,
+            host_experts,
+            stream,
+        )
+        .map(Some);
     }
     let mode = {
         let operation = lease.resource();
@@ -541,6 +559,8 @@ fn enqueue_dense_full_step<'ctx>(
     transaction: StateTransactionId,
     runs: &mut [PagedAttentionRun<'ctx>],
     layers: &BTreeMap<NodeId, u32>,
+    resident: &BTreeSet<ValueId>,
+    host_experts: &[HostExpertWeights<'_>],
     stream: &Stream<'ctx>,
 ) -> Result<Event<'ctx>> {
     let identity = full_step_identity(lease, graph, runs)?;
@@ -568,7 +588,17 @@ fn enqueue_dense_full_step<'ctx>(
         plan.full_step_identity = Some(identity);
     }
 
-    let prepared = match prepare_full_step(lease, graph, state, transaction, runs, layers, stream) {
+    let prepared = match prepare_full_step(
+        lease,
+        graph,
+        state,
+        transaction,
+        runs,
+        layers,
+        resident,
+        host_experts,
+        stream,
+    ) {
         Ok(prepared) => prepared,
         Err(error) => {
             if runs.iter().any(PagedAttentionRun::dense_is_quarantined) {
@@ -719,6 +749,7 @@ fn enqueue_dense_full_step<'ctx>(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_full_step<'ctx>(
     lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
     graph: &Graph,
@@ -726,6 +757,8 @@ fn prepare_full_step<'ctx>(
     transaction: StateTransactionId,
     runs: &mut [PagedAttentionRun<'ctx>],
     layers: &BTreeMap<NodeId, u32>,
+    resident: &BTreeSet<ValueId>,
+    host_experts: &[HostExpertWeights<'_>],
     stream: &Stream<'ctx>,
 ) -> Result<PreparedFullStep> {
     if !layers.is_empty() {
@@ -748,6 +781,31 @@ fn prepare_full_step<'ctx>(
             "full-step capture requires one-row decode and direct device runs",
         ));
     }
+    {
+        let operation = lease.resource();
+        let plan = operation
+            .plan
+            .as_ref()
+            .expect("dense operation retains plan");
+        #[cfg(feature = "cublas")]
+        validate_cublas_descriptors(plan.candidate())?;
+        validate_host_expert_weights(graph, plan.candidate().host_expert_joins(), host_experts)?;
+        validate_bindings_except(plan, graph, &operation.sources, resident)?;
+    }
+    for node in graph.nodes() {
+        if let OpParams::Embedding { vocab, .. } = node.params {
+            validate_embedding_tokens(lease.resource(), node.inputs[0], rows, vocab)?;
+        }
+    }
+    let positions_value = graph
+        .nodes()
+        .iter()
+        .find_map(|node| match node.params {
+            OpParams::Rope { .. } => node.inputs.get(1).copied(),
+            _ => None,
+        })
+        .ok_or_else(|| invalid("positions", "no position input"))?;
+    let bound_position = attention_positions(lease.resource(), positions_value, rows)?.get(0);
     let layer_count = state.layer_count()?;
     if layer_count != runs.len() {
         return Err(invalid("runs", "state layers and direct runs differ"));
@@ -759,15 +817,6 @@ fn prepare_full_step<'ctx>(
             "prepared append layers and direct runs differ",
         ));
     }
-    let positions_value = graph.nodes().iter().find_map(|node| match node.params {
-        OpParams::Rope { .. } => node.inputs.get(1).copied(),
-        _ => None,
-    });
-    let bound_position = positions_value
-        .map(|value| index_values(lease.resource(), value, rows))
-        .transpose()?
-        .map(|positions| positions.get(0));
-
     let mut slots: Vec<Option<FullStepLayer>> = Vec::new();
     slots
         .try_reserve_exact(runs.len())
@@ -812,9 +861,7 @@ fn prepare_full_step<'ctx>(
             .first()
             .map(|placement| placement.position)
             .ok_or_else(|| invalid("placements", "prepared append has no row placements"))?;
-        if bound_position.is_some_and(|bound| bound != position)
-            || first_position.is_some_and(|first| first != position)
-        {
+        if bound_position != position || first_position.is_some_and(|first| first != position) {
             return Err(invalid(
                 "positions",
                 "bound position differs from the prepared append frontier",
@@ -863,6 +910,23 @@ fn prepare_full_step<'ctx>(
             view.base,
             projected_end - view.base,
         )?;
+        let _ = launch.grid()?;
+        let visible_tokens = plan_visible_tokens(&launch)?;
+        let admitted_visible = lease
+            .resource()
+            .plan
+            .as_ref()
+            .expect("dense operation retains plan")
+            .candidate()
+            .workload()
+            .visible_tokens;
+        if visible_tokens > admitted_visible {
+            return Err(invalid(
+                "visible_tokens",
+                "state history exceeds the admitted attention bucket",
+            ));
+        }
+        let _ = step_layer_address(lease.resource(), layer as u32)?;
         runs[layer].check_dense_projected_attend(stream, &launch, view, projected_end)?;
 
         let key = address_range(lease.resource(), node.inputs[1])?;
@@ -896,18 +960,16 @@ fn prepare_full_step<'ctx>(
             return Err(invalid("output", "query and output device ranges overlap"));
         }
 
-        let mut offsets = Vec::new();
-        let offset_count = usize::try_from(
-            rows.checked_mul(2)
-                .ok_or_else(|| invalid("step_buffer", "append offset count overflowed"))?,
-        )
-        .map_err(|_| invalid("step_buffer", "append offset count exceeds usize"))?;
-        offsets
-            .try_reserve_exact(offset_count)
-            .map_err(|_| capacity(offset_count.saturating_mul(std::mem::size_of::<u64>())))?;
+        let mut offsets = None;
         let page_bytes = storage.geometry.page_bytes()?;
         for placement in placements {
             for row in 0..placement.rows {
+                if offsets.is_some() {
+                    return Err(invalid(
+                        "placements",
+                        "one-row decode has more than one key/value placement",
+                    ));
+                }
                 let slot = placement
                     .slot
                     .checked_add(row)
@@ -929,16 +991,11 @@ fn prepare_full_step<'ctx>(
                         "append destination exceeds its admitted page range",
                     ));
                 }
-                offsets.push(offset);
-                offsets.push(offset);
+                offsets = Some([offset, offset]);
             }
         }
-        if offsets.len() != offset_count {
-            return Err(invalid(
-                "placements",
-                "append offsets do not cover every row",
-            ));
-        }
+        let offsets = offsets
+            .ok_or_else(|| invalid("placements", "append offsets do not cover the decode row"))?;
         slots[layer] = Some(FullStepLayer {
             launch,
             storage,
@@ -959,6 +1016,8 @@ fn prepare_full_step<'ctx>(
     }
     prepare_rope_tables(lease, graph, rows)?;
     encode_step_mirror(lease, &prepared_layers, rows, first_position)?;
+    validate_step_mirror_upload(lease.resource())?;
+    validate_rope_table_uploads(lease.resource())?;
     Ok(PreparedFullStep {
         token,
         layers: prepared_layers,
@@ -1169,23 +1228,7 @@ fn upload_step_mirror<'ctx>(
     lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
     stream: &Stream<'ctx>,
 ) -> Result<()> {
-    let offset = {
-        let plan = lease
-            .resource()
-            .plan
-            .as_ref()
-            .expect("dense operation retains plan");
-        let (offset, bytes) = plan
-            .candidate()
-            .step_buffer()
-            .ok_or_else(|| invalid("workspace", "selected plan has no step buffer"))?;
-        let (_, selected_bytes) = plan.step_buffer_address()?;
-        if bytes != selected_bytes || plan.step_mirror()?.as_slice().len() as u64 != bytes {
-            return Err(invalid("workspace", "step-buffer byte lengths disagree"));
-        }
-        plan.workspace_range()?;
-        offset
-    };
+    let offset = validate_step_mirror_upload(lease.resource())?;
     // SAFETY: the pinned mirror and selected workspace range remain owned by
     // the lost-or-completed dense operation through its recorded event.
     lease.resource_mut().submitted = true;
@@ -1268,13 +1311,7 @@ fn enqueue_dense_segments<'ctx>(
                 scale,
             } => {
                 let token_value = node.inputs[0];
-                let token_ids = index_values(lease.resource(), token_value, rows)?;
-                if (0..token_ids.len()).any(|index| token_ids.get(index) >= vocab) {
-                    return Err(invalid(
-                        "token",
-                        "token id is outside the embedding vocabulary",
-                    ));
-                }
+                validate_embedding_tokens(lease.resource(), token_value, rows, vocab)?;
                 let mut token_address = address(lease.resource(), token_value)?;
                 let mut table_address = address(lease.resource(), node.inputs[1])?;
                 let mut output_address = address(lease.resource(), node.output)?;
@@ -2235,30 +2272,7 @@ fn execute_attention<'ctx>(
     attention_index: &mut usize,
     stream: &Stream<'ctx>,
 ) -> Result<()> {
-    let positions = index_values(lease.resource(), positions_value, rows)?;
-    if positions.is_empty() || positions.len() as u64 != rows {
-        return Err(invalid(
-            "positions",
-            "attention position count differs from rows",
-        ));
-    }
-    for index in 1..positions.len() {
-        let previous = positions.get(index - 1);
-        let current = positions.get(index);
-        if current
-            != previous.checked_add(1).ok_or_else(|| {
-                invalid(
-                    "positions",
-                    "attention positions overflowed while checking contiguity",
-                )
-            })?
-        {
-            return Err(invalid(
-                "positions",
-                "the dense paged device path requires contiguous absolute positions",
-            ));
-        }
-    }
+    let positions = attention_positions(lease.resource(), positions_value, rows)?;
     let first_position = positions.get(0);
     let run_count = runs.len();
     let run = runs.get_mut(layer as usize).ok_or_else(|| {
@@ -2305,22 +2319,7 @@ fn execute_attention<'ctx>(
         retained.start,
         retained.end - retained.start,
     )?;
-    let last_query = launch
-        .first_position()
-        .checked_add(launch.rows() - 1)
-        .ok_or_else(|| invalid("positions", "attention query position overflowed"))?;
-    let visible = match launch.visibility() {
-        Visibility::Causal => last_query
-            .checked_sub(launch.history_base())
-            .and_then(|value| value.checked_add(1))
-            .ok_or_else(|| invalid("visibility", "attention visible extent underflowed"))?,
-        Visibility::SlidingWindow { window } => window.min(
-            last_query
-                .checked_sub(launch.history_base())
-                .and_then(|value| value.checked_add(1))
-                .ok_or_else(|| invalid("visibility", "attention visible extent underflowed"))?,
-        ),
-    };
+    let visible = plan_visible_tokens(&launch)?;
     let admitted_visible = lease
         .resource()
         .plan
@@ -2405,37 +2404,7 @@ fn execute_attention_full_step<'ctx>(
         .plan
         .as_ref()
         .expect("dense operation retains plan");
-    let (base_step, step_bytes) = plan.step_buffer_address()?;
-    let max_rows = plan.candidate().workload().rows;
-    let words = 4_u64
-        .checked_add(
-            max_rows
-                .checked_mul(2)
-                .ok_or_else(|| invalid("step_buffer", "per-layer step width overflowed"))?,
-        )
-        .ok_or_else(|| invalid("step_buffer", "per-layer step width overflowed"))?;
-    let layer_stride = words
-        .checked_mul(std::mem::size_of::<u64>() as u64)
-        .ok_or_else(|| invalid("step_buffer", "per-layer byte stride overflowed"))?;
-    let step_address = base_step
-        .checked_add(
-            u64::from(layer)
-                .checked_mul(layer_stride)
-                .ok_or_else(|| invalid("step_buffer", "layer step offset overflowed"))?,
-        )
-        .ok_or_else(|| invalid("step_buffer", "layer step address overflowed"))?;
-    let step_end = step_address
-        .checked_add(layer_stride)
-        .ok_or_else(|| invalid("step_buffer", "layer step extent overflowed"))?;
-    let buffer_end = base_step
-        .checked_add(step_bytes)
-        .ok_or_else(|| invalid("step_buffer", "step buffer extent overflowed"))?;
-    if step_end > buffer_end {
-        return Err(invalid(
-            "step_buffer",
-            "layer step exceeds its selected range",
-        ));
-    }
+    let step_address = step_layer_address(lease.resource(), layer)?;
 
     let (append_symbol, attention_symbol) = *plan
         .indirect_symbol_indices
@@ -3570,6 +3539,172 @@ fn index_values_from_sources<'a>(
     Ok(IndexView {
         bytes: &source.bytes,
     })
+}
+
+fn validate_embedding_tokens(
+    operation: &DenseOperation<'_>,
+    value: ValueId,
+    rows: u64,
+    vocab: u64,
+) -> Result<()> {
+    let token_ids = index_values(operation, value, rows)?;
+    if (0..token_ids.len()).any(|index| token_ids.get(index) >= vocab) {
+        return Err(invalid(
+            "token",
+            "token id is outside the embedding vocabulary",
+        ));
+    }
+    Ok(())
+}
+
+fn attention_positions<'a>(
+    operation: &'a DenseOperation<'_>,
+    value: ValueId,
+    rows: u64,
+) -> Result<IndexView<'a>> {
+    let positions = index_values(operation, value, rows)?;
+    if positions.is_empty() || positions.len() as u64 != rows {
+        return Err(invalid(
+            "positions",
+            "attention position count differs from rows",
+        ));
+    }
+    for index in 1..positions.len() {
+        let previous = positions.get(index - 1);
+        let current = positions.get(index);
+        if current
+            != previous.checked_add(1).ok_or_else(|| {
+                invalid(
+                    "positions",
+                    "attention positions overflowed while checking contiguity",
+                )
+            })?
+        {
+            return Err(invalid(
+                "positions",
+                "the dense paged device path requires contiguous absolute positions",
+            ));
+        }
+    }
+    Ok(positions)
+}
+
+fn plan_visible_tokens(launch: &PagedAttentionLaunch) -> Result<u64> {
+    let last_query = launch
+        .first_position()
+        .checked_add(launch.rows() - 1)
+        .ok_or_else(|| invalid("positions", "attention query position overflowed"))?;
+    let causal_visible = last_query
+        .checked_sub(launch.history_base())
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| invalid("visibility", "attention visible extent underflowed"))?;
+    Ok(match launch.visibility() {
+        Visibility::Causal => causal_visible,
+        Visibility::SlidingWindow { window } => window.min(causal_visible),
+    })
+}
+
+fn step_layer_address(operation: &DenseOperation<'_>, layer: u32) -> Result<u64> {
+    let plan = operation
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan");
+    let (base, bytes) = plan.step_buffer_address()?;
+    let words = 4_u64
+        .checked_add(
+            plan.candidate()
+                .workload()
+                .rows
+                .checked_mul(2)
+                .ok_or_else(|| invalid("step_buffer", "per-layer step width overflowed"))?,
+        )
+        .ok_or_else(|| invalid("step_buffer", "per-layer step width overflowed"))?;
+    let stride = words
+        .checked_mul(std::mem::size_of::<u64>() as u64)
+        .ok_or_else(|| invalid("step_buffer", "per-layer byte stride overflowed"))?;
+    let address = base
+        .checked_add(
+            u64::from(layer)
+                .checked_mul(stride)
+                .ok_or_else(|| invalid("step_buffer", "layer step offset overflowed"))?,
+        )
+        .ok_or_else(|| invalid("step_buffer", "layer step address overflowed"))?;
+    let end = address
+        .checked_add(stride)
+        .ok_or_else(|| invalid("step_buffer", "layer step extent overflowed"))?;
+    let buffer_end = base
+        .checked_add(bytes)
+        .ok_or_else(|| invalid("step_buffer", "step buffer extent overflowed"))?;
+    if end > buffer_end {
+        return Err(invalid(
+            "step_buffer",
+            "layer step exceeds its selected range",
+        ));
+    }
+    Ok(address)
+}
+
+fn validate_step_mirror_upload(operation: &DenseOperation<'_>) -> Result<u64> {
+    let plan = operation
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan");
+    let (offset, bytes) = plan
+        .candidate()
+        .step_buffer()
+        .ok_or_else(|| invalid("workspace", "selected plan has no step buffer"))?;
+    let (address, selected_bytes) = plan.step_buffer_address()?;
+    let workspace = plan.workspace_range()?;
+    let expected_address = workspace
+        .device_address()?
+        .checked_add(offset)
+        .ok_or_else(|| invalid("workspace", "step-buffer address overflowed"))?;
+    if bytes != selected_bytes
+        || address != expected_address
+        || plan.step_mirror()?.as_slice().len() as u64 != bytes
+        || offset
+            .checked_add(bytes)
+            .is_none_or(|end| end > workspace.bytes())
+    {
+        return Err(invalid(
+            "workspace",
+            "step-buffer mirror and selected range differ",
+        ));
+    }
+    Ok(offset)
+}
+
+fn validate_rope_table_uploads(operation: &DenseOperation<'_>) -> Result<()> {
+    let plan = operation
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan");
+    let workspace = plan.workspace_range()?;
+    for (key, bytes) in &operation.rope_tables {
+        let offset = plan
+            .candidate()
+            .rope_table_offsets()
+            .get(key)
+            .copied()
+            .ok_or_else(|| {
+                invalid(
+                    "rope_table_offsets",
+                    "the selected RoPE table has no offset",
+                )
+            })?;
+        let length = u64::try_from(bytes.len())
+            .map_err(|_| invalid("workspace", "RoPE table extent exceeds u64"))?;
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > workspace.bytes())
+        {
+            return Err(invalid(
+                "workspace",
+                "RoPE table exceeds its selected workspace range",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn angle_table(

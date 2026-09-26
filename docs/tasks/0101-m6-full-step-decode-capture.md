@@ -346,3 +346,30 @@ commit while the final gates run.
   `dense_gemma_device` (17 passed, 2 ignored timing/benchmark tests) and
   `paged_attention_device` (8 passed, 1 ignored timing test). No timing or
   `test-gpu` gate was run, per contract.
+- R1 repair: every full-step prepare now checks embedding token IDs before
+  any upload or launch; the invalid-token replay test confirms refusal leaves
+  the frontier unchanged and returns a plan that replays successfully.
+- Replay pre-enqueue validation audit: `prepare_full_step` checks cuBLAS
+  descriptors, host-expert entries, and complete binding shape/value rules
+  (uniqueness and coverage, role, shape, layout, device, byte length and
+  capacity, resident/immutable-weight rules, finite BF16 values, and finite
+  nonzero affine scales). It checks embedding IDs against `vocab`; requires
+  contiguous, correctly sized absolute positions and matches them to every
+  projected append placement; and verifies state/run counts, one attention
+  layer per run, direct-run eligibility, geometry, projected page-table and
+  write-placement predicates, visible-token bucket, launch grid, key/value
+  source extents and device, query/output extents and non-aliasing, and
+  checked append offsets. It also prepares RoPE angles from the current
+  positions and validates their workspace destinations plus the step-mirror
+  address and extent before `upload_sources` starts.
+- The per-call outer checks still validate exact graph/catalogue/device
+  identity. Before prepare, `full_step_identity` checks the selected symbols,
+  every value and workspace address, ordered run IDs and addresses,
+  geometries, attention parameters, and BLAS workspace. The remaining
+  per-node launch argument and grid checks run on the initial capture through
+  the ordinary eager enqueue path; the immutable selected graph and the
+  identity check ensure those static arguments cannot change on replay.
+- R1 gates pass: workspace fmt, clippy, executor driver clippy with and
+  without `cublas`, workspace tests, arch-check, and spec-check. The new
+  invalid-token replay test and test (a), each run with `--exact` and
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID`, pass on the three GPUs.
