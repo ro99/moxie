@@ -68,6 +68,8 @@ change 7 is the escape inventory.
     new `src/nccl.rs`;
   - `crates/moxie-kernels/{cuda/dense_ops.cu,src/lib.rs}` (the one-input
     FP32 → BF16 conversion kernel, sol H4);
+  - `xtask/src/gpu.rs` (one new `test-gpu` case qualifying that kernel;
+    authorized by the coordinator answering luna's DECISION, 2026-09-25);
   - `crates/moxie-executor/{Cargo.toml,src/dense_tp_workers.rs}`, and
     `src/rank_worker.rs` if the rendezvous lives there;
   - `crates/moxie-executor/tests/dense_tp2_device.rs` (one new test) and
