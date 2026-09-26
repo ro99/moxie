@@ -197,6 +197,25 @@ low too. The builder is now Claude **Sonnet** (`builder`, the workhorse),
 and the reviewer is a new Claude **Opus** (`reviewer`, tab `wC:t14`),
 read-only. One builder at a time.
 
+### Pace ruling: one task per roadmap line (owner, 2026-09-26)
+
+The owner ruled the pace too slow, and task proliferation the coordinator's
+fault. The rule from here: **one task per roadmap line (M6.N) or exit item.**
+A split happens only when a review shows a task cannot be built safely in
+one piece, and the split is recorded with that reason. Task 0106 is folded
+back into 0102. The remaining route is eight tasks after 0104 and 0105:
+
+| Item | Task |
+|---|---|
+| M6.1 multi-GPU | **0102**: persistent TP rank chain with one stream wait (0106 folded in); then the persistent PP path, in the same line of work |
+| M6.2 | **0103**: TP and PP decode capture together |
+| M6.3 | **one task**: pipeline microbatch overlap, opt-in hot-expert tier, opt-in route prediction |
+| M6.4 | **one task**: the device KV transition |
+| M6.5 | **one task**: selection wiring and fixed-plan mode |
+| Exit, Gemma | **one task**: loader plus both Gemmas' benchmark rows |
+| Exit, Qwen | **one task**: all hybrid-attention work plus Hemmingway-1's rows |
+| Exit close | **one task**: defaults, carried tests, the milestone-end audit |
+
 ### Naming (owner, 2026-09-25)
 
 Work is named by the roadmap item it serves (M6.1–M6.5), or "M6 exit" for

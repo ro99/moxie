@@ -1,4 +1,4 @@
-# Task 0102 — persistent TP2 rank chain (joins drained inside one worker command)
+# Task 0102 — persistent TP2 rank chain with one stream wait per step
 
 Status: **active, revision 3** (coordinator, 2026-09-26). Builder Claude
 Sonnet `builder`; reviewer Claude Opus `reviewer`. Asynchronous-ownership
@@ -7,7 +7,10 @@ work.
 This contract **is** the "0102a" text of the reviewer's second design review
 ([record](../evidence/task-0102-design-review-2.md)). That review also
 rechecked sol's first design review, adopting parts of it and cutting
-others. Its "0102b" half is [task 0106](0106-m6-rank-chain-one-stream-wait.md).
+others. Its "0102b" half is **merged back in here** as the section "Final schedule:
+one stream wait per step", on the owner's pace ruling (2026-09-26). Build
+0102a's changes first, pass test (a), then apply that section, in the same
+task.
 The earlier revisions are kept below as history. **Implement only the
 numbered changes below.** Where the history disagrees with them, the
 numbered changes win.
@@ -173,6 +176,31 @@ Stop conditions:
 - a Shape A candidate has weight formats;
 - the residency cap `total` is refused;
 - a file outside the list is needed.
+
+
+## Final schedule: one stream wait per step (formerly 0102b)
+
+Apply this after 0102a's numbered changes pass test (a), in this same task.
+
+
+
+Changes only the `ChainRun` schedule and the counters:
+- `drain` split (M-E).
+- Per join: after `group_end`, run `wait_ready(deadline)` and queue the
+  conversion or interleave **unconditionally**, into the persistent output.
+  No status read, no per-join `wait_stream`.
+- After the last stage: one `wait_ready` + `wait_stream`, then read **all**
+  status words, then the 0102a tail.
+- Test (c): per decode per rank, `ready_waits` delta == joins + 1 and
+  `stream_waits` delta == 1, and `command_sequence` delta == 2.
+- Rerun (a), (b), (d), (e) unchanged.
+
+Why the split is safe: 0102a is a complete, reviewable ownership change,
+covering persistent resources, close, the escape inventory and byte identity,
+with 0100's failure semantics untouched. 0102b changes only when the status
+is read and has no resource-lifetime change. The per-join lease/range
+lifetimes are already "until the final drain" in 0102a.
+
 
 
 ## Ledger admission counter (review M-A)
