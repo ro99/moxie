@@ -1,10 +1,18 @@
 # Task 0100 — NCCL communicators and TP joins
 
-Status: **active** (coordinator, 2026-09-25). Sol's design review (4 high,
-4 medium, 1 low) is adopted verbatim in "Design review" below. Where it
-conflicts with the numbered changes, **it overrides them**.
-Builder Codex `luna`; reviewer Codex `sol`. Asynchronous-ownership work:
-change 7 is the escape inventory.
+Status: **accepted** (coordinator, 2026-09-25). Candidate `a8cfb91`, R1
+repair `efcae0f`. Builder Codex `luna`; reviewer Codex `sol`.
+- **History:** a design review (4 high, 4 medium, 1 low) and four DECISION
+  amendments from the build: the test file, the status-word fault, deleting
+  peer reads, and `poll()` readiness.
+- **R1 (early review, 1 high):** a retirement event was recorded before
+  NCCL reported Ready. Now it polls Ready, then records, waits, and retires
+  at every site. R2 delta review clean.
+- **Result:** TP2 joins run on NCCL on the rank streams, with no host
+  handshake. TP2 stays byte-identical to single-GPU. `test-gpu` 75/75,
+  `dense_tp2_device` 2/2, `dense_tp2_cublas_device` 1/1.
+- A per-join `JoinDrain` host barrier remains (design H2); task 0102 may
+  remove it.
 
 ## Identity and authority
 
