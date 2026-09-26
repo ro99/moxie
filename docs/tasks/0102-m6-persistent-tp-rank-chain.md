@@ -1,6 +1,8 @@
 # Task 0102 — persistent TP2 rank chains: plans admitted once, weights resident once, one host wait per step
 
-Status: **proposed** (coordinator, 2026-09-25), awaiting sol's design review.
+Status: **active** (coordinator, 2026-09-25). Sol's design review (2 high, 7
+medium) is adopted verbatim in "Design review" below. Where it conflicts
+with the numbered changes, **it overrides them**.
 Builder Codex `luna`; reviewer Codex `sol`. Asynchronous-ownership work:
 change 7 is the escape inventory.
 
@@ -76,7 +78,11 @@ change 7 is the escape inventory.
   KV commit is unchanged. The M5 per-step path stays for now: PP's pair
   stage uses it until the PP task.
 - **Allowed files:**
-  - `crates/moxie-plan/src/tensor_parallel.rs` (the chain builder);
+  - `crates/moxie-plan/src/tensor_parallel.rs` (the chain builder), and
+    `crates/moxie-plan/src/selected.rs` if slot liveness for escaping values
+    needs it (sol H2);
+  - `crates/moxie-memory/src/residency.rs` (a test-only cumulative upload
+    counter, if one is missing; sol M7);
   - `crates/moxie-executor/src/{dense_tp_workers.rs,dense_set.rs,chain.rs,dense.rs}`;
   - `crates/moxie-executor/tests/dense_tp2_device.rs` (new tests);
   - this task's Result.
@@ -201,5 +207,64 @@ the candidate commit.
 - a stage cannot be enqueued without a host wait;
 - byte-identity fails;
 - a file outside the allowed list is needed.
+
+## Design review (sol, 2026-09-25) — adopted verbatim; overrides the numbered changes
+
+- **H1 (outcome, change 3, test c).** Between joins, poll Ready under the
+  group deadline whenever 0100 requires it, before the next NCCL or
+  dependent enqueue. The single final CUDA drain remains. Any intermediate
+  readiness wait is counted and reported. If one host wait per step is
+  mandatory, stop for `DECISION`. Do not use the rendezvous count as a
+  proxy for host waits.
+- **H2 (changes 1, 2).** Compute records every produced value used by a
+  later chain stage or by the final graph output. Preserve each such range
+  until its boundary copy, or copy it immediately after its producer,
+  before reuse. Validate that its planned slot cannot alias before
+  copying. Preallocate and retain all corresponding boundary ranges. If
+  planner liveness needs a file outside the allowlist, invoke the stated
+  `DECISION` stop.
+- **M1 (change 2).** Key resident images by original weight plus the exact
+  rank-local row or column slice and packed layout. Create bytes matching
+  `StageWeight`, deduplicate identical images, and validate each
+  stage-local length and address against its lease before every step.
+  Share a full tied embedding and a row shard only through a checked
+  subrange when their bytes and layout permit it.
+- **M2 (change 1).** `Join` stores only static kind, source and output
+  metadata. At `LoadChain`, derive rows, columns and precision from the
+  admitted candidate for each bucket. At each `StepChain`, insert the
+  current rendezvous sequence and verify that both ranks agree.
+- **M3 (changes 3, 5).** Preinitialize a bounded dummy source. Always queue
+  the join conversion or gather and publish its boundary destination, even
+  when the local status is set, and continue the fixed collective schedule
+  on both ranks. After the final drain, read all status words, abort both
+  transactions, and restore every plan and temp to a reusable idle set. Any
+  unknown completion parks the entire set.
+- **M4 (changes 2, 4).** `JoinCopy` borrows the source range from the held
+  stage lease; no `take_range_for_value` or `release_join_source`. After the
+  one observed drain, retire the intermediate leases without host output
+  readback, settle their sources and return the plans to the set. Read only
+  the final logits. A refusal preserves each lease and its named ranges.
+- **M5 (change 6, inventory).** Close order:
+  1. plans, join resources and boundary resources;
+  2. release the leases;
+  3. `DeviceResidency::close`, returning the backing;
+  4. `ResidencyAuthority::close` against the rank ledger;
+  5. only then finalize or destroy the communicator and release its
+     reserve.
+
+  On refusal, keep the exact surviving owner, including partial
+  `LoadChain` uploads and admissions and in-flight leases.
+- **M6 (changes 2, 7).** At `LoadChain`, allocate one persistent range per
+  escaping original value per bucket (or prove a safe shared slot
+  schedule). Charge it once, reuse it only after the previous step's
+  observed drain, and keep all old ranges through a refusal or loss.
+- **M7 (tests b, c).**
+  - Expose a test-only cumulative admission count and the rank-local
+    `ResidencyStats.bytes_uploaded`. Snapshot both after `LoadChain` and
+    after each decode.
+  - Count actual Ready waits and CUDA synchronizations inside `StepChain`
+    separately, and assert the intended bound.
+  - If checking only coordinator dispatches, assert exactly one
+    `StepChain` pair and label it a command count.
 
 ## Result, filled after work
