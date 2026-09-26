@@ -1094,7 +1094,8 @@ mod tests {
 #[cfg(feature = "driver")]
 pub mod device {
     #[cfg(feature = "paged-attention-test-hooks")]
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::AtomicBool;
+    use core::sync::atomic::{AtomicU64, Ordering};
     use core::{ffi::c_void, mem::ManuallyDrop};
 
     use moxie_cuda::{
@@ -1122,6 +1123,7 @@ pub mod device {
 
     /// 256-byte alignment, as every other device range in this crate uses.
     const ALIGNMENT: u64 = 256;
+    static NEXT_PAGED_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
     #[cfg(feature = "paged-attention-test-hooks")]
     static PREFETCH_GATE_RELEASED: AtomicBool = AtomicBool::new(false);
@@ -1345,6 +1347,7 @@ pub mod device {
     #[derive(Debug)]
     #[must_use = "an unclosed run keeps its arena and its reservation"]
     pub struct PagedAttentionRun<'ctx> {
+        run_id: u64,
         module: ManuallyDrop<ResolvedModule<'ctx>>,
         descriptor: SemanticKernelDescriptor,
         geometry: PageGeometry,
@@ -1432,6 +1435,20 @@ pub mod device {
         gate_next_prefetch: bool,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct DenseRunStorage {
+        pub run_id: u64,
+        pub geometry: PageGeometry,
+        pub heads: u64,
+        pub max_rows: u64,
+        pub key_address: u64,
+        pub key_bytes: u64,
+        pub value_address: u64,
+        pub value_bytes: u64,
+        pub table_address: u64,
+        pub table_bytes: u64,
+    }
+
     impl<'ctx> PagedAttentionRun<'ctx> {
         /// No operation is outstanding: the run is not quarantined, holds no
         /// refused source or range, has no active stream or unobserved staged copy.
@@ -1443,6 +1460,112 @@ pub mod device {
                 && self.held.is_none()
                 && self.held_ranges.is_none()
                 && self.pending.is_none()
+        }
+
+        pub(crate) fn dense_step_supported(&self) -> bool {
+            matches!(self.staging, Staging::DeviceHandles)
+        }
+
+        pub(crate) fn dense_storage(&self) -> Result<DenseRunStorage> {
+            Ok(DenseRunStorage {
+                run_id: self.run_id,
+                geometry: self.geometry,
+                heads: self.heads,
+                max_rows: self.max_rows,
+                key_address: self
+                    .keys
+                    .as_ref()
+                    .expect("live key range")
+                    .device_address()?,
+                key_bytes: self.keys.as_ref().expect("live key range").bytes(),
+                value_address: self
+                    .values
+                    .as_ref()
+                    .expect("live value range")
+                    .device_address()?,
+                value_bytes: self.values.as_ref().expect("live value range").bytes(),
+                table_address: self
+                    .table
+                    .as_ref()
+                    .expect("live table range")
+                    .device_address()?,
+                table_bytes: self.table.as_ref().expect("live table range").bytes(),
+            })
+        }
+
+        pub(crate) fn dense_prepare_table(
+            &mut self,
+            stream: &Stream<'ctx>,
+            view: &PageView,
+            placements: &[PagePlacement],
+        ) -> Result<(u64, u64, u64)> {
+            self.observe_pending()?;
+            let encoded_len = self.prepare_page_table(stream, view.base, &view.table)?;
+            let table_bytes = u64::try_from(encoded_len)
+                .map_err(|_| invalid("page_table", "the encoded table exceeds u64"))?;
+            if table_bytes > self.table.as_ref().expect("live table range").bytes() {
+                return Err(invalid(
+                    "page_table",
+                    "the projected mapping exceeds the admitted device table range",
+                ));
+            }
+            self.check_write_placements_for(stream, placements, view.base, &view.table)
+        }
+
+        pub(crate) fn dense_upload_table_for(
+            &mut self,
+            stream: &Stream<'ctx>,
+            view: &PageView,
+        ) -> Result<()> {
+            if self.pending.is_some() || self.held.is_some() {
+                return Err(invalid(
+                    "page_table",
+                    "the previous page-table source has not been recovered",
+                ));
+            }
+            let encoded_len = self.prepare_page_table(stream, view.base, &view.table)?;
+            let bytes = core::mem::take(&mut self.page_table_upload);
+            self.held = Some(RefusedSource::PageTableUpload(bytes));
+            let Some(RefusedSource::PageTableUpload(bytes)) = self.held.as_ref() else {
+                unreachable!("just retained the encoded table source")
+            };
+            // SAFETY: `bytes` is stored in `self.held` before the copy call,
+            // and the destination is this run's admitted table range.
+            let copied = unsafe {
+                self.table
+                    .as_ref()
+                    .expect("live page table range")
+                    .copy_from_host_async(&bytes[..encoded_len], stream)
+            };
+            if let Err(error) = copied {
+                self.quarantined = true;
+                return Err(self.attribute(error));
+            }
+            self.page_table.clear();
+            self.page_table.extend_from_slice(&view.table);
+            self.page_table_base = view.base;
+            Ok(())
+        }
+
+        pub(crate) fn dense_quarantine(&mut self, event: Option<Event<'ctx>>) {
+            self.quarantined = true;
+            if let Some(event) = event {
+                self.pending = Some(event);
+            }
+        }
+
+        pub(crate) fn dense_install_completion(&mut self, event: Event<'ctx>, written: u64) {
+            self.pending = Some(event);
+            self.written = self.written.max(written);
+        }
+
+        pub(crate) fn dense_install_quarantined_event(&mut self, event: Event<'ctx>) {
+            self.quarantined = true;
+            self.pending = Some(event);
+        }
+
+        pub(crate) fn dense_is_quarantined(&self) -> bool {
+            self.quarantined
         }
 
         /// Observe deferred work and return any held page-table upload buffer.
@@ -2131,6 +2254,7 @@ pub mod device {
             let values = hold.pop().expect("value range");
             let keys = hold.pop().expect("key range");
             Ok(Self {
+                run_id: NEXT_PAGED_RUN_ID.fetch_add(1, Ordering::Relaxed),
                 module: ManuallyDrop::new(module),
                 descriptor,
                 geometry,
@@ -2332,156 +2456,9 @@ pub mod device {
             if defer && let Err(error) = self.order_after_pending(stream) {
                 return Err(give_back(error, table));
             }
-            if self.quarantined {
-                return Err(give_back(invalid("run", "this run is quarantined"), table));
-            }
-            if let Err(error) = self.same_device(stream) {
+            if let Err(error) = self.prepare_page_table(stream, base, &table) {
                 return Err(give_back(error, table));
             }
-            // Republishing is legal: the authority's retained range slides as
-            // its ring wraps. What must hold is the mapping's shape and its
-            // agreement with the one it replaces, both checked below.
-            let pages = self.geometry.pages;
-            if !base.is_multiple_of(self.geometry.page_tokens) {
-                return Err(give_back(
-                    invalid(
-                        "base",
-                        "a mapping's first logical page must start on a page boundary",
-                    ),
-                    table,
-                ));
-            }
-            if base > self.written {
-                return Err(give_back(
-                    invalid(
-                        "base",
-                        "a mapping cannot start beyond the rows this run has written",
-                    ),
-                    table,
-                ));
-            }
-            if table.is_empty() || table.len() as u64 > pages {
-                return Err(give_back(
-                    invalid_fmt(
-                        "page_table",
-                        format_args!(
-                            "{} logical page(s) over {pages} admitted page(s)",
-                            table.len()
-                        ),
-                    ),
-                    table,
-                ));
-            }
-            if table.len() > self.page_table.capacity() {
-                return Err(give_back(
-                    invalid(
-                        "page_table",
-                        "the mapping exceeds the admitted host table capacity",
-                    ),
-                    table,
-                ));
-            }
-            // Every physical identity must exist, and no two logical pages may
-            // name the same one: aliasing pages would make an append overwrite
-            // history that is still visible, which no later check could detect.
-            // Reuse the admitted upload buffer as a bitset, then overwrite it
-            // with the encoded table below. The buffer is cleared on every
-            // publication because a successful publication left encoded bytes
-            // in it and a refused one may have left partial bits.
-            let bitset_bytes = match pages
-                .checked_add(7)
-                .and_then(|pages| pages.checked_div(8))
-                .and_then(|bytes| usize::try_from(bytes).ok())
-            {
-                Some(bytes) => bytes,
-                None => return Err(give_back(Error::Dim(DimError::Overflow), table)),
-            };
-            if bitset_bytes > self.page_table_upload.len() {
-                return Err(give_back(
-                    invalid("page_table", "the admitted upload buffer is too small"),
-                    table,
-                ));
-            }
-            {
-                let bitset = &mut self.page_table_upload[..bitset_bytes];
-                bitset.fill(0);
-                for (logical, physical_entry) in table.iter().copied().enumerate() {
-                    let physical = u64::from(physical_entry);
-                    if physical >= pages {
-                        return Err(give_back(
-                            invalid_fmt(
-                                "page_table",
-                                format_args!(
-                                    "logical page {logical} names physical page {physical} of \
-                                     {pages} admitted"
-                                ),
-                            ),
-                            table,
-                        ));
-                    }
-                    let byte = match usize::try_from(physical / 8) {
-                        Ok(byte) => byte,
-                        Err(_) => {
-                            return Err(give_back(
-                                invalid("page_table", "a physical page is not addressable"),
-                                table,
-                            ));
-                        }
-                    };
-                    let mask = 1u8 << (physical % 8);
-                    if bitset[byte] & mask != 0 {
-                        return Err(give_back(
-                            invalid_fmt(
-                                "page_table",
-                                format_args!("physical page {physical} is named twice"),
-                            ),
-                            table,
-                        ));
-                    }
-                    bitset[byte] |= mask;
-                }
-            }
-
-            // **Agreement with the mapping it replaces**, wherever both describe
-            // the same absolute page. Rows already written live at addresses the
-            // old table resolved; a new table that sent one of them somewhere
-            // else would leave every one of those rows unreadable while every
-            // individual check still passed. This is the other half of what
-            // makes a write, a table and a launch one coherent view.
-            if !self.page_table.is_empty() {
-                let page_tokens = self.geometry.page_tokens;
-                let old_first = self.page_table_base / page_tokens;
-                let new_first = base / page_tokens;
-                for (index, physical) in table.iter().enumerate() {
-                    let absolute = new_first + index as u64;
-                    let Some(old_index) = absolute.checked_sub(old_first) else {
-                        continue;
-                    };
-                    let Some(previous) = self.page_table.get(old_index as usize) else {
-                        continue;
-                    };
-                    // Only pages that actually hold written rows are bound: a
-                    // page beyond the frontier has nothing to be inconsistent
-                    // with.
-                    if absolute * page_tokens >= self.written {
-                        continue;
-                    }
-                    if previous != physical {
-                        return Err(give_back(
-                            invalid_fmt(
-                                "page_table",
-                                format_args!(
-                                    "absolute page {absolute} holds written rows at physical \
-                                     page {previous} and the new mapping sends it to \
-                                     {physical}"
-                                ),
-                            ),
-                            table,
-                        ));
-                    }
-                }
-            }
-
             let encoded_len = match table.len().checked_mul(core::mem::size_of::<u32>()) {
                 Some(bytes) => bytes,
                 None => {
@@ -2543,6 +2520,123 @@ pub mod device {
             self.page_table.extend_from_slice(&table);
             self.page_table_base = base;
             Ok(())
+        }
+
+        fn prepare_page_table(
+            &mut self,
+            stream: &Stream<'ctx>,
+            base: u64,
+            table: &[u32],
+        ) -> Result<usize> {
+            if self.quarantined {
+                return Err(invalid("run", "this run is quarantined"));
+            }
+            self.same_device(stream)?;
+            let pages = self.geometry.pages;
+            let page_tokens = self.geometry.page_tokens;
+            if !base.is_multiple_of(page_tokens) {
+                return Err(invalid(
+                    "base",
+                    "a mapping's first logical page must start on a page boundary",
+                ));
+            }
+            if base > self.written {
+                return Err(invalid(
+                    "base",
+                    "a mapping cannot start beyond the rows this run has written",
+                ));
+            }
+            if table.is_empty() || table.len() as u64 > pages {
+                return Err(invalid_fmt(
+                    "page_table",
+                    format_args!(
+                        "{} logical page(s) over {pages} admitted page(s)",
+                        table.len()
+                    ),
+                ));
+            }
+            if table.len() > self.page_table.capacity() {
+                return Err(invalid(
+                    "page_table",
+                    "the mapping exceeds the admitted host table capacity",
+                ));
+            }
+            let bitset_bytes = pages
+                .checked_add(7)
+                .and_then(|pages| pages.checked_div(8))
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .ok_or(Error::Dim(DimError::Overflow))?;
+            if bitset_bytes > self.page_table_upload.len() {
+                return Err(invalid(
+                    "page_table",
+                    "the admitted upload buffer is too small",
+                ));
+            }
+            {
+                let bitset = &mut self.page_table_upload[..bitset_bytes];
+                bitset.fill(0);
+                for (logical, physical_entry) in table.iter().copied().enumerate() {
+                    let physical = u64::from(physical_entry);
+                    if physical >= pages {
+                        return Err(invalid_fmt(
+                            "page_table",
+                            format_args!(
+                                "logical page {logical} names physical page {physical} of {pages} admitted"
+                            ),
+                        ));
+                    }
+                    let byte = usize::try_from(physical / 8)
+                        .map_err(|_| invalid("page_table", "a physical page is not addressable"))?;
+                    let mask = 1u8 << (physical % 8);
+                    if bitset[byte] & mask != 0 {
+                        return Err(invalid_fmt(
+                            "page_table",
+                            format_args!("physical page {physical} is named twice"),
+                        ));
+                    }
+                    bitset[byte] |= mask;
+                }
+            }
+            if !self.page_table.is_empty() {
+                let old_first = self.page_table_base / page_tokens;
+                let new_first = base / page_tokens;
+                for (index, physical) in table.iter().enumerate() {
+                    let absolute = new_first + index as u64;
+                    let Some(old_index) = absolute.checked_sub(old_first) else {
+                        continue;
+                    };
+                    let Some(previous) = self.page_table.get(old_index as usize) else {
+                        continue;
+                    };
+                    if absolute * page_tokens >= self.written {
+                        continue;
+                    }
+                    if previous != physical {
+                        return Err(invalid_fmt(
+                            "page_table",
+                            format_args!(
+                                "absolute page {absolute} holds written rows at physical page {previous} and the new mapping sends it to {physical}"
+                            ),
+                        ));
+                    }
+                }
+            }
+            let encoded_len = table
+                .len()
+                .checked_mul(core::mem::size_of::<u32>())
+                .ok_or(Error::Dim(DimError::Overflow))?;
+            if encoded_len > self.page_table_upload.len() {
+                return Err(invalid(
+                    "page_table",
+                    "the admitted upload buffer is too small",
+                ));
+            }
+            for (entry, destination) in table.iter().zip(
+                self.page_table_upload[..encoded_len].chunks_exact_mut(core::mem::size_of::<u32>()),
+            ) {
+                destination.copy_from_slice(&entry.to_le_bytes());
+            }
+            Ok(encoded_len)
         }
 
         /// Eagerly copy one parent's complete admitted page storage into this
@@ -2697,21 +2791,30 @@ pub mod device {
         /// both the write path and the readback so neither can drift from the
         /// table the kernel reads.
         fn resolves_to(&self, row: u64) -> Result<u64> {
-            if self.page_table.is_empty() {
+            Self::resolve_in_view(self.page_table_base, &self.page_table, self.geometry, row)
+        }
+
+        fn resolve_in_view(
+            base: u64,
+            table: &[u32],
+            geometry: PageGeometry,
+            row: u64,
+        ) -> Result<u64> {
+            if table.is_empty() {
                 return Err(invalid("page_table", "no page mapping has been published"));
             }
-            let page_tokens = self.geometry.page_tokens;
-            let Some(offset) = row.checked_sub(self.page_table_base) else {
+            let page_tokens = geometry.page_tokens;
+            let Some(offset) = row.checked_sub(base) else {
                 return Err(invalid_fmt(
                     "placements",
                     format_args!(
                         "row {row} is below the published mapping, which starts at {}",
-                        self.page_table_base
+                        base
                     ),
                 ));
             };
             let logical = offset / page_tokens;
-            self.page_table
+            table
                 .get(logical as usize)
                 .map(|physical| u64::from(*physical))
                 .ok_or_else(|| {
@@ -2719,7 +2822,7 @@ pub mod device {
                         "placements",
                         format_args!(
                             "row {row} is beyond the published mapping's {} page(s)",
-                            self.page_table.len()
+                            table.len()
                         ),
                     )
                 })
@@ -2731,6 +2834,21 @@ pub mod device {
             &self,
             stream: &Stream<'ctx>,
             placements: &[PagePlacement],
+        ) -> Result<(u64, u64, u64)> {
+            self.check_write_placements_for(
+                stream,
+                placements,
+                self.page_table_base,
+                &self.page_table,
+            )
+        }
+
+        fn check_write_placements_for(
+            &self,
+            stream: &Stream<'ctx>,
+            placements: &[PagePlacement],
+            base: u64,
+            table: &[u32],
         ) -> Result<(u64, u64, u64)> {
             if self.quarantined {
                 return Err(invalid("run", "this run is quarantined"));
@@ -2769,7 +2887,7 @@ pub mod device {
                 // into one view: writes go where the table says, launches read
                 // what the table says, and a republication may not contradict
                 // either.
-                match self.resolves_to(placement.position) {
+                match Self::resolve_in_view(base, table, self.geometry, placement.position) {
                     Ok(physical) if physical == placement.physical_page => {}
                     Ok(physical) => {
                         return Err(invalid_fmt(
@@ -3193,10 +3311,23 @@ pub mod device {
         }
 
         /// Everything both entry points check before either touches the device.
-        fn check_attend(
-            &mut self,
+        fn check_attend(&self, stream: &Stream<'ctx>, launch: &PagedAttentionLaunch) -> Result<()> {
+            self.check_attend_view(
+                stream,
+                launch,
+                self.page_table_base,
+                self.page_table.len(),
+                self.written,
+            )
+        }
+
+        fn check_attend_view(
+            &self,
             stream: &Stream<'ctx>,
             launch: &PagedAttentionLaunch,
+            page_table_base: u64,
+            page_table_len: usize,
+            written: u64,
         ) -> Result<()> {
             if self.quarantined {
                 return Err(invalid("run", "this run is quarantined"));
@@ -3213,14 +3344,18 @@ pub mod device {
                     "this launch's geometry is not the one this run was admitted for",
                 ));
             }
-            if launch.history_base() + launch.history_rows() > self.written {
+            let history_end = launch
+                .history_base()
+                .checked_add(launch.history_rows())
+                .ok_or(Error::Dim(DimError::Overflow))?;
+            if history_end > written {
                 return Err(invalid_fmt(
                     "history_rows",
                     format_args!(
                         "a launch declaring [{}, {}) against {} written row(s)",
                         launch.history_base(),
-                        launch.history_base() + launch.history_rows(),
-                        self.written
+                        history_end,
+                        written
                     ),
                 ));
             }
@@ -3228,24 +3363,34 @@ pub mod device {
             // its `history_base` is what the kernel treats as logical page
             // zero, so a launch naming a different base would read the table
             // through an offset nothing wrote against.
-            if launch.history_base() != self.page_table_base {
+            if launch.history_base() != page_table_base {
                 return Err(invalid_fmt(
                     "history_base",
                     format_args!(
                         "this launch starts its history at {} and the published mapping \
                          starts at {}",
                         launch.history_base(),
-                        self.page_table_base
+                        page_table_base
                     ),
                 ));
             }
-            if launch.logical_pages().unwrap_or(u64::MAX) > self.page_table.len() as u64 {
+            if launch.logical_pages().unwrap_or(u64::MAX) > page_table_len as u64 {
                 return Err(invalid(
                     "page_table",
                     "the published mapping is shorter than the history",
                 ));
             }
             Ok(())
+        }
+
+        pub(crate) fn check_dense_projected_attend(
+            &self,
+            stream: &Stream<'ctx>,
+            launch: &PagedAttentionLaunch,
+            view: &PageView,
+            projected_end: u64,
+        ) -> Result<()> {
+            self.check_attend_view(stream, launch, view.base, view.table.len(), projected_end)
         }
 
         /// Check one block of a full launch for the partial-producing symbol.

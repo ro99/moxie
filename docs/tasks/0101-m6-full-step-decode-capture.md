@@ -330,3 +330,16 @@ commit while the final gates run.
   cannot be captured.
 
 ## Result, filled after work
+
+- Implemented the plan-owned step buffer and pinned mirror, eligibility and
+  pool transitions, projected append/table preflight, indirect append plus
+  attention capture/replay, run-specific completion events, recapture identity,
+  and quarantine/retention paths. Added tests (a)–(f) under the contract's
+  feature gates.
+- The replay-mirror mutant was caught: omitting the mirror upload made test
+  (a) fail on the second decode step. The mutant was reverted.
+- Targeted GPU checks passed on all three devices for tests (a), (b)/(e)/(f).
+- Host gates: fmt, workspace clippy, executor driver clippy with and without
+  cublas, arch-check, and spec-check pass. The final workspace test run is
+  running. Full `dense_gemma_device` and `paged_attention_device` suites remain
+  pending.

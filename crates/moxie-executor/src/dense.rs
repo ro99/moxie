@@ -16,7 +16,7 @@ use moxie_cuda::{Event, Module, ModuleImage, RankContext, Stream, TrustedImage};
 use moxie_graph::{Graph, NodeId, OpParams, RopeLayout, ValueId, ValueRole};
 use moxie_kernels::cpu_expert::{ExpertAssignment, ExpertShape, ExpertTiling};
 use moxie_plan::{HostExpertJoin, SelectedNode, Visibility, WeightFormat};
-use moxie_state::DeviceKvSequence;
+use moxie_state::{DeviceKvSequence, PreparedAppend};
 #[cfg(feature = "cublas")]
 use moxie_types::{AccumulationPolicy, SmVersion};
 use moxie_types::{
@@ -29,7 +29,9 @@ use crate::chain::{
     OwnedBinding, SelectedCompletion, SelectedReservedPlan, attribute_chain_error,
     attribute_node_error, validate_bindings_except,
 };
-use crate::paged_attention::device::{PagedAttentionRun, append_paged_layer_from_device};
+use crate::paged_attention::device::{
+    DenseRunStorage, PagedAttentionRun, append_paged_layer_from_device,
+};
 use crate::{AttentionLayer, PageGeometry, PagedAttentionLaunch};
 
 /// The inputs and state authorities needed for one selected dense graph step.
@@ -78,7 +80,6 @@ pub struct DensePlanRunRefused<'ctx> {
 #[derive(Debug)]
 pub struct DenseOperation<'ctx> {
     pub(crate) plan: Option<SelectedReservedPlan<'ctx>>,
-    #[cfg(feature = "cublas")]
     ctx: &'ctx RankContext,
     /// Every source copied by `upload_sources` stays here until the graph's
     /// completion event is observed. This includes token and position indices.
@@ -91,6 +92,11 @@ pub struct DenseOperation<'ctx> {
     mode: DenseStepMode,
     segment: usize,
     open: bool,
+    submitted: bool,
+    withhold: bool,
+    /// Kept with a lost operation when state publication refuses after the
+    /// completion event was recorded.
+    _quarantine_event: Option<Event<'ctx>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +104,23 @@ enum DenseStepMode {
     Eager,
     Capture,
     Replay,
+    FullCapture,
+    FullReplay,
+}
+
+#[derive(Debug)]
+struct FullStepLayer {
+    launch: PagedAttentionLaunch,
+    storage: DenseRunStorage,
+    projected_end: u64,
+    offsets: Vec<u64>,
+}
+
+#[derive(Debug)]
+struct PreparedFullStep {
+    token: PreparedAppend,
+    layers: Vec<FullStepLayer>,
+    rows: u64,
 }
 
 impl<'ctx> SelectedReservedPlan<'ctx> {
@@ -223,7 +246,6 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         }
         let operation = DenseOperation {
             plan: Some(self),
-            #[cfg(feature = "cublas")]
             ctx,
             sources: bindings,
             rope_tables: Vec::new(),
@@ -232,10 +254,13 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             mode: DenseStepMode::Eager,
             segment: 0,
             open: false,
+            submitted: false,
+            withhold: false,
+            _quarantine_event: None,
         };
         let mut lease = OperationLease::new("selected reduced dense graph", operation)
             .expect("static label is nonempty");
-        if let Err(error) = enqueue_dense(
+        let completion = match enqueue_dense(
             &mut lease,
             graph,
             state,
@@ -245,23 +270,29 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             host_experts,
             stream,
         ) {
-            lease.mark_lost(
-                ctx.ordinal(),
-                format!("selected dense graph submission failed: {error}"),
-            );
-            return Err(DensePlanRunRefused {
-                plan: None,
-                bindings: Vec::new(),
-                held: Some(lease),
-                error,
-            });
-        }
-        let event = match Event::new(ctx) {
             Ok(event) => event,
             Err(error) => {
+                let full_step = lease.resource().plan.as_ref().unwrap().full_step_capture;
+                if full_step && !lease.resource().submitted && !lease.resource().withhold {
+                    let (_, mut operation) = lease
+                        .retire()
+                        .expect("a pre-enqueue refusal has no completion to observe");
+                    let plan = operation.plan.take().expect("dense operation retains plan");
+                    return Err(DensePlanRunRefused {
+                        plan: Some(plan),
+                        bindings: operation.sources,
+                        held: None,
+                        error,
+                    });
+                }
+                if full_step && lease.resource().submitted {
+                    for run in runs.iter_mut() {
+                        run.dense_quarantine(None);
+                    }
+                }
                 lease.mark_lost(
                     ctx.ordinal(),
-                    format!("dense completion event creation failed: {error}"),
+                    format!("selected dense graph submission failed: {error}"),
                 );
                 return Err(DensePlanRunRefused {
                     plan: None,
@@ -271,18 +302,39 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                 });
             }
         };
-        if let Err(error) = event.record(stream) {
-            lease.mark_lost(
-                ctx.ordinal(),
-                format!("dense completion event record failed: {error}"),
-            );
-            return Err(DensePlanRunRefused {
-                plan: None,
-                bindings: Vec::new(),
-                held: Some(lease),
-                error,
-            });
-        }
+        let event = if let Some(event) = completion {
+            event
+        } else {
+            let event = match Event::new(ctx) {
+                Ok(event) => event,
+                Err(error) => {
+                    lease.mark_lost(
+                        ctx.ordinal(),
+                        format!("dense completion event creation failed: {error}"),
+                    );
+                    return Err(DensePlanRunRefused {
+                        plan: None,
+                        bindings: Vec::new(),
+                        held: Some(lease),
+                        error,
+                    });
+                }
+            };
+            if let Err(error) = event.record(stream) {
+                core::mem::forget(event);
+                lease.mark_lost(
+                    ctx.ordinal(),
+                    format!("dense completion event record failed: {error}"),
+                );
+                return Err(DensePlanRunRefused {
+                    plan: None,
+                    bindings: Vec::new(),
+                    held: Some(lease),
+                    error,
+                });
+            }
+            event
+        };
         let attribution = {
             let plan = lease
                 .resource()
@@ -403,7 +455,17 @@ fn enqueue_dense<'ctx>(
     layers: &BTreeMap<NodeId, u32>,
     host_experts: &[HostExpertWeights<'_>],
     stream: &Stream<'ctx>,
-) -> Result<()> {
+) -> Result<Option<Event<'ctx>>> {
+    if lease
+        .resource()
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan")
+        .full_step_capture
+    {
+        return enqueue_dense_full_step(lease, graph, state, transaction, runs, layers, stream)
+            .map(Some);
+    }
     let mode = {
         let operation = lease.resource();
         let plan = operation
@@ -433,9 +495,10 @@ fn enqueue_dense<'ctx>(
         runs,
         layers,
         host_experts,
+        None,
         stream,
     ) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(None),
         Err(error) => {
             if mode == DenseStepMode::Capture {
                 if lease.resource().open {
@@ -471,6 +534,674 @@ fn enqueue_dense<'ctx>(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn enqueue_dense_full_step<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    graph: &Graph,
+    state: &mut DeviceKvSequence,
+    transaction: StateTransactionId,
+    runs: &mut [PagedAttentionRun<'ctx>],
+    layers: &BTreeMap<NodeId, u32>,
+    stream: &Stream<'ctx>,
+) -> Result<Event<'ctx>> {
+    let identity = full_step_identity(lease, graph, runs)?;
+    {
+        let plan = lease
+            .resource_mut()
+            .plan
+            .as_mut()
+            .expect("dense operation retains plan");
+        if plan.full_step_identity.as_ref() != Some(&identity) {
+            plan.captured.clear();
+            plan.full_step_identity = None;
+        }
+        if plan.captured.len() > 1 {
+            return Err(invalid(
+                "capture",
+                "full-step plan contains more than one graph",
+            ));
+        }
+        if plan.captured.is_empty() {
+            plan.captured
+                .try_reserve(1)
+                .map_err(|_| capacity(std::mem::size_of::<usize>()))?;
+        }
+        plan.full_step_identity = Some(identity);
+    }
+
+    let prepared = match prepare_full_step(lease, graph, state, transaction, runs, layers, stream) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if runs.iter().any(PagedAttentionRun::dense_is_quarantined) {
+                lease.resource_mut().withhold = true;
+            }
+            return Err(error);
+        }
+    };
+    let mode = if lease
+        .resource()
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan")
+        .captured
+        .is_empty()
+    {
+        DenseStepMode::FullCapture
+    } else {
+        DenseStepMode::FullReplay
+    };
+    {
+        let operation = lease.resource_mut();
+        operation.mode = mode;
+        operation.segment = 0;
+        operation.open = false;
+    }
+    let mut run_events = Vec::new();
+    run_events
+        .try_reserve_exact(prepared.layers.len())
+        .map_err(|_| capacity(std::mem::size_of::<(usize, Event<'ctx>)>()))?;
+
+    let result = (|| {
+        upload_sources(lease, stream)?;
+        upload_prepared_rope_tables(lease, stream)?;
+        upload_step_mirror(lease, stream)?;
+        for (layer, run) in runs.iter_mut().enumerate().take(prepared.layers.len()) {
+            let view = prepared
+                .token
+                .page_view(layer)
+                .ok_or_else(|| invalid("state", "prepared append has no layer page view"))?;
+            lease.resource_mut().submitted = true;
+            run.dense_upload_table_for(stream, view)?;
+        }
+
+        if mode == DenseStepMode::FullCapture {
+            stream.begin_capture()?;
+            lease.resource_mut().open = true;
+            let rows = prepared.rows;
+            enqueue_dense_segments(
+                lease,
+                graph,
+                state,
+                transaction,
+                runs,
+                layers,
+                &[],
+                Some(&prepared),
+                stream,
+            )?;
+            if lease.resource().segment != 1
+                || lease
+                    .resource()
+                    .plan
+                    .as_ref()
+                    .expect("dense operation retains plan")
+                    .captured
+                    .len()
+                    != 1
+                || rows != 1
+            {
+                return Err(invalid(
+                    "capture",
+                    "a full-step decode did not produce exactly one graph",
+                ));
+            }
+            #[cfg(feature = "paged-attention-test-hooks")]
+            {
+                let plan = lease.resource_mut().plan.as_mut().unwrap();
+                plan.full_step_capture_count = plan.full_step_capture_count.saturating_add(1);
+            }
+        } else {
+            lease.resource_mut().submitted = true;
+            let plan = lease
+                .resource()
+                .plan
+                .as_ref()
+                .expect("dense operation retains plan");
+            if plan.captured.len() != 1 {
+                return Err(invalid("capture", "full-step replay has no single graph"));
+            }
+            // SAFETY: the plan keeps this graph, its module and every bound
+            // range alive until the event below is observed.
+            unsafe { plan.captured[0].launch(stream)? };
+            lease
+                .resource_mut()
+                .launch_order
+                .push("full-step-replay".into());
+        }
+
+        for layer in 0..prepared.layers.len() {
+            let event = Event::new(lease.resource().ctx);
+            // The stream's context is the selected plan's context even when
+            // this build has no cuBLAS feature.
+            let event = match event {
+                Ok(event) => event,
+                Err(error) => return Err(error),
+            };
+            if let Err(error) = event.record(stream) {
+                run_events.push((layer, event));
+                return Err(error);
+            }
+            run_events.push((layer, event));
+        }
+
+        let dense_event = Event::new(lease.resource().ctx)?;
+        if let Err(error) = dense_event.record(stream) {
+            core::mem::forget(dense_event);
+            return Err(error);
+        }
+        lease.resource_mut().submitted = true;
+        if let Err(error) = state.apply_append(prepared.token) {
+            lease.resource_mut()._quarantine_event = Some(dense_event);
+            return Err(error);
+        }
+        for (layer, event) in run_events.drain(..) {
+            runs[layer].dense_install_completion(event, prepared.layers[layer].projected_end);
+        }
+        Ok(dense_event)
+    })();
+
+    if result.is_err() {
+        if lease.resource().open {
+            if let Ok(captured) = stream.end_capture() {
+                drop(captured);
+            }
+            lease.resource_mut().open = false;
+        }
+        let submitted = lease.resource().submitted;
+        if submitted {
+            for (layer, event) in run_events.drain(..) {
+                runs[layer].dense_install_quarantined_event(event);
+            }
+            for run in runs.iter_mut() {
+                run.dense_quarantine(None);
+            }
+        }
+    }
+    result
+}
+
+fn prepare_full_step<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    graph: &Graph,
+    state: &mut DeviceKvSequence,
+    transaction: StateTransactionId,
+    runs: &mut [PagedAttentionRun<'ctx>],
+    layers: &BTreeMap<NodeId, u32>,
+    stream: &Stream<'ctx>,
+) -> Result<PreparedFullStep> {
+    if !layers.is_empty() {
+        return Err(invalid(
+            "capture",
+            "full-step capture does not admit a partial stage",
+        ));
+    }
+    let rows = lease
+        .resource()
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan")
+        .candidate()
+        .workload()
+        .rows;
+    if rows != 1 || !runs.iter().all(PagedAttentionRun::dense_step_supported) {
+        return Err(invalid(
+            "capture",
+            "full-step capture requires one-row decode and direct device runs",
+        ));
+    }
+    let layer_count = state.layer_count()?;
+    if layer_count != runs.len() {
+        return Err(invalid("runs", "state layers and direct runs differ"));
+    }
+    let token = state.prepare_append(transaction, rows)?;
+    if token.layer_count() != runs.len() {
+        return Err(invalid(
+            "state",
+            "prepared append layers and direct runs differ",
+        ));
+    }
+    let positions_value = graph.nodes().iter().find_map(|node| match node.params {
+        OpParams::Rope { .. } => node.inputs.get(1).copied(),
+        _ => None,
+    });
+    let bound_position = positions_value
+        .map(|value| index_values(lease.resource(), value, rows))
+        .transpose()?
+        .map(|positions| positions.get(0));
+
+    let mut slots: Vec<Option<FullStepLayer>> = Vec::new();
+    slots
+        .try_reserve_exact(runs.len())
+        .map_err(|_| capacity(std::mem::size_of::<Option<FullStepLayer>>()))?;
+    slots.resize_with(runs.len(), || None);
+    let mut first_position = None;
+    let graph_attention_count = graph
+        .nodes()
+        .iter()
+        .filter(|node| matches!(node.params, OpParams::Attention { .. }))
+        .count();
+    if graph_attention_count != runs.len() {
+        return Err(invalid("runs", "attention nodes and direct runs differ"));
+    }
+
+    for node in graph.nodes() {
+        let OpParams::Attention {
+            heads,
+            kv_heads,
+            head_dim,
+            scale,
+            visibility,
+            layer,
+        } = node.params
+        else {
+            continue;
+        };
+        let layer = layer as usize;
+        if layer >= runs.len() || slots[layer].is_some() {
+            return Err(invalid(
+                "runs",
+                "attention layers do not map one-to-one to runs",
+            ));
+        }
+        let view = token
+            .page_view(layer)
+            .ok_or_else(|| invalid("state", "prepared append has no page view"))?;
+        let placements = token
+            .placements(layer)
+            .ok_or_else(|| invalid("state", "prepared append has no placements"))?;
+        let position = placements
+            .first()
+            .map(|placement| placement.position)
+            .ok_or_else(|| invalid("placements", "prepared append has no row placements"))?;
+        if bound_position.is_some_and(|bound| bound != position)
+            || first_position.is_some_and(|first| first != position)
+        {
+            return Err(invalid(
+                "positions",
+                "bound position differs from the prepared append frontier",
+            ));
+        }
+        first_position = Some(position);
+
+        let storage = runs[layer].dense_storage()?;
+        if storage.geometry.kv_heads != kv_heads || storage.geometry.head_dim != head_dim {
+            return Err(invalid(
+                "geometry",
+                "attention graph geometry differs from the admitted direct run",
+            ));
+        }
+        if view.table.len() as u64 > storage.geometry.pages {
+            return Err(invalid(
+                "page_table",
+                "the projected view exceeds the run's admitted page geometry",
+            ));
+        }
+        let (row_bytes, placed_rows, projected_end) =
+            match runs[layer].dense_prepare_table(stream, view, placements) {
+                Ok(checked) => checked,
+                Err(error) => {
+                    if runs[layer].dense_is_quarantined() {
+                        lease.resource_mut().withhold = true;
+                    }
+                    return Err(error);
+                }
+            };
+        if placed_rows != rows || projected_end <= view.base {
+            return Err(invalid(
+                "placements",
+                "prepared append geometry differs from the decode bucket",
+            ));
+        }
+        let launch = PagedAttentionLaunch::new(
+            crate::AttentionLayer {
+                geometry: storage.geometry,
+                heads,
+                scale,
+                visibility,
+            },
+            rows,
+            position,
+            view.base,
+            projected_end - view.base,
+        )?;
+        runs[layer].check_dense_projected_attend(stream, &launch, view, projected_end)?;
+
+        let key = address_range(lease.resource(), node.inputs[1])?;
+        let value = address_range(lease.resource(), node.inputs[2])?;
+        let query = address_range(lease.resource(), node.inputs[0])?;
+        let output = address_range(lease.resource(), node.output)?;
+        let query_bytes = launch.query_bytes()?;
+        let output_bytes = launch.output_bytes()?;
+        if [key, value, query, output]
+            .iter()
+            .any(|range| range.device_uuid() != stream.device_uuid())
+            || key.bytes() < row_bytes * rows
+            || value.bytes() < row_bytes * rows
+            || query.bytes() < query_bytes
+            || output.bytes() < output_bytes
+        {
+            return Err(invalid(
+                "bindings",
+                "attention source or output extent does not fit its admitted device range",
+            ));
+        }
+        let query_address = query.device_address()?;
+        let output_address = output.device_address()?;
+        let query_end = query_address
+            .checked_add(query.bytes())
+            .ok_or_else(|| invalid("query", "query address extent overflowed"))?;
+        let output_end = output_address
+            .checked_add(output.bytes())
+            .ok_or_else(|| invalid("output", "output address extent overflowed"))?;
+        if query_address < output_end && output_address < query_end {
+            return Err(invalid("output", "query and output device ranges overlap"));
+        }
+
+        let mut offsets = Vec::new();
+        let offset_count = usize::try_from(
+            rows.checked_mul(2)
+                .ok_or_else(|| invalid("step_buffer", "append offset count overflowed"))?,
+        )
+        .map_err(|_| invalid("step_buffer", "append offset count exceeds usize"))?;
+        offsets
+            .try_reserve_exact(offset_count)
+            .map_err(|_| capacity(offset_count.saturating_mul(std::mem::size_of::<u64>())))?;
+        let page_bytes = storage.geometry.page_bytes()?;
+        for placement in placements {
+            for row in 0..placement.rows {
+                let slot = placement
+                    .slot
+                    .checked_add(row)
+                    .ok_or_else(|| invalid("placements", "placement slot overflowed"))?;
+                let offset = placement
+                    .physical_page
+                    .checked_mul(page_bytes)
+                    .and_then(|page| {
+                        slot.checked_mul(row_bytes)
+                            .and_then(|slot| page.checked_add(slot))
+                    })
+                    .ok_or_else(|| invalid("placements", "append byte offset overflowed"))?;
+                let end = offset
+                    .checked_add(row_bytes)
+                    .ok_or_else(|| invalid("placements", "append byte extent overflowed"))?;
+                if end > storage.key_bytes || end > storage.value_bytes {
+                    return Err(invalid(
+                        "placements",
+                        "append destination exceeds its admitted page range",
+                    ));
+                }
+                offsets.push(offset);
+                offsets.push(offset);
+            }
+        }
+        if offsets.len() != offset_count {
+            return Err(invalid(
+                "placements",
+                "append offsets do not cover every row",
+            ));
+        }
+        slots[layer] = Some(FullStepLayer {
+            launch,
+            storage,
+            projected_end,
+            offsets,
+        });
+    }
+
+    let first_position = first_position
+        .ok_or_else(|| invalid("positions", "full-step graph has no attention layer"))?;
+    let mut prepared_layers = Vec::new();
+    prepared_layers
+        .try_reserve_exact(slots.len())
+        .map_err(|_| capacity(std::mem::size_of::<FullStepLayer>()))?;
+    for slot in slots {
+        prepared_layers
+            .push(slot.ok_or_else(|| invalid("runs", "prepared append omits an attention layer"))?);
+    }
+    prepare_rope_tables(lease, graph, rows)?;
+    encode_step_mirror(lease, &prepared_layers, rows, first_position)?;
+    Ok(PreparedFullStep {
+        token,
+        layers: prepared_layers,
+        rows,
+    })
+}
+
+fn full_step_identity<'ctx>(
+    lease: &OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    graph: &Graph,
+    runs: &[PagedAttentionRun<'ctx>],
+) -> Result<Vec<u64>> {
+    let plan = lease
+        .resource()
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan");
+    let candidate = plan.candidate();
+    let (step_address, step_bytes) = plan.step_buffer_address()?;
+    let workspace = plan.workspace_range()?;
+    let workspace_address = workspace.device_address()?;
+    let workspace_bytes = workspace.bytes();
+    let symbol_bytes = plan
+        .module_symbols
+        .iter()
+        .try_fold(0usize, |total, symbol| total.checked_add(symbol.len() + 1))
+        .ok_or_else(|| invalid("capture", "symbol identity size overflowed"))?;
+    let reserve = candidate
+        .values()
+        .len()
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(candidate.nodes().len().checked_mul(8)?))
+        .and_then(|count| count.checked_add(runs.len().checked_mul(16)?))
+        .and_then(|count| count.checked_add(graph.nodes().len().checked_mul(16)?))
+        .and_then(|count| count.checked_add(symbol_bytes))
+        .and_then(|count| count.checked_add(16))
+        .ok_or_else(|| invalid("capture", "full-step identity size overflowed"))?;
+    let mut identity = Vec::new();
+    identity
+        .try_reserve_exact(reserve)
+        .map_err(|_| capacity(reserve.saturating_mul(std::mem::size_of::<u64>())))?;
+    identity.extend([
+        candidate.workload().rows,
+        candidate.workload().visible_tokens,
+        workspace_address,
+        workspace_bytes,
+        step_address,
+        step_bytes,
+    ]);
+    identity.push(candidate.values().len() as u64);
+    for value in candidate.values() {
+        identity.push(u64::from(value.value.0));
+        identity.push(plan.value_address(value.value)?);
+    }
+    identity.push(candidate.nodes().len() as u64);
+    for node in candidate.nodes() {
+        identity.push(u64::from(node.node.0));
+        identity.push(node.workspace_logical_bytes);
+        identity.push(node.descriptor.shape.max_rows);
+        identity.push(node.descriptor.shape.max_input);
+        identity.push(node.descriptor.shape.max_output);
+        let name = node.descriptor.operation.name();
+        identity.push(name.len() as u64);
+        identity.extend(name.bytes().map(u64::from));
+        identity.push(node.descriptor.symbols.len() as u64);
+        for symbol in &node.descriptor.symbols {
+            identity.push(symbol.0.len() as u64);
+            identity.extend(symbol.0.bytes().map(u64::from));
+        }
+    }
+    identity.push(plan.module_symbols.len() as u64);
+    for symbol in &plan.module_symbols {
+        identity.push(symbol.len() as u64);
+        identity.extend(symbol.bytes().map(u64::from));
+    }
+    identity.push(runs.len() as u64);
+    for run in runs {
+        let storage = run.dense_storage()?;
+        identity.extend([
+            storage.run_id,
+            storage.key_address,
+            storage.key_bytes,
+            storage.value_address,
+            storage.value_bytes,
+            storage.table_address,
+            storage.table_bytes,
+            storage.geometry.kv_heads,
+            storage.geometry.head_dim,
+            storage.geometry.page_tokens,
+            storage.geometry.pages,
+            storage.heads,
+            storage.max_rows,
+        ]);
+    }
+    for node in graph.nodes() {
+        if let OpParams::Attention {
+            heads,
+            kv_heads,
+            head_dim,
+            scale,
+            visibility,
+            layer,
+        } = node.params
+        {
+            identity.extend([
+                u64::from(node.id.0),
+                u64::from(layer),
+                heads,
+                kv_heads,
+                head_dim,
+                u64::from(scale.to_bits()),
+                plan.value_address(node.inputs[0])?,
+                plan.value_address(node.output)?,
+            ]);
+            identity.push(match visibility {
+                Visibility::Causal => 0,
+                Visibility::SlidingWindow { window } => window,
+            });
+            let symbols = plan
+                .indirect_symbol_indices
+                .get(&node.id)
+                .ok_or_else(|| invalid("symbols", "attention node has no indirect symbols"))?;
+            identity.extend([symbols.0 as u64, symbols.1 as u64]);
+        }
+    }
+    #[cfg(feature = "cublas")]
+    if candidate.blas_workspace_offset().is_some() {
+        identity.push(plan.blas_workspace()?.0);
+    } else {
+        identity.push(0);
+    }
+    #[cfg(not(feature = "cublas"))]
+    identity.push(0);
+    Ok(identity)
+}
+
+fn encode_step_mirror<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    layers: &[FullStepLayer],
+    rows: u64,
+    first_position: u64,
+) -> Result<()> {
+    let plan = lease
+        .resource_mut()
+        .plan
+        .as_mut()
+        .expect("dense operation retains plan");
+    let max_rows = plan.candidate().workload().rows;
+    let (offset, bytes) = plan
+        .candidate()
+        .step_buffer()
+        .ok_or_else(|| invalid("workspace", "selected plan has no step buffer"))?;
+    let _ = offset;
+    let wanted = usize::try_from(bytes)
+        .map_err(|_| invalid("step_buffer", "step buffer exceeds host addressability"))?;
+    let mirror = plan.step_mirror_mut()?.as_mut_slice();
+    if mirror.len() != wanted {
+        return Err(invalid(
+            "step_buffer",
+            "pinned mirror and selected range differ",
+        ));
+    }
+    mirror.fill(0);
+    let words_per_layer = 4_u64
+        .checked_add(
+            max_rows
+                .checked_mul(2)
+                .ok_or_else(|| invalid("step_buffer", "offset slot count overflowed"))?,
+        )
+        .ok_or_else(|| invalid("step_buffer", "layer step size overflowed"))?;
+    let words_per_layer = usize::try_from(words_per_layer)
+        .map_err(|_| invalid("step_buffer", "layer step size exceeds usize"))?;
+    let stride = words_per_layer
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or_else(|| invalid("step_buffer", "layer step byte stride overflowed"))?;
+    for (layer_index, layer) in layers.iter().enumerate() {
+        let start = layer_index
+            .checked_mul(stride)
+            .ok_or_else(|| invalid("step_buffer", "layer offset overflowed"))?;
+        let end = start
+            .checked_add(stride)
+            .ok_or_else(|| invalid("step_buffer", "layer extent overflowed"))?;
+        let bytes = mirror
+            .get_mut(start..end)
+            .ok_or_else(|| invalid("step_buffer", "layer exceeds the pinned mirror"))?;
+        for (index, value) in [
+            rows,
+            first_position,
+            layer.launch.history_base(),
+            layer.launch.history_rows(),
+        ]
+        .into_iter()
+        .chain(layer.offsets.iter().copied())
+        .enumerate()
+        {
+            let slot = bytes
+                .get_mut(
+                    index * std::mem::size_of::<u64>()..(index + 1) * std::mem::size_of::<u64>(),
+                )
+                .ok_or_else(|| invalid("step_buffer", "step value exceeds its layer range"))?;
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn upload_step_mirror<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    stream: &Stream<'ctx>,
+) -> Result<()> {
+    let offset = {
+        let plan = lease
+            .resource()
+            .plan
+            .as_ref()
+            .expect("dense operation retains plan");
+        let (offset, bytes) = plan
+            .candidate()
+            .step_buffer()
+            .ok_or_else(|| invalid("workspace", "selected plan has no step buffer"))?;
+        let (_, selected_bytes) = plan.step_buffer_address()?;
+        if bytes != selected_bytes || plan.step_mirror()?.as_slice().len() as u64 != bytes {
+            return Err(invalid("workspace", "step-buffer byte lengths disagree"));
+        }
+        plan.workspace_range()?;
+        offset
+    };
+    // SAFETY: the pinned mirror and selected workspace range remain owned by
+    // the lost-or-completed dense operation through its recorded event.
+    lease.resource_mut().submitted = true;
+    let operation = lease.resource();
+    let plan = operation
+        .plan
+        .as_ref()
+        .expect("dense operation retains plan");
+    let workspace = plan.workspace_range()?;
+    let source = plan.step_mirror()?.as_slice();
+    // SAFETY: the pinned mirror and workspace range remain owned by the lost
+    // or completed dense operation through the recorded event.
+    unsafe { workspace.copy_from_host_async_at(offset, source, stream) }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn enqueue_dense_segments<'ctx>(
     lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
     graph: &Graph,
@@ -479,6 +1210,7 @@ fn enqueue_dense_segments<'ctx>(
     runs: &mut [PagedAttentionRun<'ctx>],
     layers: &BTreeMap<NodeId, u32>,
     host_experts: &[HostExpertWeights<'_>],
+    full_step: Option<&PreparedFullStep>,
     stream: &Stream<'ctx>,
 ) -> Result<()> {
     let rows = lease
@@ -496,8 +1228,10 @@ fn enqueue_dense_segments<'ctx>(
     // A tensor-parallel stage without RoPE has no position input.
     let positions = || positions_value.ok_or_else(|| invalid("positions", "no position input"));
     let mut attention_index = 0usize;
-    upload_sources(lease, stream)?;
-    upload_rope_tables(lease, graph, rows, stream)?;
+    if full_step.is_none() {
+        upload_sources(lease, stream)?;
+        upload_rope_tables(lease, graph, rows, stream)?;
+    }
     let selected_nodes = lease
         .resource()
         .plan
@@ -924,24 +1658,44 @@ fn enqueue_dense_segments<'ctx>(
                 visibility,
                 layer,
             } => {
-                close_segment(lease, stream)?;
-                execute_attention(
-                    lease,
-                    node,
-                    rows,
-                    heads,
-                    kv_heads,
-                    head_dim,
-                    scale,
-                    visibility,
-                    layers.get(&node.id).copied().unwrap_or(layer),
-                    positions()?,
-                    state,
-                    transaction,
-                    runs,
-                    &mut attention_index,
-                    stream,
-                )?;
+                let layer = layers.get(&node.id).copied().unwrap_or(layer);
+                if let Some(prepared) = full_step {
+                    execute_attention_full_step(
+                        lease,
+                        node,
+                        rows,
+                        heads,
+                        kv_heads,
+                        head_dim,
+                        scale,
+                        visibility,
+                        layer,
+                        prepared,
+                        runs,
+                        &mut attention_index,
+                        stream,
+                        selected,
+                    )?;
+                } else {
+                    close_segment(lease, stream)?;
+                    execute_attention(
+                        lease,
+                        node,
+                        rows,
+                        heads,
+                        kv_heads,
+                        head_dim,
+                        scale,
+                        visibility,
+                        layer,
+                        positions()?,
+                        state,
+                        transaction,
+                        runs,
+                        &mut attention_index,
+                        stream,
+                    )?;
+                }
                 push_launch(lease, "attention");
             }
             OpParams::GeGlu { width } => {
@@ -1424,7 +2178,7 @@ fn close_segment<'ctx>(
         DenseStepMode::Eager => {
             return Err(invalid("capture", "an eager step has an open segment"));
         }
-        DenseStepMode::Capture => {
+        DenseStepMode::Capture | DenseStepMode::FullCapture => {
             let graph = stream.end_capture();
             lease.resource_mut().open = false;
             let graph = graph?;
@@ -1447,6 +2201,12 @@ fn close_segment<'ctx>(
             }
         }
         DenseStepMode::Replay => {}
+        DenseStepMode::FullReplay => {
+            return Err(invalid(
+                "capture",
+                "full-step replay bypasses segment closure",
+            ));
+        }
     }
     let operation = lease.resource_mut();
     operation.segment = operation
@@ -1605,16 +2365,181 @@ fn execute_attention<'ctx>(
     }
 }
 
-fn upload_sources<'ctx>(
-    lease: &OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+#[allow(clippy::too_many_arguments)]
+fn execute_attention_full_step<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    node: &moxie_graph::Node,
+    rows: u64,
+    _heads: u64,
+    _kv_heads: u64,
+    _head_dim: u64,
+    _scale: f32,
+    _visibility: Visibility,
+    layer: u32,
+    prepared: &PreparedFullStep,
+    runs: &[PagedAttentionRun<'ctx>],
+    attention_index: &mut usize,
     stream: &Stream<'ctx>,
+    selected: &SelectedNode,
 ) -> Result<()> {
-    let operation = lease.resource();
-    let plan = operation
+    let layer_index = usize::try_from(layer)
+        .map_err(|_| invalid("layer", "attention layer exceeds host addressability"))?;
+    let prepared_layer = prepared
+        .layers
+        .get(layer_index)
+        .ok_or_else(|| invalid("runs", "prepared attention layer is absent"))?;
+    let run = runs
+        .get(layer_index)
+        .ok_or_else(|| invalid("runs", "attention layer has no admitted run"))?;
+    if run.dense_storage()?.run_id != prepared_layer.storage.run_id {
+        return Err(invalid(
+            "runs",
+            "attention run identity changed after preparation",
+        ));
+    }
+    *attention_index = attention_index
+        .checked_add(1)
+        .ok_or_else(|| invalid("runs", "attention layer count overflowed"))?;
+    let plan = lease
+        .resource()
         .plan
         .as_ref()
         .expect("dense operation retains plan");
-    for source in &operation.sources {
+    let (base_step, step_bytes) = plan.step_buffer_address()?;
+    let max_rows = plan.candidate().workload().rows;
+    let words = 4_u64
+        .checked_add(
+            max_rows
+                .checked_mul(2)
+                .ok_or_else(|| invalid("step_buffer", "per-layer step width overflowed"))?,
+        )
+        .ok_or_else(|| invalid("step_buffer", "per-layer step width overflowed"))?;
+    let layer_stride = words
+        .checked_mul(std::mem::size_of::<u64>() as u64)
+        .ok_or_else(|| invalid("step_buffer", "per-layer byte stride overflowed"))?;
+    let step_address = base_step
+        .checked_add(
+            u64::from(layer)
+                .checked_mul(layer_stride)
+                .ok_or_else(|| invalid("step_buffer", "layer step offset overflowed"))?,
+        )
+        .ok_or_else(|| invalid("step_buffer", "layer step address overflowed"))?;
+    let step_end = step_address
+        .checked_add(layer_stride)
+        .ok_or_else(|| invalid("step_buffer", "layer step extent overflowed"))?;
+    let buffer_end = base_step
+        .checked_add(step_bytes)
+        .ok_or_else(|| invalid("step_buffer", "step buffer extent overflowed"))?;
+    if step_end > buffer_end {
+        return Err(invalid(
+            "step_buffer",
+            "layer step exceeds its selected range",
+        ));
+    }
+
+    let (append_symbol, attention_symbol) = *plan
+        .indirect_symbol_indices
+        .get(&node.id)
+        .ok_or_else(|| invalid("symbols", "attention node has no indirect module entries"))?;
+    let key_source = address(lease.resource(), node.inputs[1])?;
+    let value_source = address(lease.resource(), node.inputs[2])?;
+    let key_pages = prepared_layer.storage.key_address;
+    let value_pages = prepared_layer.storage.value_address;
+    let mut offsets_address = step_address
+        .checked_add(4 * std::mem::size_of::<u64>() as u64)
+        .ok_or_else(|| invalid("step_buffer", "offset array address overflowed"))?;
+    let mut row_bytes = prepared_layer
+        .storage
+        .geometry
+        .row_elements()?
+        .checked_mul(2)
+        .ok_or_else(|| invalid("append", "KV row byte width overflowed"))?;
+    let mut step_for_append = step_address;
+    let mut key_source = key_source;
+    let mut value_source = value_source;
+    let mut key_pages = key_pages;
+    let mut value_pages = value_pages;
+    let mut append_params: [*mut c_void; 7] = [
+        (&raw mut key_source).cast(),
+        (&raw mut value_source).cast(),
+        (&raw mut key_pages).cast(),
+        (&raw mut value_pages).cast(),
+        (&raw mut step_for_append).cast(),
+        (&raw mut offsets_address).cast(),
+        (&raw mut row_bytes).cast(),
+    ];
+    let selected_rows =
+        u32::try_from(rows).map_err(|_| invalid("launch", "append row grid exceeds u32"))?;
+    launch(
+        lease,
+        append_symbol,
+        stream,
+        (selected_rows, 1, 1),
+        (256, 1, 1),
+        &mut append_params,
+        selected,
+        moxie_kernels::KV_APPEND_INDIRECT,
+    )?;
+
+    let mut query = address(lease.resource(), node.inputs[0])?;
+    let mut table = prepared_layer.storage.table_address;
+    let mut output = address(lease.resource(), node.output)?;
+    let mut attention_step = step_address;
+    let mut heads = prepared_layer.launch.heads();
+    let mut kv_heads = prepared_layer.launch.geometry().kv_heads;
+    let mut head_dim = prepared_layer.launch.geometry().head_dim;
+    let mut page_tokens = prepared_layer.launch.geometry().page_tokens;
+    let mut window = match prepared_layer.launch.visibility() {
+        Visibility::Causal => 0,
+        Visibility::SlidingWindow { window } => window,
+    };
+    let mut scale = prepared_layer.launch.scale();
+    let grid = prepared_layer.launch.grid()?;
+    let mut attention_params: [*mut c_void; 12] = [
+        (&raw mut query).cast(),
+        (&raw mut key_pages).cast(),
+        (&raw mut value_pages).cast(),
+        (&raw mut table).cast(),
+        (&raw mut output).cast(),
+        (&raw mut attention_step).cast(),
+        (&raw mut heads).cast(),
+        (&raw mut kv_heads).cast(),
+        (&raw mut head_dim).cast(),
+        (&raw mut page_tokens).cast(),
+        (&raw mut window).cast(),
+        (&raw mut scale).cast(),
+    ];
+    launch(
+        lease,
+        attention_symbol,
+        stream,
+        grid,
+        (moxie_kernels::PAGED_ATTENTION_THREADS, 1, 1),
+        &mut attention_params,
+        selected,
+        moxie_kernels::PAGED_ATTENTION_INDIRECT,
+    )
+}
+
+fn upload_sources<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    stream: &Stream<'ctx>,
+) -> Result<()> {
+    for index in 0..lease.resource().sources.len() {
+        let value = lease.resource().sources[index].value;
+        lease
+            .resource()
+            .plan
+            .as_ref()
+            .expect("dense operation retains plan")
+            .range_for_value(value)?;
+        lease.resource_mut().submitted = true;
+        let operation = lease.resource();
+        let source = &operation.sources[index];
+        let plan = operation
+            .plan
+            .as_ref()
+            .expect("dense operation retains plan");
         // SAFETY: the operation owns the source and admitted destination until
         // the completion event retires.
         unsafe {
@@ -1631,6 +2556,15 @@ fn upload_rope_tables<'ctx>(
     rows: u64,
     stream: &Stream<'ctx>,
 ) -> Result<()> {
+    prepare_rope_tables(lease, graph, rows)?;
+    upload_prepared_rope_tables(lease, stream)
+}
+
+fn prepare_rope_tables<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    graph: &Graph,
+    rows: u64,
+) -> Result<()> {
     let DenseOperation {
         plan,
         sources,
@@ -1642,8 +2576,10 @@ fn upload_rope_tables<'ctx>(
     if offsets.is_empty() {
         return Ok(());
     }
-    let workspace = plan.workspace_range()?;
     for (key, &offset) in offsets {
+        if rope_tables.iter().any(|(existing, _)| existing == key) {
+            continue;
+        }
         let key = *key;
         let (rotary_dim, frequency_dim, _) = key;
         let Some(node) = graph.nodes().iter().find(|node| {
@@ -1667,15 +2603,48 @@ fn upload_rope_tables<'ctx>(
             .try_reserve(1)
             .map_err(|_| capacity(std::mem::size_of::<((u64, u64, u32), Vec<u8>)>()))?;
         rope_tables.push((key, angles));
+        let _ = offset;
+    }
+    Ok(())
+}
+
+fn upload_prepared_rope_tables<'ctx>(
+    lease: &mut OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>,
+    stream: &Stream<'ctx>,
+) -> Result<()> {
+    for index in 0..lease.resource().rope_tables.len() {
+        let key = lease.resource().rope_tables[index].0;
+        let offset = {
+            let plan = lease
+                .resource()
+                .plan
+                .as_ref()
+                .expect("dense operation retains plan");
+            plan.workspace_range()?;
+            plan.candidate()
+                .rope_table_offsets()
+                .get(&key)
+                .copied()
+                .ok_or_else(|| {
+                    invalid(
+                        "rope_table_offsets",
+                        "the selected RoPE table has no offset",
+                    )
+                })?
+        };
+        lease.resource_mut().submitted = true;
+        let operation = lease.resource();
+        let plan = operation
+            .plan
+            .as_ref()
+            .expect("dense operation retains plan");
+        let bytes = &operation.rope_tables[index].1;
         // SAFETY: the operation retains the table until the lease retires
         // after its completion event; the offset and destination are admitted
         // by the selected plan.
         unsafe {
-            workspace.copy_from_host_async_at(
-                offset,
-                &rope_tables.last().expect("just retained").1,
-                stream,
-            )?;
+            plan.workspace_range()?
+                .copy_from_host_async_at(offset, bytes, stream)?;
         }
     }
     Ok(())
@@ -1692,7 +2661,7 @@ fn launch<'ctx>(
     node: &SelectedNode,
     symbol: &str,
 ) -> Result<()> {
-    let (mode, open, segment, symbol_matches) = {
+    let (mode, open, segment, symbol_matches, device_ordinal) = {
         let operation = lease.resource();
         let package = operation
             .plan
@@ -1706,6 +2675,7 @@ fn launch<'ctx>(
             operation.open,
             operation.segment,
             package.symbols().get(symbol_index).map(String::as_str) == Some(symbol),
+            operation.device_ordinal,
         )
     };
     if !symbol_matches {
@@ -1714,7 +2684,7 @@ fn launch<'ctx>(
                 "launch",
                 "the selected symbol is not the kernel this operation prepared arguments for",
             ),
-            lease.resource().device_ordinal,
+            device_ordinal,
             node,
             symbol,
         ));
@@ -1741,10 +2711,11 @@ fn launch<'ctx>(
         return Ok(());
     }
 
-    if mode == DenseStepMode::Capture && !open {
+    if matches!(mode, DenseStepMode::Capture | DenseStepMode::FullCapture) && !open {
         stream.begin_capture()?;
         lease.resource_mut().open = true;
     }
+    lease.resource_mut().submitted = true;
     let operation = lease.resource();
     let package = operation
         .plan
@@ -1756,11 +2727,22 @@ fn launch<'ctx>(
     // SAFETY: descriptor selection fixes this ABI, the symbol identity is
     // checked here, and the caller passed only addresses within ranges
     // admitted for this plan.
-    unsafe {
-        package
-            .launch_async(symbol_index, stream, grid, block, 0, params)
-            .map_err(|error| attribute_node_error(error, operation.device_ordinal, node, symbol))
+    let launched = unsafe { package.launch_async(symbol_index, stream, grid, block, 0, params) }
+        .map_err(|error| attribute_node_error(error, device_ordinal, node, symbol));
+    if launched.is_ok() && mode == DenseStepMode::FullCapture && {
+        #[cfg(feature = "paged-attention-test-hooks")]
+        {
+            let plan = lease.resource_mut().plan.as_mut().unwrap();
+            core::mem::take(&mut plan.inject_full_step_failure)
+        }
+        #[cfg(not(feature = "paged-attention-test-hooks"))]
+        {
+            false
+        }
+    } {
+        return Err(invalid("launch", "injected full-step launch failure"));
     }
+    launched
 }
 
 #[cfg(feature = "cublas")]
@@ -2025,7 +3007,7 @@ fn begin_cublas_work<'ctx>(
         lease.resource_mut().open = true;
         return Ok(false);
     }
-    if mode == DenseStepMode::Capture && !open {
+    if matches!(mode, DenseStepMode::Capture | DenseStepMode::FullCapture) && !open {
         stream.begin_capture()?;
         lease.resource_mut().open = true;
     }

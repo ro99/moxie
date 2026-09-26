@@ -8,7 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "cublas")]
 use moxie_cuda::Blas;
 use moxie_cuda::{
-    CapturedGraph, Event, Module, ModuleImage, RankContext, ResolvedModule, Stream, TrustedImage,
+    CapturedGraph, Event, Module, ModuleImage, PinnedHostBuffer, RankContext, ResolvedModule,
+    Stream, TrustedImage,
 };
 #[cfg(feature = "paged-attention-binding")]
 use moxie_graph::NodeId;
@@ -174,8 +175,19 @@ pub struct SelectedReservedPlan<'ctx> {
     /// Ordinary Drop forgets graphs; `close` clears them before module teardown.
     pub(crate) captured: Vec<CapturedGraph<'ctx>>,
     pub(crate) capture_enabled: bool,
+    /// One graph captures the whole decode step when this mode is selected.
+    pub(crate) full_step_capture: bool,
+    /// Run addresses bound into the current full-step graph.
+    pub(crate) full_step_identity: Option<Vec<u64>>,
+    #[cfg(feature = "paged-attention-test-hooks")]
+    pub(crate) inject_full_step_failure: bool,
+    #[cfg(feature = "paged-attention-test-hooks")]
+    pub(crate) full_step_capture_count: u64,
     graph_reservation: Option<Reservation>,
     graph_pool_bytes: u64,
+    step_mirror: Option<PinnedHostBuffer<'ctx>>,
+    step_reservation: Option<Reservation>,
+    ctx: &'ctx RankContext,
     /// The dense kernel module, loaded by the first dense step and dropped
     /// with the plan, so it is never unloaded while a step's kernels may still
     /// run. Ordinary Drop forgets it; `close` explicitly drops it after graphs.
@@ -186,6 +198,9 @@ pub struct SelectedReservedPlan<'ctx> {
     /// First module-symbol index for each selected node.
     #[cfg(feature = "paged-attention-binding")]
     pub(crate) symbol_indices: BTreeMap<NodeId, usize>,
+    /// The indirect append and attention entry points in the plan-owned module.
+    #[cfg(feature = "paged-attention-binding")]
+    pub(crate) indirect_symbol_indices: BTreeMap<NodeId, (usize, usize)>,
     /// Ordinary Drop forgets the handle; close destroys it between graphs and module.
     #[cfg(feature = "cublas")]
     pub(crate) blas: Option<Blas<'ctx>>,
@@ -485,7 +500,8 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             }
         }
         #[cfg(feature = "paged-attention-binding")]
-        let (module_symbols, symbol_indices) = selected_module_symbols(&candidate);
+        let (module_symbols, symbol_indices, indirect_symbol_indices) =
+            selected_module_symbols(&candidate);
         Ok(Self {
             candidate,
             arena: Some(arena),
@@ -494,13 +510,24 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             resident_weights,
             captured: Vec::new(),
             capture_enabled: false,
+            full_step_capture: false,
+            full_step_identity: None,
+            #[cfg(feature = "paged-attention-test-hooks")]
+            inject_full_step_failure: false,
+            #[cfg(feature = "paged-attention-test-hooks")]
+            full_step_capture_count: 0,
             graph_reservation: None,
             graph_pool_bytes: 0,
+            step_mirror: None,
+            step_reservation: None,
+            ctx,
             package: None,
             #[cfg(feature = "paged-attention-binding")]
             module_symbols,
             #[cfg(feature = "paged-attention-binding")]
             symbol_indices,
+            #[cfg(feature = "paged-attention-binding")]
+            indirect_symbol_indices,
             #[cfg(feature = "cublas")]
             blas: None,
             ledger: ledger.id(),
@@ -523,6 +550,18 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
 
     pub fn set_segment_capture(&mut self, enabled: bool, ledger: &mut Ledger) -> Result<()> {
         if enabled {
+            if self.full_step_capture {
+                return Err(invalid(
+                    "capture",
+                    "segment capture cannot be enabled while full-step capture is active",
+                ));
+            }
+            if self.step_mirror.is_some() || self.step_reservation.is_some() {
+                return Err(invalid(
+                    "capture",
+                    "finish full-step resource cleanup before enabling segment capture",
+                ));
+            }
             if !self.candidate.is_dense()
                 || !self.candidate.host_expert_joins().is_empty()
                 || !self.candidate.linear_orders().is_empty()
@@ -562,6 +601,9 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             self.graph_pool_bytes = bytes;
             self.capture_enabled = true;
         } else {
+            if self.full_step_capture {
+                return Ok(());
+            }
             if ledger.id() != self.ledger {
                 return Err(invalid("ledger", "selected plan belongs to another ledger"));
             }
@@ -582,12 +624,139 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         Ok(())
     }
 
+    /// Enable one captured graph for each eligible one-row decode step.
+    ///
+    /// The mirror is charged and allocated before replacing a piecewise graph
+    /// reservation, so a pinned-cap refusal leaves the existing mode intact.
+    pub fn set_full_step_capture(&mut self, enabled: bool, ledger: &mut Ledger) -> Result<()> {
+        if ledger.id() != self.ledger {
+            return Err(invalid("ledger", "selected plan belongs to another ledger"));
+        }
+        if enabled {
+            if !full_step_eligible(&self.candidate) {
+                return Err(invalid(
+                    "capture",
+                    "full-step capture requires an eligible dense decode plan",
+                ));
+            }
+            if self.full_step_capture {
+                return Ok(());
+            }
+            let (pool_bytes, mirror_bytes) = full_step_bounds(&self.candidate)?;
+            let mirror_len = usize::try_from(mirror_bytes)
+                .map_err(|_| invalid("capture", "step mirror exceeds host addressability"))?;
+
+            if self.step_mirror.is_none() {
+                if self.step_reservation.is_none() {
+                    let mut request =
+                        PlanRequest::new("selected-plan-full-step-mirror", ["decode"])?;
+                    request.buffer(BufferRequest::new(
+                        "pinned-step-mirror",
+                        Scope::Host,
+                        Tier::Host(HostTier::Pinned),
+                        mirror_bytes,
+                        StageSpan::at(0),
+                    ))?;
+                    let reservation = ledger.admit(&request)?;
+                    self.step_reservation = Some(reservation);
+                }
+                match PinnedHostBuffer::alloc(self.ctx, mirror_len) {
+                    Ok(mirror) => self.step_mirror = Some(mirror),
+                    Err(error) => {
+                        if let Some(reservation) = self.step_reservation.take()
+                            && let Err(refused) = ledger.release(reservation)
+                        {
+                            self.step_reservation = Some(refused.reservation);
+                            return Err(refused.error);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+
+            // Old graphs must be destroyed before their charge is released.
+            self.captured.clear();
+            self.full_step_identity = None;
+            self.capture_enabled = false;
+            if let Some(reservation) = self.graph_reservation.take() {
+                match ledger.release(reservation) {
+                    Ok(()) => self.graph_pool_bytes = 0,
+                    Err(refused) => {
+                        self.graph_reservation = Some(refused.reservation);
+                        return Err(refused.error);
+                    }
+                }
+            }
+
+            let mut request = PlanRequest::new("selected-plan-full-step-graph-pool", ["decode"])?;
+            request.buffer(BufferRequest::new(
+                "full-step-captured-graph-pool",
+                Scope::Device(self.candidate.workload().device),
+                Tier::Device(DeviceTier::GraphPools),
+                pool_bytes,
+                StageSpan::at(0),
+            ))?;
+            let reservation = ledger.admit(&request)?;
+            self.graph_reservation = Some(reservation);
+            self.graph_pool_bytes = pool_bytes;
+            self.full_step_capture = true;
+            return Ok(());
+        }
+
+        if !self.full_step_capture
+            && self.step_mirror.is_none()
+            && self.step_reservation.is_none()
+            && self.capture_enabled
+        {
+            return Ok(());
+        }
+        self.captured.clear();
+        self.full_step_identity = None;
+        self.full_step_capture = false;
+        self.capture_enabled = false;
+        if let Some(mirror) = self.step_mirror.take()
+            && let Err((mirror, error)) = mirror.free()
+        {
+            self.step_mirror = Some(mirror);
+            return Err(error);
+        }
+        if let Some(reservation) = self.graph_reservation.take() {
+            match ledger.release(reservation) {
+                Ok(()) => self.graph_pool_bytes = 0,
+                Err(refused) => {
+                    self.graph_reservation = Some(refused.reservation);
+                    return Err(refused.error);
+                }
+            }
+        }
+        if let Some(reservation) = self.step_reservation.take() {
+            match ledger.release(reservation) {
+                Ok(()) => {}
+                Err(refused) => {
+                    self.step_reservation = Some(refused.reservation);
+                    return Err(refused.error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn captured_segments(&self) -> usize {
         self.captured.len()
     }
 
     pub fn graph_pool_bytes(&self) -> u64 {
         self.graph_pool_bytes
+    }
+
+    #[cfg(feature = "paged-attention-test-hooks")]
+    pub fn inject_full_step_launch_failure(&mut self) {
+        self.inject_full_step_failure = true;
+    }
+
+    #[cfg(feature = "paged-attention-test-hooks")]
+    pub fn full_step_capture_count(&self) -> u64 {
+        self.full_step_capture_count
     }
 
     #[cfg(feature = "paged-attention-binding")]
@@ -780,6 +949,15 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
             });
         }
         self.captured.clear();
+        self.full_step_identity = None;
+        self.full_step_capture = false;
+        self.capture_enabled = false;
+        if let Some(mirror) = self.step_mirror.take()
+            && let Err((mirror, error)) = mirror.free()
+        {
+            self.step_mirror = Some(mirror);
+            return Err(SelectedCloseRefused { plan: self, error });
+        }
         if let Some(reservation) = self.graph_reservation.take() {
             if let Err(refused) = ledger.release(reservation) {
                 self.graph_reservation = Some(refused.reservation);
@@ -789,7 +967,15 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
                 });
             }
             self.graph_pool_bytes = 0;
-            self.capture_enabled = false;
+        }
+        if let Some(reservation) = self.step_reservation.take()
+            && let Err(refused) = ledger.release(reservation)
+        {
+            self.step_reservation = Some(refused.reservation);
+            return Err(SelectedCloseRefused {
+                plan: self,
+                error: refused.error,
+            });
         }
         #[cfg(feature = "cublas")]
         if let Some(blas) = self.blas.take() {
@@ -833,6 +1019,34 @@ impl<'ctx> SelectedReservedPlan<'ctx> {
         self.ranges
             .get(&(StorageRegion::Workspace, 0))
             .ok_or_else(|| invalid("workspace", "selected workspace range is absent"))
+    }
+
+    #[cfg(feature = "paged-attention-binding")]
+    pub(crate) fn step_buffer_address(&self) -> Result<(u64, u64)> {
+        let (offset, bytes) = self
+            .candidate
+            .step_buffer()
+            .ok_or_else(|| invalid("workspace", "selected plan has no decode step buffer"))?;
+        let address = self
+            .workspace_range()?
+            .device_address()?
+            .checked_add(offset)
+            .ok_or_else(|| invalid("workspace", "decode step buffer address overflowed"))?;
+        Ok((address, bytes))
+    }
+
+    #[cfg(feature = "paged-attention-binding")]
+    pub(crate) fn step_mirror_mut(&mut self) -> Result<&mut PinnedHostBuffer<'ctx>> {
+        self.step_mirror
+            .as_mut()
+            .ok_or_else(|| invalid("capture", "full-step mirror is not allocated"))
+    }
+
+    #[cfg(feature = "paged-attention-binding")]
+    pub(crate) fn step_mirror(&self) -> Result<&PinnedHostBuffer<'ctx>> {
+        self.step_mirror
+            .as_ref()
+            .ok_or_else(|| invalid("capture", "full-step mirror is not allocated"))
     }
 
     #[cfg(feature = "cublas")]
@@ -939,6 +1153,10 @@ impl Drop for SelectedReservedPlan<'_> {
         // Reservation has no releasing Drop; the ledger stays charged until
         // explicit close releases this token.
         self.graph_reservation.take();
+        self.step_reservation.take();
+        if let Some(mirror) = self.step_mirror.take() {
+            std::mem::forget(mirror);
+        }
         if let Some(arena) = self.arena.take() {
             std::mem::forget(arena);
         }
@@ -946,11 +1164,17 @@ impl Drop for SelectedReservedPlan<'_> {
 }
 
 #[cfg(feature = "paged-attention-binding")]
-fn selected_module_symbols(
-    candidate: &SelectedPlanCandidate,
-) -> (Vec<String>, BTreeMap<NodeId, usize>) {
+type SelectedModuleSymbols = (
+    Vec<String>,
+    BTreeMap<NodeId, usize>,
+    BTreeMap<NodeId, (usize, usize)>,
+);
+
+#[cfg(feature = "paged-attention-binding")]
+fn selected_module_symbols(candidate: &SelectedPlanCandidate) -> SelectedModuleSymbols {
     let mut symbols = Vec::new();
     let mut indices = BTreeMap::new();
+    let mut indirect_indices = BTreeMap::new();
     for node in candidate.nodes() {
         for symbol in &node.descriptor.symbols {
             if symbol.0.starts_with("cublas:") {
@@ -959,8 +1183,15 @@ fn selected_module_symbols(
             indices.entry(node.node).or_insert(symbols.len());
             symbols.push(symbol.0.clone());
         }
+        if node.descriptor.operation == SemanticKernelOp::PagedAttention {
+            let append = symbols.len();
+            symbols.push(moxie_kernels::KV_APPEND_INDIRECT.into());
+            let attention = symbols.len();
+            symbols.push(moxie_kernels::PAGED_ATTENTION_INDIRECT.into());
+            indirect_indices.insert(node.node, (append, attention));
+        }
     }
-    (symbols, indices)
+    (symbols, indices, indirect_indices)
 }
 
 // CUDA 13.1 raw captures measured cublasGemmEx at (rows,in,out) 1x5376x21504,
@@ -1094,6 +1325,55 @@ fn captured_graph_counts(candidate: &SelectedPlanCandidate) -> Result<(u64, u64)
             .ok_or_else(|| invalid("capture", "kernel count overflowed"))?;
     }
     Ok((kernels, segments))
+}
+
+fn full_step_eligible(candidate: &SelectedPlanCandidate) -> bool {
+    let workload = candidate.workload();
+    candidate.is_dense()
+        && workload.phase == moxie_plan::Phase::Decode
+        && workload.rows == 1
+        && candidate
+            .nodes()
+            .iter()
+            .any(|node| node.descriptor.operation == SemanticKernelOp::PagedAttention)
+        && candidate.linear_orders().is_empty()
+        && candidate.combine_orders().is_empty()
+        && candidate.expert_ownership().is_empty()
+        && candidate.host_expert_joins().is_empty()
+        && !workload
+            .paged_state_capacity
+            .is_some_and(|capacity| workload.visible_tokens > capacity.resident_rows)
+}
+
+fn full_step_bounds(candidate: &SelectedPlanCandidate) -> Result<(u64, u64)> {
+    let mut kernels = 0u64;
+    for node in candidate.nodes() {
+        let count = if node.descriptor.operation == SemanticKernelOp::PagedAttention {
+            2
+        } else if node
+            .descriptor
+            .symbols
+            .iter()
+            .any(|symbol| symbol.0.starts_with("cublas:"))
+        {
+            CUBLAS_CAPTURE_NODE_BOUND
+        } else {
+            u64::try_from(node.descriptor.symbols.len())
+                .map_err(|_| invalid("capture", "kernel count exceeds u64"))?
+        };
+        kernels = kernels
+            .checked_add(count)
+            .ok_or_else(|| invalid("capture", "kernel count overflowed"))?;
+    }
+    let pool_bytes = kernels
+        .checked_mul(SelectedReservedPlan::CAPTURED_KERNEL_BOUND_BYTES)
+        .and_then(|bytes| bytes.checked_add(SelectedReservedPlan::CAPTURED_GRAPH_BOUND_BYTES))
+        .ok_or_else(|| invalid("capture", "graph memory bound overflowed"))?;
+    let mirror_bytes = candidate
+        .step_buffer()
+        .map(|(_, bytes)| bytes)
+        .ok_or_else(|| invalid("capture", "decode plan has no step buffer"))?;
+    Ok((pool_bytes, mirror_bytes))
 }
 
 /// Exact admission envelope derived from an immutable selected candidate.

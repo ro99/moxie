@@ -13,7 +13,7 @@ use moxie_types::{
 
 use crate::expert::WeightFormat;
 use crate::{Graph, PlanCandidate, ResourceWorkload, ValueBinding, lower};
-use crate::{HostExpertJoin, HostExpertLowering};
+use crate::{HostExpertJoin, HostExpertLowering, Phase};
 
 const ALIGNMENT: u64 = 256;
 const BLAS_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
@@ -116,6 +116,9 @@ pub struct SelectedPlanCandidate {
     package: SelectedPackage,
     host_workspace_bytes: u64,
     rope_table_offsets: BTreeMap<(u64, u64, u32), u64>,
+    /// Offset and exact byte length of the decode-only full-step control
+    /// buffer, appended after every other selected workspace range.
+    step_buffer: Option<(u64, u64)>,
     blas_workspace_offset: Option<u64>,
     linear_split_workspace: Option<LinearSplitWorkspace>,
     linear_orders: BTreeMap<NodeId, LinearReductionOrder>,
@@ -173,6 +176,9 @@ impl SelectedPlanCandidate {
     }
     pub fn rope_table_offsets(&self) -> &BTreeMap<(u64, u64, u32), u64> {
         &self.rope_table_offsets
+    }
+    pub const fn step_buffer(&self) -> Option<(u64, u64)> {
+        self.step_buffer
     }
     pub const fn blas_workspace_offset(&self) -> Option<u64> {
         self.blas_workspace_offset
@@ -542,6 +548,7 @@ pub fn lower_selected(
         package: SelectedPackage::Chain,
         host_workspace_bytes: 0,
         rope_table_offsets: BTreeMap::new(),
+        step_buffer: None,
         blas_workspace_offset: None,
         linear_split_workspace: None,
         linear_orders: BTreeMap::new(),
@@ -869,6 +876,7 @@ fn lower_attention(
         package: SelectedPackage::Attention,
         host_workspace_bytes: 0,
         rope_table_offsets: BTreeMap::new(),
+        step_buffer: None,
         blas_workspace_offset: None,
         linear_split_workspace: None,
         linear_orders: BTreeMap::new(),
@@ -1373,6 +1381,34 @@ fn lower_dense_mode(
         })
     };
 
+    let step_buffer = if workload.phase == Phase::Decode
+        && selected
+            .iter()
+            .any(|node| node.descriptor.operation == SemanticKernelOp::PagedAttention)
+    {
+        let layers = u64::try_from(
+            selected
+                .iter()
+                .filter(|node| node.descriptor.operation == SemanticKernelOp::PagedAttention)
+                .count(),
+        )
+        .map_err(|_| invalid("workspace", "attention layer count exceeds u64"))?;
+        let words_per_layer = workload
+            .rows
+            .checked_mul(2)
+            .and_then(|offsets| offsets.checked_add(4))
+            .ok_or_else(|| invalid("workspace", "decode step buffer size overflowed"))?;
+        let bytes = layers
+            .checked_mul(words_per_layer)
+            .and_then(|words| words.checked_mul(core::mem::size_of::<u64>() as u64))
+            .ok_or_else(|| invalid("workspace", "decode step buffer size overflowed"))?;
+        let offset = align_up(workspace_logical_bytes)?;
+        workspace_logical_bytes = checked_add(offset, bytes, "decode step buffer")?;
+        Some((offset, bytes))
+    } else {
+        None
+    };
+
     let base = lower(graph, workload)?;
     let last_stage = u32::try_from(graph.nodes().len())
         .map_err(|_| invalid("stages", "dense graph stage count exceeds u32"))?;
@@ -1553,6 +1589,7 @@ fn lower_dense_mode(
         package: SelectedPackage::Dense,
         host_workspace_bytes,
         rope_table_offsets,
+        step_buffer,
         blas_workspace_offset,
         linear_split_workspace,
         linear_orders: orders.clone(),

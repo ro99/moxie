@@ -855,6 +855,774 @@ fn admit_runs<'ctx>(
         .collect()
 }
 
+fn dense_test_ledger(context: &RankContext, pinned_cap: Option<u64>) -> Ledger {
+    let device = CapacitySnapshot::measured(&context.measure().expect("measure GPU"), 1 << 20)
+        .expect("device capacity");
+    let mut host =
+        CapacitySnapshot::measured_host(&moxie_host::read().expect("measure host"), 1 << 20)
+            .expect("host capacity");
+    if let Some(cap) = pinned_cap {
+        host = host
+            .with_tier_cap(Tier::Host(HostTier::Pinned), cap)
+            .expect("pinned tier cap");
+    }
+    Ledger::new([device, host]).expect("dense test ledger")
+}
+
+fn admit_dense_candidate<'ctx>(
+    candidate: SelectedPlanCandidate,
+    fixture: &moxie_cli::fixture::Fixture,
+    capability: &DeviceCapability,
+    catalogue: &moxie_types::KernelCatalogue,
+    ledger: &mut Ledger,
+    context: &'ctx RankContext,
+) -> SelectedReservedPlan<'ctx> {
+    SelectedReservedPlan::admit(
+        candidate,
+        &fixture.graph,
+        capability,
+        catalogue,
+        ledger,
+        context,
+    )
+    .unwrap_or_else(|refused| panic!("admit dense test plan: {refused:?}"))
+}
+
+fn dense_test_bindings(
+    fixture: &moxie_cli::fixture::Fixture,
+    plan: &SelectedReservedPlan<'_>,
+    tokens: &[u64],
+    positions: &[u64],
+    capability: &DeviceCapability,
+) -> Vec<moxie_executor::OwnedBinding> {
+    let mut bindings = stage_bindings(fixture, None, tokens, positions, capability);
+    if plan.bound_weight_count() != 0 {
+        bindings.retain(|binding| !matches!(binding.role, ValueRole::Weight(_)));
+    }
+    bindings
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_dense_test_step<'ctx>(
+    plan: SelectedReservedPlan<'ctx>,
+    fixture: &moxie_cli::fixture::Fixture,
+    capability: &DeviceCapability,
+    catalogue: &moxie_types::KernelCatalogue,
+    context: &'ctx RankContext,
+    stream: &Stream<'ctx>,
+    state: &mut DeviceKvSequence,
+    transaction: moxie_types::StateTransactionId,
+    runs: &mut [PagedAttentionRun<'ctx>],
+    bindings: Vec<moxie_executor::OwnedBinding>,
+) -> moxie_executor::DenseGraphResult<'ctx> {
+    plan.execute_dense(DenseGraphStep {
+        graph: &fixture.graph,
+        capability,
+        catalogue,
+        ctx: context,
+        stream,
+        state,
+        transaction,
+        runs,
+        bindings,
+        host_experts: &[],
+    })
+    .unwrap_or_else(|refused| panic!("dense test step: {}", refused.error))
+    .finish()
+    .unwrap_or_else(|refused| panic!("finish dense test step: {}", refused.error))
+}
+
+#[cfg(feature = "cublas")]
+#[test]
+fn full_step_decode_capture_matches_eager_piecewise_and_host() {
+    let _guard = one_at_a_time();
+    let count = device_count().expect("enumerate CUDA devices");
+    assert!(count >= 3, "requires all three GPUs; saw {count}");
+    let shape = moxie_cli::gemma::Shape::A;
+    let config = shape.config();
+    let fixture = moxie_cli::gemma::build(shape).expect("build dense Gemma fixture");
+    let prompt = [0, 1, 2, 3];
+    let prompt_positions = [0, 1, 2, 3];
+
+    for ordinal in 0..count {
+        let capability = query_device(ordinal).expect("query full-step GPU");
+        let context =
+            RankContext::acquire(RankId(ordinal), ordinal).expect("acquire full-step GPU context");
+        let stream = Stream::new(&context).expect("create full-step stream");
+        let sm = moxie_types::SmVersion {
+            major: capability.compute_major,
+            minor: capability.compute_minor,
+        };
+        let catalogues = [
+            moxie_kernels::dense_graph_catalogue(),
+            moxie_kernels::dense_graph_catalogue_unordered(sm),
+        ];
+
+        for catalogue in &catalogues {
+            let workload = |phase, rows, visible_tokens| ResourceWorkload {
+                phase,
+                rows,
+                visible_tokens,
+                branch_rows: rows,
+                output: fixture.graph.output(),
+                device: capability.uuid,
+                paged_state_capacity: None,
+            };
+            let mut ledger = dense_test_ledger(&context, None);
+            let mut state = DeviceKvSequence::new(geometry(&config, 4, 32, prompt.len()))
+                .expect("create full-step device state");
+            let mut runs = admit_runs(&mut ledger, &context, &config, &state, prompt.len() as u64);
+            let mut host_state = SequenceState::new([StateKind::KvPages]);
+            let mut host_cache =
+                KvCache::for_branch(config.layers as usize, &host_state, ROOT).expect("host cache");
+            let expected_prefill = host_step(
+                &fixture,
+                &mut host_state,
+                &mut host_cache,
+                &prompt,
+                &prompt_positions,
+            );
+
+            let prefill_candidate = lower_selected(
+                &fixture.graph,
+                workload(Phase::Prefill, prompt.len() as u64, prompt.len() as u64),
+                &capability,
+                catalogue,
+            )
+            .expect("lower full-step test prefill");
+            let prefill_plan = admit_dense_candidate(
+                prefill_candidate,
+                &fixture,
+                &capability,
+                catalogue,
+                &mut ledger,
+                &context,
+            );
+            let transaction = state.begin().expect("begin prompt transaction");
+            let prefill = execute_dense_test_step(
+                prefill_plan,
+                &fixture,
+                &capability,
+                catalogue,
+                &context,
+                &stream,
+                &mut state,
+                transaction,
+                &mut runs,
+                stage_bindings(&fixture, None, &prompt, &prompt_positions, &capability),
+            );
+            assert_logits("full-step prompt", &prefill.output, &expected_prefill);
+            commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
+                .expect("commit full-step test prompt");
+            prefill
+                .plan
+                .close(&mut ledger)
+                .map_err(|refused| refused.error)
+                .expect("close prompt plan");
+
+            let decode_candidate = || {
+                lower_selected(
+                    &fixture.graph,
+                    workload(Phase::Decode, 1, 32),
+                    &capability,
+                    catalogue,
+                )
+                .expect("lower full-step test decode")
+            };
+            let mut eager = admit_dense_candidate(
+                decode_candidate(),
+                &fixture,
+                &capability,
+                catalogue,
+                &mut ledger,
+                &context,
+            );
+            let mut piecewise = admit_dense_candidate(
+                decode_candidate(),
+                &fixture,
+                &capability,
+                catalogue,
+                &mut ledger,
+                &context,
+            );
+            let mut full = admit_dense_candidate(
+                decode_candidate(),
+                &fixture,
+                &capability,
+                catalogue,
+                &mut ledger,
+                &context,
+            );
+            piecewise
+                .set_segment_capture(true, &mut ledger)
+                .expect("enable piecewise capture");
+            full.set_full_step_capture(true, &mut ledger)
+                .expect("enable full-step capture");
+            assert_eq!(
+                full.graph_pool_bytes(),
+                full.candidate()
+                    .nodes()
+                    .iter()
+                    .try_fold(128 * 1024_u64, |bytes, node| {
+                        let kernels =
+                            if node.descriptor.operation == SemanticKernelOp::PagedAttention {
+                                2
+                            } else if node
+                                .descriptor
+                                .symbols
+                                .iter()
+                                .any(|symbol| symbol.0.starts_with("cublas:"))
+                            {
+                                4
+                            } else {
+                                node.descriptor.symbols.len() as u64
+                            };
+                        bytes.checked_add(kernels.checked_mul(8 * 1024)?)
+                    })
+                    .expect("full graph pool bound")
+            );
+
+            let first_sliding = (0..config.layers)
+                .find(|layer| config.layer_geometry(*layer).window.is_some())
+                .expect("Shape A has a sliding layer");
+            let first_sliding_index = first_sliding as usize;
+            let sliding_window = config.layer_geometry(first_sliding).window.unwrap();
+            assert_eq!(sliding_window, 3);
+            assert_ne!(sliding_window % 4, 0, "window width is not page-aligned");
+
+            let mut prefill_host_state = host_state;
+            let mut prefill_host_cache = host_cache;
+            for step_index in 0..8_u64 {
+                let token = [(4 + step_index) % config.vocab];
+                let position = [4 + step_index];
+                let expected = host_step(
+                    &fixture,
+                    &mut prefill_host_state,
+                    &mut prefill_host_cache,
+                    &token,
+                    &position,
+                );
+                let transaction = state.begin().expect("begin eager decode transaction");
+                let bindings =
+                    dense_test_bindings(&fixture, &eager, &token, &position, &capability);
+                let eager_result = execute_dense_test_step(
+                    eager,
+                    &fixture,
+                    &capability,
+                    catalogue,
+                    &context,
+                    &stream,
+                    &mut state,
+                    transaction,
+                    &mut runs,
+                    bindings,
+                );
+                let eager_output = eager_result.output;
+                eager = eager_result.plan;
+                state.abort(transaction).expect("abort eager comparison");
+
+                let transaction = state.begin().expect("begin piecewise decode transaction");
+                let bindings =
+                    dense_test_bindings(&fixture, &piecewise, &token, &position, &capability);
+                let piecewise_result = execute_dense_test_step(
+                    piecewise,
+                    &fixture,
+                    &capability,
+                    catalogue,
+                    &context,
+                    &stream,
+                    &mut state,
+                    transaction,
+                    &mut runs,
+                    bindings,
+                );
+                let piecewise_output = piecewise_result.output;
+                piecewise = piecewise_result.plan;
+                state
+                    .abort(transaction)
+                    .expect("abort piecewise comparison");
+
+                let transaction = state.begin().expect("begin full-step decode transaction");
+                let bindings = dense_test_bindings(&fixture, &full, &token, &position, &capability);
+                let full_result = execute_dense_test_step(
+                    full,
+                    &fixture,
+                    &capability,
+                    catalogue,
+                    &context,
+                    &stream,
+                    &mut state,
+                    transaction,
+                    &mut runs,
+                    bindings,
+                );
+                assert_eq!(eager_output, piecewise_output);
+                assert_eq!(eager_output, full_result.output);
+                assert_logits("full-step decode", &full_result.output, &expected);
+                full = full_result.plan;
+
+                if step_index == 0 {
+                    let retained = state
+                        .layer_retained(first_sliding_index)
+                        .expect("sliding history after boundary step");
+                    let view = state
+                        .page_view(first_sliding_index)
+                        .expect("sliding page view after boundary step");
+                    assert_eq!(retained, 0..5);
+                    assert_eq!(view.table.len(), 2);
+                    assert_ne!(
+                        retained.start / 4,
+                        (retained.end - 1) / 4,
+                        "visible history spans two physical pages"
+                    );
+                }
+                commit_paged_state(&mut state, transaction, 0, &mut runs, &stream)
+                    .expect("commit full-step decode");
+            }
+            assert_eq!(full.captured_segments(), 1);
+            full.close(&mut ledger)
+                .map_err(|refused| refused.error)
+                .expect("close full-step plan");
+            piecewise
+                .close(&mut ledger)
+                .map_err(|refused| refused.error)
+                .expect("close piecewise plan");
+            eager
+                .close(&mut ledger)
+                .map_err(|refused| refused.error)
+                .expect("close eager plan");
+            for run in runs.drain(..) {
+                run.close(&mut ledger)
+                    .map_err(|refused| refused.error)
+                    .expect("close full-step test run");
+            }
+            assert!(ledger.outstanding().is_empty());
+        }
+    }
+}
+
+#[cfg(feature = "paged-attention-test-hooks")]
+#[test]
+fn full_step_capture_recaptures_for_fresh_runs_and_pinned_refusal_falls_back() {
+    let _guard = one_at_a_time();
+    let count = device_count().expect("enumerate CUDA devices");
+    assert!(count >= 3, "requires all three GPUs; saw {count}");
+    let shape = moxie_cli::gemma::Shape::A;
+    let config = shape.config();
+    let fixture = moxie_cli::gemma::build(shape).expect("build dense Gemma fixture");
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+
+    for ordinal in 0..count {
+        let capability = query_device(ordinal).expect("query full-step GPU");
+        let context =
+            RankContext::acquire(RankId(ordinal), ordinal).expect("acquire full-step GPU context");
+        let stream = Stream::new(&context).expect("create full-step stream");
+        let workload = |phase, rows, visible_tokens, output| ResourceWorkload {
+            phase,
+            rows,
+            visible_tokens,
+            branch_rows: rows,
+            output,
+            device: capability.uuid,
+            paged_state_capacity: None,
+        };
+
+        let mut ledger = dense_test_ledger(&context, None);
+        let first_prompt = [0, 1, 2, 3];
+        let first_positions = [0, 1, 2, 3];
+        let mut first_state =
+            DeviceKvSequence::new(geometry(&config, 4, 16, 4)).expect("create first prompt state");
+        let mut first_runs = admit_runs(&mut ledger, &context, &config, &first_state, 4);
+        let first_prefill = lower_selected(
+            &fixture.graph,
+            workload(Phase::Prefill, 4, 4, fixture.graph.output()),
+            &capability,
+            &catalogue,
+        )
+        .expect("lower first prompt");
+        let first_prefill = admit_dense_candidate(
+            first_prefill,
+            &fixture,
+            &capability,
+            &catalogue,
+            &mut ledger,
+            &context,
+        );
+        let transaction = first_state.begin().expect("begin first prompt");
+        let first_result = execute_dense_test_step(
+            first_prefill,
+            &fixture,
+            &capability,
+            &catalogue,
+            &context,
+            &stream,
+            &mut first_state,
+            transaction,
+            &mut first_runs,
+            stage_bindings(&fixture, None, &first_prompt, &first_positions, &capability),
+        );
+        commit_paged_state(&mut first_state, transaction, 0, &mut first_runs, &stream)
+            .expect("commit first prompt");
+        first_result
+            .plan
+            .close(&mut ledger)
+            .map_err(|refused| refused.error)
+            .expect("close first prompt plan");
+
+        let decode_candidate = lower_selected(
+            &fixture.graph,
+            workload(Phase::Decode, 1, 16, fixture.graph.output()),
+            &capability,
+            &catalogue,
+        )
+        .expect("lower reusable decode");
+        let mut full_plan = admit_dense_candidate(
+            decode_candidate,
+            &fixture,
+            &capability,
+            &catalogue,
+            &mut ledger,
+            &context,
+        );
+        full_plan
+            .set_full_step_capture(true, &mut ledger)
+            .expect("enable reusable full-step capture");
+        let first_token = [4];
+        let first_decode_position = [4];
+        let transaction = first_state.begin().expect("begin first decode");
+        let bindings = dense_test_bindings(
+            &fixture,
+            &full_plan,
+            &first_token,
+            &first_decode_position,
+            &capability,
+        );
+        let lease = full_plan
+            .execute_dense(DenseGraphStep {
+                graph: &fixture.graph,
+                capability: &capability,
+                catalogue: &catalogue,
+                ctx: &context,
+                stream: &stream,
+                state: &mut first_state,
+                transaction,
+                runs: &mut first_runs,
+                bindings,
+                host_experts: &[],
+            })
+            .unwrap_or_else(|refused| panic!("first full-step submission: {}", refused.error));
+        for run in first_runs.drain(..) {
+            run.close(&mut ledger)
+                .map_err(|refused| refused.error)
+                .expect("closing a run observes the full-step completion");
+        }
+        let first_result = lease
+            .finish()
+            .map_err(|refused| refused.error)
+            .expect("finish after closing the old runs");
+        assert_eq!(first_result.plan.full_step_capture_count(), 1);
+        full_plan = first_result.plan;
+        first_state
+            .abort(transaction)
+            .expect("discard first prompt state");
+
+        let second_prompt = [3, 2, 1, 0];
+        let second_positions = [0, 1, 2, 3];
+        let mut second_state =
+            DeviceKvSequence::new(geometry(&config, 4, 16, 4)).expect("create second prompt state");
+        let mut second_runs = admit_runs(&mut ledger, &context, &config, &second_state, 4);
+        let second_prefill = lower_selected(
+            &fixture.graph,
+            workload(Phase::Prefill, 4, 4, fixture.graph.output()),
+            &capability,
+            &catalogue,
+        )
+        .expect("lower second prompt");
+        let second_prefill = admit_dense_candidate(
+            second_prefill,
+            &fixture,
+            &capability,
+            &catalogue,
+            &mut ledger,
+            &context,
+        );
+        let transaction = second_state.begin().expect("begin second prompt");
+        let result = execute_dense_test_step(
+            second_prefill,
+            &fixture,
+            &capability,
+            &catalogue,
+            &context,
+            &stream,
+            &mut second_state,
+            transaction,
+            &mut second_runs,
+            stage_bindings(
+                &fixture,
+                None,
+                &second_prompt,
+                &second_positions,
+                &capability,
+            ),
+        );
+        commit_paged_state(&mut second_state, transaction, 0, &mut second_runs, &stream)
+            .expect("commit second prompt");
+        result
+            .plan
+            .close(&mut ledger)
+            .map_err(|refused| refused.error)
+            .expect("close second prompt plan");
+
+        let mut host_state = SequenceState::new([StateKind::KvPages]);
+        let mut host_cache =
+            KvCache::for_branch(config.layers as usize, &host_state, ROOT).expect("host cache");
+        host_step(
+            &fixture,
+            &mut host_state,
+            &mut host_cache,
+            &second_prompt,
+            &second_positions,
+        );
+        let second_token = [4];
+        let second_decode_position = [4];
+        let expected = host_step(
+            &fixture,
+            &mut host_state,
+            &mut host_cache,
+            &second_token,
+            &second_decode_position,
+        );
+        let transaction = second_state.begin().expect("begin second decode");
+        let bindings = dense_test_bindings(
+            &fixture,
+            &full_plan,
+            &second_token,
+            &second_decode_position,
+            &capability,
+        );
+        let result = execute_dense_test_step(
+            full_plan,
+            &fixture,
+            &capability,
+            &catalogue,
+            &context,
+            &stream,
+            &mut second_state,
+            transaction,
+            &mut second_runs,
+            bindings,
+        );
+        assert_eq!(result.plan.full_step_capture_count(), 2);
+        assert_eq!(result.plan.captured_segments(), 1);
+        assert_logits("fresh-run full-step decode", &result.output, &expected);
+        commit_paged_state(&mut second_state, transaction, 0, &mut second_runs, &stream)
+            .expect("commit fresh-run full-step decode");
+        result
+            .plan
+            .close(&mut ledger)
+            .map_err(|refused| refused.error)
+            .expect("close recaptured plan");
+        for run in second_runs.drain(..) {
+            run.close(&mut ledger)
+                .map_err(|refused| refused.error)
+                .expect("close fresh run");
+        }
+        assert!(ledger.outstanding().is_empty());
+
+        let mut limited_ledger = dense_test_ledger(&context, Some(0));
+        let mut limited_state = DeviceKvSequence::new(geometry(&config, 4, 16, 1))
+            .expect("create pinned-cap fallback state");
+        let mut limited_runs =
+            admit_runs(&mut limited_ledger, &context, &config, &limited_state, 1);
+        let candidate = lower_selected(
+            &fixture.graph,
+            workload(Phase::Decode, 1, 16, fixture.graph.output()),
+            &capability,
+            &catalogue,
+        )
+        .expect("lower pinned-cap fallback decode");
+        let mut limited_plan = admit_dense_candidate(
+            candidate,
+            &fixture,
+            &capability,
+            &catalogue,
+            &mut limited_ledger,
+            &context,
+        );
+        limited_plan
+            .set_segment_capture(true, &mut limited_ledger)
+            .expect("enable piecewise fallback before transition");
+        let token = [0];
+        let position = [0];
+        let transaction = limited_state.begin().expect("begin piecewise capture");
+        let captured = execute_dense_test_step(
+            limited_plan,
+            &fixture,
+            &capability,
+            &catalogue,
+            &context,
+            &stream,
+            &mut limited_state,
+            transaction,
+            &mut limited_runs,
+            stage_bindings(&fixture, None, &token, &position, &capability),
+        );
+        assert!(captured.plan.captured_segments() > 0);
+        let captured_segments = captured.plan.captured_segments();
+        let captured_output = captured.output;
+        let captured_bytes = captured.plan.graph_pool_bytes();
+        let graph_charge = limited_ledger.committed(
+            Scope::Device(capability.uuid),
+            Tier::Device(DeviceTier::GraphPools),
+        );
+        assert_eq!(captured_bytes, graph_charge);
+        limited_state
+            .abort(transaction)
+            .expect("abort piecewise capture transaction");
+        let mut limited_plan = captured.plan;
+        assert!(matches!(
+            limited_plan.set_full_step_capture(true, &mut limited_ledger),
+            Err(moxie_types::Error::CapacityExceeded {
+                tier: Some(Tier::Host(HostTier::Pinned)),
+                ..
+            })
+        ));
+        assert_eq!(limited_plan.captured_segments(), captured_segments);
+        assert_eq!(limited_plan.graph_pool_bytes(), captured_bytes);
+        assert_eq!(
+            limited_ledger.committed(
+                Scope::Device(capability.uuid),
+                Tier::Device(DeviceTier::GraphPools)
+            ),
+            graph_charge
+        );
+        let transaction = limited_state.begin().expect("begin piecewise replay");
+        let bindings = dense_test_bindings(&fixture, &limited_plan, &token, &position, &capability);
+        let replayed = execute_dense_test_step(
+            limited_plan,
+            &fixture,
+            &capability,
+            &catalogue,
+            &context,
+            &stream,
+            &mut limited_state,
+            transaction,
+            &mut limited_runs,
+            bindings,
+        );
+        assert_eq!(captured_output, replayed.output);
+        commit_paged_state(
+            &mut limited_state,
+            transaction,
+            0,
+            &mut limited_runs,
+            &stream,
+        )
+        .expect("commit piecewise fallback");
+        replayed
+            .plan
+            .close(&mut limited_ledger)
+            .map_err(|refused| refused.error)
+            .expect("close piecewise fallback plan");
+        for run in limited_runs.drain(..) {
+            run.close(&mut limited_ledger)
+                .map_err(|refused| refused.error)
+                .expect("close piecewise fallback run");
+        }
+        assert!(limited_ledger.outstanding().is_empty());
+    }
+}
+
+#[cfg(feature = "paged-attention-test-hooks")]
+#[test]
+fn full_step_launch_failure_withholds_plan_and_quarantines_runs() {
+    let _guard = one_at_a_time();
+    let capability = query_device(0).expect("query failure-injection GPU");
+    let context = RankContext::acquire(RankId(0), 0).expect("acquire failure-injection GPU");
+    let stream = Stream::new(&context).expect("create failure-injection stream");
+    let shape = moxie_cli::gemma::Shape::A;
+    let config = shape.config();
+    let fixture = moxie_cli::gemma::build(shape).expect("build dense Gemma fixture");
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+    let mut ledger = dense_test_ledger(&context, None);
+    let mut state =
+        DeviceKvSequence::new(geometry(&config, 4, 16, 1)).expect("create failure-injection state");
+    let mut runs = admit_runs(&mut ledger, &context, &config, &state, 1);
+    let candidate = lower_selected(
+        &fixture.graph,
+        ResourceWorkload {
+            phase: Phase::Decode,
+            rows: 1,
+            visible_tokens: 16,
+            branch_rows: 1,
+            output: fixture.graph.output(),
+            device: capability.uuid,
+            paged_state_capacity: None,
+        },
+        &capability,
+        &catalogue,
+    )
+    .expect("lower failure-injection decode");
+    let mut plan = admit_dense_candidate(
+        candidate,
+        &fixture,
+        &capability,
+        &catalogue,
+        &mut ledger,
+        &context,
+    );
+    plan.set_full_step_capture(true, &mut ledger)
+        .expect("enable failure-injection capture");
+    let pool_charge = plan.graph_pool_bytes();
+    let mirror_charge = plan
+        .candidate()
+        .step_buffer()
+        .expect("decode step mirror bytes")
+        .1;
+    plan.inject_full_step_launch_failure();
+    let before = state.layer_retained(0).expect("initial frontier");
+    let token = [0];
+    let position = [0];
+    let transaction = state.begin().expect("begin injected step");
+    let refused = plan
+        .execute_dense(DenseGraphStep {
+            graph: &fixture.graph,
+            capability: &capability,
+            catalogue: &catalogue,
+            ctx: &context,
+            stream: &stream,
+            state: &mut state,
+            transaction,
+            runs: &mut runs,
+            bindings: stage_bindings(&fixture, None, &token, &position, &capability),
+            host_experts: &[],
+        })
+        .expect_err("injected launch failure");
+    assert!(refused.plan.is_none());
+    assert!(refused.held.is_some());
+    assert_eq!(
+        state.layer_retained(0).expect("frontier after refusal"),
+        before
+    );
+    assert_eq!(
+        ledger.committed(
+            Scope::Device(capability.uuid),
+            Tier::Device(DeviceTier::GraphPools)
+        ),
+        pool_charge
+    );
+    assert_eq!(
+        ledger.committed(Scope::Host, Tier::Host(HostTier::Pinned)),
+        mirror_charge
+    );
+    let run = runs.remove(0);
+    let refused_run = run
+        .close(&mut ledger)
+        .expect_err("injected launch quarantines every direct run");
+    std::mem::forget(refused_run.run);
+    std::mem::forget(refused);
+}
+
 #[test]
 fn reduced_dense_gemma_prefill_and_decode_match_host_on_every_gpu() {
     let _guard = one_at_a_time();
