@@ -378,8 +378,9 @@ absent, about 48.5 of 53.8 GB present). Its README declares cc-by-nc-4.0.
 **New slice, Qwen hybrid attention** (roadmap M7's Qwen row, pulled into M6
 because the owner's exit names the checkpoint). It is built as shared
 operations, not a Qwen runtime:
-- device short convolution and gated delta rule, against the existing host
-  oracles in `moxie-oracles/src/recurrent.rs`;
+- device short convolution and gated delta rule, with **new** host oracles.
+  The `moxie-oracles/src/recurrent.rs` recurrences are toys (correction,
+  2026-09-26; [research](../evidence/qwen-hybrid-research-and-draft.md));
 - recurrent state as a `moxie-state` schema, with FP32 state and a
   snapshot/rollback rule (document 04);
 - gated full attention (output gate) and interleaved partial rotary;
