@@ -260,6 +260,15 @@ commit.
     `status_result`.
   - Charge all temporary data ranges plus the NCCL reserve. Measure the
     reserve against the largest admitted join as well as a 1 MiB one.
+- **Non-blocking readiness (coordinator, answering luna's DECISION).**
+  - `Communicator` has `pub fn poll(&self) -> Result<CommState>`, with
+    `CommState::{Ready, InProgress}`, from `ncclCommGetAsyncError`. A real
+    error is `Err`.
+  - After any NCCL call returns `ncclInProgress`, no further NCCL call on
+    that communicator is made until `poll` returns `Ready`.
+  - `JoinDrain` waits, against the group deadline, for **both** the CUDA
+    completion and `Ready`. The deadline path is H3's own-rank abort.
+  - `async_error` is replaced by `poll`.
 - **M4 (ADR 0039, change 4).** Communicators are created per rank with
   `ncclCommInitRankConfig`, which is equivalent to `ncclCommInitAll` for
   Moxie's explicit per-thread contexts. ADR 0039 decision 2 is amended to
