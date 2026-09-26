@@ -191,8 +191,11 @@ mid-task 0104, with its weekly quota at about 2% (it resets 2026-09-29
 15:35). No report came, and the night was lost (see coordinator.md,
 "Unattended mode"). The owner switched building to the Claude Opus
 `builder` (Herdr pane in tab `wC:t12`). It resumes 0104 from luna's
-uncommitted changes and carries the queue until luna's quota resets. Sol
-stays the reviewer. One builder at a time.
+uncommitted changes and carries the queue until luna's quota resets.
+**Update (owner, same day):** luna and sol share one Codex quota, so sol is
+low too. The builder is now Claude **Sonnet** (`builder`, the workhorse),
+and the reviewer is a new Claude **Opus** (`reviewer`, tab `wC:t14`),
+read-only. One builder at a time.
 
 ### Naming (owner, 2026-09-25)
 

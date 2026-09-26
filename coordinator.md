@@ -202,8 +202,8 @@ Use the established team unless the owner changes it (owner direction,
 
 | Role | Agent | Effort | Skill it works under |
 |---|---|---|---|
-| Builder | Codex `luna` (`gpt-6-luna`), in its own tab; the Claude Opus `builder` takes complex or stuck tasks, by owner direction on 2026-09-22 (task 0060 rescue) | max | `/ponytail:ponytail` |
-| Independent reviewer | Codex `sol` (`gpt-6-sol`), in its own tab | high, read-only | `/ponytail:ponytail-review` |
+| Builder | Claude **Sonnet**, Herdr name `builder`, in its own tab (owner, 2026-09-26: the "workhorse"; Codex `luna` and `sol` share one exhausted weekly quota until 2026-09-29). Give it the most precise numbered, file-level contracts; it does not design | — | `/ponytail:ponytail` |
+| Independent reviewer | Claude **Opus**, Herdr name `reviewer`, in its own tab (owner, 2026-09-26). Read-only; design reviews before ownership work, candidate and delta reviews after | — | `/ponytail:ponytail-review` |
 | Coordinator | Claude Opus, Herdr name `coordinator` | high | `/ponytail:ponytail-audit` at milestone end |
 
 Owner direction, 2026-09-22: while Codex was out of credits, Claude Opus
