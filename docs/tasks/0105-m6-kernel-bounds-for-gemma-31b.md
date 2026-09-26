@@ -1,11 +1,16 @@
 # Task 0105 — qualify the affine and attention kernels at Gemma 31B's shapes
 
-Status: **active, revision 2** (coordinator, 2026-09-26). The Opus
-reviewer's design review (5 high, 4 medium, 5 low;
-[record](../evidence/task-0105-design-review.md)) is **adopted in full and
-overrides the numbered changes, allowed files, gates and stop conditions
-below wherever they differ**. Builder Claude Sonnet `builder`; reviewer
-Claude Opus `reviewer`.
+Status: **accepted** (coordinator, 2026-09-26). Hash capture `debf248`,
+implementation `0777d84`, R2 record/comment repair `da308e1`. Built by
+Claude Sonnet `builder`; reviewed by Claude Opus `reviewer`: design review
+(14 findings, all applied), R1 (0 high, 0 medium, 3 low), R2 delta clean.
+- Affine INT8/INT4 linears are qualified at input 21,504 under ADR 0028.
+- Paged attention (direct, indirect, partial) is qualified at head_dim 512,
+  and the pinned bytes for head dims 256, 200, 128 and 64 are unchanged.
+  `test-gpu` 78/78.
+- R1 L3 (a test-harness refactor extracting shared launch helpers, about
+  −60 lines) was not taken: it forces a full kernel-suite rerun for test
+  code only.
 
 ## Identity and authority
 
