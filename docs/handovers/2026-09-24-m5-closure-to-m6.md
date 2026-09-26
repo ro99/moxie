@@ -176,9 +176,9 @@ handshakes. M6 gave the single-GPU path persistent plans, shared weights and
 capture, and gave the multi-GPU path none of it. All three exit checkpoints
 need more than one GPU. Route, owner-approved NCCL
 ([ADR 0039](../decisions/adr/0039-nccl-for-tensor-parallel-joins.md)):
-- **0100 (M6.1):** NCCL communicators and joins (FP32 sum, BF16/FP32
-  gather, status max), admitted buffers, and M5's fault tests re-qualified,
-  inside the existing orchestration.
+- **0100 (M6.1): accepted 2026-09-25**. NCCL communicators and joins (FP32
+  sum, BF16/FP32 gather, status max), admitted buffers, and M5's fault tests
+  re-qualified, inside the existing orchestration. TP2 is byte-identical.
 - **0102 (M6.1):** persistent multi-GPU execution. Per-rank and per-stage
   plan sets are admitted once and reused, with weights resident once per
   rank, as `DensePlanSet` (0091) does on one GPU.
