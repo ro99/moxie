@@ -1,7 +1,11 @@
 # Task 0105 — qualify the affine and attention kernels at Gemma 31B's shapes
 
-Status: **proposed** (coordinator, 2026-09-25). Builder Codex `luna`; reviewer
-Codex `sol`. Queued after task 0100.
+Status: **active, revision 2** (coordinator, 2026-09-26). The Opus
+reviewer's design review (5 high, 4 medium, 5 low;
+[record](../evidence/task-0105-design-review.md)) is **adopted in full and
+overrides the numbered changes, allowed files, gates and stop conditions
+below wherever they differ**. Builder Claude Sonnet `builder`; reviewer
+Claude Opus `reviewer`.
 
 ## Identity and authority
 
@@ -20,8 +24,8 @@ Codex `sol`. Queued after task 0100.
   `q_sh` and the per-thread accumulator slots (`MOXIE_ATTN_ACC_SLOTS =
   MAX_HEAD_DIM / THREADS`). Each output dimension's sum is independent of
   the slot count, so smaller heads keep their order of operations.
-- Builder: Codex `luna` (`gpt-6-luna`, max, `/ponytail:ponytail`).
-  Reviewer: Codex `sol` (read-only, `/ponytail:ponytail-review`).
+- Builder: Claude Sonnet `builder` (`/ponytail:ponytail`). Reviewer: Claude
+  Opus `reviewer` (read-only, `/ponytail:ponytail-review`).
   Coordinator: Claude Opus `coordinator`.
 - The **design below is the coordinator's**; on a conflict, send `DECISION`.
 - Root `/home/rodrigo/Developer/moxie`, branch `main`. Preserve the carried
@@ -103,5 +107,50 @@ No timing.
 - head_dim 512 does not fit the block's shared memory or registers without
   restructuring the kernel;
 - a file outside the allowed list is needed.
+
+## Design review — adopted in full (read the record for exact text)
+
+The exact replacement text for each item is in
+[task-0105-design-review.md](../evidence/task-0105-design-review.md). A
+summary, in the order to apply them:
+
+- **H1:** raise `max_input` to 21,504 **only** in `affine_linear_catalogue`
+  (`lib.rs` about 438) and `dense_graph_catalogue`'s `dense-affine-linear-*`
+  (about 575). **Never** in `expert_mlp_catalogue` (about 337 and 387) or
+  any other catalogue.
+- **M1:** `max_output` stays 65,536 and `max_rows` stays 65,536.
+- **M2:** no kernel edit to `affine_linear.cu`. It is removed from the
+  allowed files. Copy the 64-bit index audit list into the Result. New stop
+  condition: the audit finds a 32-bit index.
+- **H3:** new change 3a, **before any kernel edit**. Add the `gqa-256-decode`
+  and `gqa-200-chunk` cases to `paged_attention_indirect`, capture their v1
+  SHA-256s on the unchanged kernel (SM86 and SM120 must agree), commit
+  them, and only then do change 3. New stop condition: a captured hash
+  differs between SM86 and SM120. The partial kernel is covered by the
+  oracle only; say so in the Result.
+- **H2:** rename `mha-256-widest-declared` to `mha-256-two-full-slots`, with
+  a literal 256. Add `mha-512-widest-declared`.
+- **L2:** `paged_attention_declares`, the catalogue, the host guard and the
+  refusal tests already read `PAGED_ATTENTION_MAX_HEAD_DIM`. Do not edit
+  them; confirm by grep.
+- **H4:** in `affine_linear_device.rs` `run_case`, raise both
+  `CapacitySnapshot` totals to `256 << 20`, and add the new rows to
+  `CASES`. No other edit to that file.
+- **L1:** the fixture is `Grouping::Contiguous { size: 32 }`, `asymmetric:
+  false`, `ScaleDtype::Bf16`, `mapped: false`.
+- **M3:** add the INT4 row `(1, 21504, 5376)`.
+- **M4:** register `paged_attention_head_dim_512` in both the case-name list
+  and the dispatch. The mutant is `#define MOXIE_ATTN_ACC_SLOTS 2`, run with
+  `cargo xtask-cuda test-gpu --profile sm86`. The verdict must be FAILED.
+  Revert, and confirm an empty `git diff`.
+- **L3:** run `cuobjdump -res-usage` on `paged_attention.fatbin`, and quote
+  REG and SHARED for the three attention symbols.
+- **H5:** a new GPU gate, `cargo test -p moxie-executor --features driver
+  --test affine_linear_device --locked -- --nocapture`. Quote each new
+  case's worst ULP and cancellation count.
+- **L4:** new stop condition: a 21,504 case fails ADR 0028's gate. Report the
+  element, its terms and its ULP; the gate is the owner's.
+- **L5:** the Identity is updated to the Sonnet builder and the Opus
+  reviewer.
 
 ## Result, filled after work
