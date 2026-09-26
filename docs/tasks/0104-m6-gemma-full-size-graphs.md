@@ -80,6 +80,11 @@ Codex `sol`. Host-only. Queued after task 0100.
   affine linears for the 31B. It comes with a complete role → source-tensor
   map that covers every text tensor in the index exactly once.
 - **Allowed files:**
+  - `crates/moxie-types/src/` (one new module holding `DeclaredValue`, plus
+    its `lib.rs` line). This was amended after luna's DECISION: the type
+    lives in `moxie-types`, which both `moxie-format` and `moxie-models`
+    already depend on, so no dependency boundary or arch-check allowlist
+    changes;
   - `crates/moxie-format/src/checkpoint_config.rs`;
   - `crates/moxie-models/src/gemma4.rs`;
   - `crates/moxie-cli/src/gemma.rs`, `crates/moxie-cli/Cargo.toml` (only
@@ -96,8 +101,9 @@ Codex `sol`. Host-only. Queued after task 0100.
 
 ## Numbered changes
 
-1. **Declared fields (`moxie-format`).** Add `pub enum DeclaredValue { Bool,
-   Int(i64), Float(f64), Str(String), List(Vec<DeclaredValue>), Null }` and
+1. **Declared fields (`moxie-format`).** Define `pub enum DeclaredValue {
+   Bool, Int(i64), Float(f64), Str(String), List(Vec<DeclaredValue>), Null }`
+   **in `moxie-types`**, as plain data with no serde. In `moxie-format`, add
    `pub fn declared_text_fields(config_json: &str) ->
    Result<BTreeMap<String, DeclaredValue>>`:
    - it reads `text_config` if present, else the root object;
