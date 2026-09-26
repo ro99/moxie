@@ -398,6 +398,15 @@ These rest on the reviewer's research
   and `configuration_qwen3_5.py`, to read the exact math, since the
   checkpoint declares `output_gate_type: swish`, which 5.5.3 ignores.
   Nothing is installed or executed.
+  **Resolved (coordinator, 2026-09-26): the gate is sigmoid.** The fetched
+  files (from `raw.githubusercontent.com/huggingface/transformers/v5.17.0/src/transformers/models/qwen3_5/`):
+  - `modeling_qwen3_5.py`, SHA-256 `762feb6c7426a7f15b5bf830df54c07438bf9e7c27b8cdb23179045920412c3b`;
+  - `configuration_qwen3_5.py`, SHA-256 `19966c3200cee92cc4bccaef5f94550c56d731dbf03858a9bd2ed6aebcc3f7da`.
+
+  Neither file references `output_gate_type`, and the attention gate is
+  `attn_output * torch.sigmoid(gate)` (`modeling_qwen3_5.py:818`), the same
+  as 5.5.3. The config field is inert in the exporting version itself, so
+  the model's math is sigmoid. The third-party source is not committed.
 - **D2 (owner): approved.** New shared operations: `ShortConv`,
   `GatedDeltaRule`, `GatedRmsNorm`, `SigmoidGate`, a `RmsNorm` gain offset,
   and a half-split RoPE layout. Each has an FP64 host oracle.
