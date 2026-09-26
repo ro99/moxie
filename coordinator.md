@@ -363,6 +363,41 @@ Duplicate or delayed reports must not launch duplicate jobs or overwrite newer
 results. CLI submission is not proof the recipient processed the message, and
 Herdr lifecycle settlement is not a task-specific receipt.
 
+### Unattended mode (owner, 2026-09-26)
+
+**Trigger:** the owner says anything meaning "I am going to sleep, go auto
+mode" (going away, keep working overnight, and similar).
+
+The coordinator acts only when a message arrives. A stalled worker sends
+nothing, so without a heartbeat the milestone stops silently. On
+2026-09-25, luna's session was interrupted just after midnight (its Codex
+weekly quota was nearly spent) while it built task 0104. No report came,
+and nothing moved until the owner woke up.
+
+On the trigger, in the same turn:
+1. Schedule a recurring self-wakeup, about every 30 minutes (the
+   `ScheduleWakeup` or `loop` mechanism), as a fallback heartbeat. Worker
+   reports stay the primary signal.
+2. On each wakeup, check every worker (`herdr agent list`, `herdr agent
+   read <name>`) for:
+   - a stall: idle or `done` with no report;
+   - an interruption, "Conversation interrupted" or "Reconnected";
+   - a quota or limit warning;
+   - a lost Herdr name;
+   - a pending question.
+
+   Act on each: resend the assignment, rebind the name, answer the
+   `DECISION`, or move the work to another builder under the rules below.
+3. **Quota.** Before the owner leaves, check each worker's remaining quota,
+   shown in its status line. A builder near its limit gets a
+   **replacement plan** agreed then (normally the Claude Opus `builder`),
+   so the switch happens overnight without waiting for the owner. There is
+   still only one builder at a time.
+4. Keep the ledger and board current as usual, and hold owner-only
+   decisions for the morning report.
+5. In the morning report, include every wakeup that found and fixed a
+   problem.
+
 ### Background jobs and waiting
 
 Before launching a long job, record its owner, command, source identity, log,
