@@ -17,8 +17,8 @@ use moxie_cuda::{RankContext, Stream, device_count, query_device};
 use moxie_engine::{HostTensor, Value};
 use moxie_executor::paged_attention::device::commit_paged_state;
 use moxie_executor::{
-    DenseGraphStep, DenseRankWorkerConfig, DenseRankWorkers, PageGeometry, PagedAttentionRun,
-    PipelineStageWorker, PipelineWorkers, SelectedReservedPlan, SoloRankWorker,
+    ChainBucket, DenseGraphStep, DenseRankWorkerConfig, DenseRankWorkers, PageGeometry,
+    PagedAttentionRun, PipelineStageWorker, PipelineWorkers, SelectedReservedPlan, SoloRankWorker,
     SoloRankWorkerConfig, Staging,
 };
 use moxie_format::bf16::{bf16_bits_to_f32, f32_to_bf16_bits};
@@ -1772,10 +1772,330 @@ fn nccl_status_poisons_both_ranks() {
 
 #[test]
 fn tp2_dense_prefill_decode_is_exact_and_rank_step_is_atomic() {
-    // The stall case pins the pair's claims for this process, so run it last.
     combined_tp2_tp1_pipeline_matches_host_and_reports_capacity_latency();
     tp2_worker_gate(false);
+    // `chain_worker_gate` closes every group it spawns, so it needs to run
+    // with a clean pair and before `tp2_worker_gate(true)`'s own stall case
+    // permanently claims it (that stall case pins the pair's claims for this
+    // process, so it stays last).
+    chain_worker_gate();
     tp2_worker_gate(true);
+}
+
+/// Task 0102's persistent rank chain: prompt `[1,4,7,2,9]` at positions 0..4,
+/// then 8 decodes with tokens `6..=13` at positions 5..12. Buckets
+/// `{(5,13),(1,13)}`, the ordered catalogue.
+fn chain_worker_gate() {
+    let _guard = one_at_a_time();
+    let (fixture, lowering, config) = order_sensitive_fixture(false);
+    let tokens = [1u64, 4, 7, 2, 9];
+    let positions = [0u64, 1, 2, 3, 4];
+    // `order_sensitive_fixture`'s vocab is 12; the contract's own literal
+    // 6..=13 exceeds it, so wrap into range while keeping 8 distinct
+    // successive-looking decode tokens over positions 5..12.
+    let decode_tokens = [6u64, 7, 8, 9, 10, 11, 0, 1];
+    let decode_positions = [5u64, 6, 7, 8, 9, 10, 11, 12];
+    let ordinals = pair_ordinals();
+    let local = local_config(&config);
+    let capabilities = ordinals.map(|ordinal| query_device(ordinal).expect("capability"));
+    let host_capacity =
+        CapacitySnapshot::measured_host(&moxie_host::read().expect("measure host"), 1 << 20)
+            .expect("host capacity");
+    let worker_config = |ranks: [RankId; 2]| DenseRankWorkerConfig {
+        ranks,
+        ordinals,
+        geometry: geometry(&local, 4, 64, 6),
+        heads: local.heads,
+        max_rows: 5,
+        host_capacity: host_capacity.clone(),
+        deadline: DEADLINE,
+    };
+    let catalogue = moxie_kernels::dense_graph_catalogue();
+    let buckets = vec![
+        ChainBucket {
+            rows: 5,
+            visible_tokens: 13,
+        },
+        ChainBucket {
+            rows: 1,
+            visible_tokens: 13,
+        },
+    ];
+
+    // Reference bytes: the single-GPU split-aware host oracle, for all 9 steps.
+    let mut reference_bytes: Vec<Vec<u8>> = Vec::with_capacity(9);
+    {
+        let context = RankContext::acquire(RankId(63_000), ordinals[0]).expect("reference context");
+        let mut reference = Rank::new(&context, &config);
+        reference_bytes.push(reference_step(
+            &fixture,
+            &lowering.linear_orders,
+            &lowering.combine_orders,
+            &mut reference,
+            &tokens,
+            &positions,
+        ));
+        for i in 0..8 {
+            reference_bytes.push(reference_step(
+                &fixture,
+                &lowering.linear_orders,
+                &lowering.combine_orders,
+                &mut reference,
+                &decode_tokens[i..=i],
+                &decode_positions[i..=i],
+            ));
+        }
+        reference.close();
+    }
+
+    // M5 bytes, on a first group, then close it (M-D).
+    let mut m5_bytes: Vec<Vec<u8>> = Vec::with_capacity(9);
+    {
+        let mut workers = DenseRankWorkers::spawn(worker_config([RankId(63_001), RankId(63_002)]))
+            .expect("spawn M5 workers");
+        m5_bytes.push(
+            tp_worker_step(
+                &mut workers,
+                &fixture,
+                &lowering,
+                &capabilities,
+                &tokens,
+                &positions,
+                Fault::None,
+            )
+            .expect("M5 prefill"),
+        );
+        for i in 0..8 {
+            m5_bytes.push(
+                tp_worker_step(
+                    &mut workers,
+                    &fixture,
+                    &lowering,
+                    &capabilities,
+                    &decode_tokens[i..=i],
+                    &decode_positions[i..=i],
+                    Fault::None,
+                )
+                .expect("M5 decode"),
+            );
+        }
+        workers.close().expect("close M5 workers");
+    }
+
+    // The chain, on a second group: (a), (b) and the command count.
+    {
+        let mut workers = DenseRankWorkers::spawn(worker_config([RankId(63_101), RankId(63_102)]))
+            .expect("spawn chain workers");
+        let mut oracles = OracleRegistry::new();
+        moxie_oracles::register(&mut oracles).expect("oracles");
+        let mut weights_cb = |rank: usize, stage: &StageGraph| {
+            Ok(
+                stage_host_bindings(&fixture, stage, None, &[0], &[0], &capabilities[rank])
+                    .into_iter()
+                    .filter(|binding| matches!(binding.role, ValueRole::Weight(_)))
+                    .collect(),
+            )
+        };
+        workers
+            .load_chain(
+                &fixture.graph,
+                &lowering,
+                moxie_oracles::HOST_REFERENCE,
+                &oracles,
+                &catalogue,
+                buckets.clone(),
+                &mut weights_cb,
+            )
+            .expect("load chain");
+        let counters_after_load = workers.chain_counters().expect("counters after load");
+
+        // Returns the committed bytes and the `command_sequence` delta of
+        // `step_chain` alone (excluding the separate commit round-trip), so
+        // the command-count test can check just the step_chain call.
+        let chain_step = |workers: &mut DenseRankWorkers,
+                          rows: u64,
+                          visible_tokens: u64,
+                          step_tokens: &[u64],
+                          step_positions: &[u64]|
+         -> Result<(Vec<u8>, u64), Error> {
+            let step_tokens = step_tokens.to_vec();
+            let step_positions = step_positions.to_vec();
+            let mut inputs_cb = |rank: usize, stage: &StageGraph| {
+                Ok(stage_host_bindings(
+                    &fixture,
+                    stage,
+                    None,
+                    &step_tokens,
+                    &step_positions,
+                    &capabilities[rank],
+                )
+                .into_iter()
+                .filter(|binding| !matches!(binding.role, ValueRole::Weight(_)))
+                .collect())
+            };
+            let before_sequence = workers.command_sequence();
+            let step = workers.step_chain(rows, visible_tokens, &mut inputs_cb)?;
+            let step_sequence = step.command_sequence() - before_sequence;
+            let logits = step.logits().to_vec();
+            let committed = step.commit()?;
+            assert_eq!(committed, logits, "commit returns the sampled logits");
+            Ok((committed, step_sequence))
+        };
+
+        let mut chain_bytes: Vec<Vec<u8>> = Vec::with_capacity(9);
+        chain_bytes.push(
+            chain_step(&mut workers, 5, 5, &tokens, &positions)
+                .expect("chain prefill")
+                .0,
+        );
+        for i in 0..8 {
+            let visible = 6 + i as u64;
+            let (bytes, step_sequence) = chain_step(
+                &mut workers,
+                1,
+                visible,
+                &decode_tokens[i..=i],
+                &decode_positions[i..=i],
+            )
+            .expect("chain decode");
+            assert_eq!(
+                step_sequence, 2,
+                "one decode step_chain is exactly ChainPrepare + ChainRun"
+            );
+            chain_bytes.push(bytes);
+            // (b): zero admissions and zero uploads across every decode.
+            let counters = workers.chain_counters().expect("counters after decode");
+            for rank in 0..2 {
+                assert_eq!(
+                    counters[rank].admissions, counters_after_load[rank].admissions,
+                    "rank {rank} admissions changed after decode {i}"
+                );
+                assert_eq!(
+                    counters[rank].bytes_uploaded, counters_after_load[rank].bytes_uploaded,
+                    "rank {rank} bytes_uploaded changed after decode {i}"
+                );
+            }
+        }
+
+        // (a): byte-identical to the host reference and to M5, every step.
+        for (i, ((reference, m5), chain)) in reference_bytes
+            .iter()
+            .zip(&m5_bytes)
+            .zip(&chain_bytes)
+            .enumerate()
+        {
+            assert_eq!(
+                chain, reference,
+                "step {i}: chain differs from the host reference"
+            );
+            assert_eq!(chain, m5, "step {i}: chain differs from M5");
+        }
+
+        workers.close_chain().expect("close chain before shutdown");
+        workers.close().expect("close chain workers");
+    }
+
+    // (d): a status failure on rank 1, then a byte-identical retry.
+    {
+        let mut workers = DenseRankWorkers::spawn(worker_config([RankId(63_201), RankId(63_202)]))
+            .expect("spawn fault chain workers");
+        let mut oracles = OracleRegistry::new();
+        moxie_oracles::register(&mut oracles).expect("oracles");
+        let mut weights_cb = |rank: usize, stage: &StageGraph| {
+            Ok(
+                stage_host_bindings(&fixture, stage, None, &[0], &[0], &capabilities[rank])
+                    .into_iter()
+                    .filter(|binding| matches!(binding.role, ValueRole::Weight(_)))
+                    .collect(),
+            )
+        };
+        workers
+            .load_chain(
+                &fixture.graph,
+                &lowering,
+                moxie_oracles::HOST_REFERENCE,
+                &oracles,
+                &catalogue,
+                buckets.clone(),
+                &mut weights_cb,
+            )
+            .expect("load fault chain");
+        let chain_step = |workers: &mut DenseRankWorkers,
+                          rows: u64,
+                          visible_tokens: u64,
+                          step_tokens: &[u64],
+                          step_positions: &[u64]|
+         -> Result<Vec<u8>, Error> {
+            let step_tokens = step_tokens.to_vec();
+            let step_positions = step_positions.to_vec();
+            let mut inputs_cb = |rank: usize, stage: &StageGraph| {
+                Ok(stage_host_bindings(
+                    &fixture,
+                    stage,
+                    None,
+                    &step_tokens,
+                    &step_positions,
+                    &capabilities[rank],
+                )
+                .into_iter()
+                .filter(|binding| !matches!(binding.role, ValueRole::Weight(_)))
+                .collect())
+            };
+            let step = workers.step_chain(rows, visible_tokens, &mut inputs_cb)?;
+            let logits = step.logits().to_vec();
+            let committed = step.commit()?;
+            assert_eq!(committed, logits, "commit returns the sampled logits");
+            Ok(committed)
+        };
+        chain_step(&mut workers, 5, 5, &tokens, &positions).expect("fault chain prefill");
+        let stats_before = workers.stats().expect("stats before the fault");
+        workers.fail_next_join_after_prepare(1);
+        let failed = chain_step(
+            &mut workers,
+            1,
+            6,
+            &decode_tokens[0..=0],
+            &decode_positions[0..=0],
+        );
+        assert!(
+            matches!(
+                failed,
+                Err(Error::InvalidRequest {
+                    field: "collective",
+                    ..
+                })
+            ),
+            "{failed:?}"
+        );
+        assert_eq!(
+            workers.stats().expect("stats after the fault"),
+            stats_before,
+            "a status failure leaves frontiers and reservations unchanged"
+        );
+        let retried = chain_step(
+            &mut workers,
+            1,
+            6,
+            &decode_tokens[0..=0],
+            &decode_positions[0..=0],
+        )
+        .expect("retry after a status failure");
+        assert_eq!(
+            retried, reference_bytes[1],
+            "the retry is byte-identical to the reference"
+        );
+        workers
+            .close_chain()
+            .expect("close fault chain before shutdown");
+        workers.close().expect("close fault chain workers");
+    }
+
+    // (e) is in `dense_tp2_chain_stall_device.rs`: a stall permanently loses
+    // its rank pair (`park_lost`'s worker threads never exit), and
+    // `tp2_worker_gate(true)`'s own stall already claims this file's pair as
+    // the last thing this process does to it. Two permanent losses of the
+    // same physical pair cannot both happen in one process; task 0097's own
+    // R2 isolation split a GPU-pair conflict the same way.
 }
 
 fn combined_tp2_tp1_pipeline_matches_host_and_reports_capacity_latency() {

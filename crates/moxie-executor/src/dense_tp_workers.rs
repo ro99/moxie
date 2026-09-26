@@ -1,18 +1,25 @@
 //! Persistent, rank-owned workers for dense TP execution (task 0062).
 
 use core::ffi::c_void;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use moxie_cuda::{Event, Module, ModuleImage, PeerContextToken, RankContext, Stream, TrustedImage};
-use moxie_graph::{Graph, LinearInputSlice, OracleRegistry, ValueId, ValueRole};
-use moxie_memory::{BufferRequest, CapacitySnapshot, Ledger, PlanRequest, Reservation, StageSpan};
+use moxie_cuda::{
+    Event, Module, ModuleImage, PeerContextToken, RankContext, ResolvedModule, Stream, TrustedImage,
+};
+use moxie_graph::{Graph, LinearInputSlice, OpParams, OracleRegistry, ValueId, ValueRole};
+use moxie_memory::{
+    AcquireRequest, Acquired, ArtifactId, BufferRequest, CapacitySnapshot, ChunkId, Content,
+    Ledger, LogicalRange, PlanRequest, Reservation, ResidencyAuthority, ResidencyLease,
+    ResidencyRequest, StageSpan, TensorSlot, TurnId, UseClass,
+};
 use moxie_plan::{
-    Join, Stage, StageGraph, TensorParallelLowering, build_stage_graph,
+    Join, Phase, ResourceWorkload, SelectedPlanCandidate, Stage, StageGraph, StageWeight,
+    StorageRegion, TensorParallelLowering, build_stage_graph, lower_selected_ordered,
     value_bytes as plan_value_bytes,
 };
 use moxie_state::{DeviceKvSequence, KvGeometry, PreparedCommit};
@@ -24,9 +31,13 @@ use moxie_types::{
 use moxie_cuda::nccl::{CommState, Communicator, DataType as NcclDataType, NcclId};
 
 use crate::arena::{DeviceArena, DeviceRange, OperationLease};
-use crate::chain::{OwnedBinding, SelectedAdmitRefused, SelectedCompletion, SelectedReservedPlan};
-use crate::dense::{DenseGraphStep, DenseOperation};
+use crate::chain::{
+    OwnedBinding, SelectedAdmitRefused, SelectedCompletion, SelectedReservedPlan,
+    validate_bindings_except,
+};
+use crate::dense::{DenseGraphStep, DenseOperation, validate_embedding_token_sources};
 use crate::paged_attention::device::{PagedAttentionRun, Staging, with_paged_writers};
+use crate::residency::{ChunkSource, DeviceResidency, drain_reads};
 #[cfg(feature = "paged-attention-binding")]
 use crate::tensor_parallel::{RankDeclaration, RankRendezvous};
 
@@ -72,6 +83,124 @@ const OP_JOIN_DRAIN: u16 = 14;
 const OP_CLOSE_PREPARE: u16 = 15;
 const OP_CLOSE_DESTROY: u16 = 16;
 const OP_CLOSE_RELEASE: u16 = 17;
+const OP_LOAD_CHAIN: u16 = 18;
+const OP_CHAIN_PREPARE: u16 = 19;
+const OP_CHAIN_RUN: u16 = 20;
+const OP_CLOSE_CHAIN: u16 = 21;
+const OP_CHAIN_STATS: u16 = 22;
+
+/// One row bucket a persistent chain is loaded for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainBucket {
+    pub rows: u64,
+    pub visible_tokens: u64,
+}
+
+/// Cumulative per-rank chain counters. `admissions` and `bytes_uploaded` must
+/// not move across a `LoadChain`ed step; `ready_waits`/`stream_waits` are
+/// task 0102b's, zero throughout 0102a.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainCounters {
+    pub admissions: u64,
+    pub bytes_uploaded: u64,
+    pub ready_waits: u64,
+    pub stream_waits: u64,
+}
+
+/// One step of a persistent rank chain: either a compute stage (a replicated
+/// node or the rank's local stage of a `Stage::Local`) or the join
+/// immediately following a local stage's compute. `source` is that local
+/// stage's own graph output -- the value the join reduces or gathers.
+#[derive(Debug, Clone)]
+enum ChainStage {
+    Compute(Box<StageGraph>),
+    Join { join: Join, source: ValueId },
+}
+
+/// A resident weight's identity: the original graph value, its rank-local row
+/// slice (row-parallel weights), and its rank-local column slice (input-axis
+/// splits), exactly as `StageWeight` declares them. Equal keys share one
+/// resident lease; a tied embedding used two different ways gets two keys and
+/// two leases (sol M1, adopted narrowed: no subrange sharing).
+type WeightKey = (ValueId, Option<(u64, u64)>, Option<(u64, u64, u64)>);
+
+fn weight_key(weight: &StageWeight) -> WeightKey {
+    (
+        weight.original,
+        weight.rows.as_ref().map(|rows| (rows.start, rows.end)),
+        weight
+            .slice
+            .map(|slice| (slice.first, slice.width, slice.full_width)),
+    )
+}
+
+/// One join's persistent device buffers, sized once at `LoadChain` exactly as
+/// `prepare_join` sizes its per-step temporary (`dense_tp_workers.rs`
+/// `prepare_join`), but held for the chain's life instead of one step.
+#[derive(Debug)]
+struct ChainJoinBuffers<'ctx> {
+    arena: DeviceArena<'ctx>,
+    status: DeviceRange<'ctx>,
+    data: DeviceRange<'ctx>,
+    dummy: DeviceRange<'ctx>,
+    declaration: crate::GatherDeclaration,
+}
+
+/// One row bucket's admitted plans, join buffers and boundary, all allocated
+/// once at `LoadChain` and reused by every `ChainRun` at that bucket's rows.
+#[derive(Debug)]
+struct ChainBucketSet<'ctx> {
+    /// Index = compute-stage index (into `RankChain::stages`, counting only
+    /// `ChainStage::Compute` entries). `None` only while a step holds the
+    /// plan inside an in-flight lease.
+    plans: Vec<Option<SelectedReservedPlan<'ctx>>>,
+    /// Index = join index, in the same counting-only-joins order.
+    joins: Vec<ChainJoinBuffers<'ctx>>,
+    boundary: Boundary<'ctx>,
+    admitted_visible: u64,
+}
+
+/// `ChainRun`'s two error shapes: a nonzero join status is recoverable and
+/// leaves the communicator live (test d); anything else -- an enqueue
+/// failure, a poll error, a deadline -- means the communicator itself must
+/// abort. `?` inside `run_chain_stages_inner` produces `Communicator`; the
+/// status-word path is the one explicit `Status` return.
+enum ChainRunFailure {
+    Status(Error),
+    Communicator(Error),
+}
+
+impl From<Error> for ChainRunFailure {
+    fn from(error: Error) -> Self {
+        ChainRunFailure::Communicator(error)
+    }
+}
+
+/// A persistent, rank-owned tensor-parallel chain (task 0102). Built once by
+/// `LoadChain`; every later `ChainPrepare`/`ChainRun` reuses its plans,
+/// leases, join buffers and boundary without a new admission or upload.
+struct RankChain<'ctx> {
+    stages: Vec<ChainStage>,
+    /// Per compute stage, in the same order as `plans`: the stage's own local
+    /// weight value mapped to the shared `WeightKey` its bytes are resident
+    /// under.
+    weight_keys: Vec<BTreeMap<ValueId, WeightKey>>,
+    leases: BTreeMap<WeightKey, ResidencyLease>,
+    authority: ResidencyAuthority,
+    residency: DeviceResidency<'ctx>,
+    module: ResolvedModule<'ctx>,
+    buckets: BTreeMap<u64, ChainBucketSet<'ctx>>,
+    catalogue: KernelCatalogue,
+}
+
+impl std::fmt::Debug for RankChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RankChain")
+            .field("stages", &self.stages.len())
+            .field("buckets", &self.buckets.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
 
 /// Inputs used to initialize both workers. Device capacity is measured after
 /// each worker has acquired its own context; the shared host snapshot is only
@@ -142,6 +271,23 @@ enum WorkerCommand {
     CloseDestroy,
     CloseRelease,
     Shutdown,
+    LoadChain {
+        stages: Vec<ChainStage>,
+        catalogue: KernelCatalogue,
+        buckets: Vec<ChainBucket>,
+        weights: Vec<Vec<OwnedBinding>>,
+    },
+    ChainPrepare {
+        rows: u64,
+        visible_tokens: u64,
+        inputs: Vec<Vec<OwnedBinding>>,
+    },
+    ChainRun {
+        transaction: StateTransactionId,
+        fail_first_join: bool,
+    },
+    CloseChain,
+    ChainStats,
 }
 
 enum StartupIdChannel {
@@ -161,6 +307,8 @@ enum WorkerValue {
         reservations: usize,
     },
     Closed,
+    ChainJoins(Vec<(u64, crate::GatherDeclaration)>),
+    Chain(ChainCounters),
 }
 
 #[derive(Debug)]
@@ -225,6 +373,19 @@ struct WorkerState<'ctx> {
     communicator: Option<Communicator<'ctx>>,
     nccl_reservation: Option<Reservation>,
     preserve_communicator_on_loss: bool,
+    /// The persistent rank chain, once `LoadChain` has built one. `CloseChain`
+    /// is the only way out; every other command leaves it in place, even a
+    /// refusal (H5's escape inventory).
+    chain: Option<RankChain<'ctx>>,
+    /// The bucket a `ChainPrepare` opened, `(rows, visible_tokens)`, read and
+    /// cleared by the matching `ChainRun`.
+    chain_step: Option<(u64, u64)>,
+    /// The per-compute-stage input bindings a `ChainPrepare` validated,
+    /// consumed by the matching `ChainRun`.
+    chain_inputs: Option<Vec<Vec<OwnedBinding>>>,
+    /// Task 0102b's per-decode counters. Cumulative, never reset by a step.
+    ready_waits: u64,
+    stream_waits: u64,
 }
 
 /// Owns the rank threads and their command channels. CUDA values never leave
@@ -248,6 +409,11 @@ pub struct DenseRankWorkers {
     fail_commit_next: Option<usize>,
     #[cfg(feature = "paged-attention-test-hooks")]
     fail_join_next: Option<usize>,
+    /// The coordinator's own copy of the loaded chain's stages, per rank, used
+    /// only to call the per-stage input callback in `step_chain`. The workers
+    /// hold the authoritative `RankChain`; this is not a second source of
+    /// truth about resources, only about shape.
+    chain_stages: Option<[Vec<ChainStage>; 2]>,
 }
 
 impl DenseRankWorkers {
@@ -465,6 +631,7 @@ impl DenseRankWorkers {
             fail_commit_next: None,
             #[cfg(feature = "paged-attention-test-hooks")]
             fail_join_next: None,
+            chain_stages: None,
         })
     }
 
@@ -737,6 +904,213 @@ impl DenseRankWorkers {
         }
     }
 
+    /// Build a persistent rank chain, once, from `graph`/`lowering`. After
+    /// this call, `step_chain` makes zero plan admissions and zero weight
+    /// uploads (test b).
+    ///
+    /// `weights` is called once per compute stage per rank and must return
+    /// only `ValueRole::Weight` bindings (M-B); any other role is refused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_chain(
+        &mut self,
+        graph: &Graph,
+        lowering: &TensorParallelLowering,
+        oracle: moxie_graph::OracleId,
+        oracles: &OracleRegistry,
+        catalogue: &KernelCatalogue,
+        buckets: Vec<ChainBucket>,
+        weights: &mut dyn FnMut(usize, &StageGraph) -> Result<Vec<OwnedBinding>>,
+    ) -> Result<()> {
+        self.check_live()?;
+        if self.chain_stages.is_some() {
+            return Err(invalid("chain", "a chain is already loaded"));
+        }
+        let stages = [
+            rank_chain_stages(graph, lowering, 0, oracle, oracles)?,
+            rank_chain_stages(graph, lowering, 1, oracle, oracles)?,
+        ];
+        let mut per_rank_weights: [Vec<Vec<OwnedBinding>>; 2] = [Vec::new(), Vec::new()];
+        for (rank, rank_stages) in stages.iter().enumerate() {
+            for stage in rank_stages {
+                let ChainStage::Compute(stage_graph) = stage else {
+                    continue;
+                };
+                let bindings = weights(rank, stage_graph)?;
+                if bindings
+                    .iter()
+                    .any(|binding| !matches!(binding.role, ValueRole::Weight(_)))
+                {
+                    return Err(invalid(
+                        "bindings",
+                        "load_chain's callback returned a non-weight binding",
+                    ));
+                }
+                per_rank_weights[rank].push(bindings);
+            }
+        }
+        let stage_count = stages[0].len() as u64;
+        let bucket_count = buckets.len() as u64;
+        let commands = [0, 1].map(|rank| WorkerCommand::LoadChain {
+            stages: stages[rank].clone(),
+            catalogue: catalogue.clone(),
+            buckets: buckets.clone(),
+            weights: std::mem::take(&mut per_rank_weights[rank]),
+        });
+        let values = self.pair_command(
+            commands,
+            OP_LOAD_CHAIN,
+            [([stage_count, bucket_count, 0, 0], Precision::F32); 2],
+        )?;
+        let [
+            WorkerValue::ChainJoins(joins0),
+            WorkerValue::ChainJoins(joins1),
+        ] = values
+        else {
+            return Err(invalid("chain", "load chain returned the wrong result"));
+        };
+        let agree = joins0.len() == joins1.len()
+            && joins0.iter().zip(&joins1).all(|(a, b)| {
+                a.0 == b.0
+                    && a.1.rows == b.1.rows
+                    && a.1.columns == b.1.columns
+                    && a.1.precision == b.1.precision
+            });
+        if !agree {
+            return Err(invalid(
+                "chain",
+                "the two ranks disagree on the chain's join shapes",
+            ));
+        }
+        self.chain_stages = Some(stages);
+        Ok(())
+    }
+
+    /// One decode or prefill-bucket step over an already-loaded chain: two
+    /// paired commands (`ChainPrepare` then `ChainRun`, test c's fixed
+    /// command count), with no admission or upload in between (test b).
+    ///
+    /// `inputs` is called once per compute stage per rank and must return
+    /// only non-weight bindings (tokens, positions).
+    pub fn step_chain(
+        &mut self,
+        rows: u64,
+        visible_tokens: u64,
+        inputs: &mut dyn FnMut(usize, &StageGraph) -> Result<Vec<OwnedBinding>>,
+    ) -> Result<DenseWorkerStep<'_>> {
+        self.check_live()?;
+        let stages = self
+            .chain_stages
+            .as_ref()
+            .ok_or_else(|| invalid("chain", "no chain is loaded"))?;
+        let mut per_rank_inputs: [Vec<Vec<OwnedBinding>>; 2] = [Vec::new(), Vec::new()];
+        for (rank, rank_stages) in stages.iter().enumerate() {
+            for stage in rank_stages {
+                let ChainStage::Compute(stage_graph) = stage else {
+                    continue;
+                };
+                per_rank_inputs[rank].push(inputs(rank, stage_graph)?);
+            }
+        }
+        let prepare_commands = [0, 1].map(|rank| WorkerCommand::ChainPrepare {
+            rows,
+            visible_tokens,
+            inputs: std::mem::take(&mut per_rank_inputs[rank]),
+        });
+        let prepared = self.pair_command(
+            prepare_commands,
+            OP_CHAIN_PREPARE,
+            [([rows, visible_tokens, 0, 0], Precision::F32); 2],
+        );
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if self.lost.is_none() {
+                    let _ = self.settle(None, true);
+                }
+                return Err(error);
+            }
+        };
+        let transactions = [
+            transaction_reply(&prepared[0])?,
+            transaction_reply(&prepared[1])?,
+        ];
+        let run_commands = [
+            WorkerCommand::ChainRun {
+                transaction: transactions[0],
+                fail_first_join: self.take_join_fault(0),
+            },
+            WorkerCommand::ChainRun {
+                transaction: transactions[1],
+                fail_first_join: self.take_join_fault(1),
+            },
+        ];
+        let run = self.pair_command(
+            run_commands,
+            OP_CHAIN_RUN,
+            [([rows, visible_tokens, 0, 0], Precision::F32); 2],
+        );
+        match run {
+            Ok(values) => {
+                let logits = bytes_reply(&values[0])?;
+                Ok(DenseWorkerStep {
+                    group: self,
+                    transactions,
+                    logits,
+                    settled: false,
+                })
+            }
+            Err(error) => {
+                if self.lost.is_none() {
+                    let _ = self.settle(Some(transactions), true);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Both ranks' cumulative chain counters (task 0102's admission/upload
+    /// and, from 0102b, ready/stream-wait counts). `Default` (all zero) when
+    /// no chain is loaded.
+    pub fn chain_counters(&mut self) -> Result<[ChainCounters; 2]> {
+        let values = self.pair_command(
+            [WorkerCommand::ChainStats, WorkerCommand::ChainStats],
+            OP_CHAIN_STATS,
+            [([0; 4], Precision::F32); 2],
+        )?;
+        let [WorkerValue::Chain(a), WorkerValue::Chain(b)] = values else {
+            return Err(invalid("chain", "chain stats returned the wrong result"));
+        };
+        Ok([a, b])
+    }
+
+    /// The coordinator's own paired-command counter: how many `pair_command`
+    /// rounds this group has completed. A fixed delta over one call proves a
+    /// fixed command count (test c) without a second counting mechanism.
+    pub const fn command_sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Close a loaded chain. A no-op if none is loaded.
+    pub fn close_chain(&mut self) -> Result<()> {
+        self.check_live()?;
+        if self.chain_stages.is_none() {
+            return Ok(());
+        }
+        let values = self.pair_command(
+            [WorkerCommand::CloseChain, WorkerCommand::CloseChain],
+            OP_CLOSE_CHAIN,
+            [([0; 4], Precision::F32); 2],
+        )?;
+        if values
+            .iter()
+            .any(|value| !matches!(value, WorkerValue::Unit))
+        {
+            return Err(invalid("chain", "close chain returned the wrong result"));
+        }
+        self.chain_stages = None;
+        Ok(())
+    }
+
     fn settle(&mut self, transactions: Option<[StateTransactionId; 2]>, abort: bool) -> Result<()> {
         self.pair_command(
             [WorkerCommand::Drain, WorkerCommand::Drain],
@@ -909,6 +1283,12 @@ impl DenseRankWorkers {
         if self.closed {
             return Ok(());
         }
+        // H5: a loaded chain closes before ClosePrepare, because close_runs
+        // refuses any outstanding reservation except NCCL's, and a chain's
+        // plans, join buffers and residency are exactly that.
+        if self.chain_stages.is_some() {
+            self.close_chain()?;
+        }
         self.pair_command(
             [WorkerCommand::ClosePrepare, WorkerCommand::ClosePrepare],
             OP_CLOSE_PREPARE,
@@ -1053,7 +1433,10 @@ impl DenseRankWorkers {
 
     #[cfg(feature = "paged-attention-test-hooks")]
     fn take_stall(&mut self, rank: usize, operation: u16) -> bool {
-        if self.stall_next == Some(rank) && operation == OP_STAGE {
+        // OP_CHAIN_PREPARE: a chain step's first rendezvous, so
+        // `stall_before_next_rendezvous` reaches a `step_chain` the same way
+        // it already reaches an M5 `execute_dense` step at OP_STAGE.
+        if self.stall_next == Some(rank) && matches!(operation, OP_STAGE | OP_CHAIN_PREPARE) {
             self.stall_next = None;
             true
         } else {
@@ -1119,6 +1502,14 @@ pub struct DenseWorkerStep<'g> {
 impl DenseWorkerStep<'_> {
     pub fn logits(&self) -> &[u8] {
         &self.logits
+    }
+
+    /// The group's command counter at the moment this step was produced,
+    /// before its (separate) commit. Lets a caller measure a command count
+    /// for the step alone, without racing the exclusive borrow `commit`
+    /// needs.
+    pub const fn command_sequence(&self) -> u64 {
+        self.group.command_sequence()
     }
 
     pub fn commit(mut self) -> Result<Vec<u8>> {
@@ -1187,6 +1578,70 @@ fn stage_reply_declaration(reply: &WorkerValue) -> Result<crate::GatherDeclarati
             "local stage returned no join declaration",
         )),
     }
+}
+
+/// One rank's persistent chain stages: `execute_dense`'s loop body
+/// (`Stage::Replicated` becomes one compute stage per node,
+/// `Stage::Local { .. }` becomes the rank's local stage graph plus its join),
+/// without the worker commands. A stage graph is built exactly as
+/// `execute_dense` builds it (H2): no merging of a replicated range into one
+/// stage graph.
+fn rank_chain_stages(
+    graph: &Graph,
+    lowering: &TensorParallelLowering,
+    rank: usize,
+    oracle: moxie_graph::OracleId,
+    oracles: &OracleRegistry,
+) -> Result<Vec<ChainStage>> {
+    let mut stages = Vec::new();
+    let mut produced: BTreeSet<ValueId> = graph.inputs().iter().copied().collect();
+    for declared in &lowering.stages {
+        match declared {
+            Stage::Replicated(nodes) => {
+                for node in nodes.clone() {
+                    let stage =
+                        build_stage_graph(graph, None, node..node + 1, None, oracle, oracles)?;
+                    for read in &stage.reads {
+                        if !produced.contains(&read.original) {
+                            return Err(invalid(
+                                "chain",
+                                "a replicated stage reads a value no earlier stage produced",
+                            ));
+                        }
+                    }
+                    produced.insert(graph.nodes()[node].output);
+                    stages.push(ChainStage::Compute(Box::new(stage)));
+                }
+            }
+            Stage::Local { nodes, join } => {
+                let (Join::Gather { output } | Join::Reduce { output }) = *join;
+                let stage = build_stage_graph(
+                    graph,
+                    Some(&lowering.ranks[rank]),
+                    nodes.clone(),
+                    Some(output),
+                    oracle,
+                    oracles,
+                )?;
+                for read in &stage.reads {
+                    if !produced.contains(&read.original) {
+                        return Err(invalid(
+                            "chain",
+                            "a local stage reads a value no earlier stage produced",
+                        ));
+                    }
+                }
+                let source = stage.graph.output();
+                stages.push(ChainStage::Compute(Box::new(stage)));
+                stages.push(ChainStage::Join {
+                    join: *join,
+                    source,
+                });
+                produced.insert(output);
+            }
+        }
+    }
+    Ok(stages)
 }
 
 fn declare_selected_plan(
@@ -1432,6 +1887,11 @@ fn rank_worker(
         communicator: None,
         nccl_reservation: Some(nccl_reservation),
         preserve_communicator_on_loss: false,
+        chain: None,
+        chain_step: None,
+        chain_inputs: None,
+        ready_waits: 0,
+        stream_waits: 0,
     };
     match Communicator::init(&context, 2, nccl_id, rank as i32, startup_deadline) {
         Ok(communicator) => worker.communicator = Some(communicator),
@@ -1598,7 +2058,8 @@ fn worker_loop<'ctx>(
             command => {
                 let shutdown = matches!(&command, WorkerCommand::Shutdown);
                 let deadline = envelope.deadline;
-                let local = worker.execute(command, deadline);
+                let sequence = envelope.declaration.sequence;
+                let local = worker.execute(command, sequence, deadline);
                 if let Ok(rows) = worker.state.published_rows() {
                     published_frontiers[rank].store(rows, Ordering::Release);
                 }
@@ -1879,7 +2340,12 @@ impl<'ctx> WorkerState<'ctx> {
         Ok(())
     }
 
-    fn execute(&mut self, command: WorkerCommand, deadline: Instant) -> Result<WorkerValue> {
+    fn execute(
+        &mut self,
+        command: WorkerCommand,
+        sequence: u64,
+        deadline: Instant,
+    ) -> Result<WorkerValue> {
         match command {
             WorkerCommand::Begin { boundary_bytes } => {
                 let mut all_runs_observed = true;
@@ -2029,6 +2495,29 @@ impl<'ctx> WorkerState<'ctx> {
                 }
                 Ok(WorkerValue::Closed)
             }
+            WorkerCommand::LoadChain {
+                stages,
+                catalogue,
+                buckets,
+                weights,
+            } => self
+                .load_chain(stages, catalogue, buckets, weights)
+                .map(WorkerValue::ChainJoins),
+            WorkerCommand::ChainPrepare {
+                rows,
+                visible_tokens,
+                inputs,
+            } => self
+                .chain_prepare(rows, visible_tokens, inputs)
+                .map(WorkerValue::Transaction),
+            WorkerCommand::ChainRun {
+                transaction,
+                fail_first_join,
+            } => self
+                .chain_run(transaction, fail_first_join, sequence, deadline)
+                .map(WorkerValue::Bytes),
+            WorkerCommand::CloseChain => self.close_chain().map(|()| WorkerValue::Unit),
+            WorkerCommand::ChainStats => Ok(WorkerValue::Chain(self.chain_stats())),
         }
     }
 
@@ -2767,6 +3256,1158 @@ impl<'ctx> WorkerState<'ctx> {
         }
         Ok(())
     }
+
+    /// Build this rank's `RankChain`: upload every distinct weight image
+    /// once, then admit every bucket's compute stages against those
+    /// resident addresses and allocate every bucket's persistent join and
+    /// boundary buffers. On any error the partially built chain is kept in
+    /// `self.chain`; `CloseChain` is the only way out (change 4).
+    fn load_chain(
+        &mut self,
+        stages: Vec<ChainStage>,
+        catalogue: KernelCatalogue,
+        buckets: Vec<ChainBucket>,
+        weights: Vec<Vec<OwnedBinding>>,
+    ) -> Result<Vec<(u64, crate::GatherDeclaration)>> {
+        if self.chain.is_some() || self.transaction.is_some() || self.held.boundary.is_some() {
+            return Err(invalid(
+                "chain",
+                "the worker already has an open chain or step",
+            ));
+        }
+        let compute_graphs: Vec<&StageGraph> = stages
+            .iter()
+            .filter_map(|stage| match stage {
+                ChainStage::Compute(graph) => Some(graph.as_ref()),
+                ChainStage::Join { .. } => None,
+            })
+            .collect();
+        if weights.len() != compute_graphs.len() {
+            return Err(invalid(
+                "chain",
+                "weights has a different length than the chain's compute stages",
+            ));
+        }
+
+        // 2. One image per distinct weight key, refusing a repeat under
+        // different bytes.
+        let mut images: BTreeMap<WeightKey, Vec<u8>> = BTreeMap::new();
+        let mut weight_keys: Vec<BTreeMap<ValueId, WeightKey>> =
+            Vec::with_capacity(compute_graphs.len());
+        for (stage_graph, bindings) in compute_graphs.iter().zip(&weights) {
+            let mut keys = BTreeMap::new();
+            for weight in &stage_graph.weights {
+                let key = weight_key(weight);
+                let binding = bindings
+                    .iter()
+                    .find(|binding| binding.value == weight.local)
+                    .ok_or_else(|| invalid("chain", "a stage weight has no supplied binding"))?;
+                match images.get(&key) {
+                    Some(existing) if existing != &binding.bytes => {
+                        return Err(invalid(
+                            "chain",
+                            "a repeated weight key was supplied with different bytes",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        images.insert(key, binding.bytes.clone());
+                    }
+                }
+                keys.insert(weight.local, key);
+            }
+            weight_keys.push(keys);
+        }
+
+        // 3. Open one residency authority for this rank's whole chain.
+        let mut total = 0u64;
+        for bytes in images.values() {
+            let len = u64::try_from(bytes.len())
+                .map_err(|_| invalid("chain", "a weight image does not fit u64"))?;
+            let aligned = len
+                .checked_next_multiple_of(ALIGNMENT)
+                .ok_or_else(|| invalid("chain", "a weight image size overflowed"))?;
+            total = total
+                .checked_add(aligned)
+                .ok_or_else(|| invalid("chain", "resident weight total overflowed"))?;
+        }
+        let uuid = self.ctx.uuid();
+        let mut authority = ResidencyAuthority::open(
+            &mut self.ledger,
+            &ResidencyRequest::new("tensor-parallel rank chain weights", total)
+                .device_weights(uuid, total),
+        )?;
+        let mut residency = match DeviceResidency::create(self.ctx, &mut authority) {
+            Ok(residency) => residency,
+            Err(error) => {
+                let _ = authority.close(&mut self.ledger);
+                return Err(error);
+            }
+        };
+
+        // 4. Upload every image, in key order.
+        let artifact = ArtifactId::new("tp-rank-chain")?;
+        let mut leases: BTreeMap<WeightKey, ResidencyLease> = BTreeMap::new();
+        for (index, (key, bytes)) in images.iter().enumerate() {
+            let role = format!("w{index}");
+            let len = bytes.len() as u64;
+            let chunk = ChunkId::new(
+                artifact.clone(),
+                TensorSlot::tensor(role.clone())?,
+                LogicalRange::new(0, len)?,
+                1,
+            );
+            let acquired = authority.acquire(AcquireRequest {
+                chunk: &chunk,
+                destination: Scope::Device(uuid),
+                now: 0,
+                deadline: u64::MAX,
+                class: UseClass::demand(Content::DenseSpine),
+                turn: TurnId::new(1),
+            })?;
+            let Acquired::Pending { lease, work, .. } = acquired else {
+                return Err(invalid(
+                    "chain",
+                    "a fresh chain authority must not already hold this weight",
+                ));
+            };
+            let mut source = ChainWeightSource {
+                artifact: artifact.clone(),
+                role: &role,
+                bytes,
+            };
+            let uploads = drain_reads(&mut authority, &mut source, work)?;
+            for upload in &uploads {
+                residency
+                    .perform_upload(&mut authority, self.stream, upload)
+                    .map_err(|refused| refused.error)?;
+            }
+            leases.insert(*key, lease);
+        }
+
+        // 5. The reduce conversion kernel, loaded once for the chain's life.
+        // SAFETY: the image is this build's pinned nvcc output.
+        let dense_image =
+            unsafe { TrustedImage::from_build_output(moxie_kernels::DENSE_GRAPH_FATBIN) }?;
+        let dense_module = Module::load(self.ctx, ModuleImage::Binary(dense_image))?;
+        let module = dense_module.resolve_all(&[moxie_kernels::TP_F32_TO_BF16.to_string()])?;
+
+        // 6. Per bucket, admit every compute stage and allocate every join's
+        // and every escaping value's persistent buffers.
+        let mut bucket_sets: BTreeMap<u64, ChainBucketSet<'ctx>> = BTreeMap::new();
+        let mut declarations = Vec::with_capacity(buckets.len());
+        for bucket in &buckets {
+            let mut plans: Vec<Option<SelectedReservedPlan<'ctx>>> = Vec::new();
+            let mut joins: Vec<ChainJoinBuffers<'ctx>> = Vec::new();
+            // (original escaping value, its byte size)
+            let mut escaping: Vec<(ValueId, u64)> = Vec::new();
+            let mut compute_index = 0usize;
+            for (index, stage) in stages.iter().enumerate() {
+                match stage {
+                    ChainStage::Compute(stage_graph) => {
+                        let workload = ResourceWorkload {
+                            phase: if bucket.rows == 1 {
+                                Phase::Decode
+                            } else {
+                                Phase::Prefill
+                            },
+                            rows: bucket.rows,
+                            visible_tokens: bucket.visible_tokens,
+                            branch_rows: bucket.rows,
+                            output: stage_graph.graph.output(),
+                            device: self.capability.uuid,
+                            paged_state_capacity: None,
+                        };
+                        let candidate: SelectedPlanCandidate = lower_selected_ordered(
+                            &stage_graph.graph,
+                            workload,
+                            &self.capability,
+                            &catalogue,
+                            &stage_graph.linear_orders,
+                            &stage_graph.combine_orders,
+                            &stage_graph.expert_ownership,
+                        )?;
+                        if !candidate.weight_formats().is_empty()
+                            || !candidate.host_expert_joins().is_empty()
+                        {
+                            return Err(invalid(
+                                "chain",
+                                "a chain candidate has weight formats or host expert joins",
+                            ));
+                        }
+                        let keys = &weight_keys[compute_index];
+                        let mut addresses: BTreeMap<ValueId, u64> = BTreeMap::new();
+                        for weight in &stage_graph.weights {
+                            let key = keys
+                                .get(&weight.local)
+                                .ok_or_else(|| invalid("chain", "an admitted weight has no key"))?;
+                            let lease = leases.get(key).ok_or_else(|| {
+                                invalid("chain", "an admitted weight has no lease")
+                            })?;
+                            let (offset, len) = authority.device_range(lease)?;
+                            let planned = candidate.value(weight.local).ok_or_else(|| {
+                                invalid("chain", "a resident weight is absent from its candidate")
+                            })?;
+                            if len != planned.logical_bytes
+                                || planned.region != StorageRegion::Weights
+                            {
+                                return Err(invalid(
+                                    "chain",
+                                    "a resident weight range disagrees with its candidate",
+                                ));
+                            }
+                            let address = residency.device_address(offset, len)?;
+                            addresses.insert(weight.local, address);
+                        }
+                        let local_output = stage_graph.graph.output();
+                        let escaping_bytes = candidate
+                            .value(local_output)
+                            .ok_or_else(|| invalid("chain", "a stage output has no planned value"))?
+                            .logical_bytes;
+                        let plan = SelectedReservedPlan::admit_with_resident_weights(
+                            candidate,
+                            &stage_graph.graph,
+                            &self.capability,
+                            &catalogue,
+                            &mut self.ledger,
+                            self.ctx,
+                            addresses,
+                        )
+                        .map_err(|refused| match refused {
+                            SelectedAdmitRefused::Invalid { error, .. } => error,
+                            SelectedAdmitRefused::Rejected { rejection, .. } => rejection.into(),
+                            SelectedAdmitRefused::Held { error, .. } => device_lost(
+                                self.ctx.ordinal(),
+                                format!("a refused chain admission could not release ({error})"),
+                            ),
+                        })?;
+                        plans.push(Some(plan));
+                        // A stage's output escapes into the boundary unless
+                        // the next chain stage is the join that consumes it
+                        // directly from the lease (H2's produce-and-preserve
+                        // rule: only join-consumed local outputs skip it).
+                        let joined_next = matches!(
+                            stages.get(index + 1),
+                            Some(ChainStage::Join { source, .. }) if *source == local_output
+                        );
+                        if !joined_next {
+                            let original = stage_graph
+                                .produces
+                                .iter()
+                                .find(|(_, local)| *local == local_output)
+                                .map(|(original, _)| *original)
+                                .ok_or_else(|| {
+                                    invalid("chain", "a replicated stage names no original output")
+                                })?;
+                            escaping.push((original, escaping_bytes));
+                        }
+                        compute_index += 1;
+                    }
+                    ChainStage::Join { join, source } => {
+                        let local_plan =
+                            plans.last().and_then(Option::as_ref).ok_or_else(|| {
+                                invalid("chain", "a join has no preceding local stage")
+                            })?;
+                        let declaration = declare_selected_plan(local_plan, *source)?;
+                        let (buffers, output_bytes) =
+                            self.open_chain_join_buffers(*join, declaration)?;
+                        let output = match join {
+                            Join::Gather { output } | Join::Reduce { output } => *output,
+                        };
+                        escaping.push((output, output_bytes));
+                        joins.push(buffers);
+                    }
+                }
+            }
+
+            // Persistent boundary: one arena, one range per escaping value.
+            let mut boundary_capacity = 0u64;
+            for (_, bytes) in &escaping {
+                let aligned = bytes
+                    .checked_next_multiple_of(ALIGNMENT)
+                    .ok_or_else(|| invalid("chain", "boundary extent overflowed"))?;
+                boundary_capacity = boundary_capacity
+                    .checked_add(aligned)
+                    .ok_or_else(|| invalid("chain", "boundary extent overflowed"))?;
+            }
+            let mut boundary = self.open_boundary(boundary_capacity.max(ALIGNMENT))?;
+            for (original, bytes) in &escaping {
+                let range = boundary
+                    .arena
+                    .allocate(*bytes, ALIGNMENT, "chain boundary")
+                    .map_err(|refused| refused.error)?;
+                boundary.values.insert(*original, range);
+            }
+
+            for buffers in &joins {
+                declarations.push((bucket.rows, buffers.declaration));
+            }
+            bucket_sets.insert(
+                bucket.rows,
+                ChainBucketSet {
+                    plans,
+                    joins,
+                    boundary,
+                    admitted_visible: bucket.visible_tokens,
+                },
+            );
+        }
+
+        self.chain = Some(RankChain {
+            stages,
+            weight_keys,
+            leases,
+            authority,
+            residency,
+            module,
+            buckets: bucket_sets,
+            catalogue,
+        });
+        Ok(declarations)
+    }
+
+    /// A join's persistent status/data/dummy buffers, sized exactly as
+    /// `prepare_join` sizes its per-step temporary.
+    fn open_chain_join_buffers(
+        &mut self,
+        join: Join,
+        declaration: crate::GatherDeclaration,
+    ) -> Result<(ChainJoinBuffers<'ctx>, u64)> {
+        let element = match (join, declaration.precision) {
+            (Join::Gather { .. }, Precision::Bf16) => 2u64,
+            (Join::Gather { .. }, Precision::F32) => 4u64,
+            (Join::Reduce { .. }, Precision::F32) => 4u64,
+            _ => {
+                return Err(invalid(
+                    "collective",
+                    &format!("unsupported {join:?} precision {:?}", declaration.precision),
+                ));
+            }
+        };
+        let elements = declaration
+            .rows
+            .checked_mul(declaration.columns)
+            .ok_or_else(|| invalid("collective", "join element count overflowed"))?;
+        let part_bytes = elements
+            .checked_mul(element)
+            .ok_or_else(|| invalid("collective", "join byte count overflowed"))?;
+        let collective_bytes = match join {
+            Join::Gather { .. } => part_bytes
+                .checked_mul(2)
+                .ok_or_else(|| invalid("collective", "gather buffer size overflowed"))?,
+            Join::Reduce { .. } => elements
+                .checked_mul(4)
+                .ok_or_else(|| invalid("collective", "reduce buffer size overflowed"))?,
+        };
+        let output_bytes = match join {
+            Join::Gather { .. } => part_bytes
+                .checked_mul(2)
+                .ok_or_else(|| invalid("collective", "gather output size overflowed"))?,
+            Join::Reduce { .. } => elements
+                .checked_mul(2)
+                .ok_or_else(|| invalid("collective", "reduce output size overflowed"))?,
+        };
+        let capacity = [JOIN_STATUS_BYTES, collective_bytes, part_bytes]
+            .into_iter()
+            .try_fold(0u64, |total, bytes| {
+                let aligned = bytes
+                    .checked_next_multiple_of(ALIGNMENT)
+                    .ok_or_else(|| invalid("collective", "temporary size overflowed"))?;
+                total
+                    .checked_add(aligned)
+                    .ok_or_else(|| invalid("collective", "temporary size overflowed"))
+            })?;
+        let mut request = PlanRequest::new("tensor-parallel rank chain join buffers", ["join"])?;
+        request.buffer(BufferRequest::try_new(
+            "status, collective and dummy buffers",
+            Scope::Device(self.ctx.uuid()),
+            Tier::Device(DeviceTier::CollectiveBuffers),
+            capacity,
+            StageSpan::at(0),
+        )?)?;
+        let reservation = self.ledger.admit(&request)?;
+        let mut arena = match DeviceArena::create(
+            &self.ledger,
+            reservation,
+            self.ctx,
+            DeviceTier::CollectiveBuffers,
+            capacity,
+            "tensor-parallel rank chain join buffers",
+        ) {
+            Ok(arena) => arena,
+            Err(refused) => {
+                return match self.ledger.release(refused.reservation) {
+                    Ok(()) => Err(refused.error),
+                    Err(held) => Err(device_lost(
+                        self.ctx.ordinal(),
+                        format!(
+                            "chain join reservation could not be released ({})",
+                            held.error
+                        ),
+                    )),
+                };
+            }
+        };
+        let status = arena
+            .allocate(JOIN_STATUS_BYTES, ALIGNMENT, "chain join status")
+            .map_err(|refused| refused.error)?;
+        let data = arena
+            .allocate(collective_bytes, ALIGNMENT, "chain join collective")
+            .map_err(|refused| refused.error)?;
+        let dummy = arena
+            .allocate(part_bytes, ALIGNMENT, "chain join dummy source")
+            .map_err(|refused| refused.error)?;
+        Ok((
+            ChainJoinBuffers {
+                arena,
+                status,
+                data,
+                dummy,
+                declaration,
+            },
+            output_bytes,
+        ))
+    }
+
+    /// One chain step's `ChainPrepare`: every host check the enqueue path
+    /// makes, before anything is enqueued, so a one-sided pre-enqueue
+    /// refusal never strands the peer inside a collective (H4).
+    fn chain_prepare(
+        &mut self,
+        rows: u64,
+        visible_tokens: u64,
+        inputs: Vec<Vec<OwnedBinding>>,
+    ) -> Result<StateTransactionId> {
+        let mut all_runs_observed = true;
+        for run in &mut self.runs {
+            if run.observe_pending().is_err() {
+                all_runs_observed = false;
+            }
+        }
+        if !all_runs_observed || self.runs.iter().any(|run| !run.is_idle()) {
+            return Err(invalid(
+                "runs",
+                "a chain step accepts only idle attention runs",
+            ));
+        }
+        if self.transaction.is_some() {
+            return Err(invalid(
+                "transaction",
+                "the worker already has an open step or chain step",
+            ));
+        }
+        let chain = self
+            .chain
+            .as_ref()
+            .ok_or_else(|| invalid("chain", "no chain is loaded"))?;
+        let bucket = chain
+            .buckets
+            .get(&rows)
+            .ok_or_else(|| invalid("chain", "rows is not an admitted bucket"))?;
+        if visible_tokens > bucket.admitted_visible {
+            return Err(invalid(
+                "chain",
+                "visible_tokens exceeds the bucket's admitted visibility",
+            ));
+        }
+        let compute_count = chain
+            .stages
+            .iter()
+            .filter(|stage| matches!(stage, ChainStage::Compute(_)))
+            .count();
+        if inputs.len() != compute_count {
+            return Err(invalid(
+                "chain",
+                "inputs has a different length than the chain's compute stages",
+            ));
+        }
+
+        // The per-step lease/address check `DensePlanSet::step` makes,
+        // reused verbatim (H3), plus the same binding validation a fresh
+        // admission would make.
+        let mut compute_index = 0usize;
+        for stage in &chain.stages {
+            let ChainStage::Compute(stage_graph) = stage else {
+                continue;
+            };
+            let plan = bucket.plans[compute_index]
+                .as_ref()
+                .ok_or_else(|| invalid("chain", "a compute stage plan is checked out"))?;
+            for weight in &stage_graph.weights {
+                let key = chain.weight_keys[compute_index]
+                    .get(&weight.local)
+                    .expect("weight_keys was built for every stage weight at load");
+                let lease = chain
+                    .leases
+                    .get(key)
+                    .expect("every weight key has a lease from load_chain");
+                if lease.scope() != Scope::Device(self.ctx.uuid()) {
+                    return Err(invalid("weights", "a resident lease changed device scope"));
+                }
+                let (offset, len) = chain.authority.device_range(lease)?;
+                let planned = plan
+                    .candidate()
+                    .value(weight.local)
+                    .ok_or_else(|| invalid("weights", "the admitted plan omits a graph weight"))?;
+                if len != planned.logical_bytes
+                    || chain.residency.device_address(offset, len)?
+                        != plan.value_address(weight.local)?
+                {
+                    return Err(invalid(
+                        "weights",
+                        "a resident lease range changed after admission",
+                    ));
+                }
+            }
+            // The stage's boundary-fed reads: `StageRead.local` values whose
+            // `original` already has a preallocated boundary range, exactly
+            // as `run_stage`/`run_chain_stages_inner` compute it for
+            // `copy_boundary`. Weights are a separate completeness check
+            // inside `validate_bindings_except` and are not part of this set.
+            let resident: BTreeSet<ValueId> = stage_graph
+                .reads
+                .iter()
+                .filter(|read| bucket.boundary.values.contains_key(&read.original))
+                .map(|read| read.local)
+                .collect();
+            let bindings = inputs
+                .get(compute_index)
+                .ok_or_else(|| invalid("chain", "inputs has no entry for a compute stage"))?;
+            validate_bindings_except(plan, &stage_graph.graph, bindings, &resident)?;
+            for node in stage_graph.graph.nodes() {
+                if let OpParams::Embedding { vocab, .. } = &node.params {
+                    validate_embedding_token_sources(bindings, node.inputs[0], rows, *vocab)?;
+                }
+            }
+            compute_index += 1;
+        }
+
+        let transaction = self.state.begin()?;
+        self.transaction = Some(transaction);
+        self.chain_step = Some((rows, visible_tokens));
+        self.chain_inputs = Some(inputs);
+        Ok(transaction)
+    }
+
+    /// One chain step's `ChainRun`, 0102a's schedule: every stage enqueued in
+    /// order, each join drained and checked before the next stage, then one
+    /// final drain, run reclamation (H6) and lease retirement.
+    fn chain_run(
+        &mut self,
+        transaction: StateTransactionId,
+        fail_first_join: bool,
+        sequence: u64,
+        deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        if self.transaction != Some(transaction) {
+            return Err(invalid(
+                "transaction",
+                "chain run names a different worker transaction",
+            ));
+        }
+        let (rows, _visible_tokens) = self
+            .chain_step
+            .take()
+            .ok_or_else(|| invalid("chain", "chain run has no prepared step"))?;
+        let inputs = self
+            .chain_inputs
+            .take()
+            .ok_or_else(|| invalid("chain", "chain run has no prepared bindings"))?;
+        let mut chain = self
+            .chain
+            .take()
+            .ok_or_else(|| invalid("chain", "no chain is loaded"))?;
+        let result = self.run_chain_stages(
+            &mut chain,
+            rows,
+            inputs,
+            fail_first_join,
+            sequence,
+            deadline,
+        );
+        self.chain = Some(chain);
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    /// `run_chain_stages_inner`'s `Err` is one of two kinds, and change 7's
+    /// rule differs for each: a status-word failure is the recoverable path
+    /// (test d) -- the collective machinery itself completed cleanly, only
+    /// the data was marked bad, so the communicator stays live. Every other
+    /// error (an enqueue failure, a poll error, a deadline) is post-enqueue
+    /// and means `abort_communicator`, with everything else left in
+    /// `self.chain`.
+    fn run_chain_stages(
+        &mut self,
+        chain: &mut RankChain<'ctx>,
+        rows: u64,
+        inputs: Vec<Vec<OwnedBinding>>,
+        fail_first_join: bool,
+        sequence: u64,
+        deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        match self.run_chain_stages_inner(chain, rows, inputs, fail_first_join, sequence, deadline)
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(ChainRunFailure::Status(error)) => Err(error),
+            Err(ChainRunFailure::Communicator(error)) => {
+                self.abort_communicator();
+                Err(error)
+            }
+        }
+    }
+
+    fn run_chain_stages_inner(
+        &mut self,
+        chain: &mut RankChain<'ctx>,
+        rows: u64,
+        inputs: Vec<Vec<OwnedBinding>>,
+        fail_first_join: bool,
+        sequence: u64,
+        deadline: Instant,
+    ) -> std::result::Result<Vec<u8>, ChainRunFailure> {
+        let bucket = chain
+            .buckets
+            .get_mut(&rows)
+            .ok_or_else(|| invalid("chain", "rows is not an admitted bucket"))?;
+        let mut leases: Vec<OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>> =
+            Vec::new();
+        let mut compute_index = 0usize;
+        let mut join_index = 0usize;
+        let mut any_status_failed = false;
+        let mut graph_output: Option<ValueId> = None;
+        let stage_count = chain.stages.len();
+        let transaction = self.transaction.expect("chain run has an open transaction");
+        let mut inputs = inputs.into_iter();
+
+        for (index, stage) in chain.stages.iter().enumerate() {
+            match stage {
+                ChainStage::Compute(stage_graph) => {
+                    let plan = bucket.plans[compute_index].take().ok_or_else(|| {
+                        invalid("chain", "a compute stage plan is checked out twice")
+                    })?;
+                    let local_output = stage_graph.graph.output();
+                    let mut resident = BTreeSet::new();
+                    for read in &stage_graph.reads {
+                        if let Some(source) = bucket.boundary.values.get(&read.original) {
+                            resident.insert(read.local);
+                            copy_boundary(
+                                &plan,
+                                read.local,
+                                source,
+                                read.slice,
+                                rows,
+                                self.stream,
+                            )?;
+                        }
+                    }
+                    let runs: &mut [PagedAttentionRun<'ctx>] =
+                        if stage_graph.state_layers.is_empty() {
+                            &mut []
+                        } else {
+                            self.runs.as_mut_slice()
+                        };
+                    let bindings = inputs.next().ok_or_else(|| {
+                        invalid("chain", "inputs has no entry for a compute stage")
+                    })?;
+                    let lease = match plan.execute_dense_stage(
+                        DenseGraphStep {
+                            graph: &stage_graph.graph,
+                            capability: &self.capability,
+                            catalogue: &chain.catalogue,
+                            ctx: self.ctx,
+                            stream: self.stream,
+                            state: &mut self.state,
+                            transaction,
+                            runs,
+                            bindings,
+                            host_experts: &[],
+                        },
+                        &resident,
+                        &stage_graph.state_layers,
+                    ) {
+                        Ok(lease) => lease,
+                        Err(refused) => {
+                            bucket.plans[compute_index] = refused.plan;
+                            leases.extend(refused.held);
+                            return Err(ChainRunFailure::Communicator(refused.error));
+                        }
+                    };
+                    let joined_next = matches!(
+                        chain.stages.get(index + 1),
+                        Some(ChainStage::Join { source, .. }) if *source == local_output
+                    );
+                    if !joined_next {
+                        let original = stage_graph
+                            .produces
+                            .iter()
+                            .find(|(_, local)| *local == local_output)
+                            .map(|(original, _)| *original)
+                            .expect("a replicated stage's own output is one of its produces");
+                        if index + 1 == stage_count {
+                            graph_output = Some(original);
+                        }
+                        let destination = bucket
+                            .boundary
+                            .values
+                            .get(&original)
+                            .expect("the escaping value has a preallocated boundary range");
+                        keep_into(
+                            lease
+                                .resource()
+                                .plan
+                                .as_ref()
+                                .expect("lease retains its plan"),
+                            local_output,
+                            destination,
+                            self.stream,
+                        )?;
+                    }
+                    leases.push(lease);
+                    compute_index += 1;
+                }
+                ChainStage::Join { join, source } => {
+                    let output = match join {
+                        Join::Gather { output } | Join::Reduce { output } => *output,
+                    };
+                    if index + 1 == stage_count {
+                        graph_output = Some(output);
+                    }
+                    let mut declaration = bucket.joins[join_index].declaration;
+                    declaration.sequence = sequence;
+                    let element_bytes = match declaration.precision {
+                        Precision::Bf16 => 2u64,
+                        Precision::F32 => 4u64,
+                        _ => {
+                            return Err(ChainRunFailure::Communicator(invalid(
+                                "collective",
+                                "join precision is unsupported",
+                            )));
+                        }
+                    };
+                    let elements = declaration
+                        .rows
+                        .checked_mul(declaration.columns)
+                        .ok_or_else(|| invalid("collective", "join element count overflowed"))?;
+                    let _ = element_bytes;
+                    let source_lease = leases
+                        .last()
+                        .ok_or_else(|| invalid("chain", "a join has no preceding local lease"))?;
+                    let source_plan = source_lease
+                        .resource()
+                        .plan
+                        .as_ref()
+                        .expect("lease retains its plan");
+                    let mut failed = fail_first_join && join_index == 0;
+                    let buffers = &bucket.joins[join_index];
+                    let source_address = if failed {
+                        buffers.dummy.device_address()?
+                    } else {
+                        match source_plan.value_address(*source) {
+                            Ok(address) => address,
+                            Err(_) => {
+                                failed = true;
+                                buffers.dummy.device_address()?
+                            }
+                        }
+                    };
+                    let status_address = buffers.status.device_address()?;
+                    let data_address = buffers.data.device_address()?;
+                    let communicator = self.communicator.as_ref().ok_or_else(|| {
+                        device_lost(
+                            self.ctx.ordinal(),
+                            "join has no live NCCL communicator".into(),
+                        )
+                    })?;
+                    // SAFETY: mirrors `copy_join` -- every range is admitted
+                    // for the chain's life and retained through this join's
+                    // own drain below.
+                    unsafe {
+                        communicator.set_u32_async(
+                            status_address,
+                            u32::from(failed),
+                            self.stream,
+                        )?;
+                    }
+                    communicator.group_start()?;
+                    let enqueued = (|| -> Result<()> {
+                        // SAFETY: see above.
+                        unsafe {
+                            communicator.all_reduce_u32_max(
+                                status_address,
+                                status_address,
+                                1,
+                                self.stream,
+                            )?;
+                            match join {
+                                Join::Reduce { .. } => communicator.all_reduce_f32_sum(
+                                    source_address,
+                                    data_address,
+                                    usize::try_from(elements).map_err(|_| {
+                                        invalid("collective", "join element count is too large")
+                                    })?,
+                                    self.stream,
+                                ),
+                                Join::Gather { .. } => communicator.all_gather(
+                                    source_address,
+                                    data_address,
+                                    usize::try_from(elements).map_err(|_| {
+                                        invalid("collective", "join element count is too large")
+                                    })?,
+                                    match declaration.precision {
+                                        Precision::Bf16 => NcclDataType::Bf16,
+                                        Precision::F32 => NcclDataType::F32,
+                                        _ => unreachable!(
+                                            "open_chain_join_buffers validates the join precision"
+                                        ),
+                                    },
+                                    self.stream,
+                                ),
+                            }
+                        }
+                    })();
+                    let ended = communicator.group_end();
+                    enqueued?;
+                    ended?;
+
+                    self.drain(deadline)?;
+                    let mut status_bytes = [0u8; 4];
+                    bucket.joins[join_index]
+                        .status
+                        .copy_to_host(&mut status_bytes)
+                        .map_err(|error| {
+                            device_lost(
+                                self.ctx.ordinal(),
+                                format!("join status could not be observed ({error})"),
+                            )
+                        })?;
+                    let status_failed = u32::from_le_bytes(status_bytes) != 0;
+                    any_status_failed |= status_failed;
+                    if !status_failed {
+                        let buffers = &bucket.joins[join_index];
+                        let destination = bucket
+                            .boundary
+                            .values
+                            .get(&output)
+                            .expect("the join's output has a preallocated boundary range");
+                        match join {
+                            Join::Reduce { .. } => {
+                                let mut input = buffers.data.device_address()?;
+                                let mut out = destination.device_address()?;
+                                let mut count = elements;
+                                let mut params: [*mut c_void; 3] = [
+                                    (&raw mut input).cast(),
+                                    (&raw mut out).cast(),
+                                    (&raw mut count).cast(),
+                                ];
+                                let grid = u32::try_from(count.div_ceil(256)).map_err(|_| {
+                                    invalid("collective", "reduce grid is too large")
+                                })?;
+                                // SAFETY: mirrors `drain_join`'s Reduce
+                                // conversion; both ranges are admitted for the
+                                // chain's life.
+                                unsafe {
+                                    chain.module.launch_async(
+                                        0,
+                                        self.stream,
+                                        (grid, 1, 1),
+                                        (256, 1, 1),
+                                        0,
+                                        &mut params,
+                                    )?;
+                                }
+                            }
+                            Join::Gather { .. } => {
+                                let source_row_bytes =
+                                    declaration.columns.checked_mul(element_bytes).ok_or_else(
+                                        || invalid("collective", "gather row size overflowed"),
+                                    )?;
+                                let output_row_bytes =
+                                    source_row_bytes.checked_mul(2).ok_or_else(|| {
+                                        invalid("collective", "gather output row overflowed")
+                                    })?;
+                                let gathered_rank_bytes =
+                                    declaration.rows.checked_mul(source_row_bytes).ok_or_else(
+                                        || invalid("collective", "gather source size overflowed"),
+                                    )?;
+                                for row in 0..declaration.rows {
+                                    let source_row =
+                                        row.checked_mul(source_row_bytes).ok_or_else(|| {
+                                            invalid("collective", "gather row offset overflowed")
+                                        })?;
+                                    let output_row =
+                                        row.checked_mul(output_row_bytes).ok_or_else(|| {
+                                            invalid("collective", "gather output offset overflowed")
+                                        })?;
+                                    let second_output = output_row
+                                        .checked_add(source_row_bytes)
+                                        .ok_or_else(|| {
+                                            invalid("collective", "gather output offset overflowed")
+                                        })?;
+                                    let second_source = gathered_rank_bytes
+                                        .checked_add(source_row)
+                                        .ok_or_else(|| {
+                                            invalid("collective", "gather source offset overflowed")
+                                        })?;
+                                    // SAFETY: the all-gather above is Ready and
+                                    // this join's own drain observed its stream
+                                    // completion; both ranges are admitted for
+                                    // the chain's life.
+                                    unsafe {
+                                        destination.copy_from_device_async_at(
+                                            output_row,
+                                            &buffers.data,
+                                            source_row,
+                                            source_row_bytes,
+                                            self.stream,
+                                        )?;
+                                        destination.copy_from_device_async_at(
+                                            second_output,
+                                            &buffers.data,
+                                            second_source,
+                                            source_row_bytes,
+                                            self.stream,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    join_index += 1;
+                }
+            }
+        }
+
+        self.drain(deadline)?;
+        // H6: return every attention run's held range to a chain plan before
+        // the leases that own those plans retire.
+        for run in &mut self.runs {
+            match run.reclaim_drained() {
+                Ok(Some((query, output))) => {
+                    for range in [query, output] {
+                        return_worker_range_from_leases(self.ctx, &mut leases, range)?;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(device_lost(
+                        self.ctx.ordinal(),
+                        format!("attention run cannot be reclaimed ({error})"),
+                    )
+                    .into());
+                }
+            }
+        }
+        for (index, lease) in leases.into_iter().enumerate() {
+            let (_, mut operation) = lease.retire().map_err(|refused| {
+                device_lost(
+                    self.ctx.ordinal(),
+                    format!("a chain stage lease could not retire ({})", refused.error),
+                )
+            })?;
+            let mut plan = operation
+                .plan
+                .take()
+                .expect("a retired dense operation retains its plan");
+            let _ = plan.settle_sources(std::mem::take(&mut operation.sources));
+            bucket.plans[index] = Some(plan);
+        }
+
+        if any_status_failed {
+            if let Some(current) = self.transaction {
+                self.state
+                    .abort(current)
+                    .map_err(ChainRunFailure::Communicator)?;
+                self.transaction = None;
+            }
+            return Err(ChainRunFailure::Status(invalid(
+                "collective",
+                "a rank failed after join preparation",
+            )));
+        }
+        let output_value = graph_output.expect("a nonempty chain names a graph output");
+        let range = bucket
+            .boundary
+            .values
+            .get(&output_value)
+            .ok_or_else(|| invalid("logits", "the chain output is absent from the boundary"))?;
+        let mut host = vec![0u8; range.bytes() as usize];
+        range.copy_to_host(&mut host)?;
+        Ok(host)
+    }
+
+    /// H5's exact close order: every bucket's plans, join buffers and
+    /// boundary; then the weight leases and residency authority; the
+    /// conversion module needs no ledger step and drops with the chain.
+    ///
+    /// A bucket not yet reached when an earlier one fails stays in
+    /// `self.chain`, exactly as it was. Once a bucket's own close is under
+    /// way, a failure inside it (a plan, a join buffer, or the boundary
+    /// refusing to release) is the same "this rank is lost" outcome
+    /// `close_runs` and `prepare_close` already report elsewhere in this
+    /// file: the error is returned and the caller does not retry or drop the
+    /// worker normally (`DenseRankWorkers::close` forgets `self` on any
+    /// close error, exactly as it does for the M5 path today).
+    fn close_chain(&mut self) -> Result<()> {
+        if self.transaction.is_some() {
+            return Err(invalid("chain", "a chain cannot close with an open step"));
+        }
+        let Some(mut chain) = self.chain.take() else {
+            return Ok(());
+        };
+
+        while let Some(rows) = chain.buckets.keys().next().copied() {
+            let bucket = chain.buckets.remove(&rows).expect("key came from this map");
+            if let Err(error) = self.close_chain_bucket(bucket) {
+                self.chain = Some(chain);
+                return Err(error);
+            }
+        }
+        for (key, lease) in std::mem::take(&mut chain.leases) {
+            if let Err(refused) = chain.authority.release(lease) {
+                chain.leases.insert(key, refused.lease);
+                self.chain = Some(chain);
+                return Err(refused.error);
+            }
+        }
+        chain.authority.end_turn(TurnId::new(1));
+        chain.authority.retire_all(Scope::Device(self.ctx.uuid()));
+        // Past this point residency's own backing may already be gone even on
+        // a later failure, so there is no coherent `RankChain` left to park:
+        // a refusal here is the same "this rank is lost" outcome as a mid-
+        // bucket failure above, and the caller does not retry.
+        chain
+            .residency
+            .close(&mut chain.authority)
+            .map_err(|(_, error)| error)?;
+        chain.authority.close(&mut self.ledger)?;
+        drop(chain.module);
+        Ok(())
+    }
+
+    /// One bucket's plans, then its join buffers, then its boundary.
+    fn close_chain_bucket(&mut self, mut bucket: ChainBucketSet<'ctx>) -> Result<()> {
+        for slot in &mut bucket.plans {
+            if let Some(plan) = slot.take() {
+                plan.close(&mut self.ledger)
+                    .map_err(|refused| refused.error)?;
+            }
+        }
+        while let Some(buffers) = bucket.joins.pop() {
+            close_chain_join_buffers(&mut self.ledger, buffers)?;
+        }
+        close_boundary_worker(self.ctx, &mut self.ledger, bucket.boundary)
+    }
+
+    fn chain_stats(&mut self) -> ChainCounters {
+        let Some(chain) = self.chain.as_ref() else {
+            return ChainCounters {
+                admissions: 0,
+                bytes_uploaded: 0,
+                ready_waits: self.ready_waits,
+                stream_waits: self.stream_waits,
+            };
+        };
+        ChainCounters {
+            admissions: self.ledger.admissions(),
+            bytes_uploaded: chain.authority.stats().bytes_uploaded,
+            ready_waits: self.ready_waits,
+            stream_waits: self.stream_waits,
+        }
+    }
+}
+
+/// Where a chain's weight image bytes come from during `LoadChain`'s upload:
+/// exactly the bytes the caller supplied for one role, copying only the
+/// requested `[offset, offset + len)`.
+struct ChainWeightSource<'a> {
+    artifact: ArtifactId,
+    role: &'a str,
+    bytes: &'a [u8],
+}
+
+impl ChunkSource for ChainWeightSource<'_> {
+    fn read_chunk(&mut self, chunk: &ChunkId, into: &mut [u8]) -> Result<()> {
+        if chunk.artifact() != &self.artifact || chunk.slot().role() != self.role {
+            return Err(invalid(
+                "chunk",
+                "chain weight source received an unexpected chunk",
+            ));
+        }
+        let start = usize::try_from(chunk.range().offset_bytes())
+            .map_err(|_| invalid("chunk", "chain weight range exceeds the address space"))?;
+        let end = start
+            .checked_add(into.len())
+            .ok_or_else(|| invalid("chunk", "chain weight range overflowed"))?;
+        let slice = self
+            .bytes
+            .get(start..end)
+            .ok_or_else(|| invalid("chunk", "chain weight range exceeds its image"))?;
+        into.copy_from_slice(slice);
+        Ok(())
+    }
+}
+
+/// `keep`'s persistent-boundary twin: copies a stage's output into an
+/// already-allocated range instead of allocating a fresh one every step.
+fn keep_into<'ctx>(
+    plan: &SelectedReservedPlan<'ctx>,
+    local: ValueId,
+    destination: &DeviceRange<'ctx>,
+    stream: &Stream<'ctx>,
+) -> Result<()> {
+    let bytes = plan
+        .candidate()
+        .value(local)
+        .ok_or_else(|| invalid("boundary", "a stage output is absent from its plan"))?
+        .logical_bytes;
+    // SAFETY: the boundary retains the destination through stream completion,
+    // and the source plan's lease is retained until this step's final drain.
+    unsafe {
+        destination.copy_from_device_async_at(0, plan.range_for_value(local)?, 0, bytes, stream)
+    }
+}
+
+/// `return_worker_range`'s twin over leases still holding their plans, for
+/// reclaiming an attention run's range before the chain's stage leases
+/// retire (H6).
+fn return_worker_range_from_leases<'ctx>(
+    context: &RankContext,
+    leases: &mut [OperationLease<SelectedCompletion<'ctx>, DenseOperation<'ctx>>],
+    mut range: DeviceRange<'ctx>,
+) -> Result<()> {
+    for lease in leases {
+        let plan = lease
+            .resource_mut()
+            .plan
+            .as_mut()
+            .expect("an in-flight chain lease retains its plan");
+        match plan.release_reclaimed(range) {
+            Ok(()) => return Ok(()),
+            Err(refused) => range = refused.range,
+        }
+    }
+    Err(device_lost(
+        context.ordinal(),
+        format!(
+            "reclaimed attention range of {} bytes has no owning chain plan",
+            range.bytes()
+        ),
+    ))
+}
+
+fn close_chain_join_buffers(ledger: &mut Ledger, buffers: ChainJoinBuffers<'_>) -> Result<()> {
+    let ChainJoinBuffers {
+        mut arena,
+        status,
+        data,
+        dummy,
+        ..
+    } = buffers;
+    for range in [status, data, dummy] {
+        arena.release(range).map_err(|refused| refused.error)?;
+    }
+    arena.close(ledger).map_err(|refused| refused.error)
 }
 
 fn return_worker_range<'ctx>(
@@ -3076,6 +4717,11 @@ mod close_tests {
             communicator: None,
             nccl_reservation: None,
             preserve_communicator_on_loss: false,
+            chain: None,
+            chain_step: None,
+            chain_inputs: None,
+            ready_waits: 0,
+            stream_waits: 0,
         };
         assert!(matches!(worker.close_runs(), Err(Error::DeviceLost { .. })));
         assert_eq!(worker.runs.len(), 1);

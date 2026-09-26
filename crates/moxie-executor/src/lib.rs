@@ -153,7 +153,9 @@ pub use dense_set::{
 #[cfg(feature = "paged-attention-binding")]
 mod dense_tp;
 #[cfg(feature = "paged-attention-binding")]
-pub use dense_tp::{DenseRankWorkerConfig, DenseRankWorkers, DenseWorkerStep};
+pub use dense_tp::{
+    ChainBucket, ChainCounters, DenseRankWorkerConfig, DenseRankWorkers, DenseWorkerStep,
+};
 #[cfg(feature = "paged-attention-binding")]
 mod rank_worker;
 #[cfg(feature = "paged-attention-binding")]

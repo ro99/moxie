@@ -3541,13 +3541,16 @@ fn index_values_from_sources<'a>(
     })
 }
 
-fn validate_embedding_tokens(
-    operation: &DenseOperation<'_>,
+/// The body of the embedding token check, over raw sources rather than a
+/// live `DenseOperation`: a chain step's `ChainPrepare` has bindings but no
+/// operation yet, since the enqueue that would create one has not happened.
+pub(crate) fn validate_embedding_token_sources(
+    sources: &[OwnedBinding],
     value: ValueId,
     rows: u64,
     vocab: u64,
 ) -> Result<()> {
-    let token_ids = index_values(operation, value, rows)?;
+    let token_ids = index_values_from_sources(sources, value, rows)?;
     if (0..token_ids.len()).any(|index| token_ids.get(index) >= vocab) {
         return Err(invalid(
             "token",
@@ -3555,6 +3558,15 @@ fn validate_embedding_tokens(
         ));
     }
     Ok(())
+}
+
+fn validate_embedding_tokens(
+    operation: &DenseOperation<'_>,
+    value: ValueId,
+    rows: u64,
+    vocab: u64,
+) -> Result<()> {
+    validate_embedding_token_sources(&operation.sources, value, rows, vocab)
 }
 
 fn attention_positions<'a>(

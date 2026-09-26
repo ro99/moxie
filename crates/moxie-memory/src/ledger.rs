@@ -202,6 +202,11 @@ pub struct Ledger {
     id: LedgerId,
     scopes: BTreeMap<Scope, ScopeState>,
     outstanding: crate::fallible::Map<ReservationId, OutstandingRecord>,
+    /// Every successful `admit`, ever, cumulative and never decremented by a
+    /// `release`. An admit-then-release in one step leaves `outstanding_count`
+    /// unchanged, which is exactly why a caller proving "no new admission this
+    /// step" needs a counter that only grows.
+    admissions: u64,
 }
 
 /// The intermediate result of evaluating a request against the ledger.
@@ -244,11 +249,18 @@ impl Ledger {
             id: LedgerId::next(),
             scopes,
             outstanding: crate::fallible::Map::new(),
+            admissions: 0,
         })
     }
 
     pub const fn id(&self) -> LedgerId {
         self.id
+    }
+
+    /// How many `admit` calls this ledger has ever committed. See the field's
+    /// own doc for why this differs from `outstanding_count`.
+    pub const fn admissions(&self) -> u64 {
+        self.admissions
     }
 
     pub fn scopes(&self) -> impl Iterator<Item = Scope> + '_ {
@@ -475,6 +487,7 @@ impl Ledger {
                 scope_charges: evaluation.scope_charges,
             },
         );
+        self.admissions += 1;
         Ok(Reservation {
             id,
             ledger: self.id,
