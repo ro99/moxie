@@ -70,6 +70,12 @@ change 7 is the escape inventory.
     FP32 → BF16 conversion kernel, sol H4);
   - `xtask/src/gpu.rs` (one new `test-gpu` case qualifying that kernel;
     authorized by the coordinator answering luna's DECISION, 2026-09-25);
+  - **deletions only:** `crates/moxie-executor/src/arena.rs`
+    (`export_peer_read_at` and `copy_from_peer_read_at` wrappers), plus
+    `crates/moxie-cuda/src/driver.rs` and `src/lib.rs` (`PeerReadHandle`,
+    `PeerReadOwner` and their methods, re-exports). Nothing else uses the
+    peer-read mechanism once joins move to NCCL (coordinator, answering
+    luna's DECISION; checked by grep);
   - `crates/moxie-executor/{Cargo.toml,src/dense_tp_workers.rs}`, and
     `src/rank_worker.rs` if the rendezvous lives there;
   - `crates/moxie-executor/tests/dense_tp2_device.rs` (one new test) and
