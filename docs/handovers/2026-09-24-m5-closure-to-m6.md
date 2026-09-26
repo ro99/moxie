@@ -425,6 +425,31 @@ These rest on the reviewer's research
 - **Order:** Qwen runs after the persistent PP work and the Gemma exit task,
   because the checkpoint only fits as a pipeline over three GPUs.
 
+### Gemma exit decisions (owner, 2026-09-26)
+
+These rest on the reviewer's research
+([record](../evidence/gemma-exit-research-and-draft.md)).
+- **O1:** install `compressed-tensors`, at a pinned version, in the Python
+  **reference environment only**, so transformers can read the 31B's 8-bit
+  weights. Nothing changes in Moxie.
+- **O2:** the quality bar is the same as Qwen's:
+  - relative L2 ≤ 2e-2 and cosine ≥ 0.999 per position of the test prompt,
+    on final logits;
+  - the first 32 generated tokens identical to the reference's.
+- **O3:** the owner will provide the **reference speed** later. The exit
+  comparison waits for it, and the contract leaves this part open until
+  then.
+- **O4:** order confirmed:
+  1. 0102 (persistent TP);
+  2. the **persistent pipeline**;
+  3. the Gemma exit task;
+  4. the Qwen task.
+- **Placement (engineering, reviewer's draft Part 3).** Both Gemmas run as
+  pipelines, which needs no TP slicing of 8-bit weights. The 31B uses two
+  stages on the 3090 pair (layers 0–29 and 30–59). The 26B uses three
+  stages: the 5060 Ti takes layers 0–7, 3090 #1 layers 8–18 and 3090 #2
+  layers 19–29. Memory is accounted at a 32K context.
+
 ### Known bound for slice 7 (coordinator, 2026-09-24)
 
 `gemma-4-31B-it-AWQ-8bit` is INT8, group 32, symmetric, which the affine
