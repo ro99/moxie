@@ -444,6 +444,15 @@ correction does not by itself require rerunning a product suite. New code,
 failures or changed assumptions determine what must be rerun, with the reason
 recorded. Never drop a required gate to save time.
 
+**One task through its whole cycle (owner, 2026-09-26).** The builder does
+not start the next task until the current one is accepted: build, then
+review, then repair, then accept. A repair is never queued behind new work,
+and a reviewer never reviews work that has moved on under it. The only
+overlap allowed is the reviewer reading a candidate commit while the
+builder's final gates for **that same task** run. The coordinator may draft
+and design-review the next contract meanwhile, because that touches no
+code.
+
 **Keep the wait proportional (owner, 2026-09-25).**
 - Gates follow what the task touches. For example, `cargo xtask-cuda
   test-gpu` runs only when a CUDA kernel source or its build changes.
