@@ -3693,21 +3693,7 @@ fn paged_attention_indirect(cap: &DeviceCapability) -> Result<Outcome, Error> {
         let sentinel = vec![0xa5; padded_bytes];
         let mut padded_output = DeviceBuffer::alloc(&ctx, padded_bytes)?;
         padded_output.copy_from_host(&sentinel)?;
-        let mut padded_ptr = padded_output.device_ptr();
-        let mut padded_params: [*mut c_void; 12] = [
-            (&raw mut query_ptr).cast(),
-            (&raw mut key_ptr).cast(),
-            (&raw mut value_ptr).cast(),
-            (&raw mut table_ptr).cast(),
-            (&raw mut padded_ptr).cast(),
-            (&raw mut step_ptr).cast(),
-            (&raw mut heads).cast(),
-            (&raw mut kv_heads).cast(),
-            (&raw mut head_dim).cast(),
-            (&raw mut page_tokens).cast(),
-            (&raw mut window).cast(),
-            (&raw mut scale).cast(),
-        ];
+        output_ptr = padded_output.device_ptr();
         // SAFETY: as above, with a max_rows grid; the kernel returns before
         // reading query/output rows at or beyond step[0].
         unsafe {
@@ -3715,7 +3701,7 @@ fn paged_attention_indirect(cap: &DeviceCapability) -> Result<Outcome, Error> {
                 (APPEND_MAX_ROWS, case.heads as u32, 1),
                 (moxie_kernels::PAGED_ATTENTION_THREADS, 1, 1),
                 0,
-                &mut padded_params,
+                &mut indirect_params,
             )?;
         }
         let mut padded = vec![0; padded_bytes];
