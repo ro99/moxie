@@ -184,6 +184,16 @@ need more than one GPU. Route, owner-approved NCCL
   rank, as `DensePlanSet` (0091) does on one GPU.
 - **0103 (M6.2):** per-rank capture of TP and PP decode steps.
 
+### Builder switch (owner, 2026-09-26)
+
+Codex `luna`'s session was interrupted just after midnight on 2026-09-26,
+mid-task 0104, with its weekly quota at about 2% (it resets 2026-09-29
+15:35). No report came, and the night was lost (see coordinator.md,
+"Unattended mode"). The owner switched building to the Claude Opus
+`builder` (Herdr pane in tab `wC:t12`). It resumes 0104 from luna's
+uncommitted changes and carries the queue until luna's quota resets. Sol
+stays the reviewer. One builder at a time.
+
 ### Naming (owner, 2026-09-25)
 
 Work is named by the roadmap item it serves (M6.1–M6.5), or "M6 exit" for
