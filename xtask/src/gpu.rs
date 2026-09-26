@@ -3589,7 +3589,13 @@ fn words_u32_bytes(words: &[u32]) -> Vec<u8> {
 }
 
 fn paged_attention_indirect(cap: &DeviceCapability) -> Result<Outcome, Error> {
-    const BASELINE_SHA256: [(&str, &str); 3] = [
+    // Task 0105's H3: two shapes the pre-existing three never exercised --
+    // 256 fills both accumulator slots and 200 leaves the second partly
+    // used. Their v1 SHA-256s below were captured on this unchanged kernel
+    // (SM86 and SM120 agreed) before `MOXIE_ATTN_MAX_HEAD_DIM` moved to
+    // 512, so a later codegen change at the new width has something to
+    // diff against.
+    const BASELINE_SHA256: [(&str, &str); 5] = [
         (
             "gqa-128-decode",
             "1469fabdc480f04b00e5edb73aff3efebe102d55b298e4bfc860d12df1e7d8bd",
@@ -3601,6 +3607,14 @@ fn paged_attention_indirect(cap: &DeviceCapability) -> Result<Outcome, Error> {
         (
             "sliding-20-scale-one",
             "60c641071b498e5771677b69be0f3b5159b6c66750a2c99e24b938b028d0d716",
+        ),
+        (
+            "gqa-256-decode",
+            "50a65b949de6c90123077955814097e03581a1a99d35db6ca5d3d0b6e8ef559e",
+        ),
+        (
+            "gqa-200-chunk",
+            "c1ac5bf245a6753c2833b2ff703f8edd974c3a17de2762d709d04778c3667673",
         ),
     ];
     const APPEND_MAX_ROWS: u32 = 16;
@@ -3660,6 +3674,42 @@ fn paged_attention_indirect(cap: &DeviceCapability) -> Result<Outcome, Error> {
             rows: 5,
             history: 71,
             first_position: 66,
+        },
+        // Two full accumulator slots at the pre-widening bound: the shape
+        // most exposed to a codegen change when `MOXIE_ATTN_ACC_SLOTS`
+        // moves from 2 to 4.
+        IndirectAttentionCase {
+            label: "gqa-256-decode",
+            geometry: PageGeometry {
+                kv_heads: 2,
+                head_dim: 256,
+                page_tokens: 32,
+                pages: 4,
+            },
+            heads: 8,
+            scale: moxie_plan::reciprocal_sqrt_scale(256),
+            window: 0,
+            rows: 1,
+            history: 100,
+            first_position: 99,
+        },
+        // A second accumulator slot that is only partly used -- 200 is one
+        // full slot plus a remainder in the second, unlike 256's two full
+        // slots above.
+        IndirectAttentionCase {
+            label: "gqa-200-chunk",
+            geometry: PageGeometry {
+                kv_heads: 2,
+                head_dim: 200,
+                page_tokens: 16,
+                pages: 7,
+            },
+            heads: 6,
+            scale: 1.0,
+            window: 0,
+            rows: 8,
+            history: 100,
+            first_position: 92,
         },
     ];
 
