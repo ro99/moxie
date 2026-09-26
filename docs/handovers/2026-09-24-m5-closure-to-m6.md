@@ -389,6 +389,33 @@ operations, not a Qwen runtime:
 
 The MTP head is not run in M6 (speculative decoding is M9).
 
+### Qwen decisions (2026-09-26)
+
+These rest on the reviewer's research
+([record](../evidence/qwen-hybrid-research-and-draft.md), Part 2).
+- **D1 (owner): fetch transformers 5.17.0.** Authorize one read-only
+  download of transformers 5.17.0's `models/qwen3_5/modeling_qwen3_5.py`
+  and `configuration_qwen3_5.py`, to read the exact math, since the
+  checkpoint declares `output_gate_type: swish`, which 5.5.3 ignores.
+  Nothing is installed or executed.
+- **D2 (owner): approved.** New shared operations: `ShortConv`,
+  `GatedDeltaRule`, `GatedRmsNorm`, `SigmoidGate`, a `RmsNorm` gain offset,
+  and a half-split RoPE layout. Each has an FP64 host oracle.
+- **D3 (owner): approved, N = 32.**
+  - Per device operation: bitwise against an explicitly rounded host
+    reference. The delta rule is bitwise against an FP32 host reference in
+    the same token order, plus an FP64 bound.
+  - At model level, against transformers in FP32: relative L2 ≤ 2e-2 and
+    cosine ≥ 0.999, per layer output and for the final recurrent state,
+    plus greedy agreement over **32** tokens.
+- **D4 (coordinator, an engineering choice under document 04's single
+  transaction mechanism):** double-buffered committed and tentative state
+  slots per layer. A step writes the tentative slot, commit flips it, abort
+  discards it. About 300 MB per sequence. The owner found the question too
+  technical to rule on, and it needs no product decision.
+- **Order:** Qwen runs after the persistent PP work and the Gemma exit task,
+  because the checkpoint only fits as a pipeline over three GPUs.
+
 ### Known bound for slice 7 (coordinator, 2026-09-24)
 
 `gemma-4-31B-it-AWQ-8bit` is INT8, group 32, symmetric, which the affine
