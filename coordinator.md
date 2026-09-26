@@ -426,6 +426,12 @@ recorded. Never drop a required gate to save time.
   that the findings landed is not a review: it cannot see a new defect that
   the repair introduced.
 
+**Clippy covers every lane (2026-09-25).** Workspace clippy does not enable
+`xtask`'s `cuda` feature. Eight lints accumulated in `xtask/src/gpu.rs`
+across tasks 0063–0098 because no contract listed `cargo clippy -p xtask
+--features cuda --all-targets --locked -- -D warnings`. It is a host gate
+for every task that touches `xtask`.
+
 For affected Rust/CUDA work, account for the distinct lanes: host build,
 executor driver feature, and `xtask`'s own CUDA feature. Passing one does not
 compile or qualify the others. Run architecture/spec checks and real hardware,

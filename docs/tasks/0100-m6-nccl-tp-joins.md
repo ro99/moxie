@@ -1,6 +1,8 @@
 # Task 0100 — NCCL communicators and TP joins
 
-Status: **proposed** (coordinator, 2026-09-25), awaiting sol's design review.
+Status: **active** (coordinator, 2026-09-25). Sol's design review (4 high,
+4 medium, 1 low) is adopted verbatim in "Design review" below. Where it
+conflicts with the numbered changes, **it overrides them**.
 Builder Codex `luna`; reviewer Codex `sol`. Asynchronous-ownership work:
 change 7 is the escape inventory.
 
@@ -64,6 +66,8 @@ change 7 is the escape inventory.
 - **Allowed files:**
   - `crates/moxie-cuda/{build.rs,Cargo.toml,src/lib.rs,src/ffi.rs}`, plus a
     new `src/nccl.rs`;
+  - `crates/moxie-kernels/{cuda/dense_ops.cu,src/lib.rs}` (the one-input
+    FP32 → BF16 conversion kernel, sol H4);
   - `crates/moxie-executor/{Cargo.toml,src/dense_tp_workers.rs}`, and
     `src/rank_worker.rs` if the rendezvous lives there;
   - `crates/moxie-executor/tests/dense_tp2_device.rs` (one new test) and
@@ -201,5 +205,51 @@ commit.
   split reference;
 - abort does not unblock a stalled peer within the deadline;
 - a file outside the allowed list is needed.
+
+## Design review (sol, 2026-09-25) — adopted verbatim; overrides the numbered changes
+
+- **H1 (change 5).** Stage and `JoinPrepare` failures use the existing
+  paired rendezvous and settle; no NCCL join starts. After both
+  preparations succeed, each `JoinCopy` enqueues both collectives despite a
+  local post-prepare failure, using a valid admitted dummy source if
+  necessary.
+- **H2 (changes 5, 7).** After each paired `JoinCopy`, pair a bounded
+  `JoinDrain`. It observes both streams and the status, then retires the
+  source, the temp and the plan before scheduling the next `Stage`. A
+  nonzero status aborts both transactions before later stages. Task 0102
+  may remove this host barrier.
+- **H3 (changes 6, 7).** Each responsive rank aborts its own communicator
+  from its deadline or async-error polling path before parking. The
+  coordinator marks the group lost and keeps unreachable ranks parked and
+  charged. There is no cross-thread abort.
+- **H4 (change 5).** Add a one-input round-to-nearest FP32 → BF16
+  conversion kernel (`dense_ops.cu`, and its constant in `lib.rs`), and use
+  it after the NCCL sum. `TP_REDUCE_F32` is not reused, because NCCL has
+  already summed. It must match the split reference's single rounding,
+  including signed zero. A `test-gpu` case qualifies it (kernel source
+  changes, so `test-gpu` is **required** for this task).
+- **M1 (change 8a).** The existing peer-copy fault injection no longer
+  fires once peer-copy joins are deleted. Replace only that injection with
+  an NCCL enqueue or async failure, preserving its recovery assertions.
+  Keep the host declaration-mismatch guard.
+- **M2 (changes 1, 2, 7).**
+  - Use `NCCL_CONFIG_INITIALIZER` (size, magic, version and the UNDEF
+    fields) before setting `blocking = 0`.
+  - Handle `ncclInProgress` during init and finalize.
+  - Destroy only after finalization has completed. On refusal, return
+    `Self` only while its handle is still live.
+- **M3 (changes 3, 5, 7).**
+  - The admission tier is `CollectiveBuffers` (`moxie-memory` `tier.rs`
+    about 35–37).
+  - The status is one in-place device word, written with a stream-ordered
+    `cuMemsetD32Async` and kept through `JoinDrain`. That is L1: an
+    in-place `ncclAllReduce` on one 4-byte word, with no separate
+    `status_result`.
+  - Charge all temporary data ranges plus the NCCL reserve. Measure the
+    reserve against the largest admitted join as well as a 1 MiB one.
+- **M4 (ADR 0039, change 4).** Communicators are created per rank with
+  `ncclCommInitRankConfig`, which is equivalent to `ncclCommInitAll` for
+  Moxie's explicit per-thread contexts. ADR 0039 decision 2 is amended to
+  match.
 
 ## Result, filled after work

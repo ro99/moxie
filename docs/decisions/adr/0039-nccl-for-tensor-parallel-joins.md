@@ -37,8 +37,11 @@ and rollback", and `kernels/cuda/deepseek_rank_local_layer_executor.cu`:
    header version at communicator creation, as ADR 0037 does for cuBLAS. No
    other crate links it.
 2. **Communicators.** One persistent communicator per rank, created once
-   with `ncclCommInitAll` for the TP pair at worker spawn, and destroyed at
-   close. It is bound to the rank's context and stream.
+   at worker spawn and destroyed at close, bound to the rank's context and
+   stream. Each rank thread creates its own communicator with
+   `ncclCommInitRankConfig`, sharing one unique id. That is equivalent to
+   Strata's `ncclCommInitAll`, and required by Moxie's explicit per-thread
+   contexts (amended after sol's design review of task 0100).
 3. **Joins.**
    - `Join::Reduce`: `ncclAllReduce` of the FP32 partials with `ncclSum`,
      then the existing single rounding to BF16 on each rank.
