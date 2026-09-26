@@ -698,7 +698,7 @@ fn graph_capture_replay(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let mut expected = y_initial;
     for _ in 0..4 {
         for (y, &x) in expected.iter_mut().zip(&x) {
-            *y = a * x + *y;
+            *y += a * x;
         }
     }
     let mut output = vec![0.0f32; N];
@@ -752,7 +752,7 @@ fn graph_capture_replay(cap: &DeviceCapability) -> Result<Outcome, Error> {
 
     let mut expected_after_recovery = expected;
     for (y, &x) in expected_after_recovery.iter_mut().zip(&x) {
-        *y = a * x + *y;
+        *y += a * x;
     }
     dy.copy_to_host(bytemuck_f32_mut(&mut output))?;
     for (index, (&got, &want)) in output.iter().zip(&expected_after_recovery).enumerate() {
@@ -3805,6 +3805,8 @@ fn paged_attention_indirect(cap: &DeviceCapability) -> Result<Outcome, Error> {
                     &stream,
                 )
             };
+            // SAFETY: the value source and destination are within their
+            // allocations and remain live with the stream through sync.
             let value_copy = unsafe {
                 reference_values.copy_from_device_async_at(
                     destination as usize,
@@ -5821,7 +5823,7 @@ fn paged_attention_state_lifecycle(cap: &DeviceCapability) -> Result<Outcome, Er
         geometry,
         heads,
         TENTATIVE as u64,
-        (MAX_ROWS as u64)
+        MAX_ROWS
             .checked_add(1)
             .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
@@ -6114,7 +6116,7 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
         geometry,
         heads,
         FORK_AT,
-        (MAX_ROWS as u64)
+        MAX_ROWS
             .checked_add(1)
             .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
@@ -6146,7 +6148,7 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
         geometry,
         heads,
         FORK_AT,
-        (MAX_ROWS as u64)
+        MAX_ROWS
             .checked_add(1)
             .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
@@ -6380,7 +6382,7 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
         geometry,
         heads,
         PAGE_TOKENS,
-        (MAX_ROWS as u64)
+        MAX_ROWS
             .checked_add(1)
             .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
@@ -6417,7 +6419,7 @@ fn paged_attention_device_cow(cap: &DeviceCapability) -> Result<Outcome, Error> 
         geometry,
         heads,
         PAGE_TOKENS,
-        (MAX_ROWS as u64)
+        MAX_ROWS
             .checked_add(1)
             .ok_or(Error::Dim(moxie_types::DimError::Overflow))?,
         Staging::Host,
