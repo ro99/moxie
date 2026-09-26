@@ -13,8 +13,10 @@ append) and 0101 (full-step capture).
   moxie_bf16_paged_attention_v1` and `cmp`. Identical machine code means
   identical output by construction, so the recorded hashes are the
   pre-refactor bytes whenever they were captured.
-- **R1 L1 (not taken now):** a duplicate 12-entry parameter array in the
-  test (`xtask/src/gpu.rs` about 3697–3719), carried as a small cleanup.
+- **R1 L1:** a duplicate 12-entry parameter array in the test. It was
+  removed later in `146d23f` (72/72 `test-gpu`). That round also found 8
+  xtask CUDA-feature clippy lints accumulated since task 0063, fixed in
+  `ca7d904`.
 
 ## Identity and authority
 
