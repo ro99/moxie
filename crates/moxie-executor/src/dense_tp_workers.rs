@@ -1751,6 +1751,39 @@ impl<'ctx> WorkerState<'ctx> {
     }
 
     fn drain(&mut self, deadline: Instant) -> Result<()> {
+        if self.communicator.is_none() {
+            return Err(device_lost(
+                self.ctx.ordinal(),
+                "rank stream drain has no NCCL communicator".into(),
+            ));
+        }
+        loop {
+            let poll = self
+                .communicator
+                .as_ref()
+                .expect("NCCL communicator remains until drain settles")
+                .poll();
+            match poll {
+                Ok(CommState::Ready) if Instant::now() < deadline => break,
+                Ok(CommState::InProgress) if Instant::now() < deadline => thread::yield_now(),
+                Ok(CommState::Ready | CommState::InProgress) => {
+                    self.abort_communicator();
+                    return Err(device_lost(
+                        self.ctx.ordinal(),
+                        "NCCL work missed the group deadline before stream drain".into(),
+                    ));
+                }
+                Err(error) => {
+                    self.abort_communicator();
+                    return Err(device_lost(
+                        self.ctx.ordinal(),
+                        format!("NCCL asynchronous operation failed ({error})"),
+                    ));
+                }
+            }
+        }
+
+        // NCCL may enqueue stream work after group_end returns InProgress.
         let event = match Event::new(self.ctx) {
             Ok(event) => event,
             Err(error) => {
@@ -1769,26 +1802,8 @@ impl<'ctx> WorkerState<'ctx> {
             ));
         }
         loop {
-            let communicator_ready = if let Some(communicator) = &self.communicator {
-                match communicator.poll() {
-                    Ok(CommState::Ready) => true,
-                    Ok(CommState::InProgress) => false,
-                    Err(error) => {
-                        self.abort_communicator();
-                        return Err(device_lost(
-                            self.ctx.ordinal(),
-                            format!("NCCL asynchronous operation failed ({error})"),
-                        ));
-                    }
-                }
-            } else {
-                return Err(device_lost(
-                    self.ctx.ordinal(),
-                    "rank stream drain has no NCCL communicator".into(),
-                ));
-            };
             match event.is_complete() {
-                Ok(true) if communicator_ready => return Ok(()),
+                Ok(true) if Instant::now() < deadline => return Ok(()),
                 Ok(true) | Ok(false) => {}
                 Err(error) => {
                     self.abort_communicator();

@@ -573,6 +573,20 @@ fn tp_f32_to_bf16_rounding(cap: &DeviceCapability) -> Result<Outcome, Error> {
     let mut got = vec![0u16; count];
     destination.copy_to_host(bytemuck_u16_mut(&mut got))?;
     for (index, value) in inputs.iter().enumerate() {
+        if value.is_nan() {
+            // CUDA promises NaN -> NaN for `__float2bfloat16_rn`, but leaves
+            // the payload bits unspecified. Match the split reference's
+            // NaN handling without imposing a payload representation.
+            let is_nan = got[index] & 0x7f80 == 0x7f80 && got[index] & 0x007f != 0;
+            if !is_nan {
+                return Ok(Outcome::Failed(format!(
+                    "input {index} (0x{:08x}): device 0x{:04x}, expected a BF16 NaN",
+                    value.to_bits(),
+                    got[index]
+                )));
+            }
+            continue;
+        }
         let expected = host_f32_to_bf16_bits(*value);
         if got[index] != expected {
             return Ok(Outcome::Failed(format!(

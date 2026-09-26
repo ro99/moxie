@@ -203,8 +203,8 @@ GPU gates, once, with `nccl,cublas`:
 - the full `dense_tp2_device`;
 - `dense_tp2_cublas_device`.
 
-No `test-gpu`, and no timing. The reviewer may start at the candidate
-commit.
+Run `test-gpu` for H4's new kernel, and no timing. The reviewer may start at
+the candidate commit.
 
 **Stop conditions:**
 - NCCL cannot use Moxie's explicitly created contexts (as tested for
@@ -299,7 +299,23 @@ commit.
   `nccl_status_poisons_both_ranks` fail by rendezvous deadline/loss; it was
   reverted. The unmutated test passed and verified the typed status refusal,
   unchanged frontiers and same-group byte-identical recovery.
+- R1 repaired the stream-retirement race: `WorkerState::drain` now waits for
+  communicator `Ready` before recording its CUDA event, then waits for that
+  event before returning. `drain_join` uses it before status read/resource
+  retirement and again after conversion/interleave; the step drain precedes
+  output readback and `Cleanup`; `ClosePrepare` drains before closing runs,
+  then communicator finalization polls to `Ready` before destroy. The dense
+  operation events in `dense.rs` are recorded within stage launches, before
+  the following NCCL join or after the previous `JoinDrain` has settled.
+  Error/abort paths abort the local communicator and park with resources
+  retained; they do not record a retirement event or release those resources.
+  No deterministic hook was added for forcing native `ncclGroupEnd` to return
+  `ncclInProgress`: NCCL controls that status internally, and faking only the
+  wrapper return would not ensure outstanding NCCL stream work and so would
+  not exercise this race. The corrected oracle also checks NaN classification
+  rather than a payload bit pattern, which CUDA leaves unspecified.
 - Gates: `fmt`, workspace clippy, executor driver clippy without NCCL, with
   NCCL, and with cuBLAS, xtask CUDA-feature clippy, arch-check, spec-check,
-  and the full `dense_tp2_device` suite with `nccl,cublas` passed. Workspace
-  tests, `test-gpu`, and `dense_tp2_cublas_device` are pending.
+  workspace tests, full `dense_tp2_device` with `nccl,cublas`,
+  `dense_tp2_cublas_device`, and `cargo xtask-cuda test-gpu` passed. The new
+  conversion case passed on sm_86 and sm_120 across all three GPUs.
